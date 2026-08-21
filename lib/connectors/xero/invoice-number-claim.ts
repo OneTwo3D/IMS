@@ -98,7 +98,11 @@
 
 import { xeroGet } from './api'
 import { PAGE_SIZE } from './invoice-delta'
-import type { InvoiceNumberLookup, LedgerInvoiceClaim } from '@/lib/domain/accounting/invoice-number-ownership'
+import {
+  xeroInvoiceNumberIdentity,
+  type InvoiceNumberLookup,
+  type LedgerInvoiceClaim,
+} from '@/lib/domain/accounting/invoice-number-ownership'
 
 type XeroInvoiceNumberLookupResponse = {
   Invoices?: Array<{
@@ -135,6 +139,11 @@ function asString(value: unknown): string | undefined {
  * not a fence; a document that comes back under a DIFFERENT number is not a claim on this one.
  * The comparison is case-insensitive because Xero's invoice numbers are, so `AB-1` and `ab-1`
  * are the same claim to the ledger and must be to us.
+ *
+ * That rule now lives in ONE place — `xeroInvoiceNumberIdentity` — because round 4's post-slot
+ * mutex used a narrower one and the two silently disagreed about which numbers name one document
+ * (round 5). A definition written out twice is a definition that can drift; here it drifted in the
+ * direction that ends in an overwrite.
  */
 export async function lookupXeroInvoiceNumberClaim(
   invoiceNumber: string,
@@ -192,10 +201,11 @@ export async function lookupXeroInvoiceNumberClaim(
     }
   }
 
+  const wantedIdentity = xeroInvoiceNumberIdentity(wanted)
   const claims: LedgerInvoiceClaim[] = []
   for (const inv of rows) {
     const number = asString(inv?.InvoiceNumber)
-    if (!number || number.toLowerCase() !== wanted.toLowerCase()) continue
+    if (!number || xeroInvoiceNumberIdentity(number) !== wantedIdentity) continue
     const type = asString(inv?.Type)
     // Absent Type is treated as a match: the endpoint returns it, so a missing one is a shape we
     // do not understand, and on this fence an unknown document counts as a claim.

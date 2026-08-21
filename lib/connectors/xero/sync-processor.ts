@@ -6,8 +6,9 @@
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
 import { db } from '@/lib/db'
+import { XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { logActivity, logActivityPersisted } from '@/lib/activity-log'
-import { pushSalesInvoice, updateSalesInvoice } from './invoices'
+import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
 import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
@@ -23,7 +24,7 @@ import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
-import { decideInvoiceNumberPost } from '@/lib/domain/accounting/invoice-number-ownership'
+import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { applyBackReference, followUpObligationClaim, releaseFollowUpObligation } from '@/lib/domain/accounting/back-reference'
 import { stampSyncedAtFromDatabaseClock } from './synced-at-clock'
@@ -1460,7 +1461,8 @@ export function heldClaimWhere(entryId: string, claimedAt: Date) {
 }
 
 /**
- * THE OTHER WRITER IS US: ONE IMS WORKER AT A TIME MAY POST UNDER A GIVEN NUMBER (o3d-k26m.5 r4).
+ * THE OTHER WRITER IS US: ONE IMS WORKER AT A TIME MAY POST UNDER A GIVEN NUMBER (o3d-k26m.5 r4,
+ * rebuilt on a LOCK in round 5).
  *
  * The ledger lookup answers "who holds this number NOW", and between that answer and the POST there
  * is a window. Once xeroom is removed the only thing that can take a number inside that window is
@@ -1470,125 +1472,359 @@ export function heldClaimWhere(entryId: string, claimedAt: Date) {
  * first. One invoice, one survivor, nothing anywhere recording that there had been two.
  *
  * It is the only race that survives the cutover, and unlike a foreign writer it is entirely ours to
- * close. This closes it with the record that was already being written: `attemptedInvoiceNumber` is
- * stamped BEFORE the post, and then the row looks for any OTHER live row staking the same number.
+ * close.
  *
- * WHY STAMP-THEN-LOOK IS SOUND, with no unique index and no lock spanning an HTTP request:
+ * ------------------------------------------------------------------------------------------------
+ * WHAT ROUND 4 GOT WRONG, AND WHY BOTH HALVES WERE THE SAME MISTAKE (Codex round 4 → round 5)
+ * ------------------------------------------------------------------------------------------------
+ * Round 4 closed it WITHOUT a lock: each worker wrote its stamp before it read for rivals, and
+ * yielded to any rival whose stamp was not strictly later than its own. Two independent defects,
+ * and both come from letting something other than the resource itself decide.
  *
- *   - each worker WRITES its stamp before it READS for rivals, and the write is committed before
- *     the read begins (separate awaited statements, read-committed);
- *   - so two workers cannot both miss each other: if A's read preceded B's write, then A's write
- *     preceded A's read, so B — reading after its own later write — sees A;
- *   - a worker yields to any rival whose stamp is NOT STRICTLY LATER than its own. Suppose both
- *     proceeded: whichever wrote first, say X, must not have been seen by the other, so the other
- *     read before X wrote, so the other also WROTE before X wrote — and then X, reading after that
- *     write, saw it and yielded. Contradiction.
+ * 1. THE IDENTITY WAS NARROWER THAN THE LEDGER'S. The rival scan matched `attemptedInvoiceNumber`
+ *    as an exact string. Xero matches invoice numbers case-insensitively — this module's own lookup
+ *    says so and re-compares its response that way — so `INV-1` and `inv-1` are ONE document and one
+ *    upsert target, while round 4 gave them two independent slots. Each worker found itself
+ *    unopposed; the second post replaced the first. The mutex and the ledger now share ONE
+ *    definition of "the same number", `xeroInvoiceNumberIdentity`, so a pair of rows Xero would
+ *    collide cannot hold different slots.
  *
- * WHY NOT A ROW-ID TIE-BREAK on equal stamps, which would be tidier. Timestamps are milliseconds,
- * so two stamps can record as equal while one genuinely preceded the other — and an id ordering
- * that disagrees with the real one lets BOTH through (the earlier writer sees nobody; the later one
- * sees an "outranked" rival and posts anyway). At an exact tie both may instead yield, and both then
- * come back on the ordinary retry ladder. Refusing twice costs a cycle; posting twice costs a
- * document.
+ * 2. A CLOCK DECIDED WHO WON, AND CLOCKS DO NOT AGREE. Round 4 already found one clock trap here
+ *    (two stamps recording as equal when one genuinely preceded the other, fixed by making a tie
+ *    yield both ways). The deeper one it left: the stamps come from DIFFERENT HOSTS. If worker A's
+ *    clock runs far enough ahead of worker B's, A reads B's live stamp as older than the lease and
+ *    filters it out entirely — while B, seeing A's stamp dated in its own future, reads A as
+ *    "strictly later" and posts anyway. BOTH POST. No tie-break can repair that, because the inputs
+ *    are not comparable quantities.
  *
- * WHAT COUNTS AS A LIVE RIVAL. Still PROCESSING, and stamped within {@link CLAIM_STALE_MS}. Both
- * halves matter: a loser's row drops back to PENDING as it fails, which frees the number
- * immediately, and a worker that DIED mid-post leaves its row PROCESSING forever — so the stamp is
- * honoured only for as long as the claim itself is honoured, after which the row is re-claimable
- * anyway. Any longer and one crash would fence a number off permanently.
+ * ------------------------------------------------------------------------------------------------
+ * SO THE ORDERING IS A LOCK ORDERING, NOT A CLOCK READING — AND NO HOST PARTICIPATES
+ * ------------------------------------------------------------------------------------------------
+ * The sibling branch o3d-batch-wcfix reached the same conclusion about its own evidence ordering and
+ * replaced a wall clock with a monotonic generation minted under a lock. A generation is the right
+ * answer THERE because what that code needs is an ORDER over successive writes to one row. Here
+ * there is no order to establish: what is needed is that only one worker at a time may look and then
+ * stamp. So the lock is not a way of minting an ordering, it IS the answer — the shared resource is
+ * the invoice number, and PostgreSQL will serialize on it directly:
  *
- * NOT filtered by sync type. The question is "is another worker about to write this number", and
- * the only writer of this column is this fence, so a type filter could only ever hide a rival.
+ *   `pg_advisory_xact_lock(XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE, hashtext(<identity>))`
  *
- * IT LICENSES NOTHING. Finding no rival is not permission to post — the ledger's answer is, and it
- * is asked separately. This can only ever refuse.
+ * taken as the FIRST statement of the transaction that reads the in-flight rows and writes this
+ * row's stamp. Under it, look-then-stamp is atomic with respect to every other worker asking about
+ * the same number, so:
+ *
+ *   - there is no tie to break and no stamp comparison anywhere in the decision;
+ *   - who gets the slot is decided by the lock manager, which is one arbiter with one view, not by
+ *     two hosts comparing readings of two clocks;
+ *   - the round-4 write-before-read proof is retired along with the thing it was proving. It was an
+ *     argument that two workers could not both miss each other; the lock makes "both look" impossible
+ *     rather than merely unprofitable.
+ *
+ * THE LOCK IS NOT HELD ACROSS THE POST, and could not be: the post is an HTTP request that may take
+ * minutes, and an advisory lock spanning it would wedge every other worker behind a crashed one. What
+ * fences the number DURING the post is the stamp, and the stamp has a lease.
+ *
+ * IT IS ALSO EXACTLY ONE LOCK, TAKEN FIRST AND RELEASED BY THE TRANSACTION. Nothing here acquires a
+ * second, so there is no acquisition order to get wrong and no deadlock to construct — the hazard the
+ * per-SKU product locks have to sort their ids for. A worker blocked behind a rival long enough to
+ * exhaust the interactive-transaction timeout ends in the catch below, which REFUSES; waiting too
+ * long for the lock costs a retry, never a post.
+ *
+ * THE ONE REMAINING CLOCK READING IS THAT LEASE, AND IT IS THE DATABASE'S. A stamp fences the number
+ * only while it is younger than {@link CLAIM_STALE_MS}, because a worker that DIED mid-post leaves its
+ * row PROCESSING and any longer would fence a number off behind one crash. That is a duration, not an
+ * ordering — nothing about who wins depends on it — and both ends of it are now read from the SAME
+ * clock: `now()` inside the transaction supplies the cutoff AND the value written into
+ * `attemptedInvoiceNumberAt`. So a stamp lapses exactly one lease after it was written, whatever the
+ * workers' own hosts believe the time to be, and two clocks are never compared.
+ *
+ * ------------------------------------------------------------------------------------------------
+ * WHY THE NUMBER IS COMPARED IN JAVASCRIPT AND NOT IN THE QUERY
+ * ------------------------------------------------------------------------------------------------
+ * The obvious spelling of a case-insensitive match — Prisma's `mode: 'insensitive'` — compiles to
+ * `ILIKE`, which treats the value as a PATTERN. `_wcpdf_invoice_number` is free text an admin can
+ * edit (prefix, number and suffix are all settings), so it can contain `%`, `_` or a backslash. The
+ * first two only widen the match, which is harmless here; a BACKSLASH does not — `a\_b` as a pattern
+ * matches `a_b` and NOT the stored `a\_b`, so the rival would be MISSED. A missed rival is the
+ * overwrite. So the query narrows only on things with no pattern semantics (connector, status, the
+ * lease window, a non-null stamp) and the identity comparison happens in code, where it is string
+ * equality and nothing else.
+ *
+ * The candidate set that reaches code is the rows currently mid-post across the whole connector,
+ * which is a handful — it is bounded by how many workers can be in flight at once, and served by the
+ * existing `(connector, status, processingStartedAt)` index. It is still CAPPED, and a scan that hits
+ * the cap REFUSES rather than reporting the fraction it saw: the same rule the ledger lookup applies
+ * to a page it cannot prove is complete.
+ *
+ * WHAT COUNTS AS A LIVE RIVAL. Still PROCESSING, and stamped within the lease. Both halves matter: a
+ * loser's row drops back to PENDING as it fails, which frees the number immediately.
+ *
+ * NOT filtered by sync type. The question is "is another worker about to write this number", and the
+ * only writer of this column is this fence, so a type filter could only ever hide a rival.
+ *
+ * IT LICENSES NOTHING. Finding no rival is not permission to post — the ledger's answer is, and it is
+ * asked separately. This can only ever refuse.
  *
  * EXPORTED so the exclusion can be exercised directly, against a database double and with no Xero
  * client anywhere near it — the property being pinned is about two workers and one column, and
  * driving it through `processEntry` would need the whole connector to say nothing more.
  *
- * AND A LOST CLAIM REFUSES. If the stamp updates no row, this worker no longer owns the entry: it
- * was re-claimed after aging out, another worker is on it, and continuing would post from a row
- * whose outcome this worker may no longer write.
+ * AND A LOST CLAIM REFUSES. If the stamp updates no row, this worker no longer owns the entry: it was
+ * re-claimed after aging out, another worker is on it, and continuing would post from a row whose
+ * outcome this worker may no longer write.
  */
+export const INVOICE_NUMBER_RIVAL_SCAN_LIMIT = 200
+
 export async function takeInvoiceNumberPostSlot(params: {
   entryId: string
   claimedAt: Date
   invoiceNumber: string
   orderLabel: string
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const stampedAt = new Date()
-  let stamped: { count: number }
+  const identity = xeroInvoiceNumberIdentity(params.invoiceNumber)
+  if (!identity) {
+    // Unreachable from the fence (an empty number is refused before the ledger is even asked), and
+    // kept as a refusal because an empty lock key would serialize every unrelated invoice onto one
+    // slot — a mutex that says "yes" to nobody.
+    return {
+      ok: false,
+      reason:
+        `Refusing to post ${params.orderLabel}: the invoice number is blank once trimmed, so there is no `
+        + 'number to exclude another worker on. NOTHING WAS SENT.',
+    }
+  }
+
   try {
-    // BEFORE the post, never after — and a failure to write it REFUSES the post. Not because the
-    // record licenses anything (it does not: see invoice-number-ownership.ts), but because a
-    // create whose local record cannot be written is a create whose OUTCOME cannot be written
-    // either. A database that will not take this row will not take the InvoiceID the response
-    // carries, and that is exactly the lost-response state the fence can no longer heal.
-    stamped = await db.accountingSyncLog.updateMany({
-      where: heldClaimWhere(params.entryId, params.claimedAt),
-      data: { attemptedInvoiceNumber: params.invoiceNumber, attemptedInvoiceNumberAt: stampedAt },
+    return await db.$transaction(async (tx) => {
+      // FIRST, before any read or write. Everything below is a look-then-stamp, and a look-then-stamp
+      // is only atomic for as long as this is the statement that precedes it.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE}::int4, hashtext(${identity})::int4)`
+
+      // The lease's clock, read once and used at BOTH ends — see the header. Taking it from the
+      // database rather than this host is what stops two workers' clocks being compared.
+      const clock = await tx.$queryRaw<Array<{ now: Date }>>`SELECT now() AS now`
+      const now = clock?.[0]?.now
+      if (!(now instanceof Date)) {
+        return {
+          ok: false,
+          reason:
+            `Could not read the database clock before posting ${params.orderLabel} as invoice number `
+            + `${params.invoiceNumber}, so how old another worker's in-flight stamp is cannot be established. `
+            + 'NOTHING WAS SENT.',
+        }
+      }
+
+      const inFlight = await tx.accountingSyncLog.findMany({
+        where: {
+          id: { not: params.entryId },
+          connector: XERO_CONNECTOR,
+          status: 'PROCESSING',
+          attemptedInvoiceNumber: { not: null },
+          attemptedInvoiceNumberAt: { gte: new Date(now.getTime() - CLAIM_STALE_MS) },
+        },
+        // Makes the REFUSAL deterministic when several rows qualify. It decides nothing: any live
+        // rival refuses, so which one is named is a diagnostic question, not an ordering one.
+        orderBy: { id: 'asc' },
+        select: { id: true, referenceId: true, attemptedInvoiceNumber: true },
+        take: INVOICE_NUMBER_RIVAL_SCAN_LIMIT,
+      })
+
+      if (inFlight.length >= INVOICE_NUMBER_RIVAL_SCAN_LIMIT) {
+        return {
+          ok: false,
+          reason:
+            `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: the in-flight scan `
+            + `filled its ${INVOICE_NUMBER_RIVAL_SCAN_LIMIT}-row limit, so it cannot show that it saw every sync `
+            + 'row that might be posting under that number. NOTHING WAS SENT.',
+        }
+      }
+
+      const rival = inFlight.find(
+        (r) => r.attemptedInvoiceNumber !== null && xeroInvoiceNumberIdentity(r.attemptedInvoiceNumber) === identity,
+      )
+      if (rival) {
+        return {
+          ok: false,
+          reason:
+            `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: sync row ${rival.id} `
+            + `(reference ${rival.referenceId}) is already in flight under that same number `
+            + `(${JSON.stringify(rival.attemptedInvoiceNumber)}). The create is update-or-create on the number, so `
+            + 'both posts would land on ONE document and the later one would silently replace the earlier. NOTHING '
+            + 'WAS SENT — this retries once that row settles, and if both rows genuinely describe the same invoice, '
+            + 'cancel the duplicate.',
+        }
+      }
+
+      // The number is recorded VERBATIM, not as its identity: the column is the record of what this
+      // row set out to post, and what it set out to post is the customer's own number. The identity
+      // is how the fence compares two of them, never what it stores.
+      //
+      // BEFORE the post, never after — and a failure to write it REFUSES the post. Not because the
+      // record licenses anything (it does not: see invoice-number-ownership.ts), but because a create
+      // whose local record cannot be written is a create whose OUTCOME cannot be written either. A
+      // database that will not take this row will not take the InvoiceID the response carries, and
+      // that is exactly the lost-response state the fence can no longer heal.
+      const stamped = await tx.accountingSyncLog.updateMany({
+        where: heldClaimWhere(params.entryId, params.claimedAt),
+        data: { attemptedInvoiceNumber: params.invoiceNumber, attemptedInvoiceNumberAt: now },
+      })
+      if (stamped.count === 0) {
+        return {
+          ok: false,
+          reason:
+            `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: this worker no longer `
+            + `holds the claim on sync row ${params.entryId} — it aged out and another worker re-claimed it. NOTHING `
+            + 'WAS SENT; the worker that holds the row now will post it.',
+        }
+      }
+
+      return { ok: true }
     })
   } catch (error) {
+    // Fails closed like every other read and write on this path: not knowing whether a sibling is
+    // mid-post, or failing to record that we are about to be, is not permission to post.
     return {
       ok: false,
       reason:
-        `Could not record the invoice-number attempt for ${params.invoiceNumber} on sync row ${params.entryId} `
-        + `before posting: ${String(error)}`,
+        `Could not take the exclusive post slot for invoice number ${params.invoiceNumber} on sync row `
+        + `${params.entryId} (${params.orderLabel}): ${String(error)}. NOTHING WAS SENT.`,
     }
   }
-  if (stamped.count === 0) {
-    return {
-      ok: false,
-      reason:
-        `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: this worker no longer `
-        + `holds the claim on sync row ${params.entryId} — it aged out and another worker re-claimed it. NOTHING `
-        + 'WAS SENT; the worker that holds the row now will post it.',
-    }
+}
+
+/**
+ * HOW OLD THE LEDGER'S ANSWER MAY BE WHEN THE REQUEST FINALLY LEAVES (o3d-k26m.5 round 5, #2).
+ *
+ * Deliberately the claim's own lease and not a number of its own. Past this point the claim under
+ * which the answer was obtained is itself re-takeable by another worker, so the row may no longer be
+ * ours to post from — an answer that has outlived the claim it was taken under cannot be authorising
+ * anything.
+ */
+const LEDGER_ANSWER_MAX_AGE_MS = CLAIM_STALE_MS
+
+/**
+ * A monotonic, in-process millisecond reader.
+ *
+ * `Date.now()` would be a wall clock, and a wall clock can step backwards under NTP — which on this
+ * particular measurement would report a stale answer as fresh. This measures ONE elapsed interval
+ * inside ONE process, which is exactly what `performance.now()` is for; nothing here is compared
+ * against a value from another host.
+ */
+const monotonicNowMs = (): number => performance.now()
+
+/**
+ * THE CHECK THAT RUNS IMMEDIATELY BEFORE THE REQUEST LEAVES (o3d-k26m.5 round 5, finding #2).
+ *
+ * THE PROBLEM IT FIXES. Round 4 asked the ledger, then took the post slot, then called
+ * `pushSalesInvoice` — and `pushSalesInvoice` does not post first. It PREPARES: `findOrCreateContact`
+ * is a Xero round trip, and `findOrCreateItem` is another one per distinct item code, each through
+ * the same rate-limited client whose in-request budget is six minutes PER CALL. So an ordinary
+ * multi-line invoice could sit in preparation for longer than the fifteen-minute lease that made the
+ * slot mean anything, and the sequence was:
+ *
+ *     ask the ledger → take the slot → [unbounded preparation] → POST
+ *
+ * By the time the POST left, the slot could have lapsed (so a rival's scan no longer saw it, and a
+ * second worker was free to post under the same number), the claim on the row could have aged out and
+ * been re-taken (so the row was not even ours), and the ledger's answer was as old as all of it. The
+ * answer that authorised the post was stale in every way at once.
+ *
+ * THE FIX IS PLACEMENT, NOT ANOTHER CHECK. The slot is no longer taken before preparation; it is
+ * taken by this closure, which `pushSalesInvoice` calls after the payload is fully built and
+ * immediately before `xeroPost`. So the sequence is now:
+ *
+ *     ask the ledger → [unbounded preparation] → take the slot → POST
+ *
+ * and the slot cannot expire during preparation because it does not yet exist during preparation. The
+ * gap it has to cover shrinks from "the whole entry" to "one HTTP request".
+ *
+ * WHAT HAPPENS TO EACH OF THE THREE THINGS THAT COULD GO STALE:
+ *
+ *   - THE SLOT: no longer stale by construction — see above.
+ *   - THE CLAIM ON THE ROW: RE-CHECKED, in the database, at the same instant. The stamp is fenced on
+ *     `heldClaimWhere`, so a worker whose claim aged out during preparation writes nothing and posts
+ *     nothing. That check is not advisory: it is the same statement that takes the slot.
+ *   - THE LEDGER'S ANSWER: BOUNDED, and refused past the bound. It is deliberately NOT re-asked. The
+ *     fence is costed at ONE lookup per create against a 1,000-call daily budget, and a second call
+ *     would buy almost nothing: the only writers that could have taken the number since are another
+ *     IMS worker — which the slot excludes, and now excludes at the instant of the post rather than
+ *     minutes before it — or a human typing an invoice into Xero by hand, which is unobservable from
+ *     inside IMS at any age of answer and is documented as such rather than implied to be covered.
+ *     What a bound does buy is that the fence can never post on an answer of unbounded age, which is
+ *     the state Codex found.
+ *
+ * RELATIONSHIP TO THE SIBLING BRANCH o3d-batch-small2, WHICH FOUND THE SAME WINDOW. That branch
+ * closes the GENERIC half — a lease over the whole entry, an absolute deadline, and a claim re-take
+ * before each of the fourteen remote mutations — and flagged, in its own commit message, exactly the
+ * residual it could not reach: "the fence cannot reach INSIDE a connector call, so one call that does
+ * two reads then a write is bounded only by the per-call budget — closing that needs a hook threaded
+ * through the connector modules". THIS IS THAT HOOK, threaded for the one call where the residual is
+ * an irreversible overwrite rather than a duplicate. The two answers do not disagree and are not
+ * alternatives: small2 proves the ROW is still ours, this proves the NUMBER is still ours, and after a
+ * merge both belong in the same place — `lease.fenceBeforeRemoteWrite('sales-invoice')` should move
+ * from the call site into this closure, so the claim re-take and the slot are taken at one instant
+ * immediately before `xeroPost` rather than one before preparation and one after.
+ *
+ * A REFUSAL HERE IS AN ORDINARY FAILURE, like every other refusal this fence produces: nothing was
+ * sent, the row runs the normal retry ladder, and the next run re-asks the ledger from scratch. (On
+ * small2 the same outcome is additionally marked `notPosted` so it does not spend a retry; that is
+ * that branch's field to add and this one must not invent a second spelling of it.)
+ */
+export function buildInvoiceNumberPostSlotCheck(params: {
+  entryId: string
+  claimedAt: Date
+  invoiceNumber: string
+  orderLabel: string
+  referenceType: string
+  referenceId: string
+  /** Injected only by tests. Monotonic milliseconds — never a wall clock. */
+  monotonicNowMs?: () => number
+}): () => Promise<{ ok: true } | { ok: false; error: string }> {
+  const readNow = params.monotonicNowMs ?? monotonicNowMs
+  // Taken at CONSTRUCTION, which the fence does immediately after the ledger answers. The age this
+  // measures is therefore the age of the answer, not the age of this closure.
+  const answeredAt = readNow()
+
+  const warn = async (description: string, action: string) => {
+    await logActivity({
+      entityType: params.referenceType === 'SalesOrder' ? 'SALES_ORDER' : 'SYSTEM',
+      entityId: params.referenceType === 'SalesOrder' ? params.referenceId : undefined,
+      action,
+      tag: 'accounting',
+      level: 'WARNING',
+      description,
+      metadata: { connector: XERO_CONNECTOR, syncLogId: params.entryId, invoiceNumber: params.invoiceNumber },
+      resolveUser: false,
+    }).catch(() => {})
   }
 
-  let rival: { id: string; referenceId: string; attemptedInvoiceNumberAt: Date | null } | null
-  try {
-    rival = await db.accountingSyncLog.findFirst({
-      where: {
-        id: { not: params.entryId },
-        connector: XERO_CONNECTOR,
-        status: 'PROCESSING',
-        attemptedInvoiceNumber: params.invoiceNumber,
-        attemptedInvoiceNumberAt: { gte: new Date(stampedAt.getTime() - CLAIM_STALE_MS) },
-      },
-      // The MINIMUM of the total order, so the one row fetched is the one to compare against.
-      orderBy: [{ attemptedInvoiceNumberAt: 'asc' }, { id: 'asc' }],
-      select: { id: true, referenceId: true, attemptedInvoiceNumberAt: true },
+  return async () => {
+    const ageMs = readNow() - answeredAt
+    if (ageMs >= LEDGER_ANSWER_MAX_AGE_MS) {
+      const error =
+        `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: the ledger was asked who `
+        + `holds that number ${Math.round(ageMs / 1000)}s ago — longer than the ${Math.round(LEDGER_ANSWER_MAX_AGE_MS / 60_000)} `
+        + 'minutes this worker\'s claim on the row is guaranteed for — because building the invoice took that long '
+        + '(the contact and every item are separate calls to the accounting system). The answer that would authorise '
+        + 'this post is no longer current, and the create is update-or-create on the number. NOTHING WAS SENT; the '
+        + 'next run asks again.'
+      await warn(error, 'sales_invoice_number_answer_stale')
+      return { ok: false, error }
+    }
+
+    const slot = await takeInvoiceNumberPostSlot({
+      entryId: params.entryId,
+      claimedAt: params.claimedAt,
+      invoiceNumber: params.invoiceNumber,
+      orderLabel: params.orderLabel,
     })
-  } catch (error) {
-    // Fails closed like every other read on this path: not knowing whether a sibling is mid-post is
-    // not permission to post.
-    return {
-      ok: false,
-      reason:
-        `Could not check whether another sync row is already posting under invoice number `
-        + `${params.invoiceNumber} for ${params.orderLabel}: ${String(error)}. NOTHING WAS SENT.`,
+    if (!slot.ok) {
+      await warn(slot.reason, 'sales_invoice_number_in_flight_elsewhere')
+      return { ok: false, error: slot.reason }
     }
-  }
 
-  const rivalAt = rival?.attemptedInvoiceNumberAt?.getTime()
-  // Not strictly later than mine — see the header for why an equal stamp must yield rather than
-  // be broken in someone's favour.
-  const rivalIsNotLater = rival !== null && rivalAt !== undefined && rivalAt <= stampedAt.getTime()
-  if (rival && rivalIsNotLater) {
-    return {
-      ok: false,
-      reason:
-        `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: sync row ${rival.id} `
-        + `(reference ${rival.referenceId}) is already in flight under that same number. The create is `
-        + 'update-or-create on the number, so both posts would land on ONE document and the later one would '
-        + 'silently replace the earlier. NOTHING WAS SENT — this retries once that row settles, and if both rows '
-        + 'genuinely describe the same invoice, cancel the duplicate.',
-    }
+    return { ok: true }
   }
-
-  return { ok: true }
 }
 
 /**
@@ -1615,11 +1851,15 @@ export async function takeInvoiceNumberPostSlot(params: {
  * guardCancelledSalesOrderInvoice does — a transient read outage must not become permission to
  * post.
  *
- * AND ON THE WORKER NEXT TO IT. The ledger's answer is about a moment; {@link takeInvoiceNumberPostSlot}
- * covers the window between that moment and the request, which after the cutover only another IMS
- * worker can occupy. Both fences must pass, in that order — asking the ledger first means the
- * common refusals cost no writes, and the slot is taken as late as possible so it is held for the
- * shortest time.
+ * AND ON THE WORKER NEXT TO IT — BUT NOT FROM HERE (round 5). The ledger's answer is about a moment;
+ * {@link takeInvoiceNumberPostSlot} covers the window between that moment and the request, which after
+ * the cutover only another IMS worker can occupy. Round 4 took that slot HERE, which put it in front
+ * of `pushSalesInvoice`'s preparation — a contact round trip plus one per distinct item code — so the
+ * slot, and the claim it was fenced on, could both have lapsed before the request left. This function
+ * therefore does not take the slot; it returns {@link buildInvoiceNumberPostSlotCheck}'s closure, which
+ * `pushSalesInvoice` runs after the payload is built and immediately before `xeroPost`. The order is
+ * unchanged — ledger first, so the common refusals cost no writes — but the slot is now taken as late
+ * as it is possible to take it.
  *
  * A REFUSAL IS RETURNED AS AN ORDINARY FAILURE, so the row runs the normal retry ladder and settles
  * as FAILED with the reason on it. That is not wasted budget: the fence re-asks the ledger each
@@ -1634,7 +1874,7 @@ async function guardSalesInvoiceNumberOwnership(
   payload: SyncPayload,
   /** The instant this worker stamped its claim — the fence's own writes are conditioned on it. */
   claimedAt: Date,
-): Promise<{ post: true } | { post: false; result: EntryResult }> {
+): Promise<{ post: true; beforePost: BeforeRemoteWrite } | { post: false; result: EntryResult }> {
   const invoiceNumber = typeof payload.invoiceNumber === 'string' ? payload.invoiceNumber : null
 
   let ownedInvoiceId: string | null = null
@@ -1703,7 +1943,7 @@ async function guardSalesInvoiceNumberOwnership(
     return { post: false, result: { success: false, error: decision.reason } }
   }
 
-  // EVERY post that lands on the number takes the slot first — the `unclaimed` create and the
+  // EVERY post that lands on the number takes the slot — the `unclaimed` create and the
   // `own-document` update alike. Both write to the ledger addressing it BY NUMBER, so both are
   // capable of being the second of two writes that collapse into one document. The stamp is also
   // the durability gate it always was; only its condition has changed (from "the ledger said
@@ -1716,22 +1956,20 @@ async function guardSalesInvoiceNumberOwnership(
       result: { success: false, error: `No invoice number to fence before posting ${orderLabel}` },
     }
   }
-  const slot = await takeInvoiceNumberPostSlot({ entryId, claimedAt, invoiceNumber, orderLabel })
-  if (!slot.ok) {
-    await logActivity({
-      entityType: referenceType === 'SalesOrder' ? 'SALES_ORDER' : 'SYSTEM',
-      entityId: referenceType === 'SalesOrder' ? referenceId : undefined,
-      action: 'sales_invoice_number_in_flight_elsewhere',
-      tag: 'accounting',
-      level: 'WARNING',
-      description: slot.reason,
-      metadata: { connector: XERO_CONNECTOR, syncLogId: entryId, invoiceNumber },
-      resolveUser: false,
-    }).catch(() => {})
-    return { post: false, result: { success: false, error: slot.reason } }
-  }
 
-  return { post: true }
+  // Built HERE, so the age it measures starts at the ledger's answer — and RUN by pushSalesInvoice,
+  // after preparation, immediately before the request leaves (round 5, finding #2).
+  return {
+    post: true,
+    beforePost: buildInvoiceNumberPostSlotCheck({
+      entryId,
+      claimedAt,
+      invoiceNumber,
+      orderLabel,
+      referenceType,
+      referenceId,
+    }),
+  }
 }
 
 /**
@@ -1829,7 +2067,9 @@ async function processClaimedEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId })
+        // o3d-k26m.5 round 5: the number fence's LAST word, run after the contact and item calls and
+        // immediately before the create leaves. Nothing is sent if it refuses.
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: numberFence.beforePost })
       return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
 

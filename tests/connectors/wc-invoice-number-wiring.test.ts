@@ -285,43 +285,98 @@ test('the UPDATE is not fenced — it addresses a document by an id we recorded 
   )
 })
 
+/**
+ * WITH THE COMMENTS REMOVED, and the removal asserted.
+ *
+ * Every string these tests look for also appears in the prose above the code that implements it, so
+ * a scan of the raw file passes against an implementation that has been COMMENTED OUT — which is
+ * exactly what happened to the sibling branch's wiring test, and then to this one, in round 4.
+ */
+function strippedProcessor(): string {
+  const raw = source(XERO_PROCESSOR)
+  const stripped = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+  assert.ok(raw.includes('EXPORTED so the exclusion can be exercised directly'), 'the prose marker must exist to be stripped')
+  assert.ok(
+    !stripped.includes('EXPORTED so the exclusion can be exercised directly'),
+    'comment stripping must actually strip',
+  )
+  return stripped
+}
+
 function ownershipFenceBody(): string {
-  const src = source(XERO_PROCESSOR)
+  const src = strippedProcessor()
   const start = src.indexOf('async function guardSalesInvoiceNumberOwnership(')
   assert.ok(start > 0, 'the fence must exist')
   return src.slice(start, src.indexOf('\nasync function processEntry(', start))
 }
 
 function postSlotBody(): string {
-  const src = source(XERO_PROCESSOR)
+  const src = strippedProcessor()
   const start = src.indexOf('export async function takeInvoiceNumberPostSlot(')
   assert.ok(start > 0, 'the in-flight number claim must exist')
-  return src.slice(start, src.indexOf('\n/**\n * THE OWNERSHIP FENCE', start))
+  const end = src.indexOf('\nexport function buildInvoiceNumberPostSlotCheck(', start)
+  assert.ok(end > start, 'the slot and the check it is called from must both exist')
+  return src.slice(start, end)
 }
 
 test('the attempt is written BEFORE the post, and a failure to write it blocks the post', () => {
   const body = ownershipFenceBody()
-  const slot = body.indexOf('await takeInvoiceNumberPostSlot({ entryId, claimedAt, invoiceNumber, orderLabel })')
-  const allow = body.lastIndexOf('return { post: true }')
-  assert.ok(slot > 0, 'every post must take the number slot, which is what writes the attempt')
-  assert.ok(slot < allow, 'the record must be durable before the caller is allowed to post')
+  // ROUND 5: the guard no longer TAKES the slot — taking it here put it in front of pushSalesInvoice's
+  // contact and item calls, so it could lapse before the create left. It builds the check and hands
+  // it over; pushSalesInvoice runs it at the last instruction before the request.
+  const build = body.indexOf('beforePost: buildInvoiceNumberPostSlotCheck({')
+  assert.ok(build > 0, 'every post must carry the number-slot check, which is what writes the attempt')
   assert.ok(
-    body.includes('if (!slot.ok) {'),
-    'and a slot that is refused must return the refusal, not fall through to the post',
+    !body.includes('await takeInvoiceNumberPostSlot('),
+    'the guard must not run the slot itself — that is round 4 placement, in front of unbounded preparation',
   )
+  assert.ok(!body.includes('return { post: true }\n}'), 'the guard must return the check, not a bare permission')
 
   const claim = postSlotBody()
-  const write = claim.indexOf('data: { attemptedInvoiceNumber: params.invoiceNumber, attemptedInvoiceNumberAt: stampedAt },')
-  const read = claim.indexOf('await db.accountingSyncLog.findFirst({')
-  assert.ok(write > 0, 'the number about to be posted must be recorded on the row first')
-  // THE WRITE MUST PRECEDE THE READ. That order is the entire soundness argument: two workers
-  // cannot both miss each other only because each stamped before it looked.
-  assert.ok(write < read, 'the stamp must be written before the search for a rival, or both workers can miss each other')
+  // THE LOCK IS THE FIRST STATEMENT, and everything else happens under it. That order is the whole
+  // soundness argument now: round 4 relied on each worker stamping before it looked, which no longer
+  // holds and no longer needs to — under the lock, two workers cannot both look.
+  const lock = claim.indexOf('pg_advisory_xact_lock')
+  const clock = claim.indexOf('SELECT now() AS now')
+  const read = claim.indexOf('await tx.accountingSyncLog.findMany({')
+  const write = claim.indexOf('data: { attemptedInvoiceNumber: params.invoiceNumber, attemptedInvoiceNumberAt: now },')
+  assert.ok(lock > 0, 'the exclusion must be a lock on the number, not a comparison of two hosts\u2019 clocks')
+  assert.ok(lock < clock && lock < read && lock < write, 'nothing may be read or written before the lock is held')
+  assert.ok(read < write, 'under the lock the order is look-then-stamp')
+  assert.ok(write > 0, 'the number about to be posted must be recorded on the row')
+  assert.ok(
+    claim.includes('XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE'),
+    'the lock key must come from the registry, not be written out as a literal',
+  )
+  assert.ok(
+    claim.includes('hashtext(${identity})'),
+    'the lock must be keyed on the ledger identity of the number, so two spellings of one document contend',
+  )
+  // The identity comparison happens in code. In SQL it would be an ILIKE pattern, and a number
+  // containing a backslash would MISS its rival — a miss here is the overwrite.
+  assert.ok(
+    claim.includes('xeroInvoiceNumberIdentity(r.attemptedInvoiceNumber) === identity'),
+    'the rival must be identified by the ledger\u2019s notion of the same number, in JavaScript',
+  )
+  assert.ok(
+    !claim.includes("mode: 'insensitive'"),
+    'a case-insensitive SQL match compiles to a pattern, and a pattern can miss',
+  )
+  // Both ends of the lease come from the database, so no two host clocks are ever compared.
+  assert.ok(
+    claim.includes('attemptedInvoiceNumberAt: { gte: new Date(now.getTime() - CLAIM_STALE_MS) }'),
+    'the lease cutoff must be measured from the database clock read inside this transaction',
+  )
+  assert.ok(!claim.includes('Date.now()'), 'no host clock may take part in the exclusion')
   // Not because the record licenses anything — because a create whose local record cannot be
   // written is a create whose OUTCOME cannot be written either.
   assert.ok(
-    claim.includes('Could not record the invoice-number attempt for ${params.invoiceNumber} on sync row ${params.entryId} '),
-    'failing to record the attempt must refuse the post, not proceed without it',
+    claim.includes('Could not take the exclusive post slot for invoice number '),
+    'failing to take the slot must refuse the post, not proceed without it',
+  )
+  assert.ok(
+    claim.includes('if (stamped.count === 0) {'),
+    'a stamp that lands on no row means the claim is gone, and that must refuse',
   )
   // Fenced on the claim INSTANT: a worker whose claim aged out and was re-taken must not stamp,
   // and must not post — the sibling branch o3d-batch-payidx fences every claim release the same way.

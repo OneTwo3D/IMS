@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   decideInvoiceNumberPost,
+  xeroInvoiceNumberIdentity,
   type InvoiceNumberLookup,
   type LedgerInvoiceClaim,
 } from '@/lib/domain/accounting/invoice-number-ownership'
@@ -319,4 +320,33 @@ test('an ordinary lookup failure is still the RETRYABLE one — the two must not
   })
   assert.equal(decision.post === false && decision.code, 'LEDGER_LOOKUP_UNAVAILABLE')
   assert.equal(decision.post === false && decision.retryable, true)
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 5, finding 1 — the identity the whole fence excludes on.
+//
+// Two strings that reduce to the same identity are ONE document to Xero, and the fence has to agree
+// with the ledger about that or its mutex has a hole: round 4 compared `attemptedInvoiceNumber` as
+// an exact string, so `INV-1` and `inv-1` held two independent slots, each worker found itself
+// unopposed, and the second post silently replaced the first.
+// ---------------------------------------------------------------------------
+
+test('two spellings Xero treats as one document have one identity', () => {
+  assert.equal(xeroInvoiceNumberIdentity('INV-1'), xeroInvoiceNumberIdentity('inv-1'))
+  assert.equal(xeroInvoiceNumberIdentity(' INV-1 '), xeroInvoiceNumberIdentity('INV-1'))
+  assert.equal(xeroInvoiceNumberIdentity('INV-1'), 'inv-1')
+})
+
+test('two numbers Xero treats as different documents keep different identities', () => {
+  assert.notEqual(xeroInvoiceNumberIdentity('INV-1'), xeroInvoiceNumberIdentity('INV-2'))
+  // Internal whitespace is part of the number, not padding around it.
+  assert.notEqual(xeroInvoiceNumberIdentity('INV 1'), xeroInvoiceNumberIdentity('INV1'))
+})
+
+test('the identity is not what gets posted — it never rewrites the customer’s number', () => {
+  // Pinned because the number on the wire is the number on the customer's own PDF (o3d-k26m.1).
+  // This function exists to COMPARE, and a caller that folded the value into the payload would be
+  // posting a document numbered differently from the one the customer holds.
+  const verbatim = 'INV-164981'
+  assert.notEqual(xeroInvoiceNumberIdentity(verbatim), verbatim)
 })

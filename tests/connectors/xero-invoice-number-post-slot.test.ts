@@ -2,13 +2,21 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 // ---------------------------------------------------------------------------
-// o3d-k26m.5 round 4 — THE OTHER WRITER IS US.
+// o3d-k26m.5 rounds 4-5 — THE OTHER WRITER IS US.
 //
 // The ledger lookup answers "who holds this number now"; between that answer and the POST there is
 // a window, and once xeroom is removed the only thing that can occupy it is a second IMS worker
 // holding a different sync row that carries the SAME number. Both read "unclaimed", both post, and
 // because `POST /Invoices` is update-or-create on InvoiceNumber the second silently REPLACES the
 // first. One document, one survivor, nothing recording that there were two.
+//
+// Round 5 rebuilt the exclusion on a LOCK. Two things it must now get right, and both are pinned
+// below:
+//
+//   * the identity it excludes on is the LEDGER'S — `INV-1` and `inv-1` are one document to Xero,
+//     so they must be one slot here. Round 4 compared exact strings and gave them two;
+//   * nothing about who wins may come from a host clock. The only clock left is the lease on an
+//     abandoned stamp, and both ends of it are read from the DATABASE.
 //
 // Xero is LIVE and is not touched here: this is one column and two workers, so it runs entirely
 // against a database double.
@@ -25,14 +33,24 @@ type Row = {
 }
 
 const CLAIM_STALE_MS = 15 * 60 * 1000
+const SLOT_LOCK_NAMESPACE = 411_220_869
+const RIVAL_SCAN_LIMIT = 200
 
 const state = {
   rows: [] as Row[],
-  failFindFirst: false,
-  /** Lets a test place a rival at EXACTLY the instant this worker stamped. */
-  onStamp: null as null | ((at: Date) => void),
-  /** Holds every read until every stamp has landed — the interleaving that defeats check-then-act. */
-  readBarrier: null as null | (() => Promise<void>),
+  /**
+   * The DATABASE's clock, deliberately NOT the host's. Every test that cares sets it somewhere the
+   * host clock is not, so a fence that reached for `Date.now()` would answer differently.
+   */
+  dbNow: new Date('2026-08-20T10:00:00Z'),
+  failClock: false,
+  failFindMany: false,
+  /** Every statement the fence issued, in order — the lock has to be the first one. */
+  trace: [] as string[],
+  /** The advisory-lock arguments, so two case-variants can be shown to take the SAME lock. */
+  lockKeys: [] as string[],
+  /** Slows the rival scan so an unlocked implementation is certain to interleave two workers. */
+  readDelay: null as null | (() => Promise<void>),
 }
 
 function row(overrides: Partial<Row> & { id: string }): Row {
@@ -74,9 +92,19 @@ function matches(r: Row, where: Record<string, unknown>): boolean {
         if (at !== want) return false
         break
       }
-      case 'attemptedInvoiceNumber':
-        if (r.attemptedInvoiceNumber !== value) return false
-        break
+      case 'attemptedInvoiceNumber': {
+        if (value && typeof value === 'object' && 'not' in (value as object)) {
+          if ((value as { not: unknown }).not !== null) {
+            throw new Error(`unmodelled attemptedInvoiceNumber filter: ${JSON.stringify(value)}`)
+          }
+          if (r.attemptedInvoiceNumber === null) return false
+          break
+        }
+        throw new Error(
+          `the rival scan must not compare the number in SQL: ${JSON.stringify(value)} — a case-insensitive `
+          + 'match compiles to a LIKE pattern, and a number containing a backslash would MISS its rival',
+        )
+      }
       case 'attemptedInvoiceNumberAt': {
         const gte = (value as { gte?: Date }).gte
         if (!gte) throw new Error(`unmodelled attemptedInvoiceNumberAt filter: ${JSON.stringify(value)}`)
@@ -90,50 +118,131 @@ function matches(r: Row, where: Record<string, unknown>): boolean {
   return true
 }
 
+/**
+ * A REAL mutex, not a recording one.
+ *
+ * The property under test is that two workers cannot both look before either stamps. A double that
+ * merely noted the lock statement and let both transactions run would pass against completely
+ * unlocked code, which is the defect this whole round is about.
+ */
+const lockTails = new Map<string, Promise<void>>()
+async function acquire(key: string): Promise<() => void> {
+  let release!: () => void
+  const mine = new Promise<void>((resolve) => { release = resolve })
+  const previous = lockTails.get(key) ?? Promise.resolve()
+  lockTails.set(key, previous.then(() => mine))
+  await previous
+  return release
+}
+
+function makeTx(held: { locked: boolean }) {
+  const requireLock = (what: string) => {
+    assert.ok(held.locked, `${what} ran before the advisory lock was taken — look-then-stamp is only atomic under it`)
+  }
+  return {
+    $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      const sql = strings.join('?')
+      assert.match(sql, /pg_advisory_xact_lock/, 'the only raw statement this fence may issue is its lock')
+      assert.equal(values[0], SLOT_LOCK_NAMESPACE, 'the lock must use the registered invoice-number-slot namespace')
+      assert.match(sql, /hashtext/, 'the lock must be keyed on the number, not taken globally')
+      state.trace.push('lock')
+      state.lockKeys.push(String(values[1]))
+      return 1
+    },
+    $queryRaw: async (strings: TemplateStringsArray) => {
+      const sql = strings.join('?')
+      assert.match(sql, /now\(\)/, 'the lease clock must be read from the database')
+      requireLock('the clock read')
+      state.trace.push('clock')
+      if (state.failClock) throw new Error('clock read failed')
+      return [{ now: state.dbNow }]
+    },
+    accountingSyncLog: {
+      findMany: async ({ where, take }: { where: Record<string, unknown>; take?: number }) => {
+        requireLock('the rival scan')
+        state.trace.push('scan')
+        if (state.failFindMany) throw new Error('connection terminated')
+        const hit = state.rows.filter((r) => matches(r, where))
+        hit.sort((a, b) => a.id.localeCompare(b.id))
+        const answer = (take ? hit.slice(0, take) : hit).map((r) => ({
+          id: r.id, referenceId: r.referenceId, attemptedInvoiceNumber: r.attemptedInvoiceNumber,
+        }))
+        // AFTER the rows are read and BEFORE they are returned: this is what makes a read observe an
+        // instant that the stamp does not follow immediately. Without it the two workers below never
+        // actually overlap, and the test would pass against an implementation holding no lock at all.
+        if (state.readDelay) await state.readDelay()
+        return answer
+      },
+      updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Partial<Row> }) => {
+        requireLock('the stamp')
+        state.trace.push('stamp')
+        const hit = state.rows.filter((r) => matches(r, where))
+        for (const r of hit) Object.assign(r, data)
+        return { count: hit.length }
+      },
+    },
+  }
+}
+
 mock.module('@/lib/db', {
   namedExports: {
     db: {
-      accountingSyncLog: {
-        updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Partial<Row> }) => {
-          const hit = state.rows.filter((r) => matches(r, where))
-          for (const r of hit) Object.assign(r, data)
-          if (hit.length > 0 && data.attemptedInvoiceNumberAt) state.onStamp?.(data.attemptedInvoiceNumberAt)
-          return { count: hit.length }
-        },
-        findFirst: async ({ where, orderBy }: { where: Record<string, unknown>; orderBy?: unknown }) => {
-          if (state.failFindFirst) throw new Error('connection terminated')
-          if (state.readBarrier) await state.readBarrier()
-          assert.ok(Array.isArray(orderBy), 'the rival query must order, or the row it fetches is arbitrary')
-          const hit = state.rows.filter((r) => matches(r, where))
-          hit.sort((a, b) => {
-            const at = (a.attemptedInvoiceNumberAt?.getTime() ?? 0) - (b.attemptedInvoiceNumberAt?.getTime() ?? 0)
-            return at !== 0 ? at : a.id.localeCompare(b.id)
-          })
-          return hit[0] ?? null
-        },
+      $transaction: async (fn: (tx: ReturnType<typeof makeTx>) => Promise<unknown>) => {
+        const held = { locked: false }
+        const tx = makeTx(held)
+        // A holder object rather than a `let`: assigning inside the closure below does not narrow, and
+        // a plain binding would be typed `never` at the release.
+        const lock: { release: (() => void) | null } = { release: null }
+        const wrapped = {
+          ...tx,
+          $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+            const result = await tx.$executeRaw(strings, ...values)
+            lock.release = await acquire(`${values[0]}:${values[1]}`)
+            held.locked = true
+            return result
+          },
+        }
+        try {
+          return await fn(wrapped)
+        } finally {
+          lock.release?.()
+        }
       },
     },
   },
 })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {}, logActivityPersisted: async () => {} } })
 
-type TakeSlot = typeof import('@/lib/connectors/xero/sync-processor')['takeInvoiceNumberPostSlot']
+type Mod = typeof import('@/lib/connectors/xero/sync-processor')
 
-async function takeInvoiceNumberPostSlot(...args: Parameters<TakeSlot>): ReturnType<TakeSlot> {
+async function takeInvoiceNumberPostSlot(...args: Parameters<Mod['takeInvoiceNumberPostSlot']>) {
   const mod = await import('@/lib/connectors/xero/sync-processor')
   return mod.takeInvoiceNumberPostSlot(...args)
 }
 
-function reset() {
-  state.rows = []
-  state.failFindFirst = false
-  state.onStamp = null
-  state.readBarrier = null
+async function buildInvoiceNumberPostSlotCheck(...args: Parameters<Mod['buildInvoiceNumberPostSlotCheck']>) {
+  const mod = await import('@/lib/connectors/xero/sync-processor')
+  return mod.buildInvoiceNumberPostSlotCheck(...args)
 }
 
-test('the worker that holds the claim stamps the number it is about to post under, and proceeds', async () => {
+function reset() {
+  state.rows = []
+  state.dbNow = new Date('2026-08-20T10:00:00Z')
+  state.failClock = false
+  state.failFindMany = false
+  state.trace = []
+  state.lockKeys = []
+  state.readDelay = null
+  lockTails.clear()
+}
+
+// ---------------------------------------------------------------------------
+// The lock
+// ---------------------------------------------------------------------------
+
+test('the slot is taken under an advisory lock on the number, and the lock is the FIRST statement', async () => {
   reset()
-  const claimedAt = new Date('2026-08-20T10:00:00Z')
+  const claimedAt = state.dbNow
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
 
   const slot = await takeInvoiceNumberPostSlot({
@@ -141,8 +250,232 @@ test('the worker that holds the claim stamps the number it is about to post unde
   })
 
   assert.deepEqual(slot, { ok: true })
+  assert.deepEqual(
+    state.trace, ['lock', 'clock', 'scan', 'stamp'],
+    'nothing may be read or written before the lock — a look-then-stamp in front of it is round 4 again',
+  )
+  assert.deepEqual(state.lockKeys, ['164981'])
   assert.equal(state.rows[0].attemptedInvoiceNumber, '164981')
-  assert.ok(state.rows[0].attemptedInvoiceNumberAt instanceof Date, 'the stamp must carry when it was taken')
+})
+
+test('two numbers Xero would collide take the SAME lock, so they can never both look first', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  state.rows.push(row({ id: 'entry-b', processingStartedAt: claimedAt }))
+
+  await takeInvoiceNumberPostSlot({ entryId: 'entry-a', claimedAt, invoiceNumber: 'INV-1', orderLabel: 'order a' })
+  await takeInvoiceNumberPostSlot({ entryId: 'entry-b', claimedAt, invoiceNumber: ' inv-1 ', orderLabel: 'order b' })
+
+  assert.deepEqual(
+    state.lockKeys, ['inv-1', 'inv-1'],
+    'the lock key must be the ledger identity of the number — two spellings of one document must contend',
+  )
+})
+
+test('the number is compared in code, never as a SQL pattern — a backslash must not lose its rival', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  state.rows.push(row({
+    id: 'entry-rival',
+    referenceId: 'so-other',
+    attemptedInvoiceNumber: 'A\\_1',
+    attemptedInvoiceNumberAt: new Date(state.dbNow.getTime() - 1_000),
+  }))
+
+  // `matches` throws if the fence tries to compare the number in the query at all; the rival must
+  // still be found, which can only happen if the comparison happened in JavaScript.
+  const slot = await takeInvoiceNumberPostSlot({
+    entryId: 'entry-a', claimedAt, invoiceNumber: 'A\\_1', orderLabel: 'order a',
+  })
+  assert.equal(slot.ok, false)
+  assert.match(slot.ok === false ? slot.reason : '', /entry-rival/)
+})
+
+// ---------------------------------------------------------------------------
+// The identity — the round-5 finding
+// ---------------------------------------------------------------------------
+
+test('a rival holding the SAME NUMBER IN A DIFFERENT CASE is a rival — Xero has one document, so we have one slot', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  state.rows.push(row({
+    id: 'entry-rival',
+    referenceId: 'so-other',
+    attemptedInvoiceNumber: 'inv-164981',
+    attemptedInvoiceNumberAt: new Date(state.dbNow.getTime() - 1_000),
+  }))
+
+  const slot = await takeInvoiceNumberPostSlot({
+    entryId: 'entry-a', claimedAt, invoiceNumber: 'INV-164981', orderLabel: 'order WC-164981',
+  })
+
+  assert.equal(slot.ok, false)
+  assert.match(
+    slot.ok === false ? slot.reason : '',
+    /sync row entry-rival \(reference so-other\) is already in flight under that same number/,
+  )
+  assert.equal(state.rows[0].attemptedInvoiceNumber, null, 'a worker that yields must not have stamped')
+})
+
+test('a rival holding the same number with surrounding whitespace is a rival too', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  state.rows.push(row({
+    id: 'entry-rival',
+    attemptedInvoiceNumber: ' 164981 ',
+    attemptedInvoiceNumberAt: new Date(state.dbNow.getTime() - 1_000),
+  }))
+
+  const slot = await takeInvoiceNumberPostSlot({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+  })
+  assert.equal(slot.ok, false)
+  assert.match(slot.ok === false ? slot.reason : '', /entry-rival/)
+})
+
+test('a sibling holding a DIFFERENT number is not a rival', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  state.rows.push(row({
+    id: 'entry-other', attemptedInvoiceNumber: '164982', attemptedInvoiceNumberAt: state.dbNow,
+  }))
+
+  const slot = await takeInvoiceNumberPostSlot({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+  })
+  assert.deepEqual(slot, { ok: true })
+})
+
+test('the number is recorded VERBATIM even though it is compared by identity', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+
+  await takeInvoiceNumberPostSlot({
+    entryId: 'entry-a', claimedAt, invoiceNumber: 'INV-164981', orderLabel: 'order a',
+  })
+  assert.equal(
+    state.rows[0].attemptedInvoiceNumber, 'INV-164981',
+    'the record of what this row set out to post is the customer’s number, not a folded key',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// The clock — the other half of the round-5 finding
+// ---------------------------------------------------------------------------
+
+test('the lease is measured on the DATABASE clock at BOTH ends, so no host takes part', async () => {
+  reset()
+  // The database is an hour behind this host. A fence reading `Date.now()` for its cutoff would date
+  // the rival below at 55 minutes old and DISCARD IT AS ABANDONED — then post over a live invoice.
+  state.dbNow = new Date(Date.now() - 60 * 60 * 1000)
+  const claimedAt = new Date('2026-08-20T10:00:00Z')
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  state.rows.push(row({
+    id: 'entry-rival',
+    attemptedInvoiceNumber: '164981',
+    // Five minutes old by the clock that WROTE it — comfortably inside the lease.
+    attemptedInvoiceNumberAt: new Date(state.dbNow.getTime() - 5 * 60 * 1000),
+  }))
+
+  const slot = await takeInvoiceNumberPostSlot({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+  })
+  assert.equal(slot.ok, false, 'a rival stamped five minutes ago must fence the number whatever this host thinks')
+  assert.match(slot.ok === false ? slot.reason : '', /entry-rival/)
+})
+
+test('the stamp is written with the database clock, not this process’s', async () => {
+  reset()
+  state.dbNow = new Date('2031-03-04T05:06:07Z')
+  const claimedAt = new Date('2026-08-20T10:00:00Z')
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+
+  await takeInvoiceNumberPostSlot({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+  })
+  assert.equal(
+    state.rows[0].attemptedInvoiceNumberAt?.getTime(), state.dbNow.getTime(),
+    'the value another worker will age against must come from the clock that ages it',
+  )
+})
+
+test('an unreadable database clock fails CLOSED — an unmeasurable lease is not permission to post', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  state.failClock = true
+
+  const slot = await takeInvoiceNumberPostSlot({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+  })
+  assert.equal(slot.ok, false)
+  assert.match(slot.ok === false ? slot.reason : '', /NOTHING WAS SENT/)
+  assert.equal(state.rows[0].attemptedInvoiceNumber, null)
+})
+
+test('a worker that DIED mid-post stops fencing the number once its stamp outlives the lease', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  // Still PROCESSING because nothing ever wrote its outcome. If the stamp outlived the lease, one
+  // crash would fence this number off for good.
+  const dead = row({
+    id: 'entry-dead',
+    attemptedInvoiceNumber: '164981',
+    attemptedInvoiceNumberAt: new Date(state.dbNow.getTime() - CLAIM_STALE_MS - 60_000),
+  })
+  state.rows.push(dead)
+
+  assert.deepEqual(
+    await takeInvoiceNumberPostSlot({ entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a' }),
+    { ok: true },
+  )
+
+  // ...and one still inside the window does fence it, so the bound is a lease, not "always".
+  dead.attemptedInvoiceNumberAt = new Date(state.dbNow.getTime() - CLAIM_STALE_MS + 60_000)
+  state.rows[0].attemptedInvoiceNumber = null
+  state.rows[0].attemptedInvoiceNumberAt = null
+  const fenced = await takeInvoiceNumberPostSlot({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+  })
+  assert.equal(fenced.ok, false)
+})
+
+// ---------------------------------------------------------------------------
+// Exclusion
+// ---------------------------------------------------------------------------
+
+test('EXACTLY ONE of two workers racing on the same number gets the slot, and the LOCK is what decides', async () => {
+  // The property the whole fence exists for. The scan is slowed so that, without the lock, both
+  // workers would certainly look before either stamps — the interleaving that defeats check-then-act.
+  for (const numbers of [['164981', '164981'], ['INV-1', 'inv-1']] as const) {
+    reset()
+    state.readDelay = () => new Promise((resolve) => setTimeout(resolve, 5))
+    const claimA = new Date('2026-08-20T10:00:00Z')
+    const claimB = new Date('2026-08-20T10:00:01Z')
+    state.rows.push(row({ id: 'entry-a', processingStartedAt: claimA }))
+    state.rows.push(row({ id: 'entry-b', processingStartedAt: claimB }))
+
+    const [a, b] = await Promise.all([
+      takeInvoiceNumberPostSlot({ entryId: 'entry-a', claimedAt: claimA, invoiceNumber: numbers[0], orderLabel: 'order a' }),
+      takeInvoiceNumberPostSlot({ entryId: 'entry-b', claimedAt: claimB, invoiceNumber: numbers[1], orderLabel: 'order b' }),
+    ])
+
+    const winners = [a, b].filter((r) => r.ok)
+    assert.equal(winners.length, 1, `exactly one worker may post under ${numbers.join(' / ')}`)
+    const loser = [a, b].find((r) => !r.ok)
+    assert.match(
+      loser && loser.ok === false ? loser.reason : '',
+      /is already in flight under that same number/,
+      'a worker that yields must name the row it yielded to, so the refusal is diagnosable',
+    )
+  }
 })
 
 test('the stamp is fenced on the claim INSTANT, so a displaced worker is refused and posts nothing', async () => {
@@ -161,50 +494,13 @@ test('the stamp is fenced on the claim INSTANT, so a displaced worker is refused
   assert.equal(state.rows[0].attemptedInvoiceNumber, null, 'a displaced worker must not overwrite the holder’s stamp')
 })
 
-test('a sibling row already in flight under the same number is deferred to, by name', async () => {
-  reset()
-  const claimedAt = new Date('2026-08-20T10:00:00Z')
-  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
-  state.rows.push(row({
-    id: 'entry-rival',
-    referenceId: 'so-other',
-    attemptedInvoiceNumber: '164981',
-    attemptedInvoiceNumberAt: new Date(Date.now() - 1_000),
-  }))
-
-  const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
-  })
-
-  assert.equal(slot.ok, false)
-  const reason = slot.ok === false ? slot.reason : ''
-  assert.match(reason, /sync row entry-rival \(reference so-other\) is already in flight under that same number/)
-  assert.match(reason, /silently replace the earlier/)
-  assert.match(reason, /NOTHING WAS SENT/)
-})
-
-test('a sibling holding a DIFFERENT number is not a rival', async () => {
-  reset()
-  const claimedAt = new Date('2026-08-20T10:00:00Z')
-  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
-  state.rows.push(row({ id: 'entry-other', attemptedInvoiceNumber: '164982', attemptedInvoiceNumberAt: new Date() }))
-
-  const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
-  })
-  assert.deepEqual(slot, { ok: true })
-})
-
 test('a sibling that settled is not a rival — only a row still PROCESSING can be mid-post', async () => {
   reset()
-  const claimedAt = new Date('2026-08-20T10:00:00Z')
+  const claimedAt = state.dbNow
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
   // The loser of an earlier round: it failed and dropped back to PENDING, which frees the number.
   state.rows.push(row({
-    id: 'entry-loser',
-    status: 'PENDING',
-    attemptedInvoiceNumber: '164981',
-    attemptedInvoiceNumberAt: new Date(),
+    id: 'entry-loser', status: 'PENDING', attemptedInvoiceNumber: '164981', attemptedInvoiceNumberAt: state.dbNow,
   }))
 
   const slot = await takeInvoiceNumberPostSlot({
@@ -213,125 +509,143 @@ test('a sibling that settled is not a rival — only a row still PROCESSING can 
   assert.deepEqual(slot, { ok: true })
 })
 
-test('a worker that DIED mid-post stops fencing the number once its claim could be re-taken', async () => {
+test('a scan that fills its limit REFUSES rather than reporting the fraction it saw', async () => {
   reset()
-  const claimedAt = new Date('2026-08-20T10:00:00Z')
+  const claimedAt = state.dbNow
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
-  // Still PROCESSING because nothing ever wrote its outcome. If the stamp outlived the claim, one
-  // crash would fence this number off for good.
-  state.rows.push(row({
-    id: 'entry-dead',
-    attemptedInvoiceNumber: '164981',
-    attemptedInvoiceNumberAt: new Date(Date.now() - CLAIM_STALE_MS - 60_000),
-  }))
-
-  const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
-  })
-  assert.deepEqual(slot, { ok: true })
-
-  // ...and one still inside the window does fence it, so the bound is the claim's, not "always".
-  state.rows[1].attemptedInvoiceNumberAt = new Date(Date.now() - CLAIM_STALE_MS + 60_000)
-  state.rows[0].attemptedInvoiceNumber = null
-  state.rows[0].attemptedInvoiceNumberAt = null
-  const fenced = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
-  })
-  assert.equal(fenced.ok, false)
-})
-
-test('EXACTLY ONE of two workers racing on the same number gets the slot — in either interleaving', async () => {
-  // The property the whole fence exists for. Both stamp before either reads (the interleaving that
-  // defeats a naive check-then-act), and the tie-break must let precisely one through: two would be
-  // the silent overwrite, zero would deadlock both rows into the retry ladder.
-  for (const order of [['a', 'b'], ['b', 'a']] as const) {
-    reset()
-    const claimA = new Date('2026-08-20T10:00:00Z')
-    const claimB = new Date('2026-08-20T10:00:01Z')
-    state.rows.push(row({ id: 'entry-a', processingStartedAt: claimA }))
-    state.rows.push(row({ id: 'entry-b', processingStartedAt: claimB }))
-
-    const run = (id: 'a' | 'b') => takeInvoiceNumberPostSlot({
-      entryId: `entry-${id}`,
-      claimedAt: id === 'a' ? claimA : claimB,
-      invoiceNumber: '164981',
-      orderLabel: `order ${id}`,
-    })
-    const first = await run(order[0])
-    const second = await run(order[1])
-
-    const winners = [first, second].filter((r) => r.ok)
-    assert.equal(winners.length, 1, `exactly one worker may post under the number (order ${order.join('→')})`)
-    // And the one that yields says which row it yielded to, not merely that it failed.
-    const loser = [first, second].find((r) => !r.ok)
-    assert.match(loser && loser.ok === false ? loser.reason : '', /is already in flight under that same number/)
+  for (let i = 0; i < RIVAL_SCAN_LIMIT; i++) {
+    state.rows.push(row({
+      id: `entry-${String(i).padStart(4, '0')}`,
+      attemptedInvoiceNumber: `other-${i}`,
+      attemptedInvoiceNumberAt: state.dbNow,
+    }))
   }
-})
-
-test('a rival stamped in the SAME millisecond is yielded to — a tie refuses, it does not outrank', async () => {
-  // Milliseconds cannot order two stamps that record as equal, and a rule that picks a winner
-  // anyway (lowest row id, say) lets BOTH through: the one that really wrote first sees nobody,
-  // and the one that wrote second sees an "outranked" rival and posts over it. So a tie yields.
-  reset()
-  const claimA = new Date('2026-08-20T09:00:00Z')
-  // Deliberately an id that SORTS AFTER this row's, so a passing result cannot come from id order.
-  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimA }))
-  const rival = row({ id: 'entry-z', attemptedInvoiceNumber: '164981' })
-  state.rows.push(rival)
-  // The rival's stamp lands on the very instant this worker's does.
-  state.onStamp = (at) => { rival.attemptedInvoiceNumberAt = at }
 
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt: claimA, invoiceNumber: '164981', orderLabel: 'order a',
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
   assert.equal(slot.ok, false)
-  assert.match(slot.ok === false ? slot.reason : '', /entry-z/)
+  assert.match(slot.ok === false ? slot.reason : '', /filled its 200-row limit/)
+  assert.match(slot.ok === false ? slot.reason : '', /NOTHING WAS SENT/)
 })
 
 test('an unreadable database fails CLOSED — not knowing about a rival is not permission to post', async () => {
   reset()
-  const claimedAt = new Date('2026-08-20T10:00:00Z')
+  const claimedAt = state.dbNow
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
-  state.failFindFirst = true
+  state.failFindMany = true
 
   const slot = await takeInvoiceNumberPostSlot({
     entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
 
   assert.equal(slot.ok, false)
-  assert.match(slot.ok === false ? slot.reason : '', /Could not check whether another sync row is already posting/)
+  assert.match(slot.ok === false ? slot.reason : '', /Could not take the exclusive post slot/)
   assert.match(slot.ok === false ? slot.reason : '', /NOTHING WAS SENT/)
 })
 
-test('when BOTH workers stamp before either reads, two can never both proceed', async () => {
-  // The interleaving a naive check-then-act loses to: neither read can see the other's stamp
-  // "before" it, so the safety of this fence rests entirely on the write coming first. At most one
-  // may proceed; if a millisecond tie makes both yield, that is a retry, not a lost invoice — and
-  // it is the direction the whole change is built to fail in.
+test('a number that is blank once trimmed refuses before any lock is taken', async () => {
   reset()
-  const claimA = new Date('2026-08-20T10:00:00Z')
-  const claimB = new Date('2026-08-20T10:00:01Z')
-  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimA }))
-  state.rows.push(row({ id: 'entry-b', processingStartedAt: claimB }))
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
 
-  let stamped = 0
-  let release: () => void = () => {}
-  const bothStamped = new Promise<void>((resolve) => { release = resolve })
-  state.onStamp = () => { if (++stamped >= 2) release() }
-  state.readBarrier = () => bothStamped
+  const slot = await takeInvoiceNumberPostSlot({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '   ', orderLabel: 'order a',
+  })
+  assert.equal(slot.ok, false)
+  assert.match(slot.ok === false ? slot.reason : '', /blank once trimmed/)
+  assert.deepEqual(state.trace, [], 'an empty lock key would serialize every unrelated invoice onto one slot')
+})
 
-  const [a, b] = await Promise.all([
-    takeInvoiceNumberPostSlot({ entryId: 'entry-a', claimedAt: claimA, invoiceNumber: '164981', orderLabel: 'order a' }),
-    takeInvoiceNumberPostSlot({ entryId: 'entry-b', claimedAt: claimB, invoiceNumber: '164981', orderLabel: 'order b' }),
-  ])
+// ---------------------------------------------------------------------------
+// The staleness bound — round 5, finding 2
+// ---------------------------------------------------------------------------
 
-  const winners = [a, b].filter((r) => r.ok)
-  assert.ok(winners.length <= 1, 'two workers must never both be cleared to post under one number')
-  for (const loser of [a, b].filter((r) => !r.ok)) {
-    assert.match(
-      loser.ok === false ? loser.reason : '',
-      /is already in flight under that same number/,
-      'a worker that yields must name the row it yielded to, so the refusal is diagnosable',
-    )
-  }
+test('the slot is not taken until the check RUNS — building it must send and write nothing', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+
+  await buildInvoiceNumberPostSlotCheck({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    referenceType: 'SalesOrder', referenceId: 'so-1',
+  })
+
+  assert.deepEqual(state.trace, [], 'the slot must be taken after preparation, so constructing the check cannot take it')
+  assert.equal(state.rows[0].attemptedInvoiceNumber, null)
+})
+
+test('a ledger answer that has outlived the claim refuses, and nothing is stamped', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  let monotonic = 1_000
+  const check = await buildInvoiceNumberPostSlotCheck({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    referenceType: 'SalesOrder', referenceId: 'so-1',
+    monotonicNowMs: () => monotonic,
+  })
+
+  // Preparation took longer than the claim is guaranteed for: the contact call and one call per
+  // distinct item code, each with its own six-minute budget.
+  monotonic += CLAIM_STALE_MS
+  const verdict = await check()
+
+  assert.equal(verdict.ok, false)
+  assert.match(verdict.ok === false ? verdict.error : '', /the ledger was asked who holds that number 900s ago/)
+  assert.match(verdict.ok === false ? verdict.error : '', /NOTHING WAS SENT/)
+  assert.deepEqual(state.trace, [], 'a stale answer must refuse BEFORE taking a slot it cannot justify')
+  assert.equal(state.rows[0].attemptedInvoiceNumber, null)
+})
+
+test('an answer still inside the bound proceeds, and takes the slot at that moment', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  let monotonic = 1_000
+  const check = await buildInvoiceNumberPostSlotCheck({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    referenceType: 'SalesOrder', referenceId: 'so-1',
+    monotonicNowMs: () => monotonic,
+  })
+
+  monotonic += CLAIM_STALE_MS - 1
+  assert.deepEqual(await check(), { ok: true })
+  assert.deepEqual(state.trace, ['lock', 'clock', 'scan', 'stamp'])
+  assert.equal(state.rows[0].attemptedInvoiceNumber, '164981')
+})
+
+test('the age is measured from the ANSWER, not from the moment the check runs', async () => {
+  // The regression this rules out: reading the clock inside the closure and comparing it with
+  // itself, which is always zero and always passes.
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  let monotonic = 0
+  const check = await buildInvoiceNumberPostSlotCheck({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    referenceType: 'SalesOrder', referenceId: 'so-1',
+    monotonicNowMs: () => monotonic,
+  })
+  monotonic = CLAIM_STALE_MS * 4
+  const verdict = await check()
+  assert.equal(verdict.ok, false)
+  assert.match(verdict.ok === false ? verdict.error : '', /3600s ago/)
+})
+
+test('a rival found at post time is reported through the check, not swallowed', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  state.rows.push(row({
+    id: 'entry-rival', attemptedInvoiceNumber: '164981', attemptedInvoiceNumberAt: state.dbNow,
+  }))
+  const check = await buildInvoiceNumberPostSlotCheck({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    referenceType: 'SalesOrder', referenceId: 'so-1',
+    monotonicNowMs: () => 0,
+  })
+  const verdict = await check()
+  assert.equal(verdict.ok, false)
+  assert.match(verdict.ok === false ? verdict.error : '', /entry-rival/)
 })

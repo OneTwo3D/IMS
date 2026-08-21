@@ -9,6 +9,27 @@ import { xeroDocumentRevisionAt } from './document-revision'
 import { imsRateToXeroCurrencyRate } from './fx'
 import type { InvoiceData, InvoiceLine } from '../types'
 
+/**
+ * A LAST CHECK THAT RUNS AFTER THE PAYLOAD IS BUILT AND BEFORE THE REQUEST LEAVES (o3d-k26m.5 r5).
+ *
+ * `pushSalesInvoice` does not post first. It PREPARES — `findOrCreateContact` is a Xero round trip
+ * and `findOrCreateItem` is another one per distinct item code, each through the same rate-limited
+ * client whose in-request budget is six minutes PER CALL — so anything the caller checked before
+ * calling this function may have been true minutes ago and false now. For the invoice-number
+ * ownership fence that gap is the whole hazard: the create is update-or-create on the number, and an
+ * exclusion that lapsed during preparation is an exclusion that is not there when the write happens.
+ *
+ * So the caller hands in a closure instead of checking first, and it runs HERE, at the last
+ * instruction before `xeroPost`. A refusal is returned as an ordinary failure and NOTHING IS SENT.
+ *
+ * Deliberately generic and deliberately narrow: this module knows only that some callers have a
+ * precondition that must hold at the instant of the write, not what it is. The sibling branch
+ * o3d-batch-small2 named this exact seam as the residual its per-mutation claim fence could not
+ * reach ("closing that needs a hook threaded through the connector modules"); when the two land
+ * together its claim re-take belongs in the same closure rather than at the call site.
+ */
+export type BeforeRemoteWrite = () => Promise<{ ok: true } | { ok: false; error: string }>
+
 type XeroInvoiceResponse = {
   Invoices: Array<{
     InvoiceID: string
@@ -172,12 +193,22 @@ async function prepareSalesInvoicePayload(
 export async function pushSalesInvoice(
   data: InvoiceData,
   status: string = 'AUTHORISED',
-  opts?: { idempotencyKey?: string; customerId?: string },
+  opts?: { idempotencyKey?: string; customerId?: string; beforePost?: BeforeRemoteWrite },
 ): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; externalRevisionAt?: Date | null; error?: string }> {
   const prepared = await prepareSalesInvoicePayload(data, status, opts)
   if (!prepared.success) return prepared
 
-  const res = await xeroPost<XeroInvoiceResponse>('Invoices', prepared.invoice, opts)
+  // AFTER preparation, BEFORE the request. Both halves are load-bearing: after, because preparation
+  // is the unbounded part and a check in front of it is a check about a moment that has passed;
+  // before, because the write it guards cannot be taken back.
+  if (opts?.beforePost) {
+    const cleared = await opts.beforePost()
+    if (!cleared.ok) return { success: false, error: cleared.error }
+  }
+
+  // The options are rebuilt rather than forwarded: `xeroPost` takes an idempotency key and nothing
+  // else, and a hook that reached the transport layer would be a hook nobody can account for.
+  const res = await xeroPost<XeroInvoiceResponse>('Invoices', prepared.invoice, { idempotencyKey: opts?.idempotencyKey })
   if (!res.ok || !res.data?.Invoices?.length) {
     return { success: false, error: res.error ?? 'Failed to create invoice' }
   }
@@ -196,12 +227,21 @@ export async function updateSalesInvoice(
   accountingInvoiceId: string,
   data: InvoiceData,
   status: string = 'AUTHORISED',
-  opts?: { idempotencyKey?: string; customerId?: string },
+  opts?: { idempotencyKey?: string; customerId?: string; beforePost?: BeforeRemoteWrite },
 ): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; externalRevisionAt?: Date | null; error?: string }> {
   const prepared = await prepareSalesInvoicePayload(data, status, opts)
   if (!prepared.success) return prepared
 
-  const res = await xeroPost<XeroInvoiceResponse>(`Invoices/${accountingInvoiceId}`, prepared.invoice, opts)
+  // Accepted here too, and for the same reason, even though the number fence does not use it: this
+  // path addresses a document by the id IMS recorded from the create's own response, so it is not
+  // fenced on the number. A caller with a precondition of its own must still be able to prove it at
+  // the instant of the write rather than before the preparation calls.
+  if (opts?.beforePost) {
+    const cleared = await opts.beforePost()
+    if (!cleared.ok) return { success: false, error: cleared.error }
+  }
+
+  const res = await xeroPost<XeroInvoiceResponse>(`Invoices/${accountingInvoiceId}`, prepared.invoice, { idempotencyKey: opts?.idempotencyKey })
   if (!res.ok || !res.data?.Invoices?.length) {
     return { success: false, error: res.error ?? 'Failed to update invoice' }
   }

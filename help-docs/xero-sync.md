@@ -702,7 +702,8 @@ the sync row and in the activity log as `sales_invoice_number_not_ours`:
 | **Xero could not be asked** (disconnected, rate-limited, network) | Refuses, and retries by itself | Nothing — the row re-runs once the connection is healthy. If it persists, fix the connection |
 | **Xero's answer could not be shown to be complete** (a full page of documents came back) | Refuses, and retries by itself | Nothing automatic. If it persists, look for the pile of documents sharing that number in Xero — the check will not guess past a result it cannot see the end of |
 | **The number contains a comma** | Refuses, permanently | Xero's number filter reads a comma as the separator between two numbers, so IMS cannot ask who holds *this* one — and "no documents" is exactly the answer that would let it overwrite. Change the number in WooCommerce (it is taken verbatim from `_wcpdf_invoice_number`, so this is usually a prefix or suffix in the PDF plugin's number format) and re-queue, or post the invoice in Xero by hand and link it to the order |
-| **Another IMS sync row is already posting under the same number** | Refuses, and retries by itself | Nothing — the other row settles within seconds and this one retries. If it keeps happening, two queued invoices genuinely carry one number: cancel the duplicate. Logged as `sales_invoice_number_in_flight_elsewhere` |
+| **Another IMS sync row is already posting under the same number** | Refuses, and retries by itself | Nothing — the other row settles within seconds and this one retries. If it keeps happening, two queued invoices genuinely carry one number: cancel the duplicate. Logged as `sales_invoice_number_in_flight_elsewhere`. Numbers are compared the way Xero compares them, so `INV-1` and `inv-1` count as the same number here |
+| **Building the invoice took longer than 15 minutes** | Refuses, and retries by itself | Nothing — the next run asks Xero again from scratch. Preparing an invoice makes one Xero call for the contact and one per distinct product, so a very large or heavily rate-limited invoice can outlast the answer that authorised it, and IMS will not post on an answer that old. Logged as `sales_invoice_number_answer_stale` |
 
 The refusals other than the last are verdicts about what is in Xero, not transient errors. The row
 still retries a handful of times before it settles as FAILED with the reason on it — and those
@@ -719,11 +720,27 @@ after cutover there is no second system left to notice if it ever failed to. Tha
 refuses whenever it cannot show that it read Xero's answer in full.
 
 What it cannot do is see a document that appears between the check and the post. With xeroom gone,
-only two things can land there. **A second IMS worker is now fenced off:** before any post, the sync
-row records the number it is about to use, and a row that finds another row already in flight under
-the same number stands down rather than posting — so two queued invoices carrying one number produce
-one document and one retry, not one document and a silent overwrite. What remains is somebody typing
-an invoice into Xero by hand in the same second, which no check inside IMS can see.
+only two things can land there. **A second IMS worker is now fenced off:** immediately before the
+create leaves — not before IMS starts building it — the sync row takes an exclusive slot on the
+number, and a row that finds another row already in flight under the same number stands down rather
+than posting. So two queued invoices carrying one number produce one document and one retry, not one
+document and a silent overwrite.
+
+Three details of that fence matter if you are reading a refusal:
+
+* **The slot is taken at the last possible moment.** Preparing an invoice calls Xero once for the
+  customer contact and once per distinct product, and those calls are rate-limited, so preparation
+  can take minutes. A slot taken before all of that could have expired by the time the invoice was
+  sent — which is why it is now taken after it.
+* **Numbers are matched the way Xero matches them.** Case and surrounding spaces are ignored, because
+  Xero treats `INV-1` and `inv-1` as one document; if IMS treated them as two, both workers would
+  think they were alone.
+* **Nothing depends on the servers' clocks agreeing.** Which worker gets the slot is decided by a
+  database lock, and the fifteen-minute expiry on an abandoned slot is measured by the database, not
+  by the machine running the sync.
+
+What remains is somebody typing an invoice into Xero by hand in the same second, which no check
+inside IMS can see.
 
 IMS deliberately does **not** treat "I was about to post under this number" as proof that the
 document now holding it is mine: that reasoning would only ever be used when the number *is* held,

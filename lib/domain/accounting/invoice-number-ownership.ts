@@ -100,6 +100,36 @@
  * and its wrong answer is an overwrite while the refusal's is a phone call (o3d-k26m.8).
  */
 
+/**
+ * THE NUMBER AS THE LEDGER SEES IT — ONE DEFINITION, USED BY EVERY PART OF THE FENCE (round 5).
+ *
+ * Two strings that reduce to the same identity are THE SAME INVOICE to Xero. `POST /Invoices` is
+ * update-or-create on the number, and the matching is case-insensitive — which the lookup already
+ * knew, because it re-compares its own response case-insensitively before believing a row is a
+ * claim on the number it asked about (lib/connectors/xero/invoice-number-claim.ts).
+ *
+ * SO ANY PART OF THE FENCE THAT USES A NARROWER IDENTITY HAS A HOLE IN IT. Round 4's post-slot
+ * mutex compared `attemptedInvoiceNumber` as an exact string: two sync rows carrying `INV-1` and
+ * `inv-1` — which is one document in the ledger and one upsert target — took two INDEPENDENT
+ * slots, so each worker found itself unopposed and the second post silently replaced the first.
+ * That is precisely the outcome the mutex exists to prevent, reached by agreeing with Xero about
+ * which document is at stake while disagreeing with it about which numbers name that document.
+ *
+ * `trim()` because the trimmed number is the question the ledger was actually asked (the lookup
+ * trims before building the filter), and an answer is only evidence about the question it answered.
+ *
+ * `toLowerCase()` and NOT `toLocaleLowerCase()`, deliberately: a locale-sensitive fold makes the
+ * identity depend on the HOST that computed it, and two workers deciding whether they hold the same
+ * number must never be able to disagree because of where they run.
+ *
+ * IT IS NOT WHAT GETS POSTED. The number on the wire stays verbatim — it is the number on the
+ * customer's own PDF (o3d-k26m.1) — and the local record of an attempt stays verbatim too. This is
+ * only how the fence decides that two of them are ONE.
+ */
+export function xeroInvoiceNumberIdentity(invoiceNumber: string): string {
+  return invoiceNumber.trim().toLowerCase()
+}
+
 /** One ledger document, as much of it as the ownership question needs. */
 export type LedgerInvoiceClaim = {
   /** The external document id — Xero's InvoiceID. */
