@@ -81,6 +81,37 @@ mock.module('@/lib/db', {
         count: async () => 1,
         findMany: async () => [{ id: 'shipment-1', status: 'PACKED' }],
       },
+      // o3d-okbd (merged after this test was written): before driving the shipments to SHIPPED the
+      // boundary checks that the IMS shipment lines COVER what was ordered, and refuses the update
+      // outright when they do not. That check is not what these tests are about, so the fixture is
+      // FULLY COVERED — one ordered unit, one shipped unit — rather than stubbed to "no shortfall":
+      // a stub would also hide a real regression in the check, and an under-covered fixture would
+      // make every completion-authority assertion below unreachable behind the refusal.
+      salesOrderLine: {
+        findMany: async () => [{
+          id: 'line-1',
+          productId: 'prod-1',
+          qty: 1,
+          sku: 'SKU-1',
+          description: 'Product 1',
+          product: { type: 'SIMPLE' },
+        }],
+      },
+      shipmentLine: {
+        findMany: async () => [{ lineId: 'line-1', productId: 'prod-1', qty: 1 }],
+      },
+      salesOrderRefundLine: { findMany: async () => [] },
+      // The coverage check expands the ordered products through the fulfilment graph. A SIMPLE
+      // product with no components expands to itself, which is what makes the one ordered unit and
+      // the one shipped unit compare directly.
+      product: {
+        findMany: async () => [{
+          id: 'prod-1',
+          type: 'SIMPLE',
+          fulfillmentGraphVersion: 0,
+          productComponents: [],
+        }],
+      },
     },
   },
 })

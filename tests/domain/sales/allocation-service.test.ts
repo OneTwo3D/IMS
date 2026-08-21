@@ -144,6 +144,9 @@ type OrderRow = {
   // o3d-o97 r4: the A2 journal the order was staged into. Whether the un-stage may clear the stamp
   // now depends on whether that journal's debit is still standing.
   allocationBatchSyncLogId?: string | null
+  // o3d-xlk7: the running total an ALLOCATION_REVERSAL credits back out of Allocated Inventory for
+  // this order. The refund's open balance nets it off; without it the same units are credited twice.
+  allocationReversalAmount?: number | null
   lines: OrderLineRow[]
 }
 
@@ -332,13 +335,21 @@ function createClient(state: MemoryState): AllocationServiceClient {
         return { ...state.order }
       },
       update: async ({ data }: {
-        data: { status?: string; inventoryAllocatedDate?: Date | null; allocationBatchAmount?: number | null }
+        data: {
+          status?: string
+          inventoryAllocatedDate?: Date | null
+          allocationBatchAmount?: number | null
+          allocationReversalAmount?: number | null
+        }
       }) => {
         if (data.status) state.order.status = data.status
         // resetAllocationAccountingIfStaged clears these. The double used to ignore them, which
         // made any assertion about the A2 stamp vacuous — o3d-i5it turns on exactly that write.
         if ('inventoryAllocatedDate' in data) state.order.inventoryAllocatedDate = data.inventoryAllocatedDate ?? null
         if ('allocationBatchAmount' in data) state.order.allocationBatchAmount = data.allocationBatchAmount ?? null
+        // o3d-xlk7: the reversal's own record. Ignoring this write would make every assertion about
+        // the relief a later refund can see vacuous — which is the exact shape of the defect.
+        if ('allocationReversalAmount' in data) state.order.allocationReversalAmount = data.allocationReversalAmount ?? null
         return state.order
       },
     },
@@ -2576,6 +2587,59 @@ test('o3d-0i5y r10: the deallocation teardown REVERSES the posted debit of the r
   assert.equal(queuedAccountingSyncs[0].referenceId, 'order-1')
 })
 
+test('o3d-xlk7: the reversal RECORDS its credit on the order, where the refund\'s open balance looks', async () => {
+  // THE OTHER HALF OF THE REVERSAL, and it is not optional. o3d-o97 (merged as PR #635) computes how
+  // many pounds of A2's debit are still open as `allocationBatchAmount` less relief it can PROVE,
+  // and it knows two relief sources: Group B's per-shipment figure and each prior refund's. An
+  // ALLOCATION_REVERSAL is NEITHER, so without a record of it a later full refund's residue credits
+  // these same units a SECOND time.
+  //
+  // The refund proves the figure from the reversal journal's own lines; this column is what survives
+  // `retention_sync_logs_months` hard-deleting that journal, which it will long before an order
+  // orphaned today is refunded.
+  const state = deallocatedState(POSTED_TEN_AT_FOUR)
+  resetAccountingQueue()
+
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.equal(
+    Number(state.order.allocationReversalAmount),
+    40,
+    'the £40 credited back out of Allocated Inventory is recorded on the order',
+  )
+  assert.equal(
+    Number(state.order.allocationBatchAmount),
+    40,
+    'and A2\'s own record of what it POSTED is left alone — netting the reversal into it would read '
+    + 'as "A2 recorded a debit of zero", which is o3d-o97\'s positive proof that no debit stands, and '
+    + 'the order would clear its stamp and be posted all over again',
+  )
+})
+
+test('o3d-xlk7: a reversal the queue silently dropped records NO relief', async () => {
+  // `queueAccountingSyncTx` does nothing at all under three ordinary conditions (no active
+  // connector, the posting suppressed, the order deleted mid-enqueue) and throws in none of them.
+  // Recording relief there would shrink the refund's open balance for a credit that never happened,
+  // which strands real pounds in Allocated Inventory — the silent direction of this error. The
+  // ERROR-level "post this by hand" record is raised instead, and it already was.
+  const state = deallocatedState(POSTED_TEN_AT_FOUR)
+  resetAccountingQueue('silent-no-op')
+
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.equal(accountingSyncRows.length, 0, 'the queue really did drop it — nothing was written')
+  assert.equal(
+    state.order.allocationReversalAmount ?? null,
+    null,
+    'so no relief is claimed against a credit that was never raised',
+  )
+  assert.equal(
+    activityLogWrites.filter((entry) => (entry as { action: string }).action === 'allocation_reversal_unqueued').length,
+    1,
+    'and the un-queued reversal is still reported for a human to post by hand',
+  )
+})
+
 test('o3d-0i5y r10: the teardown reverses at what A2 RECORDED, never at the revalued pin', async () => {
   // Same ten units, but a landed cost has since rewritten `unitCostBase` on the row from £4 to £9.
   // That revaluation posted to COGS/Inventory and never to Allocated Inventory, so £40 is still
@@ -3099,12 +3163,15 @@ test('resetAllocationAccountingIfStaged clears inventoryAllocatedBatchRef in the
     allocationBatchConnector: null,
     allocationBatchAccountCode: null,
   })
-  // o3d-0i5y r9: this assertion used to read `allocationUpdates.length === 1` — "and the cost
-  // snapshots are still nulled alongside it" — which pinned the DESTRUCTIVE rewrite as the
-  // requirement. It is the opposite of the requirement. The stamp says what still has to be DONE
-  // and is cleared; the row records say what has already been POSTED, and erasing them is what
-  // makes the next A2 pass post the whole order a second time.
-  assert.equal(allocationUpdates.length, 0, 'and the posted records are LEFT ALONE')
+  // o3d-0i5y r9 asserted `allocationUpdates.length === 0` here — "the posted records are LEFT
+  // ALONE" — on the reasoning that erasing them makes the next A2 pass post the whole order again.
+  // SUPERSEDED on the rebase onto o3d-o97 / PR #635, and this fixture is precisely the case where
+  // the reasoning does not apply: A2 recorded a debit of exactly £0.00, which is positive evidence
+  // that NOTHING was posted for this order. There is no record to preserve and no second debit to
+  // fear, and the pins are being replaced by the caller in any case. Where a debit DOES stand the
+  // merged rule keeps the STAMP instead, and A2 — which selects on `inventoryAllocatedDate: null` —
+  // never looks at the order again, so the re-post r9 was defending against is unreachable there.
+  assert.equal(allocationUpdates.length, 1, 'the pins go with the debit that is provably not standing')
 })
 
 test('resetAllocationAccountingIfStaged KEEPS the stamp and the recorded debit when A2 posted (o3d-o97 r4)', async () => {
@@ -3224,11 +3291,16 @@ test('o3d-0i5y r5: a permitted rebuild that ADDS allocated quantity releases the
     { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(3) }] },
   )
 
+  // o3d-0i5y r12 (rebase onto o3d-o97 / PR #635): `allocationBatchAmount: null` was in this
+  // expected payload and is deliberately gone. A2 is being handed the order back to post the
+  // INCREMENT — it reads the records this test asserts survive and posts the residual alone — so
+  // the pounds it has ALREADY debited are still standing, and o3d-o97 made that figure the basis of
+  // the refund's open balance. Nulling it here would leave the order recording only the increment
+  // and strand the first posting for ever.
   assert.deepEqual(salesOrderUpdates, [{
     inventoryAllocatedDate: null,
     inventoryAllocatedBatchRef: null,
-    allocationBatchAmount: null,
-  }], 'the order goes back to A2 so the residual unit is reclassified')
+  }], 'the order goes back to A2 so the residual unit is reclassified — with its posted record intact')
   assert.deepEqual(
     allocationUpdates,
     [],
@@ -3256,6 +3328,68 @@ test('o3d-0i5y r5: a permitted rebuild that adds NO new quantity keeps the stamp
   )
 
   assert.deepEqual(salesOrderUpdates, [], 'nothing new to account, so nothing is un-staged')
+})
+
+test('o3d-xlk7: a rebuild that adds quantity to a row RECORDING NOTHING keeps the stamp, and says why', async () => {
+  // THE HOLE THE MERGED RULE CLOSES, and the reason the release is gated rather than unconditional.
+  //
+  // r5 released the stamp whenever the declared set held quantity nothing had accounted. That is
+  // safe while the ROWS say what A2 already accounted, because A2's next pass reads those records
+  // and posts the DIFFERENCE. It is not safe here: the order is stamped (A2 ran) and recorded a £40
+  // debit, and yet no row records accounting for a single unit — the legacy shape, and the shape a
+  // blanket un-stage leaves behind. Hand this order back and A2 finds an empty record, concludes
+  // nothing has been reclassified, and posts ALL THREE units a second time on top of the £40. That
+  // is o3d-o97 r4's worked failure reached from the other direction, and nothing reverses the first
+  // debit.
+  //
+  // So the stamp stays and the refusal is REPORTED. It costs the new unit a pass, not a posting.
+  const { tx, salesOrderUpdates, activityLogs } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    allocationBatchAmount: 40,
+    persistedAllocations: [{ ...ACCOUNTED_SCOPE, costLayerSnapshot: null }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(3) }] },
+  )
+
+  assert.deepEqual(salesOrderUpdates, [], 'the stamp is NOT released against a record that accounts for nothing')
+  assert.equal(activityLogs.length, 1)
+  assert.equal((activityLogs[0] as { action: string }).action, 'allocation_accounting_stage_retained')
+  assert.match(
+    String((activityLogs[0] as { description: string }).description),
+    /NO allocation row records what A2 already accounted, so handing this order back would re-value and re-post every unit/,
+  )
+})
+
+test('o3d-xlk7: the same rebuild DOES release the stamp once A2 recorded a debit of exactly £0.00', async () => {
+  // The proof the gate above is a gate and not a blanket refusal, on o3d-o97's own positive
+  // evidence: a recorded £0.00 is A2 saying it staged this order and valued it at nothing. There is
+  // no debit to double and no record worth keeping, so the whole attribution goes with the stamp
+  // and A2 values the order afresh.
+  const { tx, salesOrderUpdates, activityLogs } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    allocationBatchAmount: 0,
+    persistedAllocations: [{ ...ACCOUNTED_SCOPE, costLayerSnapshot: null }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(3) }] },
+  )
+
+  assert.deepEqual(salesOrderUpdates, [{
+    inventoryAllocatedDate: null,
+    inventoryAllocatedBatchRef: null,
+    allocationBatchAmount: null,
+    allocationBatchSyncLogId: null,
+    allocationBatchConnector: null,
+    allocationBatchAccountCode: null,
+  }], 'a known debit of zero leaves nothing to preserve, so the attribution goes too')
+  assert.deepEqual(activityLogs, [])
 })
 
 test('o3d-0i5y r5: quantity accounted through a SHIPMENT rather than a pinned snapshot still counts as accounted', async () => {
@@ -3328,10 +3462,11 @@ test('o3d-0i5y r6: and one more unit than the row records still releases the sta
     { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(11) }] },
   )
 
+  // o3d-0i5y r12: `allocationBatchAmount: null` removed for the reason given at the r5 test above —
+  // A2 comes back for the INCREMENT, so what it already debited stays on record.
   assert.deepEqual(salesOrderUpdates, [{
     inventoryAllocatedDate: null,
     inventoryAllocatedBatchRef: null,
-    allocationBatchAmount: null,
   }], 'the eleventh unit is genuinely unaccounted')
 })
 

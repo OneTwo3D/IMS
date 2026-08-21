@@ -1088,6 +1088,12 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           orderNumber: true,
           externalOrderNumber: true,
           status: true,
+          // o3d-0i5y r5 (rebase onto o3d-o97): what EARLIER A2 passes already recorded posting for
+          // this order. Since the residual rebuild hands a stamped order back for the INCREMENT,
+          // this pass is no longer necessarily the first, and the order-level record has to be the
+          // running total rather than the latest instalment. Read under the same lock as everything
+          // else A2 plans from.
+          allocationBatchAmount: true,
           allocations: {
             select: {
               id: true,
@@ -1379,7 +1385,20 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           data: {
             inventoryAllocatedDate: new Date(),
             inventoryAllocatedBatchRef: referenceId,
-            allocationBatchAmount: orderValues.get(order.id) ?? 0,
+            // o3d-o97 r3 + o3d-0i5y r5: the pounds A2 has debited to Allocated Inventory for this
+            // order — ACCUMULATED, not replaced. o3d-o97 wrote this as one pass's figure because
+            // the stamp only ever came off an order A2 was about to re-value in full. It does not
+            // any more: `resetAllocationAccountingIfStaged` hands a stamped order back when the
+            // declared set leaves NEW quantity, and A2 then posts that increment alone. Replacing
+            // the figure would leave the order recording £20 of a £70 debit, and the refund's open
+            // balance would strand the other £50 permanently.
+            allocationBatchAmount: roundQuantity(
+              addMoney(
+                toDecimal(order.allocationBatchAmount ?? 0),
+                toDecimal(orderValues.get(order.id) ?? 0),
+              ),
+              4,
+            ).toNumber(),
             // o3d-o97 r3: the journal's identity and DESTINATION, recorded with the amount it
             // carried. All three stay null when no journal was raised, so a refund reading them
             // back can tell "A2 debited £x on ledger L, account A" from "A2 valued this order at

@@ -165,6 +165,12 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       setting: { findUnique: async () => null },
+      // o3d-o97 (merged): `createPendingSyncLog` stamps WHOSE ledger the batch was composed
+      // against, and `activeAccountingIdProvenance()` reads it from here. A double without this
+      // delegate throws INSIDE the batch transaction, and the run reports a group error for a
+      // reason that has nothing to do with what is being posted. null is the honest answer: this
+      // fixture models no connected ledger.
+      accountingToken: { findUnique: async () => null },
       salesOrder: {
         // A1's window, A2's window and the orphan sweeps all land here. Only A2 asks for the
         // allocation rows, which is what makes this dispatch exact rather than positional.
@@ -534,20 +540,36 @@ test('Xero live Group A2 owes only the residual on a row whose record MOVED ware
 
 test('Xero live Group A2 posts only the INCREMENT after an undeclared allocation change (o3d-0i5y r9)', async () => {
   resetRun()
-  // THE ROW IS NOT A LITERAL. It is whatever survives `resetAllocationAccountingIfStaged` on the
-  // path an UNDECLARED caller takes — `updateAllocation`, `addAllocation`, a teardown release —
-  // which is the path that cannot say what the order will be left holding. That path used to null
-  // every row's `costLayerSnapshot` alongside the stamp; strip r9 and this fixture arrives blank.
+  // THE ROW IS NOT A LITERAL. It is whatever survives `resetAllocationAccountingIfStaged` when the
+  // allocator declares its next set and that set holds one more unit than the record accounts for.
+  //
+  // o3d-0i5y r12 (rebase onto o3d-o97 / PR #635): r9 drove this through the UNDECLARED path
+  // instead, because on this branch alone that path cleared the stamp and kept the record. It no
+  // longer does: the merged rule KEEPS the stamp wherever the A2 debit stands, so Group A2 never
+  // looks at the order again and there is no second pass for this test to be about. The behaviour
+  // the test exists for — A2 comes back and posts the INCREMENT ALONE, never the whole order —
+  // lives entirely on the DECLARED path now, and that is what is exercised here. What is asserted
+  // below is unchanged, including the £20 figure.
   const { resetAllocationAccountingIfStaged } = await import('@/lib/domain/sales/allocation-service')
+  const { toDecimal } = await import('@/lib/domain/math/decimal')
   const store: { record: unknown } = {
     record: [{ costLayerId: 'layer-1', qty: '10.000000', unitCostBase: '5.000000', postedUnitCostBase: '5.000000' }],
   }
   const resetTx = {
     salesOrder: {
-      findUnique: async () => ({ inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z') }),
+      findUnique: async () => ({
+        inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+        // A2 posted £50 for the ten units it recorded. The debit STANDS, which is what makes the
+        // corroboration gate the thing being tested rather than bypassed.
+        allocationBatchAmount: 50,
+        allocationBatchSyncLogId: null,
+      }),
       update: async () => ({}),
     },
     shipment: { findFirst: async () => null },
+    shipmentLine: { findMany: async () => [] },
+    activityLog: { create: async () => ({}) },
+    accountingSyncLog: { findUnique: async () => null },
     orderAllocation: {
       findMany: async () => [{
         lineId: 'line-1',
@@ -564,6 +586,7 @@ test('Xero live Group A2 posts only the INCREMENT after an undeclared allocation
   await resetAllocationAccountingIfStaged(
     resetTx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
     'order-1',
+    { nextAllocations: [{ lineId: 'line-1', productId: 'prod-1', warehouseId: 'wh-1', qty: toDecimal(11) }] },
   )
 
   // One more unit was allocated. A2 owes that unit and nothing else: the other ten are recorded,

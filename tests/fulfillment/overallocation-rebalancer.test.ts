@@ -248,11 +248,6 @@ const tx = {
       }
       return true
     }) ?? null,
-  },
-  // o3d-4kfh r5 (finding 7): reconcilePendingShipments writes its audit row through the tx client,
-  // before the delete. A double without this throws, which is the correct failure for a production
-  // change that stopped writing it in-transaction.
-  accountingSyncLog: {
     // o3d-o97 r4: the A2 journal probed by its own id. null = no row (retention took it, or the
     // fixture named none), which the un-stage reads as "cannot prove nothing was debited".
     findUnique: async ({ where }: { where: { id: string } }) => (

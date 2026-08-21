@@ -47,7 +47,7 @@ import {
   validateSalesOrderStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
-import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import {
   accountedAllocationQty,
   parseCostLayerSnapshot,
@@ -829,35 +829,40 @@ export async function refileAccountedRecordsForScope(
  *
  * A whole-order cancellation `deleteMany`s every allocation row, and each row's `costLayerSnapshot`
  * is Group A2's record that it DEBITED Allocated Inventory for those units and (through
- * `postedUnitCostBase`) the amount it debited. The un-stage a few statements earlier has already
- * cleared the order-level stamp, its batch ref and `allocationBatchAmount`. So after this
- * transaction commits there is nothing anywhere — not on the order, not on a row — that says the
- * pounds standing in Allocated Inventory for this order exist. That is the same "the debit is
- * stranded AND the record it could have been reconstructed from is gone, in one committed
- * transaction" failure r10 refused on the hard-delete path.
+ * `postedUnitCostBase`) the amount it debited. After this transaction commits, no row anywhere says
+ * how many pounds of that debit these particular units carried, or which layers they came off.
  *
- * SO THE EVIDENCE IS KEPT, AND ONLY THE EVIDENCE. r10 left this site alone reasoning that
- * `o3d-batch-cancelrb` owns this contra and that reversing here would risk a double reversal when
- * that branch lands. Re-checked against that branch as it now stands, the reasoning holds and is
- * in fact stronger than when it was written:
+ * SO THE EVIDENCE IS KEPT, AND ONLY THE EVIDENCE — the reversal itself is not raised here.
  *
- *   * THAT BRANCH STILL DOES NOT REVERSE ON CANCELLATION. Its own words, in
+ * r11 justified that with an arithmetic claim: o3d-batch-cancelrb's open balance could not SEE an
+ * `ALLOCATION_REVERSAL`, so raising one here would have been credited a second time on a
+ * cancelled-then-refunded order. THAT CLAIM IS NO LONGER TRUE and must not be left where somebody
+ * would trust it (o3d-xlk7). That branch merged as PR #635, and this branch's rebase onto it taught
+ * the open balance to net `ALLOCATION_REVERSAL` relief — proved from those journals' own lines and
+ * recorded durably on `SalesOrder.allocationReversalAmount`. A reversal raised here would now be
+ * counted exactly once.
+ *
+ * WHAT STILL HOLDS, and is now the whole reason:
+ *
+ *   * THE MERGED BRANCH OWNS THIS CONTRA ON THE REFUND SIDE, and says so in
  *     `lib/domain/accounting/allocated-inventory-debit.ts`: "What is deliberately NOT attempted here
  *     is REVERSING the debit when the order's allocations shrink or the order is cancelled
  *     outright... keeping the record is what makes that repair possible later instead of
- *     impossible." What it reverses is the residual contra on a REFUND.
- *   * AND ITS ARITHMETIC CANNOT SEE OUR JOURNAL. That refund reversal opens at the order's recorded
- *     debit (`SalesOrder.allocationBatchAmount`) and subtracts relief it can PROVE from the journals'
- *     own lines — Group B's per-shipment `allocatedReliefAmount` and each earlier refund's own
- *     `allocatedReliefAmount`. An `ALLOCATION_REVERSAL` this branch raises is neither of those, so it
- *     is invisible to that subtraction. Raise one here and a cancelled-then-refunded order credits
- *     Allocated Inventory twice for the same units — which is exactly the collision r10 named, now
- *     demonstrable rather than merely suspected.
+ *     impossible." What it reverses is the residual contra on a REFUND, and a cancelled order that
+ *     is then refunded in full gets exactly that. Raising a second, competing reversal on the
+ *     cancellation itself is a behaviour change this rebase has no evidence for, and it would credit
+ *     an account for an order a human may still be deciding about.
+ *   * AND THE ORDER-LEVEL RECORD SURVIVES THIS PATH, which is what makes waiting safe. r11 wrote
+ *     that the un-stage a few statements earlier had already cleared the stamp, the batch ref and
+ *     `allocationBatchAmount`, so every copy of the record died together. It has NOT since #635:
+ *     `resetAllocationAccountingIfStaged` keeps the stamp, the recorded debit and the journal
+ *     attribution wherever `resolveStagedAllocationDebit` says the debit stands. The refund's open
+ *     balance, the batch-log recreate sweep and the delete guard all still find their figure.
  *
- * A RECORD CANNOT DOUBLE-COUNT: nothing is queued, nothing is posted, no relief is claimed. It is
- * additive against both branches, and it is the input the sibling's mechanism needs to exist — its
- * design turns on the order-level record surviving the rows, and this is the one path that destroys
- * every copy of it.
+ * A RECORD CANNOT DOUBLE-COUNT: nothing is queued, nothing is posted, no relief is claimed. What it
+ * adds over the surviving order-level figure is the part that figure cannot express — WHICH LAYERS
+ * and HOW MANY UNITS were standing when the rows went, which is what a human repairing a cancelled,
+ * never-refunded order needs and what `deleteMany` is about to destroy.
  *
  * The units that cannot say what was posted for them are named separately, on the same rule the
  * reversal path applies: an entry with no `postedUnitCostBase` is not evidence of £0, it is evidence
@@ -887,9 +892,10 @@ async function recordStandingAllocationDebitOnCancel(
         + 'Inventory stands against this order and nothing downstream will relieve it: the units will '
         + 'not ship (Group B credits only what dispatches) and they were not refunded. The allocation '
         + 'rows carrying that record are deleted by this cancellation, so it is recorded here instead. '
-        + 'NO reversal journal was raised — the refund side of this contra owns it (o3d-batch-cancelrb) '
-        + 'and raising one here would be credited a second time by that path’s open-balance '
-        + 'arithmetic, which cannot see it. Reverse by hand, or through a refund, if the debit is real.'
+        + 'NO reversal journal was raised here — the refund side of this contra owns it (o3d-o97): a '
+        + 'full refund of this order reverses whatever of the A2 debit is still open. The order still '
+        + 'carries its A2 stamp and recorded debit, so that repair remains available. Reverse by hand, '
+        + 'or through a refund, if the debit is real and no refund is coming.'
         + (unevidenced.length > 0
           ? ` ${unevidencedQty.toString()} of those unit(s) carry no record of what was posted for them `
             + `(cost layer(s) ${[...new Set(unevidenced.map((entry) => entry.costLayerId))].join(', ')}) `
@@ -908,16 +914,25 @@ async function recordStandingAllocationDebitOnCancel(
 /**
  * REVERSE THE PART OF GROUP A2'S DEBIT THIS REWRITE ORPHANED (o3d-0i5y r9).
  *
- * Group A2 posts DR Allocated Inventory / CR Inventory for the units an order has allocated. Two
- * things relieve that debit and only two: Group B credits Allocated Inventory for the units a
- * shipment dispatches, and a refund credits it for the units it takes back. A rewrite that removes
- * recorded units from the order reaches NEITHER — the units will not ship and were not refunded —
- * so their share of the debit sits in Allocated Inventory for ever, with Inventory understated by
- * the same amount. r8 named this itself: a shrunk row's over-posted value needs a REVERSAL, not a
- * floor. This is the reversal.
+ * Group A2 posts DR Allocated Inventory / CR Inventory for the units an order has allocated. Before
+ * this function existed, two things relieved that debit and only two: Group B credits Allocated
+ * Inventory for the units a shipment dispatches, and a refund credits it for the units it takes
+ * back. A rewrite that removes recorded units from the order reaches NEITHER — the units will not
+ * ship and were not refunded — so their share of the debit sat in Allocated Inventory for ever,
+ * with Inventory understated by the same amount. r8 named this itself: a shrunk row's over-posted
+ * value needs a REVERSAL, not a floor. This is the reversal, and it is the THIRD relief source.
+ *
+ * BEING THE THIRD IS NOT FREE (o3d-xlk7). o3d-o97's refund arithmetic computes how many pounds of
+ * the A2 debit are still open by subtracting relief it can prove, and it was written knowing only
+ * the first two — so a reversal raised here and a full refund later would credit the SAME units
+ * twice. The enqueue below is therefore paired with a durable record on the order
+ * (`SalesOrder.allocationReversalAmount`) that the refund's open balance nets off, and the refund
+ * proves the figure from these journals' own lines. Neither half works without the other: without
+ * the record the relief disappears when retention sweeps the journal, and without the netting the
+ * account is credited twice.
  *
  * THE AMOUNT IS THE ONE A2 RECORDED, AND THE RECORD IS THE EVIDENCE THAT IT POSTED.
- * `o3d-batch-cancelrb` established the rule tonight on the refund side of this same contra, and
+ * o3d-o97 (merged as PR #635) established the rule on the refund side of this same contra, and
  * both halves of it apply here:
  *
  *   * A reversal posted wrongly is as bad as the original, so this needs POSITIVE evidence that
@@ -1010,7 +1025,10 @@ export async function reverseOrphanedAllocationPosting(
 
   const order = await tx.salesOrder.findUnique({
     where: { id: orderId },
-    select: { orderNumber: true, externalOrderNumber: true },
+    // o3d-0i5y r12: the running total of pounds earlier reversals have already credited back out
+    // of Allocated Inventory for this order. Read here, inside the caller's transaction and under
+    // the order row lock it already holds, so the read-modify-write below cannot interleave.
+    select: { orderNumber: true, externalOrderNumber: true, allocationReversalAmount: true },
   })
   const orderRef = order?.orderNumber ?? order?.externalOrderNumber ?? orderId
 
@@ -1038,7 +1056,43 @@ export async function reverseOrphanedAllocationPosting(
     },
   })
 
-  await assertAllocationReversalQueued(tx, orderId, reversalToken, amount, orphaned)
+  const wasQueued = await assertAllocationReversalQueued(tx, orderId, reversalToken, amount, orphaned)
+  if (!wasQueued) return
+
+  // o3d-0i5y r12 / o3d-xlk7 — AND THE CREDIT IS RECORDED WHERE THE REFUND'S OPEN BALANCE LOOKS.
+  //
+  // o3d-o97 computes how many pounds of A2's debit are still open as `allocationBatchAmount` less
+  // relief it can PROVE, and it knows exactly two relief sources: each journaled shipment's
+  // `Shipment.allocatedReliefAmount` and each earlier refund's `SalesOrderRefund.allocatedReliefAmount`.
+  // An ALLOCATION_REVERSAL is NEITHER. Left unrecorded, the journal above credits the orphaned
+  // units and the eventual full refund's residue credits them AGAIN, because its open balance
+  // still contains them — the double-credit measured in o3d-xlk7.
+  //
+  // The refund proves the figure from these journals' OWN LINES, netted, exactly as it proves the
+  // other two. This record exists because the journals do not survive: `retention_sync_logs_months`
+  // hard-deletes a terminal AccountingSyncLog row past the cutoff, and an orphaning can precede its
+  // order's refund by months, after which a swept reversal reads as no relief at all.
+  //
+  // WRITTEN ONLY WHERE THE ROW EXISTS. `queueAccountingSyncTx` silently does nothing under three
+  // ordinary conditions (see `assertAllocationReversalQueued`), and recording relief for a journal
+  // nobody raised would SHRINK the open balance and under-reverse the refund — pounds left standing
+  // in Allocated Inventory with nothing pointing at them. The un-queued case already writes its own
+  // ERROR-level record naming the amount to post by hand; it must not also claim relief.
+  //
+  // A RUNNING TOTAL, because one order can be trimmed many times and there is no per-orphaning
+  // business row to hang a figure on. Not netted into `allocationBatchAmount`: that is what A2
+  // POSTED, `recreateMissingDailyBatchLogs` rebuilds the batch from it, and
+  // `resolveStagedAllocationDebit` reads a recorded ZERO as positive proof that no debit stands —
+  // so a fully-reversed order would clear its stamp and be posted all over again.
+  await tx.salesOrder.update({
+    where: { id: orderId },
+    data: {
+      allocationReversalAmount: roundQuantity(
+        addMoney(toDecimal(order?.allocationReversalAmount ?? 0), toDecimal(amount)),
+        4,
+      ).toNumber(),
+    },
+  })
 }
 
 /**
@@ -1072,7 +1126,7 @@ async function assertAllocationReversalQueued(
   reversalToken: string,
   amount: number,
   orphaned: CostLayerSnapshotEntry[],
-): Promise<void> {
+): Promise<boolean> {
   const queued = await tx.accountingSyncLog.findFirst({
     where: {
       type: 'ALLOCATION_REVERSAL',
@@ -1082,7 +1136,10 @@ async function assertAllocationReversalQueued(
     },
     select: { id: true },
   })
-  if (queued) return
+  // o3d-0i5y r12: the answer is RETURNED as well as reported, because the caller records relief off
+  // the back of it. Relief claimed for a journal that was never queued shrinks the refund's open
+  // balance and strands real pounds — the opposite error, and the silent one.
+  if (queued) return true
 
   await tx.activityLog.create({
     data: {
@@ -1099,6 +1156,7 @@ async function assertAllocationReversalQueued(
         + 'relieve it. Post DR Inventory / CR Allocated Inventory for this amount by hand.',
     },
   })
+  return false
 }
 
 /**
@@ -1145,13 +1203,13 @@ async function declaresUnaccountedAllocationQty(
    * rewrite is about to drop — which hands A2 an order to post a second time.
    */
   records?: AccountedRecordPlan,
-): Promise<boolean> {
+): Promise<{ unaccounted: boolean; accountedQty: Prisma.Decimal }> {
   const nextByKey = new Map<string, Prisma.Decimal>()
   for (const row of nextAllocations) {
     const key = allocationScopeKey(row)
     nextByKey.set(key, (nextByKey.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(row.qty)))
   }
-  if (nextByKey.size === 0) return false
+  if (nextByKey.size === 0) return { unaccounted: false, accountedQty: new Prisma.Decimal(0) }
 
   const [persisted, shippedLines] = await Promise.all([
     records
@@ -1185,6 +1243,12 @@ async function declaresUnaccountedAllocationQty(
     shippedByKey.set(key, (shippedByKey.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(line.qty)))
   }
 
+  // o3d-0i5y r12 (rebase onto o3d-o97): the TOTAL accounted quantity is returned as well as the
+  // verdict, because the caller now has a second question to answer — see the corroboration gate in
+  // `resetAllocationAccountingIfStaged`. It is accumulated over every declared scope, so the loop
+  // can no longer return early.
+  let unaccounted = false
+  let accountedQty = new Prisma.Decimal(0)
   for (const [key, nextQty] of nextByKey) {
     // o3d-0i5y r6: ONE accounted-quantity rule, shared with A2 itself. Asking it here with the row's
     // own entries — rather than re-deriving it from a bare quantity — is what keeps a residual pinned
@@ -1195,9 +1259,10 @@ async function declaresUnaccountedAllocationQty(
       snapshot: pinnedByKey.get(key) ?? [],
       shippedQty: shippedByKey.get(key) ?? 0,
     })
-    if (nextQty.gt(accounted.add(ALLOCATION_EPSILON_DECIMAL))) return true
+    accountedQty = accountedQty.add(accounted)
+    if (nextQty.gt(accounted.add(ALLOCATION_EPSILON_DECIMAL))) unaccounted = true
   }
-  return false
+  return { unaccounted, accountedQty }
 }
 
 /**
@@ -1278,13 +1343,35 @@ export async function resetAllocationAccountingIfStaged(
   })
   if (!so?.inventoryAllocatedDate) return
 
+  /**
+   * HAND THE ORDER BACK TO GROUP A2 — AND KEEP EVERY RECORD OF WHAT A2 ALREADY POSTED
+   * (o3d-0i5y r5, corrected on the rebase onto o3d-o97 / PR #635).
+   *
+   * This runs on the DECLARED path only, and it means one thing: the caller's set leaves quantity
+   * nothing has reclassified, so A2 must look at this order again and post the INCREMENT. The stamp
+   * is the claim about work still to be done, so the stamp is what is cleared.
+   *
+   * `allocationBatchAmount` is NOT. It is the record of what A2 has ALREADY debited to Allocated
+   * Inventory for this order, and o3d-o97 made it the basis of the refund's open-balance
+   * arithmetic, of `recreateMissingDailyBatchLogs` and of the hard-delete guard. Nulling it here
+   * used to be harmless because the stamp only ever came off an order A2 was about to re-value in
+   * full; it is not harmless now, because A2 comes back and posts the increment ALONE:
+   *
+   *   A2 debits £50 for 10 units and records £50. A residual rebuild adds 4 units, this clears the
+   *   stamp, and A2 returns and posts £20 for the 4. Allocated Inventory holds £70. Under the
+   *   nulled record the order says £20, so the eventual full refund reverses £20 and £50 STANDS FOR
+   *   EVER with nothing anywhere pointing at it — the same "the debit is stranded AND the evidence
+   *   died in the same committed transaction" failure o3d-o97 r4 refused at the other un-stage.
+   *
+   * So the record and its journal attribution survive, and Group A2's own write ADDS this pass's
+   * pounds to them rather than replacing them (see the A2 order update in `xero/daily-sync.ts`).
+   */
   const unstage = () => tx.salesOrder.update({
     where: { id: orderId },
     data: {
       // o3d-0qoo: stamp and batch ref move together, as everywhere else that un-stages.
       inventoryAllocatedDate: null,
       inventoryAllocatedBatchRef: null,
-      allocationBatchAmount: null,
     },
   })
 
@@ -1309,9 +1396,74 @@ export async function resetAllocationAccountingIfStaged(
   // The record therefore stays wherever the caller's own plan puts it, and the stamp is cleared
   // exactly when the declared set leaves quantity nothing has reclassified.
   if (options.nextAllocations) {
-    if (await declaresUnaccountedAllocationQty(tx, orderId, options.nextAllocations, options.accountedRecords)) {
-      await unstage()
+    const declared = await declaresUnaccountedAllocationQty(
+      tx,
+      orderId,
+      options.nextAllocations,
+      options.accountedRecords,
+    )
+    if (!declared.unaccounted) return
+
+    // o3d-0i5y r12 — AND THE RECORD HAS TO CORROBORATE THE STAMP BEFORE THE STAMP COMES OFF
+    // (rebase onto o3d-o97 / PR #635).
+    //
+    // r5 cleared the stamp on the strength of "the declared set holds quantity nothing has
+    // accounted", full stop. That is safe exactly while the ROWS say what A2 already accounted,
+    // because A2's next pass reads those records and posts the difference. It is NOT safe when they
+    // say nothing at all: the stamp then asserts that A2 ran, the records assert that it accounted
+    // NOTHING, and the two cannot both be true. Hand that order back and A2 re-values EVERY unit —
+    // the second whole-order debit o3d-o97 r4 built its gate against, arrived at from the other
+    // side.
+    //
+    // Two questions, in the order that costs least:
+    //
+    //   1. IS A DEBIT STANDING AT ALL? Only o3d-o97's positive evidence answers no — no stamp
+    //      (unreachable here) or a recorded debit of exactly £0.00. Then there is nothing to
+    //      re-post and nothing to preserve, so the stamp, the amount and the attribution all go,
+    //      exactly as the blanket path below clears them.
+    //   2. DOES THE RECORD ACCOUNT FOR ANYTHING? With a debit standing, the stamp may come off only
+    //      where the rows can show what was already accounted. Any accounted quantity at all is
+    //      enough, because A2 posts the DIFFERENCE from those same records; zero is the legacy
+    //      shape (a row staged before the pins were recorded, or one whose pins the blanket path
+    //      cleared) and it is refused and reported rather than guessed at.
+    //
+    // Refusing costs the increment a pass, not a posting: the order is reported, and an operator or
+    // a later pass with records can release it. Guessing costs a duplicate debit nothing reverses.
+    const stagedDebit = await resolveStagedAllocationDebit(tx, so)
+    if (!stagedDebit.standing) {
+      await tx.salesOrder.update({
+        where: { id: orderId },
+        data: {
+          inventoryAllocatedDate: null,
+          inventoryAllocatedBatchRef: null,
+          allocationBatchAmount: null,
+          allocationBatchSyncLogId: null,
+          allocationBatchConnector: null,
+          allocationBatchAccountCode: null,
+        },
+      })
+      return
     }
+    if (declared.accountedQty.lte(0)) {
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SALES_ORDER',
+          entityId: orderId,
+          action: 'allocation_accounting_stage_retained',
+          tag: 'accounting',
+          level: 'WARNING',
+          description:
+            `Allocations changed on an order whose Group A2 posting still stands, so the A2 stamp and its `
+            + `recorded debit were KEPT rather than cleared: ${stagedDebit.reason}. The declared set holds `
+            + `quantity nothing has accounted, but NO allocation row records what A2 already accounted, so `
+            + `handing this order back would re-value and re-post every unit on it rather than the new ones. `
+            + `The newly allocated quantity is NOT reclassified — reclassify it by hand, or re-run the `
+            + `change once the rows carry their posted records.`,
+        },
+      })
+      return
+    }
+    await unstage()
     return
   }
 
@@ -1469,13 +1621,20 @@ export async function releaseOrderAllocationsInTx(
     orderIsBeingDeleted?: boolean
   } = {},
 ): Promise<ReleaseOrderAllocationsResult> {
-  await resetAllocationAccountingIfStaged(tx, orderId)
+  // READ THE RECORD BEFORE THE UN-STAGE, NOT AFTER (o3d-0i5y r12, rebase onto o3d-o97 / PR #635).
+  //
+  // o3d-0i5y r10: the RECORD is selected, because this function is about to delete the rows that
+  // hold it — see the orphan reversal at the end. o3d-o97's blanket un-stage path clears
+  // `costLayerSnapshot` on EVERY row of the order (the pins are being replaced or, here, deleted),
+  // so reading after it returns an empty record for every row: the reversal below would value the
+  // orphaned units at nothing and raise no journal at all, and the hard-delete refusal — which asks
+  // the same question — would let a posted order through. Two statements swapped, no rule bent:
+  // o3d-o97 still clears the pins, and this still reverses what they said.
   const currentAllocs = await tx.orderAllocation.findMany({
     where: { orderId },
-    // o3d-0i5y r10: the RECORD is selected, because this function is about to delete the rows that
-    // hold it — see the orphan reversal at the end.
     select: { lineId: true, productId: true, warehouseId: true, qty: true, costLayerSnapshot: true },
   })
+  await resetAllocationAccountingIfStaged(tx, orderId)
   await lockStockLevels(
     tx,
     [...new Set(currentAllocs.map((alloc) => alloc.productId))],
@@ -1964,14 +2123,18 @@ export async function cancelSalesOrderFulfillmentState(
   })
   if (!transition.success) throw new Error(transition.error)
 
-  await resetAllocationAccountingIfStaged(tx, input.orderId)
+  // o3d-0i5y r11 (Codex round 11, finding 3): the RECORD is selected with the rows, because the
+  // `deleteMany` below destroys the only statement of WHICH LAYERS and HOW MANY UNITS Group A2
+  // debited for this order. See `recordStandingAllocationDebitOnCancel`.
+  //
+  // o3d-0i5y r12 (rebase onto o3d-o97 / PR #635): read BEFORE the un-stage, which now clears
+  // `costLayerSnapshot` on every row — read after it and the record written below is empty and the
+  // cancellation is described as carrying no posted units at all.
   const currentAllocs = await tx.orderAllocation.findMany({
     where: { orderId: input.orderId },
-    // o3d-0i5y r11 (Codex round 11, finding 3): the RECORD is selected with the rows, because the
-    // `deleteMany` below destroys the only statement of what Group A2 debited for this order. See
-    // `recordStandingAllocationDebitOnCancel` for why it is preserved here and not reversed here.
     select: { productId: true, warehouseId: true, qty: true, costLayerSnapshot: true },
   })
+  await resetAllocationAccountingIfStaged(tx, input.orderId)
   const releasedReservationScopes = uniqueReservationScopes(currentAllocs)
   await lockStockLevels(
     tx,
