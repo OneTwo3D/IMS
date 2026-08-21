@@ -16,14 +16,22 @@ import { PAGE_SIZE } from '@/lib/connectors/xero/invoice-delta'
 // actually there.
 // ---------------------------------------------------------------------------
 
-type GetResult = { ok: boolean; status: number; data?: unknown; error?: string }
+type GetResult = { ok: boolean; status: number; data?: unknown; error?: string; tenantId?: string }
+
+/**
+ * The organisation the injected client answers as. Every successful fixture reports one, because a
+ * response that does not is a LOOKUP FAILURE (round 7) — see the dedicated tests at the foot of this
+ * file.
+ */
+const LEDGER = 'tenant-answering'
 
 function getter(result: GetResult | (() => never)) {
   const paths: string[] = []
-  const get = async <T>(path: string): Promise<{ ok: boolean; status: number; data?: T; error?: string }> => {
+  const get = async <T>(path: string): Promise<{ ok: boolean; status: number; data?: T; error?: string; tenantId?: string }> => {
     paths.push(path)
     if (typeof result === 'function') result()
-    return result as { ok: boolean; status: number; data?: T; error?: string }
+    const answer = result as GetResult
+    return { tenantId: answer.ok ? LEDGER : undefined, ...answer } as { ok: boolean; status: number; data?: T; error?: string; tenantId?: string }
   }
   return { get, paths }
 }
@@ -49,7 +57,7 @@ test('asks Xero for the exact number, URL-encoded, and PAGES the request explici
 test('an empty Invoices array is the only "nobody holds it"', async () => {
   const { get } = getter({ ok: true, status: 200, data: { Invoices: [] } })
   const lookup = await lookupXeroInvoiceNumberClaim('164981', { get })
-  assert.deepEqual(lookup, { ok: true, claims: [] })
+  assert.deepEqual(lookup, { ok: true, claims: [], tenantId: LEDGER })
 })
 
 test('a matching ACCREC document is returned as the claim, with who holds it', async () => {
@@ -70,6 +78,7 @@ test('a matching ACCREC document is returned as the claim, with who holds it', a
   const lookup = await lookupXeroInvoiceNumberClaim('164981', { get })
   assert.deepEqual(lookup, {
     ok: true,
+    tenantId: LEDGER,
     claims: [{
       invoiceId: 'xero-id-1',
       invoiceNumber: '164981',
@@ -114,7 +123,7 @@ test('a FULL page is a lookup failure — one page that proves nothing is not an
 test('a page short of the cap IS the whole answer', async () => {
   const { get } = getter({ ok: true, status: 200, data: { Invoices: filler(PAGE_SIZE - 1) } })
   const lookup = await lookupXeroInvoiceNumberClaim('164981', { get })
-  assert.deepEqual(lookup, { ok: true, claims: [] })
+  assert.deepEqual(lookup, { ok: true, claims: [], tenantId: LEDGER })
 })
 
 test('bills fill the page too, so they can push a real holder out of it', async () => {
@@ -173,7 +182,7 @@ test('a purchase BILL carrying the same number is not a claim on the sales seque
     data: { Invoices: [{ InvoiceID: 'bill-1', InvoiceNumber: '164981', Type: 'ACCPAY', Status: 'AUTHORISED' }] },
   })
   const lookup = await lookupXeroInvoiceNumberClaim('164981', { get })
-  assert.deepEqual(lookup, { ok: true, claims: [] })
+  assert.deepEqual(lookup, { ok: true, claims: [], tenantId: LEDGER })
 })
 
 test('a document under a different number is not a claim on this one', async () => {
@@ -183,7 +192,7 @@ test('a document under a different number is not a claim on this one', async () 
     data: { Invoices: [{ InvoiceID: 'xero-id-2', InvoiceNumber: '1649810', Type: 'ACCREC', Status: 'AUTHORISED' }] },
   })
   const lookup = await lookupXeroInvoiceNumberClaim('164981', { get })
-  assert.deepEqual(lookup, { ok: true, claims: [] })
+  assert.deepEqual(lookup, { ok: true, claims: [], tenantId: LEDGER })
 })
 
 test('a failed call is a lookup failure carrying the ledger’s own error', async () => {
@@ -294,6 +303,51 @@ test('a number WITHOUT a comma is still asked, exactly as before', async () => {
   // may not spread to ordinary numbers with punctuation the filter has no opinion about.
   const { get, paths } = getter({ ok: true, status: 200, data: { Invoices: [] } })
   const lookup = await lookupXeroInvoiceNumberClaim('INV-2026/0042 A', { get })
-  assert.deepEqual(lookup, { ok: true, claims: [] })
+  assert.deepEqual(lookup, { ok: true, claims: [], tenantId: LEDGER })
   assert.deepEqual(paths, [`Invoices?InvoiceNumbers=INV-2026%2F0042%20A&page=1&pageSize=${PAGE_SIZE}`])
+})
+
+// ---------------------------------------------------------------------------
+// The answer is about ONE organisation, and it has to say which (Codex round 7, finding 2).
+//
+// This read resolves the Xero connection for itself; the create that spends its verdict resolves the
+// connection again, later. A reconnect, a tenant re-pin, or a refresh landing on a different tenant
+// in between makes this an answer about org A and the post a write to org B — where nobody was asked
+// anything, and where the number may be held by a live document. So the answer travels with the
+// organisation that gave it, and a response that cannot name one is a lookup failure: the same rule
+// as a page that cannot prove it is complete, for the same reason.
+// ---------------------------------------------------------------------------
+
+test('a successful lookup reports the organisation that answered it', async () => {
+  const { get } = getter({ ok: true, status: 200, data: { Invoices: [] } })
+  const lookup = await lookupXeroInvoiceNumberClaim('164981', { get })
+  assert.equal(lookup.ok && lookup.tenantId, LEDGER)
+})
+
+test('a response that does not say which organisation answered is a LOOKUP FAILURE, not "unclaimed"', async () => {
+  // The dangerous shape: a perfectly well-formed empty result. Reading it as unclaimed produces a
+  // permission nothing can bind to a ledger, which is a permission any ledger satisfies.
+  const get = async <T>(): Promise<{ ok: boolean; status: number; data?: T }> =>
+    ({ ok: true, status: 200, data: { Invoices: [] } as T })
+  const lookup = await lookupXeroInvoiceNumberClaim('164981', { get })
+  assert.equal(lookup.ok, false, 'an unattributable answer must never read as unclaimed')
+  assert.match(lookup.ok === false ? lookup.error : '', /did not report which organisation answered/)
+  assert.match(lookup.ok === false ? lookup.error : '', /cannot be bound to the organisation the post would be sent to/)
+})
+
+test('a blank organisation is no organisation', async () => {
+  for (const tenantId of ['', '   ']) {
+    const get = async <T>(): Promise<{ ok: boolean; status: number; data?: T; tenantId?: string }> =>
+      ({ ok: true, status: 200, tenantId, data: { Invoices: [] } as T })
+    const lookup = await lookupXeroInvoiceNumberClaim('164981', { get })
+    assert.equal(lookup.ok, false, `${JSON.stringify(tenantId)} must not read as an attribution`)
+  }
+})
+
+test('a HOLDER found in an unattributable answer is still a failure, not a refusal about a ledger nobody named', async () => {
+  const get = async <T>(): Promise<{ ok: boolean; status: number; data?: T }> =>
+    ({ ok: true, status: 200, data: { Invoices: [{ InvoiceID: 'x-1', InvoiceNumber: '164981', Type: 'ACCREC', Status: 'AUTHORISED' }] } as T })
+  const lookup = await lookupXeroInvoiceNumberClaim('164981', { get })
+  assert.equal(lookup.ok, false)
+  assert.match(lookup.ok === false ? lookup.error : '', /did not report which organisation answered/)
 })

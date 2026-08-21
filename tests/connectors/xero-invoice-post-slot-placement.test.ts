@@ -64,6 +64,19 @@ mock.module('@/lib/connectors/xero/items', {
     },
   },
 })
+/**
+ * The organisation this test's requests resolve to.
+ *
+ * A FRESH ONE PER TEST, and that is not cosmetic. The real client's rate limiter buckets requests by
+ * tenant and blocks in `waitForBudget` once a tenant has made XERO_MINUTE_LIMIT of them inside a
+ * minute — so a file that drives enough real requests through one tenant eventually SLEEPS for the
+ * best part of a minute in the middle of an assertion, and every test added later makes it worse.
+ * The budget is exercised deliberately elsewhere; here it is noise, and per-test tenants remove it
+ * without mocking away any of the client under test.
+ */
+let tenantSeq = 0
+let currentTenant = 'tenant-1'
+
 mock.module('@/lib/connectors/xero/auth', {
   namedExports: {
     getAccessToken: async () => {
@@ -71,7 +84,7 @@ mock.module('@/lib/connectors/xero/auth', {
       // round 5 the authorisation ran before this; under round 6 it runs after it, which is what makes
       // the checked tenant and the used tenant the same resolution.
       trace.push('resolve-auth')
-      return { accessToken: 'access-token', tenantId: 'tenant-A' }
+      return { accessToken: 'access-token', tenantId: currentTenant }
     },
     getStoredTenantBlockReason: async () => null,
   },
@@ -116,9 +129,13 @@ const data = {
   ],
 }
 
+/** Every request the authorisation was asked ABOUT, in order — round 7, finding 2. */
+let authorizeRequests: Array<{ tenantId: string }> = []
+
 /** The fence's closure, as `pushSalesInvoice` receives it: consulted once per HTTP ATTEMPT. */
-const beforePost = async () => {
+const beforePost = async (request: { tenantId: string }) => {
   if (wireCountAtFirstAuthorize < 0) wireCountAtFirstAuthorize = wireCount()
+  authorizeRequests.push(request)
   const answer = authorizeAnswers[authorizeCalls] ?? authorizeAnswers[authorizeAnswers.length - 1] ?? { ok: true as const }
   authorizeCalls++
   trace.push(`authorize:${answer.ok ? 'allow' : 'refuse'}`)
@@ -134,11 +151,13 @@ function postsTo(path: string): string[] {
 }
 
 function reset(replies: Array<{ status: number; retryAfter?: string; body?: unknown }> = [{ status: 200 }]) {
+  currentTenant = `tenant-${++tenantSeq}`
   trace.length = 0
   wireReplies = replies
   lastHeaders = {}
   authorizeCalls = 0
   authorizeAnswers = [{ ok: true }]
+  authorizeRequests = []
   wireCountAtFirstAuthorize = -1
 }
 
@@ -272,7 +291,7 @@ test('the hook does not reach the transport as an argument — it reaches it as 
   const { pushSalesInvoice } = await invoices()
   await pushSalesInvoice(data, 'AUTHORISED', { idempotencyKey: 'key-1', customerId: 'cust-1', beforePost })
   assert.equal(lastHeaders['Idempotency-Key'], 'key-1', 'the create still carries its idempotency key')
-  assert.equal(lastHeaders['Xero-Tenant-Id'], 'tenant-A')
+  assert.equal(lastHeaders['Xero-Tenant-Id'], currentTenant)
 })
 
 test('the scope does not outlive the create: the next Xero call is unauthorised and unrefused', async () => {
@@ -329,6 +348,60 @@ test('EVERY Xero egress honours a refusal, not just the JSON one', async () => {
     assert.doesNotMatch(res.error ?? '', /HTTP \d|Raw GET failed|Attachment upload failed/, `${name} must not dress it as a reply`)
   }
   assert.equal(wireCount(), 0, 'nothing at all reached the wire')
+})
+
+// ---------------------------------------------------------------------------
+// WHICH LEDGER THE REQUEST IS ADDRESSED TO reaches the authorisation (round 7, finding 2).
+//
+// The invoice-number fence holds an answer obtained from one organisation and spends it on a write
+// to whichever organisation the request resolves to. Bounding the answer's AGE, which round 6 did,
+// says nothing about its SUBJECT. The only place the two can be compared without a second token
+// resolution in between is inside `performRequest`, against the `auth` this very request was built
+// from — so the seam hands that tenant to every authorisation, and these tests drive the real client
+// to show that what the authorisation is told is what the header actually carries.
+// ---------------------------------------------------------------------------
+
+test('the authorisation is told the tenant the outgoing request carries, not one it has to re-read', async () => {
+  reset()
+  const { pushSalesInvoice } = await invoices()
+
+  await pushSalesInvoice(data, 'AUTHORISED', { idempotencyKey: 'key-1', beforePost })
+
+  assert.equal(authorizeRequests.length, 1)
+  assert.equal(authorizeRequests[0].tenantId, currentTenant)
+  assert.equal(
+    lastHeaders['Xero-Tenant-Id'],
+    authorizeRequests[0].tenantId,
+    'the tenant the fence judged must be the exact string the request went out with',
+  )
+})
+
+test('a refusal on the LEDGER alone stops the create, and nothing reaches the wire', async () => {
+  // The fence's shape, driven through the real client: an answer obtained from org B cannot license
+  // a create sent to org A, and the create must not leave.
+  reset()
+  const { pushSalesInvoice } = await invoices()
+  const answeredBy = 'tenant-B'
+  const result = await pushSalesInvoice(data, 'AUTHORISED', {
+    idempotencyKey: 'key-1',
+    beforePost: async (request) => request.tenantId === answeredBy
+      ? { ok: true as const }
+      : { ok: false as const, error: `Refusing: the ledger asked was ${answeredBy}, this request goes to ${request.tenantId}. NOTHING WAS SENT` },
+  })
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', new RegExp(`the ledger asked was tenant-B, this request goes to ${currentTenant}`))
+  assert.deepEqual(postsTo('Invoices'), [], 'a post into an unasked organisation must not leave')
+})
+
+test('the tenant reaches the authorisation on EVERY attempt, so a reconnect during a retry is seen', async () => {
+  reset([{ status: 429, retryAfter: '1' }, { status: 200 }])
+  const { pushSalesInvoice } = await invoices()
+
+  await pushSalesInvoice(data, 'AUTHORISED', { idempotencyKey: 'key-1', beforePost })
+
+  assert.equal(authorizeRequests.length, 2, 'each attempt is judged against its own resolution')
+  assert.deepEqual(authorizeRequests.map((r) => r.tenantId), [currentTenant, currentTenant])
 })
 
 // ---------------------------------------------------------------------------
@@ -399,6 +472,15 @@ test('the ONE evaluation site is inside the retry loop, after the budget wait an
 
   const calls = src.match(/accountingEgressRefusal\(/g) ?? []
   assert.equal(calls.length, 1, 'a permission is evaluated in exactly ONE place — two sites is the defect being removed')
+
+  // Round 7: and it is asked about THIS request. `auth` is the resolution the outgoing headers were
+  // built from, so passing it is what lets a precondition compare the ledger it asked against the
+  // ledger about to be written to. Re-reading the connection here would be a second resolution.
+  assert.match(
+    src,
+    /accountingEgressRefusal\(XERO_CONNECTOR, \{ tenantId: auth\.tenantId \}\)/,
+    'the evaluation must be told the tenant of the request it is authorising, taken from that request’s own auth',
+  )
 
   const start = src.indexOf('async function performRequest(')
   assert.ok(start > 0)

@@ -82,6 +82,18 @@ export type XeroResponse<T = unknown> = {
    *
    * `undefined` ONLY when no request was made (not connected / blocked token). A caller that treats
    * undefined as "the current tenant" has reintroduced the resample.
+   *
+   * WHICH ORGANISATION ANSWERED (o3d-k26m.5 r7, finding 2).
+   *
+   * A Xero response is only evidence about the ledger it came from, and which ledger that is is
+   * decided per call by `getAccessToken()` — a reconnect, a tenant re-pin or a refresh that lands
+   * elsewhere all change it between one call and the next. A caller that holds an answer across a
+   * later WRITE therefore has to be able to say which organisation the answer is about; the
+   * invoice-number fence does exactly that, and without this field its "nobody holds this number"
+   * was an unattributed sentence that any organisation could be made to satisfy.
+   *
+   * Undefined only where no tenant was ever resolved — a disconnected call, which is already a
+   * failure. Present on failures too, deliberately: a failed read is still a fact about one org.
    */
   tenantId?: string
 }
@@ -259,7 +271,14 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     //
     // BEFORE `noteRequest` because a refusal consumes no Xero budget: nothing is sent, so nothing may
     // be counted against the rolling day cap. Nothing between here and `connectorFetch` awaits.
-    const egressRefusal = await accountingEgressRefusal(XERO_CONNECTOR)
+    //
+    // AND IT IS ASKED ABOUT THIS REQUEST, NOT ABOUT REQUESTS IN GENERAL (r7, finding 2). `auth` is the
+    // resolution this very request was built from — `init.headers['Xero-Tenant-Id']` is that same
+    // string — so an authorisation holding an answer obtained from some earlier call can compare the
+    // organisation it asked against the organisation about to be written to, here, with no second
+    // token resolution able to intervene. That comparison used to be impossible to make correctly at
+    // any other point, so it was not made at all.
+    const egressRefusal = await accountingEgressRefusal(XERO_CONNECTOR, { tenantId: auth.tenantId })
     if (egressRefusal) {
       return { ok: false, status: XERO_NOT_SENT_STATUS, text: async () => egressRefusal } as Response
     }

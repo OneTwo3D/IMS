@@ -33,6 +33,10 @@ type Row = {
 }
 
 const CLAIM_STALE_MS = 15 * 60 * 1000
+/** The organisation the ledger's answer came from, and the one the post is addressed to. */
+const LEDGER = 'tenant-answering'
+/** The outgoing request as the egress seam describes it — see accounting-egress-authorization.ts. */
+const REQUEST = { tenantId: LEDGER }
 const SLOT_LOCK_NAMESPACE = 411_220_869
 const RIVAL_SCAN_LIMIT = 200
 
@@ -51,6 +55,8 @@ const state = {
   lockKeys: [] as string[],
   /** Slows the rival scan so an unlocked implementation is certain to interleave two workers. */
   readDelay: null as null | (() => Promise<void>),
+  /** Captures the rival scan's WHERE, so the predicate itself can be asserted on. */
+  recordScanWhere: null as null | Array<Record<string, unknown>>,
 }
 
 function row(overrides: Partial<Row> & { id: string }): Row {
@@ -161,6 +167,7 @@ function makeTx(held: { locked: boolean }) {
       findMany: async ({ where, take }: { where: Record<string, unknown>; take?: number }) => {
         requireLock('the rival scan')
         state.trace.push('scan')
+        state.recordScanWhere?.push(where)
         if (state.failFindMany) throw new Error('connection terminated')
         const hit = state.rows.filter((r) => matches(r, where))
         hit.sort((a, b) => a.id.localeCompare(b.id))
@@ -233,6 +240,7 @@ function reset() {
   state.trace = []
   state.lockKeys = []
   state.readDelay = null
+  state.recordScanWhere = null
   lockTails.clear()
 }
 
@@ -494,19 +502,92 @@ test('the stamp is fenced on the claim INSTANT, so a displaced worker is refused
   assert.equal(state.rows[0].attemptedInvoiceNumber, null, 'a displaced worker must not overwrite the holder’s stamp')
 })
 
-test('a sibling that settled is not a rival — only a row still PROCESSING can be mid-post', async () => {
+// ---------------------------------------------------------------------------
+// A settled row is not a row whose post did not land (Codex round 7, finding 1)
+//
+// Rounds 4-6 also required `status = 'PROCESSING'`, reasoning that a loser drops back to PENDING as
+// it fails and frees the number immediately. It does — and a TIMED-OUT post fails exactly that way
+// while its document may already stand in the ledger. The reply never arrived; the bytes did. The
+// Idempotency-Key that would replay the original answer is retained for six minutes, well inside
+// this fifteen-minute lease, and past it a replay is a fresh create against an update-or-create
+// verb. So the stamp is retired by its lease and by nothing else.
+// ---------------------------------------------------------------------------
+
+test('a row whose post TIMED OUT keeps fencing its number, even though it settled as FAILED', async () => {
   reset()
   const claimedAt = state.dbNow
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
-  // The loser of an earlier round: it failed and dropped back to PENDING, which frees the number.
+  // The shape of the hazard: the request left, the reply did not, and the row recorded the only
+  // thing it could. Whether Xero created the document is unknown HERE and knowable nowhere else.
   state.rows.push(row({
-    id: 'entry-loser', status: 'PENDING', attemptedInvoiceNumber: '164981', attemptedInvoiceNumberAt: state.dbNow,
+    id: 'entry-timed-out', status: 'FAILED', attemptedInvoiceNumber: '164981', attemptedInvoiceNumberAt: state.dbNow,
   }))
 
   const slot = await takeInvoiceNumberPostSlot({
     entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
-  assert.deepEqual(slot, { ok: true })
+
+  assert.equal(slot.ok, false, 'an unknown outcome is not a free number')
+  assert.match(slot.ok === false ? slot.reason : '', /entry-timed-out/)
+  assert.match(slot.ok === false ? slot.reason : '', /NOTHING WAS SENT/)
+  assert.equal(state.rows[0].attemptedInvoiceNumber, null, 'and nothing may be stamped for a post that is refused')
+})
+
+test('EVERY settled status keeps fencing — the fence asks about the stamp, never about the row', async () => {
+  // PENDING is the retry ladder, FAILED is exhaustion, SYNCED is a create that returned. None of
+  // them is evidence that the ledger was not written to under this number within the lease.
+  for (const status of ['PENDING', 'FAILED', 'SYNCED', 'PROCESSING']) {
+    reset()
+    const claimedAt = state.dbNow
+    state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+    state.rows.push(row({
+      id: 'entry-other', status, attemptedInvoiceNumber: '164981', attemptedInvoiceNumberAt: state.dbNow,
+    }))
+
+    const slot = await takeInvoiceNumberPostSlot({
+      entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    })
+    assert.equal(slot.ok, false, `a ${status} row stamped inside the lease must still fence its number`)
+  }
+})
+
+test('and the LEASE is still what retires it, whatever the row settled as', async () => {
+  // The other half: without this the fence would never let go, and one timed-out post would fence a
+  // number off for good. The bound is a duration measured on the database clock, not a status.
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  state.rows.push(row({
+    id: 'entry-timed-out',
+    status: 'FAILED',
+    attemptedInvoiceNumber: '164981',
+    attemptedInvoiceNumberAt: new Date(state.dbNow.getTime() - CLAIM_STALE_MS - 1),
+  }))
+
+  assert.deepEqual(
+    await takeInvoiceNumberPostSlot({
+      entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    }),
+    { ok: true },
+  )
+})
+
+test('the rival scan does not narrow on status at all — a filter here is the round-7 defect', async () => {
+  // Belt and braces on the predicate itself. The database double models `status`, so a scan that
+  // re-introduced the filter would silently pass the tests above only if its value happened to
+  // match; this pins that the fence never mentions the column.
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  const seen: Array<Record<string, unknown>> = []
+  state.recordScanWhere = seen
+
+  await takeInvoiceNumberPostSlot({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+  })
+
+  assert.equal(seen.length, 1, 'exactly one rival scan per slot')
+  assert.ok(!('status' in seen[0]), 'the rival scan must not narrow on status: a settled row can still hold the number')
 })
 
 test('a scan that fills its limit REFUSES rather than reporting the fraction it saw', async () => {
@@ -568,7 +649,7 @@ test('the slot is not taken until the check RUNS — building it must send and w
 
   await buildInvoiceNumberPostSlotCheck({
     entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
-    referenceType: 'SalesOrder', referenceId: 'so-1',
+    referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
   })
 
   assert.deepEqual(state.trace, [], 'the slot must be taken after preparation, so constructing the check cannot take it')
@@ -582,14 +663,14 @@ test('a ledger answer that has outlived the claim refuses, and nothing is stampe
   let monotonic = 1_000
   const check = await buildInvoiceNumberPostSlotCheck({
     entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
-    referenceType: 'SalesOrder', referenceId: 'so-1',
+    referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
     monotonicNowMs: () => monotonic,
   })
 
   // Preparation took longer than the claim is guaranteed for: the contact call and one call per
   // distinct item code, each with its own six-minute budget.
   monotonic += CLAIM_STALE_MS
-  const verdict = await check()
+  const verdict = await check(REQUEST)
 
   assert.equal(verdict.ok, false)
   assert.match(verdict.ok === false ? verdict.error : '', /the ledger was asked who holds that number 900s ago/)
@@ -605,12 +686,12 @@ test('an answer still inside the bound proceeds, and takes the slot at that mome
   let monotonic = 1_000
   const check = await buildInvoiceNumberPostSlotCheck({
     entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
-    referenceType: 'SalesOrder', referenceId: 'so-1',
+    referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
     monotonicNowMs: () => monotonic,
   })
 
   monotonic += CLAIM_STALE_MS - 1
-  assert.deepEqual(await check(), { ok: true })
+  assert.deepEqual(await check(REQUEST), { ok: true })
   assert.deepEqual(state.trace, ['lock', 'clock', 'scan', 'stamp'])
   assert.equal(state.rows[0].attemptedInvoiceNumber, '164981')
 })
@@ -624,11 +705,11 @@ test('the age is measured from the ANSWER, not from the moment the check runs', 
   let monotonic = 0
   const check = await buildInvoiceNumberPostSlotCheck({
     entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
-    referenceType: 'SalesOrder', referenceId: 'so-1',
+    referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
     monotonicNowMs: () => monotonic,
   })
   monotonic = CLAIM_STALE_MS * 4
-  const verdict = await check()
+  const verdict = await check(REQUEST)
   assert.equal(verdict.ok, false)
   assert.match(verdict.ok === false ? verdict.error : '', /3600s ago/)
 })
@@ -642,10 +723,188 @@ test('a rival found at post time is reported through the check, not swallowed', 
   }))
   const check = await buildInvoiceNumberPostSlotCheck({
     entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
-    referenceType: 'SalesOrder', referenceId: 'so-1',
+    referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
     monotonicNowMs: () => 0,
   })
-  const verdict = await check()
+  const verdict = await check(REQUEST)
   assert.equal(verdict.ok, false)
   assert.match(verdict.ok === false ? verdict.error : '', /entry-rival/)
+})
+
+// ---------------------------------------------------------------------------
+// The answer is bound to the ledger it was asked of (Codex round 7, finding 2)
+//
+// The lookup resolves the Xero connection for itself; the create resolves it again, later. Between
+// them a reconnect, a tenant re-pin, or a refresh landing on another tenant makes the answer a fact
+// about org A and the post a write to org B — where nobody was asked anything, and where the number
+// may be held by a live document. Age was bounded and IDENTITY WAS NOT, so a perfectly fresh answer
+// could authorise a post into a ledger it had never seen.
+//
+// The comparison is made here, against the tenant the outgoing request itself carries, because this
+// is the only point at which the ledger that answered and the ledger about to be written to can be
+// compared with no second token resolution between them.
+// ---------------------------------------------------------------------------
+
+test('a request addressed to a DIFFERENT organisation is refused, and nothing is stamped or sent', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  const check = await buildInvoiceNumberPostSlotCheck({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
+    monotonicNowMs: () => 0,
+  })
+
+  const verdict = await check({ tenantId: 'a-different-org' })
+
+  assert.equal(verdict.ok, false)
+  assert.match(verdict.ok === false ? verdict.error : '', /organisation tenant-answering/)
+  assert.match(verdict.ok === false ? verdict.error : '', /addressed to organisation a-different-org/)
+  assert.match(verdict.ok === false ? verdict.error : '', /NOTHING WAS SENT/)
+  assert.deepEqual(state.trace, [], 'a post into an unasked ledger must refuse BEFORE taking a slot in this one')
+  assert.equal(state.rows[0].attemptedInvoiceNumber, null)
+})
+
+test('the ledger check comes FIRST — before the age bound and before the slot', async () => {
+  // Both would refuse anyway; the order is what stops a slot being taken, and a row stamped, for a
+  // post that was never going to the organisation the fence asked about.
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  let monotonic = 0
+  const check = await buildInvoiceNumberPostSlotCheck({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
+    monotonicNowMs: () => monotonic,
+  })
+  monotonic = CLAIM_STALE_MS * 4
+
+  const verdict = await check({ tenantId: 'a-different-org' })
+
+  assert.equal(verdict.ok, false)
+  assert.match(
+    verdict.ok === false ? verdict.error : '',
+    /the accounting connection changed between the question and the write/,
+    'the ledger mismatch is the reason reported, not the staleness that also holds',
+  )
+})
+
+test('the SAME organisation passes, and only then is the slot taken', async () => {
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  const check = await buildInvoiceNumberPostSlotCheck({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
+    monotonicNowMs: () => 0,
+  })
+
+  assert.deepEqual(await check({ tenantId: LEDGER }), { ok: true })
+  assert.deepEqual(state.trace, ['lock', 'clock', 'scan', 'stamp'])
+})
+
+test('the ledger is compared EXACTLY — a near-miss is a different organisation', async () => {
+  // Tenant ids are opaque GUIDs. Nothing about them is case-folded, trimmed or prefixed by anything
+  // between the token store and the header, so any normalisation here would be inventing a rule
+  // that makes two ledgers one.
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  for (const tenantId of [LEDGER.toUpperCase(), ` ${LEDGER}`, `${LEDGER} `, `${LEDGER}x`, '']) {
+    const check = await buildInvoiceNumberPostSlotCheck({
+      entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+      referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
+      monotonicNowMs: () => 0,
+    })
+    const verdict = await check({ tenantId })
+    assert.equal(verdict.ok, false, `${JSON.stringify(tenantId)} is not ${LEDGER}`)
+  }
+})
+
+test('the ledger is re-checked on EVERY attempt, not once per call', async () => {
+  // The closure is the egress seam's authorisation and runs once per HTTP attempt. A reconnect
+  // during a rate-limit sleep changes the tenant the NEXT attempt is built from, so an answer bound
+  // once and spent later is the same "true when taken, false when spent" defect one level down.
+  reset()
+  const claimedAt = state.dbNow
+  state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
+  const check = await buildInvoiceNumberPostSlotCheck({
+    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
+    monotonicNowMs: () => 0,
+  })
+
+  assert.deepEqual(await check({ tenantId: LEDGER }), { ok: true }, 'first attempt: same org')
+  const second = await check({ tenantId: 'reconnected-elsewhere' })
+  assert.equal(second.ok, false, 'second attempt: the connection moved, and the answer did not move with it')
+  assert.match(second.ok === false ? second.error : '', /reconnected-elsewhere/)
+})
+
+// ---------------------------------------------------------------------------
+// The widened scan needs an index, or the fence is a table scan on the money path (round 7).
+//
+// Dropping `status = 'PROCESSING'` removed the only selective predicate the existing
+// (connector, status, "processingStartedAt") index could serve. What remains is `connector` — which
+// selects essentially the whole of accounting_sync_logs — and a range over a column nothing indexed,
+// asked before EVERY sales-invoice create, inside a transaction holding an advisory lock.
+// ---------------------------------------------------------------------------
+
+test('the rival scan has a partial index matching the predicate it actually issues', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const migration = await readFile(
+    path.join(process.cwd(), 'prisma/migrations/20260821090000_invoice_number_fence_index/migration.sql'),
+    'utf8',
+  )
+
+  assert.match(migration, /CREATE INDEX CONCURRENTLY "accounting_sync_logs_invoice_number_fence_idx"/)
+  assert.match(
+    migration,
+    /ON "accounting_sync_logs" \("connector", "attempted_invoice_number_at"\)/,
+    'connector is the equality and the stamp time is the range scan — that order, or the range is not served',
+  )
+  assert.match(
+    migration,
+    /WHERE "attempted_invoice_number_at" IS NOT NULL/,
+    'partial: only rows that ever attempted a post can match, which is a vanishing fraction of the table',
+  )
+})
+
+test('the index is built without blocking writes to accounting_sync_logs', async () => {
+  // docs/migration-conventions.md names accounting_sync_logs as a table that must build concurrently,
+  // and CONCURRENTLY cannot run inside a transaction block — Postgres puts a multi-statement
+  // simple-query string into an implicit one, so the file must carry exactly ONE statement and no
+  // BEGIN/COMMIT. That is not a style rule: a second statement makes the build fail outright.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const read = async (dir: string) =>
+    readFile(path.join(process.cwd(), 'prisma/migrations', dir, 'migration.sql'), 'utf8')
+  const withoutComments = (sql: string) =>
+    sql.split('\n').filter((line) => !/^\s*--/.test(line)).join('\n')
+  const statementsOf = (sql: string) =>
+    withoutComments(sql).split(';').map((statement) => statement.trim()).filter(Boolean)
+
+  const migration = await read('20260821090000_invoice_number_fence_index')
+  const statements = statementsOf(migration)
+
+  assert.equal(statements.length, 1, 'a concurrent build cannot share a file with anything else')
+  assert.match(statements[0], /^CREATE INDEX CONCURRENTLY /, 'writers must not be blocked for the build')
+  assert.ok(
+    !/\bBEGIN\b|\bCOMMIT\b/i.test(withoutComments(migration)),
+    'CREATE INDEX CONCURRENTLY cannot run inside a transaction block',
+  )
+  // An interrupted concurrent build leaves the index behind INVALID: unusable by the planner, so the
+  // fence silently keeps the table scan, yet still maintained by every accounting_sync_logs write.
+  // IF NOT EXISTS would no-op against that leftover and make the state permanent and invisible.
+  assert.ok(!/IF NOT EXISTS/i.test(statements[0]), 'a retry must not silently accept an invalid leftover')
+
+  const validate = await read('20260821090100_invoice_number_fence_index_validate')
+  assert.match(validate, /indisvalid/, 'the follow-up migration checks the build actually completed')
+  assert.match(validate, /accounting_sync_logs_invoice_number_fence_idx/)
+  assert.match(validate, /RAISE EXCEPTION/, 'and fails the deploy rather than logging')
+  assert.match(
+    validate,
+    /DROP INDEX CONCURRENTLY IF EXISTS/,
+    'naming the remediation, which must not take the lock the build avoided',
+  )
 })

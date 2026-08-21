@@ -1531,9 +1531,10 @@ export function heldClaimWhere(entryId: string, claimedAt: Date) {
  * long for the lock costs a retry, never a post.
  *
  * THE ONE REMAINING CLOCK READING IS THAT LEASE, AND IT IS THE DATABASE'S. A stamp fences the number
- * only while it is younger than {@link CLAIM_STALE_MS}, because a worker that DIED mid-post leaves its
- * row PROCESSING and any longer would fence a number off behind one crash. That is a duration, not an
- * ordering — nothing about who wins depends on it — and both ends of it are now read from the SAME
+ * only while it is younger than {@link CLAIM_STALE_MS} — and, since round 7, for the WHOLE of that
+ * window whatever becomes of the row. A worker that died mid-post writes no outcome at all, and a
+ * worker whose post timed out writes one that is not evidence either way; the lease is what stops
+ * either of them fencing a number off for good. That is a duration, not an ordering — nothing about who wins depends on it — and both ends of it are now read from the SAME
  * clock: `now()` inside the transaction supplies the cutoff AND the value written into
  * `attemptedInvoiceNumberAt`. So a stamp lapses exactly one lease after it was written, whatever the
  * workers' own hosts believe the time to be, and two clocks are never compared.
@@ -1550,14 +1551,59 @@ export function heldClaimWhere(entryId: string, claimedAt: Date) {
  * lease window, a non-null stamp) and the identity comparison happens in code, where it is string
  * equality and nothing else.
  *
- * The candidate set that reaches code is the rows currently mid-post across the whole connector,
- * which is a handful — it is bounded by how many workers can be in flight at once, and served by the
- * existing `(connector, status, processingStartedAt)` index. It is still CAPPED, and a scan that hits
- * the cap REFUSES rather than reporting the fraction it saw: the same rule the ledger lookup applies
- * to a page it cannot prove is complete.
+ * The candidate set that reaches code is every row that has attempted a post under this connector
+ * within the last lease — one row per create attempt, so a handful in any ordinary quarter-hour, and
+ * bounded in the limit by Xero's own 1,000-call rolling day budget (each create costs several calls,
+ * so the cap below cannot be approached except by a burst that is about to exhaust the day). It is
+ * served by `accounting_sync_logs_invoice_number_fence_idx`, a partial index on exactly the stamped
+ * rows. It is still CAPPED, and a scan that hits the cap REFUSES rather than reporting the fraction
+ * it saw: the same rule the ledger lookup applies to a page it cannot prove is complete.
  *
- * WHAT COUNTS AS A LIVE RIVAL. Still PROCESSING, and stamped within the lease. Both halves matter: a
- * loser's row drops back to PENDING as it fails, which frees the number immediately.
+ * ------------------------------------------------------------------------------------------------
+ * WHAT COUNTS AS A LIVE RIVAL — AND WHY IT IS NO LONGER "STILL PROCESSING" (Codex round 7, #1)
+ * ------------------------------------------------------------------------------------------------
+ * Stamped within the lease. THAT IS THE WHOLE TEST; the row's status is not part of it, and used to
+ * be. Rounds 4-6 also required `status = 'PROCESSING'`, on the reasoning that a loser's row drops
+ * back to PENDING as it fails, which frees the number immediately. It does — and that is the defect,
+ * because A FAILED ROW IS NOT PROOF THAT NOTHING WAS POSTED.
+ *
+ * A POST THAT TIMES OUT HAS NO OUTCOME, ONLY AN UNKNOWN ONE. The socket write happened; the reply
+ * did not arrive. Xero may have created the document, may not, and this process cannot tell which —
+ * that is the same lost-response state the whole fence is built around, and the `Idempotency-Key`
+ * that would once have replayed the original answer is retained for six minutes, well inside the
+ * fifteen this lease runs for. Past that, a replay is a fresh create, and the create is
+ * update-or-create on the number.
+ *
+ * Under the old predicate that row settled — FAILED, or back to PENDING for the retry ladder — and
+ * STOPPED FENCING ITS NUMBER within seconds of the timeout. A second worker whose ledger answer had
+ * been taken before the first post left would then find no rival, take the slot, and post under a
+ * number a live document may already be carrying. The exclusion evaporated at exactly the moment its
+ * subject became uncertain.
+ *
+ * SO A STAMP IS RETIRED BY ITS LEASE AND BY NOTHING ELSE. It says "this row may already have written
+ * this number", and only time can make that stop mattering. Nothing releases it early, because
+ * nothing available locally is proof of a remote non-write: not a FAILED status, not a refusal
+ * recorded after an earlier attempt in the same call already reached the wire, not a 429 the client
+ * gave up on.
+ *
+ * THAT IS WHAT MAKES THE TWO BOUNDS FIT TOGETHER. A rival's answer may be at most one lease old when
+ * it is spent ({@link LEDGER_ANSWER_MAX_AGE_MS}), and a stamp fences for exactly one lease from the
+ * instant it was written — which is the instant of the send, since the stamp is re-taken on every
+ * attempt. So no answer obtained BEFORE our post left can still be spendable after our fence lapses.
+ * With the status filter in place that argument was simply false; the fence could vanish in seconds
+ * while the answer it was protecting against stayed valid for fifteen minutes.
+ *
+ * WHAT THE LEASE DOES NOT COVER, STATED. A rival that asks the ledger AFTER our post left, and posts
+ * a full lease later, can outlive our stamp. Its backstop is the ledger question itself: by then a
+ * post that landed is a document Xero will report, and the answer is a refusal
+ * (NUMBER_HELD_BY_FOREIGN_DOCUMENT) rather than a permission. The local fence covers the window in
+ * which the ledger cannot yet know; it does not pretend to cover the one in which it can.
+ *
+ * THE COST OF THE WIDER SET IS REFUSALS, WHICH IS THE RECOVERABLE DIRECTION. A row that genuinely
+ * sent nothing — refused by a later authorisation in the same scope, say — still fences its number
+ * for up to a lease, so a different row carrying the SAME number waits and retries. Two rows racing
+ * on one number is the situation this fence exists for; making one of them wait fifteen minutes is
+ * not a cost worth trading an unrecoverable write for.
  *
  * NOT filtered by sync type. The question is "is another worker about to write this number", and the
  * only writer of this column is this fence, so a type filter could only ever hide a rival.
@@ -1618,7 +1664,8 @@ export async function takeInvoiceNumberPostSlot(params: {
         where: {
           id: { not: params.entryId },
           connector: XERO_CONNECTOR,
-          status: 'PROCESSING',
+          // NO STATUS FILTER, and its absence is the round-7 fix — see WHAT COUNTS AS A LIVE RIVAL
+          // in the header. A row that has left PROCESSING is not a row whose post did not land.
           attemptedInvoiceNumber: { not: null },
           attemptedInvoiceNumberAt: { gte: new Date(now.getTime() - CLAIM_STALE_MS) },
         },
@@ -1746,8 +1793,31 @@ const monotonicNowMs = (): number => performance.now()
  * lib/connectors/accounting-egress-authorization.ts. The gap it has to cover shrinks from "the whole
  * entry" to "the width of one socket write".
  *
- * WHAT HAPPENS TO EACH OF THE THREE THINGS THAT COULD GO STALE:
+ * ROUND 7 ADDED THE ONE THING THE PLACEMENT ALONE DID NOT FIX: WHICH LEDGER THE ANSWER IS ABOUT.
+ * `lookupXeroInvoiceNumberClaim` resolves the Xero connection for itself and the create resolves it
+ * again; between the two, a reconnect, a tenant re-pin, or a refresh landing on another tenant makes
+ * the answer a fact about organisation A and the post a write to organisation B — where nothing was
+ * asked, and where the number may well be held by a live document. Age was bounded and identity was
+ * not, so a perfectly fresh answer could authorise a post into a ledger it had never seen.
  *
+ * The answer therefore travels with the tenant that gave it (`answeredByTenantId`, carried out of the
+ * lookup and onto the decision), and this closure re-states it against `request.tenantId` — the
+ * `auth` the outgoing request was built from, handed in by the egress seam as the last statement
+ * before the socket. This is the ONE place the comparison is sound: anywhere earlier and the post
+ * resolves auth again afterwards, which is the stale read being removed rather than a check.
+ *
+ * It reuses the sibling `o3d-batch-realm`'s seam rather than adding a third: that branch reaches its
+ * own tenant verdict at this same point against this same `auth.tenantId`, and DELETED its earlier
+ * pre-check on the ground that a refusal from a stale read is as wrong as a permission from one.
+ * There is no pre-check here either — the guard binds nothing, it only records which organisation
+ * answered. The two questions are different (realm: may this row reach this ledger at all; here: is
+ * this the ledger my answer came from), so they are two entries in the accumulating authorisation
+ * list, evaluated in scope order, never two evaluation sites.
+ *
+ * WHAT HAPPENS TO EACH OF THE FOUR THINGS THAT COULD GO STALE:
+ *
+ *   - THE ORGANISATION THE ANSWER IS ABOUT: re-stated against the outgoing request's own tenant, on
+ *     every attempt, and refused on any difference — see above.
  *   - THE SLOT: no longer stale by construction — see above.
  *   - THE CLAIM ON THE ROW: RE-CHECKED, in the database, at the same instant. The stamp is fenced on
  *     `heldClaimWhere`, so a worker whose claim aged out during preparation writes nothing and posts
@@ -1792,9 +1862,14 @@ export function buildInvoiceNumberPostSlotCheck(params: {
   orderLabel: string
   referenceType: string
   referenceId: string
+  /**
+   * The organisation the ledger's answer came from — see the ORGANISATION section above. The post is
+   * refused unless the request on the point of leaving is addressed to this same one.
+   */
+  answeredByTenantId: string
   /** Injected only by tests. Monotonic milliseconds — never a wall clock. */
   monotonicNowMs?: () => number
-}): () => Promise<{ ok: true } | { ok: false; error: string }> {
+}): BeforeRemoteWrite {
   const readNow = params.monotonicNowMs ?? monotonicNowMs
   // Taken at CONSTRUCTION, which the fence does immediately after the ledger answers. The age this
   // measures is therefore the age of the answer, not the age of this closure.
@@ -1813,7 +1888,25 @@ export function buildInvoiceNumberPostSlotCheck(params: {
     }).catch(() => {})
   }
 
-  return async () => {
+  return async (request) => {
+    // FIRST, because it is the cheapest refusal and the most fundamental one: everything below is
+    // about a number, and a number only means anything inside one organisation. Asked here, against
+    // the tenant the outgoing request itself carries, because this is the only point at which the
+    // ledger that ANSWERED and the ledger that will be WRITTEN TO can be compared with no second
+    // token resolution able to slip between them. Nothing is stamped and no slot is taken for a post
+    // that is going somewhere the fence never asked about.
+    if (request.tenantId !== params.answeredByTenantId) {
+      const error =
+        `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: the ledger that was asked `
+        + `who holds that number was organisation ${params.answeredByTenantId}, but this request is addressed to `
+        + `organisation ${request.tenantId} — the accounting connection changed between the question and the write. `
+        + 'The answer says nothing about the organisation about to receive the post, and the create is '
+        + 'update-or-create on the number, so it could silently replace a document there. NOTHING WAS SENT; the '
+        + 'next run asks the organisation that is actually connected.'
+      await warn(error, 'sales_invoice_number_answer_wrong_tenant')
+      return { ok: false, error }
+    }
+
     const ageMs = readNow() - answeredAt
     if (ageMs >= LEDGER_ANSWER_MAX_AGE_MS) {
       const error =
@@ -1865,6 +1958,14 @@ export function buildInvoiceNumberPostSlotCheck(params: {
  * FAILS CLOSED on an unreadable order and on an unreachable ledger, the same way
  * guardCancelledSalesOrderInvoice does — a transient read outage must not become permission to
  * post.
+ *
+ * AND THE ANSWER IS NEVER SEPARATED FROM THE LEDGER THAT GAVE IT (round 7). `lookupXeroInvoiceNumberClaim`
+ * reports the tenant that answered, `decideInvoiceNumberPost` carries it onto the permission, and the
+ * closure below re-states it against the tenant on the outgoing request. Nothing in THIS function
+ * compares tenants: a pre-check here would be a comparison between two separate resolutions of "the
+ * current connection", minutes before the write, which is a refusal or a permission produced from a
+ * stale read — the sibling branch o3d-batch-realm deleted exactly such a pre-check for exactly that
+ * reason. All this function does is refuse to hand on a permission that cannot say where it came from.
  *
  * AND ON THE WORKER NEXT TO IT — BUT NOT FROM HERE (round 5). The ledger's answer is about a moment;
  * {@link takeInvoiceNumberPostSlot} covers the window between that moment and the request, which after
@@ -1983,6 +2084,11 @@ async function guardSalesInvoiceNumberOwnership(
       orderLabel,
       referenceType,
       referenceId,
+      // Not re-read from the connection here, and that is the point (round 7, finding 2). This is the
+      // organisation that ANSWERED the question above, carried out of the decision that granted the
+      // permission, so the comparison at the socket is between the ledger asked and the ledger
+      // written to — never between two separate resolutions of "the current tenant".
+      answeredByTenantId: decision.answeredByTenantId,
     }),
   }
 }

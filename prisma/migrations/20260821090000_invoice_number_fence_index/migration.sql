@@ -1,0 +1,67 @@
+-- o3d-k26m.5 Codex r7: give the invoice-number fence's rival scan an index, or it is a table scan.
+--
+-- WHAT RUNS. takeInvoiceNumberPostSlot (lib/connectors/xero/sync-processor.ts) runs inside a
+-- transaction holding an advisory lock on the invoice number, immediately before EVERY sales-invoice
+-- create attempt, and asks
+--
+--   SELECT id, "referenceId", attempted_invoice_number FROM "accounting_sync_logs"
+--    WHERE id <> $1
+--      AND connector = 'xero'
+--      AND attempted_invoice_number IS NOT NULL
+--      AND attempted_invoice_number_at >= now() - interval '15 minutes'
+--    ORDER BY id ASC LIMIT 200
+--
+-- Until r7 that query also carried `status = 'PROCESSING'`, which is selective enough to be served by
+-- the existing (connector, status, "processingStartedAt") index. R7 REMOVED IT, because a row that
+-- has left PROCESSING is not a row whose post did not land: a create whose reply never arrived
+-- settles as FAILED (or drops back to PENDING for the retry ladder) while the document it may have
+-- written stands in the ledger, and under the old predicate the number stopped being fenced within
+-- seconds of the timeout. See the WHAT COUNTS AS A LIVE RIVAL section in sync-processor.ts.
+--
+-- With that predicate gone the remaining ones are `connector` — which selects essentially the whole
+-- table — and a range over a column nothing indexes. The planner's only option is a sequential scan
+-- of accounting_sync_logs, a table that grows with every sync of every kind, taken on the money path
+-- while holding a lock. This index makes it a bounded index range read instead.
+--
+-- WHY PARTIAL. attempted_invoice_number_at is written by ONE code path — this fence, before a sales
+-- invoice create — so it is NULL on the overwhelming majority of rows (bills, COGS journals, payments,
+-- every non-Xero connector, and every row written before o3d-k26m.5). A partial index holds only the
+-- rows the scan can ever match: one per invoice-create attempt, rather than one per sync row ever
+-- written, and it costs nothing to maintain on the write paths that never touch the column.
+--
+-- (connector, attempted_invoice_number_at) in that order, matching the query: the connector is an
+-- equality and the timestamp is the range scan, so the candidate rows are identified from the index
+-- alone. `id` is deliberately not in it — the ORDER BY only makes the REFUSAL deterministic when
+-- several rows qualify (any live rival refuses, so which one is named is diagnostic), and the set
+-- being sorted is the handful of creates attempted in the last quarter of an hour.
+--
+-- Prisma cannot express an index WHERE predicate, so this index is deliberately not represented in
+-- schema.prisma — the same as activity_logs_direct_create_marker_idx.
+-- prisma-schema-scope-ok: db-native partial index | reason: Prisma schema has no way to express an index WHERE predicate, so a partial index cannot be modelled in schema.prisma
+--
+-- CONCURRENTLY, AND THIS FILE HOLDS EXACTLY ONE STATEMENT.
+--
+-- docs/migration-conventions.md names accounting_sync_logs as a table that should use a concurrent
+-- index build: a plain CREATE INDEX takes a SHARE lock for the whole build, blocking every INSERT
+-- into it, and every accounting sync of every kind writes there. CREATE INDEX CONCURRENTLY takes
+-- SHARE UPDATE EXCLUSIVE instead, so readers and writers carry on throughout. It cannot run inside a
+-- transaction block, and Postgres wraps a multi-statement simple-query string in an implicit one, so
+-- this file must contain this ONE statement and nothing else. The post-build validity check is a
+-- SEPARATE migration, 20260821090100, for the same reason.
+--
+-- NO `IF NOT EXISTS`, deliberately. An interrupted concurrent build leaves an INVALID index behind at
+-- this name: the planner refuses to use it, so the fence silently keeps the table scan this migration
+-- exists to remove, while every accounting_sync_logs write still pays to maintain it. `IF NOT EXISTS`
+-- would quietly no-op against that leftover and make the state permanent and invisible.
+--
+-- Operator remediation if this migration is interrupted and leaves an INVALID index:
+--   psql "$DATABASE_URL" -c 'DROP INDEX CONCURRENTLY IF EXISTS "accounting_sync_logs_invoice_number_fence_idx";'
+--   npx prisma migrate resolve --rolled-back 20260821090000_invoice_number_fence_index
+--   npx prisma migrate deploy
+-- DROP INDEX CONCURRENTLY, not a plain DROP, so the cleanup does not take the exclusive lock the
+-- build was written to avoid. It is safe to drop at any time: nothing reads this index for
+-- correctness — the fence refuses or permits identically without it, only slowly.
+
+CREATE INDEX CONCURRENTLY "accounting_sync_logs_invoice_number_fence_idx"
+  ON "accounting_sync_logs" ("connector", "attempted_invoice_number_at")
+  WHERE "attempted_invoice_number_at" IS NOT NULL;

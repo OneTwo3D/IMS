@@ -157,7 +157,24 @@ export type LedgerInvoiceClaim = {
  * lib/connectors/xero/invoice-number-claim.ts, where a full page is a failure and not an answer).
  */
 export type InvoiceNumberLookup =
-  | { ok: true; claims: LedgerInvoiceClaim[] }
+  | {
+      ok: true
+      claims: LedgerInvoiceClaim[]
+      /**
+       * WHICH LEDGER SAID SO (o3d-k26m.5 r7, finding 2).
+       *
+       * An answer is evidence about the organisation that gave it and about no other. Which
+       * organisation that is is resolved per call, so a reconnect, a tenant re-pin or a refresh
+       * landing elsewhere between this read and the write it authorises makes the answer be about
+       * a different ledger from the one that gets written to — and "nobody holds this number" in
+       * org A is not a fact about org B, where nobody was asked anything at all.
+       *
+       * REQUIRED, not optional. A lookup that cannot say which organisation answered cannot have
+       * its answer bound to a write, and an unbindable permission is not one: the lookup fails
+       * closed instead of returning claims nobody can attribute.
+       */
+      tenantId: string
+    }
   | {
       ok: false
       error: string
@@ -197,6 +214,19 @@ export type InvoiceNumberPostDecision =
       basis: 'unclaimed' | 'own-document'
       /** The document the post will land on, when one already exists. */
       claimedInvoiceId?: string
+      /**
+       * THE ORGANISATION THIS PERMISSION IS ABOUT (o3d-k26m.5 r7, finding 2).
+       *
+       * Carried out of the lookup and onto the decision so that a permission cannot be held
+       * without also holding the ledger it was granted in. The caller must re-state it at the
+       * instant of the write, against the tenant the outgoing request actually carries: a verdict
+       * reached against one organisation licenses nothing in another, and the create is
+       * update-or-create on the number in whichever organisation receives it.
+       *
+       * It is on the `post: true` branch alone, deliberately — a refusal needs no ledger to be
+       * bound to, and putting it on both would invite the same unbound comparison one level up.
+       */
+      answeredByTenantId: string
     }
   | {
       post: false
@@ -300,7 +330,10 @@ export function decideInvoiceNumberPost(params: {
   }
 
   const claims = params.lookup.claims
-  if (claims.length === 0) return { post: true, basis: 'unclaimed' }
+  // Every permission below carries the organisation that granted it. There is no route to `post: true`
+  // that does not, which is what stops the caller comparing an answer against a ledger it never asked.
+  const answeredByTenantId = params.lookup.tenantId
+  if (claims.length === 0) return { post: true, basis: 'unclaimed', answeredByTenantId }
 
   // A voided document HOLDS its number but cannot be modified, so it can never be the document an
   // upsert lands on. Partitioning first is what stops an arbitrary holder being picked out of
@@ -339,7 +372,7 @@ export function decideInvoiceNumberPost(params: {
 
   const holder = live[0]
   if (owned && owned === holder.invoiceId) {
-    return { post: true, basis: 'own-document', claimedInvoiceId: holder.invoiceId }
+    return { post: true, basis: 'own-document', claimedInvoiceId: holder.invoiceId, answeredByTenantId }
   }
 
   if (owned) {

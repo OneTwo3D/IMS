@@ -7,7 +7,10 @@ import { findOrCreateContact } from './contacts'
 import { findOrCreateItem } from './items'
 import { xeroDocumentRevisionAt } from './document-revision'
 import { imsRateToXeroCurrencyRate } from './fx'
-import { withAccountingEgressAuthorization } from '@/lib/connectors/accounting-egress-authorization'
+import {
+  withAccountingEgressAuthorization,
+  type AccountingEgressRequest,
+} from '@/lib/connectors/accounting-egress-authorization'
 import type { InvoiceData, InvoiceLine } from '../types'
 
 /**
@@ -40,8 +43,16 @@ import type { InvoiceData, InvoiceLine } from '../types'
  * o3d-batch-small2 named this exact seam as the residual its per-mutation claim fence could not
  * reach ("closing that needs a hook threaded through the connector modules"); when the two land
  * together its claim re-take belongs in the same authorisation rather than at the call site.
+ *
+ * IT IS ASKED ABOUT A REQUEST, NOT IN THE ABSTRACT (r7). The check receives the outgoing request as
+ * the seam describes it — chiefly the organisation it is addressed to, taken from the very `auth` the
+ * request was built from. A precondition established from an earlier call (the invoice-number fence's
+ * ledger answer is one) is only about the organisation that produced it, so without this the check
+ * could confirm a number was free in one Xero organisation while the create landed in another.
  */
-export type BeforeRemoteWrite = () => Promise<{ ok: true } | { ok: false; error: string }>
+export type BeforeRemoteWrite = (
+  request: AccountingEgressRequest,
+) => Promise<{ ok: true } | { ok: false; error: string }>
 
 /**
  * Run `send` with `check` — if there is one — applying at the instant its request reaches the wire.
@@ -62,8 +73,12 @@ function withSalesInvoiceAuthorization<T>(check: BeforeRemoteWrite | undefined, 
     {
       connector: 'xero',
       name: 'sales-invoice-precondition',
-      authorize: async () => {
-        const cleared = await check()
+      // The request is passed STRAIGHT THROUGH. What the seam knows about the outgoing call — which
+      // organisation it is addressed to, taken from the auth it was built from — is exactly what a
+      // precondition holding an answer from an earlier call needs in order to bind that answer to
+      // this write. Narrowing or re-deriving it here would put a second reading between the two.
+      authorize: async (request) => {
+        const cleared = await check(request)
         return cleared.ok ? null : cleared.error
       },
     },

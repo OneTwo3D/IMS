@@ -94,6 +94,19 @@
  * carry the same number as a sales invoice is not a claim on the sales-invoice sequence and must
  * not block a receivable. They are still COUNTED against the page cap above, because they occupy
  * rows that could push a real holder out of the page.
+ *
+ * ------------------------------------------------------------------------------------------------
+ * AND THE ANSWER IS ABOUT ONE ORGANISATION, WHICH IT NOW SAYS (Codex round 7)
+ * ------------------------------------------------------------------------------------------------
+ * `xeroGet` resolves the connection for itself, and the create resolves it again later. A reconnect,
+ * a tenant re-pin, or a refresh landing on a different tenant between the two makes this an answer
+ * about org A and the post a write to org B — where nobody was asked anything, and where the number
+ * may well be held. The lookup therefore reports the tenant that answered it, and the fence rechecks
+ * that tenant against the one on the outgoing request at the instant of the write
+ * (lib/connectors/accounting-egress-authorization.ts). A response that does not say which
+ * organisation produced it is a LOOKUP FAILURE, for the same reason a page that cannot prove it is
+ * complete is: an answer that cannot be attributed is not evidence, and here "not evidence" is being
+ * read as permission.
  */
 
 import { xeroGet } from './api'
@@ -124,7 +137,7 @@ type XeroInvoiceNumberLookupResponse = {
 const LIST_SEPARATOR = ','
 
 type LookupDeps = {
-  get: <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
+  get: <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string; tenantId?: string }>
 }
 
 function asString(value: unknown): string | undefined {
@@ -166,7 +179,7 @@ export async function lookupXeroInvoiceNumberClaim(
     }
   }
 
-  let res: { ok: boolean; status: number; data?: XeroInvoiceNumberLookupResponse; error?: string }
+  let res: { ok: boolean; status: number; data?: XeroInvoiceNumberLookupResponse; error?: string; tenantId?: string }
   try {
     res = await deps.get<XeroInvoiceNumberLookupResponse>(
       `Invoices?InvoiceNumbers=${encodeURIComponent(wanted)}&page=1&pageSize=${PAGE_SIZE}`,
@@ -182,6 +195,23 @@ export async function lookupXeroInvoiceNumberClaim(
   }
   if (!res.data || !Array.isArray(res.data.Invoices)) {
     return { ok: false, error: 'the invoice-number lookup returned no Invoices array' }
+  }
+  // WHICH ORGANISATION ANSWERED, OR NO ANSWER AT ALL (Codex round 7, finding 2).
+  //
+  // The verdict this produces is spent later, on a WRITE, and which organisation that write lands in
+  // is resolved separately — so the caller has to be able to state the ledger its permission came
+  // from and re-check it against the tenant the outgoing request actually carries. An answer nobody
+  // can attribute cannot be bound to anything, and an unbound "nobody holds this number" is a
+  // sentence that ANY organisation satisfies, including one where the number is held. Failing closed
+  // costs a retry; the alternative is the overwrite this whole module exists to prevent.
+  const tenantId = typeof res.tenantId === 'string' ? res.tenantId.trim() : ''
+  if (!tenantId) {
+    return {
+      ok: false,
+      error:
+        `the invoice-number lookup for ${wanted} did not report which organisation answered it, so its answer `
+        + 'cannot be bound to the organisation the post would be sent to',
+    }
   }
 
   const rows = res.data.Invoices
@@ -229,5 +259,5 @@ export async function lookupXeroInvoiceNumberClaim(
     claims.push(claim)
   }
 
-  return { ok: true, claims }
+  return { ok: true, claims, tenantId }
 }

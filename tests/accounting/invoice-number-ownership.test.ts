@@ -35,11 +35,14 @@ function claim(invoiceId: string, overrides: Partial<LedgerInvoiceClaim> = {}): 
   }
 }
 
+/** The organisation every fixture's answer came from — see ANSWERED_BY below. */
+const LEDGER = 'tenant-answering'
+
 function heldBy(...claims: LedgerInvoiceClaim[]): InvoiceNumberLookup {
-  return { ok: true, claims }
+  return { ok: true, claims, tenantId: LEDGER }
 }
 
-const UNCLAIMED: InvoiceNumberLookup = { ok: true, claims: [] }
+const UNCLAIMED: InvoiceNumberLookup = { ok: true, claims: [], tenantId: LEDGER }
 
 test('a number nobody holds is posted', () => {
   const decision = decideInvoiceNumberPost({
@@ -349,4 +352,47 @@ test('the identity is not what gets posted — it never rewrites the customer’
   // posting a document numbered differently from the one the customer holds.
   const verbatim = 'INV-164981'
   assert.notEqual(xeroInvoiceNumberIdentity(verbatim), verbatim)
+})
+
+// ---------------------------------------------------------------------------
+// ANSWERED_BY — a permission carries the ledger that granted it (Codex round 7, finding 2).
+//
+// The verdict is spent later, on a write, and which organisation that write lands in is resolved
+// separately. So a permission that cannot say which organisation it came from is a permission that
+// any organisation can be made to satisfy — including one where the number is held by a live
+// document. Both routes to `post: true` carry it, and nothing else does.
+// ---------------------------------------------------------------------------
+
+test('an UNCLAIMED permission names the ledger that said so', () => {
+  const decision = decideInvoiceNumberPost({
+    invoiceNumber: '164981',
+    lookup: UNCLAIMED,
+    ownedInvoiceId: null,
+    orderLabel: 'order WC-164981',
+  })
+  assert.equal(decision.post, true)
+  assert.equal(decision.post && decision.answeredByTenantId, LEDGER)
+})
+
+test('an OWN-DOCUMENT permission names the ledger that said so', () => {
+  const decision = decideInvoiceNumberPost({
+    invoiceNumber: '164981',
+    lookup: heldBy(claim(OURS)),
+    ownedInvoiceId: OURS,
+    orderLabel: 'order WC-164981',
+  })
+  assert.equal(decision.post, true)
+  assert.equal(decision.post && decision.answeredByTenantId, LEDGER)
+})
+
+test('the ledger on the permission is the one that ANSWERED, not a constant', () => {
+  // If this were sourced anywhere other than the lookup it would be a second reading of "the current
+  // connection", which is exactly the stale read the binding exists to remove.
+  const decision = decideInvoiceNumberPost({
+    invoiceNumber: '164981',
+    lookup: { ok: true, claims: [], tenantId: 'some-other-org' },
+    ownedInvoiceId: null,
+    orderLabel: 'order WC-164981',
+  })
+  assert.equal(decision.post && decision.answeredByTenantId, 'some-other-org')
 })

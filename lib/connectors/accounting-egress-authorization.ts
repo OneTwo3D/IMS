@@ -40,6 +40,13 @@
  * evaluation site. Its verdict is a pure function of an `auth` that is fixed for the whole call, so
  * being re-asked per attempt (see below) is idempotent and costs one string comparison.
  *
+ * THAT COLLAPSE IS NOW A RENAME RATHER THAN A REWRITE (r7). Every authorisation is handed the
+ * `auth.tenantId` of the request on the point of leaving — see {@link AccountingEgressRequest} —
+ * which is the exact argument realm's function already takes. The reason it is here is that this
+ * branch needed the same binding for its own question: an answer obtained from one organisation
+ * cannot license a write to another, and the only place the two tenants can be compared without a
+ * re-resolution in between is this one.
+ *
  * ------------------------------------------------------------------------------------------------
  * WHY A PARAMETER WOULD NOT DO
  * ------------------------------------------------------------------------------------------------
@@ -65,6 +72,30 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks'
 
+/**
+ * WHAT THE REQUEST ON THE POINT OF LEAVING ACTUALLY IS (o3d-k26m.5 r7, finding 2).
+ *
+ * An authorisation is a statement about an ACT, and half of this act is WHICH LEDGER it lands in. A
+ * verdict reached without that half is a verdict about some other request: the invoice-number fence
+ * asked one organisation who holds a number and then let the post go to whichever organisation the
+ * request happened to resolve — so a reconnect between the two (a second Xero org authorised, a
+ * tenant re-pin, a token refresh that lands on a different tenant) turned an answer about org A into
+ * a permission to overwrite in org B, where nobody had been asked anything.
+ *
+ * `tenantId` is therefore not context or diagnostics. It is the SAME STRING the outgoing request
+ * carries in `Xero-Tenant-Id`, taken from the `auth` the request was built from, handed to every
+ * authorisation as the last thing before the socket. An authorisation that cares which ledger it is
+ * talking to compares against this and nothing else — never against a tenant it read earlier, which
+ * is the stale read this parameter exists to retire.
+ *
+ * The field is named for the ledger's own identity, so QuickBooks' realmId lands here too when its
+ * egress is threaded through this seam.
+ */
+export type AccountingEgressRequest = {
+  /** The ledger the request is addressed to, exactly as the outgoing header spells it. */
+  tenantId: string
+}
+
 export type AccountingEgressAuthorization = {
   /** The connector whose egress this authorises, e.g. `'xero'`. Requests by others ignore it. */
   connector: string
@@ -73,10 +104,11 @@ export type AccountingEgressAuthorization = {
   /**
    * Why the request about to be sent must not be — or `null` to let it through.
    *
-   * Called immediately before the bytes move, ON EVERY ATTEMPT (see `accountingEgressRefusal`). It may
-   * read and write the database; it must not perform the act it is authorising.
+   * Called immediately before the bytes move, ON EVERY ATTEMPT (see `accountingEgressRefusal`), and
+   * given the request it is authorising. It may read and write the database; it must not perform the
+   * act it is authorising.
    */
-  authorize: () => Promise<string | null>
+  authorize: (request: AccountingEgressRequest) => Promise<string | null>
 }
 
 const scope = new AsyncLocalStorage<readonly AccountingEgressAuthorization[]>()
@@ -126,14 +158,23 @@ export function currentAccountingEgressAuthorizations(connector: string): readon
  * attempt, so a rival cannot slip in behind a retry — and it re-checks, in the database, that the row
  * is still this worker's to post from. An authorisation whose inputs are fixed pays one redundant
  * evaluation for this; an authorisation whose inputs are a lease would otherwise be unsound.
+ *
+ * `request` IS PART OF THE QUESTION, NOT CONTEXT FOR IT (r7). Every authorisation is asked about the
+ * request that is about to leave, described by the `auth` it was built from — see
+ * {@link AccountingEgressRequest}. That is what lets an authorisation bind an answer it obtained
+ * earlier to the ledger the write is actually addressed to, at the one instant where the two can be
+ * compared without a second resolution in between.
  */
-export async function accountingEgressRefusal(connector: string): Promise<string | null> {
+export async function accountingEgressRefusal(
+  connector: string,
+  request: AccountingEgressRequest,
+): Promise<string | null> {
   const entries = scope.getStore()
   if (!entries || entries.length === 0) return null
 
   for (const entry of entries) {
     if (entry.connector !== connector) continue
-    const refusal = await entry.authorize()
+    const refusal = await entry.authorize(request)
     if (refusal) return refusal
   }
   return null
