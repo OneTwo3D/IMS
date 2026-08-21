@@ -26,6 +26,8 @@ const state = {
   shipmentLines: [] as Row[],
   refundLines: [] as Row[],
   shipments: [] as Row[],
+  /** RETURN_INBOUND movements: WHICH goods a restocking refund actually received back. */
+  returnMovements: [] as Row[],
   allocationCount: 1,
   /** ('shipmentId', 'targetStatus') for every transition actually attempted. */
   transitions: [] as Array<[string, string]>,
@@ -82,12 +84,42 @@ mock.module('@/lib/db', {
           if (!select?.refund) {
             throw new Error('salesOrderRefundLine.findMany double: production stopped selecting `refund`')
           }
+          if (!select?.refundId) {
+            throw new Error('salesOrderRefundLine.findMany double: production stopped selecting `refundId`')
+          }
           return state.refundLines.map((row) => {
             if (!row.refund) {
               throw new Error(`refund line fixture must state its refund: ${JSON.stringify(row)}`)
             }
+            if (!row.refundId) {
+              throw new Error(`refund line fixture must state which refund it belongs to: ${JSON.stringify(row)}`)
+            }
             return { ...row }
           })
+        },
+      },
+      /**
+       * The per-product record of what actually came back (round 5). Refuses any query shape it
+       * does not model, so a production read that dropped the RETURN_INBOUND filter — and so
+       * counted a sale dispatch or a Mintsoft return as refund evidence — fails here rather than
+       * quietly answering with the whole table.
+       */
+      stockMovement: {
+        findMany: async ({ where }: { where?: Row } = {}) => {
+          const clause = (where ?? {}) as Row
+          const unmodelled = Object.keys(clause).filter(
+            (k) => k !== 'type' && k !== 'referenceType' && k !== 'referenceId',
+          )
+          if (unmodelled.length > 0) {
+            throw new Error(`stockMovement.findMany double got an unmodelled where: ${JSON.stringify(where)}`)
+          }
+          if (clause.type !== 'RETURN_INBOUND' || clause.referenceType !== 'SalesOrderRefund') {
+            throw new Error(`stockMovement.findMany double: unexpected filter ${JSON.stringify(where)}`)
+          }
+          const ids = ((clause.referenceId as { in?: string[] } | undefined)?.in ?? []) as string[]
+          return state.returnMovements
+            .filter((row) => ids.includes(String(row.referenceId)))
+            .map((row) => ({ ...row }))
         },
       },
       orderAllocation: { count: async () => state.allocationCount },
@@ -140,17 +172,24 @@ mock.module('@/lib/products/kit-fulfillment', {
 })
 
 /** A refund that cancelled goods which never moved: nothing to receive back, no chargeback. */
-const CANCELLED_BEFORE_DISPATCH = { returnWarehouseId: null, chargeback: false }
-/** A refund that RESTOCKED goods — they can only come back if they went out. */
-const RETURNED_TO_STOCK = { returnWarehouseId: 'wh-returns', chargeback: false }
+const CANCELLED_BEFORE_DISPATCH = { returnWarehouseId: null, chargeback: false, accountingRetryRequired: false }
+/**
+ * A refund that RESTOCKED goods — they can only come back if they went out. Round 5: the COLUMN
+ * only says a restock was attempted; `state.returnMovements` says which units actually arrived, and
+ * that is what the refund is measured by.
+ */
+const RETURNED_TO_STOCK = { returnWarehouseId: 'wh-returns', chargeback: false, accountingRetryRequired: false }
 /** A chargeback: scjz.70 suppresses restock precisely because the customer KEEPS the goods. */
-const KEPT_BY_CUSTOMER = { returnWarehouseId: null, chargeback: true }
+const KEPT_BY_CUSTOMER = { returnWarehouseId: null, chargeback: true, accountingRetryRequired: false }
+/** A restock whose return movements are still owed to the accounting-retry transaction. */
+const RETURN_STILL_OWED = { returnWarehouseId: 'wh-returns', chargeback: false, accountingRetryRequired: true }
 
 function reset() {
   state.order = { id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', status: 'ALLOCATED', refundStatus: 'NONE' }
   state.orderLines = []
   state.shipmentLines = []
   state.refundLines = []
+  state.returnMovements = []
   state.shipments = [{ id: 'shp-1', status: 'PACKED' }]
   state.allocationCount = 1
   state.transitions = []
@@ -228,7 +267,7 @@ test('refunded units are netted out of demand, so a part-refunded order is not p
   reset()
   state.order.refundStatus = 'PARTIAL'
   state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
-  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 6, refund: CANCELLED_BEFORE_DISPATCH }]
+  state.refundLines = [{ refundId: 'ref-1', salesOrderLineId: 'line-1', productId: 'p-1', qty: 6, refund: CANCELLED_BEFORE_DISPATCH }]
   state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 4 }]
 
   const result = await apply()
@@ -260,7 +299,7 @@ test('a FULL refund that really returned the goods nets to zero and proceeds', a
   state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
   // Quantity-bearing refund lines are what actually cancel goods, and the per-leaf
   // subtraction already handles them. No short-circuit is needed to reach zero demand.
-  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 10, refund: CANCELLED_BEFORE_DISPATCH }]
+  state.refundLines = [{ refundId: 'ref-1', salesOrderLineId: 'line-1', productId: 'p-1', qty: 10, refund: CANCELLED_BEFORE_DISPATCH }]
   state.shipmentLines = []
 
   const result = await apply()
@@ -340,7 +379,9 @@ test('a RESTOCKING partial refund does not excuse an uncovered dispatch', async 
   state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
   state.shipments = [{ id: 'shp-1', status: 'SHIPPED' }, { id: 'shp-2', status: 'PACKED' }]
   state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 6 }]
-  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 6, refund: RETURNED_TO_STOCK }]
+  state.refundLines = [{ refundId: 'ref-1', salesOrderLineId: 'line-1', productId: 'p-1', qty: 6, refund: RETURNED_TO_STOCK }]
+  // All six came back, so all six are goods that left: the restock is fully measured.
+  state.returnMovements = [{ referenceId: 'ref-1', productId: 'p-1', qty: 6 }]
 
   const result = await apply()
 
@@ -359,7 +400,7 @@ test('a CHARGEBACK refund does not excuse an uncovered dispatch either', async (
   state.order.refundStatus = 'PARTIAL'
   state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
   state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 3 }]
-  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 7, refund: KEPT_BY_CUSTOMER }]
+  state.refundLines = [{ refundId: 'ref-1', salesOrderLineId: 'line-1', productId: 'p-1', qty: 7, refund: KEPT_BY_CUSTOMER }]
 
   const result = await apply()
 
@@ -378,10 +419,145 @@ test('a restocking refund on a FULLY covered dispatch still proceeds', async () 
   state.order.refundStatus = 'PARTIAL'
   state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
   state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 10 }]
-  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 6, refund: RETURNED_TO_STOCK }]
+  state.refundLines = [{ refundId: 'ref-1', salesOrderLineId: 'line-1', productId: 'p-1', qty: 6, refund: RETURNED_TO_STOCK }]
+  state.returnMovements = [{ referenceId: 'ref-1', productId: 'p-1', qty: 6 }]
 
   const result = await apply()
 
   assert.deepEqual(result, { success: true })
   assert.deepEqual(state.transitions, [['shp-1', 'SHIPPED']])
+})
+
+/**
+ * ROUND 5: a refund-level mark cannot answer a line-level question.
+ *
+ * `returnWarehouseId` is a column on the REFUND. One WooCommerce "Refund" press routinely mixes
+ * goods that went out with goods that never did — the customer returns what arrived and cancels
+ * what was still on back-order — and reading the mark per refund classified all of it as goods that
+ * left. In this direction the error is not a missed under-booking but a PERMANENT REFUSAL: units
+ * nobody ever shipped stay in demand, no shipment line can ever cover them, and every redelivery of
+ * the 3PL dispatch is refused for them.
+ *
+ * The RETURN_INBOUND movements are the record of which goods actually came back, at the granularity
+ * the question is asked. `buildRefundFallbackReturnRows` already refuses to restock a line with no
+ * SHIPPED shipment behind it, so the movements are exactly the units that could have come back.
+ */
+
+test('a restocking refund that MIXES returned and cancelled units nets only the cancelled ones', async () => {
+  reset()
+  // Order 10. Six shipped and dispatched; the customer returned those six AND cancelled the four
+  // that never made it onto a shipment, on one refund. Only the six have a return movement.
+  //
+  // Read per refund, all ten are "goods that left": demand stays 10 against coverage 6 and the
+  // dispatch is refused for four units that were never shipped and never will be. Read per product,
+  // six are goods that left and four are an ordinary cancellation that nets — demand 6, coverage 6.
+  state.order.refundStatus = 'PARTIAL'
+  state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
+  state.shipments = [{ id: 'shp-1', status: 'SHIPPED' }]
+  state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 6 }]
+  state.refundLines = [{ refundId: 'ref-1', salesOrderLineId: 'line-1', productId: 'p-1', qty: 10, refund: RETURNED_TO_STOCK }]
+  state.returnMovements = [{ referenceId: 'ref-1', productId: 'p-1', qty: 6 }]
+
+  const result = await apply()
+
+  assert.deepEqual(result, { success: true })
+})
+
+test('a cancelled LINE of a restocking refund nets even when another line of it came back', async () => {
+  reset()
+  // The same mixing across PRODUCTS: p-1 shipped and was returned, p-2 never shipped at all and was
+  // cancelled on the same refund. p-2 has no return movement, so nothing was received back for it.
+  state.order.refundStatus = 'PARTIAL'
+  state.orderLines = [
+    { id: 'line-1', productId: 'p-1', qty: 6, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } },
+    { id: 'line-2', productId: 'p-2', qty: 4, sku: 'GADGET', description: 'Gadget', product: { type: 'SIMPLE' } },
+  ]
+  state.shipments = [{ id: 'shp-1', status: 'SHIPPED' }]
+  state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 6 }]
+  state.refundLines = [
+    { refundId: 'ref-1', salesOrderLineId: 'line-1', productId: 'p-1', qty: 6, refund: RETURNED_TO_STOCK },
+    { refundId: 'ref-1', salesOrderLineId: 'line-2', productId: 'p-2', qty: 4, refund: RETURNED_TO_STOCK },
+  ]
+  state.returnMovements = [{ referenceId: 'ref-1', productId: 'p-1', qty: 6 }]
+
+  const result = await apply()
+
+  // Line 1 still holds its six against six of coverage; line 2's four net away entirely.
+  assert.deepEqual(result, { success: true })
+})
+
+test('a restock that received NOTHING back nets like the cancellation it is', async () => {
+  reset()
+  // A refund routed to a returns warehouse whose lines had no SHIPPED shipment behind them:
+  // `buildRefundFallbackReturnRows` refuses to restock those, so no movement is written and no
+  // goods came back. The column alone would hold all ten units of demand up against a dispatch
+  // that has nothing to cover them with, forever.
+  state.order.refundStatus = 'FULL'
+  state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
+  state.shipmentLines = []
+  state.refundLines = [{ refundId: 'ref-1', salesOrderLineId: 'line-1', productId: 'p-1', qty: 10, refund: RETURNED_TO_STOCK }]
+  state.returnMovements = []
+
+  const result = await apply()
+
+  assert.deepEqual(result, { success: true })
+})
+
+test('a restock whose return is still OWED holds demand up, because nothing has been measured yet', async () => {
+  reset()
+  // `accountingRetryRequired` means the RETURN_INBOUND movements are written by a LATER transaction
+  // (refund-service.ts defers them when accounting staging failed). An empty measurement there means
+  // "not yet", not "nothing came back", so the mark stands for the whole refund — the recoverable
+  // direction, which clears itself when the retry writes the movements.
+  state.order.refundStatus = 'PARTIAL'
+  state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
+  state.shipments = [{ id: 'shp-1', status: 'SHIPPED' }]
+  state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 6 }]
+  state.refundLines = [{ refundId: 'ref-1', salesOrderLineId: 'line-1', productId: 'p-1', qty: 6, refund: RETURN_STILL_OWED }]
+  state.returnMovements = []
+
+  const result = await apply()
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /WIDGET \(4 of 10 uncovered\)/)
+  assert.equal(state.transitions.length, 0)
+})
+
+test('another refund\'s return movements are never borrowed as this one\'s evidence', async () => {
+  reset()
+  // Two restocking refunds on the order; only the FIRST actually received goods back. Keying the
+  // measurement by refund is what stops the second one inheriting the first one's evidence and
+  // holding four units of demand up against a dispatch that already covers them.
+  state.order.refundStatus = 'PARTIAL'
+  state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
+  state.shipments = [{ id: 'shp-1', status: 'SHIPPED' }]
+  state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 6 }]
+  state.refundLines = [
+    { refundId: 'ref-1', salesOrderLineId: 'line-1', productId: 'p-1', qty: 6, refund: RETURNED_TO_STOCK },
+    { refundId: 'ref-2', salesOrderLineId: 'line-1', productId: 'p-1', qty: 4, refund: RETURNED_TO_STOCK },
+  ]
+  state.returnMovements = [{ referenceId: 'ref-1', productId: 'p-1', qty: 6 }]
+
+  const result = await apply()
+
+  // ref-1's six are goods that left and stay in demand; ref-2's four never came back and net away.
+  assert.deepEqual(result, { success: true })
+})
+
+test('a KIT restock is measured in LEAF units, per component', async () => {
+  reset()
+  // Two kits refunded with a restock, but only the comp-a units were received back. comp-b's two
+  // units never came back, so they are a cancellation and net — while comp-a's four hold their
+  // demand up against the four that shipped.
+  state.order.refundStatus = 'PARTIAL'
+  state.kits.set('kit-1', [{ componentId: 'comp-a', qty: 2 }, { componentId: 'comp-b', qty: 1 }])
+  state.orderLines = [{ id: 'line-1', productId: 'kit-1', qty: 2, sku: 'KIT-1', description: 'Kit', product: { type: 'KIT' } }]
+  state.shipments = [{ id: 'shp-1', status: 'SHIPPED' }]
+  state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'comp-a', qty: 4 }]
+  state.refundLines = [{ refundId: 'ref-1', salesOrderLineId: 'line-1', productId: 'kit-1', qty: 2, refund: RETURNED_TO_STOCK }]
+  state.returnMovements = [{ referenceId: 'ref-1', productId: 'comp-a', qty: 4 }]
+
+  const result = await apply()
+
+  assert.deepEqual(result, { success: true })
 })

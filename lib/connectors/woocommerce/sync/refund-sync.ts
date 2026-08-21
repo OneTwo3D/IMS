@@ -500,11 +500,26 @@ export function refundedOrderLineId(rl: WcRefundLineItem): number {
 }
 
 /**
- * WooCommerce pages `/orders/{id}/refunds` at TEN unless asked otherwise, and 100 is the most
- * it will serve. Asking for the maximum is not an optimisation here — see
+ * The page size this walk ASKS FOR. WooCommerce pages `/orders/{id}/refunds` at TEN unless asked
+ * otherwise, and 100 is the most core will serve.
+ *
+ * It is a REQUEST, NOT A GRANT. A store is free to answer with fewer — a `rest_post_per_page`
+ * filter, a security plugin shedding load, a proxy trimming a response — and it does so with its
+ * own page size and no error at all. Nothing here may therefore be inferred from this number; see
  * `fetchAllWcRefundsForOrder`.
  */
 const WC_REFUND_PAGE_SIZE = 100
+
+/**
+ * A hard ceiling on one order's walk, because the walk no longer ends on a length (below) and a
+ * store that ignores `page` would otherwise be asked forever. Hitting it is reported as an
+ * INCOMPLETE read rather than passed off as the end of the collection.
+ *
+ * Fifty pages is 5,000 refunds at the size asked for, and still 500 against a store that caps
+ * `per_page` at the WooCommerce default of ten — comfortably past any real order, and cheap,
+ * because an order with no refunds costs exactly one request either way.
+ */
+const WC_REFUND_MAX_PAGES = 50
 
 async function logIncompleteRefundRead(
   externalOrderId: number,
@@ -549,25 +564,88 @@ async function logIncompleteRefundRead(
  * the same truncated page. The truncation therefore does not merely lose refund history; it
  * blocks fulfilment on the orders that have the most of it.
  *
- * Bounded twice over: by `x-wp-totalpages` when the store reports it, and by a page that comes
- * back shorter than it asked for, so a store that reports no total (or an implausible one)
- * still terminates.
+ * WHAT ENDS THE WALK, and why neither of the two things that used to is allowed to any more.
  *
- * A page that FAILS returns what was read so far together with the error, which is the same
- * leniency the single-page version had for a failed fetch — the caller syncs what it has, and
- * the next sweep re-reads the order from the start, because nothing here is cursored. It is
- * also LOGGED, here rather than at the call site, because this is the only frame that knows
- * the read was short: one page further up, a partial list and a complete one are the same
- * value, which is exactly how the ten-refund truncation stayed invisible for as long as it
- * did.
+ * `x-wp-totalpages` CANNOT end it. `wcFetch` parses it as `parseInt(header ?? '1')`, so a store
+ * that never sends the header is INDISTINGUISHABLE from one reporting a single page: both arrive
+ * as `totalPages: 1`. Ending on that number takes "the store said nothing" for "the store said
+ * there is no more", which is the original one-page defect moved a layer out.
+ *
+ * A SHORT PAGE CANNOT END IT EITHER. `per_page=100` is a request, not a grant. A store capping
+ * below it answers with its own page size and no error, so EVERY page is short and the walk stops
+ * after the first one — the exact truncation this function exists to remove, reinstated. Measuring
+ * against the size the store granted on page one does not save it: a granted size is not a promise
+ * and nothing makes it stable across requests (a proxy trims one response, a plugin sheds load
+ * mid-walk, a host lowers a filter between two calls), and a hundred then forty is indistinguishable
+ * from the end of a collection.
+ *
+ * So an ending is not inferred from a length at all:
+ *
+ *   • AN EMPTY PAGE ENDS THE WALK. Whatever the store served before it, a page with nothing on it
+ *     lies past the end of the collection, so everything the collection holds is already banked.
+ *     That is the only unconditional proof of an ending available to a client.
+ *   • A NON-EMPTY PAGE OF ANY LENGTH ADVANCES. Only the next request can tell a trimmed page from
+ *     a last one.
+ *
+ * The cost is ONE EXTRA REQUEST per order whose refunds do not fill their last page. An order with
+ * no refunds still costs one (the first page is the empty one); an order inside a single page costs
+ * two, which is what it cost before, because page one could never end the walk on its own length
+ * either. Paid deliberately: an under-read here REFUSES a dispatch (see above), and the alternative
+ * is refusing it on every sweep forever.
+ *
+ * AND WHAT THE STORE SAYS IT HOLDS IS CHECKED AGAINST WHAT IT SERVED. `x-wp-total` can never END
+ * the walk — a store omitting it arrives as 0, and a header cannot prove a body — but banking FEWER
+ * rows than the store claims is proof of the opposite and is reported as incomplete. It is the one
+ * thing that catches a page trimmed BETWEEN two others, where no length rule can help: those rows
+ * are simply never served and the walk still terminates cleanly on a later empty page. The SMALLEST
+ * total stated anywhere in the walk is used, so a refund CREATED mid-walk raises the claim on a
+ * later page without turning a complete read into a permanent refusal.
+ *
+ * AND NONE OF THAT IS ABOUT THE COLLECTION — only about the pages cut out of it. `?page=N` asks for
+ * rows by POSITION in whatever is there when you ask, so a refund DELETED behind the cursor shifts
+ * every later row down one and the row that was going to open the next page is served to nobody.
+ * Every page is full, the walk ends on an empty one, and the stated-total guard BALANCES EXACTLY,
+ * because the list still carries the id of the deleted row — it is one too long by precisely the
+ * amount it is one too short. Two deletions cancel twice. No arithmetic over a single walk recovers
+ * the difference.
+ *
+ * What a single walk CAN see is the same motion running the other way. WooCommerce lists refunds
+ * newest first, so a refund CREATED mid-walk takes offset 0 and pushes a row already read onto the
+ * next page: A REPEATED ID INSIDE ONE WALK. Offsets do not overlap, so a repeat happens only when
+ * the list moved, and it is reported as incomplete rather than banked twice.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT DO IS READ TWICE. The dismissal path in
+ * `app/actions/sync-exceptions.ts` runs its walk twice and requires the answers to agree, because
+ * its output AUTHORISES writing a refund off and a short list is indistinguishable from proof that
+ * a refund is absent. This walk's output only ever WITHHOLDS: a refund that does not arrive is
+ * demand `findExternalFulfillmentShortfall` never nets, so the coverage check REFUSES a dispatch —
+ * and no list, however short, can approve one. A refusal is retried by the next sweep from page one.
+ *
+ * AN INCOMPLETE READ — a failed page, a moved list, a short-of-stated-total walk, the page ceiling
+ * — returns what was read so far TOGETHER WITH THE ERROR, which is the same leniency the
+ * single-page version had for a failed fetch: syncing nine of ten refunds beats syncing none. It is
+ * LOGGED here rather than at the call site, because this is the only frame that can see the shape
+ * of the read.
+ *
+ * But logging it is not the same as ACTING on it, and the log alone was the round-4 gap:
+ * `syncRefundsForOrder` dropped the error and returned a bare count, so the webhook acknowledged
+ * its delivery and the order-import sweep ADVANCED ITS CURSOR over an order whose refunds it had
+ * only partly read. `error` therefore travels all the way out — see `RefundSweepResult` — so a
+ * caller can retry the delivery or hold the cursor instead of treating a partial list as the lot.
  */
 export async function fetchAllWcRefundsForOrder(
   externalOrderId: number,
 ): Promise<{ refunds: WcRefund[]; error?: string }> {
   const refunds: WcRefund[] = []
-  let page = 1
-  for (;;) {
-    const { data, totalPages, error } = await wcFetch(`/orders/${externalOrderId}/refunds`, {
+  // Every id banked so far, so a REPEATED one is caught. A repeat is not a WooCommerce quirk: it is
+  // the signature of a collection that shifted under a positional read.
+  const seen = new Set<number>()
+  // The SMALLEST refund count the store stated anywhere in this walk, or null if it never stated
+  // one — a store that omits `x-wp-total` arrives here as 0, which is not a claim about anything.
+  let statedTotal: number | null = null
+
+  for (let page = 1; page <= WC_REFUND_MAX_PAGES; page += 1) {
+    const { data, totalItems, error } = await wcFetch(`/orders/${externalOrderId}/refunds`, {
       per_page: String(WC_REFUND_PAGE_SIZE),
       page: String(page),
     })
@@ -577,19 +655,58 @@ export async function fetchAllWcRefundsForOrder(
       await logIncompleteRefundRead(externalOrderId, page, refunds.length, detail)
       return { refunds, error: detail }
     }
+    if (Number.isFinite(totalItems) && totalItems > 0) {
+      statedTotal = statedTotal === null ? totalItems : Math.min(statedTotal, totalItems)
+    }
 
-    refunds.push(...(data as WcRefund[]))
-    // A page shorter than the one asked for is the last page, whatever any header claims.
-    if (data.length < WC_REFUND_PAGE_SIZE) return { refunds }
-    const reportedPages = Number.isFinite(totalPages) && totalPages > 0 ? totalPages : 1
-    if (page >= reportedPages) return { refunds }
-    page += 1
+    for (const entry of data as WcRefund[]) {
+      const id = entry?.id
+      // An entry with no readable id cannot prove motion either way, so it is banked as before and
+      // left to `syncWcRefund` — which is where an unusable refund payload is already handled.
+      if (typeof id === 'number' && Number.isSafeInteger(id)) {
+        if (seen.has(id)) {
+          const detail = `WooCommerce served refund ${id} twice, on different pages, so its refund list `
+            + 'moved between two requests of this read'
+          await logIncompleteRefundRead(externalOrderId, page, refunds.length, detail)
+          return { refunds, error: detail }
+        }
+        seen.add(id)
+      }
+      refunds.push(entry)
+    }
+
+    // THE ONLY PROOF OF AN ENDING. Checked after banking, so the empty page itself contributes
+    // nothing, and before advancing, so an order with no refunds costs exactly one request.
+    if (data.length === 0) {
+      if (statedTotal !== null && refunds.length < statedTotal) {
+        const detail = `WooCommerce says that order has ${statedTotal} refunds but served only `
+          + `${refunds.length} of them`
+        await logIncompleteRefundRead(externalOrderId, page, refunds.length, detail)
+        return { refunds, error: detail }
+      }
+      return { refunds }
+    }
   }
+
+  const detail = `the refund list did not end within ${WC_REFUND_MAX_PAGES} pages`
+  await logIncompleteRefundRead(externalOrderId, WC_REFUND_MAX_PAGES, refunds.length, detail)
+  return { refunds, error: detail }
 }
 
-export async function syncRefundsForOrder(externalOrderId: number): Promise<number> {
+/**
+ * What one order's refund sweep did, and WHETHER IT SAW THE WHOLE LIST.
+ *
+ * `synced` alone cannot answer the second question: a count is the same number whether the walk
+ * read every refund or gave up on page two, which is how a partial read used to pass for a
+ * complete one at every call site. `complete: false` means refunds on this order are still
+ * unread — the caller must NOT treat the sweep as having settled the order (acknowledge a webhook
+ * delivery, advance an import cursor, or conclude a refund is absent from the store).
+ */
+export type RefundSweepResult = { synced: number; complete: boolean; error?: string }
+
+export async function syncRefundsForOrder(externalOrderId: number): Promise<RefundSweepResult> {
   // Every page of refunds on the order, not just the first (o3d-okbd).
-  const { refunds } = await fetchAllWcRefundsForOrder(externalOrderId)
+  const { refunds, error } = await fetchAllWcRefundsForOrder(externalOrderId)
   let synced = 0
 
   for (const refund of refunds) {
@@ -601,5 +718,8 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<numb
     if (result.success) synced++
   }
 
-  return synced
+  // The refunds that WERE read are still synced — that is the deliberate leniency above. What
+  // changes is that the caller is told the list was short, instead of inferring completeness from
+  // a number that cannot carry it.
+  return { synced, complete: error === undefined, error }
 }

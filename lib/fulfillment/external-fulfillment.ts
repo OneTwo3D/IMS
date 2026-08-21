@@ -191,9 +191,10 @@ const EXTERNAL_FULFILLMENT_QTY_EPSILON = new Prisma.Decimal('0.000001')
  * A refund that genuinely cancels goods — one whose line quantities describe goods that never
  * moved — still nets to zero, one leaf at a time, through the per-line subtraction below: that
  * is what quantity-bearing refund lines are for. A refund that returned no quantities leaves
- * demand standing, and so does one whose own record says the goods already left (a restock, a
- * chargeback — see `refundEvidencesGoodsLeft`, which is the same retrospective reasoning
- * applied to partial refunds). Either way the shipment lines have to cover the demand or the
+ * demand standing, and so do the units whose own record says the goods already left — a restock
+ * measured by its RETURN_INBOUND movements, or a chargeback (see `refundEvidencesGoodsLeft` and
+ * `refundGoodsLeftIsUnmeasured`, which are the same retrospective reasoning applied per PRODUCT
+ * rather than per refund). Either way the shipment lines have to cover the demand or the
  * dispatch is refused. Nothing loops on that refusal — this gate runs once, on an inbound
  * dispatch, not on a rotating selector.
  *
@@ -231,12 +232,56 @@ const EXTERNAL_FULFILLMENT_QTY_EPSILON = new Prisma.Decimal('0.000001')
  * What still nets, and must: a quantity-bearing refund with neither mark. That is the ordinary
  * cancellation of a line that never shipped — no return warehouse because there is nothing to
  * receive back — and it is what round 2's "nets to zero, one leaf at a time" was describing.
+ *
+ * ROUND 5: A REFUND-LEVEL MARK CANNOT ANSWER A LINE-LEVEL QUESTION.
+ *
+ * `returnWarehouseId` is a column on the REFUND, and one refund routinely mixes goods that went out
+ * with goods that never did: the customer returns the two units that shipped and cancels the three
+ * that were still on back-order, on one WooCommerce "Refund" press. Reading the mark per refund
+ * classified all five the same way, and in this direction the error is not a missed under-booking
+ * but a PERMANENT REFUSAL — the three cancelled units stay in demand, no shipment line can ever
+ * cover them, and every redelivery of the 3PL dispatch is refused for goods nobody ever shipped.
+ *
+ * `buildRefundFallbackReturnRows` already draws the line this needs, and it draws it PER PRODUCT: it
+ * refuses to restock a line with no SHIPPED shipment behind it, caps the rest at what was dispatched
+ * less what earlier refunds took back, and `applyReturnInboundStockTx` books a RETURN_INBOUND
+ * movement for exactly the units that survived. Those movements are the record of WHICH GOODS CAME
+ * BACK, at the granularity the question is asked — so they, not the column, are what a restocking
+ * refund is measured by here. Units of such a refund BEYOND its return movements were never
+ * received back, so they are the ordinary cancellation above and net as one.
+ *
+ * TWO CASES DELIBERATELY STAY REFUND-LEVEL, because for them the mark IS the line-level fact:
+ *
+ *   • A CHARGEBACK. scjz.70 suppresses restock precisely because the customer keeps the goods, so
+ *     there is no return movement to measure and none is expected. The whole refunded quantity is
+ *     goods that left.
+ *   • A RESTOCK WHOSE RETURN IS STILL OWED (`accountingRetryRequired`). The movement is written in a
+ *     later transaction when accounting staging failed first (refund-service.ts), so an empty
+ *     measurement there means "not yet", not "nothing came back". Treating the mark as covering the
+ *     whole refund holds demand up and refuses — which is the recoverable direction, and clears
+ *     itself when the retry writes the movements.
  */
-function refundEvidencesGoodsLeft(
-  refund: { returnWarehouseId: string | null; chargeback: boolean } | null,
-): boolean {
+type RefundGoodsLeftMarks = {
+  returnWarehouseId: string | null
+  chargeback: boolean
+  accountingRetryRequired: boolean
+}
+
+/** Does this refund's OWN record say goods left, before any per-product measurement? */
+function refundEvidencesGoodsLeft(refund: RefundGoodsLeftMarks | null): boolean {
   if (!refund) return false
   return refund.returnWarehouseId !== null || refund.chargeback
+}
+
+/**
+ * Is the mark the whole answer for this refund, or only the beginning of one?
+ *
+ * True means every refunded unit is goods that left (chargeback, or a restock whose movements have
+ * not been written yet). False means the units that left are exactly the ones with a RETURN_INBOUND
+ * movement behind them, and the remainder is a cancellation.
+ */
+function refundGoodsLeftIsUnmeasured(refund: RefundGoodsLeftMarks): boolean {
+  return refund.chargeback || refund.accountingRetryRequired
 }
 
 export async function findExternalFulfillmentShortfall(
@@ -264,17 +309,54 @@ export async function findExternalFulfillmentShortfall(
     }),
     db.salesOrderRefundLine.findMany({
       where: { refund: { orderId } },
+      // Round 5: a RETURN_INBOUND movement names a product, not a refund LINE, so when one refund
+      // refunds the same product on two order lines they share one measured budget and the order it
+      // is drawn down in decides which line is credited with the return. A stable order at least
+      // makes that decision REPRODUCIBLE — the total netted quantity is the same either way, and
+      // the only way to get it wrong is to hold demand up on the wrong line, which refuses a
+      // dispatch (recoverable) rather than under-booking one (not).
+      orderBy: { id: 'asc' },
       select: {
         salesOrderLineId: true,
         productId: true,
         qty: true,
+        // Which refund this line belongs to, so its return movements can be found (round 5).
+        refundId: true,
         // What the refund itself says about where the goods are (o3d-okbd round 3). Set by the
         // refund writer at creation, never by a caller, so this is a lookup rather than a
         // reconstruction — the same reason `totalsBasis` is persisted.
-        refund: { select: { returnWarehouseId: true, chargeback: true } },
+        refund: {
+          select: {
+            returnWarehouseId: true,
+            chargeback: true,
+            // Round 5: true while the return movements are still owed to a later transaction.
+            accountingRetryRequired: true,
+          },
+        },
       },
     }),
   ])
+
+  // WHICH GOODS ACTUALLY CAME BACK, per refund and per product (round 5). Only asked for refunds
+  // that claim a restock AND have finished writing it — a chargeback books no return movement by
+  // design, and a refund still owing one would read as zero and be mistaken for a cancellation.
+  const measurableRestockRefundIds = [...new Set(
+    refundLines
+      .filter((line) => line.refund
+        && !refundGoodsLeftIsUnmeasured(line.refund)
+        && refundEvidencesGoodsLeft(line.refund))
+      .map((line) => line.refundId),
+  )]
+  const returnedMovements = measurableRestockRefundIds.length > 0
+    ? await db.stockMovement.findMany({
+      where: {
+        type: 'RETURN_INBOUND',
+        referenceType: 'SalesOrderRefund',
+        referenceId: { in: measurableRestockRefundIds },
+      },
+      select: { referenceId: true, productId: true, qty: true },
+    })
+    : []
 
   const shippableLines = orderLines.filter(
     (line): line is typeof line & { productId: string } =>
@@ -300,18 +382,43 @@ export async function findExternalFulfillmentShortfall(
     }
   }
 
+  // Units a MEASURED restocking refund is still entitled to claim as goods that left, keyed by
+  // refund and product and drawn down as its lines are read. Movements are aggregated per
+  // (refund, product) — `applyReturnInboundStockTx` writes them per refund LINE but the row itself
+  // carries no line id — so several refund lines for one product share this budget, which is right:
+  // between them they can only have returned what came back.
+  const returnedBudget = new Map<string, Prisma.Decimal>()
+  for (const movement of returnedMovements) {
+    const budgetKey = key(movement.referenceId ?? '', movement.productId)
+    returnedBudget.set(budgetKey, (returnedBudget.get(budgetKey) ?? new Prisma.Decimal(0)).add(toDecimal(movement.qty)))
+  }
+
   for (const refundLine of refundLines) {
     // An unmatched external refund (no order line, or no product) cannot be attributed to a
     // leaf. Netting it against an arbitrary line would understate demand and hide a real
     // shortfall, so it nets nothing.
     if (!refundLine.salesOrderLineId || !refundLine.productId) continue
-    // ...and neither does a refund the goods have already left the warehouse for.
-    if (refundEvidencesGoodsLeft(refundLine.refund)) continue
+    const marked = refundEvidencesGoodsLeft(refundLine.refund)
+    // A chargeback, or a restock whose movements are still owed: the mark stands for the whole
+    // refund, so none of it nets (round 3's rule, kept where it is still the best evidence).
+    if (marked && refundLine.refund && refundGoodsLeftIsUnmeasured(refundLine.refund)) continue
     for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(refundLine.productId, toDecimal(refundLine.qty), graph)) {
       const leafKey = key(refundLine.salesOrderLineId, componentId)
       const current = demandByLeaf.get(leafKey)
       if (current === undefined) continue
-      demandByLeaf.set(leafKey, current.sub(componentQty))
+      let netQty = componentQty
+      if (marked) {
+        // Only the units with a return movement behind them are goods that left. The rest of this
+        // line was cancelled before it ever shipped, and still nets — that is the whole of round 5.
+        const budgetKey = key(refundLine.refundId, componentId)
+        const budget = returnedBudget.get(budgetKey) ?? new Prisma.Decimal(0)
+        const cameBack = componentQty.gt(0) && budget.gt(0)
+          ? (budget.gte(componentQty) ? componentQty : budget)
+          : new Prisma.Decimal(0)
+        returnedBudget.set(budgetKey, budget.sub(cameBack))
+        netQty = componentQty.sub(cameBack)
+      }
+      demandByLeaf.set(leafKey, current.sub(netQty))
     }
   }
 

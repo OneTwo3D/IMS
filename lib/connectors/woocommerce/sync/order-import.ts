@@ -1250,7 +1250,16 @@ export async function syncNewWcOrders(
           }
         }
         if (mode !== 'poll') {
-          await syncRefundsForOrder(order.id)
+          // The cursor below only advances on a clean run, and a refund list read only in part is
+          // not clean: advancing past this order is what makes the missing refunds permanent, since
+          // nothing here is re-driven by anything else. Recorded as an error so the cursor is HELD
+          // and the next run re-reads this order from the first page (o3d-ecbj r5).
+          const refundSweep = await syncRefundsForOrder(order.id)
+          if (!refundSweep.complete) {
+            result.errors.push(
+              `syncRefundsForOrder #${order.id}: incomplete refund read — ${refundSweep.error ?? 'unknown error'}`,
+            )
+          }
         }
         if (importResult.orderId) result.synced++
         else result.skipped++

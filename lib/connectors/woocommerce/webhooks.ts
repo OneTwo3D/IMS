@@ -335,7 +335,15 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       }
     }
     try {
-      await syncRefundsForOrder(wcOrder.id)
+      // An INCOMPLETE refund read is a failure of this delivery, not a detail of it. The refunds
+      // that were read are already applied, but acknowledging the delivery would retire the only
+      // prompt to come back for the rest — and the missing ones are demand the external-fulfilment
+      // coverage check never nets, so a complete 3PL dispatch is refused until they land. A
+      // retried delivery re-reads the order from page one, so this is self-clearing (o3d-ecbj r5).
+      const refundSweep = await syncRefundsForOrder(wcOrder.id)
+      if (!refundSweep.complete) {
+        failures.push(`syncRefundsForOrder: incomplete refund read — ${refundSweep.error ?? 'unknown error'}`)
+      }
     } catch (e) {
       failures.push(`syncRefundsForOrder: ${e instanceof Error ? e.message : String(e)}`)
     }

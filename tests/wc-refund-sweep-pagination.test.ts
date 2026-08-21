@@ -119,33 +119,39 @@ test('each page is asked for at the maximum size, so the ten-per-page default is
       { path: '/orders/4242/refunds', per_page: '100', page: '1' },
       { path: '/orders/4242/refunds', per_page: '100', page: '2' },
       { path: '/orders/4242/refunds', per_page: '100', page: '3' },
+      // The fourth is the EMPTY page that ends the walk. 205 refunds leave page 3 five rows long,
+      // and a short page proves nothing (round 5).
+      { path: '/orders/4242/refunds', per_page: '100', page: '4' },
     ],
   )
 })
 
-test('paging stops at the last page — it does not walk on past the end of the collection', async () => {
+test('paging stops one page PAST the last refund — an empty page, not a short one', async () => {
+  // 150 refunds is a full page and a half. The half-full page does NOT end the walk (round 5: a
+  // short page is exactly as consistent with a trimmed response as with the end of a collection),
+  // so page 3 comes back empty and that is what ends it.
   reset(150)
   const fetchAll = await loadFetchAll()
 
   const result = await fetchAll(4242)
 
   assert.equal(result.refunds.length, 150)
-  assert.deepEqual(requests.map((request) => request.params.page), ['1', '2'])
+  assert.deepEqual(requests.map((request) => request.params.page), ['1', '2', '3'])
 })
 
-test('an exact multiple of the page size stops on the total, without an empty extra request', async () => {
-  // 200 refunds fill two pages exactly, so the "short page" signal never fires and only the
-  // reported total can end the walk.
+test('an exact multiple of the page size ends on the empty page too', async () => {
+  // 200 refunds fill two pages exactly, so no page is ever short and only the empty third page
+  // can end the walk. This is the case the old length rule could never have covered either.
   reset(200)
   const fetchAll = await loadFetchAll()
 
   const result = await fetchAll(4242)
 
   assert.equal(result.refunds.length, 200)
-  assert.deepEqual(requests.map((request) => request.params.page), ['1', '2'])
+  assert.deepEqual(requests.map((request) => request.params.page), ['1', '2', '3'])
 })
 
-test('a store that reports no page total still terminates, on the short page', async () => {
+test('a store that reports no page total still terminates, on the empty page', async () => {
   reset(30)
   reportTotalPages = false
   const fetchAll = await loadFetchAll()
@@ -153,7 +159,7 @@ test('a store that reports no page total still terminates, on the short page', a
   const result = await fetchAll(4242)
 
   assert.equal(result.refunds.length, 30)
-  assert.deepEqual(requests.map((request) => request.params.page), ['1'])
+  assert.deepEqual(requests.map((request) => request.params.page), ['1', '2'])
 })
 
 test('a page that fails returns the refunds already read AND says it failed', async () => {
