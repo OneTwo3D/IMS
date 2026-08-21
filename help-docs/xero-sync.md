@@ -1628,6 +1628,15 @@ the outbox job is closed as **permanently failed** and its error message carries
 both ids included, and the same text is written to the application log. Look for
 `[xero-sync] Xero … POSTED as …` there. The remedy is the same as above.
 
+**No sync run will ever report one of these jobs as succeeded.** Before a run completes an outbox job
+whose sync row is already settled — a replay, or a row that settled while the job was being claimed —
+it asks the activity log whether a `xero_posted_document_unrecorded` entry exists for that row, *at that
+moment*, and buries the job with the entry's wording if one does. It asks again immediately after
+writing the completion, because the entry may be filed by another worker in between; if it appears in
+that gap the completion is retracted and the job is put back to permanently failed. So a job you find
+closed green never had one of these entries against it, and the presence of an entry always shows up as
+a failed job you can find on **Integrations**, no matter which worker or which run detected it.
+
 ### Rows stranded on a connector you switched away from
 
 Because the sync log is scoped to the active connector, unresolved rows left behind on a connector that has since been turned off appear in **no** sync log. They are listed instead in the amber banner at the top of **Integrations**, which shows each row's connector, type, reference, status, age in days, and last error — plus the external transaction ID if the row already posted something before it stalled.

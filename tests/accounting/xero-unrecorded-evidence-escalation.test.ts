@@ -43,6 +43,11 @@ const control = {
   activityWrites: [] as Array<Record<string, unknown>>,
   rowUpdateFails: false,
   /**
+   * The transaction number (1-based) from which the row `updateMany` starts failing — so an attempt can
+   * die BEFORE it reaches the branch that observes the conflict, which is the round-4 finding.
+   */
+  rowUpdateFailsFrom: Number.MAX_SAFE_INTEGER,
+  /**
    * How many COMMITS fail, after a callback that did everything right (Codex r3, HIGH). This is the
    * failure round 3 did not model: a deadlock victim, a serialization failure, a connection lost at
    * COMMIT. The double rolls the writes back when it fires, because a double that let them stand would
@@ -52,9 +57,21 @@ const control = {
   /** Writes that went through the POOLED client — i.e. outside any transaction. */
   pooledWrites: [] as Array<Record<string, unknown>>,
   pooledWriteFails: false,
-  /** Rows the pooled reader will answer with. */
-  pooledRows: [] as Array<{ entityId: string | null; description: string; createdAt: Date }>,
+  /**
+   * THE ONE ACTIVITY-LOG STORE BOTH WORKERS SEE (Codex r4, HIGH).
+   *
+   * The round-4 finding is about a worker reading evidence ANOTHER worker filed, so the double can no
+   * longer keep "what was written" and "what a reader answers with" in two unconnected arrays: with
+   * separate arrays the broken code and the fixed code are indistinguishable, because nothing a filer
+   * writes can ever appear to a reader. Every create — transactional or pooled — lands here, and the
+   * transaction double truncates it on a rolled-back commit, so an uncommitted incident is invisible
+   * to a reader exactly as it is in Postgres.
+   */
+  pooledRows: [] as Array<{ entityId: string | null; action?: string; description: string; createdAt: Date }>,
   pooledReads: [] as Array<Record<string, unknown>>,
+  /** Runs at the instant the outbox job is completed — a second worker interleaving with the first. */
+  onOutboxWrite: null as null | (() => Promise<void>),
+  outboxWrites: [] as Array<{ where: Record<string, unknown>; data: Record<string, unknown> }>,
   /** Outbox burial: how many updateMany calls throw before one succeeds, and how many were made. */
   outboxFailures: 0,
   outboxAttempts: 0,
@@ -86,7 +103,9 @@ function matches(where: Record<string, unknown>): boolean {
 
 const accountingSyncLog = {
   updateMany: async ({ where }: { where: Record<string, unknown> }) => {
-    if (control.rowUpdateFails) throw new Error('accounting_sync_logs update failed')
+    if (control.rowUpdateFails || control.transactions >= control.rowUpdateFailsFrom) {
+      throw new Error('accounting_sync_logs update failed')
+    }
     return { count: matches(where) ? 1 : 0 }
   },
   findUnique: async () => ({ externalTransactionId: row.externalTransactionId }),
@@ -99,6 +118,13 @@ const activityLog = {
       throw new Error('activity_log insert failed')
     }
     control.activityWrites.push(data)
+    // And into the store a READER can see, because that is the whole subject of round 4.
+    control.pooledRows.push({
+      entityId: (data.entityId as string | null) ?? null,
+      action: data.action as string,
+      description: String(data.description),
+      createdAt: new Date(),
+    })
     return data
   },
 }
@@ -119,18 +145,36 @@ const pooledActivityLog = {
   create: async ({ data }: { data: Record<string, unknown> }) => {
     if (control.pooledWriteFails) throw new Error('pooled activity_log insert failed')
     control.pooledWrites.push(data)
+    control.pooledRows.push({
+      entityId: (data.entityId as string | null) ?? null,
+      action: data.action as string,
+      description: String(data.description),
+      createdAt: new Date(),
+    })
     return data
   },
-  findMany: async ({ where }: { where: Record<string, unknown> }) => {
+  findFirst: async ({ where }: { where: Record<string, unknown> }) => {
     control.pooledReads.push(where)
-    const ids = (where.entityId as { in?: string[] } | undefined)?.in ?? []
-    return control.pooledRows.filter((row) => row.entityId && ids.includes(row.entityId))
+    const matches = control.pooledRows.filter((row) => (
+      row.entityId === where.entityId
+      && (row.action === undefined || row.action === where.action)
+    ))
+    // orderBy createdAt desc — newest first, which is what the reader asks for.
+    return matches.length > 0 ? matches[matches.length - 1] : null
   },
 }
 
 const pooledIntegrationOutbox = {
-  updateMany: async () => {
+  updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
     control.outboxAttempts++
+    control.outboxWrites.push({ where, data })
+    // THE INTERLEAVE POINT. A second worker gets to run WHILE this write is happening, which is the only
+    // honest way to model "the incident was filed between the read and the write".
+    const hook = control.onOutboxWrite
+    if (hook) {
+      control.onOutboxWrite = null
+      await hook()
+    }
     if (control.outboxFailures > 0) {
       control.outboxFailures--
       throw new Error('integration_outbox update failed')
@@ -148,10 +192,13 @@ mock.module('@/lib/db', {
         // The rollback point. Everything the callback wrote is undone when the commit fails, which is
         // what makes "the record was written" and "the record survived" two different facts.
         const writtenBefore = control.activityWrites.length
+        const storedBefore = control.pooledRows.length
         const value = await fn(tx)
         if (control.commitFailures > 0) {
           control.commitFailures--
           control.activityWrites.length = writtenBefore
+          // A reader must not be able to see a row whose transaction rolled back.
+          control.pooledRows.length = storedBefore
           throw new Error('could not serialize access due to concurrent update')
         }
         return value
@@ -172,11 +219,14 @@ function reset() {
   control.transactions = 0
   control.activityWrites = []
   control.rowUpdateFails = false
+  control.rowUpdateFailsFrom = Number.MAX_SAFE_INTEGER
   control.commitFailures = 0
   control.pooledWrites = []
   control.pooledWriteFails = false
   control.pooledRows = []
   control.pooledReads = []
+  control.onOutboxWrite = null
+  control.outboxWrites = []
   control.outboxFailures = 0
   control.outboxAttempts = 0
   control.outboxUpdatedCount = 1
@@ -339,6 +389,72 @@ test('Codex r3 HIGH: a COMMIT failure with NO conflict observed keeps its ordina
 })
 
 // ---------------------------------------------------------------------------
+// Codex r4, HIGH — A LATER UNOBSERVED ATTEMPT DISCARDED AN EARLIER OBSERVATION.
+//
+// Round 4 kept the observation PER ATTEMPT, so that a rolled-back attempt could not describe the next
+// one. Correct as far as it goes — and it also meant an attempt that observed NOTHING threw the earlier
+// observation away. Attempt 1 sees the conflict and cannot write the record; attempt 2 dies in the row
+// `updateMany`, BEFORE the branch that would have observed it again; `observed` is undefined, so the
+// bare database error is rethrown. The runners do not recognise that type, it takes the ordinary
+// failure branch, and the next run finds the winner's settled row and completes the job green. The
+// re-drive that exists to PRESERVE the displaced identifier discarded it on the attempt that followed.
+// ---------------------------------------------------------------------------
+
+test('Codex r4 HIGH: an attempt that observes nothing does NOT discard the conflict an earlier one saw', async () => {
+  const { recordPostedDocumentDurably } = await loadProcessor()
+  const { PostedDocumentEvidenceUnwritten } = await import('@/lib/domain/accounting/unrecorded-posted-document')
+  reset()
+  // Attempt 1: the conflict is observed and the record cannot be written.
+  control.activityFailures = 1
+  // Attempt 2 onwards: the transaction dies in the row update, before the conflict branch is reached.
+  control.rowUpdateFailsFrom = 2
+
+  const error = await recordPostedDocumentDurably(ENTRY, 'INV-XERO-SECOND', {}).then(
+    () => { throw new Error('nothing was recorded; there is no result to return') },
+    (e: unknown) => e,
+  )
+
+  assert.ok(
+    error instanceof PostedDocumentEvidenceUnwritten,
+    'the conflict attempt 1 observed is still the truth: a bare database error here is handed to the '
+      + 'ordinary retry, which settles the row and completes the job as a success',
+  )
+  assert.equal(error.postedExternalId, 'INV-XERO-SECOND', 'the identifier the row will never name')
+  assert.equal(error.namedExternalId, 'INV-XERO-FIRST', 'and the one it keeps')
+  assert.equal(error.reason, 'ANOTHER_DOCUMENT_NAMED')
+  assert.match(error.operatorMessage, /REMEDY:/)
+  assert.match(error.operatorMessage, /accounting_sync_logs update failed/, 'and why the LAST attempt died')
+  assert.equal(control.transactions, 3, 'the whole budget was spent before it was declared unsaveable')
+  assert.equal(control.activityWrites.length, 0, 'and nothing was written down, which is the premise')
+})
+
+test('Codex r4 HIGH: a FRESH observation still overrides the carried one', async () => {
+  // The per-attempt property round 4 was defending, kept: a later attempt that observes its own conflict
+  // describes ITS row state, not the previous attempt's. Green under revert BY DESIGN — it is the
+  // control that stops the fix being "keep the first observation for ever".
+  const { recordPostedDocumentDurably } = await loadProcessor()
+  const { PostedDocumentEvidenceUnwritten } = await import('@/lib/domain/accounting/unrecorded-posted-document')
+  reset()
+  control.activityFailures = Number.MAX_SAFE_INTEGER
+  const previousUpdate = accountingSyncLog.updateMany
+  accountingSyncLog.updateMany = async ({ where }: { where: Record<string, unknown> }) => {
+    // Between attempt 1 and attempt 2 the row is re-pointed at a THIRD document.
+    if (control.transactions >= 2) row.externalTransactionId = 'INV-XERO-THIRD'
+    return previousUpdate({ where })
+  }
+  try {
+    const error = await recordPostedDocumentDurably(ENTRY, 'INV-XERO-SECOND', {}).then(
+      () => { throw new Error('nothing was recorded; there is no result to return') },
+      (e: unknown) => e,
+    )
+    assert.ok(error instanceof PostedDocumentEvidenceUnwritten)
+    assert.equal(error.namedExternalId, 'INV-XERO-THIRD', 'the LAST attempt observed this, and it is what the row keeps')
+  } finally {
+    accountingSyncLog.updateMany = previousUpdate
+  }
+})
+
+// ---------------------------------------------------------------------------
 // Codex r3, HIGH — WHEN THE BURIAL ITSELF FAILS.
 //
 // Round 3 buried the outbox job precisely because burying is what stops the retry that erases the
@@ -367,6 +483,11 @@ function job() {
   return JOB as unknown as Parameters<
     Awaited<ReturnType<typeof loadProcessor>>['buryOutboxJobForUnwrittenPostedEvidence']
   >[0]
+}
+
+/** A SECOND outbox job pointing at the SAME sync log — duplicates are the ordinary case here. */
+function secondJob() {
+  return { ...JOB, id: 'job-2' } as unknown as ReturnType<typeof job>
 }
 
 test('Codex r3 HIGH: the escalation writes the record OUTSIDE the transaction that could not commit', async () => {
@@ -449,24 +570,27 @@ test('Codex r3 HIGH: a burial that lost its claim is a loud failure too, not a s
   )
 })
 
-test('Codex r3 HIGH: the reclaim reader answers with the recorded incident, per sync row', async () => {
-  const { findUnrecordedPostedDocumentEvidence } = await loadProcessor()
+test('Codex r3 HIGH: the reclaim reader answers with the recorded incident, for one sync row', async () => {
+  const { findUnrecordedPostedDocumentEvidenceFor } = await loadProcessor()
   const { UNRECORDED_POSTED_DOCUMENT_ACTION } = await import('@/lib/domain/accounting/unrecorded-posted-document')
   reset()
   control.pooledRows = [
-    { entityId: 'log-1', description: 'INV-XERO-SECOND was posted and cannot be recorded', createdAt: new Date() },
+    {
+      entityId: 'log-1',
+      action: UNRECORDED_POSTED_DOCUMENT_ACTION,
+      description: 'INV-XERO-SECOND was posted and cannot be recorded',
+      createdAt: new Date(),
+    },
   ]
 
-  const found = await findUnrecordedPostedDocumentEvidence(['log-1', 'log-2'])
-
-  assert.equal(found.get('log-1'), 'INV-XERO-SECOND was posted and cannot be recorded')
-  assert.equal(found.get('log-2'), undefined, 'a row with no incident is completed as before')
-  assert.equal(control.pooledReads.length, 1, 'one read for the whole batch, not one per job')
+  assert.equal(
+    await findUnrecordedPostedDocumentEvidenceFor('log-1'),
+    'INV-XERO-SECOND was posted and cannot be recorded',
+  )
+  assert.equal(await findUnrecordedPostedDocumentEvidenceFor('log-2'), undefined, 'a row with no incident is completed as before')
   assert.equal(control.pooledReads[0].action, UNRECORDED_POSTED_DOCUMENT_ACTION)
   assert.equal(control.pooledReads[0].entityType, 'SYSTEM', 'so it lands on the (entityType, entityId) index')
-
-  assert.equal((await findUnrecordedPostedDocumentEvidence([])).size, 0)
-  assert.equal(control.pooledReads.length, 1, 'and an empty batch asks nothing')
+  assert.equal(control.pooledReads[0].entityId, 'log-1', 'one row, asked for by id — not a batch of them')
 })
 
 // ---------------------------------------------------------------------------
@@ -536,19 +660,23 @@ test('Codex r3 HIGH: the settled-replay short-circuit reads the record before it
   assert.notEqual(shortCircuitAt, -1, 'the settled-replay short-circuit must still exist')
   const block = outbox.slice(shortCircuitAt, outbox.indexOf('const claimedAt', shortCircuitAt))
 
-  const guardAt = block.indexOf('unrecordedPostedDocuments.get(entry.id)')
-  assert.notEqual(guardAt, -1, 'it must consult the recorded incident at all')
   assert.ok(
-    guardAt < block.indexOf('markXeroOutboxSuccess(job)'),
-    'and BEFORE completing the job, or the incident is converted into a success exactly as it was',
+    block.includes('completeSettledOutboxJobUnlessIncidentFiled(job, entry.id)'),
+    'it must go through the one function that asks the store before it completes anything',
   )
   assert.ok(
-    block.slice(guardAt, block.indexOf('markXeroOutboxSuccess(job)')).includes('markXeroOutboxPermanent(job,'),
-    'a job with an incident on its row is buried, not completed',
+    !block.includes('markXeroOutboxSuccess(job)'),
+    'and must not complete the job itself, or the question can be skipped at this door alone',
   )
   assert.ok(
-    outbox.indexOf('findUnrecordedPostedDocumentEvidence(') < shortCircuitAt,
-    'read once for the batch, before the loop, not once per settled job',
+    !outbox.includes('findUnrecordedPostedDocumentEvidenceFor(entries'),
+    'THE BATCH SNAPSHOT IS GONE (Codex r4, HIGH): a read taken before the run makes its first Xero call '
+      + 'cannot contain an incident a CONCURRENT worker files during it, so the door it guarded reopened '
+      + 'under exactly the concurrency the fence exists for',
+  )
+  assert.ok(
+    !outbox.includes('unrecordedPostedDocuments'),
+    'and no per-batch Map survives for a later change to start consulting again',
   )
 })
 
@@ -564,21 +692,120 @@ test('Codex r3 HIGH: the claim-failure branch does not complete a settled job wi
   assert.notEqual(branchAt, -1, 'the claim-failure branch must still exist')
   const block = outbox.slice(branchAt, outbox.indexOf('result.processed++', branchAt))
 
-  const guardAt = block.indexOf('unrecordedPostedDocuments.get(entry.id)')
-  assert.notEqual(guardAt, -1, 'it must consult the recorded incident')
   assert.ok(
-    guardAt < block.indexOf('markXeroOutboxSuccess(job)'),
-    'and before completing the job, or a settled row with a filed incident is reported as a success',
+    block.includes('completeSettledOutboxJobUnlessIncidentFiled(job, entry.id)'),
+    'the second door asks through the SAME function as the first, not through a second spelling of the '
+      + 'same question',
   )
+  assert.ok(
+    !block.includes('markXeroOutboxSuccess(job)'),
+    'and never completes a settled job itself',
+  )
+  // CANCELLED goes through it too (Codex r4). A row can be retired while a worker is on the wire, and
+  // that worker's refusal is filed against a row whose live status is CANCELLED.
+  const cancelledAt = block.indexOf("liveStatus === 'CANCELLED'")
+  assert.notEqual(cancelledAt, -1)
+  assert.ok(
+    cancelledAt < block.indexOf('completeSettledOutboxJobUnlessIncidentFiled('),
+    'CANCELLED is inside the branch that asks, not a separate branch that completes unasked',
+  )
+  assert.ok(
+    !block.slice(0, cancelledAt).includes('markXeroOutboxSuccess('),
+    'and nothing completes a job before the CANCELLED case reaches the question',
+  )
+})
 
-  // And an incident filed DURING this run has to reach the batch answer, or the second job for the same
-  // row is decided from a read taken before the incident existed.
-  for (const site of outbox.split('if (!record.recorded) {').slice(1)) {
-    const decided = site.slice(0, site.indexOf('continue'))
-    assert.ok(
-      decided.indexOf('unrecordedPostedDocuments.set(entry.id, record.evidence)') !== -1
-        && decided.indexOf('unrecordedPostedDocuments.set(entry.id, record.evidence)') < decided.indexOf('markXeroOutboxPermanent('),
-      'every in-line burial records the incident in the batch answer before burying',
-    )
-  }
+// ---------------------------------------------------------------------------
+// Codex r4, HIGH — A SNAPSHOT CANNOT SEE AN INCIDENT A CONCURRENT WORKER FILED.
+//
+// Round 3 closed both doors by reading the filed incidents ONCE, before the loop. The incident those
+// doors exist for is filed by a DIFFERENT worker, mid-run, while it is on the wire — after the snapshot
+// was taken. So the guard answered "nothing on file" for a row that had an incident on file, and the
+// door reopened under exactly the concurrency the fence was built for.
+//
+// These drive two real workers through one shared store: worker A is `recordPostedDocumentDurably`, the
+// production path that files the incident, and worker B is the settled-job door. Only the INSTANT A
+// runs differs between them.
+// ---------------------------------------------------------------------------
+
+test('Codex r4 HIGH: two workers — an incident filed AFTER an earlier job was answered still buries the next', async () => {
+  const { recordPostedDocumentDurably, completeSettledOutboxJobUnlessIncidentFiled } = await loadProcessor()
+  reset()
+
+  // t0 — the FIRST settled job for this row is answered "nothing on file", and it is answered
+  // correctly. Round 3 kept that answer for the whole batch; this is the read it kept.
+  const first = await completeSettledOutboxJobUnlessIncidentFiled(job(), 'log-1')
+  assert.equal(first.verdict, 'COMPLETED')
+
+  // t1 — worker A comes back from Xero holding INV-XERO-SECOND, finds the row naming INV-XERO-FIRST,
+  // and files the incident. A different process; nothing in this run's memory changes.
+  const filedByA = await recordPostedDocumentDurably(ENTRY, 'INV-XERO-SECOND', {})
+  assert.equal(filedByA.recorded, false, 'the premise: A could not record its document')
+
+  // t2 — a SECOND job for the same sync row reaches the same door. Duplicate outbox jobs for one sync
+  // log are the ordinary case this fence was written for, and under a batch answer this one is decided
+  // from a read taken before the incident existed.
+  const second = await completeSettledOutboxJobUnlessIncidentFiled(secondJob(), 'log-1')
+
+  assert.equal(second.verdict, 'BURIED', 'the job must not be completed while a document is unaccounted for')
+  assert.match(second.verdict === 'BURIED' ? second.evidence : '', /INV-XERO-SECOND/)
+  assert.equal(control.outboxWrites.length, 2, 'the first job completed, the second was buried')
+  assert.equal(control.outboxWrites[0].data.status, 'SUCCEEDED')
+  assert.equal(
+    control.outboxWrites[1].data.status,
+    'PERMANENT_FAILED',
+    'and the second is the burial, not a completion — a completion is how the identifier disappears',
+  )
+  assert.match(String(control.outboxWrites[1].data.lastError), /INV-XERO-SECOND/, 'carrying both ids into the job')
+  assert.match(String(control.outboxWrites[1].data.lastError), /INV-XERO-FIRST/)
+})
+
+test('Codex r4 HIGH: two workers — an incident filed DURING the completion write RETRACTS it', async () => {
+  // The residual window of "read it fresh": the read says nothing, and A's insert lands before the
+  // completion is written. The hook makes A run at exactly that instant, which no assertion about a
+  // return value could reach.
+  const { recordPostedDocumentDurably, completeSettledOutboxJobUnlessIncidentFiled } = await loadProcessor()
+  reset()
+  control.onOutboxWrite = async () => { await recordPostedDocumentDurably(ENTRY, 'INV-XERO-SECOND', {}) }
+
+  const verdict = await completeSettledOutboxJobUnlessIncidentFiled(job(), 'log-1')
+
+  assert.equal(verdict.verdict, 'RETRACTED')
+  assert.equal(control.outboxWrites.length, 2, 'the completion, and then the retraction of it')
+  assert.equal(control.outboxWrites[0].data.status, 'SUCCEEDED', 'the read really did say nothing was on file')
+  assert.equal(control.outboxWrites[1].data.status, 'PERMANENT_FAILED')
+  assert.equal(
+    (control.outboxWrites[1].where as Record<string, unknown>).status,
+    'SUCCEEDED',
+    'the retraction is fenced on the row it just completed, not on a claim it no longer holds',
+  )
+  assert.match(String(control.outboxWrites[1].data.lastError), /INV-XERO-SECOND/)
+})
+
+test('Codex r4 HIGH: a settled job with nothing on file is completed, and nothing is retracted', async () => {
+  // The counter-guard. If the door buried on anything but a filed incident, every ordinary replay of
+  // settled work would become a PERMANENT_FAILED job.
+  const { completeSettledOutboxJobUnlessIncidentFiled } = await loadProcessor()
+  reset()
+
+  const verdict = await completeSettledOutboxJobUnlessIncidentFiled(job(), 'log-1')
+
+  assert.equal(verdict.verdict, 'COMPLETED')
+  assert.equal(control.outboxWrites.length, 1)
+  assert.equal(control.outboxWrites[0].data.status, 'SUCCEEDED')
+  assert.equal(control.pooledReads.length, 2, 'asked before the write and again after it')
+})
+
+test('Codex r4 HIGH: an incident whose transaction ROLLED BACK does not bury anything', async () => {
+  // The other counter-guard, and it is the one the shared store makes possible: an insert that happened
+  // but did not commit must be invisible to the reader, exactly as in Postgres. If the double let it
+  // stand, the fixed code would bury a job on evidence that does not exist.
+  const { recordPostedDocumentDurably, completeSettledOutboxJobUnlessIncidentFiled } = await loadProcessor()
+  reset()
+  control.commitFailures = Number.MAX_SAFE_INTEGER
+
+  await recordPostedDocumentDurably(ENTRY, 'INV-XERO-SECOND', {}).catch(() => undefined)
+  const verdict = await completeSettledOutboxJobUnlessIncidentFiled(job(), 'log-1')
+
+  assert.equal(verdict.verdict, 'COMPLETED', 'nothing committed, so nothing is on file')
 })

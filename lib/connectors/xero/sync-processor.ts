@@ -544,9 +544,30 @@ export async function recordPostedDocumentDurably(
 ): Promise<PostedSyncRecord> {
   const revision = externalRevisionAt !== undefined ? { externalRevisionAt } : {}
   let unwritten: PostedDocumentEvidenceUnwritten | undefined
+  /**
+   * THE OBSERVATION IS STICKY FOR THE WHOLE CALL, AND ROUND 4 MADE IT PER ATTEMPT (Codex r4, HIGH).
+   *
+   * Round 4 reset the observation every attempt, on the reasoning that "an observation from a
+   * rolled-back attempt must not DESCRIBE the next one". That half is still true and is still honoured
+   * below — `observed` wins whenever this attempt made one of its own. What round 4 also did, by
+   * accident, was let a later attempt that observed NOTHING throw the earlier observation away: attempt
+   * 1 sees the conflict and cannot write the record, attempt 2 dies in the row `updateMany` before it
+   * ever reaches the conflict branch, `observed` is undefined, and `throw error` leaves this function
+   * as a BARE DATABASE ERROR. The runners do not recognise that type, so it takes the ordinary failure
+   * branch, and round 3 already traced where that ends: next run the row is the winner's, settled with
+   * ITS id, and the job is completed as a success. The re-drive that exists to PRESERVE the displaced
+   * identifier discarded it on the attempt that followed.
+   *
+   * So an observation is kept for the life of the call. It is a fact about the LEDGER — this worker
+   * posted `externalId` and the row named something else — not a fact about the attempt that saw it,
+   * and no rollback can make it untrue. The part a later attempt could legitimately update
+   * (`namedExternalId`) is exactly the part a later observation overrides.
+   */
+  let carried: UnrecordablePostedDocument | undefined
   for (let attempt = 1; attempt <= EVIDENCE_TRANSACTION_ATTEMPTS; attempt++) {
-    // Per ATTEMPT, not per call: each attempt is a whole fresh transaction that re-observes the row, so
-    // an observation from a rolled-back attempt must not describe the next one.
+    // Per ATTEMPT for DESCRIBING this attempt: each attempt is a whole fresh transaction that
+    // re-observes the row, so a stale observation never gets to speak for a fresh one. It is `carried`
+    // that survives the attempt, and only as the fallback.
     let observed: UnrecordablePostedDocument | undefined
     try {
       return await db.$transaction(async (tx) => recordPostedSyncResult(tx, {
@@ -558,7 +579,10 @@ export async function recordPostedDocumentDurably(
       }))
     } catch (error) {
       if (error instanceof PostedDocumentEvidenceUnwritten) {
+        // Both halves: the ready-made failure to throw if we run out of attempts, AND the incident
+        // itself, so an attempt that observes nothing still has something true to carry (Codex r4, HIGH).
         unwritten = error
+        carried = error.incident
         continue
       }
       // THE TRANSACTION FAILED SOMEWHERE ELSE, AND THE CONFLICT WAS ALREADY OBSERVED (Codex r3, HIGH).
@@ -576,8 +600,14 @@ export async function recordPostedDocumentDurably(
       // So an observed conflict converts the failure rather than being lost to it: same incident, both
       // ids, same operator wording, and a type the runners escalate out of band. Re-driven like any
       // other attempt first — a deadlock victim is exactly the case that commits a moment later.
-      if (!observed) throw error
-      unwritten = new PostedDocumentEvidenceUnwritten(observed, error)
+      //
+      // AND `carried`, NOT ONLY `observed` (Codex r4, HIGH). A conflict this call has ALREADY seen is
+      // not unseen by a later attempt failing earlier than the branch that would have seen it again;
+      // rethrowing bare here is the same discard, one attempt further on.
+      const incident = observed ?? carried
+      if (!incident) throw error
+      carried = incident
+      unwritten = new PostedDocumentEvidenceUnwritten(incident, error)
     }
   }
   // `unwritten` is set by construction (the loop runs at least once), but throwing `undefined` if
@@ -618,7 +648,7 @@ export async function recordPostedDocumentDurably(
  * failed at COMMIT — where the insert itself was never the problem — a plain, unwrapped write of the
  * same row very often lands, and it is the only writable form of the incident that a later run can READ.
  * It is what stops a job whose burial failed from being completed as a success on the next pass (see
- * `findUnrecordedPostedDocumentEvidence`). It is attempted AFTER the console line, never before: the
+ * `findUnrecordedPostedDocumentEvidenceFor`). It is attempted AFTER the console line, never before: the
  * console line cannot fail, and the order means a crash inside this call still leaves the incident said
  * out loud. Its own failure is swallowed for the same reason — there is nothing further to try, and
  * throwing here would replace an escalation with a stack trace.
@@ -1503,15 +1533,26 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
 }
 
 /**
- * WHICH OF THESE SYNC ROWS HAS AN UNRECORDED POSTED DOCUMENT FILED AGAINST IT (Codex r3, HIGH).
+ * IS AN UNRECORDED POSTED DOCUMENT ON FILE AGAINST THIS SYNC ROW — ASKED NOW, FOR ONE ROW
+ * (Codex r3 HIGH; re-shaped by Codex r4, HIGH).
  *
  * The durable half of the burial guarantee. A job whose sync row carries one of these records must not
  * be completed as a success by ANY later run, and "later" includes runs in a process that never saw the
  * incident — the burial's own failure is precisely the case where the deciding run is a different one.
  * The record is the only thing both runs can see.
  *
- * Reading it does not weaken the in-line burial: a job buried at the point of failure never comes back
- * to be asked about. This answers the ones that did.
+ * WHY IT IS NO LONGER A BATCH SNAPSHOT (Codex r4, HIGH). Round 3 read every job's evidence once, before
+ * the loop, and both doors consulted that Map. A Map read at the top of a run answers with the world as
+ * it was BEFORE the run's Xero calls — and the incident this fence exists for is filed by ANOTHER
+ * WORKER, mid-run, while it is on the wire. A snapshot cannot contain a row that did not exist when it
+ * was taken, so the door it guards reopened under exactly the concurrency it was built for. Round 3
+ * patched half of that from inside (`unrecordedPostedDocuments.set(...)` after an in-line burial), which
+ * only ever covered incidents THIS run filed — the ones a second process files were never visible.
+ *
+ * So the question is asked at the moment the verdict is decided, for the one row being decided, and the
+ * batch read is gone rather than kept as a fast path: a fast path whose miss is unsafe is not a fast
+ * path. It costs one indexed point read on the (entityType, entityId) index, and only on the settled
+ * replay branches — the rare ones, not the per-job path.
  *
  * A stale answer here is the safe direction. If an operator has already dealt with the duplicate in
  * Xero, the record still stands (nothing in IMS can observe a void, which is why it has no clearing
@@ -1519,22 +1560,99 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
  * harmless verdict on a row that is already SYNCED and that nothing will retry. The opposite mistake is
  * a document nobody knows about.
  */
-export async function findUnrecordedPostedDocumentEvidence(syncLogIds: string[]): Promise<Map<string, string>> {
-  if (syncLogIds.length === 0) return new Map()
-  const rows = await db.activityLog.findMany({
+export async function findUnrecordedPostedDocumentEvidenceFor(syncLogId: string): Promise<string | undefined> {
+  const row = await db.activityLog.findFirst({
     where: {
       entityType: 'SYSTEM',
-      entityId: { in: [...new Set(syncLogIds)] },
+      entityId: syncLogId,
       action: UNRECORDED_POSTED_DOCUMENT_ACTION,
     },
-    select: { entityId: true, description: true },
+    select: { description: true },
     orderBy: { createdAt: 'desc' },
   })
-  const bySyncLog = new Map<string, string>()
-  for (const row of rows) {
-    if (row.entityId && !bySyncLog.has(row.entityId)) bySyncLog.set(row.entityId, row.description)
+  return row?.description ?? undefined
+}
+
+/**
+ * The verdict on a job whose sync row is already settled — the only three answers the doors below have.
+ * RETRACTED is BURIED that had to travel through a completion to get there; both are failures, and the
+ * caller counts them the same.
+ */
+type SettledOutboxVerdict =
+  | { verdict: 'BURIED'; evidence: string }
+  | { verdict: 'RETRACTED'; evidence: string }
+  | { verdict: 'COMPLETED' }
+
+/**
+ * COMPLETE A SETTLED JOB — BUT ONLY IF NO INCIDENT IS FILED AGAINST ITS ROW, AND ASK TWICE
+ * (Codex r4, HIGH).
+ *
+ * BOTH doors that turn a settled row into a green outbox job come through here, because they are one
+ * decision made in two places and round 3 fixed them as two: the settled-replay short circuit at the top
+ * of the loop, and the claim-failure branch reached when the row settles BETWEEN the batch read and the
+ * claim. One function means one ordering, and a third door added later has somewhere obvious to go.
+ *
+ * The interleaving this closes, written out, because "read it fresh" alone does not close it:
+ *
+ *   • BEFORE. `findUnrecordedPostedDocumentEvidenceFor` is the statement immediately preceding the
+ *     completion, so any incident committed before that read buries the job instead. That is the whole
+ *     of round 4's finding: the snapshot could not see it, this read can.
+ *   • AFTER. An incident committed between that read and the completion would still have been laundered,
+ *     and the window is small but it is not zero — the displaced worker's insert lands whenever it
+ *     lands. So the same question is asked again once the completion is written, and an incident that
+ *     appeared in the gap RETRACTS it: the job is put back to PERMANENT_FAILED carrying the incident
+ *     wording, which is where it would have gone had the read been a moment later.
+ *
+ * What is left after both is an incident committed strictly AFTER the confirming read, and that one is
+ * not silent by construction: the worker filing it is still running, still holding the displaced
+ * identifier, and the record it just committed is durable and exempt from retention. It buries its own
+ * job with the same wording, or — if this run stole that job's claim — fails loudly rather than
+ * completing anything. Nothing in that path ends in a green verdict with the identifier nowhere.
+ *
+ * The retraction is fenced on SUCCEEDED, not on the claim: the completion released the claim, and the
+ * only row it may touch is the one it just completed. If the retraction cannot be written the run says
+ * so on the process log — it does not throw, because the record whose wording it is quoting has already
+ * been read out of the durable store, so the incident is on file whatever happens to the job.
+ */
+export async function completeSettledOutboxJobUnlessIncidentFiled(
+  job: IntegrationOutboxRow,
+  syncLogId: string,
+): Promise<SettledOutboxVerdict> {
+  const filed = await findUnrecordedPostedDocumentEvidenceFor(syncLogId)
+  if (filed) {
+    await markXeroOutboxPermanent(job, filed)
+    return { verdict: 'BURIED', evidence: filed }
   }
-  return bySyncLog
+
+  await markXeroOutboxSuccess(job)
+
+  const filedSince = await findUnrecordedPostedDocumentEvidenceFor(syncLogId)
+  if (!filedSince) return { verdict: 'COMPLETED' }
+
+  const retracted = await db.integrationOutbox.updateMany({
+    where: { id: job.id, status: INTEGRATION_OUTBOX_STATUS.SUCCEEDED },
+    data: {
+      status: INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
+      lastError: filedSince.slice(0, 1000),
+      nextAttemptAt: null,
+      lockedAt: null,
+      lockedBy: null,
+    },
+  }).catch((cause: unknown) => {
+    console.error(
+      `[xero-sync] outbox job ${job.id} was completed a moment before an unrecorded posted document was `
+      + `filed against sync log ${syncLogId}, and the completion could not be retracted: ${String(cause)}. `
+      + filedSince,
+    )
+    return { count: 0 }
+  })
+  if (retracted.count === 0) {
+    console.error(
+      `[xero-sync] outbox job ${job.id} is still recorded as succeeded although an unrecorded posted `
+      + `document is on file against sync log ${syncLogId}. ${filedSince}`,
+    )
+  }
+  return { verdict: 'RETRACTED', evidence: filedSince }
 }
 
 async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
@@ -1573,8 +1691,10 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       })
     : []
   const entriesById = new Map(entries.map((entry) => [entry.id, entry]))
-  // Read once for the whole batch, on the (entityType, entityId) index, rather than per settled job.
-  const unrecordedPostedDocuments = await findUnrecordedPostedDocumentEvidence(entries.map((entry) => entry.id))
+  // NO BATCH READ OF THE FILED INCIDENTS (Codex r4, HIGH). One taken here answers with the world as it
+  // was before this run made a single Xero call, and the incident the doors below guard against is filed
+  // by ANOTHER worker while this one is on the wire. Each door asks at the moment it decides — see
+  // completeSettledOutboxJobUnlessIncidentFiled.
   const blockedPaymentEntryIds = await findInvoicePaymentsBlockedByEarlierLiveLogs(db, entries)
   const blockedUpdateEntryIds = await findInvoiceUpdatesBlockedByPendingCreate(db, entries)
 
@@ -1600,15 +1720,11 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       //
       // So this line now asks the durable record instead of assuming it was acted on. If an incident is
       // filed against this sync row, the job is BURIED with that record's wording — never completed —
-      // and the answer comes from the one store that outlives the run.
-      const recordedIncident = unrecordedPostedDocuments.get(entry.id)
-      if (recordedIncident) {
-        await markXeroOutboxPermanent(job, recordedIncident)
-        result.failed++
-        continue
-      }
-      await markXeroOutboxSuccess(job)
-      result.skipped++
+      // and the answer comes from the one store that outlives the run, READ AT THIS INSTANT rather than
+      // from a snapshot taken before the run's first Xero call (Codex r4, HIGH).
+      const settled = await completeSettledOutboxJobUnlessIncidentFiled(job, entry.id)
+      if (settled.verdict === 'COMPLETED') result.skipped++
+      else result.failed++
       continue
     }
 
@@ -1639,13 +1755,16 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       // THE SECOND DOOR TO THE SAME CONVERSION (Codex r3, HIGH). This branch is reached when the row was
       // settled between the batch read and the claim — which is exactly the window a displaced worker's
       // conflict is recorded in. Completing the job then turns a filed incident into a success just as
-      // the settled-replay short-circuit above did, so it asks the same question.
-      const settledIncident = liveStatus === 'SYNCED' ? unrecordedPostedDocuments.get(entry.id) : undefined
-      if (settledIncident) {
-        await markXeroOutboxPermanent(job, settledIncident)
-        result.failed++
-      } else if (liveStatus === 'SYNCED' || liveStatus === 'CANCELLED') {
-        await markXeroOutboxSuccess(job)
+      // the settled-replay short-circuit above did, so it goes through the SAME function rather than
+      // asking the same question a second way (Codex r4, HIGH).
+      //
+      // CANCELLED asks too, and round 3 did not. A row can be retired while a worker is on the wire, and
+      // that worker's post then meets a row it may not write to; the incident is filed against a row
+      // whose live status is CANCELLED, and completing green here would launder it exactly as the SYNCED
+      // case did. Asking costs one point read on a branch that is already rare.
+      if (liveStatus === 'SYNCED' || liveStatus === 'CANCELLED') {
+        const settled = await completeSettledOutboxJobUnlessIncidentFiled(job, entry.id)
+        if (settled.verdict !== 'COMPLETED') result.failed++
       } else if (liveStatus === 'FAILED' || entry.retryCount >= MAX_RETRIES) {
         await markXeroOutboxPermanent(job, entry.errorMessage ?? `Accounting sync log ${entry.id} is not claimable`)
       } else {
@@ -1688,9 +1807,10 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           // it describes was written in the conflict transaction (Codex r1, high). If that write had
           // failed, the transaction above would have thrown and the job would be retried, not buried.
           //
-          // Filed within this run, so a LATER job in the same batch — the batch read happened before it
-          // existed — is answered with it rather than completing green (Codex r3, HIGH).
-          unrecordedPostedDocuments.set(entry.id, record.evidence)
+          // Nothing is cached for later jobs in this batch any more (Codex r4, HIGH): the record is
+          // committed, and every door reads the store at the point it decides, so a second job for this
+          // row finds it — as it also finds the ones a CONCURRENT process filed, which the cache never
+          // could.
           await markXeroOutboxPermanent(job, record.evidence)
           result.failed++
           continue
@@ -1752,8 +1872,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         const record = await recordPostedDocumentDurably(entry, syncResult.externalId ?? null, payload, syncResult.externalRevisionAt ?? null)
         if (!record.recorded) {
           // See above: permanent only because the evidence is already durable, and see above for why
-          // the batch answer is updated with it.
-          unrecordedPostedDocuments.set(entry.id, record.evidence)
+          // no batch answer is kept for it.
           await markXeroOutboxPermanent(job, record.evidence)
           result.failed++
           continue
