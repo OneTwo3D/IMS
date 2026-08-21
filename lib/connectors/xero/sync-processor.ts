@@ -2070,23 +2070,15 @@ export async function guardCancelledSalesOrderInvoice(
   return { post: true, customerId: outcome.customerId }
 }
 
-/**
- * "I STILL HOLD THE CLAIM I TOOK" — the where-fence a worker must carry into any write that
- * assumes it still owns the row (o3d-a3wx r6, adopted here by o3d-k26m.5 round 4).
- *
- * A claim is `{ status: PROCESSING, processingStartedAt: <the instant I stamped> }`, and the stale
- * cutoff in {@link accountingSyncLogClaimWhere} lets a NEW worker re-take a row whose claim has aged
- * out. The displaced worker is not stopped by that — a timeout cannot reach into work already in
- * flight — so matching on `status: 'PROCESSING'` alone is not ownership: the replacement's row is
- * PROCESSING too. Only the worker that stamped that exact instant owns it.
- *
- * IDENTICAL, DELIBERATELY, to the helper of the same name on the sibling branch o3d-batch-payidx,
- * which fences every RELEASE of a claim with it. The two branches must not disagree about what
- * holding a claim means; if both land, keep one definition.
- */
-export function heldClaimWhere(entryId: string, claimedAt: Date) {
-  return { id: entryId, status: 'PROCESSING' as const, processingStartedAt: claimedAt }
-}
+// o3d-k26m.5 round 4 added a SECOND `heldClaimWhere` here, with a note saying it was deliberately
+// identical to the sibling branch's and that "if both land, keep one definition". Both have landed,
+// so this is that collapse: the definition is the one in `@/lib/domain/accounting/sync-claim-fence`,
+// imported at the top of this file and re-exported below, and the copy that stood here is gone.
+//
+// It is not merely a duplicate. It took a bare `Date`, and this branch's contract is that a claim is
+// a HOLDER asked for its instant at the point of use — which is why every consumer of the copy below
+// had to be threaded with the claim rather than a snapshot of it, and why the compiler, not a
+// reviewer, found them.
 
 /**
  * THE OTHER WRITER IS US: ONE IMS WORKER AT A TIME MAY POST UNDER A GIVEN NUMBER (o3d-k26m.5 r4,
@@ -2251,7 +2243,8 @@ export const INVOICE_NUMBER_RIVAL_SCAN_LIMIT = 200
 
 export async function takeInvoiceNumberPostSlot(params: {
   entryId: string
-  claimedAt: Date
+  /** The claim this worker HOLDS, read as each fenced statement is built — never a snapshot. */
+  held: HeldClaim
   invoiceNumber: string
   orderLabel: string
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
@@ -2340,7 +2333,7 @@ export async function takeInvoiceNumberPostSlot(params: {
       // database that will not take this row will not take the InvoiceID the response carries, and
       // that is exactly the lost-response state the fence can no longer heal.
       const stamped = await tx.accountingSyncLog.updateMany({
-        where: heldClaimWhere(params.entryId, params.claimedAt),
+        where: heldClaimWhere(params.entryId, params.held),
         data: { attemptedInvoiceNumber: params.invoiceNumber, attemptedInvoiceNumberAt: now },
       })
       if (stamped.count === 0) {
@@ -2485,7 +2478,8 @@ const monotonicNowMs = (): number => performance.now()
  */
 export function buildInvoiceNumberPostSlotCheck(params: {
   entryId: string
-  claimedAt: Date
+  /** The claim this worker HOLDS — see `takeInvoiceNumberPostSlot`. */
+  held: HeldClaim
   invoiceNumber: string
   orderLabel: string
   referenceType: string
@@ -2550,7 +2544,7 @@ export function buildInvoiceNumberPostSlotCheck(params: {
 
     const slot = await takeInvoiceNumberPostSlot({
       entryId: params.entryId,
-      claimedAt: params.claimedAt,
+      held: params.held,
       invoiceNumber: params.invoiceNumber,
       orderLabel: params.orderLabel,
     })
@@ -2616,8 +2610,12 @@ async function guardSalesInvoiceNumberOwnership(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
-  /** The instant this worker stamped its claim — the fence's own writes are conditioned on it. */
-  claimedAt: Date,
+  /**
+   * The claim this worker HOLDS — the fence's own writes are conditioned on it. A holder rather than
+   * the instant (o3d-550x): the slot stamp below is written some way after this guard is entered,
+   * and a snapshot taken here would fence on a claim that may since have moved.
+   */
+  held: HeldClaim,
 ): Promise<{ post: true; beforePost: BeforeRemoteWrite } | { post: false; result: EntryResult }> {
   const invoiceNumber = typeof payload.invoiceNumber === 'string' ? payload.invoiceNumber : null
 
@@ -2707,7 +2705,7 @@ async function guardSalesInvoiceNumberOwnership(
     post: true,
     beforePost: buildInvoiceNumberPostSlotCheck({
       entryId,
-      claimedAt,
+      held,
       invoiceNumber,
       orderLabel,
       referenceType,
@@ -2800,7 +2798,7 @@ async function processClaimedEntry(
       // o3d-k26m.5: the number must be ours to post under. Refusing is recoverable; overwriting a
       // live invoice is not. Runs AFTER the cancelled-order backstop (no point asking the ledger
       // about an order that must not be invoiced at all) and BEFORE anything is sent.
-      const numberFence = await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload, claimedAt)
+      const numberFence = await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload, held)
       if (!numberFence.post) return numberFence.result
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice', payload)
       const invoiceResult = await pushSalesInvoice({

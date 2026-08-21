@@ -146,7 +146,17 @@ const tx = new Proxy({ accountingSyncLog }, {
       return async () => { control.rawStatements++; return 1 }
     }
     return new Proxy({}, {
-      get: (_t, method: string) => async () => (method === 'findMany' ? [] : null),
+      // Reads answer NOTHING FOUND; writes answer a ROW. o3d-nf9i (merged into development after this
+      // double was written) made `updateMirroredAccountingEventStatus` return an outcome whose success
+      // value IS what `accountingEvent.update` resolved to, so a `null` write answer made the mirror
+      // dereference `null.id` and throw out of the transaction this file is about. Prisma's `update`
+      // returns the row or throws P2025 — it never resolves to null.
+      get: (_t, method: string) => async () => {
+        if (method === 'findMany') return []
+        if (method === 'findUnique' || method === 'findFirst') return null
+        if (method === 'updateMany' || method === 'deleteMany') return { count: 1 }
+        return { id: 'mirror-event-1' }
+      },
     })
   },
 })

@@ -123,12 +123,23 @@ function makeRowStore(
       if (prop === 'activityLog') return activityLog
       if (prop === '$executeRaw' || prop === '$executeRawUnsafe') return executeRaw
       // Mirror-table delegates: record the call so "the mirror was NOT written" is assertable.
-      // They answer NOTHING FOUND (null / []), which is the mirror's own "no event to update" path —
+      //
+      // READS answer NOTHING FOUND (null / []), which is the mirror's own "no event to update" path —
       // this file is about the sync row, and a half-built mirror event would only add noise.
+      //
+      // WRITES answer a ROW (o3d-nf9i, merged into development after this double was written).
+      // `updateMirroredAccountingEventStatus` now returns an OUTCOME, and the value its
+      // `accountingEvent.update` resolves to IS that outcome on the success path — so a double that
+      // answered `null` to a write made the mirror dereference `null.id` and threw out of the
+      // transaction. Prisma's `update` never resolves to null either: it returns the row or throws
+      // P2025, so answering a row is also the more truthful model.
       return new Proxy({}, {
         get: (_t, method: string) => async (args: unknown) => {
           mirrorWrites.push({ delegate: prop, method, args })
-          return method === 'findMany' ? [] : null
+          if (method === 'findMany') return []
+          if (method === 'findUnique' || method === 'findFirst') return null
+          if (method === 'updateMany' || method === 'deleteMany') return { count: 1 }
+          return { id: 'mirror-event-1' }
         },
       })
     },
