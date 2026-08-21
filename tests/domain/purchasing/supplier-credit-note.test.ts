@@ -232,3 +232,25 @@ test('an operator-supplied number never becomes the LEDGER document number — i
   assert.equal(noRef.creditNoteNumber, 'SCN-scn-3')
   assert.equal(noRef.reference, undefined)
 })
+
+/**
+ * o3d-tfri r3 retracted the claim that a number unique on OUR side makes a Xero retry CONVERGE — the
+ * verb is not the fence, the pre-create lookup is. The claim survived in one doc comment, which is
+ * how a retraction quietly un-retracts itself.
+ */
+test('the withdrawn "unique number makes the retry converge" claim stays withdrawn', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/domain/purchasing/supplier-credit-note.ts', 'utf8')
+  const builderDoc = src.slice(
+    src.indexOf('THE DOCUMENT NUMBER IS ALWAYS'),
+    src.indexOf('export function buildSupplierCreditNoteSyncPayload'),
+  )
+  assert.ok(builderDoc.length > 0, 'the builder doc must still be there, or this scan measures nothing')
+  assert.doesNotMatch(
+    builderDoc,
+    /premise\s*\n?\s*\*?\s*that lets the poster go back to the upserting verb and converge on a retry/,
+    'a number unique by construction on OUR side is not evidence that Xero matches a re-post on it',
+  )
+  assert.match(builderDoc, /RECOGNISABILITY|recognisab/i,
+    'what the minted number actually buys is that a document under it can only be THIS credit note')
+})

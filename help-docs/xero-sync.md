@@ -1418,9 +1418,18 @@ document found under it can only be this credit note:
   refuses and retries later
 
 The last two are deliberate: refusing costs an operator a look at Xero, where a duplicate credit note
-is a mis-stated payables balance nobody goes looking for. A credit note queued before this change,
-under a number IMS did not mint, is refused rather than guessed at — re-record it so it is queued
-under its own number.
+is a mis-stated payables balance nobody goes looking for.
+
+**The number has to be one IMS actually minted, not one that looks like it.** All of the above rests
+on `SCN-<the credit note's own record id>` being unique by construction; a number you typed yourself
+is not, even if you happen to type it starting `SCN-`. A supplier's own reference of the shape
+`SCN-2026-114`, or a purchase order reference every credit against that order shares, would let IMS
+either link the wrong ledger document or refuse this one for ever on the strength of somebody else's.
+So before it asks Xero anything, IMS checks that the queued number is exactly the one this credit
+note's record mints. If it is not — a credit note queued before this change, or one whose sync row no
+longer names its credit note — **nothing is sent at all**, not even the supplier lookup, and the
+failure names both the number found and the number expected. Re-record the credit note so it is
+queued under its own minted number.
 
 ### Releasing a stale external id
 

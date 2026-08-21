@@ -8,7 +8,9 @@ import { imsRateToXeroCurrencyRate } from './fx'
 import type { CreditNoteData, InvoiceLine } from '../types'
 import { PAGE_SIZE } from './invoice-delta'
 import {
+  MINTED_CREDIT_NOTE_NUMBER_PREFIX,
   decidePurchaseCreditNotePost,
+  proveSupplierCreditNoteNumberIsMinted,
   type LedgerCreditNoteClaim,
   type PurchaseCreditNoteLookup,
 } from '@/lib/domain/purchasing/supplier-credit-note'
@@ -157,8 +159,12 @@ export function buildXeroPurchaseCreditNote(
   return creditNote
 }
 
-/** The prefix `buildSupplierCreditNoteSyncPayload` mints every supplier credit-note number under. */
-export const MINTED_CREDIT_NOTE_NUMBER_PREFIX = 'SCN-'
+/**
+ * Re-exported from the MINT (o3d-tfri r4). The prefix used to be declared here, a second copy of a
+ * fact owned by `buildSupplierCreditNoteSyncPayload`; it now travels with the function that mints
+ * the number, so the two cannot drift.
+ */
+export { MINTED_CREDIT_NOTE_NUMBER_PREFIX }
 
 /**
  * Ask the ledger whether credit note `number` is ALREADY there as an ACCPAYCREDIT (o3d-tfri r3).
@@ -182,11 +188,14 @@ export const MINTED_CREDIT_NOTE_NUMBER_PREFIX = 'SCN-'
  * never contains either — the guard is what makes that a checked fact instead of an assumption, and
  * it refuses as `unaskable` (no retry can clear it) rather than sending a question with two readings.
  *
- * THE NUMBER MUST ALSO BE OURS. The whole fence rests on `SCN-<primary key>` being unique by
- * construction, which is what makes a document found under it necessarily THIS credit note. A payload
- * queued before o3d-tfri carries whatever the operator typed — or the PURCHASE ORDER's reference,
- * shared by every credit note on that PO — and adopting a document found under one of those could
- * link the WRONG ledger credit note to this row. Such a number is refused, not looked up.
+ * THE NUMBER MUST ALSO BE OURS, AND A PREFIX IS NOT THAT (o3d-tfri r4). The whole fence rests on
+ * `SCN-<primary key>` being unique by construction, which is what makes a document found under it
+ * necessarily THIS credit note. The proof belongs where the primary key is —
+ * `proveSupplierCreditNoteNumberIsMinted`, called by the poster BEFORE this function is reached — and
+ * the shape test kept here is only a backstop for a caller that has no id to prove against. It is
+ * deliberately not sufficient on its own: an operator's own `SCN-2026-114`, or a purchase-order
+ * reference typed as `SCN-1` and shared by every credit against that PO, passes a prefix test while
+ * breaking the premise entirely.
  *
  * The number is compared again on the way back rather than trusted from the filter: an ownership
  * fence that accepts "close enough" is not a fence.
@@ -338,6 +347,14 @@ export async function lookupXeroPurchaseCreditNoteByNumber(
  * `firstAttempt` IS REQUIRED AND HAS NO DEFAULT, on purpose. It is the only thing that turns "the
  * ledger shows nothing" into permission to create, so a caller that has not established whether IMS
  * already dispatched a create for this credit note must not be able to reach this by omission.
+ *
+ * `creditNote` IS REQUIRED FOR THE SAME REASON (o3d-tfri r4). The fence's premise is that the number
+ * is OURS and unique by construction; the only thing that can establish that is the IMS credit note
+ * the number is minted from, so the caller must name it. The proof runs FIRST — before the contact is
+ * resolved, before the lookup, and before any request at all — because a number IMS cannot prove it
+ * minted is a number no answer from the ledger can be trusted about, in either direction: a document
+ * found under it might be somebody else's (adopting it links the wrong ledger row), and one not found
+ * proves nothing about a replay of ours. Refusing is the only safe reading, and it costs nothing.
  */
 export async function pushPurchaseCreditNote(
   data: CreditNoteData,
@@ -345,12 +362,26 @@ export async function pushPurchaseCreditNote(
   opts: {
     /** True only when IMS has NEVER dispatched a create for this credit note. */
     firstAttempt: boolean
+    /**
+     * The IMS supplier credit note this row posts, as the sync row names it. The number on `data`
+     * must be exactly the one this row's primary key mints, or nothing is sent (o3d-tfri r4).
+     */
+    creditNote: { referenceType: string; referenceId: string }
     idempotencyKey?: string
     supplierId?: string
     /** Seam for tests; production uses the live lookup. */
     lookup?: (creditNoteNumber: string) => Promise<PurchaseCreditNoteLookup>
   },
 ): Promise<{ success: boolean; creditNoteId?: string; error?: string; adopted?: boolean }> {
+  // BEFORE ANY REQUEST — including the contact resolve, which CREATES a Xero contact as a side
+  // effect. A number IMS cannot prove it minted must leave no trace in the ledger at all.
+  const minted = proveSupplierCreditNoteNumberIsMinted({
+    creditNoteNumber: data.creditNoteNumber,
+    referenceType: opts.creditNote.referenceType,
+    referenceId: opts.creditNote.referenceId,
+  })
+  if (!minted.ok) return { success: false, error: minted.reason }
+
   const contactResult = await findOrCreateContact(data.contactName, data.contactEmail, true, { supplierId: opts.supplierId })
   if (!contactResult.success || !contactResult.contactId) {
     return { success: false, error: `Contact error: ${contactResult.error}` }

@@ -76,6 +76,7 @@ test('zero-rated postage beside standard-rated goods posts a document that total
     shippingNetForeign: 10,
     rateById: RATE_BY_ID,
     orderDefault: OUTPUT2,
+    currency: 'GBP',
   })
   assert.equal(shippingTax.resolved, true)
   assert.equal(shippingTax.taxType, 'ZERORATEDOUTPUT', 'the shipping line carries the rate WooCommerce actually charged')
@@ -84,7 +85,7 @@ test('zero-rated postage beside standard-rated goods posts a document that total
   const reconciliation = reconcileWcDocumentTax([
     { label: 'WIDGET', netForeign: 100, rateValue: 0.2, reportedTaxForeign: '20.00' },
     { label: 'Shipping', netForeign: 10, rateValue: shippingTax.rateValue, reportedTaxForeign: '0.00' },
-  ])
+  ], 'GBP')
   assert.deepEqual(reconciliation.disagreements, [])
 
   const payload = await buildDocument({ goodsNet: 100, goodsTaxType: 'OUTPUT2', shippingNet: 10, shippingTaxType: shippingTax.taxType! })
@@ -110,6 +111,7 @@ test('the mirror image — zero-rated goods with standard-rated delivery — tot
     shippingNetForeign: 10,
     rateById: RATE_BY_ID,
     orderDefault: ZERO,
+    currency: 'GBP',
   })
   assert.equal(shippingTax.taxType, 'OUTPUT2')
 
@@ -133,6 +135,7 @@ test('a shipping rate IMS cannot explain refuses to register the payment rather 
     shippingNetForeign: 10,
     rateById: RATE_BY_ID,
     orderDefault: OUTPUT2,
+    currency: 'GBP',
   })
   assert.equal(shippingTax.resolved, false)
   assert.match(shippingTax.reason ?? '', /charged 0\.50 of tax on 10\.00 of shipping/)
@@ -141,7 +144,7 @@ test('a shipping rate IMS cannot explain refuses to register the payment rather 
   const reconciliation = reconcileWcDocumentTax([
     { label: 'WIDGET', netForeign: 100, rateValue: 0.2, reportedTaxForeign: '20.00' },
     { label: 'Shipping', netForeign: 10, rateValue: shippingTax.rateValue, reportedTaxForeign: '0.50' },
-  ])
+  ], 'GBP')
   assert.equal(reconciliation.reconciles, false)
   assert.deepEqual(reconciliation.disagreements, [
     { label: 'Shipping', modelledTax: 2, reportedTax: 0.5, difference: 1.5 },
@@ -165,7 +168,7 @@ test('a GOODS line whose mapped rate does not reproduce Woo\'s own line tax is c
   const reconciliation = reconcileWcDocumentTax([
     { label: 'WIDGET', netForeign: 100, rateValue: 0.2, reportedTaxForeign: '5.00' },
     { label: 'Shipping', netForeign: 0, rateValue: 0, reportedTaxForeign: '0' },
-  ])
+  ], 'GBP')
   assert.equal(reconciliation.reconciles, false)
   assert.equal(reconciliation.disagreements[0].label, 'WIDGET')
   assert.equal(reconciliation.disagreements[0].difference, 15)
@@ -182,6 +185,7 @@ test('an ordinary single-rate order is unchanged, even when its shipping rate id
     shippingNetForeign: 10,
     rateById: RATE_BY_ID,
     orderDefault: OUTPUT2,
+    currency: 'GBP',
   })
   assert.equal(resolution.resolved, true)
   assert.equal(resolution.taxType, 'OUTPUT2')
@@ -191,7 +195,7 @@ test('an ordinary single-rate order is unchanged, even when its shipping rate id
 test('an order with no shipping resolves trivially and never refuses', async () => {
   const { resolveWcShippingTaxRate } = await orderImport()
   const resolution = resolveWcShippingTaxRate({
-    shippingLines: [], shippingNetForeign: 0, rateById: RATE_BY_ID, orderDefault: OUTPUT2,
+    shippingLines: [], shippingNetForeign: 0, rateById: RATE_BY_ID, orderDefault: OUTPUT2, currency: 'GBP',
   })
   assert.equal(resolution.resolved, true)
   assert.equal(resolution.rateValue, 0, 'no shipping line reaches the document, so nothing about it can be taxed wrongly')
@@ -206,11 +210,12 @@ test('rounded money, not rate fractions: 8.33 of shipping at 20% still reconcile
     shippingNetForeign: 8.33,
     rateById: RATE_BY_ID,
     orderDefault: OUTPUT2,
+    currency: 'GBP',
   })
   assert.equal(resolution.resolved, true)
   assert.equal(resolution.taxType, 'OUTPUT2')
   assert.equal(
-    reconcileWcDocumentTax([{ label: 'Shipping', netForeign: 8.33, rateValue: 0.2, reportedTaxForeign: '1.67' }]).reconciles,
+    reconcileWcDocumentTax([{ label: 'Shipping', netForeign: 8.33, rateValue: 0.2, reportedTaxForeign: '1.67' }], 'GBP').reconciles,
     true,
   )
 })
@@ -246,6 +251,7 @@ test('a blended-rate shipping line names the BLEND, and refuses to give the line
     shippingNetForeign: 10,
     rateById: BLEND_RATE_BY_ID,
     orderDefault: OUTPUT2,
+    currency: 'GBP',
   })
 
   assert.equal(shippingTax.resolved, false)
@@ -261,7 +267,7 @@ test('a blended-rate shipping line names the BLEND, and refuses to give the line
   const reconciliation = reconcileWcDocumentTax([
     { label: 'WIDGET', netForeign: 100, rateValue: 0.2, reportedTaxForeign: '20.00' },
     { label: 'Shipping', netForeign: 10, rateValue: shippingTax.rateValue, reportedTaxForeign: '2.50' },
-  ])
+  ], 'GBP')
   assert.deepEqual(reconciliation.disagreements, [
     { label: 'Shipping', modelledTax: 2, reportedTax: 2.5, difference: -0.5 },
   ])
@@ -278,6 +284,7 @@ test('a blend that SUMS to a rate IMS holds still resolves — the arithmetic ke
     shippingNetForeign: 10,
     rateById: BLEND_RATE_BY_ID,
     orderDefault: OUTPUT2,
+    currency: 'GBP',
   })
 
   assert.equal(shippingTax.resolved, true, 'counting the rates must not pre-empt reproducing the charge')
@@ -302,6 +309,7 @@ test('a rate listed at 0.00 alongside a charging one is NOT a blend', async () =
     shippingNetForeign: 10,
     rateById: BLEND_RATE_BY_ID,
     orderDefault: OUTPUT2,
+    currency: 'GBP',
   })
   assert.equal(shippingTax.resolved, true)
   assert.equal(shippingTax.taxType, 'OUTPUT2')
@@ -398,34 +406,162 @@ test('the Xero poster refuses a stamped document before it reads or sends anythi
   const { readFileSync } = await import('node:fs')
   const src = withoutComments(readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8'))
 
-  const createCase = src.slice(src.indexOf("case 'SALES_INVOICE': {"), src.indexOf("case 'SALES_INVOICE_UPDATE': {"))
+  /**
+   * Slice a named switch case out of the processor.
+   *
+   * `indexOf` returns -1 for absent, and `slice` reads a negative index as "from the end" — so a
+   * marker that has been renamed silently widens the region to nearly the whole file, and every
+   * ordering assertion below then measures the WRONG case while still passing. The boundaries are
+   * therefore asserted before they are used. Same family as the `-1 is less than everything` escape
+   * fixed in the UPDATE assertions below.
+   */
+  function switchCase(from: string, to: string): string {
+    const start = src.indexOf(from)
+    const end = src.indexOf(to)
+    assert.ok(start >= 0, `the region marker ${JSON.stringify(from)} is gone — this scan is measuring nothing`)
+    assert.ok(end > start, `the region marker ${JSON.stringify(to)} is gone or moved — the slice would silently widen`)
+    return src.slice(start, end)
+  }
+
+  const createCase = switchCase("case 'SALES_INVOICE': {", "case 'SALES_INVOICE_UPDATE': {")
   const guard = createCase.indexOf('refuseUnreconciledDocument(payload)')
   const cancelledGuard = createCase.indexOf('guardCancelledSalesOrderInvoice(')
   const push = createCase.indexOf('pushSalesInvoice({')
   assert.ok(guard > 0, 'the create must consult the guard')
+  assert.ok(cancelledGuard > 0 && push > 0, 'and the two things it must precede are still there to precede')
   assert.ok(guard < cancelledGuard && guard < push, 'it must run before any read and before the post')
   assert.match(createCase, /if \(!reconciled\.post\) return \{ success: false, error: reconciled\.reason \}/,
     'a refusal must return as an ordinary sync failure, so the row is visible with the reason on it')
 
-  const updateCase = src.slice(src.indexOf("case 'SALES_INVOICE_UPDATE': {"), src.indexOf("case 'PURCHASE_INVOICE': {"))
+  const updateCase = switchCase("case 'SALES_INVOICE_UPDATE': {", "case 'PURCHASE_INVOICE': {")
   const updateGuard = updateCase.indexOf('refuseUnreconciledDocument(payload)')
   // `indexOf` returns -1 for ABSENT, and -1 is less than every real index — so "before the post"
   // must be asserted as PRESENT AND before, or deleting the guard passes.
   assert.ok(updateGuard > 0, 'the UPDATE must consult the guard — overwriting a good document with the stamped one is the same damage')
-  assert.ok(updateGuard < updateCase.indexOf('updateSalesInvoice('), 'and before it posts')
+  const updatePost = updateCase.indexOf('updateSalesInvoice(')
+  assert.ok(updatePost > 0, 'the UPDATE still posts, so there is something for the guard to precede')
+  assert.ok(updateGuard < updatePost, 'and before it posts')
 })
 
 test('the supplier credit-note poster is told whether a create was ever dispatched', async () => {
   const { readFileSync } = await import('node:fs')
   const src = withoutComments(readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8'))
-  const creditCase = src.slice(
-    src.indexOf("case 'PURCHASE_CREDIT_NOTE': {"),
-    src.indexOf("case 'PURCHASE_CREDIT_NOTE_ALLOCATION': {"),
-  )
+  const start = src.indexOf("case 'PURCHASE_CREDIT_NOTE': {")
+  const end = src.indexOf("case 'PURCHASE_CREDIT_NOTE_ALLOCATION': {")
+  assert.ok(start >= 0 && end > start, 'the region markers must both still be there, or this scan measures the wrong case')
+  const creditCase = src.slice(start, end)
   const attempt = creditCase.indexOf('await isFirstPurchaseCreditNoteAttempt(entryId, referenceType, referenceId)')
   const push = creditCase.indexOf('pushPurchaseCreditNote({')
+  assert.ok(push > 0, 'the poster is still called, so there is something for the attempt check to precede')
   assert.ok(attempt > 0 && attempt < push, 'the attempt must be established before the poster is called')
   assert.match(creditCase, /if \(!attempt\.ok\) return \{ success: false, error: attempt\.error \}/,
     'a count that cannot be read must refuse, never read as "first attempt"')
   assert.match(creditCase, /firstAttempt: attempt\.firstAttempt,/, 'and the answer must actually be passed')
+  // o3d-tfri r4: and the row's own identity, without which the poster cannot PROVE the number it is
+  // about to ask the ledger for is one IMS minted.
+  assert.match(creditCase, /creditNote: \{ referenceType, referenceId \},/,
+    'the poster must be given the credit note the number is minted from, or the fence rests on a prefix')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cyn ROUND 4 — THE COMPARISON IS MONEY, AND MONEY IS NOT ALWAYS PENNIES.
+//
+// The branch's rule is that a document IMS knows will not total to its order must not post. The
+// check that decides it compared everything at 2dp and allowed `0.011` either way — a penny, and a
+// penny only. A WooCommerce store can run any currency, and this is the same minor-unit family the
+// coupon-allocation tolerance was fixed for (o3d-5tf).
+// ---------------------------------------------------------------------------------------------
+
+test('r4: a 3-decimal currency no longer posts an invoice whose tax IMS can see is wrong', async () => {
+  // KWD, minor unit 0.001. Woo charged 5.000 on 100.000 of shipping (5%); the rate IMS has mapped for
+  // that WooCommerce rate id is worth 4.99%, so the document would carry 4.990 of tax.
+  //   modelled 100.000 x 0.0499 = 4.990   Woo 5.000   difference -0.010 KWD = TEN fils
+  // The old code rounded that difference to 2dp -> -0.01, compared it against 0.011, and called it
+  // agreement: the invoice posted at 104.990 while the order is 105.000, the payment part-settled it,
+  // and the receivable stays open with 0.010 outstanding for ever.
+  const { resolveWcShippingTaxRate, reconcileWcDocumentTax } = await orderImport()
+  const KWD_499: WcResolvedRateForDocument = { accountingTaxType: 'KW_4_99', taxRateValue: 0.0499, source: 'mapped' }
+
+  const resolution = resolveWcShippingTaxRate({
+    shippingLines: [{ total_tax: '5.000', taxes: [{ id: 3, total: '5.000' }] }],
+    shippingNetForeign: '100.000',
+    rateById: new Map([[3, KWD_499]]),
+    orderDefault: KWD_499,
+    currency: 'KWD',
+  })
+  assert.equal(resolution.resolved, false,
+    'ten fils is ten posted minor units, not rounding — no rate IMS holds reproduces the charge')
+  assert.match(resolution.reason ?? '', /WooCommerce charged 5\.000 of tax on 100\.000 of shipping/,
+    'and the operator sees the figures at the currency\'s own precision, not "5.00 on 100.00"')
+
+  const reconciliation = reconcileWcDocumentTax(
+    [{ label: 'Shipping', netForeign: '100.000', rateValue: 0.0499, reportedTaxForeign: '5.000' }],
+    'KWD',
+  )
+  assert.equal(reconciliation.reconciles, false, 'so the document is stamped and the poster refuses it')
+  assert.equal(reconciliation.disagreements[0].difference, -0.01,
+    'the difference is reported at 3dp: -0.010 KWD, which 2dp rounding had been flattening to -0.01 and waving through')
+  assert.equal(reconciliation.disagreements[0].modelledTax, 4.99)
+  assert.equal(reconciliation.disagreements[0].reportedTax, 5)
+})
+
+test('r4: a 3-decimal currency still reconciles when the disagreement is genuine sub-unit rounding', async () => {
+  // Half a fils: 33.333 x 0.05 = 1.66665, Woo posts 1.667. That is Woo's own rounding, not a wrong
+  // rate, and it must not refuse the order.
+  const { reconcileWcDocumentTax } = await orderImport()
+  const reconciliation = reconcileWcDocumentTax(
+    [{ label: 'Shipping', netForeign: '33.333', rateValue: 0.05, reportedTaxForeign: '1.667' }],
+    'KWD',
+  )
+  assert.equal(reconciliation.reconciles, true, 'one posted minor unit either way is still the allowance — in fils')
+})
+
+test('r4: a 0-decimal currency stops refusing documents that are entirely correct', async () => {
+  // JPY, minor unit 1. Woo charged 10% on 1,005 yen of shipping: 100.5 -> posted as 101.
+  //   modelled 1005 x 0.10 = 100.5   Woo 101   difference -0.5 YEN, i.e. HALF THE SMALLEST COIN
+  // Against a 0.011 allowance that is a mismatch, so the shipping rate came back unresolved, the
+  // order was stamped, and the poster refused an invoice Xero would have totalled to 1,106 — exactly
+  // the order total. Legitimate work blocked on arithmetic no correct document could satisfy.
+  const { resolveWcShippingTaxRate, reconcileWcDocumentTax } = await orderImport()
+  const JPY_10: WcResolvedRateForDocument = { accountingTaxType: 'JP_CT_10', taxRateValue: 0.1, source: 'mapped' }
+
+  const resolution = resolveWcShippingTaxRate({
+    shippingLines: [{ total_tax: '101', taxes: [{ id: 5, total: '101' }] }],
+    shippingNetForeign: 1005,
+    rateById: new Map([[5, JPY_10]]),
+    orderDefault: JPY_10,
+    currency: 'JPY',
+  })
+  assert.equal(resolution.resolved, true, 'half a yen is below one posted minor unit — this is Woo rounding, not a wrong rate')
+  assert.equal(resolution.taxType, 'JP_CT_10')
+
+  assert.equal(
+    reconcileWcDocumentTax([{ label: 'Shipping', netForeign: 1005, rateValue: 0.1, reportedTaxForeign: '101' }], 'JPY').reconciles,
+    true,
+    'and the document reconciles, so it posts instead of being stamped',
+  )
+})
+
+test('r4: a 0-decimal currency still refuses a document whose tax is genuinely wrong', async () => {
+  // The loosened allowance must not become no allowance: 8% where the shop charged 10% is 20 yen out.
+  const { reconcileWcDocumentTax } = await orderImport()
+  const reconciliation = reconcileWcDocumentTax(
+    [{ label: 'Shipping', netForeign: 1000, rateValue: 0.08, reportedTaxForeign: '100' }],
+    'JPY',
+  )
+  assert.equal(reconciliation.reconciles, false)
+  assert.equal(reconciliation.disagreements[0].difference, -20, 'whole yen, reported as whole yen')
+})
+
+test('r4: the tolerance is one posted minor unit of the ORDER currency, and 2-decimal currencies do not move', async () => {
+  const { reconcileWcDocumentTax } = await orderImport()
+  // The identical component, read in three currencies. 0.005 is half a penny, five whole fils, and
+  // an invisible fraction of a yen — one number cannot be right for all three, which is the finding.
+  const component = [{ label: 'Shipping', netForeign: 100, rateValue: 0.2, reportedTaxForeign: '20.005' }]
+  assert.equal(reconcileWcDocumentTax(component, 'GBP').reconciles, true,
+    'GBP: half a penny is inside the penny allowance, exactly as before this change')
+  assert.equal(reconcileWcDocumentTax(component, 'KWD').reconciles, false,
+    'KWD: five whole fils is five posted minor units — a real discrepancy that used to post')
+  assert.equal(reconcileWcDocumentTax(component, 'JPY').reconciles, true,
+    'JPY: below the smallest coin there is nothing to disagree about')
 })

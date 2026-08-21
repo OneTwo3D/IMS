@@ -117,6 +117,14 @@ With the initial import complete, new and updated WooCommerce orders are importe
   **The remedy** is named on the failure: map the WooCommerce tax rate the order used (Tax Rates,
   below) and re-import the order. The rebuilt document posts normally.
 
+  **"Disagree" is measured in the order's own currency.** The allowance is one posted minor unit
+  either way — a penny in GBP/EUR/USD, a whole yen in a 0-decimal currency (JPY, KRW, ISK, CLP, VND),
+  a fils in a 3-decimal one (KWD, BHD, JOD, OMR, TND) — and the figures in the message are printed at
+  that precision. It used to be a penny in every currency, which was wrong in both directions: in a
+  3-decimal currency a real ten-fils error read as "within a penny" and the invoice posted, and in a
+  0-decimal one WooCommerce's own whole-unit rounding read as a mismatch and correct orders were
+  refused.
+
   **One case has no mapping that will help.** WooCommerce can tax a single shipping line at several
   rates at once — a standard rate plus a regional surcharge, say — and an accounting invoice carries
   exactly one tax type on shipping. If those rates happen to add up to a rate IMS holds (15% + 5%

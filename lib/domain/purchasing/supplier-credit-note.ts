@@ -130,8 +130,15 @@ export function resolveSupplierCreditNoteTaxType(params: {
  * what forced `pushPurchaseCreditNote` onto a create-only verb, and a create-only verb DUPLICATES the
  * credit note when a response is lost (see that function for the full argument). Minting the number
  * from the primary key unconditionally makes it unique BY CONSTRUCTION, exactly as
- * `nextCreditNoteNumber`'s advisory-locked counter does on the sales side — which is the premise
- * that lets the poster go back to the upserting verb and converge on a retry.
+ * `nextCreditNoteNumber`'s advisory-locked counter does on the sales side.
+ *
+ * WHAT ROUND 2 CONCLUDED FROM THAT WAS WITHDRAWN IN ROUND 3, and this sentence used to still carry
+ * it: "which is the premise that lets the poster go back to the upserting verb and converge on a
+ * retry". IT DOES NOT. Uniqueness on OUR side says nothing about whether XERO matches a re-post on
+ * `CreditNoteNumber`, and Xero does not require ACCPAYCREDIT numbers to be unique, so it cannot be
+ * assumed to. What the minted number actually buys is RECOGNISABILITY: a document in the ledger under
+ * it can only be this credit note, which is what makes the pre-create lookup
+ * (`decidePurchaseCreditNotePost`) answerable. The fence converges the retry; the verb does not.
  *
  * NOTHING IS LOST. `params.creditNoteNumber` is kept and deliberately NOT read — it is the seam a
  * future "show the supplier's own number in the ledger" would attach to, and reading it again is
@@ -139,6 +146,80 @@ export function resolveSupplierCreditNoteTaxType(params: {
  * the operator's number as the row's `reference` when they give one (falling back to the PO
  * reference), and `reference` posts to Xero's `Reference` field.
  */
+/**
+ * The prefix every IMS-minted supplier credit-note number carries.
+ *
+ * Lives here, beside the mint, so the poster's ownership proof and the mint cannot drift apart.
+ */
+export const MINTED_CREDIT_NOTE_NUMBER_PREFIX = 'SCN-'
+
+/** The ONE number IMS mints for a supplier credit note: its primary key under the prefix. */
+export function mintedSupplierCreditNoteNumber(creditNoteId: string): string {
+  return `${MINTED_CREDIT_NOTE_NUMBER_PREFIX}${creditNoteId.trim()}`
+}
+
+/**
+ * PROVE THE NUMBER IS ONE IMS MINTED — o3d-tfri round 4.
+ *
+ * The replay fence below (`decidePurchaseCreditNotePost`) is answerable ONLY because the number is
+ * ours and unique by construction: that is what makes "a document exists under this number" mean
+ * "THIS credit note already posted". Round 3 checked the number `startsWith('SCN-')`, which is not
+ * that fact — it is a fact about the first four characters.
+ *
+ * An operator-entered number breaks the premise while passing the check. The supplier credit-note
+ * number field is optional free text, and a supplier's own reference of the shape `SCN-2026-114`, or
+ * a PO reference an operator typed as `SCN-1`, satisfies a prefix test exactly as a minted number
+ * does. It is also SHAREABLE — several credits against one purchase order used to carry the PO's
+ * reference — so under such a number the ledger may hold a DIFFERENT document, and the fence would
+ * then ADOPT that document's id as this credit note's (silently linking the wrong ledger row), or
+ * REFUSE this credit note for ever on the strength of somebody else's.
+ *
+ * So the number is proved rather than pattern-matched: it must be exactly the number this credit
+ * note's primary key mints, and the row must be a SupplierCreditNote in the first place. Where that
+ * cannot be shown, the answer is to refuse — never to look up and act on the result.
+ */
+export function proveSupplierCreditNoteNumberIsMinted(input: {
+  creditNoteNumber: string
+  referenceType: string
+  referenceId: string
+}): { ok: true; number: string } | { ok: false; reason: string } {
+  const wanted = input.creditNoteNumber.trim()
+  const id = input.referenceId.trim()
+
+  if (input.referenceType !== SUPPLIER_CREDIT_NOTE_REFERENCE_TYPE || !id) {
+    return {
+      ok: false,
+      reason:
+        `NOTHING WAS SENT. This sync row does not identify the IMS supplier credit note it posts `
+        + `(referenceType ${JSON.stringify(input.referenceType)}, referenceId ${JSON.stringify(input.referenceId)}), `
+        + `so IMS cannot show that ${JSON.stringify(wanted)} is a number it minted. The replay fence is only `
+        + `answerable for a number that is ours and unique by construction, and a create without that fence is `
+        + `how one credit note becomes two ACCPAYCREDITs. Re-record the credit note so it is queued against its `
+        + `own row.`,
+    }
+  }
+
+  const minted = mintedSupplierCreditNoteNumber(id)
+  if (wanted !== minted) {
+    return {
+      ok: false,
+      reason:
+        `NOTHING WAS SENT. Credit note number ${JSON.stringify(wanted)} was NOT minted by IMS for this credit `
+        + `note — the number IMS mints for it is ${JSON.stringify(minted)}. A number that merely looks minted `
+        + `(an operator-entered ${JSON.stringify(MINTED_CREDIT_NOTE_NUMBER_PREFIX)} reference, or a purchase `
+        + `order's reference shared by every credit against it) is not unique by construction, so a document `
+        + `found in the ledger under it need not be this credit note: adopting it would link the WRONG ledger `
+        + `document, and refusing on it would block this one for ever. Re-record the credit note so it is queued `
+        + `under its own minted number.`,
+    }
+  }
+
+  return { ok: true, number: minted }
+}
+
+/** The only `referenceType` a supplier credit-note sync row may carry. */
+export const SUPPLIER_CREDIT_NOTE_REFERENCE_TYPE = 'SupplierCreditNote'
+
 export function buildSupplierCreditNoteSyncPayload(params: {
   creditNoteId: string
   creditNoteNumber: string | null
@@ -164,7 +245,7 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   lineAmountsIncludeTax?: boolean
 }): Record<string, unknown> {
   return {
-    creditNoteNumber: `SCN-${params.creditNoteId}`,
+    creditNoteNumber: mintedSupplierCreditNoteNumber(params.creditNoteId),
     contactName: params.supplierName,
     date: params.date,
     currency: params.currency,

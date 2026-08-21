@@ -3795,6 +3795,10 @@ async function processClaimedEntry(
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
       }, resolveInvoiceStatus(postingMode), {
         firstAttempt: attempt.firstAttempt,
+        // o3d-tfri r4: the row's own identity, so the poster can PROVE the number is one IMS minted
+        // rather than one that merely starts with the prefix. Without it the replay fence would be
+        // asking the ledger about a number that need not be ours.
+        creditNote: { referenceType, referenceId },
         idempotencyKey: buildXeroIdempotencyKey(entryId, 'purchase-credit-note'),
         supplierId: payload.supplierId as string | undefined,
       }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))

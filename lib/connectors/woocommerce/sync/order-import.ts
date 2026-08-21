@@ -26,7 +26,7 @@ import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { directCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
-import { addMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
 import {
   UNRECONCILED_TAX_PAYLOAD_KEY, buildUnreconciledTaxMarker,
@@ -339,14 +339,38 @@ export type WcShippingTaxResolution = {
 }
 
 /**
- * A penny either way. Both systems round money to 2dp, so a rate is judged by whether it REPRODUCES
- * the tax Woo charged, not by comparing rate fractions — `1.67 / 8.33` is not `0.20` and never will
- * be, while `8.33 × 0.20` rounds to `1.67` exactly as Woo's own arithmetic did.
+ * ONE POSTED MINOR UNIT EITHER WAY, IN THE ORDER'S OWN CURRENCY.
+ *
+ * A rate is judged by whether it REPRODUCES the tax Woo charged, not by comparing rate fractions —
+ * `1.67 / 8.33` is not `0.20` and never will be, while `8.33 × 0.20` lands within a penny of the
+ * `1.67` Woo's own rounding produced. The allowance therefore has to be the smallest amount either
+ * system can POST, and that is a property of the currency, not a constant.
+ *
+ * o3d-cyn r4 — THE CONSTANT WAS `0.011`, WHICH IS A PENNY AND ONLY A PENNY. A WooCommerce store can
+ * run any currency, and this is the same minor-unit family the coupon-allocation tolerance was fixed
+ * for (o3d-5tf, `couponAllocationTolerance`):
+ *
+ *   • 3-DECIMAL (KWD, BHD, JOD, OMR, TND): `0.011` is ELEVEN whole minor units. A shipping line whose
+ *     tax is out by ten fils — a mis-mapped 4.99% where the shop charged 5% — reproduced and
+ *     reconciled, so the invoice POSTED at a total that does not match the order. That is the branch's
+ *     own rule broken in the currency it was least likely to be noticed in: a document IMS had the
+ *     evidence to know was wrong went to the ledger, the payment for the order total part-settled it,
+ *     and the receivable stays open for ever.
+ *   • 0-DECIMAL (JPY, KRW, ISK, CLP, VND): `0.011` is a hundredth of the smallest coin. Woo's own
+ *     whole-yen rounding of a rate applied to a net moves the figure by up to half a yen, so an
+ *     ENTIRELY CORRECT document failed to reproduce, the shipping rate came back unresolved, and the
+ *     order was stamped and refused. Legitimate work blocked, on arithmetic that cannot be satisfied.
+ *
+ * `10^-minorUnits × 1.1` is one posted minor unit plus a tenth for binary-float slack: exactly
+ * `0.011` for a 2-decimal currency (so nothing about GBP/EUR/USD moves), `0.0011` for a 3-decimal one
+ * and `1.1` for a 0-decimal one.
  */
-const COMPONENT_TAX_TOLERANCE = 0.011
+function componentTaxTolerance(currency: string): Decimal {
+  return toDecimal(10).pow(-currencyMinorUnits(currency)).mul(11).div(10)
+}
 
-function reproducesTax(netForeign: Decimal, rateValue: number, reportedTax: Decimal): boolean {
-  return Math.abs(Number(netForeign.mul(toDecimal(rateValue)).sub(reportedTax))) <= COMPONENT_TAX_TOLERANCE
+function reproducesTax(netForeign: Decimal, rateValue: number, reportedTax: Decimal, currency: string): boolean {
+  return netForeign.mul(toDecimal(rateValue)).sub(reportedTax).abs().lte(componentTaxTolerance(currency))
 }
 
 /**
@@ -384,8 +408,15 @@ export function resolveWcShippingTaxRate(input: {
   /** Every WooCommerce rate id already resolved for this order. */
   rateById: ReadonlyMap<number, WcResolvedRateForDocument>
   orderDefault: WcResolvedRateForDocument
+  /**
+   * The ORDER currency (o3d-cyn r4). It sets the minor unit every comparison below is measured in —
+   * "reproduces the tax Woo charged" means "to within one amount either system can post", and that
+   * amount is a yen in JPY and a fils in KWD, not a penny everywhere.
+   */
+  currency: string
 }): WcShippingTaxResolution {
   const net = toDecimal(input.shippingNetForeign)
+  const money = currencyMinorUnits(input.currency)
   // No shipping line is put on the document at all below zero, so no tax type is used and there is
   // nothing here that can be wrong.
   if (!net.gt(0)) {
@@ -411,7 +442,7 @@ export function resolveWcShippingTaxRate(input: {
       if (rate && rate.source === 'mapped') named.set(tax.id, rate)
     }
   }
-  const matching = [...named.values()].filter((rate) => reproducesTax(net, rate.taxRateValue, reportedTax))
+  const matching = [...named.values()].filter((rate) => reproducesTax(net, rate.taxRateValue, reportedTax, input.currency))
   const distinctTypes = new Set(matching.map((rate) => rate.accountingTaxType))
   if (distinctTypes.size === 1) {
     const chosen = matching[0]
@@ -429,12 +460,12 @@ export function resolveWcShippingTaxRate(input: {
       resolved: false,
       contributingRateCount: contributing.size,
       reason:
-        `WooCommerce charged ${reportedTax.toFixed(2)} of tax on ${net.toFixed(2)} of shipping and IMS holds `
+        `WooCommerce charged ${reportedTax.toFixed(money)} of tax on ${net.toFixed(money)} of shipping and IMS holds `
         + `${distinctTypes.size} different accounting tax types that would produce it, so the shipping line `
         + `cannot be given one.`,
     }
   }
-  if (reproducesTax(net, input.orderDefault.taxRateValue, reportedTax)) {
+  if (reproducesTax(net, input.orderDefault.taxRateValue, reportedTax, input.currency)) {
     return {
       taxType: input.orderDefault.accountingTaxType,
       rateValue: input.orderDefault.taxRateValue,
@@ -453,11 +484,11 @@ export function resolveWcShippingTaxRate(input: {
     reason:
       contributing.size > 1
         ? `WooCommerce applied ${contributing.size} tax rates to this shipping line, together charging `
-          + `${reportedTax.toFixed(2)} on ${net.toFixed(2)} of shipping. An accounting document carries ONE tax `
+          + `${reportedTax.toFixed(money)} on ${net.toFixed(money)} of shipping. An accounting document carries ONE tax `
           + `type on shipping, and no single rate IMS holds reproduces that blend — not the order's default of `
           + `${(input.orderDefault.taxRateValue * 100).toFixed(2)}% either. There is no tax type that can be sent `
           + `for it.`
-        : `WooCommerce charged ${reportedTax.toFixed(2)} of tax on ${net.toFixed(2)} of shipping, which is neither `
+        : `WooCommerce charged ${reportedTax.toFixed(money)} of tax on ${net.toFixed(money)} of shipping, which is neither `
           + `the order's default rate of ${(input.orderDefault.taxRateValue * 100).toFixed(2)}% nor any WooCommerce `
           + `shipping rate mapped in IMS.`,
   }
@@ -492,7 +523,22 @@ export type WcDocumentTaxReconciliation = {
  * compare against; inventing one would make this check assert its own guess. Its exposure is
  * unchanged by this function and is the same one o3d-y14 records.
  */
-export function reconcileWcDocumentTax(components: WcDocumentTaxComponent[]): WcDocumentTaxReconciliation {
+export function reconcileWcDocumentTax(
+  components: WcDocumentTaxComponent[],
+  /**
+   * The ORDER currency (o3d-cyn r4). Both the rounding and the tolerance are money, and money is only
+   * defined once you know which. Rounding every figure to 2dp and allowing a penny either way was
+   * right for GBP and wrong in both directions elsewhere: in a 3-decimal currency it rounded a real
+   * ten-fils error away to `0.01` and then waved it through as "within a penny", so a document IMS
+   * knew would not total to its order POSTED; in a 0-decimal one it demanded agreement a hundred
+   * times finer than the smallest coin, so correct documents were refused.
+   */
+  currency: string,
+): WcDocumentTaxReconciliation {
+  const money = currencyMinorUnits(currency)
+  // One posted minor unit either way, in this currency — see `componentTaxTolerance`. Compared as a
+  // Decimal against Decimal-rounded money, so the threshold is not itself a float approximation.
+  const tolerance = componentTaxTolerance(currency)
   const disagreements = components
     .map((component) => {
       const net = toDecimal(component.netForeign)
@@ -500,12 +546,12 @@ export function reconcileWcDocumentTax(components: WcDocumentTaxComponent[]): Wc
       const modelled = net.mul(toDecimal(component.rateValue))
       return {
         label: component.label,
-        modelledTax: roundDecimalNumber(modelled, 2),
-        reportedTax: roundDecimalNumber(reported, 2),
-        difference: roundDecimalNumber(modelled.sub(reported), 2),
+        modelledTax: roundDecimalNumber(modelled, money),
+        reportedTax: roundDecimalNumber(reported, money),
+        difference: roundDecimalNumber(modelled.sub(reported), money),
       }
     })
-    .filter((d) => Math.abs(d.difference) > COMPONENT_TAX_TOLERANCE)
+    .filter((d) => toDecimal(d.difference).abs().gt(tolerance))
     .sort((a, b) => Math.abs(b.difference) - Math.abs(a.difference))
   return { reconciles: disagreements.length === 0, disagreements }
 }
@@ -1598,11 +1644,14 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
 
     // o3d-cyn r2: shipping need not carry the goods' rate, and a document that will not produce
     // Woo's own tax must not be claimed as settled by a payment for the order total.
+    // The ORDER's currency, not the base one: every figure compared below is in it (o3d-cyn r4).
+    const orderMoneyDigits = currencyMinorUnits(wcOrder.currency)
     const shippingTax = resolveWcShippingTaxRate({
       shippingLines: wcOrder.shipping_lines,
       shippingNetForeign: shippingForeign,
       rateById: wcResolvedById,
       orderDefault: { accountingTaxType, taxRateValue },
+      currency: wcOrder.currency,
     })
     const documentTaxReconciliation = reconcileWcDocumentTax([
       ...mappedLines.map((l, idx) => ({
@@ -1623,7 +1672,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           toDecimal(0),
         ),
       },
-    ])
+    ], wcOrder.currency)
     const documentTotalsToTheOrder = shippingTax.resolved && documentTaxReconciliation.reconciles
 
     // GBP conversions
@@ -1912,7 +1961,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           + `${wcOrder.number}, so the invoice would not total the order's ${wcOrder.total}. `
           + (shippingTax.resolved ? '' : `${shippingTax.reason} `)
           + documentTaxReconciliation.disagreements
-            .map((d) => `${d.label}: document ${d.modelledTax.toFixed(2)} vs WooCommerce ${d.reportedTax.toFixed(2)}`)
+            // Figures at the ORDER currency's own precision (o3d-cyn r4): `toFixed(2)` printed a
+            // whole-yen tax as "101.00" and a three-decimal one as "5.00", hiding the fils the
+            // disagreement is actually in.
+            .map((d) => `${d.label}: document ${d.modelledTax.toFixed(orderMoneyDigits)} vs WooCommerce ${d.reportedTax.toFixed(orderMoneyDigits)}`)
             .join('; ')
         : null
       if (unreconciledReason) {
