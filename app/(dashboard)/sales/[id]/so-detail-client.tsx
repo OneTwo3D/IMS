@@ -1721,7 +1721,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                             this same refusal. The missing fact is WHICH payment, and the operator is
                             looking at it. So they may name it, and naming it decides nothing: IMS
                             asks the accounting system about that payment and requires it to be on
-                            this invoice, for this amount, and gone. No reference, no button.
+                            this invoice, for exactly this amount, and gone — and requires that no
+                            payment for that same amount is still standing on the invoice, since the
+                            amount cannot tell two of them apart. No reference, no button.
                           */
                           <div className="space-y-2">
                             <label className="block text-[11px] text-muted-foreground" htmlFor={`asserted-ref-${p.id}`}>

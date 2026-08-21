@@ -10,6 +10,7 @@ import {
   assertedReversalNote,
   buildAssertedReversalData,
   buildVerifiedReversalData,
+  canonicalLedgerAmount,
   describeAttemptUndecidedRefusal,
   describeLedgerHoldRefusal,
   hasPostEvidence,
@@ -18,11 +19,13 @@ import {
   normalizeAssertedPaymentReference,
   refuseAssertedPaymentAmountMismatch,
   refuseAssertedPaymentNotOnInvoice,
+  refuseAssertedPaymentStillOnInvoice,
   refuseAssertedPaymentUnattributable,
   refuseLedgerLookupFailure,
   refuseLedgerStillHolds,
   refuseUnverifiableConnector,
   registrationLedgerStanding,
+  sameLedgerAmount,
   sameLedgerIdentifier,
   splitPaymentRegistrations,
   type PaymentRegistrationRow,
@@ -232,9 +235,53 @@ test('a payment on somebody else\'s invoice is refused by name, and says whose',
 })
 
 test('a payment for the wrong amount is refused, because an invoice can carry several', () => {
-  const refusal = refuseAssertedPaymentAmountMismatch('PAY-9', 40, 100)
+  const refusal = refuseAssertedPaymentAmountMismatch('PAY-9', '40', '100')
   assert.equal(refusal.code, 'asserted_payment_amount_mismatch')
   assert.match(refusal.message, /for 40 and this receipt is for 100/)
+})
+
+// ---------------------------------------------------------------------------
+// AMOUNTS ARE COMPARED EXACTLY, AND AN AMOUNT IS NOT AN IDENTITY (round 4)
+// ---------------------------------------------------------------------------
+
+test('the same amount in different renderings compares equal, to the last digit either side states', () => {
+  // The receipt is a Decimal(18, 4) and Xero states a JSON number; both have to reduce to one text.
+  assert.equal(canonicalLedgerAmount('100.0000'), '100')
+  assert.equal(canonicalLedgerAmount(100), '100')
+  assert.equal(canonicalLedgerAmount('0100.10'), '100.1')
+  assert.equal(canonicalLedgerAmount('-0.00'), '0', 'minus zero is zero')
+  assert.equal(canonicalLedgerAmount('-40.5000'), '-40.5')
+  assert.ok(sameLedgerAmount('100.0000', 100))
+  assert.ok(sameLedgerAmount({ toString: () => '100.00' }, '100'))
+})
+
+test('an amount a tolerance would have swallowed is a DIFFERENT amount', () => {
+  // `Math.abs(a - b) > 0.005` admitted every one of these. Each is a different sum of money.
+  assert.ok(!sameLedgerAmount(100.004, 100))
+  assert.ok(!sameLedgerAmount(99.9955, 100))
+  assert.ok(!sameLedgerAmount('100.005', '100.00'))
+})
+
+test('anything that is not plain decimal text is unreadable, never zero', () => {
+  // Every caller has to treat null as "cannot be matched". Read as 0 instead, `sameLedgerAmount`
+  // would make two unreadable amounts agree — which is how a refusal becomes a delete.
+  for (const value of [NaN, Infinity, -Infinity, '', '  ', 'abc', '1e21', 1e21, '+100', '1,000', null, undefined, {}, []]) {
+    assert.equal(canonicalLedgerAmount(value), null, `${String(value)} must be unreadable`)
+  }
+  assert.ok(!sameLedgerAmount(NaN, NaN), 'and two unreadable amounts are not "the same amount"')
+})
+
+test('a payment still standing on the invoice for this amount refuses, and says which one', () => {
+  // The amount was only ever a filter. The proof that the named payment is THIS receipt's cannot come
+  // from a value two payments can share — so a standing payment for that value refuses by name.
+  const refusal = refuseAssertedPaymentStillOnInvoice('PAY-9', 'SO-1001', 'PAY-77', '100')
+  assert.equal(refusal.code, 'asserted_payment_amount_ambiguous')
+  assert.match(refusal.message, /invoice for SO-1001 STILL carries a payment for 100 \(PAY-77\)/)
+  assert.match(refusal.message, /payment PAY-9 was for that same amount/)
+  assert.match(refusal.message, /Nothing was changed, and nothing was deleted/)
+  // Both ways out, because a refusal without one is where round 1 went wrong.
+  assert.match(refusal.message, /reverse THAT payment in the accounting system and name it here/)
+  assert.match(refusal.message, /Sync → Xero/)
 })
 
 test('with no ledger invoice recorded there is nothing to attribute the payment to, so it refuses', () => {

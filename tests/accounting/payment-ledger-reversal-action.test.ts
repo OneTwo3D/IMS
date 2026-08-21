@@ -28,7 +28,12 @@ type SyncRow = {
   payload: unknown
 }
 
-type PaymentRow = { id: string; orderId: string; refundId: string | null; amount: number; currency: string }
+/**
+ * `amount` is `number | string` on purpose: the column is `Decimal(18, 4)` and Prisma hands back a
+ * Decimal, not a double. A double is what a naive test would use, and it would never notice that
+ * `100.0000` and `100` have to compare equal while `100.004` and `100` must not.
+ */
+type PaymentRow = { id: string; orderId: string; refundId: string | null; amount: number | string; currency: string }
 
 const state = {
   permissions: new Set<string>(['sales.refund']),
@@ -55,6 +60,19 @@ const state = {
    */
   xeroPaymentDetails: new Map<string, { invoiceId?: string | null; amount?: number | null; omit?: boolean }>(),
   xeroError: null as string | null,
+  /**
+   * What the INVOICE says is still standing on it — the fourth fact an operator-supplied reference
+   * has to clear (Codex round 3, finding 2). Defaulted to an invoice carrying nothing, because the
+   * ordinary case is a payment that has been reversed and an invoice with nothing left on it.
+   *
+   * `null` models a response with NO payment list at all, which is a question unanswered rather than
+   * an answer of "nothing" — a double that always sent `[]` could not tell those apart.
+   */
+  xeroInvoicePayments: [] as Array<{ PaymentID?: string; Amount?: number | null }> | null,
+  /** The invoice GET fails while the payment GET succeeds — they are separate calls and can fail apart. */
+  xeroInvoiceError: null as string | null,
+  /** An `ok` response listing no invoice at all. */
+  xeroInvoiceMissing: false,
   xeroCalls: [] as string[],
   /** Runs once inside the transaction, right after the order lock, to move the world under the write. */
   mutateUnderLock: null as (() => void) | null,
@@ -200,6 +218,26 @@ mock.module('@/lib/connectors/xero/api', {
   namedExports: {
     xeroGet: async (path: string) => {
       state.xeroCalls.push(path)
+      if (path.startsWith('Invoices/')) {
+        if (state.xeroInvoiceError) return { ok: false, status: 0, error: state.xeroInvoiceError }
+        if (state.xeroInvoiceMissing) return { ok: true, status: 200, data: { Invoices: [] } }
+        const invoiceId = decodeURIComponent(path.replace('Invoices/', ''))
+        return {
+          ok: true,
+          status: 200,
+          data: {
+            Invoices: [{
+              InvoiceID: invoiceId,
+              ...(state.xeroInvoicePayments === null ? {} : {
+                Payments: state.xeroInvoicePayments.map((entry) => ({
+                  ...(entry.PaymentID === undefined ? {} : { PaymentID: entry.PaymentID }),
+                  ...(entry.Amount === null || entry.Amount === undefined ? {} : { Amount: entry.Amount }),
+                })),
+              }),
+            }],
+          },
+        }
+      }
       if (state.xeroError) return { ok: false, status: 0, error: state.xeroError }
       const id = decodeURIComponent(path.replace('Payments/', ''))
       const status = state.xeroPayments.get(id)
@@ -285,6 +323,9 @@ test.beforeEach(() => {
   state.xeroPayments = new Map([['PAY-9', 'AUTHORISED']])
   state.xeroPaymentDetails = new Map()
   state.xeroError = null
+  state.xeroInvoicePayments = []
+  state.xeroInvoiceError = null
+  state.xeroInvoiceMissing = false
   state.xeroCalls = []
   state.mutateUnderLock = null
   state.mutateAfterRegistrationRead = null
@@ -511,7 +552,11 @@ test('an operator who NAMES the reversed payment gets it CHECKED, and only then 
   state.xeroPayments.set('PAY-42', 'DELETED')
   const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
   assert.equal((result as { success: boolean }).success, true)
-  assert.deepEqual(state.xeroCalls, ['Payments/PAY-42'], 'the reference is a place to look, and IMS looks')
+  assert.deepEqual(
+    state.xeroCalls,
+    ['Payments/PAY-42', 'Invoices/INV-abc'],
+    'the reference is a place to look, and IMS looks — then asks the invoice what is still standing on it',
+  )
   assert.ok(!paymentStillThere())
   assert.equal(state.order.paidAt, null)
   // THE ROW IS DECIDED, not merely retired. The id the processor never wrote down is written down
@@ -549,6 +594,171 @@ test('a named payment for a DIFFERENT amount is refused — an invoice can carry
     assert.match((result as { error: string }).error, /for 40 and this receipt is for 100/)
     assert.ok(paymentStillThere())
   })()
+})
+
+// ---------------------------------------------------------------------------
+// THE AMOUNT IS A FILTER, NOT AN IDENTIFIER (Codex round 3, finding 2)
+// ---------------------------------------------------------------------------
+
+test('a payment a HAIR away from this receipt\'s amount is refused, not rounded into a match', async () => {
+  // THE DEFECT. Round 3 required three facts — same invoice, same amount, deleted — and compared the
+  // amount with `Math.abs(ledger - receipt) > 0.005`. A tolerance on an amount admits a DIFFERENT
+  // payment of a near-identical value, which is the "two payments against one invoice" case this
+  // whole area exists to prevent, arrived at through the check meant to stop it. Ten pounds four
+  // thousandths is not ten pounds; the ledger states amounts exactly and so does the receipt.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroPaymentDetails.set('PAY-42', { amount: 100.004 })
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'asserted_payment_amount_mismatch')
+  assert.match((result as { error: string }).error, /for 100\.004 and this receipt is for 100/)
+  assert.ok(paymentStillThere(), 'the receipt must survive')
+  assert.equal(row('log-7').status, 'FAILED', 'and the attempt stays undecided')
+  assert.equal(row('log-7').externalTransactionId, null)
+})
+
+test('the same amount written differently is the SAME amount — a stored Decimal is not a double', async () => {
+  // The other half of dropping the tolerance: exactness must not become pedantry. The column is
+  // Decimal(18, 4), so the receipt arrives as `100.0000` while Xero states `100`. Comparing the two
+  // renderings as text would refuse every genuine match, which is a refusal an operator cannot fix.
+  const { reverseLedgerPayment } = await loadActions()
+  state.payments = [{ id: 'pay-1', orderId: 'order-1', refundId: null, amount: '100.0000', currency: 'GBP' }]
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroPaymentDetails.set('PAY-42', { amount: 100 })
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { success: boolean }).success, true)
+  assert.ok(!paymentStillThere())
+})
+
+test('a receipt whose OWN amount cannot be read matches nothing, and says so', async () => {
+  // The other side of the comparison can fail too. Reading an unreadable receipt amount as zero (or
+  // as NaN, which compares false against everything) would either match a payment for nothing or
+  // produce a mismatch message with `NaN` in it; neither is a fact, so this refuses as a lookup that
+  // could not be completed and Xero is never asked about the invoice.
+  const { reverseLedgerPayment } = await loadActions()
+  state.payments = [{ id: 'pay-1', orderId: 'order-1', refundId: null, amount: 'not-a-number', currency: 'GBP' }]
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'ledger_lookup_failed')
+  assert.match((result as { error: string }).error, /cannot read this receipt's own amount as a plain decimal/)
+  assert.ok(paymentStillThere())
+  assert.deepEqual(state.xeroCalls, ['Payments/PAY-42'], 'and the invoice is never asked')
+})
+
+test('a payment for this receipt\'s amount STILL on the invoice refuses, however deleted the named one is', async () => {
+  // THE CASE THE THREE FACTS CANNOT SEE, and the one that costs money. Every fact passes: PAY-42 is
+  // on this invoice, it is for exactly this receipt's amount, and Xero says it is DELETED. And the
+  // receipt's OWN payment — PAY-77, the same £100 — is still sitting on the invoice. Retiring the
+  // registration here deletes the local receipt while the ledger goes on showing the invoice settled,
+  // with nothing local left to contradict it: the exact state o3d-1vuv exists to make unreachable,
+  // reached through the remedy instead of the fault.
+  //
+  // An amount cannot tell two payments apart. So the invoice is asked what is still standing on it,
+  // and a standing payment for this amount is a refusal — IMS does not know which of the two the
+  // operator's reference describes, and guessing is what deletes the wrong one.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroInvoicePayments = [{ PaymentID: 'PAY-77', Amount: 100 }]
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'asserted_payment_amount_ambiguous')
+  assert.match((result as { error: string }).error, /STILL carries a payment for 100 \(PAY-77\)/)
+  assert.match((result as { error: string }).error, /payment PAY-42 was for that same amount/)
+  assert.ok(paymentStillThere(), 'the receipt must survive')
+  assert.equal(state.order.paidAt !== null, true, 'and the order stays paid')
+  assert.equal(row('log-7').status, 'FAILED', 'and the attempt stays undecided')
+  assert.equal(row('log-7').externalTransactionId, null, 'and no id is written onto it')
+})
+
+test('a standing payment for a DIFFERENT amount is not a candidate, so the reversal proceeds', async () => {
+  // The refusal above must not become "an invoice with any payment on it can never be resolved". A
+  // £40 payment standing on the invoice cannot be the £100 this receipt registered, so it excludes
+  // nothing and the verified reversal goes through.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroInvoicePayments = [{ PaymentID: 'PAY-77', Amount: 40 }]
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { success: boolean }).success, true)
+  assert.ok(!paymentStillThere())
+  assert.equal(row('log-7').externalTransactionId, 'PAY-42')
+})
+
+test('the named payment still listed ON the invoice is reported as one the ledger holds', async () => {
+  // Two answers from the same ledger: the payment GET says DELETED, the invoice still lists it. The
+  // contradiction is resolved in favour of "still there", because that is the reading that refuses.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroInvoicePayments = [{ PaymentID: 'pay-42', Amount: 100 }]
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'ledger_still_holds_payment')
+  assert.match((result as { error: string }).error, /PAY-42 \(status still listed on that invoice\)/)
+  assert.ok(paymentStillThere())
+})
+
+test('an invoice the accounting system cannot be asked about refuses, and deletes nothing', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroInvoiceError = 'connection reset'
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'ledger_lookup_failed')
+  assert.match((result as { error: string }).error, /about payment INV-abc[\s\S]*connection reset/)
+  assert.ok(paymentStillThere())
+  assert.equal(row('log-7').status, 'FAILED')
+})
+
+test('an invoice that lists no payments AT ALL is a question unanswered, not an answer of "none"', async () => {
+  // An unpaid invoice answers with an EMPTY list. A response carrying no list is a different thing,
+  // and reading it as "nothing is standing there" would delete the receipt on the absence of a field.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroInvoicePayments = null
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'ledger_lookup_failed')
+  assert.match((result as { error: string }).error, /did not list the payments standing on that invoice/)
+  assert.ok(paymentStillThere())
+})
+
+test('an invoice the accounting system returns nothing for refuses too', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroInvoiceMissing = true
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'ledger_lookup_failed')
+  assert.ok(paymentStillThere())
+})
+
+test('a standing payment with no readable amount cannot be ruled out, so it refuses', async () => {
+  // The one that must not be skipped: a payment whose amount cannot be read is a payment that might
+  // be for this receipt's amount, and `continue` here would be the same defect as a silently dropped
+  // row in the refund walk.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroInvoicePayments = [{ PaymentID: 'PAY-77', Amount: null }]
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'ledger_lookup_failed')
+  assert.match((result as { error: string }).error, /\(PAY-77\) carries no readable amount/)
+  assert.ok(paymentStillThere())
+})
+
+test('a document id IMS recorded itself is never disambiguated against the invoice', async () => {
+  // The extra request is the price of accepting an id a HUMAN typed. A row whose id the processor
+  // read back off Xero's own response names one payment and only one, so there is nothing to tell
+  // apart and no reason to pay for a second call.
+  const { reverseLedgerPayment } = await loadActions()
+  state.xeroPayments.set('PAY-9', 'DELETED')
+  state.xeroInvoicePayments = [{ PaymentID: 'PAY-77', Amount: 100 }]
+  const result = await reverseLedgerPayment('pay-1', 'order-1')
+  assert.equal((result as { success: boolean }).success, true)
+  assert.deepEqual(state.xeroCalls, ['Payments/PAY-9'], 'one call, about the id IMS wrote down itself')
 })
 
 test('a named payment Xero still reports as AUTHORISED is refused by that name', async () => {

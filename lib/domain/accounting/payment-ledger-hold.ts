@@ -320,6 +320,8 @@ export type LedgerReversalRefusalCode =
   | 'asserted_payment_not_on_invoice'
   /** The named payment is on this invoice but not for this receipt's amount. */
   | 'asserted_payment_amount_mismatch'
+  /** A payment for this receipt's amount is STILL on the invoice, so the reference cannot be pinned to this receipt. */
+  | 'asserted_payment_amount_ambiguous'
   /** The connector is not one this check knows how to ask. */
   | 'connector_not_supported'
   /** The accounting system could not be asked. Nothing changed. */
@@ -412,11 +414,17 @@ export function refuseLedgerStillHolds(externalId: string, status: string): Ledg
 //
 // WHAT IS ASSERTED AND WHAT IS VERIFIED, because the difference is the whole design. The operator
 // asserts ONE thing — "the payment my attempt created is this one" — and nothing follows from
-// saying it. IMS asks Xero about that payment and then requires THREE facts from the answer before
-// a receipt is removed: it is attached to THIS invoice, it is for THIS receipt's amount, and it is
-// DELETED. A reference that fails any of them is refused by name, so a mistyped or mis-copied id
-// cannot become a delete. Compare `recoverRefundSyncPark`: the operator says which order to ask
-// about, WooCommerce says who owns the refund.
+// saying it. IMS asks Xero about that payment and then requires FOUR facts before a receipt is
+// removed: it is attached to THIS invoice, it is for EXACTLY this receipt's amount, it is DELETED,
+// and — read off the invoice itself — NO payment for that same amount is still standing on it. A
+// reference that fails any of them is refused by name, so a mistyped or mis-copied id cannot become
+// a delete. Compare `recoverRefundSyncPark`: the operator says which order to ask about, WooCommerce
+// says who owns the refund.
+//
+// WHY THE FOURTH FACT IS NOT OPTIONAL EITHER (round 4). The first three are satisfied by ANY deleted
+// payment of that value on that invoice. Two payments against one invoice is the situation this area
+// exists for, so "same amount" identifies nothing on its own — see
+// `refuseAssertedPaymentStillOnInvoice`.
 //
 // WHY THE INVOICE CHECK IS NOT OPTIONAL. Without it "any deleted payment in the tenant" would do,
 // and Xero tenants are full of deleted payments. With it, the reference has to name a payment that
@@ -462,8 +470,8 @@ export function refuseAssertedPaymentNotOnInvoice(
 
 export function refuseAssertedPaymentAmountMismatch(
   externalId: string,
-  ledgerAmount: number,
-  receiptAmount: number,
+  ledgerAmount: string,
+  receiptAmount: string,
 ): LedgerReversalRefusal {
   return {
     code: 'asserted_payment_amount_mismatch',
@@ -472,6 +480,103 @@ export function refuseAssertedPaymentAmountMismatch(
       + 'the payment this receipt was registered as. Nothing was changed. That invoice may carry more than '
       + 'one payment — check which one the failed registration created before reversing anything else.',
   }
+}
+
+/**
+ * o3d-54p round 4 — THE AMOUNT WAS NEVER AN IDENTIFIER, AND A TOLERANCE MADE THAT WORSE.
+ *
+ * WHAT THE AMOUNT CHECK IS FOR. `refuseAssertedPaymentAmountMismatch` exists to stop a reference that
+ * names some OTHER payment on this invoice from retiring this receipt's registration. It does that
+ * job: a payment for a different amount is not this one.
+ *
+ * WHAT IT CANNOT DO, and round 3 asked it to. It cannot establish the converse. "Same invoice, same
+ * amount, deleted" is satisfied by ANY payment of that value on that invoice, and a duplicate charge
+ * — two payments of the SAME amount against one invoice — is the exact situation this whole area
+ * exists to handle. Comparing with a TOLERANCE made it strictly worse: it admitted payments that are
+ * not even the same value. Both are gone now. The comparison is EXACT (see `canonicalLedgerAmount`),
+ * and the amount is treated as what it is: a filter that excludes wrong candidates, never a proof
+ * that the remaining one is right.
+ *
+ * SO THE PROOF COMES FROM THE INVOICE ITSELF. The harm is precise and one-directional: this receipt's
+ * real payment is STILL ON THE INVOICE, the operator names a different, deleted payment of the same
+ * value, and IMS deletes the local receipt while the ledger goes on showing the invoice settled —
+ * money gone from the business and no local record left to contradict it. That case is DETECTABLE,
+ * because the invoice still shows the payment that causes it. So before an asserted reversal is
+ * accepted, the invoice is read, and if it still carries ANY standing payment for this receipt's
+ * amount, this refuses: the reference cannot be pinned to this receipt while a payment it could
+ * equally describe is still there.
+ *
+ * WHAT IT DELIBERATELY DOES NOT CLAIM. Two DELETED payments of the same amount on one invoice remain
+ * indistinguishable — Xero does not list deleted payments on the invoice, and nothing in a reversal
+ * could tell them apart. That case costs an audit trail that names the wrong (equally reversed)
+ * document id; it cannot leave money standing in the ledger, because neither payment stands. The
+ * distinction is the whole reason this refusal is about STANDING payments only.
+ */
+export function refuseAssertedPaymentStillOnInvoice(
+  externalId: string,
+  orderReference: string,
+  standingPaymentId: string,
+  amount: string,
+): LedgerReversalRefusal {
+  return {
+    code: 'asserted_payment_amount_ambiguous',
+    message:
+      `The invoice for ${orderReference} STILL carries a payment for ${amount}`
+      + `${standingPaymentId ? ` (${standingPaymentId})` : ''}, and payment ${externalId} was for that same `
+      + 'amount — so IMS cannot tell which of the two this receipt created, and will not delete the receipt '
+      + 'on an amount that two payments share. Nothing was changed, and nothing was deleted.\n\n'
+      + 'If the payment still on the invoice IS this receipt\'s, then it has not been reversed: reverse THAT '
+      + 'payment in the accounting system and name it here. If it belongs to a different receipt on this '
+      + 'order, resolve this receipt\'s failed registration under Sync → Xero instead.',
+  }
+}
+
+/**
+ * An amount as a canonical decimal string, or null if it cannot be read as one.
+ *
+ * WHY NOT `Math.abs(a - b) < tolerance`, and why not `===` on the numbers either. A tolerance admits
+ * a DIFFERENT payment of a near-identical value, which is the whole of Codex round 3's second
+ * finding. Plain float equality has the opposite fault: it compares two doubles that may have been
+ * built from decimal text by different routes, and a stored `Decimal(18, 4)` is not a double at all.
+ *
+ * So both sides are reduced to the same canonical decimal text — trailing fractional zeros and
+ * leading zeros removed, `-0` normalised — and compared as text. `100`, `100.00` and `100.0000` are
+ * the same amount; `100.005` and `100.00` are not, and are refused rather than rounded together.
+ *
+ * ANYTHING THAT IS NOT PLAIN DECIMAL TEXT RETURNS NULL, and every caller must treat null as "cannot
+ * be matched" rather than as zero: exponent forms, `NaN`, `Infinity`, an empty string and an object
+ * with no numeric rendering all land here, and each of them is a fact the ledger did not supply.
+ */
+export function canonicalLedgerAmount(value: unknown): string | null {
+  let text: string
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null
+    text = String(value)
+  } else if (typeof value === 'string') {
+    text = value
+  } else if (value !== null && typeof value === 'object') {
+    // A Prisma Decimal renders its exact stored value; anything else renders as [object Object] and
+    // is rejected by the pattern below rather than silently compared.
+    text = String(value)
+  } else {
+    return null
+  }
+  const cleaned = text.trim()
+  if (!/^-?\d+(\.\d+)?$/.test(cleaned)) return null
+  const negative = cleaned.startsWith('-')
+  const [whole, fraction = ''] = cleaned.replace('-', '').split('.')
+  const fractionDigits = fraction.replace(/0+$/, '')
+  const wholeDigits = whole.replace(/^0+(?=\d)/, '')
+  const magnitude = fractionDigits ? `${wholeDigits}.${fractionDigits}` : wholeDigits
+  // -0, -0.00 and 0 are one amount.
+  return negative && /[1-9]/.test(magnitude) ? `-${magnitude}` : magnitude
+}
+
+/** Two amounts are the same only if they are the same to the last digit either side states. */
+export function sameLedgerAmount(a: unknown, b: unknown): boolean {
+  const left = canonicalLedgerAmount(a)
+  const right = canonicalLedgerAmount(b)
+  return left !== null && right !== null && left === right
 }
 
 /**

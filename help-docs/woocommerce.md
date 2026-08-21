@@ -396,13 +396,24 @@ an answer, since a store that sends no header is indistinguishable from one repo
 Nor does it compare a page against the size it *asked* for: `per_page` is a request, and a store
 configured to serve fewer (a hosting limit, a security plugin, a proxy) answers a request for a
 hundred with its own smaller page and no error at all — so "shorter than we asked for" would end the
-walk on the very first page of such a store and call a tenth of the refunds the whole list. The end
-is established either by a page that comes back **empty**, or by one shorter than a page the same
-store has already filled. This costs one extra request per check and is deliberate.
+walk on the very first page of such a store and call a tenth of the refunds the whole list.
+
+**Only a page that comes back empty ends the walk.** A short page ends nothing, however short: the
+size a store serves is not fixed, and a page trimmed by a proxy or by a plugin shedding load looks
+exactly like the last page of a list. So the check keeps asking until a page comes back with nothing
+on it. That costs **one extra request** for any order whose refunds do not happen to fill their last
+page, and it is deliberate — a refusal can be retried, but a park dismissed over money that has
+already left the business cannot be undone.
+
+As a second guard, if the store states how many refunds the order has (the `X-WP-Total` header) and
+serves fewer than that, the check is refused: that is the signature of a page trimmed in transit,
+which no rule about page lengths can catch.
 
 If the read cannot be completed — the store errors, an order carries more refunds than the check will
-read, or a refund comes back with no readable id — the recovery is **refused and nothing is changed**,
-rather than treating a list that might be short as proof the refund is missing.
+read, the list never ends within the pages the check reads, the store serves fewer refunds than it
+says the order has, or a refund comes back with no readable id — the recovery is **refused and
+nothing is changed**, rather than treating a list that might be short as proof the refund is
+missing.
 
 ## Invoice Notes and Customer PDF Downloads
 
