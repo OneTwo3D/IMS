@@ -1269,3 +1269,34 @@ test('o3d-cvj9 r5: a repaired revision whose sync log never posted records no ba
   assert.equal(createdEventData(createdEvents, 0).externalId, 'INV-9')
   assert.equal(createdEventData(createdEvents, 0).revisionOrderBasis, 'historical_backfill_repair')
 })
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r6 — Codex r5 finding 1: AN ADMINISTRATIVE REPAIR DOES NOT MOVE A DOCUMENT ID ON A GUESS.
+//
+// The live mirror acts on an assumed order because refusing one leaves its sync log retrying to
+// FAILED for ever. The backfill is under no such pressure: repairing the row WITHOUT the claim is
+// terminal, truthful, and already the path it takes for every pair nothing orders. So the two
+// callers give different answers to the same verdict, which is the point of the verdict carrying
+// its basis at all.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-cvj9 r6: the backfill repairs unclaimed rather than take an id on an ASSUMED order', async () => {
+  const { client, createdEvents, createdLogs } = makeClient({
+    syncLogs: [syncedInvoiceUpdateLog()],
+    // A create holding the invoice, with a write recorded at a time nobody knows: it may be the
+    // original post with an unreadable response stamp, or a re-post past the six-minute idempotency
+    // window that upserted over this very edit. The mirror hands over on that and says it assumed;
+    // an administrative repair does not hand over at all.
+    events: [postedInvoiceEvent({ externalRevisionAt: null, revisionOrderBasis: 'live_write_unstamped' })],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  assert.equal(
+    resultBySyncLog(report, 'sync-invoice-update').reason,
+    'created_missing_mirror_unclaimed_revision_order_unverified',
+  )
+  assert.equal(createdEventData(createdEvents).externalId ?? null, null, 'the repair took no claim')
+  assert.equal(logsByAction(createdLogs, 'superseded_by_revision').length, 0, 'and released nothing')
+  assert.equal(logsByAction(createdLogs, 'revision_claim_order_unverified').length, 1)
+})

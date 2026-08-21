@@ -7,6 +7,7 @@ import {
   buildMirroredAccountingEventDraft,
   isMirrorableAccountingSyncType,
   resetMirroredAccountingEventsToPending,
+  resolveDocumentRevisionExternalIdClaim,
   updateMirroredAccountingEventStatus,
 } from '@/lib/domain/accounting/accounting-event-mirror'
 
@@ -498,10 +499,13 @@ type FakeAccountingEventRow = {
    */
   externalRevisionAt: Date | null
   /**
-   * o3d-cvj9 r4: how a row with NO stamp may still be ordered against another revision. The only
-   * value production writes is `historical_backfill_repair`, stamped by the administrative
-   * backfill; it is a CATEGORY, not a clock. `null` on every live row — a live write records its
-   * external stamp instead.
+   * o3d-cvj9 r4/r5: how a row with NO stamp may still be read against another revision. A CATEGORY,
+   * not a clock. Production writes two values: `historical_backfill_repair` (the administrative
+   * backfill, on a repair that TOOK the document id) and `live_write_unstamped` (a connector write
+   * whose response carried no readable stamp). `null` once a live write records a real stamp.
+   *
+   * o3d-cvj9 r6: neither value ORDERS its row on its own — the rules built on them return an
+   * assumption, labelled as one.
    */
   revisionOrderBasis: string | null
 }
@@ -706,6 +710,10 @@ test('a posted sales invoice revision takes the external id from the invoice eve
         referenceId: 'so-1',
         externalId: 'INV-9',
         supersededByEventId: 'event-revision',
+        // o3d-cvj9 r6: the create rule decided this one, and the audit says so — the holder is an
+        // unstamped create that recorded no write, so nothing external ordered the pair.
+        orderingBasis: 'create_precedes_unwritten',
+        orderingEstablished: true,
       },
     },
     {
@@ -1104,9 +1112,12 @@ test('o3d-cvj9 r4: a STAMPED create is not handed over to a revision that brings
 // document's current state.
 //
 // `revisionOrderBasis = 'historical_backfill_repair'` records the one provable fact instead: the
-// write it mirrors was already complete when the backfill selected it, and the backfill only
-// selects documents with NO mirrored revision event — so every live revision able to contend with
-// it was enqueued afterwards. Causal, not a clock comparison.
+// write it mirrors was already complete when the backfill selected it. o3d-cvj9 r6 (Codex r5
+// finding 2): that fact does NOT place the repair against a later live write — what happens "now"
+// is the RECORDING of the arrival, not the write it reports — so the rule survives (a holder that
+// can never be superseded freezes its document for ever) as a labelled ASSUMPTION, not as a causal
+// order. r4's second half — "and the backfill only selects documents with no mirrored revision
+// event" — was retracted in r5: it was untrue of the candidate scan.
 // ---------------------------------------------------------------------------------------------
 
 test('o3d-cvj9 r4: a live stamped revision takes the id from a BACKFILL-REPAIRED holder that has no stamp', async () => {
@@ -1176,7 +1187,7 @@ test('o3d-cvj9 r5: a live stamped write clears the backfill repair marker off th
   )
 })
 
-test('o3d-cvj9 r5: a replay that made NO connector write is recorded superseded, not refused for ever', async () => {
+test('o3d-cvj9 r5/r6: a replay that made NO connector write yields the claim instead of being refused for ever', async () => {
   // The processor's short-circuit: a sync log that already carries its document id is replayed
   // without calling Xero, so it can never acquire a stamp however many times it runs. Against a
   // BACKFILL-REPAIRED holder r4 had no rule for it — not the create rule, not the stamp rule, and
@@ -1196,9 +1207,20 @@ test('o3d-cvj9 r5: a replay that made NO connector write is recorded superseded,
     { id: 'event-revision', status: 'SUPERSEDED', externalId: null },
     { id: 'event-revision-holder', status: 'POSTED', externalId: 'INV-9' },
   ])
-  const declined = store.logs.find((entry) => entry.action === 'revision_superseded_by_newer')
+  // o3d-cvj9 r6 (Codex r5 finding 3): it yielded because it WROTE NOTHING, which is not the same
+  // claim as "a newer write beat it" — that one is about where this row's ORIGINAL write sits, and
+  // nothing here established that.
+  assert.equal(
+    store.logs.find((entry) => entry.action === 'revision_superseded_by_newer'),
+    undefined,
+    'staleness is a claim about the original write, and this path never ordered it',
+  )
+  const declined = store.logs.find((entry) => entry.action === 'revision_claim_yielded_no_write')
   assert.ok(declined, 'the arrival records that it did not take the claim')
-  assert.equal((declined!.metadata as { externalIdHeldByEventId?: string }).externalIdHeldByEventId, 'event-revision-holder')
+  const declinedMeta = declined!.metadata as { externalIdHeldByEventId?: string; orderingBasis?: string; orderingEstablished?: boolean }
+  assert.equal(declinedMeta.externalIdHeldByEventId, 'event-revision-holder')
+  assert.equal(declinedMeta.orderingBasis, 'arrival_made_no_write')
+  assert.equal(declinedMeta.orderingEstablished, false, 'no order was established, and the trail says so')
   assert.equal(
     store.logs.find((entry) => entry.action === 'superseded_by_revision'),
     undefined,
@@ -1223,22 +1245,29 @@ test('o3d-cvj9 r5: a replay that made NO connector write is recorded superseded,
 // has made no write, so it precedes every revision of the document".
 // ---------------------------------------------------------------------------------------------
 
-test('o3d-cvj9 r5: a create that re-posted WITHOUT a stamp does not hand the document to an older edit', async () => {
+test('o3d-cvj9 r6: a create with an untimed write hands over, and the audit says the order was ASSUMED', async () => {
+  // o3d-cvj9 r6 (Codex r5 finding 1). The same row shape is left by the ORDINARY case — a first
+  // create post whose Xero response carried no readable UpdatedDateUTC — and by the rare one, a
+  // re-post past the six-minute idempotency window that upserted over this edit. Nothing on the row
+  // separates them, so r5's refusal classified the common case as the rare one, permanently: a
+  // create never writes again, so the marker is never cleared and every later edit is refused for
+  // ever. The claim moves, and the trail records that it moved on an assumption.
   const store = createAccountingEventStore([
-    // The re-post landed, and Xero's response carried no readable UpdatedDateUTC — so the stamp is
-    // gone and only the recorded write says the row wrote at all.
     invoiceCreateRow({ externalRevisionAt: null, revisionOrderBasis: 'live_write_unstamped' }),
     revisionRow(),
   ])
 
-  await assert.rejects(
-    () => postRevision(store, { externalRevisionAt: EDIT_XERO_REVISION_AT }),
-    (error: unknown) => (error as { code?: string }).code === 'P2002',
-    'a create that may have overwritten this edit must not be assumed to precede it',
-  )
-  assert.equal(store.table.find((row) => row.id === 'event-create')?.externalId, 'INV-9')
-  assert.equal(store.table.find((row) => row.id === 'event-revision')?.status, 'PENDING')
-  assert.deepEqual(store.logs, [], 'a refused claim is audited as neither a takeover nor a supersession')
+  await postRevision(store, { externalRevisionAt: EDIT_XERO_REVISION_AT })
+
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
+    { id: 'event-create', status: 'SUPERSEDED', externalId: null },
+    { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
+  ])
+  const takeover = store.logs.find((entry) => entry.action === 'superseded_by_revision')
+  assert.ok(takeover, 'the released row is audited exactly as any other takeover')
+  const meta = takeover!.metadata as { orderingBasis?: string; orderingEstablished?: boolean }
+  assert.equal(meta.orderingBasis, 'create_precedes_untimed_write')
+  assert.equal(meta.orderingEstablished, false, 'the create wrote at a time nobody recorded — this order is assumed')
 })
 
 test('o3d-cvj9 r5: an UNMARKED unstamped create still hands over, so pre-existing documents keep working', async () => {
@@ -1297,4 +1326,178 @@ test('o3d-cvj9 r5: a JOURNAL row records no revision-ordering basis when it post
   })
 
   assert.equal(store.table.find((row) => row.id === 'event-journal')?.revisionOrderBasis ?? null, null)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r6 — Codex r5 findings 1-3: AN ABSENT STAMP IS NOT A POSITIVE FACT.
+//
+// r5 read three absences as if each said something: an unstamped write on a create as "this may be
+// a late replay"; a repair marker as "any stamped arrival came after this"; and an arrival that
+// called nothing as "the holder is the newer write". The first misclassified the COMMON case as the
+// rare one and did so permanently; the second and third asserted orders nothing had established.
+//
+// What is honest is to answer where an answer exists, and to say what the answer rests on. Every
+// verdict now carries its basis and whether that basis ESTABLISHED the order or assumed it; the
+// live mirror acts on an assumed order (its only alternative is to fail a sync log for ever) and
+// records that it did, and the administrative backfill, which has an unclaimed repair to write
+// instead, declines.
+// ---------------------------------------------------------------------------------------------
+
+/** The create's own post, as the mirror records it: same shape whatever attempt it is. */
+const CREATE_PAYLOAD = {
+  _idempotencyKey: 'sales-invoice:so-1',
+  invoiceNumber: 'INV-1001',
+  contactName: 'Customer One',
+  date: '2026-08-19',
+  currency: 'GBP',
+  lines: [{ description: 'Widget', quantity: 1, unitAmount: 120, accountCode: '200' }],
+}
+
+function postCreate(store: ReturnType<typeof createAccountingEventStore>, externalRevisionAt: Date | null) {
+  return updateMirroredAccountingEventStatus(store.client as never, {
+    connector: 'xero',
+    syncLogId: 'log-create',
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-1',
+    payload: CREATE_PAYLOAD,
+    status: 'POSTED',
+    externalId: 'INV-9',
+    externalRevisionAt,
+  })
+}
+
+test('o3d-cvj9 r6: an ordinary create whose response carried no stamp still hands its document over', async () => {
+  // The common case, driven through the mirror rather than asserted on a hand-set fixture. Xero's
+  // create response carried no readable `UpdatedDateUTC` — `xeroDocumentRevisionAt` returns null for
+  // anything it cannot parse — so the create records `live_write_unstamped`, the very marker r5 read
+  // as "this create may have re-posted itself over the edit". Nothing a create does afterwards
+  // clears the marker, so under r5 EVERY later edit of this invoice was refused, for ever.
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ status: 'PENDING', externalId: null }),
+    revisionRow(),
+  ])
+
+  await postCreate(store, null)
+
+  assert.equal(
+    store.table.find((row) => row.id === 'event-create')?.revisionOrderBasis,
+    'live_write_unstamped',
+    'an ordinary first post with an unreadable response stamp leaves exactly the marker r5 refused on',
+  )
+
+  await postRevision(store, { externalRevisionAt: REVISION_XERO_REVISION_AT })
+
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
+    { id: 'event-create', status: 'SUPERSEDED', externalId: null },
+    { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
+  ])
+  const takeover = store.logs.find((entry) => entry.action === 'superseded_by_revision')
+  assert.ok(takeover, 'the create released the claim')
+  assert.deepEqual(
+    (takeover!.metadata as { orderingBasis?: string; orderingEstablished?: boolean }).orderingBasis,
+    'create_precedes_untimed_write',
+    'and the trail names the rule that decided it, not just the outcome',
+  )
+  assert.equal((takeover!.metadata as { orderingEstablished?: boolean }).orderingEstablished, false)
+})
+
+test('o3d-cvj9 r6: a repair-marked holder yields to a live stamped write, and the audit calls it assumed', async () => {
+  // Codex r5 finding 2. The repair mirrors a write its sync log had recorded complete before the
+  // backfill selected it — and that does NOT place it against the arriving write, because what is
+  // happening now is the RECORDING of the arrival, not the write it reports. The rule stays (a
+  // repaired holder that can never be superseded freezes its document permanently) and stops
+  // pretending to be causal.
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ status: 'SUPERSEDED', externalId: null }),
+    revisionRow(),
+    holdingRevisionRow({ externalRevisionAt: null, revisionOrderBasis: 'historical_backfill_repair' }),
+  ])
+
+  await postRevision(store, { externalRevisionAt: REVISION_XERO_REVISION_AT })
+
+  assert.equal(store.table.find((row) => row.id === 'event-revision')?.externalId, 'INV-9')
+  const takeover = store.logs.find((entry) => entry.action === 'superseded_by_revision')
+  assert.ok(takeover, 'the repaired holder released the claim')
+  const meta = takeover!.metadata as { orderingBasis?: string; orderingEstablished?: boolean }
+  assert.equal(meta.orderingBasis, 'historical_repair_precedes_live_write')
+  assert.equal(meta.orderingEstablished, false, 'nothing placed the repair against this write — the order is assumed')
+})
+
+test('o3d-cvj9 r6: only the external stamps may record an arrival as superseded by a newer write', async () => {
+  // The two ways an arrival ends up SUPERSEDED without the id must stay distinguishable on the
+  // trail: one is Xero telling us its write was overwritten, the other is a replay that wrote
+  // nothing at all and therefore established nothing about which write is newer.
+  const overwritten = createAccountingEventStore([
+    invoiceCreateRow({ externalRevisionAt: CREATE_REPOSTED_XERO_REVISION_AT }),
+    revisionRow(),
+  ])
+
+  await postRevision(overwritten, { externalRevisionAt: EDIT_XERO_REVISION_AT })
+
+  const stale = overwritten.logs.find((entry) => entry.action === 'revision_superseded_by_newer')
+  assert.ok(stale, 'the stamps settled this one')
+  const staleMeta = stale!.metadata as { orderingBasis?: string; orderingEstablished?: boolean }
+  assert.equal(staleMeta.orderingBasis, 'external_stamps')
+  assert.equal(staleMeta.orderingEstablished, true)
+
+  const replayed = createAccountingEventStore([
+    invoiceCreateRow({ status: 'SUPERSEDED', externalId: null }),
+    revisionRow(),
+    holdingRevisionRow({ externalRevisionAt: null, revisionOrderBasis: 'historical_backfill_repair' }),
+  ])
+
+  await postRevision(replayed)
+
+  assert.equal(
+    replayed.logs.find((entry) => entry.action === 'revision_superseded_by_newer'),
+    undefined,
+    'a replay that wrote nothing never establishes that a newer write beat it',
+  )
+  assert.equal(
+    replayed.logs.find((entry) => entry.action === 'revision_claim_yielded_no_write')?.accountingEventId,
+    'event-revision',
+  )
+})
+
+test('o3d-cvj9 r6: a caller that declines an assumed order is refused with that specific reason', async () => {
+  // The administrative backfill's position, asserted on the resolver itself: an order reached by
+  // falling back is refused as `recency_only_assumed` — not as `recency_indeterminate`, which would
+  // say nothing ordered them, and not silently as a takeover.
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ externalRevisionAt: null, revisionOrderBasis: 'live_write_unstamped' }),
+    revisionRow(),
+  ])
+  const params = {
+    connector: 'xero',
+    type: 'SALES_INVOICE_UPDATE',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-1',
+    status: 'POSTED' as const,
+    externalId: 'INV-9',
+  }
+
+  const declined = await resolveDocumentRevisionExternalIdClaim(
+    store.client as never,
+    params,
+    { externalRevisionAt: EDIT_XERO_REVISION_AT },
+    { acceptAssumedOrder: false },
+  )
+
+  assert.deepEqual(declined, { claim: 'refused', reason: 'recency_only_assumed' })
+  assert.equal(store.table.find((row) => row.id === 'event-create')?.externalId, 'INV-9', 'nothing was released')
+
+  const accepted = await resolveDocumentRevisionExternalIdClaim(
+    store.client as never,
+    params,
+    { externalRevisionAt: EDIT_XERO_REVISION_AT },
+    { acceptAssumedOrder: true },
+  )
+
+  assert.deepEqual(accepted, {
+    claim: 'takeover',
+    supersededEventId: 'event-create',
+    orderBasis: 'create_precedes_untimed_write',
+    orderEstablished: false,
+  })
 })

@@ -2272,21 +2272,22 @@ model AccountingEvent {
   // only ordering that is true of the order in which edits were APPLIED to the document, so it is
   // what decides which of two competing revisions may hold `externalId`. Null means "not
   // established" (the connector returned none, the row predates this column, or an administrative
-  // backfill wrote it) and is never guessed at — see documentRevisionHolderPrecedes.
+  // backfill wrote it) and is never guessed at — see resolveDocumentRevisionOrder.
   externalRevisionAt DateTime?
   // o3d-cvj9 r4/r5: on what basis this row can be ordered against another revision of the same
   // document when there is no `externalRevisionAt` to compare. A CATEGORY, never a clock. Two
   // values are written, both by the code that made (or repaired) the write, and both cleared the
   // moment a live write records a real stamp on the row:
   //   historical_backfill_repair — the administrative backfill repaired a write its sync log had
-  //     already recorded complete, and that row TOOK the document id. Any live write contending
-  //     with it is being made later, so it yields to one. See
+  //     already recorded complete, and that row TOOK the document id. See
   //     HISTORICAL_BACKFILL_REVISION_ORDER_BASIS.
-  //   live_write_unstamped — the connector wrote in this attempt and returned no readable stamp,
-  //     so the wiped `externalRevisionAt` must not be read as "this row never wrote". Past Xero's
-  //     six-minute Idempotency-Key window a replayed create is a fresh upsert on the invoice
-  //     number, so an unstamped create may have overwritten the edit contending with it. See
+  //   live_write_unstamped — the connector wrote in this attempt and returned no readable stamp, so
+  //     the wiped `externalRevisionAt` must not be read as "this row never wrote". See
   //     LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS.
+  // o3d-cvj9 r6: NEITHER value orders its row against another write on its own — the first says
+  // nothing about when the arriving write landed, and the second says a write happened, not when and
+  // not whether it was a re-post. Both feed rules that ASSUME an order and return it labelled as an
+  // assumption, which the live mirror acts on (and audits) and the backfill declines.
   // Null everywhere else — including on the enqueue-time row of every live revision.
   revisionOrderBasis String?
   reversalOfId     String?

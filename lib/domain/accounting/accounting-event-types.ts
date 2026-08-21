@@ -10,9 +10,18 @@ export type AccountingEventStatus =
   // readable, and its event log says WHY it holds no claim:
   //   `superseded_by_revision`          — a later write of the same document took the id over.
   //   `revision_superseded_by_newer`    — this write arrived after a later one had taken the id.
+  //                                       Only the external system's own stamps can say that, so
+  //                                       this action is only ever written on their authority.
+  //   `revision_claim_yielded_no_write`  — o3d-cvj9 r6: this attempt made NO connector call (the
+  //                                       processor's short-circuit replay), so it took no claim.
+  //                                       It asserts nothing about which write is newer.
   //   `revision_claim_order_unverified` — o3d-cvj9 r3, administrative backfill only: this write and
   //                                       the holder could not be ordered, so the claim was left
   //                                       where it was. It asserts nothing about which is newer.
+  // o3d-cvj9 r6: `superseded_by_revision` and `revision_superseded_by_newer` carry `orderingBasis`
+  // and `orderingEstablished` in their metadata — an order Xero's stamps settled and one reached by
+  // falling back on "a create precedes its revisions" are not the same claim, and whoever reads the
+  // trail has to be able to say which one moved the money's document id.
   | 'SUPERSEDED'
 
 export type AccountingEventLine = {

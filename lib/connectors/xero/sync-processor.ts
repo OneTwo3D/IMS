@@ -834,7 +834,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
             // and none is invented. `externalRevisionAt` is left UNDEFINED rather than null, so a
             // stamp an earlier write of this row established is not wiped by a replay that wrote
             // nothing. o3d-cvj9 r4: because this path makes no write, it also cannot re-order the
-            // document — which is what makes the create fallback in `documentRevisionHolderPrecedes`
+            // document — which is what makes the create fallback in `resolveDocumentRevisionOrder`
             // safe for a create replayed through here, however long after its Xero idempotency key
             // expired. A replay that DOES call the connector records the stamp of the write it made,
             // and is then ordered by that stamp like any other write.
@@ -1124,7 +1124,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             // and none is invented. `externalRevisionAt` is left UNDEFINED rather than null, so a
             // stamp an earlier write of this row established is not wiped by a replay that wrote
             // nothing. o3d-cvj9 r4: because this path makes no write, it also cannot re-order the
-            // document — which is what makes the create fallback in `documentRevisionHolderPrecedes`
+            // document — which is what makes the create fallback in `resolveDocumentRevisionOrder`
             // safe for a create replayed through here, however long after its Xero idempotency key
             // expired. A replay that DOES call the connector records the stamp of the write it made,
             // and is then ordered by that stamp like any other write.

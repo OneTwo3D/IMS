@@ -10,6 +10,7 @@ import {
   inspectDocumentRevisionExternalIdClaim,
   isCrossDocumentRevisionClaimRefusal,
   isDocumentRevisionAccountingSyncType,
+  isUnorderedRevisionClaimRefusal,
   MIRRORED_ACCOUNTING_SYNC_TYPES,
   resolveDocumentRevisionExternalIdClaim,
   type AccountingEventMirrorTransactionClient,
@@ -27,7 +28,7 @@ import {
  * be stamped with the time its sync log was enqueued rather than the repair's own clock (see
  * `writeBackfilledEvent`). o3d-cvj9 r3: it is NOT an ordering key. `accounting_events.createdAt`
  * defaults to `CURRENT_TIMESTAMP`, which PostgreSQL evaluates at TRANSACTION START, so it orders
- * neither the edits nor even the enqueues — see `documentRevisionHolderPrecedes`.
+ * neither the edits nor even the enqueues — see `resolveDocumentRevisionOrder`.
  */
 type AccountingBackfillSyncLogRow = AccountingReconciliationRows['syncLogs'][number] & { createdAt: Date }
 /** The holder row `resolveDocumentRevisionExternalIdClaim` reads when an external id is contested. */
@@ -380,9 +381,11 @@ async function writeBackfilledEvent(
     // by nothing at all — not the create rule (it is not the create) and not the stamp rule (it has
     // no stamp) — so every later live revision of that document was refused for ever and the ledger
     // froze on a historical edit. `revisionOrderBasis` says the one provable thing: this repair
-    // mirrors a write the sync log had ALREADY recorded complete when the backfill selected it, so
-    // any live write that can later contend with it is being made now, i.e. afterwards. See
-    // HISTORICAL_BACKFILL_REVISION_ORDER_BASIS and `documentRevisionHolderPrecedes` rule 3.
+    // mirrors a write the sync log had ALREADY recorded complete when the backfill selected it.
+    // o3d-cvj9 r6 (Codex r5 finding 2): that fact does NOT place this row against a later live
+    // arrival — what is happening "now" is the RECORDING of that arrival, not its write — so the
+    // rule built on it returns an assumption, labelled as one, rather than an order. See
+    // HISTORICAL_BACKFILL_REVISION_ORDER_BASIS and `resolveDocumentRevisionOrder` rule 3.
     //
     // o3d-cvj9 r5: written only on a row that actually TAKES the document id — see
     // `backfilledRevisionClaimsDocument` for why a marker on an unclaimed or unposted repair is
@@ -486,7 +489,7 @@ async function writeUnclaimedRevisionEvent(
  * document id. A PENDING or FAILED revision that never reached the connector cannot be the write
  * the document now reflects, and when it does post later it posts through the LIVE mirror, which
  * carries Xero's stamp and can order itself against this repair (rule 3 in
- * `documentRevisionHolderPrecedes`). Counting those would refuse the ordinary single-edit repair
+ * `resolveDocumentRevisionOrder`). Counting those would refuse the ordinary single-edit repair
  * for nothing.
  */
 type RevisionDocumentIdentity = {
@@ -585,9 +588,15 @@ function revisionDocumentKey(
  * It now resolves the claim the same way the live path does, through the SAME function, so the two
  * cannot drift on what a legitimate takeover is:
  *
- *  - `takeover` — the holder is the document's CREATE, which provably precedes any revision of it.
- *    Release its claim and create the revision holding the id, auditing the supersession on the
- *    released row exactly as the mirror does.
+ *  - `takeover` — the holder is the document's CREATE, which provably precedes any revision of it,
+ *    or Xero's own stamps put the holder first. Release its claim and create the revision holding
+ *    the id, auditing the supersession on the released row exactly as the mirror does — with the
+ *    BASIS the order was reached on, so a repair the stamps decided can be told from one the create
+ *    rule decided (o3d-cvj9 r6).
+ *  - `refused: recency_only_assumed` — o3d-cvj9 r6 (Codex r5 findings 1 and 2): an order the live
+ *    mirror would act on, reached by ASSUMPTION rather than established (an untimed create write, a
+ *    prior backfill repair). An administrative repair does not move a document id on one of those:
+ *    it has the unclaimed repair below to write instead, which is terminal and asserts nothing.
  *  - `stale`    — a LATER write already holds the id. The historical edit still deserves a
  *    mirrored row, so it is created as SUPERSEDED with no claim, rather than yanking the id back
  *    off the revision that supersedes it.
@@ -662,13 +671,28 @@ async function backfillDocumentRevisionEvent(
       // No connector response was ever recorded for a historical post, so this side of the
       // comparison has no external revision stamp and never pretends to.
       { externalRevisionAt: null },
+      // o3d-cvj9 r6: an ADMINISTRATIVE REPAIR does not move a document id on an assumed order. The
+      // live mirror has no alternative to acting on one — refusing leaves its sync log retrying to
+      // FAILED for ever — but this caller does: the unclaimed repair below records that the edit
+      // posted and that the order was not established, which is terminal and true. So an assumed
+      // verdict comes back `recency_only_assumed` and lands there with the unordered ones.
+      { acceptAssumedOrder: false },
     )
 
-    if (claim.claim === 'refused' && claim.reason !== 'recency_indeterminate') {
+    if (claim.claim === 'refused' && !isUnorderedRevisionClaimRefusal(claim.reason)) {
       return { claim: 'refused' as const, reason: claim.reason }
     }
 
+    // Nothing ordered these two, or the only thing that did was an assumption this caller declines
+    // to act on. Either way the repair is written and the claim is left where it is.
     if (claim.claim === 'refused') {
+      return { claim: 'unordered' as const, eventId: (await writeUnclaimedRevisionEvent(tx, log, draft)).id }
+    }
+
+    // o3d-cvj9 r6: `yielded` means the ARRIVAL made no connector write. The backfill always declares
+    // one (it is repairing a post that happened), so this cannot arise here — and if it ever does,
+    // the truthful record is the same unclaimed repair: no claim taken, no order asserted.
+    if (claim.claim === 'yielded') {
       return { claim: 'unordered' as const, eventId: (await writeUnclaimedRevisionEvent(tx, log, draft)).id }
     }
 
@@ -690,6 +714,8 @@ async function backfillDocumentRevisionEvent(
             referenceId: log.referenceId,
             externalId: draft.externalId ?? null,
             externalIdHeldByEventId: claim.holderEventId,
+            orderingBasis: claim.orderBasis,
+            orderingEstablished: claim.orderEstablished,
           },
         }) as never,
       })
@@ -709,6 +735,8 @@ async function backfillDocumentRevisionEvent(
           referenceId: log.referenceId,
           externalId: draft.externalId ?? null,
           supersededByEventId: event.id,
+          orderingBasis: claim.orderBasis,
+          orderingEstablished: claim.orderEstablished,
         },
       }) as never,
     })

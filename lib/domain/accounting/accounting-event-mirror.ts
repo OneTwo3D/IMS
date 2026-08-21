@@ -338,14 +338,20 @@ export function accountingDocumentRevisionSyncTypes(family: string): readonly st
  *   the write this row mirrors had ALREADY been recorded complete on its sync log when the backfill
  *   selected it.
  *
- * o3d-cvj9 r5: that is the WHOLE fact, and it is enough on its own. Round 4 leaned a second half on
- * it — "and the backfill only selects a document with no mirrored revision event at all" — which
- * was both untrue of the candidate scan and unnecessary. The ordering rule it supports (rule 3 in
- * `documentRevisionHolderPrecedes`) only ever fires against an arrival carrying a LIVE external
- * stamp, i.e. a write the connector is making NOW; and this row's write had already completed when
- * the backfill selected it, which is in the past. Now is after then. That is a causal ordering
- * rather than a comparison of two clocks, and it does not depend on anything about how the
- * candidate scan happened to be batched.
+ * o3d-cvj9 r5: that is the WHOLE fact, and it is the whole of what this marker may be read for.
+ * Round 4 leaned a second half on it — "and the backfill only selects a document with no mirrored
+ * revision event at all" — which was untrue of the candidate scan; that half is gone.
+ *
+ * o3d-cvj9 r6 (Codex r5 finding 2): AND THE FACT DOES NOT ORDER THIS ROW AGAINST AN ARRIVING WRITE.
+ * r4 argued it did: the rule it supports (rule 3 in `resolveDocumentRevisionOrder`) fires only
+ * against an arrival carrying a live external stamp, "i.e. a write the connector is making NOW",
+ * and now is after then. What is happening now is the RECORDING of that write, not the write. A
+ * sync log is recorded when its transaction commits, which can be long after the connector call it
+ * reports — a retry, a re-queued dead letter, a worker that posted and died before committing. The
+ * arrival's stamp says when Xero applied it; this row has no stamp at all, so nothing places the
+ * two against each other. Rule 3 therefore ASSUMES the order it returns, and says so: its verdict
+ * carries basis `historical_repair_precedes_live_write` and `established: false`, and a caller that
+ * has an alternative to acting on it (the backfill does; the live mirror does not) declines.
  *
  * It is written ONLY on a row the backfill actually lets CLAIM the document (a POSTED draft that
  * keeps the external id its sync log recorded) — see `writeBackfilledEvent`. A row repaired without
@@ -379,8 +385,17 @@ export const HISTORICAL_BACKFILL_REVISION_ORDER_BASIS = 'historical_backfill_rep
  *
  * The wipe is right: a stamp from an earlier write no longer describes this row's latest write. It
  * is reading the wipe as "never wrote" that is wrong, and the two are only distinguishable if the
- * write is recorded. This value records it. It makes rule 2 refuse instead of assume, which keeps
- * the P2002 fatal and visible rather than silently mis-ordering a document.
+ * write is recorded. This value records it.
+ *
+ * o3d-cvj9 r6 (Codex r5 finding 1): AND THAT IS ALL IT RECORDS — one write, of unknown time. It is
+ * NOT evidence of a late replay. r5 read it as one and made rule 2 refuse on it, which classifies
+ * the ordinary case as the rare one: this marker is written by EVERY unstamped live write on the
+ * row, and the write that leaves it in the overwhelming majority of cases is the create's own first
+ * post, whose Xero response simply carried no readable `UpdatedDateUTC` (`xeroDocumentRevisionAt`
+ * returns null for anything it cannot parse). Nothing on the row separates that from a re-post: both
+ * leave a POSTED create with no stamp and one recorded write. And a create makes no further write,
+ * so nothing ever clears the marker — under r5 every later edit of such a document was refused FOR
+ * EVER. Rule 2 still answers "the create precedes", and now says the answer is ASSUMED.
  */
 export const LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS = 'live_write_unstamped'
 
@@ -395,7 +410,7 @@ export function revisionOrderBasisForLiveWrite(externalRevisionAt: Date | null):
 }
 
 /**
- * o3d-cvj9 r3: WHICH OF TWO EVENTS DESCRIBES THE DOCUMENT AS IT NOW STANDS.
+ * o3d-cvj9 r3: WHICH OF TWO EVENTS DESCRIBES THE DOCUMENT AS IT NOW STANDS — AND HOW WE KNOW.
  *
  * Round 2 answered this from `accounting_events.createdAt`, arguing that a mirrored event is
  * written at ENQUEUE and so a document's edits are stamped in edit order. THAT IS NOT WHAT THE
@@ -408,15 +423,23 @@ export function revisionOrderBasisForLiveWrite(externalRevisionAt: Date | null):
  * edit order nor even enqueue order. The row-`id` tie-break r2 layered on top ordered by cuid mint
  * time, which is the same quantity measured a different way, so it went with it.
  *
- * There are exactly two things we can say truthfully about which of two events describes the
- * document now, and this function says only those two:
+ * o3d-cvj9 r6 (Codex r5 findings 1-3): THE VERDICT CARRIES ITS BASIS. Only rule 1 reads the order
+ * off the external system's own record of it. Rules 2 and 3 reach an answer by FALLING BACK on what
+ * a row with no usable stamp most likely is, and rule 4 is not an ordering at all. An answer reached
+ * by falling back is a materially weaker claim than the same answer read off Xero's stamps, so it is
+ * no longer returned as if it were the same thing: every verdict names the basis it was reached on
+ * and whether that basis ESTABLISHES the order or merely assumes it, and a caller acting on an
+ * assumed one can name which it got. The live mirror acts on an assumed order — its only
+ * alternative is to fail a sync log for ever — and records the basis on the audit trail. The
+ * administrative backfill does not: it has an unclaimed repair to write instead, so it declines
+ * (`acceptAssumedOrder: false`).
  *
- * 1. THE EXTERNAL SYSTEM'S OWN STAMPS, WHENEVER BOTH SIDES HAVE ONE. Xero stamps
- *    `Invoice.UpdatedDateUTC` on the document as it applies each write and hands it back in the
- *    response to that write. Two writes to one invoice are serialised by Xero, against one clock,
- *    so those stamps are the order in which the edits were APPLIED — which is the only order that
- *    decides what the document says. `externalRevisionAt` carries that value and nothing else; it
- *    is never derived from a local clock, because a comparison key mixing two clocks is not a key.
+ * 1. THE EXTERNAL SYSTEM'S OWN STAMPS, WHENEVER BOTH SIDES HAVE ONE — the one ESTABLISHED basis.
+ *    Xero stamps `Invoice.UpdatedDateUTC` on the document as it applies each write and hands it back
+ *    in the response to that write. Two writes to one invoice are serialised by Xero, against one
+ *    clock, so those stamps are the order in which the edits were APPLIED — which is the only order
+ *    that decides what the document says. `externalRevisionAt` carries that value and nothing else;
+ *    it is never derived from a local clock, because a comparison key mixing two clocks is not a key.
  *
  *    o3d-cvj9 r4 (Codex r3 finding 4): this rule is checked FIRST, including when the holder is the
  *    document's CREATE. r3 short-circuited on the holder's TYPE before ever looking at the stamps,
@@ -429,7 +452,7 @@ export function revisionOrderBasisForLiveWrite(externalRevisionAt: Date | null):
  *    create whose sync log is re-claimed and re-posted more than six minutes later DOES write the
  *    create's content over an edit that landed in between — and Xero stamps that write, so the
  *    create row ends up carrying a LATER `externalRevisionAt` than the revision it overwrote.
- *    Comparing the stamps first is what makes rule 2 safe to keep.
+ *    Comparing the stamps first is what keeps rule 2 from deciding a pair the stamps can decide.
  *
  * 2. THE CREATE PRECEDES ITS REVISIONS — as the fallback, when the stamps cannot answer. A document
  *    cannot be revised before it exists, so the event that CREATED it cannot describe a later state
@@ -442,45 +465,106 @@ export function revisionOrderBasisForLiveWrite(externalRevisionAt: Date | null):
  *    write this code can see the time of; if the arriving revision brings no stamp to compare it
  *    with, there is nothing to decide the pair on and it is refused rather than assumed.
  *
- * 3. A HISTORICAL BACKFILL REPAIR PRECEDES ANY LIVE WRITE — see
- *    `HISTORICAL_BACKFILL_REVISION_ORDER_BASIS` for why this is causal rather than a clock
- *    comparison. o3d-cvj9 r4 (Codex r3 finding 3): without it, a backfilled revision that holds a
- *    claim carries no stamp and is not the create, so rule 1 cannot order it and rule 2 does not
- *    reach it — every later live revision of that document is refused, FOR EVER, and the ledger is
- *    frozen naming a historical edit as the document's current state. Fail-closed, but permanent,
- *    and permanence is its own defect. The arriving side must carry a real external stamp, which is
- *    what makes it a live write made after the repair row existed: a second backfill run brings no
- *    stamp, so backfill-against-backfill stays unordered.
+ *    o3d-cvj9 r6 (Codex r5 finding 1): a create that made an UNTIMED write is still read this way,
+ *    but the verdict is marked ASSUMED (`create_precedes_untimed_write`) rather than declared. r5
+ *    refused it outright, reading `live_write_unstamped` as evidence of a re-post past the
+ *    six-minute window that may have overwritten the arriving edit. That is a real possibility, and
+ *    a rare one, and it is NOT what the marker says: the same marker is left by the create's own
+ *    first post whenever Xero's response carried no readable stamp, which is the ordinary case, and
+ *    nothing on the row tells the two apart. Refusing therefore misclassified the common case as the
+ *    rare one — and permanently, because a create makes no further write and so never clears the
+ *    marker, freezing every later edit of that document out of the ledger for ever. Both readings
+ *    are guesses; what is honest is to answer and to say the answer is a guess.
  *
- * 4. AN ARRIVAL THAT MADE NO WRITE CANNOT BE THE LATER STATE. o3d-cvj9 r5 (Codex r4 finding 3):
- *    rule 3 alone did not make the repaired holder clearable, because the one arrival that can
- *    never bring a stamp is the processor's short-circuit replay — a sync log that already carries
- *    its document id, replayed without calling the connector. It reaches rule 3 with no stamp for
- *    ever, so the repaired holder refused it for ever and the sync log retried to FAILED with
- *    nothing in live operation able to move it. It wrote nothing, so it is a stale replay: recorded
- *    SUPERSEDED with no claim, which is terminal and true. This is decided from the caller's own
- *    signal — the field ABSENT means no connector call, `null` means a call whose stamp we did not
- *    get — never from a clock.
+ * 3. A HISTORICAL BACKFILL REPAIR YIELDS TO A LIVE, EXTERNALLY STAMPED WRITE — also ASSUMED. Without
+ *    some rule here a backfilled holder freezes its document permanently (Codex r3 finding 3): it
+ *    carries no stamp and is not the create, so rule 1 cannot order it and rule 2 does not reach it,
+ *    and every later live revision is refused for ever. o3d-cvj9 r6 (Codex r5 finding 2): what r4
+ *    called causal is not. See `HISTORICAL_BACKFILL_REVISION_ORDER_BASIS` — the repair's write had
+ *    completed before the backfill selected it, but the arriving side is a RECORD being written now
+ *    of a write that may have landed at any earlier time, so the two are not placed against each
+ *    other. The rule stays, because a permanent freeze is worse than a named assumption, and it is
+ *    labelled for what it is. The arriving side must still carry a real external stamp: a second
+ *    backfill run brings none, so backfill-against-backfill stays unordered.
+ *
+ * 4. AN ARRIVAL THAT MADE NO WRITE TAKES NO CLAIM — which is NOT a statement about which write is
+ *    newer. The one arrival that can never bring a stamp is the processor's short-circuit replay: a
+ *    sync log that already carries its document id, replayed without calling the connector. Under r4
+ *    it hit `recency_indeterminate` for ever, so the P2002 stayed fatal and the sync log retried to
+ *    FAILED with nothing in live operation able to move it. o3d-cvj9 r6 (Codex r5 finding 3): r5
+ *    cleared that by returning "the holder precedes", i.e. by declaring the arrival STALE — and
+ *    staleness is a claim about where the arrival's ORIGINAL write sits, the post that put the
+ *    document id on its sync log in the first place. This rule knows nothing about that write: it
+ *    has no stamp for it, and none for the holder either, or rule 1 would have answered. What the
+ *    absent field does prove is narrower and sufficient: THIS attempt called nothing, so it changed
+ *    nothing about the document and has nothing to take the id for. The verdict is
+ *    `arrival_wrote_nothing`; the caller records the row SUPERSEDED with no claim — terminal, so the
+ *    retry loop still ends — and audits it as having yielded WITHOUT writing rather than as having
+ *    been beaten by a newer write. This is decided from the caller's own signal — the field ABSENT
+ *    means no connector call, `null` means a call whose stamp we did not get — never from a clock.
  *
  * Anything else is `null` — NOT ORDERED. A missing stamp on either side (the row predates the
  * column, the connector returned none, an administrative backfill wrote the row) and an exact tie
  * both land here. `null` is refused by the caller, which keeps the underlying P2002 fatal: the sync
  * log retries and an operator sees it, rather than a stale revision quietly taking the document id.
- *
- * Returns true when the HOLDER is the earlier write and may hand its claim over, false when the
- * holder is the later one (the arriving row is a stale replay), `null` when the two are not ordered.
  */
+
+/**
+ * How a verdict was reached. `external_stamps` is the external system's own record of the order;
+ * everything else is this code reading a row that has no usable stamp on it.
+ */
+export type RevisionOrderBasis =
+  | 'external_stamps'
+  | 'create_precedes_unwritten'
+  | 'create_precedes_untimed_write'
+  | 'historical_repair_precedes_live_write'
+  | 'arrival_made_no_write'
+
+/**
+ * The bases that do NOT establish an order: rules 2 (a create whose write nobody timed) and 3 (a
+ * historical repair) assume one, and rule 4 makes no ordering claim at all. Kept as one list so the
+ * `established` flag, and the audit metadata derived from it, cannot drift from the rule that set it.
+ */
+const NON_ESTABLISHING_REVISION_ORDER_BASES = new Set<RevisionOrderBasis>([
+  'create_precedes_untimed_write',
+  'historical_repair_precedes_live_write',
+  'arrival_made_no_write',
+])
+
+/** Did this basis ESTABLISH the order, as opposed to assuming one or asserting none? */
+export function isEstablishedRevisionOrderBasis(basis: RevisionOrderBasis): boolean {
+  return !NON_ESTABLISHING_REVISION_ORDER_BASES.has(basis)
+}
+
+/**
+ * `holder_first` — the holder wrote first and may hand its claim over.
+ * `arrival_first` — the holder is the later write, so the arriving row is a stale replay. Only rule
+ *                   1 can say this: it is a claim about where the arrival's write sits, and only the
+ *                   external system's stamps place it.
+ * `arrival_wrote_nothing` — this attempt made no connector call, so it takes no claim. NOT an
+ *                   order, which is why it carries no `established` flag: there is no order here to
+ *                   have established.
+ */
+export type RevisionOrderVerdict =
+  | { order: 'holder_first'; basis: RevisionOrderBasis; established: boolean }
+  | { order: 'arrival_first'; basis: 'external_stamps'; established: true }
+  | { order: 'arrival_wrote_nothing'; basis: 'arrival_made_no_write' }
+
 function finiteRevisionStamp(at: Date | null | undefined): number | null {
   const time = at?.getTime()
   if (time === undefined || !Number.isFinite(time)) return null
   return time
 }
 
-function documentRevisionHolderPrecedes(
+function holderFirst(basis: RevisionOrderBasis): RevisionOrderVerdict {
+  return { order: 'holder_first', basis, established: isEstablishedRevisionOrderBasis(basis) }
+}
+
+function resolveDocumentRevisionOrder(
   holder: { type: string; externalRevisionAt: Date | null; revisionOrderBasis?: string | null },
   arriving: { externalRevisionAt?: Date | null },
   createType: string,
-): boolean | null {
+): RevisionOrderVerdict | null {
   const holderAt = finiteRevisionStamp(holder.externalRevisionAt)
   const arrivingAt = finiteRevisionStamp(arriving.externalRevisionAt)
   // o3d-cvj9 r5: `undefined` and `null` are DIFFERENT FACTS on the arriving side, and every caller
@@ -491,35 +575,37 @@ function documentRevisionHolderPrecedes(
   const arrivingWrote = arriving.externalRevisionAt !== undefined
 
   // Rule 1: the external system stamped both writes, so it has already said which it applied last.
+  // The ONLY rule that can declare the arrival stale, because it is the only one that places the
+  // arriving write at all.
   if (holderAt !== null && arrivingAt !== null) {
     if (holderAt === arrivingAt) return null
     return holderAt < arrivingAt
+      ? holderFirst('external_stamps')
+      : { order: 'arrival_first', basis: 'external_stamps', established: true }
   }
 
   // Rule 2: the holder is the document's CREATE and has made no write this code can place in the
-  // document's edit order. A create that wrote WITHOUT a stamp is not that: past Xero's six-minute
-  // idempotency window a replayed create is a fresh upsert on the invoice number, so it may well
-  // have overwritten the arriving edit. Refuse rather than assume — see
-  // LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS.
+  // document's edit order. A create with a recorded but UNTIMED write may have re-posted itself over
+  // the arriving edit (past Xero's six-minute idempotency window a replayed create is a fresh upsert
+  // on the invoice number) — or, far more often, may simply be the original post with an unreadable
+  // response stamp. The row cannot tell those apart, so the create rule still answers and the answer
+  // is marked assumed. See LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS.
   if (holder.type === createType) {
     if (holderAt !== null) return null
-    return holder.revisionOrderBasis === LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS ? null : true
+    return holderFirst(holder.revisionOrderBasis === LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS
+      ? 'create_precedes_untimed_write'
+      : 'create_precedes_unwritten')
   }
 
   // Rule 3: the holder is a historical repair; the arrival is a live, externally stamped write.
+  // Assumed, not established — nothing places the repair's write against the arriving stamp.
   if (holder.revisionOrderBasis === HISTORICAL_BACKFILL_REVISION_ORDER_BASIS && arrivingAt !== null) {
-    return true
+    return holderFirst('historical_repair_precedes_live_write')
   }
 
-  // Rule 4: THE ARRIVAL MADE NO WRITE AT ALL, so it cannot describe a later state of the document
-  // than whatever holds it — whoever the holder is, and with no clock involved. o3d-cvj9 r5 (Codex
-  // r4 finding 3): this is what stops a repaired holder freezing the document permanently. The one
-  // arrival that brings no write is the processor's short-circuit replay of a sync log that already
-  // carries its document id, and it can never acquire a stamp however many times it runs — so
-  // under r4 it hit `recency_indeterminate`, the P2002 stayed fatal, and the sync log retried to
-  // FAILED for ever with no live operation able to clear it. It is a stale replay, and recording it
-  // as one (SUPERSEDED, no claim) is both truthful and terminal.
-  if (!arrivingWrote) return false
+  // Rule 4: THE ARRIVAL MADE NO WRITE AT ALL, so it has nothing to take the document id for. This
+  // says nothing about which of the two writes is newer — see the rule 4 note above.
+  if (!arrivingWrote) return { order: 'arrival_wrote_nothing', basis: 'arrival_made_no_write' }
 
   return null
 }
@@ -530,10 +616,18 @@ function documentRevisionHolderPrecedes(
  * `refused` carries the SPECIFIC reason rather than a bare no: every refusal keeps the underlying
  * P2002 fatal, and which one fired is the difference between "a second document is claiming this
  * invoice" and "we could not tell these two revisions apart".
+ *
+ * o3d-cvj9 r6: the two outcomes that MOVE or DENY a claim on the strength of an ordering also carry
+ * the basis that ordering was reached on, and whether it was established or assumed — a takeover
+ * decided by Xero's own stamps and one decided by falling back on "a create precedes its revisions"
+ * are not the same claim, and whoever reads the audit trail has to be able to say which happened.
+ * `yielded` is the third state r6 added: the arrival made no connector write at all, so it takes no
+ * claim and NOTHING is asserted about which write is newer (Codex r5 finding 3).
  */
 export type DocumentRevisionClaimOutcome =
-  | { claim: 'takeover'; supersededEventId: string }
-  | { claim: 'stale'; holderEventId: string }
+  | { claim: 'takeover'; supersededEventId: string; orderBasis: RevisionOrderBasis; orderEstablished: boolean }
+  | { claim: 'stale'; holderEventId: string; orderBasis: RevisionOrderBasis; orderEstablished: boolean }
+  | { claim: 'yielded'; holderEventId: string; orderBasis: 'arrival_made_no_write' }
   | {
       claim: 'refused'
       reason:
@@ -542,6 +636,7 @@ export type DocumentRevisionClaimOutcome =
         | 'different_source_document'
         | 'unrelated_event_type'
         | 'recency_indeterminate'
+        | 'recency_only_assumed'
         | 'claim_moved_concurrently'
     }
 
@@ -582,6 +677,16 @@ export type DocumentRevisionClaimLineage =
  */
 export function isCrossDocumentRevisionClaimRefusal(reason: string): boolean {
   return reason === 'different_source_document' || reason === 'unrelated_event_type'
+}
+
+/**
+ * The refusals that mean "which of these two writes is newer was not settled here" — either nothing
+ * ordered them at all, or the only thing that did was an assumption this caller declines to act on
+ * (o3d-cvj9 r6). A caller with a truthful alternative — the backfill's unclaimed repair — writes it
+ * for both; the claim is simply left where it is.
+ */
+export function isUnorderedRevisionClaimRefusal(reason: string): boolean {
+  return reason === 'recency_indeterminate' || reason === 'recency_only_assumed'
 }
 
 export async function inspectDocumentRevisionExternalIdClaim(
@@ -644,7 +749,7 @@ export async function inspectDocumentRevisionExternalIdClaim(
  *
  * o3d-cvj9 r2 — `stale` IS THE OTHER HALF, and r1 did not have it. r1 established that the holder
  * was a legitimate PREDECESSOR TYPE for the same document, but never that the arriving revision
- * described a LATER state than it (see `documentRevisionHolderPrecedes` for the three things that
+ * described a LATER state than it (see `resolveDocumentRevisionOrder` for the things that
  * can be said truthfully about that). Two workers can have their writes land at Xero in one order
  * and record them in the other, so a revision whose write landed FIRST can arrive here after the
  * one that landed second has already taken the id — and it would take it straight back, leaving
@@ -659,8 +764,14 @@ export async function resolveDocumentRevisionExternalIdClaim(
   params: { connector: string; type: string; referenceType: string; referenceId: string; status: AccountingEventStatus; externalId?: string | null },
   // The external system's revision stamp for the write this arrival just made, when it made one.
   // Absent for the administrative backfill, which is repairing a historical post whose connector
-  // response was never recorded — see `documentRevisionHolderPrecedes` rules 1 and 3.
+  // response was never recorded — see `resolveDocumentRevisionOrder` rules 1 and 3.
   arriving: { externalRevisionAt?: Date | null },
+  // o3d-cvj9 r6: does this caller act on an order that was ASSUMED rather than established? Stated
+  // by every caller because the honest answer differs by caller and neither answer is a default:
+  // the live mirror says yes (refusing leaves the sync log retrying to FAILED for ever, which is
+  // the permanence Codex r5 finding 1 is about), the administrative backfill says no (it writes an
+  // unclaimed repair instead, which is truthful and terminal). See `RevisionOrderVerdict`.
+  options: { acceptAssumedOrder: boolean },
 ): Promise<DocumentRevisionClaimOutcome> {
   // Only a SUCCESSFUL post owns a document id: a PENDING or FAILED attempt has nothing to hand over
   // and nothing to take. o3d-cvj9 r5: checked here rather than in the lineage half, so declining to
@@ -673,9 +784,19 @@ export async function resolveDocumentRevisionExternalIdClaim(
   if (lineage.lineage === 'refused') return { claim: 'refused', reason: lineage.reason }
   const { holder, createType, externalId } = lineage
 
-  const holderPrecedes = documentRevisionHolderPrecedes(holder, arriving, createType)
-  if (holderPrecedes === null) return { claim: 'refused', reason: 'recency_indeterminate' }
-  if (!holderPrecedes) return { claim: 'stale', holderEventId: holder.id }
+  const verdict = resolveDocumentRevisionOrder(holder, arriving, createType)
+  if (verdict === null) return { claim: 'refused', reason: 'recency_indeterminate' }
+  // The arrival called nothing, so it has nothing to claim the document for — and this says nothing
+  // about which write is newer, which is why it is not `stale`.
+  if (verdict.order === 'arrival_wrote_nothing') {
+    return { claim: 'yielded', holderEventId: holder.id, orderBasis: verdict.basis }
+  }
+  if (!verdict.established && !options.acceptAssumedOrder) {
+    return { claim: 'refused', reason: 'recency_only_assumed' }
+  }
+  if (verdict.order === 'arrival_first') {
+    return { claim: 'stale', holderEventId: holder.id, orderBasis: verdict.basis, orderEstablished: verdict.established }
+  }
 
   // Compare-and-swap on the id we are taking, not just on the row: if a concurrent worker released
   // or moved this claim between the read and here, we must not stamp SUPERSEDED over whatever it
@@ -690,7 +811,12 @@ export async function resolveDocumentRevisionExternalIdClaim(
   })
   if (released.count === 0) return { claim: 'refused', reason: 'claim_moved_concurrently' }
 
-  return { claim: 'takeover', supersededEventId: holder.id }
+  return {
+    claim: 'takeover',
+    supersededEventId: holder.id,
+    orderBasis: verdict.basis,
+    orderEstablished: verdict.established,
+  }
 }
 
 export async function updateMirroredAccountingEventStatus(
@@ -708,7 +834,7 @@ export async function updateMirroredAccountingEventStatus(
      * o3d-cvj9 r3: the EXTERNAL system's revision stamp for the write this attempt just made —
      * Xero's `Invoice.UpdatedDateUTC`, out of the response to that write. It is recorded because it
      * is the only thing that orders two revisions of one document (see
-     * `documentRevisionHolderPrecedes`), and it is left undefined whenever no write was made in
+     * `resolveDocumentRevisionOrder`), and it is left undefined whenever no write was made in
      * this attempt or the connector returned none. It is never synthesised from a local clock.
      */
     externalRevisionAt?: Date | null
@@ -783,13 +909,51 @@ export async function updateMirroredAccountingEventStatus(
       // this attempt just made, which the caller already holds. r2 re-read the arriving ROW here to
       // get its `createdAt`; that column is `DEFAULT CURRENT_TIMESTAMP`, i.e. transaction START
       // time, so it never carried the ordering it was read for. The read goes with it.
-      const claim = await resolveDocumentRevisionExternalIdClaim(client, params, {
-        externalRevisionAt: params.externalRevisionAt,
-      })
+      const claim = await resolveDocumentRevisionExternalIdClaim(
+        client,
+        params,
+        { externalRevisionAt: params.externalRevisionAt },
+        // o3d-cvj9 r6: the live mirror ACTS on an assumed order, and records that it did. Refusing
+        // one here is not a safe default: the P2002 stays fatal, the sync log retries to FAILED, and
+        // for the two rules that assume (an untimed create write, a backfill repair) nothing in live
+        // operation ever changes the inputs, so the refusal is permanent. The basis travels to the
+        // audit log instead, so a takeover reached by falling back can be told from one Xero's own
+        // stamps decided.
+        { acceptAssumedOrder: true },
+      )
       // Nothing legitimate to supersede: this is a real collision (a different document claiming
       // an external id that is already spoken for), or two revisions we cannot order. Either way it
       // must stay fatal and visible.
       if (claim.claim === 'refused') throw error
+
+      if (claim.claim === 'yielded') {
+        // o3d-cvj9 r6 (Codex r5 finding 3): this attempt made no connector call — the processor's
+        // short-circuit replay of a sync log that already carries its document id. It changed
+        // nothing about the document, so it takes no claim; and because nothing here placed its
+        // ORIGINAL write against the holder's, the audit does not say a newer write beat it. The
+        // row is still terminal, which is what stops the sync log retrying to FAILED for ever.
+        const event = await withSavepoint(client, () => applyStatus(key, { status: 'SUPERSEDED', claimExternalId: false }))
+        await client.accountingEventLog.create({
+          data: buildAccountingEventLog({
+            accountingEventId: event.id,
+            action: 'revision_claim_yielded_no_write',
+            message: 'This replay made no connector write, so it took no claim on the document. '
+              + 'Which of it and the event holding the document id describes the document now was not established.',
+            metadata: {
+              connector: params.connector,
+              ...(params.syncLogId ? { syncLogId: params.syncLogId } : {}),
+              syncType: params.type,
+              referenceType: params.referenceType,
+              referenceId: params.referenceId,
+              externalId: params.externalId ?? null,
+              externalIdHeldByEventId: claim.holderEventId,
+              orderingBasis: claim.orderBasis,
+              orderingEstablished: isEstablishedRevisionOrderBasis(claim.orderBasis),
+            },
+          }) as never,
+        })
+        return event
+      }
 
       if (claim.claim === 'stale') {
         // A NEWER revision of this document already holds the id. This edit did post remotely, but
@@ -809,6 +973,8 @@ export async function updateMirroredAccountingEventStatus(
               referenceId: params.referenceId,
               externalId: params.externalId ?? null,
               externalIdHeldByEventId: claim.holderEventId,
+              orderingBasis: claim.orderBasis,
+              orderingEstablished: claim.orderEstablished,
             },
           }) as never,
         })
@@ -828,6 +994,8 @@ export async function updateMirroredAccountingEventStatus(
             referenceId: params.referenceId,
             externalId: params.externalId ?? null,
             supersededByEventId: event.id,
+            orderingBasis: claim.orderBasis,
+            orderingEstablished: claim.orderEstablished,
           },
         }) as never,
       })
