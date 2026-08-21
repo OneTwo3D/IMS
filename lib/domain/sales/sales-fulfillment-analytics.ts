@@ -13,9 +13,13 @@ import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 import {
   calculateDecimalCoverageByLine,
+  requirementsMapToDecimalRows,
   type DecimalFulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
-import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import {
+  expandFulfillmentRequirementsDecimal,
+  loadFulfillmentProductGraph,
+} from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 
 const DEFAULT_PAGE_SIZE = 100
