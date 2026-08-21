@@ -67,6 +67,7 @@ async function runRedisBlock(source: string, env: string): Promise<ShellResult> 
     ${sliceOptionalBlock(source, 'urldecode() {') ?? ''}
     ${sliceOptionalBlock(source, 'mask_secret() {') ?? ''}
     ${sliceOptionalBlock(source, 'redact_url_credentials() {') ?? ''}
+    ${sliceOptionalBlock(source, 'redis_url_credential_state() {') ?? ''}
     ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
     ${sliceOptionalBlock(source, 'prompt() {') ?? ''}
     ${sliceOptionalBlock(source, 'prompt_yn() {') ?? ''}
@@ -210,16 +211,21 @@ test('a Redis the operator already runs gets the password put in the URL, and th
   // So this operator was handed the identical outage as before — a server nobody can sign in to,
   // because the auth buckets fail closed on a Redis that answers NOAUTH.
   const source = await readScript()
+  // A REAL port number, not the `__PORT__` placeholder this used to carry: as of o3d-l89a r4 the
+  // installer decides "does this URL already carry a credential?" by whether the authority is a
+  // syntactically valid host[:port], and a non-numeric port is not one. The placeholder was never a
+  // URL an operator could type, and substituting the live port afterwards (as the rerun tests
+  // already do) keeps the assertion on the wire exactly where it was.
   const { url, passwordEnv } = await runRedisBlock(
     source,
-    `INSTALL_REDIS=n; REDIS_URL=redis://localhost:__PORT__/2; REDIS_PASSWORD=${JSON.stringify(AWKWARD_PASSWORD)}`,
+    `INSTALL_REDIS=n; REDIS_URL=redis://localhost:16379/2; REDIS_PASSWORD=${JSON.stringify(AWKWARD_PASSWORD)}`,
   )
 
-  assert.match(url, /^redis:\/\/:[^@]+@localhost:__PORT__\/2$/, 'the credential must be spliced into the URL the operator gave')
+  assert.match(url, /^redis:\/\/:[^@]+@localhost:16379\/2$/, 'the credential must be spliced into the URL the operator gave')
   assert.ok(!url.includes(AWKWARD_PASSWORD), 'the password must be percent-encoded, not pasted in raw')
   assert.equal(passwordEnv, '', 'once the URL carries it, the unquoted .env line must not carry a second copy')
 
-  const commands = await commandsSentFor(url.replace('localhost', '127.0.0.1'))
+  const commands = await commandsSentFor(url.replace('localhost', '127.0.0.1').replace(':16379', ':__PORT__'))
   assert.deepEqual(
     commands[0],
     ['AUTH', AWKWARD_PASSWORD],
@@ -265,6 +271,119 @@ test('an external Redis with no password is left completely alone', async () => 
 
   assert.equal(url, 'rediss://cache.internal:6380/2')
   assert.equal(passwordEnv, '')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-l89a r4 (Codex r3 finding 1) — THE COST OF THE OVER-BROAD `@` TEST.
+//
+// Round 3 chose an `@`-ANYWHERE test on purpose, to keep a real trap closed: the precise-looking
+// alternative — "the authority is everything up to the first `/`" — is defeated by a password
+// containing an unencoded slash, which ends that scan BEFORE the `@`, so a URL that HAS a credential
+// reads as having none and gets a SECOND one spliced in front of it.
+//
+// The cost is the other direction and it is just as total. A URL whose `@` is in the PATH or the
+// QUERY reads as already-credentialled, the typed password is dropped, and the .env password line is
+// blanked because the URL is believed to carry it — so nothing reaches AUTH, the login buckets fail
+// closed, and nobody can sign in to the server just installed.
+//
+// The rule now answers only when the answer is FORCED and refuses otherwise. These pin both
+// directions, and the shipped block is what runs.
+// ---------------------------------------------------------------------------
+
+test('o3d-l89a r4: an `@` in the PATH or QUERY does not stop the password reaching AUTH', async () => {
+  const source = await readScript()
+  const { url, passwordEnv } = await runRedisBlock(
+    source,
+    'INSTALL_REDIS=n; REDIS_URL=redis://localhost:16379/2?client=ops@example.com; REDIS_PASSWORD=hunter2',
+  )
+
+  assert.equal(
+    url,
+    'redis://:hunter2@localhost:16379/2?client=ops@example.com',
+    'the credential is spliced in front of a host[:port] authority, and the `@` after it is left alone',
+  )
+  assert.equal(passwordEnv, '', 'and the .env line still carries no second copy')
+
+  const commands = await commandsSentFor(url.replace('localhost', '127.0.0.1').replace(':16379', ':__PORT__'))
+  assert.deepEqual(
+    commands[0],
+    ['AUTH', 'hunter2'],
+    'THE WHOLE POINT: under the over-broad test this URL got NO credential at all and the client sent '
+      + 'no AUTH, so the server answered NOAUTH and the login buckets — which fail closed — locked '
+      + 'everyone out of the machine that had just been installed',
+  )
+})
+
+test('o3d-l89a r4: an `@` in the AUTHORITY still means the URL carries a credential, and is left verbatim', async () => {
+  // The direction round 3 was protecting. It must not regress: an `@` before the first `/` can only
+  // be the userinfo separator.
+  const source = await readScript()
+  const { url, stderr } = await runRedisBlock(
+    source,
+    'INSTALL_REDIS=n; REDIS_URL=redis://:inthe%40url@cache.internal:6380/2?tag=a@b; REDIS_PASSWORD=attheprompt',
+  )
+
+  assert.equal(url, 'redis://:inthe%40url@cache.internal:6380/2?tag=a@b')
+  assert.match(stderr, /WARN: REDIS_URL already carries a credential/)
+})
+
+test('o3d-l89a r4: THE TRAP STAYS CLOSED — an unencoded slash in the password refuses instead of splicing a second credential', async () => {
+  // `redis://:pa/ss@host:6379`. Locating the authority by the first slash gives `:pa`, which is not a
+  // host[:port] and is not something carrying a credential either — the two readings cannot be told
+  // apart, so nothing is written. Under the precise-but-naive rule this URL got a SECOND credential
+  // spliced in front of the operator's own.
+  const source = await readScript()
+  const stderr = await runRedisBlockExpectingFailure(
+    source,
+    'INSTALL_REDIS=n; REDIS_URL=redis://:pa/ss@host:6379; REDIS_PASSWORD=hunter2',
+  )
+
+  assert.match(stderr, /DIE: REDIS_URL is not a shape this installer can place a password into/)
+  assert.match(stderr, /%2F/, 'the refusal says exactly how to fix it, so it is not a dead end')
+})
+
+test('o3d-l89a r4: a username with an unencoded slash refuses too, rather than reading as host:port', async () => {
+  const source = await readScript()
+  const stderr = await runRedisBlockExpectingFailure(
+    source,
+    'INSTALL_REDIS=n; REDIS_URL=redis://user:pa/ss@host:6379; REDIS_PASSWORD=hunter2',
+  )
+  assert.match(stderr, /DIE: REDIS_URL is not a shape this installer can place a password into/)
+})
+
+test('o3d-l89a r4: the credential-state rule answers only when the answer is forced', async () => {
+  // The decision itself, exercised as SHIPPED across every shape that matters. The block above proves
+  // what the installer DOES with each answer; this proves the answers.
+  const source = await readScript()
+  const cases: Array<[string, string]> = [
+    ['redis://localhost:6379', 'none'],
+    ['redis://localhost:6379/0', 'none'],
+    ['redis://localhost', 'none'],
+    ['redis://[::1]:6379/0', 'none'],
+    ['redis://localhost:6379/0?tag=a@b', 'none'],
+    ['redis://localhost:6379/db@1', 'none'],
+    ['redis://:secret@localhost:6379', 'has'],
+    ['rediss://user:p%2Fss@h:6379', 'has'],
+    ['redis://:pa/ss@host:6379', 'ambiguous'],
+    ['redis://user:pa/ss@host:6379', 'ambiguous'],
+    ['redis://', 'ambiguous'],
+    ['cache.internal:6379', 'no-scheme'],
+  ]
+
+  const script = `
+    set -euo pipefail
+    ${sliceOptionalBlock(source, 'redis_url_credential_state() {') ?? 'redis_url_credential_state() { printf missing; }'}
+    for url in ${cases.map(([url]) => JSON.stringify(url)).join(' ')}; do
+      printf '%s\n' "$(redis_url_credential_state "$url")"
+    done
+  `
+  const { stdout } = await execFileAsync('bash', ['-c', script])
+  assert.deepEqual(
+    stdout.trim().split('\n'),
+    cases.map(([, expected]) => expected),
+    'each shape must get the answer that is forced by RFC 3986 — which is also how the Redis client '
+      + 'parses it at runtime — and "ambiguous" everywhere the two readings cannot be told apart',
+  )
 })
 
 // ---------------------------------------------------------------------------

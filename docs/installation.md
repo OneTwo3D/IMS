@@ -55,6 +55,17 @@ environment variable under `--non-interactive` — still overrides the preserved
 as before. A preserved credential is never echoed as the prompt default: the URL is shown redacted and
 a preserved password is shown as `[unchanged]`.
 
+**A `.env` the installer cannot read is not a `.env` with no secrets.** Only a path with *nothing* at
+all on it is a first install. If `${APP_DIR}/.env` exists but is a directory, a dangling symlink, or
+a file this process cannot open or read to the end, the installer **stops** rather than minting fresh
+secrets over a live database. The same applies to a `.env` that was read but is missing any of
+`AUTH_SECRET`, `SETTINGS_ENCRYPTION_KEY` or `CRON_SECRET`: this installer writes all three on every
+run, so a file missing one was truncated or hand-edited, and minting a replacement for
+`SETTINGS_ENCRYPTION_KEY` is irreversible. Restore the missing line from your backup or from the
+running service's environment — or, if this really is a fresh start and the existing data is
+expendable, re-run with `IMS_INSTALL_REMINT_SECRETS=yes`, which mints them and says out loud what it
+just destroyed.
+
 Prompts NOT preserved across a re-run: the WooCommerce, Xero, Turnstile and SMTP values, and the
 database prompts. Supply them again (or as environment variables) on an upgrade run, or the re-written
 `.env` will blank them.
@@ -87,9 +98,22 @@ This applies to both branches: a locally installed Redis, and a Redis you alread
 
 If the `REDIS_URL` you supply already carries a credential of its own, it is left exactly as you typed
 it and a password entered at the prompt is ignored with a warning — the URL wins, and an operator's
-connection string is never rewritten. If you supply a password alongside a `REDIS_URL` that is not of
-the form `redis://host:port[/db]`, the installer stops rather than proceeding with a password it cannot
-place.
+connection string is never rewritten. "Already carries one" means an `@` in the **authority** — the
+text between `://` and the first `/`, `?` or `#` — where an `@` can only be the userinfo separator. An
+`@` further along, in a path or a query string, is none of the installer's business and does **not**
+stop your password being placed in the URL.
+
+If the authority is neither of those things — neither a `host[:port]` nor something carrying a
+credential — the installer **stops**. That shape is what an unencoded `/` inside a password looks
+like (`redis://:pa/ss@host:6379`, whose authority reads as `:pa`), and it cannot be told apart from a
+malformed host: guessing one way splices a *second* credential in front of yours, and guessing the
+other drops your password entirely. Percent-encode the password inside `REDIS_URL` (a `/` is `%2F`)
+and leave the Redis password prompt blank, or give a plain `redis://host:port[/db]` and let the
+installer place the password. The port, if present, must be numeric — that is what makes the two
+readings distinguishable at all.
+
+If you supply a password alongside a `REDIS_URL` with no `://` at all, the installer stops rather
+than proceeding with a password it cannot place.
 
 For a locally installed Redis, the same password is written to `/etc/redis/redis.conf` as a quoted
 `\xHH` string literal, built from the same byte-by-byte walk as the URL encoding. `redis.conf` is

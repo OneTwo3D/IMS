@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { access, chmod, constants, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -102,8 +102,10 @@ async function runInstallerCapturing(
     ${sliceOptionalBlock(source, 'urldecode() {') ?? ''}
     ${sliceOptionalBlock(source, 'mask_secret() {') ?? ''}
     ${sliceOptionalBlock(source, 'redact_url_credentials() {') ?? ''}
+    ${sliceOptionalBlock(source, 'redis_url_credential_state() {') ?? ''}
     ${sliceOptionalBlock(source, 'load_existing_env() {') ?? ''}
     ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
+    ${sliceOptionalBlock(source, 'require_preserved_secrets() {') ?? ''}
     ${sliceOptionalBlock(source, 'prompt() {') ?? ''}
     ${sliceOptionalBlock(source, 'prompt_yn() {') ?? ''}
     ${source.includes('\nload_existing_env "${APP_DIR}/.env"') ? 'load_existing_env "${APP_DIR}/.env"' : ''}
@@ -305,6 +307,7 @@ test('a preserved credential is never echoed as a prompt default', async () => {
       ${sliceOptionalBlock(source, 'urldecode() {') ?? ''}
       ${sliceOptionalBlock(source, 'mask_secret() {') ?? ''}
       ${sliceOptionalBlock(source, 'redact_url_credentials() {') ?? ''}
+      ${sliceOptionalBlock(source, 'redis_url_credential_state() {') ?? ''}
       ${sliceOptionalBlock(source, 'load_existing_env() {') ?? ''}
       ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
       ${sliceOptionalBlock(source, 'prompt() {') ?? ''}
@@ -324,4 +327,180 @@ test('a preserved credential is never echoed as a prompt default', async () => {
     !shown.includes('p%40ss'),
     'the preserved URL was printed with its credential — redact the default, do not print the encoded secret either',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-l89a r4 (Codex r3 finding 2) — A FILE WE CANNOT READ IS NOT A FILE WITH NO SECRETS.
+//
+// Round 3 preserved the three secrets that cannot be re-minted, and the preservation is only as
+// strong as what happens when the read does not succeed. `[[ -f ]] || return 0` answered "no
+// previous install" for a path this script could not read at all, and a `.env` that WAS read but was
+// truncated or hand-edited answered "this key is not present" — identically to a first install.
+// Both routed straight back to minting, and a new SETTINGS_ENCRYPTION_KEY makes every encrypted
+// Setting already in the database permanently undecryptable. The install "succeeds".
+// ---------------------------------------------------------------------------
+
+/** Load an existing .env and report what the loader concluded, running the SHIPPED functions. */
+async function loadEnvState(
+  source: string,
+  appDir: string,
+  options: { asNobody?: boolean } = {},
+): Promise<{ stdout: string; stderr: string }> {
+  const script = `
+    set -euo pipefail
+    warn() { echo "WARN: $*" >&2; }
+    die() { echo "DIE: $*" >&2; exit 9; }
+    APP_DIR=${JSON.stringify(appDir)}
+    declare -A EXISTING_ENV=()
+    ${sliceOptionalBlock(source, 'load_existing_env() {') ?? 'load_existing_env() { :; }'}
+    ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
+    load_existing_env "\${APP_DIR}/.env"
+    printf 'STATE<<<%s>>>\\n' "\${ENV_FILE_STATE:-__ABSENT__}"
+    printf 'KEY<<<%s>>>\\n' "$(existing_env SETTINGS_ENCRYPTION_KEY '__WOULD_MINT__')"
+  `
+  // A permission bit means nothing to root, and these tests run as root. `setpriv` drops to `nobody`
+  // so the readability branch is exercised for real rather than asserted from the source text.
+  return options.asNobody
+    ? execFileAsync('setpriv', ['--reuid=65534', '--regid=65534', '--clear-groups', 'bash', '-c', script])
+    : execFileAsync('bash', ['-c', script])
+}
+
+test('o3d-l89a r4: a truncated .env REFUSES rather than minting a fresh SETTINGS_ENCRYPTION_KEY', async () => {
+  // What an interrupted write, a full disk, or a hand-edit leaves behind. Every key it DOES have is
+  // read back correctly, which is exactly why the missing one is so easy to miss.
+  const source = await readScript()
+  const appDir = await appDirectory()
+  const first = await runInstaller(
+    source,
+    appDir,
+    `INSTALL_REDIS=y; REDIS_PORT=6379; REDIS_PASSWORD=${JSON.stringify(AWKWARD_PASSWORD)}`,
+  )
+  assert.ok(first.SETTINGS_ENCRYPTION_KEY, 'precondition: the first install minted one')
+
+  const truncated = (await readFile(path.join(appDir, '.env'), 'utf8'))
+    .split('\n')
+    .filter((line) => !line.startsWith('SETTINGS_ENCRYPTION_KEY='))
+    .join('\n')
+  await writeFile(path.join(appDir, '.env'), truncated, 'utf8')
+
+  let stderr = ''
+  try {
+    await runInstaller(source, appDir, 'INSTALL_REDIS=y; REDIS_PORT=6379')
+    throw new assert.AssertionError({
+      message:
+        'the re-run MINTED a fresh SETTINGS_ENCRYPTION_KEY over a database encrypted with the old one. '
+        + 'Every encrypted Setting — Xero tokens, connector secrets — is now permanently undecryptable, '
+        + 'and the install reported success',
+    })
+  } catch (error) {
+    if (error instanceof assert.AssertionError) throw error
+    stderr = String((error as { stderr?: string }).stderr ?? error)
+  }
+
+  assert.match(stderr, /DIE: .*does not carry SETTINGS_ENCRYPTION_KEY/)
+  assert.match(stderr, /permanently undecryptable/, 'the refusal says what it is protecting')
+  assert.match(stderr, /IMS_INSTALL_REMINT_SECRETS=yes/, 'and it names the way forward, so it is not a dead end')
+
+  // And the file it refused over is untouched.
+  const after = await readFile(path.join(appDir, '.env'), 'utf8')
+  assert.equal(after, truncated, 'nothing was written on the refusal path')
+})
+
+test('o3d-l89a r4: the refusal is escapable, deliberately and loudly', async () => {
+  const source = await readScript()
+  const appDir = await appDirectory()
+  await runInstaller(source, appDir, 'INSTALL_REDIS=y; REDIS_PORT=6379; REDIS_PASSWORD=hunter2')
+  const truncated = (await readFile(path.join(appDir, '.env'), 'utf8'))
+    .split('\n')
+    .filter((line) => !line.startsWith('AUTH_SECRET='))
+    .join('\n')
+  await writeFile(path.join(appDir, '.env'), truncated, 'utf8')
+
+  const { values, stderr } = await runInstallerCapturing(
+    source,
+    appDir,
+    'IMS_INSTALL_REMINT_SECRETS=yes; INSTALL_REDIS=y; REDIS_PORT=6379',
+  )
+
+  assert.ok(values.AUTH_SECRET, 'the escape hatch really does mint')
+  assert.match(stderr, /WARN: IMS_INSTALL_REMINT_SECRETS=yes/, 'and it says out loud what it just destroyed')
+  assert.match(stderr, /every existing session is invalidated/)
+})
+
+test('o3d-l89a r4: an UNREADABLE .env refuses instead of reading as "no previous install"', async () => {
+  const source = await readScript()
+  const appDir = await appDirectory()
+  await runInstaller(source, appDir, 'INSTALL_REDIS=y; REDIS_PORT=6379; REDIS_PASSWORD=hunter2')
+  await chmod(path.join(appDir, '.env'), 0o600)
+  // The directory has to be traversable or the read fails for a different reason than the one under
+  // test; the FILE is what `nobody` may not open.
+  await chmod(appDir, 0o755)
+
+  const dropped = await execFileAsync('setpriv', ['--reuid=65534', '--regid=65534', '--clear-groups', 'true'])
+    .then(() => true, () => false)
+  const stillReadable = dropped
+    ? false
+    : await access(path.join(appDir, '.env'), constants.R_OK).then(() => true, () => false)
+  if (!dropped && stillReadable) {
+    // No way to drop privilege here. Assert the SHAPE instead: the loader must consult readability
+    // rather than answering "absent".
+    assert.match(
+      sliceOptionalBlock(source, 'load_existing_env() {') ?? '',
+      /! -r "\$\{file\}"/,
+      'the loader must test readability; without it an unreadable .env answers "no previous install"',
+    )
+    return
+  }
+
+  let stderr = ''
+  try {
+    await loadEnvState(source, appDir, { asNobody: true })
+    throw new assert.AssertionError({
+      message: 'an unreadable .env was treated as absent, which routes the run straight back to minting',
+    })
+  } catch (error) {
+    if (error instanceof assert.AssertionError) throw error
+    stderr = String((error as { stderr?: string }).stderr ?? error)
+  }
+  assert.match(stderr, /DIE: .*not readable/)
+  assert.ok(!/STATE<<<absent>>>/.test(stderr), 'and it did NOT conclude that there is no previous install')
+})
+
+test('o3d-l89a r4: a DIRECTORY (or a dangling symlink) at the .env path refuses rather than minting', async () => {
+  const source = await readScript()
+  const appDir = await appDirectory()
+  await mkdir(path.join(appDir, '.env'))
+
+  let stderr = ''
+  try {
+    await loadEnvState(source, appDir)
+    throw new assert.AssertionError({ message: 'a directory at the .env path was treated as absent' })
+  } catch (error) {
+    if (error instanceof assert.AssertionError) throw error
+    stderr = String((error as { stderr?: string }).stderr ?? error)
+  }
+  assert.match(stderr, /DIE: .*is not a regular file/)
+
+  const dangling = await appDirectory()
+  await symlink(path.join(dangling, 'nowhere'), path.join(dangling, '.env'))
+  let danglingStderr = ''
+  try {
+    await loadEnvState(source, dangling)
+    throw new assert.AssertionError({ message: 'a dangling symlink at the .env path was treated as absent' })
+  } catch (error) {
+    if (error instanceof assert.AssertionError) throw error
+    danglingStderr = String((error as { stderr?: string }).stderr ?? error)
+  }
+  assert.match(danglingStderr, /DIE: .*is not a regular file/, '`-e` is false for a dangling symlink, which is why the loader tests `-L` too')
+})
+
+test('o3d-l89a r4: a genuinely absent .env still mints — the refusal must not block a first install', async () => {
+  // The control. Without it the fix above could be "refuse always", which is a different outage.
+  const source = await readScript()
+  const appDir = await appDirectory()
+
+  const { stdout } = await loadEnvState(source, appDir)
+
+  assert.match(stdout, /STATE<<<absent>>>/)
+  assert.match(stdout, /KEY<<<__WOULD_MINT__>>>/, 'a first install has nothing to preserve, and minting there is correct')
 })
