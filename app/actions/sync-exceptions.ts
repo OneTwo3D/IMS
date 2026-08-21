@@ -852,7 +852,7 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
       })
     }
 
-    await syncRefundsForOrder(Number(orderLink.externalOrderId))
+    const refundSweep = await syncRefundsForOrder(Number(orderLink.externalOrderId))
 
     const refundLanded = row.externalId
       ? await db.salesOrderRefund.findFirst({
@@ -860,6 +860,19 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
           select: { id: true },
         })
       : null
+
+    // o3d-ecbj r5: "the refund did not land" is a statement about the STORE'S list, and a list read
+    // only in part cannot make it. If the walk was short, the refund may simply be on a page nobody
+    // read — so say the store could not be read completely rather than reporting a not-applied
+    // outcome the operator would read as WooCommerce's answer. The park stays PENDING and visible,
+    // so the retry button is still the whole recovery.
+    if (!refundLanded && !refundSweep.complete) {
+      return {
+        success: false,
+        error: `WooCommerce's refund list for that order could not be read in full (${refundSweep.error ?? 'unknown error'}), `
+          + 'so this refund cannot be confirmed missing. The park is still open — retry it once the store responds.',
+      }
+    }
 
     if (refundLanded) {
       // Codex r6: repeated webhook deliveries can have parked the SAME refund

@@ -45,6 +45,7 @@ export async function processWcWebhookEvent(
       resource: input.resource,
       topic: input.topic,
       payload: input.payload,
+      originAttestation: input.originAttestation,
     }),
   })
 }
@@ -65,6 +66,7 @@ export async function processPendingWcWebhookEvents(
       resource: input.resource,
       topic: input.topic,
       payload: input.payload,
+      originAttestation: input.originAttestation,
     }),
   })
 }

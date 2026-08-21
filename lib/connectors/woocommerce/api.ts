@@ -1,6 +1,7 @@
 import { getSettingValues } from '@/lib/settings-store'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import type { ConnectorCredentials } from '../types'
+import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentials } from './credentials'
 import { validateWooCommerceBaseUrl } from './url-safety'
 
 const GENERIC_WC_NOT_CONFIGURED_ERROR = 'WooCommerce integration is not configured.'
@@ -39,18 +40,21 @@ function validateWooCommerceCredentials(
 }
 
 export async function getWcCredentials(): Promise<ConnectorCredentials | null> {
-  const map = await getSettingValues(['wc_url', 'wc_consumer_key', 'wc_consumer_secret'])
-  const url = map.get('wc_url')
-  const key = map.get('wc_consumer_key')
-  const secret = map.get('wc_consumer_secret')
-  if (!url || !key || !secret) return null
-
-  const validated = validateWooCommerceBaseUrl(url)
-  if (!validated.ok) {
-    throw new Error(validated.error)
-  }
-
-  return { url: validated.normalizedUrl, key, secret }
+  // o3d-ecbj: the same resolver the advisory-lock snapshots in stock-sync.ts /
+  // product-sync.ts use. They cannot share this READ — they must take their settings
+  // inside their own locked transaction — so the only thing that can keep them in step is
+  // sharing the interpretation of what they read.
+  const map = await getSettingValues([...WC_CREDENTIAL_SETTING_KEYS])
+  const resolution = resolveWcCredentials({
+    url: map.get('wc_url'),
+    key: map.get('wc_consumer_key'),
+    secret: map.get('wc_consumer_secret'),
+  })
+  if (resolution.ok) return resolution.credentials
+  // An unusable store URL is thrown, not swallowed: this is the interactive path, and
+  // "not configured" would send an operator hunting for a missing setting that is present.
+  if (resolution.reason === 'invalid_url') throw new Error(resolution.error)
+  return null
 }
 
 export async function wcFetch(

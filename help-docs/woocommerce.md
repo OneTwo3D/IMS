@@ -31,6 +31,8 @@ Official guide: <https://woocommerce.com/document/woocommerce-rest-api/>
 
 > **Note:** The consumer secret is masked after saving. To change it, enter the full new value — the system detects and ignores the masked placeholder.
 >
+> **Settings own the credentials.** `WC_STORE_URL`, `WC_CONSUMER_KEY` and `WC_CONSUMER_SECRET` in `.env` are used **once**, at install time, to seed these fields. After that the connection form is the only place that changes them, and editing the `.env` values has no effect. Rotate the key here, not in the file.
+>
 > **Base currency check:** the WooCommerce store currency must match the IMS base currency before credentials or sync settings can be enabled. Order currencies may still vary per transaction; the IMS converts them into its own base currency for reporting and valuation.
 
 ### Connection Test Gate
@@ -47,6 +49,22 @@ The connection test gate prevents sync from running with stale or wrong credenti
 5. If you later change the URL, key, or secret, the fingerprint comparison detects the change and reverts the status to `stale`. You must re-test.
 
 This means a credential rotation can't silently leave sync running with old (or broken) credentials.
+
+### What happens to in-flight work when you rebind
+
+Changing the URL, key or secret is a **rebind**. It clears every cached WooCommerce product id (the next sync re-matches products by SKU). Work that belongs to the old binding is then refused rather than applied:
+
+- A product import or stock push that started before the rebind abandons its writes instead of writing the old store's ids over the freshly cleared cache.
+- A **product webhook sent by the previous store** is refused, and is acknowledged rather than retried — its payload describes that store, and no number of retries can make it describe the new one. Nothing is imported and no stock is corrected from it. These appear in the activity log at ERROR level, naming the store that sent the delivery and the store you are bound to. The reconcile sync re-imports the affected products from the current store, so nothing needs replaying by hand.
+
+Every delivery is judged on **which store sent it**, taken from the store's own statement of its address in the delivery and compared against the store URL in your Connection settings. The statement is read from the **signed body first** (the product's own REST link or permalink) and only from the `X-WC-Webhook-Source` header when the body carries neither — the header travels outside the signature, so it never overrides what the signed body says about itself. The comparison includes the **subdirectory**, so two stores sharing one host (`example.com/store-a` and `example.com/store-b`, as in path-based multisite) are told apart. That is deliberately not the same as "did anything change since the delivery arrived":
+
+- Rotating the key or secret **for the same store**, or pressing *Reset cached product IDs*, is not a rebind of the store. Deliveries keep flowing normally through both.
+- A delivery that was already on its way when you changed the store URL is still recognised as coming from the old store, even though it lands afterwards.
+- A delivery that does not say which store sent it is refused as well, rather than assumed to be current. If that happens for every delivery, something between WooCommerce and IMS is stripping headers.
+- A handful of refusals immediately after an IMS upgrade is expected: deliveries accepted by the previous version during the changeover carry no store statement, so they cannot be shown to describe the current store. The reconcile sync covers them.
+
+A burst of refusals after a store change is normal for a few minutes (the old store's queued deliveries draining). A burst that keeps going means the old store is still sending webhooks — remove the webhook in that store's WooCommerce admin.
 
 ## Order Sync
 
@@ -68,7 +86,7 @@ With the initial import complete, new and updated WooCommerce orders are importe
 **Configuration options:**
 
 - **Enable/disable** order sync with the toggle
-- **Status filter** — choose which WooCommerce statuses trigger an import (e.g. `processing`, `on-hold`, `completed`)
+- **Status filter** — choose which WooCommerce statuses trigger an import (e.g. `processing`, `on-hold`, `completed`). At least one status must be ticked: an empty selection is rejected when you save, because it is not a filter WooCommerce can be asked for. To stop importing orders altogether, turn **Enable order sync** off instead.
 - **Sync interval** — how often the system polls WooCommerce for changes (default: 5 minutes). This field is disabled when webhooks are active.
 
 **What happens when an order is imported:**
@@ -238,6 +256,13 @@ Refunds created in WooCommerce are automatically synced to One Two Inventory:
 - **Monetary-only refunds** (no quantities) create a single refund line with the full amount and the WC refund reason
 
 Refunds are deduplicated by WooCommerce refund ID, so they are safe to re-process.
+
+**All of them, not the first ten.** WooCommerce returns refunds ten at a time unless asked for more, so an
+order with many separate refunds used to sync only its ten most recent. Every page is now read. If a page
+cannot be read, the sync keeps what it got and logs `wc_refund_read_incomplete` (WARNING) naming the order
+and how far it reached — until the rest arrive, that order shows a smaller refunded amount than the store
+does, and a 3PL despatch for it can be refused as uncovered. The next sweep re-reads the order from the
+first page, so it clears itself.
 
 ## Invoice Notes and Customer PDF Downloads
 

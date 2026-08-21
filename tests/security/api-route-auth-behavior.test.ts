@@ -89,6 +89,7 @@ function wcWebhookEvent(overrides: Partial<{
     topic: overrides.topic ?? 'order.created',
     payloadHash: 'hash',
     payloadJson: overrides.payloadJson ?? { id: 123 },
+    originAttestation: 'unproven:not-applicable',
     status: WC_WEBHOOK_EVENT_STATUS.pending,
     attempts: 0,
     nextAttemptAt: null,

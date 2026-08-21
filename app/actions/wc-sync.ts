@@ -203,6 +203,52 @@ async function validateWooStoreBaseCurrency(credentials?: { url: string; key: st
   return { ok: true, storeCurrency, baseCurrency }
 }
 
+/**
+ * o3d-tj6v follow-up: refuse to STORE an empty order-status selection.
+ *
+ * `wc_sync_order_statuses` holds a JSON array of WooCommerce statuses. Unticking every box
+ * in Settings -> Sync -> WooCommerce writes `[]`, and `[]` is not a usable configuration on
+ * any route: the sweeps turn the selection into a `?status=<list>` query, and an EMPTY
+ * `status=` means ANY status to the WooCommerce REST API — so "import nothing" was read by
+ * the store as "import everything", the exact inversion of the request. Honouring it as
+ * "import nothing" instead is correct at read time, but then every sweep run reports a
+ * configuration error for a state the operator was allowed to save in the first place.
+ *
+ * So it is rejected HERE, at the persistence boundary, the same way a WC->SHIPPED status
+ * mapping is (o3d-gz6). Disabling order sync is what "import nothing" is for, and it is one
+ * checkbox away.
+ *
+ * DELIBERATELY NARROW. Only a well-formed array that selects nothing is refused:
+ *
+ *   - a MISSING key means a partial save that is not touching this setting;
+ *   - a BLANK value means "unset", which every reader resolves to the default selection;
+ *   - a non-array or otherwise malformed value is a corrupt row, not an expressed choice,
+ *     and readers already fall back to the default for it.
+ *
+ * Only emptiness is decided here — normalisation (`wc-processing` -> `processing`, de-duping)
+ * belongs to the readers, and is not re-implemented in this gate.
+ */
+function rejectEmptyWcOrderStatusSelection(raw: string | undefined): string | null {
+  if (raw === undefined) return null
+  if (raw.trim() === '') return null
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!Array.isArray(parsed)) return null
+
+  const selected = parsed.filter((entry) => typeof entry === 'string' && entry.trim() !== '')
+  if (selected.length > 0) return null
+
+  return 'Select at least one WooCommerce order status to import. '
+    + 'An empty selection cannot be saved: it is not a filter WooCommerce can be asked for, '
+    + 'and it would leave every order sweep reporting a configuration error. '
+    + 'To stop importing orders entirely, turn off "Enable order sync" instead.'
+}
+
 async function getCurrentWcConnectionFingerprint(): Promise<string> {
   const [url, key, secret] = await Promise.all([
     getSettingValue('wc_url'),
@@ -229,6 +275,13 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
       if (freshAuthFailure) return freshAuthFailure
       throw e
     }
+  }
+  // Cheap, local and specific, so it is decided before the remote currency probe and the
+  // connection gate: an operator who unticked every status should be told that, not handed
+  // whichever unrelated check happens to fail first.
+  const emptyStatusSelection = rejectEmptyWcOrderStatusSelection(data.wc_sync_order_statuses)
+  if (emptyStatusSelection) {
+    return { success: false, error: emptyStatusSelection, code: 'wc_no_order_statuses_selected' }
   }
   if (data.wc_sync_enabled === 'true') {
     const validation = await validateWooStoreBaseCurrency()
@@ -565,6 +618,11 @@ export async function getWcCredentials(): Promise<{ url: string; key: string; se
     key: maskSecret(key, 7),
     secret: maskSecret(secret, 7),
     secretMasked: !!secret,
+    // Always empty now, and deliberately still computed rather than hardcoded to `{}`:
+    // WC_CONSUMER_KEY / WC_CONSUMER_SECRET are install-time SEEDS, not overrides (o3d-ecbj),
+    // so there is nothing to warn about — but if either is ever put back into
+    // SETTING_ENV_FALLBACKS, the Connection banner starts telling the operator again
+    // instead of quietly lying about which credential is in force.
     envOverrides: getActiveSettingEnvOverrides(['wc_consumer_key', 'wc_consumer_secret']),
     connectionTest,
   }

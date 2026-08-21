@@ -2556,6 +2556,22 @@ model ShoppingWebhookEvent {
   topic           String?
   payloadHash     String
   payloadJson     Json
+  /// o3d-wgl6: which STORE sent this delivery, as the store itself stated it at receipt
+  /// (`store:<host>[/<path>]`, or `store-under:` for a resource URL known only to sit beneath
+  /// the site root), or one of the `unproven:*` markers saying positively why no store could
+  /// be recorded. The payload is frozen at receipt, so a retry after a credential rebind would
+  /// otherwise import the previous store's data under the new store's credentials with every
+  /// settings version the import observes consistently pointing at the new one. Recorded here
+  /// rather than in payloadJson because idempotency hashes the body. NOT NULL: a nullable
+  /// column would mean both "pre-migration" and "nothing found", and the pre-migration rows
+  /// would silently read as fine.
+  /// The DEFAULT is deliberate and load-bearing: during a deploy the migration is already live
+  /// while the PREVIOUS build is still inserting rows that name no such column, and without a
+  /// default every webhook delivered in that window would fail NOT NULL and 500 until
+  /// WooCommerce disabled the webhook. It defaults to a marker distinct from the backfill, so a
+  /// row written by that older writer is never mistaken for one current code wrote.
+  /// See lib/connectors/webhook-origin.ts.
+  originAttestation String    @default("unproven:legacy-writer")
   status          String
   attempts        Int       @default(0)
   nextAttemptAt   DateTime?

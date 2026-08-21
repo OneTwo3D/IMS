@@ -18,11 +18,37 @@ export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
   shopify_admin_api_access_token: 'SHOPIFY_ADMIN_API_ACCESS_TOKEN',
   shopify_invoice_pdf_secret: 'SHOPIFY_INVOICE_PDF_SECRET',
   shopify_webhook_secret: 'SHOPIFY_WEBHOOK_SECRET',
-  wc_consumer_key: 'WC_CONSUMER_KEY',
-  wc_consumer_secret: 'WC_CONSUMER_SECRET',
   wc_invoice_pdf_secret: 'WC_INVOICE_PDF_SECRET',
   wc_webhook_secret: 'WC_WEBHOOK_SECRET',
 }
+
+// `wc_consumer_key` and `wc_consumer_secret` are deliberately NOT in the map above
+// (o3d-ecbj). They were, and the override was only HALF APPLIED:
+//
+//   - getSettingValue/getSettingValues PREFER the environment, so
+//     lib/connectors/woocommerce/api.ts getWcCredentials() — the order import, the FX push,
+//     the partial-shipment push, links.ts, delivery.ts — followed WC_CONSUMER_KEY /
+//     WC_CONSUMER_SECRET;
+//   - while snapshotSyncContext (sync/stock-sync.ts) and snapshotProductSyncContext
+//     (sync/product-sync.ts) read the settings ROWS inside their advisory-lock transaction
+//     — they must, or the credentials and wc_settings_version could not be captured
+//     together (o3d-mlc7) — and followed the database.
+//
+// A stale secret left in .env after a rotation therefore made one installation import
+// orders under one credential and push stock under another. Neither half errors: the
+// losing one just collects 401s that the sync reports as an ordinary transient WC API
+// error and retries forever.
+//
+// Wiring the override up on BOTH sides was rejected for the same reason it was rejected
+// for wc_url and WC_SYNC_STATUSES: scripts/install.sh writes these lines into every .env,
+// and env-wins would pin an installation to whatever was typed at install time, making the
+// Settings fields inert and silently repointing an operator who had since rotated the key.
+//
+// WC_CONSUMER_KEY / WC_CONSUMER_SECRET still have a job: scripts/provision-instance.mjs
+// SEEDS the two settings rows from them at install time (insert-only, so a re-run cannot
+// clobber the operator's value), exactly like WC_STORE_URL and the SMTP_* variables. After
+// that the Settings UI is the single source of truth, and
+// lib/connectors/woocommerce/credentials.ts is the single resolver both paths build from.
 
 export const SENSITIVE_SETTING_KEYS = new Set([
   'backup_s3_secret_key',

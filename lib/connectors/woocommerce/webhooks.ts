@@ -15,6 +15,8 @@ import {
   shouldSuppressWcWebhookEcho,
 } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
+import { judgeWebhookOrigin, type WebhookOriginJudgement } from '@/lib/connectors/webhook-origin'
+import { readWcDeliveryOrigin } from '@/lib/connectors/woocommerce/webhook-origin'
 import {
   createShoppingWebhookEventRepository,
   persistWcWebhookEvent,
@@ -23,6 +25,7 @@ import {
 } from '@/lib/connectors/woocommerce/webhook-inbox'
 import type { WcFullOrder, WcFullProduct, WcRefund } from '@/lib/connectors/woocommerce/sync/types'
 import type { ShoppingWebhookResource } from '@/lib/shopping'
+import { getSettingValue } from '@/lib/settings-store'
 
 type JsonParseResult<T> =
   | { ok: true; value: T }
@@ -42,7 +45,7 @@ export type WcWebhookDependencies = {
   persistWebhookEvent: typeof persistWcWebhookEvent
   webhookEventRepository: ShoppingWebhookEventRepository
   handleOrderWebhook: (payload: unknown, topic: string | null) => Promise<Response>
-  handleProductWebhook: (payload: unknown) => Promise<Response>
+  handleProductWebhook: (payload: unknown, originAttestation: string) => Promise<Response>
   handleRefundWebhook: (payload: unknown) => Promise<Response>
 }
 
@@ -332,7 +335,15 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       }
     }
     try {
-      await syncRefundsForOrder(wcOrder.id)
+      // An INCOMPLETE refund read is a failure of this delivery, not a detail of it. The refunds
+      // that were read are already applied, but acknowledging the delivery would retire the only
+      // prompt to come back for the rest — and the missing ones are demand the external-fulfilment
+      // coverage check never nets, so a complete 3PL dispatch is refused until they land. A
+      // retried delivery re-reads the order from page one, so this is self-clearing (o3d-ecbj r5).
+      const refundSweep = await syncRefundsForOrder(wcOrder.id)
+      if (!refundSweep.complete) {
+        failures.push(`syncRefundsForOrder: incomplete refund read — ${refundSweep.error ?? 'unknown error'}`)
+      }
     } catch (e) {
       failures.push(`syncRefundsForOrder: ${e instanceof Error ? e.message : String(e)}`)
     }
@@ -369,8 +380,69 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
   return NextResponse.json({ ok: false, failures }, { status: 500 })
 }
 
-async function handleProductWebhook(payload: unknown) {
+/**
+ * o3d-wgl6: is this delivery from the store we are bound to RIGHT NOW?
+ *
+ * Read WITHOUT the advisory lock, on purpose. A rebind committing concurrently with this read
+ * either lands first — we see the new store and refuse, the fail-safe direction — or lands
+ * after, in which case the import that follows takes the lock itself, re-checks
+ * `wc_settings_version` inside its write transaction, and abandons everything it is holding
+ * (o3d-mlc7). Both orderings are already covered, so an exclusive-lock wait here would buy
+ * nothing and would serialise the inbox drain behind every settings write.
+ */
+async function judgeWcDeliveryOrigin(originAttestation: string): Promise<WebhookOriginJudgement> {
+  return judgeWebhookOrigin(originAttestation, await getSettingValue('wc_url'))
+}
+
+async function handleProductWebhook(payload: unknown, originAttestation: string) {
   const productPayload = payload as Partial<WcFullProduct> & { stock_quantity?: number | null }
+
+  // o3d-wgl6: settled BEFORE anything else, because a delivery that does not describe this
+  // store must not reach the import, the shape warning, or the forced stock correction.
+  //
+  // `stock_quantity` in a foreign body is the OTHER store's figure, and the correction pushes
+  // it with force:true — which bypasses the echo dedupe and reopens completed stock rows. That
+  // is the same cross-store write the import fence exists to prevent, arriving by a second
+  // door, so the refusal has to cover both.
+  const origin = await judgeWcDeliveryOrigin(originAttestation)
+  if (origin.verdict === 'foreign-store' || origin.verdict === 'unproven') {
+    // ACKNOWLEDGED, not retried. The payload was captured at receipt and is frozen: no retry
+    // can make a store-A body describe store B, so all ~24 attempts would reach this identical
+    // refusal and dead-letter. Nothing is lost — a product that exists in the store we are
+    // bound to now is re-imported by the reconcile sweep against the current credentials.
+    //
+    // ERROR, because this is also how a WRONG rebind announces itself: a burst that does not
+    // stop means a store the operator believes they have left is still sending webhooks.
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_product_webhook_foreign_store',
+      tag: 'sync',
+      level: 'ERROR',
+      description: origin.verdict === 'foreign-store'
+        ? `WooCommerce product webhook for ${productPayload.sku} was sent by ${origin.deliveryStore}, which is not the `
+          + `store this installation is bound to (${origin.boundStore}). Nothing was imported and no stock was `
+          + 'corrected; the delivery is acknowledged rather than retried against a store it does not describe. '
+          + 'The reconcile sync re-imports this product from the current store.'
+        : `WooCommerce product webhook for ${productPayload.sku} did not say which store sent it `
+          + `(${origin.attestation}), so it cannot be shown to describe the store this installation is bound to. `
+          + 'Nothing was imported and no stock was corrected. The reconcile sync re-imports this product from '
+          + 'the current store.',
+      metadata: {
+        externalId: productPayload.id,
+        sku: productPayload.sku,
+        verdict: origin.verdict,
+        originAttestation: origin.attestation,
+        deliveryStore: origin.deliveryStore,
+        boundStore: origin.boundStore,
+        originScope: origin.scope,
+      },
+    })
+    return NextResponse.json({ ok: true, foreignStore: true, verdict: origin.verdict })
+  }
+  // 'binding-unreadable' falls through DELIBERATELY: the delivery named a store, and it is our
+  // own `wc_url` that is missing or malformed. Refusing here would acknowledge — permanently
+  // discard — deliveries that are perfectly valid, over a misconfiguration an operator fixes in
+  // minutes. The import fails "not configured" instead, which retries and self-heals.
   const canSyncProduct =
     typeof productPayload.id === 'number'
     && typeof productPayload.sku === 'string'
@@ -388,6 +460,14 @@ async function handleProductWebhook(payload: unknown) {
   let productSyncError: string | null = null
 
   if (canSyncProduct) {
+    // No `observedVersion` is passed, and that is not an omission (o3d-wgl6). That argument
+    // fences a payload the CALLER fetched against a rebind that landed since; the origin check
+    // above already answers that question for a webhook, using the sending store's own identity
+    // instead of a version number, and it answers it without the two false positives a version
+    // carries — a same-store key rotation and a product-id cache reset both bump the version
+    // while leaving the store exactly where it was. A rebind that lands mid-import is a
+    // different question, and `syncWcProductToIms` still fences that itself, under the advisory
+    // lock, from the version it snapshotted (o3d-mlc7).
     const result = await syncWcProductToIms(productPayload as WcFullProduct)
     if (result.success) {
       await db.setting.upsert({
@@ -538,6 +618,13 @@ export async function processWcWebhookPayload(
     resource: ShoppingWebhookResource
     topic: string | null
     payload: unknown
+    /**
+     * What the delivery said about the store that sent it, recorded at RECEIPT (o3d-wgl6).
+     * REQUIRED, with no default: a caller that cannot say where a delivery came from has to
+     * say THAT, using one of the `unproven:*` markers, rather than leave it blank and have the
+     * blank read as consent.
+     */
+    originAttestation: string
   },
   dependencies: Pick<WcWebhookDependencies, 'handleOrderWebhook' | 'handleProductWebhook' | 'handleRefundWebhook'> = defaultDependencies,
 ) {
@@ -545,7 +632,7 @@ export async function processWcWebhookPayload(
     case 'orders':
       return dependencies.handleOrderWebhook(input.payload, input.topic)
     case 'products':
-      return dependencies.handleProductWebhook(input.payload)
+      return dependencies.handleProductWebhook(input.payload, input.originAttestation)
     case 'refunds':
       return dependencies.handleRefundWebhook(input.payload)
   }
@@ -601,6 +688,13 @@ export async function handleWcWebhook(
   const parsed = parseWebhookJson<unknown>(body)
   if (!parsed.ok) return parsed.response
 
+  // o3d-wgl6: what the STORE said about itself, taken from the delivery in hand. Recorded at
+  // receipt because the request is the only place it exists — the parsed payload alone reaches
+  // the inbox, and by the time a retry runs, the headers are long gone and every setting has
+  // moved on. No database read: the answer is entirely the store's own statement, which is what
+  // makes it survive a rebind that happens afterwards.
+  const originAttestation = readWcDeliveryOrigin(request, parsed.value)
+
   const result: PersistWcWebhookEventResult = await dependencies.persistWebhookEvent(
     dependencies.webhookEventRepository,
     {
@@ -609,6 +703,7 @@ export async function handleWcWebhook(
       externalEventId,
       rawBody: body,
       payload: parsed.value,
+      originAttestation,
     },
   )
 
