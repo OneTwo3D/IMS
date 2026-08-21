@@ -403,10 +403,12 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     })
   }
 
-  async function handleRetryOne(entryId: string) {
+  // o3d-e2mz: a per-row retry carries the attempt the operator is looking at, so the server can refuse
+  // it if the row has moved on to a different attempt since this list was rendered.
+  async function handleRetryOne(entryId: string, attemptRevision: number | undefined) {
     setRetryMsg(null)
     setRetryingId(entryId)
-    const result = await retryFailedAccountingSync(entryId)
+    const result = await retryFailedAccountingSync(entryId, attemptRevision)
     setRetryingId(null)
     if (result.success) {
       setRetryMsg(`Reset ${result.reset} entry for retry.`)
@@ -1068,7 +1070,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                                   size="sm"
                                   className="h-7 w-7 p-0"
                                   title="Retry this entry"
-                                  onClick={() => handleRetryOne(log.id)}
+                                  onClick={() => handleRetryOne(log.id, log.attemptRevision)}
                                   disabled={retryingId === log.id}
                                 >
                                   {retryingId === log.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
@@ -1487,7 +1489,7 @@ function HistoryEntryRow({
     setRetryMsg(null)
     setRetrying(true)
     try {
-      const res = await retryFailedAccountingSync(entry.id)
+      const res = await retryFailedAccountingSync(entry.id, entry.attemptRevision)
       if (res.success) {
         setRetryMsg(`Reset ${res.reset} entry — will retry on next sync cycle`)
         router.refresh()

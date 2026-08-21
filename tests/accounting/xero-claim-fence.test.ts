@@ -40,6 +40,13 @@ type Row = {
   id: string
   status: string
   processingStartedAt: Date | null
+  /**
+   * o3d-e2mz: the per-attempt identity the processor now stamps on every claim. Carried by this
+   * double because `applyMainSyncFailureRetry` fences on it as well as on the claim instant — a
+   * double without it answers `undefined` to `attemptRevision: 0` and refuses EVERY write, which
+   * would make the o3d-550x tests below pass for entirely the wrong reason.
+   */
+  attemptRevision: number
   retryCount: number
   externalTransactionId: string | null
   syncedAt: Date | null
@@ -68,6 +75,7 @@ function makeRowStore(
   const state: Row | null = row === null ? null : {
     status: 'PROCESSING',
     processingStartedAt: null,
+    attemptRevision: 0,
     retryCount: 0,
     externalTransactionId: null,
     syncedAt: null,
@@ -150,6 +158,7 @@ function makeRowStore(
 const T_DISPLACED_CLAIM = new Date('2026-03-01T09:00:00.000Z')
 const T_REPLACEMENT_CLAIM = new Date('2026-03-01T09:20:00.000Z')
 
+const ATTEMPT = { id: 'log-1', attemptRevision: 0 }
 const ENTRY = {
   id: 'log-1',
   retryCount: 2,
@@ -285,7 +294,10 @@ test('Codex r1 medium 2: the cancellation retirement COMPOSES the fence, it does
   // which is exactly why it is dangerous. What must be true is that the predicate is not written out a
   // second time — so the source is read, with comments stripped so a commented example cannot satisfy it.
   const src = stripComments(readFileSync(join(process.cwd(), 'lib/domain/accounting/cancel-order-invoice-sync.ts'), 'utf8'))
-  assert.ok(src.includes('heldClaimWhere(syncLogId, held)'), 'the retirement must compose the shared fence')
+  // o3d-e2mz: the entry id now arrives as part of the ATTEMPT the worker claimed, so the composed
+  // call names `attempt.id` rather than a separate `syncLogId`. What this pins is unchanged and is
+  // the whole point: the ownership half is COMPOSED from the shared predicate, not re-spelt.
+  assert.ok(src.includes('heldClaimWhere(attempt.id, held)'), 'the retirement must compose the shared fence')
   assert.ok(
     !/processingStartedAt:\s*(claimedAt|held\.heldFrom\(\))/.test(src),
     'and must not hand-spell the claim instant into a where clause of its own',
@@ -302,7 +314,7 @@ test('o3d-550x: a displaced owner cannot release the replacement\'s claim', asyn
     retryCount: 2,
   })
 
-  await applyMainSyncFailureRetry(tx, ENTRY, 'connection reset', {}, claimHeldFrom(T_DISPLACED_CLAIM))
+  await applyMainSyncFailureRetry(tx, ATTEMPT, ENTRY, 'connection reset', {}, claimHeldFrom(T_DISPLACED_CLAIM))
 
   assert.equal(state!.status, 'PROCESSING', 'the replacement still holds the row')
   assert.equal(state!.processingStartedAt?.valueOf(), T_REPLACEMENT_CLAIM.valueOf())
@@ -320,7 +332,7 @@ test('o3d-550x: the worker that DOES hold the claim still records its failure', 
     retryCount: 2,
   })
 
-  const result = await applyMainSyncFailureRetry(tx, ENTRY, 'connection reset', {}, claimHeldFrom(T_REPLACEMENT_CLAIM))
+  const result = await applyMainSyncFailureRetry(tx, ATTEMPT, ENTRY, 'connection reset', {}, claimHeldFrom(T_REPLACEMENT_CLAIM))
 
   assert.equal(state!.status, 'PENDING')
   assert.equal(state!.retryCount, 3)
@@ -425,7 +437,7 @@ test('o3d-550x: a displaced owner cannot RETIRE a row a live worker now holds', 
     externalTransactionId: null,
   })
 
-  const retired = await retireSalesInvoiceForCancelledOrder(tx, 'log-1', 'order-1', claimHeldFrom(T_DISPLACED_CLAIM))
+  const retired = await retireSalesInvoiceForCancelledOrder(tx, ATTEMPT, 'order-1', claimHeldFrom(T_DISPLACED_CLAIM))
 
   assert.equal(retired, false)
   assert.equal(state!.status, 'PROCESSING', 'a retraction by a worker that lost the row must do nothing')
@@ -438,7 +450,7 @@ test('o3d-550x: the claim holder DOES retire, and only while the row names no do
     processingStartedAt: T_REPLACEMENT_CLAIM,
     externalTransactionId: null,
   })
-  assert.equal(await retireSalesInvoiceForCancelledOrder(holder.tx, 'log-1', 'order-1', claimHeldFrom(T_REPLACEMENT_CLAIM)), true)
+  assert.equal(await retireSalesInvoiceForCancelledOrder(holder.tx, ATTEMPT, 'order-1', claimHeldFrom(T_REPLACEMENT_CLAIM)), true)
   assert.equal(holder.state!.status, 'CANCELLED')
 
   // The arm that is this call site's own, not part of the shared fence: a row that already posted must
@@ -449,7 +461,7 @@ test('o3d-550x: the claim holder DOES retire, and only while the row names no do
     processingStartedAt: T_REPLACEMENT_CLAIM,
     externalTransactionId: 'INV-XERO-1',
   })
-  assert.equal(await retireSalesInvoiceForCancelledOrder(posted.tx, 'log-1', 'order-1', claimHeldFrom(T_REPLACEMENT_CLAIM)), false)
+  assert.equal(await retireSalesInvoiceForCancelledOrder(posted.tx, ATTEMPT, 'order-1', claimHeldFrom(T_REPLACEMENT_CLAIM)), false)
   assert.equal(posted.state!.status, 'PROCESSING')
 })
 
@@ -736,8 +748,11 @@ test('o3d-550x: neither runner writes the sync row except to CLAIM it or through
     // plus that the claim is still taken, through the one helper, so the rule cannot be satisfied by a
     // runner that simply stopped claiming.
     assert.equal(claimSites, 0, `the ${name} runner must make NO direct row write at all`)
+    // RE-POINTED, NOT RELAXED (o3d-e2mz): the helper now also carries the ATTEMPT that claim mints,
+    // so the call reads `(entry, claimedAt, staleClaimCutoff, attempt)`. Still an exact string, and
+    // still the same property — the runner takes its claim, and only through the one helper.
     assert.ok(
-      block.includes('claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff)'),
+      block.includes('claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff, attempt)'),
       `the ${name} runner must still take its claim, and only through the one helper`,
     )
 

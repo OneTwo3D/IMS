@@ -96,6 +96,11 @@ export type DailyBatchHistoryEntry = {
   externalTransactionId: string | null
   errorMessage: string | null
   retryCount: number
+  /**
+   * o3d-e2mz: the attempt this row is on, so the panel's per-row retry can name the attempt it was
+   * requested about. Optional because connectors whose processor stamps none report none.
+   */
+  attemptRevision?: number
   lines: Array<{ accountCode: string; description: string; debit: number; credit: number }>
 }
 
@@ -648,6 +653,7 @@ export async function getXeroDailyBatchHistory(
       externalTransactionId: row.externalTransactionId,
       errorMessage: row.errorMessage,
       retryCount: row.retryCount,
+      attemptRevision: row.attemptRevision,
       lines,
     }
 

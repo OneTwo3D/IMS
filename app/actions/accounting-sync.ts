@@ -686,10 +686,19 @@ export async function triggerAccountingSync(): Promise<{ success: boolean; resul
   return (connector ?? getAccountingConnector('xero')).triggerSync()
 }
 
-export async function retryFailedAccountingSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
+/**
+ * o3d-e2mz: a per-row retry must carry the attempt revision the operator was shown
+ * (AccountingSyncLogRow.attemptRevision), so the connector can refuse it when the row has moved on to a
+ * different attempt since. Connectors that stamp no revision report none and ignore it. Omit both for the
+ * bulk "Retry All".
+ */
+export async function retryFailedAccountingSync(
+  entryId?: string,
+  expectedAttemptRevision?: number,
+): Promise<{ success: boolean; reset: number; error?: string }> {
   await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
-  return (connector ?? getAccountingConnector('xero')).retryFailedSync(entryId)
+  return (connector ?? getAccountingConnector('xero')).retryFailedSync(entryId, expectedAttemptRevision)
 }
 
 export async function getAccountingSyncReadiness(): Promise<AccountingSyncReadiness> {

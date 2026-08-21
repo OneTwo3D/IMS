@@ -1114,7 +1114,18 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
         userId: session.user.id,
       })
 
-      if (so.status === 'ALLOCATED') {
+      // o3d-e2mz r8: THE DEMOTION IS DECIDED ON THE STATUS READ UNDER THIS LOCK, NEVER ON `so.status`.
+      //
+      // `so` is read at the top of this action, OUTSIDE the transaction and before the lock. Deciding
+      // on it and then writing `where: { id: orderId }` — no status predicate — is a check/use race
+      // with nothing serialising the two, and CANCELLED is where it hurts: the sales-order state
+      // machine has `CANCELLED: []`, no transition out at all, yet an order cancelled between that
+      // read and this lock was demoted straight back to PROCESSING. `validateSalesOrderStatusTransition`
+      // could not object, because it was being shown the stale ALLOCATED. The order came back to life
+      // with its accounting work live again, which is exactly what the cancellation was for.
+      const lockedOrder = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
+      if (!lockedOrder) throw new Error('Order not found')
+      if (lockedOrder.status === 'ALLOCATED') {
         // Re-read rather than assume: the guard above has already established there is no
         // non-PENDING shipment under this lock, so this count is 0 by construction. Kept as a
         // belt-and-braces read so the status demotion can never outlive the guard that justifies it.
@@ -1122,9 +1133,11 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
           where: { orderId, status: { not: 'PENDING' } },
         })
         if (activeShipmentCount === 0) {
-          const transition = validateSalesOrderStatusTransition(so.status, 'PROCESSING')
+          const transition = validateSalesOrderStatusTransition(lockedOrder.status, 'PROCESSING')
           if (!transition.success) throw new Error(transition.error)
-          await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'PROCESSING' } })
+          // Scoped to the status the decision was taken on, so the write cannot land on a row that
+          // moved after the read even if the lock were ever lost or not taken.
+          await tx.salesOrder.updateMany({ where: { id: orderId, status: 'ALLOCATED' }, data: { status: 'PROCESSING' } })
         }
       }
 

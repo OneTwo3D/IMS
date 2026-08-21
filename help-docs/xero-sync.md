@@ -1677,6 +1677,8 @@ The sync log at **Integrations → Xero** shows queued transactions for the **cu
 - **Synced** — Successfully pushed to Xero (shows Xero transaction ID)
 - **Failed** — Failed after 5 retries (shows error message)
 
+- **Cancelled** — Retired without posting (for example the sales order was cancelled before its invoice went out). Not an error, and not re-queued by any sweep.
+
 Failed entries can be investigated via the error message and retried by resetting their status in the database.
 
 ### Settling a row IMS cannot resolve for itself
@@ -1719,6 +1721,18 @@ settlement is **refused and nothing is written**, naming both ids. Two documents
 posting, and a settlement that reported success over a contradiction would leave the two records
 disagreeing with nobody told. Check both ids in Xero: if the one already recorded is the real one
 there is nothing to settle, and if it is not, reverse it in Xero before recording the other.
+
+**And the back-reference repair sweep now asks the same question itself.** It is the sweep — not the row that fed it — that actually restarts a sale's work: it writes the Xero id onto the order and re-enqueues the invoice's PDF, email, WooCommerce note and **payment**. Gating only the paths that *produce* its candidate rows could never be complete, because the ordinary success path reads no sales order at all: an invoice that posted and then failed its back-reference or its follow-up enqueue is marked `FAILED` with its Xero id intact, which is precisely the sweep's candidate shape, with nobody having asked about the sale. So before it releases anything, the sweep reads the sales order under that order's row lock and:
+
+- **live** — repairs it, exactly as before;
+- **cancelled** — retires the row to `CANCELLED` instead, writes nothing onto the order, enqueues no follow-ups, and raises an ERROR naming the Xero document that is now the only thing left to undo;
+- **unreadable** — defers: nothing is written, nothing is retired, the row keeps its status and the next sweep asks again. A WARNING records the deferral.
+
+Only rows whose reference is a **sales order** are gated this way. A supplier bill has no sale behind it, and a refund credit note is very often the direct consequence of the cancellation — refusing to finish *that* back-reference would strand the very document the cancellation created.
+
+The sweep result (returned by the cron endpoint and by manual sync) reports these as `retiredCancelledSale`, alongside `checked` / `repaired` / `failed` / `skippedAmbiguous`.
+
+What remains is a cancellation that commits **after** the sweep has read the order and released the lock — the same sub-second window the pre-post order check has, and bounded by the same lock. What is gone is the open-ended version of it: a sale cancelled hours or days ago whose row still sat in the candidate shape and was released afresh on every single sweep run.
 
 One posting can be mirrored under **either of two keys** — the one tied to this sync row, and an
 older form shared by every attempt at the same document on the same day — and *both* are checked.
@@ -1817,6 +1831,31 @@ writing the completion, because the entry may be filed by another worker in betw
 that gap the completion is retracted and the job is put back to permanently failed. So a job you find
 closed green never had one of these entries against it, and the presence of an entry always shows up as
 a failed job you can find on **Integrations**, no matter which worker or which run detected it.
+
+### A post that landed after its attempt had moved on
+
+A worker claims a sync row, mints an **attempt** for it, and only then calls Xero. Almost always the
+row is still on that attempt when the result comes back. Occasionally it is not — a settlement you
+recorded about that attempt, or a retirement, moved it while the request was on the wire.
+
+The result is still recorded: the document id goes onto the row exactly as it would have, because
+evidence that something posted must never depend on winning a race. What also happens is an **ERROR**
+in the Activity log with the action `xero_sync_post_fenced_out`, which:
+
+- names the attempt that posted and the attempt the row is on now, so a decision you made about the
+  first one is visibly a decision made without this outcome;
+- says what the post actually *did* for that sync type — a ledger document, a manual journal, an
+  applied payment, an in-place edit of an existing document, or an effect that creates nothing in the
+  ledger at all (an invoice PDF, an invoice email, a WooCommerce note, a bill attachment, a
+  credit-note allocation);
+- and states the remedy that matches: void or credit-note the document, post a reversing journal
+  (or, for a journal sent in **draft** posting mode, **delete the draft** — a draft has not reached
+  the ledger, so posting a reversal would move the accounts by exactly the amount the draft never
+  moved), remove the payment, correct the edited document — or, for the effects that create nothing,
+  that there is nothing to reverse.
+
+So if you settled a row as "it did NOT post" and it turns out it did, you are told, with the id and
+with the right remedy, rather than the assertion being quietly believed.
 
 ### Rows stranded on a connector you switched away from
 

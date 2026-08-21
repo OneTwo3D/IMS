@@ -551,8 +551,12 @@ test('both runners take the claim through the same helper — neither may claim 
   const direct = src.slice(src.indexOf('async function processPendingXeroSyncDirect('), src.indexOf('async function processPendingXeroSyncViaOutbox('))
   const outbox = src.slice(src.indexOf('async function processPendingXeroSyncViaOutbox('))
   for (const [name, block] of [['direct', direct], ['outbox', outbox]] as const) {
+    // RE-POINTED, NOT RELAXED (o3d-e2mz): the helper now also carries the ATTEMPT the claim mints,
+    // so the call is `(entry, claimedAt, staleClaimCutoff, attempt)`. The property this pins is
+    // unchanged and is still exact — the runner reaches the claim ONLY through the one helper — and
+    // the negative below still forbids a raw one.
     assert.ok(
-      block.includes('await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff)'),
+      block.includes('await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff, attempt)'),
       `the ${name} runner must claim through the exclusion helper`,
     )
     assert.equal(
@@ -586,12 +590,25 @@ const T_REPLACEMENT_CLAIM = new Date('2026-03-01T09:20:00.000Z')
  * writes match and which do not. A double that ignored `where` would report the fix as working and
  * the defect as working equally well.
  */
-function makeRowStore(row: { id: string; status: string; processingStartedAt: Date | null; retryCount: number }) {
-  const state = { ...row }
+function makeRowStore(row: {
+  id: string
+  status: string
+  processingStartedAt: Date | null
+  retryCount: number
+  /**
+   * o3d-e2mz: the per-attempt identity every processor write is now fenced on, in ADDITION to the
+   * claim instant. Carried and MATCHED here rather than ignored: this predicate answers "true" to
+   * any key it does not know, so a double without it would let `applyMainSyncFailureRetry` write
+   * through the attempt fence and the o3d-a3wx assertions below would hold with that fence removed.
+   */
+  attemptRevision?: number
+}) {
+  const state = { attemptRevision: 4, ...row }
   const matches = (where: Record<string, unknown>) => (
     (where.id === undefined || where.id === state.id)
     && (where.status === undefined || where.status === state.status)
     && (where.retryCount === undefined || where.retryCount === state.retryCount)
+    && (where.attemptRevision === undefined || where.attemptRevision === state.attemptRevision)
     && (where.processingStartedAt === undefined
       || (where.processingStartedAt as Date | null)?.valueOf() === state.processingStartedAt?.valueOf())
   )
@@ -612,6 +629,12 @@ function makeRowStore(row: { id: string; status: string; processingStartedAt: Da
   return { tx: tx as never, state }
 }
 
+/**
+ * o3d-e2mz: the attempt the runner minted when it claimed this row. It MATCHES the row's revision in
+ * both tests below, deliberately — the property they pin is o3d-a3wx's, that the CLAIM INSTANT
+ * decides, so the revision must not be what refuses the displaced write.
+ */
+const PAYMENT_ATTEMPT = { id: 'payment-claimed', attemptRevision: 4 }
 const PAYMENT_ENTRY = {
   id: 'payment-claimed',
   retryCount: 2,
@@ -630,7 +653,7 @@ test('o3d-a3wx r6: a displaced owner cannot un-claim the replacement, so the pos
     retryCount: 2,
   })
 
-  await applyMainSyncFailureRetry(tx, PAYMENT_ENTRY, 'connection reset', {}, claimHeldFrom(T_DISPLACED_CLAIM))
+  await applyMainSyncFailureRetry(tx, PAYMENT_ATTEMPT, PAYMENT_ENTRY, 'connection reset', {}, claimHeldFrom(T_DISPLACED_CLAIM))
 
   assert.equal(state.status, 'PROCESSING', 'the replacement still holds the row')
   assert.equal(state.processingStartedAt?.valueOf(), T_REPLACEMENT_CLAIM.valueOf())
@@ -661,7 +684,7 @@ test('o3d-a3wx r6: the worker that DOES own the claim still records its failure 
     retryCount: 2,
   })
 
-  const result = await applyMainSyncFailureRetry(tx, PAYMENT_ENTRY, 'connection reset', {}, claimHeldFrom(T_REPLACEMENT_CLAIM))
+  const result = await applyMainSyncFailureRetry(tx, PAYMENT_ATTEMPT, PAYMENT_ENTRY, 'connection reset', {}, claimHeldFrom(T_REPLACEMENT_CLAIM))
 
   assert.equal(state.status, 'PENDING')
   assert.equal(state.retryCount, 3)
@@ -801,9 +824,17 @@ test('o3d-a3wx r6: neither runner releases a claim with an unfenced write', () =
     release.includes('accountingSyncLog.updateMany('),
     'the shared release must write through updateMany, which is what can carry a predicate',
   )
+  // RE-POINTED, NOT RELAXED (o3d-e2mz): the predicate is now COMPOSED — `heldClaimWhere` spread
+  // together with the optional attempt revision — because the two answer different questions and
+  // neither implies the other. What this pins is what it always pinned: the claim half is the SHARED
+  // `heldClaimWhere`, called with the holder at the point of the write, not re-spelt here.
   assert.ok(
-    release.includes('where: heldClaimWhere(entryId, claim)'),
+    release.includes('...heldClaimWhere(entryId, claim),'),
     'the shared release must fence on the claim the caller holds, read at the point of the write',
+  )
+  assert.ok(
+    release.includes('...(attempt ? { attemptRevision: attempt.attemptRevision } : {}),'),
+    'and on the attempt the caller minted, where it minted one',
   )
   assert.ok(
     release.includes("status: 'PENDING'"),
