@@ -369,3 +369,106 @@ test('an exact settlement inside the rounding tolerance is still settled', () =>
   assert.equal(v.status, 'SETTLED')
   assert.equal(v.discrepancy, false)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-nf9i r3, Codex finding 1 — AN OPERATOR ASSERTION IS NOT A LEDGER CONFIRMATION.
+//
+// settleAccountingSyncRow lets a human record "this DID post, here is the document id". That writes
+// status=SYNCED + externalTransactionId, which is byte-identical to what the connector's own
+// writeback produces after a real, successful call. The verdict below is the money-path reader of
+// that column pair, and it used to compare `p.amount` (what IMS INTENDED to send) against the
+// document total and return a green SETTLED when the two agreed.
+//
+// On an asserted row those two numbers agreeing proves only that the assertion is self-consistent.
+// Xero accepts a payment smaller than the invoice as a PART payment and hands back a perfectly valid
+// payment id, so the asserted id can name a part payment while IMS's local figures match exactly.
+// The comparison is monetary-only, and a monetary-only comparison on an unverified basis must FAIL
+// CLOSED — which is what the basis marker is for.
+// ---------------------------------------------------------------------------
+
+test('an operator-asserted payment whose amount MATCHES the total is NOT settled — it is ASSERTED_UNVERIFIED', () => {
+  // The fixture can reach the defect: this is exactly the shape the settlement action writes on a
+  // POSTED assertion (SYNCED, an id, and the payload amount the row was queued with), and 100 === 100
+  // is the branch that returned `SETTLED, discrepancy: false` before the basis was read.
+  const v = settlementStatus({
+    ...base,
+    payment: row({ amount: 100, settlementBasis: 'OPERATOR_ASSERTION' }),
+    totalForeign: 100,
+  })
+  assert.equal(v.status, 'ASSERTED_UNVERIFIED')
+  assert.equal(v.basis, 'OPERATOR_ASSERTION')
+  assert.equal(v.discrepancy, true)
+  assert.match(v.detail, /never made the call/)
+  assert.match(v.detail, /PAY-1/)
+  // The remedy is nameable and an operator can perform it — no refusal may be a dead end.
+  assert.match(v.detail, /confirm its amount against the/)
+})
+
+test('the SAME row with the connector as its basis is still SETTLED — the guard is the basis, not the amount', () => {
+  // The other half of the pair: identical figures, identical id, only the basis differs. Without
+  // this, "fail closed" could be satisfied by breaking full settlement for everybody.
+  const v = settlementStatus({ ...base, payment: row({ amount: 100 }), totalForeign: 100 })
+  assert.equal(v.status, 'SETTLED')
+  assert.equal(v.basis, 'LEDGER_CONFIRMED')
+  assert.equal(v.discrepancy, false)
+})
+
+test('a part payment the CONNECTOR posted is still reported on its figures, not swallowed by the basis check', () => {
+  const v = settlementStatus({ ...base, payment: row({ amount: 1 }), totalForeign: 1000 })
+  assert.equal(v.status, 'PARTIALLY_SETTLED')
+  assert.equal(v.basis, 'LEDGER_CONFIRMED')
+  assert.match(v.detail, /PART payment of 1 against a total of 1000/)
+})
+
+test('one ASSERTED leg among several makes the whole aggregate unverified — the marker survives aggregation', () => {
+  // Reachable: a sales order carries several INVOICE_PAYMENT rows (part payments, a manual receipt on
+  // top of an imported one). aggregatePaymentSyncRows reduces them to ONE row, and dropping the basis
+  // there would have re-laundered the assertion one function further along — the aggregate would have
+  // arrived at settlementStatus looking connector-confirmed.
+  const aggregate = aggregatePaymentSyncRows([
+    { status: 'SYNCED', externalTransactionId: 'PAY-2', amount: 60, settlementBasis: 'OPERATOR_ASSERTION' },
+    { status: 'SYNCED', externalTransactionId: 'PAY-1', amount: 40 },
+  ])
+  assert.ok(aggregate)
+  assert.equal(aggregate.settlementBasis, 'OPERATOR_ASSERTION')
+  assert.equal(aggregate.amount, 100)
+  const v = settlementStatus({ ...base, payment: aggregate, totalForeign: 100 })
+  assert.equal(v.status, 'ASSERTED_UNVERIFIED')
+  assert.equal(v.basis, 'OPERATOR_ASSERTION')
+})
+
+test('an aggregate of purely connector-confirmed legs carries NO assertion basis', () => {
+  const aggregate = aggregatePaymentSyncRows([
+    { status: 'SYNCED', externalTransactionId: 'PAY-2', amount: 60 },
+    { status: 'SYNCED', externalTransactionId: 'PAY-1', amount: 40 },
+  ])
+  assert.ok(aggregate)
+  assert.equal(aggregate.settlementBasis, null)
+  assert.equal(settlementStatus({ ...base, payment: aggregate, totalForeign: 100 }).status, 'SETTLED')
+})
+
+test('an asserted payment against a document IMS does NOT show as paid names the assertion, not the ledger', () => {
+  // The disagreement pointing the other way. Before the basis was carried, this told the operator the
+  // ledger held a payment — when all that exists is a colleague's statement that it does.
+  const v = settlementStatus({
+    paidLocally: false,
+    syncEnabled: true,
+    documentPosted: true,
+    payment: row({ amount: 100, settlementBasis: 'OPERATOR_ASSERTION' }),
+    totalForeign: 100,
+  })
+  assert.equal(v.status, 'LEDGER_UNMATCHED')
+  assert.equal(v.basis, 'OPERATOR_ASSERTION')
+  assert.match(v.detail, /OPERATOR ASSERTION, not something the ledger confirmed/)
+})
+
+test('an asserted SYNCED row with no document id is still the unverifiable case, and says which basis', () => {
+  const v = settlementStatus({
+    ...base,
+    payment: row({ externalTransactionId: null, amount: 100, settlementBasis: 'OPERATOR_ASSERTION' }),
+    totalForeign: 100,
+  })
+  assert.equal(v.status, 'AWAITING_LEDGER')
+  assert.equal(v.basis, 'OPERATOR_ASSERTION')
+  assert.equal(v.discrepancy, true)
+})

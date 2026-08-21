@@ -563,6 +563,8 @@ async function latestBillPaymentSyncRows(
     where: { connector, type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: { in: invoiceIds } },
     select: {
       referenceId: true, status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true,
+      // o3d-nf9i r3: an operator-asserted BILL_PAYMENT must not read as a ledger confirmation.
+      settlementBasis: true,
     },
     orderBy: { createdAt: 'desc' },
   })
@@ -576,6 +578,7 @@ async function latestBillPaymentSyncRows(
       errorMessage: r.errorMessage,
       retryCount: r.retryCount,
       amount: typeof payload.amount === 'number' ? payload.amount : null,
+      settlementBasis: r.settlementBasis,
     })
   }
   return out

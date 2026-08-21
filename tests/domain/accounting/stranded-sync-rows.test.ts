@@ -164,8 +164,8 @@ test('the described row now carries its settlement affordance — o3d-osl8 item 
   const row = stranded() as Record<string, unknown>
   assert.deepEqual(Object.keys(row).sort(), [
     'ageDays', 'attemptRevision', 'connector', 'createdAt', 'errorMessage', 'externalTransactionId',
-    'id', 'notSettleableReason', 'referenceId', 'referenceType', 'settleable', 'settlementCaveat',
-    'status', 'type',
+    'id', 'notSettleableReason', 'referenceId', 'referenceType', 'requiresAttemptAdoption', 'settleable',
+    'settlementCaveat', 'status', 'type',
   ])
 })
 
@@ -186,12 +186,8 @@ test('a FAILED or PROCESSING row on a claimed attempt is offered the control, wi
 })
 
 test('a row that cannot be settled says WHY, and each reason names its own cause', () => {
-  // Three independent gates, and the operator is owed the one that actually applies. A single
+  // Two remaining gates, and the operator is owed the one that actually applies. A single
   // "cannot be settled" would send someone to check a connector that will never help.
-  const unfenced = stranded({ status: 'FAILED', attemptRevision: 0 })
-  assert.equal(unfenced.settleable, false)
-  assert.match(unfenced.notSettleableReason ?? '', /carries no attempt revision/)
-
   const pending = stranded({ status: 'PENDING', attemptRevision: 4 })
   assert.equal(pending.settleable, false)
   assert.match(pending.notSettleableReason ?? '', /nothing has been sent/)
@@ -200,7 +196,26 @@ test('a row that cannot be settled says WHY, and each reason names its own cause
   assert.equal(batch.settleable, false)
   assert.match(batch.notSettleableReason ?? '', /DAILY BATCH row/)
 
-  for (const row of [unfenced, pending, batch]) {
+  for (const row of [pending, batch]) {
     assert.equal(row.settlementCaveat, null, 'a caveat is for a decision that can be made')
+    assert.equal(row.requiresAttemptAdoption, false)
   }
+})
+
+test('a STRANDED row at revision 0 reaches the remedy by adoption — this list is the whole point of it', () => {
+  // r3, Codex finding 3. This used to be the third "cannot be settled" gate above, and it applied to
+  // EVERY row on this page: buildStrandedSyncRowWhere selects only rows on a connector that is not
+  // the active one, so nothing participating in the attempt fence will ever claim one, so its
+  // revision never leaves 0. The per-row remedy this list exists to point at did not reach a single
+  // row that motivated it.
+  //
+  // The fixture can reach the state: `stranded()` produces exactly what the loader's select returns
+  // for such a row, and 0 is what the migration gives every pre-existing row.
+  const adoptable = stranded({ status: 'FAILED', attemptRevision: 0 })
+  assert.equal(adoptable.settleable, true)
+  assert.equal(adoptable.requiresAttemptAdoption, true)
+  assert.equal(adoptable.notSettleableReason, null)
+  // The minting is said out loud rather than done quietly.
+  assert.match(adoptable.settlementCaveat ?? '', /MINTS one/)
+  assert.match(adoptable.settlementCaveat ?? '', /NOT proof that nothing posted/)
 })

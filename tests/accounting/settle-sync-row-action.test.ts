@@ -28,6 +28,8 @@ type SyncRow = {
   syncedAt: Date | null
   processingStartedAt: Date | null
   payload: unknown
+  /** o3d-nf9i r3: how a terminal status was reached. NULL = the connector's own writeback. */
+  settlementBasis: string | null
 }
 
 type EventRow = { id: string; idempotencyKey: string; status: string; externalId: string | null }
@@ -44,6 +46,19 @@ const state = {
   /** Thrown by the NEXT activityLog.create, to prove the audit is not best-effort. */
   throwOnActivityCreate: null as unknown,
   transactions: 0,
+  /**
+   * The sales order the row's referenceId points at. o3d-nf9i r3 finding 4: settlement now reads
+   * the sale UNDER ITS ROW LOCK before touching the sync row, because a POSTED assertion writes the
+   * back-reference sweep's candidate shape and must never write it for a cancelled sale.
+   */
+  sale: { status: 'CONFIRMED' } as { status: string } | null,
+  /** Which connector the installation has active, for the adoption gate (r3 finding 3). */
+  activeConnector: 'xero' as string | null,
+  /**
+   * Every ordered side effect, so "the lock is taken FIRST, before the sync row is touched" is an
+   * assertion rather than a hope.
+   */
+  ops: [] as string[],
 }
 
 // --- a small, honest Prisma double -----------------------------------------------------------
@@ -102,9 +117,16 @@ function makeClient() {
           state.throwOnSyncLogUpdate = null
           throw error
         }
+        state.ops.push('syncLog.updateMany')
         const hits = state.rows.filter((r) => matches(r as unknown as Record<string, unknown>, where))
         for (const hit of hits) Object.assign(hit, data)
         return { count: hits.length }
+      },
+    },
+    salesOrder: {
+      findUnique: async ({ where, select }: { where: { id: string }; select?: Record<string, boolean> }) => {
+        state.ops.push(`salesOrder.findUnique:${where.id}`)
+        return state.sale ? project(state.sale as unknown as Record<string, unknown>, select) : null
       },
     },
     accountingEvent: {
@@ -186,6 +208,21 @@ mock.module('@/lib/db', {
 
 mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
 
+// The REAL lockSalesOrder issues `SELECT ... FOR UPDATE` through $queryRaw; the double records the
+// call instead, which is what lets these tests assert the ORDER the lock is taken in. Mocking the
+// module also keeps the whole allocation service out of a settlement unit test.
+mock.module('@/lib/domain/sales/allocation-service', {
+  namedExports: {
+    lockSalesOrder: async (_tx: unknown, orderId: string) => { state.ops.push(`lockSalesOrder:${orderId}`) },
+  },
+})
+
+mock.module('@/lib/integration-plugins', {
+  namedExports: {
+    isIntegrationPluginEnabled: async (id: string) => state.activeConnector === id,
+  },
+})
+
 // The real activity log, so its redaction and its refusal to swallow errors are the ones under
 // test. It reaches the database through @/lib/db, which is the double above.
 mock.module('@/lib/auth', { namedExports: { auth: async () => null } })
@@ -208,6 +245,7 @@ function syncRow(over: Partial<SyncRow> = {}): SyncRow {
     syncedAt: null,
     processingStartedAt: null,
     payload: {},
+    settlementBasis: null,
     ...over,
   }
 }
@@ -246,6 +284,10 @@ test.beforeEach(() => {
   state.throwOnSyncLogUpdate = null
   state.throwOnActivityCreate = null
   state.transactions = 0
+  // A LIVE sale by default: the ordinary case, and the one every pre-existing test assumes.
+  state.sale = { status: 'CONFIRMED' }
+  state.activeConnector = 'xero'
+  state.ops = []
 })
 
 // ---------------------------------------------------------------------------
@@ -529,22 +571,79 @@ test('a mirror that matches no event records `not_found` — the audit never ass
   assert.match(String(audit.description), /No mirrored accounting event matched this row/)
 })
 
-test('a mirror that already records a posted document REFUSES the VOID and says so', async () => {
-  // The ownership read is not a lock: a sibling can post between it and this write. The guard on the
-  // write is what makes the losing interleaving harmless — post evidence on the mirror is never
-  // erased by an assertion.
+test('a mirror that already records a posted document REFUSES the SETTLEMENT — not just the VOID', async () => {
+  // INVERTED IN r3 (Codex finding 2). This test previously asserted `success: true` with
+  // `mirror: 'refused'`: the row was terminalised CANCELLED — "nothing posted" — while the mirrored
+  // event for the SAME logical document named INV-500, and the operator was told their assertion had
+  // been accepted. A wrong document that reported success, which is the `taxinv` shape exactly.
+  //
+  // The guard on the mirror write was already right; what was wrong was calling the refusal a
+  // success. A contradicted assertion is now REFUSED and the whole transaction unwinds.
   const settle = await loadAction()
   state.rows = [syncRow({ ...MIRRORED })]
   state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'POSTED', externalId: 'INV-500' }]
   const result = await settle('log-1', notPosted())
-  assert.equal(result.success, true, 'the ROW is still genuinely settled')
-  assert.equal('mirror' in result ? result.mirror : null, 'refused')
+  assert.equal(result.success, false)
+  assert.equal('code' in result ? result.code : null, 'contradicts_mirrored_document')
+  assert.match('error' in result ? result.error : '', /already names document INV-500/)
+  // The remedy, not a dead end.
+  assert.match('error' in result ? result.error : '', /Settle this row as POSTED with that id/)
+  // AND NOTHING WAS WRITTEN. The fenced decision had already landed inside the transaction, so a
+  // refusal that merely RETURNED would have committed a CANCELLED row and reported a failure.
+  assert.deepEqual(
+    { status: stored().status, attempt: stored().attemptRevision, id: stored().externalTransactionId },
+    { status: 'FAILED', attempt: 3, id: null },
+    'the row is exactly as it was',
+  )
   assert.deepEqual(
     { status: state.events[0].status, externalId: state.events[0].externalId },
     { status: 'POSTED', externalId: 'INV-500' },
     'the posted document keeps its record',
   )
-  assert.match(String(settlementAudit()[0].description), /already records a posted document/)
+  assert.equal(settlementAudit().length, 0, 'a refused settlement writes no audit')
+})
+
+test('asserting a DIFFERENT document from the one the mirror names is refused, and names both ids', async () => {
+  // The POSTED half of the same contradiction: two documents cannot both be one logical posting.
+  // Reachable because mirror identity is LOGICAL — every attempt at the same document shares an
+  // idempotency key — so a sibling attempt's real document sits on the event this row would write.
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...MIRRORED })]
+  state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'POSTED', externalId: 'INV-500' }]
+  const result = await settle('log-1', posted({ externalTransactionId: 'INV-9001' }))
+  assert.equal(result.success, false)
+  assert.equal('code' in result ? result.code : null, 'contradicts_mirrored_document')
+  assert.match('error' in result ? result.error : '', /already names document INV-500/)
+  assert.match('error' in result ? result.error : '', /asserts INV-9001/)
+  assert.equal(stored().status, 'FAILED')
+  assert.equal(stored().externalTransactionId, null)
+})
+
+test('re-asserting the SAME document the mirror already names still succeeds — a retried click is not a contradiction', async () => {
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...MIRRORED })]
+  state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'POSTED', externalId: 'INV-9001' }]
+  const result = await settle('log-1', posted({ externalTransactionId: 'INV-9001' }))
+  assert.equal(result.success, true)
+  assert.equal('mirror' in result ? result.mirror : null, 'refused', 'there was nothing left to write')
+  assert.equal(stored().status, 'SYNCED')
+  assert.equal(stored().externalTransactionId, 'INV-9001')
+})
+
+test('a sibling that OWNS the mirror and names another document also refuses, rather than skipping quietly', async () => {
+  // The ownership skip is a legitimate outcome, but it must not become a door round the
+  // contradiction check: the event still names a document this assertion disagrees with.
+  const settle = await loadAction()
+  state.rows = [
+    syncRow({ ...MIRRORED }),
+    syncRow({ id: 'log-2', ...MIRRORED, status: 'SYNCED', externalTransactionId: 'INV-500', attemptRevision: 4 }),
+  ]
+  state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'POSTED', externalId: 'INV-500' }]
+  const result = await settle('log-1', posted({ externalTransactionId: 'INV-9001' }))
+  assert.equal(result.success, false)
+  assert.equal('code' in result ? result.code : null, 'contradicts_mirrored_document')
+  assert.equal(stored().status, 'FAILED')
+  assert.equal(settlementAudit().length, 0)
 })
 
 test('a live sibling sharing the mirror keeps it — the settlement skips, and says whose it is', async () => {
@@ -594,4 +693,180 @@ test('a unique violation this action does not recognise is RETHROWN, not mislabe
   state.throwOnSyncLogUpdate = { code: 'P2002', meta: { target: ['some_unrelated_index'] }, message: 'boom' }
   await assert.rejects(() => settle('log-1', posted()))
   assert.equal(stored().status, 'FAILED')
+})
+
+// ---------------------------------------------------------------------------
+// r3, Codex finding 1 — THE BASIS IS WRITTEN DOWN, so no reader can mistake this for a confirmation.
+// ---------------------------------------------------------------------------
+
+test('a settled row records the OPERATOR_ASSERTION basis, and the result says so too', async () => {
+  const settle = await loadAction()
+  const result = await settle('log-1', posted())
+  assert.equal(result.success, true)
+  assert.equal(stored().status, 'SYNCED')
+  assert.equal(stored().externalTransactionId, 'INV-9001')
+  // Without this the row is byte-identical to one Xero confirmed, and settlement-status.ts would
+  // compare two local numbers nothing verified and print a green "Settled".
+  assert.equal(stored().settlementBasis, 'OPERATOR_ASSERTION')
+  assert.equal('basis' in result ? result.basis : null, 'OPERATOR_ASSERTION')
+  assert.equal((settlementAudit()[0].metadata as Record<string, unknown>).settlementBasis, 'OPERATOR_ASSERTION')
+})
+
+test('a NOT_POSTED settlement records the basis too — "a human looked" is not "no id came back"', async () => {
+  const settle = await loadAction()
+  const result = await settle('log-1', notPosted())
+  assert.equal(result.success, true)
+  assert.equal(stored().status, 'CANCELLED')
+  assert.equal(stored().settlementBasis, 'OPERATOR_ASSERTION')
+})
+
+// ---------------------------------------------------------------------------
+// r3, Codex finding 4 — SETTLEMENT TAKES THE CANCELLED-SALE LOCK.
+//
+// o3d-e2mz stacks on this branch and gates its own fence-loss recovery under `lockSalesOrder`, the
+// same lock the cancellation takes, because a row left `status IN (SYNCED, FAILED)` with an
+// externalTransactionId IS repairXeroBackReferences' candidate shape — and handing the sweep that
+// shape for a cancelled order restarts its work: back-reference, PDF, email, storefront note, and
+// PAYMENT. Settling by hand writes the same shape, so settling outside that lock reopens it.
+// ---------------------------------------------------------------------------
+
+test('the sale is locked and read BEFORE the sync row is written — not after, and not outside', async () => {
+  // ORDER IS THE WHOLE POINT (e2mz r6): reading the sale before the transaction left the answer
+  // already history by the time it was used, and a cancellation committing in that gap put the row
+  // straight into the sweep's shape.
+  const settle = await loadAction()
+  assert.equal((await settle('log-1', posted())).success, true)
+  const lock = state.ops.indexOf('lockSalesOrder:order-7')
+  const read = state.ops.indexOf('salesOrder.findUnique:order-7')
+  const write = state.ops.indexOf('syncLog.updateMany')
+  assert.ok(lock >= 0, 'the order row lock is taken')
+  assert.ok(lock < read, 'the sale is read UNDER the lock')
+  assert.ok(read < write, 'the sync row is not touched until the sale has been read')
+})
+
+test('a POSTED assertion on a CANCELLED sale records the document but leaves the row CANCELLED', async () => {
+  // The fixture reaches the state under test: referenceType is 'SalesOrder' and referenceId is the
+  // order id, which is what makes the cancellation state one locked read away.
+  const settle = await loadAction()
+  state.sale = { status: 'CANCELLED' }
+  const result = await settle('log-1', posted())
+  assert.equal(result.success, true)
+  // The document id is real evidence and the delete guard reads it whatever the status, so it is
+  // kept — but the row is OUT of the back-reference sweep's shape.
+  assert.equal(stored().externalTransactionId, 'INV-9001')
+  assert.equal(stored().status, 'CANCELLED')
+  assert.equal(stored().syncedAt, null)
+  assert.equal('settledStatus' in result ? result.settledStatus : null, 'CANCELLED')
+  assert.equal('retiredForCancelledSale' in result ? result.retiredForCancelledSale : null, true)
+  assert.match(String(stored().errorMessage), /THE SALE THIS ROW BELONGS TO IS CANCELLED/)
+})
+
+test('a DELETED sale is treated as cancelled — its work cannot be continued either', async () => {
+  const settle = await loadAction()
+  state.sale = null
+  const result = await settle('log-1', posted())
+  assert.equal(result.success, true)
+  assert.equal(stored().status, 'CANCELLED')
+  assert.equal(stored().externalTransactionId, 'INV-9001')
+})
+
+test('the mirror is NOT re-POSTed for a cancelled sale — that would say the sale\'s work is live again', async () => {
+  const settle = await loadAction()
+  state.sale = { status: 'CANCELLED' }
+  state.rows = [syncRow({ ...MIRRORED })]
+  state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'VOID', externalId: null }]
+  const result = await settle('log-1', posted())
+  assert.equal(result.success, true)
+  assert.equal('mirror' in result ? result.mirror : null, 'skipped_cancelled_sale')
+  assert.deepEqual(
+    { status: state.events[0].status, externalId: state.events[0].externalId },
+    { status: 'VOID', externalId: null },
+    'the cancellation\'s VOID stands',
+  )
+  assert.match(String(settlementAudit()[0].description), /left as the cancellation left it/)
+})
+
+test('a PURCHASE row is not gated on any sale — no lock is taken and nothing is retired', async () => {
+  // Only `SalesOrder` rows resolve to a sale. Gating a supplier bill on a sales-order read would be
+  // reading a row that does not exist, and gating a refund credit note would strand exactly the
+  // document a cancellation creates (o3d-e2mz r8).
+  const settle = await loadAction()
+  state.sale = { status: 'CANCELLED' }
+  state.rows = [syncRow({ type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: 'inv-3' })]
+  const result = await settle('log-1', posted())
+  assert.equal(result.success, true)
+  assert.equal(stored().status, 'SYNCED', 'a bill is unaffected by a cancelled sales order')
+  assert.equal('retiredForCancelledSale' in result ? result.retiredForCancelledSale : null, false)
+  assert.equal(state.ops.some((op) => op.startsWith('lockSalesOrder')), false)
+})
+
+test('a CREDIT_NOTE row on a cancelled order is NOT retired — the credit is the cancellation\'s own document', async () => {
+  const settle = await loadAction()
+  state.sale = { status: 'CANCELLED' }
+  state.rows = [syncRow({ type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund', referenceId: 'refund-2' })]
+  const result = await settle('log-1', posted())
+  assert.equal(result.success, true)
+  assert.equal(stored().status, 'SYNCED')
+  assert.equal('retiredForCancelledSale' in result ? result.retiredForCancelledSale : null, false)
+})
+
+// ---------------------------------------------------------------------------
+// r3, Codex finding 3 — THE PRE-EXISTING STRANDED ROWS REACH THE REMEDY.
+//
+// Every AccountingSyncLog row alive today is at attemptRevision 0 (the migration's default), and 0
+// is UNFENCED_ATTEMPT. Without adoption this action refuses every one of the o3d-osl8 stranded rows
+// for ever — the rows that are this branch's whole reason for existing.
+// ---------------------------------------------------------------------------
+
+test('a revision-0 row on a RETIRED connector is settled by ADOPTION, minting attempt 1', async () => {
+  const settle = await loadAction()
+  // The state under test is reachable and is the ordinary one: xero is active, this row is a
+  // leftover on quickbooks, so nothing participating in the fence will ever claim it.
+  state.activeConnector = 'xero'
+  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 0 })]
+  const result = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
+  assert.equal(result.success, true)
+  assert.equal(stored().status, 'CANCELLED')
+  assert.equal(stored().attemptRevision, 1, 'the adoption bumps 0 -> 1 exactly as a first claim would')
+  assert.equal('attemptRevision' in result ? result.attemptRevision : null, 1)
+  assert.equal('adoptedAttempt' in result ? result.adoptedAttempt : null, true)
+  assert.match(String(settlementAudit()[0].description), /ADOPTED: the row carried no attempt revision/)
+  assert.equal((settlementAudit()[0].metadata as Record<string, unknown>).adoptedAttempt, true)
+})
+
+test('adoption is a compare-and-swap too — a row whose STATUS moved first is refused, not adopted', async () => {
+  // The adoption is (id, revision 0, expectedStatus), so a sweep that retires the row first — or a
+  // second operator — loses and is told which. It must not report UNFENCED_ATTEMPT, which would say
+  // the row can never be settled when the truth is that it moved.
+  const settle = await loadAction()
+  state.activeConnector = 'xero'
+  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 0, status: 'PROCESSING' })]
+  const result = await settle('log-1', notPosted({ observedStatus: 'FAILED', observedAttemptRevision: 0 }))
+  assert.equal(result.success, false)
+  assert.equal('code' in result ? result.code : null, 'STATUS_MOVED')
+  assert.match('error' in result ? result.error : '', /is now PROCESSING/)
+  assert.equal(stored().status, 'PROCESSING', 'nothing was written')
+})
+
+test('a revision-0 row on the ACTIVE connector is still refused — it has a route, and adoption is not it', async () => {
+  // Adoption is sound ONLY because nothing can ever claim the row. An active-connector row CAN be
+  // claimed, so a compare-and-swap on status is the exact defect the fence exists to remove.
+  const settle = await loadAction()
+  state.activeConnector = 'xero'
+  state.rows = [syncRow({ connector: 'xero', attemptRevision: 0 })]
+  const result = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
+  assert.equal(result.success, false)
+  assert.equal('code' in result ? result.code : null, 'UNFENCED_ATTEMPT')
+  assert.equal(stored().status, 'FAILED')
+})
+
+test('with NO connector active, every unresolved row is adoptable — nothing is going to process any of them', async () => {
+  // buildStrandedSyncRowWhere(null) selects every unresolved row for exactly this reason, so the
+  // adoption gate has to agree with it or the list offers a control the action refuses.
+  const settle = await loadAction()
+  state.activeConnector = null
+  state.rows = [syncRow({ connector: 'xero', attemptRevision: 0 })]
+  const result = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
+  assert.equal(result.success, true)
+  assert.equal(stored().attemptRevision, 1)
 })

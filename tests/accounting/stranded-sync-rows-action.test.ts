@@ -124,11 +124,17 @@ test('a stranded row reaches the UI with its settlement affordance and the reaso
   ]
   const result = await getStrandedAccountingSyncRows()
 
-  // Every QuickBooks row is permanently here: that processor stamps no attempt revision.
-  assert.equal(result.rows[0].settleable, false)
-  assert.match(result.rows[0].notSettleableReason ?? '', /carries no attempt revision/)
+  // r3, Codex finding 3: this row used to be permanently unsettleable — and so did every other row
+  // on this page, because a stranded row's connector is retired and its revision never leaves 0. It
+  // is now settleable by ADOPTION, and the loader is what carries that through: the list's own
+  // scoping rule (connector != the active one) IS the precondition adoption needs.
+  assert.equal(result.rows[0].settleable, true)
+  assert.equal(result.rows[0].requiresAttemptAdoption, true)
+  assert.equal(result.rows[0].notSettleableReason, null)
+  assert.match(result.rows[0].settlementCaveat ?? '', /MINTS one/)
   // A claimed-forever PROCESSING row on a retired connector — the o3d-osl8 case — now has a remedy.
   assert.equal(result.rows[1].settleable, true)
+  assert.equal(result.rows[1].requiresAttemptAdoption, false, 'it names a real attempt; nothing is minted')
   assert.equal(result.rows[1].attemptRevision, 4)
   assert.match(result.rows[1].settlementCaveat ?? '', /may never have returned/)
 })

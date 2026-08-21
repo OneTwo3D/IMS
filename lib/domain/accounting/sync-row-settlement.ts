@@ -150,6 +150,54 @@ export function isSettleableAccountingSyncType(type: string): boolean {
   return !type.startsWith(DAILY_BATCH_SYNC_TYPE_PREFIX)
 }
 
+/**
+ * THE SETTLEMENT BASIS MARKER — how a terminal status was arrived at (o3d-nf9i r3, Codex finding 1).
+ *
+ * A settled POSTED row is written status=SYNCED with an externalTransactionId. So is a row the
+ * connector genuinely posted and confirmed. Until this marker existed the two were the SAME ROW, and
+ * every downstream reader that asks "did this post?" answered as though the ledger had confirmed it
+ * — laundering an operator's BELIEF into the connector's CONFIRMATION.
+ *
+ * They are not the same claim, and the difference is exactly the one `exceptions` settled: a verdict
+ * must return the answer PLUS its basis, because an answer reached by an unverifiable assertion is a
+ * materially weaker claim than the same answer reached from a confirmation, and a caller acting on
+ * the weak one must be able to name which it got.
+ *
+ * WHAT IS ACTUALLY UNVERIFIED, concretely, and why a number is not a substitute. The operator types
+ * a document id. IMS makes no call, reads no document, and compares no figure — a settled row's
+ * `payload.amount` is still only what IMS INTENDED to send. Xero accepts a payment smaller than the
+ * invoice as a PART payment and returns a perfectly good payment id, so an asserted INVOICE_PAYMENT
+ * can name a real document that settles a fraction of the invoice while IMS's two local numbers
+ * agree with each other. `settlementStatus` compares exactly those two local numbers, so a
+ * MONETARY-ONLY COMPARISON MUST FAIL CLOSED on an asserted row: see lib/domain/accounting/
+ * settlement-status.ts, which refuses to return SETTLED for one whatever the amounts say.
+ *
+ * Written on BOTH outcomes, not only POSTED. A CANCELLED row is read as "nothing posted" by the
+ * delete guard and by the follow-up ambiguity set, and "nothing posted because a human looked" is a
+ * weaker fact than "nothing posted because the connector never got a document id" in exactly the
+ * same way.
+ *
+ * NULL is the connector's own writeback and needs no marker: absence of an assertion IS the
+ * confirmation case, and back-filling every historical row to say so would be a write with no
+ * information in it.
+ */
+export const OPERATOR_ASSERTION_SETTLEMENT_BASIS = 'OPERATOR_ASSERTION'
+
+export type SettlementBasis = 'CONNECTOR_CONFIRMED' | 'OPERATOR_ASSERTION'
+
+/**
+ * The basis a row's recorded outcome rests on. Reads the column rather than the errorMessage text:
+ * o3d-h2wx established that errorMessage carries no provenance — both connectors overwrite it with
+ * the remote system's own words — so a settlement note is not something a reader may key on.
+ */
+export function settlementBasisOf(settlementBasis: string | null | undefined): SettlementBasis {
+  return settlementBasis === OPERATOR_ASSERTION_SETTLEMENT_BASIS ? 'OPERATOR_ASSERTION' : 'CONNECTOR_CONFIRMED'
+}
+
+export function isOperatorAssertedSettlement(settlementBasis: string | null | undefined): boolean {
+  return settlementBasisOf(settlementBasis) === 'OPERATOR_ASSERTION'
+}
+
 export type SettlementOutcome = 'POSTED' | 'NOT_POSTED'
 
 export type SettlementAssertion =
@@ -164,6 +212,7 @@ export type SettlementRefusalCode =
   | 'missing_external_id'
   | 'external_id_conflict'
   | 'contradicts_post_evidence'
+  | 'contradicts_mirrored_document'
 
 export type SettlementRefusal = { code: SettlementRefusalCode; message: string }
 
@@ -255,18 +304,76 @@ export type SyncRowSettleability = {
   settleable: boolean
   notSettleableReason: string | null
   settlementCaveat: string | null
+  /**
+   * True when the only thing letting this row be settled is ADOPTION — it carries no attempt
+   * revision, and it is settleable solely because nothing can ever claim it. Carried so the operator
+   * is told they are minting the attempt identity rather than naming one they were shown.
+   */
+  requiresAttemptAdoption: boolean
+}
+
+/**
+ * ADOPTING A ROW THAT NO PROCESSOR CAN EVER CLAIM (r3, Codex finding 3).
+ *
+ * Every row that exists today is at revision 0, and revision 0 is `UNFENCED_ATTEMPT`. Left there,
+ * this branch's remedy does not exist for a single one of the rows that motivated it: an o3d-osl8
+ * stranded row sits on a RETIRED connector, so no processor will ever claim it, so its revision will
+ * never leave 0, so it is refused for ever. "Wait for the fence to claim it" is a dead end, and a
+ * refusal with no remedy the operator can perform is exactly what this session ruled out.
+ *
+ * A row on the ACTIVE connector is a different case and needs nothing new: `retryFailed*` returns it
+ * to PENDING, the fence-aware processor claims it, and the claim bump makes it attempt 1. That route
+ * exists, so adoption is not offered there — it would be a second way to do what the system already
+ * does correctly by itself, which is the same objection that keeps PENDING unsettleable.
+ *
+ * WHY ADOPTING IS SOUND WHERE IT IS OFFERED, given that a compare-and-swap on (id, status) is the
+ * very defect the fence was built for. That defect is a defect because ANOTHER WRITER can return the
+ * row to a status it already held — `retryFailed*` driving FAILED -> PENDING -> FAILED, the
+ * stale-claim reclaim driving PROCESSING -> PROCESSING — so the operator's conclusion about attempt
+ * N lands on attempt N+1. Remove every such writer and there is no attempt N+1 to land on: a row
+ * whose connector is retired has exactly ONE attempt, the abandoned one in front of the operator,
+ * and status is a sufficient identity for a row that can only ever have had one. The adoption is
+ * itself a CAS on (id, revision 0, status), so two operators racing produce one winner and one
+ * ATTEMPT_MOVED, and a sweep that retires the row first moves its status and refuses the adoption.
+ *
+ * The caller decides `unclaimable` — it is a fact about the INSTALLATION (which connector is active),
+ * not about the row — and it must never be passed for the active connector.
+ */
+export function describeAttemptAdoptionCaveat(connector: string): string {
+  return `This row carries no attempt revision, so settling it MINTS one: no processor participating in the `
+    + `attempt fence will ever claim a ${connector} row while ${connector} is not the active connector, so the `
+    + 'attempt in front of you is the only one this row can ever have had. Your assertion is fenced on that — if '
+    + 'anything moves the row before you record this, it is refused rather than applied.'
 }
 
 export function describeSyncRowSettleability(
-  row: { status: string; type: string; attemptRevision: number | null | undefined },
+  row: {
+    status: string
+    type: string
+    attemptRevision: number | null | undefined
+    /**
+     * Whether NOTHING that participates in the attempt fence can ever claim this row — true for a
+     * row on a retired connector. Absent/false means the ordinary rule applies and revision 0 is
+     * refused. See describeAttemptAdoptionCaveat for why this is the whole precondition.
+     */
+    unclaimable?: boolean
+    /** Only used to word the adoption caveat. */
+    connector?: string
+  },
 ): SyncRowSettleability {
   if (!isSettleableAccountingSyncStatus(row.status)) {
-    return { settleable: false, notSettleableReason: describeUnsettleableStatus(row.status), settlementCaveat: null }
+    return {
+      settleable: false,
+      notSettleableReason: describeUnsettleableStatus(row.status),
+      settlementCaveat: null,
+      requiresAttemptAdoption: false,
+    }
   }
   if (!isSettleableAccountingSyncType(row.type)) {
     return {
       settleable: false,
       settlementCaveat: null,
+      requiresAttemptAdoption: false,
       notSettleableReason:
         `${row.type} is a DAILY BATCH row and cannot be settled by hand at any attempt. A batch row covers `
         + 'every order staged into it, and cancelling it would let one of those orders be deleted while a '
@@ -275,16 +382,35 @@ export function describeSyncRowSettleability(
     }
   }
   if (!isFencedAttemptRevision(row.attemptRevision)) {
+    // ADOPTION. The row can be settled after all when nothing can ever claim it — otherwise this
+    // branch's remedy does not reach the rows it was built for. See describeAttemptAdoptionCaveat.
+    if (row.unclaimable) {
+      return {
+        settleable: true,
+        notSettleableReason: null,
+        requiresAttemptAdoption: true,
+        settlementCaveat: [describeAttemptAdoptionCaveat(row.connector ?? 'this'), describeSettlementCaveat(row.status)]
+          .filter((part): part is string => !!part)
+          .join(' '),
+      }
+    }
     return {
       settleable: false,
       settlementCaveat: null,
+      requiresAttemptAdoption: false,
       notSettleableReason:
         'This row carries no attempt revision, so a decision cannot be tied to the attempt it would be made '
-        + 'about and would be refused. Rows predating the attempt fence, and rows belonging to a connector '
-        + 'whose processor does not stamp one, stay at revision 0 permanently.',
+        + 'about and would be refused. It is on the ACTIVE connector, so the fence-aware processor will stamp '
+        + 'one the next time it claims the row: retry the row, and settle it once it shows an attempt. Rows on a '
+        + 'RETIRED connector never get one and are settled by adoption instead.',
     }
   }
-  return { settleable: true, notSettleableReason: null, settlementCaveat: describeSettlementCaveat(row.status) }
+  return {
+    settleable: true,
+    notSettleableReason: null,
+    requiresAttemptAdoption: false,
+    settlementCaveat: describeSettlementCaveat(row.status),
+  }
 }
 
 /**
@@ -405,6 +531,10 @@ export function buildSettlementData(
       // Clear the claim stamp. A settled row must not look claimed afterwards — otherwise the
       // stale-claim reclaim would treat it as a candidate the moment its connector came back.
       processingStartedAt: null,
+      // THE BASIS, machine-readable (r3, Codex finding 1). errorMessage above is for a human and
+      // carries no provenance a reader may key on; this column is what stops settlement-status.ts
+      // reporting an asserted post as a ledger-confirmed settlement.
+      settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
     }
   }
   return {
@@ -420,7 +550,55 @@ export function buildSettlementData(
     // own fence-loss evidence write to fill in if the call turns out to have landed.
     errorMessage: settlementNote(assertion),
     processingStartedAt: null,
+    // Written on the NOT_POSTED branch too. "Nothing posted, a human looked" is a weaker fact than
+    // "nothing posted, the connector never got an id", and the delete guard and the follow-up
+    // ambiguity set both act on this row as though it were the latter.
+    settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
   }
+}
+
+/**
+ * The patch for a POSTED assertion whose SALE IS CANCELLED (r3, Codex finding 4).
+ *
+ * The ordinary POSTED patch writes status=SYNCED + externalTransactionId, and that pair IS
+ * `repairXeroBackReferences`' candidate shape (`status IN (SYNCED, FAILED) AND
+ * externalTransactionId IS NOT NULL AND backReferenceCheckedAt IS NULL`). Handing the sweep that
+ * shape for a cancelled order is handing it an instruction to stamp the document id onto the
+ * cancelled sale and carry on with its work. o3d-e2mz closed exactly this for the connector's own
+ * fence-loss recovery — twice, once for a sale cancelled before its read (r5) and once for a sale
+ * cancelled just after it (r6) — and settling by hand reopens it unless settlement writes the same
+ * shape the connector does.
+ *
+ * So the id is still RECORDED — it is real evidence, the delete guard reads
+ * externalTransactionId whatever the status, and destroying it would strand the document — but the
+ * row is terminalised CANCELLED with no syncedAt, which is outside the sweep's shape. Nothing
+ * carries the cancelled sale's work (back-reference, PDF, email, storefront note, PAYMENT) any
+ * further.
+ */
+export function buildCancelledSaleSettlementData(
+  assertion: Extract<SettlementAssertion, { outcome: 'POSTED' }>,
+  now: Date,
+): Omit<Prisma.AccountingSyncLogUpdateManyMutationInput, 'attemptRevision'> {
+  void now
+  return {
+    status: 'CANCELLED',
+    externalTransactionId: assertion.externalTransactionId.trim(),
+    // Deliberately NOT stamped. syncedAt is "this row reached the ledger as live work"; the document
+    // exists but its work is retired, and a syncedAt would make the row read as ordinary success.
+    syncedAt: null,
+    processingStartedAt: null,
+    errorMessage: cancelledSaleSettlementNote(assertion),
+    settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+  }
+}
+
+export function cancelledSaleSettlementNote(
+  assertion: Extract<SettlementAssertion, { outcome: 'POSTED' }>,
+): string {
+  return `Settled by operator: verified POSTED as ${assertion.externalTransactionId.trim()}, but THE SALE THIS ROW `
+    + 'BELONGS TO IS CANCELLED. The document id is recorded — the order delete guard reads it whatever the status '
+    + '— and the row is left CANCELLED so no sweep carries the cancelled sale\'s remaining work (back-reference, '
+    + 'PDF, email, storefront note, payment) any further. Reverse the document in the accounting system.'
 }
 
 /** The free-text note written onto a settled row, in the style of cancel-order-invoice-sync.ts. */
@@ -474,6 +652,101 @@ export function settlementMirrorGuard(): MirroredEventWriteGuard {
     // Post evidence on the mirror is never erased or replaced by an assertion, either way round.
     requireExternalIdNull: true,
   }
+}
+
+/**
+ * WHEN A REFUSED MIRROR WRITE IS A CONTRADICTION RATHER THAN A NO-OP (r3, Codex finding 2).
+ *
+ * `settlementMirrorGuard` makes the mirror write a compare-and-swap, and a CAS that does not hold
+ * returns `'refused'`. Round 2 treated every refusal the same way — record it in the audit, return
+ * the settlement as a SUCCESS — which is how a settlement that recorded document A could come back
+ * `success: true` while the mirrored event for the very same logical document names document B. The
+ * operator is told their assertion was accepted; the two systems now disagree; nothing refuses.
+ *
+ * `taxinv` is the same shape and the same verdict: a WRONG document that REPORTED SUCCESS, where the
+ * verdict half was worse than the figure. An assertion contradicted by a document IMS already holds
+ * must be REFUSED, not annotated.
+ *
+ * THE LINE IS A DOCUMENT ID, on either side — the same line `refuseSettlement` already draws for the
+ * sync row's own externalTransactionId, and for the same reason: an id is the durable pointer at
+ * something that exists in the ledger, and post evidence outranks an assertion IMS cannot check.
+ *
+ *   • NOT_POSTED against a mirror that names ANY document, or that records a POST -> contradiction.
+ *   • POSTED as A against a mirror that names B -> contradiction. Two documents for one logical
+ *     posting is precisely the state nobody can reconcile afterwards.
+ *   • POSTED as A against a mirror that names A -> NOT a contradiction. A retried click, or a lost
+ *     response; the guard declines because there is nothing left to write.
+ *   • A refusal with NO document on the mirror at all (a VOID event, a POSTED one that never
+ *     recorded an id) -> NOT a contradiction. Nothing there outranks anything; the audit records
+ *     that the mirror was left alone and the settlement stands.
+ *
+ * Returns null when the settlement may proceed, so the caller's `if (refusal) rollback` reads the
+ * same way as every other refusal in this module.
+ */
+export type MirroredDocumentView = { status: string; externalId: string | null }
+
+export function refuseSettlementContradictedByMirror(
+  assertion: SettlementAssertion,
+  mirrored: MirroredDocumentView,
+): SettlementRefusal | null {
+  const mirroredId = trimmed(mirrored.externalId)
+
+  if (assertion.outcome === 'NOT_POSTED') {
+    if (mirroredId) {
+      return {
+        code: 'contradicts_mirrored_document',
+        message:
+          `The mirrored accounting event for this row already names document ${mirroredId}, which is evidence `
+          + 'it DID post. Nothing was settled and nothing was changed. Settle this row as POSTED with that id, '
+          + 'or reverse the document in the accounting system first and settle it afterwards.',
+      }
+    }
+    if (mirrored.status === 'POSTED') {
+      return {
+        code: 'contradicts_mirrored_document',
+        message:
+          'The mirrored accounting event for this row is already recorded as POSTED, so asserting that nothing '
+          + 'posted contradicts a posting IMS has already written down. Nothing was settled and nothing was '
+          + 'changed. Find the document in the accounting system and settle this row as POSTED with its id, or '
+          + 'reverse it there first.',
+      }
+    }
+    return null
+  }
+
+  const asserted = trimmed(assertion.externalTransactionId)
+  if (mirroredId && mirroredId !== asserted) {
+    return {
+      code: 'contradicts_mirrored_document',
+      message:
+        `The mirrored accounting event for this row already names document ${mirroredId}, and this settlement `
+        + `asserts ${asserted}. Two different documents cannot both be this posting, so nothing was settled and `
+        + 'nothing was changed — the row still names whatever it named before. Check BOTH ids in the accounting '
+        + `system: if ${mirroredId} is the real one there is nothing to settle, and if it is not, reverse it there `
+        + 'before recording the other.',
+    }
+  }
+  return null
+}
+
+/**
+ * THE ONE referenceType WHOSE ROW BELONGS TO A SALE THAT CAN BE CANCELLED (r3, Codex finding 4).
+ *
+ * Read from o3d-e2mz's SALE_SCOPED_REFERENCE_TYPE, which draws the line for the connector's own
+ * fence-loss recovery, and it has to be drawn the same way here or the two disagree about the same
+ * row. `referenceId` IS the sales order id for these rows, so the cancellation state is one locked
+ * read away. Every other reference resolves to something a sales-order cancellation does not speak
+ * for:
+ *
+ *  • `PurchaseInvoice` / `PurchaseOrder` — a supplier bill; no sale is involved.
+ *  • `SalesOrderRefund` (the CREDIT_NOTE rows) — a refund credit note is very often the DIRECT
+ *    CONSEQUENCE of the cancellation. Gating it on the order being live would strand exactly the
+ *    document the cancellation created: crediting a cancelled sale is right, invoicing it is wrong.
+ */
+export const SALE_SCOPED_SETTLEMENT_REFERENCE_TYPE = 'SalesOrder'
+
+export function isSaleScopedSettlementRow(referenceType: string): boolean {
+  return referenceType === SALE_SCOPED_SETTLEMENT_REFERENCE_TYPE
 }
 
 // ---------------------------------------------------------------------------

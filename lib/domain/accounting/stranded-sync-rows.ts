@@ -24,8 +24,9 @@ import { describeSyncRowSettleability } from '@/lib/domain/accounting/sync-row-s
  *
  * `settleable` is a UI affordance, NOT a permission and NOT a guarantee: it says the row's status
  * and type admit an operator assertion and that it carries an attempt the assertion can be fenced
- * to. Whether the assertion actually lands is decided by applyFencedAttemptDecision at write time,
- * against the state then — never by this flag.
+ * to — or, for a row that carries none, that its attempt can be ADOPTED because nothing on a
+ * retired connector will ever claim it. Whether the assertion actually lands is decided by
+ * applyFencedAttemptDecision at write time, against the state then — never by this flag.
  *
  * Pure functions only, so the scoping rule — the part that must not drift back to being
  * active-connector-scoped — is unit-testable without a database, exactly as connector-orphans.ts
@@ -108,6 +109,12 @@ export type StrandedSyncRow = {
    * can still contradict them — not a recommendation.
    */
   settlementCaveat: string | null
+  /**
+   * o3d-nf9i r3: true when this row is settleable only by ADOPTION — it carries no attempt revision
+   * and is settleable solely because nothing on a retired connector can ever claim it. Carried so
+   * the operator is told they are minting the attempt identity, not naming one they were shown.
+   */
+  requiresAttemptAdoption: boolean
 }
 
 export function describeStrandedSyncRow(row: StrandedSyncRowSource, now: Date): StrandedSyncRow {
@@ -125,7 +132,15 @@ export function describeStrandedSyncRow(row: StrandedSyncRowSource, now: Date): 
     ageDays: Math.floor(ageMs / 86_400_000),
     attemptRevision: row.attemptRevision,
     // ONE implementation of "which rows get a control", shared with the active connector's sync log.
-    ...describeSyncRowSettleability(row),
+    //
+    // `unclaimable: true` UNCONDITIONALLY, and it is a property of this LIST rather than of the row:
+    // buildStrandedSyncRowWhere selects only rows whose connector is NOT the active one (or every
+    // unresolved row when no connector is active at all), so by construction nothing that
+    // participates in the attempt fence will ever claim anything on this page. That is exactly the
+    // precondition adoption needs — see describeAttemptAdoptionCaveat. Without it every row here is
+    // refused for ever as UNFENCED_ATTEMPT, and the per-row remedy this list points at does not
+    // exist for the population it was built for (o3d-nf9i r3, Codex finding 3).
+    ...describeSyncRowSettleability({ ...row, unclaimable: true }),
   }
 }
 
@@ -141,9 +156,8 @@ export type StrandedSyncRowPage = {
  *
  * WHY `take + 1`. Truncation still has to be REPORTED, and the reason has only shifted rather than
  * gone away. The per-row settlement control now exists, so an operator CAN clear rows from the front
- * of this list — but only the settleable ones. A DAILY_BATCH row, a row at attempt revision 0
- * (every QuickBooks row, permanently), or a PENDING row that no sweep reaches is not clearable from
- * this page at all, and a run of those at the head of the list starves every newer row behind them
+ * of this list — but only the settleable ones. A DAILY_BATCH row, or a PENDING row that no sweep
+ * reaches, is not clearable from this page at all, and a run of those at the head of the list starves every newer row behind them
  * for as long as they sit there. A bare `take` with no truncation signal would hide that. The extra
  * row is how the UI gets to say so.
  */

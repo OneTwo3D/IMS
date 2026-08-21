@@ -4,6 +4,8 @@ import test from 'node:test'
 import {
   DAILY_BATCH_SYNC_TYPE_PREFIX,
   SETTLEABLE_ACCOUNTING_SYNC_STATUSES,
+  OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+  buildCancelledSaleSettlementData,
   buildSettlementData,
   describeSettlementCaveat,
   describeSettlementUniqueConflict,
@@ -13,7 +15,11 @@ import {
   isFencedAttemptRevision,
   isSettleableAccountingSyncStatus,
   isSettleableAccountingSyncType,
+  isOperatorAssertedSettlement,
+  isSaleScopedSettlementRow,
   refuseSettlement,
+  refuseSettlementContradictedByMirror,
+  settlementBasisOf,
   settlementMirrorExternalId,
   settlementMirrorGuard,
   settlementMirrorStatus,
@@ -298,4 +304,160 @@ test('a status that admits no assertion says so on the status, not the attempt',
   assert.equal(pending.settleable, false)
   assert.match(pending.notSettleableReason ?? '', /nothing has been sent/)
   assert.equal(describeSettlementCaveat('PENDING'), null)
+})
+
+// ---------------------------------------------------------------------------
+// r3, Codex finding 1 — THE SETTLEMENT BASIS MARKER.
+//
+// A settled POSTED row is status=SYNCED with an externalTransactionId, which is exactly what the
+// connector's own writeback produces after a real call. Without a marker the two ARE the same row,
+// and every reader that asks "did this post?" answers as though the ledger had confirmed it.
+// ---------------------------------------------------------------------------
+
+test('a POSTED assertion writes the OPERATOR_ASSERTION basis alongside the SYNCED status', () => {
+  const data = buildSettlementData({ outcome: 'POSTED', externalTransactionId: ' INV-9001 ' }, NOW)
+  assert.equal(data.status, 'SYNCED')
+  assert.equal(data.externalTransactionId, 'INV-9001')
+  // The marker is the whole point: without it this patch is indistinguishable from the connector's.
+  assert.equal(data.settlementBasis, OPERATOR_ASSERTION_SETTLEMENT_BASIS)
+})
+
+test('a NOT_POSTED assertion carries the basis too — "a human looked" is weaker than "no id came back"', () => {
+  const data = buildSettlementData({ outcome: 'NOT_POSTED' }, NOW)
+  assert.equal(data.status, 'CANCELLED')
+  assert.equal(data.settlementBasis, OPERATOR_ASSERTION_SETTLEMENT_BASIS)
+})
+
+test('the basis is read from the COLUMN, never from the settlement note', () => {
+  // o3d-h2wx: errorMessage carries no provenance — both connectors overwrite it with the remote
+  // system's own text — so a reader keying on the note would be keying on something a connector can
+  // and does rewrite.
+  assert.equal(settlementBasisOf(OPERATOR_ASSERTION_SETTLEMENT_BASIS), 'OPERATOR_ASSERTION')
+  assert.equal(settlementBasisOf(null), 'CONNECTOR_CONFIRMED')
+  assert.equal(settlementBasisOf(undefined), 'CONNECTOR_CONFIRMED')
+  assert.equal(isOperatorAssertedSettlement('Settled by operator: verified POSTED as INV-1.'), false)
+})
+
+// ---------------------------------------------------------------------------
+// r3, Codex finding 2 — A CONTRADICTED ASSERTION IS REFUSED, NOT ANNOTATED.
+// ---------------------------------------------------------------------------
+
+test('asserting POSTED as one document over a mirror naming a DIFFERENT one is refused, and names BOTH ids', () => {
+  const refusal = refuseSettlementContradictedByMirror(
+    { outcome: 'POSTED', externalTransactionId: 'INV-9001' },
+    { status: 'POSTED', externalId: 'INV-7777' },
+  )
+  assert.equal(refusal?.code, 'contradicts_mirrored_document')
+  assert.match(refusal?.message ?? '', /already names document INV-7777/)
+  assert.match(refusal?.message ?? '', /asserts INV-9001/)
+  // A refusal needs a remedy the operator can perform.
+  assert.match(refusal?.message ?? '', /reverse it there before recording the other/)
+})
+
+test('re-asserting the SAME document over the mirror is idempotent, not a contradiction', () => {
+  // A retried click or a lost response must not become a refusal; the guard declines only because
+  // there is nothing left to write.
+  assert.equal(
+    refuseSettlementContradictedByMirror(
+      { outcome: 'POSTED', externalTransactionId: ' INV-9001 ' },
+      { status: 'POSTED', externalId: 'INV-9001' },
+    ),
+    null,
+  )
+})
+
+test('asserting NOT_POSTED over a mirror that NAMES a document is refused as a contradiction', () => {
+  const refusal = refuseSettlementContradictedByMirror({ outcome: 'NOT_POSTED' }, { status: 'POSTED', externalId: 'INV-9001' })
+  assert.equal(refusal?.code, 'contradicts_mirrored_document')
+  assert.match(refusal?.message ?? '', /already names document INV-9001/)
+  assert.match(refusal?.message ?? '', /Settle this row as POSTED with that id/)
+})
+
+test('asserting NOT_POSTED over a mirror recorded POSTED with no id is still refused', () => {
+  const refusal = refuseSettlementContradictedByMirror({ outcome: 'NOT_POSTED' }, { status: 'POSTED', externalId: null })
+  assert.equal(refusal?.code, 'contradicts_mirrored_document')
+  assert.match(refusal?.message ?? '', /already recorded as POSTED/)
+})
+
+test('a mirror with NO document on it contradicts nothing — a VOID event does not outrank an assertion', () => {
+  // The line is a DOCUMENT, on either side: the same line refuseSettlement already draws for the
+  // row's own externalTransactionId. Nothing on a VOID event outranks anything.
+  assert.equal(refuseSettlementContradictedByMirror({ outcome: 'NOT_POSTED' }, { status: 'VOID', externalId: null }), null)
+  assert.equal(
+    refuseSettlementContradictedByMirror({ outcome: 'POSTED', externalTransactionId: 'INV-9001' }, { status: 'VOID', externalId: null }),
+    null,
+  )
+})
+
+// ---------------------------------------------------------------------------
+// r3, Codex finding 4 — A POSTED ASSERTION ON A CANCELLED SALE MUST NOT ENTER THE SWEEP'S SHAPE.
+// ---------------------------------------------------------------------------
+
+test('a POSTED assertion on a cancelled sale records the document but leaves the row CANCELLED', () => {
+  const data = buildCancelledSaleSettlementData({ outcome: 'POSTED', externalTransactionId: 'INV-9001' }, NOW)
+  // The document id is REAL evidence — the delete guard reads it whatever the status — so it is kept.
+  assert.equal(data.externalTransactionId, 'INV-9001')
+  // But `SYNCED` + an id + no backReferenceCheckedAt IS repairXeroBackReferences' candidate shape,
+  // and handing the sweep that shape for a cancelled order restarts its work: back-reference, PDF,
+  // email, storefront note, PAYMENT. CANCELLED is outside the shape.
+  assert.equal(data.status, 'CANCELLED')
+  assert.equal(data.syncedAt, null)
+  assert.equal(data.settlementBasis, OPERATOR_ASSERTION_SETTLEMENT_BASIS)
+  assert.match(String(data.errorMessage), /THE SALE THIS ROW BELONGS TO IS CANCELLED/)
+})
+
+test('only SalesOrder rows are gated on the sale — a refund credit note is the cancellation\'s own document', () => {
+  assert.equal(isSaleScopedSettlementRow('SalesOrder'), true)
+  // Gating these would strand exactly the document a cancellation creates: crediting a cancelled
+  // sale is right, invoicing it is wrong (o3d-e2mz r8).
+  assert.equal(isSaleScopedSettlementRow('SalesOrderRefund'), false)
+  assert.equal(isSaleScopedSettlementRow('PurchaseInvoice'), false)
+})
+
+// ---------------------------------------------------------------------------
+// r3, Codex finding 3 — ADOPTION, so the rows that motivated this branch can reach the remedy.
+// ---------------------------------------------------------------------------
+
+test('a revision-0 row that NOTHING can ever claim is settleable by adoption, with the minting said out loud', () => {
+  // This is EVERY o3d-osl8 stranded row: on a retired connector, so no processor will ever claim it,
+  // so its revision never leaves 0. Refusing it for ever means the per-row remedy does not exist for
+  // the population it was built for.
+  const s = describeSyncRowSettleability({
+    status: 'FAILED', type: 'SALES_INVOICE', attemptRevision: UNCLAIMED_ATTEMPT_REVISION,
+    unclaimable: true, connector: 'quickbooks',
+  })
+  assert.equal(s.settleable, true)
+  assert.equal(s.requiresAttemptAdoption, true)
+  assert.equal(s.notSettleableReason, null)
+  assert.match(s.settlementCaveat ?? '', /MINTS one/)
+  assert.match(s.settlementCaveat ?? '', /while quickbooks is not the active connector/)
+  // The status caveat is still carried: a FAILED row is not proof that nothing posted.
+  assert.match(s.settlementCaveat ?? '', /NOT proof that nothing posted/)
+})
+
+test('a revision-0 row on the ACTIVE connector is still refused — and told the route it already has', () => {
+  // Not adopted, because it HAS a route: retry it, the fence-aware processor claims it and stamps
+  // attempt 1. A second way to do what the system does correctly by itself is the same objection
+  // that keeps PENDING unsettleable. The refusal is not a dead end, which is why it names the route.
+  const s = describeSyncRowSettleability({ status: 'FAILED', type: 'SALES_INVOICE', attemptRevision: 0 })
+  assert.equal(s.settleable, false)
+  assert.equal(s.requiresAttemptAdoption, false)
+  assert.match(s.notSettleableReason ?? '', /retry the row, and settle it once it shows an attempt/)
+})
+
+test('adoption never overrides the TYPE gate — a DAILY_BATCH row is unsettleable at any revision', () => {
+  const s = describeSyncRowSettleability({
+    status: 'FAILED', type: 'DAILY_BATCH_GROUP_B', attemptRevision: 0, unclaimable: true, connector: 'quickbooks',
+  })
+  assert.equal(s.settleable, false)
+  assert.equal(s.requiresAttemptAdoption, false)
+  assert.match(s.notSettleableReason ?? '', /DAILY BATCH row/)
+})
+
+test('adoption never overrides the STATUS gate — a PENDING stranded row is still the sweeps\' work', () => {
+  const s = describeSyncRowSettleability({
+    status: 'PENDING', type: 'SALES_INVOICE', attemptRevision: 0, unclaimable: true, connector: 'quickbooks',
+  })
+  assert.equal(s.settleable, false)
+  assert.match(s.notSettleableReason ?? '', /nothing has been sent/)
 })

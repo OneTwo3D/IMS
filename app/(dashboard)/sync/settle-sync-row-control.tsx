@@ -119,6 +119,13 @@ function SettleSyncRowDialog({
   const [reason, setReason] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  /**
+   * What the settlement ACTUALLY did, when that is not what was asked for (o3d-nf9i r3, finding 4).
+   * A POSTED assertion against a CANCELLED sale records the document id and leaves the row CANCELLED
+   * rather than SYNCED, so the sweeps do not carry the cancelled sale's remaining work. Closing the
+   * dialog on that silently would leave the operator believing they had recorded a live posting.
+   */
+  const [settledNotice, setSettledNotice] = useState<string | null>(null)
 
   async function submit() {
     if (!outcome) return
@@ -140,6 +147,16 @@ function SettleSyncRowDialog({
       // session, so a stale one is re-authed in place and the action retried ONCE.
       if (isFreshAuthFailure(result) && (await promptReauth())) result = await run()
       if (result.success) {
+        if (result.retiredForCancelledSale) {
+          setSettledNotice(
+            `Recorded. The sale this row belongs to is CANCELLED, so the document id was saved but the row was `
+            + `left CANCELLED rather than SYNCED — nothing will carry the cancelled sale's remaining work `
+            + `(back-reference, PDF, email, storefront note, payment) any further. Reverse the document in the `
+            + `accounting system.`,
+          )
+          onSettled()
+          return
+        }
         onClose()
         onSettled()
       } else {
@@ -224,13 +241,16 @@ function SettleSyncRowDialog({
               </div>
             )}
             {error && <p className="text-xs text-destructive">{error}</p>}
+            {settledNotice && <p className="text-xs font-medium">{settledNotice}</p>}
           </div>
           <DialogFooter>
-            <Button variant="outline" size="sm" onClick={onClose} disabled={busy}>Cancel</Button>
+            <Button variant="outline" size="sm" onClick={onClose} disabled={busy}>
+              {settledNotice ? 'Close' : 'Cancel'}
+            </Button>
             <Button
               size="sm"
               onClick={submit}
-              disabled={busy || !outcome || (outcome === 'POSTED' && externalId.trim().length === 0)}
+              disabled={busy || !!settledNotice || !outcome || (outcome === 'POSTED' && externalId.trim().length === 0)}
             >
               {busy ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
               Record this

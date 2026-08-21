@@ -115,9 +115,30 @@ export async function applyFencedAttemptDecision(
     expectedStatus: AccountingSyncStatus
     /** The decision itself. `attemptRevision` is set by the fence and must not be passed. */
     data: Omit<Prisma.AccountingSyncLogUpdateManyMutationInput, 'attemptRevision'>
+    /**
+     * ADOPT a row that has never been fence-claimed, instead of refusing it (o3d-nf9i r3).
+     *
+     * Default false, and that default is the safe one: revision 0 means no attempt has ever been
+     * identified, so a compare-and-swap on (id, status) is the exact defect this module exists to
+     * remove — every path returns a row to a status it already held, so the decision can land on a
+     * LATER attempt than the one that was judged.
+     *
+     * It is sound in ONE case, and the caller must have established it: NOTHING THAT PARTICIPATES IN
+     * THE FENCE CAN EVER CLAIM THIS ROW — a row on a connector that is not the active one, which no
+     * processor and no retry path touches. Such a row has exactly one attempt, ever, so there is no
+     * later attempt for the decision to land on and status is a sufficient identity for it. Without
+     * this door those rows are refused for ever, and the per-row remedy does not exist for the very
+     * population it was built for.
+     *
+     * The adoption is still a CAS — (id, revision 0, expectedStatus) — so a second operator, or a
+     * sweep that moves the status first, loses and is told which. It bumps to 1 exactly as a
+     * processor's first claim would, so a connector that is later re-activated finds a fenced row
+     * rather than an unfenced one.
+     */
+    adoptUnfencedAttempt?: boolean
   },
 ): Promise<AttemptDecisionOutcome> {
-  if (params.expectedAttemptRevision === UNCLAIMED_ATTEMPT_REVISION) {
+  if (params.expectedAttemptRevision === UNCLAIMED_ATTEMPT_REVISION && !params.adoptUnfencedAttempt) {
     return {
       ok: false,
       reason: 'UNFENCED_ATTEMPT',
@@ -151,7 +172,10 @@ export async function applyFencedAttemptDecision(
         + 'Reload the sync log; if the row is gone, nothing on it can be settled.',
     }
   }
-  if (current.attemptRevision === UNCLAIMED_ATTEMPT_REVISION) {
+  // A row still at 0 after an ADOPTION lost its CAS did not lose it on the revision — the revision
+  // is what the adoption expected. Reporting UNFENCED_ATTEMPT there would tell the operator the row
+  // can never be settled, when in truth its STATUS moved and their remedy is to reload and look.
+  if (current.attemptRevision === UNCLAIMED_ATTEMPT_REVISION && !params.adoptUnfencedAttempt) {
     return { ok: false, reason: 'UNFENCED_ATTEMPT', message: unfencedAttemptMessage(params.id, current.status) }
   }
   if (current.attemptRevision !== params.expectedAttemptRevision) {
