@@ -27,13 +27,21 @@ export async function GET(req: NextRequest) {
         barcode: r.barcode, mpn: r.mpn, lifecycleStatus: r.lifecycleStatus,
         qtySold: r.qtySold, qtyRefunded: r.qtyRefunded, netQty: r.netQty,
         grossRevenue: r.grossRevenue.toFixed(2), discounts: r.discounts.toFixed(2),
-        refunds: r.refunds.toFixed(2), netRevenue: r.netRevenue.toFixed(2),
+        // o3d-iigc: the error bound travels with the figure. `refunds` is NET-basis credit only,
+        // so netRevenue/grossProfit are upper bounds by at most the two columns beside them — a
+        // reader of the CSV can see how loose the bound is instead of it being invisible outside
+        // the UI.
+        refunds: r.refunds.toFixed(2),
+        refundsGrossBasis: r.refundsGrossBasis.toFixed(2),
+        refundsUnknownBasis: r.refundsUnknownBasis.toFixed(2),
+        netRevenueIsUpperBound: r.refundBasisComplete ? 'no' : 'yes',
+        netRevenue: r.netRevenue.toFixed(2),
         cogs: r.cogs.toFixed(2), grossProfit: r.grossProfit.toFixed(2),
         marginPct: r.marginPct, orderCount: r.orderCount,
         avgOrderValue: r.avgOrderValue.toFixed(2),
         salesPrice: r.salesPrice?.toFixed(2) ?? '', weight: r.weight ?? '',
       }))
-      const headers = ['sku', 'name', 'type', 'stockUnit', 'barcode', 'mpn', 'lifecycleStatus', 'qtySold', 'qtyRefunded', 'netQty', 'grossRevenue', 'discounts', 'refunds', 'netRevenue', 'cogs', 'grossProfit', 'marginPct', 'orderCount', 'avgOrderValue', 'salesPrice', 'weight']
+      const headers = ['sku', 'name', 'type', 'stockUnit', 'barcode', 'mpn', 'lifecycleStatus', 'qtySold', 'qtyRefunded', 'netQty', 'grossRevenue', 'discounts', 'refunds', 'refundsGrossBasis', 'refundsUnknownBasis', 'netRevenueIsUpperBound', 'netRevenue', 'cogs', 'grossProfit', 'marginPct', 'orderCount', 'avgOrderValue', 'salesPrice', 'weight']
       return csvResponse(toCsv(data, headers), `sales-stats-products-${date}.csv`)
     }
 
@@ -74,7 +82,9 @@ export async function GET(req: NextRequest) {
       const data = rows.map((r) => ({
         productName: r.productName, orderNumber: r.orderNumber, creditNoteNumber: r.creditNoteNumber,
         refundedAt: r.refundedAt.slice(0, 10), salesRep: r.salesRep, qty: r.qty,
-        totalBase: r.totalBase.toFixed(2), pctOfSale: r.pctOfSale, reason: r.reason,
+        // o3d-iigc: an unestablishable proportion exports EMPTY, not 0 — a 0 in a spreadsheet
+        // column averages and charts as a real zero.
+        totalBase: r.totalBase.toFixed(2), pctOfSale: r.pctOfSale ?? '', reason: r.reason,
       }))
       return csvResponse(toCsv(data, ['productName', 'orderNumber', 'creditNoteNumber', 'refundedAt', 'salesRep', 'qty', 'totalBase', 'pctOfSale', 'reason']), `refunds-${date}.csv`)
     }
@@ -85,11 +95,14 @@ export async function GET(req: NextRequest) {
         orderNumber: r.orderNumber, customerName: r.customerName, salesRep: r.salesRep,
         warehouse: r.warehouse, createdAt: r.createdAt.slice(0, 10),
         salesTotal: r.salesTotal.toFixed(2), refundsTotal: r.refundsTotal.toFixed(2),
-        netTotal: r.netTotal.toFixed(2), dueAmount: r.dueAmount.toFixed(2), avgDso: r.avgDso,
+        // o3d-iigc: withheld when the order's credits are not all on one proven basis. Empty, not
+        // 0, and the basis of the figure is exported beside it so the column is readable at all.
+        netTotal: r.netTotal?.toFixed(2) ?? '', netTotalBasis: r.netTotalBasis,
+        dueAmount: r.dueAmount.toFixed(2), avgDso: r.avgDso,
         overdue0_30: r.overdue0_30.toFixed(2), overdue31_60: r.overdue31_60.toFixed(2),
         overdue61_90: r.overdue61_90.toFixed(2), overdue91plus: r.overdue91plus.toFixed(2),
       }))
-      return csvResponse(toCsv(data, ['orderNumber', 'customerName', 'salesRep', 'warehouse', 'createdAt', 'salesTotal', 'refundsTotal', 'netTotal', 'dueAmount', 'avgDso', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus']), `customer-aging-${date}.csv`)
+      return csvResponse(toCsv(data, ['orderNumber', 'customerName', 'salesRep', 'warehouse', 'createdAt', 'salesTotal', 'refundsTotal', 'netTotal', 'netTotalBasis', 'dueAmount', 'avgDso', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus']), `customer-aging-${date}.csv`)
     }
 
     case 'forecast': {

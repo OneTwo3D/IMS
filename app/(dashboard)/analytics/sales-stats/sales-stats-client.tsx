@@ -58,6 +58,10 @@ const PRODUCT_FIELDS: FieldDef[] = [
   { key: 'grossRevenue', label: 'Gross Revenue', type: 'number' },
   { key: 'discounts', label: 'Discounts', type: 'number' },
   { key: 'refunds', label: 'Refunds', type: 'number' },
+  // o3d-iigc: refund value the ex-VAT revenue cannot absorb. Opt-in, so the default view is
+  // unchanged for the overwhelming majority of products that have neither.
+  { key: 'refundsGrossBasis', label: 'Refunds (gross)', type: 'number' },
+  { key: 'refundsUnknownBasis', label: 'Refunds (basis ?)', type: 'number' },
   { key: 'netRevenue', label: 'Net Revenue', type: 'number' },
   { key: 'cogs', label: 'COGS', type: 'number' },
   { key: 'grossProfit', label: 'Gross Profit', type: 'number' },
@@ -139,6 +143,8 @@ const AGING_FIELDS: FieldDef[] = [
   { key: 'salesTotal', label: 'Sales', type: 'number' },
   { key: 'refundsTotal', label: 'Refunds', type: 'number' },
   { key: 'netTotal', label: 'Net Total', type: 'number' },
+  // o3d-iigc: which total Net Total IS. Opt-in — every order without credits reads NONE.
+  { key: 'netTotalBasis', label: 'Net Total Basis', type: 'select', options: ['NONE', 'NET', 'GROSS', 'UNKNOWN'] },
   { key: 'dueAmount', label: 'Due', type: 'number' },
   { key: 'avgDso', label: 'Avg DSO', type: 'number' },
   { key: 'overdue0_30', label: '0-30d', type: 'number' },
@@ -146,6 +152,13 @@ const AGING_FIELDS: FieldDef[] = [
   { key: 'overdue61_90', label: '61-90d', type: 'number' },
   { key: 'overdue91plus', label: '91d+', type: 'number' },
 ]
+
+/**
+ * o3d-iigc: what an upper-bounded figure means, in one place so every bounded cell says the same
+ * thing. The bound is loose by AT MOST the row's gross-basis + unknown-basis refund value, which is
+ * shown in its own two columns.
+ */
+const BOUND_TITLE = 'Upper bound: some of this product\u2019s refunds are on the gross basis or have no proven basis, so they are not subtracted here'
 
 const TAB_FIELDS: Record<Tab, FieldDef[]> = {
   products: PRODUCT_FIELDS,
@@ -442,13 +455,19 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
     netQty: { label: 'Net Qty', align: 'right', render: (r) => <span className="tabular-nums text-xs font-medium">{r.netQty}</span> },
     grossRevenue: { label: moneyLabel('Gross Rev'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtBase(r.grossRevenue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtBase(summary.totalGrossRevenue)}</span> },
     discounts: { label: moneyLabel('Discounts'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-destructive">{r.discounts > 0 ? fmtBase(r.discounts) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-destructive">{fmtBase(summary.totalDiscounts)}</span> },
-    refunds: { label: moneyLabel('Refunds'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-orange-600">{r.refunds > 0 ? fmtBase(r.refunds) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-orange-600">{fmtBase(summary.totalRefunds)}</span> },
-    netRevenue: { label: moneyLabel('Net Revenue'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono font-medium">{fmtBase(r.netRevenue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtBase(summary.totalNetRevenue)}</span> },
+    refunds: { label: moneyLabel('Refunds'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value on the NET basis — the only credit that is the same unit as this row's ex-VAT revenue">{r.refunds > 0 ? fmtBase(r.refunds) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-orange-600">{fmtBase(summary.totalRefunds)}</span> },
+    refundsGrossBasis: { label: moneyLabel('Refunds (gross)'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value recorded on the GROSS basis — not comparable with this row's ex-VAT revenue, so it is excluded from it">{r.refundsGrossBasis > 0 ? fmtBase(r.refundsGrossBasis) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-orange-600">{fmtBase(summary.totalRefundsGrossBasis)}</span> },
+    refundsUnknownBasis: { label: moneyLabel('Refunds (basis ?)'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value whose basis was never proved — excluded from net revenue rather than guessed at">{r.refundsUnknownBasis > 0 ? fmtBase(r.refundsUnknownBasis) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-orange-600">{fmtBase(summary.totalRefundsUnknownBasis)}</span> },
+    // o3d-iigc: when the row's refunds could not all be placed on the net basis, this figure and
+    // everything derived from it are UPPER BOUNDS — marked, not presented as exact.
+    netRevenue: { label: moneyLabel('Net Revenue'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono font-medium ${r.refundBasisComplete ? '' : 'text-orange-600'}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(r.netRevenue)}{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.refundBasisComplete ? '' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(summary.totalNetRevenue)}{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
     cogs: { label: moneyLabel('COGS'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.cogs > 0 ? fmtBase(r.cogs) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-muted-foreground">{fmtBase(summary.totalCogs)}</span> },
-    grossProfit: { label: moneyLabel('Profit'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${r.grossProfit >= 0 ? 'text-green-600' : 'text-destructive'}`}>{fmtBase(r.grossProfit)}</span>, footer: () => <span className="tabular-nums font-mono text-green-600">{fmtBase(summary.totalGrossProfit)}</span> },
-    marginPct: { label: 'Margin', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${r.marginPct < 0 ? 'text-destructive' : ''}`}>{r.marginPct}%</span>, footer: () => <span className="tabular-nums">{summary.avgMarginPct}%</span> },
+    // A bounded profit/margin DROPS the green/red colouring: that colouring reads as a verdict, and
+    // an upper bound does not support one.
+    grossProfit: { label: moneyLabel('Profit'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${!r.refundBasisComplete ? 'text-orange-600' : r.grossProfit >= 0 ? 'text-green-600' : 'text-destructive'}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(r.grossProfit)}{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.refundBasisComplete ? 'text-green-600' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(summary.totalGrossProfit)}{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
+    marginPct: { label: 'Margin', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${!r.refundBasisComplete ? 'text-orange-600' : r.marginPct < 0 ? 'text-destructive' : ''}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{r.marginPct}%{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums ${summary.refundBasisComplete ? '' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{summary.avgMarginPct}%{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
     orderCount: { label: 'Orders', align: 'right', render: (r) => <span className="tabular-nums text-xs text-muted-foreground">{r.orderCount}</span>, footer: () => <span className="tabular-nums text-muted-foreground">{summary.totalOrders}</span> },
-    avgOrderValue: { label: moneyLabel('Avg Order'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtBase(r.avgOrderValue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtBase(summary.avgOrderValue)}</span> },
+    avgOrderValue: { label: moneyLabel('Avg Order'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${r.refundBasisComplete ? '' : 'text-orange-600'}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(r.avgOrderValue)}{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.refundBasisComplete ? '' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(summary.avgOrderValue)}{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
     salesPrice: { label: moneyLabel('List Price'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{r.salesPrice != null ? fmtBase(r.salesPrice) : '—'}</span> },
     weight: { label: 'Weight', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.weight != null ? `${r.weight}kg` : '—'}</span> },
     currentStock: { label: 'On Hand', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.currentStock}</span> },
@@ -490,13 +509,22 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
       if (key === 'orderNumber') return <Link href={`/sales/${row.orderId}`} className="hover:underline font-mono text-xs">{row.orderNumber}</Link>
       if (key === 'refundedAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
       if (key === 'totalBase') return <span className="tabular-nums text-xs font-mono text-destructive">{fmtBase(v)}</span>
-      if (key === 'pctOfSale') return <span className="tabular-nums text-xs text-muted-foreground">{v}%</span>
+      // o3d-iigc: null means the credit's basis is unproven (or no comparable order total exists),
+      // so no proportion is established. A 0% here would read as "refunded nothing".
+      if (key === 'pctOfSale') return v == null ? <span className="text-xs text-muted-foreground" title="No proportion is established: this credit's basis is unproven, so there is no order total it is comparable with">—</span> : <span className="tabular-nums text-xs text-muted-foreground">{v}%</span>
       if (key === 'qty') return <span className="tabular-nums text-xs">{v}</span>
     }
     if (tabKey === 'aging') {
       if (key === 'orderNumber') return <Link href={`/sales/${row.orderId}`} className="hover:underline font-mono text-xs">{row.orderNumber}</Link>
       if (key === 'createdAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
-      if (key === 'salesTotal' || key === 'netTotal') return <span className="tabular-nums text-xs font-mono font-medium">{fmtBase(v)}</span>
+      if (key === 'salesTotal') return <span className="tabular-nums text-xs font-mono font-medium">{fmtBase(v)}</span>
+      // o3d-iigc: withheld when the order's credits are not all on one proven basis. The gross
+      // invoice total minus a NET credit understated the credit by its VAT; a mixed set is not a
+      // subtraction at all. Neither is converted, so the figure is refused rather than invented.
+      if (key === 'netTotal') return v == null
+        ? <span className="text-xs text-muted-foreground" title={`Withheld: this order's credits are not all on one proven basis (${row.netTotalBasis}), and converting between bases needs a rate that is not recoverable`}>—</span>
+        : <span className="tabular-nums text-xs font-mono font-medium" title={row.netTotalBasis === 'NET' ? 'Ex-VAT: this order\u2019s credits are on the NET basis, so the figure is the ex-VAT order total less them' : row.netTotalBasis === 'GROSS' ? 'VAT-inclusive: this order\u2019s credits are on the GROSS basis' : undefined}>{fmtBase(v)}</span>
+      if (key === 'netTotalBasis') return <span className="text-xs text-muted-foreground">{v}</span>
       if (key === 'refundsTotal') return <span className="tabular-nums text-xs font-mono text-orange-600">{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0.01 ? 'text-orange-600 font-medium' : ''}`}>{v > 0.01 ? fmtBase(v) : '—'}</span>
       if (key === 'avgDso') return <span className="tabular-nums text-xs text-muted-foreground">{v > 0 ? `${v}d` : '—'}</span>
