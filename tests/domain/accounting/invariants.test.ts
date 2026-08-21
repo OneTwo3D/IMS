@@ -126,6 +126,9 @@ function cleanRows(): AccountingInvariantRows {
         syncedAt: B_DATE,
       },
     ],
+    // o3d-o97 r4: the refusals arrive as their OWN row set, loaded by a query with none of the
+    // filters the sales-order query carries — that is the whole point of the field existing.
+    unresolvedAllocationBasisRefunds: [],
   }
 }
 
@@ -592,6 +595,12 @@ test('accounting row collection selects staged orders, posted shipments, and syn
         return []
       },
     },
+    salesOrderRefund: {
+      async findMany(args: unknown) {
+        calls.salesOrderRefund = args
+        return []
+      },
+    },
   }
 
   const now = new Date('2026-08-31T00:00:00.000Z')
@@ -600,6 +609,7 @@ test('accounting row collection selects staged orders, posted shipments, and syn
   assert.ok(calls.salesOrder)
   assert.ok(calls.shipment)
   assert.ok(calls.accountingSyncLog)
+  assert.ok(calls.salesOrderRefund)
   assert.deepEqual(
     (calls.salesOrder as { where: { status: unknown; refundStatus: unknown } }).where.status,
     { not: 'CANCELLED' },
@@ -667,6 +677,7 @@ function fullyShippedNoRefundRows(): AccountingInvariantRows {
         payload: { date: '2026-01-02' }, errorMessage: null, retryCount: 0, createdAt: B_DATE, syncedAt: B_DATE,
       },
     ],
+    unresolvedAllocationBasisRefunds: [],
   }
 }
 
@@ -842,45 +853,101 @@ test('o3d-0qoo: a persisted batch ref whose log is absent still reports missing 
   assert.equal((bFinding!.details as { expectedReferenceId: string }).expectedReferenceId, B_REF)
 })
 
-test('o3d-o97 r3: a refund that could not account for the A2 debit is reported even with NO posted shipment', () => {
+test('o3d-o97 r4: a refusal is reported from its own row set, with NO posted shipment on the order', () => {
   // The refusal's remedy. The refund path deliberately reverses nothing when it cannot establish
   // what A2 debited, and the commonest shape is an ALLOCATED, never-shipped order — which has no
-  // posted shipment at all, so it must be raised BEFORE the posted-shipment guard the rest of the
-  // refund checks sit behind. Without it the pounds sit in Allocated Inventory with nothing
-  // anywhere pointing at them: both daily-batch windows exclude a fully-refunded order for ever.
+  // posted shipment at all, so it can never be reached through the per-order refund checks that sit
+  // behind the posted-shipment guard. Without this the pounds sit in Allocated Inventory with
+  // nothing anywhere pointing at them: both daily-batch windows exclude a fully-refunded order.
   const rows = cleanRows()
-  rows.salesOrders.push({
-    id: 'order-unresolved',
-    orderNumber: 'SO-UNRESOLVED',
-    externalOrderNumber: null,
-    status: 'ALLOCATED',
-    revenueDeferredDate: null,
-    unearnedRevenueAmount: null,
-    // The A2 stamp SURVIVED the refusal, which is what keeps the standing A2 checks alive too.
-    inventoryAllocatedDate: A2_DATE,
-    allocationBatchAmount: 40,
-    shipments: [],
-    refunds: [{
-      id: 'refund-unresolved',
-      creditNoteNumber: 'CN-UNRESOLVED',
-      accountingCreditNoteId: 'xero-credit-note-9',
-      totalBase: 100,
-      accountingRetryRequired: false,
-      accountingWarning: null,
-      accountingRetrySyncs: null,
-      allocationBasisUnresolved: 'the A2 journal this order was staged into is CANCELLED, not SYNCED. Recorded A2 debit £40.00; this refund credited Allocated Inventory £0.00.',
-    }],
-  })
+  rows.unresolvedAllocationBasisRefunds = [{
+    id: 'refund-unresolved',
+    orderId: 'order-unresolved',
+    creditNoteNumber: 'CN-UNRESOLVED',
+    allocatedReliefAmount: 0,
+    allocationBasisUnresolved: 'the A2 journal this order was staged into is CANCELLED, not SYNCED. Recorded A2 debit £40.00; this refund credited Allocated Inventory £0.00.',
+    order: {
+      orderNumber: 'SO-UNRESOLVED',
+      externalOrderNumber: null,
+      status: 'ALLOCATED',
+      refundStatus: 'FULL',
+      inventoryAllocatedDate: A2_DATE,
+      allocationBatchAmount: 40,
+    },
+  }]
 
   const findings = evaluateAccountingInvariantRows(rows)
   const finding = findings.find((row) => row.code === 'sales_order_refund_allocation_basis_unresolved')
   assert.ok(finding, 'the refusal is reported')
   assert.equal(finding.severity, 'critical')
   assert.equal(finding.refundId, 'refund-unresolved')
+  assert.equal(finding.orderId, 'order-unresolved')
   assert.match(finding.message, /Recorded A2 debit £40\.00/)
+  assert.equal((finding.details as { allocationBatchAmount: number }).allocationBatchAmount, 40)
   assert.equal(
     findings.filter((row) => row.code === 'sales_order_refund_allocation_basis_unresolved').length,
     1,
     'and only for the refund that carries the note',
+  )
+})
+
+test('o3d-o97 r4: a refusal on a FULLY-REFUNDED order is still reported — the per-order query never returns one', () => {
+  // THE FINDING THIS ROUND FIXES. `allocationBasisUnresolved` is written when the refusal COST
+  // something, and it only costs something on a FULL refund — that is the last moment anything in
+  // IMS looks at the order's A2 posting. The sales-order query the per-order checks are fed from
+  // excludes `refundStatus: 'FULL'` and `status: 'CANCELLED'`, so r3's version reported the refusal
+  // from inside a loop that could not, in production, ever contain it. Here the order is absent
+  // from `salesOrders` entirely — exactly what that query returns — and the finding still lands.
+  const rows = cleanRows()
+  rows.unresolvedAllocationBasisRefunds = [{
+    id: 'refund-full',
+    orderId: 'order-gone',
+    creditNoteNumber: 'CN-FULL',
+    allocatedReliefAmount: 0,
+    allocationBasisUnresolved: 'the A2 journal this order was staged into is PENDING, not SYNCED. Recorded A2 debit £40.00; this refund credited Allocated Inventory £0.00.',
+    order: {
+      orderNumber: 'SO-GONE',
+      externalOrderNumber: null,
+      status: 'CANCELLED',
+      refundStatus: 'FULL',
+      inventoryAllocatedDate: A2_DATE,
+      allocationBatchAmount: 40,
+    },
+  }]
+  assert.equal(rows.salesOrders.some((order) => order.id === 'order-gone'), false)
+
+  const finding = evaluateAccountingInvariantRows(rows)
+    .find((row) => row.code === 'sales_order_refund_allocation_basis_unresolved')
+  assert.ok(finding, 'a refusal outside the per-order query is still reported')
+  assert.equal(finding.orderId, 'order-gone')
+  assert.equal((finding.details as { refundStatus: string }).refundStatus, 'FULL')
+  assert.equal((finding.details as { orderStatus: string }).orderStatus, 'CANCELLED')
+})
+
+test('o3d-o97 r4: the refusal query carries no refundStatus, status or retention filter', async () => {
+  // The row set is only as visible as its query. Every filter on the sales-order query is right
+  // there and fatal here, so this pins the predicate to exactly the one condition that bounds it:
+  // the column being set. A window or a status filter added later would silence the report again.
+  const calls: Record<string, unknown> = {}
+  const client = {
+    salesOrder: { async findMany() { return [] } },
+    shipment: { async findMany() { return [] } },
+    accountingSyncLog: { async findMany() { return [] } },
+    salesOrderRefund: {
+      async findMany(args: unknown) {
+        calls.salesOrderRefund = args
+        return []
+      },
+    },
+  }
+
+  await collectAccountingInvariantRows(client, {
+    now: new Date('2026-08-31T00:00:00.000Z'),
+    syncLogRetentionMonths: 6,
+  })
+
+  assert.deepEqual(
+    (calls.salesOrderRefund as { where: unknown }).where,
+    { allocationBasisUnresolved: { not: null } },
   )
 })

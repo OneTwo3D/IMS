@@ -257,3 +257,29 @@ test('o3d-o97 r3: Group B records the CR Allocated Inventory it raised, in the S
     .find((line) => line.accountCode === '631' && line.credit != null)
   assert.equal(allocatedCredit?.credit, 40, 'and it is the figure the journal actually credited')
 })
+
+test('o3d-o97 r4: Group B records WHICH journal raised that credit, on which ledger, against which account', async () => {
+  // The amount alone is the inference r3 destroyed on the A2 side and then rebuilt here. It is
+  // written for EVERY shipment the batch stamps, while the CR Allocated Inventory line exists only
+  // when the window's ROUNDED COGS total is positive — and even then the log is created PENDING,
+  // in a transaction that ends before the remote call, so it can finish CANCELLED with nothing
+  // credited anywhere. Counting that as relief SHRINKS the open balance a refund reverses, and on a
+  // FULL refund — which closes both batch windows for ever — the difference is stranded silently.
+  //
+  // The id is the AccountingSyncLog row's OWN id, so it cannot exist unless the row does, and it is
+  // what the refund resolves to read that row's STATUS.
+  assert.equal(shipmentUpdates.length, 1, 'the first test in this file is what wrote this; no second run')
+  const data = shipmentUpdates[0].data
+  const journal = created.find((log) => log.type === 'DAILY_BATCH_GROUP_B')
+  assert.ok(journal, 'the Group B journal was created')
+  assert.equal(data.allocatedReliefSyncLogId, 'log-1', "the created row's own id, minted by the create above")
+  assert.equal(data.allocatedReliefConnector, 'xero', 'the LEDGER the credit was raised into')
+  assert.equal(data.allocatedReliefAccountCode, '631', 'the exact Allocated Inventory account it credited')
+  assert.equal(
+    data.allocatedReliefAccountCode,
+    (journal.payload.lines as Array<{ accountCode?: string; credit?: number }>)
+      .find((line) => line.credit === 40)?.accountCode,
+    'and it is the account the journal actually credited, not whatever the settings name',
+  )
+  assert.ok('shipmentJournalDate' in data, 'written in the same UPDATE as the journal stamp')
+})

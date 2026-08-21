@@ -1186,8 +1186,14 @@ export async function runDailyBatchSync(): Promise<{
       // re-derived from shipmentJournalDate (written later, possibly on the next UTC day).
       const referenceId = `B-${today}`
 
+      // o3d-o97 r4: null unless a journal row was created AND it carried a CR Allocated Inventory
+      // line. Two different guards: no lines at all means no log, and — separately — a window whose
+      // ROUNDED COGS total is zero still raises a revenue-only journal crediting Allocated Inventory
+      // NOTHING, while `allocatedReliefAmount` below is stamped on every member shipment regardless.
+      // Mirrors the Xero batch; see the note there.
+      let groupBSyncLogId: string | null = null
       if (journalLines.length > 0) {
-        await createPendingSyncLog(tx, {
+        const createdLogId = await createPendingSyncLog(tx, {
           type: 'DAILY_BATCH_GROUP_B',
           referenceId,
           currency: baseCurrency,
@@ -1199,6 +1205,7 @@ export async function runDailyBatchSync(): Promise<{
             _postingMode: 'submitted',
           },
         })
+        if (totalCogsNumber > 0) groupBSyncLogId = createdLogId
       }
 
       // Only mark shipments that were successfully processed. Failed
@@ -1229,6 +1236,12 @@ export async function runDailyBatchSync(): Promise<{
             // o3d-o97 r3: the CR Allocated Inventory this shipment's journal raised, recorded once
             // and never revalued. See the Xero batch.
             allocatedReliefAmount: resultForShipment.cogs,
+            // o3d-o97 r4: and which journal raised it, on which ledger, against which account — all
+            // null when no CR Allocated Inventory line was raised. Resolving the id reads that
+            // row's STATUS, so a queued or cancelled Group B journal is never counted as relief.
+            allocatedReliefSyncLogId: groupBSyncLogId,
+            allocatedReliefConnector: groupBSyncLogId ? QBO_CONNECTOR : null,
+            allocatedReliefAccountCode: groupBSyncLogId ? settings.quickbooks_allocated_inventory_account : null,
           },
         })
       }

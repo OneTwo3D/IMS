@@ -1,0 +1,62 @@
+-- o3d-o97 — index the REFUSALS, because the accounting-invariant report scans for them.
+--
+-- WHAT RUNS. collectAccountingInvariantRows (lib/domain/accounting/invariants.ts) asks, on every
+-- invariant run,
+--
+--   SELECT ... FROM "sales_order_refunds"
+--    WHERE "accounting_allocation_basis_unresolved" IS NOT NULL
+--
+-- and it asks it OUTSIDE the retention window and OUTSIDE the report's other filters, deliberately:
+-- a refusal is written precisely when a FULL refund could not account for the order's Allocated
+-- Inventory debit, and the report's main sales-order query excludes `refundStatus: 'FULL'` and
+-- `status: 'CANCELLED'`, so every refusal that cost real money was being filtered out of the very
+-- report that is supposed to surface it. Pounds are sitting in an account that no automatic path
+-- will ever take out — both daily-batch windows exclude a fully-refunded order — so the finding has
+-- to outlive the window, which means the query cannot be bounded by a date either.
+--
+-- WHY PARTIAL. A refusal is the rarest row in the table by design: the column is NULL on every
+-- refund that could account for the debit, which is all of them until a record is missing. The
+-- partial index therefore holds only the outstanding refusals — a few pages at most — costs
+-- effectively nothing to maintain on the refund write path, and turns a full scan of every refund
+-- IMS has ever issued into a bounded index read. A plain index on the column would instead be one
+-- entry per refund, nearly all of them NULL, to answer a query that wants none of them.
+--
+-- ("orderId") as the indexed column rather than the predicate column: the predicate is already
+-- fully satisfied by index membership, so what is worth carrying is the key the reader groups and
+-- joins on when it renders the finding.
+--
+-- Prisma cannot express a WHERE clause on an index in schema.prisma, so this index is deliberately
+-- not represented there — the same as hs_code_proposals_one_pending_per_product and
+-- activity_logs_direct_create_marker_idx.
+-- prisma-schema-scope-ok: db-native partial index | reason: Prisma schema has no way to express an index WHERE predicate, and a plain index would be one entry per refund to answer a query that wants only the handful carrying a refusal
+--
+-- CONCURRENTLY, AND THIS FILE HOLDS EXACTLY ONE STATEMENT.
+--
+-- sales_order_refunds grows with daily operations, which docs/migration-conventions.md names as the
+-- test for a concurrent build. A plain CREATE INDEX takes a SHARE lock for the whole build and
+-- blocks every refund INSERT for its duration — on a money path, during a deploy.
+--
+-- CREATE INDEX CONCURRENTLY takes SHARE UPDATE EXCLUSIVE instead, so readers and writers both carry
+-- on. It cannot run inside a transaction block, and Postgres wraps a multi-statement simple-query
+-- string in an implicit one — so this file must contain this ONE statement and nothing else, and
+-- the post-build validity check is a SEPARATE migration, 20260821090200. A second statement added
+-- here would fail with "CREATE INDEX CONCURRENTLY cannot run inside a transaction block".
+--
+-- NO `IF NOT EXISTS`, deliberately. An interrupted concurrent build — a cancelled deploy, a
+-- timeout, a lost connection — leaves an INVALID index behind at this name. The planner refuses to
+-- use an invalid index, so the report silently goes back to scanning the table while every refund
+-- write still pays to maintain it. `IF NOT EXISTS` would quietly no-op against that leftover and
+-- make the state permanent and invisible; without it the retry fails loudly with "relation already
+-- exists", and 20260821090200 fails the deploy if an invalid index is reached by any other route.
+--
+-- Operator remediation if this migration is interrupted and leaves an INVALID index:
+--   psql "$DATABASE_URL" -c 'DROP INDEX CONCURRENTLY IF EXISTS "sales_order_refunds_allocation_basis_unresolved_idx";'
+--   npx prisma migrate resolve --rolled-back 20260821090100_refund_allocation_basis_unresolved_index
+--   npx prisma migrate deploy
+-- DROP INDEX CONCURRENTLY, not a plain DROP, so the cleanup does not take the exclusive lock the
+-- build was written to avoid. Safe at any time: this is a performance index only, nothing reads it
+-- for correctness, and until it exists the report merely runs the slow plan.
+
+CREATE INDEX CONCURRENTLY "sales_order_refunds_allocation_basis_unresolved_idx"
+  ON "sales_order_refunds" ("orderId")
+  WHERE "accounting_allocation_basis_unresolved" IS NOT NULL;

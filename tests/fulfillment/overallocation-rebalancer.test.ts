@@ -67,6 +67,7 @@ const state = {
    * `logActivity` mock) so a test can tell the two apart — that distinction is the whole point.
    */
   txActivity: [] as Row[],
+  accountingSyncLogs: [] as Array<{ id: string; status: string }>,
   /** o3d-4kfh r5 (finding 4): what the post-release FIFO pass was actually asked to repair. */
   backorderCalls: [] as Array<{ productIds: string[] }>,
   stockLevels: [] as StockLevelRow[],
@@ -91,6 +92,7 @@ function reset() {
   state.allocationUpdates.length = 0
   state.activity.length = 0
   state.txActivity.length = 0
+  state.accountingSyncLogs.length = 0
   state.backorderCalls.length = 0
   state.allocations.length = 0
   state.shipments.length = 0
@@ -140,6 +142,13 @@ const tx = {
   // o3d-4kfh r5 (finding 7): reconcilePendingShipments writes its audit row through the tx client,
   // before the delete. A double without this throws, which is the correct failure for a production
   // change that stopped writing it in-transaction.
+  accountingSyncLog: {
+    // o3d-o97 r4: the A2 journal probed by its own id. null = no row (retention took it, or the
+    // fixture named none), which the un-stage reads as "cannot prove nothing was debited".
+    findUnique: async ({ where }: { where: { id: string } }) => (
+      state.accountingSyncLogs.find((row) => row.id === where.id) ?? null
+    ),
+  },
   activityLog: {
     create: async ({ data }: { data: Row }) => { state.txActivity.push(data); return data },
   },
@@ -331,7 +340,15 @@ async function loadRebalancer() {
 
 function order(
   id: string,
-  overrides: { status?: string; createdAt?: string; inventoryAllocatedDate?: Date | null } = {},
+  overrides: {
+    status?: string
+    createdAt?: string
+    inventoryAllocatedDate?: Date | null
+    // o3d-o97 r4: what A2 recorded for the order, which is what decides whether the un-stage below
+    // may clear the stamp or must keep it.
+    allocationBatchAmount?: number | null
+    allocationBatchSyncLogId?: string | null
+  } = {},
 ) {
   return {
     id,
@@ -340,10 +357,14 @@ function order(
     status: overrides.status ?? 'ALLOCATED',
     createdAt: overrides.createdAt ?? '2026-01-01T00:00:00Z',
     inventoryAllocatedDate: overrides.inventoryAllocatedDate ?? null,
+    allocationBatchAmount: overrides.allocationBatchAmount ?? null,
+    allocationBatchSyncLogId: overrides.allocationBatchSyncLogId ?? null,
   }
 }
 
-function seedStagedOverallocation() {
+function seedStagedOverallocation(
+  a2: { allocationBatchAmount?: number | null; allocationBatchSyncLogId?: string | null; journalStatus?: string } = {},
+) {
   // 1 unit on hand, 2 reserved by a single A2-staged order: excess 1, so the order's
   // allocation is fully released and the A2 un-stage branch runs.
   state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 2 }]
@@ -354,8 +375,20 @@ function seedStagedOverallocation() {
     productId: 'product-1',
     warehouseId: 'warehouse-1',
     qty: 1,
-    order: order('order-1', { inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z') }),
+    order: order('order-1', {
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+      allocationBatchAmount: a2.allocationBatchAmount ?? null,
+      allocationBatchSyncLogId: a2.allocationBatchSyncLogId ?? null,
+    }),
   }]
+  if (a2.allocationBatchSyncLogId && a2.journalStatus) {
+    state.accountingSyncLogs.push({ id: a2.allocationBatchSyncLogId, status: a2.journalStatus })
+  }
+}
+
+/** o3d-o97 r4: the record that the un-stage was WITHHELD because the A2 debit still stands. */
+function stageRetainedEntries() {
+  return state.txActivity.filter((entry) => entry.action === 'allocation_accounting_stage_retained')
 }
 
 /** The A2 un-stage write, distinguished from the ALLOCATED→PROCESSING status write. */
@@ -386,8 +419,10 @@ function shipmentIds(): string[] {
 }
 
 test('releaseOverallocations clears inventoryAllocatedBatchRef in the same update as the stamp (o3d-0qoo)', async () => {
+  // o3d-o97 r4: the clear only happens where the A2 debit is positively known NOT to stand, so the
+  // fixture says so — a recorded journal that ended CANCELLED debited nothing anywhere.
   reset()
-  seedStagedOverallocation()
+  seedStagedOverallocation({ allocationBatchAmount: 40, allocationBatchSyncLogId: 'a2-log-1', journalStatus: 'CANCELLED' })
   const { releaseOverallocations } = await loadRebalancer()
 
   const result = await releaseOverallocations(
@@ -415,6 +450,54 @@ test('releaseOverallocations clears inventoryAllocatedBatchRef in the same updat
     allocationBatchAccountCode: null,
   })
   assert.deepEqual(state.allocationUpdates.length, 1, 'and the cost snapshots are still nulled alongside it')
+  assert.deepEqual(stageRetainedEntries(), [])
+})
+
+test('releaseOverallocations KEEPS the A2 stamp and its recorded debit when the journal POSTED (o3d-o97 r4)', async () => {
+  // THE FINDING, on the rebalancer's copy of the same un-stage. Nulling the stamp here destroys the
+  // only record of the £40 A2 put into Allocated Inventory AND puts the order back into the A2
+  // window, where the next run raises a SECOND debit at the new pins. Only the second one has a
+  // record, so a later refund's residue can only relieve that one and the first is stranded for
+  // ever. The RELEASE still happens — the over-allocated unit is still given back — but the
+  // accounting evidence survives it.
+  reset()
+  seedStagedOverallocation({ allocationBatchAmount: 40, allocationBatchSyncLogId: 'a2-log-1', journalStatus: 'SYNCED' })
+  const { releaseOverallocations } = await loadRebalancer()
+
+  const result = await releaseOverallocations(
+    [{ productId: 'product-1', warehouseId: 'warehouse-1' }],
+    { source: 'stock_adjustment', referenceId: 'adj-1' },
+  )
+
+  assertNoSwallowedFailure()
+  assert.equal(result.released, 1, 'the over-allocated unit is still released')
+  assert.deepEqual(state.deletedAllocationIds, ['alloc-1'])
+  assert.equal(unstageWrite(), undefined, 'and no un-stage write happened at all — the £40 record stays')
+  assert.equal(stageRetainedEntries().length, 1)
+  assert.match(
+    String(stageRetainedEntries()[0].description),
+    /Group A2 debited Allocated Inventory £40\.00 for this order under journal a2-log-1 \(SYNCED\)/,
+  )
+  assert.equal(state.allocationUpdates.length, 1, 'the pins this pass changed are still cleared')
+})
+
+test('releaseOverallocations KEEPS the A2 stamp for an order staged before the attribution existed (o3d-o97 r4)', async () => {
+  // The legacy shape, and the one every order in the database has on the day this ships: a stamp
+  // and a recorded amount, but no journal id. Nothing can retroactively prove that batch never
+  // posted, so the record is kept — the reading that cannot strand pounds.
+  reset()
+  seedStagedOverallocation({ allocationBatchAmount: 40 })
+  const { releaseOverallocations } = await loadRebalancer()
+
+  await releaseOverallocations(
+    [{ productId: 'product-1', warehouseId: 'warehouse-1' }],
+    { source: 'stock_adjustment', referenceId: 'adj-1' },
+  )
+
+  assertNoSwallowedFailure()
+  assert.equal(unstageWrite(), undefined)
+  assert.equal(stageRetainedEntries().length, 1)
+  assert.match(String(stageRetainedEntries()[0].description), /named no journal/)
 })
 
 test('releaseOverallocations skips the order entirely when a shipment is journaled (o3d-0qoo)', async () => {

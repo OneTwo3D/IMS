@@ -74,12 +74,40 @@ type SalesOrderAccountingRow = {
     chargeback?: boolean
     // scjz.71: durable — whether a COGS/unearned reversal was staged for this refund.
     reversalStaged?: boolean
-    // o3d-o97 r3: set when the refund could NOT account for the order's A2 Allocated Inventory
-    // debit, so it deliberately reversed less than the account holds (or nothing). The refund row
-    // outlives every stamp on the order, which is the point — the refusal used to be reported by
-    // an A2 invariant keyed on `inventoryAllocatedDate`, and the same refund path nulled it.
-    allocationBasisUnresolved?: string | null
   }>
+}
+
+/**
+ * o3d-o97 r4 — THE REFUSALS, LOADED ON THEIR OWN TERMS.
+ *
+ * `SalesOrderRefund.allocationBasisUnresolved` is set when a refund could not establish what was
+ * still open on the order's Allocated Inventory contra, so it deliberately credited less than the
+ * account holds — or nothing. r3 reported it from inside the per-order loop above, which is fed by
+ * a query that excludes `refundStatus: 'FULL'` and `status: 'CANCELLED'` and is bounded by the
+ * sync-log retention window. A refusal is written almost exclusively on a FULL refund (that is the
+ * last moment anything will take the residue out), so the report filtered out precisely the
+ * refusals that cost money, and the branch broke its own rule — a refusal an operator cannot see is
+ * not a remedy — in the same area for the second time.
+ *
+ * This row set is therefore loaded by its OWN query, with none of those filters and no window: the
+ * pounds do not stop sitting in the account because the order reached a terminal state or because
+ * six months went by, and both daily-batch windows exclude a fully-refunded order for ever, so no
+ * automatic path will ever take them out. The finding stands until the refund's note is cleared.
+ */
+type UnresolvedAllocationBasisRefundRow = {
+  id: string
+  orderId: string
+  creditNoteNumber: string | null
+  allocationBasisUnresolved: string | null
+  allocatedReliefAmount?: DecimalLike
+  order?: {
+    orderNumber?: string | null
+    externalOrderNumber?: string | null
+    status?: string
+    refundStatus?: string | null
+    inventoryAllocatedDate?: Date | string | null
+    allocationBatchAmount?: DecimalLike
+  } | null
 }
 
 type ShipmentAccountingRow = {
@@ -119,6 +147,12 @@ export type AccountingInvariantRows = {
   salesOrders: SalesOrderAccountingRow[]
   postedShipments: ShipmentAccountingRow[]
   syncLogs: AccountingSyncLogRow[]
+  /**
+   * o3d-o97 r4: every refund carrying an unresolved allocated-inventory basis, whatever its order's
+   * refund status, lifecycle status or age. REQUIRED, not optional: a collector that forgets it
+   * would drop the findings silently, which is the exact failure this field exists to end.
+   */
+  unresolvedAllocationBasisRefunds: UnresolvedAllocationBasisRefundRow[]
 }
 
 type AccountingInvariantClient = {
@@ -130,6 +164,12 @@ type AccountingInvariantClient = {
   }
   accountingSyncLog: {
     findMany(args: unknown): Promise<AccountingSyncLogRow[]>
+  }
+  // o3d-o97 r4: the refusal query, and REQUIRED — unlike `setting` below, which has a documented
+  // default. A double that omits it would make every refusal invisible, which is the failure this
+  // whole row set exists to end, and it would do so without any signal at all.
+  salesOrderRefund: {
+    findMany(args: unknown): Promise<UnresolvedAllocationBasisRefundRow[]>
   }
   setting?: {
     findUnique(args: unknown): Promise<{ value: string } | null>
@@ -671,27 +711,6 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     }
 
     for (const refund of order.refunds) {
-      // o3d-o97 r3 — THE REFUSAL AN OPERATOR HAS TO BE ABLE TO ACT ON. Raised BEFORE the
-      // posted-shipment guard below, deliberately: the commonest shape here is an ALLOCATED,
-      // never-shipped order, which has no posted shipment at all and would otherwise be skipped.
-      // Pounds are sitting in Allocated Inventory that no automatic path will ever take out —
-      // both daily-batch windows exclude a fully-refunded order — so this has to be a standing,
-      // human-visible finding rather than a comment in the code that wrote the refusal.
-      if (refund.allocationBasisUnresolved?.trim()) {
-        findings.push({
-          severity: 'critical',
-          code: 'sales_order_refund_allocation_basis_unresolved',
-          orderId: order.id,
-          refundId: refund.id,
-          message: `Refund ${refund.creditNoteNumber ?? refund.id} could not account for the order's allocated-inventory debit: ${refund.allocationBasisUnresolved.trim()}`,
-          details: {
-            allocationBasisUnresolved: refund.allocationBasisUnresolved,
-            inventoryAllocatedDate: order.inventoryAllocatedDate,
-            allocationBatchAmount: decimalToNumber(order.allocationBatchAmount),
-          },
-        })
-      }
-
       const refundRetryTypes = retrySyncTypes(refund.accountingRetrySyncs)
       // scjz.70/.71: a chargeback is exempt from the reversal-evidence requirement
       // ONLY when it staged no COGS/unearned reversal (fully-shipped, credit-note-only).
@@ -783,6 +802,39 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     }
   }
 
+  // o3d-o97 r4 — THE REFUSAL AN OPERATOR HAS TO BE ABLE TO ACT ON, FROM ITS OWN ROW SET.
+  //
+  // Emitted here rather than inside the per-order loop above, because that loop only ever sees the
+  // orders the main query returns — and that query excludes `refundStatus: 'FULL'` and
+  // `status: 'CANCELLED'` and is bounded by the retention window. A refusal is written almost
+  // exclusively on a FULL refund, so r3's version reported nothing an operator would ever be shown.
+  //
+  // Critical, and standing: the refund reversed less than the Allocated Inventory account holds (or
+  // nothing at all), both daily-batch windows exclude a fully-refunded order for ever, and no sweep
+  // will take the remainder out. It clears only when the refund's own note clears.
+  for (const refund of rows.unresolvedAllocationBasisRefunds) {
+    const note = refund.allocationBasisUnresolved?.trim()
+    if (!note) continue
+    const order = refund.order ?? null
+    const label = order?.orderNumber ?? order?.externalOrderNumber ?? refund.orderId
+    findings.push({
+      severity: 'critical',
+      code: 'sales_order_refund_allocation_basis_unresolved',
+      orderId: refund.orderId,
+      refundId: refund.id,
+      message: `Refund ${refund.creditNoteNumber ?? refund.id} on order ${label} could not account for the order's allocated-inventory debit: ${note}`,
+      details: {
+        orderNumber: label,
+        orderStatus: order?.status ?? null,
+        refundStatus: order?.refundStatus ?? null,
+        allocationBasisUnresolved: note,
+        allocatedReliefAmount: decimalToNumber(refund.allocatedReliefAmount ?? 0),
+        inventoryAllocatedDate: order?.inventoryAllocatedDate ?? null,
+        allocationBatchAmount: decimalToNumber(order?.allocationBatchAmount ?? 0),
+      },
+    })
+  }
+
   return findings
 }
 
@@ -835,7 +887,7 @@ export async function collectAccountingInvariantRows(
           { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
         ],
       }
-  const [salesOrders, postedShipments, syncLogs] = await Promise.all([
+  const [salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds] = await Promise.all([
     client.salesOrder.findMany({
       where: {
         status: { not: 'CANCELLED' },
@@ -889,7 +941,6 @@ export async function collectAccountingInvariantRows(
             accountingRetrySyncs: true,
             chargeback: true,
             reversalStaged: true,
-            allocationBasisUnresolved: true,
           },
         },
       },
@@ -935,9 +986,48 @@ export async function collectAccountingInvariantRows(
         syncedAt: true,
       },
     }),
+    // o3d-o97 r4 — THE REFUSALS, AND DELIBERATELY OUTSIDE EVERY FILTER ABOVE.
+    //
+    // No `refundStatus: { not: 'FULL' }`, no `status: { not: 'CANCELLED' }`, and no retention
+    // window. Each of those exclusions is right for the queries above and fatal here:
+    //
+    //   refundStatus  a refusal is recorded when it COST something, and it only costs something on
+    //                 a FULL refund — that is the last moment anything in IMS looks at the order's
+    //                 A2 posting, because Group A2 and Group B both exclude a fully-refunded order
+    //                 for ever. The one filter that made the report cheap also made it silent.
+    //   status        the same pounds are stranded whether or not the order later went CANCELLED.
+    //   window        an unrelieved debit does not expire. The other queries are windowed to avoid
+    //                 emitting false *_without_sync_evidence findings for batch logs they did not
+    //                 load; this one reads nothing but the refund row and its order, so it has no
+    //                 such dependency and no reason to forget.
+    //
+    // Bounded instead by the predicate itself: the column is NULL on every refund that could
+    // account for the debit, and `sales_order_refunds_allocation_basis_unresolved_idx` (migration
+    // 20260821090100) is the matching partial index, so this reads the outstanding refusals and
+    // nothing else. A row leaves the set when a retry resolves the basis and clears the note.
+    client.salesOrderRefund.findMany({
+      where: { allocationBasisUnresolved: { not: null } },
+      select: {
+        id: true,
+        orderId: true,
+        creditNoteNumber: true,
+        allocationBasisUnresolved: true,
+        allocatedReliefAmount: true,
+        order: {
+          select: {
+            orderNumber: true,
+            externalOrderNumber: true,
+            status: true,
+            refundStatus: true,
+            inventoryAllocatedDate: true,
+            allocationBatchAmount: true,
+          },
+        },
+      },
+    }),
   ])
 
-  return { salesOrders, postedShipments, syncLogs }
+  return { salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds }
 }
 
 export async function runAccountingInvariantReport(options: {

@@ -3564,6 +3564,30 @@ model Shipment {
   // A record that survives the crash and then expires is not evidence; retention deletes stock
   // movements and sync logs, it does not delete shipments.
   allocatedReliefAmount   Decimal?  @db.Decimal(18, 4) @map("accounting_allocated_relief_amount")
+  // o3d-o97 r4 — AND WHETHER THAT RELIEF WAS EVER RAISED, AND WHERE.
+  //
+  // r3 recorded the amount alone, which is the very inference it had just destroyed on the A2 side
+  // one field along: `allocatedReliefAmount` above is written for EVERY shipment the batch stamps,
+  // while the CR Allocated Inventory line only exists when the window's ROUNDED COGS total is
+  // positive — and even then the log is created PENDING, in a transaction that ends before the
+  // remote call, so it can finish CANCELLED with nothing credited anywhere.
+  //
+  // Reading a queued (or never-raised) figure as relief SHRINKS the open balance, so the refund
+  // reverses less than the account holds and a FULL refund — which closes both batch windows for
+  // ever — strands the difference permanently. These three make the amount resolvable:
+  //
+  //   syncLogId   the AccountingSyncLog row's own id, null unless that row was created AND
+  //               carried a CR Allocated Inventory line. Resolving it reads the row's STATUS,
+  //               so queued is never read as posted.
+  //   connector   which LEDGER the credit was raised into.
+  //   accountCode the exact Allocated Inventory account it credited.
+  //
+  // NULL together on shipments journaled before these columns existed, where
+  // `allocatedReliefAmount` is also null and the CogsEntry derivation (which refuses rather than
+  // degrades) still answers.
+  allocatedReliefSyncLogId   String? @map("accounting_allocated_relief_sync_log_id")
+  allocatedReliefConnector   String? @map("accounting_allocated_relief_connector")
+  allocatedReliefAccountCode String? @map("accounting_allocated_relief_account_code")
 
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt

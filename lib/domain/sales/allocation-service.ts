@@ -32,6 +32,7 @@ import {
   reconcilePendingShipments,
   type RetiredPendingShipment,
 } from '@/lib/domain/sales/pending-shipment-reconciliation'
+import { resolveStagedAllocationDebit } from '@/lib/domain/accounting/allocated-inventory-debit'
 import { cancelPendingSalesInvoiceSyncForOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { PermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 import {
@@ -391,7 +392,13 @@ export async function resetAllocationAccountingIfStaged(
 ): Promise<void> {
   const so = await tx.salesOrder.findUnique({
     where: { id: orderId },
-    select: { inventoryAllocatedDate: true },
+    select: {
+      inventoryAllocatedDate: true,
+      // o3d-o97 r4: read WITH the stamp, because whether the stamp may be cleared depends on
+      // whether the debit it stands for is still in a ledger.
+      allocationBatchAmount: true,
+      allocationBatchSyncLogId: true,
+    },
   })
   if (!so?.inventoryAllocatedDate) return
 
@@ -406,25 +413,65 @@ export async function resetAllocationAccountingIfStaged(
     )
   }
 
-  await tx.salesOrder.update({
-    where: { id: orderId },
-    data: {
-      // o3d-0qoo: the A2 batch ref goes with its stamp in the same update — see the note at the
-      // REFUNDED un-stage in refund-service.ts for why a ref without a stamp is worse than neither.
-      inventoryAllocatedDate: null,
-      inventoryAllocatedBatchRef: null,
-      allocationBatchAmount: null,
-      // o3d-o97 r3: the journal attribution goes with the amount it describes. Leaving a sync log
-      // id, connector and account code behind on an order that is no longer staged would leave
-      // them describing a posting the next A2 run has not made yet.
-      allocationBatchSyncLogId: null,
-      allocationBatchConnector: null,
-      allocationBatchAccountCode: null,
-    },
-  })
+  // o3d-o97 r4 — THE UN-STAGE IS NO LONGER A DELETION OF EVIDENCE.
+  //
+  // r3 nulled the stamp, the recorded amount and the journal attribution here unconditionally, and
+  // flagged this site itself. Two harms, and the second only follows from the first: the ONLY
+  // record of what A2 debited for this order goes (the refund's open-balance arithmetic, the
+  // batch-log recreate sweep and the hard-delete guard all read it), and with the stamp gone Group
+  // A2 — which selects on `inventoryAllocatedDate: null` — re-values the order at its new pins and
+  // raises a SECOND debit. Only the second one has a record, so a later refund's residue can only
+  // ever relieve that one and the first is stranded for ever, invisibly.
+  //
+  // Refusing was not an option: this function is on the allocation-edit, release AND ORDER
+  // CANCELLATION paths, and blocking those would be a far larger harm than the one being fixed.
+  // Keeping the record costs nothing instead — A2 will not re-post an order it can still see a
+  // stamp on, so no second debit is raised, and the amount stays where every reader already looks
+  // for it. What is cleared either way is the per-allocation pins, which the caller is replacing.
+  //
+  // NOT a reversal. Where the order is then cancelled outright the debit still stands unrelieved;
+  // that needs a reversal journal of its own, and keeping the record is what leaves that repair
+  // possible instead of impossible.
+  const stagedDebit = await resolveStagedAllocationDebit(tx, so)
+  if (stagedDebit.standing) {
+    await tx.activityLog.create({
+      data: {
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'allocation_accounting_stage_retained',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `Allocations changed on an order whose Group A2 posting still stands, so the A2 stamp and its `
+          + `recorded debit were KEPT rather than cleared: ${stagedDebit.reason}. Group A2 will not re-post `
+          + `this order, and the recorded debit remains available for a refund to reverse. The allocation `
+          + `pins behind it have been cleared and will not be re-valued.`,
+      },
+    })
+  } else {
+    await tx.salesOrder.update({
+      where: { id: orderId },
+      data: {
+        // o3d-0qoo: the A2 batch ref goes with its stamp in the same update — see the note at the
+        // REFUNDED un-stage in refund-service.ts for why a ref without a stamp is worse than neither.
+        inventoryAllocatedDate: null,
+        inventoryAllocatedBatchRef: null,
+        allocationBatchAmount: null,
+        // o3d-o97 r3: the journal attribution goes with the amount it describes. Leaving a sync log
+        // id, connector and account code behind on an order that is no longer staged would leave
+        // them describing a posting the next A2 run has not made yet.
+        allocationBatchSyncLogId: null,
+        allocationBatchConnector: null,
+        allocationBatchAccountCode: null,
+      },
+    })
+  }
   await tx.orderAllocation.updateMany({
     where: { orderId },
-    // o3d-o97 r3: and the per-row posted basis with the row's pinned layers.
+    // o3d-o97 r3: and the per-row posted basis with the row's pinned layers. Cleared on BOTH paths:
+    // the pins are being replaced either way, and a per-row basis left pointing at layers the row no
+    // longer holds is the revaluation defect in miniature. The ORDER-level record is the one that
+    // has to survive, and above it does.
     data: { costLayerSnapshot: Prisma.DbNull, allocationBatchAmount: null },
   })
 }

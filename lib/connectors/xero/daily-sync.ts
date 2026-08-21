@@ -1378,8 +1378,16 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       // shipmentJournalDate, which is written later and can land on the next UTC day.
       const referenceId = buildDailyBatchReferenceId('B', today, [...shipmentResults.keys()])
 
+      // o3d-o97 r4: null unless a journal row was created AND it carried a CR Allocated Inventory
+      // line. Both halves matter, and they are not the same guard: the log is skipped entirely when
+      // the window produced no lines at all, and — separately — a window whose ROUNDED COGS total is
+      // zero still raises a revenue-only journal that credits Allocated Inventory NOTHING, while
+      // `allocatedReliefAmount` below is stamped on every member shipment regardless. Stamping the
+      // id off `journalLines.length` alone would attribute a credit to a journal that does not
+      // contain one, which is the same amount-implies-a-posting inference in a new place.
+      let groupBSyncLogId: string | null = null
       if (journalLines.length > 0) {
-        await createPendingSyncLog(tx, {
+        const createdLogId = await createPendingSyncLog(tx, {
           type: 'DAILY_BATCH_GROUP_B',
           referenceId,
           currency: baseCurrency,
@@ -1396,6 +1404,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             _postingMode: 'submitted',
           },
         })
+        if (totalCogsNumber > 0) groupBSyncLogId = createdLogId
       }
 
       // Only mark shipments that were successfully processed. Failed
@@ -1429,6 +1438,13 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             // `cogsBatchAmount` on the line above carries the same number TODAY and a different
             // one after the next landed-cost correction rewrites it in place.
             allocatedReliefAmount: resultForShipment.cogs,
+            // o3d-o97 r4: and WHICH journal raised it, on WHICH ledger, against WHICH account —
+            // all null when no CR Allocated Inventory line was raised at all. The refund resolves
+            // the id back to the row to read its STATUS, so a Group B journal still queued, or one
+            // that ended CANCELLED, is never counted as relief the contra has already received.
+            allocatedReliefSyncLogId: groupBSyncLogId,
+            allocatedReliefConnector: groupBSyncLogId ? XERO_CONNECTOR : null,
+            allocatedReliefAccountCode: groupBSyncLogId ? settings.xero_allocated_inventory_account : null,
           },
         })
         // khdw: record this shipment's dispatch COGS in the COGS subledger ledger as
