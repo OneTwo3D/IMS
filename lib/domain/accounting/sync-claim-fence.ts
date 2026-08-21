@@ -1,6 +1,31 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 
 /**
+ * A CLAIM THIS WORKER IS HOLDING RIGHT NOW — the thing every fence below is built from (o3d-550x).
+ *
+ * Deliberately an OBJECT WITH AN ACCESSOR rather than a `Date`, and that is the whole of Codex r2
+ * medium 2. See {@link heldClaimWhere} for why a bare instant cannot express what the three branches
+ * that import this helper each mean by "the claim I hold".
+ *
+ * The method name is `heldFrom` because that is the name the renewing sibling (o3d-batch-small2 /
+ * o3d-xl63) already gives the accessor on its remote-write lease: that lease therefore SATISFIES this
+ * interface structurally, with no adapter and no second concept — it is passed where a fixed claim
+ * would be passed, and every fence below reads the instant it currently holds.
+ */
+export type HeldClaim = { heldFrom(): Date }
+
+/**
+ * The claim of a worker that never renews: one instant, taken when the row was claimed.
+ *
+ * For runners that take a claim at the top of a sweep and finish the entry inside it. It is a HOLDER
+ * rather than the raw `Date` so that the call sites below do not have to change when a renewing lease
+ * is introduced on the same row — the holder is swapped, not the six release sites.
+ */
+export function claimHeldFrom(instant: Date): HeldClaim {
+  return { heldFrom: () => instant }
+}
+
+/**
  * "I STILL OWN THIS ROW" — the where-fence every RELEASE of an AccountingSyncLog claim must carry
  * (o3d-550x).
  *
@@ -17,12 +42,34 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * Matching on the claim INSTANT rather than on `status: 'PROCESSING'` alone is the point: the
  * replacement's row is PROCESSING too. Only the worker that stamped that exact timestamp owns it.
  *
- * THE CLAIM INSTANT IS CAPTURED ONCE AND NEVER MOVED. Every caller stamps `claimedAt` at the moment
- * it takes the row and carries that same value to every release. A writer that RENEWED the claim by
- * moving `processingStartedAt` forward mid-work would invalidate every `claimedAt` its own callers
- * still hold, and because this fence fails closed the result is silent refusal of legitimate work
- * rather than a visible error. If a renewing lease is ever wanted it needs a separate token column,
- * not this one.
+ * THE CLAIM INSTANT IS READ AT THE POINT OF USE — NOT CARRIED DOWN FROM THE TOP OF A SWEEP LOOP
+ * (Codex r2, medium 2). Three branches import this one definition and they did NOT agree about what
+ * a claim instant is:
+ *
+ *   • o3d-batch-payidx, o3d-batch-invnum and this branch CAPTURE it once, when the row is claimed,
+ *     and never move it. For them the instant is a constant for the life of the entry.
+ *   • o3d-batch-small2 (o3d-xl63) RENEWS it: `renewClaimForRemoteWrite` writes a fresh
+ *     `processingStartedAt` before every remote mutation, so a long post cannot have its claim age
+ *     out from under it while the request is on the wire.
+ *
+ * Those two conventions are not merely different, they are INCOMPATIBLE IN THE SAME PROCESS, and the
+ * damage is silent. If a renewal moves the row to T1 and a release still fences on the captured T0,
+ * the predicate matches NOTHING — and because these fences fail closed, a release that matches
+ * nothing is not an error, it is a deferral that never happened, a backoff that never landed, a
+ * failure that never spent a retry. The row simply sits in PROCESSING until it goes stale.
+ *
+ * THE VERDICT, AND IT IS NOT SYMMETRICAL: renewal is the convention that must survive. It is doing
+ * something necessary — keeping a claim alive across a remote call whose duration nobody controls —
+ * while "capture once" is only an implementation convenience of runners that happen to be quick.
+ * So the fixed-instant branches are the ones that change, and this signature is how they change:
+ * a claim is asked for its instant AT THE MOMENT OF THE WRITE, and a runner that never renews
+ * expresses itself as {@link claimHeldFrom}, which answers the same instant every time.
+ *
+ * That is also why this takes `HeldClaim` and not `Date | HeldClaim`. Accepting a bare `Date` would
+ * let every existing sibling call site keep compiling and keep failing closed in silence. Rejecting
+ * it turns the merge hazard those branches recorded — "audit every consumer that carries a claim
+ * instant down from a sweep loop" — from a note somebody has to remember into a compile error at
+ * every one of those consumers.
  *
  * WHY IT LIVES HERE AND NOT IN A CONNECTOR. Two modules release these claims — the Xero sync
  * processor and the cancelled-order invoice retirement — and a second, hand-spelt copy of the
@@ -34,8 +81,8 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * untracked — evidence of a post must never be conditional on winning a race. That write is
  * protected differently, by its own precondition: the row must not already name a DIFFERENT document.
  */
-export function heldClaimWhere(entryId: string, claimedAt: Date) {
-  return { id: entryId, status: 'PROCESSING' as const, processingStartedAt: claimedAt }
+export function heldClaimWhere(entryId: string, claim: HeldClaim) {
+  return { id: entryId, status: 'PROCESSING' as const, processingStartedAt: claim.heldFrom() }
 }
 
 /**
@@ -62,11 +109,13 @@ export function heldClaimWhere(entryId: string, claimedAt: Date) {
 export async function releaseClaimForRetry(
   client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
   entryId: string,
-  claimedAt: Date,
+  claim: HeldClaim,
   release: { errorMessage: string; nextAttemptAt: Date },
 ): Promise<boolean> {
   const released = await client.accountingSyncLog.updateMany({
-    where: heldClaimWhere(entryId, claimedAt),
+    // The instant is read HERE, as the statement is built — so a claim that has been renewed since
+    // the entry was picked up releases the row it actually holds (Codex r2, medium 2).
+    where: heldClaimWhere(entryId, claim),
     data: {
       status: 'PENDING',
       errorMessage: release.errorMessage,

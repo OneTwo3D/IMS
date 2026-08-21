@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { claimHeldFrom, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 
 import {
   SalesInvoicePostingInFlightError,
@@ -230,7 +231,7 @@ mock.module('@/lib/db', {
 })
 
 type Guard = (
-  entryId: string, referenceType: string, referenceId: string, claimedAt: Date,
+  entryId: string, referenceType: string, referenceId: string, held: HeldClaim,
 ) => Promise<{ post: true; customerId?: string } | { post: false; result: { success: boolean; skipped?: boolean; error?: string } }>
 let guard: Guard | null = null
 async function guardCancelledSalesOrderInvoice(...args: Parameters<Guard>): ReturnType<Guard> {
@@ -242,6 +243,11 @@ async function guardCancelledSalesOrderInvoice(...args: Parameters<Guard>): Retu
 }
 
 const CLAIMED_AT = new Date('2026-04-01T11:58:00.000Z')
+// o3d-550x (Codex r2, medium 2): the guard is handed the CLAIM and asks it for the instant at the
+// write, so that a renewing lease releases the claim it actually holds. A bare Date no longer type-
+// checks — and this file's local `Guard` type is exactly the kind of hand-written signature that
+// would otherwise have kept compiling while the fence matched nothing.
+const HELD = claimHeldFrom(CLAIMED_AT)
 
 test.beforeEach(() => {
   guardState.orderStatus = 'PROCESSING'
@@ -251,7 +257,7 @@ test.beforeEach(() => {
 })
 
 test('o3d-7o0: the guard reads the sale UNDER the order row lock, inside one transaction', async () => {
-  const result = await guardCancelledSalesOrderInvoice('sync-1', 'SalesOrder', 'order-1', CLAIMED_AT)
+  const result = await guardCancelledSalesOrderInvoice('sync-1', 'SalesOrder', 'order-1', HELD)
 
   assert.equal(result.post, true)
   assert.equal(guardState.transactions, 1, 'one transaction, so the lock is still held at the decision')
@@ -269,7 +275,7 @@ test('o3d-7o0: the guard reads the sale UNDER the order row lock, inside one tra
 
 test('o3d-7o0: a cancelled order retires its claimed row in the SAME locked transaction', async () => {
   guardState.orderStatus = 'CANCELLED'
-  const result = await guardCancelledSalesOrderInvoice('sync-1', 'SalesOrder', 'order-1', CLAIMED_AT)
+  const result = await guardCancelledSalesOrderInvoice('sync-1', 'SalesOrder', 'order-1', HELD)
 
   assert.equal(result.post, false)
   assert.equal(result.post === false && result.result.skipped, true, 'nothing was posted, so this is a no-op skip')
@@ -293,7 +299,7 @@ test('o3d-7o0: an unreadable order still FAILS CLOSED — a lock timeout is not 
   const original = db.$transaction
   db.$transaction = async () => { throw new Error('lock timeout') }
   try {
-    const result = await guardCancelledSalesOrderInvoice('sync-1', 'SalesOrder', 'order-1', CLAIMED_AT)
+    const result = await guardCancelledSalesOrderInvoice('sync-1', 'SalesOrder', 'order-1', HELD)
     assert.equal(result.post, false)
     assert.equal(result.post === false && result.result.success, false)
     assert.match(String(result.post === false && result.result.error), /Could not read sales order order-1 status before posting/)
@@ -303,7 +309,7 @@ test('o3d-7o0: an unreadable order still FAILS CLOSED — a lock timeout is not 
 })
 
 test('o3d-7o0: a non-order reference takes no lock at all', async () => {
-  const result = await guardCancelledSalesOrderInvoice('sync-1', 'PurchaseOrder', 'po-1', CLAIMED_AT)
+  const result = await guardCancelledSalesOrderInvoice('sync-1', 'PurchaseOrder', 'po-1', HELD)
   assert.equal(result.post, true)
   assert.equal(guardState.transactions, 0)
   assert.deepEqual(guardState.statements, [])

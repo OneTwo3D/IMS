@@ -1,6 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
-import { heldClaimWhere } from './sync-claim-fence'
+import { heldClaimWhere, type HeldClaim } from './sync-claim-fence'
 
 /** SALES_INVOICE sync types that recognise revenue for a sales order. */
 const SALES_INVOICE_SYNC_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] as const
@@ -173,7 +173,7 @@ export async function retireSalesInvoiceForCancelledOrder(
   client: Prisma.TransactionClient,
   syncLogId: string,
   orderId: string,
-  claimedAt: Date,
+  held: HeldClaim,
 ): Promise<boolean> {
   const reason = 'Cancelled: order cancelled before this invoice posted (no revenue to recognise).'
   // Claim-fenced compare-and-swap: retire the row ONLY if it is still the exact PROCESSING claim THIS
@@ -188,7 +188,7 @@ export async function retireSalesInvoiceForCancelledOrder(
   // one is a RETRACTION — a displaced worker terminalising a row a live worker owns. The extra
   // `externalTransactionId: null` arm stays this call site's own, because it guards a different fact.
   const retired = await client.accountingSyncLog.updateMany({
-    where: { ...heldClaimWhere(syncLogId, claimedAt), externalTransactionId: null },
+    where: { ...heldClaimWhere(syncLogId, held), externalTransactionId: null },
     data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
   })
   if (retired.count === 0) return false

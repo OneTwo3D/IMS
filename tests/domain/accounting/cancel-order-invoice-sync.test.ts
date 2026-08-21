@@ -5,6 +5,7 @@ import {
   cancelPendingSalesInvoiceSyncForOrder,
   retireSalesInvoiceForCancelledOrder,
 } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
 
 type Call = { where?: unknown; data?: unknown }
 
@@ -141,7 +142,7 @@ test('retireSalesInvoiceForCancelledOrder claim-fences on PROCESSING and voids t
   }
 
   const claimedAt = new Date('2026-07-18T11:59:00.000Z')
-  const retired = await retireSalesInvoiceForCancelledOrder(tx as never, 'synclog-42', 'order-1', claimedAt)
+  const retired = await retireSalesInvoiceForCancelledOrder(tx as never, 'synclog-42', 'order-1', claimHeldFrom(claimedAt))
 
   assert.equal(retired, true)
   // Claim-fenced CAS: id + status=PROCESSING + this worker's exact processingStartedAt + no external id,
@@ -172,7 +173,7 @@ test('retireSalesInvoiceForCancelledOrder leaves a row (and its mirror) alone wh
     accountingEventLog: { createMany: async () => ({ count: 0 }) },
   }
 
-  const retired = await retireSalesInvoiceForCancelledOrder(tx as never, 'synclog-42', 'order-1', new Date('2026-07-18T11:59:00.000Z'))
+  const retired = await retireSalesInvoiceForCancelledOrder(tx as never, 'synclog-42', 'order-1', claimHeldFrom(new Date('2026-07-18T11:59:00.000Z')))
 
   assert.equal(retired, false)
   assert.equal(eventUpdateMany.length, 0)

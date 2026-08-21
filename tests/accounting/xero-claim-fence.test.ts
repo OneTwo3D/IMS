@@ -10,7 +10,7 @@ import {
   heldClaimWhere as heldClaimWhereFromConnector,
   recordPostedSyncResult,
 } from '@/lib/connectors/xero/sync-processor'
-import { heldClaimWhere, releaseClaimForRetry } from '@/lib/domain/accounting/sync-claim-fence'
+import { claimHeldFrom, heldClaimWhere, releaseClaimForRetry, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 
 // ---------------------------------------------------------------------------
@@ -140,11 +140,117 @@ const ENTRY = {
 
 test('o3d-550x: heldClaimWhere names the claim INSTANT, not merely that the row is claimed', () => {
   // The replacement's row is PROCESSING too, so `status: PROCESSING` alone identifies nothing.
-  assert.deepEqual(heldClaimWhere('log-1', T_DISPLACED_CLAIM), {
+  assert.deepEqual(heldClaimWhere('log-1', claimHeldFrom(T_DISPLACED_CLAIM)), {
     id: 'log-1',
     status: 'PROCESSING',
     processingStartedAt: T_DISPLACED_CLAIM,
   })
+})
+
+// ---------------------------------------------------------------------------
+// THE CLAIM-INSTANT CONVENTION (Codex r2, medium 2).
+//
+// Three branches import this one fence and they did not agree about what a claim instant is. This
+// branch, o3d-batch-payidx and o3d-batch-invnum CAPTURE it once when the row is claimed;
+// o3d-batch-small2 RENEWS it before every remote mutation so a long post cannot have its claim age out
+// mid-flight. A captured instant fenced against a renewed row matches NOTHING, and because the fence
+// fails closed the symptom is not an error — it is a deferral that never happens, a backoff that never
+// lands, a retirement that silently does not retire.
+//
+// The resolution is that a fence is handed the CLAIM and asks it for the instant AT THE WRITE. A
+// renewing lease and a fixed claim are then the same thing to every call site.
+// ---------------------------------------------------------------------------
+
+/** Stands in for the sibling's remote-write lease: one claim whose instant moves forward. */
+function renewableClaim(initial: Date): { claim: HeldClaim; renew: (at: Date) => void } {
+  let current = initial
+  return { claim: { heldFrom: () => current }, renew: (at: Date) => { current = at } }
+}
+
+const T_RENEWED_CLAIM = new Date('2026-03-01T09:40:00.000Z')
+
+test('Codex r2 medium 2: the fence reads the claim instant AT THE POINT OF USE, not when the entry was picked up', () => {
+  const lease = renewableClaim(T_REPLACEMENT_CLAIM)
+  assert.deepEqual(heldClaimWhere('log-1', lease.claim), {
+    id: 'log-1',
+    status: 'PROCESSING',
+    processingStartedAt: T_REPLACEMENT_CLAIM,
+  })
+
+  lease.renew(T_RENEWED_CLAIM)
+
+  assert.deepEqual(heldClaimWhere('log-1', lease.claim), {
+    id: 'log-1',
+    status: 'PROCESSING',
+    processingStartedAt: T_RENEWED_CLAIM,
+  }, 'a fence built after a renewal must name the renewed instant, or it fences on a claim nobody holds')
+})
+
+test('Codex r2 medium 2: a renewing claim still releases its own row — the fence does not refuse it', async () => {
+  // The failure this pins is SILENT. The row is the one this worker holds; it simply renewed the claim
+  // while it was working, exactly as o3d-batch-small2's lease does before each remote mutation.
+  const { tx, state } = makeRowStore({
+    id: 'log-1',
+    status: 'PROCESSING',
+    processingStartedAt: T_RENEWED_CLAIM,
+  })
+  const lease = renewableClaim(T_REPLACEMENT_CLAIM)
+  // The claim is USED before it is renewed — the runner fences something early in the entry (a
+  // deferral check, a guard) and only then does the lease move the instant forward. A fence that
+  // remembered the first answer would go on releasing against a claim instant the row no longer bears.
+  heldClaimWhere('log-1', lease.claim)
+  lease.renew(T_RENEWED_CLAIM)
+
+  const released = await releaseClaimForRetry(tx, 'log-1', lease.claim, {
+    errorMessage: 'Xero rate limit exceeded',
+    nextAttemptAt: T_BACKOFF,
+  })
+
+  assert.equal(released, true, 'the holder must be able to hand back the claim it actually holds')
+  assert.equal(state!.status, 'PENDING')
+  assert.equal(state!.processingStartedAt?.valueOf(), T_BACKOFF.valueOf())
+})
+
+test('Codex r2 medium 2: the SAME row, fenced on the instant carried down from the loop, refuses everything', async () => {
+  // The control that shows the two conventions are incompatible rather than merely different: identical
+  // row, identical worker, and the only difference is that the claim instant was captured at pick-up
+  // instead of read at the write. Nothing happens, nothing is reported, and the row sits in PROCESSING
+  // until it goes stale and somebody else takes it.
+  const { tx, state } = makeRowStore({
+    id: 'log-1',
+    status: 'PROCESSING',
+    processingStartedAt: T_RENEWED_CLAIM,
+  })
+
+  const released = await releaseClaimForRetry(tx, 'log-1', claimHeldFrom(T_REPLACEMENT_CLAIM), {
+    errorMessage: 'Xero rate limit exceeded',
+    nextAttemptAt: T_BACKOFF,
+  })
+
+  assert.equal(released, false)
+  assert.equal(state!.status, 'PROCESSING', 'the work is refused, and only the return value says so')
+})
+
+test('Codex r2 medium 2: no claim carrier in either runner, or in the retirement, is a bare instant', () => {
+  // The type makes a `Date` a compile error; this pins the shape the runners are expected to have, so a
+  // future edit cannot reintroduce "capture it at the top and carry it down" by widening the type back.
+  const src = stripComments(readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8'))
+  assert.equal(
+    (src.match(/const held = claimHeldFrom\(claimedAt\)/g) ?? []).length,
+    2,
+    'each runner builds ONE claim holder for the entry it is processing',
+  )
+  for (const call of ['releaseClaimForRetry(', 'applyMainSyncFailureRetry(', 'retireSalesInvoiceForCancelledOrder(']) {
+    let at = src.indexOf(call)
+    while (at !== -1) {
+      const args = callArgs(src, at + call.length - 1)
+      assert.ok(
+        !/\bclaimedAt\b/.test(args),
+        `${call} is being handed the raw instant — a renewing sibling would make that fence match nothing:\n${args.slice(0, 200)}`,
+      )
+      at = src.indexOf(call, at + 1)
+    }
+  }
 })
 
 test('o3d-550x: there is ONE definition of claim ownership, not one per consumer', () => {
@@ -159,9 +265,9 @@ test('Codex r1 medium 2: the cancellation retirement COMPOSES the fence, it does
   // which is exactly why it is dangerous. What must be true is that the predicate is not written out a
   // second time — so the source is read, with comments stripped so a commented example cannot satisfy it.
   const src = stripComments(readFileSync(join(process.cwd(), 'lib/domain/accounting/cancel-order-invoice-sync.ts'), 'utf8'))
-  assert.ok(src.includes('heldClaimWhere(syncLogId, claimedAt)'), 'the retirement must compose the shared fence')
+  assert.ok(src.includes('heldClaimWhere(syncLogId, held)'), 'the retirement must compose the shared fence')
   assert.ok(
-    !/processingStartedAt:\s*claimedAt/.test(src),
+    !/processingStartedAt:\s*(claimedAt|held\.heldFrom\(\))/.test(src),
     'and must not hand-spell the claim instant into a where clause of its own',
   )
 })
@@ -176,7 +282,7 @@ test('o3d-550x: a displaced owner cannot release the replacement\'s claim', asyn
     retryCount: 2,
   })
 
-  await applyMainSyncFailureRetry(tx, ENTRY, 'connection reset', {}, T_DISPLACED_CLAIM)
+  await applyMainSyncFailureRetry(tx, ENTRY, 'connection reset', {}, claimHeldFrom(T_DISPLACED_CLAIM))
 
   assert.equal(state!.status, 'PROCESSING', 'the replacement still holds the row')
   assert.equal(state!.processingStartedAt?.valueOf(), T_REPLACEMENT_CLAIM.valueOf())
@@ -194,7 +300,7 @@ test('o3d-550x: the worker that DOES hold the claim still records its failure', 
     retryCount: 2,
   })
 
-  const result = await applyMainSyncFailureRetry(tx, ENTRY, 'connection reset', {}, T_REPLACEMENT_CLAIM)
+  const result = await applyMainSyncFailureRetry(tx, ENTRY, 'connection reset', {}, claimHeldFrom(T_REPLACEMENT_CLAIM))
 
   assert.equal(state!.status, 'PENDING')
   assert.equal(state!.retryCount, 3)
@@ -217,7 +323,7 @@ test('o3d-550x: a rate-limit backoff by a DISPLACED owner releases nothing', asy
     processingStartedAt: T_REPLACEMENT_CLAIM,
   })
 
-  const released = await releaseClaimForRetry(tx, 'log-1', T_DISPLACED_CLAIM, {
+  const released = await releaseClaimForRetry(tx, 'log-1', claimHeldFrom(T_DISPLACED_CLAIM), {
     errorMessage: 'Xero rate limit exceeded',
     nextAttemptAt: T_BACKOFF,
   })
@@ -235,7 +341,7 @@ test('o3d-550x: the holder\'s backoff DOES land, with the future instant as the 
     processingStartedAt: T_REPLACEMENT_CLAIM,
   })
 
-  const released = await releaseClaimForRetry(tx, 'log-1', T_REPLACEMENT_CLAIM, {
+  const released = await releaseClaimForRetry(tx, 'log-1', claimHeldFrom(T_REPLACEMENT_CLAIM), {
     errorMessage: 'Xero rate limit exceeded',
     nextAttemptAt: T_BACKOFF,
   })
@@ -253,7 +359,7 @@ test('o3d-550x: the payment-ordering deferral is fenced — a displaced owner ca
     processingStartedAt: T_REPLACEMENT_CLAIM,
   })
 
-  const deferred = await deferPaymentUntilEarlierLogsPost(tx, { id: 'log-1' }, T_DISPLACED_CLAIM)
+  const deferred = await deferPaymentUntilEarlierLogsPost(tx, { id: 'log-1' }, claimHeldFrom(T_DISPLACED_CLAIM))
 
   assert.equal(deferred, false)
   assert.equal(state!.status, 'PROCESSING')
@@ -267,7 +373,7 @@ test('o3d-550x: the holder\'s payment-ordering deferral lands and says why', asy
     processingStartedAt: T_REPLACEMENT_CLAIM,
   })
 
-  const deferred = await deferPaymentUntilEarlierLogsPost(tx, { id: 'log-1' }, T_REPLACEMENT_CLAIM)
+  const deferred = await deferPaymentUntilEarlierLogsPost(tx, { id: 'log-1' }, claimHeldFrom(T_REPLACEMENT_CLAIM))
 
   assert.equal(deferred, true)
   assert.equal(state!.status, 'PENDING')
@@ -277,11 +383,11 @@ test('o3d-550x: the holder\'s payment-ordering deferral lands and says why', asy
 
 test('o3d-550x: the UPDATE-before-CREATE deferral is fenced too', async () => {
   const displaced = makeRowStore({ id: 'log-1', status: 'PROCESSING', processingStartedAt: T_REPLACEMENT_CLAIM })
-  assert.equal(await deferUpdateUntilCreatePosts(displaced.tx, { id: 'log-1' }, T_DISPLACED_CLAIM), false)
+  assert.equal(await deferUpdateUntilCreatePosts(displaced.tx, { id: 'log-1' }, claimHeldFrom(T_DISPLACED_CLAIM)), false)
   assert.equal(displaced.state!.status, 'PROCESSING')
 
   const holder = makeRowStore({ id: 'log-1', status: 'PROCESSING', processingStartedAt: T_REPLACEMENT_CLAIM })
-  assert.equal(await deferUpdateUntilCreatePosts(holder.tx, { id: 'log-1' }, T_REPLACEMENT_CLAIM), true)
+  assert.equal(await deferUpdateUntilCreatePosts(holder.tx, { id: 'log-1' }, claimHeldFrom(T_REPLACEMENT_CLAIM)), true)
   assert.equal(holder.state!.status, 'PENDING')
   assert.equal(holder.state!.errorMessage, 'Deferred until the invoice CREATE for this document posts')
 })
@@ -299,7 +405,7 @@ test('o3d-550x: a displaced owner cannot RETIRE a row a live worker now holds', 
     externalTransactionId: null,
   })
 
-  const retired = await retireSalesInvoiceForCancelledOrder(tx, 'log-1', 'order-1', T_DISPLACED_CLAIM)
+  const retired = await retireSalesInvoiceForCancelledOrder(tx, 'log-1', 'order-1', claimHeldFrom(T_DISPLACED_CLAIM))
 
   assert.equal(retired, false)
   assert.equal(state!.status, 'PROCESSING', 'a retraction by a worker that lost the row must do nothing')
@@ -312,7 +418,7 @@ test('o3d-550x: the claim holder DOES retire, and only while the row names no do
     processingStartedAt: T_REPLACEMENT_CLAIM,
     externalTransactionId: null,
   })
-  assert.equal(await retireSalesInvoiceForCancelledOrder(holder.tx, 'log-1', 'order-1', T_REPLACEMENT_CLAIM), true)
+  assert.equal(await retireSalesInvoiceForCancelledOrder(holder.tx, 'log-1', 'order-1', claimHeldFrom(T_REPLACEMENT_CLAIM)), true)
   assert.equal(holder.state!.status, 'CANCELLED')
 
   // The arm that is this call site's own, not part of the shared fence: a row that already posted must
@@ -323,7 +429,7 @@ test('o3d-550x: the claim holder DOES retire, and only while the row names no do
     processingStartedAt: T_REPLACEMENT_CLAIM,
     externalTransactionId: 'INV-XERO-1',
   })
-  assert.equal(await retireSalesInvoiceForCancelledOrder(posted.tx, 'log-1', 'order-1', T_REPLACEMENT_CLAIM), false)
+  assert.equal(await retireSalesInvoiceForCancelledOrder(posted.tx, 'log-1', 'order-1', claimHeldFrom(T_REPLACEMENT_CLAIM)), false)
   assert.equal(posted.state!.status, 'PROCESSING')
 })
 
@@ -573,12 +679,12 @@ test('o3d-550x: neither runner writes the sync row except to CLAIM it or through
       while (at !== -1) {
         const args = callArgs(block, at + call.length - 1)
         const isClaim = args.includes('accountingSyncLogClaimWhere(')
-        const isFenced = args.includes('heldClaimWhere(entry.id, claimedAt)')
+        const isFenced = args.includes('heldClaimWhere(entry.id, held)')
         if (isClaim) claimSites++
         assert.ok(
           isClaim || isFenced,
           `${name} runner: a direct ${call} whose where is neither the claim predicate nor `
-            + `heldClaimWhere(entry.id, claimedAt) — this is how an unfenced release gets back in:\n${args.slice(0, 300)}`,
+            + `heldClaimWhere(entry.id, held) — this is how an unfenced release gets back in:\n${args.slice(0, 300)}`,
         )
         assert.ok(
           !args.includes("status: 'SYNCED'"),
@@ -594,9 +700,17 @@ test('o3d-550x: neither runner writes the sync row except to CLAIM it or through
       block.includes('releaseClaimForRetry(') || block.includes('deferPaymentUntilEarlierLogsPost('),
       `the ${name} runner must release claims through the shared fenced release`,
     )
+    // ONE call path for the evidence, and it is the one that cannot hand an unwritable record to the
+    // ordinary retry (Codex r2, HIGH). A runner that opened its own transaction around
+    // recordPostedSyncResult would be back to throwing into `catch (e)` as though it were a sync error.
     assert.ok(
-      block.includes('recordPostedSyncResult(tx, {'),
-      `the ${name} runner must record a posted document through the unfenced evidence write`,
+      block.includes('recordPostedDocumentDurably(entry, '),
+      `the ${name} runner must record a posted document through recordPostedDocumentDurably`,
+    )
+    assert.ok(
+      !block.includes('recordPostedSyncResult('),
+      `the ${name} runner must not call the evidence write directly — that is how a caller ends up `
+        + 'owning the transaction, and an unwritable record then reads as an ordinary sync failure',
     )
   }
 })

@@ -1615,6 +1615,19 @@ A rarer variant of the same entry says the sync row **no longer exists** at all
 (`reason: ROW_MISSING`). The remedy there is to find the document in Xero by the id in the entry and
 either keep it, re-entering the reference by hand, or void it.
 
+**This entry is never deleted by activity-log retention.** Ordinary ERROR entries are purged after
+90 days (configurable under **Settings → Data retention**); `xero_posted_document_unrecorded` is
+exempt, because it is not a log of something that happened — it is the *only* place in IMS that the
+displaced document exists, and nothing can rebuild it. Expect these entries to accumulate until an
+operator has dealt with each one in Xero; they are meant to be read, not aged out.
+
+**If the entry itself could not be written** — a database problem at exactly the wrong moment — IMS
+does *not* quietly retry the sync. A retry would find the row already naming the other document,
+settle it and report success, and the id that could not be recorded would be lost for good. Instead
+the outbox job is closed as **permanently failed** and its error message carries the whole incident,
+both ids included, and the same text is written to the application log. Look for
+`[xero-sync] Xero … POSTED as …` there. The remedy is the same as above.
+
 ### Rows stranded on a connector you switched away from
 
 Because the sync log is scoped to the active connector, unresolved rows left behind on a connector that has since been turned off appear in **no** sync log. They are listed instead in the amber banner at the top of **Integrations**, which shows each row's connector, type, reference, status, age in days, and last error — plus the external transaction ID if the row already posted something before it stalled.
