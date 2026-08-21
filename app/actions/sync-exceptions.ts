@@ -36,6 +36,25 @@ import {
   buildDeadReceiptEventReplayWhere,
 } from '@/lib/domain/wms/exception-inbox'
 import { syncRefundsForOrder } from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { wcFetch } from '@/lib/connectors/woocommerce/api'
+import {
+  RECOVERABLE_REFUND_PARK_STATUSES,
+  buildRefundParkDismissData,
+  buildRefundParkReassignData,
+  describeRefundParkRecoverability,
+  describeRefundReadDisagreement,
+  normalizeRefundParkRecoveryAssertion,
+  refundParkRecoveryNote,
+  refuseDismiss,
+  refuseOnLookupFailure,
+  refuseReassign,
+  refuseUnstableRefundList,
+  type RefundParkRecoveryOutcome,
+  type RefundParkRecoveryRefusal,
+  type RefundParkRecoveryRefusalCode,
+  type RefundParkView,
+  type WcOrderRefundEvidence,
+} from '@/lib/domain/sales/refund-park-recovery'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
@@ -116,6 +135,14 @@ export type RefundSyncParkRow = {
   externalRefundId: string | null
   orderId: string | null
   orderNumber: string | null
+  /**
+   * o3d-54p: the WooCommerce order this park's IMS order is linked to, or null when it has no link.
+   * Shown because a cross-order park is only recognisable by comparing the refund against the order
+   * it claims to belong to — and because a park whose order has NO WooCommerce link cannot be
+   * dismissed (the dismissal is verified against that order's own refund list), so the control has
+   * to be able to say so before it is clicked rather than after.
+   */
+  wcOrderId: string | null
   errorMessage: string | null
   createdAt: string
 }
@@ -582,6 +609,15 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       })
     : []
   const refundOrderNumberById = new Map(refundOrders.map((order) => [order.id, order.orderNumber]))
+  // o3d-54p: which WooCommerce order each parked order is linked to. Read for the whole page in one
+  // query rather than per row.
+  const refundOrderLinks = refundOrderIds.length > 0
+    ? await db.shoppingOrderLink.findMany({
+        where: { connector: 'woocommerce', orderId: { in: refundOrderIds } },
+        select: { orderId: true, externalOrderId: true },
+      })
+    : []
+  const wcOrderIdByOrderId = new Map(refundOrderLinks.map((link) => [link.orderId, link.externalOrderId]))
 
   // The cohort's orders, for the operator to review before isolating (o3d-51du).
   // Read through the same eligibility predicate the isolate action writes
@@ -669,6 +705,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       externalRefundId: log.externalId,
       orderId: log.entityId,
       orderNumber: log.entityId ? refundOrderNumberById.get(log.entityId) ?? null : null,
+      wcOrderId: log.entityId ? wcOrderIdByOrderId.get(log.entityId) ?? null : null,
       errorMessage: log.errorMessage,
       createdAt: log.createdAt.toISOString(),
     })),
@@ -920,6 +957,494 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
     })
     revalidatePath('/sync/exceptions')
     return { success: true, synced: Boolean(refundLanded) }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * o3d-54p — OPERATOR RECOVERY for a STALE CROSS-ORDER refund park.
+ *
+ * WHY RETRY IS NOT ENOUGH, AND WHY THIS IS A SEPARATE ACTION.
+ *
+ * retryRefundSyncPark re-fetches the refunds of THE PARK'S OWN RECORDED ORDER. For a park sitting on
+ * the wrong order that fetch cannot contain the refund, so the retry can never resolve it — and it
+ * deliberately refuses to resolve the park with a refund belonging to another order. Meanwhile
+ * createSalesOrderRefund and syncWcRefund both fail CLOSED on the foreign park (o3d-ee9/o3d-7yf), so
+ * the TRUE owner's refund, credit note and restock are blocked; the park is retention-exempt; and
+ * both orders are undeletable. Nothing an operator could do changed any of it.
+ *
+ * WHAT THIS ASSERTS, AND WHAT VERIFIES IT. WooCommerce is the authority on which order a refund
+ * belongs to, so this action does not take the operator's word for the ownership fact — it takes
+ * their word for WHICH ORDER TO ASK ABOUT, asks WooCommerce FRESH, and refuses when the answer
+ * contradicts them. The decision (move it, or write it off) stays theirs and is recorded with their
+ * name on it; the ownership is evidence, not an assertion. The decision vocabulary — every refusal
+ * and every patch — lives in lib/domain/sales/refund-park-recovery.ts as pure functions.
+ *
+ * THE AUDIT. logActivity is best-effort (it swallows its own errors), which is why the recovery note
+ * is written onto the PARK ROW ITSELF in the same transaction as the status change: the fact that a
+ * human recovered this park, and what WooCommerce said when they did, survives a logging failure.
+ * o3d-batch-settle adds logActivityInTransaction for exactly this problem; when that lands, this
+ * activity write should move inside the transaction rather than being duplicated here.
+ */
+export type RecoverRefundSyncParkInput = { observedOrderId: string } & (
+  | { outcome: 'REASSIGN'; wcOrderId: number }
+  | { outcome: 'DISMISS'; reason?: string }
+)
+
+export type RecoverRefundSyncParkResult =
+  | { success: true; outcome: RefundParkRecoveryOutcome; targetOrderId: string | null }
+  | { success: false; error: string; code: RefundParkRecoveryRefusalCode }
+  | FreshAuthFailureResult
+
+/**
+ * EVERY refund WooCommerce lists on an order, or a REFUSAL — never a list that might be short.
+ *
+ * WHY THIS READ IS HELD TO A HIGHER STANDARD THAN THE SWEEP'S. `fetchAllWcRefundsForOrder` in the
+ * refund sweep may hand back a partial list with an error attached, because syncing nine of ten
+ * refunds is better than syncing none and the next sweep re-reads from the start. THIS read cannot
+ * do that. Its output is EVIDENCE, and specifically evidence of ABSENCE: "WooCommerce does not list
+ * refund N on this order" is the whole of what authorises a dismissal, and a dismissal writes off a
+ * refund whose money has already left the business. A list that merely FAILED TO INCLUDE something
+ * is indistinguishable from one that PROVES it is not there — so an answer that cannot be shown to
+ * be complete must refuse rather than resolve.
+ *
+ * WHAT "COMPLETE" MEANS HERE, and why `x-wp-totalpages` cannot supply it. `wcFetch` parses that
+ * header as `parseInt(header ?? '1')`, so a store that does not send it at all is INDISTINGUISHABLE
+ * from one reporting a single page — both arrive as `totalPages: 1`. Ending the walk on that number
+ * would take "the store said nothing" for "the store said there is no more", which is the exact
+ * shape of the defect this function exists to avoid, moved one layer out. So the header is never
+ * trusted to end the walk: completeness is established from the RESPONSE BODY.
+ *
+ * AND ONLY ONE THING IN A BODY PROVES AN ENDING: A PAGE WITH NOTHING ON IT.
+ *
+ * That is Codex round 3's first finding, and it is the third and last time this rule has had to be
+ * loosened. Round 1 ended the walk on "shorter than the hundred we asked for", which ended it on the
+ * first page of every store that caps `per_page` lower. Round 2 ended it on "shorter than the first
+ * page this store filled", which learns the size the server actually granted instead of assuming it.
+ * BUT A GRANTED SIZE IS NOT A PROMISE, AND NOTHING MAKES IT STABLE ACROSS REQUESTS. A proxy trims one
+ * response; a rate-limited security plugin sheds load mid-walk; a host lowers a filter between two
+ * calls. Page one comes back with a hundred, page two with forty, and "shorter than a page this same
+ * store filled" reads the forty as the end of the collection — a false complete, on the one code path
+ * whose output authorises writing a refund off.
+ *
+ * So an ending is no longer INFERRED from a length at all:
+ *
+ *   • AN EMPTY PAGE ENDS THE WALK. Whatever size the store served on any request before it, a page
+ *     with nothing on it lies past the end of the collection, so everything the collection holds has
+ *     already been banked. This is the ONLY unconditional proof of an ending available to a client.
+ *   • A NON-EMPTY PAGE — of ANY length, short or full — ADVANCES. A short page is exactly as
+ *     consistent with a trimmed response as with the last page of a collection, and the response
+ *     itself cannot tell them apart. Only the next request can.
+ *
+ * WHAT THAT COSTS, stated plainly because it is paid on every recovery: ONE EXTRA REQUEST for any
+ * order whose refunds do not happen to fill their last page. An order with no refunds still costs
+ * one request (the first page is the empty one); an order inside a single page costs two, exactly as
+ * it did before, because page one could never end the walk on its own length either. Only orders
+ * spanning several pages pay the difference, and they pay one request. That is the whole price of
+ * not guessing, and a refusal is recoverable in a way a dismissal is not.
+ *
+ * AND WHAT THE STORE SAYS IT HAS IS CHECKED AGAINST WHAT IT ACTUALLY SERVED. `x-wp-total` cannot END
+ * the walk — a store that omits it arrives as 0, and a header cannot prove a body — but a MISMATCH
+ * is proof of the opposite, and it is the one thing that catches a page trimmed BETWEEN two full
+ * ones, where no rule about lengths can help: the rows in the gap are simply never served, the walk
+ * terminates cleanly on a later empty page, and the list it returns is quietly missing the refund
+ * that would have contradicted the dismissal. So if the store ever states a total and fewer rows than
+ * that were banked, this refuses. The SMALLEST total stated across the walk is the one used, because
+ * a refund created while the walk is running raises the total on later pages and a list one row short
+ * of the newest claim is not evidence of anything.
+ *
+ * The `x-wp-totalpages` header is still read for the one thing it CAN do: fail fast and cheaply when
+ * the store says up front there is more here than this check will read.
+ *
+ * AND NONE OF THAT IS ABOUT THE COLLECTION — only about the pages cut out of it. That is Codex round
+ * 4's first finding, and the last thing a positional pager gets wrong. `?page=N&per_page=100` asks
+ * for "rows 100N to 100N+99 OF WHATEVER IS THERE WHEN YOU ASK", so a refund DELETED behind the cursor
+ * shifts every later row down one place and the row that was going to open the next page is served to
+ * nobody. Every page is full, the walk ends on an empty one, and the list is one row short.
+ *
+ * THE STATED-TOTAL GUARD CANNOT SEE THAT, and it is worth being exact about why, because it looks as
+ * though it should: the list still carries the id of the row that was DELETED — banked before the
+ * delete — so it is one id too long by precisely the amount it is one id too short. The count balances
+ * because two errors of one cancel. Deleting two rows cancels twice. No arithmetic over a single walk
+ * recovers the difference, and the walk terminates honestly the whole time.
+ *
+ * SO THE WALK NO LONGER CLAIMS COMPLETENESS BY ITSELF. It reports what it read and what the store
+ * said, and TWO further things decide whether that may be used as evidence of ABSENCE:
+ *
+ *   • A REPEATED ID INSIDE ONE WALK REFUSES, here. A stable collection cannot serve one row on two
+ *     pages — the offsets do not overlap — so a repeat is proof the collection moved. It is what a
+ *     CREATED refund looks like (newest first, so the new row takes offset 0 and pushes a row we have
+ *     read onto the next page). That direction loses nothing, but the trace it leaves is not wasted:
+ *     the same motion running the other way is the one that loses a row in silence.
+ *   • AND THE DISMISSAL PATH RUNS THE WHOLE WALK TWICE, requiring the two answers to agree — see
+ *     `readConfirmedWcOrderRefundIds`. The row a deletion hides is hidden BECAUSE another row was
+ *     deleted, and that row is still in the first list; the store cannot serve it again, so the second
+ *     read comes back without it and the lists differ.
+ *
+ * AND AN UNREADABLE ROW REFUSES TOO. An entry whose `id` is not a usable integer used to be dropped
+ * silently, which is the same error in miniature: a list with a row we cannot read cannot establish
+ * that a particular refund is missing from it.
+ */
+const WC_REFUND_PAGE_SIZE = 100
+const WC_REFUND_MAX_PAGES = 10
+
+/** Why a read could not produce a usable list. `moved` = WooCommerce answered, but the list shifted. */
+type WcRefundReadFailure = { error: string; moved?: boolean }
+
+async function readWcOrderRefundIds(
+  wcOrderId: number,
+): Promise<{ evidence: WcOrderRefundEvidence; statedTotal: number | null } | WcRefundReadFailure> {
+  const ids: number[] = []
+  // Every id banked so far, so a REPEATED one is caught. See the note above: a repeat is not a
+  // WooCommerce quirk, it is the signature of a collection that shifted under a positional read.
+  const seen = new Set<number>()
+  // The SMALLEST refund count the store stated anywhere in this walk, or null if it never stated one
+  // (a store that omits `x-wp-total` arrives here as 0, which is not a claim about anything).
+  let statedTotal: number | null = null
+  for (let page = 1; page <= WC_REFUND_MAX_PAGES; page += 1) {
+    const { data, totalPages: reported, totalItems, error } = await wcFetch(
+      `/orders/${wcOrderId}/refunds`,
+      { per_page: String(WC_REFUND_PAGE_SIZE), page: String(page) },
+    )
+    if (error) return { error }
+    if (!Array.isArray(data)) return { error: 'WooCommerce returned an unexpected response for this order\'s refunds.' }
+    // Cheap early refusal: the store itself says the collection is bigger than this walk. Checked
+    // BEFORE the page is banked so an oversized order costs one request rather than ten.
+    if (Number.isFinite(reported) && reported > WC_REFUND_MAX_PAGES) {
+      return { error: `that order reports ${reported} pages of refunds, more than this check will read` }
+    }
+    if (Number.isFinite(totalItems) && totalItems > 0) {
+      statedTotal = statedTotal === null ? totalItems : Math.min(statedTotal, totalItems)
+    }
+    for (const entry of data) {
+      const candidate = (entry as { id?: unknown }).id
+      if (typeof candidate !== 'number' || !Number.isSafeInteger(candidate)) {
+        return { error: 'WooCommerce listed a refund on that order with no readable id, so this check cannot say which refunds it holds' }
+      }
+      // THE SAME REFUND TWICE. A stable collection cannot serve one row on two pages: the offsets do
+      // not overlap. It happens when a refund is CREATED mid-walk — WooCommerce lists refunds newest
+      // first, so the new row takes offset 0 and pushes the row we have already read onto the next
+      // page. Nothing is lost in that direction, but the same shift running the other way (a DELETE)
+      // loses a row silently and leaves no trace at all, so the trace that DOES exist is not spent.
+      if (seen.has(candidate)) {
+        return {
+          moved: true,
+          error: `WooCommerce served refund ${candidate} twice, on different pages, so its refund list `
+            + 'moved between two requests of this read',
+        }
+      }
+      seen.add(candidate)
+      ids.push(candidate)
+    }
+    // THE ONLY PROOF OF AN ENDING. Checked first, so an order with no refunds at all still costs one
+    // request. A non-empty page — however short — falls through and asks for the next one.
+    if (data.length === 0) {
+      // The walk ended cleanly, which says nothing about whether every row was served on the way.
+      if (statedTotal !== null && ids.length < statedTotal) {
+        return {
+          error: `WooCommerce says that order has ${statedTotal} refunds but served only ${ids.length} of them, `
+            + 'so this check cannot say which refunds it holds',
+        }
+      }
+      return { evidence: { wcOrderId, refundIds: ids, fetchedAt: new Date() }, statedTotal }
+    }
+  }
+  // The list never ended. It is not known to be complete and must not be used to prove a refund
+  // absent. Counted from what was actually read rather than from pages × requested size — under a
+  // capped store those differ, and quoting the size we asked for would put a number in front of the
+  // operator that never existed.
+  return {
+    error: `this check read ${ids.length} refunds over ${WC_REFUND_MAX_PAGES} pages of that order without `
+      + 'reaching the end of the list, which is more than this check will read',
+  }
+}
+
+/**
+ * The read a DISMISSAL is made on: the same walk, run TWICE, with both answers required to agree.
+ *
+ * WHY A SECOND READ AND NOT A BETTER FIRST ONE. There is no better first one. Every property of a
+ * positional page has now been used — an empty page to end the walk, no length rule at all, and the
+ * store's own count against what it served — and a refund deleted behind the cursor defeats all of
+ * them at once, because the id it removes was already banked and pays for the row it hides. The
+ * arithmetic of a single walk simply cannot see it.
+ *
+ * WHAT THE SECOND READ ADDS. The row that goes missing goes missing BECAUSE some other row was
+ * deleted, and that deleted row is sitting in the first read's list. The store cannot serve it
+ * again, so the second read comes back without it and the two lists differ — refusing exactly the
+ * case that no single walk can detect. It also catches the ordinary version of the same hazard: an
+ * order being refunded WHILE an operator is deciding whether to write a refund off.
+ *
+ * WHAT IT COSTS. Twice the requests on the dismissal path — four for the ordinary order with a page
+ * or less of refunds, where it was two. Paid because a refusal is retryable and a dismissal is not.
+ *
+ * WHAT IT IS NOT. It is not a snapshot and does not claim to be one. Two agreeing reads say the
+ * collection was not changing across them, which is the strongest statement available to a client of
+ * a collection it can only address by position.
+ */
+async function readConfirmedWcOrderRefundIds(
+  wcOrderId: number,
+): Promise<{ evidence: WcOrderRefundEvidence } | WcRefundReadFailure> {
+  const first = await readWcOrderRefundIds(wcOrderId)
+  if ('error' in first) return first
+  const second = await readWcOrderRefundIds(wcOrderId)
+  if ('error' in second) return second
+  const disagreement = describeRefundReadDisagreement(
+    { refundIds: first.evidence.refundIds, statedTotal: first.statedTotal },
+    { refundIds: second.evidence.refundIds, statedTotal: second.statedTotal },
+  )
+  if (disagreement) return { moved: true, error: disagreement }
+  // The SECOND read's evidence: same ids by construction, and the later `fetchedAt` is the honest
+  // one to record — it is the moment the answer was last confirmed, not first guessed.
+  return { evidence: second.evidence }
+}
+
+/** A read failure as the refusal an operator sees: a store that could not answer, or one that moved. */
+function refuseOnRefundReadFailure(wcOrderId: number, failure: WcRefundReadFailure): RefundParkRecoveryRefusal {
+  return failure.moved
+    ? refuseUnstableRefundList(wcOrderId, failure.error)
+    : refuseOnLookupFailure(wcOrderId, failure.error)
+}
+
+export async function recoverRefundSyncPark(
+  id: string,
+  input: RecoverRefundSyncParkInput,
+): Promise<RecoverRefundSyncParkResult> {
+  try {
+    // Same guard as retryRefundSyncPark: `sync` is not held by READONLY or SUPPLIER, and a recovery
+    // that moves a refund between orders is at least as ledger-affecting as a retry, so it takes the
+    // FRESH variant too. A 'use server' export is a public HTTP endpoint; this is the only thing
+    // between an authenticated session and a write that reassigns refund evidence.
+    const session = await requireFreshPermission('sync')
+
+    const assertion = normalizeRefundParkRecoveryAssertion(input)
+    if (!assertion) {
+      return {
+        success: false,
+        code: 'unrecognised_outcome',
+        error: 'That recovery was not supplied correctly, so nothing was changed. Reload the exception '
+          + 'inbox and recover from what it shows.',
+      }
+    }
+    if (typeof input.observedOrderId !== 'string' || !input.observedOrderId) {
+      return {
+        success: false,
+        code: 'unrecognised_outcome',
+        error: 'The order this recovery was made about was not supplied, so nothing was changed. Reload '
+          + 'the exception inbox and recover from what it shows.',
+      }
+    }
+
+    const row = await db.shoppingSyncLog.findFirst({
+      where: { id, ...REFUND_PARK_WHERE },
+      select: { id: true, status: true, entityId: true, externalId: true },
+    })
+    const recoverability = describeRefundParkRecoverability(row ?? { status: 'SYNCED', entityId: null, externalId: null })
+    if (!row || !recoverability.recoverable) {
+      return {
+        success: false,
+        code: 'park_not_actionable',
+        error: row
+          ? recoverability.notRecoverableReason ?? 'This park cannot be recovered.'
+          : 'That refund park no longer exists or is already resolved, so nothing was changed. Reload the '
+            + 'exception inbox.',
+      }
+    }
+    // Non-null by describeRefundParkRecoverability, which refuses a park with no order or no refund id.
+    const parkedOrderId = row.entityId as string
+    const externalRefundId = Number(row.externalId)
+    if (!Number.isSafeInteger(externalRefundId) || externalRefundId <= 0) {
+      return {
+        success: false,
+        code: 'park_not_actionable',
+        error: `This park records "${row.externalId}" as its WooCommerce refund id, which is not a refund `
+          + 'id WooCommerce can be asked about. Nothing was changed.',
+      }
+    }
+    // The fence's first half, checked before WooCommerce is troubled: the operator judged a park
+    // sitting on a particular order, and a park that has since moved is a different question.
+    if (parkedOrderId !== input.observedOrderId) {
+      return {
+        success: false,
+        code: 'park_moved',
+        error: 'This park is no longer on the order it was shown against, so the recovery you asked for '
+          + 'was not made. Reload the exception inbox and look again.',
+      }
+    }
+
+    const park: RefundParkView = { id: row.id, status: row.status, entityId: parkedOrderId, externalId: row.externalId as string }
+
+    // The refund as IMS currently records it, wherever it landed. Read again INSIDE the transaction
+    // under the per-refund lock — this copy only lets a refusal be reported before WooCommerce is
+    // asked and before any lock is taken.
+    const landedBefore = await db.salesOrderRefund.findFirst({
+      where: { externalRefundId },
+      select: { orderId: true },
+    })
+
+    let refusal: RefundParkRecoveryRefusal | null = null
+    let evidence: WcOrderRefundEvidence
+    let targetOrderId: string | null = null
+
+    if (assertion.outcome === 'REASSIGN') {
+      // ONE walk, and the asymmetry is deliberate. A reassign is authorised by PRESENCE — WooCommerce
+      // lists this refund on the order the operator named — and an incomplete list cannot manufacture
+      // presence, only withhold it. The worst a short read does here is refuse a reassign that should
+      // have been allowed, which the operator retries. A DISMISS is authorised by ABSENCE, where a
+      // short list IS the wrong answer, so that path pays for a confirmed read and this one does not.
+      const lookup = await readWcOrderRefundIds(assertion.wcOrderId)
+      if ('error' in lookup) {
+        const refused = refuseOnRefundReadFailure(assertion.wcOrderId, lookup)
+        return { success: false, error: refused.message, code: refused.code }
+      }
+      evidence = lookup.evidence
+      const targetLink = await db.shoppingOrderLink.findFirst({
+        where: { connector: 'woocommerce', externalOrderId: String(assertion.wcOrderId) },
+        select: { orderId: true },
+      })
+      targetOrderId = targetLink?.orderId ?? null
+      refusal = refuseReassign({
+        park,
+        externalRefundId,
+        targetEvidence: evidence,
+        targetOrderId,
+        landedOnOrderId: landedBefore?.orderId ?? null,
+      })
+    } else {
+      const parkedLink = await db.shoppingOrderLink.findFirst({
+        where: { orderId: parkedOrderId, connector: 'woocommerce' },
+        select: { externalOrderId: true },
+      })
+      const parkedWcOrderId = parkedLink ? Number(parkedLink.externalOrderId) : NaN
+      let parkedEvidence: WcOrderRefundEvidence | null = null
+      if (parkedLink && Number.isSafeInteger(parkedWcOrderId) && parkedWcOrderId > 0) {
+        // TWICE, and both answers must agree. This list is about to be read as EVIDENCE OF ABSENCE and
+        // a dismissal writes a refund off, so it is the one place where "the collection may have moved
+        // under the pager" is not an acceptable residual risk.
+        const lookup = await readConfirmedWcOrderRefundIds(parkedWcOrderId)
+        if ('error' in lookup) {
+          const refused = refuseOnRefundReadFailure(parkedWcOrderId, lookup)
+          return { success: false, error: refused.message, code: refused.code }
+        }
+        parkedEvidence = lookup.evidence
+      }
+      refusal = refuseDismiss({
+        park,
+        externalRefundId,
+        parkedEvidence,
+        landedOnOrderId: landedBefore?.orderId ?? null,
+      })
+      // refuseDismiss returns parked_order_not_linked when there is no evidence, so past it the
+      // evidence is present.
+      evidence = parkedEvidence as WcOrderRefundEvidence
+    }
+    if (refusal) return { success: false, error: refusal.message, code: refusal.code }
+
+    const now = new Date()
+    const note = refundParkRecoveryNote(assertion, evidence, externalRefundId)
+
+    const applied = await db.$transaction(async (tx) => {
+      // o3d-ee9's key, and its ordering: the per-refund advisory lock FIRST, then any order row lock,
+      // matching createSalesOrderRefund and upsertRefundPark so none of the three can deadlock. Held
+      // to commit, so a refund create for this id either happens entirely before this recovery (and
+      // is seen by the re-read below) or entirely after it (and sees the recovered park).
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`wc_refund:${externalRefundId}`}))`
+
+      // Re-read under the lock. Between the WooCommerce fetch above and this transaction the refund
+      // may have landed — on this park's order (the park is then a leftover, not a foreign one) or on
+      // another. Both are refusals with their own remedy, not something to write through.
+      const landed = await tx.salesOrderRefund.findFirst({ where: { externalRefundId }, select: { orderId: true } })
+      const lateRefusal = assertion.outcome === 'REASSIGN'
+        ? refuseReassign({ park, externalRefundId, targetEvidence: evidence, targetOrderId, landedOnOrderId: landed?.orderId ?? null })
+        : refuseDismiss({ park, externalRefundId, parkedEvidence: evidence, landedOnOrderId: landed?.orderId ?? null })
+      if (lateRefusal) return { ok: false as const, refusal: lateRefusal }
+
+      if (assertion.outcome === 'REASSIGN') {
+        // The same FOR UPDATE re-verify upsertRefundPark does before writing a park, and for the same
+        // reason: deleteSalesOrder takes this lock, so without it the target order could be deleted
+        // between the link lookup and this write, leaving an orphaned park on a gone order that
+        // retryRefundSyncPark could never resolve.
+        const rows = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE id = ${targetOrderId as string} FOR UPDATE`
+        if (rows.length === 0) {
+          return {
+            ok: false as const,
+            refusal: {
+              code: 'target_order_missing' as const,
+              message: 'The order you named was deleted while this recovery was being made, so nothing was '
+                + 'changed — a park must never be written onto an order that no longer exists.',
+            },
+          }
+        }
+      }
+
+      // The fence's second half, and the only write. Conditioned on the park still being on the order
+      // the operator judged AND still actionable, so a concurrent resolve, retry or re-park is not
+      // overwritten by a conclusion formed about the row as it was.
+      const updated = await tx.shoppingSyncLog.updateMany({
+        where: {
+          id: park.id,
+          connector: 'woocommerce',
+          direction: 'FROM_CONNECTOR',
+          entityType: 'SalesOrder',
+          externalId: park.externalId,
+          entityId: park.entityId,
+          status: { in: [...RECOVERABLE_REFUND_PARK_STATUSES] },
+        },
+        data: assertion.outcome === 'REASSIGN'
+          ? buildRefundParkReassignData(targetOrderId as string, note, now)
+          : buildRefundParkDismissData(note, now),
+      })
+      if (updated.count !== 1) {
+        return {
+          ok: false as const,
+          refusal: {
+            code: 'park_moved' as const,
+            message: 'This park changed while the recovery was being made — it was resolved, retried or '
+              + 'moved by something else — so nothing was changed. Reload the exception inbox and look again.',
+          },
+        }
+      }
+      return { ok: true as const }
+    })
+
+    if (!applied.ok) return { success: false, error: applied.refusal.message, code: applied.refusal.code }
+
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: parkedOrderId,
+      tag: 'sync',
+      action: 'wc_refund_park_recovered',
+      // WARNING, not INFO: a human correcting an order association on a refund whose money has
+      // already left the business, on evidence the system could not act on by itself.
+      level: 'WARNING',
+      description: assertion.outcome === 'REASSIGN'
+        ? `Reassigned parked WooCommerce refund ${externalRefundId} from order ${parkedOrderId} to order `
+          + `${targetOrderId} after WooCommerce confirmed it on WC order ${evidence.wcOrderId}`
+        : `Dismissed the parked WooCommerce refund ${externalRefundId} on order ${parkedOrderId} after `
+          + `WooCommerce order ${evidence.wcOrderId} did not list it`,
+      metadata: {
+        shoppingSyncLogId: park.id,
+        externalRefundId,
+        outcome: assertion.outcome,
+        parkedOrderId,
+        targetOrderId,
+        // What was asked, and what came back — so the recovery can be re-judged later against the
+        // evidence it was actually made on rather than against WooCommerce as it is by then.
+        wcOrderId: evidence.wcOrderId,
+        wcRefundIds: [...evidence.refundIds],
+        wcFetchedAt: evidence.fetchedAt.toISOString(),
+        // How many complete walks the evidence had to survive. A dismissal is made on two that agreed;
+        // a reassign on one, because presence cannot be produced by a short list. Recorded so the
+        // recovery can be re-judged later on the standard of proof it was actually held to.
+        wcEvidenceReads: assertion.outcome === 'DISMISS' ? 2 : 1,
+        priorStatus: park.status,
+        userId: session.user.id,
+      },
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true, outcome: assertion.outcome, targetOrderId }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)
     if (freshAuthFailure) return freshAuthFailure

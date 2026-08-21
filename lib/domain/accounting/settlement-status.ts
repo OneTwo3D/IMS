@@ -20,6 +20,7 @@ import {
   OPERATOR_ASSERTION_SETTLEMENT_BASIS,
   isOperatorAssertedSettlement,
 } from '@/lib/domain/accounting/sync-row-settlement'
+import { hasPostEvidence, registrationLedgerStanding } from './payment-ledger-hold'
 
 /** The payment sync row for one invoice/bill, reduced to what the verdict depends on. */
 export type PaymentSyncRow = {
@@ -57,6 +58,11 @@ export type SettlementStatus =
   | 'NOT_APPLICABLE'
   /** NOT paid in IMS, yet the ledger holds a payment for it. The disagreement pointing the other way. */
   | 'LEDGER_UNMATCHED'
+  /**
+   * NOT paid in IMS, and a payment for it was ATTEMPTED with no record of what the ledger did. The
+   * state nobody can speak for: not "settled", not "nothing was sent", and emphatically not UNPAID.
+   */
+  | 'LEDGER_UNDECIDED'
   /** The ledger recorded MORE than IMS claims was received — it is over-paid there. */
   | 'OVER_SETTLED'
   /**
@@ -78,7 +84,11 @@ export type SettlementStatus =
  *   OPERATOR_ASSERTION a human said so. No call was made, no document was read, no figure was
  *                      compared — only an id was typed in. The amount in the row is what IMS
  *                      INTENDED to send, which is not evidence of what the ledger recorded.
- *   NONE               nothing was posted at all, so there is no post to have a basis.
+ *   NONE               no post is EVIDENCED, so there is no post to have a basis. That covers two
+ *                      different worlds and deliberately does not choose between them: nothing was
+ *                      sent, or something was ATTEMPTED and its outcome was never recorded
+ *                      (LEDGER_UNDECIDED). NONE is the absence of a basis, NOT the claim that
+ *                      nothing posted — the status is what distinguishes those.
  */
 export type SettlementEvidenceBasis = 'LEDGER_CONFIRMED' | 'OPERATOR_ASSERTION' | 'NONE'
 
@@ -114,22 +124,56 @@ export function settlementStatus(input: {
     // here. Returning a flat UNPAID without looking at the payment row hid exactly the case this exists
     // to surface, just mirrored (Codex, PR #582 round 1). A FAILED or CANCELLED row holds nothing in the
     // ledger, so it is genuinely unpaid on both sides.
+    //
+    // AND THE ROW IS CLASSIFIED BY THE SAME FUNCTION THE DELETE USES (Codex, PR #626 round 2). This
+    // test used to be a hand-written status list, and it read the third answer — an ATTEMPT nobody
+    // can speak for — as neither held nor anything else, which here means UNPAID with no discrepancy
+    // at all. So the exact row deletePayment refuses to touch, on the grounds that a payment may be
+    // standing in a real ledger with nothing local to match it, was displayed as a plainly unpaid
+    // order that needs no attention: one module refusing to act, the other saying there is nothing
+    // to act on. registrationLedgerStanding is now the only place that question is answered.
     const p = input.payment
-    const heldByLedger = p && (p.status === 'SYNCED' || p.status === 'PROCESSING' || p.status === 'PENDING')
-    const asserted = !!p && isOperatorAssertedSettlement(p.settlementBasis)
-    if (heldByLedger) {
-      return {
-        status: 'LEDGER_UNMATCHED',
-        discrepancy: true,
-        detail:
-          'This is NOT marked as paid in IMS, but a payment for it was sent to the ledger' +
-          (p.externalTransactionId ? ` (payment ${p.externalTransactionId})` : '') +
-          (asserted
-            ? '. That is an OPERATOR ASSERTION, not something the ledger confirmed — nobody has checked the '
-              + 'document or its amount. Verify it in the accounting system, then reverse the payment there or '
-              + 'restore the receipt here.'
-            : '. The ledger shows it settled while IMS does not — reverse the payment there, or restore it here.'),
-        basis: asserted ? 'OPERATOR_ASSERTION' : 'LEDGER_CONFIRMED',
+    if (p) {
+      // THREE ANSWERS, NOT TWO (this branch), EACH CARRYING ITS OWN BASIS (o3d-nf9i r3). The status
+      // comes from registrationLedgerStanding — the same classifier the delete refuses on, so the two
+      // cannot drift — and the basis comes from how the row reached that standing.
+      const standing = registrationLedgerStanding(p)
+      const asserted = isOperatorAssertedSettlement(p.settlementBasis)
+      if (standing === 'HELD') {
+        return {
+          status: 'LEDGER_UNMATCHED',
+          discrepancy: true,
+          detail:
+            'This is NOT marked as paid in IMS, but a payment for it was sent to the ledger' +
+            (p.externalTransactionId ? ` (payment ${p.externalTransactionId})` : '') +
+            (asserted
+              ? '. That is an OPERATOR ASSERTION, not something the ledger confirmed — nobody has checked the '
+                + 'document or its amount. Verify it in the accounting system, then reverse the payment there or '
+                + 'restore the receipt here.'
+              : '. The ledger shows it settled while IMS does not — reverse the payment there, or restore it here.'),
+          basis: asserted ? 'OPERATOR_ASSERTION' : 'LEDGER_CONFIRMED',
+        }
+      }
+      if (standing === 'UNDECIDED') {
+        return {
+          status: 'LEDGER_UNDECIDED',
+          discrepancy: true,
+          // WHAT THIS MUST NOT SAY, in either direction: not "the ledger holds a payment" (none is
+          // known to) and not "nothing was sent" (an attempt was made). The ledger is called BEFORE
+          // the result is written down, so a FAILED row with no payment reference is a failure
+          // recorded in front of a payment that may well exist.
+          detail:
+            'This is NOT marked as paid in IMS, and a payment for it was ATTEMPTED in the ledger but the ' +
+            'outcome was never recorded' +
+            (p.errorMessage ? ` (${p.errorMessage})` : '') +
+            '. The accounting system is called before the result is written down, so this is not proof ' +
+            'that nothing posted — open the invoice there and check whether a payment is on it before ' +
+            'recording or registering anything else against it.',
+          // NONE is the ABSENCE of a basis, which is exactly the finding: no post is evidenced. It is
+          // NOT the claim that nothing posted — the status is what carries that, and it deliberately
+          // does not make it.
+          basis: 'NONE',
+        }
       }
     }
     return { status: 'UNPAID', discrepancy: false, detail: 'Not marked as paid.', basis: 'NONE' }
@@ -265,12 +309,32 @@ export function settlementStatus(input: {
         basis: 'NONE',
       }
     case 'FAILED':
+      // POST EVIDENCE OUTRANKS STATUS ON THIS SIDE TOO. A FAILED row that NAMES a document is a
+      // failure written down in front of a payment that exists, and "the ledger still shows the
+      // amount outstanding" over one of those is how an operator is talked into registering a second
+      // payment — making the sentence true twice over. Both readings stay a discrepancy, because
+      // IMS's own record of the settlement is unresolved either way; only the instruction differs.
+      if (hasPostEvidence(p)) {
+        return {
+          status: 'LEDGER_REJECTED',
+          discrepancy: true,
+          detail:
+            `The payment sync failed AFTER the ledger returned payment ${p.externalTransactionId}, so that ` +
+            `payment may well be attached to the invoice there while IMS's record of it is unresolved. Check ` +
+            `it in the accounting system before registering another: ${p.errorMessage ?? 'no error recorded'}`,
+          // The post evidence is the document id. On a connector row the ledger handed it back; on an
+          // asserted row a human typed it, which is a weaker claim and must say so.
+          basis: assertedPost ? 'OPERATOR_ASSERTION' : 'LEDGER_CONFIRMED',
+        }
+      }
       return {
         status: 'LEDGER_REJECTED',
         discrepancy: true,
         detail:
           `The ledger REJECTED this payment, so it still shows the amount outstanding while IMS reports ` +
-          `it paid: ${p.errorMessage ?? 'no error recorded'}`,
+          `it paid: ${p.errorMessage ?? 'no error recorded'}. The attempt names no payment reference, and ` +
+          `the ledger is called before the result is written down — so confirm on the invoice there before ` +
+          `registering another payment.`,
         basis: 'NONE',
       }
     case 'CANCELLED':

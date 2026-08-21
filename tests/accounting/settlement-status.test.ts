@@ -56,6 +56,29 @@ test('a REJECTED payment is a discrepancy, and names the reason', () => {
   assert.match(v.detail, /still shows the amount outstanding/)
 })
 
+test('a rejection that NAMES a payment points at that payment, not at an outstanding balance', () => {
+  // The processor calls the ledger before it writes the result down, so a FAILED row carrying a
+  // document id is a failure recorded in front of a payment that exists. Telling an operator the
+  // ledger "still shows the amount outstanding" over one of those is how a second payment gets
+  // registered — making the sentence true twice over.
+  const v = settlementStatus({
+    ...base,
+    payment: row({ status: 'FAILED', externalTransactionId: 'PAY-9', errorMessage: 'socket hang up' }),
+  })
+  assert.equal(v.status, 'LEDGER_REJECTED')
+  assert.equal(v.discrepancy, true, 'IMS\'s own record is unresolved either way')
+  assert.match(v.detail, /PAY-9/)
+  assert.match(v.detail, /before registering another/)
+  assert.ok(!/still shows the amount outstanding/.test(v.detail), 'which is exactly what nobody knows here')
+})
+
+test('a rejection with no reference still warns that a failure is not proof', () => {
+  const v = settlementStatus({ ...base, payment: row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'rejected' }) })
+  assert.equal(v.status, 'LEDGER_REJECTED')
+  assert.match(v.detail, /names no payment reference/)
+  assert.match(v.detail, /called before the result is written down/)
+})
+
 test('a payment that was never queued is the QUIETEST failure, and still a discrepancy', () => {
   // addPayment records a manual sales receipt without queueing an INVOICE_PAYMENT at all, and
   // markBillPaid swallows a queue error. Either way there is no FAILED row to notice — the absence is
@@ -296,12 +319,55 @@ test('a payment still on its way also counts as the ledger holding it', () => {
   }
 })
 
-test('a rejected or cancelled payment leaves an unclaimed order genuinely unpaid', () => {
-  for (const status of ['FAILED', 'CANCELLED'] as const) {
-    const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status, externalTransactionId: null }) })
-    assert.equal(v.status, 'UNPAID', status)
-    assert.equal(v.discrepancy, false, status)
-  }
+test('a CANCELLED payment leaves an unclaimed order genuinely unpaid', () => {
+  // CANCELLED keeps its old reading, and the distinction from FAILED below is the entire point:
+  // CANCELLED is the one status IMS only ever writes where "nothing stands in the ledger" has
+  // ALREADY been established — a queued row retired before any call was made, or a registration
+  // retired after Xero was asked and answered DELETED. Nothing is unknown about it.
+  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'CANCELLED', externalTransactionId: null }) })
+  assert.equal(v.status, 'UNPAID')
+  assert.equal(v.discrepancy, false)
+})
+
+test('an ATTEMPT nobody can speak for is not "unpaid" — it is undecided, and it is a discrepancy', () => {
+  // THE ERASURE. This case used to return a flat, undiscrepant UNPAID: the verdict had two answers
+  // for the ledger — holds / does not hold — and a FAILED row naming no document satisfied neither,
+  // so it fell into "does not hold". deletePayment gained a third answer for exactly this row (it
+  // REFUSES to delete a receipt over it, because the ledger is called before the result is written
+  // down and a lost response is recorded as a failure in front of a real payment) while the verdict
+  // went on painting the same order as needing no attention. Two modules, opposite readings, and the
+  // one on screen was the permissive one.
+  const v = settlementStatus({
+    ...base,
+    paidLocally: false,
+    payment: row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'socket hang up' }),
+  })
+  assert.equal(v.status, 'LEDGER_UNDECIDED')
+  assert.equal(v.discrepancy, true, 'the alarm this branch exists to raise must be raised for it')
+  assert.match(v.detail, /ATTEMPTED/)
+  assert.match(v.detail, /socket hang up/)
+  // It must claim NEITHER of the two things nobody knows.
+  assert.ok(!/never told|never learn/.test(v.detail), 'it must not say nothing was sent')
+  assert.ok(!/shows it settled/.test(v.detail), 'nor that the ledger holds a payment')
+})
+
+test('a FAILED row that NAMES a document is a ledger hold even on the unpaid side', () => {
+  // Post evidence outranks status, which the hand-written status list on this side could not express:
+  // it read every FAILED row as holding nothing, so a payment that reached Xero and then failed its
+  // writeback showed as an ordinary unpaid order. That is the o3d-ju8t reading, and it was still here.
+  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'FAILED', externalTransactionId: 'PAY-9' }) })
+  assert.equal(v.status, 'LEDGER_UNMATCHED')
+  assert.equal(v.discrepancy, true)
+  assert.match(v.detail, /PAY-9/)
+})
+
+test('a CANCELLED row that still names the payment it reversed does NOT alarm for ever', () => {
+  // The one place post evidence is deliberately outranked. A verified reversal writes CANCELLED and
+  // KEEPS the document id, precisely so the row remains a complete account of a payment that existed
+  // and was undone — so reading that id as a live hold would turn the fix into a permanent alarm.
+  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'CANCELLED', externalTransactionId: 'PAY-9' }) })
+  assert.equal(v.status, 'UNPAID')
+  assert.equal(v.discrepancy, false)
 })
 
 test('an order with no payment at all is simply unpaid', () => {
