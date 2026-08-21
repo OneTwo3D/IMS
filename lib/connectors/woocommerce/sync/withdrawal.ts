@@ -992,11 +992,56 @@ export async function screenLocalWithdrawalEvidence(
  * despatched by the warehouse inside that window is still fulfilled: that residue is the price of
  * keeping WooCommerce out of the dispatch path, and it is stated here rather than left implied.
  *
+ * o3d-rbyg r4 (Codex r3 finding 3) — AND THE BOUND IS NOW ACTUALLY ENFORCED.
+ *
+ * Round 3 claimed that bound and did not have it. The rotation advanced `id > cursor` and wrapped to
+ * the front only when that query came back EMPTY — and link ids ascend, so every newly created link
+ * lands ahead of the cursor. On a shop that keeps taking orders the slice ahead never empties, the
+ * wrap never fires, and the links BEHIND the cursor — the long-lived ones: parked, dead-lettered,
+ * stuck awaiting a despatch that never comes, which are exactly the links a withdrawal is most
+ * likely to be filed against — are screened once and then never again. Not "screened late": never.
+ * A bound that new arrivals keep resetting is not a bound.
+ *
+ * So a rotation now has an END, fixed when it STARTS. The stored state is a pair — the id the
+ * rotation runs up to, and how far through it we are — and the slice is `cursor < id <= bound`.
+ * Links created after the rotation began sort above `bound` and simply belong to the NEXT rotation;
+ * they cannot extend this one. When the slice empties the rotation is complete: the cursor resets,
+ * a fresh bound is taken from the set as it stands now, and the front of the set is screened again
+ * in the same run. The worst case is therefore back to what round 3 wrote down — ceil(eligible at
+ * rotation start / limit) runs — and it no longer depends on the arrival rate.
+ *
  * The cursor is the link id, not a timestamp, and it is HELD when a chunk could not be read — an
  * unread slice must not be skipped for a whole rotation on the strength of an outage.
  */
 export const WDRAW_DISPATCH_RECON_CURSOR_KEY = 'wc_withdrawal_dispatch_recon_cursor'
 export const WDRAW_DISPATCH_RECON_LIMIT = 100
+
+/**
+ * The rotation's position AND its end, stored as one row so they cannot describe different
+ * rotations. A bare string is the round-3 format (a cursor with no bound): it is read as "a rotation
+ * whose end was never recorded", which starts a fresh one rather than inventing a bound for it.
+ */
+export type WdrawRotationState = { cursor: string; bound: string | null }
+
+export function parseWdrawRotationState(raw: string | null | undefined): WdrawRotationState {
+  const trimmed = typeof raw === 'string' ? raw.trim() : ''
+  if (!trimmed) return { cursor: '', bound: null }
+  if (!trimmed.startsWith('{')) return { cursor: trimmed, bound: null }
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>
+    const cursor = typeof parsed.c === 'string' ? parsed.c : ''
+    const bound = typeof parsed.b === 'string' && parsed.b ? parsed.b : null
+    return { cursor, bound }
+  } catch {
+    // Unreadable state starts a rotation rather than skipping one: re-screening is cheap, and a
+    // silently skipped rotation is the defect this whole change is about.
+    return { cursor: '', bound: null }
+  }
+}
+
+export function serialiseWdrawRotationState(state: WdrawRotationState): string {
+  return JSON.stringify({ c: state.cursor, b: state.bound ?? '' })
+}
 
 export async function sweepDispatchEligibleWithdrawals(limit = WDRAW_DISPATCH_RECON_LIMIT): Promise<{
   scanned: number
@@ -1032,23 +1077,55 @@ export async function sweepDispatchEligibleWithdrawals(limit = WDRAW_DISPATCH_RE
     where: { key: WDRAW_DISPATCH_RECON_CURSOR_KEY },
     select: { value: true },
   })
-  const cursor = cursorRow?.value ?? ''
+  let { cursor, bound } = parseWdrawRotationState(cursorRow?.value)
+
+  /** The highest eligible link id right now — the id a rotation starting here runs up to. */
+  const currentBound = async (): Promise<string | null> => {
+    const highest = await db.wmsOrderPushLink.findFirst({ where, orderBy: { id: 'desc' }, select: { id: true } })
+    return highest?.id ?? null
+  }
+
+  // A rotation with no recorded end (a fresh installation, or the round-3 cursor format) gets one
+  // fixed HERE, before any slice is read. Fixing it up front is the whole point: taken later it
+  // would move with every order the shop takes, which is the defect.
+  if (!bound) {
+    bound = await currentBound()
+    if (!bound) {
+      // Nothing is dispatch-eligible at all. Clear any stale state and stop.
+      if (cursorRow?.value) await saveDispatchReconCursor(serialiseWdrawRotationState({ cursor: '', bound: null }))
+      return result
+    }
+    cursor = ''
+  }
 
   let links = await db.wmsOrderPushLink.findMany({
-    where: { ...where, id: { gt: cursor } },
+    // `id <= bound` is what makes the rotation finite. Links created after it began sort ABOVE the
+    // bound and belong to the next rotation; without this clause they keep the slice non-empty
+    // forever and the tail behind the cursor is never screened again.
+    where: { ...where, id: { gt: cursor, lte: bound } },
     orderBy: { id: 'asc' },
     take,
     select,
   })
-  if (links.length === 0 && cursor) {
-    // End of the rotation — start again from the front. Links whose id sorts BEHIND the cursor are
-    // the ones this wrap exists for; without it the tail of the set would be screened once and
-    // never again.
+  if (links.length === 0) {
+    // The rotation is COMPLETE — not "there is nothing to do". Reset to the front, take a fresh
+    // bound from the set as it stands now, and screen the front of it in this same run.
     result.wrapped = true
-    links = await db.wmsOrderPushLink.findMany({ where, orderBy: { id: 'asc' }, take, select })
+    cursor = ''
+    bound = await currentBound()
+    if (!bound) {
+      if (cursorRow?.value) await saveDispatchReconCursor(serialiseWdrawRotationState({ cursor: '', bound: null }))
+      return result
+    }
+    links = await db.wmsOrderPushLink.findMany({
+      where: { ...where, id: { lte: bound } },
+      orderBy: { id: 'asc' },
+      take,
+      select,
+    })
   }
   if (links.length === 0) {
-    if (cursor) await saveDispatchReconCursor('')
+    await saveDispatchReconCursor(serialiseWdrawRotationState({ cursor: '', bound: null }))
     return result
   }
   result.scanned = links.length
@@ -1085,8 +1162,13 @@ export async function sweepDispatchEligibleWithdrawals(limit = WDRAW_DISPATCH_RE
   }
 
   // A slice we could not read is a slice nobody has looked at: hold the cursor and screen it again
-  // next run, rather than rotating past it and coming back in an hour.
-  if (unreadableChunks === 0) await saveDispatchReconCursor(links[links.length - 1].id)
+  // next run, rather than rotating past it and coming back in an hour. The BOUND is written with it
+  // either way, so an outage cannot leave the position and the rotation it belongs to disagreeing.
+  if (unreadableChunks === 0) {
+    await saveDispatchReconCursor(serialiseWdrawRotationState({ cursor: links[links.length - 1].id, bound }))
+  } else if (cursorRow?.value !== serialiseWdrawRotationState({ cursor, bound })) {
+    await saveDispatchReconCursor(serialiseWdrawRotationState({ cursor, bound }))
+  }
   return result
 }
 

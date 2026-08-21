@@ -23,10 +23,12 @@ const state = {
   wmsStatus: null as Row | null,
   /** What reconcileOneOrder reports. */
   reconcile: { action: 'dispatched', reason: 'DESPATCHED' } as { action: string; reason: string },
-  reconcileCalls: [] as string[],
+  reconcileCalls: [] as Array<{ orderId: string; expectedExternalOrderId?: string; mergeNumberUnique?: boolean }>,
+  /** Claimant counts by WMS order number, as the connector reports them. */
+  claimants: null as Map<string, number> | null,
   /** Orders with a standing withdrawal, as the sweep's own local screen reads it. */
   standing: new Set<string>(),
-  releases: [] as Array<{ orderId: string; note?: string }>,
+  releases: [] as Array<{ orderId: string; generation: number; note?: string }>,
   releaseResult: { success: true } as { success: boolean; error?: string },
   activity: [] as Row[],
   lockHeld: true,
@@ -39,6 +41,7 @@ function reset() {
   state.wmsStatus = { externalOrderId: 'M-1', externalOrderNumber: 'WMS-1', status: 'DESPATCHED', dispatched: true, isSplit: false }
   state.reconcile = { action: 'dispatched', reason: 'DESPATCHED' }
   state.reconcileCalls = []
+  state.claimants = null
   state.standing = new Set<string>(['so-1'])
   state.releases = []
   state.releaseResult = { success: true }
@@ -72,9 +75,21 @@ mock.module('@/lib/domain/wms/dispatch-sweep-lock', {
 })
 mock.module('@/lib/domain/wms/dispatch-sweep', {
   namedExports: {
-    createPrismaDispatchDeps: () => ({ fetchOrderStatus: async () => state.wmsStatus }),
-    reconcileOneOrder: async (_deps: unknown, candidate: { orderId: string }) => {
-      state.reconcileCalls.push(candidate.orderId)
+    createPrismaDispatchDeps: () => ({
+      fetchOrderStatus: async () => state.wmsStatus,
+      // Present only when the test arranges one, so "the connector cannot count claimants" stays a
+      // distinguishable case from "it counted and found one".
+      ...(state.claimants ? { countLinksByOrderNumber: async () => state.claimants } : {}),
+    }),
+    reconcileOneOrder: async (
+      _deps: unknown,
+      candidate: { orderId: string },
+      _preloaded: unknown,
+      expectedExternalOrderId?: string,
+      _requireResolution?: boolean,
+      mergeNumberUnique?: boolean,
+    ) => {
+      state.reconcileCalls.push({ orderId: candidate.orderId, expectedExternalOrderId, mergeNumberUnique })
       return state.reconcile
     },
     dispatchCandidateWhere: (connector: string) => ({ connector }),
@@ -88,8 +103,8 @@ mock.module('@/lib/connectors/woocommerce/sync/withdrawal', {
 })
 mock.module('@/app/actions/sales', {
   namedExports: {
-    releaseWithdrawalHold: async (orderId: string, note?: string) => {
-      state.releases.push({ orderId, note })
+    releaseWithdrawalHold: async (orderId: string, expected: { generation: number }, note?: string) => {
+      state.releases.push({ orderId, generation: expected.generation, note })
       return state.releaseResult
     },
   },
@@ -122,7 +137,11 @@ function parkedLink(overrides: Row = {}) {
     externalOrderNumber: 'WMS-1',
     dispatchDeadLetteredAt: new Date('2026-08-19T10:00:00.000Z'),
     dispatchUnresolvedAt: null,
-    order: { status: 'ON_HOLD', orderNumber: 'SO-1', withdrawalHoldAt: new Date('2026-08-19T09:00:00.000Z'), withdrawalApprovedAt: null },
+    order: {
+      status: 'ON_HOLD', orderNumber: 'SO-1',
+      withdrawalHoldAt: new Date('2026-08-19T09:00:00.000Z'), withdrawalApprovedAt: null,
+      withdrawalHoldGeneration: 3,
+    },
     ...overrides,
   }
 }
@@ -137,7 +156,11 @@ test('remedy: recording the despatch releases the hold, dispatches, and clears t
   assert.equal(result.success, true)
   assert.deepEqual(state.releases.map((entry) => entry.orderId), ['so-1'], 'the hold is RELEASED, not bypassed')
   assert.match(String(state.releases[0].note), /already despatched/, 'and the release says why, on the order timeline')
-  assert.deepEqual(state.reconcileCalls, ['so-1'], 'the fulfilment is the sweep’s own per-order path, not a private copy')
+  assert.deepEqual(
+    state.reconcileCalls.map((call) => call.orderId),
+    ['so-1'],
+    'the fulfilment is the sweep’s own per-order path, not a private copy',
+  )
   assert.equal(state.linkUpdates[0]?.dispatchDeadLetteredAt, null, 'and the row leaves the inbox')
   assert.equal(state.activity[0]?.action, 'wms_dispatch_withdrawn_despatch_recorded')
 })
@@ -181,7 +204,7 @@ test('remedy: an APPROVED withdrawal is refused HERE and told where to go instea
   // finding is about.
   reset()
   state.link = parkedLink({
-    order: { status: 'CANCELLED', orderNumber: 'SO-1', withdrawalHoldAt: null, withdrawalApprovedAt: new Date('2026-08-19T09:30:00.000Z') },
+    order: { status: 'CANCELLED', orderNumber: 'SO-1', withdrawalHoldAt: null, withdrawalApprovedAt: new Date('2026-08-19T09:30:00.000Z'), withdrawalHoldGeneration: 4 },
   })
   const { recordWithdrawnDespatch } = await actions()
 
@@ -241,7 +264,7 @@ test('remedy: Dismiss clears the row only for a CANCELLED order (o3d-rbyg r2)', 
   // which is the loop this finding is about.
   reset()
   state.link = parkedLink({
-    order: { status: 'CANCELLED', orderNumber: 'SO-1', withdrawalHoldAt: null, withdrawalApprovedAt: new Date('2026-08-19T09:30:00.000Z') },
+    order: { status: 'CANCELLED', orderNumber: 'SO-1', withdrawalHoldAt: null, withdrawalApprovedAt: new Date('2026-08-19T09:30:00.000Z'), withdrawalHoldGeneration: 4 },
   })
   const { dismissWithdrawnDispatch } = await actions()
 
@@ -264,4 +287,176 @@ test('remedy: Dismiss refuses on a LIVE order, and says what to do instead (o3d-
   assert.match(result.success ? '' : String(result.error), /only applies to a CANCELLED order/)
   assert.match(result.success ? '' : String(result.error), /Record the despatch/)
   assert.deepEqual(state.linkUpdates, [], 'nothing was cleared')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-rbyg r4 (Codex r3 findings 1 and 2) — WHAT THE REMEDY WAS STILL TAKING ON TRUST.
+//
+// Round 3 got the SHAPE right: ask the warehouse first, and release the hold THROUGH its generation
+// guard rather than around it. Two things were still unbound.
+//
+//   • The generation guard was satisfied by a value `releaseWithdrawalHold` fetched for itself, so
+//     it closed the window between that read and that write and no other — not the window that
+//     matters, which spans the operator's decision and a warehouse round trip.
+//   • The warehouse answer was never bound to THIS link's WMS order. `fetchOrderStatus` takes an
+//     order NUMBER, and a number is a lookup key rather than an identity: renameable, reusable, and
+//     answered under a combined number by a merge survivor.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-rbyg r4: the release is guarded on the withdrawal generation READ UNDER THE SWEEP LOCK', async () => {
+  reset()
+  state.link = parkedLink()
+  const { recordWithdrawnDespatch } = await actions()
+
+  const result = await recordWithdrawnDespatch('so-1')
+
+  assert.equal(result.success, true)
+  assert.deepEqual(
+    state.releases,
+    [{
+      orderId: 'so-1',
+      generation: 3,
+      note: state.releases[0]?.note,
+    }],
+    'the request the action decided about is named to the release, so a NEWER one filed during the '
+      + 'warehouse round trip cannot be cleared by a decision taken before it existed',
+  )
+})
+
+test('o3d-rbyg r4: a WMS record with a different stable ID is refused, and nothing is released or dispatched', async () => {
+  // A reused or renamed order number. Round 3 read `dispatched` straight off this record.
+  reset()
+  state.link = parkedLink()
+  state.wmsStatus = {
+    externalOrderId: 'M-999', externalOrderNumber: 'WMS-1', status: 'DESPATCHED',
+    dispatched: true, isSplit: false, isMerged: false, mergedOrderNumbers: [],
+  }
+  const { recordWithdrawnDespatch } = await actions()
+
+  const result = await recordWithdrawnDespatch('so-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /not this link's order/)
+  assert.match(result.success ? '' : String(result.error), /stable ID M-999; expected M-1/, 'the refusal says what came back and what was expected')
+  assert.deepEqual(state.releases, [], 'the customer’s hold is NOT released on someone else’s despatch')
+  assert.deepEqual(state.reconcileCalls, [], 'and no stock is consumed and no despatch email is sent')
+  assert.deepEqual(state.linkUpdates, [], 'the link stays parked')
+})
+
+test('o3d-rbyg r4: a merge survivor that does NOT name our number is refused rather than assumed', async () => {
+  reset()
+  state.link = parkedLink()
+  state.wmsStatus = {
+    externalOrderId: 'M-SURV', externalOrderNumber: 'WMS-7+WMS-8', status: 'DESPATCHED',
+    dispatched: true, isSplit: false, isMerged: true, mergedOrderNumbers: ['WMS-7', 'WMS-8'],
+  }
+  const { recordWithdrawnDespatch } = await actions()
+
+  const result = await recordWithdrawnDespatch('so-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /stable ID M-SURV; expected M-1/)
+  assert.deepEqual(state.reconcileCalls, [])
+})
+
+test('o3d-rbyg r4: a merge survivor that DOES name our number, uniquely, is accepted', async () => {
+  // The one legitimate stable-ID change. Bound by the survivor naming our number AND exactly one
+  // link claiming it — a shared number cannot say which order was absorbed.
+  reset()
+  state.link = parkedLink()
+  state.claimants = new Map([['WMS-1', 1]])
+  state.wmsStatus = {
+    externalOrderId: 'M-SURV', externalOrderNumber: 'WMS-1+WMS-2', status: 'DESPATCHED',
+    dispatched: true, isSplit: false, isMerged: true, mergedOrderNumbers: ['WMS-1', 'WMS-2'],
+  }
+  const { recordWithdrawnDespatch } = await actions()
+
+  const result = await recordWithdrawnDespatch('so-1')
+
+  assert.equal(result.success, true, result.success ? '' : String(result.error))
+  assert.deepEqual(state.reconcileCalls.map((call) => call.orderId), ['so-1'])
+})
+
+test('o3d-rbyg r4: a merge claim on a number SEVERAL links share is refused', async () => {
+  reset()
+  state.link = parkedLink()
+  state.claimants = new Map([['WMS-1', 2]])
+  state.wmsStatus = {
+    externalOrderId: 'M-SURV', externalOrderNumber: 'WMS-1+WMS-2', status: 'DESPATCHED',
+    dispatched: true, isSplit: false, isMerged: true, mergedOrderNumbers: ['WMS-1', 'WMS-2'],
+  }
+  const { recordWithdrawnDespatch } = await actions()
+
+  const result = await recordWithdrawnDespatch('so-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /not this link's order/)
+  assert.deepEqual(state.reconcileCalls, [], 'nobody can say WHICH order was absorbed, so nothing is dispatched')
+})
+
+test('o3d-rbyg r4: the identity the action checked is HANDED ON to the dispatch, not dropped', async () => {
+  // The confirmation and the fulfilment are two separate reads of the same order. Passing neither
+  // the stable id nor the claimant count — which is what this call did — disabled the sweep's own
+  // identity guard on the one path a person had just authorised.
+  reset()
+  state.link = parkedLink()
+  state.claimants = new Map([['WMS-1', 1]])
+  const { recordWithdrawnDespatch } = await actions()
+
+  await recordWithdrawnDespatch('so-1')
+
+  assert.deepEqual(
+    state.reconcileCalls,
+    [{ orderId: 'so-1', expectedExternalOrderId: 'M-1', mergeNumberUnique: true }],
+  )
+})
+
+test('o3d-rbyg r4: a refused release stops the remedy before anything is dispatched', async () => {
+  // The generation guard firing is not advisory. If the release refuses — a newer request — the
+  // action must stop, not fall through to the fulfilment.
+  reset()
+  state.link = parkedLink()
+  state.releaseResult = { success: false, error: 'A NEWER withdrawal request has been filed against this order' }
+  const { recordWithdrawnDespatch } = await actions()
+
+  const result = await recordWithdrawnDespatch('so-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /NEWER withdrawal request/)
+  assert.deepEqual(state.reconcileCalls, [], 'no stock consumed, no despatch email')
+  assert.deepEqual(state.linkUpdates, [], 'and the link stays parked, so the row is still actionable')
+})
+
+test('o3d-rbyg r4: with no stable id on the link, the answer must at least come back under the same number', async () => {
+  // A link that never recorded a WMS id has nothing else to bind on. The record came from a
+  // BY-NUMBER lookup here, so an answer under a different number is answering about something else.
+  reset()
+  state.link = parkedLink({ externalOrderId: null })
+  state.wmsStatus = {
+    externalOrderId: 'M-77', externalOrderNumber: 'WMS-OTHER', status: 'DESPATCHED',
+    dispatched: true, isSplit: false, isMerged: false, mergedOrderNumbers: [],
+  }
+  const { recordWithdrawnDespatch } = await actions()
+
+  const result = await recordWithdrawnDespatch('so-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /answered as WMS-OTHER/)
+  assert.deepEqual(state.releases, [])
+  assert.deepEqual(state.reconcileCalls, [])
+})
+
+test('o3d-rbyg r4: the same-number answer on a link with no stable id is accepted', async () => {
+  // Control: the check must not become a way for the remedy to stop working.
+  reset()
+  state.link = parkedLink({ externalOrderId: null })
+  state.wmsStatus = {
+    externalOrderId: 'M-77', externalOrderNumber: 'WMS-1', status: 'DESPATCHED',
+    dispatched: true, isSplit: false, isMerged: false, mergedOrderNumbers: [],
+  }
+  const { recordWithdrawnDespatch } = await actions()
+
+  const result = await recordWithdrawnDespatch('so-1')
+
+  assert.equal(result.success, true, result.success ? '' : String(result.error))
 })

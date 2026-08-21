@@ -22,6 +22,8 @@ const state = {
   cursorWrites: [] as string[],
   links: [] as Array<{ id: string; orderId: string }>,
   linkWheres: [] as Row[],
+  /** The link ids each slice actually returned — how often a given link is screened. */
+  screenedSlices: [] as string[][],
   /** WooCommerce order id per sales order id. */
   external: {} as Record<string, string>,
   /** Live storefront status per WooCommerce order id, as the BATCH screen sees it. */
@@ -46,6 +48,7 @@ function reset() {
   state.cursorWrites = []
   state.links = []
   state.linkWheres = []
+  state.screenedSlices = []
   state.external = {}
   state.liveStatus = {}
   state.liveStatusOnReread = {}
@@ -122,12 +125,24 @@ mock.module('@/lib/db', {
         },
       },
       wmsOrderPushLink: {
+        // The `where` is APPLIED, both halves. `gt` is the rotation's position and `lte` is its END,
+        // and a double that ignored `lte` could not observe the starvation this round is about — it
+        // would pass whether or not the bound exists.
         findMany: async ({ where, take }: { where: Row; take: number }) => {
           state.linkWheres.push(where)
-          const gt = (where.id as { gt?: string } | undefined)?.gt
-          return state.links
-            .filter((link) => (gt === undefined || gt === '' ? true : link.id > gt))
+          const id = where.id as { gt?: string; lte?: string } | undefined
+          const rows = state.links
+            .filter((link) => (id?.gt === undefined || id.gt === '' ? true : link.id > id.gt))
+            .filter((link) => (id?.lte === undefined ? true : link.id <= id.lte))
+            .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
             .slice(0, take)
+          state.screenedSlices.push(rows.map((row) => row.id))
+          return rows
+        },
+        findFirst: async ({ orderBy }: { orderBy: { id: 'asc' | 'desc' } }) => {
+          const sorted = [...state.links].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+          const row = orderBy.id === 'desc' ? sorted[sorted.length - 1] : sorted[0]
+          return row ? { id: row.id } : null
         },
       },
       shoppingOrderLink: {
@@ -178,6 +193,17 @@ async function sweepDispatchEligibleWithdrawals(limit?: number) {
   return mod.sweepDispatchEligibleWithdrawals(limit)
 }
 
+/** The stored rotation state, decoded — position AND the end it belongs to. */
+async function rotation(raw = state.cursor) {
+  const mod = await import('../lib/connectors/woocommerce/sync/withdrawal.ts')
+  return mod.parseWdrawRotationState(raw)
+}
+
+async function writeRotation(cursor: string, bound: string | null) {
+  const mod = await import('../lib/connectors/woocommerce/sync/withdrawal.ts')
+  state.cursor = mod.serialiseWdrawRotationState({ cursor, bound })
+}
+
 function seedOrder(id: string, externalOrderId: string, liveStatus: string) {
   state.links.push({ id: `link-${id}`, orderId: id })
   state.external[id] = externalOrderId
@@ -210,7 +236,13 @@ test('recon: a clean slice advances the rotation cursor (o3d-rbyg r2)', async ()
 
   assert.equal(result.scanned, 2)
   assert.equal(result.withdrawn, 0)
-  assert.deepEqual(state.cursorWrites, ['link-o2'], 'the cursor moves to the end of the slice so the next run rotates on')
+  assert.equal(state.cursorWrites.length, 1)
+  assert.deepEqual(
+    await rotation(),
+    { cursor: 'link-o2', bound: 'link-o2' },
+    'the cursor moves to the end of the slice so the next run rotates on — and it is written together '
+      + 'with the ROTATION it belongs to, so the two can never describe different rotations',
+  )
 })
 
 test('recon: an UNREADABLE slice holds the cursor instead of rotating past it (o3d-rbyg r2)', async () => {
@@ -221,7 +253,14 @@ test('recon: an UNREADABLE slice holds the cursor instead of rotating past it (o
   const result = await sweepDispatchEligibleWithdrawals()
 
   assert.equal(result.unresolved, 1, 'the run reports that a slice went unexamined')
-  assert.deepEqual(state.cursorWrites, [], 'and the cursor is HELD — an unread slice must not wait a whole rotation')
+  assert.deepEqual(
+    (await rotation()).cursor,
+    '',
+    'and the POSITION is HELD — an unread slice must not wait a whole rotation. (o3d-rbyg r4: this '
+      + 'asserted that NOTHING was written, which is no longer the same thing: the rotation this run '
+      + 'started is recorded alongside the held position, so the next run continues it rather than '
+      + 'taking a fresh bound and re-screening from a different end.)',
+  )
   assert.deepEqual(state.orderUpdates, [], 'nothing was decided from a read that failed')
 })
 
@@ -269,13 +308,13 @@ test('recon: the rotation WRAPS when it reaches the end of the set (o3d-rbyg r2)
   // advertises ("every eligible link once per rotation") is false.
   reset()
   seedOrder('o1', '900', 'processing')
-  state.cursor = 'link-zzz'
+  await writeRotation('link-zzz', 'link-zzz')
 
   const result = await sweepDispatchEligibleWithdrawals()
 
   assert.equal(result.wrapped, true)
   assert.equal(result.scanned, 1, 'the link behind the cursor was screened after all')
-  assert.deepEqual(state.cursorWrites, ['link-o1'])
+  assert.deepEqual(await rotation(), { cursor: 'link-o1', bound: 'link-o1' }, 'and a FRESH rotation was started')
 })
 
 test('recon: no WMS connector means no dispatch path to get ahead of (o3d-rbyg r2)', async () => {
@@ -288,4 +327,134 @@ test('recon: no WMS connector means no dispatch path to get ahead of (o3d-rbyg r
   assert.equal(result.skipped, 'no active WMS connector')
   assert.equal(result.scanned, 0)
   assert.deepEqual(state.tombstones, [], 'and no storefront call was spent')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-rbyg r4 (Codex r3 finding 3) — A BOUND THAT NEW ARRIVALS KEEP RESETTING IS NOT A BOUND.
+//
+// Round 3 wrote down "every dispatch-eligible link is screened at least once per
+// ceil(eligible / limit) runs" and did not have it. The rotation advanced `id > cursor` and wrapped
+// only when THAT query came back empty — and link ids ascend, so a shop that keeps taking orders
+// keeps the slice ahead of the cursor permanently non-empty. The wrap never fires and the links
+// BEHIND the cursor are screened once and then never again. Those are the long-lived ones: parked,
+// dead-lettered, stuck awaiting a despatch that never comes — precisely the orders a customer is
+// most likely to withdraw.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-rbyg r4: continuous arrivals cannot stop the rotation coming back to an old link', async () => {
+  reset()
+  // The link that must not starve: it sorts FIRST, so once screened it is permanently behind the
+  // cursor. Under the round-3 rotation it is never reached a second time.
+  seedOrder('a-old', '900', 'processing')
+  seedOrder('b-old', '901', 'processing')
+
+  // One link per run, and a NEW order arriving before every run after the first — the shop is
+  // trading, which is the condition round 3's bound silently assumed away.
+  await sweepDispatchEligibleWithdrawals(1)
+  for (let run = 0; run < 4; run += 1) {
+    seedOrder(`z-new-${run}`, `95${run}`, 'processing')
+    await sweepDispatchEligibleWithdrawals(1)
+  }
+
+  const timesScreened = state.screenedSlices.filter((slice) => slice.includes('link-a-old')).length
+  assert.ok(
+    timesScreened >= 2,
+    `link-a-old was screened ${timesScreened} time(s) across five runs. Once is the defect: a link `
+      + 'behind the cursor is exactly the long-lived, parked, still-unfulfilled kind an order is most '
+      + 'likely to be withdrawn against, and screening it once means never noticing a withdrawal '
+      + 'filed after that moment',
+  )
+  assert.ok(
+    state.screenedSlices.some((slice) => slice.includes('link-z-new-0')),
+    'control: the arrivals really did enter the screened set, so the property above is not vacuous',
+  )
+})
+
+test('o3d-rbyg r4: links created AFTER the rotation began cannot extend it', async () => {
+  reset()
+  seedOrder('a-old', '900', 'processing')
+
+  // Run 1 fixes the rotation's end at link-a-old and screens it.
+  const run1 = await sweepDispatchEligibleWithdrawals(1)
+  assert.equal(run1.scanned, 1)
+  assert.deepEqual(await rotation(), { cursor: 'link-a-old', bound: 'link-a-old' })
+
+  // Two arrivals land above the bound.
+  seedOrder('z-new-1', '951', 'processing')
+  seedOrder('z-new-2', '952', 'processing')
+
+  const run2 = await sweepDispatchEligibleWithdrawals(1)
+
+  assert.equal(run2.wrapped, true, 'the rotation ENDED at its bound rather than being extended by the arrivals')
+  assert.equal(run2.scanned, 1)
+  const slices = state.linkWheres.slice(-2)
+  assert.deepEqual(
+    (slices[0].id as Record<string, unknown>),
+    { gt: 'link-a-old', lte: 'link-a-old' },
+    'the slice is bounded at BOTH ends — without the upper bound the two new links keep it non-empty forever',
+  )
+  assert.deepEqual(await rotation(), { cursor: 'link-a-old', bound: 'link-z-new-2' }, 'and the NEW rotation covers them')
+})
+
+test('o3d-rbyg r4: the round-3 cursor format starts a fresh rotation rather than inventing a bound for it', async () => {
+  reset()
+  seedOrder('a-old', '900', 'processing')
+  seedOrder('b-old', '901', 'processing')
+  state.cursor = 'link-a-old' // the bare-string format this replaces
+
+  const result = await sweepDispatchEligibleWithdrawals(1)
+
+  assert.equal(result.scanned, 1)
+  assert.deepEqual(
+    (state.linkWheres[0].id as Record<string, unknown>),
+    { gt: '', lte: 'link-b-old' },
+    'a position with no recorded rotation is not a rotation — it restarts from the front, which '
+      + 're-screens at most one slice and can never skip one',
+  )
+})
+
+test('o3d-rbyg r4: an unreadable slice holds BOTH halves of the rotation state, not just the position', async () => {
+  // The run that STARTS a rotation and then cannot read its first slice. The position is held at the
+  // front, but the rotation's end was decided by this run and nothing else knows it: dropping it
+  // means the next run takes a FRESH bound from a set that has grown, and the "at most one slice
+  // re-screened" property becomes "the rotation restarts, further out, every time WooCommerce is
+  // down" — which is the starvation again, wearing an outage.
+  reset()
+  seedOrder('a-old', '900', 'pending-wdraw')
+  seedOrder('b-old', '901', 'processing')
+  state.screenError = 'HTTP 502 Bad Gateway'
+
+  const result = await sweepDispatchEligibleWithdrawals(1)
+
+  assert.equal(result.unresolved, 1)
+  assert.deepEqual(
+    await rotation(),
+    { cursor: '', bound: 'link-b-old' },
+    'the position is held AND the rotation it belongs to is persisted, so an outage cannot leave the '
+      + 'two describing different rotations',
+  )
+  assert.deepEqual(state.orderUpdates, [], 'and nothing was decided from a read that failed')
+})
+
+test('o3d-rbyg r4: an unreadable slice mid-rotation keeps the rotation it was already in', async () => {
+  reset()
+  seedOrder('a-old', '900', 'pending-wdraw')
+  seedOrder('b-old', '901', 'processing')
+  await writeRotation('link-a-old', 'link-b-old')
+  state.screenError = 'HTTP 502 Bad Gateway'
+
+  const result = await sweepDispatchEligibleWithdrawals(1)
+
+  assert.equal(result.unresolved, 1)
+  assert.deepEqual(await rotation(), { cursor: 'link-a-old', bound: 'link-b-old' })
+})
+
+test('o3d-rbyg r4: an empty eligible set clears the rotation state instead of pinning a stale bound', async () => {
+  reset()
+  await writeRotation('link-gone', 'link-gone')
+
+  const result = await sweepDispatchEligibleWithdrawals()
+
+  assert.equal(result.scanned, 0)
+  assert.deepEqual(await rotation(), { cursor: '', bound: null }, 'a bound naming a link that no longer exists would wedge the rotation')
 })

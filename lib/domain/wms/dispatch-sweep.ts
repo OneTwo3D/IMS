@@ -20,6 +20,11 @@ import {
 import type { WmsConnector, WmsConnectorId, WmsOrderStatus, WmsOrderTracking } from '@/lib/connectors/wms/types'
 import { isWmsUnresolvableRecordError } from '@/lib/connectors/wms/errors'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
+// o3d-rbyg r4: the identity rule lives in its own module so the operator remedy in
+// `app/actions/sync-exceptions.ts` can apply THE SAME ONE without importing the sweep's world.
+import { bindWmsStatusToCandidate } from '@/lib/domain/wms/status-binding'
+export { bindWmsStatusToCandidate } from '@/lib/domain/wms/status-binding'
+export type { WmsStatusBinding } from '@/lib/domain/wms/status-binding'
 import { unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
 import { notify } from '@/lib/notifications'
@@ -755,45 +760,22 @@ export async function reconcileOneOrder(
       unresolved: requireResolution || Boolean(expectedExternalOrderId),
     }
   }
-  // Merge evidence is ALWAYS by number (the survivor lists the numbers it absorbed),
-  // so it is only trustworthy when exactly one link claims that number. On a shared
-  // number we cannot tell which order was absorbed — refuse rather than repoint and
-  // dispatch the wrong one (Codex round 7). Applies to both passes.
-  const mergeProvenByNumber =
-    status.isMerged
-    && status.mergedOrderNumbers.includes(candidate.externalOrderNumber)
-    && mergeNumberUnique !== false
-
-  if (expectedExternalOrderId && status.externalOrderId !== expectedExternalOrderId) {
-    // A MERGE is the one legitimate stable-ID change (o3d-bjc.2.1): the survivor
-    // authoritatively names our order number among the numbers it folded in, so a
-    // different id is expected and the link is repointed just below.
-    if (!mergeProvenByNumber) {
-      // UNRESOLVED, not pending-and-clean: the delta said this order changed and
-      // the authoritative lookup handed back a different order, so its real state
-      // is unknown. Holding the watermark keeps the change in the next window.
-      return {
-        action: 'pending',
-        reason: `Order-number lookup returned stable ID ${status.externalOrderId || 'unknown'}; expected ${expectedExternalOrderId}`,
-        unresolved: true,
-      }
-    }
+  // o3d-rbyg r4: the binding rule lives in `bindWmsStatusToCandidate`, called rather than copied,
+  // because the operator's "record the despatch" remedy has to apply exactly this one. UNRESOLVED
+  // rather than pending-and-clean: the lookup handed back a record we cannot bind to this link, so
+  // its real state is unknown and the watermark must hold.
+  const binding = bindWmsStatusToCandidate(
+    status,
+    { externalOrderNumber: candidate.externalOrderNumber, externalOrderId: expectedExternalOrderId ?? null },
+    mergeNumberUnique,
+  )
+  if (!binding.bound) {
+    return { action: 'pending', reason: binding.reason, unresolved: true }
   }
 
   // Merge: the WMS merged this order into a survivor (combined "a+b" number); our original
   // WMS order is gone. Repoint the link to the survivor, then process under its number.
   if (status.isMerged && status.externalOrderNumber !== candidate.externalOrderNumber) {
-    if (!mergeProvenByNumber) {
-      // Either the survivor doesn't actually name our number, or the number has
-      // several claimants — we can't tell whether THIS order was absorbed.
-      return {
-        action: 'pending',
-        reason:
-          `Merge survivor ${status.externalOrderNumber} does not unambiguously name ${candidate.externalOrderNumber} `
-          + '— refusing to repoint on number evidence alone',
-        unresolved: true,
-      }
-    }
     await deps.repointLink(candidate.linkId, {
       externalOrderId: status.externalOrderId,
       externalOrderNumber: status.externalOrderNumber,

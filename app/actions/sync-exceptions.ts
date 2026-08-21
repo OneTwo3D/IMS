@@ -58,6 +58,7 @@ import {
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { createPrismaDispatchDeps, reconcileOneOrder } from '@/lib/domain/wms/dispatch-sweep'
+import { bindWmsStatusToCandidate } from '@/lib/domain/wms/status-binding'
 import { releaseWithdrawalHold } from '@/app/actions/sales'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
@@ -1565,7 +1566,15 @@ export async function recordWithdrawnDespatch(orderId: string): Promise<Mutation
           externalOrderId: true,
           externalOrderNumber: true,
           dispatchDeadLetteredAt: true,
-          order: { select: { status: true, orderNumber: true, withdrawalHoldAt: true, withdrawalApprovedAt: true } },
+          // o3d-rbyg r4: the hold GENERATION as it stands under the sweep lock, carried to
+          // `releaseWithdrawalHold` so the release is guarded on the request this action decided
+          // about rather than on whatever the release re-reads for itself moments later.
+          order: {
+            select: {
+              status: true, orderNumber: true, withdrawalHoldAt: true, withdrawalApprovedAt: true,
+              withdrawalHoldGeneration: true,
+            },
+          },
         },
       })
       if (!link || link.connector !== connectorId) {
@@ -1612,6 +1621,37 @@ export async function recordWithdrawnDespatch(orderId: string): Promise<Mutation
       if (!status) {
         return { success: false, error: `The WMS did not return order ${link.externalOrderNumber}, so its despatch cannot be confirmed. Nothing was changed.` }
       }
+
+      // o3d-rbyg r4 (Codex r3 finding 2). THE ANSWER MUST BE ABOUT *THIS* LINK'S WMS ORDER.
+      // `fetchOrderStatus` takes an order NUMBER, and a number is a lookup key rather than an
+      // identity — renameable at the WMS, reusable, and answered under a combined number by a merge
+      // survivor. Reading "despatched" off an unbound record and then dispatching on it consumes
+      // stock and sends a despatch email for a parcel that may be someone else's. The binding rule
+      // is the sweep's own (`bindWmsStatusToCandidate`), called rather than copied, and the same
+      // claimant count the sweep uses decides whether a merge claim can be trusted at all.
+      const claimants = await deps.countLinksByOrderNumber?.([link.externalOrderNumber])
+      const mergeNumberUnique = claimants
+        ? (claimants.get(link.externalOrderNumber) === undefined ? undefined : claimants.get(link.externalOrderNumber) === 1)
+        : undefined
+      const binding = bindWmsStatusToCandidate(
+        status,
+        { externalOrderNumber: link.externalOrderNumber, externalOrderId: link.externalOrderId },
+        mergeNumberUnique,
+        // This record came from a BY-NUMBER lookup a line above, so when the link carries no stable
+        // id the number is the only binding left and it has to be the same number. The sweep does
+        // not pass this: its rows are preloaded by stable id, where a RENAMED order legitimately
+        // answers under a number the link has never heard of.
+        { lookedUpByNumber: true },
+      )
+      if (!binding.bound) {
+        return {
+          success: false,
+          error: `The WMS answered for ${link.externalOrderNumber} with a record that is not this link's order — ${binding.reason}. `
+            + 'Nothing was changed. Check the order at the warehouse (it may have been renamed, merged, or its number reused) '
+            + 'before recording a despatch against it.',
+        }
+      }
+
       if (!status.dispatched && !status.isSplit) {
         return {
           success: false,
@@ -1625,6 +1665,13 @@ export async function recordWithdrawnDespatch(orderId: string): Promise<Mutation
       if (link.order.withdrawalHoldAt) {
         const released = await releaseWithdrawalHold(
           orderId,
+          // o3d-rbyg r4 (Codex r3 finding 1): the generation READ UNDER THE SWEEP LOCK, before the
+          // warehouse round trip. Round 3 was careful that the release goes THROUGH the generation
+          // guard rather than around it — but the guard compared the value the release had just
+          // fetched for itself against itself, which is satisfied by construction. A customer who
+          // files a NEW withdrawal while the WMS call is in flight had their request cleared by a
+          // decision taken before it existed.
+          { generation: link.order.withdrawalHoldGeneration },
           'The warehouse had already despatched this order when the withdrawal was found. The hold is released so '
           + 'the despatch can be recorded; the request is handled as a return.',
         )
@@ -1639,7 +1686,17 @@ export async function recordWithdrawnDespatch(orderId: string): Promise<Mutation
         externalOrderNumber: link.externalOrderNumber,
         externalOrderId: link.externalOrderId,
       }
-      const reconciled = await reconcileOneOrder(deps, candidate, status)
+      // The stable id and the claimant count go THROUGH, so the sweep's own identity guard applies
+      // to the dispatch as well as to the confirmation above. Passing neither — which is what this
+      // call did — disabled that guard on the one path a person had just authorised.
+      const reconciled = await reconcileOneOrder(
+        deps,
+        candidate,
+        status,
+        link.externalOrderId ?? undefined,
+        false,
+        mergeNumberUnique,
+      )
       if (reconciled.action !== 'dispatched') {
         // The hold, if there was one, has been released and is NOT silently re-applied: re-writing
         // a customer's withdrawal marker from a failed repair would fabricate a request state
