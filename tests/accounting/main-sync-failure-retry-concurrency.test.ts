@@ -10,9 +10,23 @@ import { applyMainSyncFailureRetry } from '@/lib/connectors/xero/sync-processor'
 // permanent/retry decision), and the mirrored-event write the winner already did
 // is skipped.
 
-const noop = async () => undefined
-// Permissive stand-in for the mirror-table delegates updateMirroredEventForSyncLog
-// reaches for; the unit under test only asserts the accountingSyncLog behaviour.
+/**
+ * Stand-in for the mirror-table delegates `updateMirroredEventForSyncLog` reaches for. It answers
+ * a ROW, not `undefined`.
+ *
+ * It used to answer `undefined`, and that worked only by accident: before o3d-nf9i (batch-settle)
+ * `updateMirroredAccountingEventStatus` ended `if (!event) return`, so a delegate that produced
+ * nothing was indistinguishable from "this row has no mirrored event" and the function bailed out
+ * silently — i.e. the mirror write this test's own name asserts was never actually exercised. That
+ * branch is now an explicit outcome (`'updated' | 'not_found' | 'refused'`) and the found path
+ * reads `event.id`, so `undefined` is no longer a value any real Prisma client can return here.
+ *
+ * A row is the honest answer for what this test models: the sync log HAS a mirrored event, the
+ * update finds it, and the winning path writes it. "No mirrored event" would be the other honest
+ * fixture — but it is not this one, and it would make the assertion vacuous.
+ */
+const mirroredEventRow = { id: 'mirror-event-1' }
+const mirrorDelegateCall = async () => mirroredEventRow
 function makeTx(stub: { updateCount: number; current?: { retryCount: number; status: string } | null }) {
   const calls: { updateMany: Array<{ where: Record<string, unknown>; data: Record<string, unknown> }>; findUnique: number } = {
     updateMany: [],
@@ -34,7 +48,7 @@ function makeTx(stub: { updateCount: number; current?: { retryCount: number; sta
       get(target, prop: string) {
         if (prop === 'accountingSyncLog') return accountingSyncLog
         // Any other delegate (mirror tables) → object of no-op async methods.
-        return new Proxy({}, { get: () => noop })
+        return new Proxy({}, { get: () => mirrorDelegateCall })
       },
     },
   )

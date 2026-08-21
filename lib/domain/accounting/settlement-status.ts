@@ -16,6 +16,11 @@
  * the class of bug being fixed here.
  */
 
+import {
+  OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+  isOperatorAssertedSettlement,
+} from '@/lib/domain/accounting/sync-row-settlement'
+
 /** The payment sync row for one invoice/bill, reduced to what the verdict depends on. */
 export type PaymentSyncRow = {
   status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'CANCELLED'
@@ -26,6 +31,13 @@ export type PaymentSyncRow = {
   amount?: number | null
   /** The local Payment row it was queued for; null on rows the order's own invoice follow-up queued. */
   paymentId?: string | null
+  /**
+   * HOW this row reached its status (o3d-nf9i r3). NULL / absent = the connector's own writeback,
+   * i.e. a real call was made and the ledger answered. 'OPERATOR_ASSERTION' = a human typed the
+   * document id into the settlement dialog and IMS verified NOTHING — see the SYNCED branch below,
+   * which must not turn that into a SETTLED verdict however well the numbers line up.
+   */
+  settlementBasis?: string | null
 }
 
 export type SettlementStatus =
@@ -47,6 +59,28 @@ export type SettlementStatus =
   | 'LEDGER_UNMATCHED'
   /** The ledger recorded MORE than IMS claims was received — it is over-paid there. */
   | 'OVER_SETTLED'
+  /**
+   * An OPERATOR asserted that the payment posted, and nothing has verified it — least of all the
+   * amount. Not a settlement and not a rejection: a claim with a weaker basis than either.
+   */
+  | 'ASSERTED_UNVERIFIED'
+
+/**
+ * WHAT THE VERDICT RESTS ON — the answer's basis, returned alongside the answer (o3d-nf9i r3).
+ *
+ * `exceptions` settled the principle: a verdict reached by falling back is a materially weaker claim
+ * than the same verdict reached from a declaration, and a caller acting on the weak one must be able
+ * to NAME which it got. The same applies here, on the money path:
+ *
+ *   LEDGER_CONFIRMED   the connector made the call and the ledger answered. The amount in the row
+ *                      is the amount that was sent, so comparing it against the total means
+ *                      something.
+ *   OPERATOR_ASSERTION a human said so. No call was made, no document was read, no figure was
+ *                      compared — only an id was typed in. The amount in the row is what IMS
+ *                      INTENDED to send, which is not evidence of what the ledger recorded.
+ *   NONE               nothing was posted at all, so there is no post to have a basis.
+ */
+export type SettlementEvidenceBasis = 'LEDGER_CONFIRMED' | 'OPERATOR_ASSERTION' | 'NONE'
 
 export type SettlementVerdict = {
   status: SettlementStatus
@@ -54,6 +88,8 @@ export type SettlementVerdict = {
   discrepancy: boolean
   /** One line, written for whoever has to fix it. */
   detail: string
+  /** What the verdict rests on. Never inferred by the caller — see SettlementEvidenceBasis. */
+  basis: SettlementEvidenceBasis
 }
 
 export function settlementStatus(input: {
@@ -80,6 +116,7 @@ export function settlementStatus(input: {
     // ledger, so it is genuinely unpaid on both sides.
     const p = input.payment
     const heldByLedger = p && (p.status === 'SYNCED' || p.status === 'PROCESSING' || p.status === 'PENDING')
+    const asserted = !!p && isOperatorAssertedSettlement(p.settlementBasis)
     if (heldByLedger) {
       return {
         status: 'LEDGER_UNMATCHED',
@@ -87,10 +124,15 @@ export function settlementStatus(input: {
         detail:
           'This is NOT marked as paid in IMS, but a payment for it was sent to the ledger' +
           (p.externalTransactionId ? ` (payment ${p.externalTransactionId})` : '') +
-          '. The ledger shows it settled while IMS does not — reverse the payment there, or restore it here.',
+          (asserted
+            ? '. That is an OPERATOR ASSERTION, not something the ledger confirmed — nobody has checked the '
+              + 'document or its amount. Verify it in the accounting system, then reverse the payment there or '
+              + 'restore the receipt here.'
+            : '. The ledger shows it settled while IMS does not — reverse the payment there, or restore it here.'),
+        basis: asserted ? 'OPERATOR_ASSERTION' : 'LEDGER_CONFIRMED',
       }
     }
-    return { status: 'UNPAID', discrepancy: false, detail: 'Not marked as paid.' }
+    return { status: 'UNPAID', discrepancy: false, detail: 'Not marked as paid.', basis: 'NONE' }
   }
 
   // A payment that already FAILED or was CANCELLED is a fact, and turning sync off does not unmake it.
@@ -103,6 +145,7 @@ export function settlementStatus(input: {
       status: 'NOT_APPLICABLE',
       discrepancy: false,
       detail: 'Marked as paid. Accounting sync is off, so no payment is expected in the ledger.',
+      basis: 'NONE',
     }
   }
   if (!input.documentPosted && !terminal) {
@@ -112,6 +155,7 @@ export function settlementStatus(input: {
       detail:
         'Marked as paid, but this document has not posted to the ledger yet — a payment cannot be ' +
         'attached until it has. The document sync is what to chase, not the payment.',
+      basis: 'NONE',
     }
   }
 
@@ -123,8 +167,11 @@ export function settlementStatus(input: {
       detail:
         'Marked as paid in IMS, but NO payment was ever queued for the ledger — it will never learn ' +
         'about this settlement on its own. The ledger still shows the full amount outstanding.',
+      basis: 'NONE',
     }
   }
+
+  const assertedPost = isOperatorAssertedSettlement(p.settlementBasis)
 
   switch (p.status) {
     case 'SYNCED': {
@@ -135,6 +182,38 @@ export function settlementStatus(input: {
           status: 'AWAITING_LEDGER',
           discrepancy: true,
           detail: 'The payment sync reports success but recorded no ledger payment id, so the settlement cannot be verified.',
+          basis: assertedPost ? 'OPERATOR_ASSERTION' : 'LEDGER_CONFIRMED',
+        }
+      }
+      // A MONETARY-ONLY COMPARISON FAILS CLOSED ON AN ASSERTED ROW (o3d-nf9i r3, Codex finding 1).
+      //
+      // Everything below this point compares `p.amount` against `input.totalForeign` and, when they
+      // agree, returns SETTLED with `discrepancy: false` — a clean, green, ledger-confirmed verdict.
+      // That comparison is only evidence when a connector actually SENT p.amount and the ledger
+      // accepted it. On an operator-asserted row nothing was sent: `p.amount` is what IMS INTENDED
+      // to queue, and the external id is a string a human typed after looking at a screen. Xero
+      // accepts a payment smaller than the invoice as a PART payment and hands back a perfectly
+      // valid payment id, so the asserted id can name a part payment while IMS's two local numbers
+      // agree with each other exactly. Matching numbers prove the assertion is SELF-CONSISTENT, not
+      // that the ledger holds what IMS thinks it holds.
+      //
+      // So the comparison is not run at all here, and the verdict states its basis instead of
+      // borrowing the confirmed one. It is a DISCREPANCY: IMS is claiming a settlement nothing has
+      // checked, which is precisely what this module exists to surface. The remedy is nameable and
+      // an operator can perform it — open the document in the accounting system and confirm the
+      // amount — which is what the detail says.
+      if (assertedPost) {
+        return {
+          status: 'ASSERTED_UNVERIFIED',
+          discrepancy: true,
+          basis: 'OPERATOR_ASSERTION',
+          detail:
+            `An operator recorded this as paid in the ledger (payment ${p.externalTransactionId}) on their own ` +
+            `assertion — IMS never made the call, never read the document and never compared the amount. The ` +
+            `figure shown here (${typeof p.amount === 'number' ? p.amount : 'unknown'}) is what IMS meant to send, ` +
+            `not what the ledger recorded, so a part payment against this invoice would look identical. Open ` +
+            `payment ${p.externalTransactionId} in the accounting system and confirm its amount against the ` +
+            `document total.`,
         }
       }
       // PART PAYMENT IS NOT SETTLEMENT. markBillPaid accepts an explicit amountForeign and queues only
@@ -150,6 +229,7 @@ export function settlementStatus(input: {
             `The ledger recorded a PART payment of ${paid} against a total of ${total} (payment ` +
             `${p.externalTransactionId}), so a balance is still outstanding there while IMS shows this ` +
             `as paid in full.`,
+          basis: 'LEDGER_CONFIRMED',
         }
       }
       // OVER-PAYMENT IS ALSO A DISAGREEMENT, and only the shortfall was being checked (Codex, PR #582
@@ -164,9 +244,15 @@ export function settlementStatus(input: {
           detail:
             `The ledger recorded ${paid} against a settlement of ${total} (payment ` +
             `${p.externalTransactionId}), so it is OVER-paid there — reverse or adjust the payment in the ledger.`,
+          basis: 'LEDGER_CONFIRMED',
         }
       }
-      return { status: 'SETTLED', discrepancy: false, detail: `Settled in the ledger (payment ${p.externalTransactionId}).` }
+      return {
+        status: 'SETTLED',
+        discrepancy: false,
+        detail: `Settled in the ledger (payment ${p.externalTransactionId}).`,
+        basis: 'LEDGER_CONFIRMED',
+      }
     }
     case 'PENDING':
     case 'PROCESSING':
@@ -176,6 +262,7 @@ export function settlementStatus(input: {
         detail: p.retryCount
           ? `Payment queued for the ledger; ${p.retryCount} attempt(s) have failed so far and it is still retrying.`
           : 'Payment queued for the ledger, not yet confirmed.',
+        basis: 'NONE',
       }
     case 'FAILED':
       return {
@@ -184,6 +271,7 @@ export function settlementStatus(input: {
         detail:
           `The ledger REJECTED this payment, so it still shows the amount outstanding while IMS reports ` +
           `it paid: ${p.errorMessage ?? 'no error recorded'}`,
+        basis: 'NONE',
       }
     case 'CANCELLED':
       return {
@@ -192,6 +280,7 @@ export function settlementStatus(input: {
         detail:
           'The payment sync was cancelled, so the ledger was never told about this settlement and still ' +
           'shows the amount outstanding.',
+        basis: 'NONE',
       }
   }
 }
@@ -259,14 +348,22 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
   // settlementStatus reads as "cannot compare" rather than as a shortfall.
   const amountUnknown = synced.some((r) => typeof r.amount !== 'number')
   const syncedAmount = amountUnknown ? null : synced.reduce((sum, r) => sum + (r.amount as number), 0)
+  // THE BASIS AGGREGATES WORST-FIRST, exactly as the status does (o3d-nf9i r3). One asserted leg
+  // among several makes the WHOLE settlement unverified: the sum being compared against the document
+  // total now contains a number nothing checked, so the comparison cannot be trusted for any of it.
+  // Dropping the marker here would have re-laundered the assertion one function further along —
+  // the aggregate would have arrived at settlementStatus looking connector-confirmed.
+  const syncedBasis = synced.some((r) => isOperatorAssertedSettlement(r.settlementBasis))
+    ? OPERATOR_ASSERTION_SETTLEMENT_BASIS
+    : null
 
   const failed = rows.find((r) => r.status === 'FAILED')
   if (failed) {
-    return { ...failed, amount: syncedAmount }
+    return { ...failed, amount: syncedAmount, settlementBasis: failed.settlementBasis ?? syncedBasis }
   }
   const cancelled = rows.find((r) => r.status === 'CANCELLED')
   if (cancelled) {
-    return { ...cancelled, amount: syncedAmount }
+    return { ...cancelled, amount: syncedAmount, settlementBasis: cancelled.settlementBasis ?? syncedBasis }
   }
   const inFlight = rows.filter((r) => r.status === 'PENDING' || r.status === 'PROCESSING')
   if (inFlight.length > 0) {
@@ -276,6 +373,7 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
       errorMessage: inFlight.find((r) => r.errorMessage)?.errorMessage ?? null,
       retryCount: inFlight.reduce((max, r) => Math.max(max, r.retryCount ?? 0), 0),
       amount: syncedAmount,
+      settlementBasis: syncedBasis,
     }
   }
 
@@ -288,6 +386,7 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
     errorMessage: null,
     retryCount: synced.reduce((max, r) => Math.max(max, r.retryCount ?? 0), 0),
     amount: syncedAmount,
+    settlementBasis: syncedBasis,
   }
 }
 

@@ -1031,6 +1031,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     : settlement.status === 'PARTIALLY_SETTLED' ? ' · PART PAID IN LEDGER'
     : settlement.status === 'LEDGER_UNMATCHED' ? ' · PAID IN LEDGER ONLY'
     : settlement.status === 'OVER_SETTLED' ? ' · OVER-PAID IN LEDGER'
+    // o3d-nf9i r3: an operator's assertion is not the ledger's word. Shown as its own state so the
+    // badge never reads the same as a confirmed settlement.
+    : settlement.status === 'ASSERTED_UNVERIFIED' ? ' · ASSERTED, NOT VERIFIED'
     : ''
   // Neither badge above can speak for an order with no local payment rows, so the verdict needs its own
   // chip whenever there is something to say: a disagreement, or a payment still on its way.

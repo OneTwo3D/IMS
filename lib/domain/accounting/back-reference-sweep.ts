@@ -17,6 +17,7 @@ import {
   buildCompactedFollowUpLossActivity,
   type CompactedFollowUpLossPhase,
 } from '@/lib/domain/accounting/compacted-followup-loss'
+import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 
 // ---------------------------------------------------------------------------
 // Connector-agnostic back-reference repair sweep (audit-H3, fixed by o3d-9kek)
@@ -102,6 +103,37 @@ import {
 //    the third time in this file that "this attempt failed" was allowed to mean "this row is
 //    finished". The obligation is now a COLUMN (backReferenceFollowUpsPendingAt), written BEFORE the
 //    repair touches anything and cleared only by a successful enqueue.
+//
+// AND ONE MORE, FOUND BY o3d-nf9i ROUND 3 — THE ONE THAT IS NOT ABOUT STARVATION AT ALL:
+//
+// 7. THE SWEEP LAUNDERED AN OPERATOR'S ASSERTION INTO THE LEDGER LINK. app/actions/
+//    accounting-settlement.ts lets a named human assert "this DID post, here is the document id".
+//    That writes `status='SYNCED'` + `externalTransactionId` — BYTE-IDENTICAL to what the
+//    connector's own writeback produces after a real, successful remote call — and that pair IS this
+//    sweep's candidate shape. So the next cron cycle picked the row up, found the document unlinked,
+//    and stamped the operator-typed string onto SalesOrder.accountingInvoiceId /
+//    PurchaseInvoice.accountingInvoiceId / SupplierCreditNote.accountingCreditNoteId.
+//
+//    That column is THE LEDGER LINK EVERY LATER READER TRUSTS. Once it is written, nothing
+//    downstream can tell an id the ledger issued from an id a human read off a screen: the
+//    follow-ups are enqueued from it (PDF, attachment, and the PAYMENT — money), the settlement
+//    verdict is derived against it, and the order delete guard treats it as post evidence. IMS never
+//    made a call, never read a document and never compared a figure; the whole point of
+//    AccountingSyncLog.settlementBasis is that AN OPERATOR'S BELIEF MUST NOT BECOME THE SYSTEM'S
+//    EVIDENCE, and this sweep was the path that converted the one into the other.
+//
+//    r3 shipped the basis column and made the MONEY-PATH READER fail closed on it
+//    (settlement-status.ts), and flagged in its own commit message that this sweep still stamped an
+//    asserted id without consulting the marker. It consults it now. An asserted row gets NO
+//    sweep-driven work: no id write, no follow-up enqueue. It is REFUSED — warned about once per
+//    recheck interval and deferred, exactly like an ambiguity, because like an ambiguity the remedy
+//    is a human act and unlike a transient failure no amount of re-running performs it.
+//
+//    NOT STAMPED, for the same reason an ambiguity is not: the refusal can clear. An operator who
+//    verifies the document in the ledger and links it by hand turns the row into "already linked,
+//    nothing outstanding", which the sweep then settles on the ordinary path without ever having
+//    promoted anything — a row whose document is ALREADY linked is stamped as usual, asserted or
+//    not, because nothing about that write comes from the assertion.
 //
 // DELIBERATELY NOT IN SCOPE: connector-TENANT isolation — AND THAT IS WHY THIS SWEEP IS BOUND FOR
 // XERO ONLY (r6 finding 1).
@@ -294,6 +326,17 @@ export type BackReferenceSweepRow = {
    * `owesFollowUps` in the loop below.
    */
   backReferenceFollowUpsPendingAt: Date | null
+  /**
+   * HOW this row reached its terminal status. NULL = the connector's own writeback, i.e. a call was
+   * made and the ledger answered. 'OPERATOR_ASSERTION' = a human typed a document id into the
+   * settlement dialog and IMS verified nothing (defect 7 above).
+   *
+   * READ FROM THE COLUMN, NEVER FROM `errorMessage`. The settlement note is prose written for a
+   * person, both connectors overwrite that column with the remote system's own words, and o3d-h2wx
+   * settled that it carries no provenance a reader may key on. The sweep does not even select
+   * errorMessage.
+   */
+  settlementBasis: string | null
 }
 
 /** The columns the sweep reads. `as const` so the Prisma client's row type resolves. */
@@ -309,6 +352,9 @@ export const BACK_REFERENCE_CANDIDATE_SELECT = {
   backReferenceAmbiguousLoggedAt: true,
   backReferenceEvidenceCompactedAt: true,
   backReferenceFollowUpsPendingAt: true,
+  // Defect 7. Without this column in the SELECT the gate below cannot run at all, and an
+  // operator-asserted id is indistinguishable from a connector-confirmed one at every later step.
+  settlementBasis: true,
 } as const
 
 /**
@@ -478,6 +524,17 @@ export type BackReferenceRepairResult = {
    * ever went up in the `repaired` column would hide that entirely.
    */
   followUpsDiscarded: number
+  /**
+   * Rows whose terminal outcome is an OPERATOR ASSERTION, so the sweep refused to write its
+   * document id onto anything or to build follow-ups from it (defect 7).
+   *
+   * Counted separately from `skippedAmbiguous` and from `failed` on purpose. It is not an
+   * attribution problem — the row names exactly one document — and it is not a failure, because
+   * nothing went wrong: the sweep declined to promote an unverified claim. Folding it into either
+   * would hide the population of rows waiting on a human to check a ledger, which is the only thing
+   * that clears them.
+   */
+  skippedUnverified: number
 }
 
 export type BackReferenceCandidateCursor = { createdAt: Date; id: string }
@@ -632,7 +689,9 @@ export async function repairAccountingBackReferences(
   const now = deps.now ?? (() => new Date())
   const { connector, connectorLabel, activityActionPrefix: prefix } = deps
 
-  const result: BackReferenceRepairResult = { scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, followUpsDiscarded: 0 }
+  const result: BackReferenceRepairResult = {
+    scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, followUpsDiscarded: 0, skippedUnverified: 0,
+  }
   // One cutoff for the whole run, so every page of the scan agrees on which deferred rows
   // are due — a per-page `new Date()` would let a row fall on both sides of the boundary.
   const ambiguityRecheckBefore = new Date(now().getTime() - BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS)
@@ -811,6 +870,70 @@ export async function repairAccountingBackReferences(
   }
 
   /**
+   * THE ROW'S OUTCOME IS AN OPERATOR'S ASSERTION, SO THERE IS NOTHING HERE TO REPAIR FROM
+   * (o3d-nf9i r3, Codex finding 1 — defect 7 at the top of this file).
+   *
+   * The sweep's entire premise is that `externalTransactionId` is a DURABLE RECORD OF A POST: the
+   * connector called the ledger, the ledger issued an id, the process then died before the id
+   * reached the source document. Re-applying it reproduces a write that was always going to happen.
+   *
+   * On an operator-settled row that premise is simply false. No call was made, no document was read,
+   * no figure was compared — a human looked at the accounting system and typed a string. Copying
+   * that string into `accountingInvoiceId` would make it THE LEDGER LINK, and from that moment
+   * nothing downstream can tell it from one the ledger issued: the follow-ups (PDF, attachment,
+   * PAYMENT) are built against it, the settlement verdict is derived from it, and the order delete
+   * guard reads it as post evidence. The basis column exists precisely so this reader can decline.
+   *
+   * WHY WARN-AND-DEFER RATHER THAN STAMP. The refusal is resolvable, by exactly one act: a human
+   * opens the document in the ledger, confirms it, and links it by hand — the same manual link every
+   * other refusal in this file asks for. When they do, the next sweep finds the document already
+   * linked and settles the row on the ordinary path, having promoted nothing. Stamping the row here
+   * would exclude it from that path for good, which is this file's oldest defect (starvation) wearing
+   * a seventh disguise. Deferring throttles the warning to one per recheck interval without
+   * retiring the row.
+   *
+   * NOT counted in `failed`: nothing failed. The sweep declined, deliberately, and `skippedUnverified`
+   * is the number that says how many rows are waiting on a person.
+   */
+  const reportUnverifiedAssertion = async (
+    row: BackReferenceSweepRow,
+    refused: 'the back-reference' | 'the follow-ups',
+  ) => {
+    result.skippedUnverified++
+    // Every asserted row in the candidate set carries one: refuseSettlement demands a document id
+    // for a POSTED assertion, and a NOT_POSTED assertion terminalises the row CANCELLED, which is
+    // outside BACK_REFERENCE_REPAIRABLE_STATUSES. The fallback exists so the warning degrades to
+    // words rather than to the string "null" if that ever stops being true.
+    const documentId = row.externalTransactionId ?? 'the document id on this row'
+    await warnAndDefer(row, () => ({
+      action: `${prefix}_backreference_unverified_assertion`,
+      description: `Refused ${refused} for ${row.referenceType} ${row.referenceId}: this ${connectorLabel} sync row's outcome was `
+        + 'recorded by an OPERATOR ASSERTION, not by the connector. Nobody called '
+        + `${connectorLabel} for it, nobody read the document and nobody compared an amount — document id `
+        + `${documentId} is a string a person typed after looking at a screen. `
+        + (refused === 'the back-reference'
+          ? 'Writing it onto the record would make it the ledger link everything downstream trusts, and an unverified '
+            + 'claim would then be indistinguishable from a confirmed one. '
+          : 'Building the follow-ups from it would send a PDF, an attachment or a PAYMENT against a document nothing has '
+            + 'checked. ')
+        + `Open ${documentId} in the accounting system. If it is the right document, link it to this `
+        + `${row.referenceType} by hand and this row settles itself on the next sweep. If it is not, correct the sync row `
+        + '— it must not be repaired from.',
+      metadata: {
+        syncLogId: row.id,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        externalId: row.externalTransactionId,
+        // The basis is REPORTED, not restated as a boolean: a reader of this entry can name what the
+        // row rested on rather than infer it from the fact that a refusal was written.
+        settlementBasis: row.settlementBasis,
+        refused,
+      },
+    }))
+  }
+
+  /**
    * THE TERMINAL POLICY for a tombstone's follow-ups (r4 finding 3).
    *
    * Retention compacts an expired-but-unresolved row to attribution only, which keeps everything the
@@ -940,6 +1063,16 @@ export async function repairAccountingBackReferences(
    */
   const settleOutstandingFollowUpsOnly = async (row: BackReferenceSweepRow): Promise<boolean> => {
     if (row.backReferenceFollowUpsPendingAt === null) return true
+    // DEFECT 7, ON THE PATH THAT HAS NO ID TO WRITE. This row carries no back-reference, so nothing
+    // here can stamp a document id — but the enqueue is handed `row.externalTransactionId` as the
+    // syncResult's external id, and for an operator-settled row that is the asserted string. An
+    // INVOICE_PDF's nested email, or any allocation built from it, would then be work performed
+    // against a document nothing has checked. Refused before the marker is consumed, and NOT
+    // stamped, so the obligation survives for the sweep that runs after a human has verified it.
+    if (isOperatorAssertedSettlement(row.settlementBasis)) {
+      await reportUnverifiedAssertion(row, 'the follow-ups')
+      return false
+    }
     result.checked++
     // A compacted payload cannot rebuild anything, and enqueueing from `{}` would report success
     // while doing nothing — the silent version of the loss. Same terminal policy as the linked
@@ -1126,6 +1259,26 @@ export async function repairAccountingBackReferences(
          */
         const owesFollowUps = row.status === 'FAILED' || row.backReferenceFollowUpsPendingAt !== null
         const followUpsOnly = !missing && owesFollowUps && !evidenceOnly
+
+        // DEFECT 7 — THE GATE. Read from the persisted column, and read HERE rather than in the
+        // candidate query on purpose: a row excluded by the query would be silently invisible, and
+        // this refusal has to be ANNOUNCED, throttled and counted like every other refusal in this
+        // file. It sits after the probe because the probe decides WHICH refusal applies, and the
+        // probe is a read that promotes nothing.
+        //
+        // The two branches it blocks are the two that would convert the assertion into evidence:
+        //   • `missing` — the id write itself, which creates the ledger link.
+        //   • `followUpsOnly` — the PDF / attachment / PAYMENT built against the asserted id.
+        //
+        // It deliberately does NOT block the fall-through below. A row whose document is already
+        // linked, by a bill-keyed sync or by the human this refusal asks for, owes nothing and is
+        // stamped exactly as any other reconciled row is: that verdict is about the DOCUMENT's
+        // state, and no part of it comes from the assertion.
+        if (isOperatorAssertedSettlement(row.settlementBasis) && (missing || followUpsOnly)) {
+          await reportUnverifiedAssertion(row, missing ? 'the back-reference' : 'the follow-ups')
+          continue
+        }
+
         if (!missing && !followUpsOnly) {
           if (evidenceOnly && owesFollowUps) {
             // Linked, but its follow-ups never ran — and the payload that would let them run is

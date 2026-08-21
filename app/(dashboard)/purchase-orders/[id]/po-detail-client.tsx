@@ -2745,6 +2745,8 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                           {inv.settlement.status === 'NOT_SENT' && ' · NOT SENT TO LEDGER'}
                           {inv.settlement.status === 'PARTIALLY_SETTLED' && ' · PART PAID IN LEDGER'}
                           {inv.settlement.status === 'OVER_SETTLED' && ' · OVER-PAID IN LEDGER'}
+                          {/* o3d-nf9i r3: an operator's assertion is not the ledger's word. */}
+                          {inv.settlement.status === 'ASSERTED_UNVERIFIED' && ' · ASSERTED, NOT VERIFIED'}
                         </span>
                       )}
                       {!inv.paidAt && inv.settlement.status === 'LEDGER_UNMATCHED' && (

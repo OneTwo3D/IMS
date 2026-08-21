@@ -400,6 +400,12 @@ export type XeroSyncLogRow = {
   externalTransactionId: string | null
   errorMessage: string | null
   retryCount: number
+  /**
+   * o3d-e2mz: which attempt this row is currently on. Any operator decision taken about what this
+   * row shows must carry this value back, so the decision can be refused when the row has moved on
+   * to a different attempt since it was read. 0 means no fence-aware processor has ever claimed it.
+   */
+  attemptRevision: number
   syncedAt: string | null
   createdAt: string
 }
@@ -419,6 +425,7 @@ export async function getXeroSyncLogs(limit = 50): Promise<XeroSyncLogRow[]> {
     externalTransactionId: r.externalTransactionId,
     errorMessage: r.errorMessage,
     retryCount: r.retryCount,
+    attemptRevision: r.attemptRevision,
     syncedAt: r.syncedAt?.toISOString() ?? null,
     createdAt: r.createdAt.toISOString(),
   }))

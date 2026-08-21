@@ -2225,6 +2225,31 @@ model AccountingSyncLog {
   payload               Json? // what was sent
   errorMessage          String?
   retryCount            Int                  @default(0)
+  /// o3d-e2mz: the identity of the CURRENT attempt on this row. Bumped by the processor every time
+  /// it claims the row (PENDING/stale-PROCESSING -> PROCESSING), and by any operator decision that
+  /// terminalises it. Status cannot identify an attempt: every path returns the row to a status it
+  /// already held (retryFailed* drives FAILED -> PENDING -> FAILED, a stale reclaim drives
+  /// PROCESSING -> PROCESSING), and retryCount is reset to 0 by retryFailed*, so neither is
+  /// monotonic. This is, so a decision taken about what was read can compare-and-swap on it and be
+  /// refused when the row has moved on to a different attempt.
+  ///
+  /// 0 means "no processor that participates in the fence has ever claimed this row" — the claim
+  /// bump makes the first attempt 1. A non-PENDING row still at 0 therefore cannot be fenced at all
+  /// and must be refused rather than guessed at (see lib/domain/accounting/sync-log-attempt.ts).
+  attemptRevision       Int                  @default(0) @map("attempt_revision")
+  /// o3d-nf9i r3 — HOW this row's terminal status was reached, when it was not reached by the
+  /// connector. NULL is the ordinary case: the status is whatever the processor's own writeback
+  /// wrote, so it is a CONNECTOR CONFIRMATION. 'OPERATOR_ASSERTION' means a human asserted the
+  /// outcome (app/actions/accounting-settlement.ts) and IMS verified NOTHING about it — no call was
+  /// made, no figure was compared, only a document id was typed in.
+  ///
+  /// It exists because a verdict has to carry its basis. Without this column a settled row is
+  /// byte-identical to a connector-confirmed one, and every reader that asks "did this post?" —
+  /// most importantly lib/domain/accounting/settlement-status.ts, which then compares the amount
+  /// IMS INTENDED to send against the document total — answers as if the ledger had confirmed it.
+  /// Xero will accept a payment for less than the invoice as a PART payment, so a matching pair of
+  /// local numbers is not evidence of anything on an asserted row. Readers must fail closed on it.
+  settlementBasis       String?              @map("settlement_basis")
   processingStartedAt   DateTime?
   syncedAt              DateTime?
   // o3d-clxw r5 finding 1: the same instant as `syncedAt`, written by the same statement from a

@@ -695,7 +695,13 @@ async function loadInvoicePaymentSyncRows(orderId: string, connector: string | n
   if (!connector) return []
   const rows = await db.accountingSyncLog.findMany({
     where: { connector, type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: orderId },
-    select: { status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true },
+    select: {
+      status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true,
+      // o3d-nf9i r3: HOW the row reached its status. Without it an operator-asserted SYNCED row is
+      // indistinguishable from one Xero confirmed, and settlementStatus would compare two local
+      // numbers nothing verified and call the invoice SETTLED.
+      settlementBasis: true,
+    },
     orderBy: { createdAt: 'desc' },
   })
   return rows.map((r) => {
@@ -707,6 +713,7 @@ async function loadInvoicePaymentSyncRows(orderId: string, connector: string | n
       retryCount: r.retryCount,
       // The amount actually SENT, so a part payment is not mistaken for full settlement.
       amount: typeof payload.amount === 'number' ? payload.amount : null,
+      settlementBasis: r.settlementBasis,
       paymentId: payloadPaymentId(r.payload),
     }
   })

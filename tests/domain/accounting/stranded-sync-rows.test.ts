@@ -58,6 +58,9 @@ function sourceRow(over: Partial<Parameters<typeof describeStrandedSyncRow>[0]> 
     externalTransactionId: null,
     errorMessage: null,
     createdAt: new Date('2026-08-04T10:00:00.000Z'),
+    // o3d-e2mz: a claimed attempt, so the default fixture describes a row an operator COULD settle.
+    // Rows at 0 are covered explicitly where that matters.
+    attemptRevision: 3,
     ...over,
   }
 }
@@ -106,6 +109,7 @@ function stranded(over: Partial<Parameters<typeof describeStrandedSyncRow>[0]> =
       externalTransactionId: null,
       errorMessage: 'HTTP 500 from QuickBooks',
       createdAt: new Date('2026-08-04T10:00:00.000Z'),
+      attemptRevision: 3,
       ...over,
     },
     NOW,
@@ -137,10 +141,8 @@ test('the age is whole days since the row was queued — the "how long stuck" th
   assert.equal(stranded({ createdAt: new Date('2026-08-20T10:00:00.000Z') }).ageDays, 0)
 })
 
-test('a stranded PROCESSING row is LISTED, not filtered out — visibility is the whole of item 1', () => {
+test('a stranded PROCESSING row is LISTED, not filtered out — visibility was the whole of item 1', () => {
   // The row a connector switch left claimed forever is exactly the one nothing else shows.
-  // There is no remedy for it in this PR (that needs the claim generation, o3d-e2mz), so it is
-  // listed with its age and reference and nothing else is implied about it.
   const where = buildStrandedSyncRowWhere('xero') as { status: { in: string[] } }
   assert.equal(where.status.in.includes('PROCESSING'), true, 'a claimed-forever row must be LOADED')
   const row = stranded({ status: 'PROCESSING' })
@@ -153,15 +155,67 @@ test('post evidence is surfaced — an external id means a document may already 
   assert.equal(row.externalTransactionId, 'INV-42')
 })
 
-test('the described row carries no settlement affordance — nothing here is actionable yet', () => {
-  // Guard against re-importing the abandoned settlement branch's fields. `settleable` /
-  // `notSettleableReason` describe a control that does not exist in this PR; a UI reason string
-  // saying why a row "cannot be settled" is incoherent with no settle button anywhere.
+test('the described row now carries its settlement affordance — o3d-osl8 item 2 exists', () => {
+  // THIS TEST WAS INVERTED, deliberately. It previously asserted `settleable` / `notSettleableReason`
+  // were ABSENT, because a UI reason string saying why a row "cannot be settled" is incoherent with
+  // no settle button anywhere. There is a settle button now (o3d-nf9i / o3d-osl8 item 2), and the
+  // incoherence would be the other way round: a row an operator can SEE and cannot act on, with no
+  // explanation, reads as "there is nothing to do here".
   const row = stranded() as Record<string, unknown>
-  assert.equal('settleable' in row, false)
-  assert.equal('notSettleableReason' in row, false)
   assert.deepEqual(Object.keys(row).sort(), [
-    'ageDays', 'connector', 'createdAt', 'errorMessage', 'externalTransactionId',
-    'id', 'referenceId', 'referenceType', 'status', 'type',
+    'ageDays', 'attemptRevision', 'connector', 'createdAt', 'errorMessage', 'externalTransactionId',
+    'id', 'notSettleableReason', 'referenceId', 'referenceType', 'requiresAttemptAdoption', 'settleable',
+    'settlementCaveat', 'status', 'type',
   ])
+})
+
+test('the attempt a settlement would name is carried to the UI — the operator cannot name what they were never shown', () => {
+  assert.equal(stranded({ attemptRevision: 7 }).attemptRevision, 7)
+  assert.equal(stranded({ attemptRevision: 0 }).attemptRevision, 0)
+})
+
+test('a FAILED or PROCESSING row on a claimed attempt is offered the control, with the caveat that applies', () => {
+  const failed = stranded({ status: 'FAILED', attemptRevision: 2 })
+  assert.equal(failed.settleable, true)
+  assert.equal(failed.notSettleableReason, null)
+  assert.match(failed.settlementCaveat ?? '', /NOT proof that nothing posted/)
+
+  const processing = stranded({ status: 'PROCESSING', attemptRevision: 2 })
+  assert.equal(processing.settleable, true)
+  assert.match(processing.settlementCaveat ?? '', /may never have returned/)
+})
+
+test('a row that cannot be settled says WHY, and each reason names its own cause', () => {
+  // Two remaining gates, and the operator is owed the one that actually applies. A single
+  // "cannot be settled" would send someone to check a connector that will never help.
+  const pending = stranded({ status: 'PENDING', attemptRevision: 4 })
+  assert.equal(pending.settleable, false)
+  assert.match(pending.notSettleableReason ?? '', /nothing has been sent/)
+
+  const batch = stranded({ status: 'FAILED', type: 'DAILY_BATCH_GROUP_B', attemptRevision: 4 })
+  assert.equal(batch.settleable, false)
+  assert.match(batch.notSettleableReason ?? '', /DAILY BATCH row/)
+
+  for (const row of [pending, batch]) {
+    assert.equal(row.settlementCaveat, null, 'a caveat is for a decision that can be made')
+    assert.equal(row.requiresAttemptAdoption, false)
+  }
+})
+
+test('a STRANDED row at revision 0 reaches the remedy by adoption — this list is the whole point of it', () => {
+  // r3, Codex finding 3. This used to be the third "cannot be settled" gate above, and it applied to
+  // EVERY row on this page: buildStrandedSyncRowWhere selects only rows on a connector that is not
+  // the active one, so nothing participating in the attempt fence will ever claim one, so its
+  // revision never leaves 0. The per-row remedy this list exists to point at did not reach a single
+  // row that motivated it.
+  //
+  // The fixture can reach the state: `stranded()` produces exactly what the loader's select returns
+  // for such a row, and 0 is what the migration gives every pre-existing row.
+  const adoptable = stranded({ status: 'FAILED', attemptRevision: 0 })
+  assert.equal(adoptable.settleable, true)
+  assert.equal(adoptable.requiresAttemptAdoption, true)
+  assert.equal(adoptable.notSettleableReason, null)
+  // The minting is said out loud rather than done quietly.
+  assert.match(adoptable.settlementCaveat ?? '', /MINTS one/)
+  assert.match(adoptable.settlementCaveat ?? '', /NOT proof that nothing posted/)
 })

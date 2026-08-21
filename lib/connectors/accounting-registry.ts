@@ -312,6 +312,7 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
         externalTransactionId: row.externalTransactionId,
         errorMessage: row.errorMessage,
         retryCount: row.retryCount,
+        attemptRevision: row.attemptRevision,
         syncedAt: row.syncedAt,
         createdAt: row.createdAt,
       }))
