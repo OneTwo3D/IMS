@@ -83,7 +83,11 @@ A waterfall chart showing how cash flows from opening balance through inflows an
 
 ## Best Sellers
 
-A ranked list of your top-selling products for the selected period, showing quantity sold and revenue generated.
+A ranked list of your top-selling products for the selected period, showing quantity sold net of returns and the revenue generated.
+
+Revenue here is net of returns on the same terms as the KPI cards: a credit recorded ex-VAT is subtracted, and a credit recorded VAT-inclusive or with no recorded basis is *not* -- subtracting it would remove VAT from a figure that never contained any. Where that happens the amount carries a `≤` and hovering it names the credit that was left out. Because the list is ranked by that same figure, the **order** carries the bound too: a product can sit above another purely on credit that could not be placed, and the tooltip says so.
+
+Quantity is not affected by any of this -- a returned unit is a returned unit whatever unit the money was recorded in -- so "sold net" is exact and never marked.
 
 
 ## Incoming Purchase Orders

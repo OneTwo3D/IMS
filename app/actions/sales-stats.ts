@@ -177,6 +177,26 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
   }
 
   const rows: SalesStatRow[] = []
+  /**
+   * o3d-iigc round 5 (Codex finding 2): THE PERIOD TOTALS ARE ACCUMULATED BEFORE THE ROWS ARE
+   * ROUNDED, and the period margin and its bound are both computed from these.
+   *
+   * They used to be re-summed from the ROUNDED row fields, which put the published summary margin
+   * and marginFigureBound's model of it on different numbers — and the helper's whole case analysis
+   * is about which side of the published figure the truth lies on. Worked, on one product with
+   * 0.016 of revenue, 0.025 of COGS and 0.014 of UNKNOWN-basis credit: rounding each row field
+   * first gives revenue 0.02, COGS 0.03, unplaced credit 0.01, so the summary published -50% and
+   * case 3 (0.02 - 0.01 > 0) marked it `≤`. Place that credit on the net basis and revenue is 0.002,
+   * which rounds to 0.00, so the report's own `> 0` guard publishes 0% — AND 0% IS NOT AT MOST -50%.
+   * The `≤` was a false claim produced entirely by rounding twice.
+   *
+   * Summing unrounded and rounding once is also simply the module's stated rule ("rounding happens
+   * once, in the caller-facing figure, never on the intermediate sums").
+   */
+  const period = {
+    grossRevenue: 0, discounts: 0, refunds: 0, refundsGrossBasis: 0, refundsUnknownBasis: 0,
+    netRevenue: 0, cogs: 0, grossProfit: 0, netQty: 0, refundBasisComplete: true,
+  }
   for (const row of productMap.values()) {
     row.netQty = row.qtySold - row.qtyRefunded
     row.netRevenue = row.grossRevenue - row.discounts - row.refunds
@@ -191,6 +211,12 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
       unplacedCredit: row.refundsGrossBasis + row.refundsUnknownBasis,
       basisComplete: row.refundBasisComplete,
     })
+    period.grossRevenue += row.grossRevenue; period.discounts += row.discounts
+    period.refunds += row.refunds; period.refundsGrossBasis += row.refundsGrossBasis
+    period.refundsUnknownBasis += row.refundsUnknownBasis
+    period.netRevenue += row.netRevenue; period.cogs += row.cogs; period.grossProfit += row.grossProfit
+    period.netQty += row.netQty
+    if (!row.refundBasisComplete) period.refundBasisComplete = false
     row.grossRevenue = Math.round(row.grossRevenue * 100) / 100; row.discounts = Math.round(row.discounts * 100) / 100
     row.refunds = Math.round(row.refunds * 100) / 100; row.netRevenue = Math.round(row.netRevenue * 100) / 100
     row.refundsGrossBasis = Math.round(row.refundsGrossBasis * 100) / 100
@@ -201,28 +227,33 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
   }
   rows.sort((a, b) => b.netRevenue - a.netRevenue)
 
+  const m2 = (v: number) => Math.round(v * 100) / 100
   const summary: SalesStatSummary = {
-    totalOrders: orders.length, totalGrossRevenue: rows.reduce((s, r) => s + r.grossRevenue, 0),
-    totalDiscounts: rows.reduce((s, r) => s + r.discounts, 0), totalRefunds: rows.reduce((s, r) => s + r.refunds, 0),
-    totalRefundsGrossBasis: rows.reduce((s, r) => s + r.refundsGrossBasis, 0),
-    totalRefundsUnknownBasis: rows.reduce((s, r) => s + r.refundsUnknownBasis, 0),
-    refundBasisComplete: rows.every((r) => r.refundBasisComplete),
-    totalNetRevenue: rows.reduce((s, r) => s + r.netRevenue, 0), totalCogs: rows.reduce((s, r) => s + r.cogs, 0),
-    totalGrossProfit: rows.reduce((s, r) => s + r.grossProfit, 0), avgMarginPct: 0, avgMarginPctBound: 'exact', avgOrderValue: 0,
-    totalQtySold: rows.reduce((s, r) => s + r.netQty, 0),
+    totalOrders: orders.length, totalGrossRevenue: m2(period.grossRevenue),
+    totalDiscounts: m2(period.discounts), totalRefunds: m2(period.refunds),
+    totalRefundsGrossBasis: m2(period.refundsGrossBasis),
+    totalRefundsUnknownBasis: m2(period.refundsUnknownBasis),
+    refundBasisComplete: period.refundBasisComplete,
+    totalNetRevenue: m2(period.netRevenue), totalCogs: m2(period.cogs),
+    totalGrossProfit: m2(period.grossProfit), avgMarginPct: 0, avgMarginPctBound: 'exact', avgOrderValue: 0,
+    // Quantity is left unrounded exactly as it was: it may carry fractional units, and rounding it
+    // to two places here would be a change this finding did not call for.
+    totalQtySold: period.netQty,
   }
-  summary.avgMarginPct = summary.totalNetRevenue > 0 ? Math.round((summary.totalGrossProfit / summary.totalNetRevenue) * 1000) / 10 : 0
+  // From the UNROUNDED period figures, so the published ratio and the counterfactual the bound is
+  // classified against are the same function of the same quantities.
+  summary.avgMarginPct = period.netRevenue > 0 ? Math.round((period.grossProfit / period.netRevenue) * 1000) / 10 : 0
   // The whole-period margin is the same ratio over the same two quantities, so it is classified the
   // same way — from the period's own COGS and its own unplaced credit, NOT by OR-ing the rows'
   // verdicts: a row whose margin is indeterminate can sit inside a period whose margin is a sound
   // upper bound, and the reverse.
   summary.avgMarginPctBound = marginFigureBound({
-    netRevenue: summary.totalNetRevenue,
-    cogs: summary.totalCogs,
-    unplacedCredit: summary.totalRefundsGrossBasis + summary.totalRefundsUnknownBasis,
-    basisComplete: summary.refundBasisComplete,
+    netRevenue: period.netRevenue,
+    cogs: period.cogs,
+    unplacedCredit: period.refundsGrossBasis + period.refundsUnknownBasis,
+    basisComplete: period.refundBasisComplete,
   })
-  summary.avgOrderValue = summary.totalOrders > 0 ? Math.round((summary.totalNetRevenue / summary.totalOrders) * 100) / 100 : 0
+  summary.avgOrderValue = summary.totalOrders > 0 ? Math.round((period.netRevenue / summary.totalOrders) * 100) / 100 : 0
   return { rows, summary }
 }
 

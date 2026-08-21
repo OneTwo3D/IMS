@@ -97,6 +97,35 @@ export function cashBridgeRows(kpi: KpiSummary): { name: string; value: number; 
   ]
 }
 
+/**
+ * o3d-iigc round 5: THE BEST SELLERS ROW.
+ *
+ * A card has no refunds column beside it, so — as round 3 established for the summary cards — the
+ * LOOSENESS goes in words rather than being left for the reader to find on another page. The
+ * amount named here is the credit that was NOT subtracted, which is the whole width of the bound.
+ *
+ * The RANKING is called out too, and that is not decoration: this list is sorted by the very figure
+ * being bounded, so an unplaced credit can hold a product above one whose figure is exact. A `≤` on
+ * the number alone would leave a reader believing the ORDER was still a measurement.
+ *
+ * Module-level and pure so the marked set is assertable without mounting the page.
+ */
+export function bestSellerRevenueTitle(p: TopProduct, formatMoneyBase: (value: number) => string): string | undefined {
+  if (p.netRevenueBound === 'exact') return undefined
+  const unplaced = formatMoneyBase(p.refundsGrossBasis + p.refundsUnknownBasis)
+  return `Upper bound: ${unplaced} of credit on this product is on the gross basis or has no proven basis, so it is not subtracted from this ex-VAT figure. The list order is by this figure, so the ranking carries the same bound.`
+}
+
+/**
+ * The margin beside it. Same ratio argument as everywhere else on this page: `refundBasisComplete`
+ * being false does NOT make a ratio an upper bound, so the verdict comes from the row's own
+ * marginPctBound and an indeterminate one is published with the RELATION withheld, not the figure.
+ */
+export function bestSellerMarginTitle(p: TopProduct): string | undefined {
+  if (p.marginPctBound === 'exact') return undefined
+  return p.marginPctBound === 'indeterminate' ? MARGIN_INDETERMINATE_TITLE : UPPER_BOUND_TITLE
+}
+
 function ChangeBadge({ current, previous, comparable = true, incomparableReason }: { current: number; previous: number; comparable?: boolean; incomparableReason?: string }) {
   // o3d-iigc: when either side of the comparison is an upper bound of unknown tightness, the SIGN
   // of the change is not established — a period whose credits are all legacy GROSS has more of
@@ -500,9 +529,19 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 <span className="text-xs text-muted-foreground w-4 shrink-0">{i + 1}.</span>
                 <div className="flex-1 min-w-0">
                   <ProductLink productId={p.productId} sku={p.sku} name={p.name} />
-                  <p className="text-[10px] text-muted-foreground">{p.qtySold} sold &middot; {p.marginPct}% margin</p>
+                  {/* netQty is qtySold less every credited unit. Quantity is basis-independent, so
+                      it is EXACT and deliberately carries no marker. */}
+                  <p className="text-[10px] text-muted-foreground">
+                    {p.netQty} sold net{p.qtyRefunded > 0 ? ` (${p.qtySold} less ${p.qtyRefunded} returned)` : ''} &middot;{' '}
+                    <span className={p.marginPctBound === 'exact' ? '' : 'text-orange-600'} title={bestSellerMarginTitle(p)}>
+                      {p.marginPct}%{boundSuffix(p.marginPctBound)} margin
+                    </span>
+                  </p>
                 </div>
-                <span className="tabular-nums text-sm font-mono font-medium shrink-0">{fmtBaseFull(p.netRevenue)}</span>
+                <span
+                  className={`tabular-nums text-sm font-mono font-medium shrink-0 ${p.netRevenueBound === 'exact' ? '' : 'text-orange-600'}`}
+                  title={bestSellerRevenueTitle(p, fmtBaseFull)}
+                >{fmtBaseFull(p.netRevenue)}{boundSuffix(p.netRevenueBound)}</span>
               </div>
             ))}
             {topProducts.length === 0 && <p className="text-center text-sm text-muted-foreground py-6">No sales data.</p>}

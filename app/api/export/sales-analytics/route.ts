@@ -12,6 +12,12 @@ import {
   type SalesAnalyticsGroupBy,
   type SalesCurrencyMode,
 } from '@/lib/domain/sales/sales-fulfillment-analytics'
+import {
+  REFUND_BLIND_NOTICE_CUSTOMER_MIX,
+  REFUND_BLIND_NOTICE_GROSS_MARGIN,
+  REFUND_BLIND_NOTICE_SALES,
+  RETURNS_MIXED_BASIS_NOTICE,
+} from '@/lib/analytics/refund-figure-surfaces'
 import { canAccessSalesAnalytics } from '@/lib/security/sales-analytics-access'
 import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
@@ -64,31 +70,45 @@ export async function GET(req: NextRequest) {
   const reportType = req.nextUrl.searchParams.get('report') ?? 'sales'
   const date = new Date().toISOString().slice(0, 10)
 
+  /**
+   * o3d-iigc round 5. A FILE READER HAS NO TOOLTIP — the rule round 3 set when it renamed a column
+   * rather than relying on a header hint. Three of these six CSVs carry revenue/profit/margin
+   * figures that never see a refund, and one carries credit values whose basis varies row by row.
+   * `csvResponse` turns this metadata into `#` comment rows at the foot of the file (skipped by
+   * parseCsv, so re-import is unaffected) plus the X-IMS-Export-Metadata header, which is this
+   * repo's existing channel for saying something about a file inside the file.
+   */
+  const exportMetadata = (refundTreatment: string) => ({
+    dateFrom: filters.dateFrom, dateTo: filters.dateTo, groupBy: filters.groupBy, refundTreatment,
+  })
+
   try {
     switch (reportType) {
     case 'sales': {
       const report = await getSalesAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['key', 'label', 'groupBy', 'currency', 'orderCount', 'lineCount', 'revenue', 'tax', 'shipping', 'discount']), `sales-analytics-${date}.csv`)
+      return csvResponse(toCsv(report.rows, ['key', 'label', 'groupBy', 'currency', 'orderCount', 'lineCount', 'revenue', 'tax', 'shipping', 'discount']), `sales-analytics-${date}.csv`, exportMetadata(REFUND_BLIND_NOTICE_SALES))
     }
     case 'customers': {
       const report = await getCustomerAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['customerId', 'customerName', 'customerEmail', 'orderCount', 'revenueBase', 'grossProfitBase', 'arExposureBase', 'shareOfRevenuePct']), `customer-mix-${date}.csv`)
+      return csvResponse(toCsv(report.rows, ['customerId', 'customerName', 'customerEmail', 'orderCount', 'revenueBase', 'grossProfitBase', 'arExposureBase', 'shareOfRevenuePct']), `customer-mix-${date}.csv`, exportMetadata(REFUND_BLIND_NOTICE_CUSTOMER_MIX))
     }
     case 'margin': {
       const report = await getMarginAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['productId', 'sku', 'productName', 'categoryName', 'lineCount', 'revenueBase', 'cogsBase', 'grossProfitBase', 'marginPct', 'contributionPct']), `gross-margin-${date}.csv`)
+      return csvResponse(toCsv(report.rows, ['productId', 'sku', 'productName', 'categoryName', 'lineCount', 'revenueBase', 'cogsBase', 'grossProfitBase', 'marginPct', 'contributionPct']), `gross-margin-${date}.csv`, exportMetadata(REFUND_BLIND_NOTICE_GROSS_MARGIN))
     }
     case 'returns': {
       const report = await getReturnsAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['productId', 'sku', 'productName', 'customerName', 'reason', 'refundCount', 'returnedQty', 'refundValueBase', 'shippedQty', 'returnRatePct']), `returns-${date}.csv`)
+      // o3d-iigc round 5: refundValueBase is null where the row mixes bases, so the basis and the
+      // three per-basis buckets travel WITH it. A bare blank in a file is not an explanation.
+      return csvResponse(toCsv(report.rows, ['productId', 'sku', 'productName', 'customerName', 'reason', 'refundCount', 'returnedQty', 'refundValueBase', 'refundValueBasis', 'refundValueNetBasis', 'refundValueGrossBasis', 'refundValueUnknownBasis', 'shippedQty', 'returnRatePct']), `returns-${date}.csv`, exportMetadata(RETURNS_MIXED_BASIS_NOTICE))
     }
     case 'fulfillment': {
       const report = await getFulfillmentAnalyticsReport(filters)

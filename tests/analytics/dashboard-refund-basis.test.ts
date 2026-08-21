@@ -59,7 +59,9 @@ function order(o: OrderFixture) {
       productId: `prod-${o.id}`, sku: `SKU-${o.id}`, description: `Product ${o.id}`,
       taxRate: { rate: 0.2 },
     }],
-    refunds: o.refunds,
+    // o3d-iigc round 5: the query now selects refund LINES too (Best Sellers is per-product). The
+    // header credit is mirrored onto this order's single line, which is what a real refund carries.
+    refunds: o.refunds.map((r) => ({ ...r, lines: [{ productId: `prod-${o.id}`, qty: 1, totalBase: r.totalBase }] })),
   }
 }
 

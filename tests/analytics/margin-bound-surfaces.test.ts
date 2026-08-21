@@ -183,6 +183,11 @@ const TODAY_NOON = new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate(), 12
 
 const YESTERDAY_NOON = new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate() - 1, 12)
 
+/**
+ * o3d-iigc round 5: the dashboard query now selects each refund's LINES, because Best Sellers is
+ * per-product and a header total says nothing about which product was credited. The fixture mirrors
+ * the header credit onto the order's single line, which is what a real refund looks like.
+ */
 function dashboardOrder(cogsBase: number, refunds: { totalsBasis: string | null; totalBase: number }[], createdAt: Date = TODAY_NOON) {
   return {
     id: 'A', externalOrderNumber: null, customerName: 'Acme', status: 'COMPLETED',
@@ -193,7 +198,7 @@ function dashboardOrder(cogsBase: number, refunds: { totalsBasis: string | null;
       cogsBase, qty: 1, totalBase: 100, discountAmount: 0,
       productId: 'p1', sku: 'SKU-1', description: 'Widget', taxRate: { rate: 0.2 },
     }],
-    refunds,
+    refunds: refunds.map((r) => ({ ...r, lines: [{ productId: 'p1', qty: 1, totalBase: r.totalBase }] })),
   }
 }
 

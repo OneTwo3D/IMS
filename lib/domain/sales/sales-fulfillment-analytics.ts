@@ -21,6 +21,14 @@ import {
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
+import { refundTotalsBasis } from '@/lib/domain/sales/refund-basis-analytics'
+import {
+  REFUND_BLIND_NOTICE_CUSTOMER_MIX,
+  REFUND_BLIND_NOTICE_GROSS_MARGIN,
+  REFUND_BLIND_NOTICE_SALES,
+  RETURNS_MIXED_BASIS_MARKER,
+  RETURNS_MIXED_BASIS_NOTICE,
+} from '@/lib/analytics/refund-figure-surfaces'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -120,7 +128,26 @@ export type ReturnsReportRow = {
   reason: string
   refundCount: number
   returnedQty: string
-  refundValueBase: string
+  /**
+   * o3d-iigc round 5. The credit on this row, ON ITS OWN BASIS — and `null` when the row's credits
+   * are not all on one basis, because a NET amount added to a GROSS one is a number with no unit.
+   * Round 4 flagged this producer and left it; it was summing all three bases into one figure AND
+   * SORTING THE REPORT BY IT, so a row of legacy gross credits outranked a larger net one purely
+   * on the VAT it still carried.
+   *
+   * A null here is an ADMISSION, never a zero: a zero would read as "nothing was credited", which
+   * is the opposite of what is being said. The three buckets below always add up to the whole
+   * credit, so how much credit exists is never in doubt even when its unit is.
+   */
+  refundValueBase: string | null
+  /** Which basis `refundValueBase` is expressed on, or why it could not be expressed. */
+  refundValueBasis: 'NONE' | 'NET' | 'GROSS' | 'UNKNOWN' | 'MIXED'
+  /** Credit stamped NET (ex-VAT). Always reported, whatever the row's overall basis. */
+  refundValueNetBasis: string
+  /** Credit stamped GROSS (VAT-inclusive). */
+  refundValueGrossBasis: string
+  /** Credit whose basis was never proved. Never guessed at, never converted. */
+  refundValueUnknownBasis: string
   shippedQty: string
   returnRatePct: string
 }
@@ -229,6 +256,8 @@ type RefundLineRow = {
     id: string
     reason: string | null
     totalBase: DecimalInput
+    /** o3d-iigc round 5: NET / GROSS / null. Governs the line amounts under it. */
+    totalsBasis: string | null
     refundedAt: Date
     order: {
       customerName: string | null
@@ -605,6 +634,7 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
     },
     notices: [
       'Sales totals exclude cancelled orders. Product/category views allocate order-level totals across lines by line value so grand totals reconcile to SalesOrder totals.',
+      REFUND_BLIND_NOTICE_SALES,
       mode === 'foreign' ? 'Foreign-currency product/category rows are split by original order currency; customer/channel rows show Multiple when a group contains more than one original currency.' : `Base-currency rows use ${baseCurrency} amounts recorded on the order.`,
     ],
   }
@@ -697,7 +727,10 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
       grossProfitBase: moneyString(grossProfit, baseCurrency),
       arExposureBase: moneyString(arExposure, baseCurrency),
     },
-    notices: ['AR exposure is unpaid sales-order totalBase for the selected period. COGS comes from CogsEntry rows linked to SALE_DISPATCH movements.'],
+    notices: [
+      'AR exposure is unpaid sales-order totalBase for the selected period. COGS comes from CogsEntry rows linked to SALE_DISPATCH movements.',
+      REFUND_BLIND_NOTICE_CUSTOMER_MIX,
+    ],
   }
 }
 
@@ -985,8 +1018,36 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
       'Margin rows are product-level buckets: COGS is grouped by the sales line product behind the dispatch (the movement product for unlinked rows) and revenue is grouped from sales-order lines for COGS-linked orders. Duplicate SKU lines share the same product bucket; this report is not line-level COGS attribution.',
       'Line revenue is prorated to the quantity each line dispatched within the window (via the shipment-line link on dispatch movements), so a line shipped across periods books only its in-window revenue against in-window COGS.',
     'Kit lines are converted from component dispatch quantities to whole ordered units through the fulfillment-requirement graph, so a kit contributes revenue in the same units its line is priced in.',
+      REFUND_BLIND_NOTICE_GROSS_MARGIN,
     ],
   }
+}
+
+
+/**
+ * o3d-iigc round 5: state a period's (or a row's) credit ON ITS BASIS, or refuse to state it.
+ *
+ * A NET amount and a GROSS amount differ by VAT, so adding them yields a number that is on neither
+ * basis — the same reason `netOfRefunds` returns null for a mixed set rather than a plausible-looking
+ * total. EXACTLY-ZERO buckets are skipped: zero is identical on both bases, so it carries no basis
+ * information and must not turn an otherwise unanimous set into a mixed one. The test is `isZero()`
+ * rather than a tolerance, for the reason refundSetBasis gives — dust is still value.
+ */
+function statedRefundValue(
+  net: Prisma.Decimal,
+  gross: Prisma.Decimal,
+  unknown: Prisma.Decimal,
+): { value: Prisma.Decimal | null; basis: 'NONE' | 'NET' | 'GROSS' | 'UNKNOWN' | 'MIXED' } {
+  const present: Array<['NET' | 'GROSS' | 'UNKNOWN', Prisma.Decimal]> = []
+  if (!net.isZero()) present.push(['NET', net])
+  if (!gross.isZero()) present.push(['GROSS', gross])
+  if (!unknown.isZero()) present.push(['UNKNOWN', unknown])
+  if (present.length === 0) return { value: new Prisma.Decimal(0), basis: 'NONE' }
+  if (present.length > 1) return { value: null, basis: 'MIXED' }
+  const [basis, value] = present[0]!
+  // A single UNPROVEN bucket is a stated AMOUNT on an unstated basis. The amount is real — that much
+  // credit exists — so it is published, with `basis: 'UNKNOWN'` saying what is not known about it.
+  return { value, basis }
 }
 
 export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<ReturnsReportRow>> {
@@ -1010,6 +1071,8 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
             id: true,
             reason: true,
             totalBase: true,
+            // o3d-iigc round 5: the basis was not fetched, so the report could not have respected it.
+            totalsBasis: true,
             refundedAt: true,
             order: { select: { customerName: true, lines: { select: { productId: true, qty: true } } } },
           },
@@ -1083,13 +1146,20 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
     if (movement.shipmentLine) continue
     shippedByProduct.set(movement.productId, (shippedByProduct.get(movement.productId) ?? new Prisma.Decimal(0)).add(toDecimal(movement.qty)))
   }
-  const groups = new Map<string, ReturnsReportRow & { refundIds: Set<string>; returned: Prisma.Decimal; refundValue: Prisma.Decimal }>()
+  type ReturnsGroup = ReturnsReportRow & {
+    refundIds: Set<string>
+    returned: Prisma.Decimal
+    net: Prisma.Decimal
+    gross: Prisma.Decimal
+    unknown: Prisma.Decimal
+  }
+  const groups = new Map<string, ReturnsGroup>()
   for (const line of refundLines) {
     const productKey = line.productId ?? `desc:${line.description}`
     const reason = line.refund.reason ?? 'Unspecified'
     const customer = line.refund.order.customerName ?? 'Unknown customer'
     const key = `${productKey}:${customer}:${reason}`
-    const current = groups.get(key) ?? {
+    const current: ReturnsGroup = groups.get(key) ?? {
       productId: line.productId,
       sku: line.product?.sku ?? 'No SKU',
       productName: line.product?.name ?? line.description,
@@ -1098,21 +1168,33 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
       refundCount: 0,
       returnedQty: '0',
       refundValueBase: '0',
+      refundValueBasis: 'NONE',
+      refundValueNetBasis: '0',
+      refundValueGrossBasis: '0',
+      refundValueUnknownBasis: '0',
       shippedQty: '0',
       returnRatePct: '0',
       refundIds: new Set<string>(),
       returned: new Prisma.Decimal(0),
-      refundValue: new Prisma.Decimal(0),
+      net: new Prisma.Decimal(0),
+      gross: new Prisma.Decimal(0),
+      unknown: new Prisma.Decimal(0),
     }
     current.refundIds.add(line.refundId)
     current.refundCount = current.refundIds.size
+    // Quantity is basis-independent, so it keeps taking EVERY line whatever the basis.
     current.returned = current.returned.add(toDecimal(line.qty))
-    current.refundValue = current.refundValue.add(toDecimal(line.totalBase))
+    const amount = toDecimal(line.totalBase)
+    const bucket = refundTotalsBasis(line.refund.totalsBasis)
+    if (bucket === 'NET') current.net = current.net.add(amount)
+    else if (bucket === 'GROSS') current.gross = current.gross.add(amount)
+    else current.unknown = current.unknown.add(amount)
     groups.set(key, current)
   }
   const rows = [...groups.values()]
     .map((row) => {
       const shippedQty = row.productId ? shippedByProduct.get(row.productId) ?? new Prisma.Decimal(0) : new Prisma.Decimal(0)
+      const stated = statedRefundValue(row.net, row.gross, row.unknown)
       return {
         productId: row.productId,
         sku: row.sku,
@@ -1121,15 +1203,31 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
         reason: row.reason,
         refundCount: row.refundCount,
         returnedQty: qtyString(row.returned),
-        refundValueBase: moneyString(row.refundValue, baseCurrency),
+        refundValueBase: stated.value == null ? null : moneyString(stated.value, baseCurrency),
+        refundValueBasis: stated.basis,
+        refundValueNetBasis: moneyString(row.net, baseCurrency),
+        refundValueGrossBasis: moneyString(row.gross, baseCurrency),
+        refundValueUnknownBasis: moneyString(row.unknown, baseCurrency),
         shippedQty: qtyString(shippedQty),
         returnRatePct: pctString(row.returned, shippedQty),
       }
     })
-    .sort((a, b) => toDecimal(b.refundValueBase).cmp(a.refundValueBase) || a.sku.localeCompare(b.sku))
+    // o3d-iigc round 3's rule, applied to the report that was RANKED by the mixed figure: a row
+    // whose value could not be stated has no position in the ordering, so it goes LAST rather than
+    // being coerced to zero and sorted in among the rows that genuinely returned nothing.
+    .sort((a, b) => {
+      if (a.refundValueBase == null || b.refundValueBase == null) {
+        if (a.refundValueBase == null && b.refundValueBase == null) return a.sku.localeCompare(b.sku)
+        return a.refundValueBase == null ? 1 : -1
+      }
+      return toDecimal(b.refundValueBase).cmp(a.refundValueBase) || a.sku.localeCompare(b.sku)
+    })
   const paged = paginate(rows, filters, deps?.paginate !== false)
   const totalReturned = [...groups.values()].reduce((sum, row) => sum.add(row.returned), new Prisma.Decimal(0))
-  const totalRefund = [...groups.values()].reduce((sum, row) => sum.add(row.refundValue), new Prisma.Decimal(0))
+  const totalNet = [...groups.values()].reduce((sum, row) => sum.add(row.net), new Prisma.Decimal(0))
+  const totalGross = [...groups.values()].reduce((sum, row) => sum.add(row.gross), new Prisma.Decimal(0))
+  const totalUnknown = [...groups.values()].reduce((sum, row) => sum.add(row.unknown), new Prisma.Decimal(0))
+  const statedTotal = statedRefundValue(totalNet, totalGross, totalUnknown)
   return {
     generatedAt: generatedAt.toISOString(),
     dateFrom: dateOnly(window.dateFrom),
@@ -1138,11 +1236,18 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
     pageInfo: paged.pageInfo,
     totals: {
       returnedQty: qtyString(totalReturned),
-      refundValueBase: moneyString(totalRefund, baseCurrency),
+      // `refundValueBase` is the whole period on ONE basis, or the MIXED marker. The three buckets
+      // are always present, so a reader always sees how much credit exists.
+      refundValueBase: statedTotal.value == null ? RETURNS_MIXED_BASIS_MARKER : moneyString(statedTotal.value, baseCurrency),
+      refundValueBasis: statedTotal.basis,
+      refundValueNetBasis: moneyString(totalNet, baseCurrency),
+      refundValueGrossBasis: moneyString(totalGross, baseCurrency),
+      refundValueUnknownBasis: moneyString(totalUnknown, baseCurrency),
     },
     notices: [
       'Returns analysis uses SalesOrderRefundLine values and compares returned quantity with SALE_DISPATCH quantity in the same period. Return rate is a same-period returned ÷ same-period dispatched metric, not an order-cohort return rate.',
       'Dispatched quantity for kit products is converted from component movements to whole ordered units via the fulfillment-requirement graph, so the return rate divides like units by like units.',
+      RETURNS_MIXED_BASIS_NOTICE,
     ],
   }
 }
