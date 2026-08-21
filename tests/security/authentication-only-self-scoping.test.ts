@@ -194,24 +194,53 @@ const NON_SELF_SCOPED_READS: Record<string, string[]> = {
   'passkey.ts:getPasskeyRegistrationOptions': ['setting.findUnique where {key}'],
   'passkey.ts:verifyPasskeyRegistration': ['setting.findUnique where {key}'],
 
-  // THE ONE THAT IS NOT CONFIGURATION, and the reason this file exists.
+  // THE ONE THAT IS NOT CONFIGURATION, and the reason this file exists — CLOSED BY THE MERGE
+  // (o3d-m3gy).
   //
   // updateProfile checks its new email for uniqueness with
-  // db.user.findUnique({ where: { email: newEmail } }) — a lookup of a row that
-  // by definition is NOT the caller's, keyed on a value the caller supplies. The
-  // result is not returned, but the outcome is: 'Email already in use' tells the
-  // caller whether an account exists at any address they care to name, and the
-  // caller may be an external supplier. It is an account-enumeration oracle, not
-  // a data leak: no field of the other row reaches the response.
+  // db.user.findUnique({ where: { email: newEmail } }) — a lookup of a row that by definition is NOT
+  // the caller's, keyed on a value the caller supplies. The result is not returned, but the outcome
+  // is: it tells the caller whether an account exists at any address they care to name. That is an
+  // account-enumeration oracle, not a data leak, and this branch pinned it here as an accepted risk
+  // rather than "fixing" it quietly, because the read is load-bearing (it keeps the unique constraint
+  // from surfacing as a 500) and narrowing it is a product decision.
   //
-  // Left as it is rather than "fixed" quietly, because the read is load-bearing —
-  // it is what keeps the unique constraint from failing as a 500 — and narrowing
-  // it is a product decision about a rate limit or a generic error, not a
-  // one-line security patch. It is pinned here so it is a decision on the record
-  // instead of an assumption, and it is exactly the class the model-surface pin
-  // could not see: same model, same operation, same table, different subject.
-  'profile.ts:updateProfile': ['user.findUnique where {email}'],
+  // SUPERSEDED EXPECTATION, and by a stronger answer than the one being pinned. `development`'s
+  // o3d-4is8 narrowed the endpoint by PRINCIPAL: a SUPPLIER may no longer change its own login email
+  // at all — supplier logins are issued and maintained by staff — and that refusal returns BEFORE the
+  // uniqueness pre-check. This file's entire premise is the EXTERNAL principal (see the mocked
+  // session: role SUPPLIER), so for the caller this file is about, the foreign-row read no longer
+  // happens. The expectation is therefore empty, and the test below proves WHY it is empty rather
+  // than leaving an absence to be read as a pass.
+  //
+  // NOT claimed: that the oracle is gone for an INTERNAL principal. It is not — the pre-check still
+  // runs for staff, bounded now by a per-user rate limit and a generic error message (o3d-4is8
+  // narrowings 2 and 3). That is a different endpoint population from the one this file inventories,
+  // and pinning it here would be pinning it in the wrong place.
+  'profile.ts:updateProfile': [],
 }
+
+test('o3d-m3gy: updateProfile issues NO foreign-row read for an external principal, because it refuses first', async () => {
+  // The proof behind the empty expectation above. An absent query is only evidence if something says
+  // why it is absent — otherwise a future refactor that moves the pre-check earlier, or a fixture that
+  // stops reaching the endpoint at all, would read as the same pass.
+  recorder.reset()
+  queries.length = 0
+  const { updateProfile } = await import('@/app/actions/profile')
+
+  const result = await updateProfile({ name: 'Renamed', email: FOREIGN_EMAIL })
+
+  assert.equal(result.success, false, 'an external principal may not change its own login email')
+  assert.ok(
+    queries.some((q) => q.model === 'user' && q.op === 'findUnique'),
+    'the endpoint still ran — it read the CALLER\'s own row before refusing',
+  )
+  assert.equal(
+    queries.filter((q) => q.model === 'user' && !mentionsCaller(q)).length,
+    0,
+    'and it never reached the uniqueness pre-check, which is the only read here that is not the caller\'s',
+  )
+})
 
 for (const endpoint of ENDPOINTS) {
   test(`${endpoint.key} scopes every query it issues to the CALLER's own row`, async () => {

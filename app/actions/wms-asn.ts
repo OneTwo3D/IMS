@@ -111,6 +111,17 @@ export async function createWmsTransferAsn(
 export async function recheckWmsAsnBookedIn(
   externalAsnId: unknown,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
+  // o3d-512h round 3, applied to an export that arrived after it (o3d-m3gy). This dispatcher landed on
+  // `development` while `wms-asn.ts:*` still carried a blanket allowlist entry, and that entry was
+  // deleted here for the reason the note in tests/security/server-action-guard-coverage.test.ts gives:
+  // the no-connector arm returns WITHOUT ever reaching the delegate whose guard it claims to inherit,
+  // so on exactly the path an unauthorized caller takes there was no guard at all — and reaching that
+  // arm already means `getActiveWmsConnectorId` ran, i.e. the refused caller got a database read and
+  // an oracle for which WMS this tenant uses.
+  //
+  // The gate is the DELEGATE'S OWN, not a convenient one:
+  // mintsoft-sync.ts:recheckMintsoftAsnBookedIn → requirePermission('purchasing.receive').
+  await requirePermission('purchasing.receive')
   const connector = await getActiveWmsConnectorId()
   if (connector === 'mintsoft') {
     const { recheckMintsoftAsnBookedIn } = await import('@/app/actions/mintsoft-sync')

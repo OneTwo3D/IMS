@@ -211,6 +211,16 @@ mock.module('@/lib/auth/server', {
       }
       return { user: { id: 'u1', role: state.role } }
     },
+    // o3d-512h round 3: the internal-user gate this module now uses instead of requireAuth, because
+    // a SUPPLIER is AUTHENTICATED and requireAuth therefore admitted an external principal to
+    // internal actions. It is a REAL gate here, not a stub returning a session: a double that waved
+    // it through would make every "SUPPLIER is refused" assertion in this file vacuous.
+    requireInternalUser: async () => {
+      if (!hasPermission(state.role, 'internal' as Permission)) {
+        throw new PermissionDeniedError('Forbidden: missing permission internal', 'internal' as Permission)
+      }
+      return { user: { id: 'u1', role: state.role } }
+    },
     freshAuthFailureResult: () => null,
     PermissionDeniedError,
     isAuthorizationDenial,

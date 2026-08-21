@@ -90,45 +90,91 @@ test('getAccountingAccounts reads the chart of accounts for an ADMIN session', a
  * This is the executable version of that claim. It is the third round in which
  * this sentence has appeared; it is the first in which the code makes it true.
  */
-test('MANAGER holds `sync` and is STILL refused by the Xero delegate — the stricter branch the dispatcher note relies on', async () => {
+test('MANAGER holds `sync` and is STILL refused by the Xero CREDENTIAL delegate — the stricter branch the dispatcher note relies on', async () => {
+  // SUPERSEDED SUBJECT (o3d-m3gy): this used to assert the refusal on `getAccountingAccounts`, a
+  // READ, because round 3 applied the ADMIN role to every export in xero-sync.ts. The claim it is
+  // making — that a stricter frame exists behind the dispatcher — is unchanged and is now asserted on
+  // `testXeroConnection`, which exercises the tenant's stored OAuth credentials against Xero. That is
+  // the surface the dispatcher note is actually about ("saveXeroSettings → requireRole('ADMIN')") and
+  // round 3's own justification ("connector OAuth credentials are ADMIN business").
+  //
+  // WHY THE READS CAME BACK TO 'sync', and it is not a softening. On current `development` the /sync
+  // page treats a denial from ANY of its reads as FATAL (o3d-osl8) — a partial page is a dishonest
+  // answer to a denial — and seven of those reads route through this module. An ADMIN-only read
+  // surface therefore does not narrow MANAGER's reach, it replaces the whole /sync page (QuickBooks
+  // half included) with the generic error boundary, which is the opposite of round 3's stated reach
+  // change: "It keeps the whole QuickBooks branch". tests/accounting/dashboard-read-gates.test.ts
+  // measures that outcome directly, and the counter-guard below pins the reads that must keep working.
   currentRole = 'MANAGER'
   recorder.reset()
-  const { getAccountingAccounts } = await import('@/app/actions/xero-sync')
+  const { testXeroConnection } = await import('@/app/actions/xero-sync')
 
   await assert.rejects(
-    () => getAccountingAccounts(),
+    () => testXeroConnection(),
     (error: unknown) => {
-      // requireRole carries no permission name in this codebase, so the assertion
-      // is on the ROLE decision — and, critically, that it is a different refusal
-      // from the 'sync' one above. If this ever comes back as
-      // `permission === 'sync'` the ADMIN check has been dropped again.
-      assert.equal((error as { permission?: string }).permission, undefined)
+      // The ROLE decision, and critically a DIFFERENT refusal from the 'sync' one above: a role
+      // denial carries `permission: null` (it was not about a permission), where a permission denial
+      // names it. If this ever comes back as `permission === 'sync'` the ADMIN check has been dropped
+      // again; if it comes back `undefined` the denial has lost its ability to say which kind it is.
+      assert.equal((error as { permission?: string | null }).permission, null)
       assert.match(String((error as Error).message), /^Forbidden$/)
       return true
     },
   )
 
-  recorder.assertNoReads('MANAGER calling getAccountingAccounts')
+  recorder.assertNoReads('MANAGER calling testXeroConnection')
 })
 
-test('MANAGER is refused by every Xero export, not just the one', async () => {
+test('MANAGER is refused by every Xero CREDENTIAL export, not just the one', async () => {
+  // SUPERSEDED LIST (o3d-m3gy): this enumerated the six READ exports. It now enumerates the
+  // credential surface, for the reason given on the test above. The shape of the claim — "not just
+  // the one", i.e. the ADMIN frame is on the whole surface rather than on whichever export a reviewer
+  // happened to check — is exactly preserved; what changed is which surface it is.
+  //
+  // The `save*` / `connect*` exports catch their own errors and return `{ success: false }` (they
+  // report to a form, not to an error boundary), so they are asserted on the RESULT. A refusal that
+  // arrives as a value is still a refusal; what would not be acceptable is `success: true`.
   currentRole = 'MANAGER'
   const mod = await import('@/app/actions/xero-sync')
-  const calls: Array<[string, () => Promise<unknown>]> = [
+
+  recorder.reset()
+  await assert.rejects(() => mod.testXeroConnection(), (error: unknown) => {
+    assert.match(String((error as Error).message), /^Forbidden$/, 'testXeroConnection must refuse MANAGER')
+    return true
+  })
+  recorder.assertNoReads('MANAGER calling testXeroConnection')
+
+  const swallowing: Array<[string, () => Promise<{ success: boolean }>]> = [
+    ['saveXeroSettings', () => mod.saveXeroSettings({ xero_client_id: 'x' })],
+    ['saveXeroConnectionSettings', () => mod.saveXeroConnectionSettings('id', 'secret')],
+    ['connectXero', () => mod.connectXero('id', 'secret', 'https://ims.example', '/sync')],
+    ['disconnectXero', () => mod.disconnectXero()],
+  ]
+  for (const [name, call] of swallowing) {
+    recorder.reset()
+    const result = await call()
+    assert.equal(result.success, false, `${name} must refuse MANAGER`)
+  }
+})
+
+test('o3d-m3gy: MANAGER KEEPS every Xero read the /sync page performs', async () => {
+  // The counter-guard the scoping needs, and the one the merge exists for. "The credential surface is
+  // ADMIN" must not drift back into "the module is ADMIN": each of these is a read
+  // app/(dashboard)/sync/page.tsx performs, the page fails WHOLE on any denial, and MANAGER holds the
+  // page's own permission. A refusal here is not a tighter gate, it is a 500 where the page was owed.
+  currentRole = 'MANAGER'
+  const mod = await import('@/app/actions/xero-sync')
+  const reads: Array<[string, () => Promise<unknown>]> = [
     ['getXeroSettingsMasked', () => mod.getXeroSettingsMasked()],
     ['getXeroConnectionStatus', () => mod.getXeroConnectionStatus()],
     ['getXeroSyncLogs', () => mod.getXeroSyncLogs(5)],
     ['getXeroSyncReadiness', () => mod.getXeroSyncReadiness()],
-    ['fetchXeroTaxRates', () => mod.fetchXeroTaxRates()],
     ['getXeroConnectionTestState', () => mod.getXeroConnectionTestState()],
+    ['getAccountingAccounts', () => mod.getAccountingAccounts()],
   ]
-  for (const [name, call] of calls) {
+  for (const [name, read] of reads) {
     recorder.reset()
-    await assert.rejects(call, (error: unknown) => {
-      assert.match(String((error as Error).message), /^Forbidden$/, `${name} must refuse MANAGER`)
-      return true
-    })
-    recorder.assertNoReads(`MANAGER calling ${name}`)
+    await assert.doesNotReject(read, `${name} must admit MANAGER — the /sync page cannot render without it`)
   }
 })
 
