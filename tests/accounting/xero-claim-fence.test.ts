@@ -109,10 +109,19 @@ function makeRowStore(
     },
   }
 
+  // o3d-batch-billpay (o3d-clxw r4), merged into development after this double was written: the
+  // SYNCED transaction now stamps `syncedAt` from the DATABASE's clock through raw SQL, so the
+  // transaction client must answer `$executeRaw` with a FUNCTION. The generic delegate proxy below
+  // returns an object, which is why the un-taught double failed with "$executeRaw is not a function"
+  // rather than with anything about claims. Statements are recorded so a test can say the stamp ran.
+  const rawStatements: unknown[] = []
+  const executeRaw = async (...args: unknown[]) => { rawStatements.push(args); return 1 }
+
   const tx = new Proxy({ accountingSyncLog }, {
     get(_target, prop: string) {
       if (prop === 'accountingSyncLog') return accountingSyncLog
       if (prop === 'activityLog') return activityLog
+      if (prop === '$executeRaw' || prop === '$executeRawUnsafe') return executeRaw
       // Mirror-table delegates: record the call so "the mirror was NOT written" is assertable.
       // They answer NOTHING FOUND (null / []), which is the mirror's own "no event to update" path —
       // this file is about the sync row, and a half-built mirror event would only add noise.
@@ -124,7 +133,7 @@ function makeRowStore(
       })
     },
   })
-  return { tx: tx as never, state, mirrorWrites, activityWrites }
+  return { tx: tx as never, state, mirrorWrites, activityWrites, rawStatements }
 }
 
 const T_DISPLACED_CLAIM = new Date('2026-03-01T09:00:00.000Z')

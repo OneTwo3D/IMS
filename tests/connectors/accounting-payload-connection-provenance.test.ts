@@ -407,6 +407,15 @@ const db = {
   // fails for a reason that has nothing to do with origin provenance. Answering 1 (one row updated) is
   // what production sees; the stamp's own behaviour is pinned in xero-synced-at-clock.test.ts.
   async $executeRaw() { return 1 },
+  // o3d-7o0: the cancelled-order guard now takes the sales order's ROW LOCK before it reads the
+  // status, so that a cancellation cannot commit between the read and the post. The lock is a
+  // `SELECT ... FOR UPDATE` through `$queryRaw`, and a double without it throws inside the guard's
+  // transaction — which this file then reports as "could not read sales order", a failure with
+  // nothing to do with connection provenance. Answering an empty row set is what the lock helper
+  // does when it locks nothing of interest; the locking behaviour itself is pinned in the
+  // allocation-service and cancel-invoice-posting-intent tests.
+  async $queryRaw() { return [] },
+  async $queryRawUnsafe() { return [] },
   async $transaction(fn: (tx: unknown) => Promise<unknown>) { return fn(db) },
 }
 

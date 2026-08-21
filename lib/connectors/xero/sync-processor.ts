@@ -2745,7 +2745,7 @@ async function processEntry(
 ): Promise<EntryResult> {
   return withAccountingPostingIntent(
     { connector: XERO_CONNECTOR, payload, type, referenceType, referenceId },
-    () => processClaimedEntry(entryId, type, referenceType, referenceId, payload, claimedAt),
+    () => processClaimedEntry(entryId, type, referenceType, referenceId, payload, held),
   )
 }
 
@@ -2755,7 +2755,12 @@ async function processClaimedEntry(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
-  claimedAt: Date,
+  // o3d-550x: the HELD CLAIM, not a snapshot instant. Development split this function out of
+  // `processEntry` (o3d-19gy / o3d-s36z posting intent) while this branch was replacing the carried
+  // `claimedAt: Date` with a holder read at the point of use — the two changes merged textually and
+  // the parameter kept the old name and type. A bare `Date` is a compile error at every fence below,
+  // which is exactly what `HeldClaim` exists to force.
+  held: HeldClaim,
 ): Promise<EntryResult> {
   const postingMode = payload._postingMode
 

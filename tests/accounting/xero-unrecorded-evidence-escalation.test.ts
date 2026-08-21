@@ -77,6 +77,8 @@ const control = {
   outboxAttempts: 0,
   outboxUpdatedCount: 1,
   consoleErrors: [] as string[],
+  /** Raw statements executed inside a transaction — the database-clock stamp (o3d-batch-billpay). */
+  rawStatements: 0,
 }
 
 function makeRow(): Row {
@@ -135,6 +137,14 @@ const tx = new Proxy({ accountingSyncLog }, {
   get(_target, prop: string) {
     if (prop === 'accountingSyncLog') return accountingSyncLog
     if (prop === 'activityLog') return activityLog
+    // o3d-batch-billpay (o3d-clxw r4), merged into development after this double was written: the
+    // SYNCED write is followed, in the same transaction, by a raw-SQL stamp of `syncedAt` from the
+    // DATABASE's clock. `$executeRaw` is used as a TAGGED TEMPLATE, so it must be a function — the
+    // generic delegate below answers with an object and the un-taught double died on
+    // "$executeRaw is not a function" before it could reach anything this file is about.
+    if (prop === '$executeRaw' || prop === '$executeRawUnsafe') {
+      return async () => { control.rawStatements++; return 1 }
+    }
     return new Proxy({}, {
       get: (_t, method: string) => async () => (method === 'findMany' ? [] : null),
     })

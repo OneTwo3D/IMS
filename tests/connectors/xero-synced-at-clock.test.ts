@@ -74,18 +74,29 @@ test('the stamp writes BOTH columns from ONE reading of the clock (o3d-clxw r5, 
 
 test('every SYNCED write in the Xero sync processor stamps from the database clock (o3d-clxw r4)', () => {
   // A source invariant rather than a behavioural one on purpose: the defect is a write site that
-  // FORGETS the stamp, and a new one can be added at any time. Four sites exist today, all inside the
-  // transaction that sets the status, and each of them is where a host clock used to be written.
+  // FORGETS the stamp, and a new one can be added at any time.
+  //
+  // o3d-550x: there were FOUR sites when o3d-clxw r4 wrote this, one per runner arm. This branch
+  // routes all four arms through the single `recordPostedSyncResult`, so there is now ONE SYNCED
+  // write in this file — the property r4 defends is unchanged and is in fact now unforgettable,
+  // because there is no longer a per-arm site that could be added without the stamp. The count is
+  // kept as an exact tripwire (not relaxed to ">= 1") so that re-introducing an arm-local SYNCED
+  // write still trips this test and has to be looked at.
   const source = readFileSync(
     path.join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'),
     'utf8',
   )
   const marker = "status: 'SYNCED',"
   const sites = source.split(marker).slice(1)
-  assert.equal(sites.length, 4, 'the number of SYNCED write sites changed — check each one still stamps')
+  assert.equal(sites.length, 1, 'the number of SYNCED write sites changed — check each one still stamps')
 
+  // WINDOW WIDENED FROM 30 TO 45 LINES (o3d-550x). The stamp still follows the status write in the
+  // same transaction; what moved between them is the refusal branch that answers "this row already
+  // names a DIFFERENT document" — and the stamp MUST stay below that branch, because a row whose
+  // write did not land has no completion to stamp. The window is only a proxy for "in the same
+  // transaction", so it is the proxy that gives, not the ordering property.
   for (const [index, tail] of sites.entries()) {
-    const window = tail.split('\n').slice(0, 30).join('\n')
+    const window = tail.split('\n').slice(0, 45).join('\n')
     assert.match(window, /await stampSyncedAtFromDatabaseClock\(tx, entry\.id\)/,
       `SYNCED write site ${index + 1} does not stamp syncedAt from the database clock; the payment `
       + `poller's reversal fence would be comparing this host's wall clock against the poll host's`)
@@ -286,10 +297,13 @@ test('the stamp is the LAST statement of the SYNCED transaction, or it erases it
   // registration would be undecidable.
   const source = readFileSync(path.join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
   const sites = source.split("status: 'SYNCED',").slice(1)
-  assert.equal(sites.length, 4, 'the number of SYNCED write sites changed — check each one still stamps LAST')
+  // One site since o3d-550x routed every runner arm through `recordPostedSyncResult` — see the count
+  // note above. The ordering property below is per-site and is asserted exactly as before.
+  assert.equal(sites.length, 1, 'the number of SYNCED write sites changed — check each one still stamps LAST')
 
   for (const [index, tail] of sites.entries()) {
-    const window = tail.split('\n').slice(0, 30).join('\n')
+    // Same widening, same reason as the test above.
+    const window = tail.split('\n').slice(0, 45).join('\n')
     const stamp = window.indexOf('await stampSyncedAtFromDatabaseClock(tx, entry.id)')
     const closesPrismaWrite = window.indexOf('})')
     assert.ok(stamp > closesPrismaWrite && closesPrismaWrite >= 0,
