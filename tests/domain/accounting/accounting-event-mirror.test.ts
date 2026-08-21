@@ -1501,3 +1501,110 @@ test('o3d-cvj9 r6: a caller that declines an assumed order is refused with that 
     orderEstablished: false,
   })
 })
+
+// ---------------------------------------------------------------------------
+// Codex r6, HIGH — THE CREATE FALLBACK RAN BEFORE THE NO-WRITE VERDICT.
+//
+// Round 6 established that a replay which made NO connector call takes NO claim, and then wrote that
+// rule LAST — after the create fallback. The fallback matches on the HOLDER's type alone, so for the
+// ordinary shape of a document (an unstamped create, revised) it answered first: "the create precedes
+// its revisions", an ORDER, which the live mirror acts on because it accepts assumed orders. The claim
+// moved onto an attempt that wrote nothing, which is exactly what round 6 said must not happen.
+//
+// Round 6's own test for this covered a BACKFILL-REPAIRED holder, which no rule above rule 4 matches —
+// so it never exercised the ordering at all.
+// ---------------------------------------------------------------------------
+
+test('o3d-cvj9 r7 (Codex r6 HIGH): a replay that made NO connector call takes no claim FROM THE CREATE either', async () => {
+  // The ordinary population, and the ordinary replay: a document created and then revised, with the
+  // processor short-circuiting a sync log that already carries its document id — so no
+  // `externalRevisionAt` field arrives at all. The holder is the create.
+  const store = createAccountingEventStore([invoiceCreateRow(), revisionRow()])
+
+  await postRevision(store)
+
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
+    // The create keeps the document: nothing in this attempt reached Xero, so nothing here can say
+    // the revision describes a later state than it.
+    { id: 'event-create', status: 'POSTED', externalId: 'INV-9' },
+    { id: 'event-revision', status: 'SUPERSEDED', externalId: null },
+  ])
+  assert.equal(
+    store.logs.find((entry) => entry.action === 'superseded_by_revision'),
+    undefined,
+    'the create must NOT release the claim to an attempt that made no connector write',
+  )
+  const yielded = store.logs.find((entry) => entry.action === 'revision_claim_yielded_no_write')
+  assert.ok(yielded, 'the arrival is audited as having yielded WITHOUT writing')
+  const meta = yielded!.metadata as {
+    externalIdHeldByEventId?: string
+    orderingBasis?: string
+    orderingEstablished?: boolean
+  }
+  assert.equal(meta.externalIdHeldByEventId, 'event-create')
+  assert.equal(meta.orderingBasis, 'arrival_made_no_write')
+  assert.equal(meta.orderingEstablished, false, 'and the trail must not imply an order was reached')
+})
+
+test('o3d-cvj9 r7 (Codex r6 HIGH): the no-write verdict outranks the create fallback for BOTH callers', async () => {
+  // `acceptAssumedOrder` decides whether an ASSUMED order may be ACTED on. It must not be able to
+  // turn "this attempt wrote nothing" into a claim — and the live mirror is precisely the caller that
+  // says yes to assumptions, which is why the defect bit there and not in the backfill.
+  const params = {
+    connector: 'xero',
+    type: 'SALES_INVOICE_UPDATE',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-1',
+    status: 'POSTED' as const,
+    externalId: 'INV-9',
+  }
+
+  for (const acceptAssumedOrder of [true, false]) {
+    const store = createAccountingEventStore([invoiceCreateRow(), revisionRow()])
+
+    const claim = await resolveDocumentRevisionExternalIdClaim(
+      store.client as never,
+      params,
+      // The field is ABSENT — no connector call — as distinct from `null`, which is a call whose
+      // stamp we did not get. Collapsing the two is the thing r5 separated.
+      {},
+      { acceptAssumedOrder },
+    )
+
+    assert.deepEqual(
+      claim,
+      { claim: 'yielded', holderEventId: 'event-create', orderBasis: 'arrival_made_no_write' },
+      `acceptAssumedOrder=${acceptAssumedOrder}: no write means no claim, whatever the holder is`,
+    )
+    assert.equal(
+      store.table.find((row) => row.id === 'event-create')?.externalId,
+      'INV-9',
+      'and nothing was released — a takeover is a WRITE, and this path must not make one',
+    )
+  }
+})
+
+test('o3d-cvj9 r7: a real write with an unreadable stamp still takes the create claim', async () => {
+  // The counter-guard, and the whole reason the rule keys on the FIELD rather than on the value:
+  // `externalRevisionAt: null` is a connector call whose response carried no readable stamp, and that
+  // is a write. If the fix had reached one step further it would have frozen the ordinary
+  // create -> first-edit handover for every document Xero answers without a stamp. Green under revert
+  // BY DESIGN.
+  const store = createAccountingEventStore([invoiceCreateRow(), revisionRow()])
+
+  await postRevision(store, { externalRevisionAt: null })
+
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
+    { id: 'event-create', status: 'SUPERSEDED', externalId: null },
+    { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
+  ])
+  assert.equal(
+    store.logs.find((entry) => entry.action === 'superseded_by_revision')?.accountingEventId,
+    'event-create',
+  )
+  assert.equal(
+    store.logs.find((entry) => entry.action === 'revision_claim_yielded_no_write'),
+    undefined,
+    'a write with no readable stamp is still a write',
+  )
+})

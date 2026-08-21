@@ -458,8 +458,13 @@ export function revisionOrderBasisForLiveWrite(externalRevisionAt: Date | null):
  *    cannot be revised before it exists, so the event that CREATED it cannot describe a later state
  *    than an event that revises it. No clock is involved and none is needed. This is what carries
  *    the ordinary create -> first-edit handover for every document whose create predates the
- *    `externalRevisionAt` column, and for the processor's short-circuit path, which makes no
- *    connector call and so records no stamp.
+ *    `externalRevisionAt` column, and for any live write whose response carried no readable stamp.
+ *
+ *    o3d-cvj9 r7 (Codex r6, HIGH): it does NOT carry the processor's short-circuit path, and saying
+ *    so here was the defect. That path makes no connector call, so rule 4 answers it — and rule 4 is
+ *    therefore asked BEFORE this one. While it was asked after, this rule handed a short-circuit
+ *    replay the create's claim on the strength of "a document cannot be revised before it exists",
+ *    which is true and is not a licence to move a claim to an attempt that wrote nothing.
  *
  *    It applies only while the holding CREATE has NO stamp of its own. A stamped create has made a
  *    write this code can see the time of; if the arriving revision brings no stamp to compare it
@@ -488,7 +493,12 @@ export function revisionOrderBasisForLiveWrite(externalRevisionAt: Date | null):
  *    backfill run brings none, so backfill-against-backfill stays unordered.
  *
  * 4. AN ARRIVAL THAT MADE NO WRITE TAKES NO CLAIM — which is NOT a statement about which write is
- *    newer. The one arrival that can never bring a stamp is the processor's short-circuit replay: a
+ *    newer. ASKED FIRST, ahead of rules 1-3, even though it is numbered last: it is the only rule
+ *    that decides on the ARRIVAL alone, so no rule about the HOLDER may answer over it (o3d-cvj9 r7,
+ *    Codex r6 HIGH — rule 2 did, and moved a claim onto a replay that called nothing). Rules 1 and 3
+ *    need a finite arriving stamp and so cannot fire here anyway; rule 2 does not, and that is
+ *    exactly why it had to be put behind this one. The one arrival that can never bring a stamp is
+ *    the processor's short-circuit replay: a
  *    sync log that already carries its document id, replayed without calling the connector. Under r4
  *    it hit `recency_indeterminate` for ever, so the P2002 stayed fatal and the sync log retried to
  *    FAILED with nothing in live operation able to move it. o3d-cvj9 r6 (Codex r5 finding 3): r5
@@ -574,6 +584,25 @@ function resolveDocumentRevisionOrder(
   // Collapsing the two is what let "we wrote, time unknown" be read as "we never wrote".
   const arrivingWrote = arriving.externalRevisionAt !== undefined
 
+  // RULE 4, ASKED FIRST — the numbering is by KIND, and this is the evaluation order (Codex r6, HIGH).
+  //
+  // Round 6 wrote this rule last, after the create fallback, and the fallback got to the pair first.
+  // Trace the ordinary case: a sync log that already carries its document id is replayed, the
+  // processor short-circuits WITHOUT calling the connector, and the arriving revision's holder is the
+  // document's own unstamped CREATE. Rule 2 matches on the holder's type alone, answers
+  // `holder_first / create_precedes_unwritten`, and the live mirror — which accepts an assumed order,
+  // and must — TAKES THE CLAIM. Round 6's own finding was that a replay which made no call takes no
+  // claim; deciding the pair by a rule about the HOLDER is how one gets taken anyway. And this is not
+  // an exotic interleaving: create-then-revise is the ordinary shape of a document, and the
+  // short-circuit replay is the ordinary way a settled revision comes back through here.
+  //
+  // Asking first costs nothing above it. Rules 1 and 3 both require a finite ARRIVING stamp, which an
+  // arrival that made no write cannot have, so neither could have fired; the only rule this pre-empts
+  // is the create fallback, and pre-empting it is the fix. It is also the right shape for a rule that
+  // is about the ARRIVAL alone rather than about the pair: it needs nothing from the holder, so
+  // nothing about the holder may answer over it.
+  if (!arrivingWrote) return { order: 'arrival_wrote_nothing', basis: 'arrival_made_no_write' }
+
   // Rule 1: the external system stamped both writes, so it has already said which it applied last.
   // The ONLY rule that can declare the arrival stale, because it is the only one that places the
   // arriving write at all.
@@ -603,9 +632,8 @@ function resolveDocumentRevisionOrder(
     return holderFirst('historical_repair_precedes_live_write')
   }
 
-  // Rule 4: THE ARRIVAL MADE NO WRITE AT ALL, so it has nothing to take the document id for. This
-  // says nothing about which of the two writes is newer — see the rule 4 note above.
-  if (!arrivingWrote) return { order: 'arrival_wrote_nothing', basis: 'arrival_made_no_write' }
+  // Rule 4 is not here: it is asked at the TOP of this function, above the create fallback, because
+  // the fallback would otherwise answer for an arrival that made no write at all (Codex r6, HIGH).
 
   return null
 }
