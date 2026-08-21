@@ -21,8 +21,8 @@ const activityLog: LoggedActivity[] = []
 const settingUpserts: string[] = []
 const imported: number[] = []
 const guarded: number[] = []
-/** Every timestamp handed to the refusal watermark, so a refusal that records nothing is visible. */
-const refusalWatermarks: Array<string | null> = []
+/** Every order the gated importer turned away, so a refusal that records nothing is visible. */
+const refusalWatermarks: string[] = []
 
 /** Orders IMS already holds, by WooCommerce id. */
 let linkedExternalOrderIds: string[] = []
@@ -30,6 +30,8 @@ let linkedExternalOrderIds: string[] = []
 let statusSettingValue: string | null = JSON.stringify(['processing'])
 /** When a throttle record exists, the skip WARNING is suppressed — the log is not the assertion. */
 let notAdmittedLastLoggedAt: string | null = null
+/** Statuses the importer double reports as having no IMS reading at all (o3d-tj6v r5). */
+let unmappedStatuses: string[] = []
 
 mock.module('@/lib/activity-log', {
   namedExports: {
@@ -49,6 +51,7 @@ mock.module('@/lib/db', {
           if (where.key === 'wc_order_webhook_status_not_admitted_last_logged_at') {
             return notAdmittedLastLoggedAt === null ? null : { value: notAdmittedLastLoggedAt }
           }
+          if (where.key === 'wc_order_webhook_status_not_mapped_last_logged_at') return null
           return null
         },
         upsert: async ({ where }: { where: { key: string } }) => {
@@ -71,30 +74,48 @@ mock.module('@/lib/db', {
 })
 
 /**
- * MODELS THE REAL CONTRACT, not a convenient shape. `importWcOrder` is where the admission gate is
- * enforced (o3d-tj6v r4) — it is the only reader that knows, from its own create-vs-update query,
- * whether IMS already holds the order — so a double that imported unconditionally would make every
- * assertion below vacuous. It refuses an option shape it does not model for the same reason.
+ * MODELS THE REAL CONTRACT, not a convenient shape.
  *
- * That the REAL importWcOrder honours `admitCreate` is pinned separately, against the real
- * function, in tests/wc-order-admission-create-gate.test.ts.
+ * `importWcOrder` is where the admission gate is enforced — it is the only reader that knows, from
+ * its own create-vs-update query, whether IMS already holds the order — so a double that imported
+ * unconditionally would make every assertion below vacuous.
+ *
+ * r5 STRENGTHENS WHAT THIS DOUBLE HAS TO MODEL. The handler no longer computes admission and hands
+ * it down, so there is no `admitCreate` flag to honour: the importer is gated BY DEFAULT and reads
+ * the selection itself. The double therefore calls the REAL `resolveWcOrderCreateAdmission` against
+ * the same mocked settings row the production path would read — a double that answered from its own
+ * idea of the selection could pass while the handler stopped supplying anything at all.
+ *
+ * It still refuses an option shape it does not model, and the only option it models is the one
+ * legitimate opt-out.
  */
 mock.module('@/lib/connectors/woocommerce/sync/order-import', {
   namedExports: {
-    importWcOrder: async (order: { id: number }, options: Record<string, unknown> = {}) => {
-      const unmodelled = Object.keys(options).filter((key) => key !== 'admitCreate')
+    importWcOrder: async (order: { id: number; status: string }, options: Record<string, unknown> = {}) => {
+      const unmodelled = Object.keys(options).filter((key) => key !== 'createAdmission')
       if (unmodelled.length > 0) {
         throw new Error(`importWcOrder double got an unmodelled option: ${unmodelled.join(', ')}`)
       }
+      if (options.createAdmission !== undefined && options.createAdmission !== 'preauthorised-by-status-query') {
+        throw new Error(`importWcOrder double got an unmodelled createAdmission: ${String(options.createAdmission)}`)
+      }
       const held = linkedExternalOrderIds.includes(String(order.id))
-      if (!held && options.admitCreate === false) {
-        return { success: true, skipped: 'status_not_admitted' }
+      if (!held && options.createAdmission !== 'preauthorised-by-status-query') {
+        const { resolveWcOrderCreateAdmission } = await import(
+          '@/lib/connectors/woocommerce/sync/order-admission'
+        )
+        const admission = await resolveWcOrderCreateAdmission(order)
+        if (!admission.admitted) {
+          refusalWatermarks.push(String(order.id))
+          return { success: true, skipped: 'status_not_admitted', configured: admission.configured }
+        }
+        if (unmappedStatuses.includes(order.status)) {
+          refusalWatermarks.push(String(order.id))
+          return { success: true, skipped: 'status_not_mapped', configured: admission.configured }
+        }
       }
       imported.push(order.id)
       return { success: true, orderId: held ? 'so-existing' : 'so-new' }
-    },
-    noteWcOrderAdmissionRefusal: async (modifiedAtIso: string | null | undefined) => {
-      refusalWatermarks.push(modifiedAtIso ?? null)
     },
   },
 })
@@ -169,6 +190,7 @@ function reset() {
   linkedExternalOrderIds = []
   statusSettingValue = JSON.stringify(['processing'])
   notAdmittedLastLoggedAt = null
+  unmappedStatuses = []
 }
 
 test('a pushed order in an UNSELECTED status is not imported', async () => {
@@ -320,4 +342,43 @@ test('an UNSET selection falls back to the default, so an upgrade does not stop 
 
   await pushOrder(wcOrder(110, 'processing'))
   assert.deepEqual(imported, [110])
+})
+
+test('the handler passes the importer NO admission answer to go stale (r5)', async () => {
+  // Round 3 read the order link here and refused on it; round 4 read the SELECTION here and passed
+  // the verdict down through the withdrawal fence and a live-store read. Both put a decision in
+  // this handler and acted on it somewhere else. The importer's double throws on any option other
+  // than the one legitimate opt-out, so a handler that resumed computing an answer — under ANY
+  // option name — fails here rather than quietly reintroducing the stale-verdict window.
+  reset()
+
+  await pushOrder(wcOrder(130, 'pending'))
+  assert.deepEqual(refusalWatermarks, ['130'], 'the refusal was taken inside the importer')
+  assert.deepEqual(imported, [])
+
+  await pushOrder(wcOrder(131, 'processing'))
+  assert.deepEqual(imported, [131], 'and the admitted order still reaches the create path')
+})
+
+test('a status IMS has no reading of is refused as UNMAPPED, and says so separately', async () => {
+  // A different refusal with a different fix: ticking the status does not help, adding a mapping
+  // does. Reported under its own action and its own throttle key so a permanently excluded status
+  // cannot hold the window open and hide it.
+  reset()
+  // Selected, so it is NOT the selection that turns this away.
+  statusSettingValue = JSON.stringify(['processing', 'awaiting-parts'])
+  unmappedStatuses = ['awaiting-parts']
+
+  const response = await pushOrder(wcOrder(132, 'awaiting-parts'))
+
+  assert.deepEqual(imported, [], 'IMS must not invent a lifecycle status for a status it cannot read')
+  assert.deepEqual(await response.json(), { ok: true, skipped: 'status_not_mapped' })
+  const skip = activityLog.find((entry) => entry.action === 'wc_order_webhook_status_not_mapped')
+  assert.ok(skip, 'the unmapped refusal must be reported under its own action')
+  assert.equal(skip.metadata?.reason, 'status_not_mapped')
+  assert.equal(
+    activityLog.some((entry) => entry.action === 'wc_order_webhook_status_not_admitted'),
+    false,
+    'and must not be reported as a selection problem, whose fix is a different one',
+  )
 })

@@ -34,7 +34,8 @@ import {
 import { getSettingValue } from '@/lib/settings-store'
 import { notify } from '@/lib/notifications'
 import { parsePositiveIntegerEnv } from '@/lib/env'
-import { findWcStatusMapping, isWcStatus } from './status-mapping'
+import { isWcStatus, readWcOrderStatus } from './status-mapping'
+import type { WcAdmissionRefusalReason } from './order-admission'
 import {
   parseWcSyncOrderStatuses,
   resolveWcPullStatuses,
@@ -52,18 +53,24 @@ export type ImportWcOrderOptions = {
   useWcDateAsCreatedAt?: boolean
   pendingFxRetryLogId?: string
   /**
-   * May this import CREATE an order IMS has never seen? (o3d-tj6v r4)
+   * How this import may CREATE an order IMS has never seen (o3d-tj6v r5).
    *
-   * `undefined` — the default — means yes, and is what every PULL route passes: those already
-   * asked WooCommerce for `?status=<selection>`, so a row that came back is admitted by
-   * construction, and re-judging it here would drop the reconcile sweep's `completed` backstop.
+   * ROUND 4 MADE THIS A BOOLEAN THE CALLER COMPUTED, and every caller that forgot it was open.
+   * Round 3 forgot `sweepWithdrawalSuppressions`; round 4 fixed that one and forgot
+   * `retryPendingWcOrdersWaitingForFx`, which replays a stored snapshot by id — no `?status=`
+   * query, no cursor, nothing upstream that filtered it — exactly the shape it had just closed.
+   * A rule you can bypass by not opting in will be bypassed again by the next route.
    *
-   * `false` is passed by the routes that receive an order WITHOUT having asked for a status —
-   * the order webhook and the withdrawal recovery sweep. It is enforced at the one point that
-   * knows the answer to "does IMS already hold this order?", which is the `findFirst` below.
-   * See the note there for why the check cannot live anywhere else.
+   * So the default is `'gate'`: `importWcOrder` resolves admission ITSELF, from the payload's own
+   * status, at the one read that knows whether IMS already holds the order. Forgetting this option
+   * now fails CLOSED, and a route can only opt out by naming the reason it is entitled to.
+   *
+   * `'preauthorised-by-status-query'` is the ONLY opt-out, and it asserts a fact rather than a
+   * preference: this caller already asked WooCommerce for `?status=<selection>`, so a row that came
+   * back is admitted by construction. Re-judging it would also drop the reconcile sweep's
+   * `completed` backstop and the withdrawal statuses the live sweeps always carry.
    */
-  admitCreate?: boolean
+  createAdmission?: 'gate' | 'preauthorised-by-status-query'
 }
 
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
@@ -1404,11 +1411,54 @@ export type ImportWcOrderResult = {
   orderId?: string
   error?: string
   /**
-   * Set when nothing was imported because the order is NEW and its status is outside the
-   * operator's "Import order statuses" selection. `success` is true: this is a resolved
-   * decision, not a failure to retry.
+   * Set when nothing was imported because the order is NEW and IMS declined to take it on:
+   * `status_not_admitted` — outside the "Import order statuses" selection; `status_not_mapped` —
+   * no mapping row and no built-in reading of the WooCommerce status, so creating it would mean
+   * inventing a lifecycle status. `success` is true for both: these are resolved decisions, not
+   * failures to retry. Both leave a durable by-id row in the admission-refusal queue.
    */
-  skipped?: 'status_not_admitted'
+  skipped?: WcAdmissionRefusalReason
+  /** The operator's selection at the moment of the refusal, so the caller can say so. */
+  configured?: string[]
+}
+
+/**
+ * The ONE exit for "IMS is not taking this order on" (o3d-tj6v r5).
+ *
+ * Both refusal reasons leave the SAME three durable facts, because a refusal that leaves fewer is
+ * a refusal that disappears:
+ *
+ *   1. THE QUEUE ROW, keyed on the WooCommerce order id. This is the only recovery that does not
+ *      depend on another delivery arriving or on a cursor still reaching back far enough, and it is
+ *      what makes the refusal non-terminal — including the refusal that lost a race to a
+ *      concurrent create, which the drain re-reads and applies as an update.
+ *   2. THE WATERMARK, so a widening of the selection still rewinds the pull cursors. Kept as the
+ *      cheap bulk recovery: one rewound sweep imports a whole excluded status, where the queue
+ *      does it one by-id read at a time. Recorded for EVERY gated route now, not just the webhook.
+ *   3. THE PENDING-FX ROW RESOLVED, when this refusal came from that queue's retry. Leaving it
+ *      PENDING would have the FX drain re-read and re-refuse the same order on every FX refresh
+ *      while counting it as imported.
+ */
+async function refuseWcOrderCreate(
+  wcOrder: WcFullOrder,
+  reason: WcAdmissionRefusalReason,
+  configured: string[],
+  options: ImportWcOrderOptions,
+): Promise<ImportWcOrderResult> {
+  const { recordWcOrderAdmissionRefusal } = await import('./order-admission')
+  await recordWcOrderAdmissionRefusal(wcOrder, reason, configured)
+  await noteWcOrderAdmissionRefusal(wcOrder.date_modified_gmt ?? wcOrder.date_created_gmt)
+  if (options.pendingFxRetryLogId) {
+    await markPendingFxRetryLogFailed(
+      options.pendingFxRetryLogId,
+      reason === 'status_not_admitted'
+        ? 'An FX rate arrived, but the order\'s status is outside the "Import order statuses" selection. '
+          + 'It is queued for retry by order id instead.'
+        : 'An FX rate arrived, but IMS has no reading of this order\'s WooCommerce status. '
+          + 'It is queued for retry by order id instead.',
+    ).catch(() => {})
+  }
+  return { success: true, skipped: reason, configured }
 }
 
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<ImportWcOrderResult> {
@@ -1429,6 +1479,15 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // in flight at once, is settled by the DATA: `@@unique([connector, externalOrderId])` on
     // shopping_order_links lets exactly one create win, and the loser's P2002 handler turns itself
     // into the UPDATE of an order IMS now holds — which is never gated.
+    //
+    // ROUND 5: THAT ARGUMENT COVERS THE ADMITTED SIDE ONLY. Two deliveries for an order IMS has
+    // never seen BOTH read "not held" here, and only the one that goes on to create is arbitrated
+    // by the constraint. A delivery that is REFUSED never reaches a create, so nothing arbitrates
+    // it: it is acknowledged against an answer a concurrent create can falsify a millisecond
+    // later, and an acknowledged delivery is never sent again. No read placed anywhere can fix
+    // that, because the create it races commits long after this statement returns. What fixes it
+    // is that the refusal is no longer TERMINAL — see the queue row written below, and
+    // `drainWcOrderAdmissionRefusals`, which re-reads the order by id and finds the update branch.
     const existing = await db.salesOrder.findFirst({
       where: {
         shoppingLinks: {
@@ -1452,19 +1511,39 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       return { success: true, orderId: existing.id }
     }
 
-    // IMS does not hold this order, so the selection decides whether it may take it on. Placed
-    // immediately after the pivot read and before any mapping work, so an excluded order costs one
-    // query rather than a full import's worth of lookups.
-    if (options.admitCreate === false) {
-      return { success: true, skipped: 'status_not_admitted' }
+    // IMS does not hold this order, so the selection decides whether it may take it on. Resolved
+    // HERE rather than by the caller (r5): every route that receives an order without asking
+    // WooCommerce for a status is gated by default, so a new ingress path is closed until it
+    // proves otherwise. Placed immediately after the pivot read and before any mapping work, so an
+    // excluded order costs two settings reads rather than a full import's worth of lookups.
+    const { resolveWcOrderCreateAdmission } = await import('./order-admission')
+    const admission = options.createAdmission === 'preauthorised-by-status-query'
+      ? null
+      : await resolveWcOrderCreateAdmission(wcOrder)
+    if (admission && !admission.admitted) {
+      return refuseWcOrderCreate(wcOrder, 'status_not_admitted', admission.configured, options)
     }
 
-    // Resolve IMS status from WC status. Read through `findWcStatusMapping` so a mapping saved as
-    // `wc-processing` is not invisible to a store that reports `processing` — the admission
-    // boundary already compares those as one status, and this default-to-PROCESSING fallback is
-    // exactly where that disagreement used to be silent (o3d-tj6v r4).
-    const statusMapping = await findWcStatusMapping(wcOrder.status)
-    const imsStatus = statusMapping?.imsStatus ?? 'PROCESSING'
+    // ONE reading of the status, shared with the admission boundary above and with
+    // `syncWcOrderStatus` (o3d-tj6v r5). Round 4 unified the LOOKUP and left the two callers
+    // inventing different answers when it found nothing — a silent `?? 'PROCESSING'` here, "ignore
+    // this status" there. `readWcOrderStatus` answers once: the operator's mapping row, else the
+    // built-in reading of WooCommerce's own statuses, else nothing at all.
+    const statusReading = await readWcOrderStatus(wcOrder.status)
+    if (!statusReading.imsStatus) {
+      // NOT `?? 'PROCESSING'`. Defaulting an unknown storefront status to PROCESSING creates the
+      // order, auto-allocates its stock and queues its accounting invoice on a status IMS has no
+      // reading of — while the same status arriving as an UPDATE is ignored. Withholding the
+      // create is the same answer the update path gives, and the queue row makes it recoverable
+      // the moment a mapping exists.
+      // The selection is reported alongside, because an operator looking at a refused order needs
+      // to see both controls at once — but it is only READ again on the preauthorised path, which
+      // never resolved it above.
+      const configured = admission?.configured
+        ?? (await resolveWcOrderCreateAdmission(wcOrder)).configured
+      return refuseWcOrderCreate(wcOrder, 'status_not_mapped', configured, options)
+    }
+    const imsStatus = statusReading.imsStatus
     // Refund state is orthogonal to the lifecycle status: never store
     // REFUNDED/PARTIALLY_REFUNDED as `status`. A refunded-at-import order keeps a base
     // lifecycle status plus a refundStatus; the allocation/invoice gates below still
@@ -1868,8 +1947,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     } catch (error) {
       // The constraint arbitrating a concurrent create (o3d-tj6v r4). Losing this race means IMS
       // DOES hold the order, so this payload becomes an UPDATE — and an update is never gated,
-      // whatever `admitCreate` said, because the selection decides what IMS takes on and not what
-      // it may keep hearing about.
+      // whatever the admission gate said, because the selection decides what IMS takes on and not
+      // what it may keep hearing about. This arbitrates two ADMITTED creates only — the delivery
+      // that was REFUSED never gets here, which is why its recovery is the by-id queue instead.
       if (!isUniqueConstraintError(error)) throw error
       const concurrent = await db.salesOrder.findFirst({
         where: {
@@ -2297,6 +2377,14 @@ export async function retryPendingWcOrdersWaitingForFx(limit = 50): Promise<{ at
       continue
     }
     const importResult = guarded.result
+    if (importResult.skipped) {
+      // The FX rate arrived but the order is no longer one IMS takes on. `refuseWcOrderCreate`
+      // has already retired this queue row and moved the order to the by-id admission-refusal
+      // queue, so counting it as imported — which is what a bare `success: true` did — would
+      // report an import that did not happen.
+      result.failed++
+      continue
+    }
     if (importResult.success && guarded.compensationFailed) {
       // importWcOrder already marked this queue row SYNCED, so there is no
       // pending row left to carry the retry. Count it as failed and say why —
@@ -2526,7 +2614,14 @@ export async function syncNewWcOrders(
       // Shared with both webhook topics, so the rule cannot drift between
       // ingestion paths.
       const { importWcOrderGuarded } = await import('./withdrawal')
-      const guarded = await importWcOrderGuarded(order, () => importWcOrder(order))
+      // PREAUTHORISED: this loop's orders came back from `?status=<statuses>` above, so the
+      // selection has already been applied by WooCommerce itself. Re-judging them here would also
+      // throw away the reconcile sweep's `completed` backstop and the withdrawal statuses the live
+      // sweeps always carry, both of which are deliberately outside the operator's selection.
+      const guarded = await importWcOrderGuarded(
+        order,
+        () => importWcOrder(order, { createAdmission: 'preauthorised-by-status-query' }),
+      )
       if (guarded.outcome === 'skipped-withdrawal') {
         result.skipped++
         continue

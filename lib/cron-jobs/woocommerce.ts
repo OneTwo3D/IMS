@@ -19,9 +19,9 @@ registerCronJobs([
     moduleLabel: 'WooCommerce',
     label: 'WooCommerce Withdrawal Sweep',
     description:
-      'Re-checks orders refused as EU withdrawal requests against the live storefront status, by order ID. '
-      + 'The only route that does not depend on another webhook or poll reaching the order, so a request '
-      + 'rejected back to a status the poll does not query is still imported.',
+      'Re-checks every order IMS refused — EU withdrawal requests, and orders held back by the "Import '
+      + 'order statuses" selection or an unmapped status — against the live storefront, BY ORDER ID. The '
+      + 'only route that does not depend on another webhook or poll reaching the order.',
     defaultSchedule: '*/15 * * * *',
     defaultEnabled: true,
   },

@@ -8,7 +8,7 @@ import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition
 import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 import { wcFetch, wcPut } from '../api'
 import type { WcFullOrder } from './types'
-import { findWcStatusMapping, isWcStatus } from './status-mapping'
+import { isWcStatus, readWcOrderStatus } from './status-mapping'
 
 type SalesOrderStatus = string
 
@@ -54,14 +54,22 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success
     // as already-held and does nothing.
     if (withdrawal.kind !== 'not-a-withdrawal') return withdrawal.result
 
-    // Resolve IMS status
-    // o3d-tj6v r4: normalised lookup. "No mapping" is a silent no-op here, so a row saved as
-    // `wc-completed` against a store reporting `completed` meant the status simply never synced —
-    // and the admission boundary had already treated the two as one status.
-    const mapping = await findWcStatusMapping(wcOrder.status)
-    if (!mapping) return { success: true } // no mapping = ignore this status
+    // Resolve IMS status through the ONE reading of a WooCommerce status (o3d-tj6v r4, r5).
+    //
+    // r4 made the LOOKUP normalised, so a row saved as `wc-completed` against a store reporting
+    // `completed` is found. r5 makes the ANSWER shared: `readWcOrderStatus` falls back to the
+    // built-in reading of WooCommerce's own statuses — the same rows the install seeds — so a
+    // deleted mapping row no longer means "ignore this status" here while it means "default to
+    // PROCESSING" in `importWcOrder`. That is finding 4: one normaliser AND one answer, consumed
+    // by admission, creation and this sync.
+    //
+    // `imsStatus === null` still means "ignore": a custom storefront status IMS has no reading of
+    // must not be forced onto an order through the full transition bypass. Creation now gives the
+    // same answer by declining to create rather than inventing PROCESSING.
+    const reading = await readWcOrderStatus(wcOrder.status)
+    if (!reading.imsStatus) return { success: true } // no reading = ignore this status
 
-    const targetStatus = mapping.imsStatus
+    const targetStatus = reading.imsStatus
     if (targetStatus === so.status) return { success: true } // already in sync
 
     // Special case: WC completed → run completion flow

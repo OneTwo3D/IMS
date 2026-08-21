@@ -94,7 +94,9 @@ export type RedisRateLimitOptions = {
    * o3d-esha: scripts/install.sh:445 writes `requirepass` into redis.conf but
    * builds REDIS_URL with no credentials, so the only password an operator can
    * supply through the installer never reached AUTH. Used when the URL itself
-   * carries no password; an inline URL password still wins.
+   * carries no password; REDIS_URL is canonical (o3d-tsc0), so an inline URL
+   * password wins — and two DIFFERENT passwords are refused outright rather
+   * than resolved by precedence (o3d-uqz0, see `redisConnectionOptions`).
    */
   password?: string
   /**
@@ -111,13 +113,32 @@ export function redisConnectionOptions(redisUrl: string, fallbackPassword = '') 
     throw new Error('REDIS_URL must use redis:// or rediss://')
   }
 
+  const inlinePassword = decodeURIComponent(url.password)
+
+  // TWO CONFIGURED PASSWORDS THAT DISAGREE ARE A CONFIGURATION ERROR, NOT A PRECEDENCE QUESTION
+  // (o3d-uqz0). `REDIS_URL` is canonical and `REDIS_PASSWORD` is its fallback, and while only one
+  // of them is set that ordering is all this needs. When BOTH are set to DIFFERENT values, though,
+  // silently preferring one means the operator who rotated the password in the variable they
+  // happened to look at gets a connection that still uses the old one — and the symptom is not a
+  // Redis error. `checkRateLimit` fails OPEN on ordinary buckets, so the login rate limiter is the
+  // thing that quietly stops working, which is the exact class of "advertised control that does
+  // nothing" this branch exists to remove. Refuse instead, and say which two values disagree
+  // WITHOUT printing either of them.
+  if (inlinePassword && fallbackPassword && inlinePassword !== fallbackPassword) {
+    throw new Error(
+      'REDIS_URL carries an inline password and REDIS_PASSWORD is set to a DIFFERENT value. '
+      + 'Refusing to guess which one you meant: make them identical, or clear REDIS_PASSWORD and '
+      + 'keep the password in REDIS_URL, which is canonical.',
+    )
+  }
+
   return {
     url,
     tls: url.protocol === 'rediss:',
     host: url.hostname,
     port: url.port ? Number(url.port) : (url.protocol === 'rediss:' ? 6380 : 6379),
     username: decodeURIComponent(url.username),
-    password: decodeURIComponent(url.password) || fallbackPassword,
+    password: inlinePassword || fallbackPassword,
     db: url.pathname.length > 1 ? url.pathname.slice(1) : '',
   }
 }

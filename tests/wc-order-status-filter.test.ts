@@ -133,10 +133,15 @@ test('the Sync page says the selection governs the webhook too, and what it does
   assert.match(filterSection, /orders pushed by the order webhook, which are imported\s+only if they arrive in a selected status/)
   assert.match(filterSection, /if it later moves into a\s+selected status it is imported then/)
   assert.match(filterSection, /never stops updates to an order\s+you already have/)
-  // r4: and that ticking a status later recovers what was skipped, which is the half an operator
+  // r4/r5: and that ticking a status later recovers what was skipped, which is the half an operator
   // cannot otherwise discover — nothing in WooCommerce redelivers an order because IMS changed a
-  // setting. Keep in step with the cursor rewind in sync/order-import.ts.
-  assert.match(filterSection, /reaches back and imports the orders that were skipped/)
+  // setting, and the delivery that was refused was ACKNOWLEDGED, so it never comes back on its own.
+  // r5 makes the page state the mechanism that is actually a guarantee: each skipped order is
+  // remembered BY ORDER NUMBER and re-checked on the fifteen-minute sweep, rather than depending on
+  // a cursor rewind that only fires on a widening it can prove. Keep in step with
+  // drainWcOrderAdmissionRefusals in sync/order-admission.ts.
+  assert.match(filterSection, /remembered by its\s+WooCommerce order number and re-checked every 15 minutes/)
+  assert.match(filterSection, /whether or not WooCommerce ever sends them again/)
   // ...and which fetch routes it governs, so the statement is still complete.
   assert.match(filterSection, /polling sweep/)
   assert.match(filterSection, /backup reconciliation/)

@@ -36,8 +36,8 @@ const state = {
   /** The live storefront status the sweep will read back for the tombstoned order. */
   liveStatus: 'pending',
   configuredStatuses: JSON.stringify(['processing']),
-  /** Every (id, admitCreate) importWcOrder was actually asked to perform. */
-  importCalls: [] as Array<{ id: number; admitCreate: unknown }>,
+  /** Every (id, createAdmission) importWcOrder was actually asked to perform. */
+  importCalls: [] as Array<{ id: number; createAdmission: unknown }>,
   imported: [] as number[],
   activity: [] as Row[],
 }
@@ -65,14 +65,29 @@ mock.module('@/lib/connectors/woocommerce/api', {
 })
 
 /**
- * Models the production contract: an unheld order whose create is not admitted imports nothing and
- * says so. A double that imported unconditionally would make this whole file vacuous.
+ * Models the production contract: `importWcOrder` is gated BY DEFAULT and resolves the selection
+ * itself, so the double resolves it with the REAL `resolveWcOrderCreateAdmission` against the same
+ * mocked settings row (o3d-tj6v r5).
+ *
+ * ROUND 4'S DOUBLE TOOK THE SWEEP'S WORD FOR IT — it honoured whatever `admitCreate` the sweep
+ * computed, so the sweep could have computed it from anything, at any distance from the import it
+ * governed, and this file would still pass. Reading the setting here instead means the assertions
+ * below are about the SELECTION reaching the recovery route, not about one route's arithmetic. A
+ * double that imported unconditionally would make the whole file vacuous either way.
  */
 mock.module('@/lib/connectors/woocommerce/sync/order-import', {
   namedExports: {
-    importWcOrder: async (order: { id: number }, options: Record<string, unknown> = {}) => {
-      state.importCalls.push({ id: order.id, admitCreate: options.admitCreate })
-      if (options.admitCreate === false) return { success: true, skipped: 'status_not_admitted' }
+    importWcOrder: async (order: { id: number; status: string }, options: Record<string, unknown> = {}) => {
+      state.importCalls.push({ id: order.id, createAdmission: options.createAdmission })
+      if (options.createAdmission !== 'preauthorised-by-status-query') {
+        const { resolveWcOrderCreateAdmission } = await import(
+          '@/lib/connectors/woocommerce/sync/order-admission'
+        )
+        const admission = await resolveWcOrderCreateAdmission(order)
+        if (!admission.admitted) {
+          return { success: true, skipped: 'status_not_admitted', configured: admission.configured }
+        }
+      }
       state.imported.push(order.id)
       return { success: true, orderId: 'so-new' }
     },
@@ -138,8 +153,8 @@ test('a recovered order whose status the operator excluded is NOT imported', asy
 
   assert.deepEqual(
     state.importCalls,
-    [{ id: 901, admitCreate: false }],
-    'the sweep must put the recovered order through the same admission the webhook uses',
+    [{ id: 901, createAdmission: undefined }],
+    'the sweep must hand the order to the GATED importer — it has no `?status=` query to opt out with',
   )
   assert.deepEqual(state.imported, [], 'an excluded status must not enter IMS by the recovery route')
   assert.equal(result.notAdmitted, 1)
@@ -162,7 +177,7 @@ test('the sweep DISCRIMINATES — a recovered order in a selected status still i
 
   const result = await sweep()
 
-  assert.deepEqual(state.importCalls, [{ id: 901, admitCreate: true }])
+  assert.deepEqual(state.importCalls, [{ id: 901, createAdmission: undefined }])
   assert.deepEqual(state.imported, [901], 'the recovery route must still recover what the operator wants')
   assert.equal(result.imported, 1)
   assert.equal(result.notAdmitted, 0)

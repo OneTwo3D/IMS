@@ -209,7 +209,13 @@ async function runInitialImport(progress: InitialImportProgress) {
         const { importWcOrderGuarded } = await import('./withdrawal')
         const guarded = await importWcOrderGuarded(
           order,
-          () => importWcOrder(order, { useWcDateAsCreatedAt: true }),
+          // PREAUTHORISED (o3d-tj6v r5): the backfill fetched these with `?status=<selection>`
+          // via `getWcPullStatuses('initial')`, so WooCommerce has already applied the operator's
+          // choice. Gating them a second time here would judge the same orders twice.
+          () => importWcOrder(order, {
+            useWcDateAsCreatedAt: true,
+            createAdmission: 'preauthorised-by-status-query',
+          }),
         )
         if (guarded.outcome !== 'imported') {
           progress.activeOrdersSkipped++

@@ -133,3 +133,67 @@ test('the special-cased statuses are compared the same normalised way', async ()
   assert.equal(isWcStatus('wc-pending-wdraw', 'pending-wdraw'), true)
   assert.equal(isWcStatus('pending', 'pending-wdraw'), false)
 })
+
+// --- r5: one reading, not just one lookup ----------------------------------------------------
+
+/**
+ * Round 4 gave the two readers a shared LOOKUP and left them with two ANSWERS. `readWcOrderStatus`
+ * is the shared answer, and these pin the property that actually matters: for any status, the two
+ * readers agree about whether IMS has a reading of it, and about what that reading is.
+ */
+async function reading(status: unknown) {
+  const { readWcOrderStatus } = await import('@/lib/connectors/woocommerce/sync/status-mapping')
+  return readWcOrderStatus(status)
+}
+
+test('WooCommerce\'s OWN statuses are readable with no mapping rows at all', async () => {
+  // These were seeded by a 2026-04 migration and lived nowhere else, so an operator who deleted a
+  // row left the connector with two inventions instead of one reading.
+  reset()
+  state.mappings = []
+
+  assert.equal((await reading('pending')).imsStatus, 'PENDING_PAYMENT')
+  assert.equal((await reading('failed')).imsStatus, 'PENDING_PAYMENT')
+  assert.equal((await reading('on-hold')).imsStatus, 'ON_HOLD')
+  assert.equal((await reading('processing')).imsStatus, 'PROCESSING')
+  assert.equal((await reading('completed')).imsStatus, 'COMPLETED')
+  assert.equal((await reading('cancelled')).imsStatus, 'CANCELLED')
+  // Refund state is the orthogonal RefundDisposition, never the lifecycle status.
+  assert.equal((await reading('refunded')).imsStatus, 'PROCESSING')
+  assert.equal((await reading('processing')).source, 'built-in')
+})
+
+test('an operator row OUTRANKS the built-in reading, so the setting still means something', async () => {
+  // Paired with the test above: defaults that could not be overridden would be a different bug of
+  // the same family — a control the UI offers and nothing reads.
+  reset()
+  state.mappings = [{ externalStatus: 'wc-cancelled', imsStatus: 'ON_HOLD' }]
+
+  const resolved = await reading('cancelled')
+
+  assert.equal(resolved.imsStatus, 'ON_HOLD', 'not the built-in CANCELLED')
+  assert.equal(resolved.source, 'mapping')
+})
+
+test('a status with NO reading is null — the one answer both readers give', async () => {
+  // This is the whole of finding 4. `importWcOrder` used to answer PROCESSING here (creating the
+  // order, allocating its stock and queueing its invoice off a status nothing defined) while
+  // `syncWcOrderStatus` answered "ignore". One null, consumed by both.
+  reset()
+  state.mappings = [{ externalStatus: 'processing', imsStatus: 'PROCESSING' }]
+
+  const resolved = await reading('awaiting-parts')
+
+  assert.equal(resolved.imsStatus, null)
+  assert.equal(resolved.source, 'unknown')
+  assert.equal(resolved.slug, 'awaiting-parts', 'and it still carries the canonical spelling')
+})
+
+test('the special cases ride on the same reading, in either spelling', async () => {
+  reset()
+  state.mappings = []
+
+  assert.equal((await reading('wc-completed')).handledBy, 'completion-flow')
+  assert.equal((await reading('REFUNDED')).handledBy, 'refund-sync')
+  assert.equal((await reading('processing')).handledBy, null)
+})

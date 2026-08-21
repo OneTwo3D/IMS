@@ -1110,8 +1110,10 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                 </p>
                 <p className="text-xs text-muted-foreground">
                   An order in an unselected status is skipped, not lost: if it later moves into a
-                  selected status it is imported then, and if you tick its status later the next sync
-                  reaches back and imports the orders that were skipped while it was unticked. Once IMS
+                  selected status it is imported then, and every skipped order is remembered by its
+                  WooCommerce order number and re-checked every 15 minutes — so when you tick a
+                  status, the orders that were skipped while it was unticked are imported within the
+                  next quarter of an hour whether or not WooCommerce ever sends them again. Once IMS
                   has an order it keeps following it whatever status it moves to afterwards — this
                   setting never stops updates to an order
                   you already have.

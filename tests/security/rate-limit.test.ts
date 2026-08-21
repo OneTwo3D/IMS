@@ -215,14 +215,38 @@ test('two key prefixes produce disjoint buckets for the same logical key', async
 // o3d-esha item 6: install.sh:445 writes `requirepass` into redis.conf but
 // install.sh:277 builds REDIS_URL with no credentials, so the prompted password
 // never reached AUTH and a redis-backed install would fail NOAUTH.
-test('redis connection falls back to the standalone password, and an inline URL password still wins', () => {
+test('redis connection falls back to the standalone password, and REDIS_URL stays canonical', () => {
   assert.equal(
     redisConnectionOptions('redis://example.test:6379/0', 'from-redis-password').password,
     'from-redis-password',
   )
+  // REDIS_URL is canonical (o3d-tsc0), so the fallback is ignored when the URL says the SAME
+  // thing. Only a disagreement is a configuration error — see below.
   assert.equal(
-    redisConnectionOptions('redis://:from-url@example.test:6379/0', 'from-redis-password').password,
+    redisConnectionOptions('redis://:agreed@example.test:6379/0', 'agreed').password,
+    'agreed',
+  )
+  assert.equal(
+    redisConnectionOptions('redis://:from-url@example.test:6379/0').password,
     'from-url',
   )
   assert.equal(redisConnectionOptions('redis://example.test:6379/0').password, '')
+})
+
+// o3d-uqz0: two configured passwords that DISAGREE are a configuration error, not a precedence
+// question. Silently preferring one means the operator who rotated the password in the variable
+// they happened to look at gets a connection using the old one — and `checkRateLimit` fails OPEN
+// on ordinary buckets, so the visible symptom is the login limiter quietly not working rather
+// than any Redis error at all.
+test('REDIS_URL and REDIS_PASSWORD disagreeing is REFUSED rather than resolved by precedence', () => {
+  assert.throws(
+    () => redisConnectionOptions('redis://:from-url@example.test:6379/0', 'from-redis-password'),
+    (error: Error) => {
+      assert.match(error.message, /REDIS_URL carries an inline password and REDIS_PASSWORD is set to a DIFFERENT value/)
+      // The refusal must not print either secret, or it lands in whatever captured the throw.
+      assert.equal(error.message.includes('from-url'), false)
+      assert.equal(error.message.includes('from-redis-password'), false)
+      return true
+    },
+  )
 })
