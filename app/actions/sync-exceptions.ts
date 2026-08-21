@@ -1255,6 +1255,33 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
       })
     }
 
+    // o3d-w00 (Codex r1 #3): put the quarantine BACK if the re-fetch never re-decided this refund.
+    // The transition above is only safe because the sync normally re-parks the row (as QUARANTINED
+    // again, or SYNCED); when the WooCommerce fetch itself fails, or the refund is absent from the
+    // response, nothing rewrites it and the row is stranded as PENDING — carrying the original
+    // deliberate-refusal message, but no longer offering the ONE action that can resolve it
+    // (Record manually is scoped to QUARANTINED, because hand-recording a retryable park would race
+    // its retry into a duplicate credit note). Detected by the row being untouched: still PENDING,
+    // still carrying the same error text it had before the transition.
+    //
+    // It is a closure and not a tail-end block because EVERY route that leaves this function without
+    // the sync having re-decided the refund has to run it — including the short-read refusal below,
+    // which returns before any of the not-landed handling. That early return is what previously let a
+    // quarantine escape as PENDING.
+    const restoreQuarantineIfUntouched = async (): Promise<void> => {
+      if (row.status !== 'QUARANTINED' || !row.externalId) return
+      await db.shoppingSyncLog.updateMany({
+        where: {
+          ...REFUND_PARK_WHERE,
+          externalId: row.externalId,
+          entityId: row.entityId,
+          status: 'PENDING',
+          errorMessage: row.errorMessage,
+        },
+        data: { status: 'QUARANTINED' },
+      })
+    }
+
     const refundSweep = await syncRefundsForOrder(Number(orderLink.externalOrderId))
 
     const refundLanded = row.externalId
@@ -1267,9 +1294,11 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
     // o3d-ecbj r5: "the refund did not land" is a statement about the STORE'S list, and a list read
     // only in part cannot make it. If the walk was short, the refund may simply be on a page nobody
     // read — so say the store could not be read completely rather than reporting a not-applied
-    // outcome the operator would read as WooCommerce's answer. The park stays PENDING and visible,
-    // so the retry button is still the whole recovery.
+    // outcome the operator would read as WooCommerce's answer. The park stays open and visible — and
+    // is restored to QUARANTINED if that is what it was, since Retry is offered whatever the status
+    // and a short read must not cost a quarantine the one action that can end it (o3d-w00).
     if (!refundLanded && !refundSweep.complete) {
+      await restoreQuarantineIfUntouched()
       return {
         success: false,
         error: `WooCommerce's refund list for that order could not be read in full (${refundSweep.error ?? 'unknown error'}), `
@@ -1309,26 +1338,7 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
         await db.shoppingSyncLog.deleteMany({ where: { id: { in: staleIds } } })
       }
 
-      // o3d-w00 (Codex r1 #3): put the quarantine BACK if the re-fetch never re-decided this refund.
-      // The transition above is only safe because the sync normally re-parks the row (as QUARANTINED
-      // again, or SYNCED); when the WooCommerce fetch itself fails, or the refund is absent from the
-      // response, nothing rewrites it and the row is stranded as PENDING — carrying the original
-      // deliberate-refusal message, but no longer offering the ONE action that can resolve it
-      // (Record manually is scoped to QUARANTINED, because hand-recording a retryable park would race
-      // its retry into a duplicate credit note). Detected by the row being untouched: still PENDING,
-      // still carrying the same error text it had before the transition.
-      if (row.status === 'QUARANTINED') {
-        await db.shoppingSyncLog.updateMany({
-          where: {
-            ...REFUND_PARK_WHERE,
-            externalId: row.externalId,
-            entityId: row.entityId,
-            status: 'PENDING',
-            errorMessage: row.errorMessage,
-          },
-          data: { status: 'QUARANTINED' },
-        })
-      }
+      await restoreQuarantineIfUntouched()
     }
 
     await logActivity({
