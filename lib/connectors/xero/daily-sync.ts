@@ -373,21 +373,67 @@ export function takeDailyBatchWindow<T>(
   }
 }
 
+/** In the outbox or in the ledger: a log in any of these states blocks a recreate outright. */
+const LIVE_DAILY_BATCH_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
+
 /**
- * Is a daily-batch log for this batch still live (PENDING/PROCESSING/SYNCED)?
+ * o3d-o97 r6 — MAY THIS BATCH BE POSTED AGAIN? AND THE ANSWER IS NEVER A STATUS.
  *
- * Accepts either a single derived `<group>-<date>` key (the reconciliation sweeps, whose
- * identity is `<PREFIX>-<date>` by construction and never persisted) or a bucket's full
- * set of candidate referenceIds.
+ * This probe is the ONLY thing standing between the recreate sweep and a DUPLICATE journal in a
+ * real ledger, and until r6 it asked "is a log for this batch still live?", where live meant
+ * `status in (PENDING, PROCESSING, SYNCED)`. Everything else — CANCELLED above all — read as "no
+ * log, so the journal never posted, so post it again".
  *
- * This probe is the ONLY thing standing between the recreate sweep and a duplicate
- * journal, so it errs towards "live": every candidate is ORed together, and a bucket with
- * no candidates at all is reported LIVE rather than recreated blind.
+ * That is the exact inference r5 spent the rest of this branch dismantling, inverted. r5 made
+ * CANCELLED stop being proof that a debit DID NOT post (`allocated-inventory-debit.ts`,
+ * `proveJournalPosting` in refund-service.ts): it means SOMEBODY OR SOMETHING ABANDONED THE ROW —
+ * a sweep, an order cancellation, an operator — and none of them can see whether the remote call
+ * had already landed, because the processors POST BEFORE they persist SYNCED and the external id.
+ * The same status was still proof to THIS reader that the batch must be posted again. Two readers,
+ * opposite conclusions, one fact; and this is the reader that writes to the ledger.
+ *
+ * WORKED. Group A2 stages 30 orders into journal J for £4,120 and J reaches Xero. J is later marked
+ * CANCELLED — by the cross-connector orphan sweep during a connector switch, or by an operator
+ * tidying the sync screen. The next daily run sweeps: the 30 orders still carry
+ * `inventoryAllocatedDate`, J is not "live", so a SECOND £4,120 DR Allocated Inventory / CR
+ * Inventory is queued and posts. Allocated Inventory now holds £8,240 for £4,120 of allocations,
+ * and each order's `allocationBatchAmount` records one £-share, so the eventual refunds can only
+ * ever reverse half of it. r5 made this MORE reachable, not less: it stopped the un-stage sites
+ * clearing the stamp on a cancelled journal, so those 30 orders now stay in this sweep's candidate
+ * set instead of leaving it.
+ *
+ * SO THE QUESTION IS ASKED THE SAME WAY IT IS ASKED EVERYWHERE ELSE IN o3d-o97 — only POSITIVE
+ * EVIDENCE moves money — and there are exactly three answers:
+ *
+ *   BLOCKED, live       a row in PENDING/PROCESSING/SYNCED. Unchanged: the journal is in the outbox
+ *                       or in the ledger.
+ *   BLOCKED, unproved   a row that is neither live nor provably pre-call — CANCELLED, FAILED, a row
+ *                       cancelled before this column existed. It may already be in the ledger, so
+ *                       re-raising it is a coin flip that costs a duplicate journal when it loses.
+ *                       Nothing is posted and the batch is REPORTED on the run's errors, so the
+ *                       refusal is visible instead of being a silent skip. (FAILED rows are already
+ *                       reset to PENDING by `resetFailedDailyBatchLogs` before this runs, so in
+ *                       practice this is the cancelled set.)
+ *   ALLOWED             no row at all — which, INSIDE the retention window this sweep is bounded to
+ *                       (scjz.36), means the log genuinely went missing before it posted — or every
+ *                       row for the batch carries `abandonedBeforeRemoteCall`, the orphan sweep's
+ *                       own record that it cancelled a PENDING row and nothing was ever sent.
+ *
+ * A row bearing an `externalTransactionId` blocks whatever its status says: that id exists only
+ * because the remote call returned, so it is the ledger's own receipt and outranks any later
+ * abandonment written over the top of it.
+ *
+ * `refs` is either a single derived `<group>-<date>` key (the reconciliation sweeps, whose identity
+ * is `<PREFIX>-<date>` by construction and never persisted) or a bucket's full set of candidate
+ * referenceIds. Every candidate is ORed together, and a bucket with NO candidates at all is blocked
+ * rather than recreated blind.
  */
-async function hasLiveDailyBatchLog(
+type DailyBatchRecreateVerdict = { blocked: boolean; refusal: string | null }
+
+async function dailyBatchRecreateVerdict(
   type: DailyBatchLogType,
   refs: string | DailyBatchLiveRefs,
-): Promise<boolean> {
+): Promise<DailyBatchRecreateVerdict> {
   const { exact, derived } = typeof refs === 'string' ? { exact: [], derived: [refs] } : refs
   const alternatives: Prisma.AccountingSyncLogWhereInput[] = []
   // The exact persisted referenceId of the batch this row was staged into — the only
@@ -398,24 +444,45 @@ async function hasLiveDailyBatchLog(
   // the bare `<group>-<date>` never finds it and recreate would post a duplicate
   // batch (double-post). Match the bare key OR any digest-suffixed variant for the
   // same group+date (scjz.37). Kept ALONGSIDE the persisted refs, never replaced by
-  // them: this probe must never see fewer live logs than it did before the column.
+  // them: this probe must never see fewer logs than it did before the column.
   for (const bareReferenceId of derived) {
     alternatives.push(
       { referenceId: bareReferenceId },
       { referenceId: { startsWith: `${bareReferenceId}-` } },
     )
   }
-  if (alternatives.length === 0) return true
-  const count = await db.accountingSyncLog.count({
+  if (alternatives.length === 0) return { blocked: true, refusal: null }
+  // NO STATUS PREDICATE. The rows are read and judged here, because "which rows exist" and "what
+  // they prove" are two different questions and the old query answered the second one in the WHERE
+  // clause, where a cancelled row simply vanished.
+  const rows = await db.accountingSyncLog.findMany({
     where: {
       connector: XERO_CONNECTOR,
       type,
-      status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
       OR: alternatives,
     },
+    select: { id: true, referenceId: true, status: true, externalTransactionId: true, abandonedBeforeRemoteCall: true },
   })
-  return count > 0
+  if (rows.length === 0) return { blocked: false, refusal: null }
+  if (rows.some((row) => LIVE_DAILY_BATCH_STATUSES.includes(row.status as typeof LIVE_DAILY_BATCH_STATUSES[number]))) {
+    return { blocked: true, refusal: null }
+  }
+  const unproved = rows.filter((row) => row.abandonedBeforeRemoteCall !== true || row.externalTransactionId)
+  if (unproved.length === 0) return { blocked: false, refusal: null }
+  const describe = unproved
+    .map((row) => `${row.referenceId} (${row.id}, ${row.status}${row.externalTransactionId ? `, external id ${row.externalTransactionId}` : ''})`)
+    .join(', ')
+  return {
+    blocked: true,
+    refusal:
+      `Daily batch ${type} not recreated: ${describe} — ` +
+      'a cancelled or failed row does not establish that its journal never reached the ledger ' +
+      '(the processor posts before it persists SYNCED), so re-raising it could post the same ' +
+      'journal twice. Re-post it deliberately, or leave it: the orders/shipments keep their stamps ' +
+      'and the standing accounting invariants keep reporting them.',
+  }
 }
+
 
 /**
  * Rebuild daily-batch logs that went missing before they posted.
@@ -427,8 +494,13 @@ async function hasLiveDailyBatchLog(
  * ledger. The persisted reference is the batch's real identity, so it is what the sweep
  * probes for, recreates under, and dates the journal from. Rows staged before that column
  * existed have no persisted ref and keep the old derived-key behaviour exactly.
+ *
+ * o3d-o97 r6: returns the batches it REFUSED to rebuild — a cancelled log is not evidence that its
+ * journal never posted, so the sweep leaves it alone and the caller surfaces it on the run instead
+ * of skipping silently. See `dailyBatchRecreateVerdict`.
  */
-export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof getXeroSettings>>, baseCurrency: string): Promise<void> {
+export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof getXeroSettings>>, baseCurrency: string): Promise<string[]> {
+  const refusals: string[] = []
   // scjz.36: only recreate within the sync-log retention window — beyond it, SYNCED
   // daily-batch logs are pruned by data-retention, so a "missing" log can't be told
   // apart from one that already posted, and rebuilding would double-post the journal.
@@ -444,9 +516,10 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
       // excludes `refundStatus: FULL` permanently, and so does Group B, so a debit re-posted here
       // has nothing left in IMS that will ever relieve it. The case is now reachable: a refund
       // that CANNOT account for the A2 debit deliberately keeps the order's A2 stamp so the
-      // standing invariants stay able to report it (see refund-service.ts), and a CANCELLED A2 log
-      // does not count as live — so without this filter the very orders held open for a human to
-      // resolve would have a fresh, permanently unrelievable debit posted under them.
+      // standing invariants stay able to report it (see refund-service.ts) — so without this filter
+      // the very orders held open for a human to resolve would be candidates for a fresh,
+      // permanently unrelievable debit. (o3d-o97 r6 closed the other half of that: a CANCELLED log
+      // no longer reads as "no journal" and no longer licenses a rebuild on its own.)
       refundStatus: { not: 'FULL' },
     },
     select: { inventoryAllocatedDate: true, inventoryAllocatedBatchRef: true, allocationBatchAmount: true },
@@ -501,7 +574,12 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
   }
 
   for (const { referenceId, date, summary, ...batch } of a1Batches.values()) {
-    if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_REVENUE_DEFERRAL', dailyBatchLiveRefs(batch))) continue
+    if (summary.total <= 0) continue
+    const verdict = await dailyBatchRecreateVerdict('DAILY_BATCH_REVENUE_DEFERRAL', dailyBatchLiveRefs(batch))
+    if (verdict.blocked) {
+      if (verdict.refusal) refusals.push(verdict.refusal)
+      continue
+    }
     await db.$transaction(async (tx) => {
       await createPendingSyncLog(tx, {
         type: 'DAILY_BATCH_REVENUE_DEFERRAL',
@@ -523,7 +601,12 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
   }
 
   for (const { referenceId, date, summary, ...batch } of a2Batches.values()) {
-    if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_INVENTORY_ALLOC', dailyBatchLiveRefs(batch))) continue
+    if (summary.total <= 0) continue
+    const verdict = await dailyBatchRecreateVerdict('DAILY_BATCH_INVENTORY_ALLOC', dailyBatchLiveRefs(batch))
+    if (verdict.blocked) {
+      if (verdict.refusal) refusals.push(verdict.refusal)
+      continue
+    }
     await db.$transaction(async (tx) => {
       await createPendingSyncLog(tx, {
         type: 'DAILY_BATCH_INVENTORY_ALLOC',
@@ -545,7 +628,12 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
   }
 
   for (const { referenceId, date, summary, ...batch } of bBatches.values()) {
-    if ((summary.revenue <= 0 && summary.cogs <= 0) || await hasLiveDailyBatchLog('DAILY_BATCH_GROUP_B', dailyBatchLiveRefs(batch))) continue
+    if (summary.revenue <= 0 && summary.cogs <= 0) continue
+    const verdict = await dailyBatchRecreateVerdict('DAILY_BATCH_GROUP_B', dailyBatchLiveRefs(batch))
+    if (verdict.blocked) {
+      if (verdict.refusal) refusals.push(verdict.refusal)
+      continue
+    }
     const lines: JournalLinePayload[] = []
     if (round2(summary.revenue) > 0) {
       lines.push(
@@ -592,6 +680,8 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
       }
     })
   }
+
+  return refusals
 }
 
 export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
@@ -625,7 +715,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     }
 
     await resetFailedDailyBatchLogs()
-    await recreateMissingDailyBatchLogs(settings, baseCurrency)
+    // o3d-o97 r6: a batch the sweep REFUSED to rebuild (its only log is cancelled, which does not
+    // establish that the journal never reached the ledger) is reported on the run rather than
+    // skipped silently — it is the one outcome where a human has to decide whether to re-post.
+    result.errors.push(...await recreateMissingDailyBatchLogs(settings, baseCurrency))
 
   // --- Group A1: Revenue Deferral ---
   try {
@@ -1494,7 +1587,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     //  - the gap must be pure accumulated rounding ('sweep'); a material gap ('flag')
     //    is surfaced by the reconciliation invariant and NEVER swept (sweeping it
     //    would mask a genuine misstatement).
-    // Idempotent per as-of date via hasLiveDailyBatchLog, so re-running the batch the
+    // Idempotent per as-of date via dailyBatchRecreateVerdict, so re-running the batch the
     // same period never double-posts. A failure here must never abort the batch — the
     // core postings already committed.
     result.inventoryReconciliationSwept = null
@@ -1507,7 +1600,12 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       })
       if (journal) {
         const referenceId = `INVRECON-${journal.date}`
-        if (!(await hasLiveDailyBatchLog('DAILY_BATCH_INVENTORY_RECONCILIATION', referenceId))) {
+        // o3d-o97 r6: the same idempotency guard the recreate sweep uses, and for the same reason —
+        // a CANCELLED sweep journal for this as-of date does not establish that nothing was posted,
+        // so it blocks a second one and is reported rather than silently re-raised.
+        const reconciliationVerdict = await dailyBatchRecreateVerdict('DAILY_BATCH_INVENTORY_RECONCILIATION', referenceId)
+        if (reconciliationVerdict.refusal) result.errors.push(reconciliationVerdict.refusal)
+        if (!reconciliationVerdict.blocked) {
           await db.$transaction((tx) => createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_INVENTORY_RECONCILIATION',
             referenceId,
@@ -1546,7 +1644,12 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       })
       if (journal) {
         const referenceId = `COGSRECON-${journal.date}`
-        if (!(await hasLiveDailyBatchLog('DAILY_BATCH_COGS_RECONCILIATION', referenceId))) {
+        // o3d-o97 r6: the same idempotency guard the recreate sweep uses, and for the same reason —
+        // a CANCELLED sweep journal for this as-of date does not establish that nothing was posted,
+        // so it blocks a second one and is reported rather than silently re-raised.
+        const reconciliationVerdict = await dailyBatchRecreateVerdict('DAILY_BATCH_COGS_RECONCILIATION', referenceId)
+        if (reconciliationVerdict.refusal) result.errors.push(reconciliationVerdict.refusal)
+        if (!reconciliationVerdict.blocked) {
           await db.$transaction((tx) => createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_COGS_RECONCILIATION',
             referenceId,
@@ -1587,7 +1690,12 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       })
       if (journal) {
         const referenceId = `TRANSITRECON-${journal.date}`
-        if (!(await hasLiveDailyBatchLog('DAILY_BATCH_TRANSIT_RECONCILIATION', referenceId))) {
+        // o3d-o97 r6: the same idempotency guard the recreate sweep uses, and for the same reason —
+        // a CANCELLED sweep journal for this as-of date does not establish that nothing was posted,
+        // so it blocks a second one and is reported rather than silently re-raised.
+        const reconciliationVerdict = await dailyBatchRecreateVerdict('DAILY_BATCH_TRANSIT_RECONCILIATION', referenceId)
+        if (reconciliationVerdict.refusal) result.errors.push(reconciliationVerdict.refusal)
+        if (!reconciliationVerdict.blocked) {
           await db.$transaction((tx) => createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_TRANSIT_RECONCILIATION',
             referenceId,

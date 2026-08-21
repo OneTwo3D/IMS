@@ -86,3 +86,24 @@ ALTER TABLE "sales_order_refunds" ADD COLUMN "accounting_allocation_basis_unreso
 -- the attribution and turn "the journal this order was staged into is no longer on record" — which
 -- every reader treats as a refusal — into "this order was never staged into a journal", which they
 -- treat as a fact. A dangling id is the honest state and is read as one.
+
+-- o3d-o97 r6 — accounting_sync_logs.abandoned_before_remote_call
+--
+-- The columns above stopped a STATUS being read as proof that pounds moved. One reader was still
+-- reading the same status as proof of the opposite: `recreateMissingDailyBatchLogs` re-raises a
+-- daily-batch journal when it can see no LIVE log for the batch, and CANCELLED is not live — so a
+-- row cancelled after its remote call had already landed made the sweep post the journal a second
+-- time. The refund path refuses on that status; the recreate path acted on it. Same fact, opposite
+-- conclusions, and only one of them writes to a real ledger.
+--
+-- This column records the thing the status was standing in for. The cross-connector orphan sweep
+-- matches `status = 'PENDING'` ONLY — a PENDING row is provably pre-call, nothing was sent — so it,
+-- and nothing else, sets this true in the same UPDATE that writes CANCELLED. Recreate then rebuilds
+-- a batch only where a cancelled row SAYS it never reached the ledger, and treats every other
+-- cancelled row as unproved: no journal re-raised, and a refusal reported on the run.
+--
+-- Nullable, NO DEFAULT, NOT BACKFILLED, no index, no FK — the same argument as every column above.
+-- `false` would be an assertion that a historical cancelled row DID make its call; NULL is "not on
+-- record", which every reader treats as unproved. No index because it is only ever read from rows
+-- already located by (connector, type, referenceId) or by primary key.
+ALTER TABLE "accounting_sync_logs" ADD COLUMN "abandoned_before_remote_call" BOOLEAN;

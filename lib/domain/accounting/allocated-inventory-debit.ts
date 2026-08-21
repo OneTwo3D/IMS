@@ -58,10 +58,21 @@
  *         £52 it can see; the original £40 stands for ever, and NOTHING ANYWHERE POINTS AT IT,
  *         because the evidence was deleted by the very write that made the second debit possible.
  *   r5    the debit STANDS. The stamp and the £40 are kept, so A2 never re-posts and the refund's
- *         open balance still finds the £40. If J genuinely never reached a ledger,
- *         `recreateMissingDailyBatchLogs` re-raises it — a CANCELLED log does not count as live
- *         there — so the honest outcome is reached without anyone having to guess. Either way
- *         exactly £40 is on record and reversible.
+ *         open balance still finds the £40. Either way exactly £40 is on record and reversible.
+ *
+ * o3d-o97 r6 — AND THE OTHER READER OF THAT SAME STATUS NOW AGREES. r5 justified the paragraph above
+ * partly by saying that if J genuinely never reached a ledger `recreateMissingDailyBatchLogs`
+ * re-raises it, "a CANCELLED log does not count as live there". That was true and it was the defect:
+ * the recreate sweep read CANCELLED as proof the journal MUST be posted again, which is the same
+ * unsound inference as r4's, pointed the other way — and it is the one that writes to the ledger, so
+ * where r4 stranded pounds this DOUBLED them. The sweep no longer reads the status at all. It asks
+ * for positive evidence that no remote call was made (`abandonedBeforeRemoteCall`, written only by
+ * the orphan sweep, which cancels PENDING — pre-call — rows only) and otherwise refuses and reports.
+ *
+ * So the healing path this file used to point at is narrower and honest: a cancelled A2 journal is
+ * re-raised only where its canceller RECORDED that nothing was sent. Everywhere else the debit
+ * stands, exactly as below, and a human decides — which is what both readers now say about the same
+ * fact instead of two opposite things.
  *
  * TWO facts still clear the stamp, and both are records A2 WROTE ABOUT ITSELF rather than statuses
  * some later sweep imposed: no stamp at all, and a recorded debit of exactly zero.
@@ -147,9 +158,12 @@ export async function resolveStagedAllocationDebit(
   if (journal.status === 'CANCELLED') {
     // o3d-o97 r5: NOT a clearance. A cancelled row is an abandoned row, and abandonment is written
     // by sweeps and operators that cannot see whether the remote call had already landed. Keeping
-    // the record costs nothing (A2 will not re-post; `recreateMissingDailyBatchLogs` re-raises the
-    // journal if it truly never posted) while clearing it destroys the only evidence of the debit
-    // AND lets A2 raise a second one.
+    // the record costs nothing — A2 will not re-post an order it can still see a stamp on — while
+    // clearing it destroys the only evidence of the debit AND lets A2 raise a second one.
+    //
+    // o3d-o97 r6: the recreate sweep no longer re-raises this journal off the back of the status
+    // either (it demands `abandonedBeforeRemoteCall` and otherwise refuses and reports), so the
+    // stamp standing here is the state a human resolves, not a state a sweep resolves behind them.
     return {
       standing: true,
       reason: `the Group A2 journal carrying this order's ${amountLabel} debit is recorded CANCELLED, which says the row was abandoned and not that the ledger was never reached, so that debit cannot be treated as un-posted`,

@@ -334,7 +334,19 @@ async function cancelOrphanedRowsUnderLock(
     where: { AND: [scope, { status: 'PENDING' as const }] },
     // audit-46ry: CANCELLED (not FAILED) so these abandoned rows are excluded from
     // FAILED-scanning reconciliation/backfill sweeps and error dashboards.
-    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
+    //
+    // o3d-o97 r6: and `abandonedBeforeRemoteCall` records the ONE thing this sweep — alone among
+    // the cancellers — can prove. The `status: 'PENDING'` predicate above is exactly the o3d-sref
+    // argument written down: a PENDING row is PRE-CALL, nothing was sent, so its journal is in no
+    // ledger. Every other reader of a cancelled row (the refund's open balance, the A2 un-stage,
+    // the daily-batch recreate sweep) must otherwise treat CANCELLED as unproved, because the
+    // processors post BEFORE persisting SYNCED. Writing the negative HERE, where it is known, is
+    // what lets `recreateMissingDailyBatchLogs` rebuild a genuinely lost batch without guessing
+    // from a status — and refuse on every cancelled row that does not carry it.
+    //
+    // It is set in the SAME UPDATE as the status, under the same predicate, so a row can never
+    // carry the claim without having been cancelled from PENDING by this sweep.
+    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null, abandonedBeforeRemoteCall: true },
   })
 
   // Counted, not cancelled — so the activity log explains why the orphan count did not reach zero.

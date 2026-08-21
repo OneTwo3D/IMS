@@ -2302,6 +2302,33 @@ model AccountingSyncLog {
   // "back-reference done, follow-ups outstanding" pass that used to be FAILED-only.
   backReferenceFollowUpsPendingAt DateTime?
 
+  // o3d-o97 r6 — THE ONE FACT THAT MAKES A CANCELLED ROW EVIDENCE ABOUT POUNDS.
+  //
+  // r5 established, in three places, that `status = CANCELLED` proves nothing: it records that a
+  // sweep or an operator ABANDONED the row, and the processors POST BEFORE persisting SYNCED and the
+  // external id, so an abandoned row may already have reached the ledger. That left
+  // `recreateMissingDailyBatchLogs` — which re-raises a journal when it can see no live log — reading
+  // the same status as proof that the batch MUST be posted again. Two readers, opposite conclusions,
+  // one fact; and the recreate side's conclusion costs a DUPLICATE journal in a real ledger.
+  //
+  // The reconciliation is not to pick a winner but to record the thing the status was standing in
+  // for. ONE canceller can prove there was no remote call: the cross-connector orphan sweep
+  // (`cancelOrphanedRowsUnderLock`) matches `status = PENDING` only, and its own comment states why
+  // — "A PENDING row is provably PRE-CALL: nothing was sent". That writer, and only that writer,
+  // sets this to true in the same UPDATE as the status.
+  //
+  //   true    nothing was ever sent for this row. Its journal is NOT in any ledger, so recreate may
+  //           rebuild it and a relief/debit record naming it moved zero pounds.
+  //   null    everything else — every other canceller, every pre-r6 cancelled row, and every row
+  //           that was never cancelled at all. NOT "a call was made": "not on record", which every
+  //           reader treats as unproved, exactly as it treats a null attribution column.
+  //
+  // Nullable, no DEFAULT and NOT BACKFILLED for the same reason as the o97 attribution columns: a
+  // default is a value, and `false` would assert that a historical cancelled row HAD made its call —
+  // manufacturing the confidence this column exists to stop being assumed. It is never written on
+  // any path that posts, so it can only ever be set by a writer that knows the negative.
+  abandonedBeforeRemoteCall Boolean? @map("abandoned_before_remote_call")
+
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
 

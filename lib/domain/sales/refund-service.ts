@@ -1230,15 +1230,61 @@ async function stageRefundAccountingReversals(
     //     inside both batch windows, and the standing invariant reports it — the pounds stay open
     //     and visible instead of being moved wrongly and silently.
     //
-    // A single-product pool keeps the blend, because there the rate IS that product's own average
-    // across the pool and k units of it are exactly k/n of its debit; and a FULL refund keeps it for
-    // every pool, because the residue closes the order to precisely the open balance whatever the
-    // per-line split was.
+    // o3d-o97 r6 — AND ONE PRODUCT ID IS NOT THE PROPERTY THAT MADE IT SAFE.
+    //
+    // r5 kept the blend for a single-product pool on the reasoning that "there the rate IS that
+    // product's own average across the pool and k units of it are exactly k/n of its debit". That
+    // holds only if EVERY UNIT IN THE POOL WAS DEBITED AT THE SAME RATE, and a product is not a
+    // rate: two allocation rows of the same product, pinned to different cost layers, were debited
+    // at different rates by the same A2 pass. `unrecordedRowProductIds.size === 1` says nothing
+    // about that, and the pool is built precisely FROM the rows that record no rate of their own.
+    //
+    // WORKED, one product. A2 debits £40 for 4 units of product X: row R1 is 3 units pinned to a £5
+    // layer (£15) and row R2 is 1 unit pinned to a £25 layer (£25). The rebalancer re-created both
+    // rows after A2 stamped the order, so neither records its share and only the order's £40
+    // survives. The pool is 4 units of ONE product, so r5 blends at £10 a unit.
+    //   r5, PARTIAL refund of R2's single unit: £10 credited to Allocated Inventory for a unit A2
+    //     debited £25. £15 of that unit's debit is stranded, while the 3 units left can still claim
+    //     £30 against a real £15 — so the next refund conjures £15 of Inventory. Refund R1's 3 units
+    //     instead and it is £30 credited against £15 debited, immediately.
+    //   r6: REFUSED. Nothing is credited, the reason is recorded on the refund row, the order stays
+    //     inside both batch windows and the standing invariant reports it.
+    //
+    // WHAT THE SAFETY ARGUMENT ACTUALLY NEEDS IS THE THING A2 VALUED, WHICH IS THE ROW. A2 values
+    // each allocation ROW and records a figure for it; the order's total is the sum of those. So a
+    // rate obtained by spreading the residual is that row's OWN AVERAGE exactly when the residual
+    // belongs to ONE row, and is a cross-row blend — a rate A2 never applied to anything — the
+    // moment it belongs to two. Products are the wrong unit of account for this: two rows of one
+    // product were valued separately (the example above), and one row of one product was valued as
+    // a whole however many layers it spanned. So the gate moves from products to ROWS.
+    //
+    // And there is a second, stronger exemption that needs no uniformity at all: the residual IS the
+    // pool's debit BY CONSTRUCTION (the order's recorded figure less every row that recorded its own
+    // share), so a refund taking EVERY UNIT of the pool credits exactly that residual whatever the
+    // per-row split was — the split cancels in the sum. That covers a many-row pool being wound down
+    // completely by a refund that is not (yet) the order's last.
+    //
+    //   ONE unrecorded row          the rate is that row's own average across the units A2 valued
+    //                               together. Allowed, and this is the legacy shape r4 exists for:
+    //                               every allocation row in the database is basis-less on the day
+    //                               this ships, and refusing them all would strand the backlog
+    //                               permanently, which r4 already established is worse than the bug.
+    //   k === n over the pool       the apportioned pounds sum to the recorded debit exactly.
+    //                               Allowed.
+    //   two or more rows, k < n     a share of a pool whose rows A2 priced separately and nothing on
+    //                               record can tell apart. Refused on a partial.
+    //
+    // A FULL refund keeps the blend for every pool, unchanged: the residue closes the order to
+    // precisely the open balance whatever the per-line split was.
     const orderRecordedDebit = orderAccounting?.allocationBatchAmount != null
       ? refundBoundaryNumber(orderAccounting.allocationBatchAmount)
       : null
     let recordedRowDebitTotal = 0
     let unrecordedRowQtyTotal = 0
+    // o3d-o97 r6: the rows A2 priced SEPARATELY and that record no price. Two or more of them is
+    // what makes the apportioned rate a rate A2 never applied — see above. Counted, not just
+    // flagged, so the refusal can say how big the pool it could not split actually is.
+    let unrecordedRowCount = 0
     const unrecordedRowProductIds = new Set<string>()
     for (const allocation of orderAccounting?.allocations ?? []) {
       const rowQty = refundBoundaryNumber(allocation.qty)
@@ -1246,6 +1292,7 @@ async function stageRefundAccountingReversals(
         recordedRowDebitTotal += Math.max(0, refundBoundaryNumber(allocation.allocationBatchAmount))
       } else if (rowQty > 0) {
         unrecordedRowQtyTotal += rowQty
+        unrecordedRowCount += 1
         if (allocation.productId) unrecordedRowProductIds.add(allocation.productId)
       }
     }
@@ -1260,48 +1307,75 @@ async function stageRefundAccountingReversals(
     // o3d-o97 r5: true only when a rate was actually apportioned (a zero residual prices the rows at
     // zero, which is an under-reversal the residue closes, not a fabrication) AND that rate belongs
     // to no single product. This is what makes a PARTIAL refund refuse below.
-    const apportionmentBlendsProducts = unrecordedRowUnitCost > 0 && unrecordedRowProductIds.size > 1
 
     // Set whenever a refunded unit was priced from that residual rather than from its own row's
     // record. Named in the refusal note, because it is an apportionment rather than a posting.
     let allocationRowBasisMissing = false
+    // o3d-o97 r6: how many of the pool's units this refund is actually reversing — the `k` above.
+    // Accumulated here because this is the one place a unit is priced from the residual, so it
+    // cannot drift from `allocationRowBasisMissing`.
+    let unrecordedQtyRefunded = 0
     const applyPostedAllocationUnitCosts = (entries: CostLayerSnapshotEntry[]): CostLayerSnapshotEntry[] => (
       entries.map((entry) => {
         const posted = entry.orderAllocationId
           ? postedAllocationUnitCostByAllocationId.get(entry.orderAllocationId)
           : undefined
         if (posted != null) return { ...entry, unitCostBase: posted }
-        if (refundBoundaryNumber(entry.qty) > 0) allocationRowBasisMissing = true
+        const entryQty = refundBoundaryNumber(entry.qty)
+        if (entryQty > 0) {
+          allocationRowBasisMissing = true
+          unrecordedQtyRefunded += entryQty
+        }
         return { ...entry, unitCostBase: unrecordedRowUnitCost }
       })
     )
 
-    const extractPayloadAmount = (
+    // o3d-o97 r6 — WHAT AN ACCOUNT MOVED, WHICH IS NOT THE GROSS OF ONE SIDE.
+    //
+    // r2 read the CREDIT side of a journal's lines for the Allocated Inventory contra and r5 read
+    // the DEBIT side for the A2 posting, each summing only the matching lines on the side it cared
+    // about. A JOURNAL CAN TOUCH ONE ACCOUNT ON BOTH SIDES, and every reader of these figures is
+    // asking what the account MOVED — how much relief it received, how much debit it is carrying —
+    // which is the net, never one side's gross.
+    //
+    // It is not hypothetical for these journals in particular. Group B's is a WHOLE DAY's batch,
+    // built line by line, and the reconciliation sweeps add their own rounding lines to it; A2's is
+    // likewise a day's window; and both take their account codes from settings, so two roles
+    // (Allocated Inventory and, say, the inventory-rounding-difference account) mapped to the SAME
+    // code put both sides of a pair on one account.
+    //
+    // WORKED, on the A2 bound. A day's A2 journal debits Allocated Inventory £1,000 and — because
+    // the rounding-difference account is mapped to the same code — credits it £700 in the same
+    // journal. The account moved £300. An order records a £500 share of that batch.
+    //   gross: 500 <= 1,000, so the share is "inside its batch", the basis resolves, and a full
+    //     refund credits Allocated Inventory £500 against a journal that put £300 into it.
+    //   net:   500 > 300, so the share cannot have come from this journal, the basis is UNRESOLVED,
+    //     nothing is credited and the refund says why. The £300 stays open and visible.
+    // The relief side fails the same way in the opposite direction: a batch crediting Allocated
+    // £500 and debiting it £120 has relieved £380, and bounding a shipment's £400 recorded share by
+    // the £500 gross lets a figure the journal did not deliver be subtracted from the open balance.
+    //
+    // An empty account code is not a match — an unconfigured account would otherwise sum every line
+    // whose own accountCode is blank (o3d-o97 r2).
+    const extractPayloadNetMovement = (
       payload: unknown,
       accountCode: string,
+      side: 'credit' | 'debit',
     ): number => {
+      if (!accountCode) return 0
       const linesPayload = (payload as { lines?: Array<{ accountCode?: string; debit?: number; credit?: number }> } | null)?.lines
       if (!Array.isArray(linesPayload)) return 0
-      return linesPayload.reduce((sum, line) => (
-        line.accountCode === accountCode ? sum + refundBoundaryNumber(line.debit ?? 0) : sum
-      ), 0)
+      return linesPayload.reduce((sum, line) => {
+        if (line.accountCode !== accountCode) return sum
+        const debit = refundBoundaryNumber(line.debit ?? 0)
+        const credit = refundBoundaryNumber(line.credit ?? 0)
+        return sum + (side === 'credit' ? credit - debit : debit - credit)
+      }, 0)
     }
 
     const priorUnearnedReversed = livePriorReversals
       .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
-      .reduce((sum, row) => sum + extractPayloadAmount(row.payload, settings.unearnedRevenueAccount), 0)
-
-    // o3d-o97 r2: the CREDIT side of a journal, for the Allocated Inventory contra. An empty
-    // account code is not a match — an unconfigured account would otherwise sum every line whose
-    // own accountCode is blank.
-    const extractPayloadCredit = (payload: unknown, accountCode: string): number => {
-      if (!accountCode) return 0
-      const linesPayload = (payload as { lines?: Array<{ accountCode?: string; credit?: number }> } | null)?.lines
-      if (!Array.isArray(linesPayload)) return 0
-      return linesPayload.reduce((sum, line) => (
-        line.accountCode === accountCode ? sum + refundBoundaryNumber(line.credit ?? 0) : sum
-      ), 0)
-    }
+      .reduce((sum, row) => sum + extractPayloadNetMovement(row.payload, settings.unearnedRevenueAccount, 'debit'), 0)
 
     // o3d-o97 r5 — WHAT A JOURNAL ROW PROVES, WHICH IS NEVER ITS STATUS.
     //
@@ -1353,9 +1427,15 @@ async function stageRefundAccountingReversals(
       if (!accountCode) return { kind: 'unproved', statuses: 'no Allocated Inventory account configured' }
       return {
         kind: 'proved',
-        amount: rows.reduce((sum, row) => sum + (side === 'credit'
-          ? extractPayloadCredit(row.payload, accountCode)
-          : extractPayloadAmount(row.payload, accountCode)), 0),
+        // o3d-o97 r6: the account's NET movement across the journal's own lines, not the gross of
+        // whichever side the caller expects — see `extractPayloadNetMovement`. Floored at zero
+        // because a negative net is the account moving the OTHER WAY, which is not a smaller
+        // relief/debit but none of one, and letting it go negative would make several journals sum
+        // to a figure no single one of them can be held to.
+        amount: Math.max(0, rows.reduce(
+          (sum, row) => sum + extractPayloadNetMovement(row.payload, accountCode, side),
+          0,
+        )),
       }
     }
 
@@ -1413,9 +1493,30 @@ async function stageRefundAccountingReversals(
     // still not treated as positive evidence of relief — it is treated as no evidence, resolved to
     // the least destructive side, and it is the reason the amount is recorded on a row retention
     // never deletes in the first place.
+    //
+    // o3d-o97 r6 — AND AN ABSENCE RESOLVED THE LEAST-DESTRUCTIVE WAY IS STILL AN ABSENCE, SO IT HAS
+    // TO SAY SO. The reading above is right about the pounds and was silent about the reasoning,
+    // and that silence is a defect on its own: the relief record is COUNTED, the open balance
+    // shrinks, the refund credits less, and nothing on the refund row or in the invariant report
+    // distinguishes it from a relief proved out of a journal's own lines.
+    //
+    // The combination that makes it a repair signal rather than a footnote: a relief journal that
+    // was CANCELLED and never posted refuses while its row survives (r5 — `proveJournalPosting`
+    // rejects any non-SYNCED row), and then `retention_sync_logs_months` DELETES that row, because
+    // CANCELLED is terminal. From that moment the same record resolves to "posted" at the recorded
+    // amount. RETENTION HAS MANUFACTURED A RESOLUTION: the refusal that was standing yesterday is
+    // gone today, the invariant stops reporting the order, and the under-reversal — a debit left
+    // standing in Allocated Inventory that nothing points at — becomes permanent on a FULL refund.
+    //
+    // So the third verdict, ASSUMED: the pounds are counted exactly as before (the reading that
+    // moves the least money is unchanged), and the reason is recorded on the refund row alongside
+    // any refusal, so the finding stands until a human resolves it. It does NOT withhold the
+    // reversal — an assumption is not a refusal, and treating it as one would strand the very
+    // pre-column and post-retention cases these columns were added to survive.
     type AllocatedReliefVerdict =
       | { kind: 'posted' }
       | { kind: 'none' }
+      | { kind: 'assumed'; reason: string }
       | { kind: 'unresolved'; reason: string }
 
 
@@ -1453,8 +1554,15 @@ async function stageRefundAccountingReversals(
         select: { status: true, connector: true, payload: true },
       })
       // Deleted by retention once terminal: read as the recorded amount, the least destructive of
-      // the two readings left. See the block comment above.
-      if (!journal) return { kind: 'posted' }
+      // the two readings left — but ASSUMED, not proved (o3d-o97 r6). Retention deletes SYNCED and
+      // CANCELLED rows alike, so this absence is equally consistent with a relief that never
+      // posted; counting it silently is how a refusal that was standing becomes a resolution.
+      if (!journal) {
+        return {
+          kind: 'assumed',
+          reason: `${record.subject}'s £${record.recorded.toFixed(2)} of Allocated Inventory relief was counted from its own record because the journal it names is no longer on record (retention) — retention deletes cancelled journals as well as settled ones, so whether those pounds ever reached the account is not established`,
+        }
+      }
       // o3d-o97 r5: the ROW's own connector, not just the stamp beside the amount. The stamp is
       // written by the same statement as the figure and can only be as right as that writer was;
       // the row is the ledger's own record of which books it was raised into.
@@ -1469,8 +1577,14 @@ async function stageRefundAccountingReversals(
       // share; the share is the recorded figure, and the journal BOUNDS it. Two ways to fail:
       const proof = proveJournalPosting([journal], settings.allocatedInventoryAccount, 'credit')
       // Payload compacted off a settled row (backReferenceEvidenceCompactedAt): the same position
-      // as a row retention deleted, resolved the same way — the recorded amount stands.
-      if (proof.kind === 'illegible') return { kind: 'posted' }
+      // as a row retention deleted, resolved the same way — the recorded amount stands, and says
+      // that it stands on the record rather than on the journal (o3d-o97 r6).
+      if (proof.kind === 'illegible') {
+        return {
+          kind: 'assumed',
+          reason: `${record.subject}'s £${record.recorded.toFixed(2)} of Allocated Inventory relief was counted from its own record because its journal has settled but its lines have been compacted off the row, so what that journal actually credited to ${settings.allocatedInventoryAccount} cannot be read`,
+        }
+      }
       if (proof.kind === 'unproved') {
         return {
           kind: 'unresolved',
@@ -1512,11 +1626,17 @@ async function stageRefundAccountingReversals(
     // outcomes per prior refund, and the fourth REFUSES rather than assuming zero:
     let priorRefundAllocationRelief = 0
     let priorRefundReliefUnresolved: string | null = null
+    // o3d-o97 r6: relief counted from a record because its journal could not be read — deleted by
+    // retention, or compacted. Not a refusal (the pounds are counted, the reversal is not withheld),
+    // but it MUST reach the refund row, or retention silently turns an unproved relief into a
+    // resolved one and the standing invariant stops reporting the order.
+    const assumedReliefNotes: string[] = []
+    let assumedReliefTotal = 0
     // Order-scoped reversal rows (referenceType 'SalesOrder') belong to no refund in particular,
     // so they are counted whole. There is no per-order row to record them on.
     for (const row of livePriorReversals) {
       if (row.type !== 'UNEARNED_REV_REVERSAL' || row.referenceType !== 'SalesOrder') continue
-      priorRefundAllocationRelief += extractPayloadCredit(row.payload, settings.allocatedInventoryAccount)
+      priorRefundAllocationRelief += extractPayloadNetMovement(row.payload, settings.allocatedInventoryAccount, 'credit')
     }
     for (const priorRefund of orderAccounting?.refunds ?? []) {
       // (1) THE RECORD the refund wrote when it decided its own reversal — RESOLVED, not trusted.
@@ -1554,15 +1674,23 @@ async function stageRefundAccountingReversals(
         ))
         // No row at all: retention has taken a TERMINAL row (only SYNCED and CANCELLED rows are
         // ever deleted), which is precisely what this column exists to survive. Count it — the
-        // reading that moves the least money — exactly as r3 does.
+        // reading that moves the least money — exactly as r3 does, and SAY that it was counted on
+        // the record rather than on a journal (o3d-o97 r6): "only SYNCED and CANCELLED are deleted"
+        // includes CANCELLED, so this absence is exactly as consistent with a relief that never
+        // reached the ledger, and counting it silently retires the refusal that stood yesterday.
         if (ownReversalRows.length === 0) {
           priorRefundAllocationRelief += recordedRelief
+          assumedReliefTotal += recordedRelief
+          assumedReliefNotes.push(`prior refund ${priorRefund.id}'s £${recordedRelief.toFixed(2)} of Allocated Inventory relief was counted from its own record because its reversal journal is no longer on record (retention) — retention deletes cancelled journals as well as settled ones, so whether those pounds ever reached the account is not established`)
           continue
         }
         const proof = proveJournalPosting(ownReversalRows, settings.allocatedInventoryAccount, 'credit')
         if (proof.kind === 'illegible') {
-          // A settled row whose payload was compacted away. Same position as no row at all.
+          // A settled row whose payload was compacted away. Same position as no row at all, and
+          // recorded as an assumption for the same reason (o3d-o97 r6).
           priorRefundAllocationRelief += recordedRelief
+          assumedReliefTotal += recordedRelief
+          assumedReliefNotes.push(`prior refund ${priorRefund.id}'s £${recordedRelief.toFixed(2)} of Allocated Inventory relief was counted from its own record because its reversal journal has settled but its lines have been compacted off the row, so what it actually credited to ${settings.allocatedInventoryAccount} cannot be read`)
         } else if (proof.kind === 'unproved') {
           priorRefundReliefUnresolved = `prior refund ${priorRefund.id} recorded £${recordedRelief.toFixed(2)} of Allocated Inventory relief but its reversal journal is ${proof.statuses}, not SYNCED — whether that credit reached the ledger is not established, so how much of the A2 debit is still open cannot be either`
         } else {
@@ -1647,7 +1775,12 @@ async function stageRefundAccountingReversals(
           groupBReliefUnresolved = verdict.reason
           continue
         }
-        if (verdict.kind === 'posted') {
+        if (verdict.kind === 'assumed') {
+          // o3d-o97 r6: counted, and reported as counted-on-the-record. Not a refusal.
+          assumedReliefTotal += recordedRelief
+          assumedReliefNotes.push(verdict.reason)
+        }
+        if (verdict.kind === 'posted' || verdict.kind === 'assumed') {
           postedGroupBAllocationRelief = addMoney(postedGroupBAllocationRelief, toDecimal(recordedRelief))
         }
         // 'none' contributes zero relief, which is a FACT and not a gap: the contra never received
@@ -2191,12 +2324,16 @@ async function stageRefundAccountingReversals(
     if (!allocationBasisUnresolved) {
       allocationBasisUnresolved = groupBReliefUnresolved ?? priorRefundReliefUnresolved
     }
-    // o3d-o97 r5: the apportioned rate is a blend across products and this refund is PARTIAL, so
-    // neither of the two things that make the blend safe applies — the cap only bites above the
-    // open balance and the residue only runs on a full refund. See the worked example beside
-    // `apportionmentBlendsProducts`.
-    if (!allocationBasisUnresolved && allocationRowBasisMissing && apportionmentBlendsProducts && params.newStatus !== 'REFUNDED') {
-      allocationBasisUnresolved = `some refunded units came from allocation rows carrying no posted A2 basis of their own, and this order's remaining A2 debit of £${residualDebitForUnrecordedRows.toFixed(2)} covers ${unrecordedRowProductIds.size} different products — apportioning it by unit would price these units at a rate that is no product's own, and a partial refund has neither the open-balance cap nor the full refund's residue to correct it`
+    // o3d-o97 r6: the apportionment prices only SOME of the pool's unrecorded units and this refund
+    // is PARTIAL, so neither of the two things that make the blend safe applies — the cap only bites
+    // above the open balance and the residue only runs on a full refund, and a strict subset of a
+    // pool whose internal rates are unknown is a guess whichever products it spans. See the worked
+    // example beside `unrecordedRowUnitCost`.
+    const apportionmentIsInexact = unrecordedRowUnitCost > 0
+      && unrecordedRowCount > 1
+      && unrecordedQtyRefunded < unrecordedRowQtyTotal - 0.0000001
+    if (!allocationBasisUnresolved && allocationRowBasisMissing && apportionmentIsInexact && params.newStatus !== 'REFUNDED') {
+      allocationBasisUnresolved = `some refunded units came from allocation rows carrying no posted A2 basis of their own, and this refund reverses ${unrecordedQtyRefunded} of the ${unrecordedRowQtyTotal} such unit(s) spread across ${unrecordedRowCount} separately-valued allocation rows (${unrecordedRowProductIds.size} product(s)) that share this order's remaining A2 debit of £${residualDebitForUnrecordedRows.toFixed(2)} — apportioning that debit by unit prices them at a blended rate A2 applied to no row, and a partial refund has neither the open-balance cap nor the full refund's residue to correct it`
     }
     if (stagedA2?.inventoryAllocatedDate && hasRecordedAllocationAmount && !allocationBasisUnresolved) {
       // THE LEDGER BALANCE: what A2 debited, less every relief already credited against it. This
@@ -2255,7 +2392,14 @@ async function stageRefundAccountingReversals(
     // stamp on the order. Keeping the stamp is inert for the batches: Group A2 selects only
     // `inventoryAllocatedDate: null`, and both groups exclude `refundStatus: FULL`, so a
     // fully-refunded order is out of both windows whatever its stamp says.
-    const capBitInto = cappedLineAllocationReversal < lineAllocationReversal - 0.005
+    // o3d-o97 r6: a REFUSAL is not a cap. Under r5 both were reported for the same refund, because a
+    // refusal zeroes `cappedLineBasis` and so trivially "bit into" the line value — and the cap's
+    // sentence then printed `openAllocatedContra ?? 0`, telling an operator the balance was £0.00
+    // when the truth is that it could not be established at all. Two contradictory explanations of
+    // the same withheld pounds, one of them a fabricated figure. The cap now speaks only where the
+    // basis RESOLVED and the ceiling genuinely bound the reversal.
+    const capBitInto = allocationBasisUnresolved == null
+      && cappedLineAllocationReversal < lineAllocationReversal - 0.005
     // Recorded only when the refusal COST something: a full refund is the last chance to take the
     // residue out, so an unresolved basis there strands pounds and must be reported. On a partial
     // the order stays inside both batch windows and no residue was owed yet, so an unresolved
@@ -2275,14 +2419,28 @@ async function stageRefundAccountingReversals(
     // so the test is now what the refusal COST rather than which status the refund reached: a full
     // refund always (the residue is owed and lost), a partial only when a non-zero line reversal was
     // actually withheld, which keeps a monetary-only partial from generating noise.
+    //
+    // o3d-o97 r6 — AND AN ASSUMPTION COUNTS AS COSTING SOMETHING TOO, because it is subtracted from
+    // the open balance. Relief counted from a record whose journal retention has deleted (or
+    // compacted) SHRINKS what this refund credits, by exactly those pounds, on evidence nobody can
+    // read. Silently, that is how a refusal standing yesterday becomes a resolution today: the
+    // cancelled journal is deleted, the record resolves, the invariant stops reporting the order and
+    // the under-reversal is permanent on a FULL refund. So it is reported whenever it moved money.
     const refusalWithheldLineReversal = allocationBasisUnresolved != null && lineAllocationReversal > 0.005
+    const assumedReliefCounted = assumedReliefTotal > 0.005 && assumedReliefNotes.length > 0
     const withheldSomething = (allocationBasisUnresolved != null && params.newStatus === 'REFUNDED')
       || refusalWithheldLineReversal
       || capBitInto
+      || assumedReliefCounted
       || (allocationRowBasisMissing && params.newStatus === 'REFUNDED')
     const unresolvedNote = withheldSomething
       ? [
           allocationBasisUnresolved,
+          // The pounds this refund did NOT credit because a relief it could not read was counted
+          // against the debit. Listed per record, so an operator knows which journal to go and find.
+          assumedReliefCounted
+            ? `£${assumedReliefTotal.toFixed(2)} of Allocated Inventory relief was counted against this order's A2 debit WITHOUT the journal that was to carry it being legible, so the open balance may be overstated as relieved by up to that much: ${assumedReliefNotes.join('; ')}`
+            : null,
           capBitInto
             ? `the refund's own lines valued £${lineAllocationReversal.toFixed(2)} of allocated basis against an open balance of £${(openAllocatedContra ?? 0).toFixed(2)} and were capped to it`
             : null,

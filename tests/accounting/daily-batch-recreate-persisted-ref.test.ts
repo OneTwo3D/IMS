@@ -13,7 +13,17 @@ import test, { mock } from 'node:test'
 // It now keys off the exact referenceId persisted alongside the stamp. These tests drive the
 // real sweep on both connectors against an in-memory AccountingSyncLog.
 
-type SyncLogRow = { connector: string; type: string; referenceId: string; status: string }
+type SyncLogRow = {
+  connector: string
+  type: string
+  referenceId: string
+  status: string
+  // o3d-o97 r6: the two facts the Xero sweep judges a non-live row by. Optional, so every existing
+  // fixture keeps meaning "no external id, and no record that the call was never made".
+  externalTransactionId?: string | null
+  abandonedBeforeRemoteCall?: boolean | null
+  id?: string
+}
 type CreatedLog = { connector: string; type: string; referenceId: string; payload: Record<string, unknown> }
 
 let salesOrderRows: { a1: unknown[]; a2: unknown[] } = { a1: [], a2: [] }
@@ -95,6 +105,16 @@ mock.module('@/lib/db', {
       accountingSyncLog: {
         count: async ({ where }: { where: LogWhere }) =>
           syncLogs.filter((row) => matchesLog(row, where)).length,
+        // o3d-o97 r6: the Xero sweep no longer filters by status in the query — it READS the rows
+        // and judges them, so a cancelled row can no longer vanish from the probe's result set.
+        findMany: async ({ where }: { where: LogWhere }) =>
+          syncLogs.filter((row) => matchesLog(row, where)).map((row, index) => ({
+            id: row.id ?? `log-${index}`,
+            referenceId: row.referenceId,
+            status: row.status,
+            externalTransactionId: row.externalTransactionId ?? null,
+            abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null,
+          })),
       },
       $transaction: async (fn: (client: unknown) => Promise<unknown>) => fn(tx),
     },
@@ -137,9 +157,9 @@ const QBO_SETTINGS = {
   quickbooks_cogs_account: '310',
 } as never
 
-async function runXeroSweep() {
+async function runXeroSweep(): Promise<string[]> {
   const { recreateMissingDailyBatchLogs } = await import('@/lib/connectors/xero/daily-sync')
-  await recreateMissingDailyBatchLogs(XERO_SETTINGS, 'GBP')
+  return recreateMissingDailyBatchLogs(XERO_SETTINGS, 'GBP')
 }
 
 async function runQboSweep() {
@@ -599,10 +619,11 @@ test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated, on 
   // because a refund that CANNOT account for the debit deliberately KEEPS the stamp so the
   // standing invariants can still report the order to a human.
   //
-  // The A2 log below is CANCELLED, which `hasLiveDailyBatchLog` does not count as live — exactly
-  // the shape that makes the refund refuse. Without the exclusion the sweep would answer that
-  // refusal by posting a brand-new, permanently unrelievable debit under the very order being
-  // held open for someone to resolve.
+  // The A2 log below is CANCELLED and carries the orphan sweep's `abandonedBeforeRemoteCall` record,
+  // so o3d-o97 r6 has positive evidence the journal never reached a ledger and would otherwise
+  // rebuild it. Without the refundStatus exclusion the sweep would answer the refund's refusal by
+  // posting a brand-new, permanently unrelievable debit under the very order being held open for
+  // someone to resolve.
   for (const [label, ref, run] of [
     ['xero', XERO_A2_REF, runXeroSweep],
     ['quickbooks', QBO_A2_REF, runQboSweep],
@@ -614,7 +635,7 @@ test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated, on 
       allocationBatchAmount: 80,
       refundStatus: 'FULL',
     }]
-    syncLogs = [{ connector: label, type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: ref, status: 'CANCELLED' }]
+    syncLogs = [{ connector: label, type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: ref, status: 'CANCELLED', abandonedBeforeRemoteCall: true }]
 
     await run()
 
@@ -630,7 +651,7 @@ test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated, on 
     allocationBatchAmount: 80,
     refundStatus: 'PARTIAL',
   }]
-  syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: XERO_A2_REF, status: 'CANCELLED' }]
+  syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: XERO_A2_REF, status: 'CANCELLED', abandonedBeforeRemoteCall: true }]
 
   await runXeroSweep()
 
@@ -639,4 +660,106 @@ test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated, on 
   const debit = (created[0].payload.lines as Array<{ accountCode?: string; debit?: number }>)
     .find((line) => line.accountCode === '631' && line.debit != null)
   assert.equal(debit?.debit, 80)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-o97 r6 — A CANCELLED LOG IS NOT PROOF THE BATCH MUST BE POSTED AGAIN
+//
+// r5 made CANCELLED stop being proof that a debit DID NOT post, everywhere a refund or an un-stage
+// reads it. The recreate sweep read the SAME status as proof it MUST post again: CANCELLED was not
+// in ('PENDING','PROCESSING','SYNCED'), so the probe's query returned nothing, so the batch was
+// rebuilt. Two readers, opposite conclusions, one fact — and this is the reader that writes to a
+// real ledger, so where the other one stranded pounds this one DOUBLES them.
+//
+// WORKED (the assertions below are this, at 1/1 scale): A2 stages an order into journal J for £80
+// and J reaches Xero. J is later marked CANCELLED — by the orphan sweep during a connector switch,
+// or by an operator. The next daily run finds the order still stamped, sees no "live" log, and
+// queues a SECOND £80 DR Allocated Inventory / CR Inventory. The account then holds £160 for £80 of
+// allocations while the order records one £80 share, so the eventual refund can only reverse half.
+// r5 made this MORE reachable, not less: it stopped the un-stage sites clearing the stamp on a
+// cancelled journal, so those orders now STAY in this sweep's candidate set.
+// ---------------------------------------------------------------------------
+
+test('Xero: a CANCELLED A2 log blocks the rebuild and is REPORTED, not silently skipped (o3d-o97 r6)', async () => {
+  reset()
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80 }]
+  // Cancelled with NO record of why: the row does not say the remote call was never made, so it may
+  // already be in the ledger.
+  syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: XERO_A2_REF, status: 'CANCELLED', id: 'log-a2-J' }]
+
+  const refusals = await runXeroSweep()
+
+  assert.deepEqual(created, [], 'rebuilding here posts a second £80 DR Allocated Inventory for one £80 allocation')
+  assert.equal(refusals.length, 1, 'the refusal must reach the run, or the double-post is only avoided silently')
+  assert.match(refusals[0], /DAILY_BATCH_INVENTORY_ALLOC/)
+  assert.match(refusals[0], /log-a2-J, CANCELLED/, 'the refusal names the row a human has to go and settle')
+})
+
+test('Xero: a CANCELLED Group B log blocks the rebuild AND its DISPATCH subledger row (o3d-o97 r6)', async () => {
+  reset()
+  shipmentRows = [{ id: 'ship-1', shipmentJournalDate: STAMP_NEXT_DAY, shipmentJournalBatchRef: XERO_B_REF, revenueRecognizedAmount: 60, cogsBatchAmount: 40 }]
+  syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_GROUP_B', referenceId: XERO_B_REF, status: 'CANCELLED', id: 'log-b-J' }]
+
+  const refusals = await runXeroSweep()
+
+  assert.deepEqual(created, [], 'a second Group B journal would re-recognise £60 of revenue and re-book £40 of COGS')
+  assert.deepEqual(cogsMovements, [], 'and the subledger row must not be written for a journal that was not raised')
+  assert.equal(refusals.length, 1)
+  assert.match(refusals[0], /log-b-J, CANCELLED/)
+})
+
+test('Xero: a CANCELLED log the orphan sweep recorded as PRE-CALL is still rebuilt, for its own amount (o3d-o97 r6)', async () => {
+  reset()
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80 }]
+  // `abandonedBeforeRemoteCall` is written ONLY by cancelOrphanedRowsUnderLock, whose predicate is
+  // `status = 'PENDING'` — provably pre-call, nothing was sent. That is positive evidence, so the
+  // journal genuinely is in no ledger and the batch may be raised.
+  syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: XERO_A2_REF, status: 'CANCELLED', abandonedBeforeRemoteCall: true }]
+
+  const refusals = await runXeroSweep()
+
+  assert.deepEqual(refusals, [], 'proved pre-call is not a refusal')
+  assert.equal(created.length, 1, 'refusing here would strand every batch lost to a connector switch')
+  const debit = (created[0].payload.lines as Array<{ accountCode?: string; debit?: number }>)
+    .find((line) => line.accountCode === '631' && line.debit != null)
+  assert.equal(debit?.debit, 80, 'rebuilt for the batch\'s own £80, not a re-valued figure')
+})
+
+test('Xero: an external transaction id outranks a pre-call claim written over the top of it (o3d-o97 r6)', async () => {
+  reset()
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80 }]
+  // The id exists only because the remote call RETURNED, so it is the ledger's own receipt. A row
+  // that carries one and also claims to be pre-call is contradicting itself, and the receipt wins.
+  syncLogs = [{
+    connector: 'xero',
+    type: 'DAILY_BATCH_INVENTORY_ALLOC',
+    referenceId: XERO_A2_REF,
+    status: 'CANCELLED',
+    abandonedBeforeRemoteCall: true,
+    externalTransactionId: 'xero-manual-journal-77',
+    id: 'log-a2-K',
+  }]
+
+  const refusals = await runXeroSweep()
+
+  assert.deepEqual(created, [], 'the journal is in Xero — rebuilding it is a duplicate whatever the row now claims')
+  assert.equal(refusals.length, 1)
+  assert.match(refusals[0], /external id xero-manual-journal-77/)
+})
+
+test('Xero: one cancelled split blocks only ITS half — the other half still rebuilds (o3d-o97 r6)', async () => {
+  reset()
+  salesOrderRows.a1 = [
+    { revenueDeferredDate: new Date('2026-07-20T09:00:00.000Z'), revenueDeferredBatchRef: 'A1-2026-07-20-aaaaaaaa', unearnedRevenueAmount: 100 },
+    { revenueDeferredDate: new Date('2026-07-20T17:30:00.000Z'), revenueDeferredBatchRef: 'A1-2026-07-20-bbbbbbbb', unearnedRevenueAmount: 25 },
+  ]
+  syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-20-aaaaaaaa', status: 'CANCELLED', id: 'log-a1-aaaa' }]
+
+  const refusals = await runXeroSweep()
+
+  assert.equal(created.length, 1, 'the block is per batch identity, not a blanket stop on the run')
+  assert.equal(created[0].referenceId, 'A1-2026-07-20-bbbbbbbb')
+  assert.match(String(created[0].payload.narration), /1 order\(s\), £25\.00/)
+  assert.equal(refusals.length, 1)
+  assert.match(refusals[0], /log-a1-aaaa, CANCELLED/)
 })
