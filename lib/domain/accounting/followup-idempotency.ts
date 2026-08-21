@@ -48,8 +48,8 @@
  */
 
 import {
-  ACCOUNTING_PAYLOAD_CONNECTION_KEY,
   accountingOriginRecordsMatch,
+  carryAccountingOriginRecord,
 } from '@/lib/connectors/accounting-connection-provenance'
 
 export type FollowUpPayload = Record<string, unknown>
@@ -111,17 +111,15 @@ function asPayload(value: unknown): FollowUpPayload | null {
  * cvj9's rule, applied literally: a marker may only be written by the row that actually took the action.
  * A repair writes no marker. If the stored row recorded nothing (a row from before stamping shipped),
  * this carries the ABSENCE forward rather than inventing an origin for an attempt it did not witness —
- * the post-time verdict reads that as `legacy-unstamped`, which is the truth.
+ * and since Codex r3 finding 2 the post-time verdict refuses that (`no-origin-recorded`) rather than
+ * waving it through, so the carried nothing is now load-bearing rather than merely honest.
+ *
+ * The mechanism itself lives in `carryAccountingOriginRecord`, beside the reader and the verdict, and is
+ * shared with the connectors' CREATE path (r3 finding 1). Two implementations of "inherit, never mint"
+ * is two places for one of them to start minting again.
  */
 function withStoredOriginRecord(body: FollowUpPayload, storedPayload: unknown): FollowUpPayload {
-  const { [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: _currentConnection, ...withoutCurrentOrigin } = body
-  const stored = asPayload(storedPayload)
-  if (stored && ACCOUNTING_PAYLOAD_CONNECTION_KEY in stored) {
-    // Copied VERBATIM, including a value this module cannot interpret: normalising it here would be a
-    // second reader of the stamp, and the point is that only the post-time verdict reads it.
-    return { ...withoutCurrentOrigin, [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: stored[ACCOUNTING_PAYLOAD_CONNECTION_KEY] }
-  }
-  return withoutCurrentOrigin
+  return carryAccountingOriginRecord(body, storedPayload)
 }
 
 function anchorOf(payload: FollowUpPayload, field: string): string {

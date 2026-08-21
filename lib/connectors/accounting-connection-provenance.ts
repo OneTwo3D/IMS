@@ -42,9 +42,10 @@
  * That is the incident, in miniature. o3d-t74p happened because a fresh connection with no pin fell
  * through to `connections[0]`: an absence of evidence produced the same answer as evidence of
  * permission. ABSENCE MUST NEVER READ AS AGREEMENT. So the question is now answered with a VERDICT that
- * names its own basis, every unreadable state refuses, and the single remaining "allowed without a
- * comparison" state — a genuinely unstamped legacy row — is a NAMED decision (`legacy-unstamped`) that a
- * caller can see, count and act on, rather than the same `null` a match produces.
+ * names its own basis, and every unreadable state refuses. Round 1 left ONE state still allowed without
+ * a comparison — a genuinely unstamped row — as a NAMED decision a caller could see, count and act on
+ * rather than the same `null` a match produces; round 3 kept the name (`no-origin-recorded`) and took
+ * away the permission. See the last section of this header.
  *
  * AND THE UNSTAMPED POPULATION IS NOW ACTUALLY CLOSED. The old header claimed "the unstamped population
  * only shrinks after one deploy". That was FALSE: `stampAccountingPayloadConnection(payload, null)` added
@@ -53,6 +54,40 @@
  * different organisation, then posted" is the incident's own shape. Enqueueing with no connection now
  * writes an EXPLICIT `!disconnected` stamp, which refuses. Absence therefore means one thing only:
  * queued before this shipped.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────────────────────────────
+ * WHY ABSENCE NOW REFUSES TOO (Codex r3 finding 2, HIGH). Round 2 kept ONE allowance — a readable,
+ * unstamped payload was posted — and defended it on the ground that absence had been made to mean
+ * exactly one thing: queued before this shipped, a population that drains within a cron cycle and never
+ * grows again. That defence fails twice, and the paragraph above is half of why.
+ *
+ * It fails on the FACT first. Codex r3 finding 1 requires that a repair which CREATES a follow-up row,
+ * and did not witness the post that issued the external ids it is carrying, record NOTHING rather than
+ * invent an origin. So absence is now minted deliberately, by design, every time a sweep re-enqueues
+ * work whose parent row is gone or was itself unstamped. The population does not drain. An allowance
+ * whose only bound was "this can only get smaller" has no bound at all once the thing it counts is still
+ * being produced — and it was being produced before this round too, just invisibly, by the repair paths
+ * stamping the current tenant instead.
+ *
+ * And it fails on the KIND regardless of the count. "We deployed the guard after this row was written"
+ * is a fact about our release calendar, not evidence about which ledger issued the ids in the payload.
+ * The whole of o3d-t74p is one sentence — an absence of evidence produced the same answer as evidence of
+ * permission — and keeping one state where it still does keeps the incident alive in the corner nobody
+ * looks at, underneath a verdict type that advertises that it does not.
+ *
+ * WHAT HAPPENS TO GENUINELY PRE-DEPLOY ROWS. They refuse, at the socket, with nothing sent, and the
+ * refusal names the same remedy every other refusal here names: cancel the row and re-queue the work
+ * from the source document, which rebuilds the payload — invoice or bill id, bank account, contact and
+ * item ids, account codes, tax types — against the organisation connected now, and stamps it. That is
+ * bounded, visible, operator-drivable work over however many rows were PENDING at the moment of the
+ * deploy, and re-queueing is the operator remedy: there is no in-database way to recover the origin of a
+ * row that never recorded one, so nothing may be back-filled — a back-fill would be this module writing
+ * a marker for an act it did not witness, which is the defect, not the repair. The decision keeps its
+ * own name (`no-origin-recorded`) rather than folding into `mismatch`, so "how many, and are any still
+ * appearing?" stays a question with an answer.
+ *
+ * The four states are still four and still never conflated. What changed is how many of them ALLOW: one,
+ * `match`, where two strings were compared and were equal.
  */
 
 import { accountingIdProvenanceMatches } from './accounting-id-provenance'
@@ -167,12 +202,60 @@ export function accountingOriginRecordsMatch(a: unknown, b: unknown): boolean {
   return left.state === right.state
 }
 
+/**
+ * Give `body` the origin record of the row that ACTUALLY TOOK THE ACTION — verbatim, including its
+ * ABSENCE — and discard whatever origin the caller had already stamped on `body`
+ * (o3d-19gy; Codex r2 finding 1, r3 finding 1, both CRITICAL).
+ *
+ * THE RULE, AND THE ONLY IMPLEMENTATION OF IT. A marker may only be written by the row that took the
+ * action it marks. Everything downstream of a post — a revived retry, a follow-up built from the id that
+ * post returned, a sweep re-enqueueing work the process died before finishing — is one step out from an
+ * act it did not witness, and "the organisation connected right now" is not evidence about that act.
+ * Reading the token row again there does not merely lose evidence; it FORGES agreement, because the
+ * post-time guard then compares the current tenant against the current tenant and cannot fail. Round 2
+ * fixed this for the row a repair REVIVES; a row a repair CREATES is the same act one step further out,
+ * and it goes through here for the same reason.
+ *
+ * So a derived row INHERITS, and only inherits. `source` is the payload of the row whose post issued the
+ * ids being carried. Pass a non-object — or a payload carrying no stamp — when nothing in hand observed
+ * the origin, and the result carries no stamp at all, which `accountingPayloadConnectionVerdict` refuses
+ * as `no-origin-recorded`. The value is copied WITHOUT being parsed: interpreting it here would make
+ * this a second reader of the stamp, and the point is that only the verdict reads it.
+ *
+ * WHY NOT AN EXPLICIT `!unwitnessed` SENTINEL, next to `!disconnected`. Because that is the repair
+ * writing a marker again, and a marker that states something about the repair ("I did not look") rather
+ * than about the origin, which is the only fact the guard needs. `!disconnected` earns its place because
+ * it records something OBSERVED — this instance had no connection when the row was raised — by the code
+ * that observed it. "I inherited nothing" is not an observation about the ledger, absence already says
+ * precisely as much as is known, and since absence now refuses, saying it louder buys no safety. When an
+ * operator needs to tell a pre-deploy row from a sweep-created one, the row's own `createdAt` is already
+ * stored and already answers it.
+ */
+export function carryAccountingOriginRecord<T extends Record<string, unknown>>(
+  body: T,
+  source: unknown,
+): Record<string, unknown> {
+  const { [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: _stampedByTheCaller, ...withoutCallerOrigin } = body
+  // An ARRAY is not a payload here for the same reason it is not one in the reader: `typeof [] ===
+  // 'object'` and the key lookup on it is `undefined`, so a JSON array would silently read as a
+  // stamp-less object and inherit nothing while looking like a considered answer.
+  if (typeof source !== 'object' || source === null || Array.isArray(source)) return withoutCallerOrigin
+  if (!(ACCOUNTING_PAYLOAD_CONNECTION_KEY in source)) return withoutCallerOrigin
+  return {
+    ...withoutCallerOrigin,
+    [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: (source as Record<string, unknown>)[ACCOUNTING_PAYLOAD_CONNECTION_KEY],
+  }
+}
+
 /** Why a queued payload may or may not be posted to the connection now in hand. */
 export type AccountingConnectionDecision =
   /** The stamp names the connection the request is about to use. */
   | 'match'
-  /** Readable, unstamped: queued before this shipped. The one documented allowance. */
-  | 'legacy-unstamped'
+  /**
+   * Readable, but NOTHING on the row records an origin — queued before this shipped, or created by a
+   * repair that did not witness the post whose ids it carries. Refuses; see the header.
+   */
+  | 'no-origin-recorded'
   /** The stamp names a DIFFERENT organisation (or a different connector). */
   | 'mismatch'
   /** The row was raised while nothing was connected, so nothing vouches for its ids. */
@@ -197,21 +280,20 @@ export type AccountingConnectionVerdict = {
 /**
  * May this queued row be posted to the connection now in hand?
  *
- * ONE FUNCTION, ONE ANSWER, AND THE ANSWER CARRIES ITS BASIS. `mayPost` is true for exactly two
- * decisions — `match`, where the two strings were compared and were equal, and `legacy-unstamped`, where
- * the payload is a readable object that predates stamping. Everything else refuses, INCLUDING every way
- * this analysis can fail, because a guard whose failure mode is indistinguishable from its pass is not a
- * guard. That is the o3d-t74p lesson stated as code: no pin meant no objection, and 553 objects went
- * into the live ledger.
+ * ONE FUNCTION, ONE ANSWER, AND THE ANSWER CARRIES ITS BASIS. `mayPost` is true for exactly ONE
+ * decision — `match`, where the row's recorded origin and the tenant the request is addressed to were
+ * compared and were equal. Every other decision refuses, INCLUDING every way this analysis can fail and
+ * INCLUDING the case where the row recorded nothing at all, because a guard whose failure mode is
+ * indistinguishable from its pass is not a guard. That is the o3d-t74p lesson stated as code: no pin
+ * meant no objection, and 553 objects went into the live ledger.
  *
- * `legacy-unstamped` is the one remaining allowance and it is now genuinely bounded. Every writer stamps
- * (see the callers of `stampAccountingPayloadConnection`), and a writer with no connection stamps
- * `!disconnected` rather than nothing, so absence can only mean "queued before this shipped" — a
- * population that drains within one cron cycle and never grows again. Refusing it instead would fail
- * every payment sitting in the queue at the moment of the deploy, and an operator who has to hand-drive
- * a queue of real payments because of a guard is an operator who turns the guard off. It is reported as
- * its own decision rather than as a match so that "how many of these are still happening?" is a question
- * with an answer.
+ * Round 2 allowed a second decision, `legacy-unstamped`, and round 3 closed it; the header says why, and
+ * says what a pre-deploy row's operator remedy is. The DECISION still exists, renamed
+ * `no-origin-recorded` because absence no longer implies "legacy", and it is still reported separately
+ * from `mismatch` so the population stays countable — it just no longer permits anything.
+ *
+ * The refusals are deliberately not interchangeable strings: each one tells an operator which of the
+ * four states the row is in, what that state means about the ids in the payload, and what to do next.
  */
 export function accountingPayloadConnectionVerdict(params: {
   payload: unknown
@@ -254,8 +336,20 @@ export function accountingPayloadConnectionVerdict(params: {
   }
 
   if (stamp.state === 'absent') {
-    // The documented allowance. See the header — bounded, named, and no longer growing.
-    return allow('legacy-unstamped')
+    return refuse(
+      'no-origin-recorded',
+      `Refused to post ${what}: nothing on this row records which accounting organisation its external `
+      + `ids came from, and it would now be posted to ${active ?? 'whatever is connected'}. Nothing was `
+      + 'sent. Exactly two things produce a row like this and neither is evidence about the ledger: it '
+      + 'was queued before this instance recorded connections at all, or a repair created it from work '
+      + 'whose own record of its origin was absent or gone — and "the check shipped after this row was '
+      + 'written" is a fact about our release, not about the organisation that issued these ids. There '
+      + 'is nothing to back-fill from, so this cannot be resolved by stamping it: cancel this row and '
+      + 're-queue the work from the source document, which rebuilds the payload — the invoice or bill '
+      + 'id, the bank account, the contact and item ids, the account codes and tax types — against the '
+      + 'organisation connected now, and stamps it, so the next attempt can be checked rather than '
+      + 'assumed.',
+    )
   }
 
   if (active === null) {

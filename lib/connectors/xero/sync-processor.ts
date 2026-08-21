@@ -13,8 +13,7 @@ import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } fr
 import { pushManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
-import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
-import { stampAccountingPayloadConnection } from '@/lib/connectors/accounting-connection-provenance'
+import { carryAccountingOriginRecord } from '@/lib/connectors/accounting-connection-provenance'
 import { withAccountingPostingIntent } from '@/lib/connectors/accounting-posting-intent'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
@@ -354,26 +353,50 @@ export function isUniqueConstraintViolation(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'P2002'
 }
 
+/**
+ * Where a follow-up's ORIGIN RECORD comes from. Never from "what is connected now" (Codex r3 finding 1).
+ *
+ * A follow-up is always work about a document some earlier post created, so the only honest statement
+ * about which organisation its ids belong to is the one the row that made that post already carries.
+ * Naming the two cases in the type is the point: a caller cannot reach the enqueue without saying which
+ * of them it is in, and there is no third option that means "look it up".
+ */
+type FollowUpOriginEvidence =
+  /**
+   * The stored payload of the row whose post issued the ids in this follow-up. Its record is carried
+   * VERBATIM — including its absence, which then refuses.
+   */
+  | { from: 'postedRow'; payload: unknown }
+  /** Nothing in hand observed the origin. The row is created carrying no record, and cannot post. */
+  | { from: 'unobserved' }
+
 async function enqueueFollowUpSyncLog(
   type: FollowUpSyncType,
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
+  origin: FollowUpOriginEvidence,
   /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
   attempt = 0,
 ): Promise<void> {
-  // o3d-19gy: stamped HERE, before anything reads or plans against it, so a follow-up payload carries
-  // the connection it was raised against — it is rebuilt from a document that was just posted and
-  // carries that post's external id, which is exactly the shape this guard exists for.
+  // o3d-19gy: the origin record is settled HERE, before anything reads or plans against it, so a
+  // follow-up payload carries the connection whose post issued the external id it is built from.
   //
-  // THIS STAMP IS FOR THE *CREATE* OUTCOME ONLY (Codex r1 finding 2). An earlier revision claimed
-  // "re-stamping on a revival is deliberate", and that was the defect: a revived row is pinned to the
-  // idempotency token its EARLIER attempt was spent under, and rewriting its origin to the current
-  // tenant made a payment first attempted against organisation A look, to the post-time guard, like
-  // ordinary organisation-B work. `planFollowUpEnqueue` now discards this stamp on every reuse and
-  // carries the stored row's own record forward instead, so what follows can only ADD an origin to a
-  // new row, never replace one.
-  payload = stampAccountingPayloadConnection(payload, await activeAccountingIdProvenance(XERO_CONNECTOR))
+  // IT IS INHERITED, NEVER MINTED (Codex r2 finding 1, then r3 finding 1). Round 1 claimed "re-stamping
+  // on a revival is deliberate", and that was the defect: a revived row is pinned to the idempotency
+  // token its EARLIER attempt was spent under, and rewriting its origin to the current tenant made a
+  // payment first attempted against organisation A look, to the post-time guard, like ordinary
+  // organisation-B work. Round 2 fixed the REVIVAL path in `planFollowUpEnqueue`, and left the CREATE
+  // path still reading `activeAccountingIdProvenance()` — the same forgery one step out, because a
+  // creating repair had not witnessed the post either, and the guard would later compare B against B.
+  //
+  // So there is no read of the live connection on this path at all. A caller that took the post hands
+  // over that row's payload and its record travels; a caller that did not hands over nothing and the row
+  // is born with no record, which `accountingPayloadConnectionVerdict` refuses rather than assumes.
+  payload = carryAccountingOriginRecord(
+    payload,
+    origin.from === 'postedRow' ? origin.payload : undefined,
+  ) as SyncPayload
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
   const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId)
@@ -467,7 +490,13 @@ async function enqueueFollowUpSyncLog(
         // plan.payload carries the PINNED token, and withFollowUpIdempotencyKey never
           // overwrites one — so a row created by the re-plan posts under the same remote
           // key as the row that vanished. That is what makes losing the row survivable.
-          retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
+          // The plan's payload already holds the origin this enqueue resolved (carried from the row
+          // it reuses, or inherited on a create), so the re-plan inherits from itself rather than
+          // asking again — asking again is what "look it up" would reintroduce.
+          retry: () => enqueueFollowUpSyncLog(
+            type, referenceType, referenceId, plan.payload,
+            { from: 'postedRow', payload: plan.payload }, attempt + 1,
+          ),
       })
       return
     }
@@ -488,7 +517,10 @@ async function enqueueFollowUpSyncLog(
         payload: plan.payload,
         syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
         attempt,
-        retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
+        retry: () => enqueueFollowUpSyncLog(
+          type, referenceType, referenceId, plan.payload,
+          { from: 'postedRow', payload: plan.payload }, attempt + 1,
+        ),
       })
       return
     }
@@ -1917,6 +1949,29 @@ export function selectCreditNotesNeedingAllocation(
  * draft posting mode the Xero credit is DRAFT and can't be allocated yet — the
  * allocation no-ops/retries until it's authorised. This matches the live v08m
  * enqueue path; freight credits are posted authorised in practice.
+ *
+ * WHERE THIS SWEEP'S ORIGIN RECORD COMES FROM (Codex r3 finding 1, CRITICAL). This is the purest form of
+ * the defect that finding names: a cron that witnessed nothing, building a payload out of external ids
+ * that were written to local columns at some unknown earlier time, and — until this round — stamping
+ * whichever organisation happens to be connected when the cron fires onto it. That is not weak evidence,
+ * it is manufactured evidence: the post-time guard would then compare the current tenant against the
+ * current tenant and could not fail, on exactly the rows nobody watched being made.
+ *
+ * So the sweep inherits instead. `creditNoteId` is `SupplierCreditNote.accountingCreditNoteId`, which was
+ * written by one specific PURCHASE_CREDIT_NOTE sync row's successful post; that row's own origin record
+ * is read here and carried onto the allocation verbatim. If no such row survives (retention, or a
+ * pre-stamping credit), the allocation is created carrying NO record and refuses at post time — a
+ * bounded, one-per-credit-note outcome, since the sweep skips any credit note that already has an
+ * allocation row of any status, and it says so in the activity log rather than leaving an operator to
+ * discover it from a refusal.
+ *
+ * AND WHAT THAT RECORD DOES NOT COVER, stated rather than implied. It vouches for `creditNoteId`. The
+ * bill id (`accountingInvoiceId`) came from a DIFFERENT post — the whole reason this gap exists is that
+ * the bill synced after the credit — and no column records that post's tenant, so nothing here can
+ * compare the two. If they ever disagreed, the allocation would be addressed to the credit's
+ * organisation carrying a foreign bill id, and Xero would reject it: a visible failure, not a silent
+ * one. Closing that residual needs a provenance column beside `PurchaseInvoice.accountingInvoiceId`,
+ * the same shape `Product.accountingItemProvenance` already has; it is not closed here.
  */
 export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promise<CreditNoteAllocationReenqueueResult> {
   const result: CreditNoteAllocationReenqueueResult = { checked: 0, enqueued: 0, failed: 0 }
@@ -1951,24 +2006,57 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
   })
   const hasAllocation = new Set(existing.map((e) => e.referenceId))
   const toEnqueue = selectCreditNotesNeedingAllocation(candidates, hasAllocation)
+  if (toEnqueue.length === 0) return result
+
+  // The row whose post ISSUED each credit id, so its record of the organisation can be carried onto the
+  // allocation rather than a fresh read of the token row being invented for it. Newest SYNCED row wins:
+  // a credit re-posted after a failure carries the id the latest successful post returned.
+  const creditNotePosts = await db.accountingSyncLog.findMany({
+    where: {
+      connector: XERO_CONNECTOR,
+      type: 'PURCHASE_CREDIT_NOTE',
+      referenceType: 'SupplierCreditNote',
+      referenceId: { in: toEnqueue.map((item) => item.supplierCreditNoteId) },
+      status: 'SYNCED',
+    },
+    orderBy: { syncedAt: 'desc' },
+    select: { referenceId: true, payload: true },
+  })
+  const originRecords = new Map<string, unknown>()
+  for (const row of creditNotePosts) {
+    if (!originRecords.has(row.referenceId)) originRecords.set(row.referenceId, row.payload)
+  }
 
   for (const item of toEnqueue) {
     result.checked++
     try {
+      const witnessed = originRecords.has(item.supplierCreditNoteId)
       await enqueueFollowUpSyncLog('PURCHASE_CREDIT_NOTE_ALLOCATION', 'SupplierCreditNote', item.supplierCreditNoteId, {
         creditNoteId: item.creditNoteId,
         accountingInvoiceId: item.accountingInvoiceId,
         amount: item.amount,
         sourceEntryId: 'reenqueue-sweep',
-      })
+      }, witnessed
+        ? { from: 'postedRow', payload: originRecords.get(item.supplierCreditNoteId) }
+        : { from: 'unobserved' })
       result.enqueued++
       await logActivity({
         entityType: 'SYSTEM',
         action: 'xero_credit_note_allocation_reenqueued',
         tag: 'sync',
-        level: 'INFO',
-        description: `Enqueued a missing supplier-credit-note allocation for ${item.supplierCreditNoteId} (bill synced after the credit posted).`,
-        metadata: { supplierCreditNoteId: item.supplierCreditNoteId, creditNoteId: item.creditNoteId, accountingInvoiceId: item.accountingInvoiceId },
+        level: witnessed ? 'INFO' : 'WARNING',
+        description: witnessed
+          ? `Enqueued a missing supplier-credit-note allocation for ${item.supplierCreditNoteId} (bill synced after the credit posted).`
+          : `Enqueued a missing supplier-credit-note allocation for ${item.supplierCreditNoteId}, but no surviving sync row `
+            + 'records which accounting organisation issued the credit, so the allocation carries no origin and WILL be '
+            + 'refused at post time rather than sent to whichever organisation is connected. Re-queue the allocation from '
+            + 'the credit note itself if it is still owed.',
+        metadata: {
+          supplierCreditNoteId: item.supplierCreditNoteId,
+          creditNoteId: item.creditNoteId,
+          accountingInvoiceId: item.accountingInvoiceId,
+          originRecordInherited: witnessed,
+        },
       })
     } catch (error) {
       result.failed++
@@ -2030,7 +2118,7 @@ async function enqueueSalesInvoiceFollowUps(
             currency,
             method,
             sourceEntryId: entryId,
-          })
+          }, { from: 'postedRow', payload })
         }
       }
     }
@@ -2041,7 +2129,7 @@ async function enqueueSalesInvoiceFollowUps(
     referenceId,
     invoiceNumber: syncResult.invoiceNumber,
     sourceEntryId: entryId,
-  })
+  }, { from: 'postedRow', payload })
 }
 
 async function enqueuePurchaseInvoiceFollowUps(
@@ -2056,7 +2144,7 @@ async function enqueuePurchaseInvoiceFollowUps(
     accountingInvoiceId: syncResult.externalId,
     supplierInvoicePath: payload.supplierInvoicePath,
     sourceEntryId: entryId,
-  })
+  }, { from: 'postedRow', payload })
 }
 
 async function enqueuePurchaseCreditNoteFollowUps(
@@ -2084,9 +2172,24 @@ async function enqueuePurchaseCreditNoteFollowUps(
     // retry of a pinned request was no longer the same request (Codex review, r2 #3).
     date: (payload.date as string | undefined)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
     sourceEntryId: entryId,
-  })
+  }, { from: 'postedRow', payload })
 }
 
+/**
+ * Fan a posted row out into the follow-up work it owes.
+ *
+ * `payload` IS THE ORIGIN EVIDENCE, not just the source of fields (Codex r3 finding 1). It is the stored
+ * payload of the row that posted — whether this call comes from the processor moments after the post, or
+ * from the back-reference sweep days later for a row whose process died before its follow-ups ran — and
+ * the record it carries is the only thing that knows which organisation the external ids being handed on
+ * belong to. Every `enqueueFollowUpSyncLog` below therefore passes `{ from: 'postedRow', payload }`, and
+ * none of them reads the live connection.
+ *
+ * A row whose payload recorded nothing hands nothing on, and the follow-up refuses at post time instead
+ * of being addressed to whoever is connected. That is the same answer the parent row itself would now
+ * get, which is the property that makes the chain sound: a follow-up can never be MORE permitted than
+ * the post it descends from.
+ */
 async function enqueueFollowUps(
   entryId: string,
   type: AccountingSyncType,
@@ -2119,10 +2222,16 @@ async function enqueueFollowUps(
       },
     })
     if (order?.customerEmail) {
-      await enqueueFollowUpSyncLog('INVOICE_EMAIL', referenceType, referenceId, { referenceId, sourceEntryId: entryId })
+      await enqueueFollowUpSyncLog(
+        'INVOICE_EMAIL', referenceType, referenceId, { referenceId, sourceEntryId: entryId },
+        { from: 'postedRow', payload },
+      )
     }
     if (order?.shoppingLinks.length) {
-      await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId, sourceEntryId: entryId })
+      await enqueueFollowUpSyncLog(
+        'WC_INVOICE_NOTE', referenceType, referenceId, { referenceId, sourceEntryId: entryId },
+        { from: 'postedRow', payload },
+      )
     }
   }
 }

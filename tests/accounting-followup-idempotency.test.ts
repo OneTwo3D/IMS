@@ -913,7 +913,8 @@ test('o3d-19gy: a MONEY revival keeps organisation A on the row, so the post-tim
 test('o3d-19gy: a repair does not INVENT an origin for a legacy row that recorded none', () => {
   // The row predates stamping. It took an action, under some organisation, and nobody wrote it down.
   // Stamping the current one now would claim knowledge the repair does not have — the post-time verdict
-  // must go on reading this as `legacy-unstamped`, which is the truth.
+  // must go on reading this as `no-origin-recorded`, which is the truth, and (since Codex r3 finding 2)
+  // refuse it rather than wave it through.
   const plan = planFollowUpEnqueue({
     ...ORDER,
     type: 'INVOICE_PDF',
