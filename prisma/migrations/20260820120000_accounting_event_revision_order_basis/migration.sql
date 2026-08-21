@@ -10,16 +10,20 @@
 -- timestamp:
 --
 --   'historical_backfill_repair' — the write this row mirrors had already been recorded complete on
---                                  its sync log when the backfill selected it, AND the backfill
---                                  only selects sync logs for a document with NO mirrored event of
---                                  that revision type at all.
+--                                  its sync log when the backfill selected it.
 --
--- The second half is what makes it usable. A live revision's mirrored event row is created at
--- ENQUEUE, in the same transaction as its sync log, and the backfill's candidate scan excludes any
--- document that already has such a row. So every live revision able to contend with a repaired row
--- was enqueued after that row's write had finished, and its write is therefore the later one. That
--- is a causal ordering — no local clock is read, and no local clock is compared with Xero's, which
--- is the mistake r2 made and r3 removed.
+-- o3d-cvj9 r5/r6: THAT IS THE WHOLE FACT, and it does NOT order this row against a later arrival.
+-- Round 4 wrote a second half here — "and the backfill only selects sync logs for a document with NO
+-- mirrored event of that revision type at all", from which it argued a causal ordering. Both halves
+-- are withdrawn. The first was untrue of the candidate scan (r5). The second does not follow even
+-- where it is (r6): a sync log is recorded when its transaction COMMITS, which can be long after the
+-- connector call it reports, so what is happening when an arrival reaches the mirror is the
+-- RECORDING of a write, not the write. The rule built on this marker therefore ASSUMES the order it
+-- returns and is labelled as assuming it (`historical_repair_precedes_live_write`,
+-- `established: false`); the administrative backfill declines to act on it and the live mirror acts
+-- on it, records it under its own audit action, and the reconciliation report lists it for review.
+-- No local clock is read here and none is compared with Xero's, which is the mistake r2 made and r3
+-- removed — but that is a statement about what this column is NOT, not a licence to call it causal.
 --
 -- Deliberately a nullable text category with no default and no backfill:
 --   * NULL is the correct value for every existing row and for every row the live mirror writes —
@@ -28,3 +32,16 @@
 -- Adding a nullable column with no default is metadata-only on Postgres (no table rewrite).
 ALTER TABLE "accounting_events"
   ADD COLUMN "revisionOrderBasis" TEXT;
+
+-- ---------------------------------------------------------------------------------------------
+-- o3d-cvj9 r7 (Codex r7, HIGH): make an identifier that moved on an ASSUMED order LISTABLE.
+--
+-- Extending this migration rather than adding another, because it is not applied anywhere yet and
+-- the two changes belong to one statement: this column is what lets the mirror reach an assumed
+-- verdict, and this index is what lets an operator find the documents it reached one about. The
+-- accounting reconciliation report selects `accounting_event_logs` by ACTION over its lookback
+-- window; the table's only other index is keyed by event id, which that query cannot use, so
+-- without this it is a sequential scan of the largest audit table in the schema on every run.
+-- ---------------------------------------------------------------------------------------------
+CREATE INDEX "accounting_event_logs_action_createdAt_idx"
+  ON "accounting_event_logs" ("action", "createdAt");

@@ -8,6 +8,7 @@ import {
   evaluateAccountingReconciliationRows,
   listAccountingReconciliationRuns,
   persistAccountingReconciliationReport,
+  reconciliationLookbackDate,
   updateAccountingReconciliationFindingStatus,
   type AccountingReconciliationReport,
   type AccountingReconciliationRows,
@@ -794,6 +795,12 @@ test('accounting reconciliation row collection selects required datasets', async
         return []
       },
     },
+    accountingEventLog: {
+      async findMany(args: unknown) {
+        calls.accountingEventLog = args
+        return []
+      },
+    },
   }
 
   await collectAccountingReconciliationRows(client)
@@ -803,6 +810,7 @@ test('accounting reconciliation row collection selects required datasets', async
   assert.ok(calls.salesOrderRefund)
   assert.ok(calls.accountingSyncLog)
   assert.ok(calls.accountingEvent)
+  assert.ok(calls.accountingEventLog)
   const salesOrderCall = calls.salesOrder as {
     where: {
       OR: Array<{
@@ -1080,4 +1088,116 @@ test('o3d-cvj9 r2: a purchase bill and ITS OWN update on one PO still share a re
   )
 
   assert.deepEqual(duplicateReferenceFindings(rows, 'xero|BILL-3'), [])
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r7 (Codex r7, HIGH) — THE OPERATOR SURFACE FOR AN IDENTIFIER THAT MOVED ON A GUESS.
+//
+// The mirror answers a pair it cannot order, in the direction that converges, and says so. Round 6
+// then named the gap: the saying-so lived in an audit row's metadata and NOTHING LISTED IT. These
+// cover the listing — the read that finds the entries, and the finding that makes one checkable.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-cvj9 r7: the report reads the handovers made on an assumed order, bounded by its lookback', async () => {
+  const calls: Record<string, unknown> = {}
+  const client = {
+    salesOrder: { async findMany() { return [] } },
+    shipment: { async findMany() { return [] } },
+    salesOrderRefund: { async findMany() { return [] } },
+    accountingSyncLog: { async findMany() { return [] } },
+    accountingEvent: { async findMany() { return [] } },
+    accountingEventLog: {
+      async findMany(args: unknown) {
+        calls.accountingEventLog = args
+        return []
+      },
+    },
+  }
+
+  const toDate = new Date('2026-08-20T00:00:00.000Z')
+  const rows = await collectAccountingReconciliationRows(client, { lookbackDays: 30, toDate })
+
+  const call = calls.accountingEventLog as { where: { action?: string; createdAt?: { gte?: Date } }; take?: number }
+  assert.ok(call, 'the dataset is read at all — without this the finding can never fire in production')
+  assert.equal(
+    call.where.action,
+    'superseded_by_assumed_order',
+    'selected on the ASSUMED action alone, so a handover the stamps settled is never listed for review',
+  )
+  assert.deepEqual(
+    call.where.createdAt,
+    { gte: reconciliationLookbackDate(30, toDate) },
+    'bounded by the report window like every other dataset; an unbounded read re-reports for ever and stops being read',
+  )
+  assert.equal(rows.revisionClaimLogs?.length, 0, 'and the dataset reaches the evaluator, empty or not')
+})
+
+test('o3d-cvj9 r7: a claim that moved on an assumed order is reported for review, with both rows named', () => {
+  const rows = cleanRows()
+  rows.revisionClaimLogs = [{
+    id: 'log-1',
+    accountingEventId: 'event-holder',
+    action: 'superseded_by_assumed_order',
+    metadata: {
+      connector: 'xero',
+      externalId: 'INV-9',
+      orderingBasis: 'create_precedes_untimed_write',
+      supersededByEventId: 'event-revision',
+      syncType: 'SALES_INVOICE_UPDATE',
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+    },
+    createdAt: new Date('2026-08-19T10:06:00.000Z'),
+  }]
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+    .filter((finding) => finding.code === 'document_claim_moved_on_assumed_order')
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].severity, 'warning', 'unverified is not the same as broken — the critical next door is')
+  assert.equal(findings[0].accountingEventId, 'event-revision', 'keyed to the row that now holds the document id')
+  assert.deepEqual(findings[0].details, {
+    connector: 'xero',
+    externalId: 'INV-9',
+    orderingBasis: 'create_precedes_untimed_write',
+    releasedByEventId: 'event-holder',
+    holdingEventId: 'event-revision',
+    syncType: 'SALES_INVOICE_UPDATE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    movedAt: '2026-08-19T10:06:00.000Z',
+  })
+})
+
+test('o3d-cvj9 r7: an entry whose metadata lost the taker is still traced to a document, not dropped', () => {
+  // A finding an operator cannot act on is the failure this whole surface exists to avoid, so a
+  // malformed entry degrades to "here is the row that released the id" rather than to silence.
+  const rows = cleanRows()
+  rows.revisionClaimLogs = [{
+    id: 'log-1',
+    accountingEventId: 'event-holder',
+    action: 'superseded_by_assumed_order',
+    metadata: { connector: 'xero', externalId: 'INV-9' },
+    createdAt: new Date('2026-08-19T10:06:00.000Z'),
+  }]
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+    .filter((finding) => finding.code === 'document_claim_moved_on_assumed_order')
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].accountingEventId, 'event-holder')
+  assert.match(findings[0].message, /INV-9/)
+})
+
+test('o3d-cvj9 r7: fixtures that never read the dataset report neither a finding nor a row cap', () => {
+  // `revisionClaimLogs` is optional, and absent must stay distinguishable from empty: reading it as
+  // zero would make a dataset that was never queried look like one that returned nothing.
+  const rows = cleanRows()
+  assert.equal(rows.revisionClaimLogs, undefined)
+  assert.deepEqual(
+    evaluateAccountingReconciliationRows(rows)
+      .filter((finding) => finding.code === 'document_claim_moved_on_assumed_order'
+        || (finding.details as { dataset?: string })?.dataset === 'revisionClaimLogs'),
+    [],
+  )
 })

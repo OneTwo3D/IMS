@@ -13,6 +13,7 @@ import {
   isUnorderedRevisionClaimRefusal,
   MIRRORED_ACCOUNTING_SYNC_TYPES,
   resolveDocumentRevisionExternalIdClaim,
+  revisionTakeoverLogAction,
   type AccountingEventMirrorTransactionClient,
 } from './accounting-event-mirror'
 import type { AccountingEventDraft } from './accounting-event-types'
@@ -726,7 +727,10 @@ async function backfillDocumentRevisionEvent(
     await tx.accountingEventLog.create({
       data: buildAccountingEventLog({
         accountingEventId: claim.supersededEventId,
-        action: 'superseded_by_revision',
+        // o3d-cvj9 r7: same derivation as the live mirror. This caller declines assumed orders, so
+        // only the established action can be reached from here — but the action is decided by the
+        // verdict rather than by which caller wrote it, so the two cannot drift.
+        action: revisionTakeoverLogAction(claim.orderEstablished),
         metadata: {
           connector: log.connector,
           syncLogId: log.id,

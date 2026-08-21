@@ -833,11 +833,14 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
             // document id from an earlier successful post — so there is no revision stamp to record
             // and none is invented. `externalRevisionAt` is left UNDEFINED rather than null, so a
             // stamp an earlier write of this row established is not wiped by a replay that wrote
-            // nothing. o3d-cvj9 r4: because this path makes no write, it also cannot re-order the
-            // document — which is what makes the create fallback in `resolveDocumentRevisionOrder`
-            // safe for a create replayed through here, however long after its Xero idempotency key
-            // expired. A replay that DOES call the connector records the stamp of the write it made,
-            // and is then ordered by that stamp like any other write.
+            // nothing. o3d-cvj9 r7: and the ABSENCE of the field is what `resolveDocumentRevisionOrder`
+            // decides this path on, in the rule it asks FIRST — an attempt that called nothing changed
+            // nothing about the document and so takes no claim on it. (r3/r4 credited the create
+            // fallback with carrying this path safely. It did not: the fallback matches on the
+            // HOLDER's type, so for the ordinary create-then-revise shape it answered "the create
+            // precedes" and handed a replay that wrote nothing the claim anyway — Codex r6, HIGH.)
+            // A replay that DOES call the connector records the stamp of the write it made, and is
+            // then ordered by that stamp like any other write.
             externalId: entry.externalTransactionId,
           })
         })
@@ -1123,11 +1126,14 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             // document id from an earlier successful post — so there is no revision stamp to record
             // and none is invented. `externalRevisionAt` is left UNDEFINED rather than null, so a
             // stamp an earlier write of this row established is not wiped by a replay that wrote
-            // nothing. o3d-cvj9 r4: because this path makes no write, it also cannot re-order the
-            // document — which is what makes the create fallback in `resolveDocumentRevisionOrder`
-            // safe for a create replayed through here, however long after its Xero idempotency key
-            // expired. A replay that DOES call the connector records the stamp of the write it made,
-            // and is then ordered by that stamp like any other write.
+            // nothing. o3d-cvj9 r7: and the ABSENCE of the field is what `resolveDocumentRevisionOrder`
+            // decides this path on, in the rule it asks FIRST — an attempt that called nothing changed
+            // nothing about the document and so takes no claim on it. (r3/r4 credited the create
+            // fallback with carrying this path safely. It did not: the fallback matches on the
+            // HOLDER's type, so for the ordinary create-then-revise shape it answered "the create
+            // precedes" and handed a replay that wrote nothing the claim anyway — Codex r6, HIGH.)
+            // A replay that DOES call the connector records the stamp of the write it made, and is
+            // then ordered by that stamp like any other write.
             externalId: entry.externalTransactionId,
           })
         })

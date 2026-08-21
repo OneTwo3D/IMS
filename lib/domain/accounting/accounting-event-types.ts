@@ -8,7 +8,14 @@ export type AccountingEventStatus =
   // does (accounting_events is @@unique([externalSystem, externalId]), so exactly one row may claim
   // a document at a time). The row keeps the payload it posted, so the revision chain stays
   // readable, and its event log says WHY it holds no claim:
-  //   `superseded_by_revision`          — a later write of the same document took the id over.
+  //   `superseded_by_revision`          — a later write of the same document took the id over, on
+  //                                       an order the external system's own stamps ESTABLISHED.
+  //   `superseded_by_assumed_order`     — o3d-cvj9 r7: the same handover, on an order nothing
+  //                                       established — see ASSUMED_REVISION_ORDER_TAKEOVER_ACTION.
+  //                                       Its own action, not a flag on the line above, because the
+  //                                       accounting reconciliation report selects on it to raise
+  //                                       `document_claim_moved_on_assumed_order`; a claim that
+  //                                       moved on a guess has to be listable, not merely recorded.
   //   `revision_superseded_by_newer`    — this write arrived after a later one had taken the id.
   //                                       Only the external system's own stamps can say that, so
   //                                       this action is only ever written on their authority.
@@ -18,10 +25,11 @@ export type AccountingEventStatus =
   //   `revision_claim_order_unverified` — o3d-cvj9 r3, administrative backfill only: this write and
   //                                       the holder could not be ordered, so the claim was left
   //                                       where it was. It asserts nothing about which is newer.
-  // o3d-cvj9 r6: `superseded_by_revision` and `revision_superseded_by_newer` carry `orderingBasis`
-  // and `orderingEstablished` in their metadata — an order Xero's stamps settled and one reached by
-  // falling back on "a create precedes its revisions" are not the same claim, and whoever reads the
-  // trail has to be able to say which one moved the money's document id.
+  // o3d-cvj9 r6: `superseded_by_revision`, `superseded_by_assumed_order` and
+  // `revision_superseded_by_newer` carry `orderingBasis` and `orderingEstablished` in their
+  // metadata — an order Xero's stamps settled and one reached by falling back on "a create precedes
+  // its revisions" are not the same claim, and whoever reads the trail has to be able to say which
+  // one moved the money's document id.
   | 'SUPERSEDED'
 
 export type AccountingEventLine = {

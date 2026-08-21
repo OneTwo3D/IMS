@@ -547,6 +547,46 @@ export function isEstablishedRevisionOrderBasis(basis: RevisionOrderBasis): bool
 }
 
 /**
+ * o3d-cvj9 r7 (Codex r7, HIGH): the `accounting_event_logs.action` for a takeover whose ordering was
+ * ASSUMED rather than read off the external system's stamps.
+ *
+ * Round 6 already recorded the basis and `orderingEstablished: false` in the metadata of the
+ * ordinary `superseded_by_revision` entry, and then said the honest thing about it: nothing LISTS
+ * the documents whose identifier moved on an assumption. A flag inside a JSON column of an
+ * append-only audit table is not an operator surface — no report reads it, no page shows it, and
+ * finding one means knowing to go and look.
+ *
+ * Giving the assumed takeover its own action is what makes it listable: the accounting
+ * reconciliation report selects on this action alone (indexed, bounded by its lookback) and raises
+ * `document_claim_moved_on_assumed_order` for every one it finds. `superseded_by_revision` is
+ * left meaning what a reader would expect it to mean — a handover the external system's own stamps
+ * settled.
+ *
+ * THE REMEDY THE FINDING HANDS THE OPERATOR, which is what makes it actionable rather than a park:
+ * the finding names the connector, the external document id and both event rows. Open that document
+ * in the accounting system and compare its current content with the two payloads.
+ *  - If the row that TOOK the id describes it, the assumption held; nothing to do.
+ *  - If the row that RELEASED it describes it, the assumption was wrong: re-post the revision that
+ *    does describe the document. That write comes back with a real external stamp, so the claim is
+ *    then settled by rule 1 on the external system's own record — established, and the ledger
+ *    self-corrects from there.
+ * Neither remedy is reachable at all if the event is not surfaced, which is why this exists.
+ */
+export const ASSUMED_REVISION_ORDER_TAKEOVER_ACTION = 'superseded_by_assumed_order'
+
+/**
+ * The audit action for a handover, chosen by whether the order was ESTABLISHED. Derived in one place
+ * and used by both callers that move a claim (the live mirror and the administrative backfill), so
+ * the action can never disagree with the `orderingEstablished` recorded beside it. The backfill
+ * cannot reach the assumed branch today — it passes `acceptAssumedOrder: false`, so an assumed
+ * verdict comes back refused — but the branch it takes must be decided by the same fact, not by
+ * which caller it is.
+ */
+export function revisionTakeoverLogAction(orderEstablished: boolean): string {
+  return orderEstablished ? 'superseded_by_revision' : ASSUMED_REVISION_ORDER_TAKEOVER_ACTION
+}
+
+/**
  * `holder_first` — the holder wrote first and may hand its claim over.
  * `arrival_first` — the holder is the later write, so the arriving row is a stale replay. Only rule
  *                   1 can say this: it is a claim about where the arrival's write sits, and only the
@@ -941,12 +981,43 @@ export async function updateMirroredAccountingEventStatus(
         client,
         params,
         { externalRevisionAt: params.externalRevisionAt },
-        // o3d-cvj9 r6: the live mirror ACTS on an assumed order, and records that it did. Refusing
-        // one here is not a safe default: the P2002 stays fatal, the sync log retries to FAILED, and
-        // for the two rules that assume (an untimed create write, a backfill repair) nothing in live
-        // operation ever changes the inputs, so the refusal is permanent. The basis travels to the
-        // audit log instead, so a takeover reached by falling back can be told from one Xero's own
-        // stamps decided.
+        // o3d-cvj9 r7 (Codex r7, HIGH): the live mirror ACTS on an assumed order, records that it
+        // did, and now PUTS IT IN FRONT OF AN OPERATOR. Codex proposed a third outcome instead — a
+        // terminal state that records the successful write without moving the claim — on the ground
+        // that r6's defence ("the only alternative is a permanent failure loop") was a false
+        // dichotomy. The loop half of that is right and is fixed by any terminal outcome. The
+        // refusal half is not, for three reasons, and they are why the claim still moves:
+        //
+        //  - NOT MOVING THE CLAIM IS NOT NEUTRAL. The document id is already on the holder, and the
+        //    holder is POSTED, so it already names the document. Declining to move it is not
+        //    abstaining from the guess; it is making the OPPOSITE guess — "the holder describes the
+        //    document" — silently, by inaction, on exactly the same absent evidence. Both bases that
+        //    get here arise only when a write DID land in this attempt, so the two rows are two
+        //    writes of unknown order and one of them must hold the id. (The genuinely neutral act,
+        //    releasing the id from both, is worse still: it deletes the only link the ledger has to
+        //    a real Xero document.) This is the difference from rule 4's `yielded`, whose defence
+        //    does not transfer: there the arrival made NO write, so leaving the holder naming the
+        //    document is contradicted by nothing.
+        //
+        //  - THE GUESS THAT MOVES CONVERGES; THE GUESS THAT PARKS NEVER DOES. A takeover leaves the
+        //    arrival holding the id WITH the stamp of the write it just made (always, for rule 3,
+        //    which requires one), so the NEXT revision of that document is settled by rule 1 on the
+        //    external system's own stamps — established, not assumed. Parking leaves the id on a
+        //    holder whose basis nothing clears (a create makes no further write; a repair makes
+        //    none), so every later revision of that document meets the same assumed rule and parks
+        //    again. It converts a one-off assumption per document into a permanent regime — the same
+        //    permanence r6 removed, wearing a better status.
+        //
+        //  - AND THE ASSUMPTION IS NOW VISIBLE. r6's honest complaint against itself was that the
+        //    assumption lived in metadata and nothing listed it. It does now: an assumed takeover is
+        //    audited under its OWN action, and the accounting reconciliation report raises
+        //    `document_claim_moved_on_assumed_order` for each one, naming the document, both rows
+        //    and the basis. See ASSUMED_REVISION_ORDER_TAKEOVER_ACTION for the remedy that finding
+        //    hands the operator.
+        //
+        // What has NOT changed: refusing is still not a safe default here. The P2002 stays fatal,
+        // the sync log retries to FAILED, and for both assuming rules nothing in live operation ever
+        // changes the inputs, so the refusal would be permanent as well as wrong-way-round.
         { acceptAssumedOrder: true },
       )
       // Nothing legitimate to supersede: this is a real collision (a different document claiming
@@ -1013,7 +1084,18 @@ export async function updateMirroredAccountingEventStatus(
       await client.accountingEventLog.create({
         data: buildAccountingEventLog({
           accountingEventId: claim.supersededEventId,
-          action: 'superseded_by_revision',
+          // o3d-cvj9 r7: an ASSUMED takeover is a different claim from one Xero's stamps settled, so
+          // it is a different entry — not the same entry with a flag buried in its metadata. This is
+          // the row the reconciliation report selects on. See ASSUMED_REVISION_ORDER_TAKEOVER_ACTION.
+          action: revisionTakeoverLogAction(claim.orderEstablished),
+          ...(claim.orderEstablished
+            ? {}
+            : {
+                message: 'The document id moved to a later revision on an ASSUMED order: nothing placed '
+                  + 'these two writes against each other. Compare the document in the accounting system '
+                  + 'with both payloads, and if the released row is the one that describes it, re-post '
+                  + 'that revision — its write returns a real revision stamp and settles the claim.',
+              }),
           metadata: {
             connector: params.connector,
             ...(params.syncLogId ? { syncLogId: params.syncLogId } : {}),

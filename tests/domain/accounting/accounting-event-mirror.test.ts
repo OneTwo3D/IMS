@@ -10,6 +10,9 @@ import {
   resolveDocumentRevisionExternalIdClaim,
   updateMirroredAccountingEventStatus,
 } from '@/lib/domain/accounting/accounting-event-mirror'
+// o3d-cvj9 r7: the report end of the operator surface, asserted in the same test as the mirror end —
+// the two halves agree on the audit metadata or the surface silently degrades to a blank finding.
+import { evaluateAccountingReconciliationRows } from '@/lib/domain/accounting/reconciliation'
 
 test('daily batch sync log payload mirrors to an accounting event', () => {
   const payload = {
@@ -1134,9 +1137,16 @@ test('o3d-cvj9 r4: a live stamped revision takes the id from a BACKFILL-REPAIRED
     { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
     { id: 'event-revision-holder', status: 'SUPERSEDED', externalId: null },
   ])
+  // o3d-cvj9 r7: the handover is filed under the ASSUMED action, because rule 3 assumed the order.
+  // Not under `superseded_by_revision`, which is now reserved for a handover Xero's stamps settled.
   assert.equal(
-    store.logs.find((entry) => entry.action === 'superseded_by_revision')?.accountingEventId,
+    store.logs.find((entry) => entry.action === 'superseded_by_assumed_order')?.accountingEventId,
     'event-revision-holder',
+  )
+  assert.equal(
+    store.logs.find((entry) => entry.action === 'superseded_by_revision'),
+    undefined,
+    'nothing established this order, so nothing may file it as established',
   )
 })
 
@@ -1263,8 +1273,10 @@ test('o3d-cvj9 r6: a create with an untimed write hands over, and the audit says
     { id: 'event-create', status: 'SUPERSEDED', externalId: null },
     { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
   ])
-  const takeover = store.logs.find((entry) => entry.action === 'superseded_by_revision')
-  assert.ok(takeover, 'the released row is audited exactly as any other takeover')
+  // o3d-cvj9 r7 (Codex r7): audited under the ASSUMED action, not as an ordinary takeover with a
+  // flag buried in its metadata — that is what the reconciliation report selects on.
+  const takeover = store.logs.find((entry) => entry.action === 'superseded_by_assumed_order')
+  assert.ok(takeover, 'the released row is audited as a handover made on an assumption')
   const meta = takeover!.metadata as { orderingBasis?: string; orderingEstablished?: boolean }
   assert.equal(meta.orderingBasis, 'create_precedes_untimed_write')
   assert.equal(meta.orderingEstablished, false, 'the create wrote at a time nobody recorded — this order is assumed')
@@ -1392,8 +1404,8 @@ test('o3d-cvj9 r6: an ordinary create whose response carried no stamp still hand
     { id: 'event-create', status: 'SUPERSEDED', externalId: null },
     { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
   ])
-  const takeover = store.logs.find((entry) => entry.action === 'superseded_by_revision')
-  assert.ok(takeover, 'the create released the claim')
+  const takeover = store.logs.find((entry) => entry.action === 'superseded_by_assumed_order')
+  assert.ok(takeover, 'the create released the claim, and the trail says the order was assumed')
   assert.deepEqual(
     (takeover!.metadata as { orderingBasis?: string; orderingEstablished?: boolean }).orderingBasis,
     'create_precedes_untimed_write',
@@ -1417,8 +1429,8 @@ test('o3d-cvj9 r6: a repair-marked holder yields to a live stamped write, and th
   await postRevision(store, { externalRevisionAt: REVISION_XERO_REVISION_AT })
 
   assert.equal(store.table.find((row) => row.id === 'event-revision')?.externalId, 'INV-9')
-  const takeover = store.logs.find((entry) => entry.action === 'superseded_by_revision')
-  assert.ok(takeover, 'the repaired holder released the claim')
+  const takeover = store.logs.find((entry) => entry.action === 'superseded_by_assumed_order')
+  assert.ok(takeover, 'the repaired holder released the claim, on an order labelled as assumed')
   const meta = takeover!.metadata as { orderingBasis?: string; orderingEstablished?: boolean }
   assert.equal(meta.orderingBasis, 'historical_repair_precedes_live_write')
   assert.equal(meta.orderingEstablished, false, 'nothing placed the repair against this write — the order is assumed')
@@ -1606,5 +1618,196 @@ test('o3d-cvj9 r7: a real write with an unreadable stamp still takes the create 
     store.logs.find((entry) => entry.action === 'revision_claim_yielded_no_write'),
     undefined,
     'a write with no readable stamp is still a write',
+  )
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r7 — Codex r7, HIGH: THE IDENTIFIER STILL MOVES ON AN ADMITTED GUESS.
+//
+// Codex proposed a third outcome — terminal, recording the write, NOT moving the claim. It is
+// rejected, and the reasoning is on the `acceptAssumedOrder` call in the mirror: the id is already
+// on the holder, so declining to move it is not abstention but the OPPOSITE guess, made silently and
+// permanently (nothing ever clears the holder's basis, so every later revision of that document
+// meets the same rule and parks again), where moving it converges — the taker holds a real external
+// stamp, so the NEXT revision is settled by rule 1.
+//
+// What Codex is right about is the half r6 admitted against itself: the assumption had no operator
+// surface. It has one now, and these two tests are the cases the reviewer named — the two shapes in
+// which the guess is WRONG. Neither can be detected from the rows, which is the point: what is
+// asserted is that the wrong guess is made VISIBLY and is traceable to the document, both ends of
+// which have to hold for the refusal to be defensible.
+// ---------------------------------------------------------------------------------------------
+
+/** The report's view of one audit entry, as the database would hand it back. */
+function claimLogRows(store: ReturnType<typeof createAccountingEventStore>, movedAt: Date) {
+  return store.logs
+    .filter((entry) => entry.action === 'superseded_by_assumed_order')
+    .map((entry, index) => ({
+      id: `log-${index}`,
+      accountingEventId: entry.accountingEventId as string,
+      action: entry.action as string,
+      metadata: entry.metadata,
+      createdAt: movedAt,
+    }))
+}
+
+function emptyReconciliationRows() {
+  return { salesOrders: [], shipments: [], refunds: [], syncLogs: [], accountingEvents: [] }
+}
+
+test('o3d-cvj9 r7 (Codex r7 HIGH): an unstamped late create replay takes the id from the edit it overwrote, and the report LISTS it', async () => {
+  // The create's own first post, and then — past Xero's six-minute idempotency window, so the same
+  // request is a fresh one and `POST /Invoices` on an existing `InvoiceNumber` UPSERTS — a REPLAY of
+  // that same sync log, which writes the create's content over an edit that had landed in between.
+  // Both responses carried no readable `UpdatedDateUTC`, so the row records two writes of unknown
+  // time and NOTHING on it separates the first post from the replay.
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ status: 'PENDING', externalId: null }),
+    revisionRow(),
+  ])
+
+  await postCreate(store, null)
+  await postCreate(store, null)
+
+  const create = store.table.find((row) => row.id === 'event-create')
+  assert.equal(create?.externalId, 'INV-9', 'the replay re-posted under the same claim, so no collision arose')
+  assert.equal(create?.externalRevisionAt, null)
+  assert.equal(
+    create?.revisionOrderBasis,
+    'live_write_unstamped',
+    'the replay leaves EXACTLY the row an ordinary unstamped first post leaves — that is why this cannot be detected',
+  )
+
+  // The overwritten edit is only recorded now. Its stamp is from when Xero applied it, which was
+  // BEFORE the replay above — so the true order is create, edit, replay, and the create is the write
+  // the invoice actually reflects. Rule 1 cannot see that (the holder has no stamp to compare), so
+  // rule 2 answers "the create precedes its revisions" and the claim moves the wrong way.
+  await postRevision(store, { externalRevisionAt: EDIT_XERO_REVISION_AT })
+
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
+    { id: 'event-create', status: 'SUPERSEDED', externalId: null },
+    { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
+  ])
+
+  const takeover = store.logs.find((entry) => entry.action === 'superseded_by_assumed_order')
+  assert.ok(takeover, 'the handover is filed under the action that says the order was assumed')
+  assert.equal(
+    store.logs.find((entry) => entry.action === 'superseded_by_revision'),
+    undefined,
+    'and never under the action reserved for an order the external stamps settled',
+  )
+  assert.equal(takeover!.accountingEventId, 'event-create', 'filed against the row that RELEASED the id')
+  const meta = takeover!.metadata as Record<string, unknown>
+  assert.equal(meta.orderingBasis, 'create_precedes_untimed_write')
+  assert.equal(meta.orderingEstablished, false)
+  assert.equal(meta.supersededByEventId, 'event-revision', 'and it names the row that now holds it')
+  assert.equal(meta.externalId, 'INV-9', 'and the document, without which no operator can go and check')
+  assert.match(String(takeover!.message ?? ''), /ASSUMED order/, 'the entry says what was assumed and what to do about it')
+
+  // The half of Codex r7 that stands: an assumption nothing lists is not an audited decision.
+  const findings = evaluateAccountingReconciliationRows({
+    ...emptyReconciliationRows(),
+    revisionClaimLogs: claimLogRows(store, new Date('2026-08-19T10:06:00.000Z')),
+  })
+  assert.deepEqual(findings.map((finding) => finding.code), ['document_claim_moved_on_assumed_order'])
+  assert.equal(findings[0].severity, 'warning')
+  assert.equal(findings[0].accountingEventId, 'event-revision', 'keyed to the row a reader is asked to confirm')
+  assert.deepEqual(
+    findings[0].details as Record<string, unknown>,
+    {
+      connector: 'xero',
+      externalId: 'INV-9',
+      orderingBasis: 'create_precedes_untimed_write',
+      releasedByEventId: 'event-create',
+      holdingEventId: 'event-revision',
+      syncType: 'SALES_INVOICE_UPDATE',
+      referenceType: 'SalesOrder',
+      referenceId: 'so-1',
+      movedAt: '2026-08-19T10:06:00.000Z',
+    },
+    'both rows, the document and the basis — everything the check needs without opening the audit table',
+  )
+})
+
+test('o3d-cvj9 r7 (Codex r7 HIGH): a historical repair whose true write order is REVERSED still hands over, and the report LISTS it', async () => {
+  // The repair mirrors a historical post and carries no stamp — there was never a connector response
+  // to take one from. Here its write is the LATER of the two: the sync log it repairs was raised
+  // after the arriving revision's, which is what `createdAt` records below. Nothing in production
+  // reads that column for ordering (r2 did, and it is transaction START time, so it never carried
+  // edit order at all), so the fixture states the reversed truth in the one place the code is
+  // required to ignore — and the claim moves against it.
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ status: 'SUPERSEDED', externalId: null }),
+    revisionRow({ createdAt: new Date('2026-08-19T10:00:00.000Z') }),
+    holdingRevisionRow({
+      externalRevisionAt: null,
+      revisionOrderBasis: 'historical_backfill_repair',
+      createdAt: new Date('2026-08-19T23:00:00.000Z'),
+    }),
+  ])
+
+  await postRevision(store, { externalRevisionAt: REVISION_XERO_REVISION_AT })
+
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
+    { id: 'event-create', status: 'SUPERSEDED', externalId: null },
+    { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
+    { id: 'event-revision-holder', status: 'SUPERSEDED', externalId: null },
+  ])
+
+  const takeover = store.logs.find((entry) => entry.action === 'superseded_by_assumed_order')
+  assert.ok(takeover, 'rule 3 assumed the order, so the handover is filed as assumed')
+  assert.equal(
+    store.logs.find((entry) => entry.action === 'superseded_by_revision'),
+    undefined,
+    'a repair carries no stamp, so no external record ever settled this pair',
+  )
+  assert.equal(takeover!.accountingEventId, 'event-revision-holder')
+  const meta = takeover!.metadata as Record<string, unknown>
+  assert.equal(meta.orderingBasis, 'historical_repair_precedes_live_write')
+  assert.equal(meta.orderingEstablished, false)
+  assert.equal(meta.supersededByEventId, 'event-revision')
+
+  const findings = evaluateAccountingReconciliationRows({
+    ...emptyReconciliationRows(),
+    revisionClaimLogs: claimLogRows(store, new Date('2026-08-20T00:00:00.000Z')),
+  })
+  assert.deepEqual(findings.map((finding) => finding.code), ['document_claim_moved_on_assumed_order'])
+  const details = findings[0].details as Record<string, unknown>
+  assert.equal(details.orderingBasis, 'historical_repair_precedes_live_write')
+  assert.equal(details.releasedByEventId, 'event-revision-holder')
+  assert.equal(details.holdingEventId, 'event-revision')
+  assert.equal(details.externalId, 'INV-9')
+})
+
+test('o3d-cvj9 r7: a handover the external stamps SETTLED is not reported for review', async () => {
+  // The other side of the surface, and the thing that decides whether it is signal or noise: an
+  // ESTABLISHED takeover is filed under its own action and never reaches the report. Without this the
+  // finding would fire on every ordinary create -> first-edit handover in the ledger.
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ externalRevisionAt: new Date('2026-08-19T09:00:01.000Z') }),
+    revisionRow(),
+  ])
+
+  await postRevision(store, { externalRevisionAt: REVISION_XERO_REVISION_AT })
+
+  const takeover = store.logs.find((entry) => entry.action === 'superseded_by_revision')
+  assert.ok(takeover, 'Xero stamped both writes, so this order was established')
+  assert.equal((takeover!.metadata as Record<string, unknown>).orderingEstablished, true)
+  assert.deepEqual(claimLogRows(store, new Date()), [], 'nothing for the report to pick up')
+
+  // And the evaluator asserts the action rather than trusting the query that selected it, so a
+  // widened read cannot start reporting established handovers as guesses.
+  assert.deepEqual(
+    evaluateAccountingReconciliationRows({
+      ...emptyReconciliationRows(),
+      revisionClaimLogs: [{
+        id: 'log-1',
+        accountingEventId: 'event-create',
+        action: 'superseded_by_revision',
+        metadata: takeover!.metadata,
+        createdAt: new Date(),
+      }],
+    }),
+    [],
   )
 })

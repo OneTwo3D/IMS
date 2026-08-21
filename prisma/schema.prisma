@@ -2316,6 +2316,12 @@ model AccountingEventLog {
   accountingEvent   AccountingEvent @relation(fields: [accountingEventId], references: [id], onDelete: Cascade)
 
   @@index([accountingEventId, createdAt])
+  // o3d-cvj9 r7: the accounting reconciliation report selects this table by ACTION — the handovers
+  // the live mirror made on an order nothing established (`superseded_by_assumed_order`) — bounded
+  // by its lookback. Without this index that is a scan of the largest audit table in the schema on
+  // every run. The existing index is keyed by event, which that query has no value for: the whole
+  // point is to find the entries without knowing which events they hang off.
+  @@index([action, createdAt])
   @@map("accounting_event_logs")
 }
 

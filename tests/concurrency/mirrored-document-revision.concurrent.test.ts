@@ -82,6 +82,16 @@ test(
         const base = { connector: 'xero', referenceType: 'SalesOrder', referenceId: orderId, currency: 'GBP' }
 
         // 1. the original invoice: mirrored PENDING at enqueue, then POSTED with Xero's InvoiceID.
+        //
+        // o3d-cvj9 r7: BOTH posts carry the revision stamp Xero returned for the write they made.
+        // They did not before, and that had stopped being a faithful probe: r7 asks the no-write
+        // rule FIRST, and an ABSENT `externalRevisionAt` is precisely the caller saying "this
+        // attempt called nothing" (the processor's short-circuit replay). With the field omitted on
+        // both writes this probe was describing a pair of replays that never called Xero — for which
+        // the correct outcome is the revision YIELDING, not taking the invoice — while asserting the
+        // takeover it was written for. Every live write path now records a stamp
+        // (`xeroDocumentRevisionAt` off the write's own response), so this is also the ordinary
+        // production shape.
         await mirrorAccountingSyncLogToEvent(tx, {
           ...base,
           syncLogId: 'log-create',
@@ -96,6 +106,7 @@ test(
           payload: invoicePayload(createKey, 'INV-CVJ9', 100),
           status: 'POSTED',
           externalId: invoiceId,
+          externalRevisionAt: xeroAppliedAt(0),
         })
 
         // 2. the edit: a second sync log, a second mirrored event — and the SAME InvoiceID back
@@ -114,6 +125,7 @@ test(
           payload: invoicePayload(updateKey, 'INV-CVJ9', 120),
           status: 'POSTED',
           externalId: invoiceId,
+          externalRevisionAt: xeroAppliedAt(10),
         })
 
         // 3. the transaction must still be usable — this is the part 25P02 destroyed.
@@ -152,6 +164,8 @@ test(
     assert.equal(seen.create.externalId, null, 'exactly one event may claim an external id')
     assert.ok(
       seen.logs.includes('create:superseded_by_revision'),
+      // The ESTABLISHED action: Xero stamped both writes, so rule 1 settled the order. A handover
+      // reached by falling back is filed as `superseded_by_assumed_order` instead (o3d-cvj9 r7).
       `the takeover must be audited on the superseded event: ${seen.logs.join(', ')}`,
     )
     assert.ok(
@@ -521,24 +535,36 @@ test(
         const first = invoicePayload(probeId('rev-first'), 'INV-CVJ9R3', 120)
         const second = invoicePayload(probeId('rev-second'), 'INV-CVJ9R3', 140)
 
+        // o3d-cvj9 r7: every write here passes `externalRevisionAt: null` — A WRITE WHOSE RESPONSE
+        // CARRIED NO READABLE STAMP, which is the pair this probe is about. The field was OMITTED
+        // before, and after r7 that is a different fact entirely: an ABSENT field is the caller
+        // saying this attempt made no connector call, which the no-write rule answers FIRST by
+        // yielding, so the probe would have recorded three replays that never called Xero and never
+        // reached the unordered pair it exists to pin. `null` is the value the live processor passes
+        // for a write it made and got no stamp back for.
         await mirrorAccountingSyncLogToEvent(tx, { ...base, syncLogId: 'log-create', type: 'SALES_INVOICE', payload: create, status: 'PENDING' })
         await updateMirroredAccountingEventStatus(tx, {
           ...base, syncLogId: 'log-create', type: 'SALES_INVOICE', payload: create, status: 'POSTED', externalId: invoiceId,
+          externalRevisionAt: null,
         })
 
-        // The first edit takes the invoice from the CREATE — that pairing needs no stamp, because a
-        // document cannot be revised before it exists.
+        // The first edit takes the invoice from the CREATE. The create made a write nobody timed, so
+        // this handover is ASSUMED (`create_precedes_untimed_write`) rather than established — the
+        // live mirror acts on it, and files it as an assumption.
         await mirrorAccountingSyncLogToEvent(tx, { ...base, syncLogId: 'log-rev-first', type: 'SALES_INVOICE_UPDATE', payload: first, status: 'PENDING' })
         await updateMirroredAccountingEventStatus(tx, {
           ...base, syncLogId: 'log-rev-first', type: 'SALES_INVOICE_UPDATE', payload: first, status: 'POSTED', externalId: invoiceId,
+          externalRevisionAt: null,
         })
 
-        // The second edit contends with a REVISION, and neither side carries a stamp.
+        // The second edit contends with a REVISION, and neither side carries a stamp: not the create
+        // rule (the holder is not the create), not the stamps, not the repair rule. Unordered.
         await mirrorAccountingSyncLogToEvent(tx, { ...base, syncLogId: 'log-rev-second', type: 'SALES_INVOICE_UPDATE', payload: second, status: 'PENDING' })
         let raised: unknown = null
         try {
           await updateMirroredAccountingEventStatus(tx, {
             ...base, syncLogId: 'log-rev-second', type: 'SALES_INVOICE_UPDATE', payload: second, status: 'POSTED', externalId: invoiceId,
+            externalRevisionAt: null,
           })
         } catch (error) {
           raised = error

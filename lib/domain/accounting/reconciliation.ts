@@ -4,6 +4,7 @@ import { toJsonInputValue } from '@/lib/db/json-input'
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import {
   accountingDocumentRevisionFamily,
+  ASSUMED_REVISION_ORDER_TAKEOVER_ACTION,
   isDocumentRevisionAccountingSyncType,
   isMirrorableAccountingSyncType,
 } from './accounting-event-mirror'
@@ -99,12 +100,37 @@ type AccountingEventRow = {
   externalId: string | null
 }
 
+/**
+ * o3d-cvj9 r7 (Codex r7, HIGH): an audit entry recording that a document's external identifier moved
+ * between event rows on an order NOTHING ESTABLISHED — the live mirror's assumed takeover.
+ *
+ * The mirror has to answer such a pair one way or the other (see the `acceptAssumedOrder` block in
+ * `updateMirroredAccountingEventStatus` for why declining is the opposite guess rather than no
+ * guess), and it answers in the direction that converges. What it must not do is answer silently:
+ * the claim it moved is the money's document identity, and until this dataset existed nothing in the
+ * product listed the documents it had moved. That is the whole reason this is read here.
+ */
+type RevisionClaimLogRow = {
+  id: string
+  accountingEventId: string
+  action: string
+  metadata: unknown
+  createdAt: Date | string
+}
+
 export type AccountingReconciliationRows = {
   salesOrders: SourceOrderRow[]
   shipments: SourceShipmentRow[]
   refunds: SourceRefundRow[]
   syncLogs: AccountingSyncLogRow[]
   accountingEvents: AccountingEventRow[]
+  /**
+   * Optional so the pure-evaluator fixtures that predate it still compile and still mean what they
+   * meant; `collectAccountingReconciliationRows` always provides it. Absent is NOT the same as empty
+   * for the row-cap check below, which is why that check skips it rather than reading `?.length ?? 0`
+   * — a dataset that was never read has not "returned zero rows".
+   */
+  revisionClaimLogs?: RevisionClaimLogRow[]
 }
 
 type AccountingReconciliationClient = {
@@ -122,6 +148,9 @@ type AccountingReconciliationClient = {
   }
   accountingEvent: {
     findMany(args: unknown): Promise<AccountingEventRow[]>
+  }
+  accountingEventLog: {
+    findMany(args: unknown): Promise<RevisionClaimLogRow[]>
   }
 }
 
@@ -402,6 +431,8 @@ function addRowCapFindings(
     { dataset: 'refunds', count: rows.refunds.length },
     { dataset: 'syncLogs', count: rows.syncLogs.length },
     { dataset: 'accountingEvents', count: rows.accountingEvents.length },
+    // Only when the dataset was actually read — see `revisionClaimLogs`.
+    ...(rows.revisionClaimLogs ? [{ dataset: 'revisionClaimLogs' as const, count: rows.revisionClaimLogs.length }] : []),
   ]
 
   for (const { dataset, count } of cappedDatasets) {
@@ -704,7 +735,72 @@ export function evaluateAccountingReconciliationRows(
     })
   }
 
+  addAssumedRevisionOrderFindings(findings, rows)
+
   return findings
+}
+
+/**
+ * o3d-cvj9 r7 (Codex r7, HIGH) — THE OPERATOR SURFACE FOR AN IDENTIFIER THAT MOVED ON A GUESS.
+ *
+ * Rounds 3-6 made the live mirror's assumption honest: the verdict carries the basis it was reached
+ * on and whether that basis established the order, and an assumed handover records both. r6 then
+ * named the gap it had left — the assumption lives in an audit row's metadata, and NOTHING LISTS
+ * THE DOCUMENTS WHOSE IDENTIFIER MOVED ON ONE. This closes that, because a guess about which row
+ * describes a real accounting document is only defensible if a person can go and check it.
+ *
+ * The finding is a WARNING, not a critical. Nothing here is known to be broken: the handover may
+ * well be right, and in the common shape of both assuming rules it is (see the `acceptAssumedOrder`
+ * block in the mirror). What is true is that it was not verified against the external system, and
+ * only a person with access to that system can verify it. `posted_event_without_external_id` next
+ * to it is the critical, because a posted row with no document id IS a defect.
+ *
+ * One finding per handover, keyed to the row that now HOLDS the identifier — the row a reader is
+ * being asked to confirm describes the document — with the row that released it, the document id and
+ * the basis alongside, so the check can be made without opening the audit table.
+ */
+function addAssumedRevisionOrderFindings(
+  findings: AccountingReconciliationFinding[],
+  rows: AccountingReconciliationRows,
+): void {
+  for (const log of rows.revisionClaimLogs ?? []) {
+    // The dataset is selected on this action, but it is asserted rather than assumed: the row shape
+    // is shared with every other accounting event log, and a caller that widened the query must not
+    // silently start reporting established handovers as guesses.
+    if (log.action !== ASSUMED_REVISION_ORDER_TAKEOVER_ACTION) continue
+    const metadata = (log.metadata ?? {}) as {
+      connector?: unknown
+      externalId?: unknown
+      supersededByEventId?: unknown
+      orderingBasis?: unknown
+      syncType?: unknown
+      referenceType?: unknown
+      referenceId?: unknown
+    }
+    const holdingEventId = typeof metadata.supersededByEventId === 'string' ? metadata.supersededByEventId : null
+    const externalId = typeof metadata.externalId === 'string' ? metadata.externalId : null
+    findings.push({
+      severity: 'warning',
+      code: 'document_claim_moved_on_assumed_order',
+      // Keyed to the taker when the trail names one; otherwise to the row that released the claim,
+      // so a malformed entry is still traceable to a document rather than dropped.
+      accountingEventId: holdingEventId ?? log.accountingEventId,
+      message: `External accounting document ${externalId ?? '(unknown)'} was reassigned to a later `
+        + 'revision on an assumed order; confirm which revision the document actually reflects',
+      details: {
+        connector: typeof metadata.connector === 'string' ? metadata.connector : null,
+        externalId,
+        orderingBasis: typeof metadata.orderingBasis === 'string' ? metadata.orderingBasis : null,
+        // Both sides by name: `releasedByEventId` no longer holds the id, `holdingEventId` does.
+        releasedByEventId: log.accountingEventId,
+        holdingEventId,
+        syncType: typeof metadata.syncType === 'string' ? metadata.syncType : null,
+        referenceType: typeof metadata.referenceType === 'string' ? metadata.referenceType : null,
+        referenceId: typeof metadata.referenceId === 'string' ? metadata.referenceId : null,
+        movedAt: log.createdAt instanceof Date ? log.createdAt.toISOString() : log.createdAt,
+      },
+    })
+  }
 }
 
 export async function collectAccountingReconciliationRows(
@@ -715,7 +811,7 @@ export async function collectAccountingReconciliationRows(
     options.lookbackDays ?? DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
     options.toDate,
   )
-  const [salesOrders, shipments, refunds, syncLogs, accountingEvents] = await Promise.all([
+  const [salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs] = await Promise.all([
     client.salesOrder.findMany({
       where: {
         OR: [
@@ -813,9 +909,34 @@ export async function collectAccountingReconciliationRows(
         externalId: true,
       },
     }),
+    // o3d-cvj9 r7: the handovers the live mirror made on an order nothing established. Selected on
+    // the ACTION alone — not by joining the events above — because the row that carries the entry is
+    // the SUPERSEDED holder, and whether that row was loaded above depends on a business date that
+    // has nothing to do with when the claim moved. Backed by @@index([action, createdAt]) on
+    // AccountingEventLog.
+    //
+    // Bounded by the report's own lookback like every other dataset here. An unbounded read would
+    // grow monotonically and re-report a handover that was checked and accepted years ago, and a
+    // finding that can never stop appearing stops being read at all — which is the failure mode this
+    // whole surface exists to avoid.
+    client.accountingEventLog.findMany({
+      where: {
+        action: ASSUMED_REVISION_ORDER_TAKEOVER_ACTION,
+        createdAt: { gte: fromDate },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: MAX_RECONCILIATION_ROWS,
+      select: {
+        id: true,
+        accountingEventId: true,
+        action: true,
+        metadata: true,
+        createdAt: true,
+      },
+    }),
   ])
 
-  return { salesOrders, shipments, refunds, syncLogs, accountingEvents }
+  return { salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs }
 }
 
 export async function runAccountingReconciliationReport(options: {
