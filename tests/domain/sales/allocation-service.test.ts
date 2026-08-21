@@ -2849,15 +2849,21 @@ test('re-running that same allocation is a no-op and does not move reservedQty (
   assert.equal(writeCounts.allocationCreates, 0)
 })
 
-test('KNOWN DEFECT o3d-i4qd: the persisted quantity can exceed the stock it was checked against', async () => {
-  // CHARACTERISATION, not an invariant. Feasibility is decided against the UNROUNDED value, but
-  // OrderAllocation.qty is @db.Decimal(12,4) and Postgres rounds HALF-UP on write. With 0.999960
-  // available the allocator accepts 0.999960 and the column stores 1.0000 — more than was proven
-  // available, which against the real database violates reservedQty <= quantity.
+test('o3d-aqke: the persisted quantity NEVER exceeds the stock it was checked against', async () => {
+  // WAS "KNOWN DEFECT o3d-i4qd", pinned as a characterisation with the instruction that whoever
+  // fixed it should replace it with the invariant. This is that replacement (Codex r1 finding 2).
   //
-  // This is pinned rather than asserted away because three attempts to canonicalise it all broke
-  // something worse (see o3d-i4qd: over-claiming, then KIT proportionality). When that issue is
-  // fixed this test SHOULD fail, and whoever fixes it should replace it with the invariant.
+  // The defect: feasibility was decided against the UNROUNDED 6dp availability while
+  // `OrderAllocation.qty` is `Decimal(12,4)` rounded HALF-UP on write, so with 0.999960 available
+  // the allocator accepted 0.999960 and the column stored 1.0000 — more stock than was proven, and
+  // against the real database a violation of the VALIDATED `reservedQty <= quantity` constraint,
+  // which aborts the transaction rather than over-booking.
+  //
+  // The three earlier attempts the old note refers to all tried to change the ROUNDING, and each
+  // broke something worse (over-claiming, then KIT proportionality). The rounding was never the
+  // problem: half-up, once, after the whole multiplication is right. What was wrong was the CEILING
+  // it was measured against, and flooring that ceiling to the canonical scale costs at most one ulp
+  // of a column no allocation row could have held.
   const state = baseState({
     order: {
       ...baseState().order,
@@ -2876,8 +2882,9 @@ test('KNOWN DEFECT o3d-i4qd: the persisted quantity can exceed the stock it was 
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
   const persisted = (state.allocations ?? []).reduce((sum, row) => sum + Number(row.qty), 0)
-  assert.equal(persisted, 1, 'the column rounds 0.999960 up to 1.0000 — the defect, documented')
-  assert.ok(persisted > 0.99996, 'and that exceeds the 0.99996 the allocator checked against')
+  assert.equal(persisted, 0.9999, 'floor4(0.999960) = 0.9999, and half-up leaves it there')
+  assert.ok(persisted <= 0.99996, 'and it fits inside the 0.99996 the allocator checked against')
+  assert.equal(state.stockLevels[0].reservedQty, 0.9999)
 })
 
 // ---------------------------------------------------------------------------
@@ -5132,4 +5139,49 @@ test('o3d-0i5y r11: a warehouse move KEEPS a landed-cost correction that lands b
     + 'reaching cost of sales',
   )
   assert.deepEqual(queuedAccountingSyncs, [], 'nothing left the order, so nothing is reversed')
+})
+
+// o3d-aqke (Codex r1 finding 2) — THE ALLOCATOR MUST NOT PLAN A ROW ITS OWN STORAGE REFUSES.
+//
+// `StockLevel.quantity` is `Decimal(14,6)`; `OrderAllocation.qty` is `Decimal(12,4)`. Feasibility
+// used to be decided against the RAW 6dp availability, and `canonicalAllocationQty` then rounded
+// the requirement half-up — correctly, once, after the whole multiplication — which can land the
+// persisted row up to half an ulp ABOVE the stock the plan was drawn from. The reserve follows the
+// row, and `stock_levels_reserved_qty_lte_quantity` is a VALIDATED check constraint (migration
+// 20260624120000), so the outcome is not an over-booking that a census can see later: it is a
+// Postgres check violation that rolls the whole allocation transaction back, leaving the operator a
+// constraint name and no statement of what IMS was attempting.
+
+test('o3d-aqke: a 6dp availability is allocated at the scale the row can hold, not half an ulp above it', async () => {
+  // 1.000050 of stock. Raw: allocQty = min(3, 1.00005) -> canonical 1.0001, i.e. 0.00005 MORE than
+  // exists. Floored: allocQty = min(3, 1.0000) -> canonical 1.0000, which fits exactly.
+  const state = baseState({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 1.00005, reservedQty: 0 }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal((state.allocations ?? [])[0]?.qty, 1, 'the row is 1.0000, the largest Decimal(12,4) inside 1.000050')
+  assert.equal(state.stockLevels[0].reservedQty, 1)
+  assert.equal(
+    state.stockLevels[0].reservedQty <= state.stockLevels[0].quantity,
+    true,
+    'reservedQty <= quantity is a VALIDATED check constraint — breaching it aborts the transaction, it does not over-book',
+  )
+  // The sub-ulp remainder is not lost stock, it is stock no allocation row could ever have held.
+  assert.equal(result.unallocatedLines.length, 1)
+})
+
+test('o3d-aqke: an exact availability is still allocated in full', async () => {
+  // The guard against the floor becoming a tax. Nothing below the fourth decimal means nothing to
+  // give up, and a whole-unit warehouse — every real one — must be unaffected.
+  const state = baseState({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 3, reservedQty: 0 }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(result.success, true)
+  assert.equal((state.allocations ?? [])[0]?.qty, 3)
+  assert.equal(state.stockLevels[0].reservedQty, 3)
 })

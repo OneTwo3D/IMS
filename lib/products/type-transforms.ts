@@ -169,6 +169,38 @@ export function summarizeTransformBlockers(blockers: ProductTransformBlockers): 
  * between the two statements is seen by neither the transfer read nor the product predicate.
  * That is on top of the write-skew residual above, not instead of it. Callers must say so
  * rather than claim the whole question is closed.
+ *
+ * THE DECISION (o3d-0fok, 2026-08): THE RESIDUAL IS ACCEPTED, PERMANENTLY. It is not an
+ * unfinished item and no future change should quietly try to "fix" it here. The two closures
+ * were both weighed and both rejected:
+ *
+ *   - A PRODUCT-SCOPED LOCK THAT EVERY BLOCKER WRITER TAKES. The blocker writers are stock
+ *     receipts, allocation, and the sales/purchase/production/transfer document writers — the
+ *     hottest paths in the system. They would each take a new lock, which then has to be
+ *     ordered against the sales-order lock and COMPONENT_GRAPH_WRITE_LOCK_KEY. Adding a
+ *     deadlock surface across every inventory write to protect an occasional administrative
+ *     edit trades a rare, visible, repairable fault for a common one.
+ *   - SERIALIZABLE ISOLATION. Postgres SSI holds only among transactions that are ALL
+ *     serializable, so raising this one alone buys nothing; raising all of them is the same
+ *     list of hot paths plus serialization-failure retry loops in each.
+ *
+ * WHAT MAKES THE RESIDUAL TOLERABLE, stated so the judgement can be re-examined rather than
+ * merely inherited:
+ *
+ *   - the window is the width of ONE statement (the predicate ANDed into the UPDATE) plus the
+ *     pre-commit re-assertion, not the width of the transaction;
+ *   - the uncontended case — which is all of them in practice, since these edits are made by a
+ *     human in an editor, not by a sweep — is refused outright;
+ *   - the failure mode is a product whose type or parent changed under a document that
+ *     references it. That is visible in the document and repairable by transforming the
+ *     product back or voiding the document. It is not a silent quantity or money error, and
+ *     nothing downstream computes a wrong number from it.
+ *
+ * WHAT IS NOT DONE, and is the honest next step if this ever bites in practice: nothing
+ * DETECTS the residual after the fact. The scheduled inventory-invariant census
+ * (lib/domain/inventory/invariants.ts) has no check for "a product whose type is inconsistent
+ * with the documents that reference it". Adding one would make the accepted residual
+ * observable without touching a single write path, and is the cheap half of this problem.
  */
 export const PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE: Prisma.ProductWhereInput = {
   stockLevels: { none: { OR: [{ quantity: { gt: 0 } }, { reservedQty: { gt: 0 } }] } },

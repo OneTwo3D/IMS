@@ -1561,6 +1561,53 @@ test('transitionShipmentStatus does not reject a fractional KIT on a rounding ul
   assert.equal(state.shipments[0].status, 'SHIPPED')
 })
 
+test('o3d-i4qd: a fractional KIT with TWO components dispatches — the committed set IS complete', async () => {
+  // `findUncoveredCommittedShipment` ran the same unquantised proportionality test
+  // `validateAllocationIntegrity` did, so it refused the same sets — but at DISPATCH, after the
+  // goods were picked and packed, with the operator holding the box.
+  //
+  // 0.5 kits of (0.3333 x comp-1 + 1 x comp-2). comp-1's entitlement is 0.16665, which
+  // `Decimal(12,4)` stores as 0.1667; comp-2's is exactly 0.5. Inferring one coverage from comp-2
+  // and multiplying it back out expects comp-1 = 0.16665, sees 0.1667, and calls a set that is as
+  // proportional as the column permits "not a complete component set".
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: {
+      'kit-1': [
+        { componentId: 'comp-1', qty: 0.3333, sku: 'COMP-1' },
+        { componentId: 'comp-2', qty: 1, sku: 'COMP-2' },
+      ],
+    },
+    allocations: [
+      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-1', warehouseId: 'warehouse-1', qty: 0.1667 },
+      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-2', warehouseId: 'warehouse-1', qty: 0.5 },
+    ],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 0.1667 },
+      { id: 'shipment-line-2', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-2', qty: 0.5 },
+    ],
+    stockLevels: [
+      { productId: 'comp-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 0.1667 },
+      { productId: 'comp-2', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 0.5 },
+    ],
+    costLayers: [
+      { id: 'layer-1', productId: 'comp-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 },
+      { id: 'layer-2', productId: 'comp-2', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 7 },
+    ],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.equal(state.shipments[0].status, 'SHIPPED')
+})
+
 // ---------------------------------------------------------------------------
 // o3d-4kfh r3 — PENDING -> PICKING is a COMMITMENT, and it must be backed.
 //
