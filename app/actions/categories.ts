@@ -5,7 +5,7 @@ import { z } from 'zod'
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import {
   buildProductCategoryPathDisplay,
   buildProductCategoryPathMap,
@@ -31,7 +31,7 @@ const NameSchema = z.string().max(PRODUCT_CATEGORY_NAME_MAX_LENGTH * 4, 'Name to
 const IdSchema = z.string().min(1, 'Missing id')
 
 export async function listCategoryTree(): Promise<ProductCategoryNode[]> {
-  await requireAuth()
+  await requireInternalUser()
   return listProductCategoryNodes()
 }
 

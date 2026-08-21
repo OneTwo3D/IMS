@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { maskSecret } from '@/lib/security/secret-mask'
 import {
   decryptSettingValue,
   encryptSettingValue,
@@ -71,6 +72,13 @@ export const SENSITIVE_SETTING_KEYS = new Set([
   'shopify_invoice_pdf_secret',
   'shopify_webhook_secret',
   'trackship_api_key',
+  // o3d-512h: the WooCommerce consumer KEY, not only the secret. getWcCredentials
+  // has always masked it before returning it to the client (app/actions/wc-sync.ts),
+  // i.e. the product already treats it as a credential — but it was absent from this
+  // set, so the generic `getSetting('wc_consumer_key')` endpoint returned it in clear
+  // to any authenticated principal and it was stored in plaintext at rest. The set is
+  // the single authority for BOTH facts, which is why the drift was invisible.
+  'wc_consumer_key',
   'wc_consumer_secret',
   'wc_invoice_pdf_secret',
   'wc_webhook_secret',
@@ -231,4 +239,33 @@ export function deserializeSettingValue(key: string, value: string): string {
 export function serializeSettingValue(key: string, value: string): string {
   if (!SENSITIVE_SETTING_KEYS.has(key) || !value) return value
   return encryptSettingValue(key, value)
+}
+
+/**
+ * Mask a SETTING value for display, declaring the key it belongs to (o3d-512h).
+ *
+ * Masking a value is a getter stating "this is a credential". That statement used
+ * to live only in the getter, while the authorization gate on the generic
+ * `getSetting` endpoint read SENSITIVE_SETTING_KEYS — two independent lists, and
+ * they drifted: `wc_consumer_key` was masked by getWcCredentials for as long as it
+ * has existed and was never in the set, so the endpoint served it in clear.
+ *
+ * Routing the maskers through here makes the set the single authority instead of
+ * the second opinion: masking a key that is not in it fails immediately. Every call
+ * site passes a string literal, so this can only fire for a key a developer is
+ * adding right now — never on production data.
+ */
+export function maskSettingSecret(
+  key: string,
+  value: string | null | undefined,
+  visibleChars = 4,
+): string {
+  if (!SENSITIVE_SETTING_KEYS.has(key)) {
+    throw new Error(
+      `maskSettingSecret called for '${key}', which is not in SENSITIVE_SETTING_KEYS. `
+      + 'A masked setting is a credential: add the key to that set so it is encrypted '
+      + 'at rest AND gated on the generic getSetting endpoint.',
+    )
+  }
+  return maskSecret(value, visibleChars)
 }

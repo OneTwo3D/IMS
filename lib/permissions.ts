@@ -5,6 +5,21 @@
 export type Role = 'ADMIN' | 'MANAGER' | 'WAREHOUSE' | 'FINANCE' | 'READONLY' | 'SUPPLIER'
 
 export type Permission =
+  /**
+   * o3d-512h round 3 — the INTERNAL-PRINCIPAL boundary.
+   *
+   * SUPPLIER is an EXTERNAL principal: a third party we hand a login to so it
+   * can quote its own RFQs. Every other role is an internal user of the ERP.
+   * `requireAuth` cannot tell those apart — it answers "is someone signed in" —
+   * so every endpoint gated on it served the supplier's browser the same rows it
+   * served a warehouse operative's.
+   *
+   * This permission is the difference, expressed in the table rather than as a
+   * hard-coded role check, so a role added later has to make the call explicitly
+   * instead of inheriting internal reach by omission. Nothing in the nav uses
+   * it; it exists to be required, not displayed.
+   */
+  | 'internal'
   | 'dashboard'
   | 'inventory' | 'inventory.edit' | 'inventory.prices'
   | 'stock_control' | 'stock_control.adjust' | 'stock_control.transfer'
@@ -26,6 +41,7 @@ export type Permission =
  */
 const ROLE_PERMISSIONS: Record<Role, Set<Permission>> = {
   ADMIN: new Set([
+    'internal',
     'dashboard', 'inventory', 'inventory.edit', 'inventory.prices',
     'stock_control', 'stock_control.adjust', 'stock_control.transfer',
     'purchasing', 'purchasing.create', 'purchasing.receive', 'purchasing.invoice',
@@ -35,6 +51,7 @@ const ROLE_PERMISSIONS: Record<Role, Set<Permission>> = {
     'activity_log', 'help',
   ]),
   MANAGER: new Set([
+    'internal',
     'dashboard', 'inventory', 'inventory.edit', 'inventory.prices',
     'stock_control', 'stock_control.adjust', 'stock_control.transfer',
     'purchasing', 'purchasing.create', 'purchasing.receive', 'purchasing.invoice',
@@ -43,6 +60,7 @@ const ROLE_PERMISSIONS: Record<Role, Set<Permission>> = {
     'activity_log', 'help',
   ]),
   WAREHOUSE: new Set([
+    'internal',
     'dashboard', 'inventory', 'inventory.edit',
     'stock_control', 'stock_control.adjust', 'stock_control.transfer',
     'purchasing', 'purchasing.receive',
@@ -52,6 +70,7 @@ const ROLE_PERMISSIONS: Record<Role, Set<Permission>> = {
     'help',
   ]),
   FINANCE: new Set([
+    'internal',
     'dashboard', 'inventory', 'inventory.prices',
     'purchasing', 'purchasing.create', 'purchasing.invoice',
     'sales', 'sales.refund',
@@ -59,11 +78,15 @@ const ROLE_PERMISSIONS: Record<Role, Set<Permission>> = {
     'help',
   ]),
   READONLY: new Set([
+    'internal',
     'dashboard', 'inventory',
     'purchasing', 'sales',
     'analytics',
     'help',
   ]),
+  // No 'internal': a supplier is an external party. Anything it may read has to
+  // be scoped to its OWN rows by the action itself (app/actions/supplier-portal.ts),
+  // which is why holding a permission is never sufficient on that surface.
   SUPPLIER: new Set([
     'supplier_portal', 'supplier_portal.products', 'supplier_portal.po', 'supplier_portal.rfq',
     'help',

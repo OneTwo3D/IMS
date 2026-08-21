@@ -124,6 +124,9 @@ function mapSyncLogRows(
 }
 
 export async function getShoppingIntegrationConnector() {
+  // o3d-1fel: the delegate (getActiveShoppingConnectorInfo) is a lib helper with
+  // no guard of its own, so the gate has to live here.
+  await requirePermission('sync')
   return getActiveShoppingConnectorInfo()
 }
 

@@ -7,19 +7,53 @@ import { logActivity } from '@/lib/activity-log'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
-import { assertSupplierOwnsResource, SupplierPortalAccessError } from '@/lib/security/supplier-portal-boundary'
+import { assertSupplierOwnsResource, SupplierPortalAccessError, type SupplierPortalContext } from '@/lib/security/supplier-portal-boundary'
+import { sessionAccessDenial } from '@/lib/auth/session-state'
 import { applyHeaderOrderDiscount, resolveHeaderOrderDiscountForeign } from '@/lib/domain/purchasing/order-discount'
 import { calcRequotedLineAmounts } from '@/lib/domain/purchasing/quote-line-amounts'
 import { z } from 'zod'
 
 // ---------------------------------------------------------------------------
-// Auth helper — get supplier ID from session
+// Auth helper — the supplier portal's session gate
 // ---------------------------------------------------------------------------
 
-async function requireSupplier(): Promise<{ userId: string; supplierId: string } | null> {
+/**
+ * The gate every endpoint in this module sits behind (o3d-512h round 4).
+ *
+ * Codex round 4, finding 1: this used to read `auth()` and check only that the
+ * role was SUPPLIER and a supplierId was bound. That is the same function round
+ * 3 deleted from app/actions/allocation.ts for shadowing `requireAuth` — it
+ * accepted any session-shaped object with the right role, including:
+ *
+ *   * a REVOKED login (`sessionInvalidReason`): an admin deactivating the
+ *     supplier user, or "sign out all sessions", bumps sessionVersion /
+ *     forceLogoutAt, and the jwt callback stamps the reason on the very next
+ *     request — but nothing here read it, so the revoked token kept working
+ *     until it expired 30 days later;
+ *   * a REASSIGNED login: app/actions/users.ts bumps sessionVersion whenever
+ *     role or supplierId changes, so the old token carries the OLD supplierId
+ *     and, with the version mismatch ignored, kept reading the previous
+ *     company's RFQs and prices;
+ *   * a session with the password accepted and the SECOND FACTOR not yet
+ *     presented, which requireAuth sends to /2fa and this let straight through.
+ *
+ * The decision is now the shared one — lib/auth/session-state.ts:
+ * sessionAccessDenial — so this gate cannot drift from requireAuth again. What
+ * stays local is what is specific to this surface: the principal must be a
+ * SUPPLIER with a supplier bound, and every endpoint scopes its query to that
+ * supplierId (a supplier_portal permission proves nothing, because every
+ * supplier holds all of them).
+ *
+ * Returns null rather than throwing because that is this module's refusal shape:
+ * every caller null-checks it and returns an empty result without reading
+ * anything.
+ */
+async function requireSupplier(): Promise<SupplierPortalContext | null> {
   const session = await auth()
-  if (!session?.user || session.user.role !== 'SUPPLIER' || !session.user.supplierId) return null
-  return { userId: session.user.id, supplierId: session.user.supplierId }
+  if (sessionAccessDenial(session?.user)) return null
+  const user = session?.user
+  if (!user || user.role !== 'SUPPLIER' || !user.supplierId) return null
+  return { userId: user.id, supplierId: user.supplierId }
 }
 
 function sanitizeSupplierRef(value: string): string {

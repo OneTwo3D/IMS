@@ -1,3 +1,5 @@
+import { AccessDenied } from '@/components/auth/access-denied'
+import { authorizePage } from '@/lib/auth/server'
 import type { Metadata } from 'next'
 import Link from 'next/link'
 import { HardDrive, Clock, Cloud } from 'lucide-react'
@@ -23,6 +25,13 @@ export default async function BackupSettingsPage({
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>
 }) {
+  // o3d-512h: page-level authorization. The (dashboard) layout establishes only
+  // AUTHENTICATION, and the sidebar hiding a link is not a boundary — without
+  // this, any authenticated role that types the URL renders the page and its
+  // reads run. Must stay the FIRST statement so a denial performs no read.
+  const gate = await authorizePage('settings')
+  if (!gate.authorized) return <AccessDenied permission={gate.permission} />
+
   const params = await searchParams
   const raw = typeof params.tab === 'string' ? params.tab : undefined
   const activeTab: Tab = TABS.some((t) => t.key === raw) ? (raw as Tab) : 'backup'

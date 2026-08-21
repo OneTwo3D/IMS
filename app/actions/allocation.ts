@@ -4,8 +4,7 @@ import { revalidatePath } from 'next/cache'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { auth } from '@/lib/auth'
-import { requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { decimalToNumber } from '@/lib/decimal'
@@ -124,11 +123,15 @@ async function logShipmentStatusFailure(
   })
 }
 
-async function requireAuth() {
-  const session = await auth()
-  if (!session?.user?.id) throw new Error('Unauthorized')
-  return session
-}
+// o3d-512h round 3 — a module-local `requireAuth` used to live here, shadowing the
+// import of the same name. It called `auth()` and checked only that a user id
+// existed: no sessionInvalidReason check (so a session revoked by a password change
+// or a role change still passed), no 2FA check (so a session that had not cleared
+// its TOTP challenge still passed), and of course no role check. The three exports
+// below were credited as guarded by every reviewer and by the scanner, because both
+// only ever saw the NAME. They now call the real gate; the shadow is deleted, and
+// the scanner's guard rule resolves a callee to its declaration instead of matching
+// its name (tests/security/module-graph.ts).
 
 /**
  * o3d-4kfh r5 (Codex finding 7): THE RETIREMENT ENTRY IS NO LONGER WRITTEN HERE.
@@ -196,7 +199,7 @@ export type FulfillmentRequirementRow = {
 // ---------------------------------------------------------------------------
 
 export async function getOrderAllocations(orderId: string): Promise<AllocationRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.orderAllocation.findMany({
     where: { orderId },
     include: {
@@ -228,7 +231,7 @@ export async function getOrderAllocations(orderId: string): Promise<AllocationRo
 // ---------------------------------------------------------------------------
 
 export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.shipment.findMany({
     where: { orderId },
     include: {
@@ -268,7 +271,7 @@ export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]>
 export async function getOrderFulfillmentRequirements(
   orderId: string,
 ): Promise<FulfillmentRequirementRow[]> {
-  await requireAuth()
+  await requireInternalUser()
 
   const lines = await db.salesOrderLine.findMany({
     where: { orderId, productId: { not: null } },

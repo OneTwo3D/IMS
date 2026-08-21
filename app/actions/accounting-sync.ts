@@ -12,7 +12,7 @@ import {
   type PluginSelectionLockTx,
 } from '@/lib/integration-plugin-selection-lock'
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
-import { freshAuthFailureResult, requireAuth, requirePermission } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireInternalUser, requirePermission, requireRole } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import {
   summarizeCrossConnectorOrphans,
@@ -117,7 +117,7 @@ const LIVE_ACCOUNTING_SYNC_STATUSES = ['PENDING', 'PROCESSING'] as const
  * own connector's rows), so switching connectors strands them silently.
  */
 export async function getCrossConnectorOrphanSummary(): Promise<ConnectorOrphanSummary> {
-  await requireAuth()
+  await requireInternalUser()
   const activeConnector = await getActiveConnector()
   const groups = await db.accountingSyncLog.groupBy({
     by: ['connector'],
@@ -145,7 +145,7 @@ export type FailedAccountingSyncSummary = {
  * are NOT FAILED, so they are correctly excluded — these are real failures.
  */
 export async function getFailedAccountingSyncSummary(): Promise<FailedAccountingSyncSummary> {
-  await requireAuth()
+  await requireInternalUser()
   const connector = await getActiveConnector()
   if (!connector) return { connector: null, failedCount: 0 }
   const failedCount = await db.accountingSyncLog.count({
@@ -409,6 +409,8 @@ async function cancelOrphanedRowsUnderLock(
 }
 
 export async function getAccountingIntegrationConnector() {
+  // o3d-1fel: not a facade — resolves plugin state (a DB-backed read) itself.
+  await requireInternalUser()
   const connector = await getActiveConnector()
   if (!connector) return null
   return {
@@ -418,7 +420,73 @@ export async function getAccountingIntegrationConnector() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Connector dispatchers (o3d-512h)
+//
+// Each of these resolves the active accounting connector and hands off to a
+// guarded connector action, and they used to carry no guard of their own on the
+// strength of that hand-off. Two things make that justification false:
+//
+//   1. Several dispatchers RETURN BEFORE reaching the delegate — the
+//      `if (!connector) return …` arm answers straight from this module, so on
+//      that path there is no delegate and therefore no guard. Unguarded, they
+//      told any authenticated principal whether an accounting integration is
+//      enabled, and reached `isIntegrationPluginEnabled` (a database read) to
+//      find out.
+//   2. Some connector-side implementations answer from a constant instead of
+//      calling a guarded action at all (getConnectionTestState, testConnection
+//      and syncAccountBalanceSnapshots on the QuickBooks branch each return a
+//      literal), so "the delegate is guarded" is not even true for every branch.
+//
+// WHICH gate, and why not the delegate's own: a dispatcher serves BOTH branches,
+// and the two branches do not gate alike. The Xero delegates use
+// requireRole('ADMIN') — o3d-512h round 3: they DID NOT when this paragraph was
+// first written. xero-sync.ts's module-local `requireAdmin` was
+// `requirePermission('sync')`, the same gate as the dispatcher and as QuickBooks,
+// so "the stricter branch keeps enforcing its own" was false and MANAGER passed
+// straight through. The sentence was not softened to match; xero-sync.ts:
+// requireAdmin now enforces 'sync' AND the ADMIN role, and
+// tests/security/accounting-dispatcher-authorization.test.ts asserts the
+// difference between the two frames. quickbooks-sync.ts declares a module-local
+// `requireAdmin` that is literally `requirePermission('sync')`, which also admits
+// MANAGER. So
+// there is no single "the delegate's gate" to copy, and copying Xero's stricter
+// one would lock MANAGER out of the QuickBooks branch that legitimately admits
+// it. Each dispatcher therefore takes the LOOSEST gate any branch's delegate
+// applies, and the stricter branch keeps enforcing its own on top:
+//
+//   * 'sync' where the branches disagree (Xero ADMIN-only vs QuickBooks 'sync').
+//   * requireRole('ADMIN','FINANCE') on syncAccountingAccountBalanceSnapshots,
+//     which is what its delegate uses — gating it on 'sync' would lock FINANCE,
+//     which holds no 'sync' permission, out of its own balance snapshots.
+//   * 'settings.company' on the three tax-rate dispatchers, where BOTH branches'
+//     delegates agree on that permission (settings.ts:{autoLink,previewMissing,
+//     generateMissing}{Xero,QuickBooks}TaxRates).
+//
+// Reach change per principal: ADMIN unchanged. MANAGER passed the unguarded
+// dispatcher before, and is now refused by the Xero delegate (round 3 — this is
+// the part that was claimed but not implemented) / still admitted by the
+// QuickBooks one; on the tax-rate dispatchers it was already
+// refused by both delegates and is now refused one frame earlier. FINANCE keeps
+// balance snapshots and loses the rest. WAREHOUSE, READONLY and SUPPLIER lose the
+// early-return answer and the plugin-state read that produced it — which is the
+// whole point: none of them could ever reach a delegate.
+//
+// Where the delegate additionally requires FRESH auth, that stays with the
+// delegate on purpose: it is thrown from inside the try/catch that converts it
+// into a step-up re-auth result for the client, and hoisting it here would turn
+// that structured result into an unhandled throw.
+//
+// NOT claimed here: that the delegates themselves are all guarded. Six
+// quickbooks-sync.ts exports carry no guard at all (see the allowlist note in
+// tests/security/server-action-guard-coverage.test.ts). They are out of scope by
+// owner instruction, and the gate below is what stands between them and an
+// unauthorized caller *via this module* — it is not a gate on those exports,
+// which remain separately addressable endpoints of their own.
+// ---------------------------------------------------------------------------
+
 export async function getAccountingSettingsMasked(): Promise<AccountingConnectorSettingsMasked> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   return connector
     ? connector.getSettingsMasked()
@@ -426,6 +494,14 @@ export async function getAccountingSettingsMasked(): Promise<AccountingConnector
 }
 
 export async function saveAccountingSettings(data: Record<string, string>): Promise<{ success: boolean; error?: string }> {
+  // o3d-1fel: the delegate (saveXeroSettings) is guarded, but this body reads the
+  // CURRENT account-mapping settings and can return a validation error BEFORE
+  // ever reaching that delegate — so unguarded it is both a read of the mapping
+  // and an oracle for the validator. o3d-512h: 'sync' is the loosest gate the two
+  // branches' delegates apply (saveQuickBooksSettings → requirePermission('sync');
+  // saveXeroSettings → requireRole('ADMIN'), which still applies on its own path)
+  // — see the dispatcher note above.
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   const resolved = connector ?? getAccountingConnector('xero')
 
@@ -453,6 +529,7 @@ export async function saveAccountingConnectionSettings(
   clientSecret: string,
   preferredConnector?: AccountingConnectorId,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector(preferredConnector)
   if (!connector) {
     return { success: false, error: 'Enable Xero or QuickBooks first.' }
@@ -469,6 +546,7 @@ export async function saveAccountingConnectionSettings(
 }
 
 export async function getAccountingConnectionTestState(): Promise<IntegrationConnectionTestState> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   if (!connector) {
     return { status: 'never', testedAt: null, message: '', fingerprint: null }
@@ -477,6 +555,7 @@ export async function getAccountingConnectionTestState(): Promise<IntegrationCon
 }
 
 export async function testAccountingConnection(): Promise<{ success: boolean; error?: string; message?: string }> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   if (!connector) {
     return { success: false, error: 'Enable Xero or QuickBooks first.' }
@@ -485,6 +564,7 @@ export async function testAccountingConnection(): Promise<{ success: boolean; er
 }
 
 export async function getAccountingConnectionStatus(): Promise<AccountingConnectionStatus> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).getConnectionStatus()
 }
@@ -496,6 +576,7 @@ export async function connectAccountingConnector(
   returnPath?: string,
   preferredConnector?: AccountingConnectorId,
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector(preferredConnector)
   if (!connector) {
     return { success: false, error: 'Enable Xero or QuickBooks first.' }
@@ -511,16 +592,21 @@ export async function connectAccountingConnector(
 }
 
 export async function disconnectAccountingConnector(): Promise<{ success: boolean; error?: string }> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).disconnect()
 }
 
 export async function syncAccountingAccounts(): Promise<{ synced: number; errors: string[] }> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).syncAccounts()
 }
 
 export async function syncAccountingAccountBalanceSnapshots(balanceDate?: string): Promise<{ fetched: number; persisted: number; skipped: number; errors: string[] }> {
+  // Matches the delegate exactly: FINANCE holds no 'sync' permission, so gating
+  // this on 'sync' would lock a legitimate role out of its own balance snapshots.
+  await requireRole('ADMIN', 'FINANCE')
   const connector = await getActiveAccountingConnector()
   if (!connector) {
     return { fetched: 0, persisted: 0, skipped: 0, errors: ['Enable Xero or QuickBooks first.'] }
@@ -529,6 +615,7 @@ export async function syncAccountingAccountBalanceSnapshots(balanceDate?: string
 }
 
 export async function getAccountingAccounts(): Promise<AccountingAccountRow[]> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).getAccounts()
 }
@@ -536,6 +623,7 @@ export async function getAccountingAccounts(): Promise<AccountingAccountRow[]> {
 export async function fetchAccountingTaxRates(
   opts?: { allowCache?: boolean },
 ): Promise<AccountingTaxCodeRow[]> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).fetchTaxRates(opts)
 }
@@ -548,6 +636,7 @@ export async function autoLinkAccountingTaxRates(): Promise<{
   externalRatesCount: number
   error?: string
 }> {
+  await requirePermission('settings.company')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).autoLinkTaxRates()
 }
@@ -558,6 +647,7 @@ export async function autoLinkAccountingTaxRates(): Promise<{
  * Read-only — nothing is written to the accounting system. Connector-agnostic.
  */
 export async function previewMissingAccountingTaxRates(): Promise<MissingTaxRatePreviewResult> {
+  await requirePermission('settings.company')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).previewMissingTaxRates()
 }
@@ -571,11 +661,13 @@ export async function generateMissingAccountingTaxRates(
   taxRateIds: string[],
   reportTypeOverrides?: Record<string, string>,
 ): Promise<MissingTaxRateGenerateResult> {
+  await requirePermission('settings.company')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).generateMissingTaxRates(taxRateIds, reportTypeOverrides)
 }
 
 export async function getAccountingSyncLogs(limit = 50): Promise<AccountingSyncLogRow[]> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).getSyncLogs(limit)
 }
@@ -584,21 +676,24 @@ export async function getRejectedAccountingDocumentUpdateWarnings(
   references: AccountingDocumentUpdateReference[],
   limit = 10,
 ): Promise<RejectedAccountingDocumentUpdateWarning[]> {
-  await requireAuth()
+  await requireInternalUser()
   return collectRejectedAccountingDocumentUpdateWarnings(db, references, limit)
 }
 
 export async function triggerAccountingSync(): Promise<{ success: boolean; result?: unknown; error?: string }> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).triggerSync()
 }
 
 export async function retryFailedAccountingSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).retryFailedSync(entryId)
 }
 
 export async function getAccountingSyncReadiness(): Promise<AccountingSyncReadiness> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).getSyncReadiness()
 }

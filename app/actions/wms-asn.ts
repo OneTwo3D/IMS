@@ -1,5 +1,6 @@
 'use server'
 
+import { requirePermission } from '@/lib/auth/server'
 import { getActiveWmsConnectorId } from '@/lib/connectors/wms/active-connector'
 import { getWmsConnectorDef } from '@/lib/connectors/wms/registry'
 import type {
@@ -13,6 +14,20 @@ import type {
  * these; the facade resolves the active WMS connector and dispatches to that
  * connector's implementation. Adding a new WMS connector means registering its
  * implementation here (one case), not editing the PO/transfer views.
+ *
+ * o3d-512h round 3 — GUARDS, not an allowlist wildcard. These four carried no gate
+ * of their own and sat behind `'wms-asn.ts:*'` in
+ * tests/security/server-action-guard-coverage.test.ts, on a reason that said in as
+ * many words that the no-connector arm returns unguarded. It is the accounting-sync
+ * defect verbatim: `getActiveWmsConnectorId` is a plugin-state DATABASE READ, and on
+ * the arm where no WMS connector is enabled the answer comes back from this module
+ * with no delegate anywhere on the path. Every principal — including SUPPLIER —
+ * could POST these to learn whether the tenant runs a WMS.
+ *
+ * Each takes ITS OWN delegate's gate, not one gate for the file: the two reads go to
+ * requireMintsoftReadAccess (= 'sync'), the PO ASN create to 'purchasing.receive' and
+ * the transfer ASN create to 'stock_control.transfer'. Copying a single permission
+ * across all four would have locked WAREHOUSE out of an ASN it is entitled to create.
  */
 
 function disabledAsnState(): WmsPurchaseOrderAsnState {
@@ -29,6 +44,8 @@ function disabledAsnState(): WmsPurchaseOrderAsnState {
 }
 
 export async function getWmsPurchaseOrderAsnState(poId: string): Promise<WmsPurchaseOrderAsnState> {
+  // mintsoft-sync.ts:getMintsoftPurchaseOrderAsnState → requireMintsoftReadAccess() → requirePermission('sync')
+  await requirePermission('sync')
   const connector = await getActiveWmsConnectorId()
   if (connector === 'mintsoft') {
     const { getMintsoftPurchaseOrderAsnState } = await import('@/app/actions/mintsoft-sync')
@@ -41,6 +58,8 @@ export async function getWmsPurchaseOrderAsnState(poId: string): Promise<WmsPurc
 export async function getWmsTransferAsnStates(
   transferIds: string[],
 ): Promise<Record<string, WmsTransferAsnState>> {
+  // mintsoft-sync.ts:getMintsoftTransferAsnStates → requireMintsoftReadAccess() → requirePermission('sync')
+  await requirePermission('sync')
   const connector = await getActiveWmsConnectorId()
   if (connector === 'mintsoft') {
     const { getMintsoftTransferAsnStates } = await import('@/app/actions/mintsoft-sync')
@@ -57,6 +76,8 @@ export async function createWmsPurchaseOrderAsn(
   poId: unknown,
   input: unknown,
 ): Promise<WmsCreateAsnResult> {
+  // mintsoft-sync.ts:createMintsoftPurchaseOrderAsn → requirePermission('purchasing.receive')
+  await requirePermission('purchasing.receive')
   const connector = await getActiveWmsConnectorId()
   if (connector === 'mintsoft') {
     const { createMintsoftPurchaseOrderAsn } = await import('@/app/actions/mintsoft-sync')
@@ -69,6 +90,8 @@ export async function createWmsTransferAsn(
   transferId: unknown,
   input: unknown,
 ): Promise<WmsCreateAsnResult> {
+  // mintsoft-sync.ts:createMintsoftTransferAsn → requirePermission('stock_control.transfer')
+  await requirePermission('stock_control.transfer')
   const connector = await getActiveWmsConnectorId()
   if (connector === 'mintsoft') {
     const { createMintsoftTransferAsn } = await import('@/app/actions/mintsoft-sync')
@@ -88,6 +111,17 @@ export async function createWmsTransferAsn(
 export async function recheckWmsAsnBookedIn(
   externalAsnId: unknown,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
+  // o3d-512h round 3, applied to an export that arrived after it (o3d-m3gy). This dispatcher landed on
+  // `development` while `wms-asn.ts:*` still carried a blanket allowlist entry, and that entry was
+  // deleted here for the reason the note in tests/security/server-action-guard-coverage.test.ts gives:
+  // the no-connector arm returns WITHOUT ever reaching the delegate whose guard it claims to inherit,
+  // so on exactly the path an unauthorized caller takes there was no guard at all — and reaching that
+  // arm already means `getActiveWmsConnectorId` ran, i.e. the refused caller got a database read and
+  // an oracle for which WMS this tenant uses.
+  //
+  // The gate is the DELEGATE'S OWN, not a convenient one:
+  // mintsoft-sync.ts:recheckMintsoftAsnBookedIn → requirePermission('purchasing.receive').
+  await requirePermission('purchasing.receive')
   const connector = await getActiveWmsConnectorId()
   if (connector === 'mintsoft') {
     const { recheckMintsoftAsnBookedIn } = await import('@/app/actions/mintsoft-sync')
