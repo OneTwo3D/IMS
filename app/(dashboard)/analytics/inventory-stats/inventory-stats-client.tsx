@@ -14,6 +14,7 @@ import { saveView, type SavedView } from '@/app/actions/sales-stats'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
+import { filterAndSortRows } from '@/lib/analytics/table-filter-sort'
 
 type Tab = 'onhand' | 'movements' | 'allocations' | 'reorder'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -114,22 +115,6 @@ const SEL_OPS = [{ value: 'is', label: 'is' }, { value: 'is_not', label: 'is not
 
 function getOps(fields: FieldDef[], key: string) { const f = fields.find((pf) => pf.key === key); return f?.type === 'number' ? NUM_OPS : f?.type === 'select' ? SEL_OPS : TEXT_OPS }
 function getOpts(fields: FieldDef[], key: string) { return fields.find((pf) => pf.key === key)?.options }
-
-function applyFilter(val: string | number | null | boolean | undefined, rule: FilterRule): boolean {
-  const v = val == null ? '' : String(val).toLowerCase(); const rv = rule.value.toLowerCase()
-  switch (rule.operator) {
-    case 'contains': return v.includes(rv); case 'equals': case 'is': return v === rv; case 'starts_with': return v.startsWith(rv); case 'is_not': return v !== rv
-    case '>': return Number(val) > Number(rule.value); case '>=': return Number(val) >= Number(rule.value)
-    case '<': return Number(val) < Number(rule.value); case '<=': return Number(val) <= Number(rule.value); case '=': return Number(val) === Number(rule.value)
-    default: return true
-  }
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function getVal(row: any, field: string): string | number | null {
-  const v = row[field]
-  return v === undefined ? null : v
-}
 
 // ---------------------------------------------------------------------------
 // Filter Dialog
@@ -234,23 +219,10 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
     <TableHead className={`text-xs cursor-pointer hover:text-foreground select-none ${right ? 'text-right' : 'text-left'}`} onClick={() => handleSort(col)}>{children} <SortIcon col={col} /></TableHead>
   )
 
-  // Generic filter + sort for any tab data
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  function filterAndSort<T extends Record<string, any>>(data: T[]): T[] {
-    let result = data
-    for (const rule of filterRules) {
-      if (!rule.value) continue
-      result = result.filter((row) => applyFilter(getVal(row, rule.field), rule))
-    }
-    if (sortCol) {
-      result = [...result].sort((a, b) => {
-        const va = getVal(a, sortCol) ?? 0
-        const vb = getVal(b, sortCol) ?? 0
-        const cmp = typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb))
-        return sortDir === 'asc' ? cmp : -cmp
-      })
-    }
-    return result
+  // Generic filter + sort for any tab data — shared with the sales and purchase stat pages
+  // (o3d-iigc round 2), so an absent figure keeps its distance from a real zero here too.
+  function filterAndSort<T extends object>(data: T[]): T[] {
+    return filterAndSortRows(data, filterRules, sortCol, sortDir)
   }
 
   // Filtered data per tab

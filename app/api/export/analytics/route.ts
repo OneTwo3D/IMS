@@ -135,8 +135,10 @@ export async function GET(req: NextRequest) {
     }
     case 'po_aging': {
       const rows = await getSupplierAging()
-      const data = rows.map((r) => ({ supplierName: r.supplierName, grossAmount: r.grossAmount.toFixed(2), refunds: r.refunds.toFixed(2), netAmount: r.netAmount.toFixed(2), landedCosts: r.landedCosts.toFixed(2), tax: r.tax.toFixed(2), totalAmount: r.totalAmount.toFixed(2), billedAmount: r.billedAmount.toFixed(2), dueAmount: r.dueAmount.toFixed(2), overdue0_30: r.overdue0_30.toFixed(2), overdue31_60: r.overdue31_60.toFixed(2), overdue61_90: r.overdue61_90.toFixed(2), overdue91plus: r.overdue91plus.toFixed(2), poCount: r.poCount, avgLeadTimeDays: r.avgLeadTimeDays }))
-      return csvResponse(toCsv(data, ['supplierName', 'grossAmount', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus', 'poCount', 'avgLeadTimeDays']), `supplier-aging-${date}.csv`)
+      const data = rows.map((r) => ({ supplierName: r.supplierName, grossAmount: r.grossAmount.toFixed(2), refunds: r.refunds.toFixed(2),
+        // o3d-iigc round 2: the basis travels with the figure — a CSV reader has no tooltip.
+        netAmountExVat: r.netAmount.toFixed(2), landedCosts: r.landedCosts.toFixed(2), tax: r.tax.toFixed(2), totalAmount: r.totalAmount.toFixed(2), billedAmount: r.billedAmount.toFixed(2), dueAmount: r.dueAmount.toFixed(2), overdue0_30: r.overdue0_30.toFixed(2), overdue31_60: r.overdue31_60.toFixed(2), overdue61_90: r.overdue61_90.toFixed(2), overdue91plus: r.overdue91plus.toFixed(2), poCount: r.poCount, avgLeadTimeDays: r.avgLeadTimeDays }))
+      return csvResponse(toCsv(data, ['supplierName', 'grossAmount', 'refunds', 'netAmountExVat', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus', 'poCount', 'avgLeadTimeDays']), `supplier-aging-${date}.csv`)
     }
     case 'po_details': {
       const rows = await getPurchaseDetails(dateFrom, dateTo)

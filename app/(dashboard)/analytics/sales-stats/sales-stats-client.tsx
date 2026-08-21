@@ -14,6 +14,7 @@ import { saveView, type SalesStatRow, type SalesStatSummary, type ShipmentRow, t
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
+import { filterAndSortRows } from '@/lib/analytics/table-filter-sort'
 
 type Tab = 'products' | 'shipments' | 'details' | 'invoices' | 'refunds' | 'aging'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -160,6 +161,47 @@ const AGING_FIELDS: FieldDef[] = [
  */
 const BOUND_TITLE = 'Upper bound: some of this product\u2019s refunds are on the gross basis or have no proven basis, so they are not subtracted here'
 
+/**
+ * The same statement for a WHOLE-PERIOD figure, where the loose refunds may belong to any product.
+ */
+const BOUND_TITLE_SUMMARY = 'Upper bound: some refunds in this period are on the gross basis or have no proven basis, so they are not subtracted from this total'
+
+/**
+ * o3d-iigc round 2 (Codex finding 1): A SUMMARY CARD IS THE FIGURE PEOPLE ACTUALLY READ, and on a
+ * card an upper bound was indistinguishable from a measurement — the marks the table cells carry
+ * were on the columns hardly anyone scrolls to, while the five cards above them printed the same
+ * bounded totals as if they were exact.
+ *
+ * A bounded card therefore carries the table's own marks — the `≤`, and the bound colour INSTEAD
+ * of any colouring that would read as a verdict — plus, because a card has no "Refunds (gross)"
+ * column beside it to reveal how loose the bound is, the looseness in words underneath.
+ */
+function SummaryCard({ label, value, bounded, boundedBy, valueClass }: {
+  label: string
+  /** Already formatted: money through fmtBase, a percentage with its sign. */
+  value: string
+  /** True when this figure is an upper bound rather than a measurement. */
+  bounded?: boolean
+  /** Formatted refund value the figure could not absorb — how loose the bound is. */
+  boundedBy?: string
+  /** Colouring that reads as a verdict on the figure. Dropped when the figure is bounded. */
+  valueClass?: string
+}) {
+  return (
+    <div className="rounded-md border p-3">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className={`text-xl font-bold ${bounded ? 'text-orange-600' : valueClass ?? ''}`} title={bounded ? BOUND_TITLE_SUMMARY : undefined}>
+        {value}{bounded ? ' \u2264' : ''}
+      </p>
+      {bounded && (
+        <p className="text-[10px] leading-tight text-orange-600" title={BOUND_TITLE_SUMMARY}>
+          Upper bound &mdash; {boundedBy} of refunds not subtracted
+        </p>
+      )}
+    </div>
+  )
+}
+
 const TAB_FIELDS: Record<Tab, FieldDef[]> = {
   products: PRODUCT_FIELDS,
   shipments: SHIPMENT_FIELDS,
@@ -209,31 +251,6 @@ function getOperators(fields: FieldDef[], fieldKey: string) {
 
 function getFieldOptions(fields: FieldDef[], fieldKey: string) {
   return fields.find((pf) => pf.key === fieldKey)?.options
-}
-
-function applyFilter(value: string | number | null | boolean | undefined, rule: FilterRule): boolean {
-  const v = value == null ? '' : String(value).toLowerCase()
-  const rv = rule.value.toLowerCase()
-  switch (rule.operator) {
-    case 'contains': return v.includes(rv)
-    case 'equals': case 'is': return v === rv
-    case 'starts_with': return v.startsWith(rv)
-    case 'not_contains': return !v.includes(rv)
-    case 'is_not': return v !== rv
-    case '>': return Number(value) > Number(rule.value)
-    case '>=': return Number(value) >= Number(rule.value)
-    case '<': return Number(value) < Number(rule.value)
-    case '<=': return Number(value) <= Number(rule.value)
-    case '=': return Number(value) === Number(rule.value)
-    case '!=': return Number(value) !== Number(rule.value)
-    default: return true
-  }
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function getVal(row: any, field: string): string | number | null {
-  const v = row[field]
-  return v === undefined ? null : v
 }
 
 // ---------------------------------------------------------------------------
@@ -404,24 +421,19 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
     setFilterRules(view.filters.map((f) => ({ ...f, id: makeId() })))
   }
 
-  // Generic filter + sort for any tab data
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  function filterAndSort<T extends Record<string, any>>(data: T[]): T[] {
-    let result = data
-    for (const rule of filterRules) {
-      if (!rule.value) continue
-      result = result.filter((row) => applyFilter(getVal(row, rule.field), rule))
-    }
-    if (sortCol) {
-      result = [...result].sort((a, b) => {
-        const va = getVal(a, sortCol) ?? 0
-        const vb = getVal(b, sortCol) ?? 0
-        const cmp = typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb))
-        return sortDir === 'asc' ? cmp : -cmp
-      })
-    }
-    return result
+  // Generic filter + sort for any tab data. o3d-iigc round 2: the rules live in
+  // lib/analytics/table-filter-sort so a WITHHELD figure (a null net total, an unestablished % of
+  // sale) is not sorted or filtered as if it were zero — on any of the six tabs, or on the two
+  // sibling stat pages that share the module.
+  function filterAndSort<T extends object>(data: T[]): T[] {
+    return filterAndSortRows(data, filterRules, sortCol, sortDir)
   }
+
+  // How loose the bounded summary figures are: every refund the ex-VAT revenue could not absorb,
+  // which is exactly the two columns the products table reports beside the figure. Rounded once,
+  // here, because both totals are themselves sums of rounded rows.
+  const summaryIsBounded = !summary.refundBasisComplete
+  const summaryBoundedBy = fmtBase(Math.round((summary.totalRefundsGrossBasis + summary.totalRefundsUnknownBasis) * 100) / 100)
 
   // Filtered data per tab
   const filteredProducts = filterAndSort(rows)
@@ -586,13 +598,16 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
       <div className="flex items-center justify-between">
       </div>
 
-      {/* Summary cards */}
+      {/* Summary cards. Three of the five are derived from net revenue, so when a refund could not
+          be placed on the net basis they are UPPER BOUNDS and say so (o3d-iigc round 2). COGS and
+          Orders/Qty are basis-independent — quantity nets off every refund line whatever its
+          basis — so they are never marked. */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Net Revenue</p><p className="text-xl font-bold">{fmtBase(summary.totalNetRevenue)}</p></div>
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">COGS</p><p className="text-xl font-bold">{fmtBase(summary.totalCogs)}</p></div>
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Gross Profit</p><p className="text-xl font-bold text-green-600">{fmtBase(summary.totalGrossProfit)}</p></div>
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Avg Margin</p><p className="text-xl font-bold">{summary.avgMarginPct}%</p></div>
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Orders / Qty</p><p className="text-xl font-bold">{summary.totalOrders} / {summary.totalQtySold}</p></div>
+        <SummaryCard label="Net Revenue" value={fmtBase(summary.totalNetRevenue)} bounded={summaryIsBounded} boundedBy={summaryBoundedBy} />
+        <SummaryCard label="COGS" value={fmtBase(summary.totalCogs)} />
+        <SummaryCard label="Gross Profit" value={fmtBase(summary.totalGrossProfit)} bounded={summaryIsBounded} boundedBy={summaryBoundedBy} valueClass="text-green-600" />
+        <SummaryCard label="Avg Margin" value={`${summary.avgMarginPct}%`} bounded={summaryIsBounded} boundedBy={summaryBoundedBy} />
+        <SummaryCard label="Orders / Qty" value={`${summary.totalOrders} / ${summary.totalQtySold}`} />
       </div>
 
       {/* Tabs + actions */}
