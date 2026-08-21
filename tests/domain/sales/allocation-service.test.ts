@@ -59,7 +59,6 @@ import {
   type FulfillmentGraphNode,
 } from '@/lib/products/kit-fulfillment'
 import { toDecimal } from '@/lib/domain/math/decimal'
-import { Prisma } from '@/app/generated/prisma/client'
 import {
   parseCostLayerSnapshot,
   sumCostLayerSnapshot,
