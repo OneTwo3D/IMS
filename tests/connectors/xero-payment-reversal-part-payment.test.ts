@@ -72,6 +72,8 @@ const state = {
    * timeout, a statement cancelled under load (o3d-clxw round 5, finding 2).
    */
   registrationReadFails: false,
+  /** Every raw statement the poll issued, so the SQL itself can be asserted about (round 6). */
+  rawStatements: [] as string[],
 }
 
 /** The unpatched clock, so the database double keeps real time while a HOST clock is skewed. */
@@ -115,6 +117,7 @@ function reset(): void {
   state.salesOrders = []
   state.purchaseInvoices = []
   state.syncLogs = []
+  state.rawStatements = []
   state.attempts = 0
   state.activity = []
   state.notifications = []
@@ -226,11 +229,56 @@ mock.module('@/app/actions/sales', {
 mock.module('@/lib/db', {
   namedExports: {
     db: {
-      // `SELECT clock_timestamp() AT TIME ZONE 'UTC'` — the fence end of the ordering. Answers from
-      // the DATABASE clock, never from whatever `new Date()` says on the host running the poll.
-      $queryRaw: async () => {
-        if (state.dbClockFails) throw new Error('database clock unavailable')
-        return [{ fence: databaseNow() }]
+      // Two raw statements reach this double, and it answers the one it was actually asked.
+      //
+      //  - `SELECT clock_timestamp() AT TIME ZONE 'UTC'` — the fence end of the ordering. Answers
+      //    from the DATABASE clock, never from whatever `new Date()` says on the host running the
+      //    poll.
+      //  - the withheld-marker scan, which GROUPS the activity log per document and computes BOTH
+      //    aggregates — each document's last open marker and its last closure — then keeps only the
+      //    documents whose latest marker across the two is an open one, and only then applies the
+      //    bound. All three of those are the fix (round 6, finding 2), so all three are computed
+      //    here for real: a double that returned rows, or that filtered after slicing, would make
+      //    the starvation tests vacuous exactly as a row-returning double did in round 5.
+      $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const sql = Array.isArray(strings) ? [...strings].join('?') : String(strings)
+        state.rawStatements.push(sql)
+        if (sql.includes('clock_timestamp()')) {
+          if (state.dbClockFails) throw new Error('database clock unavailable')
+          return [{ fence: databaseNow() }]
+        }
+        if (!sql.includes('activity_logs')) throw new Error(`unexpected raw statement: ${sql}`)
+        // The statement binds its horizon as an explicit UTC instant and renders both aggregates as
+        // explicit UTC strings, because the column is TIMESTAMP WITHOUT TIME ZONE; the double
+        // answers in the same shapes, so the production side's parsing is exercised rather than
+        // bypassed.
+        const [openActions, closedActions, allActions, horizonIso, limit] =
+          values as [string[], string[], string[], string, number]
+        const horizon = new Date(horizonIso)
+        const groups = new Map<string, { entityType: unknown; entityId: string; openMax: Date | null; closedMax: Date | null }>()
+        for (const row of state.activityRows) {
+          if (row.tag !== 'sync') continue
+          if (!allActions.includes(row.action as string)) continue
+          if (row.entityId == null) continue
+          const at = row.createdAt as Date
+          if (at.getTime() < horizon.getTime()) continue
+          const key = `${String(row.entityType)}:${String(row.entityId)}`
+          const held = groups.get(key)
+            ?? { entityType: row.entityType, entityId: row.entityId as string, openMax: null, closedMax: null }
+          if (openActions.includes(row.action as string) && (held.openMax == null || held.openMax.getTime() < at.getTime())) held.openMax = at
+          if (closedActions.includes(row.action as string) && (held.closedMax == null || held.closedMax.getTime() < at.getTime())) held.closedMax = at
+          groups.set(key, held)
+        }
+        return [...groups.values()]
+          .filter((g) => g.openMax != null && (g.closedMax == null || g.openMax.getTime() > g.closedMax.getTime()))
+          .sort((a, b) => a.openMax!.getTime() - b.openMax!.getTime())
+          .slice(0, limit)
+          .map((g) => ({
+            entityType: g.entityType,
+            entityId: g.entityId,
+            openMax: g.openMax!.toISOString(),
+            closedMax: g.closedMax?.toISOString() ?? null,
+          }))
       },
       activityLog: {
         // The pre-round-5 scan: marker ROWS, ordered and bounded as rows. Production does not call
@@ -251,8 +299,12 @@ mock.module('@/lib/db', {
             .sort((a, b) => direction * ((a.createdAt as Date).getTime() - (b.createdAt as Date).getTime()))
             .slice(0, take ?? undefined)
         },
-        // Prisma's groupBy, reduced to what the withheld-marker scan asks of it: one entry per
-        // document, ordered by an aggregate of its markers, bounded in DOCUMENTS. It really groups —
+        // Prisma's groupBy, reduced to what the withheld-marker scan asked of it BEFORE round 6:
+        // one entry per document, ordered by an aggregate of its markers, bounded in DOCUMENTS.
+        // Production does not call this any more either — the two grouped queries were the reason
+        // the bound had to be spent before the closures were known (finding 2) — and it is kept for
+        // the same reason `findMany` is: the revert evidence for the round-6 test needs to be able
+        // to run the round-5 query. It really groups —
         // a double that returned rows and called them groups would make the starvation test vacuous,
         // because grouping is the entire fix (o3d-clxw round 5, finding 3). BOTH `_max` and `_min`
         // are computed and either may be ordered on, because WHICH aggregate the scan reads is
@@ -1351,4 +1403,91 @@ test('the due order is each document\'s LAST reconsideration, not its first (r5)
 
   assert.equal(result.withheldRechecked, 1, 'a document reconsidered half an hour ago is still resting')
   assert.deepEqual(state.recheckFetches, ['Invoices?IDs=XB2'])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-clxw ROUND 6 — A BOUND ON DOCUMENTS IS NOT A BOUND ON DOCUMENTS THAT NEED SOMETHING
+// (Codex finding 2)
+//
+// Round 5 made the scan group per document, and then applied its bound to the OPEN markers alone,
+// before any closure had been read. A settled document keeps its historical open marker for the rest
+// of the thirty-day horizon, and that marker is FROZEN — nothing rewrites it, because the document is
+// never reconsidered again — while an open document's marker is rewritten every time it IS
+// reconsidered. So under oldest-first every settled document sorts ahead of every worked one, and
+// once the horizon holds as many settled documents as the scan is wide, the page is entirely
+// documents with nothing left to decide. Reading the closures afterwards cannot help: the bound has
+// already been spent.
+// ---------------------------------------------------------------------------
+
+test('documents whose withheld verdict is already CLOSED cannot spend the scan (r6)', async () => {
+  const { WITHHELD_MARKER_SCAN } = await import('@/lib/connectors/xero/payment-poller')
+  reset()
+  state.invoices = []
+  const day = 24 * 60 * 60_000
+  // A full scan's worth of documents that were withheld and then SETTLED weeks ago. Each still has
+  // its open marker in the horizon, older than anything still being worked, and each has a closure
+  // written after it. They need nothing.
+  for (let i = 0; i < WITHHELD_MARKER_SCAN; i += 1) {
+    const entityId = `po_settled_${i}`
+    state.activityRows.push(withheldMarker({ entityId, createdAt: databaseNow(-20 * day + i * 1000) }))
+    state.activityRows.push(withheldMarker({
+      entityId,
+      action: 'bill_payment_reversal_withheld_cleared',
+      createdAt: databaseNow(-19 * day + i * 1000),
+    }))
+  }
+  // And one document that is genuinely open, withheld two hours ago. Under a bound applied to open
+  // markers before closures are known it is the (SCAN + 1)th row and never appears — which means it
+  // is never reconsidered, which means it never writes a newer marker, so it never appears. The same
+  // permanent, self-sustaining starvation as round 5's, one column over.
+  state.activityRows.push(withheldMarker({ entityId: 'po_2', createdAt: databaseNow(-2 * 60 * 60_000) }))
+  state.purchaseInvoices = [
+    { ...paidBillRow(), id: 'pi_2', accountingInvoiceId: 'XB2', poId: 'po_2', po: { reference: 'PO-0002', status: 'RECEIVED' } },
+  ]
+  state.recheckInvoices = [bill({ InvoiceID: 'XB2', AmountPaid: 0, AmountDue: 500 })]
+
+  const result = await poll()
+
+  assert.equal(result.withheldRechecked, 1,
+    'the scan is a scan of documents that are STILL OPEN — a settled document never reaches the bound')
+  assert.deepEqual(state.recheckFetches, ['Invoices?IDs=XB2'])
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates).map((u) => u.id), ['pi_2'])
+  assert.equal(result.withheldResolved, 1)
+  assert.equal(
+    state.activity.filter((a) => a.action === 'bill_payment_reversal_withheld_cleared').length, 1,
+    'and no settled document is re-opened, re-asked, or written about again')
+})
+
+test('the scan classifies open against closed BEFORE it cuts the page, in the statement itself (r6)', async () => {
+  // The double above models this statement, and a model cannot notice the statement changing. What is
+  // asserted here is the one property the model cannot re-derive: WHERE THE BOUND SITS. Move the
+  // LIMIT inside the aggregate and every behavioural test still passes — the double would go on
+  // filtering before slicing — while production would go back to spending its page on documents that
+  // were settled weeks ago.
+  reset()
+  state.invoices = []
+  state.activityRows = [withheldMarker()]
+  state.purchaseInvoices = [paidBillRow()]
+  state.recheckInvoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
+
+  await poll()
+
+  const sql = state.rawStatements.find((s) => s.includes('activity_logs'))
+  assert.ok(sql, 'the withheld-marker scan is a statement of its own')
+  assert.equal((sql.match(/MAX\("createdAt"\) FILTER \(WHERE "action" = ANY/g) ?? []).length, 2,
+    'both aggregates — the last open marker AND the last closure — come from ONE grouped pass')
+
+  const subquery = sql.slice(sql.indexOf('FROM ('), sql.indexOf(') d'))
+  assert.doesNotMatch(subquery, /LIMIT/,
+    'a bound inside the aggregate is a bound spent before any closure is known, which is the finding')
+  const classification = sql.indexOf('d."openMax" IS NOT NULL')
+  const bound = sql.indexOf('LIMIT')
+  assert.ok(classification >= 0 && bound > classification,
+    'the settled documents are dropped first; only what is still open reaches the bound')
+  assert.match(sql.slice(classification, bound), /d\."openMax" > d\."closedMax"/,
+    'and "still open" means this document\'s latest marker across BOTH kinds is an open one')
+  assert.match(sql.slice(0, bound), /ORDER BY d\."openMax" ASC/,
+    'least recently reconsidered first — the round robin round 4 built')
+  assert.doesNotMatch(sql, /bill_payment_reversal/,
+    'the action lists are bound as parameters, never interpolated into the statement')
 })

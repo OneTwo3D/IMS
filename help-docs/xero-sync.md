@@ -764,7 +764,11 @@ queue for good. While it is still withheld the warning is simply rewritten, whic
 and sends it to the back of the queue, so one stuck document can never crowd out the others — the
 queue is built one entry per **document**, from each document's most recent warning, so a document
 that has been withheld for weeks cannot fill the page with its own history and hide the ones behind
-it. The operator alert is raised once, when the verdict is first withheld, not on every recheck.
+it. Documents that have already been **closed** are dropped before the queue is cut to size, for the
+same reason: a settled document keeps its old warning for the rest of the thirty-day window and that
+warning never moves again, so counting it would let weeks of finished work occupy every place in the
+round and leave the documents that still need an answer permanently unasked. The operator alert is
+raised once, when the verdict is first withheld, not on every recheck.
 
 A recheck that could not be completed **closes nothing**. If Xero does not answer, or does not return
 one of the invoices, or a database read fails while the answer is being turned into a verdict, the
@@ -807,6 +811,19 @@ release for this to hold: an older instance keeps writing exactly as it did, and
 qualify. The cost is deliberate — registrations that predate this change never become decidable on
 their own, because filling the marker in for them would be the database vouching for a stamp it did
 not make.
+
+**The database is what keeps that marker honest.** Two matching timestamps are not by themselves proof
+of who wrote them: the column is stored to the millisecond, so any writer that lands on the same
+millisecond matches — and an older build's completion write reads the row, posts to Xero and writes it
+back, so it can carry the database's own stamp forward onto a registration that finished later. There
+is nothing left in such a row for the poll to notice. The rule therefore lives in the database itself,
+as a trigger on the sync log: any statement that changes what a registration says it did — its status,
+its completion time, the payment id it created, or a re-claim — **clears the marker** unless that same
+statement mints a new one, and a marker supplied when a row is first inserted is refused outright. An
+older build cannot avoid this, because it must claim the row before it can re-post, and the claim
+alone is enough. The rule can only ever take provenance away, so the worst it can do is withhold a
+reversal for a human to check. Restoring a database backup clears the markers on the restored rows for
+the same reason, and their reversals are withheld until a fresh registration is stamped.
 
 All four checks are answered by a **single** request that asks Xero only for invoices changed since
 the last successful poll, using the `If-Modified-Since` header. The poll advances its cursor only

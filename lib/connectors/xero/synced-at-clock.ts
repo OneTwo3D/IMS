@@ -53,6 +53,20 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * holds, and every registration this process ever stamps would read as undecidable. One evaluation,
  * assigned to both columns, is the whole mechanism. (Both columns are `TIMESTAMP(3)`, so both round
  * the one value identically and the equality is exact rather than approximate.)
+ *
+ * THE EQUALITY IS ENFORCED BY THE DATABASE, AND THIS STATEMENT MUST BE THE LAST OF THE TWO (round 6,
+ * Codex finding 1). Equality alone was never proof: `TIMESTAMP(3)` means any writer landing on the
+ * same millisecond satisfies it, and the previous release's completion write is a read-modify-write
+ * that can carry this very stamp forward onto a registration that finished later. The rule is
+ * therefore a trigger (migration 20260821090000): a statement that changes `status`, `syncedAt`,
+ * `externalTransactionId` or `processingStartedAt` WITHOUT assigning the marker in the same statement
+ * has the marker cleared out from under it.
+ *
+ * That is why the caller runs the Prisma SYNCED write FIRST and this statement SECOND. The SYNCED
+ * write changes the status (and often the external id) without touching the marker, so it trips the
+ * trigger and clears whatever provenance the row was carrying; this statement then mints the new
+ * pair, and because it assigns the marker itself the trigger does not fire on it. Swap the two and
+ * the transaction would erase its own stamp — every registration undecidable, silently.
  */
 export async function stampSyncedAtFromDatabaseClock(
   tx: Pick<Prisma.TransactionClient, '$executeRaw'>,

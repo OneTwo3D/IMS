@@ -1035,6 +1035,11 @@ export type RegisteredPaymentRow = {
    * NULL, or any value other than `syncedAt`, means the completion time was NOT minted by the
    * database — an old build wrote it, or moved `syncedAt` out from under a marker it did not know
    * about. See `databaseStampedCompletion`.
+   *
+   * What makes a present-and-equal pair mean anything is NOT this reader: it is the trigger in
+   * 20260821090000, which clears this column whenever a statement changes the completion facts it
+   * was minted with and does not mint a new one. Without that, equality is only a statement about
+   * two millisecond values, and any writer can produce it.
    */
   syncedAtDatabaseClock: Date | null
 }
@@ -1074,12 +1079,33 @@ export type RegisteredPaymentRow = {
  * o3d-batch-payidx merge algebra intact: `billpay` still withholds everywhere the sibling's
  * `OR: [{ syncedAt: null }, { syncedAt: { gte: fence } }]` calls a row undecidable, and now in
  * strictly more places besides.
+ *
+ * WHAT THE EQUALITY ACTUALLY RESTS ON (o3d-clxw round 6, Codex finding 1). Round 5's third line —
+ * "the only writer that can produce it" — was false, and this function cannot repair it. `syncedAt`
+ * is `TIMESTAMP(3)`: any writer that lands a value on the same stored millisecond satisfies the
+ * equality, and the old build's completion write does not even need luck to do it, because it is a
+ * read-modify-write that can carry the database's own stamp forward onto a registration that
+ * completed later. A laundered pair is bit-identical to a minted one, so THERE IS NOTHING FOR A
+ * READER TO SEE. The rule had to move to write time, and to a place that binds writers this
+ * repository does not contain:
+ *
+ *   the trigger in prisma/migrations/20260821090000_accounting_sync_log_synced_at_database_clock
+ *   clears this column whenever a statement changes `status`, `syncedAt`, `externalTransactionId`
+ *   or `processingStartedAt` without minting a new marker in the same statement — and refuses one
+ *   supplied by an INSERT altogether.
+ *
+ * So an old build invalidates provenance because of WHAT IT TOUCHED, never because of what value it
+ * happened to write (its re-sync must claim the row first, and the claim alone is enough). This
+ * function is then what it always claimed to be: a check that the pair the database left behind is
+ * still the pair it minted. It is deliberately kept as well — a row from a database where the
+ * trigger is somehow absent still has to answer for itself, and the answer is "undecided".
  */
 export function databaseStampedCompletion(row: Pick<RegisteredPaymentRow, 'syncedAt' | 'syncedAtDatabaseClock'>): Date | null {
   const { syncedAt, syncedAtDatabaseClock } = row
   if (syncedAt == null || syncedAtDatabaseClock == null) return null
   // Equality, not "the marker exists": a stale marker under a host-clock rewrite would otherwise
-  // vouch for an instant that is no longer this row's.
+  // vouch for an instant that is no longer this row's. What makes the equality PROOF rather than a
+  // coincidence is the database refusing to let anyone but the stamp leave the pair agreeing.
   if (syncedAt.getTime() !== syncedAtDatabaseClock.getTime()) return null
   return syncedAtDatabaseClock
 }

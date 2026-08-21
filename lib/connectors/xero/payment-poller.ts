@@ -957,7 +957,12 @@ async function processDeltaChunk(
 //   PLACE IN THE ORDERING (round 5, finding 3): rewriting a marker appends a row rather than moving
 //   one, so a page bounded by ROWS fills with the histories of the longest-withheld documents and
 //   starves every newer one permanently. The candidate set is therefore built by GROUPING the markers
-//   per document and taking each document's newest — see `recheckWithheldReversals`.
+//   per document and taking each document's newest. AND THE PAGE MUST BE A PAGE OF DOCUMENTS THAT
+//   NEED SOMETHING (round 6, finding 2): a settled document's open marker is frozen where an open
+//   document's is rewritten, so under oldest-first every settled document sorts ahead of every worked
+//   one, and a bound spent before the closures are read is spent on documents with nothing left to
+//   decide. Openness is therefore decided across BOTH kinds of marker before the bound is applied —
+//   see `openWithheldDocuments`.
 //
 // Failure is always towards asking again: a marker that could not be rewritten stays as it was, which
 // leaves the document due; a Xero read that fails re-asks nothing and closes nothing; and a
@@ -982,13 +987,17 @@ const WITHHELD_CLOSED_ACTIONS = [
 export const WITHHELD_RECHECK_INTERVAL_MS = 60 * 60 * 1000
 
 /**
- * How many DOCUMENTS one poll rebuilds the open set from — not how many marker rows it reads.
+ * How many STILL-OPEN DOCUMENTS one poll rebuilds the open set from — not how many marker rows it
+ * reads, and not how many documents have markers.
  *
- * The distinction is the whole of round 5's finding 3: markers accumulate (reconsidering appends a
- * row), so a bound on rows is a bound that one long-running document's own history can consume,
- * while a bound on documents is not.
+ * The first distinction is round 5's finding 3: markers accumulate (reconsidering appends a row), so
+ * a bound on rows is a bound one long-running document's own history can consume. The second is
+ * round 6's finding 2: a settled document keeps its historical open marker for the rest of the
+ * horizon, so a bound applied before the closures are known is a bound that documents needing
+ * nothing can consume. Both are the same starvation, and both are answered by deciding what the
+ * bound is counting BEFORE spending it — see `openWithheldDocuments`.
  */
-const WITHHELD_MARKER_SCAN = 400
+export const WITHHELD_MARKER_SCAN = 400
 
 /**
  * How old a marker may be and still be believed.
@@ -1025,14 +1034,15 @@ type WithheldMarker = {
  *
  * Reduced from the activity log rather than a queue table: a document is open when its newest OPEN
  * marker is newer than any closure written for it, and due when that marker has rested a full
- * interval. Open and closed markers are read separately so neither can crowd the other out of a
- * bounded scan — the open side wants the documents whose last reconsideration is OLDEST (that is
- * where the overdue work is) and the closure side wants each document's NEWEST closure (that is what
- * settles it).
+ * interval. The two kinds arrive from one grouped scan that has already compared them per document
+ * (`openWithheldDocuments`), so the rule below is applied a second time to data that satisfies it —
+ * deliberately, because the openness rule belongs where it can be read and tested, and re-asserting
+ * it costs a map lookup.
  *
- * Each list holds at most one entry per document, because the queries group by document. That is
+ * Each list holds at most one entry per document, because the query groups by document. That is
  * load-bearing rather than tidy: the caller's page is bounded, and a list of raw marker ROWS lets one
- * document's history fill it and starve every other document for ever (finding 3).
+ * document's history fill it and starve every other document for ever (r5 finding 3) — as does a
+ * page whose bound is spent before closed documents are recognised (r6 finding 2).
  *
  * Note the two clocks that appear here are BOTH scheduling, not ordering — `createdAt` is the
  * database's and `now` is this host's, and disagreement between them can only make a recheck happen
@@ -1097,6 +1107,116 @@ async function deferWithheldMarker(marker: WithheldMarker, reason: string): Prom
   })
 }
 
+/** The entity types the recheck can act on — the two the withheld markers are ever written for. */
+const RECHECKABLE_ENTITY_TYPES: ReadonlySet<string> = new Set(['PURCHASE_ORDER', 'SALES_ORDER'])
+
+/**
+ * The documents whose withheld verdict is STILL OPEN, least-recently-reconsidered first, with each
+ * one's last closure alongside — classified in the database, before anything is discarded.
+ *
+ * ONE ROW PER DOCUMENT, NOT ONE PER MARKER (o3d-clxw round 5, Codex finding 3).
+ *
+ * Round 4's round robin rests on "oldest first means least recently reconsidered", and that only
+ * holds if a document occupies ONE place in the ordering. It does not: reconsidering a document
+ * APPENDS a marker, the old ones stay in the activity log for the whole thirty-day horizon, and a
+ * bounded scan of ROWS ordered oldest-first therefore fills with the HISTORY of whichever documents
+ * have been withheld longest. One document reconsidered hourly writes seven hundred rows a month on
+ * its own — more than the whole scan — so a document that became withheld yesterday need never appear
+ * in the page at all, and never being in the page means never being reconsidered, which means never
+ * writing a newer marker: the starvation is permanent and self-sustaining. Worse, the marker such a
+ * page DOES yield for the starving document is its oldest row, so the timer that decides whether it
+ * is due is read from history rather than from its last reconsideration.
+ *
+ * Grouping per document made the bound a bound on DOCUMENTS. It did not make it a bound on documents
+ * THAT NEED ANYTHING (round 6, Codex finding 2), and that is the same starvation one step along:
+ *
+ *   a settled document keeps its historical open marker for the rest of the horizon, and that marker
+ *   is FROZEN — nothing rewrites it, because the document is never reconsidered again. An open
+ *   document's marker, by contrast, is rewritten every time it IS reconsidered. So in an
+ *   oldest-first ordering over open markers alone, every settled document sorts AHEAD of every
+ *   document that is actually being worked, and once there are as many settled documents in the
+ *   horizon as the scan is wide, the page is entirely documents that need nothing and no open
+ *   document is ever reconsidered again. Reading the closures afterwards cannot repair it: by then
+ *   the bound has already been spent.
+ *
+ * So the classification happens BEFORE the bound, and in the only place that can do it in one pass:
+ * each document's last OPEN marker and last CLOSURE are aggregated together, the documents whose
+ * latest marker across BOTH kinds is a closure are dropped, and only then are the oldest
+ * `WITHHELD_MARKER_SCAN` of what remains returned. A settled document cannot occupy a slot, because
+ * it never reaches the LIMIT.
+ *
+ * Raw SQL because this is a conditional aggregate — `MAX(...) FILTER (WHERE action IN ...)` twice
+ * over one grouped scan — and comparing two aggregates of the same group is not something Prisma's
+ * `groupBy` can express: `having` compares an aggregate against a constant. Two `groupBy` calls is
+ * what round 5 did, and two calls is precisely what forces the bound to be applied to one kind before
+ * the other kind is known. The closure is still returned rather than only used as a filter, so
+ * `dueWithheldMarkers` keeps deciding openness from the pair it is given.
+ *
+ * (Cost: the aggregate sees the whole horizon rather than stopping at the first N rows — as round 5's
+ * group already did. These six actions are a vanishingly small fraction of `activity_logs`, so
+ * finding N of them meant scanning most of the window anyway. An index over
+ * (action, entityType, entityId, createdAt) would make it cheap and is worth doing; it is a separate
+ * concurrent-build migration, not part of this correctness fix.)
+ */
+async function openWithheldDocuments(horizon: Date): Promise<{ open: WithheldMarker[]; closed: WithheldMarker[] }> {
+  const openActions = [...WITHHELD_OPEN_ACTIONS]
+  const closedActions = [...WITHHELD_CLOSED_ACTIONS]
+  // The horizon goes in as an explicit UTC instant and the two aggregates come back as explicit UTC
+  // strings: `activity_logs."createdAt"` is TIMESTAMP WITHOUT TIME ZONE holding UTC, so a bare
+  // parameter or a bare column would be read through whatever the session's TimeZone happens to be.
+  // These markers only schedule (see `dueWithheldMarkers`) — but a whole-timezone shift in the due
+  // timer is still a recheck that runs hours early or not at all.
+  const rows = await db.$queryRaw<Array<{
+    entityType: string
+    entityId: string
+    openMax: Date | string | null
+    closedMax: Date | string | null
+  }>>`
+    SELECT d."entityType",
+           d."entityId",
+           to_char(d."openMax", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "openMax",
+           to_char(d."closedMax", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "closedMax"
+    FROM (
+      SELECT "entityType"::text AS "entityType",
+             "entityId" AS "entityId",
+             MAX("createdAt") FILTER (WHERE "action" = ANY(${openActions}::text[])) AS "openMax",
+             MAX("createdAt") FILTER (WHERE "action" = ANY(${closedActions}::text[])) AS "closedMax"
+      FROM activity_logs
+      WHERE "tag" = 'sync'
+        AND "action" = ANY(${[...openActions, ...closedActions]}::text[])
+        AND "entityId" IS NOT NULL
+        AND "createdAt" >= ${horizon.toISOString()}::timestamptz AT TIME ZONE 'UTC'
+      GROUP BY "entityType", "entityId"
+    ) d
+    WHERE d."openMax" IS NOT NULL
+      AND (d."closedMax" IS NULL OR d."openMax" > d."closedMax")
+    ORDER BY d."openMax" ASC
+    LIMIT ${WITHHELD_MARKER_SCAN}
+  `
+
+  // Normalised rather than trusted: a raw query hands back whatever the driver made of a
+  // `timestamp` — a Date, a Date from another realm, or a string — and none of those is a reason to
+  // lose a document. A value that cannot be read as an instant is dropped, because a marker with no
+  // time cannot be ordered, and an unordered marker would hold the head of an oldest-first page.
+  const at = (value: Date | string | null): Date | null => {
+    if (value == null) return null
+    const ms = new Date(value).getTime()
+    return Number.isFinite(ms) ? new Date(ms) : null
+  }
+  const open: WithheldMarker[] = []
+  const closed: WithheldMarker[] = []
+  for (const row of rows) {
+    if (!RECHECKABLE_ENTITY_TYPES.has(row.entityType) || !row.entityId) continue
+    const entityType = row.entityType as ActivityEntityType
+    const openAt = at(row.openMax)
+    if (openAt == null) continue
+    open.push({ entityType, entityId: row.entityId, createdAt: openAt })
+    const closedAt = at(row.closedMax)
+    if (closedAt != null) closed.push({ entityType, entityId: row.entityId, createdAt: closedAt })
+  }
+  return { open, closed }
+}
+
 /**
  * Go back and re-ask every withheld reversal that has rested long enough.
  *
@@ -1110,56 +1230,7 @@ async function recheckWithheldReversals(
   fetchInvoices: (path: string) => Promise<{ ok: boolean; data?: XeroInvoicesResponse; error?: string; status?: number }>,
 ): Promise<void> {
   const horizon = new Date(Date.now() - WITHHELD_MARKER_HORIZON_MS)
-  // ONE ROW PER DOCUMENT, NOT ONE PER MARKER (o3d-clxw round 5, Codex finding 3).
-  //
-  // Round 4's round robin rests on "oldest first means least recently reconsidered", and that only
-  // holds if a document occupies ONE place in the ordering. It does not: reconsidering a document
-  // APPENDS a marker, the old ones stay in the activity log for the whole thirty-day horizon, and a
-  // bounded scan of ROWS ordered oldest-first therefore fills with the HISTORY of whichever documents
-  // have been withheld longest. One document reconsidered hourly writes seven hundred rows a month on
-  // its own — more than the whole scan — so a document that became withheld yesterday need never
-  // appear in the page at all, and never being in the page means never being reconsidered, which
-  // means never writing a newer marker: the starvation is permanent and self-sustaining. Worse, the
-  // marker such a page DOES yield for the starving document is its oldest row, so the timer that
-  // decides whether it is due is read from history rather than from its last reconsideration.
-  //
-  // Grouping makes the bound a bound on DOCUMENTS, which is what it was always meant to be, and takes
-  // the newest marker per document, which is what "least recently reconsidered" was always meant to
-  // read. History cannot occupy a slot, because a document has exactly one.
-  //
-  // (Cost: the group has to see the whole horizon rather than stopping at the first N rows. In
-  // practice the old query rarely stopped early either — these four actions are a vanishingly small
-  // fraction of activity_logs, so finding N of them already meant scanning most of the window. An
-  // index over (action, entityType, entityId, createdAt) would make this cheap and is worth doing;
-  // it is a separate concurrent-build migration, not part of this correctness fix.)
-  const lastMarkerPerDocument = (
-    actions: readonly string[],
-    order: 'asc' | 'desc',
-    onlyEntityIds?: string[],
-  ) => db.activityLog.groupBy({
-    by: ['entityType', 'entityId'],
-    where: {
-      tag: 'sync',
-      action: { in: [...actions] },
-      entityId: onlyEntityIds ? { in: onlyEntityIds } : { not: null },
-      createdAt: { gte: horizon },
-    },
-    _max: { createdAt: true },
-    orderBy: { _max: { createdAt: order } },
-    take: WITHHELD_MARKER_SCAN,
-  })
-  const named = (groups: Awaited<ReturnType<typeof lastMarkerPerDocument>>): WithheldMarker[] =>
-    groups.flatMap((g) => (g.entityId == null || g._max.createdAt == null
-      ? []
-      : [{ entityType: g.entityType, entityId: g.entityId, createdAt: g._max.createdAt }]))
-
-  // OPEN documents least-recently-reconsidered first (the overdue end). Their closures are then read
-  // FOR THOSE DOCUMENTS ONLY: a closure that decides one of these documents can no longer be crowded
-  // out of a bounded page by unrelated closures, which would have re-opened a settled document.
-  const openMarkers = named(await lastMarkerPerDocument(WITHHELD_OPEN_ACTIONS, 'asc'))
-  const closureMarkers = openMarkers.length === 0
-    ? []
-    : named(await lastMarkerPerDocument(WITHHELD_CLOSED_ACTIONS, 'desc', openMarkers.map((m) => m.entityId)))
+  const { open: openMarkers, closed: closureMarkers } = await openWithheldDocuments(horizon)
 
   const due = dueWithheldMarkers(openMarkers, closureMarkers, Date.now())
   if (due.length === 0) return
