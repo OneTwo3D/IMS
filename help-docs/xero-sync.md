@@ -1398,12 +1398,29 @@ from the credit note's own record (`SCN-…`)**, whatever you type in the number
 can never claim one number. What you type is still sent — it travels as the credit note's *Reference*
 in Xero, which is also where the purchase order reference goes when you leave the field blank.
 
-That is what lets the supplier credit note use the same posting verb as the sales credit note. The
-alternative — a create-only post, which refuses a duplicate number — protects against a collision
-that can no longer happen, and in exchange **creates a second credit note** whenever the response to
-the first post is lost in transit, understating payables by the duplicate. Posting under a number that
-is unique to the record means a retry replaces that record's own document and the two systems
-converge.
+A number that is unique to the record is also what makes the *other* supplier credit-note hazard
+closable. If the response to a post is lost in transit — the request landed, the reply did not — IMS
+has no ledger id for the credit note and the sync row retries. Xero's idempotency key only covers six
+minutes, so a queued retry is a fresh request, and nothing about the posting verb reliably stops it
+becoming a **second credit note**, which understates payables by the duplicate.
+
+So IMS asks the ledger first. Before creating a supplier credit note it looks for one already filed
+under that `SCN-…` number, and because the number is minted from the credit note's own record, a
+document found under it can only be this credit note:
+
+- **Found** — IMS links that document and sends nothing. This is the lost-response case healing
+  itself
+- **Not there, and IMS has never sent a create for this credit note** — it is created
+- **Not there, but a create was already sent** — IMS **refuses** and says so. An empty answer is not
+  proof the earlier attempt failed. Check Xero for the number: if the credit note is there, link it
+  to the IMS record; if it genuinely is not, post it in Xero and link it
+- **The ledger could not answer** (Xero unreachable, or a partial result it cannot vouch for) — IMS
+  refuses and retries later
+
+The last two are deliberate: refusing costs an operator a look at Xero, where a duplicate credit note
+is a mis-stated payables balance nobody goes looking for. A credit note queued before this change,
+under a number IMS did not mint, is refused rather than guessed at — re-record it so it is queued
+under its own number.
 
 ### Releasing a stale external id
 

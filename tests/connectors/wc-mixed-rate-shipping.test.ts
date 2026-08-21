@@ -214,3 +214,218 @@ test('rounded money, not rate fractions: 8.33 of shipping at 20% still reconcile
     true,
   )
 })
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cyn ROUND 3 — A BLENDED SHIPPING LINE, AND WHAT A DOCUMENT IMS KNOWS IS WRONG MAY DO.
+//
+// Round 2 picks the shipping rate by ARITHMETIC: a candidate is accepted only if applying it to the
+// shipping net reproduces the tax Woo charged. That is sound whenever ONE rate explains the charge —
+// and a shipping line can be taxed at several at once (`shipping_lines[].taxes` is a LIST), in which
+// case no single rate reproduces it unless the blend happens to SUM to one IMS holds.
+//
+// What round 2 then did with that answer was withhold the PAYMENT and post the invoice anyway. The
+// payment is the recoverable half. Round 3 withholds the DOCUMENT.
+// ---------------------------------------------------------------------------------------------
+
+/** A 5% regional surcharge Woo can levy ALONGSIDE the standard rate on the same line. */
+const OUTPUT5: WcResolvedRateForDocument = { accountingTaxType: 'OUTPUT5', taxRateValue: 0.05, source: 'mapped' }
+/** A 15% rate, so a 15+5 blend SUMS to the 20% the order default already carries. */
+const OUTPUT15: WcResolvedRateForDocument = { accountingTaxType: 'OUTPUT15', taxRateValue: 0.15, source: 'mapped' }
+const BLEND_RATE_BY_ID = new Map<number, WcResolvedRateForDocument>([
+  [1, OUTPUT2], [2, ZERO], [3, OUTPUT5], [4, OUTPUT15], [7, UNMAPPED],
+])
+
+test('a blended-rate shipping line names the BLEND, and refuses to give the line a tax type', async () => {
+  // Woo: goods net 100.00 + 20.00 VAT. Shipping net 10.00 taxed TWICE — standard 20% (2.00) and a
+  // 5% regional surcharge (0.50) — so Woo charged 2.50 on shipping and wcOrder.total is 132.50.
+  // No single tax type produces 2.50 on 10.00: 20% gives 2.00, 5% gives 0.50.
+  const { resolveWcShippingTaxRate, reconcileWcDocumentTax } = await orderImport()
+
+  const shippingTax = resolveWcShippingTaxRate({
+    shippingLines: [{ total_tax: '2.50', taxes: [{ id: 1, total: '2.00' }, { id: 3, total: '0.50' }] }],
+    shippingNetForeign: 10,
+    rateById: BLEND_RATE_BY_ID,
+    orderDefault: OUTPUT2,
+  })
+
+  assert.equal(shippingTax.resolved, false)
+  assert.equal(shippingTax.contributingRateCount, 2)
+  assert.match(shippingTax.reason ?? '', /applied 2 tax rates to this shipping line, together charging 2\.50 on 10\.00/)
+  assert.match(shippingTax.reason ?? '', /carries ONE tax type on shipping/)
+  // The operator's next move differs between the two failures, so the message must not conflate them.
+  assert.doesNotMatch(shippingTax.reason ?? '', /nor any WooCommerce shipping rate mapped in IMS/,
+    'sending someone to hunt for a mapping would waste the trip — no mapping expresses a blend')
+
+  // And the document it WOULD have posted, which is the amount half of the defect: shipping taxed at
+  // the order default gives a 132.00 invoice for a 132.50 order.
+  const reconciliation = reconcileWcDocumentTax([
+    { label: 'WIDGET', netForeign: 100, rateValue: 0.2, reportedTaxForeign: '20.00' },
+    { label: 'Shipping', netForeign: 10, rateValue: shippingTax.rateValue, reportedTaxForeign: '2.50' },
+  ])
+  assert.deepEqual(reconciliation.disagreements, [
+    { label: 'Shipping', modelledTax: 2, reportedTax: 2.5, difference: -0.5 },
+  ])
+})
+
+test('a blend that SUMS to a rate IMS holds still resolves — the arithmetic keeps its win', async () => {
+  // The same two-rate shipping line, but 15% + 5%: Woo charged 2.00 on 10.00, which the order's own
+  // 20% reproduces EXACTLY. There is a tax type that produces the right invoice, so the blend is not
+  // a refusal — order total 132.00, document 132.00, and it settles.
+  const { resolveWcShippingTaxRate, resolveWcInvoicePaymentAmount } = await orderImport()
+
+  const shippingTax = resolveWcShippingTaxRate({
+    shippingLines: [{ total_tax: '2.00', taxes: [{ id: 4, total: '1.50' }, { id: 3, total: '0.50' }] }],
+    shippingNetForeign: 10,
+    rateById: BLEND_RATE_BY_ID,
+    orderDefault: OUTPUT2,
+  })
+
+  assert.equal(shippingTax.resolved, true, 'counting the rates must not pre-empt reproducing the charge')
+  assert.equal(shippingTax.taxType, 'OUTPUT2')
+  assert.equal(shippingTax.rateValue, 0.2)
+  assert.equal(shippingTax.contributingRateCount, 2, 'it IS a blend; it is simply one a single rate explains')
+
+  const payload = await buildDocument({ goodsNet: 100, goodsTaxType: 'OUTPUT2', shippingNet: 10, shippingTaxType: 'OUTPUT2' })
+  assert.equal(xeroDocumentTotal(payload, { OUTPUT2: 0.2 }), 132)
+  assert.equal(
+    resolveWcInvoicePaymentAmount({ date_paid_gmt: '2026-08-20T10:00:00', total: '132.00' }, { totalsToTheOrder: true }),
+    132,
+  )
+})
+
+test('a rate listed at 0.00 alongside a charging one is NOT a blend', async () => {
+  // Zero-rated postage beside a standard rate is one rate charging. Counting rate IDS rather than
+  // CONTRIBUTIONS would call this a blend and refuse an order that resolves perfectly well.
+  const { resolveWcShippingTaxRate } = await orderImport()
+  const shippingTax = resolveWcShippingTaxRate({
+    shippingLines: [{ total_tax: '2.00', taxes: [{ id: 1, total: '2.00' }, { id: 2, total: '0.00' }] }],
+    shippingNetForeign: 10,
+    rateById: BLEND_RATE_BY_ID,
+    orderDefault: OUTPUT2,
+  })
+  assert.equal(shippingTax.resolved, true)
+  assert.equal(shippingTax.taxType, 'OUTPUT2')
+  assert.equal(shippingTax.contributingRateCount, 1)
+})
+
+// --- the document that will not total to its order does not reach the ledger --------------------
+
+test('a stamped document is REFUSED at the poster, with the reason and the remedy on the refusal', async () => {
+  const { buildUnreconciledTaxMarker, refuseUnreconciledDocument, UNRECONCILED_TAX_PAYLOAD_KEY } =
+    await import('@/lib/domain/accounting/document-tax-reconciliation')
+
+  const stamped = {
+    invoiceNumber: 'WC-INV-1',
+    shippingTaxType: 'OUTPUT2',
+    [UNRECONCILED_TAX_PAYLOAD_KEY]: buildUnreconciledTaxMarker(
+      'WooCommerce applied 2 tax rates to this shipping line, together charging 2.50 on 10.00 of shipping.',
+    ),
+  }
+  const refusal = refuseUnreconciledDocument(stamped)
+  assert.equal(refusal.post, false)
+  assert.match(refusal.post === false ? refusal.reason : '', /NOTHING WAS SENT/)
+  assert.match(refusal.post === false ? refusal.reason : '', /applied 2 tax rates/)
+  assert.match(refusal.post === false ? refusal.reason : '', /re-import the order/)
+})
+
+test('an ordinary document is untouched by the guard — no key, no refusal', async () => {
+  const { refuseUnreconciledDocument } = await import('@/lib/domain/accounting/document-tax-reconciliation')
+  assert.deepEqual(refuseUnreconciledDocument({ invoiceNumber: 'WC-INV-1', shippingTaxType: 'OUTPUT2' }), { post: true })
+})
+
+test('a stamp that did not survive the round trip still refuses', async () => {
+  // The marker travels through a Json column. Reading it back as a string, a null, or an empty object
+  // means the reason is lost — it does NOT mean the document became right.
+  const { refuseUnreconciledDocument, UNRECONCILED_TAX_PAYLOAD_KEY } =
+    await import('@/lib/domain/accounting/document-tax-reconciliation')
+
+  for (const mangled of ['a string', null, {}, { reason: 42 }]) {
+    const refusal = refuseUnreconciledDocument({ [UNRECONCILED_TAX_PAYLOAD_KEY]: mangled })
+    assert.equal(refusal.post, false, `a ${JSON.stringify(mangled)} marker must still refuse`)
+    assert.match(refusal.post === false ? refusal.reason : '', /could not be read back/)
+  }
+})
+
+test('the refused document leaves a verdict that points at the DOCUMENT, not the payment', async () => {
+  // Nothing posted, so nothing settles — and the settlement verdict says which of the two to chase.
+  const verdict = settlementStatus({ paidLocally: true, syncEnabled: true, documentPosted: false, payment: null, totalForeign: 132.5 })
+  assert.equal(verdict.status, 'NOT_APPLICABLE')
+  assert.match(verdict.detail, /document sync is what to chase, not the payment/)
+  // What must NOT happen: a payment for the order total registered against a 132.00 invoice, which
+  // Xero accepts as a PART payment and IMS reports as settled.
+  assert.notEqual(verdict.status, 'SETTLED')
+})
+
+// --- the seam ----------------------------------------------------------------------------------
+//
+// The rules above are pure and unit-tested. What they cannot see is whether the importer STAMPS and
+// the poster CONSULTS — one expression each, in the middle of a 1,600-line importer and a switch in
+// the Xero processor, neither reachable without a database and a live ledger. Pinned at the source,
+// the same way tests/connectors/wc-invoice-number-wiring.test.ts pins its own seam.
+
+/** Block and line comments removed, so a commented-out call cannot satisfy a source scan. */
+function withoutComments(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+}
+
+test('the comment stripper actually strips — the scan below is worthless otherwise', () => {
+  const stripped = withoutComments('/**\n * queueAccountingSync({\n */\nconst x = 1 // queueAccountingSync({\n')
+  assert.doesNotMatch(stripped, /queueAccountingSync/)
+  assert.match(stripped, /const x = 1/)
+  assert.match(withoutComments("const url = 'https://x.test/a'"), /https:\/\/x\.test\/a/, 'a URL is not a comment')
+})
+
+test('the importer stamps the document it computed will not total to the order', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = withoutComments(readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8'))
+
+  assert.match(src, /const unreconciledReason = !documentTotalsToTheOrder/,
+    'the reason must be derived from the reconciliation, not re-decided at the payload')
+  assert.match(
+    src,
+    /\.\.\.\(unreconciledReason\s*\n?\s*\? \{ \[UNRECONCILED_TAX_PAYLOAD_KEY\]: buildUnreconciledTaxMarker\(unreconciledReason\) \}/,
+    'the stamp must ride on the queued accounting payload, or the poster has nothing to refuse',
+  )
+  // Round 2's gate: the warning fired only for a PAID order, so an unpaid one posted a wrong document
+  // in silence and was paid against it later.
+  assert.doesNotMatch(src, /if \(!documentTotalsToTheOrder && wcOrder\.date_paid_gmt\)/,
+    'the refusal must not be conditioned on the order already being paid')
+  assert.match(src, /action: 'wc_invoice_tax_does_not_reconcile',\s*\n\s*tag: 'accounting',\s*\n\s*level: 'ERROR',/,
+    'a document that will never post is an ERROR, not a WARNING attached to one that did')
+})
+
+test('the Xero poster refuses a stamped document before it reads or sends anything', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = withoutComments(readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8'))
+
+  const createCase = src.slice(src.indexOf("case 'SALES_INVOICE': {"), src.indexOf("case 'SALES_INVOICE_UPDATE': {"))
+  const guard = createCase.indexOf('refuseUnreconciledDocument(payload)')
+  const cancelledGuard = createCase.indexOf('guardCancelledSalesOrderInvoice(')
+  const push = createCase.indexOf('pushSalesInvoice({')
+  assert.ok(guard > 0, 'the create must consult the guard')
+  assert.ok(guard < cancelledGuard && guard < push, 'it must run before any read and before the post')
+  assert.match(createCase, /if \(!reconciled\.post\) return \{ success: false, error: reconciled\.reason \}/,
+    'a refusal must return as an ordinary sync failure, so the row is visible with the reason on it')
+
+  const updateCase = src.slice(src.indexOf("case 'SALES_INVOICE_UPDATE': {"), src.indexOf("case 'PURCHASE_INVOICE': {"))
+  const updateGuard = updateCase.indexOf('refuseUnreconciledDocument(payload)')
+  // `indexOf` returns -1 for ABSENT, and -1 is less than every real index — so "before the post"
+  // must be asserted as PRESENT AND before, or deleting the guard passes.
+  assert.ok(updateGuard > 0, 'the UPDATE must consult the guard — overwriting a good document with the stamped one is the same damage')
+  assert.ok(updateGuard < updateCase.indexOf('updateSalesInvoice('), 'and before it posts')
+})
+
+test('the supplier credit-note poster is told whether a create was ever dispatched', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = withoutComments(readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8'))
+  const creditCase = src.slice(
+    src.indexOf("case 'PURCHASE_CREDIT_NOTE': {"),
+    src.indexOf("case 'PURCHASE_CREDIT_NOTE_ALLOCATION': {"),
+  )
+  const attempt = creditCase.indexOf('await isFirstPurchaseCreditNoteAttempt(entryId, referenceType, referenceId)')
+  const push = creditCase.indexOf('pushPurchaseCreditNote({')
+  assert.ok(attempt > 0 && attempt < push, 'the attempt must be established before the poster is called')
+  assert.match(creditCase, /if \(!attempt\.ok\) return \{ success: false, error: attempt\.error \}/,
+    'a count that cannot be read must refuse, never read as "first attempt"')
+  assert.match(creditCase, /firstAttempt: attempt\.firstAttempt,/, 'and the answer must actually be passed')
+})

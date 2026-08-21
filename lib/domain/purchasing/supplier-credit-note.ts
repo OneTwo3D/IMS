@@ -194,3 +194,139 @@ export function buildSupplierCreditNoteSyncPayload(params: {
       : {}),
   }
 }
+
+// ---------------------------------------------------------------------------
+// THE REPLAY FENCE ON THE SUPPLIER CREDIT-NOTE CREATE (o3d-tfri round 3)
+// ---------------------------------------------------------------------------
+//
+// A supplier credit note posts EXACTLY ONCE or the ledger understates payables by the duplicate.
+// What is supposed to stop a second one is IMS's own record of the first — `accountingCreditNoteId`
+// — and that record is precisely what is missing in the case that matters: the response to the
+// first attempt was LOST. The request may have landed; IMS cannot tell; the row retries.
+//
+// NOTHING ELSE COVERS IT.
+//
+//  • Xero's `Idempotency-Key` is retained for SIX MINUTES. A queued retry is minutes-to-hours later,
+//    so beyond that window a replay is simply a new request.
+//  • `PUT` is create-only, and ACCPAYCREDIT numbers are NOT required to be unique in Xero, so the
+//    replay does not collide — it CREATES A SECOND CREDIT NOTE. That is round 1's defect.
+//  • `POST` is create-or-update on `CreditNoteNumber` — for document types where Xero ENFORCES that
+//    number's uniqueness. Round 2 reached for that as the answer, on the reasoning that a replay
+//    would replace its own document and converge. IT DOES NOT FOLLOW, AND THE SAME PARAGRAPH SAYS
+//    SO: a number Xero does not require to be unique is not a key Xero can match on. Whether POST
+//    upserts an ACCPAYCREDIT by number cannot be established without a live call against an
+//    organisation holding real payables, and the sibling branch o3d-batch-invnum already settled
+//    what to do with a premise like that — it must not carry the irreversible write.
+//
+// SO THE VERB IS NOT THE FENCE. The fence is asking the ledger, and the reason it CAN be asked here
+// — where the sales side's o3d-k26m.5 could not — is the other half of round 1: the number is
+// `SCN-<primary key>`, ours and unique by construction. A document in Xero under that number cannot
+// be anyone else's, cannot be a different credit note of ours, and can only be THIS one, already
+// posted. That makes a replayed create RECOGNISABLE, which is exactly the pairing o3d-batch-invnum
+// recorded as the thing create-only semantics needed and did not have.
+//
+// ONLY A POSITIVE ANSWER IS EVIDENCE. Finding the document proves the create landed. NOT finding it
+// proves nothing about a filter we cannot verify, so an empty answer is never on its own the reason
+// a second create is allowed — the caller pairs it with the fact that this is the FIRST attempt, and
+// where it cannot, it refuses. A refusal is recoverable: an operator links or voids the document and
+// the row moves. A duplicate credit note is a mis-stated payables balance that nobody is looking for.
+export type LedgerCreditNoteClaim = {
+  creditNoteId: string
+  creditNoteNumber: string
+  /** Xero's own status string, upper-cased. `UNKNOWN` when the lookup did not report one. */
+  status: string
+}
+
+export type PurchaseCreditNoteLookup =
+  | { ok: true; claims: LedgerCreditNoteClaim[] }
+  /** `unaskable`: no retry can fix this — the question itself cannot be put to the ledger. */
+  | { ok: false; error: string; unaskable?: boolean }
+
+export type PurchaseCreditNotePostDecision =
+  | { action: 'create' }
+  | { action: 'adopt'; creditNoteId: string; detail: string }
+  | { action: 'refuse'; reason: string; retryable: boolean }
+
+/**
+ * A credit note in one of these states is a live document holding our number: the create landed, and
+ * the only thing missing is IMS's copy of its id. Anything else — VOIDED, DELETED, or a status we do
+ * not recognise — is a human decision or an unknown, and neither is something to adopt silently.
+ */
+const ADOPTABLE_STATUSES = new Set(['DRAFT', 'SUBMITTED', 'AUTHORISED', 'PAID'])
+
+/**
+ * What to do about a supplier credit note whose ledger document may or may not already exist.
+ *
+ * `firstAttempt` is the ONLY thing that licenses a create on an empty answer, and it is about this
+ * credit note rather than this sync row: if IMS has never dispatched a create for it, there is
+ * nothing for a replay to duplicate and the empty answer only has to be no worse than the state
+ * before the fence existed.
+ */
+export function decidePurchaseCreditNotePost(input: {
+  creditNoteNumber: string
+  lookup: PurchaseCreditNoteLookup
+  firstAttempt: boolean
+}): PurchaseCreditNotePostDecision {
+  const { creditNoteNumber: number, lookup } = input
+
+  if (!lookup.ok) {
+    return {
+      action: 'refuse',
+      retryable: !lookup.unaskable,
+      reason:
+        `NOTHING WAS SENT. IMS could not establish whether credit note ${number} is already in the ledger: `
+        + `${lookup.error}. Posting without that answer risks a SECOND ACCPAYCREDIT for one credit — Xero's `
+        + `idempotency key lasts six minutes and ACCPAYCREDIT numbers need not be unique, so a replay creates `
+        + `rather than collides. ${lookup.unaskable
+          ? 'This will not clear on its own: post the credit note in Xero by hand and link its id to the IMS credit note.'
+          : 'It retries.'}`,
+    }
+  }
+
+  if (lookup.claims.length > 1) {
+    return {
+      action: 'refuse',
+      retryable: false,
+      reason:
+        `NOTHING WAS SENT. The ledger already holds ${lookup.claims.length} credit notes numbered ${number} `
+        + `(${lookup.claims.map((c) => `${c.creditNoteId} ${c.status}`).join(', ')}). That number is minted from `
+        + `this credit note's primary key, so every one of them is a duplicate of THIS credit note and payables `
+        + `is understated by all but one. Void the extras in Xero, then retry so IMS links the survivor.`,
+    }
+  }
+
+  const [claim] = lookup.claims
+  if (claim) {
+    if (ADOPTABLE_STATUSES.has(claim.status.toUpperCase())) {
+      return {
+        action: 'adopt',
+        creditNoteId: claim.creditNoteId,
+        detail:
+          `Credit note ${number} is already in the ledger as ${claim.creditNoteId} (${claim.status}) — a previous `
+          + `attempt landed and its response was lost. IMS linked that document instead of creating a second one.`,
+      }
+    }
+    return {
+      action: 'refuse',
+      retryable: false,
+      reason:
+        `NOTHING WAS SENT. The ledger holds credit note ${number} as ${claim.creditNoteId} with status `
+        + `${claim.status}, so a previous attempt landed and was then voided or is in a state IMS does not `
+        + `recognise. Re-creating it under the same number is a decision for a person: either restore/replace `
+        + `that document in Xero and link it, or cancel this sync row.`,
+    }
+  }
+
+  if (input.firstAttempt) return { action: 'create' }
+
+  return {
+    action: 'refuse',
+    retryable: false,
+    reason:
+      `NOTHING WAS SENT. A create for credit note ${number} has already been dispatched to Xero and its outcome `
+      + `is unknown — the ledger does not show the document now, but an empty answer is not proof that the earlier `
+      + `attempt failed, and creating again is how one credit note becomes two ACCPAYCREDITs. Check Xero for `
+      + `${number}: if it is there, link its id to the IMS credit note; if it is genuinely absent, post it from a `
+      + `fresh sync row.`,
+  }
+}

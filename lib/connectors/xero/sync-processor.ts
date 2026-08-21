@@ -35,6 +35,7 @@ import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/can
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
+import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
 import { applyBackReference, followUpObligationClaim, releaseFollowUpObligation } from '@/lib/domain/accounting/back-reference'
 import { stampSyncedAtFromDatabaseClock } from './synced-at-clock'
 import { claimHeldFrom, heldClaimWhere, releaseClaimForRetry, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
@@ -3345,6 +3346,54 @@ async function guardSalesInvoiceNumberOwnership(
 }
 
 /**
+ * HAS IMS EVER DISPATCHED A CREATE FOR THIS SUPPLIER CREDIT NOTE? (o3d-tfri r3)
+ *
+ * The question is about the CREDIT NOTE, not this row. `retryCount` alone answers it for the ordinary
+ * case — a row that has failed once may have failed AFTER the request left — but a row whose retries
+ * exhausted settles as FAILED, and `queueXeroSync` dedupes new enqueues on PENDING/PROCESSING/SYNCED
+ * only, so the same credit note can legitimately be re-queued as a BRAND NEW row with `retryCount` 0.
+ * Reading this row alone would then call a replay a first attempt, which is the one wrong answer that
+ * ends in a second ACCPAYCREDIT.
+ *
+ * Conservative in the safe direction, and deliberately: a sibling row that never actually sent
+ * (cancelled, or refused before the request was built) makes this say "not the first attempt", and
+ * the poster then refuses a create the ledger cannot vouch for. That costs an operator a look at
+ * Xero. The opposite error costs the ledger a duplicate credit note.
+ *
+ * FAILS CLOSED. A count that cannot be read is not permission to treat this as a first attempt.
+ */
+async function isFirstPurchaseCreditNoteAttempt(
+  entryId: string,
+  referenceType: string,
+  referenceId: string,
+): Promise<{ ok: true; firstAttempt: boolean } | { ok: false; error: string }> {
+  try {
+    const row = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { retryCount: true } })
+    if (!row) {
+      return { ok: false, error: `NOTHING WAS SENT. Sync row ${entryId} could not be read back to establish whether a supplier credit-note create has already been dispatched.` }
+    }
+    if (row.retryCount > 0) return { ok: true, firstAttempt: false }
+    const siblings = await db.accountingSyncLog.count({
+      where: {
+        connector: XERO_CONNECTOR,
+        type: 'PURCHASE_CREDIT_NOTE',
+        referenceType,
+        referenceId,
+        id: { not: entryId },
+      },
+    })
+    return { ok: true, firstAttempt: siblings === 0 }
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        `NOTHING WAS SENT. IMS could not establish whether a create has already been dispatched for this supplier `
+        + `credit note: ${String(error)}. Creating without that answer risks a second ACCPAYCREDIT.`,
+    }
+  }
+}
+
+/**
  * o3d-19gy / o3d-s36z / o3d-gfh: every remote call this entry makes is attributed to this entry's row.
  *
  * WHERE THE PERMISSION IS ACTUALLY GRANTED. Not here. This establishes the INTENT — which row is being
@@ -3419,6 +3468,11 @@ async function processClaimedEntry(
 
   switch (type) {
     case 'SALES_INVOICE': {
+      // o3d-cyn r3: FIRST, and before any read, let alone any write. A document the importer already
+      // computed will not total to its order is refused here rather than posted with a warning
+      // attached — see lib/domain/accounting/document-tax-reconciliation.ts.
+      const reconciled = refuseUnreconciledDocument(payload)
+      if (!reconciled.post) return { success: false, error: reconciled.reason }
       const guard = await guardCancelledSalesOrderInvoice(entryId, referenceType, referenceId, lease)
       if (!guard.post) return guard.result
       const customerId = guard.customerId
@@ -3459,6 +3513,10 @@ async function processClaimedEntry(
     }
 
     case 'SALES_INVOICE_UPDATE': {
+      // An UPDATE carrying the stamp would overwrite a good document with the bad one, which is the
+      // same damage as the create and one step harder to spot.
+      const reconciledUpdate = refuseUnreconciledDocument(payload)
+      if (!reconciledUpdate.post) return { success: false, error: reconciledUpdate.reason }
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for SALES_INVOICE_UPDATE' }
@@ -3719,8 +3777,12 @@ async function processClaimedEntry(
       // audit-g5u2: supplier credit note (ACCPAYCREDIT) — e.g. crediting a
       // duplicate freight bill. The payload carries the supplier contact + the
       // expense-account lines (built by recordSupplierFreightCreditNote, g5u2.3).
-      const fence = await lease.fenceBeforeRemoteWrite('purchase-credit-note')
-      if (!fence.ok) return fence.result
+      //
+      // o3d-tfri r3: and the poster must be told whether IMS has EVER dispatched a create for this
+      // credit note, because that is the only thing that turns "the ledger shows nothing" into
+      // permission to create one. Fails closed — a count we cannot read is not a first attempt.
+      const attempt = await isFirstPurchaseCreditNoteAttempt(entryId, referenceType, referenceId)
+      if (!attempt.ok) return { success: false, error: attempt.error }
       return pushPurchaseCreditNote({
         creditNoteNumber: payload.creditNoteNumber as string,
         contactName: payload.contactName as string,
@@ -3731,7 +3793,11 @@ async function processClaimedEntry(
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'purchase-credit-note'), supplierId: payload.supplierId as string | undefined }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+      }, resolveInvoiceStatus(postingMode), {
+        firstAttempt: attempt.firstAttempt,
+        idempotencyKey: buildXeroIdempotencyKey(entryId, 'purchase-credit-note'),
+        supplierId: payload.supplierId as string | undefined,
+      }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
     }
 
     case 'PURCHASE_CREDIT_NOTE_ALLOCATION': {

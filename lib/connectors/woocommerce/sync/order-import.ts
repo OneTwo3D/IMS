@@ -28,6 +28,9 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
 import { addMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
+import {
+  UNRECONCILED_TAX_PAYLOAD_KEY, buildUnreconciledTaxMarker,
+} from '@/lib/domain/accounting/document-tax-reconciliation'
 import { getSettingValue } from '@/lib/settings-store'
 import { notify } from '@/lib/notifications'
 import { parsePositiveIntegerEnv } from '@/lib/env'
@@ -197,8 +200,14 @@ export function pendingFxQueueWhere(externalOrderId?: string): Prisma.ShoppingSy
  * refuses it or, worse, accepts it as a PART payment and leaves a balance nobody is looking at — while
  * IMS compares the amount it sent against the order total, finds them equal, and reports SETTLED. The
  * caller establishes whether the document reconciles (see `reconcileWcDocumentTax`), and an order that
- * does not reconcile registers NOTHING: settlement then reads NOT_SENT, which is a discrepancy an
- * operator is shown.
+ * does not reconcile registers NOTHING.
+ *
+ * SINCE ROUND 3 THAT DOCUMENT ALSO DOES NOT POST (`refuseUnreconciledDocument`), so this guard is the
+ * second of two rather than the only one — and it stays, because it is the one that holds if a
+ * document ever reaches the ledger by another route. The verdict an operator sees is then
+ * NOT_APPLICABLE naming the DOCUMENT sync ("a payment cannot be attached until it has posted"), with
+ * the failed sync row and an ERROR activity naming the tax disagreement — rather than SETTLED, which
+ * is a lie nobody is shown.
  *
  * The argument is REQUIRED and has no default on purpose. A default would make the guard opt-in, and
  * the callers who forget it are exactly the ones whose documents are wrong.
@@ -286,14 +295,24 @@ export function resolveWcAccountingAmountConvention(input: {
 // correctly-built document totals to — and prints SETTLED. The one figure neither system compares
 // against is the one the ledger actually holds.
 //
-// Two changes, and they are layers rather than alternatives:
+// Three changes, and they are layers rather than alternatives:
 //
 //  1. RESOLVE THE SHIPPING RATE FROM THE SHIPPING LINE'S OWN TAX, so the ordinary mixed-rate order
 //     posts a document that does total to the order and settles.
-//  2. CHECK THE DOCUMENT AGAINST WOO'S OWN PER-COMPONENT TAX BEFORE CLAIMING THE PAYMENT SETTLES
-//     IT. When the tax the document will produce disagrees with the tax Woo reports, no payment is
-//     registered at all: the settlement verdict is then NOT_SENT, which is a discrepancy an operator
-//     is shown, rather than SETTLED, which is a lie nobody is shown.
+//  2. CHECK THE DOCUMENT AGAINST WOO'S OWN PER-COMPONENT TAX BEFORE CLAIMING THE PAYMENT SETTLES IT.
+//     When the tax the document will produce disagrees with the tax Woo reports, no payment is
+//     registered at all.
+//  3. AND DO NOT POST THAT DOCUMENT (round 3). Rounds 1 and 2 still sent the invoice — shipping on
+//     the order default, "there is no better guess" — and withheld only the payment. That withholds
+//     the recoverable half: a payment can be registered later, while an AUTHORISED receivable at the
+//     wrong total is on the VAT return and takes a credit note to undo. The document is STAMPED at
+//     import and REFUSED at the poster (`refuseUnreconciledDocument`), which leaves a failed sync row
+//     naming the fault and the remedy instead of a wrong figure in the ledger.
+//
+// THE CASE THAT FORCED (3) is a shipping line WooCommerce taxed at a BLEND of rates. (1) is chosen by
+// arithmetic — a rate is accepted only if it reproduces the tax Woo charged — which answers a blend
+// correctly whenever the blend SUMS to a rate IMS holds, and cannot answer one that does not. There
+// is no tax type to send, so there is no document to post.
 
 /** A tax rate as `resolveWcTaxRateById` reports it, reduced to what these decisions depend on. */
 export type WcResolvedRateForDocument = {
@@ -311,6 +330,12 @@ export type WcShippingTaxResolution = {
   resolved: boolean
   /** Named when unresolved, for the operator-facing warning. */
   reason?: string
+  /**
+   * How many WooCommerce tax rates actually CONTRIBUTED tax to the shipping line. More than one and
+   * the line is taxed at a BLEND, which no single tax type can reproduce unless the blend happens to
+   * sum to a rate we hold — see `resolveWcShippingTaxRate`.
+   */
+  contributingRateCount?: number
 }
 
 /**
@@ -336,9 +361,19 @@ function reproducesTax(netForeign: Decimal, rateValue: number, reportedTax: Deci
  *  1. a MAPPED rate the shipping line itself names, which reproduces Woo's shipping tax;
  *  2. the ORDER DEFAULT, if it reproduces Woo's shipping tax — this is the ordinary single-rate
  *     order, and it is what was always sent, so nothing about that case moves;
- *  3. nothing. The order default is still sent (there is no better guess, and omitting shipping
- *     would understate the invoice), but `resolved` is false and the caller must not then claim the
- *     document settles for the order total.
+ *  3. nothing. `resolved` is false, and since o3d-cyn round 3 that is not a warning attached to a
+ *     document that posts anyway — the document is stamped and the poster refuses it (see
+ *     `refuseUnreconciledDocument`). The order default is still reported as the type it WOULD have
+ *     carried, because that is what the operator needs to see to recognise the mis-mapping.
+ *
+ * A BLENDED SHIPPING LINE IS THE CASE WITH NO RIGHT ANSWER, and it is why (3) had to stop posting.
+ * WooCommerce taxes one shipping line at as many rates as apply to it — `shipping_lines[].taxes` is
+ * a LIST — so a line can carry, say, 15% + 5%. An accounting document has ONE `shippingTaxType`, so
+ * unless the blend SUMS to a rate IMS holds (and then the arithmetic above finds it, and the
+ * document is right), there is nothing to send that reproduces the charge. Guessing the order
+ * default there posts a receivable at a total nobody will reconcile against. The blend is COUNTED
+ * rather than inferred from the failure, so the operator is told which of the two situations they
+ * are in: a rate IMS has not mapped (map it) or a genuine blend (the document cannot express it).
  */
 export function resolveWcShippingTaxRate(input: {
   shippingLines: Array<{
@@ -354,7 +389,7 @@ export function resolveWcShippingTaxRate(input: {
   // No shipping line is put on the document at all below zero, so no tax type is used and there is
   // nothing here that can be wrong.
   if (!net.gt(0)) {
-    return { taxType: input.orderDefault.accountingTaxType, rateValue: 0, resolved: true }
+    return { taxType: input.orderDefault.accountingTaxType, rateValue: 0, resolved: true, contributingRateCount: 0 }
   }
 
   const reportedTax = input.shippingLines.reduce<Decimal>(
@@ -363,8 +398,13 @@ export function resolveWcShippingTaxRate(input: {
   )
 
   const named = new Map<number, WcResolvedRateForDocument>()
+  // Rates that actually MOVED money on this line. A rate id listed at 0.00 is not part of a blend —
+  // zero-rated postage alongside a standard rate is one rate charging, and the arithmetic below
+  // resolves it exactly as it always did.
+  const contributing = new Set<number>()
   for (const line of input.shippingLines) {
     for (const tax of line.taxes ?? []) {
+      if (!toDecimal(tax.total ?? 0).eq(0)) contributing.add(tax.id)
       const rate = input.rateById.get(tax.id)
       // `source: 'default'` means Woo named a rate id IMS has no mapping for, so its tax type is a
       // substitution rather than a translation — exactly what the per-line path refuses to trust.
@@ -375,13 +415,19 @@ export function resolveWcShippingTaxRate(input: {
   const distinctTypes = new Set(matching.map((rate) => rate.accountingTaxType))
   if (distinctTypes.size === 1) {
     const chosen = matching[0]
-    return { taxType: chosen.accountingTaxType, rateValue: chosen.taxRateValue, resolved: true }
+    return {
+      taxType: chosen.accountingTaxType,
+      rateValue: chosen.taxRateValue,
+      resolved: true,
+      contributingRateCount: contributing.size,
+    }
   }
   if (distinctTypes.size > 1) {
     return {
       taxType: input.orderDefault.accountingTaxType,
       rateValue: input.orderDefault.taxRateValue,
       resolved: false,
+      contributingRateCount: contributing.size,
       reason:
         `WooCommerce charged ${reportedTax.toFixed(2)} of tax on ${net.toFixed(2)} of shipping and IMS holds `
         + `${distinctTypes.size} different accounting tax types that would produce it, so the shipping line `
@@ -393,16 +439,27 @@ export function resolveWcShippingTaxRate(input: {
       taxType: input.orderDefault.accountingTaxType,
       rateValue: input.orderDefault.taxRateValue,
       resolved: true,
+      contributingRateCount: contributing.size,
     }
   }
   return {
     taxType: input.orderDefault.accountingTaxType,
     rateValue: input.orderDefault.taxRateValue,
     resolved: false,
+    contributingRateCount: contributing.size,
+    // Two different faults, and the operator's next move differs: a rate to map, versus a charge no
+    // single tax type can express. Counting the contributors is what tells them apart — inferring
+    // "unmapped rate" from the failure would send someone hunting for a mapping that would not help.
     reason:
-      `WooCommerce charged ${reportedTax.toFixed(2)} of tax on ${net.toFixed(2)} of shipping, which is neither `
-      + `the order's default rate of ${(input.orderDefault.taxRateValue * 100).toFixed(2)}% nor any WooCommerce `
-      + `shipping rate mapped in IMS.`,
+      contributing.size > 1
+        ? `WooCommerce applied ${contributing.size} tax rates to this shipping line, together charging `
+          + `${reportedTax.toFixed(2)} on ${net.toFixed(2)} of shipping. An accounting document carries ONE tax `
+          + `type on shipping, and no single rate IMS holds reproduces that blend — not the order's default of `
+          + `${(input.orderDefault.taxRateValue * 100).toFixed(2)}% either. There is no tax type that can be sent `
+          + `for it.`
+        : `WooCommerce charged ${reportedTax.toFixed(2)} of tax on ${net.toFixed(2)} of shipping, which is neither `
+          + `the order's default rate of ${(input.orderDefault.taxRateValue * 100).toFixed(2)}% nor any WooCommerce `
+          + `shipping rate mapped in IMS.`,
   }
 }
 
@@ -1838,33 +1895,48 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       // and it is sent that way — see `resolveWcAccountingAmountConvention`.
       const { lineAmountsIncludeTax, shippingAmount, discountAmount: orderLevelDiscountAmount } =
         resolveWcAccountingAmountConvention({ pricesIncludeVat, shippingForeign, orderLevelDiscountForeign })
-      // o3d-cyn r2: say it out loud when the document will not total to the order. This is the
-      // difference between a wrong number nobody sees and an unsettled invoice somebody can fix — the
-      // payment is withheld below, so the settlement verdict becomes NOT_SENT rather than SETTLED.
-      if (!documentTotalsToTheOrder && wcOrder.date_paid_gmt) {
+      // o3d-cyn r2/r3: say it out loud when the document will not total to the order, and STAMP the
+      // document so it cannot post.
+      //
+      // ROUND 2 withheld the PAYMENT and let the invoice post anyway, on the reasoning that omitting
+      // shipping would understate it. That trades a recoverable fault for an unrecoverable one: a
+      // payment can be registered later, while an AUTHORISED receivable at the wrong total is already
+      // on the VAT return and takes a credit note to undo. Round 3 withholds the DOCUMENT instead —
+      // see `refuseUnreconciledDocument`, which refuses it at the poster before anything is sent.
+      //
+      // NO LONGER GATED ON THE ORDER BEING PAID. An unpaid order's document is just as wrong, it
+      // posts just as immediately, and it is paid later — at which point the fault is already in the
+      // ledger and nothing was ever logged about it.
+      const unreconciledReason = !documentTotalsToTheOrder
+        ? `The tax the accounting document would produce does not match the tax WooCommerce charged on order `
+          + `${wcOrder.number}, so the invoice would not total the order's ${wcOrder.total}. `
+          + (shippingTax.resolved ? '' : `${shippingTax.reason} `)
+          + documentTaxReconciliation.disagreements
+            .map((d) => `${d.label}: document ${d.modelledTax.toFixed(2)} vs WooCommerce ${d.reportedTax.toFixed(2)}`)
+            .join('; ')
+        : null
+      if (unreconciledReason) {
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: so.id,
           action: 'wc_invoice_tax_does_not_reconcile',
           tag: 'accounting',
-          level: 'WARNING',
+          level: 'ERROR',
           description:
-            `WooCommerce order ${wcOrder.number} is paid, but the tax the accounting document will produce `
-            + `does not match the tax WooCommerce charged, so the invoice will not total to the order's `
-            + `${wcOrder.total}. NO payment was registered against it — registering one would settle a `
-            + `figure the ledger does not hold. `
-            + (shippingTax.resolved ? '' : `${shippingTax.reason} `)
-            + documentTaxReconciliation.disagreements
-              .map((d) => `${d.label}: document ${d.modelledTax.toFixed(2)} vs WooCommerce ${d.reportedTax.toFixed(2)}`)
-              .join('; '),
+            `${unreconciledReason} The invoice was NOT posted to the ledger and no payment was registered — `
+            + `posting it would put a receivable at a total nobody reconciles against. Map the shipping tax rate `
+            + `in IMS and re-import the order.`,
           metadata: {
             connector: 'woocommerce',
             externalOrderId: String(wcOrder.id),
             externalOrderNumber: wcOrder.number,
             orderTotal: wcOrder.total,
+            orderPaid: !!wcOrder.date_paid_gmt,
+            documentPosted: false,
             shippingTaxResolved: shippingTax.resolved,
             shippingTaxType: shippingTax.taxType,
             shippingTaxRate: shippingTax.rateValue,
+            shippingContributingRateCount: shippingTax.contributingRateCount,
             disagreements: documentTaxReconciliation.disagreements,
           },
         })
@@ -1931,6 +2003,18 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // released later.
           _registerPayment: !!wcOrder.date_paid_gmt && documentTotalsToTheOrder,
           _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder, { totalsToTheOrder: documentTotalsToTheOrder }),
+          // o3d-cyn r3: the stamp that stops this document at the poster. Present ONLY when the
+          // document will not total to the order — an ordinary order's payload is byte-for-byte what
+          // it was. The row is still queued deliberately: a refusal that leaves a FAILED sync row
+          // naming the reason is something an operator can find, where queueing nothing leaves an
+          // order that simply never reaches the ledger and no record of why.
+          //
+          // It sits INSIDE `accountingPayload`, so it reaches the HELD path below as well as the
+          // queued one (development's invoice-number branch): a document that will not total to the
+          // order must carry its reason whether it is queued now or released later.
+          ...(unreconciledReason
+            ? { [UNRECONCILED_TAX_PAYLOAD_KEY]: buildUnreconciledTaxMarker(unreconciledReason) }
+            : {}),
       }
 
       if (invoiceNumberResolution.ok) {
