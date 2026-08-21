@@ -5,7 +5,7 @@ import {
   cancelPendingSalesInvoiceSyncForOrder,
   retireSalesInvoiceForCancelledOrder,
 } from '@/lib/domain/accounting/cancel-order-invoice-sync'
-import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
+import { claimHeldFrom, heldClaimWhere } from '@/lib/domain/accounting/sync-claim-fence'
 
 type Call = { where?: unknown; data?: unknown }
 
@@ -155,6 +155,15 @@ test('retireSalesInvoiceForCancelledOrder claim-fences on PROCESSING and voids t
     externalTransactionId: null,
   })
   assert.equal((syncUpdateMany[0].data as { status: string }).status, 'CANCELLED')
+  // o3d-xl63 r6: that WHERE is now the SHARED `heldClaimWhere` plus this site's own extra
+  // precondition, not a second hand-spelt copy of it — and the claim is asked for its instant as the
+  // statement is built, so a runner that renews `processingStartedAt` mid-entry is followed rather
+  // than silently refused. Pinned by value here so a re-spelt predicate cannot drift from the one the
+  // two sync processors fence with.
+  assert.deepEqual(
+    syncUpdateMany[0].where,
+    { ...heldClaimWhere('synclog-42', claimHeldFrom(claimedAt)), externalTransactionId: null },
+  )
   // Only after winning the CAS is the order's un-posted mirror voided.
   assert.equal(eventUpdateMany.length, 1)
   assert.equal((eventUpdateMany[0].data as { status: string }).status, 'VOID')
@@ -213,3 +222,4 @@ test('cancelPendingSalesInvoiceSyncForOrder does not clobber an event a worker p
   assert.deepEqual(updateWhere.status.in, ['PENDING', 'FAILED'])
   assert.equal(eventLogCreateMany.length, 0)
 })
+

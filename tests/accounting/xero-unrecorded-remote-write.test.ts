@@ -66,7 +66,8 @@ function runGiveUpScenario(fallbackBehaviour: 'succeeds' | 'claim-lost' | 'fails
       externalId: 'PAY-77',
       // 15-minute claim, taken 14m59.7s ago: 300ms of spendable life left, so the re-drive gives up
       // in milliseconds instead of minutes and the test does not have to wait out a real deadline.
-      claimedAt: new Date(Date.now() - (15 * 60 * 1000 - 60000 - 300)),
+      // A claim HOLDER, not a Date (r6) — the persist asks it for its instant as each statement is built.
+      claim: { heldFrom: () => new Date(Date.now() - (15 * 60 * 1000 - 60000 - 300)) },
     })
     console.log(JSON.stringify({ recorded, transactionAttempts }))
     process.exit(0)
@@ -203,7 +204,7 @@ function runLostClaimScenario(): { stdout: string; stderr: string } {
       externalId: 'PAY-88',
       // A HEALTHY claim: minutes left on it. The arithmetic has no complaint — which is the point.
       // Only the WHERE clause can discover that the row has changed hands.
-      claimedAt: new Date(Date.now() - 1000),
+      claim: { heldFrom: () => new Date(Date.now() - 1000) },
     })
     console.log(JSON.stringify({ recorded }))
     process.exit(0)

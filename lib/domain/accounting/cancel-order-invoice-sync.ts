@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
 import { heldClaimWhere, type HeldClaim } from './sync-claim-fence'
 

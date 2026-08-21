@@ -135,10 +135,11 @@ function pendingSalesInvoice(): Record<string, unknown> {
 
 test('the claim is RE-TAKEN at the instant the remote write begins, fenced on this worker\'s own timestamp', async () => {
   reset()
-  const { renewClaimForRemoteWrite } = await processor()
+  const { renewClaimForRemoteWrite, claimHeldFrom } = await processor()
   const heldFrom = new Date('2026-08-20T10:00:00.000Z')
 
-  const renewed = await renewClaimForRemoteWrite('log-1', heldFrom)
+  // A fixed claim says so explicitly (r6): the fence takes a claim, and a bare `Date` no longer compiles.
+  const renewed = await renewClaimForRemoteWrite('log-1', claimHeldFrom(heldFrom))
 
   assert.ok(renewed instanceof Date)
   assert.ok(renewed.getTime() > heldFrom.getTime(),
@@ -156,9 +157,9 @@ test('the claim is RE-TAKEN at the instant the remote write begins, fenced on th
 test('a claim taken by another worker returns null, and nothing else is written', async () => {
   reset()
   state.updateManyCount = 0
-  const { renewClaimForRemoteWrite } = await processor()
+  const { renewClaimForRemoteWrite, claimHeldFrom } = await processor()
 
-  const renewed = await renewClaimForRemoteWrite('log-1', new Date('2026-08-20T10:00:00.000Z'))
+  const renewed = await renewClaimForRemoteWrite('log-1', claimHeldFrom(new Date('2026-08-20T10:00:00.000Z')))
 
   assert.equal(renewed, null, 'null is what stops the post — a check that only logged would still send the document')
   assert.equal(state.transactionAttempts, 0)
@@ -166,7 +167,7 @@ test('a claim taken by another worker returns null, and nothing else is written'
 
 test('r4 #2: a persist reached on a LAPSED claim runs no transaction at all, and still records the id', async () => {
   reset()
-  const { persistPostedXeroDocument } = await processor()
+  const { persistPostedXeroDocument, claimHeldFrom } = await processor()
   const staleAfterMs = 15 * 60 * 1000
 
   const recorded = await persistPostedXeroDocument({
@@ -174,7 +175,7 @@ test('r4 #2: a persist reached on a LAPSED claim runs no transaction at all, and
     payload: {},
     externalId: 'PAY-77',
     // Claimed a full stale-window ago: there is nothing left of it.
-    claimedAt: new Date(Date.now() - staleAfterMs - 1_000),
+    claim: claimHeldFrom(new Date(Date.now() - staleAfterMs - 1_000)),
   })
 
   assert.equal(recorded, false, 'the caller is told the row was not recorded normally')
@@ -215,8 +216,11 @@ test('both sweep paths open the lease before posting and anchor the persist to t
   const persistSites = lines.flatMap((line, index) => (line.includes('await persistPostedXeroDocument({') ? [index] : []))
   assert.equal(persistSites.length, 2)
   for (const index of persistSites) {
-    assert.match(lines.slice(index, index + 9).join('\n'), /claimedAt: lease\.heldFrom\(\),/,
-      `the persist at line ${index + 1} must be anchored to the claim the lease currently holds`)
+    assert.match(lines.slice(index, index + 16).join('\n'), /claim: lease,/,
+      `the persist at line ${index + 1} must be handed the LEASE, so every statement it makes reads the `
+        + `claim the row currently carries; a \`lease.heldFrom()\` snapshot here is the r6 finding`)
+    assert.doesNotMatch(lines.slice(index, index + 16).join('\n'), /claimedAt: lease\.heldFrom\(\)/,
+      `and must NOT snapshot it (line ${index + 1})`)
   }
 
   // And the outbox path must pass its job in, or the queue-side lock is never renewed.

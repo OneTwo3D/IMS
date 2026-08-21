@@ -1280,33 +1280,27 @@ function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date) {
 }
 
 /**
- * "I STILL HOLD THE CLAIM I TOOK" — the where-fence every write that assumes ownership must carry.
+ * THE CLAIM FENCE IS SHARED, AND IT TAKES A CLAIM — NOT A TIMESTAMP (o3d-xl63 r6).
  *
- * A claim is `{ status: PROCESSING, processingStartedAt: <the instant I stamped> }`, and the stale
- * cutoff in {@link accountingSyncLogClaimWhere} lets a NEW worker re-take a row whose claim has aged
- * out. The displaced worker is not stopped by that — a timeout cannot reach into a request already on
- * the wire — so matching on `status: 'PROCESSING'` alone is NOT ownership: the replacement's row is
- * PROCESSING too. Only the worker that stamped that exact instant owns it.
+ * `heldClaimWhere` used to be spelt out here, taking a bare `Date`. It now lives in
+ * `@/lib/domain/accounting/sync-claim-fence` and takes a {@link HeldClaim}: an object asked for its
+ * instant AS THE STATEMENT IS BUILT. Re-exported so the existing consumers (and the tests that pin
+ * the definition) keep reaching it through this module.
  *
- * IDENTICAL, DELIBERATELY, to the helper of the same name on the sibling branches o3d-batch-payidx
- * (which fences every RELEASE of a claim with it) and o3d-batch-invnum (which fences the pre-post
- * invoice-number stamp with it). The three branches must not disagree about what holding a claim
- * means; if more than one lands, keep ONE definition. Call sites add their own conditions by
- * spreading, exactly as payidx does with `retryCount` — the definition itself stays the three fields.
+ * WHY THE SIGNATURE, AND WHY IT IS THE HALF OF THE CROSS-BRANCH DECISION THAT LANDS HERE. A claim
+ * instant is not a constant for the life of an entry on this branch: {@link openRemoteWriteLease}
+ * RENEWS it before every remote mutation, so `processingStartedAt` moves forward repeatedly while one
+ * entry is being processed. A consumer that captured the instant when the row was first claimed and
+ * fenced on that value later would match NOTHING — and because all of these fences fail closed, it
+ * would silently refuse work it was entitled to do rather than doing work it was not. Refusing a bare
+ * `Date` at the type level is what turns that from a note somebody has to remember into a compile
+ * error at every site that carries a snapshot.
  *
- * WHAT THIS BRANCH ADDS, AND WHAT EVERY CONSUMER MUST THEREFORE DO. A claim instant is not a constant
- * for the life of an entry here: {@link openRemoteWriteLease} RENEWS it before every remote mutation,
- * so `processingStartedAt` moves forward repeatedly while one entry is being processed. A consumer
- * that captured `claimedAt` when the row was first claimed and fenced on that value later would match
- * NOTHING — and because all of these fences fail closed, it would refuse work it was entitled to do
- * rather than doing work it was not. So the claim instant must always be read from the lease at the
- * moment it is used (`lease.heldFrom()`), never carried down from the top of the loop. That is why
- * `guardCancelledSalesOrderInvoice` takes a getter rather than a Date, and it is the one thing a merge
- * with either sibling branch has to preserve.
+ * {@link RemoteWriteLease} satisfies `HeldClaim` structurally — same accessor name — so the lease is
+ * passed wherever a claim is wanted and every fence reads the instant the row actually carries. A
+ * runner that genuinely never renews says so with {@link claimHeldFrom}.
  */
-export function heldClaimWhere(entryId: string, claimedAt: Date) {
-  return { id: entryId, status: 'PROCESSING' as const, processingStartedAt: claimedAt }
-}
+export { claimHeldFrom, heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 
 /**
  * RECORD A DOCUMENT XERO HAS ALREADY ACCEPTED (o3d-xl63 r2 #2, r3 #1-#3).
@@ -1368,11 +1362,13 @@ export function heldClaimWhere(entryId: string, claimedAt: Date) {
  */
 // Exported for tests/accounting/xero-claim-before-remote-write.test.ts: "we did not post" is the
 // outcome under test, and it is only observable at this seam.
-export async function renewClaimForRemoteWrite(entryId: string, heldFrom: Date): Promise<Date | null> {
+export async function renewClaimForRemoteWrite(entryId: string, held: HeldClaim): Promise<Date | null> {
   const renewedAt = new Date()
   const renewed = await db.accountingSyncLog.updateMany({
-    // The shared claim-identity fence (see heldClaimWhere), narrowed to this connector.
-    where: { ...heldClaimWhere(entryId, heldFrom), connector: XERO_CONNECTOR },
+    // The shared claim-identity fence (see heldClaimWhere), narrowed to this connector. `held` is
+    // asked for its instant HERE, as the statement is built — so a renewal that has happened since
+    // the caller obtained the claim is the instant this re-take fences on (o3d-xl63 r6).
+    where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR },
     data: { processingStartedAt: renewedAt },
   })
   return renewed.count === 1 ? renewedAt : null
@@ -1420,9 +1416,15 @@ export const XERO_ENTRY_LEASE_MS = CLAIM_STALE_MS
 
 export type RemoteWriteFence = { ok: true } | { ok: false; result: EntryResult }
 
-export type RemoteWriteLease = {
+export type RemoteWriteLease = HeldClaim & {
   entryId: string
-  /** The claim this worker holds RIGHT NOW. Moves forward on every successful fence. */
+  /**
+   * The claim this worker holds RIGHT NOW. Moves forward on every successful fence.
+   *
+   * This accessor is the whole of the {@link HeldClaim} contract, so a lease IS a claim: it is passed
+   * to `heldClaimWhere` and to every consumer that fences, and each of them reads the instant the row
+   * currently carries rather than one snapshotted before the fences ran (o3d-xl63 r6).
+   */
   heldFrom: () => Date
   /** Wall-clock instant past which no further remote mutation may BEGIN. Never moves. */
   deadlineAt: number
@@ -1470,10 +1472,15 @@ export async function openRemoteWriteLease(
   outboxJob?: IntegrationOutboxRow,
   now: () => number = () => Date.now(),
 ): Promise<RemoteWriteLease | null> {
-  const renewed = await renewClaimForRemoteWrite(entryId, claimedAt)
+  // `claimedAt` really is a fixed instant at this one point — it is the claim the sweep loop stamped,
+  // and this is the statement that replaces it — so it is wrapped rather than carried further.
+  const renewed = await renewClaimForRemoteWrite(entryId, claimHeldFrom(claimedAt))
   if (!renewed) return null
 
   let heldFrom = renewed
+  // From here on the claim is an OBJECT, never a value: the fences below move `heldFrom`, and
+  // everything downstream must see those moves (o3d-xl63 r6).
+  const claim: HeldClaim = { heldFrom: () => heldFrom }
   const deadlineAt = now() + XERO_ENTRY_LEASE_MS
 
   return {
@@ -1500,7 +1507,7 @@ export async function openRemoteWriteLease(
         return { ok: false, result: { success: false, error: message, notPosted: { reason: 'claim-lost', operation, message } } }
       }
 
-      const again = await renewClaimForRemoteWrite(entryId, heldFrom)
+      const again = await renewClaimForRemoteWrite(entryId, claim)
       if (!again) {
         const message = lostClaimMessage(entryId, operation)
         return { ok: false, result: { success: false, error: message, notPosted: { reason: 'claim-lost', operation, message } } }
@@ -1533,7 +1540,14 @@ export async function persistPostedXeroDocument(input: {
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
   payload: SyncPayload
   externalId: string | null | undefined
-  claimedAt: Date
+  /**
+   * THE CLAIM, NOT A SNAPSHOT OF IT (o3d-xl63 r6). The caller hands over the LEASE. Every statement
+   * below asks it for its instant as that statement is built, so a claim that has been renewed since
+   * this function was entered is fenced on the instant the row actually carries. A `Date` here would
+   * compile and then fail closed in silence: the fence would match nothing, the persist would report
+   * a lost claim, and a document Xero already holds would go unrecorded for a claim we never lost.
+   */
+  claim: HeldClaim
   /**
    * o3d-cvj9 (merged into development as o3d-batch-cvj9): the revision stamp Xero put on the document
    * as it applied THIS write. Supplied by the call sites where a connector write actually landed; a
@@ -1542,7 +1556,7 @@ export async function persistPostedXeroDocument(input: {
    */
   externalRevisionAt?: Date | null
 }): Promise<PostedDocumentPersistOutcome> {
-  const { entry, payload, claimedAt } = input
+  const { entry, payload, claim } = input
   const externalId = input.externalId ?? null
   const what = `xero sync log ${entry.id} (${entry.type})`
 
@@ -1569,7 +1583,11 @@ export async function persistPostedXeroDocument(input: {
         input.externalRevisionAt,
         POST_REMOTE_PERSIST_TX_OPTIONS,
       ),
-      { claim: { heldFrom: claimedAt, staleAfterMs: CLAIM_STALE_MS } },
+      // o3d-xl63 r6/r7: the deadline is derived from the claim THIS worker holds, read here as the
+      // call is built rather than carried down from the top of the sweep. A renewal that moved the
+      // claim forward lengthens the window it is safe to re-drive in; a snapshot would have shortened
+      // it silently.
+      { claim: { heldFrom: claim.heldFrom(), staleAfterMs: CLAIM_STALE_MS } },
     )
     // Not a pool problem and not this branch's to report: a newer claim posted its own document while
     // this attempt was on the wire, and o3d-550x has already made both identifiers durable.
@@ -1578,8 +1596,12 @@ export async function persistPostedXeroDocument(input: {
   } catch (error) {
     // Only the pool's own give-up is handled here. Everything else — including the unwritten-evidence
     // throw o3d-550x raises when it cannot file a conflict — is left to the runner, untouched.
+    //
+    // o3d-xl63 r5/r6 also caught `LostClaimDuringPersistError` here. Nothing raises it any more: it
+    // was thrown by the claim fence this branch put on the SETTLING write, and #639 rejected that
+    // fence for this write in as many words. See the note on it in persistPostedXeroDocument.
     if (!(error instanceof UnrecordedRemoteWriteError)) throw error
-    await reportUnrecordedXeroWrite({ entry, externalId, claimedAt, error })
+    await reportUnrecordedXeroWrite({ entry, externalId, claim, error })
     return { persisted: false, reason: 'pool-exhausted' }
   }
 }
@@ -1600,10 +1622,13 @@ export async function persistPostedXeroDocument(input: {
 async function reportLostClaimAfterXeroWrite(input: {
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
   externalId: string | null
-  claimedAt: Date
+  claim: HeldClaim
   error: LostClaimDuringPersistError
 }): Promise<void> {
-  const { entry, externalId, claimedAt, error } = input
+  const { entry, externalId, claim, error } = input
+  // The instant the fence that just failed was built from — read from the claim, so the evidence
+  // names the claim this worker actually held rather than one it captured earlier (r6).
+  const claimedAt = claim.heldFrom()
 
   reportUnrecordedRemoteWrite({
     what: error.what,
@@ -1676,10 +1701,11 @@ async function reportLostClaimAfterXeroWrite(input: {
 async function reportUnrecordedXeroWrite(input: {
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
   externalId: string | null
-  claimedAt: Date
+  claim: HeldClaim
   error: UnrecordedRemoteWriteError
 }): Promise<void> {
-  const { entry, externalId, claimedAt, error } = input
+  const { entry, externalId, claim, error } = input
+  const claimedAt = claim.heldFrom()
   const base = {
     what: `xero sync log ${entry.id} (${entry.type})`,
     externalId,
@@ -1710,7 +1736,12 @@ async function reportUnrecordedXeroWrite(input: {
   try {
     const recovery = await db.accountingSyncLog.updateMany({
       where: {
-        ...heldClaimWhere(entry.id, claimedAt),
+        // Read at the point of use (r6), NOT from the value the deadline was derived from minutes
+        // ago: the re-drive above can span the whole claim, and on this branch a claim moves. A
+        // fence on the stale instant matches nothing, and `count === 0` here is indistinguishable
+        // from a genuinely lost claim — so the external id of a document Xero holds would be
+        // reported as unrecoverable while the row was still ours.
+        ...heldClaimWhere(entry.id, claim),
         connector: XERO_CONNECTOR,
         ...(externalId ? { externalTransactionId: null } : {}),
       },
@@ -1974,10 +2005,12 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           entry,
           payload,
           externalId: syncResult.externalId,
-          // The claim as it stands after the LAST fence (r4 #1, r5 #1): the persist's deadline, its own
-          // fence, and the claim-fenced terminal write on the give-up path must all use the claim this
-          // worker actually holds — which the fence before the document post moved forward.
-          claimedAt: lease.heldFrom(),
+          // THE LEASE ITSELF, not `lease.heldFrom()` (r6). The persist's deadline, its own fence, and
+          // the claim-fenced terminal write on the give-up path must each use the claim this worker
+          // holds AT THE MOMENT THEY RUN. A snapshot taken here would be read minutes before the
+          // give-up path's write, and because these fences fail closed the symptom of it being wrong
+          // is silence: a document Xero already holds recorded nowhere.
+          claim: lease,
           // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it
           // made is recorded and orders the document against other writers.
           externalRevisionAt: syncResult.externalRevisionAt ?? null,
@@ -2461,8 +2494,8 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           entry,
           payload,
           externalId: syncResult.externalId,
-          // The claim as it stands after the LAST fence (r4 #1, r5 #1) — see the direct path.
-          claimedAt: lease.heldFrom(),
+          // The lease itself (r6) — see the direct path.
+          claim: lease,
           // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it
           // made is recorded and orders the document against other writers.
           externalRevisionAt: syncResult.externalRevisionAt ?? null,

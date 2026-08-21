@@ -496,19 +496,21 @@ test('both Xero post-remote persists are routed through the anchored helper, not
 
   assert.equal(successBranches.length, 2, 'the direct path and the outbox path — if this changed, so did the fix')
   for (const index of successBranches) {
-    const branch = lines.slice(index, index + 12).join('\n')
+    const branch = lines.slice(index, index + 18).join('\n')
     assert.match(
       branch, /persistPostedXeroDocument\(/,
       `the post-remote persist at line ${index + 1} must not be denied by the pre-flight pool bound`,
     )
-    assert.match(branch, /claimedAt/, 'and must hand it the claim its deadline is anchored to')
+    assert.match(branch, /claim: lease,/,
+      'and must hand it the LEASE — the claim its deadline is anchored to, read at the point of use (r6)')
   }
 
   // The helper itself: the anchor and the transaction options are the fix, so neither may be dropped.
   const helper = source.slice(source.indexOf('async function persistPostedXeroDocument'))
-  assert.match(helper.slice(0, 3_000), /claim: \{ heldFrom: claimedAt, staleAfterMs: CLAIM_STALE_MS \}/,
-    'the deadline is derived from the row\'s own claim and the cutoff another worker measures against')
-  assert.match(helper.slice(0, 3_000), /POST_REMOTE_PERSIST_TX_OPTIONS/,
+  assert.match(helper.slice(0, 6_000), /claim: \{ heldFrom: claim\.heldFrom\(\), staleAfterMs: CLAIM_STALE_MS \}/,
+    'the deadline is derived from the row\'s own claim — asked for its instant here — and the cutoff '
+      + 'another worker measures staleness against')
+  assert.match(helper.slice(0, 6_000), /POST_REMOTE_PERSIST_TX_OPTIONS/,
     'and the transaction waits on the POOL bound rather than Prisma\'s shorter default maxWait')
 })
 

@@ -43,6 +43,21 @@ const state = {
   },
   /** Every fenced write attempted against the sync row, with whether it MATCHED. */
   syncLogWrites: [] as Array<{ where: Record<string, unknown>; data: Record<string, unknown>; count: number }>,
+  /** How many interactive transactions have been STARTED (the persist re-drives across failures). */
+  transactionAttempts: 0,
+  /**
+   * Called before each transaction body runs, with the attempt number. May throw (to model an
+   * exhausted pool) and may mutate the row (to model another statement landing in between).
+   */
+  beforeTransaction: null as (null | ((attempt: number) => Promise<void> | void)),
+}
+
+/** What Prisma raises when an interactive transaction cannot be STARTED — the production shape. */
+function poolExhausted(): Error {
+  return Object.assign(new Error('Unable to start a transaction in the given time'), {
+    code: 'P2028',
+    name: 'PrismaClientKnownRequestError',
+  })
 }
 
 /** Evaluate one Prisma-style predicate against a value. Only the shapes this module actually uses. */
@@ -117,14 +132,21 @@ function makeDbDouble(): Record<string, unknown> {
       if (method === 'findMany') return []
       if (method === 'findUnique' || method === 'findFirst') return null
       state.mirroredEventWrites += 1
-      return method === 'updateMany' ? { count: 1 } : {}
+      // The mirror UPDATEs the event and then writes a log row keyed on the returned id, so the
+      // double must return one: `{}` made every settling write throw out of the mirror instead of
+      // completing, which would have made these assertions about the persist vacuous.
+      return method === 'updateMany' ? { count: 1 } : { id: 'event-1' }
     },
   })
   const syncLog = syncLogModel()
   const db: Record<string, unknown> = new Proxy({}, {
     get: (_target, key: string) => {
       if (key === '$transaction') {
-        return async (arg: unknown) => (typeof arg === 'function' ? (arg as (tx: unknown) => unknown)(db) : [])
+        return async (arg: unknown) => {
+          state.transactionAttempts += 1
+          await state.beforeTransaction?.(state.transactionAttempts)
+          return typeof arg === 'function' ? (arg as (tx: unknown) => unknown)(db) : []
+        }
       }
       if (key === 'then') return undefined
       if (key === 'accountingSyncLog') return syncLog
@@ -201,6 +223,8 @@ function reset(): void {
   state.pendingServed = false
   state.outbox = { lockHeld: true, calls: [] }
   state.syncLogWrites = []
+  state.transactionAttempts = 0
+  state.beforeTransaction = null
   process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = 'false'
 }
 
@@ -396,7 +420,7 @@ test('r5 #1: the fence renews the OUTBOX lock too, and refuses without touching 
  */
 test('r5: a claim instant captured at the top of the loop is NOT ownership once the lease has renewed', async () => {
   reset()
-  const { openRemoteWriteLease, heldClaimWhere } = await processor()
+  const { openRemoteWriteLease, heldClaimWhere, claimHeldFrom } = await processor()
   const { db } = await import('@/lib/db') as unknown as {
     db: { accountingSyncLog: { updateMany: (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => Promise<{ count: number }> } }
   }
@@ -418,7 +442,7 @@ test('r5: a claim instant captured at the top of the loop is NOT ownership once 
   // A consumer fencing on the captured instant. Driven through the double, which evaluates the WHERE
   // against real row state — a canned count could not tell these two cases apart at all.
   const stale = await db.accountingSyncLog.updateMany({
-    where: heldClaimWhere('log-1', claimedAtTopOfLoop),
+    where: heldClaimWhere('log-1', claimHeldFrom(claimedAtTopOfLoop)),
     data: { errorMessage: 'fenced-on-the-captured-instant' },
   })
   assert.equal(stale.count, 0,
@@ -428,16 +452,42 @@ test('r5: a claim instant captured at the top of the loop is NOT ownership once 
 
   // The same consumer, reading the claim from the lease at the moment it uses it.
   const current = await db.accountingSyncLog.updateMany({
-    where: heldClaimWhere('log-1', heldNow),
+    where: heldClaimWhere('log-1', claimHeldFrom(heldNow)),
     data: { errorMessage: 'fenced-on-the-held-instant' },
   })
   assert.equal(current.count, 1, 'read from the lease at the point of use, the very same fence matches')
   assert.equal(state.row?.errorMessage, 'fenced-on-the-held-instant')
 
+  // r6: AND THE LEASE IS ITSELF A CLAIM. `heldClaimWhere(id, lease)` needs no adapter — the accessor
+  // name is the contract — and because the instant is read when the WHERE is built, a fence written
+  // once against the lease keeps matching across a renewal that a captured value would have missed.
+  const beforeAnotherRenewal = lease.heldFrom()
+  // `renewClaimForRemoteWrite` stamps `new Date()`, so the two renewals must land in different
+  // milliseconds for "the instant moved" to be observable at all.
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  const fenceAgain = await lease.fenceBeforeRemoteWrite('invoice-payment')
+  assert.equal(fenceAgain.ok, true)
+  assert.ok(lease.heldFrom().getTime() > beforeAnotherRenewal.getTime(), 'the claim moved again')
+  assert.deepEqual(heldClaimWhere('log-1', lease).processingStartedAt, lease.heldFrom(),
+    'the lease satisfies HeldClaim structurally, and the fence reads it at the moment of use')
+  const throughTheLease = await db.accountingSyncLog.updateMany({
+    where: heldClaimWhere('log-1', lease),
+    data: { errorMessage: 'fenced-through-the-lease' },
+  })
+  assert.equal(throughTheLease.count, 1, 'a fence built from the lease tracks the renewal it would otherwise have missed')
+  assert.equal(state.row?.errorMessage, 'fenced-through-the-lease')
+  const staleAfterRenewal = await db.accountingSyncLog.updateMany({
+    where: heldClaimWhere('log-1', claimHeldFrom(beforeAnotherRenewal)),
+    data: { errorMessage: 'must-not-land-either' },
+  })
+  assert.equal(staleAfterRenewal.count, 0,
+    'while the instant captured one fence ago matches nothing — which is the silent refusal r6 removes')
+  assert.notEqual(state.row?.errorMessage, 'must-not-land-either')
+
   // And a genuine theft is still refused, so the fence has not been loosened into a no-op.
   stealTheRow()
   const stolen = await db.accountingSyncLog.updateMany({
-    where: heldClaimWhere('log-1', heldNow),
+    where: heldClaimWhere('log-1', lease),
     data: { errorMessage: 'must-not-land' },
   })
   assert.equal(stolen.count, 0, "once another worker re-stamps the row, the held instant stops matching too")
@@ -445,8 +495,125 @@ test('r5: a claim instant captured at the top of the loop is NOT ownership once 
 
   // THE DEFINITION ITSELF, because a merge keeps exactly one of the three copies. Matching on
   // `status: 'PROCESSING'` alone is not ownership — the replacement's row is PROCESSING too.
-  assert.deepEqual(Object.keys(heldClaimWhere('log-1', heldNow)).sort(), ['id', 'processingStartedAt', 'status'],
+  assert.deepEqual(Object.keys(heldClaimWhere('log-1', claimHeldFrom(heldNow))).sort(), ['id', 'processingStartedAt', 'status'],
     'identical to the helper on o3d-batch-payidx and o3d-batch-invnum: three fields, no more, no fewer')
-  assert.equal(heldClaimWhere('log-1', heldNow).status, 'PROCESSING')
-  assert.deepEqual(heldClaimWhere('log-1', heldNow).processingStartedAt, heldNow)
+  assert.equal(heldClaimWhere('log-1', claimHeldFrom(heldNow)).status, 'PROCESSING')
+  assert.deepEqual(heldClaimWhere('log-1', claimHeldFrom(heldNow)).processingStartedAt, heldNow)
+})
+
+/**
+ * o3d-xl63 ROUND 6 — THE PERSIST HOLDS THE CLAIM, NOT A PHOTOGRAPH OF IT.
+ *
+ * `persistPostedXeroDocument` used to take `claimedAt: Date`, read once by the caller as
+ * `lease.heldFrom()`. Everything it then does — the settling write's fence, the deadline, and the
+ * give-up path's terminal write — was measured against that one value, minutes after it was read.
+ *
+ * On a branch that RENEWS the claim that is the wrong value by construction, and the failure is
+ * silent: the fence fails closed, so a WHERE built from a superseded instant matches nothing, and
+ * "matched nothing" is indistinguishable from "another worker owns this row". The two tests below
+ * pin both ends of it — the ordinary settling write and the give-up path — with the row state the
+ * double actually evaluates the predicate against, so an unfenced or wrongly-fenced write cannot pass.
+ */
+test('r6: a claim renewed while the persist is RE-DRIVEN is the claim the settling write fences on', async () => {
+  reset()
+  const { openRemoteWriteLease, persistPostedXeroDocument } = await processor()
+
+  const claimedAtTopOfLoop = new Date('2026-08-20T10:00:00.000Z')
+  state.row!.status = 'PROCESSING'
+  state.row!.processingStartedAt = claimedAtTopOfLoop
+
+  const lease = await openRemoteWriteLease('log-1', claimedAtTopOfLoop)
+  assert.ok(lease, 'the claim was ours, so the lease opened')
+  const heldWhenThePersistWasCalled = lease.heldFrom()
+
+  // The re-drive window: the first transaction cannot be STARTED (the exhausted pool), and before the
+  // second one the lease renews the claim — which is what the lease does at every fence, and what a
+  // concurrent renewal for this row looks like from the persist's point of view.
+  const renewals: Date[] = []
+  state.beforeTransaction = async (attempt) => {
+    if (attempt === 1) throw poolExhausted()
+    if (attempt === 2 && renewals.length === 0) {
+      const fence = await lease.fenceBeforeRemoteWrite('invoice-payment')
+      assert.equal(fence.ok, true, 'the row is still ours — the renewal is legitimate, not a theft')
+      renewals.push(lease.heldFrom())
+    }
+  }
+
+  const recorded = await persistPostedXeroDocument({
+    entry: { id: 'log-1', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-1' },
+    // The row's own payload, so the mirrored-event write runs exactly as it does in the sweep.
+    payload: state.row!.payload as Record<string, unknown>,
+    externalId: 'XERO-INV-1',
+    // THE LEASE, not `lease.heldFrom()`.
+    claim: lease,
+  })
+
+  assert.equal(renewals.length, 1, 'the scenario ran: the claim moved between the two attempts')
+  const renewed = renewals[0]
+  assert.ok(renewed.getTime() > heldWhenThePersistWasCalled.getTime(),
+    'and it moved FORWARD, so a caller-side snapshot would now be a superseded instant')
+  assert.equal(state.transactionAttempts, 2, 'one failure to start, then the re-drive')
+
+  assert.equal(recorded, true,
+    'the document Xero holds is recorded: the fence used the claim the row carries NOW, not the one read before the re-drive')
+  const settled = settlingWrite()
+  assert.ok(settled, 'the settling write was attempted')
+  assert.equal(settled!.count, 1, 'and it MATCHED — the double evaluated the WHERE against real row state')
+  assert.deepEqual(settled!.where.processingStartedAt, renewed,
+    'the instant in the WHERE is the renewed one, read as the statement was built')
+  assert.equal(state.row?.status, 'SYNCED')
+  assert.equal(state.row?.externalTransactionId, 'XERO-INV-1')
+  assert.equal(
+    state.activity.filter((a) => a.action === 'xero_sync_claim_lost_during_persist').length, 0,
+    'and no lost-claim alarm is raised for a claim that was never lost',
+  )
+})
+
+test('r6: the give-up path records the external id against the RENEWED claim, not the one the persist started with', async () => {
+  reset()
+  const { persistPostedXeroDocument } = await processor()
+
+  // A claim with 300ms of spendable life left, so the whole re-drive plays out in milliseconds instead
+  // of the fourteen real minutes a freshly renewed claim would buy. A real lease stamps `new Date()`
+  // and cannot be positioned like this, so the claim is hand-built — but it is the same shape the
+  // lease exposes: an accessor answering the instant the row currently carries.
+  let held = new Date(Date.now() - (CLAIM_STALE_MS - 60_000 - 300))
+  const claim = { heldFrom: () => held }
+  state.row!.status = 'PROCESSING'
+  state.row!.processingStartedAt = held
+  const heldWhenThePersistWasCalled = held
+
+  // No transaction ever starts. Partway through, the claim is renewed — the row's stamp moves, and so
+  // does the claim, because they are the same fact.
+  state.beforeTransaction = (attempt) => {
+    if (attempt === 2) {
+      held = new Date(held.getTime() + 5_000)
+      state.row!.processingStartedAt = held
+    }
+    throw poolExhausted()
+  }
+
+  const recorded = await persistPostedXeroDocument({
+    entry: { id: 'log-1', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-1' },
+    payload: {},
+    externalId: 'XERO-INV-1',
+    claim,
+  })
+
+  assert.ok(state.transactionAttempts >= 2, 'the persist was re-driven across the failure before giving up')
+  assert.notDeepEqual(held, heldWhenThePersistWasCalled, 'the scenario ran: the claim moved during the re-drive')
+  assert.equal(recorded, false, 'the caller is told the row was not recorded normally — the pool never gave it a transaction')
+
+  // THE VERDICT: the single-statement fallback is the only thing that can still save the id, and it is
+  // claim-fenced. Built from a snapshot it matches nothing and the id is lost with an "already lost"
+  // reason on a row this worker still owns.
+  const fallback = state.syncLogWrites.find((w) => w.data.externalTransactionId === 'XERO-INV-1')
+  assert.ok(fallback, 'the give-up path attempted its terminal write')
+  assert.deepEqual(fallback!.where.processingStartedAt, held,
+    'fenced on the claim as it stands NOW, not as it stood when the persist began')
+  assert.equal(fallback!.count, 1, 'so it matched the row this worker still owns')
+  assert.equal(state.row?.externalTransactionId, 'XERO-INV-1',
+    'and the id of the document Xero already holds is recovered, which is the whole point of the give-up path')
+  assert.equal(state.row?.status, 'PENDING',
+    'handed back so the next run short-circuits on the external id instead of posting a second document')
 })
