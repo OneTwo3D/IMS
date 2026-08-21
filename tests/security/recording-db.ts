@@ -26,6 +26,8 @@
  */
 import assert from 'node:assert/strict'
 
+import { installedPrismaFilterOperators } from './installed-prisma'
+
 /** Property names an await/inspect touches that say nothing about a query. */
 const NON_QUERY_KEYS = new Set(['then', 'catch', 'finally', 'constructor', 'toJSON', 'inspect'])
 
@@ -187,6 +189,14 @@ export function queryConstraint(ctx: QueryContext): unknown {
  * as a whole segment. What is left is a positively-spelled future operator that
  * does not mean equality — and that one is a diff to this file, not a silent pass,
  * the day the operator vocabulary below stops matching Prisma's.
+ *
+ * ROUND 9 CLOSED BOTH HALVES OF THAT PARAGRAPH. The vocabulary is no longer a
+ * literal that can stop matching Prisma's — it is READ from the installed
+ * generated client, so the operators Prisma has are the operators this file knows
+ * (finding 3, below). And the whole-segment leaf was over-crediting on the other
+ * side: a boundary was any non-identifier character, which made a SPACE a
+ * boundary, so `description: 'created by u1'` was proof of scoping in any field
+ * at all (finding 4, at stringCarries).
  */
 
 /** Operators that restrict every row the query reaches to ones carrying the needle. */
@@ -222,8 +232,53 @@ const NON_SCOPING_OPERATORS = new Set([
   'mode',
 ])
 
-/** Everything this file recognises as an operator. Keys outside it are field names. */
-const KNOWN_OPERATORS = new Set([...SCOPING_OPERATORS, ...NON_SCOPING_OPERATORS])
+/**
+ * o3d-512h round 9, Codex finding 3 — THE VOCABULARY IS READ, NOT WRITTEN.
+ *
+ * Round 8's own report named this as the residue it would not ship blind: "the
+ * operator vocabulary is still a list, and lists in this file have lost every
+ * round they have been in." It lost again. The two sets above are the reviewed
+ * JUDGEMENT — which operators scope and which do not — and that part has to be
+ * written by a person. What must NOT be written by a person is the set of
+ * operators that EXIST, because everything outside it is read as a field name and
+ * descended into as a filter:
+ *
+ *   where: { metadata: { string_contains: 'u1' } }   // `contains`, spelled for JSON
+ *   where: { metadata: { path: ['owners'], array_contains: 'u1' } }
+ *
+ * Not one of `string_contains`, `string_starts_with`, `array_contains`,
+ * `array_starts_with` or `path` was on either list, so each object was read as the
+ * to-one relation shorthand and walked as a filter — and the leaf found the
+ * caller's id and called it scoping. `string_contains` is the exact predicate
+ * round 7 refused under its scalar spelling, credited because it is spelled
+ * differently for a Json column.
+ *
+ * So the EXISTENCE half is derived from the INSTALLED Prisma client rather than
+ * maintained here — see ./installed-prisma.ts. Every `export type …Filter… = { … }`
+ * in the generated client is a filter shape and every key of it is an operator;
+ * that is 365 types and 32 operators for the client generated from this repo's
+ * schema, including all five above. A Prisma upgrade regenerates the client, so
+ * the vocabulary cannot go stale behind the judgement the way a literal does, and
+ * a client that cannot be read REFUSES rather than falling back to a literal.
+ */
+let operatorVocabulary: Set<string> | undefined
+
+/**
+ * Everything recognised as an operator: what the INSTALLED Prisma client
+ * declares (./installed-prisma.ts, which refuses rather than guessing), plus the
+ * reviewed sets above. Keys outside it are field names.
+ *
+ * The reviewed sets are UNIONED in rather than replaced: `search`, `hasNone` and
+ * `isSet` are real Prisma operators that this schema generates no filter type for
+ * (no fullTextSearch preview feature, no Mongo provider), and dropping them would
+ * turn three refusals back into walk-throughs.
+ */
+function knownOperators(): Set<string> {
+  operatorVocabulary ??= new Set([
+    ...installedPrismaFilterOperators(), ...SCOPING_OPERATORS, ...NON_SCOPING_OPERATORS,
+  ])
+  return operatorVocabulary
+}
 
 /**
  * Logical operators, which live in FILTER position rather than operator position.
@@ -242,10 +297,43 @@ function isNegationKey(key: string): boolean {
   return /^not/i.test(key) || key === 'NOT' || key === 'none' || key === 'hasNone' || key === 'isNot'
 }
 
-/** Does this string carry `needle` as a WHOLE segment, not as a substring? */
+/**
+ * o3d-512h round 9, Codex finding 4 — A SEGMENT OF A KEY, NOT A WORD IN A SENTENCE.
+ *
+ * Round 8 replaced `value.includes(needle)` with a WHOLE-SEGMENT test, and chose
+ * against a bare `===` on a real argument: the one-time-token rows are keyed by a
+ * composed string (`passkey_challenge:reg:<userId>`, built in app/actions/
+ * passkey.ts and queried by lib/auth/token-store.ts), so equality would have made
+ * this predicate refuse the shapes it exists to approve.
+ *
+ * The way it drew the boundary is what over-credits. A segment ended at any
+ * character that is not `[A-Za-z0-9_-]`, which makes a SPACE a boundary, and a
+ * `@`, a `,`, a `(`, an `=`. So every value that merely MENTIONS the caller was
+ * proof that the query was scoped to them, in any field at all:
+ *
+ *   where: { description: 'created by u1' }
+ *   where: { email: 'u1@example.test' }        // somebody else's address
+ *   where: { label: 'audit (u1)' }
+ *
+ * None of those reaches only the caller's rows, and two of them reach rows that
+ * have nothing to do with the caller. The compound-key allowance was for a
+ * STRUCTURED key; it was being spent on free text.
+ *
+ * So a boundary is now a DELIMITER rather than "not an identifier character":
+ * the needle must be the whole value, or a complete segment of a value delimited
+ * by one of KEY_DELIMITERS. Everything else — whitespace, punctuation, anything
+ * unrecognised — is not a boundary and so does not match.
+ *
+ * The list is unavoidable here and it fails in the safe direction: a composed key
+ * built with a delimiter nobody listed earns NOTHING, which costs a red build on
+ * a query that is in fact scoped. The opposite default is what this fixes.
+ */
+const KEY_DELIMITERS = new Set([':', '/', '|', '#'])
+
+/** Does this string carry `needle` as a whole segment of a composed KEY? */
 function stringCarries(value: string, needle: string): boolean {
   if (needle.length === 0) return false
-  const isSegmentChar = (c: string) => /[A-Za-z0-9_-]/.test(c)
+  const isBoundary = (c: string) => c === '' || KEY_DELIMITERS.has(c)
   let from = 0
   for (;;) {
     const at = value.indexOf(needle, from)
@@ -253,7 +341,7 @@ function stringCarries(value: string, needle: string): boolean {
     const before = at === 0 ? '' : value[at - 1]
     const afterAt = at + needle.length
     const after = afterAt >= value.length ? '' : value[afterAt]
-    if (!isSegmentChar(before) && !isSegmentChar(after)) return true
+    if (isBoundary(before) && isBoundary(after)) return true
     from = at + 1
   }
 }
@@ -289,7 +377,8 @@ function constraintCarries(
   if (entries.length === 0) return false
 
   if (position === 'operator') {
-    const known = entries.filter(([key]) => KNOWN_OPERATORS.has(key) || LOGICAL_KEYS.has(key))
+    const operators = knownOperators()
+    const known = entries.filter(([key]) => operators.has(key) || LOGICAL_KEYS.has(key))
     // No operator at all: the to-one relation shorthand, `owner: { id: 'u1' }`.
     // This is the residual named in the note above.
     if (known.length === 0) return constraintCarries(node, needle, 'filter', arrayMode)

@@ -149,6 +149,41 @@
  *     are FOLLOWED through the graph instead, and the residue is not allowlistable
  *     at all.
  *
+ * ---------------------------------------------------------------------------
+ * o3d-512h round 9 — TWO OF ROUND 8'S RULES WERE NOT YET GENERAL.
+ *
+ * Round 8 shipped on the argument that its fixes were structural: one file
+ * predicate, one export enumerator, one write-position rule. Codex round 9 found
+ * two of those three still stated too narrowly, and in both cases the answer is
+ * to finish the generalisation rather than to patch the next site.
+ *
+ *   * THE FUNCTION IS NOT ONLY ITS BODY. Every rule here walked a `ConciseBody`.
+ *     A function's PARAMETER DEFAULT INITIALIZERS execute before the body and are
+ *     not in that node, so `async function purge(id, _ = db.thing.deleteMany(…))`
+ *     was a fully guarded endpoint by every rule in this file. That is round 8's
+ *     own finding one step out — it established that a call's SOURCE OFFSET and
+ *     its EXECUTION ORDER can disagree, and answered the one case it found with a
+ *     range check. The disagreement is answered at the INPUT now: every walk takes
+ *     the function's EXECUTABLE REGION (see executableRegions), and source offsets
+ *     order it correctly because a parameter list precedes its body.
+ *     `collectExecutedCalls` is deliberately not extended — a default initializer
+ *     runs only when its argument is omitted, so a guard in one earns nothing.
+ *   * AN UNFINISHED WALK IS NOT A NEGATIVE ANSWER. Round 8 made exactly this
+ *     correction to the model walk and left the WRITE walk it was modelled on
+ *     alone. `declarationWrites` returned a bare `false` for "no write found",
+ *     "hit MAX_GUARD_DEPTH" and "no readable body" alike, and the caller read all
+ *     three as no-write. The depth cut is gone (a budget for how far a GUARD may
+ *     hide says nothing about how far a WRITE may), what remains unfinished is
+ *     recorded in `v.incompleteWrites`, and the caller asks
+ *     `declarationWriteIsRuledOut`. An unresolvable callee — a place the walk
+ *     never STARTED — is still the stated limit it always was.
+ *   * THE OTHER LIST, CHECKED AGAINST THE INSTALLED PRISMA.
+ *     `MUTATING_PRISMA_OPS` is a literal whose failure direction grants credit: a
+ *     write operation nobody added reads as a READ. It is now a CLASSIFICATION
+ *     checked against the operations the generated client actually declares
+ *     (assertPrismaOperationsClassified, ./installed-prisma.ts), so an operation
+ *     on neither side stops the suite by name instead of widening the hole.
+ *
  * Not named *.test.ts on purpose — `npm run test:unit` globs tests/**\/*.test.ts.
  */
 import { readdirSync, readFileSync } from 'node:fs'
@@ -156,6 +191,7 @@ import path from 'node:path'
 
 import ts from 'typescript'
 
+import { installedPrismaModelOperations } from './installed-prisma'
 import {
   calleeRootName,
   createRepoGraph,
@@ -360,6 +396,13 @@ type Verifier = {
    * the live tree.
    */
   incompleteModels: Set<string>
+  /**
+   * Declarations whose WRITE question could not be established (round 9), keyed
+   * `file:name` exactly as `writeMemo` is — the same inverse store round 8 gave
+   * the model walk, for the same reason. A key in `writeMemo` has an answer; a
+   * key here has one nobody may credit a guard on.
+   */
+  incompleteWrites: Set<string>
   active: Set<string>
 }
 
@@ -374,11 +417,103 @@ function verifierFor(graph: ModuleGraph): Verifier {
       writeMemo: new Map(),
       modelMemo: new Map(),
       incompleteModels: new Set(),
+      incompleteWrites: new Set(),
       active: new Set(),
     }
     verifiers.set(graph, v)
   }
   return v
+}
+
+/**
+ * o3d-512h round 9, Codex finding 1 — THE FUNCTION IS NOT ONLY ITS BODY.
+ *
+ * Every rule in this file has been handed a `ts.ConciseBody` and has read that
+ * body as "the code this endpoint runs". It is not: a function's PARAMETER
+ * DEFAULT INITIALIZERS run first, before the first statement of the body, and
+ * they are not in the body node at all. So
+ *
+ *   export async function purge(id: string, _ = db.purchaseOrder.deleteMany({ where: { id } })) {
+ *     await requirePermission('purchasing.manage')
+ *   }
+ *
+ * was a fully credited, guarded endpoint by every rule here: `dataMutationPositions`
+ * never saw the delete, `firstWrite` stayed at Infinity, and the permission check
+ * kept full credit over rows that were gone before the body started.
+ *
+ * And this is reachable from the wire, not a curiosity. In the installed Next
+ * (16.2.10), server/app-render/action-handler.js decodes the POST body with
+ * `boundActionArguments = await decodeReply(actionData, serverModuleMap, …)` and
+ * then invokes the export as `action.apply(null, args)`. The caller therefore
+ * controls the argument LIST, including its LENGTH — `apply` with a shorter array
+ * leaves the remaining parameters `undefined`, which is precisely the condition
+ * that fires a default initializer. Omitting an argument is not a shape anyone has
+ * to be tricked into sending; it is a shape a caller chooses.
+ *
+ * This is round 8's finding one step further out, and it is worth naming as the
+ * same fact. Round 8 established that a call's SOURCE OFFSET and its EXECUTION
+ * ORDER can disagree — "a call starts before its arguments do, while the
+ * arguments evaluate first" — and answered that one case with a range check.
+ * Parameter initializers are the same disagreement between what a rule reads and
+ * what actually runs, so the answer is at the INPUT rather than at another
+ * comparison: the region every rule walks is now the function's EXECUTABLE
+ * REGION — its parameter initializers, then its body — and not the body alone.
+ *
+ * Source offsets order this correctly with no special case: a parameter list
+ * precedes the body it belongs to, so an initializer write is at a lower offset
+ * than every guard in the body, which is exactly where it executes.
+ *
+ * `collectExecutedCalls` is deliberately NOT extended. A default initializer runs
+ * only when its argument is `undefined`, so a GUARD in one is conditional and
+ * earns nothing — the same polarity as everywhere else here: writes are counted
+ * wherever they might happen, guards are credited only where execution is not in
+ * question.
+ */
+function preBodyNodes(body: ts.ConciseBody): ts.Node[] {
+  const fn = body.parent as ts.Node | undefined
+  if (!fn || !ts.isFunctionLike(fn)) return []
+  if ((fn as ts.FunctionLikeDeclaration).body !== body) return []
+  const out: ts.Node[] = []
+  const fromBinding = (name: ts.BindingName) => {
+    if (ts.isIdentifier(name)) return
+    for (const el of name.elements) {
+      // `[, a = expr]` — an elision binds nothing and initializes nothing.
+      if (ts.isOmittedExpression(el)) continue
+      if (el.initializer) out.push(el.initializer)
+      // `{ [db.thing.deleteMany({…}) ? 'a' : 'b']: x }` — a COMPUTED property name
+      // in a binding pattern is evaluated to work out which property to read, and
+      // it is evaluated wherever the pattern is: here, before the body.
+      if (el.propertyName && ts.isComputedPropertyName(el.propertyName)) {
+        out.push(el.propertyName.expression)
+      }
+      fromBinding(el.name)
+    }
+  }
+  for (const param of fn.parameters) {
+    if (param.initializer) out.push(param.initializer)
+    // `{ id, _ = db.thing.deleteMany() }` — a destructuring default is an
+    // initializer too, and it is not on the ParameterDeclaration.
+    fromBinding(param.name)
+  }
+  return out
+}
+
+/**
+ * Everything that runs when this function is called, in execution order: the
+ * parameter default initializers, then the body.
+ *
+ * The one place any rule here turns a function into nodes to walk. A rule that
+ * walked `body` directly would be reading the body-only region again.
+ */
+function executableRegions(body: ts.ConciseBody): ts.Node[] {
+  const regions = preBodyNodes(body)
+  // A concise arrow body IS the expression, so it must be visited itself rather
+  // than only its children — `async () => requirePermission('sync')` is a call,
+  // and `async () => requireAuth` is NOT one, which is the distinction the whole
+  // rule turns on.
+  if (ts.isBlock(body)) regions.push(...body.statements)
+  else regions.push(body)
+  return regions
 }
 
 function collectCalls(body: ts.ConciseBody): ts.CallExpression[] {
@@ -387,12 +522,7 @@ function collectCalls(body: ts.ConciseBody): ts.CallExpression[] {
     if (ts.isCallExpression(n)) calls.push(n)
     ts.forEachChild(n, visit)
   }
-  // A concise arrow body IS the expression, so it must be visited itself rather
-  // than only its children — `async () => requirePermission('sync')` is a call,
-  // and `async () => requireAuth` is NOT one, which is the distinction the whole
-  // rule turns on.
-  if (ts.isBlock(body)) ts.forEachChild(body, visit)
-  else visit(body)
+  for (const region of executableRegions(body)) visit(region)
   return calls
 }
 
@@ -789,16 +919,68 @@ export function collectExecutedCalls(
  * entries. What is claimed is exactly what is checked: no credited guard sits
  * after a write.
  */
-const MUTATING_PRISMA_OPS = new Set([
+export const MUTATING_PRISMA_OPS = new Set([
   'create', 'createMany', 'createManyAndReturn',
   'update', 'updateMany', 'updateManyAndReturn',
   'upsert', 'delete', 'deleteMany',
 ])
 
+/**
+ * The model operations that do NOT write. Not "everything not above" — the two
+ * together are a CLASSIFICATION of the operations Prisma actually has, and
+ * assertPrismaOperationsClassified checks that they cover it.
+ */
+export const NON_MUTATING_PRISMA_OPS = new Set([
+  'findUnique', 'findUniqueOrThrow', 'findFirst', 'findFirstOrThrow', 'findMany',
+  'count', 'aggregate', 'groupBy',
+])
+
+/**
+ * o3d-512h round 9 — THE OTHER LIST, CHECKED AGAINST THE INSTALLED PRISMA.
+ *
+ * `MUTATING_PRISMA_OPS` is a literal, and this branch's whole history is lists
+ * losing. Today it is complete: the installed client declares exactly seventeen
+ * model operations and these nine are the writing ones. But "today it is
+ * complete" is the argument this file exists to stop anyone from making, and the
+ * failure direction is the bad one — a write operation nobody added would be read
+ * as a READ, and a guard placed after it would keep full credit.
+ *
+ * Inverting the list (anything unrecognised is a write) is the obvious answer and
+ * it is the wrong one here: `isDataMutationCall` fires on any `X.y.z()` whose root
+ * identifier is `db`/`prisma`/`tx`/`client`, and `client` is a very ordinary name
+ * for something that is not Prisma at all. Defaulting to "write" would put red
+ * builds on correctly guarded endpoints for calls into unrelated SDKs.
+ *
+ * So the classification is CHECKED instead of guessed: every operation the
+ * installed client declares on a model delegate must be on one side or the other,
+ * and an operation on neither stops the suite with its name in the message. A
+ * Prisma upgrade that adds one cannot widen the hole quietly; it fails, and
+ * somebody classifies it.
+ */
+let operationsChecked = false
+
+function assertPrismaOperationsClassified(): void {
+  if (operationsChecked) return
+  operationsChecked = true
+  const unclassified = [...installedPrismaModelOperations()]
+    .filter((op) => !MUTATING_PRISMA_OPS.has(op) && !NON_MUTATING_PRISMA_OPS.has(op))
+    .sort()
+  if (unclassified.length > 0) {
+    throw new Error(
+      'tests/security/server-action-guard-scan.ts: the installed Prisma client declares model '
+      + `operation(s) this file has not classified as writing or reading: ${unclassified.join(', ')}. `
+      + 'Add each to MUTATING_PRISMA_OPS or NON_MUTATING_PRISMA_OPS with the reason. Until then the '
+      + 'write-position rule would treat them as reads, and a guard placed after one would keep '
+      + 'credit for a write it did not gate.',
+    )
+  }
+}
+
 const RAW_MUTATION_METHODS = new Set(['$executeRaw', '$executeRawUnsafe'])
 
 /** `db.thing.delete(...)` / `db.$executeRaw(...)` — a call that writes. */
 function isDataMutationCall(call: ts.CallExpression): boolean {
+  assertPrismaOperationsClassified()
   const callee = call.expression
   if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.name)) return false
   const root = calleeRootName(callee)
@@ -924,8 +1106,9 @@ function mutatedModelsOfDeclaration(decl: Declaration, v: Verifier): Set<string>
       }
       ts.forEachChild(n, visit)
     }
-    if (ts.isBlock(body)) ts.forEachChild(body, visit)
-    else visit(body)
+    // The executable region, not the body: a guard whose parameter default
+    // initializer writes has written just as permanently (round 9, finding 1).
+    for (const region of executableRegions(body)) visit(region)
 
     for (const call of collectCalls(body)) {
       const root = calleeRootName(call.expression)
@@ -1018,7 +1201,12 @@ export function firstDataMutationPosition(body: ts.ConciseBody | undefined): num
   return first
 }
 
-/** Every source offset in this body at which a write happens. */
+/**
+ * Every source offset in this function's EXECUTABLE REGION at which a write
+ * happens — its parameter default initializers as well as its body (round 9,
+ * finding 1). A parameter list precedes the body, so an initializer write lands
+ * at a lower offset than every guard in the body, which is where it runs.
+ */
 function dataMutationPositions(body: ts.ConciseBody | undefined): number[] {
   if (!body) return []
   const at: number[] = []
@@ -1026,8 +1214,7 @@ function dataMutationPositions(body: ts.ConciseBody | undefined): number[] {
     if (ts.isCallExpression(n) && isDataMutationCall(n)) at.push(n.getStart())
     ts.forEachChild(n, visit)
   }
-  if (ts.isBlock(body)) ts.forEachChild(body, visit)
-  else visit(body)
+  for (const region of executableRegions(body)) visit(region)
   return at
 }
 
@@ -1046,17 +1233,61 @@ function dataMutationPositions(body: ts.ConciseBody | undefined): number[] {
  * time a guard sat below any call the graph cannot follow, which is most of them.
  * So this half under-reports: it catches a laundered write it can see, and says
  * nothing about one it cannot.
+ *
+ * ---------------------------------------------------------------------------
+ * o3d-512h round 9, Codex finding 2 — AN UNFINISHED WALK IS NOT A NEGATIVE ANSWER.
+ *
+ * Round 8 made exactly this correction to the MODEL walk: "every way this walk
+ * could fail to find a write produced that same empty set … 'I found nothing' was
+ * returned as 'there is nothing', to a caller whose next move was to grant an
+ * exemption." The same sentence was true here, in the walk the model walk was
+ * modelled on, and it survived round 8 because only one of the two was looked at.
+ *
+ * There are exactly two kinds of `false` this function can return, and they are
+ * not the same fact:
+ *
+ *   * ESTABLISHED — the body was read, every resolvable callee was followed to
+ *     the end, and no write was found;
+ *   * NOT ESTABLISHED — the walk stopped early. Three ways it could: a depth cut
+ *     at MAX_GUARD_DEPTH, a recursion cut, and a declaration whose body could not
+ *     be read at all. All three returned the same bare `false`, and the caller
+ *     read it as "this helper carries no write" and left the guards after it with
+ *     full credit. `await w1(id)` where w1 → w2 → w3 → w4 → `db.thing.deleteMany`
+ *     was a guarded endpoint, because MAX_GUARD_DEPTH is a budget for how far a
+ *     GUARD may hide behind wrappers and has nothing whatever to do with how far
+ *     a WRITE may.
+ *
+ * So, as in round 8: the depth cut is gone (there is a cycle guard and a memo, so
+ * following every resolvable callee costs one visit per reachable declaration),
+ * what remains unfinished is RECORDED in `v.incompleteWrites`, and the caller
+ * asks `declarationWriteIsRuledOut` rather than `!declarationWrites`.
+ *
+ * Note which way the two limits point, because they look alike and are not. An
+ * unresolvable callee is a place the walk never STARTED — the stated limit above,
+ * shared with the model walk, and still not a write. An incomplete walk is one
+ * that started and did not finish, and a guard may not be credited over it.
  */
-function declarationWrites(decl: Declaration, v: Verifier, depth: number): boolean {
-  if (depth > MAX_GUARD_DEPTH) return false
-  const key = `writes:${decl.file}:${decl.name}:${depth}`
+function declarationWrites(decl: Declaration, v: Verifier): boolean {
+  const key = `${decl.file}:${decl.name}`
   const cached = v.writeMemo.get(key)
   if (cached !== undefined) return cached
-  if (v.active.has(key)) return false // recursion: prove nothing, claim nothing
-  v.active.add(key)
+  if (v.active.has(`writes:${key}`)) {
+    // A cycle: this frame cannot contribute, and the answer it is part of is not
+    // established. Not cached — the outer frame's result is the one to keep.
+    v.incompleteWrites.add(key)
+    return false
+  }
+  v.active.add(`writes:${key}`)
+  let complete = true
   try {
     const body = declarationBody(decl)
-    if (!body) return false
+    if (!body) {
+      // Resolved to a declaration, but nothing to read: `export const helper =
+      // wrap(async () => db.thing.deleteMany(…))` names a real declaration whose
+      // writes are behind a call this walk cannot enter. Unknown, not none.
+      v.incompleteWrites.add(key)
+      return false
+    }
     if (firstDataMutationPosition(body) < Infinity) {
       v.writeMemo.set(key, true)
       return true
@@ -1076,16 +1307,30 @@ function declarationWrites(decl: Declaration, v: Verifier, depth: number): boole
       // that write — or the rule is inconsistent one call deep in the direction
       // that hides the laundering.
       if (guardKindOfDeclaration(target) !== null && !guardWritesBusinessData(target, v)) continue
-      if (declarationWrites(target, v, depth + 1)) {
+      if (declarationWrites(target, v)) {
         v.writeMemo.set(key, true)
         return true
       }
+      if (v.incompleteWrites.has(`${target.file}:${target.name}`)) complete = false
     }
-    v.writeMemo.set(key, false)
+    if (complete) v.writeMemo.set(key, false)
+    else v.incompleteWrites.add(key)
     return false
   } finally {
-    v.active.delete(key)
+    v.active.delete(`writes:${key}`)
   }
+}
+
+/**
+ * Is this declaration ESTABLISHED to carry no write?
+ *
+ * The question every caller of `declarationWrites` actually has. `false` from
+ * that function means "no write was found", which is only an answer when the walk
+ * finished — see the note above.
+ */
+function declarationWriteIsRuledOut(decl: Declaration, v: Verifier): boolean {
+  if (declarationWrites(decl, v)) return false
+  return !v.incompleteWrites.has(`${decl.file}:${decl.name}`)
 }
 
 /**
@@ -1202,7 +1447,12 @@ export function guardKindsOfBody(
       guardKindOfDeclaration(entry.target) !== null
       && !guardWritesBusinessData(entry.target, v)
     ) continue
-    if (declarationWrites(entry.target, v, depth + 1)) {
+    // ROUND 9, Codex finding 2 — a walk that did not finish is not a "no". A
+    // callee whose writes could not be established sets the write position
+    // exactly as a callee known to write does: the guards after it are credited
+    // over something nobody checked, which is the whole defect this branch has
+    // been unwinding.
+    if (!declarationWriteIsRuledOut(entry.target, v)) {
       writeAt.push(entry.call.getStart())
       firstWrite = Math.min(firstWrite, entry.call.getStart())
     }
@@ -1760,8 +2010,9 @@ export function readsSettingSecret(
     ts.forEachChild(n, visit)
   }
 
-  if (ts.isBlock(body)) ts.forEachChild(body, visit)
-  else visit(body)
+  // The executable region, not the body: a decrypting read in a parameter default
+  // initializer is a read (round 9, finding 1).
+  for (const region of executableRegions(body)) visit(region)
   return found
 }
 
@@ -2197,8 +2448,7 @@ export function reachedPrismaModels(
     }
     ts.forEachChild(n, visit)
   }
-  if (ts.isBlock(body)) ts.forEachChild(body, visit)
-  else visit(body)
+  for (const region of executableRegions(body)) visit(region)
 
   for (const call of collectCalls(body)) {
     const root = calleeRootName(call.expression)

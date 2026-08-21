@@ -3,8 +3,11 @@ import test from 'node:test'
 
 import ts from 'typescript'
 
+import { installedPrismaModelOperations } from './installed-prisma'
 import { createSourceGraph, type ModuleGraph } from './module-graph'
 import {
+  MUTATING_PRISMA_OPS,
+  NON_MUTATING_PRISMA_OPS,
   isDelegatingFacadeBody,
   scanAuthenticationOnlyActions,
   scanInlineServerActions,
@@ -2137,5 +2140,215 @@ test('…and a guard whose arguments write nothing is untouched', () => {
   return db.purchaseOrder.findMany()
 }`),
     [],
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Round 9, Codex finding 1 — A FUNCTION IS NOT ONLY ITS BODY
+// ---------------------------------------------------------------------------
+
+/**
+ * Every rule here was handed a `ConciseBody` and read it as "the code this
+ * endpoint runs". A function's PARAMETER DEFAULT INITIALIZERS run first, before
+ * the first statement of the body, and they are not in the body node at all — so
+ * a write parked in one was invisible to `firstDataMutationPosition`, `firstWrite`
+ * stayed at Infinity, and the guard below it kept full credit over rows that were
+ * gone before the body started.
+ *
+ * Same fact as round 8's argument-write finding, one step out: what a rule READS
+ * and what actually RUNS had come apart. Round 8 answered its case with a range
+ * check; this is answered at the input, by walking the function's EXECUTABLE
+ * REGION — parameter initializers, then body — everywhere a body was walked.
+ *
+ * A Server Action's arguments come off the wire, so a caller that simply OMITS
+ * the argument fires the initializer. It is not a shape anyone has to be tricked
+ * into writing.
+ */
+test('a write in a DEFAULT PARAMETER INITIALIZER runs before the guard — round 9, finding 1', () => {
+  assert.deepEqual(
+    scan(`export async function doIt(id: string, _purged = db.purchaseOrder.deleteMany({ where: { id } })) {
+  await requirePermission('purchasing.manage')
+  return true
+}`),
+    [`${F}:doIt`],
+    'the initializer evaluates before the body, so the rows are gone before requirePermission runs',
+  )
+})
+
+test('a write LAUNDERED through a helper in a default initializer counts too', () => {
+  const WIPE = 'export async function wipeHelper(id: string) { await db.purchaseOrder.deleteMany({ where: { id } }) }'
+  assert.deepEqual(
+    scan(`import { wipeHelper } from '@/lib/wipe'
+export async function doIt(id: string, _p = wipeHelper(id)) {
+  await requirePermission('purchasing.manage')
+  return true
+}`, {}, { 'lib/wipe.ts': WIPE }),
+    [`${F}:doIt`],
+  )
+})
+
+test('a DESTRUCTURING default is an initializer too — it is not on the parameter', () => {
+  assert.deepEqual(
+    scan(`export async function doIt({ id, _p = db.purchaseOrder.deleteMany({ where: { id: 'x' } }) }: { id: string; _p?: unknown }) {
+  await requirePermission('purchasing.manage')
+  return { id }
+}`),
+    [`${F}:doIt`],
+  )
+})
+
+test('a HELPER whose own default initializer writes launders nothing either', () => {
+  const H = 'export async function helper(id: string, _p = db.purchaseOrder.deleteMany({ where: { id } })) { void _p; return id }'
+  assert.deepEqual(
+    scan(`import { helper } from '@/lib/h'
+export async function doIt(id: string) {
+  await helper(id)
+  await requirePermission('purchasing.manage')
+  return true
+}`, {}, { 'lib/h.ts': H }),
+    [`${F}:doIt`],
+    'the write is in the helper\'s parameter list, which is still the helper running',
+  )
+})
+
+test('a GUARD in a default initializer earns nothing — it runs only when the argument is omitted', () => {
+  // The other half of the polarity: writes are counted wherever they might
+  // happen, guards are credited only from a position where execution is not in
+  // question. A default initializer is not such a position.
+  assert.deepEqual(
+    scan(`export async function doIt(id: string, _g = requirePermission('purchasing.manage')) {
+  return db.purchaseOrder.findMany({ where: { id } })
+}`),
+    [`${F}:doIt`],
+  )
+})
+
+test('the SECRET-READ rule sees a default initializer too', () => {
+  assert.deepEqual(
+    scanSecrets(`export async function doIt(_v = getSettingValue('smtp_password')) {
+  await requireAuth()
+  return _v
+}`),
+    [`${F}:doIt`],
+  )
+})
+
+test('an ordinary default parameter keeps its endpoint\'s credit — the rule did not just get louder', () => {
+  assert.deepEqual(
+    scan(`export async function doIt(id: string, limit = 50, { skip = 0 } = {}) {
+  await requirePermission('purchasing.manage')
+  return db.purchaseOrder.findMany({ take: limit, skip, where: { id } })
+}`),
+    [],
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Round 9, Codex finding 2 — AN UNFINISHED WALK IS NOT A NEGATIVE ANSWER
+// ---------------------------------------------------------------------------
+
+/**
+ * Round 8 made this exact correction to the MODEL walk — "every way this walk
+ * could fail to find a write produced that same empty set" — and the write walk
+ * it was modelled on kept the defect, because only one of the two was looked at.
+ *
+ * `declarationWrites` returned a bare `false` for three different facts: no write
+ * found, the walk hit MAX_GUARD_DEPTH, and the declaration had no readable body.
+ * The caller read all three as "this helper carries no write" and left every
+ * guard after the call with full credit.
+ */
+test('a write FOUR WRAPPERS DEEP is still a write — round 9, finding 2', () => {
+  const mods = {
+    'lib/w1.ts': "import { w2 } from '@/lib/w2'\nexport async function w1(id: string) { await w2(id) }",
+    'lib/w2.ts': "import { w3 } from '@/lib/w3'\nexport async function w2(id: string) { await w3(id) }",
+    'lib/w3.ts': "import { w4 } from '@/lib/w4'\nexport async function w3(id: string) { await w4(id) }",
+    'lib/w4.ts': 'export async function w4(id: string) { await db.purchaseOrder.deleteMany({ where: { id } }) }',
+  }
+  assert.deepEqual(
+    scan(`import { w1 } from '@/lib/w1'
+export async function doIt(id: string) {
+  await w1(id)
+  await requirePermission('purchasing.manage')
+  return true
+}`, {}, mods),
+    [`${F}:doIt`],
+    'MAX_GUARD_DEPTH is a budget for how far a GUARD may hide, not for how far a WRITE may',
+  )
+})
+
+test('a resolved declaration with NO READABLE BODY is not established to write nothing', () => {
+  const H = "import { wrap } from 'some-package'\n"
+    + 'export const helper = wrap(async (id: string) => db.purchaseOrder.deleteMany({ where: { id } }))'
+  assert.deepEqual(
+    scan(`import { helper } from '@/lib/h'
+export async function doIt(id: string) {
+  await helper(id)
+  await requirePermission('purchasing.manage')
+  return true
+}`, {}, { 'lib/h.ts': H }),
+    [`${F}:doIt`],
+    'the graph named the declaration and could not read it — unknown, not none',
+  )
+})
+
+test('a CYCLE the walk cannot finish is not a proof that nothing writes', () => {
+  const mods = {
+    'lib/a.ts': "import { b } from '@/lib/b'\nexport async function a(id: string) { await b(id) }",
+    'lib/b.ts': "import { a } from '@/lib/a'\nexport async function b(id: string) { await a(id) }",
+  }
+  assert.deepEqual(
+    scan(`import { a } from '@/lib/a'
+export async function doIt(id: string) {
+  await a(id)
+  await requirePermission('purchasing.manage')
+  return true
+}`, {}, mods),
+    [`${F}:doIt`],
+    'the recursion cut means the answer was never established; the fix is to guard first',
+  )
+})
+
+test('a HELPER THE WALK CAN FINISH still keeps the guard after it — the rule did not just get louder', () => {
+  const mods = {
+    'lib/r1.ts': "import { r2 } from '@/lib/r2'\nexport async function r1(id: string) { return r2(id) }",
+    'lib/r2.ts': "import { r3 } from '@/lib/r3'\nexport async function r2(id: string) { return r3(id) }",
+    'lib/r3.ts': "import { r4 } from '@/lib/r4'\nexport async function r3(id: string) { return r4(id) }",
+    'lib/r4.ts': 'export async function r4(id: string) { return db.purchaseOrder.findMany({ where: { id } }) }',
+  }
+  assert.deepEqual(
+    scan(`import { r1 } from '@/lib/r1'
+export async function doIt(id: string) {
+  await r1(id)
+  await requirePermission('purchasing.manage')
+  return true
+}`, {}, mods),
+    [],
+    'four wrappers of READS is a finished walk that found no write, which is an answer',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Round 9, Codex finding 3 (scanner half) — THE OPERATION LIST IS CHECKED
+// ---------------------------------------------------------------------------
+
+test('every model operation the INSTALLED Prisma declares is classified as writing or reading', () => {
+  // `MUTATING_PRISMA_OPS` is a literal, and a write operation nobody added would
+  // be read as a READ — the direction that grants credit. The classification is
+  // checked against the generated client on every scan; this states the fact.
+  const ops = installedPrismaModelOperations()
+  assert.ok(ops.has('deleteMany') && ops.has('findMany'), 'the derivation must actually read a client')
+  const unclassified = [...ops].filter((op) => !MUTATING_PRISMA_OPS.has(op) && !NON_MUTATING_PRISMA_OPS.has(op))
+  assert.deepEqual(unclassified, [], 'classify each in server-action-guard-scan.ts, with the reason')
+})
+
+test('a COMPUTED PROPERTY NAME in a destructuring parameter runs before the body too', () => {
+  // The pattern is evaluated to decide which property to read, and it is
+  // evaluated where the pattern is — in the parameter list.
+  assert.deepEqual(
+    scan(`export async function doIt({ [await db.purchaseOrder.deleteMany({ where: {} }) ? 'a' : 'b']: picked }: Record<string, unknown>) {
+  await requirePermission('purchasing.manage')
+  return picked
+}`),
+    [`${F}:doIt`],
   )
 })

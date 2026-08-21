@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import path from 'node:path'
 import test, { before, mock } from 'node:test'
 
+import { installedPrismaFilterOperators } from './installed-prisma'
 import { constraintMentions, createRecordingDb, queryConstraint, type QueryContext } from './recording-db'
 import {
   createRepoGraph,
@@ -621,4 +622,108 @@ test('the positive vocabulary is unchanged — the predicate did not just get qu
   assert.equal(constraintMentions(q('findMany', { where: { tags: { has: CALLER_ID } } }), CALLER_ID), true)
   assert.equal(constraintMentions(q('findMany', { where: { userId: { in: [CALLER_ID] } } }), CALLER_ID), true)
   assert.equal(constraintMentions(q('deleteMany', { where: { AND: [{ id: 'pk' }, { userId: CALLER_ID }] } }), CALLER_ID), true)
+})
+
+// ---------------------------------------------------------------------------
+// Round 9, Codex finding 3 — THE OPERATORS THE LIST HAD NEVER HEARD OF
+// ---------------------------------------------------------------------------
+
+/**
+ * Round 8's own report named the operator vocabulary as the residue it would not
+ * ship blind: "the operator vocabulary is still a list, and lists in this file
+ * have lost every round they have been in." It lost.
+ *
+ * The Json filter family — `string_contains`, `string_starts_with`,
+ * `string_ends_with`, `array_contains`, `array_starts_with`, `array_ends_with`,
+ * `path` — is in every Prisma client this repo has ever generated and was on
+ * neither the scoping nor the non-scoping list. An object made only of keys this
+ * file did not recognise is read as the to-one relation shorthand and descended
+ * into as a FILTER, so every one of them reached the leaf and was credited.
+ * `string_contains` is `contains`, which round 7 refused explicitly, waved
+ * through because a Json column spells it differently.
+ *
+ * The vocabulary is now READ from the installed generated client
+ * (./installed-prisma.ts) rather than maintained here, so it cannot go stale
+ * behind the judgement; a client that cannot be read refuses rather than falling
+ * back to a literal.
+ */
+test('a JSON PARTIAL MATCH does not scope — `contains` spelled for a Json column', () => {
+  for (const args of [
+    { where: { metadata: { string_contains: CALLER_ID } } },
+    { where: { metadata: { string_starts_with: CALLER_ID } } },
+    { where: { metadata: { string_ends_with: CALLER_ID } } },
+    { where: { metadata: { array_contains: CALLER_ID } } },
+    { where: { metadata: { array_starts_with: [CALLER_ID] } } },
+    { where: { metadata: { array_ends_with: [CALLER_ID] } } },
+    { where: { metadata: { path: ['owners'], array_contains: CALLER_ID } } },
+  ]) {
+    assert.equal(
+      constraintMentions(q('findMany', args), CALLER_ID),
+      false,
+      `${JSON.stringify(args)} reaches rows whose Json merely CONTAINS the caller's id`,
+    )
+  }
+})
+
+test('the operator vocabulary is READ from the installed Prisma client, not written here', () => {
+  const ops = installedPrismaFilterOperators()
+  // The anchors that make the derivation a fact rather than an empty set, and the
+  // family that got past round 8.
+  for (const op of ['equals', 'in', 'not', 'some', 'none', 'every', 'is', 'isNot', 'contains']) {
+    assert.ok(ops.has(op), `${op} must come from the generated client`)
+  }
+  for (const op of ['path', 'string_contains', 'string_starts_with', 'array_contains']) {
+    assert.ok(ops.has(op), `${op} is a real Prisma operator no hand-written list had`)
+  }
+})
+
+test('a Json to-one shorthand still scopes — the vocabulary did not just get louder', () => {
+  assert.equal(constraintMentions(q('findMany', { where: { metadata: { equals: CALLER_ID } } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('findMany', { where: { owner: { id: CALLER_ID } } }), CALLER_ID), true)
+})
+
+// ---------------------------------------------------------------------------
+// Round 9, Codex finding 4 — A SEGMENT OF A KEY, NOT A WORD IN A SENTENCE
+// ---------------------------------------------------------------------------
+
+/**
+ * Round 8 replaced the substring leaf with whole-segment matching and drew the
+ * segment boundary at "any character that is not `[A-Za-z0-9_-]`" — which makes a
+ * SPACE a boundary, and a `@`, a `,`, a `(`, an `=`. So a value that merely
+ * MENTIONS the caller was proof that the query was scoped to them, in any field
+ * at all. The compound-key allowance was for a STRUCTURED key; it was being spent
+ * on free text.
+ */
+test('free text that MENTIONS the caller does not scope to the caller', () => {
+  for (const value of [
+    'created by u1',
+    'u1 and friends',
+    'audit (u1)',
+    'u1@example.test',
+    'ref=u1',
+    'a,u1,b',
+    'reassigned u1 -> u2',
+  ]) {
+    assert.equal(
+      constraintMentions(q('findMany', { where: { description: value } }), CALLER_ID),
+      false,
+      `${JSON.stringify(value)} mentions ${CALLER_ID}; it does not restrict the query to their rows`,
+    )
+  }
+})
+
+test('…and the composed KEYS the tree really issues still scope', () => {
+  // The reason a bare `===` is still not the answer: lib/auth/token-store.ts keys
+  // one-time-token rows by a composed string built in app/actions/passkey.ts.
+  assert.equal(constraintMentions(q('findUnique', { where: { id: CALLER_ID } }), CALLER_ID), true)
+  assert.equal(
+    constraintMentions(q('upsert', { where: { key: `passkey_challenge:reg:${CALLER_ID}` }, create: {}, update: {} }), CALLER_ID),
+    true,
+  )
+  assert.equal(constraintMentions(q('findFirst', { where: { key: `${CALLER_ID}:reg` } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('delete', { where: { key: `a/${CALLER_ID}/b` } }), CALLER_ID), true)
+  // …and the round-8 near-misses stay refused.
+  for (const foreign of ['u1x', 'u10', 'u1-victim', 'xu1', 'au1b', 'u1_2']) {
+    assert.equal(constraintMentions(q('findMany', { where: { id: foreign } }), CALLER_ID), false, foreign)
+  }
 })
