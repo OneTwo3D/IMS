@@ -76,6 +76,9 @@ type OrderRow = {
   shipFromWarehouseId: string | null
   inventoryAllocatedDate?: Date | null
   allocationBatchAmount?: number | null
+  // o3d-o97 r4: the A2 journal the order was staged into. Whether the un-stage may clear the stamp
+  // now depends on whether that journal's debit is still standing.
+  allocationBatchSyncLogId?: string | null
   lines: OrderLineRow[]
 }
 
@@ -151,6 +154,8 @@ type MemoryState = {
   shipments?: ShipmentRow[]
   shipmentLines?: ShipmentLineRow[]
   refundLines?: RefundLineRow[]
+  /** o3d-o97 r4: A2 journal rows, so a test can say whether the debit reached a ledger. */
+  accountingSyncLogs?: Array<{ id: string; status: string }>
 }
 
 function decimalLikeToNumber(value: number | { toNumber(): number } | undefined): number {
@@ -552,6 +557,11 @@ function createClient(state: MemoryState): AllocationServiceClient {
     // (cancel-order-invoice-sync); these stubs let that run without a real accounting queue.
     accountingSyncLog: {
       updateMany: async () => ({ count: 0 }),
+      // o3d-o97 r4: the A2 journal probed by its own id. A missing row is NOT "no journal" —
+      // retention deletes terminal rows — so the un-stage keeps the stamp for it.
+      findUnique: async ({ where }: { where: { id: string } }) => (
+        (state.accountingSyncLogs ?? []).find((row) => row.id === where.id) ?? null
+      ),
     },
     accountingEvent: {
       findMany: async () => [],
@@ -1692,9 +1702,16 @@ test('o3d-4kfh r6 (finding 3): an unchanged, FULLY BACKED order still writes abs
   assert.deepEqual(txWriteOrder, [], 'no audit row, so the real retirements are not drowned every 15 minutes')
 })
 
-test('a genuine allocation change still resets accounting state (o3d-i5it)', async () => {
-  // The other side of the same line: more stock has arrived, so the set really does change and
-  // the reset must still run. Skipping it here would leave a stale A2 stamp against new numbers.
+test('a genuine allocation change still resets accounting state (o3d-i5it), keeping a standing A2 debit (o3d-o97 r4)', async () => {
+  // The other side of the o3d-i5it line: more stock has arrived, so the set really does change and
+  // the reset must still run.
+  //
+  // o3d-o97 r4: what the reset may NOT do is clear the A2 record. This order is stamped with an
+  // unrecorded amount and no journal id — the shape of every order staged before the attribution
+  // columns existed — so nothing proves its debit was never raised. Nulling the stamp would let
+  // Group A2, which selects on `inventoryAllocatedDate: null`, raise a SECOND debit at the new pins
+  // while destroying the only record of the first, which nothing could then ever relieve. The
+  // ALLOCATION CHANGE still happens; only the evidence survives it.
   const state = baseState({
     order: {
       ...baseState().order,
@@ -1714,10 +1731,106 @@ test('a genuine allocation change still resets accounting state (o3d-i5it)', asy
   const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
   assert.equal(state.allocations?.[0].qty, 3, 'the extra unit was allocated')
-  assert.equal(state.order.inventoryAllocatedDate, null, 'a real change still resets the A2 stamp')
+  assert.equal(
+    state.order.inventoryAllocatedDate?.toISOString(),
+    '2026-01-01T00:00:00.000Z',
+    'the A2 stamp SURVIVES: A2 will not re-post an order it can still see a stamp on',
+  )
+  assert.equal(
+    activityLogWrites.filter((entry) => (entry as { action: string }).action === 'allocation_accounting_stage_retained').length,
+    1,
+    'and the retention is recorded where an operator can see it',
+  )
   assert.ok(result.syncProductIds.includes('product-1'), 'and still pushes the storefront update')
   assert.ok(writeCounts.allocationDeletes > 0, 'and the destructive cycle DID run for a real change')
   assert.ok(writeCounts.allocationCreates > 0)
+})
+
+test('an allocation change does NOT clear the A2 stamp on a CANCELLED journal either (o3d-o97 r5)', async () => {
+  // r4 made a CANCELLED journal one of the three POSITIVE proofs that no pounds stand, and cleared
+  // the stamp, the amount and the attribution on it. CANCELLED is not that. It is written by the
+  // cross-connector orphan sweep (whose own comment records an unscoped run cancelling the rows of
+  // the connector that had just become ACTIVE), by `cancelPendingSalesInvoiceSyncForOrder`, and by
+  // an operator — and a claimed row is retired without anyone being able to see whether the remote
+  // call already landed, because the processors post BEFORE persisting SYNCED.
+  //
+  // WORKED. A2 debits £40 under journal a2-log-1 and it reaches Xero; the row is later marked
+  // CANCELLED. This allocation edit then runs:
+  //   r4  the stamp and the £40 are nulled. Group A2 selects on `inventoryAllocatedDate: null`, so
+  //       the next run re-values the order at its new pins — 3 units now, say £52 — and raises a
+  //       SECOND debit. Allocated Inventory holds £92 with £52 on record; the eventual refund
+  //       reverses the £52 it can see and the original £40 stands for ever, with the only evidence
+  //       of it deleted by the very write that made the second debit possible.
+  //   r5  the record is KEPT, A2 never re-posts, and `recreateMissingDailyBatchLogs` re-raises the
+  //       journal if it genuinely never landed (a CANCELLED log does not count as live there).
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+      allocationBatchAmount: 40,
+      allocationBatchSyncLogId: 'a2-log-1',
+    },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 2 }],
+    allocations: [{
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+    }],
+  })
+  state.accountingSyncLogs = [{ id: 'a2-log-1', status: 'CANCELLED' }]
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(state.allocations?.[0].qty, 3, 'the allocation change itself still happens')
+  assert.equal(
+    state.order.inventoryAllocatedDate?.toISOString(),
+    '2026-01-01T00:00:00.000Z',
+    'the stamp SURVIVES, so Group A2 cannot raise a second debit at the new pins',
+  )
+  assert.equal(state.order.allocationBatchAmount, 40, 'and the only record of the £40 survives with it')
+  const retained = activityLogWrites.filter((entry) => (entry as { action: string }).action === 'allocation_accounting_stage_retained')
+  assert.equal(retained.length, 1)
+  assert.match(
+    String((retained[0] as { description: string }).description),
+    /recorded CANCELLED, which says the row was abandoned and not that the ledger was never reached/,
+  )
+})
+
+test('an allocation change DOES clear the A2 stamp when A2 recorded a debit of exactly £0.00 (o3d-o97 r5)', async () => {
+  // The proof the retention above is a gate rather than a blanket refusal — and that the gate now
+  // opens only on a record A2 WROTE ABOUT ITSELF rather than on a status some later sweep imposed.
+  // A recorded £0.00 is A2 saying it valued this order at nothing: a KNOWN debit of zero, so there
+  // is no record worth keeping and no second debit to worry about.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+      allocationBatchAmount: 0,
+      allocationBatchSyncLogId: 'a2-log-1',
+    },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 2 }],
+    allocations: [{
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+    }],
+  })
+  state.accountingSyncLogs = [{ id: 'a2-log-1', status: 'SYNCED' }]
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(state.order.inventoryAllocatedDate, null, 'a known debit of zero leaves nothing to keep')
+  assert.equal(state.order.allocationBatchAmount, null)
+  assert.equal(
+    activityLogWrites.filter((entry) => (entry as { action: string }).action === 'allocation_accounting_stage_retained').length,
+    0,
+  )
 })
 
 test('an unchanged set is not refused even when a shipment has been journaled (o3d-i5it)', async () => {
@@ -2000,15 +2113,25 @@ test('a FULL MONETARY refund deallocates and reports success too (o3d-754w)', as
 function createResetTx(options: {
   inventoryAllocatedDate: Date | null
   journaledShipmentId?: string | null
+  // o3d-o97 r4: what A2 recorded, and the fate of the journal it named. Together these decide
+  // whether the un-stage may clear the stamp at all.
+  allocationBatchAmount?: number | null
+  allocationBatchSyncLogId?: string | null
+  a2JournalStatus?: string | null
 }) {
   const salesOrderUpdates: Array<Record<string, unknown>> = []
   const allocationUpdates: Array<Record<string, unknown>> = []
+  const activityLogs: Array<Record<string, unknown>> = []
   const tx = {
     salesOrder: {
       findUnique: async () => (
         options.inventoryAllocatedDate === null
-          ? { inventoryAllocatedDate: null }
-          : { inventoryAllocatedDate: options.inventoryAllocatedDate }
+          ? { inventoryAllocatedDate: null, allocationBatchAmount: null, allocationBatchSyncLogId: null }
+          : {
+              inventoryAllocatedDate: options.inventoryAllocatedDate,
+              allocationBatchAmount: options.allocationBatchAmount ?? null,
+              allocationBatchSyncLogId: options.allocationBatchSyncLogId ?? null,
+            }
       ),
       update: async ({ data }: { data: Record<string, unknown> }) => {
         salesOrderUpdates.push(data)
@@ -2018,6 +2141,15 @@ function createResetTx(options: {
     shipment: {
       findFirst: async () => (options.journaledShipmentId ? { id: options.journaledShipmentId } : null),
     },
+    accountingSyncLog: {
+      findUnique: async () => (options.a2JournalStatus ? { status: options.a2JournalStatus } : null),
+    },
+    activityLog: {
+      create: async ({ data }: { data: Record<string, unknown> }) => {
+        activityLogs.push(data)
+        return data
+      },
+    },
     orderAllocation: {
       updateMany: async ({ data }: { data: Record<string, unknown> }) => {
         allocationUpdates.push(data)
@@ -2025,12 +2157,19 @@ function createResetTx(options: {
       },
     },
   }
-  return { tx, salesOrderUpdates, allocationUpdates }
+  return { tx, salesOrderUpdates, allocationUpdates, activityLogs }
 }
 
 test('resetAllocationAccountingIfStaged clears inventoryAllocatedBatchRef in the same update as the stamp (o3d-0qoo)', async () => {
+  // o3d-o97 r4: the clear only happens where the A2 debit is positively known NOT to stand, so the
+  // fixture says so. o3d-o97 r5: and it says so with A2's OWN RECORD — a recorded debit of exactly
+  // £0.00 — rather than with a journal STATUS. r4 used a CANCELLED journal here, which is an
+  // abandonment written by a sweep or an operator and proves nothing about whether pounds moved.
   const { tx, salesOrderUpdates, allocationUpdates } = createResetTx({
     inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    allocationBatchAmount: 0,
+    allocationBatchSyncLogId: 'a2-log-1',
+    a2JournalStatus: 'CANCELLED',
   })
 
   await resetAllocationAccountingIfStaged(
@@ -2045,8 +2184,82 @@ test('resetAllocationAccountingIfStaged clears inventoryAllocatedBatchRef in the
     inventoryAllocatedDate: null,
     inventoryAllocatedBatchRef: null,
     allocationBatchAmount: null,
+    // o3d-o97 r3: the journal ATTRIBUTION goes in the same update as the amount it describes —
+    // which journal row carried the debit, on which ledger, to which account.
+    allocationBatchSyncLogId: null,
+    allocationBatchConnector: null,
+    allocationBatchAccountCode: null,
   })
   assert.equal(allocationUpdates.length, 1, 'and the cost snapshots are still nulled alongside it')
+})
+
+test('resetAllocationAccountingIfStaged KEEPS the stamp and the recorded debit when A2 posted (o3d-o97 r4)', async () => {
+  // THE FINDING. r3 nulled the stamp, the amount and the attribution here unconditionally, on an
+  // order that is not being refunded. Two harms in one write: the ONLY record of the pounds A2 put
+  // into Allocated Inventory is destroyed, and Group A2 — which selects on
+  // `inventoryAllocatedDate: null` — re-values the order at its new pins and raises a SECOND debit
+  // that nothing will ever relieve, because the residue arithmetic can only see the latest one.
+  const { tx, salesOrderUpdates, allocationUpdates, activityLogs } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    allocationBatchAmount: 40,
+    allocationBatchSyncLogId: 'a2-log-1',
+    a2JournalStatus: 'SYNCED',
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+  )
+
+  assert.deepEqual(salesOrderUpdates, [], 'no un-stage write at all — the £40 record stays exactly where it is')
+  assert.equal(allocationUpdates.length, 1, 'the pins the caller is replacing are still cleared')
+  assert.equal(allocationUpdates[0].costLayerSnapshot, Prisma.DbNull)
+  assert.equal(allocationUpdates[0].allocationBatchAmount, null)
+  assert.equal(activityLogs.length, 1)
+  assert.equal((activityLogs[0] as { action: string }).action, 'allocation_accounting_stage_retained')
+  assert.match(
+    String((activityLogs[0] as { description: string }).description),
+    /Group A2 debited Allocated Inventory £40\.00 for this order under journal a2-log-1 \(SYNCED\)/,
+  )
+})
+
+test('resetAllocationAccountingIfStaged KEEPS the stamp when the A2 journal is merely QUEUED (o3d-o97 r4)', async () => {
+  // A PENDING journal is the sharpest version: the debit has not landed yet, so "nothing is
+  // standing" looks true — but the outbox is about to post it. Clearing the stamp now lets A2 pick
+  // the order up again and raise a second debit while the first is still in flight.
+  const { tx, salesOrderUpdates, activityLogs } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    allocationBatchAmount: 40,
+    allocationBatchSyncLogId: 'a2-log-1',
+    a2JournalStatus: 'PENDING',
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+  )
+
+  assert.deepEqual(salesOrderUpdates, [])
+  assert.equal((activityLogs[0] as { action: string }).action, 'allocation_accounting_stage_retained')
+})
+
+test('resetAllocationAccountingIfStaged clears the stamp when A2 recorded a debit of ZERO (o3d-o97 r4)', async () => {
+  // NULL and ZERO are different facts. A recorded £0 is A2 saying it staged the order and valued it
+  // at nothing — a KNOWN debit of zero, with nothing to strand — so the un-stage proceeds and the
+  // order goes back into the A2 window to be valued afresh.
+  const { tx, salesOrderUpdates, activityLogs } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    allocationBatchAmount: 0,
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+  )
+
+  assert.equal(salesOrderUpdates.length, 1)
+  assert.equal(salesOrderUpdates[0].inventoryAllocatedDate, null)
+  assert.equal(activityLogs.length, 0)
 })
 
 test('resetAllocationAccountingIfStaged writes nothing when A2 never staged the order (o3d-0qoo)', async () => {

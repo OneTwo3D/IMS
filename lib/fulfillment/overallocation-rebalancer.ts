@@ -3,6 +3,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { canonicalAllocationQty, clearDormantFulfillmentPinsInTx } from '@/lib/domain/sales/allocation-service'
+import { resolveStagedAllocationDebit } from '@/lib/domain/accounting/allocated-inventory-debit'
 import { reconcilePendingShipments } from '@/lib/domain/sales/pending-shipment-reconciliation'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -140,6 +141,10 @@ export async function releaseOverallocations(
               select: {
                 id: true, orderNumber: true, externalOrderNumber: true, status: true,
                 inventoryAllocatedDate: true,
+                // o3d-o97 r4: what A2 recorded, so the un-stage below can tell a debit that stands
+                // from one that was never raised.
+                allocationBatchAmount: true,
+                allocationBatchSyncLogId: true,
               },
             },
           },
@@ -162,15 +167,50 @@ export async function releaseOverallocations(
               select: { id: true },
             })
             if (journaled) { pending.skipped += 1; continue }
-            await tx.salesOrder.update({
-              where: { id: alloc.orderId },
-              // o3d-0qoo: the A2 batch ref is cleared with its stamp in the same update — see the
-              // note at the REFUNDED un-stage in refund-service.ts for why the pair must move together.
-              data: { inventoryAllocatedDate: null, inventoryAllocatedBatchRef: null, allocationBatchAmount: null },
-            })
+            // o3d-o97 r4: the same rule as resetAllocationAccountingIfStaged, for the same reason —
+            // see the note there. Un-staging an order whose A2 debit still stands destroys the only
+            // record of it AND lets Group A2, which selects on `inventoryAllocatedDate: null`, raise
+            // a second debit at the new pins that nothing will ever relieve. Where the debit stands
+            // the stamp and its recorded amount are KEPT; only the pins this pass is about to change
+            // are cleared.
+            const stagedDebit = await resolveStagedAllocationDebit(tx, alloc.order)
+            if (stagedDebit.standing) {
+              await tx.activityLog.create({
+                data: {
+                  entityType: 'SALES_ORDER',
+                  entityId: alloc.orderId,
+                  action: 'allocation_accounting_stage_retained',
+                  tag: 'accounting',
+                  level: 'WARNING',
+                  description:
+                    `Over-allocation released on an order whose Group A2 posting still stands, so the A2 `
+                    + `stamp and its recorded debit were KEPT rather than cleared: ${stagedDebit.reason}. `
+                    + `Group A2 will not re-post this order, and the recorded debit remains available for a `
+                    + `refund to reverse.`,
+                },
+              })
+            } else {
+              await tx.salesOrder.update({
+                where: { id: alloc.orderId },
+                // o3d-0qoo: the A2 batch ref is cleared with its stamp in the same update — see the
+                // note at the REFUNDED un-stage in refund-service.ts for why the pair must move together.
+                // o3d-o97 r3: the journal attribution is cleared with the amount it describes.
+                data: {
+                  inventoryAllocatedDate: null,
+                  inventoryAllocatedBatchRef: null,
+                  allocationBatchAmount: null,
+                  allocationBatchSyncLogId: null,
+                  allocationBatchConnector: null,
+                  allocationBatchAccountCode: null,
+                },
+              })
+            }
             await tx.orderAllocation.updateMany({
               where: { orderId: alloc.orderId },
-              data: { costLayerSnapshot: Prisma.DbNull },
+              // o3d-o97 r4: and the per-row posted basis with the pins, on both paths — the row is
+              // about to change quantity or be deleted outright, so its share of the A2 debit is no
+              // longer described by it. The ORDER-level record is the one that survives.
+              data: { costLayerSnapshot: Prisma.DbNull, allocationBatchAmount: null },
             })
           }
 

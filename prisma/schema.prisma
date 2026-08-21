@@ -1727,6 +1727,33 @@ model SalesOrder {
   // back to deriving from the stamp.
   revenueDeferredBatchRef    String?            @map("accounting_revenue_deferred_batch_ref")
   inventoryAllocatedBatchRef String?            @map("accounting_inventory_allocated_batch_ref")
+  // o3d-o97 r3 — WHAT A2 ACTUALLY RAISED, AND WHERE.
+  //
+  // `allocationBatchAmount` above says how many pounds A2 VALUED this order at. It does NOT say a
+  // journal was ever created (the batch log is raised only when the window's ROUNDED total is
+  // positive, while the amount is written for every member row), it does not say that journal
+  // reached a ledger, and it names no ledger and no account. A refund crediting Allocated
+  // Inventory off that number alone can credit an account that was never debited, or the wrong
+  // ledger entirely after a connector switch.
+  //
+  // These three are written in the SAME UPDATE as the stamp and the amount, and only when the A2
+  // journal row was actually created:
+  //
+  //   syncLogId   the AccountingSyncLog row's own id — a value that cannot exist unless
+  //               `createPendingSyncLog` created the row, so an amount can no longer imply a
+  //               journal. It is also the handle the refund resolves to read that row's STATUS:
+  //               queued is not posted, and CANCELLED/FAILED is not posted at all.
+  //   connector   which LEDGER the journal was raised into. A reversal is raised on the connector
+  //               that is active NOW; if that is not the one A2 debited, the credit lands in a
+  //               ledger with no matching debit.
+  //   accountCode the exact Allocated Inventory account A2 DEBITED. The reversal credits whatever
+  //               the settings name today, which is not necessarily the same account.
+  //
+  // NULL on rows staged before these columns existed: there is nothing that can retroactively
+  // prove a 2025 batch posted, so those rows keep the older amount-implies-posting inference.
+  allocationBatchSyncLogId   String?            @map("accounting_allocation_batch_sync_log_id")
+  allocationBatchConnector   String?            @map("accounting_allocation_batch_connector")
+  allocationBatchAccountCode String?            @map("accounting_allocation_batch_account_code")
 
   notes             String?     // customer-visible notes
   internalNotes     String?     // private/staff notes
@@ -1829,6 +1856,19 @@ model SalesOrderRefund {
   source          String?
   accountingRetryRequired Boolean @default(false) @map("accounting_retry_required")
   accountingWarning String?   @map("accounting_warning")
+  // o3d-o97 r3: THE CR ALLOCATED INVENTORY THIS REFUND'S OWN REVERSAL JOURNAL RAISED, written in
+  // the same transaction that decides it. A later refund on the same order must subtract what
+  // earlier refunds already relieved, and its only previous source was the earlier refund's
+  // UNEARNED_REV_REVERSAL sync payload — a row `retention_sync_logs_months` HARD-DELETES once it
+  // terminalises. With the row gone the relief reads ZERO and the residue reverses the whole A2
+  // debit a second time. Refund rows are never deleted by retention.
+  allocatedReliefAmount Decimal? @db.Decimal(18, 4) @map("accounting_allocated_relief_amount")
+  // o3d-o97 r3: why this refund could NOT account for the order's A2 debit, or null when it could.
+  // A refusal has to leave a remedy an operator can actually perform: the un-stage below is
+  // SUPPRESSED whenever this is set, so the A2 stamp survives and the standing A2 invariants keep
+  // reporting the order — and this string says, on a row that outlives the order's stamps, which
+  // record was missing and how many pounds are still sitting in Allocated Inventory.
+  allocationBasisUnresolved String? @map("accounting_allocation_basis_unresolved")
   accountingRetrySyncs Json?  @map("accounting_retry_syncs")
   // scjz.70: revenue-only chargeback — credit note reverses recognised revenue
   // against AR, but COGS reversal + inventory restock are suppressed (cost kept as
@@ -2261,6 +2301,33 @@ model AccountingSyncLog {
   // Not a candidate-query predicate: an unstamped row is a candidate already. It only widens the
   // "back-reference done, follow-ups outstanding" pass that used to be FAILED-only.
   backReferenceFollowUpsPendingAt DateTime?
+
+  // o3d-o97 r6 — THE ONE FACT THAT MAKES A CANCELLED ROW EVIDENCE ABOUT POUNDS.
+  //
+  // r5 established, in three places, that `status = CANCELLED` proves nothing: it records that a
+  // sweep or an operator ABANDONED the row, and the processors POST BEFORE persisting SYNCED and the
+  // external id, so an abandoned row may already have reached the ledger. That left
+  // `recreateMissingDailyBatchLogs` — which re-raises a journal when it can see no live log — reading
+  // the same status as proof that the batch MUST be posted again. Two readers, opposite conclusions,
+  // one fact; and the recreate side's conclusion costs a DUPLICATE journal in a real ledger.
+  //
+  // The reconciliation is not to pick a winner but to record the thing the status was standing in
+  // for. ONE canceller can prove there was no remote call: the cross-connector orphan sweep
+  // (`cancelOrphanedRowsUnderLock`) matches `status = PENDING` only, and its own comment states why
+  // — "A PENDING row is provably PRE-CALL: nothing was sent". That writer, and only that writer,
+  // sets this to true in the same UPDATE as the status.
+  //
+  //   true    nothing was ever sent for this row. Its journal is NOT in any ledger, so recreate may
+  //           rebuild it and a relief/debit record naming it moved zero pounds.
+  //   null    everything else — every other canceller, every pre-r6 cancelled row, and every row
+  //           that was never cancelled at all. NOT "a call was made": "not on record", which every
+  //           reader treats as unproved, exactly as it treats a null attribution column.
+  //
+  // Nullable, no DEFAULT and NOT BACKFILLED for the same reason as the o97 attribution columns: a
+  // default is a value, and `false` would assert that a historical cancelled row HAD made its call —
+  // manufacturing the confidence this column exists to stop being assumed. It is never written on
+  // any path that posts, so it can only ever be set by a writer that knows the negative.
+  abandonedBeforeRemoteCall Boolean? @map("abandoned_before_remote_call")
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
@@ -3472,6 +3539,14 @@ model OrderAllocation {
   /// when it no longer matches the product's current version — see the note on Product.
   fulfillmentGraphVersion Int @default(0) @map("fulfillment_graph_version")
   costLayerSnapshot Json?
+  // o3d-o97 r3: THE POUNDS GROUP A2 DEBITED FOR THIS ROW, written in the same transaction as the
+  // order's stamp. `costLayerSnapshot` beside it is the row's PINNED LAYERS, and landed-cost
+  // revaluation rewrites their unitCostBase in place (updateSnapshotsForCostLayerChange) — so
+  // valuing a partial refund's reversal from the snapshot reverses today's price for a debit
+  // raised at yesterday's. This is the posted basis, and `qty` divides it into a posted unit cost
+  // that no downstream revaluation can move. NULL on rows created after A2 stamped the order (the
+  // rebalancer re-pins), where no posting was raised for the row at all.
+  allocationBatchAmount Decimal? @db.Decimal(18, 4) @map("accounting_allocation_batch_amount")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
@@ -3504,6 +3579,42 @@ model Shipment {
   // o3d-0qoo: exact Group B batch referenceId this shipment was staged into. See the same
   // pair of columns on SalesOrder for why identity is persisted rather than re-derived.
   shipmentJournalBatchRef String?                @map("accounting_shipment_journal_batch_ref")
+  // o3d-o97 r3: THE CR ALLOCATED INVENTORY THIS SHIPMENT'S GROUP B JOURNAL RAISED, written in the
+  // same UPDATE as `shipmentJournalDate`. Group B posts DR COGS / CR Allocated for exactly this
+  // shipment's dispatch COGS, so this is the relief the allocated contra received.
+  //
+  // Deliberately NOT `cogsBatchAmount` beside it, which landed-cost revaluation REWRITES IN PLACE
+  // (refreshShipmentCogsForCostLayerChange) while posting only to COGS/Inventory — the Allocated
+  // relief never moves. And deliberately not re-derived from the CogsEntry dispatch rows either:
+  // those are HARD-DELETED by `retention_stock_movements_months`, after which the derivation
+  // silently returns the CURRENT layer cost, or zero for a shipment with no stored line snapshot.
+  // A record that survives the crash and then expires is not evidence; retention deletes stock
+  // movements and sync logs, it does not delete shipments.
+  allocatedReliefAmount   Decimal?  @db.Decimal(18, 4) @map("accounting_allocated_relief_amount")
+  // o3d-o97 r4 — AND WHETHER THAT RELIEF WAS EVER RAISED, AND WHERE.
+  //
+  // r3 recorded the amount alone, which is the very inference it had just destroyed on the A2 side
+  // one field along: `allocatedReliefAmount` above is written for EVERY shipment the batch stamps,
+  // while the CR Allocated Inventory line only exists when the window's ROUNDED COGS total is
+  // positive — and even then the log is created PENDING, in a transaction that ends before the
+  // remote call, so it can finish CANCELLED with nothing credited anywhere.
+  //
+  // Reading a queued (or never-raised) figure as relief SHRINKS the open balance, so the refund
+  // reverses less than the account holds and a FULL refund — which closes both batch windows for
+  // ever — strands the difference permanently. These three make the amount resolvable:
+  //
+  //   syncLogId   the AccountingSyncLog row's own id, null unless that row was created AND
+  //               carried a CR Allocated Inventory line. Resolving it reads the row's STATUS,
+  //               so queued is never read as posted.
+  //   connector   which LEDGER the credit was raised into.
+  //   accountCode the exact Allocated Inventory account it credited.
+  //
+  // NULL together on shipments journaled before these columns existed, where
+  // `allocatedReliefAmount` is also null and the CogsEntry derivation (which refuses rather than
+  // degrades) still answers.
+  allocatedReliefSyncLogId   String? @map("accounting_allocated_relief_sync_log_id")
+  allocatedReliefConnector   String? @map("accounting_allocated_relief_connector")
+  allocatedReliefAccountCode String? @map("accounting_allocated_relief_account_code")
 
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
