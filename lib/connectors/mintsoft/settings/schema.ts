@@ -286,3 +286,88 @@ export function parseMintsoftDeltaGeneration(raw: string | null | undefined): nu
 export function nextMintsoftDeltaGeneration(current: number | null): number {
   return (current ?? 0) + 1
 }
+
+/**
+ * o3d-hl8l r6 (Codex r5 finding 3) — THE GENERATION HAS TO TRAVEL WITH THE CLAIM.
+ *
+ * WHAT ROUND 5 STILL COULD NOT SEE. The fence `saveMintsoftDeltaCursors` arms is a compare-and-swap
+ * inside our own code: a run hands back the generation it read, the write re-reads it under the
+ * dispatch row lock, and a mismatch discards the advance. That works for every writer that RUNS THAT
+ * CODE. A rolling deploy — or a rollback — puts a second instance in front of the SAME database
+ * running a BUILD FROM BEFORE THE FENCE, and that instance does not merely fail to attribute its
+ * write: it never asks the question at all. It executes its own `saveMintsoftDeltaCursors`, which
+ * upserts `mintsoft_order_delta_since` unconditionally, and no amount of checking on our side is
+ * reached. Round 5 treated the "carries a scope but no generation" payload as that instance; it is
+ * not — it is a payload shape that only OUR code can produce.
+ *
+ * SO THE CHECK MOVES INTO THE VALUE. A cursor row now stores the generation it was written under
+ * alongside the instant it claims, and the READER refuses a cursor it cannot attribute to the
+ * generation currently in force. An older instance writes a bare timestamp, exactly as it always
+ * did; the next reader sees a value with no stamp, cannot place it in the chain, and treats it as
+ * ABSENT — which restarts the delta from the lookback window rather than trusting a watermark that
+ * may have been established under a scope this installation has since abandoned.
+ *
+ * WHY "TREAT AS ABSENT" IS THE SAFE SIDE, and the only one. A watermark is one claim — "every
+ * changed order up to this instant has been applied". Discarding it costs a single wider Order/List
+ * window, which is idempotent: the sweep re-reads orders it has already applied and applies nothing.
+ * Trusting it costs the opposite and unrecoverable thing — if the stale value is LATER than what the
+ * current scope has ever fetched, every order changed in between is skipped and nothing ever says
+ * so. The asymmetry is why this refuses rather than merges, in the same words the write side uses.
+ *
+ * THE ONE-TIME COST OF ADOPTING IT is exactly that: on the first sweep after this ships, the
+ * existing unstamped cursors read as absent and the delta starts once from the lookback window. That
+ * is the same work a reset asks for, and it happens once.
+ */
+export type MintsoftDeltaCursorRefusal = 'absent' | 'unstamped' | 'unreadable' | 'superseded'
+
+export type MintsoftDeltaCursorDecode =
+  | { value: string; refusal: null }
+  | { value: null; refusal: MintsoftDeltaCursorRefusal }
+
+/**
+ * The stored form of a cursor: the instant it claims, and the reset generation in force when the
+ * run that claimed it started. JSON rather than a delimiter because the instant is operator-visible
+ * in `settings` and a delimiter would have to be one an ISO timestamp can never contain.
+ */
+export function encodeMintsoftDeltaCursor(generation: number, at: string): string {
+  return JSON.stringify({ g: generation, at })
+}
+
+/**
+ * Decode a stored cursor against the generation currently in force.
+ *
+ * Every "no" is NAMED, because they mean different things to whoever reads the log: `unstamped` is
+ * an instance that does not participate in the scheme (a pre-fence build, or the one-time migration
+ * above); `unreadable` is a stamped value nobody can order; `superseded` is a stamp from a
+ * generation the reset chain has moved past. All four produce the same conservative answer.
+ */
+export function decodeMintsoftDeltaCursor(
+  raw: string | null | undefined,
+  currentGeneration: number | null,
+): MintsoftDeltaCursorDecode {
+  const trimmed = typeof raw === 'string' ? raw.trim() : ''
+  if (!trimmed) return { value: null, refusal: 'absent' }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    // A bare ISO timestamp lands here: it is what every build before this fence wrote.
+    return { value: null, refusal: 'unstamped' }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { value: null, refusal: 'unstamped' }
+  }
+
+  const record = parsed as Record<string, unknown>
+  const at = typeof record.at === 'string' ? record.at.trim() : ''
+  const stamped = typeof record.g === 'number' && Number.isSafeInteger(record.g) && record.g >= 0 ? record.g : null
+  if (!at || stamped === null) return { value: null, refusal: 'unreadable' }
+
+  // A generation row nobody can order cannot establish that a cursor is current, which is the same
+  // rule `saveMintsoftDeltaCursors` applies to the write side.
+  if (currentGeneration === null || stamped !== currentGeneration) {
+    return { value: null, refusal: 'superseded' }
+  }
+  return { value: at, refusal: null }
+}

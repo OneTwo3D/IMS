@@ -6,6 +6,8 @@ import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import {
   MINTSOFT_DELTA_GENERATION_KEY,
+  decodeMintsoftDeltaCursor,
+  encodeMintsoftDeltaCursor,
   mintsoftDeltaScopeToken,
   nextMintsoftDeltaGeneration,
   parseMintsoftDeltaGeneration,
@@ -1762,11 +1764,34 @@ export async function readMintsoftDeltaCursors(
     select: { key: true, value: true },
   })
   const map = new Map(rows.map((row) => [row.key, row.value]))
+  const generation = parseMintsoftDeltaGeneration(map.get(MINTSOFT_DELTA_GENERATION_KEY) ?? null)
+
+  // o3d-hl8l r6 (Codex r5 finding 3). THE CAS AT SAVE TIME ONLY BINDS WRITERS THAT RUN IT. A
+  // mixed-version deployment — a rolling restart, or a rollback — puts an instance from before the
+  // fence in front of this same row, and that instance writes a bare timestamp through code paths
+  // that never look at the generation at all. So the attribution is read out of the VALUE here:
+  // a cursor that cannot be placed in the current reset chain is treated as ABSENT, which restarts
+  // the delta from the lookback window instead of resuming from a claim nobody can vouch for.
+  const decoded = {
+    watermark: decodeMintsoftDeltaCursor(map.get('mintsoft_order_delta_since') ?? null, generation),
+    lastReconcile: decodeMintsoftDeltaCursor(map.get('mintsoft_order_reconcile_at') ?? null, generation),
+  }
+  for (const [name, result] of Object.entries(decoded)) {
+    // 'absent' is the ordinary cold start and says nothing worth a line in the log.
+    if (result.refusal && result.refusal !== 'absent') {
+      console.warn(
+        `[wms-dispatch-sweep] the inbound delta ${name} cursor cannot be attributed to reset generation `
+          + `${generation === null ? 'unreadable' : generation} (${result.refusal}) — ignoring it and `
+          + 'restarting from the lookback window rather than resuming from a claim this installation cannot place',
+      )
+    }
+  }
+
   return {
-    watermark: map.get('mintsoft_order_delta_since') || null,
-    lastReconcile: map.get('mintsoft_order_reconcile_at') || null,
+    watermark: decoded.watermark.value,
+    lastReconcile: decoded.lastReconcile.value,
     scope,
-    generation: parseMintsoftDeltaGeneration(map.get(MINTSOFT_DELTA_GENERATION_KEY) ?? null),
+    generation,
   }
 }
 
@@ -1824,34 +1849,43 @@ export type MintsoftDeltaCursorWriteResult =
  * participates.
  *
  * AN UNATTRIBUTABLE WRITE APPLIES NO CHANGE AT ALL. A caller that supplies a scope but NO generation
- * is a build older than this fence: it read its cursors without ever seeing the generation row, so
- * nothing about its write can be placed in the chain. It is refused rather than waved through on the
- * weaker token — guessing here is exactly the ABA hole this replaces. A caller that supplies NEITHER
- * is a connector with no delta scope at all, which asks for no check and is written unconditionally;
- * that is an absent question, not an unanswerable one, and the two are kept distinguishable in the
- * payload precisely so they can be treated differently.
+ * read its cursors without ever seeing the generation row, so nothing about its write can be placed
+ * in the chain. It is refused rather than waved through on the weaker token — guessing here is
+ * exactly the ABA hole this replaces. A caller that supplies NEITHER asks for no check; that is an
+ * absent question, not an unanswerable one, and the two are kept distinguishable in the payload
+ * precisely so they can be treated differently.
+ *
+ * o3d-hl8l r6 (Codex r5 finding 3) — AND EVERY WRITE IS STAMPED, INCLUDING THE UNCHECKED ONE. The
+ * CAS above binds writers that execute it, which a mixed-version instance does not; the durable half
+ * of the fence is the generation written INTO the cursor value, which the reader checks (see
+ * `decodeMintsoftDeltaCursor`). So the generation is now read under the lock on EVERY path — for the
+ * comparison when one was asked for, and for the stamp always. The unchecked path therefore takes
+ * the lock too: a stamp read outside it could name a generation the reset had already moved past,
+ * which would write a cursor that is a lie rather than a refusal.
  */
 export async function saveMintsoftDeltaCursors(
   tx: MintsoftDeltaCursorTx,
   state: { watermark?: string; lastReconcile?: string; scope?: string | null; generation?: number | null },
   lockScope: (tx: MintsoftDeltaCursorTx) => Promise<MintsoftDeltaScope>,
 ): Promise<MintsoftDeltaCursorWriteResult> {
-  if (state.scope != null || state.generation != null) {
-    if (state.generation == null) {
-      console.warn(
-        '[wms-dispatch-sweep] the inbound delta cursor write carries no reset generation, so it '
-          + 'cannot be shown to be current — discarding the cursor advance',
-      )
-      return { written: false, reason: 'generation_unknown' }
-    }
-    // The lock is taken for its ORDERING, not for the scope it returns: holding the dispatch rows
-    // is what makes the generation read below and the reset that would move it mutually exclusive.
-    await lockScope(tx)
-    const rows = await tx.setting.findMany({
-      where: { key: { in: [MINTSOFT_DELTA_GENERATION_KEY] } },
-      select: { key: true, value: true },
-    })
-    const current = parseMintsoftDeltaGeneration(rows[0]?.value ?? null)
+  if (state.scope != null && state.generation == null) {
+    console.warn(
+      '[wms-dispatch-sweep] the inbound delta cursor write carries no reset generation, so it '
+        + 'cannot be shown to be current — discarding the cursor advance',
+    )
+    return { written: false, reason: 'generation_unknown' }
+  }
+
+  // The lock is taken for its ORDERING, not for the scope it returns: holding the dispatch rows is
+  // what makes the generation read below and the reset that would move it mutually exclusive.
+  await lockScope(tx)
+  const rows = await tx.setting.findMany({
+    where: { key: { in: [MINTSOFT_DELTA_GENERATION_KEY] } },
+    select: { key: true, value: true },
+  })
+  const current = parseMintsoftDeltaGeneration(rows[0]?.value ?? null)
+
+  if (state.generation != null) {
     if (current === null || current !== state.generation) {
       console.warn(
         '[wms-dispatch-sweep] the inbound delta cursors were reset during this pass (generation '
@@ -1860,20 +1894,33 @@ export async function saveMintsoftDeltaCursors(
       )
       return { written: false, reason: 'cursors_reset' }
     }
+  } else if (current === null) {
+    // No comparison was asked for, but a cursor still has to be STAMPED with a generation the
+    // reader can order, and there is no such number here. Writing it unstamped would leave a value
+    // the reader must then refuse — a cursor that never advances — so refuse at the write instead,
+    // where the reason is visible.
+    console.warn(
+      '[wms-dispatch-sweep] the reset generation row is unreadable, so a cursor written now could '
+        + 'not be attributed by any later reader — discarding the cursor advance',
+    )
+    return { written: false, reason: 'generation_unknown' }
   }
 
+  const stamp = current ?? 0
   if (state.watermark !== undefined) {
+    const value = encodeMintsoftDeltaCursor(stamp, state.watermark)
     await tx.setting.upsert({
       where: { key: 'mintsoft_order_delta_since' },
-      create: { key: 'mintsoft_order_delta_since', value: state.watermark },
-      update: { value: state.watermark },
+      create: { key: 'mintsoft_order_delta_since', value },
+      update: { value },
     })
   }
   if (state.lastReconcile !== undefined) {
+    const value = encodeMintsoftDeltaCursor(stamp, state.lastReconcile)
     await tx.setting.upsert({
       where: { key: 'mintsoft_order_reconcile_at' },
-      create: { key: 'mintsoft_order_reconcile_at', value: state.lastReconcile },
-      update: { value: state.lastReconcile },
+      create: { key: 'mintsoft_order_reconcile_at', value },
+      update: { value },
     })
   }
   return { written: true }

@@ -33,6 +33,10 @@ const state = {
   rechecked: [] as Array<{ externalAsnId: string; reason: string }>,
   recheckThrowsFor: null as string | null,
   deletedKeys: [] as string[],
+  /** Fires once inside the clear's FOR UPDATE window. */
+  beforeLockedRead: null as null | (() => void),
+  /** Called before each candidate's re-check, so a test can move the world mid-pass. */
+  onRecheck: null as null | ((externalAsnId: string) => void),
 }
 
 // The `where` is APPLIED, not ignored. A double that hands back every ASN it holds cannot observe
@@ -52,15 +56,46 @@ function matchesAsnWhere(row: AsnRow, where: {
   return true
 }
 
-const db = {
-  setting: {
-    findUnique: async ({ where }: { where: { key: string } }) =>
-      (state.settings.has(where.key) ? { key: where.key, value: state.settings.get(where.key) } : null),
-    deleteMany: async ({ where }: { where: { key: string } }) => {
-      state.deletedKeys.push(where.key)
-      return { count: state.settings.delete(where.key) ? 1 : 0 }
-    },
+// o3d-hl8l r6: the marker is no longer cleared by a bare delete — it goes through
+// `clearPostMaintenanceRecheckMarker`, which materialises the rows, takes them FOR UPDATE and
+// re-decides from what it read there. The double models that, including the `FOR UPDATE` window:
+// `beforeLockedRead` fires between the materialise and the locked read, which is the last moment a
+// racing restore could commit.
+const settingDelegate = {
+  findUnique: async ({ where }: { where: { key: string } }) =>
+    (state.settings.has(where.key) ? { key: where.key, value: state.settings.get(where.key) } : null),
+  deleteMany: async ({ where }: { where: { key: string } | { key: { in: string[] } } }) => {
+    const keys = typeof where.key === 'string' ? [where.key] : where.key.in
+    let count = 0
+    for (const key of keys) {
+      state.deletedKeys.push(key)
+      if (state.settings.delete(key)) count += 1
+    }
+    return { count }
   },
+  upsert: async ({ where, update }: { where: { key: string }; update: { value: string } }) => {
+    state.settings.set(where.key, update.value)
+    return {}
+  },
+}
+
+const db = {
+  setting: settingDelegate,
+  $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn({
+    setting: settingDelegate,
+    async $executeRaw(_q: TemplateStringsArray, ...values: unknown[]) {
+      // FOR UPDATE locks only rows that EXIST, so the materialise is load-bearing.
+      for (const key of (values[0] as string[]) ?? []) if (!state.settings.has(key)) state.settings.set(key, '')
+      return 0
+    },
+    async $queryRaw<R>(_q: TemplateStringsArray, ...values: unknown[]) {
+      const keys = (values[0] as string[]) ?? []
+      if (state.beforeLockedRead) { state.beforeLockedRead(); state.beforeLockedRead = null }
+      return keys
+        .filter((key) => state.settings.has(key))
+        .map((key) => ({ key, value: state.settings.get(key) ?? null })) as unknown as R
+    },
+  }),
   wmsAsnMap: {
     findMany: async (args: {
       where: { connector: string; closedAt: null; status: { notIn: string[] }; sourceType?: string }
@@ -95,6 +130,7 @@ const WMS_BOOKED_IN_RECHECK_DUE_KEY = 'wms_booked_in_recheck_due_since'
 
 const deps = {
   recheckAsn: async (externalAsnId: string, options: { reason: string }) => {
+    state.onRecheck?.(externalAsnId)
     if (state.recheckThrowsFor === externalAsnId) throw new Error(`WMS unreachable for ${externalAsnId}`)
     state.rechecked.push({ externalAsnId, reason: options.reason })
   },
@@ -118,6 +154,8 @@ function reset() {
   state.rechecked = []
   state.recheckThrowsFor = null
   state.deletedKeys = []
+  state.beforeLockedRead = null
+  state.onRecheck = null
 }
 
 test('o3d-hl8l r4: with no marker the pass does nothing — a re-check is not a routine sweep', async () => {
@@ -245,4 +283,122 @@ test('o3d-hl8l r4: the marker key the sweep drains is the one disableMaintenance
     WMS_BOOKED_IN_RECHECK_DUE_KEY,
     'the writer and the reader must name the same Setting key, or the recovery never fires',
   )
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-hl8l r6 (Codex r5 finding 2) — A CLAIM IS NOT A LEASE.
+//
+// Round 5's `claimPostMaintenanceRecheck` re-read the marker under FOR UPDATE and refused if
+// maintenance mode was on. That proved someone held the marker AT THE INSTANT OF THE CLICK. The pass
+// it authorises then runs for minutes — one WMS read per open ASN — in a different transaction, and
+// the automatic path did not consult maintenance mode at all. A restore starting anywhere in there
+// had the re-check writing into the window the fence exists to keep writers out of, and then
+// CLEARING the marker, so the window that had just been fenced was recorded as recovered.
+// ---------------------------------------------------------------------------------------------
+
+const MAINTENANCE_ENABLED_KEY = 'system_maintenance_mode'
+
+test('o3d-hl8l r6: a re-check does not START inside a maintenance window', async () => {
+  reset()
+  state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:00:00.000Z')
+  state.settings.set(MAINTENANCE_ENABLED_KEY, 'true')
+  state.asns = [asn({ externalAsnId: 'ASN-1' })]
+
+  const { runPostMaintenanceBookedInRecheck } = await loadSweep()
+  const result = await runPostMaintenanceBookedInRecheck('mintsoft', deps)
+
+  assert.equal(result.refusal, 'maintenance_mode_on', 'named, so "0 attempted" cannot be read as "nothing was owed"')
+  assert.deepEqual(state.rechecked, [], 'every write this pass would cause is being replayed over')
+  assert.deepEqual(state.deletedKeys, [])
+  assert.equal(state.settings.get(WMS_BOOKED_IN_RECHECK_DUE_KEY), '2026-07-20T10:00:00.000Z', 'still owed')
+})
+
+test('o3d-hl8l r6: a restore starting MID-PASS stops the re-check at the next ASN and keeps the marker', async () => {
+  // The genuine interleave: the window opens from inside the first ASN's re-check, so the pass is
+  // really in flight when it happens. This is the shape the locked claim could not see at all.
+  reset()
+  state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:00:00.000Z')
+  state.asns = [
+    asn({ externalAsnId: 'ASN-1', createdAt: new Date('2026-07-01T00:00:00Z') }),
+    asn({ externalAsnId: 'ASN-2', createdAt: new Date('2026-07-02T00:00:00Z') }),
+    asn({ externalAsnId: 'ASN-3', createdAt: new Date('2026-07-03T00:00:00Z') }),
+  ]
+  state.onRecheck = (id) => {
+    if (id === 'ASN-1') state.settings.set(MAINTENANCE_ENABLED_KEY, 'true')
+  }
+
+  const { runPostMaintenanceBookedInRecheck } = await loadSweep()
+  const result = await runPostMaintenanceBookedInRecheck('mintsoft', deps)
+
+  assert.deepEqual(
+    state.rechecked.map((r) => r.externalAsnId),
+    ['ASN-1'],
+    'the gate is re-read per candidate, so the window stops the pass at the NEXT ASN rather than at '
+      + 'the end of a hundred-ASN page',
+  )
+  assert.equal(result.attempted, 1)
+  assert.equal(result.refusal, 'window_reopened')
+  assert.equal(result.drained, false)
+  assert.deepEqual(state.deletedKeys, [], 'clearing here would record the window as recovered by a pass a restore interrupted')
+  assert.equal(state.settings.get(WMS_BOOKED_IN_RECHECK_DUE_KEY), '2026-07-20T10:00:00.000Z')
+  const entry = state.logs.find((log) => log.action === 'wms_post_maintenance_recheck')
+  assert.equal(entry?.level, 'WARNING')
+  assert.match(entry?.description ?? '', /a maintenance window opened mid-pass/)
+})
+
+test('o3d-hl8l r6: a restore that starts after the LAST ASN still stops the marker being cleared', async () => {
+  // The narrowest window there is: every candidate attempted, and the restore commits between the
+  // final re-check and the clear. The per-candidate gate cannot see this one — the locked re-read
+  // inside the clear is what does.
+  reset()
+  state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:00:00.000Z')
+  state.asns = [asn({ externalAsnId: 'ASN-ONLY' })]
+  state.beforeLockedRead = () => { state.settings.set(MAINTENANCE_ENABLED_KEY, 'true') }
+
+  const { runPostMaintenanceBookedInRecheck } = await loadSweep()
+  const result = await runPostMaintenanceBookedInRecheck('mintsoft', deps)
+
+  assert.deepEqual(state.rechecked.map((r) => r.externalAsnId), ['ASN-ONLY'], 'the pass itself completed')
+  assert.equal(result.drained, false)
+  assert.equal(result.refusal, 'window_reopened')
+  assert.deepEqual(state.deletedKeys, [], 'the racer won inside the FOR UPDATE window, and the re-read is what sees it')
+  assert.equal(state.settings.get(WMS_BOOKED_IN_RECHECK_DUE_KEY), '2026-07-20T10:00:00.000Z')
+})
+
+test('o3d-hl8l r6: a marker RESTAMPED by a window that opened and closed mid-pass is left for the newer window', async () => {
+  // A restore can open AND close inside a long pass. The flag is then off again, so the gate says
+  // "go" — but the marker now describes a DIFFERENT window, which this pass established nothing
+  // about. Clearing it makes that window's refused callbacks nobody's.
+  reset()
+  state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:00:00.000Z')
+  state.asns = [asn({ externalAsnId: 'ASN-ONLY' })]
+  state.beforeLockedRead = () => { state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:40:00.000Z') }
+
+  const { runPostMaintenanceBookedInRecheck } = await loadSweep()
+  const result = await runPostMaintenanceBookedInRecheck('mintsoft', deps)
+
+  assert.equal(result.drained, false)
+  assert.equal(result.refusal, 'recheck_marker_moved')
+  assert.equal(
+    state.settings.get(WMS_BOOKED_IN_RECHECK_DUE_KEY),
+    '2026-07-20T10:40:00.000Z',
+    'the newer window is still owed a re-check, and the next tick runs it',
+  )
+  assert.deepEqual(state.deletedKeys, [])
+})
+
+test('o3d-hl8l r6: with no restore anywhere near it, the pass still drains exactly as before', async () => {
+  // The gate must not become a way for the recovery to stop happening.
+  reset()
+  state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:00:00.000Z')
+  state.settings.set(MAINTENANCE_ENABLED_KEY, 'false')
+  state.asns = [asn({ externalAsnId: 'ASN-1' }), asn({ externalAsnId: 'ASN-2', createdAt: new Date('2026-07-02T00:00:00Z') })]
+
+  const { runPostMaintenanceBookedInRecheck } = await loadSweep()
+  const result = await runPostMaintenanceBookedInRecheck('mintsoft', deps)
+
+  assert.equal(result.drained, true)
+  assert.equal(result.refusal, undefined)
+  assert.equal(result.attempted, 2)
+  assert.equal(state.settings.has(WMS_BOOKED_IN_RECHECK_DUE_KEY), false)
 })

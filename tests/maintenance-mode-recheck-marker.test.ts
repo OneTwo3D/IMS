@@ -15,6 +15,9 @@ const WMS_BOOKED_IN_RECHECK_DUE_KEY = 'wms_booked_in_recheck_due_since'
 
 const rows = new Map<string, string>()
 const upsertOrder: string[] = []
+/** Every key touched, upsert or delete, in order — so a lock ORDER can be asserted, not just a set. */
+const touchOrder: string[] = []
+const deletedKeys: string[] = []
 /** Every upsert, tagged with whether it happened inside a transaction. */
 const upsertTrace: Array<{ key: string; inTransaction: boolean }> = []
 let inTransaction = false
@@ -28,8 +31,18 @@ const settingDelegate = {
   upsert: async ({ where, update }: { where: { key: string }; update: { value: string } }) => {
     rows.set(where.key, update.value)
     upsertOrder.push(where.key)
+    touchOrder.push(where.key)
     upsertTrace.push({ key: where.key, inTransaction })
     return { key: where.key, value: update.value }
+  },
+  deleteMany: async ({ where }: { where: { key: { in: string[] } } }) => {
+    let count = 0
+    for (const key of where.key.in) {
+      deletedKeys.push(key)
+      touchOrder.push(key)
+      if (rows.delete(key)) count += 1
+    }
+    return { count }
   },
 }
 
@@ -55,6 +68,8 @@ function loadMaintenance() {
 function reset() {
   rows.clear()
   upsertOrder.length = 0
+  touchOrder.length = 0
+  deletedKeys.length = 0
   upsertTrace.length = 0
   transactions = 0
   inTransaction = false
@@ -111,4 +126,48 @@ test('o3d-hl8l r4: enabling maintenance mode does not stamp the marker', async (
 
   assert.equal(rows.get('system_maintenance_mode'), 'true')
   assert.equal(rows.has(WMS_BOOKED_IN_RECHECK_DUE_KEY), false)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-hl8l r6 (Codex r5 finding 1) — A HOLD RECORD BELONGS TO THE WINDOW IT WAS RECORDED IN.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-hl8l r6: opening a window DELETES the hold recorded by the previous one', async () => {
+  // Without this, a hold from restore #1 outlives it. Restore #2 then turns the same flag on, and
+  // "End the hold" re-reads a row that passes every check — flag on, hold present, backend 4242
+  // long gone — and clears maintenance mode over a LIVE restore.
+  const { enableMaintenanceMode, MAINTENANCE_HOLD_KEY } = await loadMaintenance()
+  reset()
+  rows.set(MAINTENANCE_HOLD_KEY, JSON.stringify({ backendPid: 4242, backendStart: 'x', heldAt: 'y' }))
+
+  await enableMaintenanceMode('Database restore requested by admin u2')
+
+  assert.equal(
+    rows.has(MAINTENANCE_HOLD_KEY),
+    false,
+    'the hold described restore #1; restore #2 is a different window and the row must not vouch for it',
+  )
+  assert.equal(rows.get('system_maintenance_mode'), 'true')
+  assert.equal(rows.get('system_maintenance_reason'), 'Database restore requested by admin u2')
+})
+
+test('o3d-hl8l r6: the flag, the reason and the hold delete move in ONE transaction, in one key order', async () => {
+  const { enableMaintenanceMode, MAINTENANCE_HOLD_KEY } = await loadMaintenance()
+  reset()
+  rows.set(MAINTENANCE_HOLD_KEY, 'anything')
+
+  await enableMaintenanceMode('restore')
+
+  assert.equal(transactions, 1, 'a flag on with the PREVIOUS window’s reason is a readable intermediate state')
+  assert.deepEqual(
+    upsertTrace.filter((u) => !u.inTransaction),
+    [],
+    'every write on this path is inside the transaction',
+  )
+  assert.deepEqual(
+    touchOrder,
+    ['system_maintenance_hold', 'system_maintenance_mode', 'system_maintenance_reason'],
+    'sorted — the same order lockRecoveryRows takes the rows FOR UPDATE in, so the recovery actions '
+      + 'and a starting restore serialize instead of deadlocking',
+  )
 })

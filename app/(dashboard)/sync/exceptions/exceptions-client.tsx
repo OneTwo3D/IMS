@@ -87,6 +87,9 @@ export function ExceptionsClient({ data }: Props) {
   }
 
   const empty = data.summary.total === 0
+  // Bound once so the button can hand the action the hold THIS RENDER SAW, rather than the action
+  // ending whatever hold happens to be recorded when the click lands (o3d-hl8l r6).
+  const hold = data.maintenanceRecovery.hold
 
   return (
     <div className="space-y-4">
@@ -116,7 +119,7 @@ export function ExceptionsClient({ data }: Props) {
         </Card>
       ) : null}
 
-      {data.maintenanceRecovery.hold || data.maintenanceRecovery.recheckDueSince ? (
+      {hold || data.maintenanceRecovery.recheckDueSince ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`Maintenance window (${data.summary.maintenanceRecovery})`}
@@ -124,17 +127,17 @@ export function ExceptionsClient({ data }: Props) {
             shown={data.summary.maintenanceRecovery}
             total={data.summary.maintenanceRecovery}
           />
-          {data.maintenanceRecovery.hold ? (
+          {hold ? (
             <div className="rounded-lg border border-amber-300 bg-amber-50/60 p-3 space-y-2">
               <p className="text-sm font-medium">
                 Maintenance mode is HELD after a restore whose database backend could not be confirmed gone.
               </p>
               <p className="text-xs text-muted-foreground">
-                Held {formatDateTime(data.maintenanceRecovery.hold.heldAt)} · backend pid{' '}
-                <span className="font-mono">{data.maintenanceRecovery.hold.backendPid}</span>, started{' '}
-                <span className="font-mono">{data.maintenanceRecovery.hold.backendStart}</span>
+                Held {formatDateTime(hold.heldAt)} · backend pid{' '}
+                <span className="font-mono">{hold.backendPid}</span>, started{' '}
+                <span className="font-mono">{hold.backendStart}</span>
               </p>
-              <p className="text-xs text-muted-foreground">{data.maintenanceRecovery.hold.reason}</p>
+              <p className="text-xs text-muted-foreground">{hold.reason}</p>
               <p className="text-xs text-muted-foreground">
                 Ending the hold clears maintenance mode AND schedules a re-check of every open ASN, which is how the
                 callbacks refused during the window are recovered. It refuses unless that backend is gone from
@@ -147,7 +150,14 @@ export function ExceptionsClient({ data }: Props) {
                 size="sm"
                 disabled={isPending}
                 onClick={() => runAction(
-                  endHeldMaintenanceWindow,
+                  // The hold THIS PAGE IS SHOWING, handed to the action so it can refuse if the row
+                  // under the lock is a different restore's (o3d-hl8l r6). The action re-reads and
+                  // compares; nothing here is trusted as a precondition.
+                  () => endHeldMaintenanceWindow({
+                    backendPid: hold.backendPid,
+                    backendStart: hold.backendStart,
+                    heldAt: hold.heldAt,
+                  }),
                   'Ended the held maintenance window — a warehouse booked-in re-check is now due.',
                 )}
               >

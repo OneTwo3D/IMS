@@ -132,6 +132,14 @@ nothing in):
   gate the callbacks were.
 - **Per ASN.** The **Re-check** button on the ASN table of the purchase order or the stock transfer.
 
+A re-check pass **stops if a restore starts while it is running.** The gate is re-read before the
+pass, before each ASN, and again — under a row lock, together with "is this still the marker we
+drained" — before the stamp is cleared. A pass stopped that way keeps the stamp and reports
+`window_reopened`, so the next tick after the window closes repeats it; a stamp that a *newer*
+window restamped mid-pass is left alone (`recheck_marker_moved`) because that window is owed a
+re-check this pass established nothing about. Being told "0 attempted" is never ambiguous: a refusal
+is always named.
+
 #### When a restore times out and the backend cannot be confirmed gone
 
 The endpoint keeps the connector-selection lock rather than releasing it, leaves maintenance mode on,
@@ -149,6 +157,14 @@ Recovery, in this order:
    lock, re-checks that the named backend is gone from `pg_stat_activity` at that moment, and
    refuses — naming which precondition failed — if any of them has moved. Ending it there also
    stamps the booked-in re-check described above.
+
+The action ends **the hold the page showed you**, not whichever hold happens to be recorded when the
+click lands. The button carries the record's pid, `backend_start` and `heldAt`, and the transition
+refuses with *hold_superseded* if the row under the lock is a different restore's — reload the inbox
+and read the new hold before ending it. A **starting restore deletes any hold recorded by the
+previous window**, in the same transaction that turns the flag on, so a second restore beginning
+between the render and the click turns the click into *no_hold_recorded* (the refusal that means "a
+restore is still running") rather than into an unfenced database.
 
 Do **not** clear the `system_maintenance_mode` row by hand. It ends the window without scheduling the
 re-check, so any callbacks refused during it are left to the WMS watchdog's days-scale alert. The

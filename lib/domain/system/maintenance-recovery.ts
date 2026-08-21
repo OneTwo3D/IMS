@@ -72,6 +72,10 @@ export const MAINTENANCE_RECOVERY_REFUSALS = {
   backendIndeterminate: 'backend_indeterminate',
   maintenanceModeOn: 'maintenance_mode_on',
   noRecheckDue: 'no_recheck_due',
+  /** o3d-hl8l r6: the hold under the lock is not the one the operator was shown. */
+  holdSuperseded: 'hold_superseded',
+  /** o3d-hl8l r6: the re-check marker moved while the pass was running, so it is not ours to clear. */
+  recheckMarkerMoved: 'recheck_marker_moved',
 } as const
 
 export type MaintenanceRecoveryRefusal =
@@ -153,6 +157,32 @@ async function lockRecoveryRows(tx: MaintenanceRecoveryTx, keys: string[]): Prom
   return new Map(rows.map((row) => [row.key, row.value ?? '']))
 }
 
+/**
+ * o3d-hl8l r6 (Codex r5 finding 1) — WHICH HOLD THE OPERATOR WAS LOOKING AT.
+ *
+ * Re-reading under the lock proved that A hold was there. It did not prove it was THE hold the inbox
+ * rendered, and the two come apart the moment a second restore times out and records its own: the
+ * action then checked a backend the operator never saw, against a reason they never read, and
+ * cleared a window they never approved ending. `(pid, backend_start)` is the pair the whole branch
+ * identifies a restore by — a pid alone is reused — and `heldAt` separates two records that somehow
+ * name the same backend.
+ *
+ * Paired with `enableMaintenanceMode` deleting the hold when a window opens, the two together mean:
+ * a hold row present under the lock AND identical to the rendered one is a window that has not been
+ * superseded by any restore since the page was drawn.
+ */
+export type MaintenanceHoldIdentity = {
+  backendPid: number
+  backendStart: string
+  heldAt: string
+}
+
+export function maintenanceHoldIdentityToken(identity: MaintenanceHoldIdentity): string {
+  // Joined on NUL, spelled as an escape: `backend_start` is a timestamp WITH a space in it, so a
+  // space separator could in principle let two different triples produce the same token.
+  return [identity.backendPid, identity.backendStart.trim(), identity.heldAt.trim()].join('\u0000')
+}
+
 export type EndMaintenanceHoldResult =
   | { ended: true; hold: MaintenanceHoldRecord; recheckDueSince: string }
   | { ended: false; reason: MaintenanceRecoveryRefusal; hold?: MaintenanceHoldRecord }
@@ -171,6 +201,8 @@ export type EndMaintenanceHoldDeps = {
 export async function endMaintenanceHold(
   tx: MaintenanceRecoveryTx,
   deps: EndMaintenanceHoldDeps,
+  /** The hold the operator was shown. The action must prove it is clearing THAT one. */
+  expected: MaintenanceHoldIdentity,
 ): Promise<EndMaintenanceHoldResult> {
   const rows = await lockRecoveryRows(tx, [
     MAINTENANCE_ENABLED_KEY,
@@ -192,6 +224,13 @@ export async function endMaintenanceHold(
   }
   const hold = parseMaintenanceHoldRecord(stored)
   if (!hold) return { ended: false, reason: MAINTENANCE_RECOVERY_REFUSALS.holdUnreadable }
+
+  // BEFORE the backend check, not after: asking `pg_stat_activity` about a backend the operator
+  // never saw is already the wrong question, and an answer of "gone" for the wrong restore is
+  // exactly how the previous version cleared a live window.
+  if (maintenanceHoldIdentityToken(hold) !== maintenanceHoldIdentityToken(expected)) {
+    return { ended: false, reason: MAINTENANCE_RECOVERY_REFUSALS.holdSuperseded, hold }
+  }
 
   const attached = await deps.isRestoreBackendAttached({ pid: hold.backendPid, backendStart: hold.backendStart })
   if (attached === null) return { ended: false, reason: MAINTENANCE_RECOVERY_REFUSALS.backendIndeterminate, hold }
@@ -241,6 +280,49 @@ export async function claimPostMaintenanceRecheck(
   if (!windowEndedAt) return { due: false, reason: MAINTENANCE_RECOVERY_REFUSALS.noRecheckDue }
 
   return { due: true, windowEndedAt }
+}
+
+export type ClearPostMaintenanceRecheckResult =
+  | { cleared: true }
+  | { cleared: false; reason: MaintenanceRecoveryRefusal }
+
+/**
+ * o3d-hl8l r6 (Codex r5 finding 2) — THE END OF THE PASS IS A SECOND DECISION, AND IT NEEDS ITS OWN
+ * PROOF.
+ *
+ * `claimPostMaintenanceRecheck` establishes that a re-check is owed at the instant of the click. It
+ * cannot establish anything about the minutes that follow, and the pass it authorises is minutes
+ * long — one WMS read per open ASN. A restore starting inside that window turns the pass into
+ * exactly what the fence exists to stop: our own writes landing in a database that is being replayed
+ * over. Worse, the pass would then CLEAR the marker, so the window that had just been fenced would
+ * be recorded as already recovered and nothing would ever re-check it.
+ *
+ * Clearing is therefore re-decided here, under the same row lock, against the same two facts:
+ *
+ *   • MAINTENANCE MODE IS STILL OFF. If a window opened during the pass, the marker is not ours to
+ *     clear — the pass ran into the new window and its results cannot be trusted.
+ *   • THE MARKER IS STILL THE ONE WE DRAINED. A window that opened AND closed during the pass
+ *     restamps it; clearing it then would discard a re-check that is owed for a DIFFERENT window,
+ *     and the callbacks that window refused would be nobody's. Same shape as the cursor generation:
+ *     a marker is one claim, and a value that moved is not the value we established anything about.
+ */
+export async function clearPostMaintenanceRecheckMarker(
+  tx: MaintenanceRecoveryTx,
+  expected: { windowEndedAt: string },
+): Promise<ClearPostMaintenanceRecheckResult> {
+  const rows = await lockRecoveryRows(tx, [MAINTENANCE_ENABLED_KEY, WMS_BOOKED_IN_RECHECK_DUE_KEY])
+
+  if (rows.get(MAINTENANCE_ENABLED_KEY) === 'true') {
+    return { cleared: false, reason: MAINTENANCE_RECOVERY_REFUSALS.maintenanceModeOn }
+  }
+  const current = (rows.get(WMS_BOOKED_IN_RECHECK_DUE_KEY) ?? '').trim()
+  if (!current) return { cleared: false, reason: MAINTENANCE_RECOVERY_REFUSALS.noRecheckDue }
+  if (current !== expected.windowEndedAt.trim()) {
+    return { cleared: false, reason: MAINTENANCE_RECOVERY_REFUSALS.recheckMarkerMoved }
+  }
+
+  await tx.setting.deleteMany({ where: { key: { in: [WMS_BOOKED_IN_RECHECK_DUE_KEY] } } })
+  return { cleared: true }
 }
 
 /** What the exception inbox renders for the maintenance-recovery section. */

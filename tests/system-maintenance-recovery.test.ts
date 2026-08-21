@@ -3,9 +3,11 @@ import test from 'node:test'
 import {
   buildMaintenanceRecoveryState,
   claimPostMaintenanceRecheck,
+  clearPostMaintenanceRecheckMarker,
   countMaintenanceRecovery,
   endMaintenanceHold,
   MAINTENANCE_RECOVERY_REFUSALS,
+  maintenanceHoldIdentityToken,
   parseMaintenanceHoldRecord,
 } from '../lib/domain/system/maintenance-recovery.ts'
 
@@ -102,12 +104,15 @@ function makeTx(initial: Record<string, string> = {}) {
 const goneBackend = { isRestoreBackendAttached: async () => false }
 const unknownBackend = { isRestoreBackendAttached: async () => null }
 
+/** The hold as the inbox rendered it — what the operator actually looked at before clicking. */
+const SHOWN = { backendPid: HOLD.backendPid, backendStart: HOLD.backendStart, heldAt: HOLD.heldAt }
+
 // --- ending the hold ----------------------------------------------------------------------------
 
 test('o3d-hl8l r5: ending a held window clears the flag AND stamps the booked-in re-check, in one transaction', async () => {
   const h = makeTx({ [ENABLED_KEY]: 'true', [REASON_KEY]: 'restore', [HOLD_KEY]: JSON.stringify(HOLD) })
 
-  const result = await endMaintenanceHold(h.tx, { ...goneBackend, now: () => new Date('2026-08-18T10:00:00Z') })
+  const result = await endMaintenanceHold(h.tx, { ...goneBackend, now: () => new Date('2026-08-18T10:00:00Z') }, SHOWN)
 
   assert.equal(result.ended, true)
   assert.equal(result.ended && result.recheckDueSince, '2026-08-18T10:00:00.000Z')
@@ -128,7 +133,7 @@ test('o3d-hl8l r5: the decision is made from rows read under FOR UPDATE, not fro
   // A second operator ends the window in the instant between the materialise and the locked read.
   h.concurrent = () => { h.rows.set(ENABLED_KEY, 'false'); h.rows.delete(HOLD_KEY) }
 
-  const result = await endMaintenanceHold(h.tx, goneBackend)
+  const result = await endMaintenanceHold(h.tx, goneBackend, SHOWN)
 
   assert.deepEqual(
     result,
@@ -149,7 +154,7 @@ test('o3d-hl8l r5: a flag on with NO hold recorded is refused — that is a rest
   // webhooks over a database that is actively being replayed, which is the original defect.
   const h = makeTx({ [ENABLED_KEY]: 'true' })
 
-  const result = await endMaintenanceHold(h.tx, goneBackend)
+  const result = await endMaintenanceHold(h.tx, goneBackend, SHOWN)
 
   assert.deepEqual(result, { ended: false, reason: MAINTENANCE_RECOVERY_REFUSALS.noHoldRecorded })
   assert.equal(h.rows.get(ENABLED_KEY), 'true', 'a live restore keeps its fences')
@@ -162,7 +167,7 @@ test('o3d-hl8l r5: the hold is NOT ended while the named backend is still attach
 
   const result = await endMaintenanceHold(h.tx, {
     isRestoreBackendAttached: async (identity) => { checked.push(identity); return true },
-  })
+  }, SHOWN)
 
   assert.equal(result.ended, false)
   assert.equal(!result.ended && result.reason, MAINTENANCE_RECOVERY_REFUSALS.backendStillRunning)
@@ -177,7 +182,7 @@ test('o3d-hl8l r5: the hold is NOT ended while the named backend is still attach
 test('o3d-hl8l r5: an unanswerable backend check refuses rather than assuming either way', async () => {
   const h = makeTx({ [ENABLED_KEY]: 'true', [HOLD_KEY]: JSON.stringify(HOLD) })
 
-  const result = await endMaintenanceHold(h.tx, unknownBackend)
+  const result = await endMaintenanceHold(h.tx, unknownBackend, SHOWN)
 
   assert.equal(!result.ended && result.reason, MAINTENANCE_RECOVERY_REFUSALS.backendIndeterminate)
   assert.equal(h.rows.get(ENABLED_KEY), 'true', 'assuming "gone" would unfence the writers over a live restore')
@@ -187,7 +192,7 @@ test('o3d-hl8l r5: a hold record naming no backend is unreadable, not "a hold wi
   const h = makeTx({ [ENABLED_KEY]: 'true', [HOLD_KEY]: JSON.stringify({ ...HOLD, backendPid: 0 }) })
   let checks = 0
 
-  const result = await endMaintenanceHold(h.tx, { isRestoreBackendAttached: async () => { checks += 1; return false } })
+  const result = await endMaintenanceHold(h.tx, { isRestoreBackendAttached: async () => { checks += 1; return false } }, SHOWN)
 
   assert.equal(!result.ended && result.reason, MAINTENANCE_RECOVERY_REFUSALS.holdUnreadable)
   assert.equal(checks, 0, 'skipping the check because the evidence is malformed is the button deciding for itself')
@@ -201,7 +206,7 @@ test('o3d-hl8l r5: an already-pending re-check marker is KEPT, not restamped to 
     [RECHECK_KEY]: '2026-08-01T00:00:00.000Z',
   })
 
-  const result = await endMaintenanceHold(h.tx, { ...goneBackend, now: () => new Date('2026-08-18T10:00:00Z') })
+  const result = await endMaintenanceHold(h.tx, { ...goneBackend, now: () => new Date('2026-08-18T10:00:00Z') }, SHOWN)
 
   assert.equal(result.ended && result.recheckDueSince, '2026-08-01T00:00:00.000Z')
   assert.equal(
@@ -209,6 +214,114 @@ test('o3d-hl8l r5: an already-pending re-check marker is KEPT, not restamped to 
     '2026-08-01T00:00:00.000Z',
     'an un-drained older window has been owed a re-check for longer; restamping makes a backlog look new',
   )
+})
+
+// --- o3d-hl8l r6: the hold it ENDS must be the hold it was SHOWN --------------------------------
+
+test('o3d-hl8l r6: a hold recorded by a LATER restore is refused by name, and its backend is never asked about', async () => {
+  // Restore #1 was held; the operator opened the inbox. Restore #2 then timed out too and recorded
+  // its own hold. Every check the old version made was about restore #1 — a backend long gone — so
+  // it cleared a window it had never looked at.
+  const later = { ...HOLD, heldAt: '2026-08-18T11:30:00.000Z', backendPid: 9999, backendStart: '2026-08-18 11:25:00.000000+00' }
+  const h = makeTx({ [ENABLED_KEY]: 'true', [HOLD_KEY]: JSON.stringify(later) })
+  let checks = 0
+
+  const result = await endMaintenanceHold(
+    h.tx,
+    { isRestoreBackendAttached: async () => { checks += 1; return false } },
+    SHOWN,
+  )
+
+  assert.equal(!result.ended && result.reason, MAINTENANCE_RECOVERY_REFUSALS.holdSuperseded)
+  assert.equal(result.ended === false && result.hold?.backendPid, 9999, 'the refusal carries what IS recorded, so the log can say what changed')
+  assert.equal(checks, 0, 'asking pg_stat_activity about a backend the operator never saw is already the wrong question')
+  assert.equal(h.rows.get(ENABLED_KEY), 'true')
+  assert.equal(h.rows.get(RECHECK_KEY) ?? '', '', 'and no window is recorded as ended')
+  assert.deepEqual(h.deleted, [], 'the newer hold is not consumed by a click meant for the older one')
+})
+
+test('o3d-hl8l r6: a second restore recording ITS hold in the instant before the locked read is refused', async () => {
+  // The interleave, driven through the transition: the racer commits between the materialise and
+  // the FOR UPDATE read, which is the last moment Postgres would let it in.
+  const h = makeTx({ [ENABLED_KEY]: 'true', [HOLD_KEY]: JSON.stringify(HOLD) })
+  h.concurrent = () => {
+    h.rows.set(HOLD_KEY, JSON.stringify({ ...HOLD, heldAt: '2026-08-18T12:00:00.000Z', backendPid: 7777 }))
+  }
+
+  const result = await endMaintenanceHold(h.tx, goneBackend, SHOWN)
+
+  assert.equal(!result.ended && result.reason, MAINTENANCE_RECOVERY_REFUSALS.holdSuperseded)
+  assert.equal(h.rows.get(ENABLED_KEY), 'true', 'the second restore keeps its fences')
+  assert.deepEqual(h.upserts, [], 'nothing was written on the refusal path')
+  assert.deepEqual(h.trace, ['materialise', 'locked-read'], 'the racer won inside the lock window, and the re-read is what sees it')
+})
+
+test('o3d-hl8l r6: heldAt alone distinguishes two holds that name the same backend', async () => {
+  // A pid IS reused, and a backend_start can repeat to the microsecond in a test fixture; the
+  // record the operator read is identified by all three or by none.
+  const h = makeTx({ [ENABLED_KEY]: 'true', [HOLD_KEY]: JSON.stringify({ ...HOLD, heldAt: '2026-08-18T09:05:00.001Z' }) })
+
+  const result = await endMaintenanceHold(h.tx, goneBackend, SHOWN)
+
+  assert.equal(!result.ended && result.reason, MAINTENANCE_RECOVERY_REFUSALS.holdSuperseded)
+})
+
+test('o3d-hl8l r6: the identity token is the pair PLUS heldAt, and is whitespace-stable', () => {
+  assert.equal(
+    maintenanceHoldIdentityToken(SHOWN),
+    maintenanceHoldIdentityToken({ ...SHOWN, backendStart: ` ${SHOWN.backendStart} `, heldAt: ` ${SHOWN.heldAt}` }),
+    'a value round-tripped through JSON must not fail to match itself',
+  )
+  assert.notEqual(maintenanceHoldIdentityToken(SHOWN), maintenanceHoldIdentityToken({ ...SHOWN, backendPid: 4243 }))
+  assert.notEqual(maintenanceHoldIdentityToken(SHOWN), maintenanceHoldIdentityToken({ ...SHOWN, heldAt: '2026-08-18T09:05:00.001Z' }))
+})
+
+// --- o3d-hl8l r6: clearing the re-check marker is its own decision -------------------------------
+
+test('o3d-hl8l r6: the marker is cleared only when the window is still closed AND still ours', async () => {
+  const h = makeTx({ [ENABLED_KEY]: 'false', [RECHECK_KEY]: '2026-08-18T10:00:00.000Z' })
+
+  const result = await clearPostMaintenanceRecheckMarker(h.tx, { windowEndedAt: '2026-08-18T10:00:00.000Z' })
+
+  assert.deepEqual(result, { cleared: true })
+  assert.equal(h.rows.has(RECHECK_KEY), false)
+  assert.deepEqual(
+    h.lockedKeys,
+    [ENABLED_KEY, RECHECK_KEY].sort(),
+    'both rows the decision reads are locked, in the same canonical order every other transition uses',
+  )
+})
+
+test('o3d-hl8l r6: a window that opened DURING the pass keeps the marker — the pass ran into a restore', async () => {
+  const h = makeTx({ [ENABLED_KEY]: 'true', [RECHECK_KEY]: '2026-08-18T10:00:00.000Z' })
+
+  const result = await clearPostMaintenanceRecheckMarker(h.tx, { windowEndedAt: '2026-08-18T10:00:00.000Z' })
+
+  assert.deepEqual(result, { cleared: false, reason: MAINTENANCE_RECOVERY_REFUSALS.maintenanceModeOn })
+  assert.equal(
+    h.rows.get(RECHECK_KEY),
+    '2026-08-18T10:00:00.000Z',
+    'clearing here records the window as recovered by a pass that was itself fenced, and nothing ever re-checks it',
+  )
+  assert.deepEqual(h.deleted, [])
+})
+
+test('o3d-hl8l r6: a marker RESTAMPED by a newer window is not the one the pass drained, and is left alone', async () => {
+  const h = makeTx({ [ENABLED_KEY]: 'false', [RECHECK_KEY]: '2026-08-18T11:00:00.000Z' })
+
+  const result = await clearPostMaintenanceRecheckMarker(h.tx, { windowEndedAt: '2026-08-18T10:00:00.000Z' })
+
+  assert.deepEqual(result, { cleared: false, reason: MAINTENANCE_RECOVERY_REFUSALS.recheckMarkerMoved })
+  assert.equal(h.rows.get(RECHECK_KEY), '2026-08-18T11:00:00.000Z', 'the newer window is still owed a re-check')
+})
+
+test('o3d-hl8l r6: an already-drained marker is a no-op refusal, not a second delete', async () => {
+  const h = makeTx({ [ENABLED_KEY]: 'false' })
+
+  const result = await clearPostMaintenanceRecheckMarker(h.tx, { windowEndedAt: '2026-08-18T10:00:00.000Z' })
+
+  assert.deepEqual(result, { cleared: false, reason: MAINTENANCE_RECOVERY_REFUSALS.noRecheckDue })
+  assert.deepEqual(h.deleted, [])
 })
 
 // --- claiming the re-check ----------------------------------------------------------------------

@@ -10,6 +10,7 @@ import {
   countMaintenanceRecovery,
   endMaintenanceHold,
   MAINTENANCE_RECOVERY_REFUSALS,
+  type MaintenanceHoldIdentity,
   type MaintenanceRecoveryState,
 } from '@/lib/domain/system/maintenance-recovery'
 import {
@@ -1364,6 +1365,12 @@ const MAINTENANCE_REFUSAL_MESSAGES: Record<string, string> = {
     + 'End the maintenance window first.',
   [MAINTENANCE_RECOVERY_REFUSALS.noRecheckDue]:
     'No maintenance window is waiting to be re-checked — either none has closed since the last run, or the re-check has already drained.',
+  [MAINTENANCE_RECOVERY_REFUSALS.holdSuperseded]:
+    'The held restore recorded now is NOT the one this page showed you — another restore has been recorded since. '
+    + 'Nothing was changed. Reload the exception inbox and read the new hold before ending it.',
+  [MAINTENANCE_RECOVERY_REFUSALS.recheckMarkerMoved]:
+    'The re-check ran, but the window it was recorded against changed while it was running, so the marker was left in '
+    + 'place for the newer window. Nothing was lost — the next run re-checks it.',
 }
 
 /**
@@ -1379,9 +1386,35 @@ const MAINTENANCE_REFUSAL_MESSAGES: Record<string, string> = {
  * 4. That is the half a hand-written UPDATE always missed, and it is why this action exists at all
  * rather than a line of documentation telling someone which row to edit.
  */
-export async function endHeldMaintenanceWindow(): Promise<MutationResult & { recheckDueSince?: string }> {
+export async function endHeldMaintenanceWindow(
+  /**
+   * o3d-hl8l r6: WHICH hold the operator was looking at. Not a convenience — without it the action
+   * ends whatever hold happens to be recorded at the moment of the click, which after a second
+   * restore is a different window with a different backend and a different reason.
+   */
+  shown: MaintenanceHoldIdentity,
+): Promise<MutationResult & { recheckDueSince?: string }> {
   try {
     const session = await requireFreshPermission('sync')
+
+    // Server actions take their arguments over the wire, so the shape is checked here rather than
+    // assumed from the component that renders the button.
+    const expected: MaintenanceHoldIdentity | null =
+      shown
+        && typeof shown.backendPid === 'number'
+        && Number.isInteger(shown.backendPid)
+        && shown.backendPid > 0
+        && typeof shown.backendStart === 'string'
+        && shown.backendStart.trim() !== ''
+        && typeof shown.heldAt === 'string'
+        ? { backendPid: shown.backendPid, backendStart: shown.backendStart, heldAt: shown.heldAt }
+        : null
+    if (!expected) {
+      return {
+        success: false,
+        error: 'The hold this page was showing could not be identified, so nothing was changed. Reload the exception inbox and try again.',
+      }
+    }
 
     const result = await db.$transaction(async (tx) => endMaintenanceHold(tx, {
       isRestoreBackendAttached: async ({ pid, backendStart }) => {
@@ -1397,7 +1430,7 @@ export async function endHeldMaintenanceWindow(): Promise<MutationResult & { rec
           return null
         }
       },
-    }))
+    }, expected))
 
     if (!result.ended) {
       return {
@@ -1471,6 +1504,18 @@ export async function runPostMaintenanceRecheckNow(): Promise<MutationResult & {
         success: false,
         error: 'No enabled warehouse connector performs a booked-in re-check, so nothing was run. '
           + 'The re-check is still recorded as due.',
+      }
+    }
+
+    // o3d-hl8l r6: the claim above proved a re-check was owed at the instant of the click and
+    // nothing about the minutes the pass takes. The pass re-reads the gate as it goes and names why
+    // it stopped; reporting "done" over that would tell an operator the window was recovered when a
+    // restore had just fenced it.
+    if (result.refusal === 'maintenance_mode_on' || result.refusal === 'window_reopened') {
+      return {
+        success: false,
+        error: `A maintenance window is in force, so the re-check ${result.attempted > 0 ? `stopped after ${result.attempted} ASN(s)` : 'did not start'}. `
+          + 'It is still recorded as due and will run once the window ends. Nothing was lost.',
       }
     }
 

@@ -2,7 +2,8 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
 import { enqueueMintsoftBookedInRecheckForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
-import { WMS_BOOKED_IN_RECHECK_DUE_KEY } from '@/lib/maintenance-mode'
+import { MAINTENANCE_ENABLED_KEY, WMS_BOOKED_IN_RECHECK_DUE_KEY } from '@/lib/maintenance-mode'
+import { clearPostMaintenanceRecheckMarker } from '@/lib/domain/system/maintenance-recovery'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
 
 /**
@@ -58,6 +59,41 @@ export type PostMaintenanceRecheckResult = {
   /** True when the marker was cleared (every open ASN was attempted this tick). */
   drained: boolean
   windowEndedAt?: string
+  /**
+   * o3d-hl8l r6: named when the pass stopped or declined to clear because a maintenance window was
+   * in force. Never bare — an operator seeing "0 attempted" has to be able to tell "nothing was
+   * owed" from "a restore is running".
+   */
+  refusal?: 'maintenance_mode_on' | 'window_reopened' | 'recheck_marker_moved' | 'no_recheck_due'
+}
+
+/**
+ * o3d-hl8l r6 (Codex r5 finding 2) — A CLAIM IS NOT A LEASE.
+ *
+ * The manual path took a locked claim and then ran the pass in a separate transaction, and the
+ * automatic path did not check maintenance mode at all — it read the marker with an unlocked
+ * `findUnique` and went. Both left the same hole: a restore starting after the read, and the pass
+ * then issuing WMS reads and enqueueing booked-in work into a window whose entire purpose is to keep
+ * writers out. The claim proved SOMEONE held the marker; it proved nothing about whether a restore
+ * was in flight, and nothing at all about the minutes the pass takes.
+ *
+ * The gate is now read at three points, each because a different thing goes wrong without it:
+ *
+ *   • BEFORE THE PASS — so a re-check issued into a live window does no WMS work at all;
+ *   • BEFORE EACH CANDIDATE — so a window opening mid-pass stops it at the next ASN rather than
+ *     running to the end of a hundred-ASN page. One settings row read against one WMS round trip per
+ *     candidate is not a cost worth reasoning about, and the alternative — checking every N — is a
+ *     bound chosen for no reason;
+ *   • BEFORE CLEARING THE MARKER — see `clearPostMaintenanceRecheckMarker`, which re-decides it
+ *     under the lock together with "is this still the marker we drained".
+ *
+ * A pass stopped this way KEEPS THE MARKER and reports `window_reopened`, so the next tick after the
+ * window closes repeats it. Re-checking an ASN with nothing outstanding books nothing in, so the
+ * repeat is cheap and the abandonment it prevents is not.
+ */
+async function isMaintenanceModeOn(): Promise<boolean> {
+  const row = await db.setting.findUnique({ where: { key: MAINTENANCE_ENABLED_KEY } })
+  return row?.value === 'true'
 }
 
 export type PostMaintenanceRecheckDeps = {
@@ -72,6 +108,12 @@ export async function runPostMaintenanceBookedInRecheck(
   const marker = await db.setting.findUnique({ where: { key: WMS_BOOKED_IN_RECHECK_DUE_KEY } })
   const windowEndedAt = marker?.value?.trim()
   if (!windowEndedAt) return { skipped: true, attempted: 0, failed: 0, drained: false }
+
+  // A window in force here means a restore is running (or held). Every write this pass would cause
+  // is being replayed over, and the WMS reads are wasted, so it does not start.
+  if (await isMaintenanceModeOn()) {
+    return { skipped: true, attempted: 0, failed: 0, drained: false, windowEndedAt, refusal: 'maintenance_mode_on' }
+  }
 
   const pageSize = options.pageSize ?? POST_MAINTENANCE_RECHECK_PAGE_SIZE
   // Open ASNs only, and NOT the ones that were never verifiably created in the WMS — a synthetic
@@ -94,7 +136,20 @@ export async function runPostMaintenanceBookedInRecheck(
   const candidates = truncated ? openAsns.slice(0, pageSize) : openAsns
 
   let failed = 0
+  let attempted = 0
+  let reopened = false
   for (const asn of candidates) {
+    // Re-read per candidate: a restore that starts mid-pass must stop it at the NEXT ASN, not at
+    // the end of the page. The read is one settings row against one WMS round trip per candidate.
+    if (await isMaintenanceModeOn()) {
+      reopened = true
+      console.warn(
+        '[wms-post-maintenance-recheck] a maintenance window opened while the pass was running — '
+          + `stopping after ${attempted} of ${candidates.length} ASN(s) and keeping the marker`,
+      )
+      break
+    }
+    attempted += 1
     try {
       await deps.recheckAsn(asn.externalAsnId, {
         reason: `automatic re-check after maintenance window ended ${windowEndedAt}`,
@@ -105,30 +160,48 @@ export async function runPostMaintenanceBookedInRecheck(
     }
   }
 
-  // Keep the marker when anything is still owed — a truncated page, or an attempt that threw. The
-  // next tick repeats the pass; a re-check of an ASN with nothing outstanding books nothing in, so
-  // repeating is cheap and losing an ASN is not.
-  const drained = !truncated && failed === 0
-  if (drained) {
-    await db.setting.deleteMany({ where: { key: WMS_BOOKED_IN_RECHECK_DUE_KEY } })
+  // Keep the marker when anything is still owed — a truncated page, an attempt that threw, or a
+  // window that reopened. The next tick repeats the pass; a re-check of an ASN with nothing
+  // outstanding books nothing in, so repeating is cheap and losing an ASN is not.
+  const complete = !truncated && failed === 0 && !reopened
+  let drained = false
+  let refusal: PostMaintenanceRecheckResult['refusal'] = reopened ? 'window_reopened' : undefined
+  if (complete) {
+    // Not a bare delete: the marker is only ours to clear if no window opened during the pass AND
+    // it is still the same marker we drained. See `clearPostMaintenanceRecheckMarker`.
+    const cleared = await db.$transaction((tx) => clearPostMaintenanceRecheckMarker(tx, { windowEndedAt }))
+    drained = cleared.cleared
+    if (!cleared.cleared) {
+      refusal = cleared.reason === 'maintenance_mode_on'
+        ? 'window_reopened'
+        : cleared.reason === 'recheck_marker_moved'
+          ? 'recheck_marker_moved'
+          : 'no_recheck_due'
+      console.warn(
+        `[wms-post-maintenance-recheck] the pass finished but the marker was not cleared (${cleared.reason}) — `
+          + 'it describes a window this pass did not establish anything about',
+      )
+    }
   }
 
-  if (candidates.length > 0) {
+  if (attempted > 0 || reopened) {
     await logActivity({
       entityType: 'SYNC',
       tag: 'sync',
       action: 'wms_post_maintenance_recheck',
-      level: failed > 0 ? 'WARNING' : 'INFO',
+      level: failed > 0 || refusal ? 'WARNING' : 'INFO',
       description:
-        `Re-checked ${candidates.length} open ASN(s) after a maintenance window ended ${windowEndedAt}`
+        `Re-checked ${attempted} open ASN(s) after a maintenance window ended ${windowEndedAt}`
         + (failed > 0 ? ` — ${failed} could not be re-checked and will be retried` : '')
+        + (reopened ? ' — a maintenance window opened mid-pass, so the rest were left for the next tick' : '')
+        + (refusal === 'recheck_marker_moved' ? ' — the marker moved during the pass and was left alone' : '')
         + (truncated ? ' — more remain and will be re-checked next tick' : ''),
-      metadata: { connector: connectorId, windowEndedAt, attempted: candidates.length, failed, truncated },
+      metadata: { connector: connectorId, windowEndedAt, attempted, failed, truncated, refusal: refusal ?? null },
       resolveUser: false,
     })
   }
 
-  return { skipped: false, attempted: candidates.length, failed, drained, windowEndedAt }
+  return { skipped: false, attempted, failed, drained, windowEndedAt, ...(refusal ? { refusal } : {}) }
 }
 
 /**

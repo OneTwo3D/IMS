@@ -62,11 +62,39 @@ async function setSetting(key: string, value: string) {
   })
 }
 
+/**
+ * o3d-hl8l r6 (Codex r5 finding 1) — OPENING A WINDOW SUPERSEDES ANY HOLD RECORDED BEFORE IT.
+ *
+ * A recorded hold used to outlive the restore it described. The row said "maintenance mode is held
+ * because backend 4242 could not be confirmed gone", and it kept saying that while a SECOND restore
+ * started, turned the same flag on for its own reasons, and began replaying. The "End the hold"
+ * action then re-read that row, found the flag on and backend 4242 long gone, and cleared maintenance
+ * mode — over a live restore. Every check it performed passed, because every check was about the
+ * FIRST restore.
+ *
+ * A hold record is now scoped to the window it was recorded in: opening a window deletes it, in the
+ * SAME transaction that sets the flag. What survives is the invariant the action already relies on —
+ * the flag on with NO hold row is a restore that is still running, and is refused by name. So a
+ * second restore starting between the render and the click turns the click into
+ * `no_hold_recorded` rather than into an unfenced database.
+ *
+ * ONE TRANSACTION AND ONE KEY ORDER. The two writes were a `Promise.all` of independent upserts, so
+ * a reader could see the flag on with the reason of the previous window (or vice versa). The keys
+ * are touched in sorted order, the same order `lockRecoveryRows` locks them in, so this and the
+ * recovery actions cannot deadlock against each other — and because the hold delete needs the row
+ * lock the recovery action holds, the two are serialized rather than interleaved.
+ */
 export async function enableMaintenanceMode(reason: string) {
-  await Promise.all([
-    setSetting(MAINTENANCE_ENABLED_KEY, 'true'),
-    setSetting(MAINTENANCE_REASON_KEY, reason),
-  ])
+  await db.$transaction(async (tx) => {
+    // Sorted: system_maintenance_hold < system_maintenance_mode < system_maintenance_reason.
+    await tx.setting.deleteMany({ where: { key: { in: [MAINTENANCE_HOLD_KEY] } } })
+    for (const [key, value] of [
+      [MAINTENANCE_ENABLED_KEY, 'true'],
+      [MAINTENANCE_REASON_KEY, reason],
+    ] as ReadonlyArray<readonly [string, string]>) {
+      await tx.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+    }
+  })
 }
 
 export async function disableMaintenanceMode() {
