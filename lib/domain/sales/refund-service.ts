@@ -1144,6 +1144,54 @@ async function stageRefundAccountingReversals(
       .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
       .reduce((sum, row) => sum + extractPayloadAmount(row.payload, settings.unearnedRevenueAccount), 0)
 
+    // o3d-o97 r2: the CREDIT side of a journal, for the Allocated Inventory contra. An empty
+    // account code is not a match — an unconfigured account would otherwise sum every line whose
+    // own accountCode is blank.
+    const extractPayloadCredit = (payload: unknown, accountCode: string): number => {
+      if (!accountCode) return 0
+      const linesPayload = (payload as { lines?: Array<{ accountCode?: string; credit?: number }> } | null)?.lines
+      if (!Array.isArray(linesPayload)) return 0
+      return linesPayload.reduce((sum, line) => (
+        line.accountCode === accountCode ? sum + refundBoundaryNumber(line.credit ?? 0) : sum
+      ), 0)
+    }
+
+    // o3d-o97 r2: THE RECORD of the Allocated Inventory contra this order's PRIOR refunds actually
+    // relieved — the CR they posted, read off their live reversal journals. Not their refund lines'
+    // costLayerSnapshot, which records which units a refund claimed and is written whether or not
+    // the journal behind it was ever raised.
+    const priorRefundAllocationRelief = priorReversals
+      .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
+      .reduce((sum, row) => sum + extractPayloadCredit(row.payload, settings.allocatedInventoryAccount), 0)
+
+    // o3d-o97 r2: THE RECORD of the Allocated Inventory contra Group B relieved — its CR Allocated
+    // equals the dispatch COGS it debited, per journaled shipment. Valued at the ORIGINALLY-POSTED
+    // basis (immutable CogsEntry rows, 6oyu.5), never at the current layer cost: a later landed-cost
+    // revaluation rewrites the snapshot and Shipment.cogsBatchAmount in place while posting only to
+    // COGS/Inventory, so the Allocated relief stays exactly what Group B credited.
+    // `orderAccounting.shipments` is already filtered to journaled shipments, so an un-journaled
+    // dispatch contributes nothing here — its allocated contra is still open, which is what lets
+    // consumeAllocationCostForLine reverse it.
+    const postedGroupBAllocationRelief = (orderAccounting?.shipments ?? []).reduce(
+      (shipmentSum, shipment) => shipment.lines.reduce(
+        (lineSum, shipmentLine) => addMoney(
+          lineSum,
+          sumCostLayerSnapshot(applyPostedShipmentUnitCosts(
+            // The stored snapshot does not name its own shipment line — the consume path stamps
+            // that on at take time (takeFromSnapshotEntries), and the posted-cost lookup is keyed
+            // by it — so stamp it here the same way before valuing.
+            (shipmentLineSnapshots.get(shipmentLine.id) ?? []).map((entry) => ({
+              ...entry,
+              shipmentLineId: shipmentLine.id,
+            })),
+            postedShipmentUnitCostByKey,
+          )),
+        ),
+        shipmentSum,
+      ),
+      toDecimal(0),
+    )
+
     const lineContexts = (orderAccounting?.lines ?? []).map((line) => ({
       id: line.id,
       productId: line.productId,
@@ -1493,29 +1541,90 @@ async function stageRefundAccountingReversals(
     // Allocated Inventory with nothing left in IMS that knows it is owed. The same happens, in
     // part, to any full-by-amount refund whose lines cover fewer units than the order allocated.
     //
-    // `allocationAvailability` is exactly that residue: each allocation row's pinned layers, less
-    // every JOURNALED shipment's relief, less every prior refund's relief, less this refund's own
-    // consumption immediately above. Reversing it applies the SAME rule the line-driven path
-    // already applies — an allocation pin that no posted journal has relieved is reversible
-    // allocated contra — to the part no line reached. It is not a new judgement about the units:
-    // `orderAccounting.shipments` is filtered to journaled shipments only, so a dispatched-but-
-    // unjournaled unit is already reversed this way by `consumeAllocationCostForLine`.
+    // WHAT HAS BEEN POSTED IS A RECORD, NOT A QUANTITY RE-DERIVED EACH PASS (o3d-o97 r2, the rule
+    // o3d-0i5y round 8 established on the A2 side of the same contra). Round 1 answered "what is
+    // still owed?" with `allocationAvailability` — the allocation rows' pinned layers as they stand
+    // NOW, netted by whatever snapshots happen to sit on the shipment and refund rows NOW. That is a
+    // re-derivation from mutable current state, and it was wrong three separate ways:
+    //
+    //   * IT REVALUED A HISTORICAL POSTING. A2 debited Allocated Inventory a fixed number of pounds.
+    //     Landed-cost revaluation rewrites the pinned layers' unitCostBase in place
+    //     (updateSnapshotsForCostLayerChange), and a transfer re-source rewrites which layers are
+    //     pinned at all — so a £30 debit was reversed as £12 once the layers behind it fell to £4,
+    //     stranding £18, and as £42 when they rose, moving £12 that was never in the account.
+    //   * IT READ A PRIOR REFUND'S SNAPSHOT AS PROOF THAT REFUND'S REVERSAL POSTED. A refund line's
+    //     costLayerSnapshot is written for EVERY line, unconditionally, in this same transaction,
+    //     before any journal decision — and it long outlives the journal's fate. The reversal sync
+    //     it belongs to can be CANCELLED as a cross-connector orphan when the active connector is
+    //     switched (audit-46ry), or end FAILED against a locked period or an archived account, and
+    //     a refund old enough to predate the allocation-reversal journal never had one at all. In
+    //     every one of those the snapshot still says the units were relieved. (The one route that
+    //     is NOT reachable is staging failing outright: scjz.22 blocks a further refund while a
+    //     prior one still has accountingRetryRequired.) The snapshot says which units a refund
+    //     CLAIMED; only a live sync log says which pounds it POSTED.
+    //   * IT TREATED THE A2 STAMP AS EVIDENCE A2 POSTED. The stamp only says the order passed
+    //     through the A2 window. A2 stamps EVERY order it selects, including ones it valued at
+    //     zero — the batch journal is raised only when the window's total is positive, and it
+    //     names no order individually — so a stamp on its own is consistent with this order having
+    //     contributed nothing to any journal. A reversal posted wrongly is as bad as the original,
+    //     so this path needs POSITIVE evidence of the original, not the absence of evidence
+    //     against it.
+    //
+    // So all three inputs are now RECORDS written BY the postings they stand for:
+    //
+    //   posted    `SalesOrder.allocationBatchAmount` — the DR Allocated Inventory that A2 wrote for
+    //             THIS order, in the same UPDATE as the stamp, and nulled together with the stamp by
+    //             every un-stage site. It is the same record `recreateMissingDailyBatchLogs` rebuilds
+    //             the A2 journal from, so the two paths can never disagree about what A2 posted.
+    //             It is per-ORDER, so it survives allocation rows being deleted, re-created or
+    //             re-pinned entirely — the record follows the order's posting, never a row.
+    //   relieved  every JOURNALED shipment, valued at the ORIGINALLY-POSTED dispatch COGS
+    //             (`postedShipmentUnitCostByKey`, sourced from the immutable CogsEntry rows) — which
+    //             is exactly the CR Allocated Inventory Group B raised. Deliberately NOT
+    //             Shipment.cogsBatchAmount nor the live snapshot cost: revaluation mutates both in
+    //             place, and a revaluation posts to COGS/Inventory, never to Allocated Inventory, so
+    //             the relief stays at the posted basis for ever (the same 6oyu.5 rule the COGS
+    //             reversal above already follows).
+    //   relieved  every PRIOR refund's own CR Allocated Inventory, read off its live
+    //             UNEARNED_REV_REVERSAL sync (`priorReversals`, already loaded above for the
+    //             equivalent unearned guard and already scoped to the active connector and to
+    //             PENDING/PROCESSING/SYNCED).
+    //
+    // The residue is the arithmetic on those records — posted, less relieved, less what this
+    // refund's own lines are reversing immediately below — floored at zero. No layer cost is
+    // consulted, so nothing downstream of A2 can revalue it.
     //
     // NOT a fix for the other un-stage sites. `resetAllocationAccountingIfStaged` and
     // `releaseOverallocations` un-stage an order that is NOT refunded, so A2 re-runs and posts a
-    // SECOND debit; there is no refund credit note to carry a reversal, and reversing from there
-    // needs its own sync type. That half of o3d-o97 is untouched here.
-    let residualAllocationSnapshot: CostLayerSnapshotEntry[] = []
+    // SECOND debit — and they null `allocationBatchAmount` with the stamp, so the FIRST debit's
+    // record goes with it and the residue here can only ever cover the latest posting. There is no
+    // refund credit note to carry a reversal for the orphaned one, and reversing from there needs
+    // its own sync type. That half of o3d-o97 is untouched here.
+    let residualAllocationReversal = 0
     if (params.newStatus === 'REFUNDED') {
-      // Gated on the A2 STAMP, read before the update below clears it. An order A2 never staged
-      // has no Allocated Inventory contra, and crediting that account for its pins would move a
-      // balance the daily batch never posted.
+      // Read before the update below clears it. The AMOUNT is the positive evidence, not the stamp:
+      // a stamp with no recorded amount (a row A2 valued at zero, or one staged before the column
+      // existed) is a claim that something was posted with no statement of what, and this path
+      // fails closed on it rather than guessing from the pins. Those rows are not silently dropped
+      // — `sales_order_inventory_allocation_missing_amount` in the accounting invariants already
+      // reports every stamped order with no allocation amount, which is where a human picks up a
+      // legacy debit that has to be reversed by hand.
+      //
+      // A live A2 sync log is deliberately NOT probed as well: SYNCED daily-batch logs are pruned by
+      // data retention (scjz.36), so beyond the retention window a missing log cannot be told from
+      // one that posted, and its absence would be evidence of nothing.
       const stagedA2 = await tx.salesOrder.findUnique({
         where: { id: params.orderId },
-        select: { inventoryAllocatedDate: true },
+        select: { inventoryAllocatedDate: true, allocationBatchAmount: true },
       })
-      if (stagedA2?.inventoryAllocatedDate) {
-        residualAllocationSnapshot = [...allocationAvailability.values()].flat()
+      const postedAllocationDebit = refundBoundaryNumber(stagedA2?.allocationBatchAmount ?? 0)
+      if (stagedA2?.inventoryAllocatedDate && postedAllocationDebit > 0) {
+        const relieved = addMoney(
+          addMoney(postedGroupBAllocationRelief, toDecimal(priorRefundAllocationRelief)),
+          sumCostLayerSnapshot(allocationRefundSnapshot),
+        )
+        const residue = subtractMoney(toDecimal(postedAllocationDebit), relieved)
+        residualAllocationReversal = residue.gt(0) ? roundQuantity(residue, 2).toNumber() : 0
       }
       // o3d-0qoo: each batch ref is cleared IN THE SAME UPDATE as the stamp it pairs with. A row
       // left holding a ref with no stamp would make the delete guard match a batch the row is no
@@ -1544,12 +1653,12 @@ async function stageRefundAccountingReversals(
         Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
       ),
       // o3d-o97: the lines' own allocation cost PLUS, on a full refund that un-stages A2, the
-      // residue nothing else will ever relieve. Summed at full precision and rounded once, so the
-      // two halves cannot each shed half a penny.
+      // residue of the RECORDED A2 debit that nothing else will ever relieve. Summed at full
+      // precision and rounded once, so the two halves cannot each shed half a penny.
       allocationReversal: roundQuantity(
         addMoney(
           sumCostLayerSnapshot(allocationRefundSnapshot),
-          sumCostLayerSnapshot(residualAllocationSnapshot),
+          toDecimal(residualAllocationReversal),
         ),
         2,
       ).toNumber(),
