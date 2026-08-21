@@ -257,6 +257,13 @@ Refunds created in WooCommerce are automatically synced to One Two Inventory:
 
 Refunds are deduplicated by WooCommerce refund ID, so they are safe to re-process.
 
+**All of them, not the first ten.** WooCommerce returns refunds ten at a time unless asked for more, so an
+order with many separate refunds used to sync only its ten most recent. Every page is now read. If a page
+cannot be read, the sync keeps what it got and logs `wc_refund_read_incomplete` (WARNING) naming the order
+and how far it reached — until the rest arrive, that order shows a smaller refunded amount than the store
+does, and a 3PL despatch for it can be refused as uncovered. The next sweep re-reads the order from the
+first page, so it clears itself.
+
 ## Invoice Notes and Customer PDF Downloads
 
 When an invoice is generated for a WooCommerce order, the system pushes invoice metadata to the WC order. The customer-facing invoice PDF download is then handled by the **OneTwoInventory Helper** WordPress plugin via a server-to-server handoff.

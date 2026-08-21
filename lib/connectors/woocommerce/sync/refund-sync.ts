@@ -499,12 +499,97 @@ export function refundedOrderLineId(rl: WcRefundLineItem): number {
   return Number.isFinite(id) && id > 0 ? id : rl.id
 }
 
-export async function syncRefundsForOrder(externalOrderId: number): Promise<number> {
-  // Fetch refunds from WC
-  const { data, error } = await wcFetch(`/orders/${externalOrderId}/refunds`)
-  if (error || !data) return 0
+/**
+ * WooCommerce pages `/orders/{id}/refunds` at TEN unless asked otherwise, and 100 is the most
+ * it will serve. Asking for the maximum is not an optimisation here — see
+ * `fetchAllWcRefundsForOrder`.
+ */
+const WC_REFUND_PAGE_SIZE = 100
 
-  const refunds = data as WcRefund[]
+async function logIncompleteRefundRead(
+  externalOrderId: number,
+  failedPage: number,
+  readSoFar: number,
+  detail: string,
+): Promise<void> {
+  try {
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_refund_read_incomplete',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Reading refunds for WooCommerce order ${externalOrderId} stopped at page ${failedPage} `
+        + `after ${readSoFar} refund(s): ${detail}. Refunds beyond that point are not in IMS yet, so the `
+        + 'order may show a smaller refunded amount than the store does, and a 3PL dispatch for it can be '
+        + 'refused as uncovered until the next sweep reads them. The sweep re-reads the order from the '
+        + 'first page each time, so this clears itself once the store responds.',
+      metadata: { externalOrderId, failedPage, readSoFar, error: detail },
+      resolveUser: false,
+    })
+  } catch {
+    // Telemetry must never turn a partial read into a thrown sweep.
+  }
+}
+
+/**
+ * EVERY refund on the order, not the first page of them (o3d-okbd).
+ *
+ * `/orders/{id}/refunds` takes the collection parameters and defaults `per_page` to 10,
+ * newest first. The sweep asked for the path with no parameters at all, so on an order with
+ * more than ten refunds it read the ten most recent and returned as though that were the lot —
+ * silently, because a short page and a capped page look identical from the caller's side.
+ *
+ * Ten is not a hypothetical ceiling. A partial refund per line item reaches it on an ordinary
+ * multi-line order, and WooCommerce writes one refund per "Refund" press, not one per order.
+ *
+ * WHY IT MATTERS BEYOND THE MISSING ROWS. `findExternalFulfillmentShortfall` nets refunded
+ * quantity out of the demand a 3PL dispatch has to cover, reading the refund lines IMS holds.
+ * Refunds that never arrived are demand that is never netted, so the coverage check refuses a
+ * dispatch that is in fact complete — and the refusal is permanent, since redelivery re-reads
+ * the same truncated page. The truncation therefore does not merely lose refund history; it
+ * blocks fulfilment on the orders that have the most of it.
+ *
+ * Bounded twice over: by `x-wp-totalpages` when the store reports it, and by a page that comes
+ * back shorter than it asked for, so a store that reports no total (or an implausible one)
+ * still terminates.
+ *
+ * A page that FAILS returns what was read so far together with the error, which is the same
+ * leniency the single-page version had for a failed fetch — the caller syncs what it has, and
+ * the next sweep re-reads the order from the start, because nothing here is cursored. It is
+ * also LOGGED, here rather than at the call site, because this is the only frame that knows
+ * the read was short: one page further up, a partial list and a complete one are the same
+ * value, which is exactly how the ten-refund truncation stayed invisible for as long as it
+ * did.
+ */
+export async function fetchAllWcRefundsForOrder(
+  externalOrderId: number,
+): Promise<{ refunds: WcRefund[]; error?: string }> {
+  const refunds: WcRefund[] = []
+  let page = 1
+  for (;;) {
+    const { data, totalPages, error } = await wcFetch(`/orders/${externalOrderId}/refunds`, {
+      per_page: String(WC_REFUND_PAGE_SIZE),
+      page: String(page),
+    })
+    if (error || !data || !Array.isArray(data)) {
+      const detail = error
+        ?? (data ? 'WooCommerce returned a non-list refund page' : 'WooCommerce returned no refund data')
+      await logIncompleteRefundRead(externalOrderId, page, refunds.length, detail)
+      return { refunds, error: detail }
+    }
+
+    refunds.push(...(data as WcRefund[]))
+    // A page shorter than the one asked for is the last page, whatever any header claims.
+    if (data.length < WC_REFUND_PAGE_SIZE) return { refunds }
+    const reportedPages = Number.isFinite(totalPages) && totalPages > 0 ? totalPages : 1
+    if (page >= reportedPages) return { refunds }
+    page += 1
+  }
+}
+
+export async function syncRefundsForOrder(externalOrderId: number): Promise<number> {
+  // Every page of refunds on the order, not just the first (o3d-okbd).
+  const { refunds } = await fetchAllWcRefundsForOrder(externalOrderId)
   let synced = 0
 
   for (const refund of refunds) {
