@@ -73,6 +73,14 @@ function makeDbDouble(): Record<string, unknown> {
         }
       }
       if (key === 'then') return undefined
+      // Raw-SQL delegates must be FUNCTIONS. The generic `model` proxy below answers method access,
+      // so returning it for these made them objects and the caller died on "is not a function".
+      //  • `$queryRaw`  — o3d-7o0's `SELECT ... FOR UPDATE` row lock, merged into development as part
+      //    of #639. Un-taught, the cancelled-order guard failed with "could not read sales order",
+      //    which this file reported as "nothing was posted" — i.e. as a claim failure, which it isn't.
+      //  • `$executeRaw` — o3d-clxw r4's database-clock stamp on the SYNCED transition.
+      if (key === '$queryRaw' || key === '$queryRawUnsafe') return async () => []
+      if (key === '$executeRaw' || key === '$executeRawUnsafe') return async () => 1
       return model
     },
   })
@@ -193,7 +201,11 @@ test('r4 #2: a persist reached on a LAPSED claim runs no transaction at all, and
     claim: claimHeldFrom(new Date(Date.now() - staleAfterMs - 1_000)),
   })
 
-  assert.equal(recorded, false, 'the caller is told the row was not recorded normally')
+  // `{ persisted: false, reason: 'pool-exhausted' }` rather than a bare `false`: the persist now names
+  // which failure it hit, so the outbox runner can bury a refused document permanently and leave a
+  // pool-exhausted job alone. The property asserted here is unchanged.
+  assert.deepEqual(recorded, { persisted: false, reason: 'pool-exhausted' },
+    'the caller is told the row was not recorded normally')
   assert.equal(state.transactionAttempts, 0,
     'the ordinary persist updates the row BY ID with no claim fence — under a lapsed claim it must not run at all')
 

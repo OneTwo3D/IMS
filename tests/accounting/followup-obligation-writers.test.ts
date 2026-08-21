@@ -704,9 +704,22 @@ test('[o3d-9kek r10 f1] a FRESHLY POSTED Xero row claims the obligation in the w
   // this file is about is unchanged: the obligation is claimed in the SAME write.
   const synced = state.journal.find((entry) => entry.op === 'syncLog.updateMany' && entry.data?.status === 'SYNCED')
   assert.ok(synced, 'the row must be marked SYNCED')
-  assert.equal(synced.where?.status, 'PROCESSING',
-    'and fenced on the claim: an update keyed on the row id alone would settle a row another worker had taken')
-  assert.ok(synced.where?.processingStartedAt instanceof Date)
+  // o3d-xl63 r5 #2 ASSERTED `synced.where.status === 'PROCESSING'` here — the settling write fenced
+  // on this worker's claim. SUPERSEDED by #639, and deliberately not restated: o3d-550x considered
+  // claim-fencing this exact write and rejected it, because a displaced worker that DID post must
+  // still be able to record its document id or the document sits in Xero with nothing naming it.
+  // The hazard that assertion named — "an update keyed on the row id alone would settle a row
+  // another worker had taken" — is closed by a DIFFERENT precondition, which is what is asserted
+  // instead: the write refuses to overwrite a row that already names another document. That is a
+  // real precondition on the WHERE, so the concern it was raised against is still covered.
+  assert.ok(
+    Array.isArray((synced.where as { OR?: unknown[] } | undefined)?.OR),
+    'the settling write must still carry a precondition — the "do not overwrite a DIFFERENT document" '
+      + 'OR-clause — rather than being keyed on the row id alone',
+  )
+  // The other half of the same superseded r5 #2 assertion (the claim INSTANT in the WHERE). Not
+  // restated, for the reason above; what this test exists to prove — the id and the obligation ride
+  // ONE write — is asserted immediately below and is untouched by any of it.
   assert.equal(synced.data?.externalTransactionId, 'XBILL-1', 'this is the write that records the id')
   assert.ok(
     synced.data?.backReferenceFollowUpsPendingAt instanceof Date,

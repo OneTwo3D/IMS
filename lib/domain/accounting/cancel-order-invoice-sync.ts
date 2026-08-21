@@ -1,7 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
-import { heldClaimWhere, type HeldClaim } from './sync-claim-fence'
 
 /** SALES_INVOICE sync types that recognise revenue for a sales order. */
 const SALES_INVOICE_SYNC_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] as const

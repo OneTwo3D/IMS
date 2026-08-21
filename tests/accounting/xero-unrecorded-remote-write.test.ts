@@ -85,8 +85,13 @@ function runGiveUpScenario(fallbackBehaviour: 'succeeds' | 'claim-lost' | 'fails
 test('r3 #3: the id of the document Xero holds reaches fd 2 BEFORE anything touches the database', () => {
   const { stdout, stderr } = runGiveUpScenario('succeeds')
 
+  // `{ persisted: false, reason: 'pool-exhausted' }` rather than a bare `false`: the persist now names
+  // WHICH failure it hit, because the outbox runner buries a refused document permanently and must
+  // leave a pool-exhausted job alone. The property here — the caller is told it was not recorded
+  // normally — is unchanged.
   const result = JSON.parse(stdout.trim().split('\n').pop()!)
-  assert.equal(result.recorded, false, 'the caller is told the row was not recorded normally')
+  assert.deepEqual(result.recorded, { persisted: false, reason: 'pool-exhausted' },
+    'the caller is told the row was not recorded normally')
   assert.ok(result.transactionAttempts > 1,
     `the persist was re-driven across the failure before giving up (attempts: ${result.transactionAttempts})`)
 
@@ -134,7 +139,7 @@ test('r3 #3: the database attempt is ONE claim-guarded statement, not another tr
 test('r3 #3: when the evidence genuinely cannot be written, it says so instead of pretending', () => {
   const { stdout, stderr } = runGiveUpScenario('fails')
   const result = JSON.parse(stdout.trim().split('\n').pop()!)
-  assert.equal(result.recorded, false)
+  assert.deepEqual(result.recorded, { persisted: false, reason: 'pool-exhausted' })
 
   const lines = stderr.split('\n').filter((line) => line.includes('[UNRECORDED-REMOTE-WRITE]'))
   const last = JSON.parse(lines[lines.length - 1].slice(lines[lines.length - 1].indexOf('{')))
@@ -181,9 +186,16 @@ function runLostClaimScenario(): { stdout: string; stderr: string } {
                 writeSync(2, 'FENCE-WRITE ' + JSON.stringify(args.where) + '\\n')
                 return { count: 0 }
               },
+              // What a refused precondition MEANS under #639: the row already names another document.
+              // The helper reads it back so the evidence can name both ids.
+              findUnique: async () => ({ externalTransactionId: 'PAY-OTHER' }),
             },
             accountingEvent: { updateMany: async () => { writeSync(2, 'MIRRORED-EVENT\\n'); return { count: 1 } } },
             accountingEventLog: { create: async () => { writeSync(2, 'MIRRORED-EVENT\\n'); return {} } },
+            // #639 files the conflict evidence INSIDE the transaction that observed it, so the
+            // transaction client needs the activity-log delegate. Without it the evidence write
+            // throws and the whole thing surfaces as "the record could not be saved".
+            activityLog: { create: async (args) => { writeSync(2, 'ACTIVITY-WRITE ' + JSON.stringify(args.data) + '\\n'); return { id: 'act-1' } } },
           }),
           accountingSyncLog: { updateMany: async () => { writeSync(2, 'FALLBACK-WRITE\\n'); return { count: 1 } } },
         },
@@ -194,6 +206,8 @@ function runLostClaimScenario(): { stdout: string; stderr: string } {
       namedExports: {
         logActivity: async (entry) => { writeSync(2, 'ACTIVITY-WRITE ' + JSON.stringify(entry) + '\\n') },
         logActivityPersisted: async (entry) => { writeSync(2, 'ACTIVITY-WRITE ' + JSON.stringify(entry) + '\\n'); return true },
+        redactActivityLogText: (text) => text,
+        sanitizeActivityLogMetadata: (metadata) => metadata,
       },
     })
     const ns = await import('@/lib/connectors/xero/sync-processor')
@@ -219,46 +233,61 @@ function runLostClaimScenario(): { stdout: string; stderr: string } {
   return { stdout: child.stdout, stderr: child.stderr }
 }
 
-test('r5 #2: a claim lost mid-persist reports the id to fd 2 BEFORE the database, and records nothing over the new owner', () => {
+/**
+ * o3d-xl63 r5 #2, RETARGETED — the scenario survives, the CAUSE it attributed does not.
+ *
+ * As written, this drove the claim fence r5 #2 put on the settling write: the WHERE carried this
+ * worker's claim, matched nothing once the row changed hands, and the displaced id was reported
+ * without being written anywhere. #639 (o3d-550x) removed that fence from this write deliberately —
+ * see the note in tests/accounting/xero-remote-write-lease.test.ts — so nothing raises a lost-claim
+ * error any more and the harness's `count: 0` now means the other thing a refused precondition can
+ * mean: the row ALREADY NAMES A DIFFERENT DOCUMENT.
+ *
+ * That is still exactly the situation this test was built to interrogate — a document is in Xero and
+ * the local row will not take it — so the harness is kept and pointed at the surviving mechanism. The
+ * ordering claim in the old title (fd 2 before the database) belongs to the POOL-EXHAUSTION path and
+ * is asserted by the two tests above; this path never loses its connection, so it files its evidence
+ * transactionally instead, which is the stronger of the two.
+ */
+test('r5 #2 (retargeted): a write the row refuses records the evidence rather than dropping the id', () => {
   const { stdout, stderr } = runLostClaimScenario()
 
-  assert.deepEqual(JSON.parse(stdout.trim()), { recorded: false },
+  const outcome = JSON.parse(stdout.trim()).recorded as { persisted: boolean; reason: string; evidence?: string }
+  assert.equal(outcome.persisted, false,
     'the caller is told the row was not recorded, so it does not go on to report success')
+  assert.equal(outcome.reason, 'not-recorded',
+    'and it is told WHICH failure, because the outbox runner buries this one permanently and must '
+      + 'not bury the pool-exhaustion one')
+  assert.match(String(outcome.evidence), /BOTH documents exist in Xero/,
+    'the wording the runner puts on the buried job comes back with the outcome, so the operator '
+      + 'reads it on the job rather than having to find the activity row')
 
-  // The write was ATTEMPTED and it was FENCED — without both, this proves nothing.
+  // The write was ATTEMPTED and it carried a real precondition — without both, this proves nothing.
   const fenceLine = stderr.split('\n').find((line) => line.startsWith('FENCE-WRITE'))
   assert.ok(fenceLine, 'the persist must have attempted its write')
   const fenceWhere = JSON.parse(fenceLine!.slice('FENCE-WRITE '.length))
   assert.equal(fenceWhere.id, 'log-88')
-  assert.equal(fenceWhere.status, 'PROCESSING')
-  assert.ok(fenceWhere.processingStartedAt,
-    "the claim is IN the WHERE — an update keyed on the row id alone could not have refused, and would "
-      + "have flipped the new owner's row to SYNCED carrying this worker's id")
+  assert.ok(
+    Array.isArray(fenceWhere.OR),
+    'the precondition is IN the WHERE — an update keyed on the row id alone could not have refused, '
+      + "and would have flipped the other document's row to carry this worker's id",
+  )
 
   assert.equal(stderr.includes('MIRRORED-EVENT'), false,
-    'the fence throws before the mirrored event, so the transaction rolls back whole rather than leaving '
-      + 'an event that says POSTED beside a row that does not')
+    'the refusal happens before the mirrored event, so the transaction rolls back whole rather than '
+      + 'leaving an event that says POSTED beside a row that names something else')
   assert.equal(stderr.includes('FALLBACK-WRITE'), false,
-    'and no recovery write is attempted: every write here is fenced on a claim that is gone, so it could '
-      + 'only match nothing — or, unfenced, trample the worker that now owns the row')
+    'and no pooled recovery write is attempted: nothing here lost its connection, and writing the id '
+      + 'over the row would destroy the record of the document it already names')
 
-  const evidenceAt = stderr.indexOf('[UNRECORDED-REMOTE-WRITE]')
+  // THE POINT: the displaced identifier is written down, naming BOTH documents, so an operator can
+  // reconcile them. Under r5 #2 this lived only on fd 2; here it is a durable row.
   const activityAt = stderr.indexOf('ACTIVITY-WRITE')
-  assert.ok(evidenceAt >= 0, `the id must reach fd 2. Got:\n${stderr}`)
-  assert.ok(activityAt >= 0, 'and an activity row must follow, or the evidence is grep-only')
-  assert.ok(evidenceAt < activityAt,
-    'fd 2 FIRST (r3 #3): the durable record is attempted only after the line that needs nothing but this '
-      + 'process still holding the id')
-
-  const evidence = JSON.parse(stderr.slice(evidenceAt + '[UNRECORDED-REMOTE-WRITE]'.length).split('\n')[0])
-  assert.equal(evidence.externalId, 'PAY-88', 'the id itself, not a pointer to a row that does not have it')
-  assert.equal(evidence.recorded, false)
-  assert.match(evidence.reason, /claim was lost between deriving the deadline and writing/,
-    'and the reason distinguishes this from the pool-exhaustion give-up, which is a different remedy')
-
+  assert.ok(activityAt >= 0, `the evidence must be filed. Got:\n${stderr}`)
   const activity = JSON.parse(stderr.slice(activityAt + 'ACTIVITY-WRITE '.length).split('\n')[0])
-  assert.equal(activity.action, 'xero_sync_claim_lost_during_persist')
+  assert.equal(activity.action, 'xero_posted_document_unrecorded')
   assert.equal(activity.level, 'ERROR', 'a document in Xero that no row names is not a warning')
-  assert.equal(activity.metadata.externalId, 'PAY-88')
-  assert.match(activity.description, /CHECK XERO/)
+  assert.match(String(activity.description), /PAY-88/, 'the id this worker posted')
+  assert.match(String(activity.description), /PAY-OTHER/, 'and the id the row already names')
+  assert.match(String(activity.description), /BOTH documents exist in Xero/)
 })

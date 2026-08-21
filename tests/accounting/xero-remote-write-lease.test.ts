@@ -160,6 +160,13 @@ function makeDbDouble(): Record<string, unknown> {
       if (key === '$executeRaw' || key === '$executeRawUnsafe') {
         return async () => { state.databaseClockStamps += 1; return 1 }
       }
+      // o3d-7o0, merged into development as part of #639: the cancelled-order guard now takes the
+      // sales order's ROW LOCK before it reads the status, so a cancellation cannot commit between
+      // the read and the post. The lock is a `SELECT ... FOR UPDATE` through `$queryRaw`, and an
+      // un-taught double made the guard fail with "could not read sales order" — which this file
+      // then reported as "nothing was posted", i.e. as a claim/lease failure with nothing at all to
+      // do with claims. Locking behaviour itself is pinned in the allocation-service tests.
+      if (key === '$queryRaw' || key === '$queryRawUnsafe') return async () => []
       if (key === 'accountingSyncLog') return syncLog
       if (key === 'accountingEvent' || key === 'accountingEventLog') return events
       if (key === 'integrationOutbox') {
@@ -189,6 +196,13 @@ mock.module('@/lib/activity-log', {
   namedExports: {
     logActivity: async (entry: Record<string, unknown>) => { state.activity.push(entry) },
     logActivityPersisted: async (entry: Record<string, unknown>) => { state.activity.push(entry); return true },
+    // Merged into development after this double was written (#637/#638): the unrecorded-posted-document
+    // record is redacted and its metadata sanitised before it is filed. A double without these throws
+    // INSIDE the evidence write, which then reports itself as "the record could not be saved" — an
+    // alarming failure that is really just a missing test stub. Identity stand-ins: this file asserts
+    // on the CONTENT of what is filed, not on how it is scrubbed.
+    redactActivityLogText: (text: string) => text,
+    sanitizeActivityLogMetadata: (metadata: unknown) => metadata,
   },
 })
 mock.module('@/lib/connectors/xero/auth', {
@@ -259,6 +273,22 @@ function settlingWrite() {
   return state.syncLogWrites.find((w) => w.data.status === 'SYNCED' && w.data.externalTransactionId === 'XERO-INV-1')
 }
 
+/**
+ * A SECOND worker tries to record a DIFFERENT document against the same row.
+ *
+ * This is the guarantee o3d-550x (#639) substitutes for the claim fence that used to sit on the
+ * settling write, so a test that stops asserting the fence has to assert this instead — otherwise the
+ * rewrite would have removed a check and replaced it with nothing.
+ */
+async function recordSecondDocument(externalId: string) {
+  const { recordPostedDocumentDurably } = await processor()
+  return recordPostedDocumentDurably(
+    { id: 'log-1', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-1' },
+    externalId,
+    state.row!.payload as Record<string, unknown>,
+  )
+}
+
 /** Another worker re-claims the row: same id, a claim stamp that is not ours. */
 function stealTheRow(): void {
   state.row!.status = 'PROCESSING'
@@ -306,54 +336,73 @@ test('control: with the claim held throughout, the sweep posts exactly once and 
   // back to PENDING afterwards. The property under test is that the fenced write LANDED.
   const settled = settlingWrite()
   assert.ok(settled, 'the persist must have attempted to record the document')
-  assert.equal(settled.count, 1, 'and the claim fence must have MATCHED — the ordinary path is not blocked by it')
-  assert.ok(settled.where.processingStartedAt instanceof Date,
-    'fenced on a real claim timestamp rather than on the row id alone')
-  assert.equal(settled.where.status, 'PROCESSING')
+  assert.equal(settled.count, 1, 'and its precondition MATCHED — the ordinary path is not blocked by it')
+  // r5 #2 asserted the claim itself here (`where.processingStartedAt instanceof Date`, `where.status
+  // === 'PROCESSING'`). SUPERSEDED by #639 — see the r5 #2 test below for the full reasoning. The
+  // property this control exists to prove is that the ordinary path is not blocked by whatever
+  // precondition the settling write carries, so the precondition is asserted, just not that one.
+  assert.ok(
+    Array.isArray((settled.where as { OR?: unknown[] }).OR),
+    'the settling write still carries a precondition — the "do not overwrite a DIFFERENT document" '
+      + 'OR-clause — rather than being keyed on the row id alone',
+  )
   assert.equal(state.activity.some((a) => a.action === 'xero_sync_claim_lost_before_post'), false)
   assert.equal(state.activity.some((a) => a.action === 'xero_sync_claim_lost_during_persist'), false)
 })
 
-test('r5 #2: a claim taken WHILE the document was in flight cannot be recorded over the top of it', async () => {
+/**
+ * o3d-xl63 r5 #2, REWRITTEN AGAINST THE MERGED RULE — and this is the one place in this rebase where
+ * the two branches genuinely disagreed rather than merely collided.
+ *
+ * WHAT r5 #2 ASSERTED. The claim is stolen while the document is on the wire; the settling write is
+ * fenced on this worker's claim, matches NO row, and the persist therefore records NOTHING over the
+ * new owner — the displaced document id surviving only in an ERROR alarm.
+ *
+ * WHY IT NO LONGER HOLDS. o3d-550x (merged as #639) considered claim-fencing this exact write and
+ * rejected it in as many words: "Making it conditional on still holding the claim would mean the
+ * displaced worker — the one that DID post — writes nothing, and the document exists in Xero with
+ * nothing in IMS naming it." Its precondition is the fact it protects instead: the row must not
+ * already name a DIFFERENT document. In THIS scenario the thief has not recorded anything yet, so
+ * the precondition holds and the real document id is written to the row rather than left in a log.
+ *
+ * WHAT IS ASSERTED NOW. The same scenario, and the same thing that actually matters: a document that
+ * reached Xero is not lost, and a second, different document cannot be silently written over it.
+ * The two rules disagree about WHICH id ends up on the row; they agree completely that neither id may
+ * vanish, and that is what this test pins.
+ */
+test('r5 #2 (superseded): a claim taken WHILE the document was in flight cannot LOSE the document', async () => {
   reset()
   // The narrowest window there is, and the one no pre-check can close: the claim is taken after the
-  // persist's deadline was derived and before its write lands. Round 4's zero-deadline refusal cannot
-  // see this — the arithmetic still says the claim is healthy.
+  // persist's deadline was derived and before its write lands.
   state.onPost = stealTheRow
 
   const { processPendingXeroSync } = await processor()
-  const result = await processPendingXeroSync()
+  await processPendingXeroSync()
 
   assert.deepEqual(state.posted, ['INV-1'], 'the document DID reach Xero — that is the premise of this test')
-  assert.equal(result.failed, 1, 'and the row is reported as not recorded')
-  assert.equal(result.succeeded, 0)
 
   const settled = settlingWrite()
   assert.ok(settled,
-    'the persist must have been ATTEMPTED — otherwise this test proves nothing about the fence, only that '
-      + 'the code took some other branch')
-  assert.equal(settled.count, 0, 'and the claim fence must have matched NO row, which is what stopped it')
-  assert.equal(settled.where.status, 'PROCESSING')
-  assert.ok(settled.where.processingStartedAt instanceof Date,
-    "the WHERE carries this worker's claim: an `update({ where: { id } })` could not have refused at all")
+    'the persist must have been ATTEMPTED — otherwise this test proves nothing about the precondition, '
+      + 'only that the code took some other branch')
+  assert.ok(
+    Array.isArray((settled.where as { OR?: unknown[] }).OR),
+    'and it carries the "do not overwrite a DIFFERENT document" precondition rather than being keyed '
+      + 'on the row id alone — an `update({ where: { id } })` could not have refused anything',
+  )
 
-  assert.equal(state.row?.status, 'PROCESSING',
-    'the row must NOT be flipped to SYNCED: it belongs to another worker, which is at this moment posting under it')
-  assert.deepEqual(state.row?.processingStartedAt, new Date('2031-01-01T00:00:00.000Z'),
-    "the persist must not have overwritten the other worker's claim")
-  assert.equal(state.row?.externalTransactionId, null,
-    "and must not have stamped THIS worker's document id onto the other worker's row")
-  assert.equal(state.mirroredEventWrites, 0,
-    'the fence throws before the mirrored event, so the transaction rolls back whole rather than half-recording')
+  // THE POINT. The row now names the document that was actually posted. Under r5 #2 this id lived
+  // only in an activity-log alarm; under #639 it is on the row, which is strictly more recoverable.
+  assert.equal(state.row?.externalTransactionId, 'XERO-INV-1',
+    'the displaced worker DID post this document, so its id must be recorded somewhere durable')
 
-  const alarm = state.activity.find((a) => a.action === 'xero_sync_claim_lost_during_persist')
-  assert.ok(alarm, 'a document is in Xero that no row names — that is an ERROR, not a warning')
-  assert.equal(alarm.level, 'ERROR')
-  assert.equal(alarm.metadata?.externalId, 'XERO-INV-1',
-    'the id is the only evidence that survives, so it has to be IN the record')
-  assert.match(alarm.description ?? '', /CHECK XERO/)
-  assert.match(alarm.description ?? '', /SECOND time/,
-    'and says plainly what may already have happened, rather than reporting a generic persistence fault')
+  // And the half that makes the disagreement safe either way: the next worker cannot quietly replace
+  // it. A different document arriving for the same row is refused, not written over the top.
+  const otherWorker = await recordSecondDocument('XERO-INV-2')
+  assert.equal(otherWorker.recorded, false,
+    'a SECOND, different document must not be able to overwrite the first — that is the guarantee '
+      + 'o3d-550x substitutes for the claim fence, and it is what stops an id being lost')
+  assert.equal(state.row?.externalTransactionId, 'XERO-INV-1', 'the row keeps the id it already names')
 })
 
 test('r5 #1: the absolute lease deadline covers the preparation calls and is NOT extended by a renewal', async () => {
@@ -580,13 +629,17 @@ test('r6: a claim renewed while the persist is RE-DRIVEN is the claim the settli
     'and it moved FORWARD, so a caller-side snapshot would now be a superseded instant')
   assert.equal(state.transactionAttempts, 2, 'one failure to start, then the re-drive')
 
-  assert.equal(recorded, true,
-    'the document Xero holds is recorded: the fence used the claim the row carries NOW, not the one read before the re-drive')
+  assert.deepEqual(recorded, { persisted: true },
+    'the document Xero holds is recorded across the re-drive')
   const settled = settlingWrite()
   assert.ok(settled, 'the settling write was attempted')
   assert.equal(settled!.count, 1, 'and it MATCHED — the double evaluated the WHERE against real row state')
-  assert.deepEqual(settled!.where.processingStartedAt, renewed,
-    'the instant in the WHERE is the renewed one, read as the statement was built')
+  // r6 asserted that the RENEWED instant appears in this WHERE. SUPERSEDED: #639 does not put the
+  // claim on this write at all (see the r5 #2 test above). The r6 property — the persist holds the
+  // CLAIM and not a photograph of it — is still real and is still asserted, at the two places that
+  // still read it: the deadline, which is why this re-drive was allowed to continue at all after the
+  // claim moved, and the give-up path's terminal write in the test below. Both would break under a
+  // caller-side snapshot; neither is touched by the settling write's precondition changing.
   assert.equal(state.row?.status, 'SYNCED')
   assert.equal(state.row?.externalTransactionId, 'XERO-INV-1')
   assert.equal(
@@ -628,7 +681,11 @@ test('r6: the give-up path records the external id against the RENEWED claim, no
 
   assert.ok(state.transactionAttempts >= 2, 'the persist was re-driven across the failure before giving up')
   assert.notDeepEqual(held, heldWhenThePersistWasCalled, 'the scenario ran: the claim moved during the re-drive')
-  assert.equal(recorded, false, 'the caller is told the row was not recorded normally — the pool never gave it a transaction')
+  // `{ persisted: false, reason: 'pool-exhausted' }` rather than a bare `false`: the persist now
+  // distinguishes "the pool refused me" from "the row already names a DIFFERENT document", because
+  // the outbox runner has to bury the second and must NOT touch the database after the first.
+  assert.deepEqual(recorded, { persisted: false, reason: 'pool-exhausted' },
+    'the caller is told the row was not recorded normally — the pool never gave it a transaction')
 
   // THE VERDICT: the single-statement fallback is the only thing that can still save the id, and it is
   // claim-fenced. Built from a snapshot it matches nothing and the id is lost with an "already lost"

@@ -1279,28 +1279,6 @@ function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date) {
   }
 }
 
-/**
- * THE CLAIM FENCE IS SHARED, AND IT TAKES A CLAIM — NOT A TIMESTAMP (o3d-xl63 r6).
- *
- * `heldClaimWhere` used to be spelt out here, taking a bare `Date`. It now lives in
- * `@/lib/domain/accounting/sync-claim-fence` and takes a {@link HeldClaim}: an object asked for its
- * instant AS THE STATEMENT IS BUILT. Re-exported so the existing consumers (and the tests that pin
- * the definition) keep reaching it through this module.
- *
- * WHY THE SIGNATURE, AND WHY IT IS THE HALF OF THE CROSS-BRANCH DECISION THAT LANDS HERE. A claim
- * instant is not a constant for the life of an entry on this branch: {@link openRemoteWriteLease}
- * RENEWS it before every remote mutation, so `processingStartedAt` moves forward repeatedly while one
- * entry is being processed. A consumer that captured the instant when the row was first claimed and
- * fenced on that value later would match NOTHING — and because all of these fences fail closed, it
- * would silently refuse work it was entitled to do rather than doing work it was not. Refusing a bare
- * `Date` at the type level is what turns that from a note somebody has to remember into a compile
- * error at every site that carries a snapshot.
- *
- * {@link RemoteWriteLease} satisfies `HeldClaim` structurally — same accessor name — so the lease is
- * passed wherever a claim is wanted and every fence reads the instant the row actually carries. A
- * runner that genuinely never renews says so with {@link claimHeldFrom}.
- */
-export { claimHeldFrom, heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 
 /**
  * RECORD A DOCUMENT XERO HAS ALREADY ACCEPTED (o3d-xl63 r2 #2, r3 #1-#3).

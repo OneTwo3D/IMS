@@ -668,7 +668,20 @@ test('Codex r1 medium 2: the scanner really does remove comments before it asser
   // assertion above and every negative assertion below.
   assert.ok(stripped.includes('export async function recordPostedSyncResult('), 'code survives stripping')
   assert.ok(stripped.includes('accountingSyncLogClaimWhere('), 'and so do the predicates the scan reads')
-  assert.ok(stripped.length > src.length / 2, 'a stripper that returned nothing would pass every negative assertion')
+  // Round 5 expressed this as a BYTE RATIO (`stripped.length > src.length / 2`). That threshold no
+  // longer holds and its failure said nothing about the stripper: merging o3d-550x's prose with this
+  // branch's took the file past 52% comments, so a perfectly correct strip now returns 48% of the
+  // bytes. Replaced rather than lowered, because a ratio was always the weaker way to say it — half
+  // the CODE could vanish and a ratio would still pass. Counting surviving top-level declarations
+  // cannot be satisfied by an empty result, and cannot be satisfied by a half-eaten one either.
+  const declarations = (stripped.match(/^(export )?(async )?function /gm) ?? []).length
+  assert.equal(
+    declarations,
+    (src.match(/^(export )?(async )?function /gm) ?? []).length,
+    'a stripper that returned nothing — or that ate code along with the comments — would pass every '
+      + 'negative assertion below, so every top-level declaration in the file must survive it',
+  )
+  assert.ok(declarations > 40, 'and the file really does contain the declarations being counted')
 })
 
 test('o3d-550x: neither runner writes the sync row except to CLAIM it or through a fenced helper', () => {
