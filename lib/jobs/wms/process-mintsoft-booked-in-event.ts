@@ -250,6 +250,70 @@ function incrementCounter(counters: MintsoftBookedInCounters, result: ProcessMin
   }
 }
 
+/**
+ * o3d-hl8l — THE RECOVERY FOR A BOOKED-IN CALLBACK THAT NEVER BECAME A ROW.
+ *
+ * The webhook route refuses (503) while maintenance mode is on rather than persisting into a window
+ * a restore may still be replaying over. That is the right refusal — the fence runs BEFORE signature
+ * verification, so persisting there would mean writing rows from unauthenticated callers — but it
+ * only holds up if a dropped trigger can be recovered, and until now it could not be.
+ *
+ * `replayMintsoftBookedInEventsForAsn` is NOT that path: it re-drives rows that already exist. A
+ * refused callback left no row, so there was nothing for it to find. The watchdog's overdue-ASN
+ * alert DETECTS the loss (a day after the ETA, or a week without one) and then named no remedy.
+ *
+ * WHY A SYNTHETIC EVENT IS SOUND, and not an invented fact. The callback carries an ASN id and
+ * nothing else that is used: `processBookedInEvent` re-fetches the ASN from the WMS and applies only
+ * the DELTA over each line's `lastProcessedReceivedQty`. So this reconstructs the TRIGGER, never the
+ * quantities — the warehouse remains the authority for those. It is also why a real callback
+ * arriving later is harmless: it finds the delta already applied and books nothing in twice.
+ *
+ * EXISTING WORK FIRST. If unprocessed rows for this ASN already exist — dead-lettered, mid-ladder,
+ * awaiting review — those are re-driven instead. Creating a second row alongside them would race
+ * the sweeper for the same delta and turn a reviewable failure into two.
+ */
+export async function enqueueMintsoftBookedInRecheckForAsn(
+  externalAsnId: string,
+  options: { reason?: string; now?: () => Date } = {},
+): Promise<MintsoftBookedInCounters & { created: boolean }> {
+  const normalized = externalAsnId.trim()
+  if (!normalized) throw new Error('externalAsnId is required')
+
+  const outstanding = await db.wmsInboundReceiptEvent.findFirst({
+    where: buildMintsoftWebhookReplayForAsnWhere(normalized),
+    select: { id: true },
+  })
+  if (outstanding) {
+    return { ...(await replayMintsoftBookedInEventsForAsn(normalized)), created: false }
+  }
+
+  const at = (options.now ?? (() => new Date()))()
+  const repository = createMintsoftWebhookEventRepository()
+  // The id records WHERE this came from. It is deliberately not shaped like a Mintsoft event id: a
+  // reader of this table must be able to tell a reconstructed trigger from a delivered callback, and
+  // the (connector, externalEventId) unique key makes two rechecks in the same millisecond one row.
+  const created = await repository.createEvent({
+    externalEventId: `mintsoft-recheck:${normalized}:${at.toISOString()}`,
+    externalAsnId: normalized,
+    payload: {
+      source: 'operator-recheck',
+      externalAsnId: normalized,
+      requestedAt: at.toISOString(),
+      ...(options.reason ? { reason: options.reason } : {}),
+    },
+  })
+
+  const counters = {
+    processed: 0,
+    duplicates: 0,
+    pending: 0,
+    requiresReview: 0,
+    failed: 0,
+  }
+  incrementCounter(counters, await processMintsoftBookedInEvent(created.id))
+  return { ...counters, created: true }
+}
+
 export async function replayMintsoftBookedInEventsForAsn(externalAsnId: string): Promise<MintsoftBookedInCounters> {
   const events = await db.wmsInboundReceiptEvent.findMany({
     where: buildMintsoftWebhookReplayForAsnWhere(externalAsnId),

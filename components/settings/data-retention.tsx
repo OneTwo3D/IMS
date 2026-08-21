@@ -14,6 +14,8 @@ type Props = {
   stockMovementsValue: string
   syncLogsValue: string
   webhookEventsValue: string
+  wmsEventsValue: string
+  wmsSyncJobsValue: string
 }
 
 const FIELDS = [
@@ -23,6 +25,8 @@ const FIELDS = [
   { key: 'retention_stock_movements_months', label: 'Stock Movements', stateKey: 'stockMovements' as const, hint: 'Permanently delete movements' },
   { key: 'retention_sync_logs_months', label: 'Sync Logs', stateKey: 'syncLogs' as const, hint: 'Permanently delete settled sync logs (unfinished accounting work is kept)' },
   { key: 'retention_webhook_events_months', label: 'Webhook Events', stateKey: 'webhookEvents' as const, hint: 'Clear processed inbox payloads (keeps dedup + dead letters)' },
+  { key: 'retention_wms_events_months', label: 'WMS Inbound Events', stateKey: 'wmsEvents' as const, hint: 'Clear processed WMS callback payloads (keeps dedup + dead letters)' },
+  { key: 'retention_wms_sync_jobs_months', label: 'WMS Sync Runs', stateKey: 'wmsSyncJobs' as const, hint: 'Delete finished sync runs and their per-SKU log lines' },
 ] as const
 
 export function DataRetentionSetting({
@@ -32,6 +36,8 @@ export function DataRetentionSetting({
   stockMovementsValue,
   syncLogsValue,
   webhookEventsValue,
+  wmsEventsValue,
+  wmsSyncJobsValue,
 }: Props) {
   const [isPending, startTransition] = useTransition()
   const [values, setValues] = useState({
@@ -41,6 +47,8 @@ export function DataRetentionSetting({
     stockMovements: stockMovementsValue,
     syncLogs: syncLogsValue,
     webhookEvents: webhookEventsValue,
+    wmsEvents: wmsEventsValue,
+    wmsSyncJobs: wmsSyncJobsValue,
   })
   const [saved, setSaved] = useState(false)
 
@@ -62,7 +70,7 @@ export function DataRetentionSetting({
       <p className="text-xs text-muted-foreground">
         One exception: accounting sync entries that are still <strong>pending, in progress or failed</strong> are never deleted by age. They are unfinished work, not history — the payload is what a retry posts, and deleting one while a worker still holds it would put a document in the ledger that nothing here records. They expire normally once they settle (synced or cancelled), so clearing them is a matter of resolving them on the Accounting Sync page.
       </p>
-      <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-6 gap-x-4 max-w-4xl">
+      <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-4 gap-x-4 max-w-4xl">
         {FIELDS.map((f) => (
           <div key={f.key} className="grid grid-rows-subgrid row-span-3 gap-0">
             <Label className="text-xs self-end pb-1">{f.label} (months)</Label>

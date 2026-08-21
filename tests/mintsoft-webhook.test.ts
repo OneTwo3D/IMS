@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import test from 'node:test'
+import { NextResponse } from 'next/server'
 import {
   handleMintsoftBookedInWebhook,
   type MintsoftBookedInWebhookRouteDependencies,
@@ -70,8 +71,16 @@ function buildSignedWebhookRequest(payload: Record<string, unknown>, timestamp =
 function buildWebhookRouteDependencies(
   repository: MintsoftWebhookEventRepository,
   logs: unknown[] = [],
+  maintenance: (() => NextResponse | null) | null = null,
+  refusals: Array<{ route: string; reason: 'maintenance_mode' }> = [],
 ): MintsoftBookedInWebhookRouteDependencies {
   return {
+    recordMaintenanceRefusal(detail) {
+      refusals.push(detail)
+    },
+    async getMaintenanceModeResponse() {
+      return maintenance ? maintenance() : null
+    },
     async getMintsoftApiConfiguration() {
       return {
         baseUrl: '',
@@ -586,4 +595,165 @@ test('isMintsoftWebhookTimestampFresh rejects stale signed timestamps', () => {
     isMintsoftWebhookTimestampFresh(new Date('2026-04-22T09:30:00.000Z'), now),
     false,
   )
+})
+
+
+// ---------------------------------------------------------------------------
+// o3d-hl8l: THE MAINTENANCE-MODE FENCE.
+//
+// The restore endpoint leaves maintenance mode ON when a restore backend cannot be confirmed dead,
+// and this route used to persist a receipt event straight through that window. It is now fenced —
+// as the FIRST statement, before the body is read and before the signature is verified, so nothing
+// on the persist path can run.
+// ---------------------------------------------------------------------------
+
+function maintenanceResponse(): NextResponse {
+  return NextResponse.json(
+    { skipped: true, reason: 'maintenance_mode', detail: 'Database restore in progress.' },
+    { status: 503 },
+  )
+}
+
+test('the booked-in webhook refuses with 503 maintenance_mode and persists NOTHING while maintenance mode is on', async () => {
+  const created: PersistMintsoftWebhookEventInput[] = []
+  const logs: unknown[] = []
+  const repository: MintsoftWebhookEventRepository = {
+    async findEvent() { return null },
+    async createEvent(input) {
+      created.push(input)
+      return { id: 'evt-row' }
+    },
+    async updatePendingEvent() { return true },
+  }
+
+  const response = await handleMintsoftBookedInWebhook(
+    buildSignedWebhookRequest({ eventId: 'evt-maint', asnId: 'asn-maint' }),
+    buildWebhookRouteDependencies(repository, logs, maintenanceResponse),
+  )
+
+  // The SPECIFIC refusal, not merely "not a 202": a 503 is the standard retry signal, and the
+  // reason names maintenance mode so an operator reading the sender's delivery log knows why.
+  assert.equal(response.status, 503)
+  assert.deepEqual(await response.json(), {
+    skipped: true,
+    reason: 'maintenance_mode',
+    detail: 'Database restore in progress.',
+  })
+
+  // The whole point: no row, and no activity row either. Both are writes into a database that may
+  // still be being replayed over.
+  assert.deepEqual(created, [], 'no receipt event may be persisted during maintenance mode')
+  assert.deepEqual(logs, [], 'and no activity row either')
+})
+
+test('the booked-in webhook fence runs BEFORE signature verification, so an unsigned delivery is refused as maintenance rather than unauthorized', async () => {
+  const repository: MintsoftWebhookEventRepository = {
+    async findEvent() { return null },
+    async createEvent() { return { id: 'x' } },
+    async updatePendingEvent() { return true },
+  }
+  const request = new Request('https://ims.example.com/api/webhooks/mintsoft/asn-booked-in', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ eventId: 'evt-unsigned' }),
+  })
+
+  const response = await handleMintsoftBookedInWebhook(
+    request,
+    buildWebhookRouteDependencies(repository, [], maintenanceResponse),
+  )
+
+  // 503 (fenced), NOT 401 (rejected signature) — the ordering is the assertion. If the fence moved
+  // below the signature check, this delivery would be a 401 and the fence would be reading the
+  // webhook secret out of the database mid-restore to decide it.
+  assert.equal(response.status, 503)
+  assert.equal((await response.json()).reason, 'maintenance_mode')
+})
+
+test('with maintenance mode OFF the booked-in webhook still persists and returns 202', async () => {
+  const created: PersistMintsoftWebhookEventInput[] = []
+  const repository: MintsoftWebhookEventRepository = {
+    async findEvent() { return null },
+    async createEvent(input) {
+      created.push(input)
+      return { id: 'evt-row' }
+    },
+    async updatePendingEvent() { return true },
+  }
+
+  const response = await handleMintsoftBookedInWebhook(
+    buildSignedWebhookRequest({ eventId: 'evt-open', asnId: 'asn-open' }),
+    buildWebhookRouteDependencies(repository, []),
+  )
+
+  assert.equal(response.status, 202)
+  assert.deepEqual(created.map((input) => input.externalEventId), ['evt-open'])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-hl8l r3 (Codex r2 finding 1): A REFUSED CALLBACK LEFT NO TRACE AT ALL.
+//
+// Round 2 built the Re-check recovery and kept the 503, but the refusal itself was silent: no row
+// (deliberately — the fence exists to stop writes), and no log line either. The earliest anything
+// noticed was the WMS watchdog's overdue-ASN alert, a day after the ETA at best and seven days for
+// an ASN with none, and only if a WMS connector is enabled and an active admin exists to notify.
+// ---------------------------------------------------------------------------
+
+test('o3d-hl8l r3: a refused booked-in callback is recorded at the fence, and still writes nothing to the database', async () => {
+  const created: PersistMintsoftWebhookEventInput[] = []
+  const logs: unknown[] = []
+  const refusals: Array<{ route: string; reason: 'maintenance_mode' }> = []
+  const repository: MintsoftWebhookEventRepository = {
+    async findEvent() { return null },
+    async createEvent(input) {
+      created.push(input)
+      return { id: 'evt-row' }
+    },
+    async updatePendingEvent() { return true },
+  }
+
+  const response = await handleMintsoftBookedInWebhook(
+    buildSignedWebhookRequest({ eventId: 'evt-maint-logged', asnId: 'asn-maint-logged' }),
+    buildWebhookRouteDependencies(repository, logs, maintenanceResponse, refusals),
+  )
+
+  assert.equal(response.status, 503)
+  // Recorded once, naming the route, with the SPECIFIC reason — not a generic "something failed".
+  assert.deepEqual(refusals, [{
+    route: 'app/api/webhooks/mintsoft/asn-booked-in',
+    reason: 'maintenance_mode',
+  }])
+  // And the fence's own guarantee is intact: the record is not a database write.
+  assert.deepEqual(created, [], 'the refusal record must not become a receipt-event row')
+  assert.deepEqual(logs, [], 'nor an activity row — logActivity writes into the window being replayed over')
+})
+
+test('o3d-hl8l r3: nothing is recorded when the fence does not fire', async () => {
+  const refusals: Array<{ route: string; reason: 'maintenance_mode' }> = []
+  const repository: MintsoftWebhookEventRepository = {
+    async findEvent() { return null },
+    async createEvent() { return { id: 'evt-row' } },
+    async updatePendingEvent() { return true },
+  }
+
+  const response = await handleMintsoftBookedInWebhook(
+    buildSignedWebhookRequest({ eventId: 'evt-open-2', asnId: 'asn-open-2' }),
+    buildWebhookRouteDependencies(repository, [], null, refusals),
+  )
+
+  assert.equal(response.status, 202)
+  assert.deepEqual(refusals, [], 'a delivered callback is not a refused one')
+})
+
+test('o3d-hl8l r3: the fenced webhook 503 carries Retry-After, so "the sender retries" is a schedule and not a hope', async () => {
+  const { buildMaintenanceModeResponse, MAINTENANCE_MODE_RETRY_AFTER_SECONDS } = await import('../lib/maintenance-mode.ts')
+
+  const webhook = buildMaintenanceModeResponse('webhook', { reason: 'Database restore in progress.' })
+  assert.equal(webhook.status, 503)
+  assert.equal(webhook.headers.get('Retry-After'), String(MAINTENANCE_MODE_RETRY_AFTER_SECONDS))
+
+  // The cron side is a 423 an operator reads, not a sender: no schedule is being promised there.
+  const cron = buildMaintenanceModeResponse('cron', { reason: null })
+  assert.equal(cron.status, 423)
+  assert.equal(cron.headers.get('Retry-After'), null)
 })

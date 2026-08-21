@@ -102,6 +102,8 @@ function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
     deleteToken: 0,
     enableMaintenance: 0,
     disableMaintenance: 0,
+    // o3d-hl8l r5: what the held branch recorded for the operator to act on.
+    maintenanceHolds: [] as Array<{ reason: string; backendPid: number; backendStart: string; applicationName: string }>,
     runRestore: 0,
     getTargetDatabaseTimestamp: 0,
   }
@@ -138,6 +140,10 @@ function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
     },
     disableMaintenance: async () => {
       calls.disableMaintenance += 1
+    },
+    recordMaintenanceHold: async (detail) => {
+      calls.maintenanceHolds.push(detail as { reason: string; backendPid: number; backendStart: string; applicationName: string })
+      return true
     },
     runRestoreFile: async () => {
       calls.runRestore += 1
@@ -1345,6 +1351,7 @@ test('an unconfirmed restore backend leaves MAINTENANCE MODE ON as well as the l
         throw new RestoreBackendNotConfirmedError(
           'Restore timed out and its database backend could NOT be confirmed gone. The '
           + 'connector-selection lock is being HELD, not released. Maintenance mode stays ON.',
+          { pid: 4242, backendStart: '2026-07-15 11:00:00+00', applicationName: 'ims_restore_abc123' },
         )
       },
     })
@@ -1364,6 +1371,24 @@ test('an unconfirmed restore backend leaves MAINTENANCE MODE ON as well as the l
     assert.ok(failureLog, 'the failure is still audited')
     assert.equal((failureLog.metadata as { maintenanceModeHeld?: unknown }).maintenanceModeHeld, true)
     assert.equal((failureLog.metadata as { backendUnconfirmed?: unknown }).backendUnconfirmed, true)
+
+    // o3d-hl8l r5 (Codex r4 finding 1). THE HELD BRANCH MUST LEAVE SOMETHING TO ACT ON. Without
+    // this record the window is a bare `'true'` in `settings` with no screen: the operator clears
+    // it by hand, no re-check marker is ever stamped, and every warehouse callback the fence
+    // refused during the LONGEST kind of window is left to a days-scale alert.
+    assert.deepEqual(calls.maintenanceHolds, [{
+      reason: 'Restore timed out and its database backend could NOT be confirmed gone. The '
+        + 'connector-selection lock is being HELD, not released. Maintenance mode stays ON.',
+      backendPid: 4242,
+      backendStart: '2026-07-15 11:00:00+00',
+      applicationName: 'ims_restore_abc123',
+    }], 'the record names the exact backend the operator action re-checks before it clears anything')
+    assert.equal(
+      (failureLog.metadata as { holdRecorded?: unknown }).holdRecorded,
+      true,
+      'and whether it landed is audited — a lost record means no inbox row, which the operator has '
+        + 'no other way to discover',
+    )
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -1402,7 +1427,10 @@ test('an audit-log failure cannot switch maintenance mode off while the backend 
       },
       runRestoreFile: async () => {
         calls.runRestore += 1
-        throw new RestoreBackendNotConfirmedError('backend pid 4242 could NOT be confirmed gone')
+        throw new RestoreBackendNotConfirmedError(
+          'backend pid 4242 could NOT be confirmed gone',
+          { pid: 4242, backendStart: '2026-07-15 11:00:00+00', applicationName: 'ims_restore_abc123' },
+        )
       },
     })
     const handler = createBackupRestorePostHandler(deps)
@@ -2366,30 +2394,48 @@ test('the reach of maintenance mode is what the restore path SAYS it is, measure
   const cron = consulting.filter((rel) => rel.startsWith('app/api/cron/'))
   const other = consulting.filter((rel) => !rel.startsWith('app/api/cron/'))
   assert.ok(cron.length > 0, 'cron routes do consult it')
+  // o3d-hl8l: this list was ['lib/connectors/woocommerce/webhooks.ts'] and the assertion below
+  // PINNED that as the intended reach. Fencing the Mintsoft ASN webhook is exactly the growth this
+  // test exists to force a decision about, so the expectation moves WITH the production change —
+  // and MAINTENANCE_MODE_REACH plus the operator message move with it too, which is the property
+  // being protected.
   assert.deepEqual(
     other,
-    ['lib/connectors/woocommerce/webhooks.ts'],
-    'and outside cron, exactly ONE entry point does. If this list grows, MAINTENANCE_MODE_REACH and '
+    ['app/api/webhooks/mintsoft/asn-booked-in/route.ts', 'lib/connectors/woocommerce/webhooks.ts'],
+    'and outside cron, exactly TWO entry points do. If this list grows, MAINTENANCE_MODE_REACH and '
       + 'the operator message in the restore route have to grow with it — that is the whole point of '
       + 'pinning it here.',
   )
-  assert.deepEqual([...MAINTENANCE_MODE_REACH.fenced], ['app/api/cron/*', 'lib/connectors/woocommerce/webhooks.ts'])
+  assert.deepEqual([...MAINTENANCE_MODE_REACH.fenced], [
+    'app/api/cron/*',
+    'app/api/webhooks/mintsoft/asn-booked-in/route.ts',
+    'lib/connectors/woocommerce/webhooks.ts',
+  ])
 
   // THE HALF THAT WAS ASSUMED. Not one interactive server action gates on it, so an unconfirmed
   // restore overlaps every dashboard write there is.
   const actions = consulting.filter((rel) => rel.startsWith('app/actions/'))
   assert.deepEqual(actions, [], 'no server action consults maintenance mode — so it fences none of them')
-  assert.equal(MAINTENANCE_MODE_REACH.hasOperatorControl, false)
 
-  // ...and there is no screen for the flag either, which is why the recovery in the message is a
-  // database operation and not "turn it off in Settings".
-  const uiReferences: string[] = []
-  for (const file of await filesUnder(path.join(repo, 'app'))) {
-    const rel = path.relative(repo, file)
-    if (!rel.startsWith('app/(dashboard)') && !rel.startsWith('app/settings')) continue
-    if (/system_maintenance_mode|MaintenanceMode/.test(await readFile(file, 'utf8'))) uiReferences.push(rel)
+  // o3d-hl8l r5 (Codex r4 finding 1). THIS ASSERTION USED TO SAY `false`, AND IT WAS PINNING THE
+  // DEFECT: the flag had no control, so the held branch was cleared by a hand-written UPDATE that
+  // stamped no re-check marker, and every callback the fence refused during the longest kind of
+  // window was left to a days-scale alert. The control exists now, and it is measured — not
+  // asserted as prose — by finding the action that clears the flag.
+  assert.equal(MAINTENANCE_MODE_REACH.hasOperatorControl, true)
+
+  const clearingActions: string[] = []
+  for (const file of await filesUnder(path.join(repo, 'app', 'actions'))) {
+    const source = await readFile(file, 'utf8')
+    if (/endMaintenanceHold/.test(source)) clearingActions.push(path.relative(repo, file))
   }
-  assert.deepEqual(uiReferences, [], 'no dashboard screen can clear it')
+  assert.deepEqual(
+    clearingActions,
+    ['app/actions/sync-exceptions.ts'],
+    'EXACTLY ONE action may end a held window, and it is the one that re-reads the flag under a '
+      + 'lock, re-checks the backend, and stamps the booked-in re-check as it clears. A second '
+      + 'clearing path is a path that skips one of those.',
+  )
 })
 
 test('the unconfirmed-restore message describes only the protection that exists', async () => {
@@ -2409,8 +2455,12 @@ test('the unconfirmed-restore message describes only the protection that exists'
   // round that was specifically about measuring this message. A test that asserts the wording is
   // only as good as the measurement behind the wording, so the classification itself is now
   // measured from the route files in 'the webhook fencing claim is measured FROM THE ROUTES'.
-  assert.match(message, /Scheduled jobs \(app\/api\/cron\/\*\) and WooCommerce webhooks are stopped by maintenance mode/)
-  assert.match(message, /MINTSOFT AND SHIPHERO WEBHOOK ROUTES[\s\S]*?NOT STOPPED BY ANYTHING/)
+  assert.match(message, /Scheduled jobs \(app\/api\/cron\/\*\), WooCommerce webhooks and the Mintsoft ASN webhook are stopped by maintenance mode/)
+  // o3d-hl8l: was /MINTSOFT AND SHIPHERO WEBHOOK ROUTES/. The Mintsoft half is now fenced, so a
+  // message still naming it as unstopped would be the same class of false claim round 12 removed —
+  // only inverted. ShipHero stays, because the ShipHero route was deliberately left unfenced.
+  assert.match(message, /SHIPHERO WEBHOOK ROUTE[\s\S]*?NOT STOPPED BY ANYTHING/)
+  assert.doesNotMatch(message, /MINTSOFT[\s\S]*?NOT STOPPED BY ANYTHING/, 'the Mintsoft route IS stopped now')
   assert.match(message, /INTERACTIVE WRITES FROM THE DASHBOARD ARE NOT STOPPED BY ANYTHING/)
   assert.match(message, /Backend pid 4242, started 2026-08-18 09:00:00\.123456\+00/, 'the operator is told what to look for')
 
@@ -2419,8 +2469,15 @@ test('the unconfirmed-restore message describes only the protection that exists'
   // advisory lock, so the instructed recovery destroyed the one real protection.
   assert.doesNotMatch(message, /Maintenance mode stays ON\./, 'that clause implied the application was down')
   assert.match(message, /Do NOT restart yet: restarting releases the held lock/)
-  assert.match(message, /clear maintenance mode/, 'and the flag it leaves behind has a named recovery')
-  assert.match(message, /system_maintenance_mode/)
+  // o3d-hl8l r5 (Codex r4 finding 1). "Clear the `system_maintenance_mode` row" was a remedy that
+  // WORKED and still lost data: it ends the window without stamping the booked-in re-check, so the
+  // callbacks the fence refused stay nobody's. The message now names the control that does both,
+  // and says why the hand edit is not equivalent — a refusal is only as good as the remedy it
+  // points at.
+  assert.match(message, /end the hold from Sync → Exceptions → "Maintenance window"/)
+  assert.match(message, /re-checks this backend before it clears anything/, 'the control is not a rubber stamp')
+  assert.match(message, /schedules the re-check for the warehouse callbacks refused during the window/)
+  assert.match(message, /editing the `system_maintenance_mode` row in `settings` by hand does neither/)
 })
 
 test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag readers', async () => {
@@ -2457,15 +2514,33 @@ test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag r
 
   // ...and the classification has to match what the route actually does. `fenced: 'no'` means the
   // whole reachable path from the route file consults the flag NOWHERE.
+  //
+  // o3d-hl8l: this loop asserted `consults(route) === false` for EVERY row — i.e. it pinned "no
+  // webhook route fences itself", which was true only while none of them did. It is now the
+  // classification that is asserted, per row, against what the route file actually contains:
+  // `fenced: 'yes'` MUST consult the flag, and `fenced: 'no'` must not. That keeps the same
+  // property (a route cannot be misdescribed) without hard-coding the answer.
   const consults = async (rel: string) => /getMaintenanceModeResponse\(|getMaintenanceModeState\(/.test(await readFile(path.join(repo, rel, 'route.ts'), 'utf8'))
   for (const { route, fenced } of MAINTENANCE_MODE_REACH.inboundWebhooks) {
+    assert.ok(
+      fenced === 'no' || fenced === 'yes' || fenced === 'woocommerce-only',
+      `${route}: unexpected classification ${fenced}`,
+    )
     assert.equal(
       await consults(route),
-      false,
-      `${route}: no webhook route consults the flag directly — the WooCommerce fence is inside the handler it dispatches to, which is exactly why a per-route glob could not express this`,
+      fenced === 'yes',
+      fenced === 'yes'
+        ? `${route}: classified FENCED, so the route file itself must consult the flag`
+        : `${route}: classified ${fenced}, so it must NOT consult the flag directly — the WooCommerce fence is inside the handler it dispatches to, which is exactly why a per-route glob could not express this`,
     )
-    assert.ok(fenced === 'no' || fenced === 'woocommerce-only', `${route}: unexpected classification ${fenced}`)
   }
+
+  // ...and the ShipHero row is deliberately still 'no' (owner-scoped out of o3d-hl8l). Pinned so a
+  // later reader cannot mistake an unfenced route for one nobody has measured.
+  assert.equal(
+    MAINTENANCE_MODE_REACH.inboundWebhooks.find((w) => w.route === 'app/api/webhooks/shiphero/[event]')?.fenced,
+    'no',
+  )
 
   // The shopping route is the one that is fenced for ONE connector and not another. Pinned by
   // reading the dispatch, because that asymmetry is what the round-11 claim flattened.
@@ -2481,6 +2556,6 @@ test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag r
     !/inbound webhooks are stopped by maintenance mode/i.test(routeSrc),
     'the false claim ("inbound webhooks are stopped") must not come back',
   )
-  assert.match(routeSrc, /WooCommerce webhooks are stopped by maintenance mode/, 'it says WooCommerce specifically')
-  assert.match(routeSrc, /MINTSOFT AND SHIPHERO WEBHOOK ROUTES[\s\S]{0,120}NOT STOPPED BY ANYTHING/, 'and names what is NOT stopped')
+  assert.match(routeSrc, /WooCommerce webhooks and the Mintsoft ASN webhook are stopped by /, 'it says which connectors specifically')
+  assert.match(routeSrc, /SHIPHERO WEBHOOK ROUTE[\s\S]{0,120}NOT STOPPED BY ANYTHING/, 'and names what is NOT stopped')
 })

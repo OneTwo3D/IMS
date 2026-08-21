@@ -217,7 +217,9 @@ export {
 export {
   getMintsoftSettings,
   MINTSOFT_AUTH_MODES,
+  MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE,
   mintsoftDeltaScopeChanged,
+  mintsoftDeltaScopeToken,
   mintsoftHasAuthMaterial,
   MINTSOFT_SETTING_KEYS,
   MintsoftAuthModeError,
@@ -225,5 +227,6 @@ export {
   parseMintsoftPositiveId,
   resolveMintsoftAuthMode,
   type MintsoftAuthMode,
+  type MintsoftDeltaScope,
   type MintsoftSettings,
 } from './settings/schema'

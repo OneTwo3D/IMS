@@ -36,6 +36,13 @@ mock.module('@/lib/db', {
       salesOrder: noopDelegate(),
       purchaseOrder: noopDelegate(),
       customer: noopDelegate(),
+      // q66in.7.4: the WMS retention passes added to purgeExpiredData run unconditionally on
+      // their own defaults, so this harness has to answer for their delegates too. Inert here —
+      // their behaviour is asserted in tests/data-retention-wms-events.test.ts.
+      wmsInboundReceiptEvent: noopDelegate(),
+      wmsWebhookEvent: noopDelegate(),
+      wmsSyncJob: noopDelegate(),
+      externalWmsBinding: noopDelegate(),
       shoppingWebhookEvent: {
         deleteMany: async () => {
           throw new Error('inbox rows must be COMPACTED, never deleted (dedup + audit)')

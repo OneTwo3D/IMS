@@ -107,25 +107,72 @@ nothing has been changed.
 A restore enables maintenance mode for its duration. Maintenance mode is **not an application-wide
 write fence**. It is consulted by:
 
-- the scheduled-job endpoints under `/api/cron/*`, and
-- the inbound connector webhook entry point.
+- the scheduled-job endpoints under `/api/cron/*`,
+- the WooCommerce webhook entry point, and
+- the Mintsoft ASN booked-in webhook.
 
-It is **not** consulted by interactive server actions, by any other API route, or by anything
-holding a direct database connection. Ordinary dashboard writes continue during a restore.
+It is **not** consulted by interactive server actions, by the ShipHero webhook route, by the
+accounting OAuth callback, by any other API route, or by anything holding a direct database
+connection. Ordinary dashboard writes continue during a restore.
 
-If a restore times out **and** its database backend cannot be confirmed gone, the endpoint keeps the
-connector-selection lock rather than releasing it, and leaves maintenance mode on. The error names
-the backend's pid and `backend_start`. Recovery, in this order:
+#### Warehouse callbacks refused during the window
+
+A booked-in callback that arrives while maintenance mode is on gets a `503` with `Retry-After: 300`
+and **no row is written** — the fence runs before the signature is verified, and anything written
+into the window is being replayed over. Recovery is by re-checking the ASNs afterwards, which
+reconstructs the trigger and applies only what is still outstanding (an ASN with nothing owed books
+nothing in):
+
+- **Automatically.** Ending a maintenance window stamps `wms_booked_in_recheck_due_since`, and the
+  Mintsoft webhook sweeper (every five minutes, enabled by default) drains that stamp by re-checking
+  every open ASN — purchase-order and stock-transfer alike.
+- **On demand.** *Sync → Exceptions → Maintenance window → Run the re-check now*, for an
+  installation whose sweeper cron is disabled or whose scheduler is down. It refuses while
+  maintenance mode is still on, because a re-check issued into the window is stopped at the same
+  gate the callbacks were.
+- **Per ASN.** The **Re-check** button on the ASN table of the purchase order or the stock transfer.
+
+A re-check pass **stops if a restore starts while it is running.** The gate is re-read before the
+pass, before each ASN, and again — under a row lock, together with "is this still the marker we
+drained" — before the stamp is cleared. A pass stopped that way keeps the stamp and reports
+`window_reopened`, so the next tick after the window closes repeats it; a stamp that a *newer*
+window restamped mid-pass is left alone (`recheck_marker_moved`) because that window is owed a
+re-check this pass established nothing about. Being told "0 attempted" is never ambiguous: a refusal
+is always named.
+
+#### When a restore times out and the backend cannot be confirmed gone
+
+The endpoint keeps the connector-selection lock rather than releasing it, leaves maintenance mode on,
+and records a **maintenance hold** naming the backend's pid and `backend_start`. The hold appears in
+*Sync → Exceptions → Maintenance window* and in the exception count on the Integrations page.
+Recovery, in this order:
 
 1. **Take the application out of service.** Interactive writes are not fenced by anything, and this
    is the only way to stop them.
-2. Check `pg_stat_activity` for the pid and `backend_start` named in the error, and
+2. Check `pg_stat_activity` for the pid and `backend_start` named in the hold, and
    `pg_terminate_backend` it if it is still there.
 3. **Only then restart.** Restarting earlier drops the lock-holding session, which releases the
    advisory lock while the restore backend may still be replaying.
-4. Clear maintenance mode. It is the `system_maintenance_mode` row in the `settings` table and there
-   is no screen for it, so it stays enabled until it is set to `false` — scheduled jobs and inbound
-   webhooks remain stopped until then.
+4. **End the hold from the exception inbox.** It re-reads the flag and the hold record under a row
+   lock, re-checks that the named backend is gone from `pg_stat_activity` at that moment, and
+   refuses — naming which precondition failed — if any of them has moved. Ending it there also
+   stamps the booked-in re-check described above.
+
+The action ends **the hold the page showed you**, not whichever hold happens to be recorded when the
+click lands. The button carries the record's pid, `backend_start` and `heldAt`, and the transition
+refuses with *hold_superseded* if the row under the lock is a different restore's — reload the inbox
+and read the new hold before ending it. A **starting restore deletes any hold recorded by the
+previous window**, in the same transaction that turns the flag on, so a second restore beginning
+between the render and the click turns the click into *no_hold_recorded* (the refusal that means "a
+restore is still running") rather than into an unfenced database.
+
+Do **not** clear the `system_maintenance_mode` row by hand. It ends the window without scheduling the
+re-check, so any callbacks refused during it are left to the WMS watchdog's days-scale alert. The
+inbox action is the supported clear; the raw row exists only as a fallback if the hold record was
+lost with the restore's rollback, in which case use the per-ASN **Re-check** button.
+
+The backend check proves the restore backend has **detached**, not that the application is quiet —
+step 1 is still yours.
 
 Denied restore attempts are written to the activity log as `WARNING` entries with action `backup_restore_denied` and a machine-readable `metadata.reason`, such as `production_restore_disabled`, `production_upload_restore_disabled`, or `cross_origin_restore_request`.
 

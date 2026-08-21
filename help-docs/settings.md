@@ -275,12 +275,20 @@ This means an admin viewing the activity log can see who did what but not see se
 - **Data retention** — configure archival/deletion windows for operational records. Accounting sync entries that are still **pending, in progress or failed** are exempt from the age-based deletion: they are unfinished work rather than history, their payload is what a retry posts, and deleting one while a worker is holding it would land a document in the accounting system that nothing in IMS records. They expire normally once they settle (synced or cancelled), so the way to clear them is to resolve them on the Accounting Sync page.
 - Two kinds of
   record are compacted rather than deleted at the end of their window, because deleting them would
-  break something that cannot be reconstructed: shopping webhook events (the row is the idempotency
-  record) and accounting sync rows whose back-reference is still unresolved (the row is the only
+  break something that cannot be reconstructed: webhook events — both shopping and warehouse
+  (the row is the idempotency record) — and accounting sync rows whose back-reference is still
+  unresolved (the row is the only
   evidence of which accounting document an unlinked order or bill belongs to, and deleting a
   competing one would silently turn a refused-because-ambiguous attribution into a wrong answer). In
   both cases the *content* — payloads, error text, and the customer details and financial lines they
   contain — is cleared on schedule; only the small identifying record is kept.
+  Nothing that is still **unresolved** is cleared at all. A warehouse event that failed and was
+  dead-lettered, or that is waiting for you to approve it, keeps its full payload however old it
+  gets — that payload is what a replay re-attempts, so clearing it would turn a problem you can
+  still fix into one you cannot. The same applies to sync runs: **WMS Sync Runs** deletes finished
+  runs and their per-item lines, but never a run that has not finished, and never the dry run an
+  unconfirmed "Align To WMS" binding is still waiting on — that one run is kept until you confirm
+  or change the binding, and the rest of that warehouse's runs expire normally.
   On **Xero**, a compacted accounting sync row is **still repaired**: the repair sweep can still
   write its external id onto the order or bill, because everything that write needs survives
   compaction. What cannot survive is the follow-up work built from the payload (invoice PDF, payment

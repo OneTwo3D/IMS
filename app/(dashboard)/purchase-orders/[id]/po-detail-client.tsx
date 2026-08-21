@@ -38,6 +38,7 @@ import type {
   WmsPurchaseOrderAsnState,
 } from '@/lib/connectors/wms/asn-types'
 import { createWmsPurchaseOrderAsn } from '@/app/actions/wms-asn'
+import { AsnBookedInRecheck } from '@/components/wms/asn-booked-in-recheck'
 import { getTrackingUrl } from '@/lib/tracking'
 import type { AccountingBankAccount } from '@/lib/accounting'
 import type { RejectedAccountingDocumentUpdateWarning } from '@/lib/domain/accounting/rejected-sync-warnings'
@@ -2327,6 +2328,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                   <TableHead className="text-xs text-right">Expected</TableHead>
                   <TableHead className="text-xs text-right">Received</TableHead>
                   <TableHead className="text-xs">Created</TableHead>
+                  {wmsAsnState.canManage && <TableHead className="text-xs text-right">Booked in</TableHead>}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -2345,6 +2347,16 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                     <TableCell className="text-xs text-muted-foreground">
                       {formatDateTime(asn.createdAt, { day: 'numeric', month: 'short', year: 'numeric' })}
                     </TableCell>
+                    {wmsAsnState.canManage && (
+                      <TableCell className="text-right">
+                        <AsnBookedInRecheck
+                          externalAsnId={asn.externalAsnId}
+                          lastCallbackAt={asn.lastCallbackAt}
+                          closed={Boolean(asn.closedAt)}
+                          connectorLabel={wmsAsnState.connectorLabel}
+                        />
+                      </TableCell>
+                    )}
                   </TableRow>
                 ))}
               </TableBody>
@@ -2842,3 +2854,4 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
     </div>
   )
 }
+

@@ -244,6 +244,8 @@ export default async function SystemSettingsPage({
               stockMovementsValue={retentionData.drMovements ?? '0'}
               syncLogsValue={retentionData.drSyncLogs ?? '6'}
               webhookEventsValue={retentionData.drWebhookEvents ?? '3'}
+              wmsEventsValue={retentionData.drWmsEvents ?? '3'}
+              wmsSyncJobsValue={retentionData.drWmsSyncJobs ?? '12'}
             />
           </Card>
         </div>
@@ -318,7 +320,7 @@ async function loadCronJobs(): Promise<CronJobState[]> {
 }
 
 async function loadRetentionData() {
-  const [retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents] = await Promise.all([
+  const [retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents, drWmsEvents, drWmsSyncJobs] = await Promise.all([
     getSetting('activity_log_retention_info'),
     getSetting('activity_log_retention_warning'),
     getSetting('activity_log_retention_error'),
@@ -328,6 +330,8 @@ async function loadRetentionData() {
     getSetting('retention_stock_movements_months'),
     getSetting('retention_sync_logs_months'),
     getSetting('retention_webhook_events_months'),
+    getSetting('retention_wms_events_months'),
+    getSetting('retention_wms_sync_jobs_months'),
   ])
-  return { retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents }
+  return { retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents, drWmsEvents, drWmsSyncJobs }
 }

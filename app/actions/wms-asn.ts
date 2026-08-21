@@ -76,3 +76,22 @@ export async function createWmsTransferAsn(
   }
   return { success: false, error: 'No WMS connector is enabled.' }
 }
+
+/**
+ * o3d-hl8l: re-check an ASN's booked-in state directly with the warehouse.
+ *
+ * The recovery path behind the webhook's maintenance-mode 503 (and behind the watchdog's
+ * overdue-ASN alert): a callback that was refused, never sent or lost leaves no receipt-event row,
+ * so nothing that replays existing rows can reach it. This reconstructs the trigger; the warehouse
+ * remains the authority for the quantities.
+ */
+export async function recheckWmsAsnBookedIn(
+  externalAsnId: unknown,
+): Promise<{ success: boolean; error?: string; message?: string }> {
+  const connector = await getActiveWmsConnectorId()
+  if (connector === 'mintsoft') {
+    const { recheckMintsoftAsnBookedIn } = await import('@/app/actions/mintsoft-sync')
+    return recheckMintsoftAsnBookedIn(externalAsnId)
+  }
+  return { success: false, error: 'No WMS connector is enabled.' }
+}
