@@ -42,6 +42,8 @@ const state = {
   notifications: [] as { title?: string; message?: string; userId?: string | null }[],
   chargebacks: [] as string[],
   purchaseInvoiceUpdates: [] as { id: unknown; data: Row }[],
+  /** o3d-a3wx: every registration retirement the bill-reversal transaction wrote. */
+  syncLogUpdates: [] as { where: Row; data: Row }[],
   salesOrderUpdates: [] as { id: unknown; data: Row }[],
   /** Every cursor write the drain made. Empty means the chunk was NOT checkpointed. */
   settingUpserts: [] as unknown[],
@@ -123,6 +125,7 @@ function reset(): void {
   state.notifications = []
   state.chargebacks = []
   state.purchaseInvoiceUpdates = []
+  state.syncLogUpdates = []
   state.salesOrderUpdates = []
   state.settingUpserts = []
   state.activityWriteFails = false
@@ -226,158 +229,184 @@ mock.module('@/app/actions/sales', {
     },
   },
 })
-mock.module('@/lib/db', {
-  namedExports: {
-    db: {
-      // Two raw statements reach this double, and it answers the one it was actually asked.
-      //
-      //  - `SELECT clock_timestamp() AT TIME ZONE 'UTC'` — the fence end of the ordering. Answers
-      //    from the DATABASE clock, never from whatever `new Date()` says on the host running the
-      //    poll.
-      //  - the withheld-marker scan, which GROUPS the activity log per document and computes BOTH
-      //    aggregates — each document's last open marker and its last closure — then keeps only the
-      //    documents whose latest marker across the two is an open one, and only then applies the
-      //    bound. All three of those are the fix (round 6, finding 2), so all three are computed
-      //    here for real: a double that returned rows, or that filtered after slicing, would make
-      //    the starvation tests vacuous exactly as a row-returning double did in round 5.
-      $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
-        const sql = Array.isArray(strings) ? [...strings].join('?') : String(strings)
-        state.rawStatements.push(sql)
-        if (sql.includes('clock_timestamp()')) {
-          if (state.dbClockFails) throw new Error('database clock unavailable')
-          return [{ fence: databaseNow() }]
+/**
+ * Hoisted out of the `mock.module` call so it can hand ITSELF to `$transaction` (o3d-a3wx).
+ *
+ * The bill-reversal pass is now one interactive transaction — the paidAt clear and the registration
+ * retirement commit together or not at all — and a double with no `$transaction` throws inside the
+ * pass, which the poller catches and records as a polling error. Every reversal in this file then
+ * "fails" for a reason that has nothing to do with what it asserts.
+ */
+const dbDouble: Record<string, unknown> = {
+  // Two raw statements reach this double, and it answers the one it was actually asked.
+  //
+  //  - `SELECT clock_timestamp() AT TIME ZONE 'UTC'` — the fence end of the ordering. Answers
+  //    from the DATABASE clock, never from whatever `new Date()` says on the host running the
+  //    poll.
+  //  - the withheld-marker scan, which GROUPS the activity log per document and computes BOTH
+  //    aggregates — each document's last open marker and its last closure — then keeps only the
+  //    documents whose latest marker across the two is an open one, and only then applies the
+  //    bound. All three of those are the fix (round 6, finding 2), so all three are computed
+  //    here for real: a double that returned rows, or that filtered after slicing, would make
+  //    the starvation tests vacuous exactly as a row-returning double did in round 5.
+  $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    const sql = Array.isArray(strings) ? [...strings].join('?') : String(strings)
+    state.rawStatements.push(sql)
+    if (sql.includes('clock_timestamp()')) {
+      if (state.dbClockFails) throw new Error('database clock unavailable')
+      return [{ fence: databaseNow() }]
+    }
+    if (!sql.includes('activity_logs')) throw new Error(`unexpected raw statement: ${sql}`)
+    // The statement binds its horizon as an explicit UTC instant and renders both aggregates as
+    // explicit UTC strings, because the column is TIMESTAMP WITHOUT TIME ZONE; the double
+    // answers in the same shapes, so the production side's parsing is exercised rather than
+    // bypassed.
+    const [openActions, closedActions, allActions, horizonIso, limit] =
+      values as [string[], string[], string[], string, number]
+    const horizon = new Date(horizonIso)
+    const groups = new Map<string, { entityType: unknown; entityId: string; openMax: Date | null; closedMax: Date | null }>()
+    for (const row of state.activityRows) {
+      if (row.tag !== 'sync') continue
+      if (!allActions.includes(row.action as string)) continue
+      if (row.entityId == null) continue
+      const at = row.createdAt as Date
+      if (at.getTime() < horizon.getTime()) continue
+      const key = `${String(row.entityType)}:${String(row.entityId)}`
+      const held = groups.get(key)
+        ?? { entityType: row.entityType, entityId: row.entityId as string, openMax: null, closedMax: null }
+      if (openActions.includes(row.action as string) && (held.openMax == null || held.openMax.getTime() < at.getTime())) held.openMax = at
+      if (closedActions.includes(row.action as string) && (held.closedMax == null || held.closedMax.getTime() < at.getTime())) held.closedMax = at
+      groups.set(key, held)
+    }
+    return [...groups.values()]
+      .filter((g) => g.openMax != null && (g.closedMax == null || g.openMax.getTime() > g.closedMax.getTime()))
+      .sort((a, b) => a.openMax!.getTime() - b.openMax!.getTime())
+      .slice(0, limit)
+      .map((g) => ({
+        entityType: g.entityType,
+        entityId: g.entityId,
+        openMax: g.openMax!.toISOString(),
+        closedMax: g.closedMax?.toISOString() ?? null,
+      }))
+  },
+  activityLog: {
+    // The pre-round-5 scan: marker ROWS, ordered and bounded as rows. Production does not call
+    // this any more — it is kept because it is the harness the starvation test's revert evidence
+    // needs, and a double that cannot run the old query cannot show what the old query did.
+    findMany: async (
+      { where, take, orderBy }:
+      { where: Row; take?: number; orderBy?: { createdAt?: 'asc' | 'desc' } },
+    ) => {
+      const actions = (where.action as { in?: string[] } | undefined)?.in ?? null
+      const since = (where.createdAt as { gte?: Date } | undefined)?.gte ?? null
+      const direction = orderBy?.createdAt === 'asc' ? 1 : -1
+      return state.activityRows
+        .filter((r) => (where.tag == null || r.tag === where.tag))
+        .filter((r) => (actions == null || actions.includes(r.action as string)))
+        .filter((r) => r.entityId != null)
+        .filter((r) => since == null || (r.createdAt as Date).getTime() >= since.getTime())
+        .sort((a, b) => direction * ((a.createdAt as Date).getTime() - (b.createdAt as Date).getTime()))
+        .slice(0, take ?? undefined)
+    },
+    // Prisma's groupBy, reduced to what the withheld-marker scan asked of it BEFORE round 6:
+    // one entry per document, ordered by an aggregate of its markers, bounded in DOCUMENTS.
+    // Production does not call this any more either — the two grouped queries were the reason
+    // the bound had to be spent before the closures were known (finding 2) — and it is kept for
+    // the same reason `findMany` is: the revert evidence for the round-6 test needs to be able
+    // to run the round-5 query. It really groups —
+    // a double that returned rows and called them groups would make the starvation test vacuous,
+    // because grouping is the entire fix (o3d-clxw round 5, finding 3). BOTH `_max` and `_min`
+    // are computed and either may be ordered on, because WHICH aggregate the scan reads is
+    // itself one of the things under test: `_min` would time a document from its FIRST marker,
+    // which is the history-reading the round robin exists to stop.
+    groupBy: async (
+      { where, orderBy, take }:
+      {
+        by: string[]
+        where: Row
+        orderBy?: { _max?: { createdAt?: 'asc' | 'desc' }; _min?: { createdAt?: 'asc' | 'desc' } }
+        take?: number
+      },
+    ) => {
+      const actions = (where.action as { in?: string[] } | undefined)?.in ?? null
+      const since = (where.createdAt as { gte?: Date } | undefined)?.gte ?? null
+      const onlyIds = (where.entityId as { in?: string[] } | undefined)?.in ?? null
+      const orderKey = orderBy?._min ? '_min' as const : '_max' as const
+      const direction = (orderBy?._max?.createdAt ?? orderBy?._min?.createdAt) === 'asc' ? 1 : -1
+      const groups = new Map<string, { entityType: unknown; entityId: unknown; _max: { createdAt: Date }; _min: { createdAt: Date } }>()
+      for (const row of state.activityRows) {
+        if (where.tag != null && row.tag !== where.tag) continue
+        if (actions != null && !actions.includes(row.action as string)) continue
+        if (row.entityId == null) continue
+        if (onlyIds != null && !onlyIds.includes(row.entityId as string)) continue
+        const at = row.createdAt as Date
+        if (since != null && at.getTime() < since.getTime()) continue
+        const key = `${String(row.entityType)}:${String(row.entityId)}`
+        const held = groups.get(key)
+        if (!held) {
+          groups.set(key, { entityType: row.entityType, entityId: row.entityId, _max: { createdAt: at }, _min: { createdAt: at } })
+          continue
         }
-        if (!sql.includes('activity_logs')) throw new Error(`unexpected raw statement: ${sql}`)
-        // The statement binds its horizon as an explicit UTC instant and renders both aggregates as
-        // explicit UTC strings, because the column is TIMESTAMP WITHOUT TIME ZONE; the double
-        // answers in the same shapes, so the production side's parsing is exercised rather than
-        // bypassed.
-        const [openActions, closedActions, allActions, horizonIso, limit] =
-          values as [string[], string[], string[], string, number]
-        const horizon = new Date(horizonIso)
-        const groups = new Map<string, { entityType: unknown; entityId: string; openMax: Date | null; closedMax: Date | null }>()
-        for (const row of state.activityRows) {
-          if (row.tag !== 'sync') continue
-          if (!allActions.includes(row.action as string)) continue
-          if (row.entityId == null) continue
-          const at = row.createdAt as Date
-          if (at.getTime() < horizon.getTime()) continue
-          const key = `${String(row.entityType)}:${String(row.entityId)}`
-          const held = groups.get(key)
-            ?? { entityType: row.entityType, entityId: row.entityId as string, openMax: null, closedMax: null }
-          if (openActions.includes(row.action as string) && (held.openMax == null || held.openMax.getTime() < at.getTime())) held.openMax = at
-          if (closedActions.includes(row.action as string) && (held.closedMax == null || held.closedMax.getTime() < at.getTime())) held.closedMax = at
-          groups.set(key, held)
-        }
-        return [...groups.values()]
-          .filter((g) => g.openMax != null && (g.closedMax == null || g.openMax.getTime() > g.closedMax.getTime()))
-          .sort((a, b) => a.openMax!.getTime() - b.openMax!.getTime())
-          .slice(0, limit)
-          .map((g) => ({
-            entityType: g.entityType,
-            entityId: g.entityId,
-            openMax: g.openMax!.toISOString(),
-            closedMax: g.closedMax?.toISOString() ?? null,
-          }))
-      },
-      activityLog: {
-        // The pre-round-5 scan: marker ROWS, ordered and bounded as rows. Production does not call
-        // this any more — it is kept because it is the harness the starvation test's revert evidence
-        // needs, and a double that cannot run the old query cannot show what the old query did.
-        findMany: async (
-          { where, take, orderBy }:
-          { where: Row; take?: number; orderBy?: { createdAt?: 'asc' | 'desc' } },
-        ) => {
-          const actions = (where.action as { in?: string[] } | undefined)?.in ?? null
-          const since = (where.createdAt as { gte?: Date } | undefined)?.gte ?? null
-          const direction = orderBy?.createdAt === 'asc' ? 1 : -1
-          return state.activityRows
-            .filter((r) => (where.tag == null || r.tag === where.tag))
-            .filter((r) => (actions == null || actions.includes(r.action as string)))
-            .filter((r) => r.entityId != null)
-            .filter((r) => since == null || (r.createdAt as Date).getTime() >= since.getTime())
-            .sort((a, b) => direction * ((a.createdAt as Date).getTime() - (b.createdAt as Date).getTime()))
-            .slice(0, take ?? undefined)
-        },
-        // Prisma's groupBy, reduced to what the withheld-marker scan asked of it BEFORE round 6:
-        // one entry per document, ordered by an aggregate of its markers, bounded in DOCUMENTS.
-        // Production does not call this any more either — the two grouped queries were the reason
-        // the bound had to be spent before the closures were known (finding 2) — and it is kept for
-        // the same reason `findMany` is: the revert evidence for the round-6 test needs to be able
-        // to run the round-5 query. It really groups —
-        // a double that returned rows and called them groups would make the starvation test vacuous,
-        // because grouping is the entire fix (o3d-clxw round 5, finding 3). BOTH `_max` and `_min`
-        // are computed and either may be ordered on, because WHICH aggregate the scan reads is
-        // itself one of the things under test: `_min` would time a document from its FIRST marker,
-        // which is the history-reading the round robin exists to stop.
-        groupBy: async (
-          { where, orderBy, take }:
-          {
-            by: string[]
-            where: Row
-            orderBy?: { _max?: { createdAt?: 'asc' | 'desc' }; _min?: { createdAt?: 'asc' | 'desc' } }
-            take?: number
-          },
-        ) => {
-          const actions = (where.action as { in?: string[] } | undefined)?.in ?? null
-          const since = (where.createdAt as { gte?: Date } | undefined)?.gte ?? null
-          const onlyIds = (where.entityId as { in?: string[] } | undefined)?.in ?? null
-          const orderKey = orderBy?._min ? '_min' as const : '_max' as const
-          const direction = (orderBy?._max?.createdAt ?? orderBy?._min?.createdAt) === 'asc' ? 1 : -1
-          const groups = new Map<string, { entityType: unknown; entityId: unknown; _max: { createdAt: Date }; _min: { createdAt: Date } }>()
-          for (const row of state.activityRows) {
-            if (where.tag != null && row.tag !== where.tag) continue
-            if (actions != null && !actions.includes(row.action as string)) continue
-            if (row.entityId == null) continue
-            if (onlyIds != null && !onlyIds.includes(row.entityId as string)) continue
-            const at = row.createdAt as Date
-            if (since != null && at.getTime() < since.getTime()) continue
-            const key = `${String(row.entityType)}:${String(row.entityId)}`
-            const held = groups.get(key)
-            if (!held) {
-              groups.set(key, { entityType: row.entityType, entityId: row.entityId, _max: { createdAt: at }, _min: { createdAt: at } })
-              continue
-            }
-            if (held._max.createdAt.getTime() < at.getTime()) held._max = { createdAt: at }
-            if (held._min.createdAt.getTime() > at.getTime()) held._min = { createdAt: at }
-          }
-          return [...groups.values()]
-            .sort((a, b) => direction * (a[orderKey].createdAt.getTime() - b[orderKey].createdAt.getTime()))
-            .slice(0, take ?? undefined)
-        },
-      },
-      setting: {
-        findUnique: async () => ({ key: 'xero_last_payment_poll', value: new Date(Date.now() - 60_000).toISOString() }),
-        upsert: async (args: unknown) => { state.settingUpserts.push(args); return {} },
-      },
-      user: { findMany: async () => [{ id: 'admin_1' }] },
-      salesOrderRefund: { findFirst: async () => null },
-      salesOrder: {
-        findMany: async ({ where }: { where: Row }) => state.salesOrders.filter((r) => rowMatches(r, where)),
-        updateMany: async () => ({ count: 0 }),
-        update: async ({ where, data }: { where: { id: unknown }; data: Row }) => {
-          state.salesOrderUpdates.push({ id: where.id, data })
-          return {}
-        },
-      },
-      accountingSyncLog: {
-        findMany: async ({ where }: { where: Row }) => {
-          // The real one throws; `processDeltaChunk` catches it and records the failure on the poll
-          // result rather than letting it escape.
-          if (state.registrationReadFails) throw new Error('connection terminated unexpectedly')
-          return state.syncLogs.filter((r) => rowMatches(r, where))
-        },
-      },
-      purchaseInvoice: {
-        findMany: async ({ where }: { where: Row }) => state.purchaseInvoices.filter((r) => rowMatches(r, where)),
-        update: async ({ where, data }: { where: { id: unknown }; data: Row }) => {
-          state.purchaseInvoiceUpdates.push({ id: where.id, data })
-          return {}
-        },
-      },
+        if (held._max.createdAt.getTime() < at.getTime()) held._max = { createdAt: at }
+        if (held._min.createdAt.getTime() > at.getTime()) held._min = { createdAt: at }
+      }
+      return [...groups.values()]
+        .sort((a, b) => direction * (a[orderKey].createdAt.getTime() - b[orderKey].createdAt.getTime()))
+        .slice(0, take ?? undefined)
     },
   },
-})
+  setting: {
+    findUnique: async () => ({ key: 'xero_last_payment_poll', value: new Date(Date.now() - 60_000).toISOString() }),
+    upsert: async (args: unknown) => { state.settingUpserts.push(args); return {} },
+  },
+  user: { findMany: async () => [{ id: 'admin_1' }] },
+  salesOrderRefund: { findFirst: async () => null },
+  salesOrder: {
+    findMany: async ({ where }: { where: Row }) => state.salesOrders.filter((r) => rowMatches(r, where)),
+    updateMany: async () => ({ count: 0 }),
+    update: async ({ where, data }: { where: { id: unknown }; data: Row }) => {
+      state.salesOrderUpdates.push({ id: where.id, data })
+      return {}
+    },
+  },
+  accountingSyncLog: {
+    findMany: async ({ where }: { where: Row }) => {
+      // The real one throws; `processDeltaChunk` catches it and records the failure on the poll
+      // result rather than letting it escape.
+      if (state.registrationReadFails) throw new Error('connection terminated unexpectedly')
+      return state.syncLogs.filter((r) => rowMatches(r, where))
+    },
+    // o3d-a3wx: the bill-reversal transaction RETIRES the registrations the ledger has just
+    // disproved. Without this the retirement throws a TypeError, the poller records it as a polling
+    // error, and every reversal in this file silently stops happening.
+    updateMany: async ({ where, data }: { where: Row; data: Row }) => {
+      state.syncLogUpdates.push({ where, data })
+      const ids = (where.id as { in?: string[] } | undefined)?.in ?? null
+      let count = 0
+      for (const row of state.syncLogs) {
+        if (ids != null && !ids.includes(row.id as string)) continue
+        if (ids == null && !rowMatches(row, where)) continue
+        Object.assign(row, data)
+        count++
+      }
+      return { count }
+    },
+  },
+  purchaseInvoice: {
+    findMany: async ({ where }: { where: Row }) => state.purchaseInvoices.filter((r) => rowMatches(r, where)),
+    update: async ({ where, data }: { where: { id: unknown }; data: Row }) => {
+      state.purchaseInvoiceUpdates.push({ id: where.id, data })
+      return {}
+    },
+  },
+}
+
+// An INTERACTIVE transaction hands the callback a client; this double is that client, so a write made
+// on `tx` lands in the same recorded state as one made on `db`. Rollback is not modelled: no test here
+// asserts on a failed transaction, and pretending to roll back would be a second, wrong answer.
+dbDouble.$transaction = async (fn: (tx: unknown) => unknown) => fn(dbDouble)
+
+mock.module('@/lib/db', { namedExports: { db: dbDouble } })
 
 async function poll(hostClockSkewMs = 0) {
   const { pollXeroPayments } = await import('@/lib/connectors/xero/payment-poller')

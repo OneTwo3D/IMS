@@ -104,3 +104,18 @@ test('lost race with a vanished row falls back to the computed view', async () =
   const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 4 }, 'boom', {}, claimHeldFrom(CLAIMED_AT))
   assert.equal(result.finalFailure, true) // 4 → 5 == MAX
 })
+
+test('o3d-a3wx r6: the write is keyed on the CLAIM INSTANT, not merely on the row being PROCESSING', async () => {
+  // The replacement's row is PROCESSING too — that is what re-claiming a stale row produces — so a
+  // status-only fence would still let the displaced owner through. Only the worker that stamped this
+  // exact timestamp owns the row.
+  const { tx, calls } = makeTx({ updateCount: 0, current: { retryCount: 2, status: 'PROCESSING' } })
+  const result = await applyMainSyncFailureRetry(tx, entry, 'boom', {}, claimHeldFrom(CLAIMED_AT))
+
+  assert.equal(calls.updateMany[0].where.processingStartedAt, CLAIMED_AT)
+  assert.equal(calls.updateMany[0].where.status, 'PROCESSING')
+  // Displaced: nothing was written, and the row is reported as it actually stands — still claimed and
+  // still retryable — so the caller retries the outbox job instead of marking it permanently failed.
+  assert.equal(calls.findUnique, 1)
+  assert.equal(result.finalFailure, false)
+})

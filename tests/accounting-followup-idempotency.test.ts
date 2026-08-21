@@ -9,6 +9,7 @@ import {
   buildFollowUpIdempotencySource,
   planFollowUpEnqueue,
   readFollowUpIdempotencyKey,
+  storedBodyMayHaveReachedTheLedger,
   withFollowUpIdempotencyKey,
 } from '@/lib/domain/accounting/followup-idempotency'
 
@@ -987,4 +988,100 @@ test('o3d-19gy: an UNREADABLE origin on the spent row is not treated as a match'
   })
 
   assert.equal(plan.action, 'create')
+})
+
+// ---------------------------------------------------------------------------
+// ONE PREDICATE FOR "DID THIS ATTEMPT REACH THE LEDGER" (o3d-m5qk)
+// ---------------------------------------------------------------------------
+//
+// Two branches arrived at this merge with a version of the question, and they answer differently on
+// exactly one input: an EMPTY `{}` body. The pin-selection predicate (`bodyCouldHaveReachedTheLedger`,
+// private) reads `{}` as "could not have been sent", because it is missing every required field. The
+// capacity guards must NOT read it that way: retention compacts a payload to `{}`, so reading a
+// compacted body as proof that nothing posted is retention manufacturing evidence about a remote call.
+// `storedBodyMayHaveReachedTheLedger` is built on `bodyProvesNoCallLeft` for that reason, and it is
+// the ONE definition both capacity guards import — the sales one and the supplier one.
+
+test('o3d-m5qk: a RETENTION-COMPACTED body is not proof that nothing posted', () => {
+  // The case the two branches disagreed about, and the one that pays a supplier twice if it goes the
+  // other way: `{}` is what a payload looks like after retention has compacted it away, and it is
+  // indistinguishable from a body that was never populated.
+  assert.equal(storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', {}), true)
+  assert.equal(storedBodyMayHaveReachedTheLedger('BILL_PAYMENT', {}), true)
+})
+
+test('o3d-m5qk: an unreadable or absent body is not proof either', () => {
+  for (const payload of [null, undefined, 'not an object', 42, ['array']]) {
+    assert.equal(
+      storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', payload),
+      true,
+      `${JSON.stringify(payload) ?? 'undefined'} must not be read as "nothing was sent"`,
+    )
+  }
+})
+
+test('o3d-m5qk: a PRESENT body missing a field the connector rejects pre-call IS proof', () => {
+  // The one sound "this did not post" signal in the system. Both connectors validate before they build
+  // a request, so a body they would have rejected never reached the wire — and this is the only
+  // exemption either capacity guard grants a FAILED money row.
+  assert.equal(
+    storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', { accountingInvoiceId: 'INV-1', amount: 10 }),
+    false,
+    'no bankAccountId: the Xero INVOICE_PAYMENT case returns before building a request',
+  )
+  assert.equal(
+    storedBodyMayHaveReachedTheLedger('BILL_PAYMENT', { bankAccountId: 'bank-1', amount: 10 }),
+    false,
+    'no accountingInvoiceId, and the supplier guard is the identical shape',
+  )
+  // A complete body could have been sent, so it counts against capacity.
+  assert.equal(
+    storedBodyMayHaveReachedTheLedger('BILL_PAYMENT', { accountingInvoiceId: 'INV-1', bankAccountId: 'b', amount: 10 }),
+    true,
+  )
+})
+
+test('o3d-m5qk: a legitimate ZERO amount is present, and an empty-string id is not', () => {
+  // Mirrors the connectors' guards exactly, which are not uniform: `!accountingInvoiceId` rejects an
+  // empty string, while `amount == null` accepts a zero. Getting either wrong misreads whether an
+  // attempt could have posted.
+  assert.equal(
+    storedBodyMayHaveReachedTheLedger('BILL_PAYMENT', { accountingInvoiceId: 'INV-1', bankAccountId: 'b', amount: 0 }),
+    true,
+    'a zero-value payment is a request the connector would have sent',
+  )
+  assert.equal(
+    storedBodyMayHaveReachedTheLedger('BILL_PAYMENT', { accountingInvoiceId: '', bankAccountId: 'b', amount: 10 }),
+    false,
+    'an empty id is falsy, and the connector rejects it before building anything',
+  )
+})
+
+test('o3d-m5qk: a type with no declared required fields answers "may have posted"', () => {
+  // Non-money follow-ups (PDF, attachment, note) have no pre-call validation to prove anything from, so
+  // nothing about them is ever proof that no call was made.
+  assert.equal(storedBodyMayHaveReachedTheLedger('INVOICE_PDF', {}), true)
+  assert.equal(storedBodyMayHaveReachedTheLedger('INVOICE_PDF', { anything: 1 }), true)
+})
+
+test('o3d-m5qk: the two capacity guards import the ONE predicate rather than deriving their own', async () => {
+  // The whole point of merging them. Two guards deriving "nothing was sent" differently would disagree
+  // about whether a document still has capacity, which for money is the entire question — and the
+  // disagreement would be invisible, because each one is individually reasonable.
+  const root = process.cwd()
+  for (const file of [
+    'lib/domain/accounting/invoice-payment-capacity.ts',
+    'lib/domain/accounting/payment-reversal.ts',
+  ]) {
+    const src = await readFile(path.join(root, file), 'utf8')
+    assert.ok(
+      src.includes("import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'"),
+      `${file} must import the shared predicate`,
+    )
+    assert.equal(
+      src.indexOf('REQUIRED_BODY_FIELDS'),
+      -1,
+      `${file} must not re-derive the required-field table — that is the second definition`,
+    )
+  }
 })

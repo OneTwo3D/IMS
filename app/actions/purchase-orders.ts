@@ -28,6 +28,13 @@ import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, r
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import {
+  BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE,
+  billPaymentRefusalMessage,
+  BillPaymentEnqueueDeclined,
+  BillPaymentSupersessionRollback,
+  markBillPaidSupersedingStaleRegistrations,
+} from '@/lib/domain/accounting/payment-reversal'
+import {
   updatePurchaseOrderFxRateOnly,
   type PurchaseOrderFxRateOnlyUpdateDb,
 } from '@/lib/domain/purchasing/purchase-order-fx-update'
@@ -3470,17 +3477,155 @@ export async function markBillPaid(
       STOCK_TX_OPTIONS,
     )
 
-    const paidUpdate = await db.purchaseInvoice.updateMany({
-      where: { id: invoiceId, paidAt: null },
-      data: {
-        paidAt: paymentDate,
-        paymentAccountId: input.bankAccountId,
-        paymentAccountName: account.name,
-        paymentReference: input.reference || null,
-      },
-    })
-    if (paidUpdate.count === 0) {
-      return { success: false, error: 'Bill is already marked as paid' }
+    // MARK PAID, RETIRE THE PRE-CALL REGISTRATIONS, AND QUEUE THE REPLACEMENT — ALL THREE, OR NONE
+    // (o3d-a3wx; Codex round 3 #4).
+    //
+    // Winning the `paidAt: null -> paid` transition means IMS held this bill as UNSETTLED, so a live
+    // BILL_PAYMENT row contradicts it. A PENDING row is provably pre-call and is retired here to free
+    // the accounting_sync_logs_followup_live_unique slot the replacement needs — without that, the
+    // constraint meant to stop a DOUBLE payment would strand a real one. A CLAIMED or POSTED row is
+    // not stale evidence and is refused instead; see payment-reversal.ts for why a status alone can
+    // never establish what the ledger holds.
+    //
+    // WHY THE ENQUEUE IS NOW INSIDE THE TRANSACTION. Round 2 committed the paid transition and the
+    // retirement together and then queued the replacement afterwards, so a crash — or any throw from
+    // the queue — in between left a bill marked PAID in IMS with NOTHING queued and no FAILED row to
+    // notice: the ledger goes on showing the full amount outstanding and nothing ever retries. That is
+    // the quietest way the two systems can disagree, and it was being handled by writing an ERROR to
+    // the activity log and returning success. It is not an unavoidable gap: `queueAccountingSyncTx`
+    // exists precisely to write the sync row inside a caller's transaction, and BILL_PAYMENT is
+    // PurchaseInvoice-scoped, so the o3d-3zgy sales-order lock assertion does not apply to it. Queued
+    // in the same transaction, the three writes share one fate.
+    //
+    // The remote call is still made later by the worker, which is the point: what commits here is the
+    // INTENT to pay, durably, next to the state that claims it has been paid.
+    let settlement: { requestedIds: string[]; retiredCount: number; queued: boolean }
+    try {
+      settlement = await db.$transaction(async (tx) => {
+        const result = await markBillPaidSupersedingStaleRegistrations(tx, {
+          invoiceId,
+          paidAt: paymentDate,
+          paymentAccountId: input.bankAccountId,
+          paymentAccountName: account.name,
+          paymentReference: input.reference || null,
+        })
+        // Anything but `paid` must undo the paidAt write as well, which only a rollback can do.
+        if (result.outcome !== 'paid') throw new BillPaymentSupersessionRollback(result)
+
+        // Only if the bill has actually been pushed to the accounting connector already (has an
+        // external id) — otherwise the payment would have nothing to attach to.
+        //
+        // Ordering invariant (audit-68cv): accountingInvoiceId is written back ONLY after the
+        // PURCHASE_INVOICE CREATE posts, so this guard means a BILL_PAYMENT can never be queued ahead
+        // of its bill's CREATE. Unlike SALES_INVOICE_UPDATE / PURCHASE_INVOICE_UPDATE (which CAN be
+        // queued before their CREATE and so need findInvoiceUpdatesBlockedByPendingCreate deferral,
+        // audit-H5), BILL_PAYMENT needs no CREATE-ordering deferral — it is safe by construction,
+        // exactly like INVOICE_PAYMENT.
+        //
+        // A FALSY RETURN IS A NON-EVENT, AND ROUND 3 COMMITTED ON IT ANYWAY (Codex round 4 #4).
+        //
+        // Moving the enqueue inside the transaction made the two writes share a fate only against a
+        // THROW. `queueAccountingSyncTx` does not throw when it declines: it RETURNS FALSE — no
+        // posting context (the connector or BILL_PAYMENT posting is switched off), or the suppression
+        // rule. Round 3 stored that in `queued`, never read it, and committed. The result is exactly
+        // the state the round-3 comment describes as "the quietest way the two systems can disagree":
+        // the bill marked PAID in IMS, nothing queued, no FAILED row, and the ledger showing the full
+        // amount outstanding for as long as anyone cares to look.
+        //
+        // THE DISTINCTION THAT MAKES THIS SAFE TO ENFORCE is the bill's own external id, not the
+        // connector's settings:
+        //
+        //   no accountingInvoiceId  this bill was never posted to a ledger. There is no second system
+        //                           to keep in step, so paid-in-IMS-only is COMPLETE, not partial.
+        //                           This is the escape valve for a tenant running without accounting
+        //                           sync, and it is untouched.
+        //   accountingInvoiceId set the ledger holds this bill. Marking it paid here while the ledger
+        //                           is not told is a divergence, whatever the reason the queue gave.
+        //
+        // So the declined enqueue is refused rather than absorbed, and the refusal names the cause an
+        // operator can act on.
+        let queued = false
+        if (invoice.accountingInvoiceId) {
+          queued = await queueAccountingSyncTx(tx, {
+            type: 'BILL_PAYMENT',
+            referenceType: 'PurchaseInvoice',
+            referenceId: invoice.id,
+            payload: {
+              accountingInvoiceId: invoice.accountingInvoiceId,
+              bankAccountId: input.bankAccountId,
+              paymentDate: input.paymentDate,
+              amount: paymentAmount,
+              currency: invoice.po.currency,
+              reference: input.reference ?? undefined,
+            },
+          })
+          if (!queued) throw new BillPaymentEnqueueDeclined(invoice.accountingInvoiceId)
+        }
+        return { requestedIds: result.requestedIds, retiredCount: result.retiredCount, queued }
+      }, STOCK_TX_OPTIONS)
+    } catch (rollback) {
+      if (rollback instanceof BillPaymentSupersessionRollback) {
+        if (rollback.result.outcome === 'already-paid') {
+          return { success: false, error: 'Bill is already marked as paid' }
+        }
+        if (rollback.result.outcome !== 'refused') throw rollback
+        const { refusal, blockingIds } = rollback.result
+        const error = billPaymentRefusalMessage(refusal)
+        await logActivity({
+          entityType: 'PURCHASE_ORDER',
+          entityId: invoice.poId,
+          action: 'bill_payment_not_marked_paid',
+          tag: 'purchase',
+          level: 'WARNING',
+          description:
+            `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid (${refusal}): ${error}`,
+          metadata: {
+            invoiceId: invoice.id,
+            reference: invoice.po.reference,
+            blockingSyncLogIds: blockingIds,
+            refusal,
+          },
+        }).catch(() => { /* logging must never block the refusal */ })
+        return { success: false, error }
+      }
+      // The enqueue did not happen — it either threw, or DECLINED by returning false — so the whole
+      // transaction rolled back: the bill is NOT marked paid and no row was written. Both systems
+      // still agree, which is the point of moving the enqueue inside — but the operator must be told,
+      // because the action they took did not happen.
+      //
+      // The two are logged apart because they are different problems with different fixes: a throw is
+      // a fault to retry, a decline is a SETTING to change (round 4 #4). Telling an operator to
+      // "retry" a switched-off connector would send them round the same loop indefinitely.
+      const declined = rollback instanceof BillPaymentEnqueueDeclined
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: invoice.poId,
+        action: declined ? 'bill_payment_enqueue_declined' : 'bill_payment_not_queued',
+        tag: 'purchase',
+        level: 'ERROR',
+        description: declined
+          ? `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the accounting queue ` +
+            `declined a BILL_PAYMENT for a bill the ledger already holds (posting for this sync type ` +
+            `is switched off), so the paid status was rolled back rather than left standing with ` +
+            `nothing queued.`
+          : `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the payment could not be ` +
+            `queued for the accounting connector, so the paid status was rolled back rather than left ` +
+            `standing with nothing queued. Retry, or record the payment in the ledger by hand.`,
+        metadata: {
+          invoiceId: invoice.id,
+          reference: invoice.po.reference,
+          accountingInvoiceId: invoice.accountingInvoiceId,
+          amountForeign: paymentAmount,
+          error: rollback instanceof Error ? rollback.message : String(rollback),
+        },
+      }).catch(() => { /* logging must never swallow the real error */ })
+      return {
+        success: false,
+        error: declined
+          ? BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE
+          : 'The payment could not be queued for the accounting connector, so the bill was not marked ' +
+            'paid. Nothing was changed — try again, or record the payment in the ledger by hand.',
+      }
     }
 
     revalidatePath('/purchase-orders')
@@ -3499,62 +3644,16 @@ export async function markBillPaid(
         bankAccountName: account.name,
         paymentDate: input.paymentDate,
         amountForeign: paymentAmount,
+        // Which pre-call registrations were retired to free the live-follow-up slot for this payment.
+        supersededSyncLogIds: settlement.requestedIds,
+        supersededSyncLogCount: settlement.retiredCount,
+        paymentQueued: settlement.queued,
       },
     })
 
-    // Queue accounting payment sync — only if the bill has actually been
-    // pushed to the accounting connector already (has an external id).
-    // Otherwise the payment would have nothing to attach to; users should
-    // wait for the bill to sync before marking paid.
-    //
-    // Ordering invariant (audit-68cv): accountingInvoiceId is written back ONLY
-    // after the PURCHASE_INVOICE CREATE posts to Xero, so this guard means a
-    // BILL_PAYMENT can never be queued ahead of its bill's CREATE. Unlike
-    // SALES_INVOICE_UPDATE / PURCHASE_INVOICE_UPDATE (which CAN be queued before
-    // their CREATE and so need findInvoiceUpdatesBlockedByPendingCreate
-    // deferral, audit-H5), BILL_PAYMENT needs no CREATE-ordering deferral — it is
-    // safe by construction, exactly like INVOICE_PAYMENT.
-    if (invoice.accountingInvoiceId) {
-      try {
-        await queueAccountingSync({
-          type: 'BILL_PAYMENT',
-          referenceType: 'PurchaseInvoice',
-          referenceId: invoice.id,
-          payload: {
-            accountingInvoiceId: invoice.accountingInvoiceId,
-            bankAccountId: input.bankAccountId,
-            paymentDate: input.paymentDate,
-            amount: paymentAmount,
-            currency: invoice.po.currency,
-            reference: input.reference ?? undefined,
-          },
-        })
-      } catch (e) {
-        // Queue errors must not block marking the bill paid — but they must not vanish either. The bill
-        // is now PAID in IMS with nothing queued to tell the ledger, so the ledger will go on showing
-        // the full amount outstanding and nothing will ever retry: there is no FAILED row to notice,
-        // because the row was never written (o3d-lgo.15). This is the quietest way the two systems can
-        // disagree, so it is recorded as an ERROR against the PO with the bill named.
-        await logActivity({
-          entityType: 'PURCHASE_ORDER',
-          entityId: invoice.poId,
-          action: 'bill_payment_not_queued',
-          tag: 'purchase',
-          level: 'ERROR',
-          description:
-            `Bill ${invoice.invoiceNumber ?? '(no number)'} was marked PAID in IMS, but the payment could ` +
-            `not be queued for the accounting connector — the ledger still shows it outstanding and ` +
-            `nothing will retry. Re-queue it, or record the payment in the ledger by hand.`,
-          metadata: {
-            invoiceId: invoice.id,
-            reference: invoice.po.reference,
-            accountingInvoiceId: invoice.accountingInvoiceId,
-            amountForeign: paymentAmount,
-            error: e instanceof Error ? e.message : String(e),
-          },
-        }).catch(() => { /* logging must never block the main flow either */ })
-      }
-    } else {
+    // When the bill HAS posted there is nothing more to do here: its BILL_PAYMENT row committed with
+    // the paid transition above.
+    if (!invoice.accountingInvoiceId) {
       // Paid in IMS against a bill the ledger has never seen. Not a settlement fault — a payment cannot
       // attach to an invoice that does not exist there — but it does mean the payment is nobody's job
       // once the bill finally posts, so say so rather than leaving it to be discovered by reconciliation.

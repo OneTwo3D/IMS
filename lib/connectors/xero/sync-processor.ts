@@ -36,7 +36,13 @@ import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
-import { applyBackReference, followUpObligationClaim, releaseFollowUpObligation } from '@/lib/domain/accounting/back-reference'
+import {
+  applyBackReference,
+  backReferenceIsMissing,
+  followUpObligationClaim,
+  releaseFollowUpObligation,
+  syncTypeWritesBackReference,
+} from '@/lib/domain/accounting/back-reference'
 import { stampSyncedAtFromDatabaseClock } from './synced-at-clock'
 import { claimHeldFrom, heldClaimWhere, releaseClaimForRetry, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import {
@@ -52,11 +58,20 @@ import {
   repairAccountingBackReferences,
   type BackReferenceRepairResult,
 } from '@/lib/domain/accounting/back-reference-sweep'
-import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import {
+  liveRowOccupiesFollowUpSlot,
+  planFollowUpEnqueue,
+  readFollowUpIdempotencyKey,
+  type FollowUpPayload,
+} from '@/lib/domain/accounting/followup-idempotency'
 import {
   buildCompactedFollowUpLossActivity,
   isCompactedFollowUpEvidence,
 } from '@/lib/domain/accounting/compacted-followup-loss'
+import {
+  guardInvoicePaymentCapacity,
+  retireOverSettlingInvoicePayment,
+} from '@/lib/domain/accounting/invoice-payment-capacity'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
@@ -270,6 +285,16 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
  * when the two land together the holder is swapped for the lease and all six releases keep fencing on
  * the claim this worker actually holds. A carried-down `Date` would compile there and match nothing —
  * and these fences fail closed, so the symptom is silent refusal, not an error.
+ *
+ * WHAT A MISSING FENCE COSTS ON THIS BRANCH SPECIFICALLY (o3d-a3wx r6). A displaced owner that writes
+ * the row back erases the replacement's PROCESSING claim and drops the row to PENDING/FAILED WHILE THE
+ * REPLACEMENT'S REQUEST IS STILL ON THE WIRE — and that reopens the post slot with nothing to show a
+ * post is in flight. For an order-scoped INVOICE_PAYMENT that is the double post: the exclusion test
+ * ({@link decideInvoicePaymentClaim}) admits a sibling the moment no row for the reference is
+ * PROCESSING, the sibling posts, and the same invoice is settled twice. Nothing downstream catches it,
+ * because the capacity guard counts SYNCED rows and neither request has landed yet. A re-claim does not
+ * advance retryCount, so the `{ id, retryCount }` guard those writers used to carry does not stop any
+ * of it.
  */
 export { claimHeldFrom, heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 
@@ -746,6 +771,12 @@ export async function buryOutboxJobForUnwrittenPostedEvidence(
   )
 }
 
+/**
+ * NOT fenced on the claim, deliberately (o3d-a3wx r6). This runs only AFTER the post succeeded and the
+ * row was written SYNCED with `processingStartedAt: null`, so there is no claim left to match — the
+ * row is already out of the live set either way. A displaced owner reaching here has posted, and its
+ * SYNCED row is what the post-time capacity guard counts, so the slot it frees is not a silent one.
+ */
 export async function markSyncLogForFollowUpRetry(
 
   entry: { id: string; retryCount: number },
@@ -863,12 +894,23 @@ async function logFollowUpRetry(entryId: string, error: unknown): Promise<void> 
   })
 }
 
+/**
+ * o3d-hbgo: a live row only owns this follow-up when it targets the SAME external document. Counting
+ * rows by (connector, type, reference) alone made a re-invoiced order's payment look already-handled,
+ * so the replacement invoice was never settled — and a skip logs nothing. The anchor comparison lives
+ * in the follow-up idempotency module so the ROW dedup and the remote TOKEN are scoped by the same
+ * fields; a dedup that names less than the token can only discard work the token could distinguish.
+ *
+ * Payloads rather than a count: the anchors live inside the JSON, and the live rows for one scope are
+ * bounded by the partial unique index that backs this check.
+ */
 async function hasExistingSyncLog(
   type: AccountingSyncType,
   referenceType: string,
   referenceId: string,
+  payload: SyncPayload,
 ): Promise<boolean> {
-  const count = await db.accountingSyncLog.count({
+  const liveRows = await db.accountingSyncLog.findMany({
     where: {
       connector: XERO_CONNECTOR,
       type,
@@ -876,8 +918,9 @@ async function hasExistingSyncLog(
       referenceId,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
     },
+    select: { payload: true },
   })
-  return count > 0
+  return liveRows.some((row) => liveRowOccupiesFollowUpSlot(row.payload, payload as FollowUpPayload))
 }
 
 /**
@@ -936,7 +979,7 @@ async function enqueueFollowUpSyncLog(
   ) as SyncPayload
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
-  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId)
+  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId, payload)
   // o3d-h2wx: a FAILED row is REUSED rather than replaced. Xero's Idempotency-Key is
   // derived from the entry id, so creating a replacement row would post the retry under a
   // key Xero has never seen — and if the failed attempt had actually committed, a SECOND
@@ -1083,6 +1126,36 @@ function invoicePaymentReferenceKey(entry: Pick<InvoicePaymentOrderingEntry, 're
   return `${entry.referenceType}\u0000${entry.referenceId}`
 }
 
+/**
+ * A TOTAL order over the live INVOICE_PAYMENT rows of one reference (Codex round 3 #2).
+ *
+ * `createdAt` ALONE IS NOT AN ORDER. `default(now())` is transaction-clock, so two rows inserted in
+ * the same transaction — or in two transactions that committed inside the same clock tick — carry the
+ * IDENTICAL timestamp. Under a strict `<` comparison neither of them is "after" the other, so NEITHER
+ * is deferred, and both run.
+ *
+ * That is not a cosmetic tie. The whole reason the post-time capacity guard may treat PENDING and
+ * PROCESSING siblings as consuming no capacity is that this function lets exactly ONE live entry per
+ * order be undeferred at a time — the later ones re-run the arithmetic against the earlier one's
+ * SYNCED row when their turn comes. Two same-timestamp receipts defeat that serialisation, both read
+ * a table in which neither has posted yet, and both post: the order is settled twice.
+ *
+ * So the order is made total by falling back to the row id, which is unique by construction. The
+ * TIE-BREAK VALUE DOES NOT MATTER — only that every runner computing this set independently picks the
+ * SAME winner. `id` is stable and identical in every process, where `createdAt` is not discriminating.
+ * (`[{ createdAt: 'asc' }, { id: 'asc' }]` is the same tie-break the tree already uses for stable
+ * pagination, e.g. pending-shipment-reconciliation.ts and outbox-admin.ts.)
+ */
+export function invoicePaymentLogPrecedes(
+  a: { id: string; createdAt: Date },
+  b: { id: string; createdAt: Date },
+): boolean {
+  const at = a.createdAt.getTime()
+  const bt = b.createdAt.getTime()
+  if (at !== bt) return at < bt
+  return a.id < b.id
+}
+
 export async function findInvoicePaymentsBlockedByEarlierLiveLogs(
   client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
   entries: InvoicePaymentOrderingEntry[],
@@ -1103,26 +1176,210 @@ export async function findInvoicePaymentsBlockedByEarlierLiveLogs(
       status: { in: ['PENDING', 'PROCESSING'] },
       OR: referenceFilters,
     },
-    select: { id: true, referenceType: true, referenceId: true, createdAt: true },
-    orderBy: { createdAt: 'asc' },
+    // `status` is selected because this pre-filter now asks decideInvoicePaymentClaim the question
+    // rather than re-deriving a second, narrower rule of its own (round 5 #1).
+    select: { id: true, referenceType: true, referenceId: true, status: true, createdAt: true },
+    // Tie-broken by id so the database's own ordering agrees with invoicePaymentLogPrecedes below.
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
   })
 
-  const earliestLiveByReference = new Map<string, { id: string; createdAt: Date }>()
+  // ONE RULE, ASKED TWICE (round 5 #1). Both runners consult this set AFTER taking the locked claim
+  // and defer the entry if it is a member — so a verdict here that the locked claim does not share is
+  // not a cheap pre-filter, it is a second, contradictory decider that hands the claim straight back.
+  //
+  // Round 4's local rule was "is any live row for this reference earlier than me?", which says YES for
+  // the stale PROCESSING holder that the claim had just admitted: claimed, then immediately deferred,
+  // every minute, for ever. That is the same deadlock as decideInvoicePaymentClaim's, reached through
+  // the pre-filter instead. Delegating removes the possibility of the two disagreeing at all.
+  const liveByReference = new Map<string, LiveInvoicePaymentEntry[]>()
   for (const log of liveLogs) {
     const key = invoicePaymentReferenceKey(log)
-    if (!earliestLiveByReference.has(key)) {
-      earliestLiveByReference.set(key, log)
-    }
+    const bucket = liveByReference.get(key)
+    if (bucket) bucket.push(log)
+    else liveByReference.set(key, [log])
   }
 
   const blocked = new Set<string>()
   for (const entry of paymentEntries) {
-    const earliest = earliestLiveByReference.get(invoicePaymentReferenceKey(entry))
-    if (earliest && earliest.id !== entry.id && earliest.createdAt < entry.createdAt) {
+    const live = liveByReference.get(invoicePaymentReferenceKey(entry)) ?? []
+    if (!decideInvoicePaymentClaim({ entryId: entry.id, live }).claim) {
       blocked.add(entry.id)
     }
   }
   return blocked
+}
+
+/**
+ * THE ELECTION IS NOT A SERIALISATION (Codex round 4 #3).
+ *
+ * `findInvoicePaymentsBlockedByEarlierLiveLogs` makes every runner that sees THE SAME ROWS elect the
+ * same winner. Round 3 proved that property and then used it as though it were mutual exclusion. It
+ * is not, and the gap is not the tie-break:
+ *
+ *   Both runners compute the blocked set ONCE, before their claim loop, from their OWN snapshot of
+ *   the table. `processPendingXeroSyncDirect` reads at t1; the outbox worker reads at t2. A row that
+ *   commits between them is in one snapshot and not the other:
+ *
+ *     t1  direct runner reads live rows for order O and sees only X. X is the minimum, so X runs.
+ *     t1' a second receipt Y commits for order O, with an EARLIER createdAt (a deferred re-drive
+ *         restoring an older row's timestamp, or simply two receipts recorded seconds apart under
+ *         clock skew between the app instances).
+ *     t2  outbox worker reads and sees {X, Y}. The minimum is Y — not X — so Y runs.
+ *
+ *   Two runners, one total order, no tie anywhere, and both entries post. The post-time capacity
+ *   guard cannot catch it either: it counts SYNCED rows, and at the moment both read the table
+ *   neither sibling has posted yet. That guard's own header states the assumption plainly — "only the
+ *   EARLIEST live INVOICE_PAYMENT for an order is ever un-deferred, so a sibling cannot be posting
+ *   alongside us" — and that is precisely what an unsynchronised election does not deliver.
+ *
+ * WHAT ACTUALLY EXCLUDES. A rule of the form "am I the smallest?" can always be invalidated by a row
+ * arriving later with a smaller key, so no amount of agreement about ORDER produces exclusion. What
+ * does is a rule that only ever looks BACKWARD: another entry for this reference is already claimed,
+ * therefore I may not be. That is monotone — a newly-committed row cannot un-claim an existing claim.
+ *
+ * So the ordering keeps its job (which PENDING entry goes next, and it is still total so both runners
+ * pick the same one) and a second, decisive test is added: nothing else for this reference may be
+ * PROCESSING. Both are evaluated INSIDE the transaction that takes the claim, under the sales order's
+ * row lock — the same lock o3d-3zgy already makes order-scoped accounting writes take — so two
+ * runners cannot interleave their read and their write at all.
+ *
+ * STALENESS IS NOT AN EXEMPTION. A PROCESSING sibling whose claim went stale fifteen minutes ago is
+ * still a request nothing local can recall; that is the settled reading everywhere else in this tree
+ * (IN_FLIGHT_BILL_PAYMENT_STATUSES, the round-2 supersession rule). Blocking on it costs a 60-second
+ * deferral, because a stale row is itself re-claimable and will be driven to SYNCED or FAILED by
+ * whichever runner takes it — at which point this entry proceeds and the capacity guard judges it on
+ * what that row ended up saying.
+ *
+ * AND THAT LAST SENTENCE WAS NOT TRUE AS ROUND 4 WROTE IT (Codex round 5 #1). The stale row is only
+ * re-claimable if the rules let it claim, and they did not:
+ *
+ *     S  PROCESSING, claimed fifteen minutes ago, createdAt 09:00:05
+ *     P  PENDING, createdAt 09:00:00
+ *
+ *   P asks to claim: S is PROCESSING, so ANOTHER_ENTRY_IS_POSTING — defer 60s.
+ *   S asks to re-claim: P is PENDING and precedes it, so AN_EARLIER_ENTRY_IS_WAITING — defer 60s.
+ *
+ * Each defers to the other, for ever, and the order's payment never posts. The exclusion rule and the
+ * ordering rule formed a cycle: exclusion points forward in status, ordering points backward in time,
+ * and with the two rows disagreeing on those two axes there is no member of the live set that either
+ * rule admits.
+ *
+ * THE CUT IS AT THE ORDERING RULE, NEVER AT THE EXCLUSION. Ordering exists to pick which UNCLAIMED
+ * entry goes next; a row that is ITSELF PROCESSING is not queueing for the slot, it already holds it.
+ * Applying a queue-position rule to the holder is what closed the cycle. So the holder skips the
+ * ordering test — and only that test: it still has to pass the exclusion, so it can never run
+ * alongside a different in-flight post. Nothing forward-looking is reintroduced.
+ *
+ * WHY THIS TERMINATES, as a property of the live set L for one reference rather than a hope:
+ *   • If some row of L is PROCESSING, it is the ONLY one (exclusion + the order row lock admit no
+ *     second claim), every other row is deferred by exclusion, and the holder is admitted by the
+ *     exemption above. Whoever takes it drives it to SYNCED/FAILED/CANCELLED and it leaves L.
+ *   • If no row of L is PROCESSING, the minimum under the total order has no PROCESSING sibling and
+ *     no earlier sibling, so it is admitted.
+ * L is therefore never fully blocked, and every admission ends with a row leaving L. |L| strictly
+ * decreases, which is the termination argument round 4 asserted and did not have.
+ *
+ * The exemption costs nothing in safety: `accountingSyncLogClaimWhere` is still the fence that decides
+ * whether a PROCESSING row may actually be re-taken, and it requires the claim to be older than the
+ * stale cutoff. A live worker's own row is admitted by this function and then refused by that where
+ * clause. This function decides QUEUE POSITION; the where clause decides WHO OWNS THE ROW.
+ */
+export type LiveInvoicePaymentEntry = { id: string; status: string; createdAt: Date }
+
+export type InvoicePaymentClaimDecision =
+  | { claim: true }
+  /** Another entry for this reference holds the post slot. Nothing may be sent alongside it. */
+  | { claim: false; reason: 'ANOTHER_ENTRY_IS_POSTING'; blockedBy: string }
+  /** An earlier live entry for this reference has not gone yet. Ordering, not exclusion. */
+  | { claim: false; reason: 'AN_EARLIER_ENTRY_IS_WAITING'; blockedBy: string }
+
+/**
+ * Pure. `live` is every PENDING/PROCESSING INVOICE_PAYMENT row for this entry's reference, INCLUDING
+ * the entry itself when it is still live (a stale re-claim reads its own row back as PROCESSING —
+ * self is never a blocker, or nothing could ever be retried).
+ */
+export function decideInvoicePaymentClaim(input: {
+  entryId: string
+  live: LiveInvoicePaymentEntry[]
+}): InvoicePaymentClaimDecision {
+  const others = input.live.filter((row) => row.id !== input.entryId)
+  const self = input.live.find((row) => row.id === input.entryId)
+
+  // BACKWARD-LOOKING, and therefore the only test here that excludes. Ordered by the same total order
+  // so the id reported is stable rather than whichever row the database happened to return first.
+  const posting = others
+    .filter((row) => row.status === 'PROCESSING')
+    .sort((a, b) => (invoicePaymentLogPrecedes(a, b) ? -1 : 1))[0]
+  if (posting) return { claim: false, reason: 'ANOTHER_ENTRY_IS_POSTING', blockedBy: posting.id }
+
+  // THE HOLDER OF THE SLOT IS NOT QUEUEING FOR IT (round 5 #1). Reached only when nothing ELSE is
+  // posting, so this row is the single live claim for the reference. Deferring it behind an earlier
+  // PENDING row — which is itself deferred by the exclusion above, because THIS row is the thing
+  // posting — is the deadlock: the two rules point in opposite directions and neither admits anybody.
+  // Ordering decides which unclaimed entry goes next; it has no opinion about the entry that already
+  // went. Whether this row may actually be RE-taken is `accountingSyncLogClaimWhere`'s question, and
+  // it still answers "only if the claim is stale".
+  if (self?.status === 'PROCESSING') return { claim: true }
+
+  if (!self) return { claim: true }
+  const earlier = others
+    .filter((row) => invoicePaymentLogPrecedes(row, self))
+    .sort((a, b) => (invoicePaymentLogPrecedes(a, b) ? -1 : 1))[0]
+  if (earlier) return { claim: false, reason: 'AN_EARLIER_ENTRY_IS_WAITING', blockedBy: earlier.id }
+  return { claim: true }
+}
+
+export type SyncLogClaimResult =
+  | { outcome: 'claimed' }
+  /** The row was not claimable (already taken, retired, posted, or out of retries). */
+  | { outcome: 'not-claimable' }
+  /** Another INVOICE_PAYMENT for the same reference owns the slot, or precedes this one. */
+  | { outcome: 'deferred'; reason: 'ANOTHER_ENTRY_IS_POSTING' | 'AN_EARLIER_ENTRY_IS_WAITING'; blockedBy: string }
+
+/**
+ * Take the claim. For an order-scoped INVOICE_PAYMENT this happens under the order row lock together
+ * with the exclusion test, so the read that authorises the claim and the claim itself cannot be
+ * interleaved by another runner. Everything else claims exactly as before — the lock buys nothing for
+ * a type that is not competing for a single per-reference post slot, and taking it would put an
+ * unnecessary order lock in front of every journal and invoice push.
+ */
+async function claimAccountingSyncLog(
+  entry: { id: string; type: string; referenceType: string; referenceId: string },
+  claimedAt: Date,
+  staleClaimCutoff: Date,
+): Promise<SyncLogClaimResult> {
+  const claimData = { status: 'PROCESSING' as const, processingStartedAt: claimedAt }
+
+  if (entry.type !== 'INVOICE_PAYMENT' || entry.referenceType !== 'SalesOrder') {
+    const claim = await db.accountingSyncLog.updateMany({
+      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
+      data: claimData,
+    })
+    return claim.count === 0 ? { outcome: 'not-claimable' } : { outcome: 'claimed' }
+  }
+
+  return db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, entry.referenceId)
+    const live = await tx.accountingSyncLog.findMany({
+      where: {
+        connector: XERO_CONNECTOR,
+        type: 'INVOICE_PAYMENT',
+        referenceType: entry.referenceType,
+        referenceId: entry.referenceId,
+        status: { in: ['PENDING', 'PROCESSING'] },
+      },
+      select: { id: true, status: true, createdAt: true },
+    })
+    const decision = decideInvoicePaymentClaim({ entryId: entry.id, live })
+    if (!decision.claim) {
+      return { outcome: 'deferred', reason: decision.reason, blockedBy: decision.blockedBy }
+    }
+    const claim = await tx.accountingSyncLog.updateMany({
+      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
+      data: claimData,
+    })
+    return claim.count === 0 ? { outcome: 'not-claimable' } : { outcome: 'claimed' }
+  })
 }
 
 /**
@@ -1136,16 +1393,73 @@ const ORDERING_DEFERRAL_MS = 60_000
 const PAYMENT_ORDERING_DEFERRAL_MESSAGE = 'Deferred until older invoice payment sync logs post'
 const UPDATE_ORDERING_DEFERRAL_MESSAGE = 'Deferred until the invoice CREATE for this document posts'
 
+/** Which of the two exclusion tests declined, and the entry that stands in the way. */
+export type InvoicePaymentDeferralDetail = {
+  reason: 'ANOTHER_ENTRY_IS_POSTING' | 'AN_EARLIER_ENTRY_IS_WAITING'
+  blockedBy: string
+}
+
+/**
+ * What the row's errorMessage says while it waits, in terms an operator reading the queue can act on.
+ *
+ * Still ONE spelling per condition and still shared by both runners (o3d-550x): the no-detail answer
+ * is `PAYMENT_ORDERING_DEFERRAL_MESSAGE` itself, so the pre-filter deferral reads exactly as it did.
+ * The two detailed forms are not a second spelling of that condition — they are the two conditions
+ * the locked claim can distinguish and the snapshot pre-filter cannot, and each names the entry to
+ * go and look at.
+ */
+export function invoicePaymentDeferralMessage(detail?: InvoicePaymentDeferralDetail): string {
+  if (detail?.reason === 'ANOTHER_ENTRY_IS_POSTING') {
+    return `Deferred: invoice payment sync log ${detail.blockedBy} for the same order is being sent now`
+  }
+  if (detail?.reason === 'AN_EARLIER_ENTRY_IS_WAITING') {
+    return `Deferred until earlier invoice payment sync log ${detail.blockedBy} posts`
+  }
+  return PAYMENT_ORDERING_DEFERRAL_MESSAGE
+}
+
 /** o3d-550x: the caller holds the claim, so this gives it back through the one fenced release. */
 export async function deferPaymentUntilEarlierLogsPost(
   client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
   entry: { id: string },
   held: HeldClaim,
+  detail?: InvoicePaymentDeferralDetail,
 ): Promise<boolean> {
   return releaseClaimForRetry(client, entry.id, held, {
-    errorMessage: PAYMENT_ORDERING_DEFERRAL_MESSAGE,
+    errorMessage: invoicePaymentDeferralMessage(detail),
     nextAttemptAt: new Date(Date.now() + ORDERING_DEFERRAL_MS),
   })
+}
+
+/**
+ * THE OTHER WAY TO GET HERE, AND IT IS NOT A RELEASE (o3d-a3wx round 4 #3, merged with o3d-550x).
+ *
+ * The locked claim can DECLINE, and then this entry was never claimed at all. There is no claim to
+ * give back, so this deliberately does not go through `releaseClaimForRetry` and is not a second copy
+ * of it: that function's whole job is to return a row this worker owns to PENDING under
+ * `heldClaimWhere`, and here we own nothing.
+ *
+ * WHAT IT MUST NOT DO IS WRITE THE STATUS. An unconditional `status: 'PENDING'` would stamp over a
+ * claim another runner took in the meantime — un-claiming a request that may already be on the wire,
+ * which is the exact failure `heldClaimWhere` exists to prevent, reached from the opposite direction.
+ * So the where-clause pins the row to PENDING (if it is not PENDING, somebody else owns it and this
+ * must be a no-op) and only the next-attempt gate and the message move.
+ */
+export async function deferUnclaimedPaymentUntilEarlierLogsPost(
+  client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  entry: { id: string },
+  detail?: InvoicePaymentDeferralDetail,
+): Promise<boolean> {
+  // A future `processingStartedAt` on a PENDING row is the existing retry gate: it is read as
+  // "earliest next claim time", not as a claim.
+  const deferred = await client.accountingSyncLog.updateMany({
+    where: { id: entry.id, status: 'PENDING' },
+    data: {
+      processingStartedAt: new Date(Date.now() + ORDERING_DEFERRAL_MS),
+      errorMessage: invoicePaymentDeferralMessage(detail),
+    },
+  })
+  return deferred.count > 0
 }
 
 // audit-H5: an *_INVOICE_UPDATE must not post before the invoice's CREATE. The
@@ -1859,19 +2173,26 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
     // closing over a Date, which is what a renewing lease needs and what a merge would otherwise have
     // to find by hand at six call sites.
     const held = claimHeldFrom(claimedAt)
-    const claim = await db.accountingSyncLog.updateMany({
-      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
-      data: {
-        status: 'PROCESSING',
-        processingStartedAt: claimedAt,
-      },
-    })
-    if (claim.count === 0) continue
+    // The claim itself is the exclusion for INVOICE_PAYMENT: taken under the order row lock together
+    // with the "is anything else for this order already posting?" test, so two runners working from
+    // different snapshots cannot both elect themselves (round 4 #3).
+    const claim = await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff)
+    if (claim.outcome === 'deferred') {
+      // NOT `deferPaymentUntilEarlierLogsPost`: the locked claim declined, so `held` was never
+      // granted and there is nothing to release. See deferUnclaimedPaymentUntilEarlierLogsPost.
+      await deferUnclaimedPaymentUntilEarlierLogsPost(db, entry, claim)
+      result.skipped++
+      continue
+    }
+    if (claim.outcome === 'not-claimable') continue
 
     result.processed++
     const payload = (entry.payload ?? {}) as SyncPayload
 
     try {
+      // Kept as a cheap pre-filter over the run's snapshot. It is no longer what makes the ordering
+      // safe — the locked claim above is — but it still spares a lock round-trip in the ordinary case
+      // and its verdict, when it fires, is the same one.
       if (blockedPaymentEntryIds.has(entry.id)) {
         await deferPaymentUntilEarlierLogsPost(db, entry, held)
         result.skipped++
@@ -2282,14 +2603,19 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     // closing over a Date, which is what a renewing lease needs and what a merge would otherwise have
     // to find by hand at six call sites.
     const held = claimHeldFrom(claimedAt)
-    const claim = await db.accountingSyncLog.updateMany({
-      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
-      data: {
-        status: 'PROCESSING',
-        processingStartedAt: claimedAt,
-      },
-    })
-    if (claim.count === 0) {
+    const claim = await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff)
+    if (claim.outcome === 'deferred') {
+      // Same shape as the blocked-payment branch below: the sync row's next attempt moves out and the
+      // outbox job is retried, in ONE transaction so the queue and the row cannot disagree about
+      // whether this entry is waiting. Unclaimed, so `held` is not used — the claim was declined.
+      await db.$transaction(async (tx) => {
+        await deferUnclaimedPaymentUntilEarlierLogsPost(tx, entry, claim)
+        await markXeroOutboxRetry(job, invoicePaymentDeferralMessage(claim), tx)
+      })
+      result.skipped++
+      continue
+    }
+    if (claim.outcome === 'not-claimable') {
       // The claim failed because the row is no longer PENDING/claimable. `entry` is a snapshot, so
       // re-read the live status: it may have been retired (CANCELLED — e.g. its order was cancelled,
       // o3d-5rs) or posted (SYNCED) since. CANCELLED is an INTENTIONAL no-op, not a failure — completing
@@ -2325,6 +2651,8 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     const payload = (entry.payload ?? {}) as SyncPayload
 
     try {
+      // Cheap pre-filter over the run's snapshot; the locked claim above is what makes the ordering
+      // safe. The claim IS held here, so the deferral gives it back under its own fence.
       if (blockedPaymentEntryIds.has(entry.id)) {
         await db.$transaction(async (tx) => {
           // o3d-550x: THE SAME release as the direct runner, not a copy of it.
@@ -3609,6 +3937,61 @@ async function processClaimedEntry(
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT' }
       }
+      // OVER-SETTLEMENT IS REFUSED HERE, NOT AT THE ENQUEUE (o3d-cjt8 round 2).
+      //
+      // The under-lock capacity re-check in registerInvoicePaymentWithLedger only ever covered the
+      // enqueue paths someone remembered to list, and that list was already wrong: the imported-order
+      // follow-up (`_registerPayment`, enqueueSalesInvoiceFollowUps below) enqueues a payment with no
+      // order lock and no arithmetic at all. Rather than add the check to a third call site — the same
+      // assumption that has now failed once — it goes where nothing can route around it. Every
+      // INVOICE_PAYMENT, whatever enqueued it, must come through this case to reach Xero.
+      //
+      // Fails CLOSED on anything it cannot measure, and on a genuine refusal retires the row as
+      // CANCELLED — accurate, because this runs BEFORE the remote call, so nothing was sent.
+      const capacity = await guardInvoicePaymentCapacity(db, {
+        connector: XERO_CONNECTOR,
+        entryId,
+        referenceType,
+        referenceId,
+        accountingInvoiceId,
+        amount,
+      })
+      if (!capacity.post) {
+        if (capacity.kind === 'unmeasurable') return { success: false, error: capacity.message }
+        // The LEASE, which is the claim: `heldClaimWhere` reads the instant it holds as the statement
+        // is built, so a renewal between the guard and this write cannot make the retirement a no-op.
+        const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, {
+          entryId,
+          claim: lease,
+          reason: capacity.message,
+        }))
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: referenceId,
+          // The two refusals need an operator to do DIFFERENT things — reconcile an over-settlement,
+          // versus find out whether a failed attempt actually posted — so they are not filed under one
+          // action name that would make the second read as the first.
+          action: capacity.refusal === 'AMBIGUOUS_FAILED_REGISTRATION'
+            ? 'invoice_payment_refused_unknown_ledger_state'
+            : 'invoice_payment_refused_over_settlement',
+          tag: 'accounting',
+          level: 'ERROR',
+          description: capacity.message,
+          metadata: {
+            syncLogId: entryId,
+            accountingInvoiceId,
+            amount,
+            refusal: capacity.refusal,
+            alreadyPosted: capacity.alreadyPosted,
+            ledgerTotal: capacity.ledgerTotal,
+            ambiguousSyncLogIds: capacity.ambiguousIds,
+            retired,
+          },
+        }).catch(() => { /* logging must never turn a safe refusal into a failure */ })
+        // Nothing was sent and nothing should be retried: report it as handled, not as a failure that
+        // burns retries and ends FAILED (which would then read as "may have posted").
+        return { success: true, skipped: true }
+      }
       const account = await db.accountingAccount.findFirst({
         where: { connector: XERO_CONNECTOR, OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },
         select: { externalAccountId: true },
@@ -4359,6 +4742,18 @@ async function enqueueSalesInvoiceFollowUps(
     invoiceNumber: syncResult.invoiceNumber,
     sourceEntryId: entryId,
   }, { from: 'postedRow', payload })
+
+  // o3d-ekn8: receipts recorded BEFORE this invoice existed were refused with DOCUMENT_NOT_POSTED and
+  // nothing ever came back for them. This is the moment that refusal stops applying — the CREATE has
+  // posted and updateBackReference (which runs before enqueueFollowUps) has written accountingInvoiceId
+  // — so re-drive the same guarded decision here. Imported orders are unaffected: their receipt is
+  // registered by the `_registerPayment` branch above and has no local Payment row to re-drive.
+  //
+  // Imported dynamically so the connector does not take a static dependency on the sales domain, and
+  // awaited but never allowed to throw: the invoice HAS posted, and a receipt that could not be
+  // re-registered must not turn that into a failed sync entry.
+  const { registerDeferredOrderReceipts } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
+  await registerDeferredOrderReceipts(referenceId)
 }
 
 async function enqueuePurchaseInvoiceFollowUps(

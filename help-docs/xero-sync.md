@@ -1260,13 +1260,47 @@ A payment recorded on a sales order (**Add Payment**) is registered against the 
 
 - accounting sync is on and the invoice has already posted to Xero;
 - the payment method and currency resolve to a bank account in the mapping above;
-- no payment for that order has already been sent to Xero, and the receipt is not larger than the invoice Xero holds.
+- the receipt still **fits** in what is left of the invoice Xero holds, after everything already registered against it.
 
 If any of those does not hold, the receipt is still recorded in the IMS, nothing is sent, and a warning naming the order appears in the activity log — the order then shows **NOT SENT TO LEDGER** until it is registered.
 
-The third condition matters most for imported orders: a paid WooCommerce order registers its payment automatically without creating a payment row in the IMS, so recording "the" payment by hand afterwards would pay the Xero invoice twice. The IMS refuses that rather than doing it silently. It also means only **one** registration per order is sent automatically — record a second part payment and you will be asked to register it in Xero yourself.
+**Part payments.** Each receipt gets its own Xero payment, so a deposit followed by a balance settles the invoice in two steps without anyone touching Xero. The IMS keeps a running total instead of a one-at-a-time rule: the receipt that would take the total past the invoice is the one refused, and the warning names both figures. If a registration already on the invoice does not record its amount, the IMS cannot work out the room left and refuses rather than guess.
+
+**Imported orders.** A paid WooCommerce order registers its payment automatically without creating a payment row in the IMS. That registration cannot be matched to any particular receipt, so while it is there the IMS will not register a hand-recorded one on the same order — recording "the" payment afterwards would pay the Xero invoice twice.
+
+**The fit check is applied again at the moment of posting**, not only when the receipt is recorded. Every payment bound for Xero — hand-recorded, re-registered after the invoice posts, or raised automatically by an imported order — is measured against the invoice one last time immediately before the call goes out, counting only payments that have actually posted. A payment that no longer fits is **not sent**: its sync entry is retired as cancelled and an error appears in the activity log naming the invoice, what is already registered against it, and the amount refused. Reconcile the invoice in Xero and register the balance there by hand if it is genuinely owed. If the order or its totals cannot be read at that moment, nothing is sent either and the entry retries — an unreadable order is never treated as permission to move money.
+
+**A receipt recorded before the invoice posts** is no longer lost. A payment cannot attach to a document Xero has never seen, so it is refused at the time with a warning — but the IMS now re-registers it by itself as soon as the invoice reaches Xero, re-running the same checks. Only receipts with no registration attempt of their own are picked up this way; one that already failed is left to the retry path, since a failed attempt may still have reached Xero.
+
+**A re-issued invoice** (deleted in Xero and posted again) starts with a clean slate: payments registered against the old invoice no longer count against the new one, and the payment for the replacement is queued rather than skipped as already-done.
 
 Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there.
+
+### Supplier bills: marking one paid again
+
+The payment poller clears **Paid** on a bill whose payment Xero has demonstrably released, so a bill can legitimately be marked paid a second time. The poller is the only thing that retires the earlier registration, and it does so in the same write that clears **Paid** — because it has just read the bill back from Xero, which is the one moment "the ledger no longer holds this payment" is an *observation* rather than a guess. With the registration retired, **Mark as paid** queues a fresh one normally.
+
+**"Not fully paid" is not "the payment is gone", and only a voided invoice proves the difference.** Xero marks a bill *authorised* whenever it is approved and not fully settled, which is equally what a genuine **part payment** looks like, and what a bill looks like in the minutes between **Mark as paid** and the sync worker actually posting the payment. Clearing **Paid** on either of those re-arms the button over money that has already left, or is about to — and pressing it again pays the supplier twice, with nothing downstream to refuse it. So the poller only retires a registration and clears **Paid** when Xero has **voided** the invoice, which Xero does not allow while any payment is attached to it. Every other regression is reported and left alone:
+
+| What Xero says | What the poller does | What to do |
+|---|---|---|
+| The invoice is **voided** | Clears **Paid** and retires the payment registration, so the bill can be marked paid again | Nothing, unless the void was a mistake |
+| The invoice is **authorised** (approved, not fully paid) | Leaves **Paid** set, retires nothing, and logs a warning against the PO | Open the bill in Xero. If a part payment is sitting against it, settle the balance there or correct the bill total in the IMS. If the payment really was removed, cancel the bill's payment sync entry by hand and mark the bill paid again |
+
+**Mark as paid refuses whenever the IMS cannot prove what the ledger holds.** Each refusal leaves the bill unpaid, queues nothing, changes nothing, and writes a warning naming the sync entry involved:
+
+| What the IMS sees | Why it refuses | What to do |
+|---|---|---|
+| The registration is **being sent now** (claimed by the sync worker) | The request may already be on its way and nothing here can recall it | Wait for that entry to finish — it will end up synced or failed; a dead claim is released after 15 minutes — then check the bill in Xero |
+| The registration is **synced** and no poll has retired it | It posted, and no Xero read has since disproved it | Open the bill in Xero. If the payment is there, the bill is settled. If it is genuinely gone, cancel that sync entry and mark the bill paid again |
+| The registration **failed** | A failed money call is *not* proof that nothing reached Xero — the payment may have been created and the response lost | Open the bill in Xero. If the failed payment is there, the bill is settled. If it is not, cancel that sync entry and mark the bill paid again |
+| The registration **changed status** while the bill was being marked paid | A worker picked it up mid-operation, so its outcome is open | Check that entry, then try again |
+
+A failed registration whose stored request was missing a field Xero rejects before sending (no invoice id, no bank account, no amount) blocks nothing — that one *is* provable.
+
+**When the poller cannot decide, it leaves the bill marked Paid.** The same is true one step further in, on a voided invoice: if a payment registration finished *after* the Xero read the reversal was computed from, that read cannot say whether the payment it created is gone. Clearing **Paid** then would re-arm the button over money that may have moved, so the poll withholds the whole verdict, logs a warning naming the undecidable entries, and counts it on the poll result. The IMS resolves this by itself on the next Xero read that covers those registrations. If it never does, the daily reconcile keeps reporting the bill as a *suspect advance* — settle it in Xero, or cancel the named sync entry by hand.
+
+**Marking a bill paid needs somewhere to send the payment.** If the bill has already been posted to Xero but bill-payment posting is switched off, **Mark as paid** is refused rather than recorded locally: marking it paid with nothing queued would leave Xero showing the full amount outstanding and nothing to correct it. A bill that was never posted to Xero is unaffected — there is no second system to keep in step.
 
 ## FIFO Cost Layers
 

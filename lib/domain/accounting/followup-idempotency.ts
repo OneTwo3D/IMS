@@ -233,6 +233,18 @@ const REQUIRED_BODY_FIELDS: Record<string, readonly { field: string; kind: 'id' 
     { field: 'bankAccountId', kind: 'id' },
     { field: 'amount', kind: 'amount' },
   ],
+  // The SUPPLIER side of the same guard, verified against both connectors rather than assumed from
+  // the sales one: xero/sync-processor.ts and quickbooks/sync-processor.ts each open their
+  // BILL_PAYMENT case with the identical
+  //   if (!accountingInvoiceId || !bankAccountId || amount == null)
+  // and return before building any request. Without this entry a FAILED BILL_PAYMENT row would be
+  // permanently unknowable even when its stored body could never have been sent, which is the one
+  // case that IS provable (o3d-a3wx round 4 #5).
+  BILL_PAYMENT: [
+    { field: 'accountingInvoiceId', kind: 'id' },
+    { field: 'bankAccountId', kind: 'id' },
+    { field: 'amount', kind: 'amount' },
+  ],
   PURCHASE_CREDIT_NOTE_ALLOCATION: [
     { field: 'creditNoteId', kind: 'id' },
     { field: 'accountingInvoiceId', kind: 'id' },
@@ -269,7 +281,7 @@ function bodyCouldHaveReachedTheLedger(type: string, stored: FollowUpPayload | n
 
 /**
  * PROOF that a stored attempt never reached the ledger — the opposite question, and deliberately
- * NOT the negation of the one above (o3d-qsbs).
+ * NOT the negation of `bodyCouldHaveReachedTheLedger` (o3d-qsbs).
  *
  * The two differ on exactly the cases where "no information" must not be read as "no call". A
  * `null` payload is unreadable, and an EMPTY one is indistinguishable from a payload retention
@@ -289,6 +301,32 @@ function bodyProvesNoCallLeft(type: string, stored: FollowUpPayload | null): boo
   if (stored === null) return false
   if (Object.keys(stored).length === 0) return false
   return !required.every(({ field, kind }) => fieldIsPresent(stored[field], kind))
+}
+
+/**
+ * DID THIS STORED ATTEMPT MAYBE REACH THE LEDGER? The one answer in this tree, over a raw payload.
+ *
+ * Exported so the POST-TIME capacity guards — `invoice-payment-capacity.ts` on the sales side and
+ * `payment-reversal.ts` on the supplier side — decide what a FAILED money row means using THIS
+ * definition rather than a second copy of it. There is exactly one sound "nothing was sent" signal in
+ * the system, and two guards deriving it differently would disagree about whether a document still has
+ * capacity, which for money is the whole question.
+ *
+ * IT IS BUILT ON `bodyProvesNoCallLeft`, NOT ON `bodyCouldHaveReachedTheLedger` (o3d-m5qk). Both
+ * branches that arrived at this merge had a version of the question and they answer differently on one
+ * input: an EMPTY `{}` body. `bodyCouldHaveReachedTheLedger` reads it as "could not have been sent",
+ * because it is missing every required field; `bodyProvesNoCallLeft` refuses to read it that way,
+ * because retention compacts a payload to `{}` and a compacted body says nothing whatever about what
+ * left the process. For choosing which body to PIN the first reading is right and harmless — an empty
+ * body genuinely cannot be re-sent. For deciding whether an invoice still has CAPACITY it is a claim
+ * that a payment provably never posted, made on evidence retention destroyed, and it ends in a second
+ * payment. So this reader takes the stricter one: unproven means it counts against capacity.
+ *
+ * Returns TRUE for an unreadable, absent or compacted payload: not knowing what was sent is not
+ * evidence that nothing was.
+ */
+export function storedBodyMayHaveReachedTheLedger(type: string, payload: unknown): boolean {
+  return !bodyProvesNoCallLeft(type, asPayload(payload))
 }
 
 /** Fields whose value defines the remote request, so a divergence is worth reporting. */
@@ -520,4 +558,28 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     }
   }
   return { action: 'create', payload: freshPayload }
+}
+
+/**
+ * DOES THIS LIVE ROW ALREADY OWN THE FOLLOW-UP WE ARE ABOUT TO ENQUEUE? (o3d-hbgo)
+ *
+ * `hasExistingSyncLog` decided that from (connector, type, referenceType, referenceId) alone, and the
+ * partial unique index was scoped the same way — neither consulted the external document the follow-up
+ * TARGETS. So a SalesOrder whose invoice was deleted and re-posted kept the SYNCED INVOICE_PAYMENT row
+ * from the FIRST invoice, the payment follow-up for the SECOND was skipped as already handled, and the
+ * new invoice was never settled. Silently: a skip logs nothing.
+ *
+ * o3d-h2wx had already made the remote TOKEN anchor-aware, so a follow-up targeting a different
+ * accountingInvoiceId derives a different Idempotency-Key rather than being deduped by the ledger. This
+ * closes the same gap one level down, using the SAME anchors — a row-level dedup that names less than
+ * the token it would post under can only ever throw away work the token was ready to distinguish.
+ *
+ * An unanchored stored payload counts as MATCHING, exactly as `couldHaveCommittedThis` treats it: we
+ * cannot tell what it targeted, and skipping a possibly-duplicate payment is recoverable where posting
+ * one is not. That is the OPPOSITE of the database index's null handling — the index groups unanchored
+ * rows into their own slot — and deliberately so: the application guard may be stricter than the
+ * constraint that backs it, never laxer.
+ */
+export function liveRowOccupiesFollowUpSlot(storedPayload: unknown, freshPayload: FollowUpPayload): boolean {
+  return couldHaveCommittedThis(asPayload(storedPayload), anchorsOf(freshPayload))
 }
