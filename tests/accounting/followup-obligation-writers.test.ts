@@ -225,6 +225,10 @@ const db = {
   // stamps the same answer onto every follow-up payload it queues. A double with no token row is a
   // DISCONNECTED instance, which is a different scenario from the one these tests are about.
   accountingToken: { async findUnique() { return { tenantId: 'tenant-A' } } },
+  // The outbox runner reads the filed unrecorded-posted-document incidents once per batch, before it
+  // decides anything about a settled row (Codex r3, HIGH). Nothing in this file files one, so the
+  // honest answer is "none" — not a missing model.
+  activityLog: { async findMany() { return [] }, async create(args: { data: unknown }) { return args.data } },
   purchaseInvoice: billClient,
   salesOrder: { async findUnique() { return null }, async update() { return {} } },
   salesOrderRefund: { async findUnique() { return null }, async update() { return {} } },

@@ -65,6 +65,12 @@ export function describeUnrecordablePostedDocument(incident: UnrecordablePostedD
  * it back into the ordinary retry that would lose it.
  */
 export class PostedDocumentEvidenceUnwritten extends Error {
+  /**
+   * The whole incident, not only its parts. A caller that still has a working database — the record
+   * failed inside a transaction that then rolled back, which says nothing about the next statement —
+   * can write the record from this, in exactly the shape the transaction meant to write it.
+   */
+  readonly incident: UnrecordablePostedDocument
   readonly syncLogId: string
   readonly postedExternalId: string | null
   readonly namedExternalId: string | null
@@ -87,6 +93,7 @@ export class PostedDocumentEvidenceUnwritten extends Error {
       { cause },
     )
     this.name = 'PostedDocumentEvidenceUnwritten'
+    this.incident = incident
     this.syncLogId = incident.entry.id
     this.postedExternalId = incident.postedExternalId
     this.namedExternalId = incident.namedExternalId
