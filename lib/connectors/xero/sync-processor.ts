@@ -14,9 +14,8 @@ import { pushManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
 import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
-import {
-  accountingPayloadConnectionRefusal, stampAccountingPayloadConnection,
-} from '@/lib/connectors/accounting-connection-provenance'
+import { stampAccountingPayloadConnection } from '@/lib/connectors/accounting-connection-provenance'
+import { withAccountingPostingIntent } from '@/lib/connectors/accounting-posting-intent'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -363,12 +362,17 @@ async function enqueueFollowUpSyncLog(
   /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
   attempt = 0,
 ): Promise<void> {
-  // o3d-19gy: stamped HERE, before anything reads or plans against it, so `plan.payload` carries the
-  // connection whether it is used to create a row or to revive a FAILED one — a follow-up payload is
-  // rebuilt from a document that was just posted, and it carries that post's external id, so it is
-  // exactly the shape this guard exists for. Re-stamping on a revival is deliberate: the revived row
-  // will post NOW, against the connection resolved now, and the pinned Idempotency-Key that makes the
-  // revival safe is a separate field this does not touch.
+  // o3d-19gy: stamped HERE, before anything reads or plans against it, so a follow-up payload carries
+  // the connection it was raised against — it is rebuilt from a document that was just posted and
+  // carries that post's external id, which is exactly the shape this guard exists for.
+  //
+  // THIS STAMP IS FOR THE *CREATE* OUTCOME ONLY (Codex r1 finding 2). An earlier revision claimed
+  // "re-stamping on a revival is deliberate", and that was the defect: a revived row is pinned to the
+  // idempotency token its EARLIER attempt was spent under, and rewriting its origin to the current
+  // tenant made a payment first attempted against organisation A look, to the post-time guard, like
+  // ordinary organisation-B work. `planFollowUpEnqueue` now discards this stamp on every reuse and
+  // carries the stored row's own record forward instead, so what follows can only ADD an origin to a
+  // new row, never replace one.
   payload = stampAccountingPayloadConnection(payload, await activeAccountingIdProvenance(XERO_CONNECTOR))
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
@@ -1378,7 +1382,35 @@ async function guardCancelledSalesOrderInvoice(
   return { post: true, customerId: so.customerId ?? undefined }
 }
 
+/**
+ * o3d-19gy / o3d-s36z / o3d-gfh: every remote call this entry makes is attributed to this entry's row.
+ *
+ * WHERE THE PERMISSION IS ACTUALLY GRANTED. Not here. This establishes the INTENT — which row is being
+ * posted — and the verdict is reached inside `performRequest`, against the tenant id that will be
+ * written into the outgoing `Xero-Tenant-Id` header, immediately before the request leaves. The earlier
+ * revision decided it here, from its own read of the `AccountingToken` row, and the request then made a
+ * second, independent selection of the tenant when it built its headers; a permission taken at T1 and
+ * spent at T2 is not a permission, and that gap is what Codex r1 finding 3 names.
+ *
+ * The wrap covers the whole entry rather than just its write, because a handler's contact and item
+ * lookups CACHE ids from the responses they get: reading organisation C's chart of accounts on behalf of
+ * a row raised against B is the same error one step earlier.
+ */
 async function processEntry(
+  entryId: string,
+  type: AccountingSyncType,
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+  claimedAt: Date,
+): Promise<EntryResult> {
+  return withAccountingPostingIntent(
+    { connector: XERO_CONNECTOR, payload, type, referenceType, referenceId },
+    () => processClaimedEntry(entryId, type, referenceType, referenceId, payload, claimedAt),
+  )
+}
+
+async function processClaimedEntry(
   entryId: string,
   type: AccountingSyncType,
   referenceType: string,
@@ -1388,23 +1420,21 @@ async function processEntry(
 ): Promise<EntryResult> {
   const postingMode = payload._postingMode
 
-  // o3d-19gy / o3d-s36z: does this payload still belong to the ledger we are about to post it to?
+  // THE CONNECTION CHECK USED TO BE HERE, and removing it is the fix rather than a regression.
   //
-  // FIRST, before the scope check and before any handler runs, because everything below either sends
-  // something or reads something on the assumption that the connection is the one that composed this
-  // row. It is asked here rather than in each of the thirty case arms for the reason the scope guard is:
-  // a check the next arm has to remember to repeat is one the next arm will forget.
+  // It compared the row's origin stamp against a tenant read from the `AccountingToken` row; the
+  // request then resolved the tenant AGAIN, from `getAccessToken()`, when it built its headers. Two
+  // independent selections of one thing, and the gap between them is measured in whatever the handler
+  // does plus, on a rate-limited entry, tens of seconds asleep on a Retry-After. Keeping it as a
+  // "harmless early no" was tempting and is the same mistake one notch quieter: it would still be a
+  // second reading of a value that can disagree with the one the request uses, and a refusal produced
+  // from a stale read is as wrong as a permission produced from one. `small2`: A PERMISSION IS
+  // EVALUATED IN EXACTLY ONE PLACE, IMMEDIATELY BEFORE THE ACT IT AUTHORISES.
   //
-  // Fails as an ordinary entry failure — the message goes onto the row's errorMessage and onto /sync —
-  // rather than throwing, so a queue holding one previous-tenant row does not stop the rows behind it.
-  const connectionRefusal = accountingPayloadConnectionRefusal({
-    payload,
-    activeProvenance: await activeAccountingIdProvenance(XERO_CONNECTOR),
-    type,
-    referenceType,
-    referenceId,
-  })
-  if (connectionRefusal) return { success: false, error: connectionRefusal }
+  // It is now evaluated in `performRequest`, against the `auth.tenantId` that is going into this
+  // request's own `Xero-Tenant-Id` header, and it reaches the row the same way it always did — as the
+  // response's `error`, which each arm returns as an ordinary entry failure, so a queue holding one
+  // previous-tenant row still does not stop the rows behind it.
 
   // A MISSING SCOPE IS A CONFIGURATION FAULT, NOT AN API ERROR (o3d-g2i). Adding a scope to the
   // authorization URL only affects future consents, so a connection made before it keeps 401ing

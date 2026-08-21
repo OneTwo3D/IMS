@@ -13,11 +13,17 @@ import test, { mock } from 'node:test'
  * The bad one is an id that HAPPENS to exist in the new organisation, and money settling an unrelated
  * invoice from an unrelated bank account.
  *
- * The refusal here is deliberately a PRE-FLIGHT one: it is answered before any remote call, from two
- * values already in hand. It cannot make enqueue-to-post atomic — a rebinding that commits between the
- * check and the request is the remaining half of o3d-gfh — but it is the only check that sees the
- * reconnect at all, and it turns a window measured in hours into one measured in the milliseconds of a
- * single call.
+ * WHERE THE REFUSAL LIVES, AFTER Codex r1. It used to be a PRE-FLIGHT check in `processEntry`, answered
+ * from the `AccountingToken` row before any handler ran — which left the request free to resolve the
+ * tenant a second time, from `getAccessToken()`, when it built its headers. That is the whole of finding
+ * 3: a permission taken at T1 and spent at T2. The check now lives in the client, immediately before the
+ * request leaves, against the very `auth.tenantId` that goes into the outgoing `Xero-Tenant-Id` header,
+ * and the pre-flight was REMOVED rather than kept as a harmless early "no" — a refusal produced from a
+ * stale read is as wrong as a permission produced from one.
+ *
+ * These tests therefore mock the WIRE (`connectorFetch`) rather than `xeroPost`: stubbing the api module
+ * would stub out the guard itself. `tests/connectors/xero-posting-intent-tenant.test.ts` is the sibling
+ * that forces the two tenant readings apart and pins that the header is what decides.
  */
 
 // LAZILY imported, and it has to be. A static import here is evaluated before `mock.module` runs, and
@@ -46,23 +52,41 @@ test('the stamp is the SAME string the document-side id columns already use', as
   assert.equal(payload.accountingInvoiceId, 'INV-1', 'and the document fields are untouched')
 })
 
-test('a null provenance adds NOTHING rather than an empty stamp', async () => {
-  const { stampAccountingPayloadConnection, readAccountingPayloadConnection } = await provenance()
-  // Enqueueing while disconnected is ordinary and recoverable. An empty stamp would be a third state
-  // that reads exactly like the second (unstamped) to every consumer — which is how a guard acquires a
-  // hole nobody can see.
+test('a null provenance records THAT there was no connection, rather than recording nothing', async () => {
+  const { stampAccountingPayloadConnection, readAccountingPayloadConnectionStamp } = await provenance()
+  // Reversed from the first cut, which added nothing. Enqueueing while disconnected is ordinary and
+  // recoverable, but it is a FACT — "the ids in this payload came from no connection" — and the old
+  // behaviour threw it away, leaving a live writer that produced rows the guard could not distinguish
+  // from pre-deploy legacy ones and therefore waved through.
   const payload = stampAccountingPayloadConnection({ amount: 10 }, null)
-  assert.equal(ACCOUNTING_PAYLOAD_CONNECTION_KEY in payload, false)
-  assert.equal(readAccountingPayloadConnection(payload), null)
+  assert.equal(payload[ACCOUNTING_PAYLOAD_CONNECTION_KEY], '!disconnected')
+  assert.deepEqual(readAccountingPayloadConnectionStamp(payload), { state: 'raised-disconnected' })
+  // A blank/whitespace provenance is the same fact and must not become a blank stamp.
+  assert.equal(stampAccountingPayloadConnection({ amount: 10 }, '   ')[ACCOUNTING_PAYLOAD_CONNECTION_KEY], '!disconnected')
 })
 
-test('a non-string or blank stamp reads as UNSTAMPED, not as a connection', async () => {
-  const { readAccountingPayloadConnection } = await provenance()
-  assert.equal(readAccountingPayloadConnection({ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: '' }), null)
-  assert.equal(readAccountingPayloadConnection({ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: '  ' }), null)
-  assert.equal(readAccountingPayloadConnection({ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 42 }), null)
-  assert.equal(readAccountingPayloadConnection(null), null)
-  assert.equal(readAccountingPayloadConnection('not an object'), null)
+test('the four stamp states are FOUR states, and none of them is another', async () => {
+  const { readAccountingPayloadConnectionStamp } = await provenance()
+  const state = (payload: unknown) => readAccountingPayloadConnectionStamp(payload).state
+
+  assert.equal(state({ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 'xero:tenant-A' }), 'stamped')
+  assert.equal(state({ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: '!disconnected' }), 'raised-disconnected')
+  assert.equal(state({ accountingInvoiceId: 'XBILL-A' }), 'absent')
+
+  // Everything below used to collapse into the SAME null that an unstamped payload produced, and
+  // therefore into the same "allowed" that a genuine match produced.
+  assert.equal(state({ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: '' }), 'unreadable')
+  assert.equal(state({ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: '  ' }), 'unreadable')
+  assert.equal(state({ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 42 }), 'unreadable')
+  assert.equal(state({ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: null }), 'unreadable')
+  assert.equal(state({ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: { connector: 'xero' } }), 'unreadable')
+  assert.equal(state(null), 'unreadable')
+  assert.equal(state('not an object'), 'unreadable')
+  assert.equal(state(7), 'unreadable')
+  // An ARRAY specifically: `typeof [] === 'object'` and `[]['_connectionProvenance']` is undefined, so
+  // the earlier reader classified a JSON array as an ordinary unstamped payload.
+  assert.equal(state([{ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 'xero:tenant-A' }]), 'unreadable')
+  assert.equal(state([]), 'unreadable')
 })
 
 // --- the refusal -------------------------------------------------------------
@@ -103,27 +127,107 @@ test('a CONNECTOR switch is refused too, not only an organisation switch', async
   }) ?? '', /queued for accounting connection xero:tenant-A/)
 })
 
-test('an UNSTAMPED payload is allowed — and that is the documented limit, not an oversight', async () => {
-  const { accountingPayloadConnectionRefusal } = await provenance()
+test('an UNSTAMPED payload is allowed — as its OWN named decision, not as a match', async () => {
+  const { accountingPayloadConnectionVerdict } = await provenance()
   // Rows queued before this shipped. Refusing them would fail every payment already in the queue at the
   // moment of the deploy, and an operator who has to hand-re-drive real payments because of a guard is
-  // an operator who removes the guard. The unstamped population only shrinks after one deploy.
-  assert.equal(accountingPayloadConnectionRefusal({
+  // an operator who removes the guard. It stays allowed — but it is reported as `legacy-unstamped`
+  // rather than sharing `match`'s answer, so "is this still happening?" has an answer, and so the one
+  // allowance cannot silently acquire company.
+  const verdict = accountingPayloadConnectionVerdict({
     payload: { accountingInvoiceId: 'XBILL-A' },
     activeProvenance: 'xero:tenant-B',
     ...REFERENCE,
-  }), null)
+  })
+  assert.equal(verdict.decision, 'legacy-unstamped')
+  assert.equal(verdict.mayPost, true)
+  assert.equal(verdict.refusal, null)
 })
 
-test('a DISCONNECTED instance is not reported as a mismatch', async () => {
-  const { accountingPayloadConnectionRefusal } = await provenance()
-  // The post is about to fail with "Not connected to Xero" either way. A second, differently worded
-  // failure for the ordinary disconnected state would bury the one refusal that means something.
-  assert.equal(accountingPayloadConnectionRefusal({
+test('an UNREADABLE payload or stamp is REFUSED, not treated as unstamped', async () => {
+  const { accountingPayloadConnectionVerdict } = await provenance()
+  // The heart of Codex r1 finding 1. Every one of these used to return the same null a match returns.
+  for (const payload of [
+    null,
+    'not an object',
+    [{ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 'xero:tenant-B' }],
+    { [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: '' },
+    { [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 42 },
+    { [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: { connector: 'xero', tenantId: 'tenant-B' } },
+  ]) {
+    const verdict = accountingPayloadConnectionVerdict({ payload, activeProvenance: 'xero:tenant-B', ...REFERENCE })
+    assert.equal(verdict.decision, 'unreadable', `${JSON.stringify(payload)} must refuse`)
+    assert.equal(verdict.mayPost, false)
+    assert.match(verdict.refusal ?? '', /cannot \n?be read|cannot be read/)
+    assert.match(verdict.refusal ?? '', /BILL_PAYMENT for PurchaseInvoice bill-1/)
+    assert.match(verdict.refusal ?? '', /Nothing was sent/)
+  }
+})
+
+test('a row raised while DISCONNECTED is refused, naming the ledger it would otherwise reach', async () => {
+  const { accountingPayloadConnectionVerdict } = await provenance()
+  const verdict = accountingPayloadConnectionVerdict({
+    payload: { accountingInvoiceId: 'XBILL-?', [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: '!disconnected' },
+    activeProvenance: 'xero:tenant-B',
+    ...REFERENCE,
+  })
+  assert.equal(verdict.decision, 'raised-disconnected')
+  assert.equal(verdict.mayPost, false)
+  assert.match(verdict.refusal ?? '', /queued while this instance had NO accounting connection/)
+  assert.match(verdict.refusal ?? '', /posted to xero:tenant-B/)
+})
+
+test('a stamped payload with NO active connection is refused, not waved through', async () => {
+  const { accountingPayloadConnectionVerdict } = await provenance()
+  // The first cut allowed this, reasoning that "the post is about to fail with Not connected anyway".
+  // That is a guard delegating its own correctness to a downstream it does not control, and it is the
+  // same shape as the rest of this finding: "we could not check" answered with "checked, fine". The
+  // refusal names the organisation to reconnect to, so it is more actionable than the error it replaces.
+  const verdict = accountingPayloadConnectionVerdict({
     payload: { [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 'xero:tenant-A' },
     activeProvenance: null,
     ...REFERENCE,
-  }), null)
+  })
+  assert.equal(verdict.decision, 'no-active-connection')
+  assert.equal(verdict.mayPost, false)
+  assert.match(verdict.refusal ?? '', /queued for accounting connection xero:tenant-A/)
+  assert.match(verdict.refusal ?? '', /no accounting connection at all right now/)
+})
+
+test('mayPost is true for EXACTLY two decisions, and the refusal text agrees with it', async () => {
+  const { accountingPayloadConnectionVerdict } = await provenance()
+  // The invariant that makes the `string | null` face safe to keep: message and permission are two
+  // projections of one decision, so they cannot drift apart the way two separately-written checks do.
+  const cases: Array<[unknown, string | null, string]> = [
+    [{ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 'xero:tenant-B' }, 'xero:tenant-B', 'match'],
+    [{ accountingInvoiceId: 'X' }, 'xero:tenant-B', 'legacy-unstamped'],
+    [{ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 'xero:tenant-A' }, 'xero:tenant-B', 'mismatch'],
+    [{ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: '!disconnected' }, 'xero:tenant-B', 'raised-disconnected'],
+    [{ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 9 }, 'xero:tenant-B', 'unreadable'],
+    [{ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 'xero:tenant-A' }, null, 'no-active-connection'],
+  ]
+  const allowed = new Set(['match', 'legacy-unstamped'])
+  for (const [payload, activeProvenance, expected] of cases) {
+    const verdict = accountingPayloadConnectionVerdict({ payload, activeProvenance, ...REFERENCE })
+    assert.equal(verdict.decision, expected)
+    assert.equal(verdict.mayPost, allowed.has(expected), `${expected} permission`)
+    assert.equal(verdict.refusal === null, verdict.mayPost, `${expected} message must match its permission`)
+  }
+})
+
+test('accountingOriginRecordsMatch: unknown never equals unknown', async () => {
+  const { accountingOriginRecordsMatch } = await provenance()
+  const stamped = (v: unknown) => ({ [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: v })
+
+  assert.equal(accountingOriginRecordsMatch(stamped('xero:tenant-A'), stamped('xero:tenant-A')), true)
+  assert.equal(accountingOriginRecordsMatch(stamped('xero:tenant-A'), stamped('xero:tenant-B')), false)
+  assert.equal(accountingOriginRecordsMatch(stamped('xero:tenant-A'), { amount: 1 }), false)
+  assert.equal(accountingOriginRecordsMatch({ amount: 1 }, { amount: 2 }), true, 'two absences record the same nothing')
+  assert.equal(accountingOriginRecordsMatch(stamped('!disconnected'), stamped('!disconnected')), true)
+  assert.equal(accountingOriginRecordsMatch(stamped('!disconnected'), stamped('xero:tenant-A')), false)
+  // Two unreadable values are not "the same": the whole point is that neither could be read.
+  assert.equal(accountingOriginRecordsMatch(stamped(1), stamped(1)), false)
+  assert.equal(accountingOriginRecordsMatch(null, null), false)
 })
 
 // --- the Xero processor actually refuses, end to end -------------------------
@@ -156,6 +260,8 @@ const state = {
   /** Every Xero write attempted. The load-bearing assertion is that this stays EMPTY. */
   posts: [] as Array<{ path: string; body: unknown }>,
   activities: [] as Array<{ action: string }>,
+  /** SALES_INVOICE re-reads its order right before posting; a missing one fails locally, not remotely. */
+  liveSalesOrder: false,
 }
 
 function blankRow(payload: Record<string, unknown>): SyncRow {
@@ -207,8 +313,16 @@ const db = {
   accountingAccount: {
     async findFirst() { return { externalAccountId: 'BANK-1' } },
   },
+  // SALES_INVOICE resolves its contact (and any item) before it can build a body. Cached ids are
+  // deliberately absent so the handler has to ASK Xero — which is the call the verdict intercepts.
+  customer: { async findUnique() { return { accountingContactId: null, accountingContactProvenance: null } }, async update() { return {} }, async updateMany() { return { count: 0 } } },
+  supplier: { async findUnique() { return { accountingContactId: null, accountingContactProvenance: null } }, async update() { return {} }, async updateMany() { return { count: 0 } } },
+  product: { async findUnique() { return null }, async update() { return {} }, async updateMany() { return { count: 0 } } },
   purchaseInvoice: { async findUnique() { return null }, async update() { return {} } },
-  salesOrder: { async findUnique() { return null }, async update() { return {} } },
+  salesOrder: {
+    async findUnique() { return state.liveSalesOrder ? { customerId: 'cust-1', status: 'CONFIRMED' } : null },
+    async update() { return {} },
+  },
   salesOrderRefund: { async findUnique() { return null }, async update() { return {} } },
   supplierCreditNote: { async findUnique() { return null }, async update() { return {} } },
   setting: { async findUnique() { return null } },
@@ -231,19 +345,35 @@ mock.module('@/lib/activity-log', {
 mock.module('@/lib/domain/accounting/accounting-event-mirror', {
   namedExports: { updateMirroredAccountingEventStatus: async () => {} },
 })
+// `getAccessToken` is what a request is BUILT from, and since Codex r1 finding 3 it is also what the
+// connection verdict is reached against — the same object, so the tenant checked and the tenant used
+// cannot diverge. It reads `activeTenantId` here for the same reason the token row above does: in
+// production both come from one row, and these tests are about the ordinary case where they agree.
+// `tests/connectors/xero-posting-intent-tenant.test.ts` is the one that forces them apart.
 mock.module('@/lib/connectors/xero/auth', {
-  namedExports: { getGrantedScopes: async () => null },
-})
-// The only Xero call a BILL_PAYMENT makes. It records rather than posts, so "nothing was sent" is an
-// observation rather than an assumption — a stub that threw would prove the same thing by accident even
-// if the guard never ran.
-mock.module('@/lib/connectors/xero/api', {
   namedExports: {
-    xeroPost: async (path: string, body: unknown) => {
-      state.posts.push({ path, body })
-      return { ok: true, status: 200, data: { Payments: [{ PaymentID: 'PAY-1' }] }, tenantId: state.activeTenantId ?? undefined }
+    getGrantedScopes: async () => null,
+    getStoredTenantBlockReason: async () => null,
+    getAccessToken: async () =>
+      state.activeTenantId === null ? null : { accessToken: 'access-token', tenantId: state.activeTenantId },
+  },
+})
+// MOCKED AT THE WIRE, NOT AT `xeroPost`. The verdict now lives inside the real client, at the last
+// statement before the socket, so stubbing `@/lib/connectors/xero/api` would stub out the guard itself
+// and leave these tests green for no reason. Recording rather than throwing keeps "nothing was sent" an
+// observation: a stub that threw would prove the same thing by accident even if the guard never ran.
+mock.module('@/lib/security/connector-fetch', {
+  namedExports: {
+    connectorFetch: async (url: string, init: { body?: string }) => {
+      state.posts.push({ path: url.replace(/^.*\/api\.xro\/2\.0\//, ''), body: JSON.parse(init?.body ?? 'null') })
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => ({ Payments: [{ PaymentID: 'PAY-1' }] }),
+        text: async () => '',
+      }
     },
-    xeroUploadAttachment: async () => ({ ok: true, status: 200 }),
   },
 })
 
@@ -303,18 +433,29 @@ test('o3d-19gy: an UNSTAMPED row queued before this shipped still posts', async 
   assert.equal(state.posts.length, 1)
 })
 
-test('o3d-19gy: the refusal is asked BEFORE the scope check and before every handler', async () => {
-  // Ordering matters: everything below it either sends something or reads something on the assumption
-  // that the connection is the one that composed the row. A SALES_INVOICE composed under organisation A
-  // carries A's account codes, tax types, contact and item ids — none of which mean anything in B — so
-  // the refusal is not specific to the payment types that carry an explicit external id.
-  reset({ invoiceNumber: 'INV-1', [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 'xero:tenant-A' }, 'tenant-B')
+test('o3d-19gy: the refusal is not specific to types carrying an explicit external id', async () => {
+  // A SALES_INVOICE composed under organisation A carries A's account codes, tax types, contact and item
+  // ids — none of which mean anything in B — so it must be refused just as a payment is, even though it
+  // names no A-issued document. It reaches the refusal through the FIRST Xero call the handler makes,
+  // whatever that call is, because the verdict now lives in the client rather than in a pre-flight the
+  // handler runs before it. `state.posts` is the assertion that matters: nothing went out.
+  state.liveSalesOrder = true
+  reset({
+    invoiceNumber: 'INV-1',
+    contactName: 'Acme Ltd',
+    date: '2026-01-02',
+    currency: 'GBP',
+    // Account code and tax type are exactly the organisation-A facts that mean nothing in B.
+    lines: [{ description: 'Widget', quantity: 1, unitAmount: 10, accountCode: '200', taxType: 'OUTPUT2' }],
+    [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 'xero:tenant-A',
+  }, 'tenant-B')
   state.rows[0].type = 'SALES_INVOICE'
   state.rows[0].referenceType = 'SalesOrder'
 
   const result = await runXeroSync()
 
   assert.equal(result.failed, 1)
-  assert.deepEqual(state.posts, [])
+  assert.deepEqual(state.posts, [], 'NOTHING was sent for an organisation-A invoice')
   assert.match(state.rows[0].errorMessage ?? '', /queued for accounting connection xero:tenant-A/)
+  assert.match(state.rows[0].errorMessage ?? '', /now connected to xero:tenant-B/)
 })

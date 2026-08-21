@@ -438,6 +438,26 @@ export function readXeroTenantAllowList(env: Record<string, string | undefined> 
  * NODE_ENV is counted as non-production. Deliberately reads the injected `env` rather than
  * `process.env` directly, so the question is testable — the o3d-t74p rig is precisely an instance whose
  * environment nobody could interrogate after the fact.
+ *
+ * KNOWN HOLE, DELIBERATELY NOT PATCHED HERE (o3d-l89a; Codex r1 finding 4). Both signals below are set
+ * by the BUILD, so an instance that serves a production build, sets NODE_ENV=production and does not set
+ * E2E_TEST_MODE is indistinguishable from production to this function — which is what stage is, what a
+ * second production-shaped copy is, and what the o3d-t74p rig became on the day E2E_TEST_MODE fell out
+ * of its .env. Such an instance is therefore still exempt from the o3d-iaqy requirement.
+ *
+ * THE ANSWER ALREADY EXISTS AND IS NOT THIS FUNCTION'S TO WRITE AGAIN. `lib/ops/instance-identity.ts`
+ * (branch o3d-batch-exceptions, unmerged as of this commit) answers it from an `IMS_INSTANCE_ROLE`
+ * declaration, returns the verdict PLUS ITS BASIS, and lands in two steps because absence must read as
+ * non-production and production is absent today. The remaining edit is a one-line delegation — replace
+ * this body with `instanceIsNonProduction(env, { requireDeclaration: true })` — and it is filed as
+ * o3d-c413, gated on IMS_INSTANCE_ROLE=production actually being on the live server first (verified by
+ * the production preflight) so the flip cannot take production's connector offline. Writing a second
+ * IMS_INSTANCE_ROLE reader on this branch would BE the defect being removed: two answers to one
+ * question, diverging the moment either is edited. This function is kept module-private with a single
+ * call site precisely so that delegation stays a one-line change.
+ *
+ * Note that o3d-c413 also owns the consequent wording fix in `xeroUnguardedInstanceRefusal`, whose
+ * remedy sentence still names NODE_ENV.
  */
 function readInstanceIsNonProduction(env: Record<string, string | undefined>): boolean {
   if ((env.E2E_TEST_MODE ?? '').trim() === '1') return true

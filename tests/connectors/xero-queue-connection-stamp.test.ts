@@ -10,9 +10,13 @@ import test, { mock } from 'node:test'
  * from o3d-9tbz r9 applies here too: a rule that lives in one call site is a rule the next call site
  * will not have. So the stamp is applied by a single shared helper and every Xero writer routes through
  * it (`queueXeroSync`, `createPendingSyncLog` in daily-sync, `enqueueFollowUpSyncLog` in the processor,
- * and the connector-generic `queueAccountingSyncTx`), and the processor's guard treats an UNSTAMPED row
- * as legacy rather than as current — so a writer that somehow escapes leaves work that is allowed
- * through, not work that is silently mis-attributed.
+ * and the connector-generic `queueAccountingSyncTx`).
+ *
+ * The helper ALWAYS writes something now (Codex r1 finding 1): a real `"<connector>:<tenantId>"` when
+ * there is a connection, and an explicit `!disconnected` when there is not. Absence is therefore no
+ * longer produced by any live writer, which is what lets the processor's guard treat it as "queued
+ * before this shipped" — a population that drains and never grows — instead of as a state it is
+ * still manufacturing on every disconnection.
  */
 
 const CONNECTION_KEY = '_connectionProvenance'
@@ -112,17 +116,41 @@ test('o3d-19gy: the stamp follows the CONNECTION, not a constant', async () => {
   assert.equal((state.created[0].payload as Record<string, unknown>)[CONNECTION_KEY], 'xero:tenant-B')
 })
 
-test('o3d-19gy: enqueueing while DISCONNECTED stamps nothing rather than a placeholder', async () => {
-  // A row can legitimately be queued with no connection — the sync is off, or the token was revoked —
-  // and it simply waits. Stamping an empty or invented value would make it indistinguishable from a
-  // pre-o3d-19gy row to every reader, which is a hole rather than a record.
+test('o3d-19gy: enqueueing while DISCONNECTED records THAT, rather than recording nothing', async () => {
+  // REVERSED, and the reversal is the point (Codex r1 finding 1). The earlier rule was "stamp nothing",
+  // on the reasoning that an EMPTY stamp would be indistinguishable from a pre-o3d-19gy row. True of an
+  // empty stamp — and an argument for a DISTINGUISHABLE one, not for silence. Silence is what made them
+  // indistinguishable, and it made the claim "the unstamped population only shrinks after one deploy"
+  // false: every row queued during a disconnection was born unstamped, and "queued while disconnected,
+  // then connected to a different organisation, then posted" is the incident's own shape.
   reset(null)
 
   await queueXeroSync(PARAMS)
 
   const payload = state.created[0].payload as Record<string, unknown>
-  assert.equal(CONNECTION_KEY in payload, false)
+  assert.equal(payload[CONNECTION_KEY], '!disconnected')
   assert.equal(payload.invoiceNumber, 'INV-1', 'and the row is still queued — this is not a refusal')
+})
+
+test('o3d-19gy: the disconnected marker can never be read as an organisation', async () => {
+  // It has to be unmistakable in BOTH directions: it must not match any connection, and no connection
+  // may ever spell itself this way. `"<connector>:<tenantId>"` cannot — no connector name is empty and
+  // none begins with `!` — so the two vocabularies do not overlap.
+  const { readAccountingPayloadConnectionStamp, accountingPayloadConnectionVerdict } =
+    await import('@/lib/connectors/accounting-connection-provenance')
+
+  assert.deepEqual(readAccountingPayloadConnectionStamp({ [CONNECTION_KEY]: '!disconnected' }), {
+    state: 'raised-disconnected',
+  })
+  const verdict = accountingPayloadConnectionVerdict({
+    payload: { [CONNECTION_KEY]: '!disconnected' },
+    activeProvenance: 'xero:!disconnected',
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+  })
+  assert.equal(verdict.decision, 'raised-disconnected')
+  assert.equal(verdict.mayPost, false)
 })
 
 test('o3d-19gy: the stamp does not disturb the idempotency short-circuit', async () => {

@@ -4,8 +4,19 @@
 
 import { getAccessToken, getStoredTenantBlockReason } from './auth'
 import { connectorFetch } from '@/lib/security/connector-fetch'
+import { accountingPostingIntentRefusal } from '@/lib/connectors/accounting-posting-intent'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
+const XERO_CONNECTOR = 'xero'
+
+/**
+ * The status `performRequest` reports when it refused to send (o3d-gfh, Codex r1 finding 3).
+ *
+ * Zero, and deliberately not an HTTP code: nothing was sent, so there is no HTTP status to report, and
+ * borrowing one (403, 409) would make the row's errorMessage claim Xero answered when Xero was never
+ * asked. It matches the `status: 0` `notConnectedResponse` already uses for the same reason.
+ */
+const XERO_NOT_SENT_STATUS = 0
 const XERO_MAX_RETRIES = 3
 const XERO_MINUTE_LIMIT = 55 // Xero's is 60/min, rolling
 
@@ -202,6 +213,23 @@ function parseRetryAfterMs(value: string | null): number {
 async function performRequest(auth: { accessToken: string; tenantId: string }, init: RequestInit, url: string) {
   let lastRateLimitMs = 0
 
+  // THE ONE PLACE the queued row's connection is authorised, and the last statement before anything
+  // leaves this process (o3d-gfh, Codex r1 finding 3).
+  //
+  // Here rather than at the top of `processEntry` because `auth.tenantId` is the string that goes into
+  // this request's own `Xero-Tenant-Id` header: the value checked and the value used are one object, so
+  // no rebinding can land between them. The processor's earlier read of the token row was a SECOND,
+  // independent selection of the same thing, and a check at T1 says nothing about a request sent at T2.
+  //
+  // Every Xero egress in this file funnels through here — xeroFetchWithAuth, xeroGetRaw and
+  // xeroUploadAttachment all call it — so there is no arm left to forget it. Evaluated once rather than
+  // per retry attempt on purpose: `auth` is fixed for the whole call, so the verdict cannot change
+  // across the retry loop, and re-asking would be a second evaluation of a settled permission.
+  const intentRefusal = accountingPostingIntentRefusal(XERO_CONNECTOR, auth.tenantId)
+  if (intentRefusal) {
+    return { ok: false, status: XERO_NOT_SENT_STATUS, text: async () => intentRefusal } as Response
+  }
+
   for (let attempt = 0; attempt <= XERO_MAX_RETRIES; attempt++) {
     const budget = await waitForBudget(auth.tenantId)
     if (!budget.ok) {
@@ -317,6 +345,11 @@ async function xeroFetchWithAuth<T = unknown>(
   }
 
   const res = await performRequest(auth, init, url)
+  // Refused before sending. Reported verbatim rather than falling through to the !res.ok branch, which
+  // would prefix it with "HTTP 0:" and so describe a reply Xero never made.
+  if (res.status === XERO_NOT_SENT_STATUS) {
+    return { ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text(), tenantId: auth.tenantId }
+  }
   if (res.status === 429) {
     return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited'), tenantId: auth.tenantId }
   }
@@ -481,6 +514,10 @@ export async function xeroGetRaw(
     },
   }, url)
 
+  if (res.status === XERO_NOT_SENT_STATUS) {
+    return { ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text() }
+  }
+
   if (res.status === 429) {
     return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited') }
   }
@@ -520,6 +557,10 @@ export async function xeroUploadAttachment(
     },
     body: new Uint8Array(fileBuffer),
   }, url)
+
+  if (res.status === XERO_NOT_SENT_STATUS) {
+    return { ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text() }
+  }
 
   if (res.status === 429) {
     return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited') }

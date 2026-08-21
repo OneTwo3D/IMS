@@ -14,8 +14,6 @@
  * path remembering to clear the column.
  */
 
-import { db } from '@/lib/db'
-
 /**
  * The provenance string for an id a KNOWN connection issued (o3d-gfh).
  *
@@ -39,6 +37,12 @@ export function accountingIdProvenanceFor(connector: string, tenantId: string | 
  * has no token (so nothing can legitimately match — a stored id is treated as stale).
  */
 export async function activeAccountingIdProvenance(connector: string): Promise<string | null> {
+  // Imported HERE rather than at module scope so that the two PURE functions in this file —
+  // `accountingIdProvenanceFor` and `accountingIdProvenanceMatches` — can be reached without
+  // constructing a Prisma client. `lib/domain/accounting/followup-idempotency.ts` is a pure planner
+  // whose whole point is being decidable without a database, and it now needs the connection
+  // comparison; a static `import { db }` here would drag Prisma into it and into its tests.
+  const { db } = await import('@/lib/db')
   const token = await db.accountingToken.findUnique({
     where: { connector },
     select: { tenantId: true },
