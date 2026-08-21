@@ -163,6 +163,69 @@ export const BILL_PAYMENT_LEDGER_REVERSED_REASON =
   'connector (detected by the payment reversal poller), so the row no longer describes the ledger. ' +
   'The entry posted — its external id records what it created — and is retired rather than deleted.'
 
+// ---------------------------------------------------------------------------
+// WHAT THE LEDGER CAN SETTLE ON ITS OWN (Codex round 8)
+// ---------------------------------------------------------------------------
+//
+// The reversal pass reaches this module with a bill whose Xero invoice is no longer PAID, and rounds
+// 3 and 4 built the whole retirement on the phrase "the poller has just read the bill back and found
+// it no longer PAID". THAT PHRASE IS NOT A REVERSAL. Xero's ACCPAY statuses are PAID, AUTHORISED and
+// VOIDED, and AUTHORISED means APPROVED AND NOT FULLY PAID — which includes a bill carrying a real
+// PART payment, because Xero only moves an invoice to PAID once the outstanding amount reaches zero.
+//
+// So the caller's reversal set (`AUTHORISED` ∪ `VOIDED`) contains three populations that look
+// identical from a status alone:
+//
+//   the payment was REMOVED          a genuine reversal.
+//   the payment was a PART payment   money HAS left the bank. The ordinary cause is not exotic: the
+//                                    bill was edited upward in Xero after IMS posted it, so the
+//                                    full-total payment IMS sent leaves a balance.
+//   the payment HAS NOT LANDED YET   Mark Paid set paidAt locally and queued a BILL_PAYMENT; until
+//                                    the worker posts it the ledger holds nothing.
+//
+// AND RETIREMENT IS DESTRUCTIVE. It CANCELs the SYNCED rows that are the only record that a supplier
+// payment was registered, and — in the same transaction — clears `paidAt`, which re-arms Mark Paid.
+// On either of the last two populations that is a second supplier payment: markBillPaid sends no
+// idempotency key, BILL_PAYMENT sits outside every live-row dedupe, and the operator is looking at an
+// IMS bill that says unpaid and an activity log that says the payment is gone. Nothing downstream
+// refuses them. State a destructive write clears is state a later correct answer cannot rebuild, so
+// gating it on a classification known to be wrong is the wrong direction: the gate must be a PROOF.
+//
+// EXACTLY ONE LEDGER STATUS IS A PROOF ON ITS OWN, and it is the one o3d-batch-billpay's partition
+// also settles without consulting anything else: VOIDED. Xero requires every payment to be removed
+// before an invoice can be voided and refuses a payment against a voided one, so a voided invoice
+// demonstrably holds no payment, and re-arming Mark Paid against it cannot move money twice (the
+// re-payment is rejected by Xero, which is noise, not a supplier paid again).
+//
+// AUTHORISED IS NOT DECIDABLE FROM ANYTHING THIS BRANCH READS. Telling the three populations apart
+// needs `AmountPaid` and the `Payments[]` list off the invoice payload, weighed against IMS's own
+// registration rows — that is o3d-batch-billpay's classifier, and it is deliberately NOT re-derived
+// here. Two answers to one question is the defect, not the fix. Until that classifier arrives, an
+// AUTHORISED bill is WITHHELD: nothing retired, `paidAt` left set, and the disagreement reported.
+//
+// What withholding costs is a bill IMS keeps showing as paid, warned about on every read that sees
+// it, which a human corrects in a minute. The other direction costs a supplier payment nobody can
+// take back. See BillPaymentRetirementOutcome for what the caller does with each answer.
+export const LEDGER_SETTLED_REVERSAL_STATUSES = ['VOIDED'] as const
+
+/**
+ * Does the ledger's own status, with no further evidence, PROVE the payment is gone?
+ *
+ * The single definition of that question in this tree, and deliberately the narrowest one that is
+ * sound. It is the same rule as `partitionPaymentReversals`'s `voided` bucket on the sibling branch —
+ * when that lands, the widening (a stated zero paid whose registrations the read can account for, or
+ * a registered PaymentID proved absent from the invoice's own list) belongs to ITS classifier, handed
+ * in here as further admissible proofs. It must never be re-derived at a call site.
+ *
+ * Null/undefined answers FALSE: a status nobody could read is not a status that proves anything.
+ */
+export function ledgerAloneProvesTheReversal(ledgerStatus: string | null | undefined): boolean {
+  return (
+    typeof ledgerStatus === 'string'
+    && (LEDGER_SETTLED_REVERSAL_STATUSES as readonly string[]).includes(ledgerStatus)
+  )
+}
+
 /**
  * RETIRE THE REGISTRATIONS A LEDGER READ HAS JUST DISPROVED (Codex round 3 #1).
  *
@@ -172,8 +235,14 @@ export const BILL_PAYMENT_LEDGER_REVERSED_REASON =
  * cannot prove: the ordinary reversal-then-re-pay flow arrives with no live row at all, so the refusal
  * only ever fires on the cases nobody has looked at.
  *
- * FENCED THREE WAYS:
+ * FENCED FOUR WAYS, AND THE FIRST ONE IS NEW (Codex round 8):
  *
+ *  - `ledgerStatus` — the reversal itself has to be PROVED before anything is read, let alone written.
+ *    Rounds 3–7 took "the caller selected this bill into its reversal set" as the observation, and the
+ *    caller's set was `AUTHORISED` ∪ `VOIDED` — which is "not fully paid", not "the payment is gone".
+ *    A part-paid bill therefore walked into the destructive path. See the note above
+ *    `LEDGER_SETTLED_REVERSAL_STATUSES`; anything this status does not settle alone is WITHHELD, and
+ *    it is checked FIRST so an unproven bill never even reaches the registration query.
  *  - `status: 'SYNCED'` — only a row that finished. A PENDING row is a re-payment somebody has already
  *    queued and a PROCESSING row may be posting this instant; neither is the payment the poller just
  *    failed to find, and cancelling either is round 1's defect over again.
@@ -196,13 +265,30 @@ export type BillPaymentRetirementOutcome =
    * At least one posted registration finished AFTER the ledger was read, so this observation cannot
    * speak for it. NOTHING is retired and the caller must NOT clear paidAt — see the note below.
    */
-  | { decided: false; undecided: string[] }
+  | { decided: false; withheld: 'REGISTRATION_UNDECIDED'; undecided: string[] }
+  /**
+   * The ledger status does not prove a reversal AT ALL (Codex round 8) — an AUTHORISED bill is
+   * "approved and not fully paid", which a part payment and an unposted registration of ours both
+   * produce. NOTHING is retired, NOTHING is read, and the caller must NOT clear paidAt.
+   *
+   * A distinct answer from REGISTRATION_UNDECIDED because it asks the operator for something else:
+   * that one resolves itself once a later read covers the registrations, this one needs somebody to
+   * look at the bill in Xero (or the sibling's amount/identity classifier to land).
+   */
+  | { decided: false; withheld: 'REVERSAL_UNPROVEN'; ledgerStatus: string | null }
 
 export async function retireBillPaymentRegistrationsReversedInLedger(
   client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
   params: {
     connector: string
     invoiceId: string
+    /**
+     * The status the LEDGER reports for this invoice on the read that produced this verdict, verbatim
+     * — a fact, not a judgement. The caller must not pre-classify it: `ledgerAloneProvesTheReversal`
+     * is the one place that decides what a status proves, and it is applied here, at the destructive
+     * write, so no caller can skip it.
+     */
+    ledgerStatus: string | null
     /**
      * The instant the ledger was asked, AS THE DATABASE MEASURED IT — never a host `Date`, which is
      * why this is the branded `LedgerReadFence` and not a plain one (o3d-clxw round 4, #634). NULL
@@ -212,6 +298,13 @@ export async function retireBillPaymentRegistrationsReversedInLedger(
     ledgerObservedBefore: LedgerReadFence | null
   },
 ): Promise<BillPaymentRetirementOutcome> {
+  // PROVE THE REVERSAL BEFORE READING ANYTHING (Codex round 8). Ordered first on purpose: an
+  // unproven bill must not reach the registration query, so there is no path on which an AUTHORISED
+  // bill's rows are surveyed, let alone cancelled.
+  if (!ledgerAloneProvesTheReversal(params.ledgerStatus)) {
+    return { decided: false, withheld: 'REVERSAL_UNPROVEN', ledgerStatus: params.ledgerStatus ?? null }
+  }
+
   const scope = {
     connector: params.connector,
     type: 'BILL_PAYMENT' as const,
@@ -232,6 +325,16 @@ export async function retireBillPaymentRegistrationsReversedInLedger(
   // `syncedAt: null` is undecidable deliberately: a posted row with no timestamp cannot be placed
   // relative to the read at all, which is the same answer, not a lesser one.
   //
+  // THE ALGEBRA WITH o3d-batch-billpay, WHICH MERGED AS #634. That branch admits a bill only when
+  // `classifyRegisteredPayment` returned GONE, NOTHING_REGISTERED or LEDGER_DID_NOT_LIST_PAYMENTS, and
+  // all three require its `undecided` list to be empty — i.e. every non-CANCELLED registration is
+  // SYNCED, carries an external id, and has a DATABASE-STAMPED completion strictly below the fence.
+  // This predicate is now the exact complement over the same rows, judged by the same reader, so when
+  // the sibling admits, this set is NECESSARILY EMPTY and the two cannot disagree in the unsafe
+  // direction. The remaining disagreement runs the other way — this branch withholds on a VOIDED bill
+  // whose registration is undecidable while the sibling's voided bucket admits it — and shrinking the
+  // decided set is the direction both branches allow.
+  //
   // ONE ANSWER TO "DID THIS REACH THE LEDGER", NOT TWO (o3d-m5qk). This used to be a Prisma predicate
   // — `OR: [{ syncedAt: null }, { syncedAt: { gte: fence } }]` — reading `syncedAt` ALONE. The sibling
   // o3d-clxw (#634) proved that column cannot answer the question by itself: an old build writes its
@@ -244,12 +347,11 @@ export async function retireBillPaymentRegistrationsReversedInLedger(
   // loses provenance because of WHAT IT TOUCHED, not because of the value it happened to write.
   //
   // The old predicate treated such a row as DECIDABLE where the merged branch withholds. That
-  // direction was safe under the round-8 proof gate but it was WEAKER, and two guards answering one
-  // money question differently is the defect this branch spent eight rounds removing elsewhere. So
-  // the rows are read and judged by the SAME function `classifyRegisteredPayment` uses. The decided
-  // set can only shrink, which is the direction the merge algebra requires: when the sibling admits a
-  // bill, every non-CANCELLED registration on it is SYNCED with an external id and a
-  // database-stamped completion strictly below the fence, so this set is NECESSARILY EMPTY.
+  // direction was safe under the round-8 proof gate above — only a VOIDED bill reaches here, and the
+  // ledger has already proved a voided bill holds no payment — but it was WEAKER, and two guards
+  // answering one money question differently is the defect this branch spent eight rounds removing
+  // everywhere else. So the rows are read and judged by the SAME function that decides it on the
+  // sibling, and the decided set can only shrink.
   const posted = await client.accountingSyncLog.findMany({
     where: scope,
     select: { id: true, syncedAt: true, syncedAtDatabaseClock: true },
@@ -267,7 +369,11 @@ export async function retireBillPaymentRegistrationsReversedInLedger(
     // the bill in a state that reads as fully reconciled while one registration's payment may be
     // sitting in the ledger unaccounted for. When a later observation arrives — one taken after every
     // one of these rows finished — it decides them together.
-    return { decided: false, undecided: undecidable.map((row) => row.id) }
+    return {
+      decided: false,
+      withheld: 'REGISTRATION_UNDECIDED',
+      undecided: undecidable.map((row) => row.id),
+    }
   }
 
   // By id, and STILL SCOPED: `scope` pins the status, so a row that changed underneath the read is

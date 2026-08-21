@@ -576,10 +576,12 @@ type PollResult = {
    * from `reversed` because they are the opposite outcome: nothing was reconciled, and a human has
    * something to look at.
    *
-   * `billReversalsWithheld` is ALSO what an undecidable registration withholds under (o3d-a3wx round
-   * 4), on the same activity action `bill_payment_reversal_withheld`: "we would have cleared paidAt
-   * and did not" is one fact with several causes, and splitting it into per-cause counters would hide
-   * it. The cause is named in the activity description, not in a second number.
+   * ONE FIELD AND ONE ACTION (`bill_payment_reversal_withheld`) FOR EVERY CAUSE: "we would have
+   * cleared paidAt and did not" is one fact, and splitting it into per-cause counters would hide it.
+   * Three causes now that the two branches are together — the ledger's amount/identity reading cannot
+   * prove the payment is gone (o3d-clxw), a registration this read cannot speak for (o3d-a3wx round 4
+   * #2), and a ledger status that does not prove a reversal at all (round 8). The cause is named in
+   * the activity description, not in a second number.
    */
   salesReversalsWithheld: number
   billReversalsWithheld: number
@@ -927,14 +929,35 @@ async function processDeltaChunk(
     })
     if (paidBills.length > 0) {
       for (const bill of detectPaymentReversals(paidBills, reversedBillIds)) {
+        // THE STATUS THE LEDGER ACTUALLY REPORTED, handed on verbatim (Codex round 8).
+        //
+        // `reversedBillIds` is `AUTHORISED` ∪ `VOIDED`, and AUTHORISED is Xero's status for an
+        // APPROVED BILL THAT IS NOT FULLY PAID — a part payment, or a payment of ours that has not
+        // posted yet, reads identically to a removal. Selecting a bill into this loop is therefore not
+        // an observation that the payment is gone, and rounds 3–7 treated it as one. The candidate
+        // query is deliberately left wide, because an AUTHORISED bill IMS holds paid still needs
+        // REPORTING; what narrows is the destructive path, and it narrows inside
+        // retireBillPaymentRegistrationsReversedInLedger where no caller can skip it.
+        //
+        // No classification happens here. The poller passes a fact; the domain module decides what it
+        // proves — the sibling branch's amount/identity reading widens that same decision in one place
+        // rather than adding a second answer at this call site.
+        const ledgerStatus = (bill.accountingInvoiceId ? invoiceById.get(bill.accountingInvoiceId)?.Status : null) ?? null
+
         // THE ONE PLACE THAT CAN RETIRE A POSTED REGISTRATION (Codex round 3 #1).
         //
         // markBillPaid used to call a SYNCED BILL_PAYMENT row "stale" from its status alone, which is
         // an inference about Xero made without reading Xero — and a slow worker that posted and then
         // wrote SYNCED looked identical to a payment the ledger had thrown away. Here it is not an
-        // inference: this pass has just read the bill back and found it no longer PAID. Recording
-        // that against the row, in the SAME transaction that clears paidAt, is what lets markBillPaid
-        // refuse everything it cannot prove without stranding the ordinary reversal-then-re-pay flow.
+        // inference: this pass has read the bill back and the ledger has VOIDED it, which Xero does
+        // not permit while any payment is attached. Recording that against the row, in the SAME
+        // transaction that clears paidAt, is what lets markBillPaid refuse everything it cannot prove
+        // without stranding the ordinary reversal-then-re-pay flow.
+        //
+        // ROUND 8 IS WHAT MAKES THAT SENTENCE TRUE. Rounds 3–7 wrote "found it no longer PAID", and
+        // "no longer PAID" is AUTHORISED as well as VOIDED — a part-paid bill, or one whose payment
+        // IMS has queued and not yet posted. Both walked into this transaction and had their
+        // registrations cancelled and paidAt cleared. The proof gate now lives inside the retirement.
         //
         // `ledgerObservedBefore` is the instant Xero was asked (see processDeltaChunk), so a row that
         // synced before it had certainly posted by the time Xero answered. One synced later may have
@@ -958,6 +981,7 @@ async function processDeltaChunk(
           const verdict = await retireBillPaymentRegistrationsReversedInLedger(tx, {
             connector: XERO_CONNECTOR,
             invoiceId: bill.id,
+            ledgerStatus,
             ledgerObservedBefore,
           })
           // The clear is written only on a decided verdict, and inside the same transaction as the
@@ -969,15 +993,26 @@ async function processDeltaChunk(
         })
 
         if (!outcome.decided) {
+          // ONE OUTCOME, TWO CAUSES, and they are told apart in the words rather than in the counter.
+          // `billReversalsWithheld` stays a single number — "we would have cleared paidAt and did not"
+          // is one fact an operator watches, and splitting it per cause would hide it — but the two
+          // causes ask for different things, so the description and the metadata name which one it is.
           result.billReversalsWithheld++
-          await logActivity({
-            entityType: 'PURCHASE_ORDER',
-            entityId: bill.poId,
-            action: 'bill_payment_reversal_withheld',
-            tag: 'sync',
-            level: 'WARNING',
-            description:
-              `Bill payment appears to be no longer present in Xero for PO ${bill.po.reference} `
+          const description = outcome.withheld === 'REVERSAL_UNPROVEN'
+            // Round 8. The bill is not fully paid in Xero and that is ALL this read establishes.
+            ? `Xero reports the bill for PO ${bill.po.reference} (PO status: ${bill.po.status}) as `
+              + `${outcome.ledgerStatus ?? 'a status IMS could not read'} — approved and NOT FULLY PAID — `
+              + `which IMS cannot tell apart from a genuine PART payment, or from a payment of its own `
+              + `that has not reached Xero yet. Only a VOIDED invoice proves a payment was removed on `
+              + `its own, because Xero requires every payment to be released before an invoice can be `
+              + `voided. So nothing was retired and the bill is LEFT MARKED PAID: clearing paidAt would `
+              + `re-arm Mark Paid over a supplier payment that may already have been made, and pressing `
+              + `it would pay the supplier a second time — there is no idempotency key on that path to `
+              + `refuse it. Open the bill in Xero: if the balance is a part payment, settle it or `
+              + `correct the bill total in IMS; if the payment really was removed, cancel the bill's `
+              + `payment sync entry by hand and mark the bill paid again.`
+            // Round 4 #2. The reversal IS proved; it is IMS's own registrations the read cannot cover.
+            : `Bill payment appears to be no longer present in Xero for PO ${bill.po.reference} `
               + `(PO status: ${bill.po.status}), but ${outcome.undecided.length} posted payment `
               + `registration(s) finished AFTER this Xero read was taken, so the read cannot say `
               + `whether the payment they created is gone. The bill is LEFT MARKED PAID rather than `
@@ -985,11 +1020,20 @@ async function processDeltaChunk(
               + `one that may exist. IMS will decide this by itself on the next Xero read that covers `
               + `those registrations; if it never does, open the bill in Xero and either settle it or `
               + `cancel sync entr${outcome.undecided.length === 1 ? 'y' : 'ies'} `
-              + `${outcome.undecided.join(', ')} by hand.`,
+              + `${outcome.undecided.join(', ')} by hand.`
+          await logActivity({
+            entityType: 'PURCHASE_ORDER',
+            entityId: bill.poId,
+            action: 'bill_payment_reversal_withheld',
+            tag: 'sync',
+            level: 'WARNING',
+            description,
             metadata: {
               invoiceId: bill.id,
               reference: bill.po.reference,
-              undecidedSyncLogIds: outcome.undecided,
+              withheld: outcome.withheld,
+              ledgerStatus,
+              undecidedSyncLogIds: outcome.withheld === 'REGISTRATION_UNDECIDED' ? outcome.undecided : [],
               // Null when the database clock could not be read — the case where NOTHING is decidable.
               ledgerObservedBefore: ledgerObservedBefore?.databaseClock.toISOString() ?? null,
             },
@@ -1005,7 +1049,7 @@ async function processDeltaChunk(
           action: 'bill_payment_reversal_detected',
           tag: 'sync',
           level: 'WARNING',
-          description: `Bill payment no longer present in Xero for PO ${bill.po.reference} (PO status: ${bill.po.status}) — cleared paidAt`
+          description: `Bill invoice VOIDED in Xero for PO ${bill.po.reference} (PO status: ${bill.po.status}), so the payment it held has been released — cleared paidAt`
             + (outcome.retired > 0
               ? ` and retired ${outcome.retired} posted payment registration(s), so the bill can be marked paid again.`
               : `. There was no posted payment registration to retire — if marking this bill paid again is refused, the entry named by the refusal must be reconciled in Xero and cancelled by hand.`)

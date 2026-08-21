@@ -1278,7 +1278,14 @@ Deleting a payment removes its queued registration if it has not posted yet; if 
 
 ### Supplier bills: marking one paid again
 
-The payment poller clears **Paid** on a bill whose payment has disappeared from Xero, so a bill can legitimately be marked paid a second time. The poller is the only thing that retires the earlier registration, and it does so in the same write that clears **Paid** — because it has just read the bill back from Xero, which is the one moment "the ledger no longer holds this payment" is an *observation* rather than a guess. With the registration retired, **Mark as paid** queues a fresh one normally.
+The payment poller clears **Paid** on a bill whose payment Xero has demonstrably released, so a bill can legitimately be marked paid a second time. The poller is the only thing that retires the earlier registration, and it does so in the same write that clears **Paid** — because it has just read the bill back from Xero, which is the one moment "the ledger no longer holds this payment" is an *observation* rather than a guess. With the registration retired, **Mark as paid** queues a fresh one normally.
+
+**"Not fully paid" is not "the payment is gone", and only a voided invoice proves the difference.** Xero marks a bill *authorised* whenever it is approved and not fully settled, which is equally what a genuine **part payment** looks like, and what a bill looks like in the minutes between **Mark as paid** and the sync worker actually posting the payment. Clearing **Paid** on either of those re-arms the button over money that has already left, or is about to — and pressing it again pays the supplier twice, with nothing downstream to refuse it. So the poller only retires a registration and clears **Paid** when Xero has **voided** the invoice, which Xero does not allow while any payment is attached to it. Every other regression is reported and left alone:
+
+| What Xero says | What the poller does | What to do |
+|---|---|---|
+| The invoice is **voided** | Clears **Paid** and retires the payment registration, so the bill can be marked paid again | Nothing, unless the void was a mistake |
+| The invoice is **authorised** (approved, not fully paid) | Leaves **Paid** set, retires nothing, and logs a warning against the PO | Open the bill in Xero. If a part payment is sitting against it, settle the balance there or correct the bill total in the IMS. If the payment really was removed, cancel the bill's payment sync entry by hand and mark the bill paid again |
 
 **Mark as paid refuses whenever the IMS cannot prove what the ledger holds.** Each refusal leaves the bill unpaid, queues nothing, changes nothing, and writes a warning naming the sync entry involved:
 
@@ -1291,7 +1298,7 @@ The payment poller clears **Paid** on a bill whose payment has disappeared from 
 
 A failed registration whose stored request was missing a field Xero rejects before sending (no invoice id, no bank account, no amount) blocks nothing — that one *is* provable.
 
-**When the poller cannot decide, it leaves the bill marked Paid.** If a payment registration finished *after* the Xero read the reversal was computed from, that read cannot say whether the payment it created is gone. Clearing **Paid** then would re-arm the button over money that may have moved, so the poll withholds the whole verdict, logs a warning naming the undecidable entries, and counts it on the poll result. The IMS resolves this by itself on the next Xero read that covers those registrations. If it never does, the daily reconcile keeps reporting the bill as a *suspect advance* — settle it in Xero, or cancel the named sync entry by hand.
+**When the poller cannot decide, it leaves the bill marked Paid.** The same is true one step further in, on a voided invoice: if a payment registration finished *after* the Xero read the reversal was computed from, that read cannot say whether the payment it created is gone. Clearing **Paid** then would re-arm the button over money that may have moved, so the poll withholds the whole verdict, logs a warning naming the undecidable entries, and counts it on the poll result. The IMS resolves this by itself on the next Xero read that covers those registrations. If it never does, the daily reconcile keeps reporting the bill as a *suspect advance* — settle it in Xero, or cancel the named sync entry by hand.
 
 **Marking a bill paid needs somewhere to send the payment.** If the bill has already been posted to Xero but bill-payment posting is switched off, **Mark as paid** is refused rather than recorded locally: marking it paid with nothing queued would leave Xero showing the full amount outstanding and nothing to correct it. A bill that was never posted to Xero is unaffected — there is no second system to keep in step.
 

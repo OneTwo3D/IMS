@@ -8,6 +8,8 @@ import {
   BILL_PAYMENT_LEDGER_REVERSED_REASON,
   BILL_PAYMENT_SUPERSEDED_REASON,
   billPaymentRefusalMessage,
+  LEDGER_SETTLED_REVERSAL_STATUSES,
+  ledgerAloneProvesTheReversal,
   markBillPaidSupersedingStaleRegistrations,
   planBillPaymentSupersession,
   retireBillPaymentRegistrationsReversedInLedger,
@@ -342,8 +344,13 @@ test('the survey reads the payload, so the FAILED exemption is decided by the sh
 // ---------------------------------------------------------------------------
 
 /**
- * THE DOUBLE NOW RETURNS COMPLETION PROVENANCE, NOT JUST IDS (o3d-m5qk, merging o3d-clxw #634).
+ * ROUND 8. Every retirement below states the LEDGER STATUS it is acting on, because that is the fact
+ * the whole destructive path now rests on and rounds 3–7 never had it. `VOIDED` is the only status
+ * that proves a reversal without further evidence, and the tests that exercise the fence say so
+ * explicitly rather than relying on a default — a default would be the branch re-deciding on the
+ * fixtures' behalf, which is the defect one level up.
  *
+ * AND THE DOUBLE NOW RETURNS COMPLETION PROVENANCE, NOT JUST IDS (o3d-m5qk, merging o3d-clxw #634).
  * The fence used to be a Prisma predicate over `syncedAt` alone, so a double only had to hand back
  * the rows the query "selected". It is now `databaseStampedCompletion` applied in this process, which
  * reads BOTH columns: `syncedAt` and the marker `syncedAtDatabaseClock` the database mints beside it.
@@ -387,11 +394,16 @@ test('a posted registration that finished AFTER the ledger read is REPORTED, not
   const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
     connector: 'xero',
     invoiceId: 'inv-1',
+    ledgerStatus: 'VOIDED',
     ledgerObservedBefore: observedBefore,
   })
 
   assert.equal(outcome.decided, false)
-  assert.deepEqual(outcome.decided === false && outcome.undecided, ['log-late'])
+  assert.equal(outcome.decided === false && outcome.withheld, 'REGISTRATION_UNDECIDED')
+  assert.deepEqual(
+    outcome.decided === false && outcome.withheld === 'REGISTRATION_UNDECIDED' && outcome.undecided,
+    ['log-late'],
+  )
   assert.equal(updates.length, 0, 'nothing may be retired on a verdict this read cannot support')
   // SUPERSEDED ASSERTION (o3d-m5qk). This used to be
   //   assert.deepEqual(finds[0].where?.OR, [{ syncedAt: null }, { syncedAt: { gte: observedBefore } }])
@@ -425,11 +437,17 @@ test('a completion time the database did not mint is UNDECIDABLE, however early 
   const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
     connector: 'xero',
     invoiceId: 'inv-1',
+    // VOIDED, so the round-8 proof gate is satisfied and the fence is what decides this.
+    ledgerStatus: 'VOIDED',
     ledgerObservedBefore: observedBefore,
   })
 
   assert.equal(outcome.decided, false)
-  assert.deepEqual(outcome.decided === false && outcome.undecided, ['log-legacy', 'log-rewritten'])
+  assert.equal(outcome.decided === false && outcome.withheld, 'REGISTRATION_UNDECIDED')
+  assert.deepEqual(
+    outcome.decided === false && outcome.withheld === 'REGISTRATION_UNDECIDED' ? outcome.undecided : null,
+    ['log-legacy', 'log-rewritten'],
+  )
   assert.equal(updates.length, 0)
 })
 
@@ -442,11 +460,16 @@ test('a NULL fence decides nothing at all, even for a row stamped long ago', asy
   const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
     connector: 'xero',
     invoiceId: 'inv-1',
+    ledgerStatus: 'VOIDED',
     ledgerObservedBefore: null,
   })
 
   assert.equal(outcome.decided, false)
-  assert.deepEqual(outcome.decided === false && outcome.undecided, ['log-old'])
+  assert.equal(outcome.decided === false && outcome.withheld, 'REGISTRATION_UNDECIDED')
+  assert.deepEqual(
+    outcome.decided === false && outcome.withheld === 'REGISTRATION_UNDECIDED' ? outcome.undecided : null,
+    ['log-old'],
+  )
   assert.equal(updates.length, 0)
 })
 
@@ -462,11 +485,15 @@ test('one undecidable registration withholds the whole bill, including its decid
   const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
     connector: 'xero',
     invoiceId: 'inv-1',
+    ledgerStatus: 'VOIDED',
     ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
   })
 
   assert.equal(outcome.decided, false)
-  assert.deepEqual(outcome.decided === false && outcome.undecided, ['log-late'])
+  assert.deepEqual(
+    outcome.decided === false && outcome.withheld === 'REGISTRATION_UNDECIDED' ? outcome.undecided : null,
+    ['log-late'],
+  )
   assert.equal(updates.length, 0)
 })
 
@@ -477,6 +504,7 @@ test('a reversed bill retires only SYNCED rows that had already posted when the 
   const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
     connector: 'xero',
     invoiceId: 'inv-1',
+    ledgerStatus: 'VOIDED',
     ledgerObservedBefore: observedBefore,
   })
 
@@ -502,6 +530,135 @@ test('a reversed bill retires only SYNCED rows that had already posted when the 
   // o3d-sref: CANCELLED must never silently assert "nothing was sent" where that is false, so the
   // reason string is what carries the truth — this entry DID post.
   assert.match(BILL_PAYMENT_LEDGER_REVERSED_REASON, /The entry posted/)
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 8: "NOT FULLY PAID" IS NOT "THE PAYMENT IS GONE".
+// ---------------------------------------------------------------------------
+
+test('an AUTHORISED bill is REFUSED by the retirement, and nothing is even read (round 8)', async () => {
+  // THE DEFECT THIS CLOSES, and it is the money path. The poller's reversal set is AUTHORISED ∪
+  // VOIDED, and Xero's AUTHORISED means APPROVED AND NOT FULLY PAID — a bill carrying a real PART
+  // payment sits there, and so does one whose payment IMS has queued and not yet posted. Rounds 3–7
+  // took selection into that set as the ledger observation, so both walked into the destructive path:
+  // the SYNCED registration recording a real supplier payment was CANCELLED and paidAt cleared in the
+  // same transaction, which re-arms Mark Paid. markBillPaid sends no idempotency key and BILL_PAYMENT
+  // sits outside every live-row dedupe, so the second payment is refused by nothing.
+  //
+  // `retiredCount` is 1 and the undecidable list is EMPTY — i.e. this fixture is the shape that
+  // previously retired successfully. The refusal has to come from the status alone.
+  const { client, updates, finds } = retirementClient([], 1)
+
+  const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
+    connector: 'xero',
+    invoiceId: 'inv-1',
+    ledgerStatus: 'AUTHORISED',
+    ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
+  })
+
+  assert.equal(outcome.decided, false)
+  assert.equal(outcome.decided === false && outcome.withheld, 'REVERSAL_UNPROVEN')
+  assert.equal(
+    outcome.decided === false && outcome.withheld === 'REVERSAL_UNPROVEN' && outcome.ledgerStatus,
+    'AUTHORISED',
+    'the refusal must carry the status it refused, so the operator is told what Xero actually said',
+  )
+  assert.equal(updates.length, 0, 'a part-paid bill must not have its payment registration cancelled')
+  assert.equal(
+    finds.length,
+    0,
+    'the proof gate must be checked BEFORE the registration survey — an unproven bill has no business '
+      + 'reaching the fence at all',
+  )
+})
+
+test('a ledger status the read could not produce is not a proof either', async () => {
+  // Absence of a status is not permission. If the invoice fell out of the delta map — a shape this
+  // loop has no guarantee against — reading that as "nothing said, so proceed" would restore the
+  // defect for exactly the rows nobody can explain afterwards.
+  const { client, updates, finds } = retirementClient([], 1)
+
+  const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
+    connector: 'xero',
+    invoiceId: 'inv-1',
+    ledgerStatus: null,
+    ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
+  })
+
+  assert.equal(outcome.decided === false && outcome.withheld, 'REVERSAL_UNPROVEN')
+  assert.equal(outcome.decided === false && outcome.withheld === 'REVERSAL_UNPROVEN' && outcome.ledgerStatus, null)
+  assert.equal(updates.length, 0)
+  assert.equal(finds.length, 0)
+})
+
+test('VOIDED is the ONLY status that settles a reversal on its own', () => {
+  // Xero requires every payment to be released before an invoice can be voided, and refuses a payment
+  // against a voided one — so a voided invoice demonstrably holds no payment, and re-arming Mark Paid
+  // on it cannot move money a second time. Nothing else in Xero's ACCPAY vocabulary carries that.
+  //
+  // This is the SAME rule as partitionPaymentReversals' `voided` bucket on o3d-batch-billpay, stated
+  // once. The widening — a stated zero paid whose registrations the read accounts for — is that
+  // branch's classifier and is deliberately absent here: two answers to one question is the defect.
+  assert.deepEqual([...LEDGER_SETTLED_REVERSAL_STATUSES], ['VOIDED'])
+  assert.equal(ledgerAloneProvesTheReversal('VOIDED'), true)
+  for (const status of ['AUTHORISED', 'PAID', 'DRAFT', 'SUBMITTED', 'DELETED', '']) {
+    assert.equal(ledgerAloneProvesTheReversal(status), false, `${status || '<empty>'} must not prove a reversal`)
+  }
+  assert.equal(ledgerAloneProvesTheReversal(null), false)
+  assert.equal(ledgerAloneProvesTheReversal(undefined), false)
+  // Not case-folded on purpose: Xero sends these upper-cased, and quietly accepting a variant would be
+  // this module guessing what a status it does not recognise meant.
+  assert.equal(ledgerAloneProvesTheReversal('voided'), false)
+})
+
+test('a VOIDED bill still retires, so the proof gate did not just switch the pass off', async () => {
+  // The counter-test. A gate that refused everything would also pass every assertion above, and would
+  // strand every genuine reversal behind a refusal markBillPaid can never clear.
+  const { client, updates } = retirementClient([], 2)
+
+  const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
+    connector: 'xero',
+    invoiceId: 'inv-1',
+    ledgerStatus: 'VOIDED',
+    ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
+  })
+
+  assert.equal(outcome.decided, true)
+  assert.equal(outcome.decided === true && outcome.retired, 2)
+  assert.equal(updates.length, 1)
+})
+
+test('the two withheld causes are distinct verdicts, because they ask the operator for different things', async () => {
+  // Both leave paidAt set and both count on `billReversalsWithheld` — "we would have cleared paidAt and
+  // did not" is one fact an operator watches. But REGISTRATION_UNDECIDED resolves itself once a later
+  // read covers the registrations, while REVERSAL_UNPROVEN needs somebody to look at the bill in Xero.
+  // Collapsing them into a bare `decided: false` would hand both the same instructions, and the
+  // undecided one's instructions ("IMS will decide this by itself") are wrong for a part payment.
+  const undecided = await retireBillPaymentRegistrationsReversedInLedger(
+    retirementClient([stamped('log-late', '2026-08-20T09:46:00.000Z')]).client as never,
+    {
+      connector: 'xero',
+      invoiceId: 'inv-1',
+      ledgerStatus: 'VOIDED',
+      ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
+    },
+  )
+  const unproven = await retireBillPaymentRegistrationsReversedInLedger(
+    retirementClient([stamped('log-late', '2026-08-20T09:46:00.000Z')]).client as never,
+    {
+      connector: 'xero',
+      invoiceId: 'inv-1',
+      ledgerStatus: 'AUTHORISED',
+      ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
+    },
+  )
+
+  assert.equal(undecided.decided === false && undecided.withheld, 'REGISTRATION_UNDECIDED')
+  assert.equal(unproven.decided === false && unproven.withheld, 'REVERSAL_UNPROVEN')
+  assert.notEqual(
+    undecided.decided === false && undecided.withheld,
+    unproven.decided === false && unproven.withheld,
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -551,8 +708,95 @@ test('the poller withholds the paidAt clear when the read cannot decide a regist
   assert.ok(block.includes("action: 'bill_payment_reversal_withheld'"), 'a withheld reversal must be logged')
   assert.ok(block.includes('result.billReversalsWithheld++'), 'a withheld reversal must be counted')
   assert.ok(
-    block.includes('undecidedSyncLogIds: outcome.undecided'),
-    'the log must name the registrations the read could not decide',
+    block.includes("undecidedSyncLogIds: outcome.withheld === 'REGISTRATION_UNDECIDED' ? outcome.undecided : []"),
+    'the log must name the registrations the read could not decide — and only when that is the cause, '
+      + 'since round 8 added a second withheld cause that has no registration list at all',
+  )
+})
+
+/**
+ * Comments are stripped before any of the round-8 structural claims are read, and the strip is itself
+ * asserted to have removed something. Every one of these claims is about what the CODE does, and this
+ * block is heavily commented in exactly the vocabulary the assertions look for — "VOIDED",
+ * "AUTHORISED", "ledgerStatus" — so an unstripped scan would pass on the prose after the code that
+ * earned it had been deleted. That is the round-7 failure mode (a guard inspecting nothing) with a
+ * different disguise.
+ *
+ * Line-oriented rather than tokenising: only whole-line `//` comments and block-comment runs are
+ * removed, so a string literal is never touched.
+ */
+function stripComments(source: string): string {
+  const withoutBlocks = source.replace(/\/\*[\s\S]*?\*\//g, '')
+  return withoutBlocks
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('//'))
+    .join('\n')
+}
+
+test('the poller hands the retirement the ledger\'s OWN status and classifies nothing itself (round 8)', () => {
+  // THE DEFECT THIS CLOSES lives at this call site: the poller selected a bill into the reversal loop
+  // from `AUTHORISED` ∪ `VOIDED` and then called the retirement, so "the ledger says the payment is
+  // gone" was asserted by the SELECTION rather than by any status. The fix must not become a second
+  // classifier here — one module decides what a status proves, and the poller passes a fact — so this
+  // asserts both halves: the status IS handed over, and no judgement about it is made on the way.
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/payment-poller.ts'), 'utf8')
+  const blockStart = src.indexOf('--- Purchase bill payment reversals')
+  assert.ok(blockStart > 0, 'the bill reversal pass must exist')
+  const raw = src.slice(blockStart, src.indexOf('export async function pollXeroPayments', blockStart))
+  const block = stripComments(raw)
+  assert.ok(
+    block.length < raw.length,
+    'the comment strip removed nothing — these assertions would be reading prose, not code',
+  )
+  assert.ok(
+    block.includes('retireBillPaymentRegistrationsReversedInLedger(tx,'),
+    'the strip must not have eaten the code under inspection',
+  )
+
+  assert.ok(
+    /const ledgerStatus =[\s\S]*?invoiceById\.get\(/.test(block),
+    'the status must be read off the invoice the delta actually returned, not inferred from the candidate set',
+  )
+  assert.ok(
+    /retireBillPaymentRegistrationsReversedInLedger\(tx, \{[\s\S]*?ledgerStatus,/.test(block),
+    'the retirement must be TOLD the ledger status — without it the destructive path has no proof to check',
+  )
+  // No second answer to the one question. A comparison against a Xero status literal here would mean
+  // the poller deciding what counts as a reversal alongside the domain module, and the two would
+  // eventually disagree about whether a supplier has been paid.
+  assert.ok(
+    !/[=!]==\s*'(VOIDED|AUTHORISED)'/.test(block) && !/'(VOIDED|AUTHORISED)'\s*[=!]==/.test(block),
+    'the poller must not compare the ledger status itself — that decision belongs to ledgerAloneProvesTheReversal',
+  )
+  assert.ok(
+    !block.includes('ledgerAloneProvesTheReversal') && !block.includes('LEDGER_SETTLED_REVERSAL_STATUSES'),
+    'the proof rule must be applied at the destructive write, not re-applied at the call site',
+  )
+})
+
+test('the poller reports WHICH withheld cause it hit, because the two need different actions (round 8)', () => {
+  // One counter, two sentences. REGISTRATION_UNDECIDED tells the operator to wait — IMS will decide it
+  // on a later read — and that instruction is actively wrong for a part payment, which no future Xero
+  // read will resolve on its own. A single shared message would send every part-paid bill away with it.
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/payment-poller.ts'), 'utf8')
+  const blockStart = src.indexOf('--- Purchase bill payment reversals')
+  const raw = src.slice(blockStart, src.indexOf('export async function pollXeroPayments', blockStart))
+  const block = stripComments(raw)
+  assert.ok(block.length < raw.length, 'the comment strip removed nothing')
+
+  assert.ok(block.includes("outcome.withheld === 'REVERSAL_UNPROVEN'"), 'the unproven cause must get its own description')
+  assert.ok(block.includes('withheld: outcome.withheld'), 'the activity metadata must record which cause it was')
+  assert.ok(block.includes('ledgerStatus,'), 'the activity metadata must record the status that was refused')
+  // Still ONE counter and ONE action: splitting them per cause would hide the fact an operator watches.
+  assert.equal(
+    block.split('result.billReversalsWithheld++').length - 1,
+    1,
+    'both causes must increment the same single withheld counter',
+  )
+  assert.equal(
+    block.split("action: 'bill_payment_reversal_withheld'").length - 1,
+    1,
+    'both causes must be logged under the one action o3d-batch-billpay also writes',
   )
 })
 
