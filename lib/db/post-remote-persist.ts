@@ -229,8 +229,9 @@ export class UnrecordedRemoteWriteError extends Error {
     super(
       (attempts === 0
         ? `A completed remote write (${what}) was NOT recorded locally and was NOT ATTEMPTED: the `
-          + `deadline derived from this worker's claim was 0 (deadline ${deadlineMs}ms, set by how much `
-          + `of this worker's claim was left), so the claim had already lapsed — or had only the safety `
+          + `deadline derived from this worker's claim had already passed before the first attempt `
+          + `(deadline ${deadlineMs}ms, ${elapsedMs}ms already spent, set by how much of this worker's `
+          + `claim was left), so the claim had already lapsed — or had only the safety `
           + `margin left — by the time the record was reached. The ordinary persist updates the row by `
           + `id with no claim fence, so running it here could trample a row another worker has already `
           + `taken and is posting under. `
@@ -282,49 +283,66 @@ export async function persistAfterRemoteWrite<T>(
   const onRetry = options.onRetry ?? ((detail) => {
     console.error(
       `[post-remote-persist] ${detail.what}: no transaction for the record of a completed remote write `
-        + `(attempt ${detail.attempts}, ${detail.elapsedMs}ms elapsed of ${detail.deadlineMs}ms) — retrying `
-        + `rather than losing it`,
+        + `(attempt ${detail.attempts}, ${detail.elapsedMs}ms elapsed of ${detail.deadlineMs}ms) — re-driving `
+        + `for as long as this worker's claim allows, rather than losing it`,
     )
   })
 
   const startedAt = now()
   const deadlineMs = postRemotePersistDeadlineMs(options.claim, startedAt, options.maxDeadlineMs)
 
-  // ZERO MEANS ZERO ATTEMPTS, NOT ONE (round 4, finding 2).
+  // ONE RULE, RE-CHECKED AT THE POINT OF USE: NO ATTEMPT MAY *BEGIN* ONCE THE DEADLINE HAS PASSED
+  // (round 4 finding 2, completed in round 5).
   //
   // Round 3 made the deadline arithmetic — `Math.max(0, ...)` — and wrote down what 0 means: "the
   // claim has already lapsed, another worker may already be on this row, so re-driving is no longer
-  // provably safe and the give-up path runs immediately". The loop below did not implement that. It
-  // attempts FIRST and only compares elapsed against the deadline in the CATCH, so a deadline of 0
-  // bought exactly one execution of the persist — the one execution the clamp existed to prevent.
+  // provably safe and the give-up path runs immediately". Round 4 implemented that as a SEPARATE
+  // pre-check (`if (deadlineMs <= 0) throw`) in front of a loop that still compared elapsed against
+  // the deadline only in its CATCH. Two checks, and between them a gap neither owned: the loop's own
+  // boundary. With a 1000ms deadline and a 250ms delay the fourth failure lands at 750ms, the sleep
+  // is clamped to the remaining 250ms — and the fifth attempt BEGINS at exactly 1000ms, on a deadline
+  // that has expired. Worse, `sleep` is only a request: a stalled event loop, a suspended container
+  // or a clock step returns from a 250ms sleep seconds later, and the old loop then ran the persist
+  // regardless of how far past the deadline it had drifted, because nothing was consulted until that
+  // attempt had already failed. "Zero means zero attempts" and "an expired deadline means no further
+  // attempt" are the same rule; they were two, so the second went unenforced.
   //
-  // That single attempt is not harmless, because the persist it runs is not claim-fenced: the Xero
-  // one is `accountingSyncLog.update({ where: { id } })`, which will happily flip a row that another
-  // worker has re-claimed and is at that moment posting under, to SYNCED with THIS worker's external
-  // id. Two documents in the ledger, one id recorded, and the row says it is finished.
+  // An attempt that begins past the deadline is not harmless. The deadline exists to end this worker
+  // before another may reclaim the row, and each attempt is unbounded work (`$transaction` may sit on
+  // `maxWait`, then run the body). Every millisecond it runs beyond the deadline is eaten out of the
+  // safety margin reserved for the give-up path, which is the single-statement claim-fenced write
+  // that records the external id. Spend the margin and the id has nowhere to go.
   //
-  // The give-up path is strictly better here and always was: its terminal write is a single statement
-  // fenced on `processingStartedAt`, so it records the id when the claim is genuinely still ours and
-  // does nothing at all when it is not — and it says which of the two happened. So a lapsed claim goes
-  // straight there, with the id, having touched nothing.
-  if (deadlineMs <= 0) {
-    throw new UnrecordedRemoteWriteError(what, 0, 0, deadlineMs, new Error(LAPSED_CLAIM_REASON))
-  }
-
+  // So the deadline is evaluated in exactly ONE place — immediately before each attempt, first
+  // iteration included. A lapsed claim (deadline 0, elapsed 0) refuses with `attempts: 0` and the
+  // claim as its cause, which is round 4's behaviour reached by the general rule rather than by a
+  // special case. The give-up path that follows is strictly better than any attempt made here: its
+  // terminal write is a single statement fenced on `processingStartedAt`, so it records the id when
+  // the claim is genuinely still ours, does nothing at all when it is not, and says which happened.
   let attempts = 0
+  // Why the persist was last refused. Before any attempt there is only one possible reason — this
+  // worker's claim no longer covers the write — so that is what the error carries.
+  let lastFailure: unknown = new Error(LAPSED_CLAIM_REASON)
+
   for (;;) {
+    const elapsedMs = now() - startedAt
+    if (elapsedMs >= deadlineMs) {
+      throw new UnrecordedRemoteWriteError(what, attempts, elapsedMs, deadlineMs, lastFailure)
+    }
     attempts += 1
     try {
       return await persist()
     } catch (error) {
       if (!isConnectionAcquisitionTimeout(error)) throw error
-      const elapsedMs = now() - startedAt
-      if (elapsedMs >= deadlineMs) {
-        throw new UnrecordedRemoteWriteError(what, attempts, elapsedMs, deadlineMs, error)
-      }
-      onRetry({ what, attempts, elapsedMs, deadlineMs })
-      // Never sleep past the deadline: the give-up path needs the margin it was promised.
-      await sleep(Math.min(retryDelayMs, deadlineMs - elapsedMs))
+      lastFailure = error
+      // Read the clock again: the attempt itself consumed time, and on the paths that matter it
+      // consumed a lot of it.
+      const spentMs = now() - startedAt
+      onRetry({ what, attempts, elapsedMs: spentMs, deadlineMs })
+      // Never sleep past the deadline: the give-up path needs the margin it was promised. Whether
+      // this buys another attempt is not decided here — the top of the loop decides it, on the clock
+      // as it reads AFTER the sleep rather than as it read before.
+      await sleep(Math.max(0, Math.min(retryDelayMs, deadlineMs - spentMs)))
     }
   }
 }

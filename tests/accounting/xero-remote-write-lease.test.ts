@@ -378,3 +378,75 @@ test('r5 #1: the fence renews the OUTBOX lock too, and refuses without touching 
   assert.deepEqual(lease.heldFrom(), heldBefore,
     'the row claim is left exactly as it was: the outbox lock is checked first for precisely this reason')
 })
+
+/**
+ * ROUND 5 — ONE DEFINITION OF "I STILL HOLD THIS CLAIM", AND IT IS READ AT THE MOMENT IT IS USED.
+ *
+ * `heldClaimWhere` is the sibling branches' helper (o3d-batch-payidx fences every RELEASE of a claim
+ * with it; o3d-batch-invnum fences the pre-post invoice-number stamp with it), adopted here by name
+ * and shape rather than reinvented, so a merge that keeps one definition does not silently change
+ * what the other two meant by ownership.
+ *
+ * What THIS branch adds is that the claim instant MOVES: the lease renews it before every remote
+ * mutation. Both sibling branches capture `claimedAt` once, at the top of the sweep loop, and fence
+ * on that value much later. Against this branch such a fence matches nothing — and because these
+ * fences all fail closed, the failure is silent refusal of legitimate work rather than a visible
+ * error. That is the one thing a merge has to preserve, so it is pinned here rather than described
+ * in a commit message.
+ */
+test('r5: a claim instant captured at the top of the loop is NOT ownership once the lease has renewed', async () => {
+  reset()
+  const { openRemoteWriteLease, heldClaimWhere } = await processor()
+  const { db } = await import('@/lib/db') as unknown as {
+    db: { accountingSyncLog: { updateMany: (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => Promise<{ count: number }> } }
+  }
+
+  // The claim as the sweep loop takes it, which is the value a sibling branch would carry downstream.
+  const claimedAtTopOfLoop = new Date('2026-08-20T10:00:00.000Z')
+  state.row!.status = 'PROCESSING'
+  state.row!.processingStartedAt = claimedAtTopOfLoop
+
+  const lease = await openRemoteWriteLease('log-1', claimedAtTopOfLoop)
+  assert.ok(lease, 'the claim was ours, so the lease opened')
+  const fence = await lease.fenceBeforeRemoteWrite('sales-invoice')
+  assert.equal(fence.ok, true, 'and it is still ours at the fence — no theft in this test at all')
+
+  const heldNow = lease.heldFrom()
+  assert.ok(heldNow.getTime() > claimedAtTopOfLoop.getTime(),
+    'opening the lease and fencing each renewed the claim, so the instant the row carries has moved')
+
+  // A consumer fencing on the captured instant. Driven through the double, which evaluates the WHERE
+  // against real row state — a canned count could not tell these two cases apart at all.
+  const stale = await db.accountingSyncLog.updateMany({
+    where: heldClaimWhere('log-1', claimedAtTopOfLoop),
+    data: { errorMessage: 'fenced-on-the-captured-instant' },
+  })
+  assert.equal(stale.count, 0,
+    'a fence on the captured instant matches NOTHING: this worker still owns the row, but not under that stamp')
+  assert.notEqual(state.row?.errorMessage, 'fenced-on-the-captured-instant',
+    'and it fails CLOSED — the write is refused, which is why the mistake is silent rather than loud')
+
+  // The same consumer, reading the claim from the lease at the moment it uses it.
+  const current = await db.accountingSyncLog.updateMany({
+    where: heldClaimWhere('log-1', heldNow),
+    data: { errorMessage: 'fenced-on-the-held-instant' },
+  })
+  assert.equal(current.count, 1, 'read from the lease at the point of use, the very same fence matches')
+  assert.equal(state.row?.errorMessage, 'fenced-on-the-held-instant')
+
+  // And a genuine theft is still refused, so the fence has not been loosened into a no-op.
+  stealTheRow()
+  const stolen = await db.accountingSyncLog.updateMany({
+    where: heldClaimWhere('log-1', heldNow),
+    data: { errorMessage: 'must-not-land' },
+  })
+  assert.equal(stolen.count, 0, "once another worker re-stamps the row, the held instant stops matching too")
+  assert.notEqual(state.row?.errorMessage, 'must-not-land')
+
+  // THE DEFINITION ITSELF, because a merge keeps exactly one of the three copies. Matching on
+  // `status: 'PROCESSING'` alone is not ownership — the replacement's row is PROCESSING too.
+  assert.deepEqual(Object.keys(heldClaimWhere('log-1', heldNow)).sort(), ['id', 'processingStartedAt', 'status'],
+    'identical to the helper on o3d-batch-payidx and o3d-batch-invnum: three fields, no more, no fewer')
+  assert.equal(heldClaimWhere('log-1', heldNow).status, 'PROCESSING')
+  assert.deepEqual(heldClaimWhere('log-1', heldNow).processingStartedAt, heldNow)
+})

@@ -1280,6 +1280,35 @@ function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date) {
 }
 
 /**
+ * "I STILL HOLD THE CLAIM I TOOK" — the where-fence every write that assumes ownership must carry.
+ *
+ * A claim is `{ status: PROCESSING, processingStartedAt: <the instant I stamped> }`, and the stale
+ * cutoff in {@link accountingSyncLogClaimWhere} lets a NEW worker re-take a row whose claim has aged
+ * out. The displaced worker is not stopped by that — a timeout cannot reach into a request already on
+ * the wire — so matching on `status: 'PROCESSING'` alone is NOT ownership: the replacement's row is
+ * PROCESSING too. Only the worker that stamped that exact instant owns it.
+ *
+ * IDENTICAL, DELIBERATELY, to the helper of the same name on the sibling branches o3d-batch-payidx
+ * (which fences every RELEASE of a claim with it) and o3d-batch-invnum (which fences the pre-post
+ * invoice-number stamp with it). The three branches must not disagree about what holding a claim
+ * means; if more than one lands, keep ONE definition. Call sites add their own conditions by
+ * spreading, exactly as payidx does with `retryCount` — the definition itself stays the three fields.
+ *
+ * WHAT THIS BRANCH ADDS, AND WHAT EVERY CONSUMER MUST THEREFORE DO. A claim instant is not a constant
+ * for the life of an entry here: {@link openRemoteWriteLease} RENEWS it before every remote mutation,
+ * so `processingStartedAt` moves forward repeatedly while one entry is being processed. A consumer
+ * that captured `claimedAt` when the row was first claimed and fenced on that value later would match
+ * NOTHING — and because all of these fences fail closed, it would refuse work it was entitled to do
+ * rather than doing work it was not. So the claim instant must always be read from the lease at the
+ * moment it is used (`lease.heldFrom()`), never carried down from the top of the loop. That is why
+ * `guardCancelledSalesOrderInvoice` takes a getter rather than a Date, and it is the one thing a merge
+ * with either sibling branch has to preserve.
+ */
+export function heldClaimWhere(entryId: string, claimedAt: Date) {
+  return { id: entryId, status: 'PROCESSING' as const, processingStartedAt: claimedAt }
+}
+
+/**
  * RECORD A DOCUMENT XERO HAS ALREADY ACCEPTED (o3d-xl63 r2 #2, r3 #1-#3).
  *
  * Both processors reach the same point: `POST /Invoices` (or /Payments, /ManualJournals ...) has
@@ -1342,12 +1371,8 @@ function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date) {
 export async function renewClaimForRemoteWrite(entryId: string, heldFrom: Date): Promise<Date | null> {
   const renewedAt = new Date()
   const renewed = await db.accountingSyncLog.updateMany({
-    where: {
-      id: entryId,
-      connector: XERO_CONNECTOR,
-      status: 'PROCESSING',
-      processingStartedAt: heldFrom,
-    },
+    // The shared claim-identity fence (see heldClaimWhere), narrowed to this connector.
+    where: { ...heldClaimWhere(entryId, heldFrom), connector: XERO_CONNECTOR },
     data: { processingStartedAt: renewedAt },
   })
   return renewed.count === 1 ? renewedAt : null
@@ -1685,10 +1710,8 @@ async function reportUnrecordedXeroWrite(input: {
   try {
     const recovery = await db.accountingSyncLog.updateMany({
       where: {
-        id: entry.id,
+        ...heldClaimWhere(entry.id, claimedAt),
         connector: XERO_CONNECTOR,
-        status: 'PROCESSING',
-        processingStartedAt: claimedAt,
         ...(externalId ? { externalTransactionId: null } : {}),
       },
       data: externalId

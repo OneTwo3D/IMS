@@ -320,7 +320,110 @@ test('waiting for ever is not coming back: past the deadline it gives up, and sa
       return true
     },
   )
-  assert.deepEqual(attemptsAt, [0, 250, 500, 750, 1000], 'it kept trying across the whole deadline, then stopped')
+  // NOT `[..., 1000]`: the attempt that would have begun at exactly 1000ms would have begun on a
+  // deadline already spent. See the r5 test below, which is about that boundary specifically.
+  assert.deepEqual(attemptsAt, [0, 250, 500, 750],
+    'it kept trying across the whole deadline, and stopped BEFORE an attempt that would start on it')
+})
+
+/**
+ * ROUND 5 — A DEADLINE THAT HAS PASSED MUST NOT AUTHORISE THE WORK, WHICHEVER WAY IT PASSED.
+ *
+ * Round 4 refused a persist whose deadline was 0 before it started, and left the loop comparing
+ * elapsed against the deadline only in its CATCH. Two checks, and the gap between them is the loop's
+ * own boundary: whether another attempt may BEGIN was never asked. It was inferred, from a clock read
+ * before a sleep that had not happened yet.
+ *
+ * Both cases below are the SAME defect — a permission checked at T1 and spent at T2 — and both are
+ * closed by the same single rule: the deadline is evaluated immediately before each attempt, first
+ * iteration included, on the clock as it reads THEN.
+ */
+test('r5: no attempt may BEGIN once the deadline has passed — the rule is re-checked before each attempt, not only after a failure', async () => {
+  const heldFrom = 1_000_000_000_000
+  // A claim with exactly 1s of spendable life once the give-up margin is reserved.
+  const claim = { heldFrom, staleAfterMs: CLAIM_SAFETY_MARGIN_MS + 1_000 }
+
+  // CASE 1 — THE LOOP'S OWN BOUNDARY. 1000ms of deadline and a 250ms delay puts the fourth failure at
+  // 750ms; the sleep is clamped to the 250ms remaining, so the next attempt lands on exactly 1000ms.
+  // That attempt is unbounded work (`$transaction` sits on `maxWait`, then runs the body) begun with
+  // no claim behind it, and every millisecond of it is taken out of the margin reserved for the
+  // claim-fenced write that records the external id.
+  {
+    let now = heldFrom
+    const beganAt: number[] = []
+    const failure = await persistAfterRemoteWrite('xero sync log boundary-1 (SALES_INVOICE)', async () => {
+      beganAt.push(now - heldFrom)
+      throw new Error('Transaction API error: Unable to start a transaction in the given time.')
+    }, {
+      claim,
+      retryDelayMs: 250,
+      now: () => now,
+      sleep: async (ms: number) => { now += ms },
+      onRetry: () => {},
+    }).then(() => null, (error: unknown) => error)
+
+    assert.ok(failure instanceof UnrecordedRemoteWriteError, 'it still gives up by naming the unrecorded write')
+    assert.equal(failure.deadlineMs, 1_000, "the deadline is the claim's spendable life, as round 3 fixed it")
+    assert.deepEqual(beganAt, [0, 250, 500, 750],
+      'the attempt that would have begun at exactly 1000ms — ON a deadline of 1000ms — must not be made')
+    assert.ok(beganAt.every((at) => at < 1_000),
+      'the verdict under test is "began strictly inside the deadline", not "eventually gave up"')
+    assert.equal(failure.attempts, 4, 'and the refusal counts the attempts actually made, not one more')
+    assert.equal(failure.elapsedMs, 1_000)
+  }
+
+  // CASE 2 — `sleep` IS A REQUEST, NOT A PROMISE. A stalled event loop, a suspended container or a
+  // clock step returns from a 250ms sleep thirty seconds later. Deciding "may I attempt again?" from
+  // the clock BEFORE the sleep meant the persist then ran regardless of how far past the deadline it
+  // had drifted: the "once anyway" execution, reached by the clock instead of by the arithmetic, and
+  // reached in exactly the conditions (a machine under enough pressure to stall) that made the pool
+  // refuse in the first place.
+  {
+    let now = heldFrom
+    const beganAt: number[] = []
+    const failure = await persistAfterRemoteWrite('xero sync log overslept-1 (INVOICE_PAYMENT)', async () => {
+      beganAt.push(now - heldFrom)
+      throw new Error('Transaction API error: Unable to start a transaction in the given time.')
+    }, {
+      claim,
+      retryDelayMs: 250,
+      now: () => now,
+      // Asked for 250ms; gone for 30 seconds. The claim is long past reclaimable by the time it returns.
+      sleep: async (ms: number) => { now += ms + 30_000 },
+      onRetry: () => {},
+    }).then(() => null, (error: unknown) => error)
+
+    assert.ok(failure instanceof UnrecordedRemoteWriteError)
+    assert.deepEqual(beganAt, [0],
+      'exactly one attempt: when the second would have begun the clock was 29 seconds past the deadline, '
+        + 'and a deadline that has passed authorises nothing')
+    assert.equal(failure.attempts, 1)
+    assert.equal(failure.elapsedMs, 30_250,
+      'and it reports how far past the deadline the clock actually went, rather than the deadline it '
+        + 'would have liked to have stopped on')
+    assert.equal(failure.deadlineMs, 1_000)
+  }
+
+  // CONTROL — the rule refuses a spent deadline and nothing else. A claim with life left still gets
+  // its attempts, so this is not "stop earlier" dressed up as a fix.
+  {
+    let now = heldFrom
+    let ran = 0
+    const value = await persistAfterRemoteWrite('xero sync log live-2 (SALES_INVOICE)', async () => {
+      ran += 1
+      if (ran < 3) throw new Error('Transaction API error: Unable to start a transaction in the given time.')
+      return 'recorded'
+    }, {
+      claim,
+      retryDelayMs: 250,
+      now: () => now,
+      sleep: async (ms: number) => { now += ms },
+      onRetry: () => {},
+    })
+    assert.equal(value, 'recorded')
+    assert.equal(ran, 3, 'three attempts inside a 1000ms deadline, and the third recorded the document')
+    assert.equal(now - heldFrom, 500, 'having spent only the two sleeps it needed')
+  }
 })
 
 /**

@@ -1118,10 +1118,14 @@ safe**, whichever side of the line it lands on. What does the work instead:
   protection: when the database connection pool is exhausted it is re-driven rather than abandoned,
   for as long as this worker's 15-minute claim on the row allows (minus a minute held back for the
   give-up path, so it can never still be running when another worker may reclaim the row and post the
-  document a second time). When the claim has already lapsed by the time the record is reached, the
-  ordinary write is **not attempted at all** — it updates the row by id with no claim check, so under
-  a lost claim it could flip a row another worker is posting under. The give-up path below is used
-  instead, because its write *is* claim-checked.
+  document a second time). **No attempt is ever started on a deadline that has already passed** — not
+  the first one and not a later one. If the claim has lapsed by the time the record is reached, the
+  ordinary write is not attempted at all; and if the window runs out between attempts — including when
+  a machine under enough pressure to exhaust the pool stalls for far longer than the short pause IMS
+  asked for — the next attempt is not made either. The deadline is re-read from the clock immediately
+  before every attempt rather than inferred from the last one, because every millisecond spent past it
+  is taken out of the minute reserved for the give-up path. The give-up path below is used instead,
+  because its write *is* claim-checked, whereas the ordinary one updates the row by id.
 - **The claim is re-taken at the moment the document is sent — every time, not once.** Posting is not
   the first thing the worker does after claiming a row: it reads the connection's granted permissions,
   looks the customer or supplier up in Xero, resolves item codes — and any of those can sit out a Xero
