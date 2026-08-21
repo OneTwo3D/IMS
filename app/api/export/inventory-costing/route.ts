@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { csvBufferedStreamResponse } from '@/lib/csv'
+import { REFUND_BLIND_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
 import { db } from '@/lib/db'
 import {
   getCogsReport,
@@ -118,7 +119,11 @@ export async function getInventoryCostingExportResponse(
         rows,
         ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'customerName', 'channel', 'qty', 'cogsBase', 'revenueBase', 'grossMarginBase', 'grossMarginPct', 'movementCount', 'revenueCaptured'],
         `cogs-${date}.csv`,
-        { dateFrom: report.dateFrom, dateTo: report.dateTo, groupBy: report.groupBy, generatedAt: report.generatedAt },
+        // o3d-iigc round 5: A FILE READER HAS NO TOOLTIP, and revenueBase/grossMarginBase/
+        // grossMarginPct here are refund-blind. The repo's own CSV metadata channel turns that into
+        // `#` comment rows at the foot of the file (which parseCsv skips, so re-import is unharmed)
+        // and an X-IMS-Export-Metadata header for API consumers.
+        { dateFrom: report.dateFrom, dateTo: report.dateTo, groupBy: report.groupBy, generatedAt: report.generatedAt, refundTreatment: REFUND_BLIND_NOTICE_COGS_MARGIN },
       )
     }
 

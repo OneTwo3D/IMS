@@ -7,6 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
+import { marginFigureBound, netOfRefunds, refundLineBucket, refundPctOfSale, type DerivedFigureBound, type RefundSetBasis } from '@/lib/domain/sales/refund-basis-analytics'
 
 // ---------------------------------------------------------------------------
 // Products tab (line-level)
@@ -30,12 +31,34 @@ export type SalesStatRow = {
   qtyRefunded: number
   netQty: number
   grossRevenue: number
-  discounts: number
+  /**
+   * NET-basis refund value only. o3d-iigc: `grossRevenue`/`netRevenue` are built from ex-VAT line
+   * totals, so a GROSS or unstamped credit is not the same unit and is bucketed below instead.
+   */
   refunds: number
+  discounts: number
+  /** Refund value recorded on the GROSS basis — reported, NOT subtracted from `netRevenue`. */
+  refundsGrossBasis: number
+  /** Refund value with no proven basis — reported, NOT subtracted from `netRevenue`. */
+  refundsUnknownBasis: number
+  /**
+   * False when this product carried refund value that could not be placed on the net basis. When
+   * false, `netRevenue`, `grossProfit` and `avgOrderValue` are UPPER BOUNDS, loose by at most
+   * refundsGrossBasis + refundsUnknownBasis. `marginPct` is NOT covered by this flag — see
+   * `marginPctBound`.
+   */
+  refundBasisComplete: boolean
   netRevenue: number
   cogs: number
   grossProfit: number
   marginPct: number
+  /**
+   * o3d-iigc round 4: margin is a RATIO, and an unsubtracted credit moves its numerator and its
+   * denominator together, so `refundBasisComplete === false` does NOT make it an upper bound the way
+   * it does the three figures above. Classified by marginFigureBound; 'indeterminate' means the
+   * figure stands but the direction of its error does not. Never marked from refundBasisComplete.
+   */
+  marginPctBound: DerivedFigureBound
   orderCount: number
   avgOrderValue: number
   salesPrice: number | null
@@ -46,11 +69,21 @@ export type SalesStatSummary = {
   totalOrders: number
   totalGrossRevenue: number
   totalDiscounts: number
+  /** NET-basis refunds only — see SalesStatRow.refunds. */
   totalRefunds: number
+  totalRefundsGrossBasis: number
+  totalRefundsUnknownBasis: number
+  /**
+   * False when ANY row's refunds could not all be placed on the net basis. Governs totalNetRevenue,
+   * totalGrossProfit and avgOrderValue. NOT avgMarginPct — see avgMarginPctBound.
+   */
+  refundBasisComplete: boolean
   totalNetRevenue: number
   totalCogs: number
   totalGrossProfit: number
   avgMarginPct: number
+  /** As SalesStatRow.marginPctBound, for the whole-period Avg Margin figure. */
+  avgMarginPctBound: DerivedFigureBound
   avgOrderValue: number
   totalQtySold: number
 }
@@ -75,7 +108,8 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
       id: true, totalBase: true, discountAmount: true, fxRateToBase: true, pricesIncludeVat: true, taxRatePercent: true, customerName: true, salesRep: true,
       shoppingLinks: { select: { connector: true } },
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true, taxRate: { select: { rate: true } } } },
-      refunds: { select: { totalBase: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
+      // o3d-iigc: the basis was not even fetched before, so the report could not have respected it.
+      refunds: { select: { totalsBasis: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
     },
   })
 
@@ -104,7 +138,8 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
           salesPrice: info?.salesPriceBase ? Number(info.salesPriceBase) : null,
           weight: info?.weight ? Number(info.weight) : null,
           qtySold: 0, qtyRefunded: 0, netQty: 0, grossRevenue: 0, discounts: 0, refunds: 0,
-          netRevenue: 0, cogs: 0, grossProfit: 0, marginPct: 0, orderCount: 0, avgOrderValue: 0,
+          refundsGrossBasis: 0, refundsUnknownBasis: 0, refundBasisComplete: true,
+          netRevenue: 0, cogs: 0, grossProfit: 0, marginPct: 0, marginPctBound: 'exact', orderCount: 0, avgOrderValue: 0,
         })
       }
       const row = productMap.get(pid)!
@@ -118,39 +153,107 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
       row.cogs += Number(line.cogsBase ?? 0)
       row.orderCount++
     }
+    // o3d-iigc: `grossRevenue` above is built from ex-VAT line totals, so `netRevenue` is a NET
+    // figure and only a NET-basis refund is the same unit. A GROSS credit carries its whole VAT and
+    // would over-subtract; an unstamped one cannot be placed at all. Neither is CONVERTED — on a
+    // mixed-rate order the rate that produced the gross figure is not recoverable — so both are
+    // bucketed beside the figure and the row is flagged, which makes `netRevenue` an upper bound
+    // rather than a number wrong in an undisclosed direction. Quantity is basis-independent, so
+    // qtyRefunded keeps netting off EVERY refund line.
     for (const refund of order.refunds) {
       for (const rl of refund.lines) {
         if (!rl.productId) continue
         const row = productMap.get(rl.productId)
-        if (row) { row.qtyRefunded += Number(rl.qty); row.refunds += Number(rl.totalBase) }
+        if (!row) continue
+        row.qtyRefunded += Number(rl.qty)
+        const amount = Number(rl.totalBase)
+        const placement = refundLineBucket(refund.totalsBasis, rl.totalBase)
+        if (placement.bucket === 'net') row.refunds += amount
+        else if (placement.bucket === 'gross') row.refundsGrossBasis += amount
+        else row.refundsUnknownBasis += amount
+        if (!placement.placeableOnNetBasis) row.refundBasisComplete = false
       }
     }
   }
 
   const rows: SalesStatRow[] = []
+  /**
+   * o3d-iigc round 5 (Codex finding 2): THE PERIOD TOTALS ARE ACCUMULATED BEFORE THE ROWS ARE
+   * ROUNDED, and the period margin and its bound are both computed from these.
+   *
+   * They used to be re-summed from the ROUNDED row fields, which put the published summary margin
+   * and marginFigureBound's model of it on different numbers — and the helper's whole case analysis
+   * is about which side of the published figure the truth lies on. Worked, on one product with
+   * 0.016 of revenue, 0.025 of COGS and 0.014 of UNKNOWN-basis credit: rounding each row field
+   * first gives revenue 0.02, COGS 0.03, unplaced credit 0.01, so the summary published -50% and
+   * case 3 (0.02 - 0.01 > 0) marked it `≤`. Place that credit on the net basis and revenue is 0.002,
+   * which rounds to 0.00, so the report's own `> 0` guard publishes 0% — AND 0% IS NOT AT MOST -50%.
+   * The `≤` was a false claim produced entirely by rounding twice.
+   *
+   * Summing unrounded and rounding once is also simply the module's stated rule ("rounding happens
+   * once, in the caller-facing figure, never on the intermediate sums").
+   */
+  const period = {
+    grossRevenue: 0, discounts: 0, refunds: 0, refundsGrossBasis: 0, refundsUnknownBasis: 0,
+    netRevenue: 0, cogs: 0, grossProfit: 0, netQty: 0, refundBasisComplete: true,
+  }
   for (const row of productMap.values()) {
     row.netQty = row.qtySold - row.qtyRefunded
     row.netRevenue = row.grossRevenue - row.discounts - row.refunds
     row.grossProfit = row.netRevenue - row.cogs
     row.marginPct = row.netRevenue > 0 ? (row.grossProfit / row.netRevenue) * 100 : 0
     row.avgOrderValue = row.orderCount > 0 ? row.netRevenue / row.orderCount : 0
+    // Classified from the UNROUNDED figures, before the roundings below, because the classification
+    // is about which side of the published number the truth lies on, not about its last penny.
+    row.marginPctBound = marginFigureBound({
+      netRevenue: row.netRevenue,
+      cogs: row.cogs,
+      unplacedCredit: row.refundsGrossBasis + row.refundsUnknownBasis,
+      basisComplete: row.refundBasisComplete,
+    })
+    period.grossRevenue += row.grossRevenue; period.discounts += row.discounts
+    period.refunds += row.refunds; period.refundsGrossBasis += row.refundsGrossBasis
+    period.refundsUnknownBasis += row.refundsUnknownBasis
+    period.netRevenue += row.netRevenue; period.cogs += row.cogs; period.grossProfit += row.grossProfit
+    period.netQty += row.netQty
+    if (!row.refundBasisComplete) period.refundBasisComplete = false
     row.grossRevenue = Math.round(row.grossRevenue * 100) / 100; row.discounts = Math.round(row.discounts * 100) / 100
     row.refunds = Math.round(row.refunds * 100) / 100; row.netRevenue = Math.round(row.netRevenue * 100) / 100
+    row.refundsGrossBasis = Math.round(row.refundsGrossBasis * 100) / 100
+    row.refundsUnknownBasis = Math.round(row.refundsUnknownBasis * 100) / 100
     row.cogs = Math.round(row.cogs * 100) / 100; row.grossProfit = Math.round(row.grossProfit * 100) / 100
     row.marginPct = Math.round(row.marginPct * 10) / 10; row.avgOrderValue = Math.round(row.avgOrderValue * 100) / 100
     rows.push(row)
   }
   rows.sort((a, b) => b.netRevenue - a.netRevenue)
 
+  const m2 = (v: number) => Math.round(v * 100) / 100
   const summary: SalesStatSummary = {
-    totalOrders: orders.length, totalGrossRevenue: rows.reduce((s, r) => s + r.grossRevenue, 0),
-    totalDiscounts: rows.reduce((s, r) => s + r.discounts, 0), totalRefunds: rows.reduce((s, r) => s + r.refunds, 0),
-    totalNetRevenue: rows.reduce((s, r) => s + r.netRevenue, 0), totalCogs: rows.reduce((s, r) => s + r.cogs, 0),
-    totalGrossProfit: rows.reduce((s, r) => s + r.grossProfit, 0), avgMarginPct: 0, avgOrderValue: 0,
-    totalQtySold: rows.reduce((s, r) => s + r.netQty, 0),
+    totalOrders: orders.length, totalGrossRevenue: m2(period.grossRevenue),
+    totalDiscounts: m2(period.discounts), totalRefunds: m2(period.refunds),
+    totalRefundsGrossBasis: m2(period.refundsGrossBasis),
+    totalRefundsUnknownBasis: m2(period.refundsUnknownBasis),
+    refundBasisComplete: period.refundBasisComplete,
+    totalNetRevenue: m2(period.netRevenue), totalCogs: m2(period.cogs),
+    totalGrossProfit: m2(period.grossProfit), avgMarginPct: 0, avgMarginPctBound: 'exact', avgOrderValue: 0,
+    // Quantity is left unrounded exactly as it was: it may carry fractional units, and rounding it
+    // to two places here would be a change this finding did not call for.
+    totalQtySold: period.netQty,
   }
-  summary.avgMarginPct = summary.totalNetRevenue > 0 ? Math.round((summary.totalGrossProfit / summary.totalNetRevenue) * 1000) / 10 : 0
-  summary.avgOrderValue = summary.totalOrders > 0 ? Math.round((summary.totalNetRevenue / summary.totalOrders) * 100) / 100 : 0
+  // From the UNROUNDED period figures, so the published ratio and the counterfactual the bound is
+  // classified against are the same function of the same quantities.
+  summary.avgMarginPct = period.netRevenue > 0 ? Math.round((period.grossProfit / period.netRevenue) * 1000) / 10 : 0
+  // The whole-period margin is the same ratio over the same two quantities, so it is classified the
+  // same way — from the period's own COGS and its own unplaced credit, NOT by OR-ing the rows'
+  // verdicts: a row whose margin is indeterminate can sit inside a period whose margin is a sound
+  // upper bound, and the reverse.
+  summary.avgMarginPctBound = marginFigureBound({
+    netRevenue: period.netRevenue,
+    cogs: period.cogs,
+    unplacedCredit: period.refundsGrossBasis + period.refundsUnknownBasis,
+    basisComplete: period.refundBasisComplete,
+  })
+  summary.avgOrderValue = summary.totalOrders > 0 ? Math.round((period.netRevenue / summary.totalOrders) * 100) / 100 : 0
   return { rows, summary }
 }
 
@@ -337,7 +440,14 @@ export type RefundRow = {
   refundedAt: string
   qty: number
   totalBase: number
-  pctOfSale: number
+  /**
+   * The credit as a proportion of the order total ON THE CREDIT'S OWN BASIS.
+   *
+   * o3d-iigc: `null` when the refund's basis is unproven, or when no comparable order total exists.
+   * It is NOT 0 — a zero here would read as "refunded nothing", which is the opposite of "we cannot
+   * say what fraction this is".
+   */
+  pctOfSale: number | null
 }
 
 export async function getRefundStats(dateFrom?: string, dateTo?: string): Promise<RefundRow[]> {
@@ -349,8 +459,10 @@ export async function getRefundStats(dateFrom?: string, dateTo?: string): Promis
   const refunds = await db.salesOrderRefund.findMany({
     where: Object.keys(dateFilter).length ? { refundedAt: dateFilter } : undefined,
     select: {
-      id: true, creditNoteNumber: true, reason: true, totalBase: true, refundedAt: true,
-      order: { select: { id: true, orderNumber: true, externalOrderNumber: true, customerName: true, salesRep: true, totalBase: true } },
+      id: true, creditNoteNumber: true, reason: true, totalBase: true, refundedAt: true, totalsBasis: true,
+      // taxBase is what makes the order's NET total derivable, so a NET credit can be measured
+      // against a NET total instead of against the VAT-inclusive one.
+      order: { select: { id: true, orderNumber: true, externalOrderNumber: true, customerName: true, salesRep: true, totalBase: true, taxBase: true } },
       lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
     },
     orderBy: { refundedAt: 'desc' },
@@ -358,7 +470,6 @@ export async function getRefundStats(dateFrom?: string, dateTo?: string): Promis
 
   const rows: RefundRow[] = []
   for (const r of refunds) {
-    const orderTotal = Number(r.order.totalBase)
     for (const l of r.lines) {
       const lineTotal = Number(l.totalBase)
       rows.push({
@@ -368,7 +479,9 @@ export async function getRefundStats(dateFrom?: string, dateTo?: string): Promis
         customerName: r.order.customerName ?? '—', salesRep: r.order.salesRep,
         reason: r.reason, refundedAt: r.refundedAt.toISOString(),
         qty: Number(l.qty), totalBase: lineTotal,
-        pctOfSale: orderTotal > 0 ? Math.round((lineTotal / orderTotal) * 1000) / 10 : 0,
+        // o3d-iigc: divided by the order total on the CREDIT'S basis. Against the GROSS total a
+        // full NET refund of a 20%-taxable order read as 83.3% — a full credit shown as partial.
+        pctOfSale: refundPctOfSale(l.totalBase, r.order, r.totalsBasis),
       })
     }
   }
@@ -388,9 +501,24 @@ export type CustomerAgingRow = {
   warehouse: string | null
   createdAt: string
   currency: string
+  /** The order's GROSS (VAT-inclusive) invoice total. */
   salesTotal: number
+  /** Total credit raised against the order, whatever basis each credit carries. */
   refundsTotal: number
-  netTotal: number
+  /**
+   * The order total less its refunds, expressed on `netTotalBasis`.
+   *
+   * o3d-iigc: `null` when the credits are not all on one proven basis. Subtracting a NET credit
+   * from the GROSS invoice total understated the credit by its VAT; subtracting a mixed set is not
+   * a subtraction at all. Neither is converted — the rate behind a legacy gross total is not
+   * recoverable on a mixed-rate order — so the figure is withheld rather than guessed.
+   */
+  netTotal: number | null
+  /**
+   * Which total `netTotal` is: `NONE` (no credits — the gross invoice total), `GROSS`
+   * (VAT-inclusive), `NET` (ex-VAT), or `UNKNOWN` (netTotal is null).
+   */
+  netTotalBasis: RefundSetBasis
   dueAmount: number
   avgDso: number
   overdue0_30: number
@@ -405,10 +533,11 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
     where: { invoiceNumber: { not: null } },
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, customerId: true, customerName: true, salesRep: true,
-      currency: true, totalBase: true, invoicedAt: true, paidAt: true, createdAt: true,
+      currency: true, totalBase: true, taxBase: true, invoicedAt: true, paidAt: true, createdAt: true,
       shipFromWarehouse: { select: { code: true } },
       payments: { where: { refundId: null }, select: { amount: true } },
-      refunds: { select: { totalBase: true } },
+      // o3d-iigc: the basis was not fetched before, so the report could not have respected it.
+      refunds: { select: { totalBase: true, totalsBasis: true } },
     },
     orderBy: { createdAt: 'desc' },
   })
@@ -417,7 +546,10 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
   return orders.map((o) => {
     const total = Number(o.totalBase)
     const paid = o.payments.reduce((s, p) => s + Number(p.amount), 0)
-    const refundsTotal = o.refunds.reduce((s, r) => s + Number(r.totalBase), 0)
+    // `balance` stays GROSS-on-GROSS and is untouched: Payment.amount is cash actually moved, which
+    // is the same unit as the VAT-inclusive invoice total. Only the net-of-credits figure below has
+    // a basis question, because a credit's stored total does not.
+    const credits = netOfRefunds(o, o.refunds)
     const balance = Math.max(0, total - paid)
     const ageDays = o.invoicedAt ? Math.round((now - o.invoicedAt.getTime()) / 86400000) : 0
     let o0 = 0, o31 = 0, o61 = 0, o91 = 0
@@ -433,8 +565,9 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
       salesRep: o.salesRep, warehouse: o.shipFromWarehouse?.code ?? null,
       createdAt: o.createdAt.toISOString(), currency: o.currency,
       salesTotal: Math.round(total * 100) / 100,
-      refundsTotal: Math.round(refundsTotal * 100) / 100,
-      netTotal: Math.round((total - refundsTotal) * 100) / 100,
+      refundsTotal: credits.refundsTotal,
+      netTotal: credits.netTotal,
+      netTotalBasis: credits.basis,
       dueAmount: Math.round(balance * 100) / 100, avgDso: ageDays,
       overdue0_30: Math.round(o0 * 100) / 100, overdue31_60: Math.round(o31 * 100) / 100,
       overdue61_90: Math.round(o61 * 100) / 100, overdue91plus: Math.round(o91 * 100) / 100,

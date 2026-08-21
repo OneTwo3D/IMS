@@ -3,6 +3,7 @@
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { COMMITTED_PURCHASE_ORDER_WHERE, INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
+import { headerDiscountedReturnCreditBase } from '@/lib/domain/purchasing/return-credit-basis'
 
 // ---------------------------------------------------------------------------
 // Product purchase stats (Products tab)
@@ -258,9 +259,15 @@ export async function getPurchaseBills(dateFrom?: string, dateTo?: string): Prom
 export type SupplierAgingRow = {
   supplierId: string
   supplierName: string
+  /** VAT-INCLUSIVE committed spend: PurchaseOrder.totalBase, which is net goods + VAT + freight. */
   grossAmount: number
   discounts: number
+  /** Returned value at the EX-VAT line cost — PurchaseOrderLine.unitCostBase is always net. */
   refunds: number
+  /**
+   * EX-VAT: `grossAmount` less its own stored VAT, less `refunds`. Both sides of that subtraction
+   * are therefore on the net basis. See getSupplierAging for why this convention and not the other.
+   */
   netAmount: number
   landedCosts: number
   tax: number
@@ -288,6 +295,10 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
         where: { type: 'GOODS', ...COMMITTED_PURCHASE_ORDER_WHERE },
         select: {
           totalBase: true, taxBase: true, directFreightBase: true, poSentAt: true, receivedAt: true,
+          // o3d-iigc round 4: subtotalBase and the line totals were not fetched before, so the header
+          // discount was not merely mishandled — it was NOT VISIBLE to this query at all.
+          subtotalBase: true,
+          lines: { select: { totalBase: true } },
           invoices: { select: { totalBase: true, invoiceDate: true } },
           returns: { select: { lines: { select: { qtyReturned: true, poLine: { select: { unitCostBase: true } } } } } },
         },
@@ -305,7 +316,7 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
       grossAmount += Number(po.totalBase)
       tax += Number(po.taxBase)
       landedCosts += Number(po.directFreightBase)
-      refunds += po.returns.reduce((sum, r) => sum + r.lines.reduce((s2, rl) => s2 + Number(rl.qtyReturned) * Number(rl.poLine.unitCostBase), 0), 0)
+      refunds += headerDiscountedReturnCreditBase(po)
       for (const inv of po.invoices) {
         const t = Number(inv.totalBase); billedAmount += t
         const d = Math.round((now - inv.invoiceDate.getTime()) / 86400000)
@@ -314,10 +325,42 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
       if (po.poSentAt && po.receivedAt) { const d = Math.round((po.receivedAt.getTime() - po.poSentAt.getTime()) / 86400000); if (d > 0 && d < 365) leadTimes.push(d) }
     }
 
+    // o3d-iigc round 2 (Codex finding 2): NET AMOUNT IS EX-VAT, AND THE COLUMN NOW SAYS SO.
+    //
+    // `po.totalBase` is VAT-INCLUSIVE — createPurchaseOrder stores subtotalBase + taxBase +
+    // directFreightBase — while a return is valued at `poLine.unitCostBase`, which is EX-VAT at
+    // every writer of that column (createPurchaseOrder and updatePurchaseOrder both extract the
+    // VAT into `netUnitForeign` before calcLineTotals; calcRequotedLineAmounts does the same for a
+    // supplier requote; the FX rebase only re-divides the stored foreign value). Verified in the
+    // tree rather than assumed, and PurchaseReturnLine stores no amount of its own, so this is the
+    // only place the credit's value is formed.
+    //
+    // The old figure subtracted that ex-VAT credit straight from the VAT-inclusive total, which is
+    // NEITHER convention: on a £1,000 net PO plus £200 VAT with a £100 net return it reported
+    // £1,100, where consistent-gross is £1,080 and consistent-net is £900. It matched neither, so
+    // it answered no question a reader could have asked.
+    //
+    // Unlike the sales side there is no basis ambiguity to refuse here — the credit is provably
+    // NET — so a figure IS computable, and withholding it would be the opposite error. WHICH
+    // convention follows this branch's existing rule for the customer-aging net total: put the
+    // ORDER total on THE CREDIT'S basis and then subtract (orderTotalOnBasis + netOfRefunds in
+    // lib/domain/sales/refund-basis-analytics). The credit is NET, so the PO total goes on the NET
+    // basis: gross less its own stored VAT. That also requires NO CONVERSION — `taxBase` is stored
+    // on the header and exact — whereas grossing the return up would mean re-deriving a rate per
+    // return line, and each line of a PO may carry its own.
+    //
+    // It still includes direct freight, because `grossAmount` does and `landedCosts` reports that
+    // same freight beside it; only the VAT basis was in question.
+    //
+    // o3d-iigc round 4 (Codex finding 4): AND THE HEADER-DISCOUNT LOOSENESS ROUND 3 FLAGGED IS NOW
+    // FIXED, in headerDiscountedReturnCreditBase below — it was the same class of defect as the one
+    // round 3 had just repaired (an order total on one basis, a credit on another), only the
+    // mismatched axis was the DISCOUNT rather than the VAT, so leaving it produced a `netAmount`
+    // that was again neither convention.
     return {
       supplierId: s.id, supplierName: s.name,
       grossAmount: Math.round(grossAmount * 100) / 100, discounts: 0,
-      refunds: Math.round(refunds * 100) / 100, netAmount: Math.round((grossAmount - refunds) * 100) / 100,
+      refunds: Math.round(refunds * 100) / 100, netAmount: Math.round((grossAmount - tax - refunds) * 100) / 100,
       landedCosts: Math.round(landedCosts * 100) / 100, tax: Math.round(tax * 100) / 100,
       totalAmount: Math.round(grossAmount * 100) / 100,
       billedAmount: Math.round(billedAmount * 100) / 100, paidAmount: 0,
