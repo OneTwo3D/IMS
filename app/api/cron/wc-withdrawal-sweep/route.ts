@@ -6,6 +6,7 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
 import { sweepDispatchEligibleWithdrawals, sweepWithdrawalSuppressions } from '@/lib/connectors/woocommerce/sync/withdrawal'
+import { drainWcOrderAdmissionRefusals } from '@/lib/connectors/woocommerce/sync/order-admission'
 
 // Called by cron with Authorization: Bearer $CRON_SECRET.
 export async function GET(request: Request) {
@@ -53,6 +54,18 @@ export async function GET(request: Request) {
         console.error('[wc-withdrawal-sweep] dispatch-eligible withdrawal screen failed:', error)
       }
 
+      // A THIRD by-id backstop rides this job, for the same reason the two above do, and it rides this job for the same reason the withdrawal sweep
+      // exists at all (o3d-tj6v r5): an order the "Import order statuses" boundary refused was
+      // ACKNOWLEDGED, so WooCommerce never pushes it again, and the pull cursors have moved past
+      // it. Nothing that depends on a `?modified_after=` sweep can reach it. This drain re-reads
+      // each refused order BY ID and puts it back through the ordinary gated importer.
+      //
+      // Run even when the withdrawal sweep found nothing, and its own unresolved count is reported
+      // rather than thrown: a WooCommerce outage already surfaces through the sweep above, and
+      // failing this job on an order that is simply still excluded would make a correct refusal
+      // look like a broken cron every fifteen minutes.
+      const admissionRefusals = await drainWcOrderAdmissionRefusals()
+
       // Unresolved rows are orders we could not prove are safe to import. A
       // silent 200 here is exactly how a credential outage hides.
       if (sweep.unresolved > 0) {
@@ -73,7 +86,7 @@ export async function GET(request: Request) {
               + '— the rotation cursor was held, so they are re-screened next run',
         )
       }
-      return { ...sweep, dispatchScreen: recon ?? undefined }
+      return { ...sweep, dispatchScreen: recon ?? undefined, admissionRefusals }
     },
   })
 

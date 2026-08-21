@@ -38,6 +38,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getSettingValues } from '@/lib/settings-store'
 import { INTERNAL_STATUS_TRANSITION_AUTH_ONLY } from '@/lib/sales/status-transition-bypass'
+import { normaliseWcOrderStatus } from '../order-status-filter'
 import type { WcFullOrder } from './types'
 
 /** Settings keys, so a store that renames the plugin's statuses can follow. */
@@ -74,13 +75,12 @@ export type TransitionResult = { success: boolean; error?: string; permanent?: b
  *  lifecycle against real dispatch evidence. */
 const POST_DISPATCH: ReadonlySet<string> = new Set(['SHIPPED', 'COMPLETED', 'DELIVERED'])
 
-export function normaliseStatus(status: unknown): string {
-  const s = String(status ?? '').trim().toLowerCase()
-  // WooCommerce reports `processing`, but a setting may be entered as
-  // `wc-processing`. NB startsWith + slice, never lstrip-style character
-  // stripping, which would turn "withdrawn" into "ithdrawn".
-  return s.startsWith('wc-') ? s.slice(3) : s
-}
+/**
+ * Re-exported from the shared filter module so the withdrawal statuses and the
+ * operator's `wc_sync_order_statuses` selection can never be normalised by two
+ * different rules and then compared to each other.
+ */
+export const normaliseStatus = normaliseWcOrderStatus
 
 export async function getWithdrawalStatuses(): Promise<{ submitted: string; approved: string }> {
   const map = await getSettingValues([WDRAW_SUBMITTED_STATUS_KEY, WDRAW_APPROVED_STATUS_KEY])
@@ -676,7 +676,7 @@ type SuppressionClaim = { token: string; wcStatus: string; revision: number }
  * can hide it. Unresolved reads stay put and are retried next run.
  */
 export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
-  scanned: number; imported: number; stillWithdrawn: number; unresolved: number
+  scanned: number; imported: number; stillWithdrawn: number; unresolved: number; notAdmitted: number
 }> {
   const staleBefore = new Date(Date.now() - SUPPRESSION_LEASE_MS)
   const rows = await db.wcWithdrawalSuppression.findMany({
@@ -694,7 +694,7 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
     select: { externalOrderId: true, retiredAt: true },
   })
 
-  const result = { scanned: rows.length, imported: 0, stillWithdrawn: 0, unresolved: 0 }
+  const result = { scanned: rows.length, imported: 0, stillWithdrawn: 0, unresolved: 0, notAdmitted: 0 }
   const { importWcOrder } = await import('./order-import')
   for (const row of rows) {
     // Fetch the FULL order by id — no status filter, no modified cursor — then
@@ -732,9 +732,24 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
     }
 
     try {
+      // o3d-tj6v r4: THIS PATH IS AN IMPORT TOO, and round 3 left it outside the boundary it had
+      // just built. The sweep reads the order by ID — no `?status=` query, no cursor — so nothing
+      // upstream has filtered it, and an order whose withdrawal was rejected back into a status the
+      // operator excluded was created here regardless of the selection.
+      //
+      // r5: it no longer resolves admission ITSELF and hands the answer down. Round 4 did, and the
+      // answer was read here, before a live status re-read inside `importWcOrderGuarded` and
+      // before the import that acts on it. `importWcOrder` is gated BY DEFAULT now and judges the
+      // payload it is actually importing, so this route cannot hold a different answer from the
+      // one being enforced — and a future recovery route that forgets to say anything is gated too.
+      //
+      // The tombstone is NOT resolved by a refusal: it stays as the durable retry signal (already
+      // rotated to the back of the queue by the lastCheckedAt stamp above), alongside the by-id
+      // admission-refusal row importWcOrder writes. Tick the status and the next sweep imports it.
       const guarded = await importWcOrderGuarded(live, () => importWcOrder(live))
       if (guarded.outcome === 'skipped-withdrawal') result.stillWithdrawn++
       else if (guarded.outcome === 'unresolved') result.unresolved++
+      else if (guarded.outcome === 'imported' && guarded.result.skipped) result.notAdmitted++
       else if (guarded.result.success && !guarded.compensationFailed) result.imported++
       else result.unresolved++
     } catch (e) {

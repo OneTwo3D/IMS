@@ -445,7 +445,7 @@ Xero integration is implemented as a modular connector in `lib/connectors/xero/`
 - **Payment polling** — 15-min cron detects paid invoices (manual orders) and paid bills (POs) via Xero API
 - **Invoice PDF** — downloaded from Xero, saved locally, emailed to customer, download link pushed to WC order
 - **Payment method mapping** — composite `{method}:{currency}` key maps to Xero bank account codes
-- **OAuth 2.0** — tokens stored at `XERO_TOKEN_PATH`, refreshed before each API call
+- **OAuth 2.0** — access/refresh tokens stored encrypted in Postgres (`AccountingToken`), refreshed before each API call. There is no token file and no `XERO_TOKEN_PATH`
 - **Deep links** — "View in Xero" links on sales order and PO detail pages
 
 ### WooCommerce

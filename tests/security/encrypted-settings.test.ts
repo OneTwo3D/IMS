@@ -204,7 +204,12 @@ test('settings-store env fallbacks take precedence and expose active overrides',
     process.env.WC_WEBHOOK_SECRET = 'env-secret'
 
     assert.equal(getEnvFallback('wc_webhook_secret'), 'env-secret')
-    assert.deepEqual(getActiveSettingEnvOverrides(['wc_webhook_secret', 'wc_url']), {
+    // wc_sync_order_statuses is the negative case on purpose: o3d-tj6v decided
+    // NOT to give it an env fallback, because install.sh wrote
+    // WC_SYNC_STATUSES=processing into every .env and an override would pin
+    // every install to it and make the Settings checkboxes inert.
+    assert.equal(getSettingEnvFallbackKey('wc_sync_order_statuses'), null)
+    assert.deepEqual(getActiveSettingEnvOverrides(['wc_webhook_secret', 'wc_url', 'wc_sync_order_statuses']), {
       wc_webhook_secret: 'WC_WEBHOOK_SECRET',
     })
   } finally {
@@ -244,5 +249,54 @@ test('the WooCommerce API credentials have no environment override, so both sync
     else process.env.WC_CONSUMER_KEY = previousKey
     if (previousSecret == null) delete process.env.WC_CONSUMER_SECRET
     else process.env.WC_CONSUMER_SECRET = previousSecret
+  }
+})
+
+// o3d-esha item 3, reconsidered. An earlier pass made WC_STORE_URL a runtime
+// override for wc_url, on the grounds that install.sh prompts for it alongside
+// the three WooCommerce secrets. That is the same argument this sweep REJECTED
+// for WC_SYNC_STATUSES — the installer writes the line into every .env, so
+// wiring it pins every existing installation — and it bites harder here:
+//
+//   - getSettingValue prefers the environment, so an install repointed at a new
+//     store in Settings would silently revert to the store it was first
+//     installed against the moment it upgraded;
+//   - the override would only be HALF applied. getWcCredentials (order import,
+//     FX push, partial shipment) resolves wc_url through getSettingValues and
+//     would follow the environment, while product-sync.ts / stock-sync.ts /
+//     lib/shopping.ts read the settings ROW directly inside their advisory-lock
+//     snapshots and would follow the database. One install, two stores.
+//
+// WC_STORE_URL now seeds the setting once at install time
+// (scripts/provision-instance.mjs, insert-only) and never overrides it.
+test('settings-store does NOT let WC_STORE_URL override the saved WooCommerce store URL', () => {
+  const previousUrl = process.env.WC_STORE_URL
+  const previousKey = process.env.WC_CONSUMER_KEY
+  const previousWebhook = process.env.WC_WEBHOOK_SECRET
+  try {
+    process.env.WC_STORE_URL = 'https://stale-store-from-an-old-install.example'
+    process.env.WC_CONSUMER_KEY = 'env-key'
+    process.env.WC_WEBHOOK_SECRET = 'env-webhook-secret'
+
+    assert.equal(getSettingEnvFallbackKey('wc_url'), null)
+    assert.equal(getEnvFallback('wc_url'), null)
+    // SUPERSEDED POSITIVE CONTROL, REWRITTEN WITH THE REASON. This used to prove the point against
+    // `wc_consumer_key`, "which IS an override and still reports itself as such". It is not any
+    // more: o3d-ecbj (merged) removed both WooCommerce credentials from SETTING_ENV_FALLBACKS for
+    // exactly the reason this test states about the store URL — the override was only half applied,
+    // so one installation imported orders under one credential and pushed stock under another.
+    // Asserting the empty object here would have made the whole test vacuous, so the control moved
+    // to a key that really is still an override.
+    assert.equal(getSettingEnvFallbackKey('wc_consumer_key'), null, 'the credentials are seeds too now')
+    assert.deepEqual(getActiveSettingEnvOverrides(['wc_url', 'wc_consumer_key', 'wc_webhook_secret']), {
+      wc_webhook_secret: 'WC_WEBHOOK_SECRET',
+    })
+  } finally {
+    if (previousUrl == null) delete process.env.WC_STORE_URL
+    else process.env.WC_STORE_URL = previousUrl
+    if (previousKey == null) delete process.env.WC_CONSUMER_KEY
+    else process.env.WC_CONSUMER_KEY = previousKey
+    if (previousWebhook == null) delete process.env.WC_WEBHOOK_SECRET
+    else process.env.WC_WEBHOOK_SECRET = previousWebhook
   }
 })

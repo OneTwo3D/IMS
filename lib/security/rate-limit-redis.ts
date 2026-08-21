@@ -73,10 +73,63 @@ function parseRedisValue(buffer: Buffer, offset = 0): ParsedRedisValue | null {
   throw new Error(`Unsupported Redis response type "${type}"`)
 }
 
-function redisConnectionOptions(redisUrl: string) {
+/**
+ * Both options below are wired from environment variables the installer already
+ * writes into every `.env`, which is the same shape as the WC_STORE_URL override
+ * that was rejected (see lib/settings-store.ts) — so it is worth saying why
+ * these two survive that argument and it did not.
+ *
+ * The rejected failure mode is an environment value silently OVERRIDING a
+ * setting an operator has since changed in the UI. That needs a stored setting
+ * to shadow and a UI that accepts the change and appears to work. Neither
+ * REDIS_PASSWORD nor REDIS_KEY_PREFIX has either: there is no setting, no form
+ * field, and no other way to configure them, so wiring them makes the only
+ * control that exists start working rather than overruling a competing one.
+ * Their failure mode is also loud, not silent — a wrong password fails AUTH and
+ * `checkRateLimit` records a `rate_limit_backend_error` WARNING, where a wrong
+ * store URL would quietly import orders from somebody else's shop.
+ */
+export type RedisRateLimitOptions = {
+  /**
+   * o3d-esha: scripts/install.sh:445 writes `requirepass` into redis.conf but
+   * builds REDIS_URL with no credentials, so the only password an operator can
+   * supply through the installer never reached AUTH. Used when the URL itself
+   * carries no password; REDIS_URL is canonical (o3d-tsc0), so an inline URL
+   * password wins — and two DIFFERENT passwords are refused outright rather
+   * than resolved by precedence (o3d-uqz0, see `redisConnectionOptions`).
+   */
+  password?: string
+  /**
+   * o3d-esha: keys were hardcoded to `rate-limit:`, so two tenants sharing one
+   * Redis shared rate-limit buckets while provision-ims-tenant.sh reported a
+   * per-tenant namespace that did not exist.
+   */
+  keyPrefix?: string
+}
+
+export function redisConnectionOptions(redisUrl: string, fallbackPassword = '') {
   const url = new URL(redisUrl)
   if (url.protocol !== 'redis:' && url.protocol !== 'rediss:') {
     throw new Error('REDIS_URL must use redis:// or rediss://')
+  }
+
+  const inlinePassword = decodeURIComponent(url.password)
+
+  // TWO CONFIGURED PASSWORDS THAT DISAGREE ARE A CONFIGURATION ERROR, NOT A PRECEDENCE QUESTION
+  // (o3d-uqz0). `REDIS_URL` is canonical and `REDIS_PASSWORD` is its fallback, and while only one
+  // of them is set that ordering is all this needs. When BOTH are set to DIFFERENT values, though,
+  // silently preferring one means the operator who rotated the password in the variable they
+  // happened to look at gets a connection that still uses the old one — and the symptom is not a
+  // Redis error. `checkRateLimit` fails OPEN on ordinary buckets, so the login rate limiter is the
+  // thing that quietly stops working, which is the exact class of "advertised control that does
+  // nothing" this branch exists to remove. Refuse instead, and say which two values disagree
+  // WITHOUT printing either of them.
+  if (inlinePassword && fallbackPassword && inlinePassword !== fallbackPassword) {
+    throw new Error(
+      'REDIS_URL carries an inline password and REDIS_PASSWORD is set to a DIFFERENT value. '
+      + 'Refusing to guess which one you meant: make them identical, or clear REDIS_PASSWORD and '
+      + 'keep the password in REDIS_URL, which is canonical.',
+    )
   }
 
   return {
@@ -85,9 +138,14 @@ function redisConnectionOptions(redisUrl: string) {
     host: url.hostname,
     port: url.port ? Number(url.port) : (url.protocol === 'rediss:' ? 6380 : 6379),
     username: decodeURIComponent(url.username),
-    password: decodeURIComponent(url.password),
+    password: inlinePassword || fallbackPassword,
     db: url.pathname.length > 1 ? url.pathname.slice(1) : '',
   }
+}
+
+export function redisRateLimitKey(key: string, keyPrefix = ''): string {
+  const prefix = keyPrefix.trim()
+  return prefix ? `${prefix}:rate-limit:${key}` : `rate-limit:${key}`
 }
 
 type PendingRedisBatch = {
@@ -110,6 +168,7 @@ class RedisCommandClient {
   constructor(
     private readonly redisUrl: string,
     private readonly idleTimeoutMs = 30_000,
+    private readonly password = '',
   ) {}
 
   run(commands: string[][]): Promise<RedisValue[]> {
@@ -129,7 +188,7 @@ class RedisCommandClient {
   }
 
   private setupCommands(): string[][] {
-    const options = redisConnectionOptions(this.redisUrl)
+    const options = redisConnectionOptions(this.redisUrl, this.password)
     const commands: string[][] = []
     if (options.password) {
       commands.push(options.username
@@ -262,31 +321,29 @@ class RedisCommandClient {
   }
 }
 
-function redisKey(key: string): string {
-  return `rate-limit:${key}`
-}
-
 function numberValue(value: RedisValue): number {
   return typeof value === 'number' ? value : Number(value ?? 0)
 }
 
 export class RedisRateLimitBackend implements RateLimitBackend {
   private readonly runCommands: RedisCommandRunner
+  private readonly keyPrefix: string
 
-  constructor(redisUrl: string, runner?: RedisCommandRunner) {
+  constructor(redisUrl: string, runner?: RedisCommandRunner, options: RedisRateLimitOptions = {}) {
+    this.keyPrefix = options.keyPrefix ?? ''
     if (runner) {
       this.runCommands = runner
       return
     }
 
-    const client = new RedisCommandClient(redisUrl)
+    const client = new RedisCommandClient(redisUrl, 30_000, options.password ?? '')
     this.runCommands = (commands) => client.run(commands)
   }
 
   async check(key: string, max = 5, windowMs = 5 * 60_000): Promise<RateLimitResult> {
     const now = Date.now()
     const cutoff = now - windowMs
-    const bucketKey = redisKey(key)
+    const bucketKey = redisRateLimitKey(key, this.keyPrefix)
     const member = `${now}:${randomUUID()}`
 
     const [resultRaw] = await this.runCommands([
@@ -305,6 +362,6 @@ export class RedisRateLimitBackend implements RateLimitBackend {
   }
 
   async clear(key: string): Promise<void> {
-    await this.runCommands([['DEL', redisKey(key)]])
+    await this.runCommands([['DEL', redisRateLimitKey(key, this.keyPrefix)]])
   }
 }

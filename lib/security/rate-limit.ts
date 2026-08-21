@@ -32,9 +32,17 @@ function getBackendSignature(): string {
   const redisUrlHash = redisUrl
     ? createHash('sha256').update(redisUrl).digest('hex').slice(0, 16)
     : ''
+  // REDIS_PASSWORD and REDIS_KEY_PREFIX change the connection and the keyspace,
+  // so they must be part of the signature or the memoised backend outlives them.
+  const redisPassword = process.env.REDIS_PASSWORD ?? ''
+  const redisPasswordHash = redisPassword
+    ? createHash('sha256').update(redisPassword).digest('hex').slice(0, 16)
+    : ''
   return [
     backendName,
     redisUrlHash,
+    redisPasswordHash,
+    process.env.REDIS_KEY_PREFIX ?? '',
   ].join(':')
 }
 
@@ -49,7 +57,10 @@ async function createRateLimitBackend(): Promise<RateLimitBackend> {
   if (!redisUrl) throw new Error('RATE_LIMIT_BACKEND=redis requires REDIS_URL')
 
   const { RedisRateLimitBackend } = await import('./rate-limit-redis')
-  return new RedisRateLimitBackend(redisUrl)
+  return new RedisRateLimitBackend(redisUrl, undefined, {
+    password: process.env.REDIS_PASSWORD ?? '',
+    keyPrefix: process.env.REDIS_KEY_PREFIX ?? '',
+  })
 }
 
 export async function getRateLimitBackend(): Promise<RateLimitBackend> {
