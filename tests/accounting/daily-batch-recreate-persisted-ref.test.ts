@@ -81,8 +81,15 @@ mock.module('@/lib/db', {
       // different scenario from the one these tests are about.
       accountingToken: { findUnique: async () => ({ tenantId: 'tenant-A' }) },
       salesOrder: {
-        findMany: async ({ where }: { where: Record<string, unknown> }) =>
-          ('revenueDeferredDate' in where ? salesOrderRows.a1 : salesOrderRows.a2),
+        findMany: async ({ where }: { where: Record<string, unknown> }) => {
+          const rows = 'revenueDeferredDate' in where ? salesOrderRows.a1 : salesOrderRows.a2
+          // o3d-o97 r3: the A2 sweep now excludes fully-refunded orders, so the mock has to honour
+          // that predicate — modelling it as "no filter" would make the exclusion untestable and
+          // read as if every row were still a candidate.
+          const refundStatus = where.refundStatus as { not?: string } | undefined
+          if (!refundStatus?.not) return rows
+          return rows.filter((row) => (row as { refundStatus?: string }).refundStatus !== refundStatus.not)
+        },
       },
       shipment: { findMany: async () => shipmentRows },
       accountingSyncLog: {
@@ -579,4 +586,57 @@ test('QuickBooks: a live log for ANOTHER connector never counts as this one (o3d
 
   assert.equal(created.length, 1, 'the QuickBooks ledger is still missing this journal')
   assert.equal(created[0].referenceId, QBO_A1_REF)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-o97 r3 — a debit nothing will ever relieve must not be rebuilt.
+// ---------------------------------------------------------------------------
+
+test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated, on either connector', async () => {
+  // Group A2 and Group B both exclude `refundStatus: FULL` for ever, so an A2 debit posted under
+  // a fully-refunded order has nothing left in IMS that can relieve it. That used to be
+  // unreachable here because the refund path always cleared the A2 stamp; it is reachable now,
+  // because a refund that CANNOT account for the debit deliberately KEEPS the stamp so the
+  // standing invariants can still report the order to a human.
+  //
+  // The A2 log below is CANCELLED, which `hasLiveDailyBatchLog` does not count as live — exactly
+  // the shape that makes the refund refuse. Without the exclusion the sweep would answer that
+  // refusal by posting a brand-new, permanently unrelievable debit under the very order being
+  // held open for someone to resolve.
+  for (const [label, ref, run] of [
+    ['xero', XERO_A2_REF, runXeroSweep],
+    ['quickbooks', QBO_A2_REF, runQboSweep],
+  ] as const) {
+    reset()
+    salesOrderRows.a2 = [{
+      inventoryAllocatedDate: STAMP_NEXT_DAY,
+      inventoryAllocatedBatchRef: ref,
+      allocationBatchAmount: 80,
+      refundStatus: 'FULL',
+    }]
+    syncLogs = [{ connector: label, type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: ref, status: 'CANCELLED' }]
+
+    await run()
+
+    assert.deepEqual(created, [], `${label}: no A2 journal may be rebuilt for a fully-refunded order`)
+  }
+
+  // The mirror, so the exclusion is a filter rather than a blanket refusal: the SAME row on a
+  // partially-refunded order still gets its missing journal rebuilt, for the full £80.
+  reset()
+  salesOrderRows.a2 = [{
+    inventoryAllocatedDate: STAMP_NEXT_DAY,
+    inventoryAllocatedBatchRef: XERO_A2_REF,
+    allocationBatchAmount: 80,
+    refundStatus: 'PARTIAL',
+  }]
+  syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: XERO_A2_REF, status: 'CANCELLED' }]
+
+  await runXeroSweep()
+
+  assert.equal(created.length, 1, 'a partially-refunded order is still inside both windows')
+  assert.equal(created[0].type, 'DAILY_BATCH_INVENTORY_ALLOC')
+  const debit = (created[0].payload.lines as Array<{ accountCode?: string; debit?: number }>)
+    .find((line) => line.accountCode === '631' && line.debit != null)
+  assert.equal(debit?.debit, 80)
 })

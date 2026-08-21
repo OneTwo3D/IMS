@@ -74,6 +74,11 @@ type SalesOrderAccountingRow = {
     chargeback?: boolean
     // scjz.71: durable — whether a COGS/unearned reversal was staged for this refund.
     reversalStaged?: boolean
+    // o3d-o97 r3: set when the refund could NOT account for the order's A2 Allocated Inventory
+    // debit, so it deliberately reversed less than the account holds (or nothing). The refund row
+    // outlives every stamp on the order, which is the point — the refusal used to be reported by
+    // an A2 invariant keyed on `inventoryAllocatedDate`, and the same refund path nulled it.
+    allocationBasisUnresolved?: string | null
   }>
 }
 
@@ -666,6 +671,27 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     }
 
     for (const refund of order.refunds) {
+      // o3d-o97 r3 — THE REFUSAL AN OPERATOR HAS TO BE ABLE TO ACT ON. Raised BEFORE the
+      // posted-shipment guard below, deliberately: the commonest shape here is an ALLOCATED,
+      // never-shipped order, which has no posted shipment at all and would otherwise be skipped.
+      // Pounds are sitting in Allocated Inventory that no automatic path will ever take out —
+      // both daily-batch windows exclude a fully-refunded order — so this has to be a standing,
+      // human-visible finding rather than a comment in the code that wrote the refusal.
+      if (refund.allocationBasisUnresolved?.trim()) {
+        findings.push({
+          severity: 'critical',
+          code: 'sales_order_refund_allocation_basis_unresolved',
+          orderId: order.id,
+          refundId: refund.id,
+          message: `Refund ${refund.creditNoteNumber ?? refund.id} could not account for the order's allocated-inventory debit: ${refund.allocationBasisUnresolved.trim()}`,
+          details: {
+            allocationBasisUnresolved: refund.allocationBasisUnresolved,
+            inventoryAllocatedDate: order.inventoryAllocatedDate,
+            allocationBatchAmount: decimalToNumber(order.allocationBatchAmount),
+          },
+        })
+      }
+
       const refundRetryTypes = retrySyncTypes(refund.accountingRetrySyncs)
       // scjz.70/.71: a chargeback is exempt from the reversal-evidence requirement
       // ONLY when it staged no COGS/unearned reversal (fully-shipped, credit-note-only).
@@ -863,6 +889,7 @@ export async function collectAccountingInvariantRows(
             accountingRetrySyncs: true,
             chargeback: true,
             reversalStaged: true,
+            allocationBasisUnresolved: true,
           },
         },
       },

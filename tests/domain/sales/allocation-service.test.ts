@@ -2045,6 +2045,11 @@ test('resetAllocationAccountingIfStaged clears inventoryAllocatedBatchRef in the
     inventoryAllocatedDate: null,
     inventoryAllocatedBatchRef: null,
     allocationBatchAmount: null,
+    // o3d-o97 r3: the journal ATTRIBUTION goes in the same update as the amount it describes —
+    // which journal row carried the debit, on which ledger, to which account.
+    allocationBatchSyncLogId: null,
+    allocationBatchConnector: null,
+    allocationBatchAccountCode: null,
   })
   assert.equal(allocationUpdates.length, 1, 'and the cost snapshots are still nulled alongside it')
 })

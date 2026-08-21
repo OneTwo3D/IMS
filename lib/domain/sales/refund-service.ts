@@ -999,7 +999,11 @@ async function stageRefundAccountingReversals(
             lineId: true,
             productId: true,
             warehouseId: true,
+            qty: true,
             costLayerSnapshot: true,
+            // o3d-o97 r3: the pounds A2 DEBITED for this row. `costLayerSnapshot` beside it is
+            // re-priced in place by landed-cost revaluation; this is not.
+            allocationBatchAmount: true,
           },
         },
         lines: {
@@ -1019,8 +1023,13 @@ async function stageRefundAccountingReversals(
         shipments: {
           where: { shipmentJournalDate: { not: null } },
           select: {
+            id: true,
             revenueRecognizedAmount: true,
             cogsBatchAmount: true,
+            // o3d-o97 r3: the CR Allocated Inventory Group B raised for this shipment, recorded by
+            // Group B itself. The CogsEntry-derived fallback below it is HARD-DELETED by
+            // `retention_stock_movements_months`.
+            allocatedReliefAmount: true,
             lines: {
               select: {
                 id: true,
@@ -1036,6 +1045,10 @@ async function stageRefundAccountingReversals(
           where: { id: { not: params.refundId } },
           select: {
             id: true,
+            // o3d-o97 r3: the CR Allocated Inventory this earlier refund's own reversal raised,
+            // recorded on the refund row. Its sync log — the only previous source — is deleted by
+            // `retention_sync_logs_months` once it terminalises.
+            allocatedReliefAmount: true,
             lines: {
               select: {
                 id: true,
@@ -1057,6 +1070,12 @@ async function stageRefundAccountingReversals(
     // syncs (resolved by the caller), not a hardcoded 'xero'. This keeps the double-
     // reversal guard correct after a connector switch, where accountingSyncLog still
     // holds the old connector's reversal rows. Undefined (unit-test path) → no filter.
+    // o3d-o97 r3: NO STATUS FILTER, and the reference columns are selected. The status IN-list
+    // used to be part of the query, which made a CANCELLED reversal indistinguishable from a row
+    // that was never written at all — and those are opposite facts. A terminal row is positive
+    // evidence that the reversal DID NOT post; an ABSENT row is evidence of nothing, because
+    // `retention_sync_logs_months` hard-deletes these rows once they terminalise. The status is
+    // applied per consumer below instead.
     const priorReversals = await tx.accountingSyncLog.findMany({
       where: {
         ...(params.activeConnector ? { connector: params.activeConnector } : {}),
@@ -1068,10 +1087,13 @@ async function stageRefundAccountingReversals(
           },
         ],
         type: { in: ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL'] },
-        status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
       },
-      select: { type: true, payload: true },
+      select: { type: true, status: true, referenceType: true, referenceId: true, payload: true },
     })
+    /** Rows whose journal is queued, in flight or in the ledger — i.e. pounds that will move. */
+    const livePriorReversals = priorReversals.filter((row) => (
+      row.status === 'PENDING' || row.status === 'PROCESSING' || row.status === 'SYNCED'
+    ))
 
     const shipmentLineSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
     for (const shipment of orderAccounting?.shipments ?? []) {
@@ -1116,17 +1138,42 @@ async function stageRefundAccountingReversals(
     const productIdByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, layer.productId]))
     const poLineIdByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, layer.poLineId]))
     const currentUnitCostByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, refundBoundaryNumber(layer.unitCostBase)]))
-    // 6oyu.5: ALLOCATION-only valuation. Unshipped/allocated units never posted
-    // dispatch COGS, so their allocated-inventory contra reversal is valued at the
-    // current carrying cost (matching the allocation's live layer). The SHIPMENT
-    // path no longer uses this — it reverses at the originally-posted COGS
-    // (applyPostedShipmentUnitCosts) so a post-dispatch landed-cost revaluation
-    // delta stays in COGS for the refunded units.
-    const refreshAllocationSnapshotCosts = (entries: CostLayerSnapshotEntry[]): CostLayerSnapshotEntry[] => (
-      entries.map((entry) => ({
-        ...entry,
-        unitCostBase: currentUnitCostByCostLayerId.get(entry.costLayerId) ?? entry.unitCostBase,
-      }))
+    // o3d-o97 r3 — THE POSTED UNIT BASIS OF AN ALLOCATION ROW: the pounds A2 debited for the row,
+    // divided by the units it debited them for. `OrderAllocation.allocationBatchAmount` is written
+    // by A2 in the same transaction as the order's stamp, and nothing revalues it.
+    const postedAllocationUnitCostByAllocationId = new Map<string, number>()
+    for (const allocation of orderAccounting?.allocations ?? []) {
+      if (allocation.allocationBatchAmount == null) continue
+      const postedAmount = refundBoundaryNumber(allocation.allocationBatchAmount)
+      const allocatedQty = refundBoundaryNumber(allocation.qty)
+      if (postedAmount <= 0 || allocatedQty <= 0) continue
+      postedAllocationUnitCostByAllocationId.set(allocation.id, postedAmount / allocatedQty)
+    }
+
+    // o3d-o97 r3: value an allocation-source reversal at the basis A2 POSTED for its row.
+    //
+    // r2 valued it at the CURRENT layer cost (`currentUnitCostByCostLayerId`), which is what
+    // landed-cost revaluation rewrites — so a partial refund of units A2 debited at £10 reversed
+    // them at whatever they are worth today. r2 flagged this itself and argued a full refund
+    // self-corrects, because the residue below is the recorded debit less what the lines took. It
+    // does not: the residue is floored at zero, so an over-valued line reversal is not clawed back
+    // by a negative residue, and a PARTIAL refund never reaches the residue at all. Both are
+    // handled — this values at the posted basis, and the cap further down bounds the total by the
+    // debit that is actually still open.
+    //
+    // The fallback is the old current-cost refresh, for rows the rebalancer re-pinned after A2
+    // stamped the order (no posting was raised for them) and for pre-column rows.
+    const applyPostedAllocationUnitCosts = (entries: CostLayerSnapshotEntry[]): CostLayerSnapshotEntry[] => (
+      entries.map((entry) => {
+        const posted = entry.orderAllocationId
+          ? postedAllocationUnitCostByAllocationId.get(entry.orderAllocationId)
+          : undefined
+        if (posted != null) return { ...entry, unitCostBase: posted }
+        return {
+          ...entry,
+          unitCostBase: currentUnitCostByCostLayerId.get(entry.costLayerId) ?? entry.unitCostBase,
+        }
+      })
     )
 
     const extractPayloadAmount = (
@@ -1140,7 +1187,7 @@ async function stageRefundAccountingReversals(
       ), 0)
     }
 
-    const priorUnearnedReversed = priorReversals
+    const priorUnearnedReversed = livePriorReversals
       .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
       .reduce((sum, row) => sum + extractPayloadAmount(row.payload, settings.unearnedRevenueAccount), 0)
 
@@ -1156,13 +1203,64 @@ async function stageRefundAccountingReversals(
       ), 0)
     }
 
-    // o3d-o97 r2: THE RECORD of the Allocated Inventory contra this order's PRIOR refunds actually
-    // relieved — the CR they posted, read off their live reversal journals. Not their refund lines'
-    // costLayerSnapshot, which records which units a refund claimed and is written whether or not
-    // the journal behind it was ever raised.
-    const priorRefundAllocationRelief = priorReversals
-      .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
-      .reduce((sum, row) => sum + extractPayloadCredit(row.payload, settings.allocatedInventoryAccount), 0)
+    // o3d-o97 r3 — THE ALLOCATED CONTRA THIS ORDER'S PRIOR REFUNDS RELIEVED, and — separately —
+    // whether that is KNOWN at all.
+    //
+    // r2 read it off the live reversal journals alone. That is neither FINAL nor DURABLE:
+    //
+    //   not final    the query counted PENDING and PROCESSING rows as relief. Those are pounds
+    //                that have not moved yet. Kept, deliberately — the refund is blocked while an
+    //                earlier one still owes a retry (scjz.22), so a queued reversal is work that
+    //                completes, and counting it errs towards UNDER-reversing (a debit left
+    //                standing) rather than crediting an account twice.
+    //   not durable  the row is HARD-DELETED by `retention_sync_logs_months` the moment it is
+    //                terminal and past the cutoff. With the row gone the relief read ZERO and the
+    //                residue below reversed the WHOLE A2 debit a second time. A record that
+    //                survives the crash and then expires is not evidence.
+    //
+    // So the relief now comes from a record on the REFUND ROW, which retention never deletes, and
+    // the sync log is only the fallback for refunds written before that column existed. Four
+    // outcomes per prior refund, and the fourth REFUSES rather than assuming zero:
+    let priorRefundAllocationRelief = 0
+    let priorRefundReliefUnresolved: string | null = null
+    // Order-scoped reversal rows (referenceType 'SalesOrder') belong to no refund in particular,
+    // so they are counted whole. There is no per-order row to record them on.
+    for (const row of livePriorReversals) {
+      if (row.type !== 'UNEARNED_REV_REVERSAL' || row.referenceType !== 'SalesOrder') continue
+      priorRefundAllocationRelief += extractPayloadCredit(row.payload, settings.allocatedInventoryAccount)
+    }
+    for (const priorRefund of orderAccounting?.refunds ?? []) {
+      // (1) THE RECORD the refund wrote when it decided its own reversal.
+      if (priorRefund.allocatedReliefAmount != null) {
+        priorRefundAllocationRelief += refundBoundaryNumber(priorRefund.allocatedReliefAmount)
+        continue
+      }
+      // (2) It claimed no ALLOCATION-source units, so it cannot have relieved the allocated
+      // contra at all — whatever became of its journal. A monetary-only or shipped-only refund
+      // is the common case, and this is durable: the snapshot is written for every line.
+      const claimedAllocationUnits = priorRefund.lines.some((line) => (
+        parseCostLayerSnapshot(line.costLayerSnapshot).some((entry) => entry.source === 'allocation')
+      ))
+      if (!claimedAllocationUnits) continue
+      // (3) Its reversal sync still exists, so its fate is known either way: a live row's payload
+      // credit is the relief, and a CANCELLED/FAILED row is positive evidence of NO relief.
+      const ownRows = priorReversals.filter((row) => (
+        row.type === 'UNEARNED_REV_REVERSAL' &&
+        row.referenceType === 'SalesOrderRefund' &&
+        row.referenceId === priorRefund.id
+      ))
+      if (ownRows.length > 0) {
+        priorRefundAllocationRelief += ownRows.reduce((sum, row) => (
+          row.status === 'PENDING' || row.status === 'PROCESSING' || row.status === 'SYNCED'
+            ? sum + extractPayloadCredit(row.payload, settings.allocatedInventoryAccount)
+            : sum
+        ), 0)
+        continue
+      }
+      // (4) It claimed allocated units and NOTHING says what it did with them. Reading that as
+      // zero relief is what double-credits the account.
+      priorRefundReliefUnresolved = `prior refund ${priorRefund.id} claimed allocated units but its reversal journal is no longer on record (retention), so how much it already credited Allocated Inventory cannot be established`
+    }
 
     // o3d-o97 r2: THE RECORD of the Allocated Inventory contra Group B relieved — its CR Allocated
     // equals the dispatch COGS it debited, per journaled shipment. Valued at the ORIGINALLY-POSTED
@@ -1172,25 +1270,60 @@ async function stageRefundAccountingReversals(
     // `orderAccounting.shipments` is already filtered to journaled shipments, so an un-journaled
     // dispatch contributes nothing here — its allocated contra is still open, which is what lets
     // consumeAllocationCostForLine reverse it.
-    const postedGroupBAllocationRelief = (orderAccounting?.shipments ?? []).reduce(
-      (shipmentSum, shipment) => shipment.lines.reduce(
-        (lineSum, shipmentLine) => addMoney(
-          lineSum,
-          sumCostLayerSnapshot(applyPostedShipmentUnitCosts(
-            // The stored snapshot does not name its own shipment line — the consume path stamps
-            // that on at take time (takeFromSnapshotEntries), and the posted-cost lookup is keyed
-            // by it — so stamp it here the same way before valuing.
-            (shipmentLineSnapshots.get(shipmentLine.id) ?? []).map((entry) => ({
-              ...entry,
-              shipmentLineId: shipmentLine.id,
-            })),
-            postedShipmentUnitCostByKey,
-          )),
-        ),
-        shipmentSum,
-      ),
-      toDecimal(0),
-    )
+    //
+    // o3d-o97 r3: FROM THE RECORD GROUP B WROTE, not from the CogsEntry rows. r2 valued this at the
+    // "immutable posted basis" — but `retention_stock_movements_months` HARD-DELETES the
+    // StockMovement rows and their CogsEntry children outright (data-retention.ts), and once they
+    // are gone the derivation below silently degrades: it re-values the stored line snapshot at the
+    // CURRENT (revalued) layer cost, or — for a shipment whose lines carry no stored snapshot at
+    // all — returns ZERO, which reads as "Group B relieved nothing" and reverses its relief a
+    // second time. So `Shipment.allocatedReliefAmount`, written in the same UPDATE as
+    // `shipmentJournalDate`, is the source; the derivation is only for shipments journaled before
+    // that column existed, and it REFUSES when its own basis has expired.
+    let postedGroupBAllocationRelief = toDecimal(0)
+    let groupBReliefUnresolved: string | null = null
+    for (const shipment of orderAccounting?.shipments ?? []) {
+      if (shipment.allocatedReliefAmount != null) {
+        postedGroupBAllocationRelief = addMoney(
+          postedGroupBAllocationRelief,
+          toDecimal(refundBoundaryNumber(shipment.allocatedReliefAmount)),
+        )
+        continue
+      }
+      let derived = toDecimal(0)
+      let basisIntact = true
+      for (const shipmentLine of shipment.lines) {
+        // The stored snapshot does not name its own shipment line — the consume path stamps that
+        // on at take time (takeFromSnapshotEntries), and the posted-cost lookup is keyed by it —
+        // so stamp it here the same way before valuing.
+        const entries = (shipmentLineSnapshots.get(shipmentLine.id) ?? []).map((entry) => ({
+          ...entry,
+          shipmentLineId: shipmentLine.id,
+        }))
+        if (entries.length === 0) {
+          // A journaled line that dispatched units and can show no basis for them: its movement
+          // and CogsEntry rows have been swept. Zero here is a wrong answer, not a small one.
+          if (refundBoundaryNumber(shipmentLine.qty) > 0) basisIntact = false
+          continue
+        }
+        for (const entry of entries) {
+          if (!postedShipmentUnitCostByKey.has(postedShipmentUnitCostKey(shipmentLine.id, entry.costLayerId))) {
+            // The snapshot survived but the posted unit cost behind it did not, so the only
+            // valuation left is the CURRENT layer cost — the exact revaluation 6oyu.5 forbids.
+            basisIntact = false
+          }
+        }
+        derived = addMoney(
+          derived,
+          sumCostLayerSnapshot(applyPostedShipmentUnitCosts(entries, postedShipmentUnitCostByKey)),
+        )
+      }
+      if (!basisIntact) {
+        groupBReliefUnresolved = `shipment ${shipment.id} was journaled but the dispatch cost rows behind its Allocated Inventory relief have been swept by stock-movement retention, so how much Group B already credited cannot be established`
+        continue
+      }
+      postedGroupBAllocationRelief = addMoney(postedGroupBAllocationRelief, derived)
+    }
 
     const lineContexts = (orderAccounting?.lines ?? []).map((line) => ({
       id: line.id,
@@ -1414,7 +1547,7 @@ async function stageRefundAccountingReversals(
             orderAllocationId: allocation.id,
             source: 'allocation',
           })
-          consumed.push(...refreshAllocationSnapshotCosts(taken.taken))
+          consumed.push(...applyPostedAllocationUnitCosts(taken.taken))
           remainingQty = taken.remainingQty
           allocationAvailability.set(
             allocation.id,
@@ -1570,29 +1703,32 @@ async function stageRefundAccountingReversals(
     //     so this path needs POSITIVE evidence of the original, not the absence of evidence
     //     against it.
     //
-    // So all three inputs are now RECORDS written BY the postings they stand for:
+    // So all three inputs are RECORDS written BY the postings they stand for — and r3 makes each of
+    // them survive the sweep whose entire job is deleting old rows:
     //
-    //   posted    `SalesOrder.allocationBatchAmount` — the DR Allocated Inventory that A2 wrote for
-    //             THIS order, in the same UPDATE as the stamp, and nulled together with the stamp by
-    //             every un-stage site. It is the same record `recreateMissingDailyBatchLogs` rebuilds
-    //             the A2 journal from, so the two paths can never disagree about what A2 posted.
-    //             It is per-ORDER, so it survives allocation rows being deleted, re-created or
-    //             re-pinned entirely — the record follows the order's posting, never a row.
-    //   relieved  every JOURNALED shipment, valued at the ORIGINALLY-POSTED dispatch COGS
-    //             (`postedShipmentUnitCostByKey`, sourced from the immutable CogsEntry rows) — which
-    //             is exactly the CR Allocated Inventory Group B raised. Deliberately NOT
-    //             Shipment.cogsBatchAmount nor the live snapshot cost: revaluation mutates both in
-    //             place, and a revaluation posts to COGS/Inventory, never to Allocated Inventory, so
-    //             the relief stays at the posted basis for ever (the same 6oyu.5 rule the COGS
-    //             reversal above already follows).
-    //   relieved  every PRIOR refund's own CR Allocated Inventory, read off its live
-    //             UNEARNED_REV_REVERSAL sync (`priorReversals`, already loaded above for the
-    //             equivalent unearned guard and already scoped to the active connector and to
-    //             PENDING/PROCESSING/SYNCED).
+    //   posted    `SalesOrder.allocationBatchAmount` — the DR Allocated Inventory A2 wrote for THIS
+    //             order, in the same UPDATE as the stamp. It is the same record
+    //             `recreateMissingDailyBatchLogs` rebuilds the A2 journal from, so the two paths can
+    //             never disagree about what A2 posted, and it is per-ORDER, so it survives
+    //             allocation rows being deleted, re-created or re-pinned. r3 adds what the amount
+    //             alone never said: WHICH JOURNAL carried it, whether that journal POSTED, and to
+    //             WHICH LEDGER AND ACCOUNT (see the block below the narrative).
+    //   relieved  every JOURNALED shipment's own `Shipment.allocatedReliefAmount`, written by Group
+    //             B in the same UPDATE as `shipmentJournalDate`. r2 derived this from the CogsEntry
+    //             dispatch rows instead, calling them immutable — they are, right up until
+    //             `retention_stock_movements_months` HARD-DELETES them, after which the derivation
+    //             re-values at the CURRENT layer cost or returns zero. It is still the fallback for
+    //             shipments journaled before the column existed, and it now REFUSES rather than
+    //             returning a number it cannot stand behind.
+    //   relieved  every PRIOR refund's own `SalesOrderRefund.allocatedReliefAmount`, written by that
+    //             refund when it decided its reversal. Its UNEARNED_REV_REVERSAL sync — r2's only
+    //             source — is deleted by `retention_sync_logs_months` once terminal, and a missing
+    //             row read as zero relief credits the same pounds twice. The sync is still consulted
+    //             for pre-column refunds, and where it says nothing at all this refuses too.
     //
-    // The residue is the arithmetic on those records — posted, less relieved, less what this
-    // refund's own lines are reversing immediately below — floored at zero. No layer cost is
-    // consulted, so nothing downstream of A2 can revalue it.
+    // The open balance is the arithmetic on those records — posted, less relieved — and it both
+    // CAPS what this refund's lines may reverse and, on a full refund, supplies the residue no line
+    // reached. No layer cost is consulted, so nothing downstream of A2 can revalue it.
     //
     // NOT a fix for the other un-stage sites. `resetAllocationAccountingIfStaged` and
     // `releaseOverallocations` un-stage an order that is NOT refunded, so A2 re-runs and posts a
@@ -1600,44 +1736,176 @@ async function stageRefundAccountingReversals(
     // record goes with it and the residue here can only ever cover the latest posting. There is no
     // refund credit note to carry a reversal for the orphaned one, and reversing from there needs
     // its own sync type. That half of o3d-o97 is untouched here.
-    let residualAllocationReversal = 0
-    if (params.newStatus === 'REFUNDED') {
-      // Read before the update below clears it. The AMOUNT is the positive evidence, not the stamp:
-      // a stamp with no recorded amount (a row A2 valued at zero, or one staged before the column
-      // existed) is a claim that something was posted with no statement of what, and this path
-      // fails closed on it rather than guessing from the pins. Those rows are not silently dropped
-      // — `sales_order_inventory_allocation_missing_amount` in the accounting invariants already
-      // reports every stamped order with no allocation amount, which is where a human picks up a
-      // legacy debit that has to be reversed by hand.
-      //
-      // A live A2 sync log is deliberately NOT probed as well: SYNCED daily-batch logs are pruned by
-      // data retention (scjz.36), so beyond the retention window a missing log cannot be told from
-      // one that posted, and its absence would be evidence of nothing.
-      const stagedA2 = await tx.salesOrder.findUnique({
-        where: { id: params.orderId },
-        select: { inventoryAllocatedDate: true, allocationBatchAmount: true },
+
+    // Read BEFORE the update at the bottom of this block clears the stamp. Read on EVERY refund,
+    // not only a full one: the open balance it yields is what caps a PARTIAL line-driven reversal.
+    const stagedA2 = await tx.salesOrder.findUnique({
+      where: { id: params.orderId },
+      select: {
+        inventoryAllocatedDate: true,
+        allocationBatchAmount: true,
+        allocationBatchSyncLogId: true,
+        allocationBatchConnector: true,
+        allocationBatchAccountCode: true,
+      },
+    })
+    // NULL and ZERO are different facts and must not collapse into one. A recorded £0 is A2
+    // saying it valued this order at nothing — a KNOWN debit of zero, nothing to reverse and
+    // nothing to refuse over. A NULL is A2 having recorded no figure at all.
+    const hasRecordedAllocationAmount = stagedA2?.allocationBatchAmount != null
+    const postedAllocationDebit = refundBoundaryNumber(stagedA2?.allocationBatchAmount ?? 0)
+
+    // o3d-o97 r3 — WHAT THE A2 AMOUNT PROVES, AND ABOUT WHICH LEDGER.
+    //
+    // r2 argued the amount is positive evidence A2 posted, because it is written in the SAME
+    // UPDATE as the stamp. That establishes only that the A2 PASS RAN and valued this order. It
+    // does not establish that a journal was created, that the journal reached a ledger, or WHICH
+    // ledger — and the residue below credits an account off the back of all three:
+    //
+    //   no journal      the batch log is created only when the window's ROUNDED total is positive
+    //                   (`totalAllocatedValueNumber > 0`), while the per-order amount is written
+    //                   unconditionally. A window whose only member values at £0.004 stamps an
+    //                   amount and raises nothing.
+    //   never posted    the log is created PENDING inside the batch transaction. Everything after
+    //                   that — the remote call — is a different transaction that can end FAILED,
+    //                   or CANCELLED as a cross-connector orphan when the connector is switched.
+    //   another ledger  the reversal is raised on the connector active NOW, against the Allocated
+    //                   Inventory account configured NOW. A2 may have debited a different ledger,
+    //                   or a different account in the same one.
+    //
+    // A2 now records all three with the amount: the sync log's OWN ID (a value that cannot exist
+    // unless `createPendingSyncLog` created the row — see o3d-batch-billpay: a stamp nothing minted
+    // can be trusted by nobody), the CONNECTOR, and the ACCOUNT CODE it debited (o3d-batch-realm: a
+    // record must name which ledger it was raised against). The id is resolved back to the row to
+    // read its status, so "queued" is not read as "posted".
+    //
+    // Rows staged BEFORE those columns existed carry null and keep the older amount-implies-posting
+    // inference, unchanged. Nothing can retroactively prove a 2025 batch posted; what is available
+    // is that every batch from here on says so itself.
+    let allocationBasisUnresolved: string | null = null
+    let openAllocatedContra: number | null = null
+    if (stagedA2?.inventoryAllocatedDate && !hasRecordedAllocationAmount) {
+      allocationBasisUnresolved = 'the order carries an A2 stamp with no recorded allocation amount, so the pounds A2 debited to Allocated Inventory are not on record and cannot be reversed automatically'
+    } else if (stagedA2?.inventoryAllocatedDate && postedAllocationDebit > 0 && stagedA2.allocationBatchSyncLogId) {
+      const recordedConnector = stagedA2.allocationBatchConnector
+      const recordedAccount = stagedA2.allocationBatchAccountCode
+      const a2Journal = await tx.accountingSyncLog.findUnique({
+        where: { id: stagedA2.allocationBatchSyncLogId },
+        select: { status: true, connector: true },
       })
-      const postedAllocationDebit = refundBoundaryNumber(stagedA2?.allocationBatchAmount ?? 0)
-      if (stagedA2?.inventoryAllocatedDate && postedAllocationDebit > 0) {
-        const relieved = addMoney(
-          addMoney(postedGroupBAllocationRelief, toDecimal(priorRefundAllocationRelief)),
-          sumCostLayerSnapshot(allocationRefundSnapshot),
-        )
-        const residue = subtractMoney(toDecimal(postedAllocationDebit), relieved)
-        residualAllocationReversal = residue.gt(0) ? roundQuantity(residue, 2).toNumber() : 0
+      if (params.activeConnector && recordedConnector && recordedConnector !== params.activeConnector) {
+        allocationBasisUnresolved = `A2 debited Allocated Inventory on ${recordedConnector}, but this reversal would be raised on ${params.activeConnector} — crediting it there would leave the ${recordedConnector} debit standing and move pounds a ${params.activeConnector} ledger never held`
+      } else if (recordedAccount && recordedAccount !== settings.allocatedInventoryAccount) {
+        allocationBasisUnresolved = `A2 debited account ${recordedAccount}, but Allocated Inventory is configured as ${settings.allocatedInventoryAccount} today — the reversal would credit an account that was never debited for this order`
+      } else if (!a2Journal) {
+        allocationBasisUnresolved = 'the A2 journal this order was staged into is no longer on record (retention), so whether it reached the ledger cannot be established'
+      } else if (a2Journal.status !== 'SYNCED') {
+        allocationBasisUnresolved = `the A2 journal this order was staged into is ${a2Journal.status}, not SYNCED — nothing has been debited to Allocated Inventory for this order to reverse`
       }
+    }
+    if (!allocationBasisUnresolved) {
+      allocationBasisUnresolved = groupBReliefUnresolved ?? priorRefundReliefUnresolved
+    }
+    if (stagedA2?.inventoryAllocatedDate && hasRecordedAllocationAmount && !allocationBasisUnresolved) {
+      // THE LEDGER BALANCE: what A2 debited, less every relief already credited against it. This
+      // is a per-order figure derived from records the postings wrote — not a pool of entries
+      // netted to choose units, which is the sibling's rule and would be the wrong shape here.
+      const relieved = addMoney(postedGroupBAllocationRelief, toDecimal(priorRefundAllocationRelief))
+      const open = subtractMoney(toDecimal(postedAllocationDebit), relieved)
+      openAllocatedContra = open.gt(0) ? roundQuantity(open, 2).toNumber() : 0
+    }
+
+    // o3d-o97 r3 — THE DEBIT CAP. The line-driven reversal reverses whatever the refund's lines
+    // consumed; nothing bounded it by what the account actually holds. Even at the posted basis a
+    // partial refund can exceed it — units re-pinned after A2, a kit re-composed, a row created by
+    // the rebalancer with no posted amount of its own. The reversal can never credit more than is
+    // open, so it is clamped here; on a FULL refund the residue below then tops it back up to
+    // exactly the open balance, which is the whole point of the residue.
+    // Kept in Decimal until the single 2dp round below, so the capped line value and the residue
+    // cannot each shed half a penny (o3d-o97 r2).
+    const lineAllocationBasis = sumCostLayerSnapshot(allocationRefundSnapshot)
+    const cappedLineBasis = openAllocatedContra != null && lineAllocationBasis.gt(toDecimal(openAllocatedContra))
+      ? toDecimal(openAllocatedContra)
+      : lineAllocationBasis
+    const lineAllocationReversal = roundQuantity(lineAllocationBasis, 2).toNumber()
+    const cappedLineAllocationReversal = roundQuantity(cappedLineBasis, 2).toNumber()
+    // A full refund closes BOTH batch windows for ever (`refundStatus: { not: 'FULL' }` on Group A2
+    // and Group B), so this is the last moment anything will look at the order's A2 posting: the
+    // part of the open balance no line reached has to come out now or never.
+    const residualAllocationBasis = params.newStatus === 'REFUNDED' && openAllocatedContra != null
+      ? subtractMoney(toDecimal(openAllocatedContra), cappedLineBasis)
+      : toDecimal(0)
+    const allocationReversal = roundQuantity(
+      addMoney(cappedLineBasis, residualAllocationBasis.gt(0) ? residualAllocationBasis : toDecimal(0)),
+      2,
+    ).toNumber()
+
+    // o3d-o97 r3 — THE REMEDY, and why it has to be this one.
+    //
+    // r2 refused on a null amount and named the remedy as the standing accounting invariant
+    // `sales_order_inventory_allocation_missing_amount`, which reports every STAMPED order with no
+    // allocation amount. The very next statement nulled `inventoryAllocatedDate` — so the refusal
+    // destroyed its own remedy: the invariant reads `hasA2 = !!order.inventoryAllocatedDate`, and
+    // from that update onwards the order was not stamped, would never be reported again, and the
+    // stranded debit had nothing anywhere pointing at it.
+    //
+    // So the un-stage is now CONDITIONAL. If this refund could not account for the A2 debit, the
+    // A2 stamp and its attribution SURVIVE — the standing invariants keep reporting the order,
+    // exactly as claimed — and the reason is recorded on the refund row, which outlives every
+    // stamp on the order. Keeping the stamp is inert for the batches: Group A2 selects only
+    // `inventoryAllocatedDate: null`, and both groups exclude `refundStatus: FULL`, so a
+    // fully-refunded order is out of both windows whatever its stamp says.
+    const capBitInto = cappedLineAllocationReversal < lineAllocationReversal - 0.005
+    // Recorded only when the refusal COST something: a full refund is the last chance to take the
+    // residue out, so an unresolved basis there strands pounds and must be reported. On a partial
+    // the order stays inside both batch windows and no residue was owed yet, so an unresolved
+    // basis withheld nothing — flagging it would be noise, and the full refund that follows will
+    // raise it for real.
+    const withheldSomething = (allocationBasisUnresolved != null && params.newStatus === 'REFUNDED') || capBitInto
+    const unresolvedNote = withheldSomething
+      ? [
+          allocationBasisUnresolved,
+          capBitInto
+            ? `the refund's own lines valued £${lineAllocationReversal.toFixed(2)} of allocated basis against an open balance of £${(openAllocatedContra ?? 0).toFixed(2)} and were capped to it`
+            : null,
+          `Recorded A2 debit £${postedAllocationDebit.toFixed(2)}; this refund credited Allocated Inventory £${allocationReversal.toFixed(2)}.`,
+        ].filter((part): part is string => !!part).join('. ')
+      : null
+
+    // o3d-o97 r3: written on EVERY pass, so a retry that now resolves clears a stale refusal.
+    //  * `allocatedReliefAmount` — THIS REFUND'S OWN RELIEF, recorded inside the same transaction
+    //    that decides it, so a later refund on this order can subtract it without depending on a
+    //    sync log retention will delete. It records what the journal RAISES, the same basis on
+    //    which a queued prior reversal is counted above.
+    //  * `allocationBasisUnresolved` — the refusal, on a row that outlives every stamp on the
+    //    order, naming which record was missing and how many pounds are still sitting in the
+    //    account. Surfaced by `sales_order_refund_allocation_basis_unresolved` in the accounting
+    //    invariants.
+    await tx.salesOrderRefund.update({
+      where: { id: params.refundId },
+      data: {
+        allocatedReliefAmount: allocationReversal,
+        allocationBasisUnresolved: unresolvedNote,
+      },
+    })
+
+    if (params.newStatus === 'REFUNDED') {
       // o3d-0qoo: each batch ref is cleared IN THE SAME UPDATE as the stamp it pairs with. A row
       // left holding a ref with no stamp would make the delete guard match a batch the row is no
-      // longer part of, and block that order forever. The refs still go — what changed above is
-      // only that the A2 AMOUNT is now reversed before they do. The A1 ref is still discarded
-      // with nothing checking that the deferral reversal below covers what A1 posted.
+      // longer part of, and block that order forever. The A1 ref is still discarded with nothing
+      // checking that the deferral reversal below covers what A1 posted.
       await tx.salesOrder.update({
         where: { id: params.orderId },
         data: {
           revenueDeferredDate: null,
           revenueDeferredBatchRef: null,
-          inventoryAllocatedDate: null,
-          inventoryAllocatedBatchRef: null,
+          ...(allocationBasisUnresolved ? {} : {
+            inventoryAllocatedDate: null,
+            inventoryAllocatedBatchRef: null,
+            allocationBatchSyncLogId: null,
+            allocationBatchConnector: null,
+            allocationBatchAccountCode: null,
+          }),
         },
       })
     }
@@ -1652,16 +1920,10 @@ async function stageRefundAccountingReversals(
         remainingUnearned,
         Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
       ),
-      // o3d-o97: the lines' own allocation cost PLUS, on a full refund that un-stages A2, the
-      // residue of the RECORDED A2 debit that nothing else will ever relieve. Summed at full
-      // precision and rounded once, so the two halves cannot each shed half a penny.
-      allocationReversal: roundQuantity(
-        addMoney(
-          sumCostLayerSnapshot(allocationRefundSnapshot),
-          toDecimal(residualAllocationReversal),
-        ),
-        2,
-      ).toNumber(),
+      // o3d-o97: the lines' own allocation cost, capped by the open balance, PLUS — on a full
+      // refund — the part of that balance no line reached. On a resolved full refund the two sum
+      // to exactly the open balance.
+      allocationReversal,
     }
   })
 

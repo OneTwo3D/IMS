@@ -407,6 +407,12 @@ test('releaseOverallocations clears inventoryAllocatedBatchRef in the same updat
     inventoryAllocatedDate: null,
     inventoryAllocatedBatchRef: null,
     allocationBatchAmount: null,
+    // o3d-o97 r3: the journal ATTRIBUTION goes in the same update as the amount it describes —
+    // which journal row carried the debit, on which ledger, to which account. An order that is no
+    // longer staged must not keep describing a posting the next A2 run has not made.
+    allocationBatchSyncLogId: null,
+    allocationBatchConnector: null,
+    allocationBatchAccountCode: null,
   })
   assert.deepEqual(state.allocationUpdates.length, 1, 'and the cost snapshots are still nulled alongside it')
 })

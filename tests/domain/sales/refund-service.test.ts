@@ -37,6 +37,12 @@ type Order = {
   // path must null them alongside the stamps they pair with.
   revenueDeferredBatchRef?: string | null
   inventoryAllocatedBatchRef?: string | null
+  // o3d-o97 r3: what A2 recorded ABOUT the journal that carried the amount — its DB-minted sync
+  // log id, the ledger it was raised on, and the account it debited. Optional so every pre-r3
+  // fixture keeps the legacy amount-implies-posting inference unchanged.
+  allocationBatchSyncLogId?: string | null
+  allocationBatchConnector?: string | null
+  allocationBatchAccountCode?: string | null
 }
 
 type LineTaxRate = { accountingTaxType: string | null; reverseCharge: boolean | null }
@@ -84,6 +90,10 @@ type Refund = {
   reversalStaged?: boolean
   accountingRetryRequired?: boolean
   accountingWarning?: string | null
+  // o3d-o97 r3: the CR Allocated Inventory this refund's own reversal raised, and the refusal note
+  // when it could not account for the order's A2 debit.
+  allocatedReliefAmount?: number | null
+  allocationBasisUnresolved?: string | null
   accountingRetrySyncs?: unknown
   totalsBasis?: string | null
   source?: string | null
@@ -121,9 +131,15 @@ type State = {
     shipmentJournalDate: Date | null
     revenueRecognizedAmount: number | null
     cogsBatchAmount: number | null
+    // o3d-o97 r3: the CR Allocated Inventory Group B raised for this shipment, recorded by Group B
+    // itself. Absent = journaled before the column existed, which falls back to the CogsEntry
+    // derivation (and refuses when retention has swept it).
+    allocatedReliefAmount?: number | null
     lines: Array<{ id: string; lineId: string; productId?: string; qty: number; costLayerSnapshot: unknown }>
   }>
-  allocations: Array<{ id: string; orderId: string; lineId: string; productId: string; warehouseId: string; qty: number; costLayerSnapshot: unknown }>
+  // o3d-o97 r3: `allocationBatchAmount` is the pounds A2 debited for THIS row — the posted basis a
+  // partial refund reverses at, immune to the revaluation that rewrites costLayerSnapshot.
+  allocations: Array<{ id: string; orderId: string; lineId: string; productId: string; warehouseId: string; qty: number; costLayerSnapshot: unknown; allocationBatchAmount?: number | null }>
   costLayers: Array<{ id: string; productId: string; poLineId: string | null; receivedQty: number; unitCostBase: number }>
   movements: Array<{
     id?: string
@@ -156,6 +172,7 @@ type State = {
   // the prior-reversal guards (unearned double-count, and now the Allocated Inventory contra) were
   // structurally unobservable. Backed by state now; tests that post nothing simply leave it empty.
   accountingSyncLogs?: Array<{
+    id?: string
     connector: string
     type: string
     referenceType: string
@@ -398,6 +415,7 @@ function createClient(state: State): RefundServiceClient {
               })
               .map((refund) => ({
                 id: refund.id,
+                allocatedReliefAmount: refund.allocatedReliefAmount ?? null,
                 lines: state.refundLines.filter((line) => line.refundId === refund.id),
             })),
           }
@@ -508,7 +526,19 @@ function createClient(state: State): RefundServiceClient {
           const ref = clause.referenceId
           return typeof ref === 'string' ? ref === log.referenceId : (ref.in ?? []).includes(log.referenceId)
         })
-      }).map((log) => ({ type: log.type, payload: log.payload })),
+      }).map((log) => ({
+        type: log.type,
+        status: log.status,
+        referenceType: log.referenceType,
+        referenceId: log.referenceId,
+        payload: log.payload,
+      })),
+      // o3d-o97 r3: the A2 journal probed BY ITS OWN DB-MINTED ID. A missing row is not "no
+      // journal" — retention deletes terminal rows — which is why the caller refuses on it.
+      findUnique: async ({ where }: { where: { id: string } }) => {
+        const log = (state.accountingSyncLogs ?? []).find((row) => row.id === where.id)
+        return log ? { status: log.status, connector: log.connector } : null
+      },
     },
     cogsSubledgerMovement: {
       // khdw: refund staging records the COGS reversal into the subledger ledger.
@@ -1890,6 +1920,10 @@ test('createSalesOrderRefund clears accounting deferral dates for full refunds',
       shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
       revenueRecognizedAmount: 100,
       cogsBatchAmount: 20,
+      // o3d-o97 r3: what Group B recorded it credited Allocated Inventory, in the same UPDATE as
+      // the journal stamp. Without it the order's A2 debit cannot be accounted for and the
+      // un-stage below is deliberately withheld.
+      allocatedReliefAmount: 20,
       lines: [{
         id: 'shipment-line-1',
         lineId: 'line-1',
@@ -2199,6 +2233,8 @@ test('an ALLOCATION-ONLY reversal journal is labelled for what it contains (o3d-
       // Group B recognised the entire deferral for this order.
       revenueRecognizedAmount: 100,
       cogsBatchAmount: 20,
+      // o3d-o97 r3: and recorded the £20 it credited Allocated Inventory.
+      allocatedReliefAmount: 20,
       lines: [{
         id: 'shipment-line-1',
         lineId: 'line-1',
@@ -2515,13 +2551,17 @@ test("Group B's relief is the dispatch COGS it POSTED, not the revalued shipment
   assert.equal(findAllocatedInventoryCredit(result), 10, '£30 posted less the £20 Group B actually credited')
 })
 
-test('an A2 STAMP with no recorded amount reverses nothing (o3d-o97 r2)', async () => {
+test('an A2 STAMP with no recorded amount reverses nothing AND KEEPS THE REMEDY (o3d-o97 r3)', async () => {
   // The stamp says the order went through the A2 window; it does not say what A2 posted, and on a
   // row staged before allocationBatchAmount existed there is nothing that does. Guessing the figure
   // from the pins credited £20 to Allocated Inventory on no evidence — and a reversal posted wrongly
-  // is as bad as the original. The order is not lost: the accounting invariant
-  // `sales_order_inventory_allocation_missing_amount` already reports every stamped order with no
-  // allocation amount, which is where a legacy debit gets reversed by hand.
+  // is as bad as the original.
+  //
+  // r2 refused here and named the remedy as `sales_order_inventory_allocation_missing_amount`,
+  // which reports every STAMPED order with no allocation amount — and then nulled
+  // inventoryAllocatedDate three statements later, so the invariant's `hasA2` went false and the
+  // order was never reported again. THE REFUSAL DESTROYED ITS OWN REMEDY. The stamp now survives a
+  // refusal, and the reason is recorded on the refund row, which outlives every stamp on the order.
   const state = a2StagedAllocatedState()
   state.orders[0].allocationBatchAmount = null
 
@@ -2534,8 +2574,21 @@ test('an A2 STAMP with no recorded amount reverses nothing (o3d-o97 r2)', async 
   })
 
   assert.equal(result.success, true)
-  assert.equal(state.orders[0].inventoryAllocatedDate, null, 'still un-staged — the stamp is cleared either way')
   assert.equal(findAllocatedInventoryCredit(result), null, 'no Allocated Inventory credit line at all')
+  // The A1 half is still un-staged: its deferral reversal is amount-driven and did run.
+  assert.equal(state.orders[0].revenueDeferredDate, null, 'the A1 stamp still goes')
+  // The A2 half is NOT, because nothing accounted for its debit.
+  assert.notEqual(
+    state.orders[0].inventoryAllocatedDate,
+    null,
+    'the A2 stamp survives the refusal, so sales_order_inventory_allocation_missing_amount keeps reporting the order',
+  )
+  assert.equal(state.orders[0].inventoryAllocatedBatchRef, 'A2-2026-01-01-deadbeef', 'and its batch ref stays paired with it')
+  assert.match(
+    String(state.refunds[0].allocationBasisUnresolved),
+    /A2 stamp with no recorded allocation amount/,
+    'and the refund itself records why it reversed nothing',
+  )
 })
 
 test('an order A2 valued at ZERO reverses nothing, stamp and pins notwithstanding (o3d-o97 r2)', async () => {
@@ -3767,4 +3820,288 @@ test('o3d-kouj: a kit re-composed AFTER dispatch still reverses the component un
   }], '3 kits x the PINNED factor of 2 = the 6 component units that were dispatched')
   assert.equal(state.movements[0].productId, 'comp-1')
   assert.equal(state.movements[0].qty, 6, 'and the same 6 units are restocked, not 3')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-o97 r3 — the records the postings write have to SURVIVE the sweep whose job is
+// deleting old rows, PROVE they posted, name WHICH LEDGER, and BOUND what may be
+// reversed. Every test below drives the real refund path and asserts the FIGURE on the
+// Allocated Inventory credit, or the specific refusal — never bare success.
+// ---------------------------------------------------------------------------
+
+/** A2 recorded the journal it raised: its DB-minted sync log id, the ledger, the account. */
+function withRecordedA2Journal(
+  state: State,
+  overrides: { syncLogId?: string; connector?: string; accountCode?: string; status?: string } = {},
+) {
+  const syncLogId = overrides.syncLogId ?? 'a2-log-1'
+  state.orders[0].allocationBatchSyncLogId = syncLogId
+  state.orders[0].allocationBatchConnector = overrides.connector ?? 'xero'
+  state.orders[0].allocationBatchAccountCode = overrides.accountCode ?? accountingSettings.allocatedInventoryAccount
+  if (overrides.status !== undefined) {
+    state.accountingSyncLogs?.push({
+      id: syncLogId,
+      connector: overrides.connector ?? 'xero',
+      type: 'DAILY_BATCH_INVENTORY_ALLOC',
+      referenceType: 'DailyBatch',
+      referenceId: 'A2-2026-01-01-deadbeef',
+      status: overrides.status,
+      payload: { lines: [] },
+    })
+  }
+}
+
+/**
+ * The WooCommerce monetary-only shape (no productId, no qty) that carries the whole remaining
+ * order value — so `isFullRefundAmount` makes it FULL and the un-stage path is actually reached.
+ * Every caller below asserts refundStatus === 'FULL' as well, because a total that quietly falls
+ * short would make the whole assertion vacuous.
+ */
+function monetaryFullRefund(totalBase = 100) {
+  return {
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase, lineKind: 'sale' as const }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+  }
+}
+
+test('the A2 amount is not evidence its journal POSTED — a CANCELLED A2 batch reverses nothing (o3d-o97 r3)', async () => {
+  // A2 wrote £40 and the stamp in ONE UPDATE, which r2 read as proof a journal exists. It is not:
+  // the batch log is created PENDING inside that transaction and the remote call is a LATER one.
+  // Here it ended CANCELLED — the ordinary fate of a cross-connector orphan — so Allocated
+  // Inventory was never debited a penny for this order.
+  //
+  // Reversing off the amount alone credited £40 to that account and debited £40 to Inventory,
+  // overstating inventory by £40 against no matching entry anywhere. Now: nothing, the A2 stamp
+  // survives so the standing invariants keep reporting it, and the refund says why.
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'CANCELLED' })
+
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), null, 'no credit at all — the debit it would reverse was never raised')
+  assert.notEqual(state.orders[0].inventoryAllocatedDate, null, 'the A2 stamp survives the refusal')
+  assert.match(String(state.refunds[0].allocationBasisUnresolved), /is CANCELLED, not SYNCED/)
+})
+
+test('a SYNCED A2 batch on the recorded ledger and account reverses the whole £40 (o3d-o97 r3)', async () => {
+  // The mirror of the test above, and the proof the new gate is a gate rather than a refusal: same
+  // fixture, same £40, but the journal reached the ledger it says it reached.
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), 40, 'the whole posted debit')
+  assert.equal(findInventoryReversalDebit(result), 40)
+  assert.equal(state.orders[0].inventoryAllocatedDate, null, 'and the debit being accounted for is what allows the un-stage')
+  assert.equal(state.refunds[0].allocationBasisUnresolved, null)
+  assert.equal(state.refunds[0].allocatedReliefAmount, 40, 'recorded on the refund, so a later pass need not re-derive it')
+})
+
+test('a PENDING A2 batch is queued, not posted, so nothing is reversed yet (o3d-o97 r3)', async () => {
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'PENDING' })
+
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), null, 'the pounds have not moved, so there are none to move back')
+  assert.match(String(state.refunds[0].allocationBasisUnresolved), /is PENDING, not SYNCED/)
+})
+
+test('the A2 record names WHICH LEDGER it was raised against, and a reversal will not cross ledgers (o3d-o97 r3)', async () => {
+  // A2 debited Allocated Inventory in the ledger that was active then. The org has since switched
+  // connectors, so this reversal would be raised in a DIFFERENT ledger — one that holds no debit
+  // for this order. Crediting there moves £40 that ledger never held AND leaves the original
+  // £40 debit standing, so the same mistake is made twice in opposite books.
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    accountingSettings,
+    activeAccountingConnector: 'quickbooks',
+    ...monetaryFullRefund(),
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), null)
+  assert.match(String(state.refunds[0].allocationBasisUnresolved), /A2 debited Allocated Inventory on xero/)
+})
+
+test('the A2 record names WHICH ACCOUNT it debited, and a re-mapped account is not credited (o3d-o97 r3)', async () => {
+  // Allocated Inventory was account 1215 when A2 posted; the settings name 1210 today. The
+  // reversal would credit 1210 — never debited for this order — while 1215 keeps the £40.
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'SYNCED', accountCode: '1215' })
+
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), null)
+  assert.match(String(state.refunds[0].allocationBasisUnresolved), /A2 debited account 1215/)
+})
+
+/** The A2-staged four-unit order, with one journaled shipment that relieved 2 of the 4 units. */
+function a2StagedWithJournaledShipment(): State {
+  const state = a2StagedFourUnitState()
+  state.orders[0].status = 'SHIPPED'
+  state.shipments.push({
+    id: 'shipment-1',
+    orderId: 'order-1',
+    status: 'SHIPPED',
+    shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+    revenueRecognizedAmount: 50,
+    cogsBatchAmount: 20,
+    lines: [{
+      id: 'shipment-line-1',
+      lineId: 'line-1',
+      qty: 2,
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10, orderAllocationId: 'alloc-1', source: 'shipment' }],
+    }],
+  })
+  return state
+}
+
+test("Group B's recorded relief survives stock-movement retention AND a revaluation (o3d-o97 r3)", async () => {
+  // r2 valued Group B's relief from the CogsEntry dispatch rows, calling them immutable. They are
+  // — right up until `retention_stock_movements_months` HARD-DELETES the StockMovement and its
+  // CogsEntry children (data-retention.ts). Here they are gone AND layer-1 has since been revalued
+  // from £10 to £4, which rewrote the shipment line's snapshot in place.
+  //
+  // With no CogsEntry rows to override it, the derivation valued the surviving snapshot at the new
+  // £4: relief 2 × £4 = £8, residue £30 − £8 = £22 — £2 more than the account can give back, and
+  // the wrong side of the £10 that IS owed. Group B's own record says £20, so the residue is £10.
+  const state = a2StagedWithJournaledShipment()
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+  state.orders[0].allocationBatchAmount = 30
+  state.allocations[0].allocationBatchAmount = 30
+  state.allocations[0].qty = 3
+  state.lines[0].qty = 3
+  state.allocations[0].costLayerSnapshot = [{ costLayerId: 'layer-1', qty: 3, unitCostBase: 4 }]
+  state.shipments[0].allocatedReliefAmount = 20
+  state.shipments[0].lines[0].costLayerSnapshot = [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 4, orderAllocationId: 'alloc-1', source: 'shipment' }]
+  state.costLayers[0].unitCostBase = 4
+  // Retention has swept the dispatch movement and its CogsEntry rows: state.movements is empty.
+
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), 10, '£30 posted less the £20 Group B RECORDED it credited')
+  assert.equal(state.refunds[0].allocationBasisUnresolved, null)
+})
+
+test('a journaled shipment whose dispatch cost rows were swept and never recorded its relief REFUSES (o3d-o97 r3)', async () => {
+  // The same shipment with no recorded relief and no CogsEntry rows behind it. The only valuation
+  // left is the CURRENT layer cost — the exact revaluation 6oyu.5 forbids — so the residue is not
+  // computed at all rather than computed from a basis that expired.
+  const state = a2StagedWithJournaledShipment()
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+  state.orders[0].allocationBatchAmount = 30
+  state.lines[0].qty = 3
+
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund() })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), null, 'no figure is invented from an expired basis')
+  assert.notEqual(state.orders[0].inventoryAllocatedDate, null, 'the stamp survives so the order stays reportable')
+  assert.match(String(state.refunds[0].allocationBasisUnresolved), /swept by stock-movement retention/)
+})
+
+test("a prior refund's RECORDED relief survives sync-log retention (o3d-o97 r3)", async () => {
+  // r2 read a prior refund's relief off its UNEARNED_REV_REVERSAL sync log. That row is
+  // HARD-DELETED by `retention_sync_logs_months` once it terminalises — and with the row gone the
+  // relief read ZERO, so the residue reversed the WHOLE £40 again, double-crediting the £10 the
+  // earlier refund had already taken out. The refund row records what it credited, and refund rows
+  // are not swept.
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+  seedPriorAllocationRefund(state)
+  state.refunds.find((refund) => refund.id === 'refund-prior')!.allocatedReliefAmount = 10
+  // No accountingSyncLogs entry for refund-prior at all: retention has taken it.
+
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund(75) })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), 30, '£40 posted less the £10 the earlier refund RECORDED it credited')
+})
+
+test('a prior refund that claimed allocated units with no surviving record REFUSES (o3d-o97 r3)', async () => {
+  // The same prior refund with neither a recorded relief nor a sync row of any status. Reading
+  // that silence as "it relieved nothing" is what credits the same £10 twice; reading it as
+  // "it relieved everything" strands a debit. Neither is known, so nothing is reversed.
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+  seedPriorAllocationRefund(state)
+
+  const result = await createSalesOrderRefund(createClient(state), { orderId: 'order-1', accountingSettings, ...monetaryFullRefund(75) })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), null)
+  assert.match(String(state.refunds.find((refund) => refund.id !== 'refund-prior')!.allocationBasisUnresolved), /no longer on record/)
+})
+
+test('a PARTIAL refund reverses the basis A2 POSTED, not the layers revalued since (o3d-o97 r3)', async () => {
+  // A2 debited £40 for 4 units at £10 and pinned £40 on the allocation row itself. A landed-cost
+  // correction then rewrote layer-1 to £18 and, with it, the row's costLayerSnapshot
+  // (updateSnapshotsForCostLayerChange) — while posting to COGS/Inventory and NEVER to Allocated
+  // Inventory. Three of the four units are then refunded.
+  //
+  // Valuing the reversal at the current pin credited 3 × £18 = £54 against an account holding £40:
+  // £14 of it was never there, and the residue is floored at zero so a full refund would not have
+  // clawed it back either. The posted basis is £40/4 = £10 a unit, so £30.
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+  state.allocations[0].allocationBatchAmount = 40
+  state.allocations[0].costLayerSnapshot = [{ costLayerId: 'layer-1', qty: 4, unitCostBase: 18 }]
+  state.costLayers[0].unitCostBase = 18
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 3, totalBase: 40 }],
+    reason: 'Three units back',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.notEqual(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), 30, '3 units at the £10 A2 debited them at, not the £18 they are worth today')
+  assert.equal(findInventoryReversalDebit(result), 30)
+})
+
+test('a PARTIAL refund can never credit more than the allocated contra still holds (o3d-o97 r3)', async () => {
+  // The rebalancer re-pinned this order's allocation AFTER A2 stamped it, so the row carries no
+  // posted amount of its own and its units can only be valued at the current £18. Three units
+  // valued that way is £54 against a £40 debit with nothing relieved — £14 credited to an account
+  // that never held it, on a refund that never reaches the residue arithmetic at all.
+  const state = a2StagedFourUnitState()
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+  state.allocations[0].costLayerSnapshot = [{ costLayerId: 'layer-1', qty: 4, unitCostBase: 18 }]
+  state.costLayers[0].unitCostBase = 18
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 3, totalBase: 40 }],
+    reason: 'Three units back',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.notEqual(state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(result), 40, 'clamped to the whole open balance — never past it')
+  assert.match(String(state.refunds[0].allocationBasisUnresolved), /valued £54\.00 of allocated basis against an open balance of £40\.00/)
 })

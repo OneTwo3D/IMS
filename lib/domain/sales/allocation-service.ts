@@ -414,11 +414,18 @@ export async function resetAllocationAccountingIfStaged(
       inventoryAllocatedDate: null,
       inventoryAllocatedBatchRef: null,
       allocationBatchAmount: null,
+      // o3d-o97 r3: the journal attribution goes with the amount it describes. Leaving a sync log
+      // id, connector and account code behind on an order that is no longer staged would leave
+      // them describing a posting the next A2 run has not made yet.
+      allocationBatchSyncLogId: null,
+      allocationBatchConnector: null,
+      allocationBatchAccountCode: null,
     },
   })
   await tx.orderAllocation.updateMany({
     where: { orderId },
-    data: { costLayerSnapshot: Prisma.DbNull },
+    // o3d-o97 r3: and the per-row posted basis with the row's pinned layers.
+    data: { costLayerSnapshot: Prisma.DbNull, allocationBatchAmount: null },
   })
 }
 

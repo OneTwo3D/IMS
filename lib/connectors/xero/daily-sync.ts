@@ -237,10 +237,15 @@ async function createPendingSyncLog(
     payload: Record<string, unknown>
     currency: string
   },
-): Promise<void> {
+): Promise<string> {
   // o3d-19gy: the connection this batch was composed against. A daily-batch journal carries no external
   // document id, but every account code and tax type in it was resolved from the chart of accounts of
   // ONE organisation, so posting it into another is wrong for exactly the same reason.
+  //
+  // o3d-o97: the return type is the log's OWN id, handed back so A2 can stamp WHICH journal it raised.
+  // An identifier cannot exist unless the row was created, and resolving it reads that row's status —
+  // which is what stops a queued journal being read as a posted one. The two changes are independent:
+  // this stamps whose ledger the batch was composed for, that records which row carries it.
   const payload = stampAccountingPayloadConnection(
     params.payload,
     await activeAccountingIdProvenance(XERO_CONNECTOR),
@@ -280,6 +285,10 @@ async function createPendingSyncLog(
       description: `Daily-batch sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
     },
   }).then(() => undefined))
+  // o3d-o97 r3: hand the row's OWN id back. A caller that stamps it on the rows the journal was
+  // built from records a value that cannot exist unless this row does — so a stamped amount can no
+  // longer merely imply a journal, and the row's status can be read back to ask whether it posted.
+  return log.id
 }
 
 async function lockCostLayers(
@@ -429,7 +438,17 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     select: { revenueDeferredDate: true, revenueDeferredBatchRef: true, unearnedRevenueAmount: true },
   })
   const orphanA2Orders = await db.salesOrder.findMany({
-    where: { inventoryAllocatedDate: journaledDateFilter },
+    where: {
+      inventoryAllocatedDate: journaledDateFilter,
+      // o3d-o97 r3: NEVER rebuild an A2 journal for a fully-refunded order. Group A2's own window
+      // excludes `refundStatus: FULL` permanently, and so does Group B, so a debit re-posted here
+      // has nothing left in IMS that will ever relieve it. The case is now reachable: a refund
+      // that CANNOT account for the A2 debit deliberately keeps the order's A2 stamp so the
+      // standing invariants stay able to report it (see refund-service.ts), and a CANCELLED A2 log
+      // does not count as live — so without this filter the very orders held open for a human to
+      // resolve would have a fresh, permanently unrelievable debit posted under them.
+      refundStatus: { not: 'FULL' },
+    },
     select: { inventoryAllocatedDate: true, inventoryAllocatedBatchRef: true, allocationBatchAmount: true },
   })
   const orphanBShipments = await db.shipment.findMany({
@@ -814,8 +833,13 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         }
 
         const totalAllocatedValueNumber = round2Decimal(totalAllocatedValue)
+        // o3d-o97 r3: null when NO journal was raised. The guard below is on the batch's ROUNDED
+        // total, so a window whose only member values at £0.004 stamps that order with an amount
+        // and creates no journal at all — which is exactly the inference ("an amount implies a
+        // pass that created a journal") the refund reversal used to rest on.
+        let a2SyncLogId: string | null = null
         if (totalAllocatedValueNumber > 0) {
-          await createPendingSyncLog(tx, {
+          a2SyncLogId = await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_INVENTORY_ALLOC',
             referenceId,
             currency: baseCurrency,
@@ -839,10 +863,18 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
         for (const order of orders) {
           for (const alloc of order.allocations) {
+            const allocationSnapshot = allocationSnapshots.get(alloc.id) ?? []
             await tx.orderAllocation.update({
               where: { id: alloc.id },
               data: {
-                costLayerSnapshot: (allocationSnapshots.get(alloc.id) ?? []) as never,
+                costLayerSnapshot: allocationSnapshot as never,
+                // o3d-o97 r3: the pounds this row contributed to the DR above, pinned beside the
+                // layers it was pinned from. Revaluation rewrites those layers' unitCostBase in
+                // the snapshot; it never posts to Allocated Inventory, so this figure is what a
+                // refund of part of this row has to reverse at.
+                allocationBatchAmount: a2SyncLogId
+                  ? roundQuantity(sumCostLayerSnapshot(allocationSnapshot), 4).toNumber()
+                  : null,
               },
             })
           }
@@ -852,6 +884,13 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
               inventoryAllocatedDate: new Date(),
               inventoryAllocatedBatchRef: referenceId,
               allocationBatchAmount: orderValues.get(order.id) ?? 0,
+              // o3d-o97 r3: the journal's identity and DESTINATION, recorded with the amount it
+              // carried. All three stay null when no journal was raised, so a refund reading them
+              // back can tell "A2 debited £x on ledger L, account A" from "A2 valued this order at
+              // £x and posted nothing".
+              allocationBatchSyncLogId: a2SyncLogId,
+              allocationBatchConnector: a2SyncLogId ? XERO_CONNECTOR : null,
+              allocationBatchAccountCode: a2SyncLogId ? settings.xero_allocated_inventory_account : null,
             },
           })
         }
@@ -1385,6 +1424,11 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             shipmentJournalBatchRef: referenceId,
             cogsBatchAmount: resultForShipment.cogs,
             revenueRecognizedAmount: resultForShipment.revenue,
+            // o3d-o97 r3: the CR Allocated Inventory this shipment's share of the journal above
+            // raised — the same figure as the COGS debit, recorded once and never revalued.
+            // `cogsBatchAmount` on the line above carries the same number TODAY and a different
+            // one after the next landed-cost correction rewrites it in place.
+            allocatedReliefAmount: resultForShipment.cogs,
           },
         })
         // khdw: record this shipment's dispatch COGS in the COGS subledger ledger as

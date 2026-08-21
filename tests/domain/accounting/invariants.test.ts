@@ -841,3 +841,46 @@ test('o3d-0qoo: a persisted batch ref whose log is absent still reports missing 
   assert.ok(bFinding, 'expected the Group-B sync-evidence finding to still be reported')
   assert.equal((bFinding!.details as { expectedReferenceId: string }).expectedReferenceId, B_REF)
 })
+
+test('o3d-o97 r3: a refund that could not account for the A2 debit is reported even with NO posted shipment', () => {
+  // The refusal's remedy. The refund path deliberately reverses nothing when it cannot establish
+  // what A2 debited, and the commonest shape is an ALLOCATED, never-shipped order — which has no
+  // posted shipment at all, so it must be raised BEFORE the posted-shipment guard the rest of the
+  // refund checks sit behind. Without it the pounds sit in Allocated Inventory with nothing
+  // anywhere pointing at them: both daily-batch windows exclude a fully-refunded order for ever.
+  const rows = cleanRows()
+  rows.salesOrders.push({
+    id: 'order-unresolved',
+    orderNumber: 'SO-UNRESOLVED',
+    externalOrderNumber: null,
+    status: 'ALLOCATED',
+    revenueDeferredDate: null,
+    unearnedRevenueAmount: null,
+    // The A2 stamp SURVIVED the refusal, which is what keeps the standing A2 checks alive too.
+    inventoryAllocatedDate: A2_DATE,
+    allocationBatchAmount: 40,
+    shipments: [],
+    refunds: [{
+      id: 'refund-unresolved',
+      creditNoteNumber: 'CN-UNRESOLVED',
+      accountingCreditNoteId: 'xero-credit-note-9',
+      totalBase: 100,
+      accountingRetryRequired: false,
+      accountingWarning: null,
+      accountingRetrySyncs: null,
+      allocationBasisUnresolved: 'the A2 journal this order was staged into is CANCELLED, not SYNCED. Recorded A2 debit £40.00; this refund credited Allocated Inventory £0.00.',
+    }],
+  })
+
+  const findings = evaluateAccountingInvariantRows(rows)
+  const finding = findings.find((row) => row.code === 'sales_order_refund_allocation_basis_unresolved')
+  assert.ok(finding, 'the refusal is reported')
+  assert.equal(finding.severity, 'critical')
+  assert.equal(finding.refundId, 'refund-unresolved')
+  assert.match(finding.message, /Recorded A2 debit £40\.00/)
+  assert.equal(
+    findings.filter((row) => row.code === 'sales_order_refund_allocation_basis_unresolved').length,
+    1,
+    'and only for the refund that carries the note',
+  )
+})
