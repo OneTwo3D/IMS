@@ -31,6 +31,7 @@ import { stampAccountingPayloadConnection } from '@/lib/connectors/accounting-co
 import {
   accountedAllocationQty,
   parseCostLayerSnapshot,
+  recordedPostedBasis,
   reduceSnapshotByCostLayer,
   reduceSnapshotByQty,
   sumCostLayerSnapshot,
@@ -466,6 +467,35 @@ async function lockCostLayers(
   await tx.$queryRaw(
     Prisma.sql`SELECT id FROM "cost_layers" WHERE id IN (${Prisma.join(ids)}) FOR UPDATE`,
   )
+}
+
+/**
+ * Row-lock the allocation rows this A2 pass is about to write, and hand back the record each one
+ * holds AS OF THE LOCK (o3d-0i5y r10 — Codex round 10, finding 4).
+ *
+ * The sales-order lock r9 introduced does not cover these rows. `updateSnapshotsForCostLayerChange`
+ * — the late-landed-cost correction — rewrites `unitCostBase` on `order_allocations` directly,
+ * selecting them by `costLayerSnapshot @> [{costLayerId}] FOR UPDATE` and taking NO sales-order
+ * lock at all, because it is a purchasing-side sweep that does not know which orders it will touch.
+ * So it is the one writer that can move a row A2 has already read.
+ *
+ * TAKEN HERE, NOT AT THE TOP OF THE TRANSACTION. Locking these rows before `buildLayerSnapshot`
+ * would put A2 on order_allocations → cost_layers while the correction runs cost_layers →
+ * order_allocations, which is a deadlock cycle between two writers that both matter. Taken at the
+ * point the `UPDATE` would take the row lock anyway, the ordering is unchanged and nothing new can
+ * wait on anything new.
+ *
+ * Ordered by id so two lockers of the same set queue rather than interleave.
+ */
+async function lockAllocationRecords(
+  tx: Prisma.TransactionClient,
+  ids: string[],
+): Promise<Map<string, Prisma.JsonValue | null>> {
+  if (ids.length === 0) return new Map()
+  const rows = await tx.$queryRaw<Array<{ id: string; costLayerSnapshot: Prisma.JsonValue | null }>>(
+    Prisma.sql`SELECT id, "costLayerSnapshot" FROM "order_allocations" WHERE id IN (${Prisma.join(ids)}) ORDER BY id FOR UPDATE`,
+  )
+  return new Map(rows.map((row) => [row.id, row.costLayerSnapshot ?? null]))
 }
 
 async function resetFailedDailyBatchLogs(): Promise<void> {
@@ -1119,6 +1149,16 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       )
       const orderValues = new Map<string, number>()
       const allocationSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
+      /**
+       * o3d-0i5y r10: the entries THIS pass adds to a row, kept apart from the ones it merely read.
+       *
+       * A2 appends; it never authors what is already on the row. Holding the two halves separately
+       * is what lets the write rebase its append onto the record AS LOCKED instead of replaying the
+       * base it planned from — see `lockAllocationRecords`.
+       */
+      const allocationAppends = new Map<string, CostLayerSnapshotEntry[]>()
+      /** The quantity the planned-from base recorded, so a base that MOVED can be told from one that was revalued. */
+      const allocationBaseQty = new Map<string, Decimal>()
 
       for (const order of orders) {
         const plan = plans.get(order.id)!
@@ -1130,7 +1170,11 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
         // Rows that have never been reclassified at all, owe nothing and have nothing to record are
         // still STAMPED with an empty snapshot, exactly as before.
-        for (const allocationId of plan.stampEmptyAllocationIds) allocationSnapshots.set(allocationId, [])
+        for (const allocationId of plan.stampEmptyAllocationIds) {
+          allocationSnapshots.set(allocationId, [])
+          allocationAppends.set(allocationId, [])
+          allocationBaseQty.set(allocationId, toDecimal(0))
+        }
 
         for (const alloc of order.allocations) {
           const outstanding = plan.outstandingByAllocation.get(alloc.id)
@@ -1196,11 +1240,17 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           // the field — a landed-cost correction rewrites `unitCostBase` on these very rows
           // without touching Allocated Inventory, so the pin stops being able to say what was
           // debited the moment it is revalued.
-          allocationSnapshots.set(alloc.id, [
-            ...alreadyRecorded,
+          //
+          // o3d-0i5y r10: the append is kept SEPARATE from `alreadyRecorded`, because the write is
+          // no longer allowed to replay the base it planned from — see `lockAllocationRecords` and
+          // the write loop below.
+          const appended = [
             ...recorded.map(withPostedUnitCost),
             ...consumed.map(withPostedUnitCost),
-          ])
+          ]
+          allocationAppends.set(alloc.id, appended)
+          allocationBaseQty.set(alloc.id, sumCostLayerSnapshotQty(alreadyRecorded))
+          allocationSnapshots.set(alloc.id, [...alreadyRecorded, ...appended])
           orderCostValue = addMoney(
             orderCostValue,
             addMoney(sumCostLayerSnapshot(recorded), sumCostLayerSnapshot(consumed)),
@@ -1241,6 +1291,44 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         })
       }
 
+      // -----------------------------------------------------------------------------------
+      // o3d-0i5y r10 (Codex round 10, finding 4) — THE WRITE REBASES ONTO THE ROW AS LOCKED.
+      //
+      // r9 moved the PLAN inside the transaction and under the orders' row locks, which was the
+      // right half of the fix. This is the other half: the write the plan leads to. It rewrites the
+      // WHOLE `costLayerSnapshot` array, and the front of that array is `alreadyRecorded` — entries
+      // read at the top of this transaction and not touched by A2 since.
+      //
+      // One writer can change them in that window, and it is not covered by the sales-order lock:
+      // `updateSnapshotsForCostLayerChange` rewrites `unitCostBase` in place on `order_allocations`
+      // when a landed cost lands late. It takes no order lock (it selects by cost layer, across
+      // every table that carries a snapshot), so it commits freely between A2's read and A2's
+      // write — and then A2 writes the array it read and the correction is gone.
+      //
+      //   a layer bought at £4 is corrected to £5 while the batch runs. 10 recorded units on the
+      //   row are repriced £40 -> £50 and the revaluation posts that £10 to COGS/Inventory.
+      //   A2 then writes back its planned array, at £4. The row says £40 again while the ledger
+      //   says £50, and Group B relieves those units at £4 when they ship: £10 of real cost never
+      //   reaches COGS, permanently, and the refund reversal reverses the same £10 short.
+      //
+      // So the base is RE-READ under the row lock at the moment of writing, and this pass's own
+      // entries are appended to THAT. A2 appends; it does not author what it merely read. The
+      // append is unaffected — `recorded` and `consumed` are this pass's own valuations, stamped
+      // with `postedUnitCostBase` — and a correction that lands after the lock waits for it, then
+      // patches the array A2 committed.
+      //
+      // A base whose QUANTITY moved is a different matter and is refused: the revaluation cannot
+      // change quantities or entry counts (it maps each entry to itself), so a base that grew or
+      // shrank means a writer nothing here can account for, and the plan built on it — `outstanding`
+      // above all — is describing a row that no longer exists. It cannot be reached today, because
+      // every path that changes WHICH units are recorded takes the order lock this pass holds.
+      const lockedRecords = await lockAllocationRecords(
+        tx,
+        orders.flatMap((order) => order.allocations
+          .filter((alloc) => allocationSnapshots.has(alloc.id))
+          .map((alloc) => alloc.id)),
+      )
+
       for (const order of orders) {
         for (const alloc of order.allocations) {
           const next = allocationSnapshots.get(alloc.id)
@@ -1248,25 +1336,41 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           // the same as `[]`, which is a deliberate stamp; writing `?? []` here would erase the
           // pinned layers of every row a previous pass posted (o3d-0i5y r5).
           if (!next) continue
-          const priorPosted = parseCostLayerSnapshot(alloc.costLayerSnapshot)
+          const lockedBase = parseCostLayerSnapshot(lockedRecords.get(alloc.id) ?? null)
+          const plannedBaseQty = allocationBaseQty.get(alloc.id) ?? toDecimal(0)
+          const lockedBaseQty = sumCostLayerSnapshotQty(lockedBase)
+          if (!lockedBaseQty.eq(plannedBaseQty)) {
+            throw new Error(
+              `Allocation ${alloc.id} on order ${order.id} recorded ${plannedBaseQty.toString()} unit(s) when this `
+              + `pass planned from it and ${lockedBaseQty.toString()} unit(s) under the write lock — the record moved `
+              + 'under Group A2 and the plan built on it cannot be trusted',
+            )
+          }
+          const written = [...lockedBase, ...(allocationAppends.get(alloc.id) ?? [])]
           await tx.orderAllocation.update({
             where: { id: alloc.id },
             data: {
-              costLayerSnapshot: next as never,
+              costLayerSnapshot: written as never,
               // o3d-o97 r3: the pounds this row contributed to the DR above, pinned beside the
               // layers it was pinned from. Revaluation rewrites those layers' unitCostBase in
               // the snapshot; it never posts to Allocated Inventory, so this figure is what a
               // refund of part of this row has to reverse at.
               //
-              // o3d-0i5y r5 (rebase): `next` is the APPENDED snapshot, so this is the total ever
-              // posted against the row rather than one pass's share — which is the figure a
-              // partial refund of the row needs, and it stays in step with `snapshotQty`.
-              // And where THIS pass raised no journal, an EARLIER pass's record is left alone
-              // rather than nulled: `undefined` is "do not update", while `null` would erase a
-              // debit that is still standing and is the evidence-deletion o3d-o97 r4 refused.
+              // o3d-0i5y r10 (rebase): read off the array actually WRITTEN — the record re-read
+              // under the write lock plus this pass's appends — never the array this pass planned
+              // from. A landed-cost correction landing mid-batch rewrites the former and not the
+              // latter, and writing the planned copy back is how £10 of real cost never reaches
+              // COGS. And the figure is the POSTED basis where the entries carry one, so an
+              // earlier pass's pounds are the pounds it debited rather than what its layers have
+              // been revalued to since; pre-r9 entries carry no posted basis, and for those the pin
+              // is the only evidence there is, exactly as before.
+              //
+              // Where THIS pass raised no journal an EARLIER pass's record is left alone rather
+              // than nulled: `undefined` is "do not update", while `null` would erase a debit that
+              // is still standing and is the evidence-deletion o3d-o97 r4 refused.
               allocationBatchAmount: a2SyncLogId
-                ? roundQuantity(sumCostLayerSnapshot(next), 4).toNumber()
-                : priorPosted.length > 0 ? undefined : null,
+                ? roundQuantity(recordedPostedBasis(written), 4).toNumber()
+                : lockedBase.length > 0 ? undefined : null,
             },
           })
         }

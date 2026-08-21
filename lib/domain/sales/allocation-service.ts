@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto'
+
 import { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import {
@@ -685,8 +687,15 @@ export function planAccountedRecordCarryOver(
  * row rewrite that orphaned the units, so it commits or rolls back with it — a retry re-does both
  * or neither. A key would instead make two genuinely separate shrinks of the same units at
  * different times collapse into one reversal, which is a silent under-reversal.
+ *
+ * AND THE ENQUEUE IS VERIFIED AGAINST THE DATABASE, NOT AGAINST ITS OWN RETURN (o3d-0i5y r10).
+ * See {@link assertAllocationReversalQueued}.
+ *
+ * EXPORTED because it is not the allocator's private business: every path that takes recorded
+ * units off an order owes the same reversal, and there must be exactly one implementation of it
+ * (o3d-0i5y r10 — the manual editor and the deallocation teardown both call it now).
  */
-async function reverseOrphanedAllocationPosting(
+export async function reverseOrphanedAllocationPosting(
   tx: Prisma.TransactionClient,
   orderId: string,
   orphaned: CostLayerSnapshotEntry[],
@@ -746,11 +755,18 @@ async function reverseOrphanedAllocationPosting(
   })
   const orderRef = order?.orderNumber ?? order?.externalOrderNumber ?? orderId
 
+  // o3d-0i5y r10: a fresh identity for THIS enqueue, so the row it is supposed to create can be
+  // asked for by name afterwards. Deliberately NOT `_idempotencyKey`: a key would make two
+  // genuinely separate shrinks of the same units collapse into one reversal (see the note above),
+  // whereas a token is unique per call and dedupes nothing.
+  const reversalToken = randomUUID()
+
   await queueAccountingSyncTx(tx, {
     type: 'ALLOCATION_REVERSAL',
     referenceType: 'SalesOrder',
     referenceId: orderId,
     payload: {
+      _reversalToken: reversalToken,
       date: new Date().toISOString().slice(0, 10),
       reference: `Allocation reversal: ${orderRef}`,
       narration:
@@ -760,6 +776,68 @@ async function reverseOrphanedAllocationPosting(
         { accountCode: settings.inventoryAccount, description: `Allocation reversal: ${orderRef}`, debit: amount },
         { accountCode: settings.allocatedInventoryAccount, description: `Allocation reversal: ${orderRef}`, credit: amount },
       ],
+    },
+  })
+
+  await assertAllocationReversalQueued(tx, orderId, reversalToken, amount, orphaned)
+}
+
+/**
+ * A REVERSAL THAT WAS NOT QUEUED IS NOT A REVERSAL (o3d-0i5y r10 — Codex round 10, finding 3).
+ *
+ * `queueAccountingSyncTx` does nothing at all under three ordinary, non-exceptional conditions:
+ * the order was deleted while we were enqueuing (`scope: 'deleted'`), no active connector posts
+ * this type (`getAccountingPostingContext` returns null), or the posting is suppressed for the
+ * connector. It throws in none of them. So `await queueAccountingSyncTx(...)` followed by nothing
+ * is the shape that treats all three as "reversed" — and this is the worst place in the codebase
+ * to make that assumption, because the caller has already trimmed or deleted the very rows that
+ * carried the evidence. The debit is stranded AND the record it could have been reconstructed
+ * from is gone, in the same committed transaction.
+ *
+ * ITS RETURN VALUE IS NOT THE THING TO TRUST. It is a summary of a decision made several layers
+ * away, and it can be `true` for "an existing row matched the idempotency key" as easily as for "I
+ * created one". A queue call that silently does nothing has now been found three times in this
+ * session on three unrelated queues; the answer each time was the same, and it is the answer here:
+ * ASK THE DATABASE FOR THE ROW, under the enqueue's own predicate — same type, same reference,
+ * plus the `_reversalToken` that identifies THIS call and no other.
+ *
+ * It does not throw. Rolling back would undo the allocation edit the operator asked for because
+ * the accounting connector is switched off, which is the same trade the `unpostable` branch above
+ * already refused. What it does instead is leave a durable, ERROR-level record that names the
+ * exact amount, both account codes and the units — everything a human needs to post the reversal
+ * by hand — which is precisely what the silent path destroyed.
+ */
+async function assertAllocationReversalQueued(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  reversalToken: string,
+  amount: number,
+  orphaned: CostLayerSnapshotEntry[],
+): Promise<void> {
+  const queued = await tx.accountingSyncLog.findFirst({
+    where: {
+      type: 'ALLOCATION_REVERSAL',
+      referenceType: 'SalesOrder',
+      referenceId: orderId,
+      payload: { path: ['_reversalToken'], equals: reversalToken },
+    },
+    select: { id: true },
+  })
+  if (queued) return
+
+  await tx.activityLog.create({
+    data: {
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'allocation_reversal_unqueued',
+      tag: 'accounting',
+      level: 'ERROR',
+      description:
+        `Allocation reversal of £${amount.toFixed(2)} on order ${orderId} was NOT queued — no `
+        + `AccountingSyncLog row exists for reversal token ${reversalToken}. `
+        + `${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) left the order and their `
+        + 'Group A2 Allocated Inventory debit has been left standing with nothing downstream to '
+        + 'relieve it. Post DR Inventory / CR Allocated Inventory for this amount by hand.',
     },
   })
 }
@@ -1087,6 +1165,13 @@ export type ReleasedOrderAllocation = {
  * User-initiated deallocation on a LIVE order must therefore go through
  * {@link releaseOrderAllocationsForDeallocationInTx}, which refuses instead.
  *
+ * o3d-0i5y r10 — AND IT DESTROYS A THIRD THING, WHICH IS WHY THE REVERSAL AT THE END EXISTS: the
+ * `costLayerSnapshot` on each row is Group A2's record that it has DEBITED Allocated Inventory for
+ * those units, and the amount it debited. Deleting the rows leaves that debit standing with
+ * nothing that will ever relieve it and nothing left that can say what it was. On the live-order
+ * (deallocation) path the debit is therefore REVERSED here; on the hard-delete path — where a
+ * journal about the order could not resolve to one — the delete is refused instead.
+ *
  * The caller MUST already hold the order's row lock (lockSalesOrder).
  *
  * Throws (via resetAllocationAccountingIfStaged) when a shipment on this order has already
@@ -1108,12 +1193,29 @@ export async function releaseOrderAllocationsInTx(
    * this transaction now (see `reconcilePendingShipments`), so the cause must arrive with the call
    * rather than being narrated by the caller after the commit.
    */
-  audit: { cause?: string; userId?: string | null } = {},
+  audit: {
+    cause?: string
+    userId?: string | null
+    /**
+     * o3d-0i5y r10: the caller is about to DELETE the sales order in this same transaction.
+     *
+     * It changes exactly one thing — what may be done about a posted debit these rows carry. A
+     * reversal is a journal ABOUT an order, enqueued as `referenceType: 'SalesOrder'`, so raising
+     * one against an order that ceases to exist a few statements later is the o3d-hrak orphan the
+     * enqueue lock exists to prevent. There is no third option that leaves the ledger right, so
+     * this path REFUSES instead (see below) — and the refusal is already unreachable in the
+     * ordinary case, because `findSalesOrderDeleteBlocker` will not let an order out of a live A2
+     * batch be deleted at all.
+     */
+    orderIsBeingDeleted?: boolean
+  } = {},
 ): Promise<ReleaseOrderAllocationsResult> {
   await resetAllocationAccountingIfStaged(tx, orderId)
   const currentAllocs = await tx.orderAllocation.findMany({
     where: { orderId },
-    select: { lineId: true, productId: true, warehouseId: true, qty: true },
+    // o3d-0i5y r10: the RECORD is selected, because this function is about to delete the rows that
+    // hold it — see the orphan reversal at the end.
+    select: { lineId: true, productId: true, warehouseId: true, qty: true, costLayerSnapshot: true },
   })
   await lockStockLevels(
     tx,
@@ -1183,6 +1285,56 @@ export async function releaseOrderAllocationsInTx(
     cause: audit.cause ?? 'a release of the order’s allocations',
     userId: audit.userId ?? null,
   })
+
+  // -----------------------------------------------------------------------------------------
+  // o3d-0i5y r10 (Codex round 10, finding 2) — THE ROWS GO; THE POSTED DEBIT DOES NOT JUST GO
+  // WITH THEM.
+  //
+  // r9 flagged this itself and deferred it: "the teardown path deletes rows and the record dies
+  // with them". That is not a bookkeeping detail, it is the entire evidence of a real posting
+  // being destroyed by the one path that destroys the most of it. Every other route trims a
+  // record; this one deletes all of them, for the whole order, unconditionally.
+  //
+  // What Group A2 posted for these units is DR Allocated Inventory / CR Inventory. Exactly two
+  // things ever relieve that debit — Group B crediting Allocated Inventory when a shipment
+  // dispatches, and a refund crediting it for units taken back — and a deallocation reaches
+  // NEITHER: the units will not ship (there is nothing left to ship them from) and they were not
+  // refunded. So on the live-order path the debit sits in Allocated Inventory for ever, with
+  // Inventory understated by the same amount, and after `deleteMany` there is not one row left
+  // that says how much it was.
+  //
+  // Ten units posted at £4 = £40. Deallocate: r9 left £40 of Allocated Inventory with nothing
+  // that could ever relieve it and no record of the £40. r10 raises CR Allocated £40 / DR
+  // Inventory £40 in this same transaction, so the account is back where it stood before A2 ran.
+  //
+  // ORPHANED IN FULL, and rightly: `planAccountedRecordCarryOver` moves a record between the
+  // scopes of a DECLARED next set, and this teardown's next set is empty by construction. There
+  // is no surviving row for any unit to carry to.
+  //
+  // RAISED LAST, after the delete and the pin retirement, for the reason the rebase settled: the
+  // journal and the state it describes commit together. And the sibling's rule holds on both
+  // halves — the amount comes from what A2 RECORDED posting (`postedUnitCostBase`), never from
+  // the pin as a landed-cost correction has since revalued it, and a record that cannot say what
+  // was posted for it reverses nothing and is reported.
+  const orphanedRecord = currentAllocs.flatMap((alloc) => parseCostLayerSnapshot(alloc.costLayerSnapshot))
+  if (audit.orderIsBeingDeleted) {
+    // A reversal journal keyed to an order that is about to stop existing resolves to nothing, and
+    // deleting without one strands the debit — so neither is available and the delete is refused.
+    // `findSalesOrderDeleteBlocker` already refuses an order in a live A2 batch, which is why this
+    // is a backstop rather than the primary guard; it is here so a retention sweep that removes
+    // the batch log cannot quietly turn a posted order into a deletable one.
+    const { posted } = sumPostedCostLayerSnapshot(orphanedRecord)
+    if (roundQuantity(posted, 2).gt(0)) {
+      throw new Error(
+        `Cannot delete this order: Group A2 has already posted £${roundQuantity(posted, 2).toFixed(2)} of `
+        + 'Allocated Inventory against its allocation rows, and deleting them would strand that debit with '
+        + 'nothing left to say it exists. Cancel the order instead, so the reversal can be raised against an '
+        + 'order that still exists.',
+      )
+    }
+  } else {
+    await reverseOrphanedAllocationPosting(tx, orderId, orphanedRecord)
+  }
 
   return {
     allocations,

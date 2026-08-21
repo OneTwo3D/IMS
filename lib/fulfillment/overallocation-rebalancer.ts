@@ -212,6 +212,18 @@ export async function releaseOverallocations(
               // longer described by it. The ORDER-level record is the one that survives.
               data: { costLayerSnapshot: Prisma.DbNull, allocationBatchAmount: null },
             })
+            // o3d-0i5y r10, SUPERSEDED IN PART (rebase onto o3d-o97 / PR #635). r10 replaced this
+            // site's blanket reset with "the stamp alone", keeping every row's `costLayerSnapshot`,
+            // to stop Group A2 reading an empty row and re-posting the WHOLE order. The merged rule
+            // above removes that failure a different way — where the debit stands the STAMP is kept,
+            // so A2 (which selects on `inventoryAllocatedDate: null`) never looks at the order again
+            // and cannot re-post it at all. The record is cleared only on the branch that proves the
+            // debit is not standing, where there is nothing to preserve.
+            //
+            // What survives from r10 unchanged is the other half: the units this sweep RELEASES are
+            // orphaned — they will not ship and were not refunded — so their share of the A2 debit
+            // is stranded and is reversed explicitly. See `releaseOverallocations`' reversal below
+            // and `reverseOrphanedAllocationPosting`.
           }
 
           const allocQty = Number(alloc.qty)

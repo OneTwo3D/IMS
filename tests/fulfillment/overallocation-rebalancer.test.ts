@@ -451,6 +451,13 @@ test('releaseOverallocations clears inventoryAllocatedBatchRef in the same updat
     allocationBatchConnector: null,
     allocationBatchAccountCode: null,
   })
+  // o3d-0i5y r10 asserted the OPPOSITE here — `state.allocationUpdates` empty, on the reasoning that
+  // nulling every row's `costLayerSnapshot` makes Group A2 read an empty row and post the WHOLE
+  // order again. That assertion is superseded rather than deleted (rebase onto o3d-o97 / PR #635):
+  // the merged rule keeps the STAMP wherever the debit stands, and A2 selects only on
+  // `inventoryAllocatedDate: null`, so it never looks at this order again and the second posting
+  // r10 was defending against is unreachable. This test is the branch where the debit is proved NOT
+  // to stand, so the record it clears is an empty one.
   assert.deepEqual(state.allocationUpdates.length, 1, 'and the cost snapshots are still nulled alongside it')
   assert.deepEqual(stageRetainedEntries(), [])
 })

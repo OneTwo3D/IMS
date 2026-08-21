@@ -55,6 +55,19 @@ let a2Order: A2OrderRow | null = null
  */
 let staleA2Order: A2OrderRow | null = null
 
+/**
+ * o3d-0i5y r10: the `costLayerSnapshot` each allocation row holds AT THE MOMENT A2 TAKES ITS WRITE
+ * LOCK, keyed by allocation id.
+ *
+ * `null` (the default) means "nothing moved" and the lock read is served from `a2Order` itself, so
+ * every existing fixture behaves exactly as before. A test sets it to model the one writer that can
+ * change these rows without the sales-order lock A2 holds — `updateSnapshotsForCostLayerChange`,
+ * the late-landed-cost correction, which rewrites `unitCostBase` in place. A pass that writes back
+ * the array it PLANNED from instead of the array it LOCKED silently discards that correction, and
+ * this is the only way to see it: the two arrays differ in pounds, not in shape.
+ */
+let lockedA2Records: Record<string, unknown> | null = null
+
 /** Ordered log of the calls A2 makes on the TRANSACTION client, for the lock-ordering assertion. */
 const txCalls: string[] = []
 
@@ -67,6 +80,7 @@ const orderUpdates: Array<{ id: string; data: Record<string, unknown> }> = []
 
 function resetRun(): void {
   staleA2Order = null
+  lockedA2Records = null
   txCalls.length = 0
   created.length = 0
   allocationUpdates.length = 0
@@ -124,7 +138,25 @@ const tx = {
       : Array.isArray(first)
       ? first.join(' ')
       : String(first)
-    txCalls.push(`$queryRaw:${text.replace(/\s+/g, ' ').trim()}`)
+    const sql = text.replace(/\s+/g, ' ').trim()
+    txCalls.push(`$queryRaw:${sql}`)
+    // o3d-0i5y r10: the ALLOCATION-row write lock is a row-returning query — it hands back the
+    // record each row holds as of the lock, which is what A2 must append onto. Answering it with
+    // `[]` (as this double did while it was only ever a lock) would make every A2 row read as
+    // holding NOTHING at write time, so the assertions below would be made against a writer that
+    // had just been handed an empty base.
+    if (sql.includes('order_allocations') && sql.includes('FOR UPDATE')) {
+      const rows = (a2Order?.allocations ?? []).map((alloc) => ({
+        id: alloc.id,
+        costLayerSnapshot: lockedA2Records && alloc.id in lockedA2Records
+          ? lockedA2Records[alloc.id]
+          : alloc.costLayerSnapshot,
+      }))
+      // Honours the id predicate: A2 locks only the rows it is about to write, and a double that
+      // returned rows it never asked for would hide a missing entry in that list.
+      const ids = Array.isArray(args[0]) ? [] : ((args[0] as { values?: unknown[] }).values ?? [])
+      return ids.length === 0 ? rows : rows.filter((row) => ids.includes(row.id))
+    }
     return []
   },
 }
@@ -635,4 +667,152 @@ test('Xero live Group A2 plans and stamps from the LOCKED row, not a pre-transac
   assert.ok(lockIndex >= 0, 'A2 row-locks the orders it is about to post')
   assert.ok(readIndex >= 0, 'and reads them through the transaction client')
   assert.ok(lockIndex < readIndex, 'the lock comes first, so the read cannot describe a state that has already moved')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-0i5y r10 (Codex round 10, finding 4) — THE WRITE, NOT THE PLAN.
+//
+// r9 moved A2's window read inside the transaction and under the orders' row locks. That closed the
+// gap on everything the SALES-ORDER lock covers. It does not cover `order_allocations`, and there is
+// exactly one writer that touches them without it: `updateSnapshotsForCostLayerChange`, the late-
+// landed-cost correction, which selects rows by `costLayerSnapshot @> [{costLayerId}] FOR UPDATE`
+// across every table that carries a snapshot and takes no order lock at all, because it does not
+// know which orders it is about to touch.
+//
+// A2 rewrites the WHOLE snapshot array, and the front of that array is the base it read at the top
+// of the transaction. So a correction committing in between is written straight back out.
+// ---------------------------------------------------------------------------------------------
+
+test('Xero live Group A2 keeps a landed-cost correction that lands between its plan and its write (o3d-0i5y r10)', async () => {
+  resetRun()
+  // 14 units allocated. 10 of them were pinned and posted by an earlier pass at £4 (£40 into
+  // Allocated Inventory, recorded as `postedUnitCostBase`). While this batch is running, a landed
+  // cost arrives for that layer and the correction reprices the row's ten recorded units £4 -> £5,
+  // posting the £10 difference to COGS/Inventory — it never touches Allocated Inventory, which is
+  // why `postedUnitCostBase` stays at £4.
+  a2Order = {
+    id: 'order-1',
+    orderNumber: 'SO-1',
+    externalOrderNumber: null,
+    status: 'ALLOCATED',
+    allocations: [{
+      id: 'alloc-1',
+      lineId: 'line-1',
+      productId: 'prod-1',
+      warehouseId: 'wh-1',
+      qty: 14,
+      // What A2 reads when it plans.
+      costLayerSnapshot: [{
+        costLayerId: 'layer-1',
+        qty: '10.000000',
+        unitCostBase: '4.000000',
+        postedUnitCostBase: '4.000000',
+      }],
+    }],
+    shipments: [],
+  }
+  // What the row actually holds by the time A2 takes its write lock.
+  lockedA2Records = {
+    'alloc-1': [{
+      costLayerId: 'layer-1',
+      qty: '10.000000',
+      unitCostBase: '5.000000',
+      postedUnitCostBase: '4.000000',
+    }],
+  }
+  shelfLayers = [{ id: 'layer-shelf', remainingQty: 4, unitCostBase: 5 }]
+
+  const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
+  const result = await runDailyBatchSync()
+
+  assert.deepEqual(result.errors, [], 'the run must complete, not be asserted on after failing')
+  assert.equal(result.groupA2, 1)
+
+  // What this pass OWES is unchanged: four unaccounted units at the shelf's £5.
+  assert.deepEqual(
+    a2Journal()?.payload.lines,
+    [
+      { accountCode: '631', description: 'Daily inventory allocation — 1 order(s)', debit: 20 },
+      { accountCode: '630', description: 'Daily inventory allocation — 1 order(s)', credit: 20 },
+    ],
+    'A2 still debits Allocated Inventory £20 — the correction is not this pass\'s to post',
+  )
+
+  assert.equal(allocationUpdates.length, 1)
+  const written = allocationUpdates[0].costLayerSnapshot as Array<Record<string, string>>
+  assert.equal(
+    String(written[0].unitCostBase),
+    '5.000000',
+    'the corrected £5 survives A2\'s write. Writing back the planned array puts the row at £4 while '
+    + 'the ledger says £5: Group B then relieves those ten units at £40, £10 of real cost never '
+    + 'reaches COGS, and the refund reversal reverses the same £10 short',
+  )
+  assert.equal(
+    String(written[0].postedUnitCostBase),
+    '4.000000',
+    'and the amount A2 actually POSTED is untouched by the revaluation — it is what prices a reversal',
+  )
+  assert.equal(written.length, 2, 'this pass appends its own entry; it does not re-author the base')
+  assert.equal(String(written[1].costLayerId), 'layer-shelf')
+
+  // And the write lock is taken on the ALLOCATION rows before they are written, after the cost-layer
+  // lock — the ordering that keeps this deadlock-free against the correction itself, which runs
+  // cost_layers -> order_allocations.
+  const costLayerLock = txCalls.findIndex((call) => call.startsWith('$queryRaw:') && call.includes('cost_layers'))
+  const allocationLock = txCalls.findIndex((call) => (
+    call.startsWith('$queryRaw:') && call.includes('order_allocations') && call.includes('FOR UPDATE')
+  ))
+  assert.ok(allocationLock >= 0, 'A2 row-locks the allocation rows it is about to write')
+  assert.ok(costLayerLock >= 0 && costLayerLock < allocationLock, 'and does so AFTER the cost-layer lock')
+})
+
+test('Xero live Group A2 REFUSES to write when the record it planned from changed QUANTITY (o3d-0i5y r10)', async () => {
+  resetRun()
+  // The revaluation maps every entry to itself, so it cannot change how many units a record
+  // accounts for. A base that grew or shrank means a writer this pass cannot account for, and the
+  // plan built on it — `outstanding` above all — describes a row that no longer exists.
+  a2Order = {
+    id: 'order-1',
+    orderNumber: 'SO-1',
+    externalOrderNumber: null,
+    status: 'ALLOCATED',
+    allocations: [{
+      id: 'alloc-1',
+      lineId: 'line-1',
+      productId: 'prod-1',
+      warehouseId: 'wh-1',
+      qty: 14,
+      costLayerSnapshot: [{
+        costLayerId: 'layer-1',
+        qty: '10.000000',
+        unitCostBase: '4.000000',
+        postedUnitCostBase: '4.000000',
+      }],
+    }],
+    shipments: [],
+  }
+  lockedA2Records = {
+    'alloc-1': [{
+      costLayerId: 'layer-1',
+      qty: '6.000000',
+      unitCostBase: '4.000000',
+      postedUnitCostBase: '4.000000',
+    }],
+  }
+  shelfLayers = [{ id: 'layer-shelf', remainingQty: 4, unitCostBase: 5 }]
+
+  const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
+  const result = await runDailyBatchSync()
+
+  assert.equal(result.groupA2, 0, 'nothing is stamped')
+  // No row is written and no order is stamped. The journal `createPendingSyncLog` raised earlier in
+  // the same transaction is rolled back with it in Postgres; this double is not transactional, so
+  // the honest assertion here is on the writes that never happened rather than on `created`.
+  assert.deepEqual(allocationUpdates, [], 'no allocation row is rewritten')
+  assert.deepEqual(orderUpdates, [], 'and no order carries an A2 stamp out of this run')
+  assert.match(
+    result.errors.join('\n'),
+    /Group A2 error:.*Allocation alloc-1 on order order-1 recorded 10 unit\(s\) when this pass planned from it and 6 unit\(s\) under the write lock/,
+    'the refusal names the allocation, the order and both quantities',
+  )
 })

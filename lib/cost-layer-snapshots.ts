@@ -165,6 +165,26 @@ export function sumPostedCostLayerSnapshot(entries: CostLayerSnapshotEntry[]): {
   return { posted, unevidenced }
 }
 
+/**
+ * THE POUNDS A POSTING RECORDED FOR THESE ENTRIES (o3d-0i5y r10, rebase onto o3d-o97).
+ *
+ * `sumCostLayerSnapshot` values entries at `unitCostBase`, which `updateSnapshotsForCostLayerChange`
+ * REWRITES IN PLACE when a landed cost arrives late — and that revaluation posts to COGS/Inventory
+ * and never to Allocated Inventory. So it is the wrong basis for anything that has to say what was
+ * DEBITED: o3d-o97 established the same thing on the refund side, where valuing a reversal from the
+ * live pin credited £12 against a £30 debit once the layers fell.
+ *
+ * Entries stamped by Group A2 since o3d-0i5y r9 carry `postedUnitCostBase` — the amount A2 wrote in
+ * the same statement as the entry — and those are valued at it. Entries written BEFORE that carry
+ * none, and for them the pin is the only evidence that exists, so they keep the old basis rather
+ * than contributing nothing: this is a per-row RECORD of a posting, and dropping the legacy part of
+ * it would under-state a debit that is genuinely standing.
+ */
+export function recordedPostedBasis(entries: CostLayerSnapshotEntry[]): Decimal {
+  const { posted, unevidenced } = sumPostedCostLayerSnapshot(entries)
+  return addMoney(posted, sumCostLayerSnapshot(unevidenced))
+}
+
 export function sumCostLayerSnapshot(entries: CostLayerSnapshotEntry[]): Decimal {
   return entries.reduce(
     (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),

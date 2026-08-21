@@ -6,12 +6,42 @@ import test, { mock } from 'node:test'
 // allocator reaches for (dynamically, at call time, which is why registering the mock here works);
 // capturing it gives the tests below the journal lines production would have written, rather than a
 // plan-level proxy that cannot tell £16 from £36.
-const queuedAccountingSyncs: Array<{
+type QueuedAccountingSync = {
   type: string
   referenceType: string
   referenceId: string
-  payload: { lines?: Array<{ accountCode: string; debit?: number; credit?: number }> }
-}> = []
+  payload: {
+    _reversalToken?: string
+    lines?: Array<{ accountCode: string; debit?: number; credit?: number }>
+  }
+}
+
+/** Every enqueue ATTEMPT, whether or not it ended up writing a row. */
+const queuedAccountingSyncs: QueuedAccountingSync[] = []
+
+/**
+ * The AccountingSyncLog rows the enqueue actually wrote (o3d-0i5y r10).
+ *
+ * Kept apart from the attempt log above because that separation IS the defect finding 3 is about:
+ * `queueAccountingSyncTx` returns without writing anything at all when the order was deleted under
+ * it, when no active connector posts the type, or when the posting is suppressed — and it throws in
+ * none of those cases. A double whose enqueue could only ever succeed can neither exercise the
+ * verification nor observe its absence, so it is settable per test.
+ */
+const accountingSyncRows: QueuedAccountingSync[] = []
+
+/**
+ * What the enqueue DOES this test. `'writes'` is production's happy path; `'silent-no-op'` is the
+ * shape production takes with no connector configured — the call returns, nothing is written, and
+ * nothing is thrown.
+ */
+let accountingEnqueueOutcome: 'writes' | 'silent-no-op' = 'writes'
+
+function resetAccountingQueue(outcome: 'writes' | 'silent-no-op' = 'writes'): void {
+  queuedAccountingSyncs.length = 0
+  accountingSyncRows.length = 0
+  accountingEnqueueOutcome = outcome
+}
 
 mock.module('@/lib/accounting', {
   namedExports: {
@@ -19,13 +49,10 @@ mock.module('@/lib/accounting', {
       inventoryAccount: '630',
       allocatedInventoryAccount: '631',
     }),
-    queueAccountingSyncTx: async (_tx: unknown, params: {
-      type: string
-      referenceType: string
-      referenceId: string
-      payload: { lines?: Array<{ accountCode: string; debit?: number; credit?: number }> }
-    }) => {
+    queueAccountingSyncTx: async (_tx: unknown, params: QueuedAccountingSync) => {
       queuedAccountingSyncs.push(params)
+      if (accountingEnqueueOutcome === 'silent-no-op') return false
+      accountingSyncRows.push(params)
       return true
     },
     isAccountingSyncTypeEnabled: async () => true,
@@ -651,8 +678,40 @@ function createClient(state: MemoryState): AllocationServiceClient {
     // in flight" is what every pre-existing cancellation test assumes. The dedicated refusal tests
     // live in tests/accounting/cancel-invoice-posting-intent.test.ts against a where-honouring store.
     accountingSyncLog: {
-      findFirst: async () => state.syncPostingClaim ?? null,
       updateMany: async () => ({ count: 0 }),
+      // o3d-0i5y r10 + o3d-7o0: ONE `findFirst` serves two different probes here, so it dispatches
+      // on WHAT WAS ASKED FOR rather than answering both with the same fixture.
+      //
+      //   * the post-enqueue verification asks the DATABASE for the row the enqueue was supposed to
+      //     create, under that enqueue's own predicate — same type, same reference, plus the
+      //     `_reversalToken` JSON path that identifies one call and no other. Answering it with a
+      //     hardcoded row (or with `null`) would decide the outcome of every such test in the double
+      //     rather than in production, so it really searches `accountingSyncRows` — the rows the
+      //     enqueue wrote — and really honours the JSON path filter.
+      //   * the posting-intent probe (o3d-7o0) asks whether an invoice post for the order is on the
+      //     wire. `state.syncPostingClaim` is what it finds, and the default of "nothing in flight"
+      //     is what every pre-existing cancellation test assumes.
+      findFirst: async (args?: {
+        where?: {
+          type?: string
+          referenceType?: string
+          referenceId?: string
+          payload?: { path: string[]; equals: unknown }
+        }
+      }) => {
+        const where = args?.where ?? {}
+        if (where.payload == null) return state.syncPostingClaim ?? null
+        return accountingSyncRows.find((row) => {
+          if (where.type != null && row.type !== where.type) return false
+          if (where.referenceType != null && row.referenceType !== where.referenceType) return false
+          if (where.referenceId != null && row.referenceId !== where.referenceId) return false
+          const value = where.payload!.path.reduce<unknown>(
+            (node, key) => (node == null ? undefined : (node as Record<string, unknown>)[key]),
+            row.payload,
+          )
+          return value === where.payload!.equals
+        }) ?? null
+      },
       // o3d-o97 r4: the A2 journal probed by its own id. A missing row is NOT "no journal" —
       // retention deletes terminal rows — so the un-stage keeps the stamp for it.
       findUnique: async ({ where }: { where: { id: string } }) => (
@@ -2286,7 +2345,7 @@ const POSTED_TEN_AT_FOUR = [{
 
 test('o3d-0i5y r9: shrinking a recorded allocation REVERSES the part of the A2 debit nothing will relieve', async () => {
   const state = shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR })
-  queuedAccountingSyncs.length = 0
+  resetAccountingQueue()
 
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
@@ -2324,7 +2383,7 @@ test('o3d-0i5y r9: the reversal is valued at what A2 POSTED, never at the pin a 
     lineQty: 6,
     record: [{ costLayerId: 'layer-1', qty: '10.000000', unitCostBase: '9.000000', postedUnitCostBase: '4.000000' }],
   })
-  queuedAccountingSyncs.length = 0
+  resetAccountingQueue()
 
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
@@ -2348,7 +2407,7 @@ test('o3d-0i5y r9: a record that cannot say what was posted for it reverses NOTH
     lineQty: 6,
     record: [{ costLayerId: 'layer-1', qty: '10.000000', unitCostBase: '4.000000' }],
   })
-  queuedAccountingSyncs.length = 0
+  resetAccountingQueue()
 
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
@@ -2364,10 +2423,164 @@ test('o3d-0i5y r9: a rewrite that orphans NOTHING raises no reversal at all', as
   // credit Allocated Inventory for units that are still on the order and still going to ship.
   const state = shrunkState({ lineQty: 10, record: POSTED_TEN_AT_FOUR })
   state.stockLevels[0].quantity = 20
-  queuedAccountingSyncs.length = 0
+  resetAccountingQueue()
 
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
+  assert.deepEqual(queuedAccountingSyncs, [])
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-0i5y r10 (Codex round 10) — THE ENQUEUE THAT DID NOTHING, AND THE TEARDOWN THAT DELETED
+// EVERYTHING.
+//
+// r9 raised the reversal but trusted the queue to have taken it, and left the one path that
+// destroys the MOST evidence — the teardown release — out of the fix entirely, flagging it as the
+// cancellation path's problem. Both are on the money path and both are asserted on the amount.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-0i5y r10: a reversal the queue silently DROPPED is detected, and the amount is reported', async () => {
+  // `queueAccountingSyncTx` writes nothing and throws nothing when no active connector posts the
+  // type, when the posting is suppressed, or when the order was deleted under it. r9 awaited it and
+  // moved on, so all three read as "reversed" — while the rows carrying the evidence had already
+  // been trimmed in this same transaction. The debit stranded AND the record gone.
+  const state = shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR })
+  resetAccountingQueue('silent-no-op')
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(queuedAccountingSyncs.length, 1, 'the enqueue was attempted')
+  assert.equal(accountingSyncRows.length, 0, 'and it wrote nothing — which is what production has to notice')
+
+  const reported = activityLogWrites.filter((row) => row.action === 'allocation_reversal_unqueued')
+  assert.equal(reported.length, 1, 'the dropped reversal is recorded, not assumed')
+  assert.equal(reported[0].level, 'ERROR')
+  assert.match(
+    String(reported[0].description),
+    /Allocation reversal of £16\.00 on order order-1 was NOT queued/,
+    'and it names the exact amount a human now has to post by hand — £16.00, not "a reversal failed"',
+  )
+  assert.match(String(reported[0].description), /4 recorded unit\(s\) left the order/)
+})
+
+test('o3d-0i5y r10: a reversal the queue DID take is not reported as dropped', async () => {
+  // The guard against the opposite failure. The verification asks for the row under the enqueue's
+  // own predicate; a predicate that could never match would turn every successful reversal into an
+  // ERROR-level false alarm and train whoever reads the log to ignore it.
+  const state = shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(accountingSyncRows.length, 1)
+  assert.equal(
+    typeof accountingSyncRows[0].payload._reversalToken,
+    'string',
+    'the row carries the token the verification looks it up by',
+  )
+  assert.deepEqual(activityLogWrites.filter((row) => row.action === 'allocation_reversal_unqueued'), [])
+})
+
+/**
+ * o3d-0i5y r10 — THE DEALLOCATION TEARDOWN, WHICH DELETES EVERY ROW ON THE ORDER.
+ *
+ *   line L holds 10 units at warehouse-1. A2 pinned them at £4 and posted DR Allocated /
+ *   CR Inventory £40.
+ *   the operator presses Deallocate. There is no committed shipment, so nothing refuses it.
+ *   BEFORE r10: `deleteMany({ orderId })` takes all ten rows and the record with them. The units
+ *     will never ship, so Group B never credits Allocated Inventory; they were never invoiced, so
+ *     no refund reversal sees them. £40 sits in Allocated Inventory for ever, Inventory is
+ *     understated by £40, and not one row survives that could say how much it was.
+ *   AFTER r10: CR Allocated £40 / DR Inventory £40, in the same transaction as the delete.
+ */
+function deallocatedState(record: Array<Record<string, string>> | null): ReturnType<typeof baseState> {
+  const state = shrunkState({ lineQty: 10, record })
+  state.stockLevels[0].reservedQty = 10
+  return state
+}
+
+test('o3d-0i5y r10: the deallocation teardown REVERSES the posted debit of the rows it deletes', async () => {
+  const state = deallocatedState(POSTED_TEN_AT_FOUR)
+  resetAccountingQueue()
+
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.deepEqual(state.allocations, [], 'the rows are gone, as this path has always intended')
+  assert.equal(queuedAccountingSyncs.length, 1, 'and their posted debit does not go with them')
+  assert.deepEqual(
+    queuedAccountingSyncs[0].payload.lines?.map((line) => [line.accountCode, line.debit ?? null, line.credit ?? null]),
+    [
+      ['630', 40, null],
+      ['631', null, 40],
+    ],
+    'CR Allocated Inventory £40, DR Inventory £40 — all ten units, at the £4 A2 recorded posting',
+  )
+  assert.equal(queuedAccountingSyncs[0].type, 'ALLOCATION_REVERSAL')
+  assert.equal(queuedAccountingSyncs[0].referenceId, 'order-1')
+})
+
+test('o3d-0i5y r10: the teardown reverses at what A2 RECORDED, never at the revalued pin', async () => {
+  // Same ten units, but a landed cost has since rewritten `unitCostBase` on the row from £4 to £9.
+  // That revaluation posted to COGS/Inventory and never to Allocated Inventory, so £40 is still
+  // what stands there. Reversing the live pin would take £90 out of an account that received £40.
+  const state = deallocatedState([{
+    costLayerId: 'layer-1',
+    qty: '10.000000',
+    unitCostBase: '9.000000',
+    postedUnitCostBase: '4.000000',
+  }])
+  resetAccountingQueue()
+
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.deepEqual(
+    queuedAccountingSyncs[0].payload.lines?.map((line) => [line.accountCode, line.debit ?? null, line.credit ?? null]),
+    [
+      ['630', 40, null],
+      ['631', null, 40],
+    ],
+    'still £40 — the recorded amount, not 10 x the revalued £9',
+  )
+})
+
+test('o3d-0i5y r10: a teardown of rows with NO record raises no reversal', async () => {
+  // The guard against the opposite failure: an order A2 never posted for has no debit to credit
+  // back, and a journal raised for it would move £40 out of an account that never received it.
+  const state = deallocatedState(null)
+  resetAccountingQueue()
+
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.deepEqual(state.allocations, [])
+  assert.deepEqual(queuedAccountingSyncs, [])
+})
+
+test('o3d-0i5y r10: a HARD DELETE of an order carrying a posted debit is refused, not silently reversed', async () => {
+  // The delete path cannot take the reversal: a journal enqueued as `referenceType: 'SalesOrder'`
+  // against an order that ceases to exist a few statements later resolves to nothing, which is the
+  // o3d-hrak orphan the enqueue lock exists to prevent. Deleting without one strands the £40. So
+  // neither is available, and the refusal names the amount and the remedy.
+  const state = deallocatedState(POSTED_TEN_AT_FOUR)
+  resetAccountingQueue()
+
+  await assert.rejects(
+    () => releaseOrderAllocationsInTx(createClient(state) as never, 'order-1', { orderIsBeingDeleted: true }),
+    /Group A2 has already posted £40\.00 of Allocated Inventory/,
+  )
+  assert.deepEqual(queuedAccountingSyncs, [], 'and no journal is raised against an order about to vanish')
+})
+
+test('o3d-0i5y r10: a hard delete of an order with NO posted debit is still allowed', async () => {
+  // The guard against the opposite failure — the refusal above must not turn every order delete
+  // into an error. Legacy rows carry no `postedUnitCostBase`, so they evidence nothing and cannot
+  // be the basis of a refusal either.
+  const state = deallocatedState([{ costLayerId: 'layer-1', qty: '10.000000', unitCostBase: '4.000000' }])
+  resetAccountingQueue()
+
+  const released = await releaseOrderAllocationsInTx(createClient(state) as never, 'order-1', { orderIsBeingDeleted: true })
+
+  assert.equal(released.allocations.length, 1)
+  assert.deepEqual(state.allocations, [])
   assert.deepEqual(queuedAccountingSyncs, [])
 })
 

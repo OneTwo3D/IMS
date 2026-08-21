@@ -32,8 +32,10 @@ import {
   clearDormantFulfillmentPinsInTx,
   lockSalesOrder,
   lockStockLevels,
+  planAccountedRecordCarryOver,
   releaseOrderAllocationsForDeallocationInTx,
   resetAllocationAccountingIfStaged,
+  reverseOrphanedAllocationPosting,
   validateAllocationIntegrity,
   type AllocationUnallocatedLine,
 } from '@/lib/domain/sales/allocation-service'
@@ -531,6 +533,20 @@ export async function updateAllocation(
       }
 
       await resetAllocationAccountingIfStaged(tx, locked.orderId)
+
+      // o3d-0i5y r10 (Codex round 10, finding 1): WHERE GROUP A2'S POSTED RECORD STANDS RIGHT NOW,
+      // read before this action's first write, from the rows as they still are.
+      //
+      // Scoped to this (line, product) because that is the grain the carry-over pools at, and it is
+      // the only grain this action can honestly speak for: it edits ONE row, and the units it moves
+      // can only ever land on a row of the same line and product. Every other row on the order is
+      // untouched, so including them would be inventing a claim about a set nobody declared — the
+      // exact thing `resetAllocationAccountingIfStaged`'s undeclared-caller path refuses to do.
+      const existingScopeRecords = await tx.orderAllocation.findMany({
+        where: { orderId: locked.orderId, lineId: locked.lineId, productId: locked.productId },
+        select: { lineId: true, productId: true, warehouseId: true, costLayerSnapshot: true },
+      })
+
       await lockStockLevels(tx, [locked.productId], Array.from(new Set([locked.warehouseId, newWarehouseId])))
 
       const stockLevels = await tx.stockLevel.findMany({
@@ -723,6 +739,69 @@ export async function updateAllocation(
       // that the next allocation has already decided not to use. Retired here, so no reader is left
       // answering from it.
       await clearDormantFulfillmentPinsInTx(tx, locked.orderId)
+
+      // -------------------------------------------------------------------------------------
+      // o3d-0i5y r10 (Codex round 10, finding 1) — THE MANUAL EDITOR CARRIES AND REVERSES TOO.
+      //
+      // r9 gave the carry-over and the orphan reversal to `allocateSalesOrder`, the one caller that
+      // DECLARES its next set, and left this path out on the reading that an undeclared caller has
+      // nothing to declare. That reading was about the STAMP, and it was right about the stamp. It
+      // was never right about the record, and this action is the single most direct way a recorded
+      // unit leaves an order: an operator types a smaller number into the allocation editor.
+      //
+      // Worked example — the same shape r9 fixed for the allocator, arriving through the UI:
+      //   line L holds 10 units at W1. A2 pinned them at £4 and posted DR Allocated / CR Inventory
+      //   £40, stamping `postedUnitCostBase` 4.000000 on the entry.
+      //   the operator edits the allocation to 6. Nothing is refused: no shipment is committed.
+      //   BEFORE r10: the row keeps a record of 10 units. `unaccountedAllocationQty`'s floor stops
+      //     A2 posting them again — and that is all it does. Group B will credit Allocated
+      //     Inventory 6 x £4 = £24 when the six ship, no refund ever sees the other four (they were
+      //     never invoiced), and £16 of a real debit sits in Allocated Inventory for ever with
+      //     Inventory understated by the same £16.
+      //   AFTER r10: the record is trimmed to the 6 units the row will hold (£24) and the 4 units
+      //     that left the order raise CR Allocated £16.00 / DR Inventory £16.00. Allocated
+      //     Inventory holds exactly the £24 Group B will relieve.
+      //
+      // A reduction to zero is the same thing at its limit: the row is deleted, all 10 units are
+      // orphaned, and £40 is reversed. A warehouse MOVE, by contrast, keeps every unit on the
+      // order — the carry-over moves the record onto the destination row and there is nothing to
+      // reverse, which is exactly what the merge branch above needs, because it DELETES the source
+      // row and its record with it.
+      //
+      // Read from the rows AS PERSISTED, the same rule the reservation delta above follows: the
+      // database is the authority on what its own `numeric(12,4)` column stored, and a record
+      // trimmed against anything else would disagree with the quantity the row actually holds.
+      //
+      // The reversal is raised LAST, after every row write, so the journal and the state it
+      // describes commit together (the r9 rebase decision), and inside this transaction, under the
+      // order row lock taken at the top — which is what `queueAccountingSyncTx` requires of an
+      // order-scoped enqueue.
+      // -------------------------------------------------------------------------------------
+      const writtenScopeRows = await tx.orderAllocation.findMany({
+        where: { orderId: locked.orderId, lineId: locked.lineId, productId: locked.productId },
+        select: { lineId: true, productId: true, warehouseId: true, qty: true },
+      })
+      const { records: accountedRecords, orphaned: orphanedRecord } = planAccountedRecordCarryOver(
+        existingScopeRecords,
+        writtenScopeRows.map((row) => ({ ...row, qty: toDecimal(row.qty) })),
+      )
+      for (const row of writtenScopeRows) {
+        // `write` is null for a row that already holds its own record and must simply be left
+        // alone; re-writing it would serialize a value nothing asked to change.
+        const carriedRecord = accountedRecords.get(allocationScopeKey(row))?.write
+        if (!carriedRecord) continue
+        await tx.orderAllocation.update({
+          where: {
+            lineId_warehouseId_productId: {
+              lineId: row.lineId,
+              warehouseId: row.warehouseId,
+              productId: row.productId,
+            },
+          },
+          data: { costLayerSnapshot: carriedRecord as Prisma.InputJsonValue },
+        })
+      }
+      await reverseOrphanedAllocationPosting(tx, locked.orderId, orphanedRecord)
 
       const integrityError = await validateAllocationIntegrity(tx, locked.orderId, [locked.lineId])
       if (integrityError) throw new Error(integrityError)
