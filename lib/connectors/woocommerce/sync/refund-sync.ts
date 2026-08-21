@@ -929,9 +929,6 @@ export async function syncWcRefund(
 }
 
 /**
- * Check for new refunds on synced orders and process them.
- */
-/**
  * The page size this walk ASKS FOR. WooCommerce pages `/orders/{id}/refunds` at TEN unless asked
  * otherwise, and 100 is the most core will serve.
  *
@@ -1136,6 +1133,9 @@ export async function fetchAllWcRefundsForOrder(
  */
 export type RefundSweepResult = { synced: number; complete: boolean; error?: string }
 
+/**
+ * Check for new refunds on synced orders and process them.
+ */
 export async function syncRefundsForOrder(externalOrderId: number): Promise<RefundSweepResult> {
   // Every page of refunds on the order, not just the first (o3d-okbd).
   const { refunds, error } = await fetchAllWcRefundsForOrder(externalOrderId)
