@@ -51,6 +51,39 @@ export const LEDGER_HELD_REGISTRATION_STATUSES = ['PENDING', 'PROCESSING', 'SYNC
  */
 export const RETIRABLE_REGISTRATION_STATUSES = ['PENDING'] as const
 
+/**
+ * The statuses that mean IMS ATTEMPTED to register the payment and does not know what the ledger did
+ * with it (o3d-clxw's `REGISTRATION_UNDECIDED`, reached from the other side).
+ *
+ * FAILED, with no document id. The sync processor makes its remote call BEFORE it writes down the
+ * result, so everything between the request leaving and the row being updated — a timeout, a dropped
+ * response, a killed worker, a rejection Xero recorded anyway — is written down as a FAILURE IN
+ * FRONT OF A PAYMENT THAT EXISTS. The row says the attempt did not succeed; it does not say the
+ * ledger was never told. Reading it as "nothing posted" is exactly the reading o3d-ju8t, o3d-sref and
+ * o3d-clxw each removed from a different call site, and it was still here.
+ *
+ * A row in this state is DECIDABLE ONLY LATER, never from here: retried, it either posts and carries
+ * a document id (verifiable) or lands in a state that is. So the delete withholds, and says so.
+ *
+ * CANCELLED is deliberately NOT in this set. It is the one status IMS only ever writes where "nothing
+ * was sent" is an assertion something already checked — a PENDING row retired pre-call, or a
+ * registration a verified reversal retired — so it holds nothing and blocks nothing.
+ */
+export const UNDECIDED_REGISTRATION_STATUSES = ['FAILED'] as const
+
+/**
+ * Every status a registration must be READ in for the split below to see it.
+ *
+ * Lives here so the database query and the classification cannot drift: a status the query omits is
+ * a status the splitter can never classify, and the failure mode of that drift is silent and
+ * one-directional — the row is simply absent, which reads as "there is no registration", which is
+ * the permissive answer. That is precisely how FAILED rows with no document id went unexamined.
+ */
+export const READABLE_REGISTRATION_STATUSES = [
+  ...LEDGER_HELD_REGISTRATION_STATUSES,
+  ...UNDECIDED_REGISTRATION_STATUSES,
+] as const
+
 /** Xero's own value for a payment that has been removed. There is no VOIDED payment in Xero. */
 export const XERO_DELETED_PAYMENT_STATUS = 'DELETED'
 
@@ -70,6 +103,14 @@ export type PaymentRegistrationSplit = {
    * failure can sit in front of a real payment in the ledger, and post evidence outranks status.
    */
   ledgerHold: PaymentRegistrationRow[]
+  /**
+   * Rows that were ATTEMPTED and whose effect on the ledger is unknown — FAILED with no document id.
+   * Not `ledgerHold`, because nothing establishes that the ledger holds anything, and emphatically
+   * not nothing, because nothing establishes that it does not. See
+   * UNDECIDED_REGISTRATION_STATUSES; they are refused separately so the operator is told what is
+   * actually unknown rather than shown a document id that does not exist.
+   */
+  undecided: PaymentRegistrationRow[]
 }
 
 function trimmed(value: string | null | undefined): string {
@@ -81,16 +122,22 @@ export function hasPostEvidence(row: PaymentRegistrationRow): boolean {
 }
 
 /**
- * Split the registrations that NAME this payment into the ones that can simply be retired and the
- * ones the ledger holds.
+ * Split the registrations that NAME this payment into the ones that can simply be retired, the ones
+ * the ledger holds, and the ones nobody can currently speak for.
  *
  * The caller is responsible for having filtered to rows whose payload names this payment id — a row
  * that names no payment is nobody's to retract, and matching by amount instead is what used to
  * retract an imported order's own registration (Codex, PR #582 round 2).
+ *
+ * THREE BUCKETS, NOT TWO, and the third is the correction. The two-bucket version had to answer
+ * "does the ledger hold a payment?" with a yes or a no, and had no way to say "an attempt was made
+ * and nobody knows" — so it said NO, and the delete went through. See
+ * UNDECIDED_REGISTRATION_STATUSES.
  */
 export function splitPaymentRegistrations(rows: readonly PaymentRegistrationRow[]): PaymentRegistrationSplit {
   const retirable: PaymentRegistrationRow[] = []
   const ledgerHold: PaymentRegistrationRow[] = []
+  const undecided: PaymentRegistrationRow[] = []
   for (const row of rows) {
     const held = (LEDGER_HELD_REGISTRATION_STATUSES as readonly string[]).includes(row.status)
     if (hasPostEvidence(row)) {
@@ -99,11 +146,14 @@ export function splitPaymentRegistrations(rows: readonly PaymentRegistrationRow[
       retirable.push(row)
     } else if (held) {
       ledgerHold.push(row)
+    } else if ((UNDECIDED_REGISTRATION_STATUSES as readonly string[]).includes(row.status)) {
+      undecided.push(row)
     }
-    // Anything else — FAILED or CANCELLED with no document id — holds nothing in the ledger and
-    // needs no action: settlementStatus already reads it as genuinely unpaid on both sides.
+    // Anything else — in practice CANCELLED with no document id — genuinely holds nothing: that
+    // status is only ever written where "nothing was sent" has already been established, so
+    // settlementStatus correctly reads it as unpaid on both sides.
   }
-  return { retirable, ledgerHold }
+  return { retirable, ledgerHold, undecided }
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +165,8 @@ export type PaymentDeleteRefusalCode =
   | 'ledger_holds_payment'
   /** A worker claimed the queued registration while the delete was running. */
   | 'registration_in_flight'
+  /** A registration was ATTEMPTED and failed without naming a document. Nobody can say what posted. */
+  | 'registration_attempt_undecided'
 
 export type PaymentDeleteRefusal = { code: PaymentDeleteRefusalCode; message: string }
 
@@ -140,6 +192,48 @@ export function describeLedgerHoldRefusal(
   }
 }
 
+/**
+ * The refusal for an ATTEMPTED registration whose outcome nobody knows.
+ *
+ * WHAT IT MUST NOT SAY. Not "a payment exists" — none is known to. Not "the sync failed, try again"
+ * — that is the reading that deleted the receipt. It has to state the actual epistemic position,
+ * because the operator is the only party who can resolve it and they can only do that if they are
+ * told what is missing: an attempt was made, the result was not recorded, and the row names no
+ * document to ask about.
+ *
+ * AND IT MUST NOT BE A DEAD END. The row is undecidable from IMS, but it is not undecidable: a
+ * retry from Sync → Xero re-posts it, and a registration that posts carries a document id back —
+ * at which point this receipt falls under the ordinary ledger-hold refusal, which HAS a verified
+ * remedy. So the instruction is "look, then retry", in that order, because the looking is what
+ * decides whether the retry duplicates a payment.
+ *
+ * WHY IMS DOES NOT LOOK ITSELF. It cannot. The row names no payment, so the only question the
+ * ledger could be asked is about the INVOICE — and an invoice showing no payment is exactly what a
+ * removed payment and a never-posted one BOTH look like (o3d-clxw). Asking would produce a
+ * confident answer with no evidence under it, which is worse than refusing.
+ */
+export function describeAttemptUndecidedRefusal(
+  undecided: readonly PaymentRegistrationRow[],
+  orderReference: string,
+): PaymentDeleteRefusal {
+  const entries = undecided.map((row) => row.id).join(', ')
+  return {
+    code: 'registration_attempt_undecided',
+    message:
+      `IMS tried to register this receipt against the invoice for ${orderReference} in the accounting `
+      + 'system and the attempt was recorded as FAILED, without a payment reference. A failure is not '
+      + 'proof that nothing was posted: the accounting system is called BEFORE the result is written '
+      + 'down, so a timeout or a lost response is recorded as a failure even when the payment went '
+      + 'through. Nothing was deleted.\n\n'
+      + `Open the invoice for ${orderReference} in the accounting system and look at the payments on it.\n`
+      + '• If a payment IS there, the attempt landed. Reverse it there, then delete this receipt.\n'
+      + '• If there is NO payment, retry the registration under Sync → Xero. Once it posts, IMS knows '
+      + 'the payment reference and can check the reversal for you.\n\n'
+      + `IMS cannot settle this itself: the failed entry (${entries}) names no payment to look up, and an `
+      + 'invoice showing nothing looks the same whether the payment was removed or never arrived.',
+  }
+}
+
 export const REGISTRATION_IN_FLIGHT_REFUSAL: PaymentDeleteRefusal = {
   code: 'registration_in_flight',
   message:
@@ -159,6 +253,8 @@ export type LedgerReversalRefusalCode =
   | 'payment_missing'
   /** A registration is in flight with no document id, so there is nothing to check yet. */
   | 'unverifiable_in_flight'
+  /** A registration was attempted and failed without naming a document, so there is nothing to check. */
+  | 'attempt_undecided'
   /** The connector is not one this check knows how to ask. */
   | 'connector_not_supported'
   /** The accounting system could not be asked. Nothing changed. */
@@ -195,6 +291,25 @@ export const UNVERIFIABLE_IN_FLIGHT_REFUSAL: LedgerReversalRefusal = {
     'This receipt\'s payment registration is still in flight and carries no document id, so there is '
     + 'nothing for IMS to look up in the accounting system and no way to tell whether a payment exists '
     + 'there. Nothing was changed. Wait for the sync to finish, then reverse it.',
+}
+
+/**
+ * The reversal's version of the same refusal, and it exists so the reversal cannot become the way
+ * AROUND the delete's.
+ *
+ * "I have reversed it — check and delete" is a promise that IMS checked. Against a FAILED entry with
+ * no document id there is nothing to check, so honouring the click would delete the receipt on the
+ * operator's unverified word — the one outcome o3d-1vuv was built to make impossible, reached
+ * through the remedy instead of the fault.
+ */
+export const UNDECIDED_ATTEMPT_REVERSAL_REFUSAL: LedgerReversalRefusal = {
+  code: 'attempt_undecided',
+  message:
+    'This receipt has a payment registration that was attempted and recorded as FAILED, and it names no '
+    + 'payment reference — so there is nothing for IMS to look up and no way to confirm anything was '
+    + 'reversed. Nothing was changed. IMS will not delete a receipt on an unchecked claim. Check the '
+    + 'invoice in the accounting system, and retry the registration under Sync → Xero so it records a '
+    + 'payment reference IMS can then verify against.',
 }
 
 export const NO_LEDGER_HOLD_REFUSAL: LedgerReversalRefusal = {

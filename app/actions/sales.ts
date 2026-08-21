@@ -16,11 +16,14 @@ import {
   HOLD_MOVED_REFUSAL,
   NO_LEDGER_HOLD_REFUSAL,
   PAYMENT_REGISTRATION_TYPE,
+  READABLE_REGISTRATION_STATUSES,
   REGISTRATION_IN_FLIGHT_REFUSAL,
   RETIRABLE_REGISTRATION_STATUSES,
+  UNDECIDED_ATTEMPT_REVERSAL_REFUSAL,
   UNVERIFIABLE_IN_FLIGHT_REFUSAL,
   VERIFIABLE_REVERSAL_CONNECTORS,
   buildVerifiedReversalData,
+  describeAttemptUndecidedRefusal,
   describeLedgerHoldRefusal,
   hasPostEvidence,
   isReversedInLedger,
@@ -3563,6 +3566,12 @@ class PaymentTransactionRefusal extends Error {
  * registration can sit in front of a real payment in the ledger — and post evidence outranks status
  * everywhere else in this codebase, so it must here too.
  *
+ * AND IT ADMITS FAILED ROWS THAT CARRY NO DOCUMENT ID. Those are the ones the previous version could
+ * not see, and not seeing them was the whole defect: the splitter classifies what it is given, so a
+ * status the query omits is silently classified as "no registration exists" — the permissive answer.
+ * The status list therefore comes from READABLE_REGISTRATION_STATUSES, alongside the classification
+ * it feeds, so the two cannot drift apart again.
+ *
  * Matching is by the payload's own paymentId and never by amount: an imported paid order carries a
  * perfectly legitimate INVOICE_PAYMENT with no local Payment row behind it, and a row that names no
  * payment is nobody's to retract (Codex, PR #582 round 2).
@@ -3578,7 +3587,7 @@ async function readPaymentRegistrations(
       referenceType: 'SalesOrder',
       referenceId: orderId,
       OR: [
-        { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
+        { status: { in: [...READABLE_REGISTRATION_STATUSES] } },
         { externalTransactionId: { not: null } },
       ],
     },
@@ -3678,9 +3687,17 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
       // path — so it has no INVOICE_PAYMENT registration to hold it back.
       if (!payment.refundId) {
         const registrations = await readPaymentRegistrations(tx, orderId, paymentId)
-        const { retirable, ledgerHold } = splitPaymentRegistrations(registrations)
+        const { retirable, ledgerHold, undecided } = splitPaymentRegistrations(registrations)
         if (ledgerHold.length > 0) {
           const refusal = describeLedgerHoldRefusal(ledgerHold, getSalesOrderReference(so))
+          throw new PaymentTransactionRefusal(refusal.code, refusal.message)
+        }
+        // AFTER the ledger hold, because a row that names a document is the more useful thing to
+        // report: it tells the operator which payment to go and look at. An undecided attempt names
+        // none, and refuses on its own account — a FAILED registration is not proof that nothing was
+        // posted, and this is the delete that used to go through on exactly that assumption.
+        if (undecided.length > 0) {
+          const refusal = describeAttemptUndecidedRefusal(undecided, getSalesOrderReference(so))
           throw new PaymentTransactionRefusal(refusal.code, refusal.message)
         }
         if (retirable.length > 0) {
@@ -3805,7 +3822,15 @@ export async function reverseLedgerPayment(paymentId: string, orderId: string): 
     }
 
     const registrations = await readPaymentRegistrations(db, orderId, paymentId)
-    const { retirable, ledgerHold } = splitPaymentRegistrations(registrations)
+    const { retirable, ledgerHold, undecided } = splitPaymentRegistrations(registrations)
+    // BEFORE the empty-hold check, and that order is the point. An undecided attempt puts nothing in
+    // `ledgerHold`, so checking emptiness first would answer "the accounting system does not hold a
+    // payment for this receipt" — a confident statement of exactly the fact nobody knows — and send
+    // the operator back to the ordinary delete, which now refuses. Two contradictory answers to one
+    // question is worse than either of them.
+    if (undecided.length > 0) {
+      return { success: false, code: UNDECIDED_ATTEMPT_REVERSAL_REFUSAL.code, error: UNDECIDED_ATTEMPT_REVERSAL_REFUSAL.message }
+    }
     if (ledgerHold.length === 0) {
       return { success: false, code: NO_LEDGER_HOLD_REFUSAL.code, error: NO_LEDGER_HOLD_REFUSAL.message }
     }
@@ -3851,6 +3876,17 @@ export async function reverseLedgerPayment(paymentId: string, orderId: string): 
       const stillRecorded = await tx.payment.findUnique({ where: { id: paymentId }, select: { orderId: true } })
       if (!stillRecorded || stillRecorded.orderId !== orderId) {
         throw new PaymentTransactionRefusal('payment_missing', 'That receipt no longer exists on this order, so nothing was changed.')
+      }
+
+      // THE FENCE'S OTHER HALF: a registration that APPEARED since the check. The per-row
+      // compare-and-swap below can only fence rows this call already knows about, and the Xero GETs
+      // above take as long as Xero takes — long enough for the processor to claim a queued sibling,
+      // post it and record a failure with no document id. Deleting the receipt on top of that is the
+      // same defect as before, arrived at through a race instead of a misclassification. Re-read
+      // under the order lock and abandon if the answer has changed shape.
+      const freshUndecided = splitPaymentRegistrations(await readPaymentRegistrations(tx, orderId, paymentId)).undecided
+      if (freshUndecided.length > 0) {
+        throw new PaymentTransactionRefusal(HOLD_MOVED_REFUSAL.code, HOLD_MOVED_REFUSAL.message)
       }
 
       // THE FENCE. Each row is compare-and-swapped on the EXACT status and document id that was

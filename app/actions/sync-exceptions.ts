@@ -998,11 +998,34 @@ export type RecoverRefundSyncParkResult =
   | FreshAuthFailureResult
 
 /**
- * WooCommerce's default page size for /orders/{id}/refunds is 10, and syncRefundsForOrder never asks
- * for more. Reading only the first page here would be far worse than a missing sync: a refund on
- * page 2 would look ABSENT, and "absent from this order" is precisely what authorises a dismissal.
- * So this pages exhaustively, and refuses rather than guessing when an order carries more refunds
- * than the cap.
+ * EVERY refund WooCommerce lists on an order, or a REFUSAL — never a list that might be short.
+ *
+ * WHY THIS READ IS HELD TO A HIGHER STANDARD THAN THE SWEEP'S. `fetchAllWcRefundsForOrder` in the
+ * refund sweep may hand back a partial list with an error attached, because syncing nine of ten
+ * refunds is better than syncing none and the next sweep re-reads from the start. THIS read cannot
+ * do that. Its output is EVIDENCE, and specifically evidence of ABSENCE: "WooCommerce does not list
+ * refund N on this order" is the whole of what authorises a dismissal, and a dismissal writes off a
+ * refund whose money has already left the business. A list that merely FAILED TO INCLUDE something
+ * is indistinguishable from one that PROVES it is not there — so an answer that cannot be shown to
+ * be complete must refuse rather than resolve.
+ *
+ * WHAT "COMPLETE" MEANS HERE, and why `x-wp-totalpages` cannot supply it. `wcFetch` parses that
+ * header as `parseInt(header ?? '1')`, so a store that does not send it at all is INDISTINGUISHABLE
+ * from one reporting a single page — both arrive as `totalPages: 1`. Ending the walk on that number
+ * would take "the store said nothing" for "the store said there is no more", which is the exact
+ * shape of the defect this function exists to avoid, moved one layer out. So the header is never
+ * trusted to end the walk. Only a SHORT PAGE ends it: a page holding fewer rows than were asked for
+ * cannot have been truncated, so it proves the end of the collection whatever any header claims. A
+ * FULL page always advances, even when the header says there is nothing after it — the cost is one
+ * extra request on an order whose refund count is an exact multiple of a hundred, and the benefit is
+ * that completeness is established by the response body rather than asserted by a header.
+ *
+ * The reported total is still read, for the one thing it CAN do: fail fast and cheaply when the
+ * store says up front there is more here than this check will read.
+ *
+ * AND AN UNREADABLE ROW REFUSES TOO. An entry whose `id` is not a usable integer used to be dropped
+ * silently, which is the same error in miniature: a list with a row we cannot read cannot establish
+ * that a particular refund is missing from it.
  */
 const WC_REFUND_PAGE_SIZE = 100
 const WC_REFUND_MAX_PAGES = 10
@@ -1011,28 +1034,35 @@ async function readWcOrderRefundIds(
   wcOrderId: number,
 ): Promise<{ evidence: WcOrderRefundEvidence } | { error: string }> {
   const ids: number[] = []
-  let page = 1
-  let totalPages = 1
-  do {
+  for (let page = 1; page <= WC_REFUND_MAX_PAGES; page += 1) {
     const { data, totalPages: reported, error } = await wcFetch(
       `/orders/${wcOrderId}/refunds`,
       { per_page: String(WC_REFUND_PAGE_SIZE), page: String(page) },
     )
     if (error) return { error }
     if (!Array.isArray(data)) return { error: 'WooCommerce returned an unexpected response for this order\'s refunds.' }
+    // Cheap early refusal: the store itself says the collection is bigger than this walk. Checked
+    // BEFORE the page is banked so an oversized order costs one request rather than ten.
+    if (Number.isFinite(reported) && reported > WC_REFUND_MAX_PAGES) {
+      return { error: `that order reports ${reported} pages of refunds, more than this check will read` }
+    }
     for (const entry of data) {
       const candidate = (entry as { id?: unknown }).id
-      if (typeof candidate === 'number' && Number.isSafeInteger(candidate)) ids.push(candidate)
-    }
-    totalPages = Math.max(1, reported || 1)
-    if (totalPages > WC_REFUND_MAX_PAGES) {
-      return {
-        error: `that order reports ${totalPages} pages of refunds, more than this check will read`,
+      if (typeof candidate !== 'number' || !Number.isSafeInteger(candidate)) {
+        return { error: 'WooCommerce listed a refund on that order with no readable id, so this check cannot say which refunds it holds' }
       }
+      ids.push(candidate)
     }
-    page += 1
-  } while (page <= totalPages)
-  return { evidence: { wcOrderId, refundIds: ids, fetchedAt: new Date() } }
+    // THE ONLY PROOF OF THE END. A page shorter than the one asked for cannot have been truncated.
+    if (data.length < WC_REFUND_PAGE_SIZE) {
+      return { evidence: { wcOrderId, refundIds: ids, fetchedAt: new Date() } }
+    }
+  }
+  // Every page this walk is willing to read came back FULL, so there may well be another. The list
+  // is not known to be complete and must not be used to prove a refund absent.
+  return {
+    error: `that order has more than ${WC_REFUND_MAX_PAGES * WC_REFUND_PAGE_SIZE} refunds, more than this check will read`,
+  }
 }
 
 export async function recoverRefundSyncPark(

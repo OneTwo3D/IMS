@@ -374,10 +374,13 @@ and neither order can be deleted.
 Use **"Wrong order"** on the parked row. It offers two things, and checks both with WooCommerce
 before changing anything:
 
-- **It belongs to another WooCommerce order** — give the WooCommerce order number. One Two Inventory
-  asks WooCommerce which refunds that order actually has, right now, and refuses if this refund is
-  not one of them. If it is, the park moves to that order and becomes retryable there. The refund
-  itself has still not been applied — retry it from its new order.
+- **It belongs to another WooCommerce order** — give the WooCommerce **order ID**, which is the
+  `id=` in the address bar with that order open in WooCommerce (or the refund's own `parent_id`), and
+  is *not* necessarily the order number shown to the customer. The two are the same on a plain store
+  and differ wherever order numbering has been customised — and the wrong one addresses a different
+  order or none. One Two Inventory asks WooCommerce which refunds that order actually has, right now,
+  and refuses if this refund is not one of them. If it is, the park moves to that order and becomes
+  retryable there. The refund itself has still not been applied — retry it from its new order.
 - **WooCommerce no longer has it on this order** — for a refund that has since been deleted in
   WooCommerce. One Two Inventory asks WooCommerce which refunds *this* order has and refuses if the
   refund is still one of them. Dismissing only clears a park WooCommerce contradicts; it does not
@@ -385,6 +388,15 @@ before changing anything:
 
 Either way the WooCommerce answer it acted on — the order asked, the refunds returned, and the time —
 is recorded in the activity log alongside who did it.
+
+Both checks need WooCommerce's answer to be **complete**, because "this refund is not on that order"
+is what they turn on. One Two Inventory reads every page of an order's refunds and stops only once a
+page comes back short, which is the point at which there provably is no more; it does not take the
+store's page-count header for an answer, since a store that sends no header is indistinguishable from
+one reporting a single page. If the read cannot be completed — the store errors, an order carries
+more refunds than the check will read, or a refund comes back with no readable id — the recovery is
+**refused and nothing is changed**, rather than treating a list that might be short as proof the
+refund is missing.
 
 ## Invoice Notes and Customer PDF Downloads
 

@@ -368,7 +368,10 @@ export function ExceptionsClient({ data }: Props) {
                       {row.orderId
                         ? <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
                         : '—'}
-                      {row.wcOrderId ? <span className="ml-2 text-[11px] text-muted-foreground font-mono">WC #{row.wcOrderId}</span> : null}
+                      {/* "id", not "#": this is the value the recovery panel asks for and the one the
+                          REST path addresses, and it is not necessarily the order number WooCommerce
+                          shows the customer. */}
+                      {row.wcOrderId ? <span className="ml-2 text-[11px] text-muted-foreground font-mono">WC id {row.wcOrderId}</span> : null}
                     </TableCell>
                     <TableCell className="text-xs font-mono">{row.externalRefundId ?? '—'}</TableCell>
                     <TableCell className="text-xs">{row.status}</TableCell>
@@ -843,8 +846,18 @@ function RecoverRefundParkPanel({
 
       {outcome === 'REASSIGN' ? (
         <div className="space-y-1 max-w-sm">
+          {/*
+            THE ID, NOT THE ORDER NUMBER. What is typed here is sent to WooCommerce verbatim as
+            /orders/{value}/refunds, which addresses an order by its ID. On a plain store the two
+            happen to be equal, so the wrong label costs nothing and reads as correct — but the
+            moment a sequential-order-number plugin is in use they diverge, and then an operator who
+            does what the label says supplies a number that addresses SOMEBODY ELSE'S order or no
+            order at all. A refund reassigned onto the wrong order is the very fault this panel
+            exists to repair. The nearest wrong answer is also the most visible one: the IMS order
+            number in the row above this panel is not a WooCommerce id either.
+          */}
           <label className="block text-muted-foreground" htmlFor={`wc-order-${row.id}`}>
-            WooCommerce order number that holds this refund
+            WooCommerce order ID that holds this refund
           </label>
           <Input
             id={`wc-order-${row.id}`}
@@ -853,6 +866,12 @@ function RecoverRefundParkPanel({
             onChange={(event) => setWcOrderId(event.target.value)}
             placeholder={row.wcOrderId ? `not ${row.wcOrderId}` : 'e.g. 10432'}
           />
+          <p className="text-muted-foreground">
+            The ID, not the order number the customer sees — read it off the <span className="font-mono">id=</span>{' '}
+            in the address bar while the order is open in WooCommerce, or off the refund&apos;s own{' '}
+            <span className="font-mono">parent_id</span>. They are the same number on a plain store and
+            different ones wherever order numbering is customised{row.wcOrderId ? <> — this park&apos;s own order is ID <span className="font-mono">{row.wcOrderId}</span></> : null}.
+          </p>
           <p className="text-muted-foreground">
             IMS will ask WooCommerce which refunds that order actually has, right now, and refuse if this
             refund is not one of them. If it is, the park moves there as PENDING and becomes retryable from

@@ -37,6 +37,12 @@ const state = {
   payments: [] as PaymentRow[],
   syncRows: [] as SyncRow[],
   activity: [] as Array<Record<string, unknown>>,
+  /**
+   * Every `where` the production code asked accountingSyncLog for. Recorded because the
+   * classification is only half the guard: a status the QUERY does not ask for is invisible to the
+   * classifier and reads as "no registration exists", so the query has to be asserted on directly.
+   */
+  registrationQueries: [] as Array<Record<string, unknown>>,
   /** Xero's answer per PaymentID. Absent => the GET fails. */
   xeroPayments: new Map<string, string>(),
   xeroError: null as string | null,
@@ -108,6 +114,7 @@ function makeClient() {
     },
     accountingSyncLog: {
       findMany: async ({ where, select }: { where: Record<string, unknown>; select?: Record<string, boolean> }) => {
+        state.registrationQueries.push(where)
         const rows = state.syncRows
           .filter((r) => matches(r as unknown as Record<string, unknown>, where))
           .map((r) => project(r as unknown as Record<string, unknown>, select))
@@ -250,6 +257,7 @@ test.beforeEach(() => {
   state.payments = [{ id: 'pay-1', orderId: 'order-1', refundId: null, amount: 100, currency: 'GBP' }]
   state.syncRows = [syncRow()]
   state.activity = []
+  state.registrationQueries = []
   state.xeroPayments = new Map([['PAY-9', 'AUTHORISED']])
   state.xeroError = null
   state.xeroCalls = []
@@ -280,6 +288,55 @@ test('a FAILED registration that names a document still refuses the delete', asy
   const result = await deletePayment('pay-1', 'order-1')
   assert.equal(result.code, 'ledger_holds_payment')
   assert.ok(paymentStillThere())
+})
+
+test('a FAILED registration with NO document id refuses the delete — a failure is not proof', async () => {
+  // THE DEFECT. A FAILED row carrying no document id used to satisfy no branch of the split at all,
+  // so it was classified as nothing, the delete proceeded, and the receipt disappeared while a
+  // payment the attempt may well have created stayed in Xero. The processor POSTS BEFORE IT
+  // PERSISTS, so this row is precisely the shape of "we called Xero and never learned what
+  // happened" — a timeout, a dropped response, a worker killed mid-call.
+  const { deletePayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  const result = await deletePayment('pay-1', 'order-1')
+  assert.equal(result.success, false)
+  // Its OWN code, not the ledger-hold one: the remedies differ, and the ledger-hold remedy (the
+  // verified reversal) cannot run without a document id.
+  assert.equal(result.code, 'registration_attempt_undecided')
+  assert.match(result.error ?? '', /A failure is not proof that nothing was posted/)
+  assert.match(result.error ?? '', /log-7/)
+  assert.ok(paymentStillThere(), 'the receipt must survive an attempt nobody can account for')
+  assert.equal(row('log-7').status, 'FAILED', 'and the failed entry is left exactly as it was')
+  assert.notEqual(state.order.paidAt, null, 'and paidAt must not be cleared')
+})
+
+test('a FAILED registration is READ at all — the query, not just the classification', async () => {
+  // The failure mode this pins is silent: a status the query omits never reaches the classifier and
+  // is indistinguishable from "there is no registration", which is the permissive answer. Widening
+  // the classifier without widening the query would leave the receipt deletable exactly as before,
+  // and every classifier-level test would still pass.
+  const { deletePayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  await deletePayment('pay-1', 'order-1')
+  const readWithStatus = state.registrationQueries.some((where) => {
+    const branches = (where.OR ?? []) as Array<Record<string, unknown>>
+    return branches.some((branch) => {
+      const status = branch.status as { in?: unknown[] } | undefined
+      return Array.isArray(status?.in) && status.in.includes('FAILED')
+    })
+  })
+  assert.ok(readWithStatus, 'the registration query must ask for FAILED rows, not only rows with a document id')
+})
+
+test('a CANCELLED registration with no document id still lets the receipt go', async () => {
+  // The boundary of the change. CANCELLED is the one status IMS only writes where "nothing was
+  // sent" has already been established, so widening FAILED must not sweep it up and make an
+  // ordinary correction impossible.
+  const { deletePayment } = await loadActions()
+  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null })]
+  const result = await deletePayment('pay-1', 'order-1')
+  assert.equal(result.success, true)
+  assert.ok(!paymentStillThere())
 })
 
 test('a receipt with only a queued registration deletes, retiring it in the SAME transaction', async () => {
@@ -387,6 +444,46 @@ test('a registration with no document id cannot be checked, so the reversal refu
   assert.equal((result as { code?: string }).code, 'unverifiable_in_flight')
   assert.equal(state.xeroCalls.length, 0)
   assert.ok(paymentStillThere())
+})
+
+test('a FAILED attempt with no document id refuses the REVERSAL too, and asks Xero nothing', async () => {
+  // The remedy must not become the way round the refusal. There is no document to look up, so
+  // "check and delete" could only ever delete on the operator's unchecked word — which is the exact
+  // outcome the delete refusal exists to prevent.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ status: 'FAILED', externalTransactionId: null })]
+  const result = await reverseLedgerPayment('pay-1', 'order-1')
+  assert.equal((result as { code?: string }).code, 'attempt_undecided')
+  assert.equal(state.xeroCalls.length, 0, 'there is nothing to ask Xero about')
+  assert.ok(paymentStillThere())
+  assert.notEqual(state.order.paidAt, null)
+})
+
+test('an undecided attempt is NOT reported as "the ledger holds nothing"', async () => {
+  // The ordering that matters. An undecided attempt puts nothing in the ledger-hold bucket, so an
+  // emptiness check reached first would answer no_ledger_hold — a confident statement of precisely
+  // the fact nobody knows — and send the operator to the ordinary delete, which refuses. One
+  // question must not get two contradictory answers.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ status: 'FAILED', externalTransactionId: null })]
+  const result = await reverseLedgerPayment('pay-1', 'order-1')
+  assert.notEqual((result as { code?: string }).code, 'no_ledger_hold')
+})
+
+test('a failed attempt appearing DURING the reversal aborts it rather than deleting over it', async () => {
+  // The per-row compare-and-swap can only fence rows this call already knows about. The Xero GETs
+  // take as long as Xero takes — long enough for the processor to claim a queued sibling, post it,
+  // and record a failure with no document id. Deleting on top of that is the same defect reached
+  // through a race instead of a misclassification.
+  const { reverseLedgerPayment } = await loadActions()
+  state.xeroPayments = new Map([['PAY-9', 'DELETED']])
+  state.mutateUnderLock = () => {
+    state.syncRows.push(syncRow({ id: 'log-late', status: 'FAILED', externalTransactionId: null }))
+  }
+  const result = await reverseLedgerPayment('pay-1', 'order-1')
+  assert.equal((result as { code?: string }).code, 'hold_moved')
+  assert.ok(paymentStillThere(), 'nothing may be deleted while an unaccountable attempt is present')
+  assert.equal(row('log-1').status, 'SYNCED', 'and the verified row must roll back with it')
 })
 
 test('a connector this check cannot ask is refused rather than trusted', async () => {

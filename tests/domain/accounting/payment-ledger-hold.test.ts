@@ -3,7 +3,11 @@ import test from 'node:test'
 
 import {
   LEDGER_HELD_REGISTRATION_STATUSES,
+  READABLE_REGISTRATION_STATUSES,
+  UNDECIDED_ATTEMPT_REVERSAL_REFUSAL,
+  UNDECIDED_REGISTRATION_STATUSES,
   buildVerifiedReversalData,
+  describeAttemptUndecidedRefusal,
   describeLedgerHoldRefusal,
   hasPostEvidence,
   isReversedInLedger,
@@ -35,6 +39,7 @@ test('only a PENDING row with no document id can be retired without asking anyon
   const split = splitPaymentRegistrations([reg({ id: 'a', status: 'PENDING' })])
   assert.deepEqual(split.retirable.map((r) => r.id), ['a'])
   assert.deepEqual(split.ledgerHold, [])
+  assert.deepEqual(split.undecided, [])
 })
 
 test('a PROCESSING or SYNCED registration holds the ledger and blocks the delete', () => {
@@ -59,13 +64,54 @@ test('a PENDING row that somehow carries a document id is a hold, not something 
   assert.deepEqual(split.ledgerHold.map((r) => r.id), ['a'])
 })
 
-test('a FAILED or CANCELLED row with no document id holds nothing and needs no action', () => {
-  const split = splitPaymentRegistrations([
-    reg({ id: 'a', status: 'FAILED' }),
-    reg({ id: 'b', status: 'CANCELLED' }),
-  ])
+test('a FAILED row with no document id is UNDECIDED — an attempt nobody can speak for', () => {
+  // THE CORRECTION. This used to fall through every branch and be classified as nothing at all, so
+  // deletePayment removed the receipt while a payment the attempt may well have created stayed in
+  // the ledger. A FAILED row is not proof that nothing posted: the processor calls the accounting
+  // system BEFORE it writes the result down, so a lost response is recorded as a failure in front
+  // of a real payment. It is not `ledgerHold` either — nothing establishes that a payment exists —
+  // which is exactly why it needs a bucket of its own.
+  const split = splitPaymentRegistrations([reg({ id: 'a', status: 'FAILED' })])
   assert.deepEqual(split.retirable, [])
   assert.deepEqual(split.ledgerHold, [])
+  assert.deepEqual(split.undecided.map((r) => r.id), ['a'])
+})
+
+test('a CANCELLED row with no document id holds nothing and needs no action', () => {
+  // CANCELLED is the one status IMS only ever writes where "nothing was sent" has ALREADY been
+  // established, so unlike FAILED it asserts something rather than merely recording an outcome.
+  const split = splitPaymentRegistrations([reg({ id: 'b', status: 'CANCELLED' })])
+  assert.deepEqual(split.retirable, [])
+  assert.deepEqual(split.ledgerHold, [])
+  assert.deepEqual(split.undecided, [])
+})
+
+test('post evidence still wins over undecided: a FAILED row naming a document is a HOLD', () => {
+  // The two FAILED cases must not collapse into one. A document id makes the payment checkable, and
+  // the checkable one gets the refusal that has a verified remedy behind it.
+  const split = splitPaymentRegistrations([
+    reg({ id: 'a', status: 'FAILED', externalTransactionId: 'PAY-1' }),
+    reg({ id: 'b', status: 'FAILED' }),
+  ])
+  assert.deepEqual(split.ledgerHold.map((r) => r.id), ['a'])
+  assert.deepEqual(split.undecided.map((r) => r.id), ['b'])
+})
+
+test('the undecided statuses are FAILED, and CANCELLED is deliberately not one of them', () => {
+  assert.deepEqual([...UNDECIDED_REGISTRATION_STATUSES], ['FAILED'])
+  assert.ok(!(UNDECIDED_REGISTRATION_STATUSES as readonly string[]).includes('CANCELLED'))
+})
+
+test('every status the splitter can classify is one the query is told to read', () => {
+  // The drift this pins is silent and one-directional: a status the QUERY omits never reaches the
+  // splitter, so it is classified as "no registration exists" — the permissive answer, and the one
+  // that deleted receipts over FAILED rows. Both lists live in this module so they move together.
+  for (const status of [...LEDGER_HELD_REGISTRATION_STATUSES, ...UNDECIDED_REGISTRATION_STATUSES]) {
+    assert.ok(
+      (READABLE_REGISTRATION_STATUSES as readonly string[]).includes(status),
+      `${status} is classified but would never be read`,
+    )
+  }
 })
 
 test('the delete refusal names the document and points at the remedy, not at a warning', () => {
@@ -82,6 +128,35 @@ test('the delete refusal names the document and points at the remedy, not at a w
 test('a hold with no document id is called out separately, because it cannot be checked', () => {
   const refusal = describeLedgerHoldRefusal([reg({ status: 'PROCESSING' })], 'SO-1001')
   assert.match(refusal.message, /still in flight and has no document id/)
+})
+
+test('the undecided refusal states what is UNKNOWN, and never that a payment exists', () => {
+  const refusal = describeAttemptUndecidedRefusal([reg({ id: 'log-7', status: 'FAILED' })], 'SO-1001')
+  assert.equal(refusal.code, 'registration_attempt_undecided')
+  assert.match(refusal.message, /SO-1001/)
+  assert.match(refusal.message, /Nothing was deleted/)
+  // The reasoning, not just the verdict — this is the sentence that stops the next reader
+  // "simplifying" a FAILED row back into "nothing posted".
+  assert.match(refusal.message, /A failure is not proof that nothing was posted/)
+  assert.match(refusal.message, /called BEFORE the result is written down/)
+  // It names the entry, so the operator can find it rather than hunt for it.
+  assert.match(refusal.message, /log-7/)
+  // And a remedy in two branches, because which branch applies is the fact that is missing.
+  assert.match(refusal.message, /look at the payments on it/)
+  assert.match(refusal.message, /retry the registration under Sync → Xero/)
+  // It must NOT claim a payment id it does not have, nor point at the verified-reversal button:
+  // there is nothing for that button to check, and offering it would invite the unchecked delete.
+  assert.ok(!/payment PAY-/.test(refusal.message))
+  assert.ok(!/Reverse in ledger and delete/.test(refusal.message))
+})
+
+test('the reversal refuses an undecided attempt too, so the remedy is not a way round the refusal', () => {
+  // "I have reversed it — check and delete" promises IMS checked. Against an entry with no document
+  // id there is nothing to check, so honouring it would delete the receipt on the operator's word.
+  assert.equal(UNDECIDED_ATTEMPT_REVERSAL_REFUSAL.code, 'attempt_undecided')
+  assert.match(UNDECIDED_ATTEMPT_REVERSAL_REFUSAL.message, /names no payment reference/)
+  assert.match(UNDECIDED_ATTEMPT_REVERSAL_REFUSAL.message, /Nothing was changed/)
+  assert.match(UNDECIDED_ATTEMPT_REVERSAL_REFUSAL.message, /will not delete a receipt on an unchecked claim/)
 })
 
 test('only Xero DELETED counts as reversed; anything else is the ledger still holding it', () => {

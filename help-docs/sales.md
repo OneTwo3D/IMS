@@ -240,6 +240,26 @@ A receipt whose registration is still queued (nothing has been sent yet) deletes
 queued registration is cancelled with it. A receipt against a **credit note** settles the credit
 note rather than the invoice, so this check does not apply to it.
 
+#### When the registration was tried and failed
+
+A registration that was **attempted and recorded as failed, with no payment reference**, also
+refuses the deletion — and there is no "check and delete" button for it, because there is nothing to
+check.
+
+A failure does not mean nothing was posted. The accounting system is called *before* the result is
+written down, so a timeout, a dropped response or a worker that died mid-call is recorded as a
+failure even when the payment went through. One Two Inventory cannot tell the two apart on its own:
+the entry names no payment to look up, and an invoice showing no payment looks identical whether the
+payment was removed or never arrived.
+
+You resolve it, in this order:
+
+1. Open the invoice in the accounting system and look at its payments.
+2. **If a payment is there**, the attempt landed — reverse it there, then delete the receipt here.
+3. **If there is no payment**, retry the entry under **Sync → Xero**. When it posts, One Two
+   Inventory records the payment reference, and from then on the receipt falls under the ordinary
+   refusal above, which *can* check the reversal for you.
+
 ## Invoice Generation
 
 Invoices can be generated either manually or automatically. The trigger for automatic invoice generation is configurable in **Settings > Sales Settings**. Options include:

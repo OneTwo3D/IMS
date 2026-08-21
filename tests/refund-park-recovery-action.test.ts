@@ -43,6 +43,10 @@ const state = {
   rawSql: [] as string[],
   /** WooCommerce's answer per order id. Absent => an error from the store. */
   wcRefundsByOrder: new Map<number, number[]>(),
+  /** Whether the fake store sends `x-wp-totalpages` at all. See the wcFetch double. */
+  reportTotalPages: true,
+  /** Refund ids the store returns with an unusable `id`, e.g. a string where a number belongs. */
+  wcUnreadableIds: new Set<number>(),
   wcError: null as string | null,
   wcCalls: [] as Array<{ path: string; params: Record<string, string> }>,
   /** Runs once, inside the transaction, after the advisory lock — to move the world under the write. */
@@ -208,17 +212,35 @@ mock.module('@/lib/db', {
 
 mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
+    /**
+     * WooCommerce's REAL collection semantics, not a convenient approximation:
+     *
+     *  - `per_page` DEFAULTS TO TEN and CAPS AT ONE HUNDRED, so code that asks for neither gets ten
+     *    and code that asks for more than a hundred still gets a hundred. A double that served
+     *    whatever was asked for would let a one-page read pass as exhaustive, and the pre-fix code
+     *    would agree with it — a double written to agree with the code cannot falsify it.
+     *  - `x-wp-totalpages` is a HEADER, and `wcFetch` reads a missing header as `parseInt('1')`. So a
+     *    store that does not report a total is INDISTINGUISHABLE, at this seam, from one reporting a
+     *    single page. `reportTotalPages: false` reproduces that exactly, by answering 1 — not 0, not
+     *    undefined — because 1 is what production would actually see.
+     */
     wcFetch: async (path: string, params: Record<string, string> = {}) => {
       state.wcCalls.push({ path, params })
       if (state.wcError) return { data: null, totalPages: 0, totalItems: 0, error: state.wcError }
       const match = /^\/orders\/(\d+)\/refunds$/.exec(path)
       if (!match) throw new Error(`test double does not implement WC path ${path}`)
+      if (state.wcCalls.length > 40) throw new Error(`the refund read did not terminate: ${state.wcCalls.length} requests`)
       const all = state.wcRefundsByOrder.get(Number(match[1])) ?? []
-      const perPage = Number(params.per_page ?? '10')
+      const requested = Number(params.per_page ?? '10')
+      const perPage = Math.min(Number.isFinite(requested) && requested > 0 ? requested : 10, 100)
       const page = Number(params.page ?? '1')
-      const totalPages = Math.max(1, Math.ceil(all.length / perPage))
+      const totalPages = state.reportTotalPages ? Math.max(1, Math.ceil(all.length / perPage)) : 1
       const slice = all.slice((page - 1) * perPage, page * perPage)
-      return { data: slice.map((id) => ({ id })), totalPages, totalItems: all.length }
+      return {
+        data: slice.map((id) => (state.wcUnreadableIds.has(id) ? { id: String(id) } : { id })),
+        totalPages,
+        totalItems: all.length,
+      }
     },
   },
 })
@@ -272,6 +294,8 @@ test.beforeEach(() => {
   state.activity = []
   state.rawSql = []
   state.wcRefundsByOrder = new Map([[1001, [7001]], [2002, [9001]]])
+  state.reportTotalPages = true
+  state.wcUnreadableIds = new Set()
   state.wcError = null
   state.wcCalls = []
   state.mutateUnderLock = null
@@ -353,6 +377,130 @@ test('a refund on the SECOND page of WooCommerce refunds is still found', async 
   assert.deepEqual(result, { success: true, outcome: 'REASSIGN', targetOrderId: 'order-A' })
   assert.ok(state.wcCalls.length >= 2, 'the second page must actually be requested')
   assert.equal(state.wcCalls[0].params.per_page, '100')
+})
+
+// ---------------------------------------------------------------------------
+// WHAT THE OPERATOR IS ASKED FOR MUST BE WHAT THE SERVER CONSUMES
+// ---------------------------------------------------------------------------
+
+test('the recovery panel asks for the WooCommerce order ID, which is what the server sends', async () => {
+  // The value typed into that field is sent to WooCommerce verbatim as /orders/{value}/refunds,
+  // which addresses an order by its ID. The field used to be labelled "order number". On a plain
+  // store the two are equal, so the wrong label is invisible and reads as correct — but with a
+  // sequential-order-number plugin they diverge, and an operator doing exactly what the label says
+  // then supplies a value that resolves to SOMEBODY ELSE'S order or to none. Reassigning a refund
+  // onto the wrong order is the very fault this panel exists to repair.
+  //
+  // Asserted against the source rather than a rendered tree: what is being pinned is a WORD in a
+  // label, and a DOM harness for this panel would test the harness. The pairing that matters — that
+  // the same value reaches wcFetch as a path segment — is covered by the action tests above.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const panel = readFileSync(join(process.cwd(), 'app/(dashboard)/sync/exceptions/exceptions-client.tsx'), 'utf8')
+
+  assert.match(panel, /WooCommerce order ID that holds this refund/, 'the field asks for the ID')
+  assert.doesNotMatch(
+    panel,
+    /WooCommerce order number that holds this refund/,
+    'and never for the order number, which is a different value wherever numbering is customised',
+  )
+  // The operator has to be able to FIND the id, so saying "ID" is not on its own enough.
+  assert.match(panel, /not the order number the customer sees/)
+  assert.match(panel, /parent_id/, 'and the refund itself names its parent order')
+
+  // The server consumes it as a path segment against WooCommerce — the fact the label has to match.
+  const action = readFileSync(join(process.cwd(), 'app/actions/sync-exceptions.ts'), 'utf8')
+  assert.match(action, /`\/orders\/\$\{wcOrderId\}\/refunds`/)
+})
+
+// ---------------------------------------------------------------------------
+// THE EVIDENCE MUST BE KNOWN COMPLETE — an ambiguous answer refuses, it does not resolve
+// ---------------------------------------------------------------------------
+
+test('a store that reports no page total cannot dismiss a refund sitting on page two', async () => {
+  // THE HARM, in the one arrangement that produces it. `wcFetch` parses `x-wp-totalpages` as
+  // parseInt(header ?? '1'), so a store sending no header arrives as totalPages: 1 — identical, at
+  // this seam, to a store that genuinely has one page. Ending the walk there takes "the store said
+  // nothing" for "the store said there is no more".
+  //
+  // 150 refunds on the parked order, and the parked refund 7001 is the 120th of them — page TWO. A
+  // walk that stops on the silent header reports it ABSENT, and absent from this order is precisely
+  // what authorises a dismissal. The park would be written off, on a list that never contained the
+  // page the refund was on, over money that has already left the business.
+  const recover = await loadAction()
+  state.reportTotalPages = false
+  const held = Array.from({ length: 150 }, (_, i) => 8000 + i)
+  held[119] = 7001
+  state.wcRefundsByOrder.set(2002, held)
+  const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
+  assert.equal((result as { success?: boolean }).success, false)
+  // WooCommerce still confirms this order owns the refund, so the dismissal is contradicted.
+  assert.equal((result as { code?: string }).code, 'wc_confirms_current_owner')
+  assert.equal(stored().status, 'FAILED', 'the park survives')
+  assert.equal(stored().entityId, 'order-B')
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2'])
+})
+
+test('a FULL page always advances, so completeness comes from the body and not from a header', async () => {
+  // The mechanism behind the test above, asserted directly: a page holding exactly what was asked
+  // for is never the proof of an ending, whatever the header claims. The second request is the
+  // whole fix — without it the walk ends on the header and the answer above flips to a dismissal.
+  const recover = await loadAction()
+  state.reportTotalPages = false
+  state.wcRefundsByOrder.set(1001, [...Array.from({ length: 100 }, (_, i) => 8000 + i), 7001])
+  const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'REASSIGN', wcOrderId: 1001 })
+  assert.deepEqual(result, { success: true, outcome: 'REASSIGN', targetOrderId: 'order-A' })
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2'])
+})
+
+test('an order with more refunds than the check will read REFUSES rather than answering short', async () => {
+  // Every page the walk is willing to read came back full, so there may well be another. A list not
+  // known to be complete cannot be used to prove a refund missing — and this is a REFUSAL, not a
+  // truncated success, because the caller one frame up cannot tell a partial list from a whole one.
+  const recover = await loadAction()
+  state.reportTotalPages = false
+  state.wcRefundsByOrder.set(2002, Array.from({ length: 1500 }, (_, i) => 8000 + i))
+  const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
+  assert.equal((result as { code?: string }).code, 'wc_lookup_failed')
+  assert.match((result as { error: string }).error, /more than this check will read/)
+  assert.equal(stored().status, 'FAILED')
+  assert.equal(state.transactions, 0, 'and nothing is opened, let alone written')
+})
+
+test('a store REPORTING an oversized total is refused on the first request, not after ten', async () => {
+  // The header is still worth reading for the one thing it can do — fail fast and cheaply — and the
+  // refusal must come before the page is banked, or an oversized order costs ten round trips to the
+  // live store for an answer already known to be unusable.
+  const recover = await loadAction()
+  state.wcRefundsByOrder.set(2002, Array.from({ length: 1500 }, (_, i) => 8000 + i))
+  const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
+  assert.equal((result as { code?: string }).code, 'wc_lookup_failed')
+  assert.match((result as { error: string }).error, /15 pages of refunds/)
+  assert.equal(state.wcCalls.length, 1, 'one request, then the refusal')
+})
+
+test('a refund WooCommerce lists with an unreadable id refuses — a list we cannot read proves nothing', async () => {
+  // The same error in miniature, and it used to be a silent `continue`: an entry whose id is not a
+  // usable integer was dropped, and the resulting list was then used to establish that some OTHER
+  // refund is not in it. A list with a row we cannot read cannot establish that.
+  const recover = await loadAction()
+  state.wcRefundsByOrder.set(2002, [9001, 9002])
+  state.wcUnreadableIds = new Set([9002])
+  const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
+  assert.equal((result as { code?: string }).code, 'wc_lookup_failed')
+  assert.match((result as { error: string }).error, /no readable id/)
+  assert.equal(stored().status, 'FAILED')
+})
+
+test('an order with no refunds at all is still a COMPLETE answer, and dismisses', async () => {
+  // The bound must not swallow the ordinary case it exists to protect. An empty page is the
+  // shortest page there is, so absence really is established, and the dismissal proceeds.
+  const recover = await loadAction()
+  state.reportTotalPages = false
+  state.wcRefundsByOrder.set(2002, [])
+  const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
+  assert.equal((result as { success: boolean }).success, true)
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1'])
 })
 
 test('a reassign to an order WooCommerce says has no such refund is refused, and writes nothing', async () => {
