@@ -156,6 +156,12 @@ type MemoryState = {
   refundLines?: RefundLineRow[]
   /** o3d-o97 r4: A2 journal rows, so a test can say whether the debit reached a ledger. */
   accountingSyncLogs?: Array<{ id: string; status: string }>
+  /**
+   * o3d-7o0: a LIVE invoice-posting claim for this order, if any. A fresh PROCESSING SALES_INVOICE
+   * sync row means a worker is mid-post, and a cancellation must be refused rather than committed
+   * behind its back. Undefined — the default — means nothing is in flight.
+   */
+  syncPostingClaim?: { id: string; connector: string; type: string; processingStartedAt: Date | null }
 }
 
 function decimalLikeToNumber(value: number | { toNumber(): number } | undefined): number {
@@ -555,7 +561,13 @@ function createClient(state: MemoryState): AllocationServiceClient {
     },
     // Cancelling retires the order's pending SALES_INVOICE accounting work in the same tx
     // (cancel-order-invoice-sync); these stubs let that run without a real accounting queue.
+    //
+    // o3d-7o0: `findFirst` is the posting-intent probe — a cancellation is REFUSED while an invoice
+    // post for the order is on the wire. `syncPostingClaim` is what it finds; the default of "nothing
+    // in flight" is what every pre-existing cancellation test assumes. The dedicated refusal tests
+    // live in tests/accounting/cancel-invoice-posting-intent.test.ts against a where-honouring store.
     accountingSyncLog: {
+      findFirst: async () => state.syncPostingClaim ?? null,
       updateMany: async () => ({ count: 0 }),
       // o3d-o97 r4: the A2 journal probed by its own id. A missing row is NOT "no journal" —
       // retention deletes terminal rows — so the un-stage keeps the stamp for it.
@@ -1184,6 +1196,36 @@ test('cancelSalesOrderFulfillmentState refuses a partially-shipped order with a 
     /Cannot cancel an order with a dispatched shipment/,
   )
   assert.equal(state.order.status, 'ALLOCATED')
+})
+
+test('o3d-7o0: cancelSalesOrderFulfillmentState REFUSES while an invoice post is on the wire', async () => {
+  // The cancel side of the posting-intent protocol. The processor's fresh PROCESSING claim is the
+  // intent; both paths take lockSalesOrder first, so the cancellation either sees the claim (here) or
+  // the guard sees the CANCELLED this would have written. Refusing is the only outcome that does not
+  // leave a receivable in Xero for a sale that never happened.
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+    syncPostingClaim: {
+      id: 'sync-1',
+      connector: 'xero',
+      type: 'SALES_INVOICE',
+      processingStartedAt: new Date('2026-04-01T11:58:00.000Z'),
+    },
+  })
+  const client = createClient(state)
+
+  const error = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' }).catch((e) => e)
+
+  // The SPECIFIC reason, naming the row an operator can go and look at.
+  assert.match(String(error?.message), /while its xero SALES_INVOICE is being posted \(sync log sync-1/)
+  assert.equal(state.order.status, 'ALLOCATED', 'the order is NOT cancelled')
+  assert.equal(state.stockLevels[0].reservedQty, 3, 'and nothing was released before the refusal')
+  assert.deepEqual(state.allocations?.length, 1, 'nor were the allocations deleted')
+  // Transient: the claim ages out within fifteen minutes, so an inbound Woo cancellation must RETRY
+  // rather than acknowledge and drop a real status change.
+  assert.equal(isPermanentStatusTransitionError(error), false)
 })
 
 test('a SHIPPED order WITH a dispatched shipment refuses PERMANENTLY', async () => {

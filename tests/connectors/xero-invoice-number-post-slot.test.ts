@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+// o3d-550x: a claim is a HOLDER asked for its instant as each fenced statement is built, not a
+// bare `Date`. When o3d-k26m.5's second `heldClaimWhere` collapsed into the shared one, the slot
+// fence adopted that contract with it — so these tests hand it the same claim they stamped on the
+// row, wrapped. Statically imported: `sync-claim-fence` is not one of the modules mocked below.
+import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
+
 // ---------------------------------------------------------------------------
 // o3d-k26m.5 rounds 4-5 — THE OTHER WRITER IS US.
 //
@@ -254,7 +260,7 @@ test('the slot is taken under an advisory lock on the number, and the lock is th
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
 
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
 
   assert.deepEqual(slot, { ok: true })
@@ -272,8 +278,8 @@ test('two numbers Xero would collide take the SAME lock, so they can never both 
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
   state.rows.push(row({ id: 'entry-b', processingStartedAt: claimedAt }))
 
-  await takeInvoiceNumberPostSlot({ entryId: 'entry-a', claimedAt, invoiceNumber: 'INV-1', orderLabel: 'order a' })
-  await takeInvoiceNumberPostSlot({ entryId: 'entry-b', claimedAt, invoiceNumber: ' inv-1 ', orderLabel: 'order b' })
+  await takeInvoiceNumberPostSlot({ entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: 'INV-1', orderLabel: 'order a' })
+  await takeInvoiceNumberPostSlot({ entryId: 'entry-b', held: claimHeldFrom(claimedAt), invoiceNumber: ' inv-1 ', orderLabel: 'order b' })
 
   assert.deepEqual(
     state.lockKeys, ['inv-1', 'inv-1'],
@@ -295,7 +301,7 @@ test('the number is compared in code, never as a SQL pattern — a backslash mus
   // `matches` throws if the fence tries to compare the number in the query at all; the rival must
   // still be found, which can only happen if the comparison happened in JavaScript.
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: 'A\\_1', orderLabel: 'order a',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: 'A\\_1', orderLabel: 'order a',
   })
   assert.equal(slot.ok, false)
   assert.match(slot.ok === false ? slot.reason : '', /entry-rival/)
@@ -317,7 +323,7 @@ test('a rival holding the SAME NUMBER IN A DIFFERENT CASE is a rival — Xero ha
   }))
 
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: 'INV-164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: 'INV-164981', orderLabel: 'order WC-164981',
   })
 
   assert.equal(slot.ok, false)
@@ -339,7 +345,7 @@ test('a rival holding the same number with surrounding whitespace is a rival too
   }))
 
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
   assert.equal(slot.ok, false)
   assert.match(slot.ok === false ? slot.reason : '', /entry-rival/)
@@ -354,7 +360,7 @@ test('a sibling holding a DIFFERENT number is not a rival', async () => {
   }))
 
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
   assert.deepEqual(slot, { ok: true })
 })
@@ -365,7 +371,7 @@ test('the number is recorded VERBATIM even though it is compared by identity', a
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
 
   await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: 'INV-164981', orderLabel: 'order a',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: 'INV-164981', orderLabel: 'order a',
   })
   assert.equal(
     state.rows[0].attemptedInvoiceNumber, 'INV-164981',
@@ -392,7 +398,7 @@ test('the lease is measured on the DATABASE clock at BOTH ends, so no host takes
   }))
 
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
   assert.equal(slot.ok, false, 'a rival stamped five minutes ago must fence the number whatever this host thinks')
   assert.match(slot.ok === false ? slot.reason : '', /entry-rival/)
@@ -405,7 +411,7 @@ test('the stamp is written with the database clock, not this process’s', async
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
 
   await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order a',
   })
   assert.equal(
     state.rows[0].attemptedInvoiceNumberAt?.getTime(), state.dbNow.getTime(),
@@ -420,7 +426,7 @@ test('an unreadable database clock fails CLOSED — an unmeasurable lease is not
   state.failClock = true
 
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
   assert.equal(slot.ok, false)
   assert.match(slot.ok === false ? slot.reason : '', /NOTHING WAS SENT/)
@@ -441,7 +447,7 @@ test('a worker that DIED mid-post stops fencing the number once its stamp outliv
   state.rows.push(dead)
 
   assert.deepEqual(
-    await takeInvoiceNumberPostSlot({ entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a' }),
+    await takeInvoiceNumberPostSlot({ entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order a' }),
     { ok: true },
   )
 
@@ -450,7 +456,7 @@ test('a worker that DIED mid-post stops fencing the number once its stamp outliv
   state.rows[0].attemptedInvoiceNumber = null
   state.rows[0].attemptedInvoiceNumberAt = null
   const fenced = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order a',
   })
   assert.equal(fenced.ok, false)
 })
@@ -471,8 +477,8 @@ test('EXACTLY ONE of two workers racing on the same number gets the slot, and th
     state.rows.push(row({ id: 'entry-b', processingStartedAt: claimB }))
 
     const [a, b] = await Promise.all([
-      takeInvoiceNumberPostSlot({ entryId: 'entry-a', claimedAt: claimA, invoiceNumber: numbers[0], orderLabel: 'order a' }),
-      takeInvoiceNumberPostSlot({ entryId: 'entry-b', claimedAt: claimB, invoiceNumber: numbers[1], orderLabel: 'order b' }),
+      takeInvoiceNumberPostSlot({ entryId: 'entry-a', held: claimHeldFrom(claimA), invoiceNumber: numbers[0], orderLabel: 'order a' }),
+      takeInvoiceNumberPostSlot({ entryId: 'entry-b', held: claimHeldFrom(claimB), invoiceNumber: numbers[1], orderLabel: 'order b' }),
     ])
 
     const winners = [a, b].filter((r) => r.ok)
@@ -493,7 +499,7 @@ test('the stamp is fenced on the claim INSTANT, so a displaced worker is refused
   state.rows.push(row({ id: 'entry-a', processingStartedAt: new Date('2026-08-20T10:20:00Z') }))
 
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt: mine, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(mine), invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
 
   assert.equal(slot.ok, false)
@@ -524,7 +530,7 @@ test('a row whose post TIMED OUT keeps fencing its number, even though it settle
   }))
 
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
 
   assert.equal(slot.ok, false, 'an unknown outcome is not a free number')
@@ -545,7 +551,7 @@ test('EVERY settled status keeps fencing — the fence asks about the stamp, nev
     }))
 
     const slot = await takeInvoiceNumberPostSlot({
-      entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+      entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
     })
     assert.equal(slot.ok, false, `a ${status} row stamped inside the lease must still fence its number`)
   }
@@ -566,7 +572,7 @@ test('and the LEASE is still what retires it, whatever the row settled as', asyn
 
   assert.deepEqual(
     await takeInvoiceNumberPostSlot({
-      entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+      entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
     }),
     { ok: true },
   )
@@ -583,7 +589,7 @@ test('the rival scan does not narrow on status at all — a filter here is the r
   state.recordScanWhere = seen
 
   await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
 
   assert.equal(seen.length, 1, 'exactly one rival scan per slot')
@@ -603,7 +609,7 @@ test('a scan that fills its limit REFUSES rather than reporting the fraction it 
   }
 
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
   assert.equal(slot.ok, false)
   assert.match(slot.ok === false ? slot.reason : '', /filled its 200-row limit/)
@@ -617,7 +623,7 @@ test('an unreadable database fails CLOSED — not knowing about a rival is not p
   state.failFindMany = true
 
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
   })
 
   assert.equal(slot.ok, false)
@@ -631,7 +637,7 @@ test('a number that is blank once trimmed refuses before any lock is taken', asy
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
 
   const slot = await takeInvoiceNumberPostSlot({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '   ', orderLabel: 'order a',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '   ', orderLabel: 'order a',
   })
   assert.equal(slot.ok, false)
   assert.match(slot.ok === false ? slot.reason : '', /blank once trimmed/)
@@ -648,7 +654,7 @@ test('the slot is not taken until the check RUNS — building it must send and w
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
 
   await buildInvoiceNumberPostSlotCheck({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order a',
     referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
   })
 
@@ -662,7 +668,7 @@ test('a ledger answer that has outlived the claim refuses, and nothing is stampe
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
   let monotonic = 1_000
   const check = await buildInvoiceNumberPostSlotCheck({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
     referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
     monotonicNowMs: () => monotonic,
   })
@@ -685,7 +691,7 @@ test('an answer still inside the bound proceeds, and takes the slot at that mome
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
   let monotonic = 1_000
   const check = await buildInvoiceNumberPostSlotCheck({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
     referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
     monotonicNowMs: () => monotonic,
   })
@@ -704,7 +710,7 @@ test('the age is measured from the ANSWER, not from the moment the check runs', 
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
   let monotonic = 0
   const check = await buildInvoiceNumberPostSlotCheck({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order a',
     referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
     monotonicNowMs: () => monotonic,
   })
@@ -722,7 +728,7 @@ test('a rival found at post time is reported through the check, not swallowed', 
     id: 'entry-rival', attemptedInvoiceNumber: '164981', attemptedInvoiceNumberAt: state.dbNow,
   }))
   const check = await buildInvoiceNumberPostSlotCheck({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order a',
     referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
     monotonicNowMs: () => 0,
   })
@@ -750,7 +756,7 @@ test('a request addressed to a DIFFERENT organisation is refused, and nothing is
   const claimedAt = state.dbNow
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
   const check = await buildInvoiceNumberPostSlotCheck({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order WC-164981',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order WC-164981',
     referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
     monotonicNowMs: () => 0,
   })
@@ -773,7 +779,7 @@ test('the ledger check comes FIRST — before the age bound and before the slot'
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
   let monotonic = 0
   const check = await buildInvoiceNumberPostSlotCheck({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order a',
     referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
     monotonicNowMs: () => monotonic,
   })
@@ -794,7 +800,7 @@ test('the SAME organisation passes, and only then is the slot taken', async () =
   const claimedAt = state.dbNow
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
   const check = await buildInvoiceNumberPostSlotCheck({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order a',
     referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
     monotonicNowMs: () => 0,
   })
@@ -812,7 +818,7 @@ test('the ledger is compared EXACTLY — a near-miss is a different organisation
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
   for (const tenantId of [LEDGER.toUpperCase(), ` ${LEDGER}`, `${LEDGER} `, `${LEDGER}x`, '']) {
     const check = await buildInvoiceNumberPostSlotCheck({
-      entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+      entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order a',
       referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
       monotonicNowMs: () => 0,
     })
@@ -829,7 +835,7 @@ test('the ledger is re-checked on EVERY attempt, not once per call', async () =>
   const claimedAt = state.dbNow
   state.rows.push(row({ id: 'entry-a', processingStartedAt: claimedAt }))
   const check = await buildInvoiceNumberPostSlotCheck({
-    entryId: 'entry-a', claimedAt, invoiceNumber: '164981', orderLabel: 'order a',
+    entryId: 'entry-a', held: claimHeldFrom(claimedAt), invoiceNumber: '164981', orderLabel: 'order a',
     referenceType: 'SalesOrder', referenceId: 'so-1', answeredByTenantId: LEDGER,
     monotonicNowMs: () => 0,
   })

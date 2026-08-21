@@ -264,7 +264,11 @@ function salesInvoiceCase(): string {
 
 test('the sales-invoice CREATE asks who owns the number before it sends anything', () => {
   const body = salesInvoiceCase()
-  const fence = body.indexOf('await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload, claimedAt)')
+  // `held`, not `claimedAt`: o3d-k26m.5's own `heldClaimWhere` and o3d-550x's collapsed into one
+  // definition (development's copy said in as many words to keep one if both landed), and the
+  // surviving one takes a HOLDER asked for its instant at the point of use. The ORDER this test
+  // pins — fence before post — is unchanged; only the name of what is threaded through it moved.
+  const fence = body.indexOf('await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload, held)')
   const push = body.indexOf('await pushSalesInvoice({')
   assert.ok(fence > 0, 'the create must consult the ownership fence')
   assert.ok(fence < push, 'the fence must run BEFORE the post, not after it')
@@ -381,7 +385,7 @@ test('the attempt is written BEFORE the post, and a failure to write it blocks t
   // Fenced on the claim INSTANT: a worker whose claim aged out and was re-taken must not stamp,
   // and must not post — the sibling branch o3d-batch-payidx fences every claim release the same way.
   assert.ok(
-    claim.includes('where: heldClaimWhere(params.entryId, params.claimedAt),'),
+    claim.includes('where: heldClaimWhere(params.entryId, params.held),'),
     'the stamp must be conditioned on this worker still holding the claim it took',
   )
   // Fails closed on an unreadable order, matching guardCancelledSalesOrderInvoice.

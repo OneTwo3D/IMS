@@ -9,6 +9,7 @@ import { createHash } from 'crypto'
 import { db } from '@/lib/db'
 import { activeAccountingIdProvenance, accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
 import { logActivity } from '@/lib/activity-log'
 import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
@@ -572,7 +573,11 @@ async function processEntry(
           return { success: false, error: `Sales order ${referenceId} not found before posting an invoice` }
         }
         if (so.status === 'CANCELLED') {
-          await db.$transaction((tx) => retireSalesInvoiceForCancelledOrder(tx, entryId, referenceId, claimedAt))
+          // o3d-550x (Codex r2, medium 2): the retirement fences on the claim as it reads AT THE WRITE,
+          // so it is handed the CLAIM rather than an instant. This connector never renews one, so the
+          // holder answers the instant it was given — the behaviour is unchanged, and the day a renewing
+          // lease appears here the holder is what changes, not this call.
+          await db.$transaction((tx) => retireSalesInvoiceForCancelledOrder(tx, entryId, referenceId, claimHeldFrom(claimedAt)))
           return { success: true, skipped: true }
         }
         customerId = so.customerId ?? undefined

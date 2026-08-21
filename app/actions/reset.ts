@@ -6,6 +6,7 @@ import { logActivity } from '@/lib/activity-log'
 import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
 import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
+import { UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
 
 export type ResetLevel = 'transactions' | 'products' | 'full'
 
@@ -97,7 +98,44 @@ async function clearTransactionScope() {
   // Sync / audit history
   await db.shoppingSyncLog.deleteMany({})
   await db.accountingSyncLog.deleteMany({})
-  await db.activityLog.deleteMany({})
+
+  // A RESET CLEARS IMS. IT CANNOT CLEAR XERO (o3d-550x; Codex r3, medium).
+  //
+  // Everything else on this list describes something that lives in this database, so deleting it is the
+  // whole point of a reset. `xero_posted_document_unrecorded` does not: it says a document was ACCEPTED
+  // BY XERO and its sync row can never name it — real money in somebody else's ledger, which no reset of
+  // ours voids, and which nothing in IMS can re-derive. That is the same sentence that earned it the
+  // retention exemption, and a factory reset is not a weaker eraser than a 90-day sweep; it is a
+  // stronger one.
+  //
+  // An earlier answer was that the reset "deletes the sync rows too", so the record has nothing left to
+  // point at. Read the other way round, that is the argument FOR keeping it: after the reset there is no
+  // sync row, no accounting event and no external id anywhere in IMS, so this row is not one of several
+  // traces of the document — it is the only one that ever existed, and the wording is self-contained
+  // (both ids, the reference it was for, and what to do about it), so it still means exactly what it
+  // meant before the rest of the row's world was deleted.
+  //
+  // The direct-create marker, the exemption's other half, is deliberately NOT kept: it is an open
+  // obligation about a sales order that this reset is deleting, so the thing it asks for cannot be done
+  // and nothing is lost by discharging it.
+  //
+  // WHERE AN OPERATOR SEES IT AFTERWARDS: /activity — filter level ERROR or tag `sync`, or search for
+  // the action name or either Xero id; the description is the full incident and its remedy. The
+  // breadcrumb below puts the count in the same list so nobody has to know to look.
+  await db.activityLog.deleteMany({ where: { action: { not: UNRECORDED_POSTED_DOCUMENT_ACTION } } })
+  const preserved = await db.activityLog.count({ where: { action: UNRECORDED_POSTED_DOCUMENT_ACTION } })
+  if (preserved > 0) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      tag: 'sync',
+      action: 'database_reset_preserved_unrecorded_documents',
+      level: 'WARNING',
+      description: `Database reset kept ${preserved} record(s) of Xero document(s) that IMS posted and `
+        + 'could never record. Those documents still exist in Xero and nothing else in IMS references '
+        + `them any more. Search this log for "${UNRECORDED_POSTED_DOCUMENT_ACTION}".`,
+      metadata: { preserved, action: UNRECORDED_POSTED_DOCUMENT_ACTION },
+    })
+  }
 
   // Reset WooCommerce transaction intake state so orders can be imported from
   // scratch after a transaction reset.

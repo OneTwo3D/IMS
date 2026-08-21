@@ -424,6 +424,9 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
 const inertModel = {
   deleteMany: async () => ({ count: 0 }),
   updateMany: async () => ({ count: 0 }),
+  // The transaction scope counts what its activity-log delete deliberately kept — the records of Xero
+  // documents IMS could never record (Codex r3, medium). This file models none, so: nothing kept.
+  count: async () => 0,
 }
 
 const dbDouble: Record<string, unknown> = {

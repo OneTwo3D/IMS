@@ -1018,6 +1018,34 @@ If the active accounting connector is QuickBooks (not Xero), IMS records a
 `sales_invoice_update_skipped_unsupported_connector` WARNING and does not queue the update. The
 behaviour is symmetric with the purchase bill path.
 
+### Cancelling an order while its invoice is posting
+
+Cancelling a sales order retires any invoice work still queued for it, so the ledger never receives
+an ACCREC invoice for a sale that did not happen. There is one moment where that is not enough: the
+worker has already decided to post and its request is on its way to Xero. Nothing local can recall
+a request that has left, so **the cancellation is refused instead**:
+
+> Cannot cancel this order while its xero SALES_INVOICE is being posted (sync log …). The invoice
+> request may already be on the wire, and cancelling now would leave a receivable in the ledger for
+> a sale that never happened. Wait for the post to settle — at most 15 minutes — then cancel: if it
+> posted, the cancellation will need an explicit credit note.
+
+**This refusal is temporary and needs no action.** The claim it names clears as soon as the post
+settles, and in any case within fifteen minutes. Try the cancel again then. A WooCommerce
+cancellation arriving over the webhook is retried automatically — it is not dropped.
+
+Once the post has settled, which outcome you get is visible on the sync row:
+
+| Row after the post | What cancelling now means |
+| --- | --- |
+| Failed or Pending, no external ID | Nothing reached Xero. Cancel normally; the queued row is retired with it. |
+| Synced, with an external ID | The invoice IS in Xero. Cancelling the IMS order does **not** reverse it — raise a credit note in Xero. |
+
+The opposite order is handled too: if the cancellation commits first, the worker re-reads the order
+immediately before posting, finds it cancelled, and retires its own row instead of posting. The two
+paths take the same lock on the order, so exactly one of them wins and neither can act on a stale
+view.
+
 ### Rejected Update Sync Alerts
 
 When Xero rejects a `SALES_INVOICE_UPDATE` or `PURCHASE_INVOICE_UPDATE` (e.g. the external invoice
@@ -1564,6 +1592,50 @@ cancelled. Reverse the document in Xero instead.
 
 Settling needs the **sync** permission and a recently re-verified session; you will be asked to
 confirm your identity if your session is older than that.
+
+### A document posted in Xero that IMS could not record
+
+Very rarely a worker posts a document to Xero and then finds its sync row already naming a **different**
+document — a replacement worker took the row while the first request was still on the wire, and posted
+its own. Both documents are real and in the Xero ledger. IMS refuses to overwrite what the row already
+names, because that would destroy the only local record of one of the two.
+
+When that happens an **ERROR** entry appears in the activity log with the action
+`xero_posted_document_unrecorded`. It names **both** ids — the one the row keeps and the one that could
+not be recorded — and the sync row's reference, and it is written in the same database transaction that
+detected the conflict, so it exists whenever the conflict did. The same wording is put on the outbox job
+as its final error, so the two never describe the incident differently.
+
+**Remedy.** Open both ids in Xero. Keep the document the sync row names; **void or credit-note the
+duplicate**. Nothing further will be retried for either one — the sync row is settled against the first
+document and the outbox job is closed — so this is a one-off manual correction, not something that will
+resolve itself on the next cron run.
+
+A rarer variant of the same entry says the sync row **no longer exists** at all
+(`reason: ROW_MISSING`). The remedy there is to find the document in Xero by the id in the entry and
+either keep it, re-entering the reference by hand, or void it.
+
+**This entry is never deleted by activity-log retention.** Ordinary ERROR entries are purged after
+90 days (configurable under **Settings → Data retention**); `xero_posted_document_unrecorded` is
+exempt, because it is not a log of something that happened — it is the *only* place in IMS that the
+displaced document exists, and nothing can rebuild it. Expect these entries to accumulate until an
+operator has dealt with each one in Xero; they are meant to be read, not aged out.
+
+**If the entry itself could not be written** — a database problem at exactly the wrong moment — IMS
+does *not* quietly retry the sync. A retry would find the row already naming the other document,
+settle it and report success, and the id that could not be recorded would be lost for good. Instead
+the outbox job is closed as **permanently failed** and its error message carries the whole incident,
+both ids included, and the same text is written to the application log. Look for
+`[xero-sync] Xero … POSTED as …` there. The remedy is the same as above.
+
+**No sync run will ever report one of these jobs as succeeded.** Before a run completes an outbox job
+whose sync row is already settled — a replay, or a row that settled while the job was being claimed —
+it asks the activity log whether a `xero_posted_document_unrecorded` entry exists for that row, *at that
+moment*, and buries the job with the entry's wording if one does. It asks again immediately after
+writing the completion, because the entry may be filed by another worker in between; if it appears in
+that gap the completion is retracted and the job is put back to permanently failed. So a job you find
+closed green never had one of these entries against it, and the presence of an entry always shows up as
+a failed job you can find on **Integrations**, no matter which worker or which run detected it.
 
 ### Rows stranded on a connector you switched away from
 

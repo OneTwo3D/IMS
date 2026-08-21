@@ -1713,7 +1713,9 @@ test('retention cleanup cannot age out an unresolved marker (o3d-z82a)', async (
   const path = await import('node:path')
   const source = await readFile(path.join(process.cwd(), 'lib/activity-log-cleanup.ts'), 'utf8')
 
-  assert.match(source, /const RETAINED_ACTIONS = \[DIRECT_CREATE_PENDING_ACTION\]/, 'the marker action must be exempt')
+  // The array now has a SECOND entry (o3d-550x's unrecorded-posted-document evidence), so this asserts
+  // the marker is still IN it rather than that it is the only one.
+  assert.match(source, /const RETAINED_ACTIONS = \[[^\]]*\bDIRECT_CREATE_PENDING_ACTION\b/, 'the marker action must be exempt')
   assert.match(source, /action <> ALL\(\$\{RETAINED_ACTIONS\}::text\[\]\)/, 'and the exemption must be in the DELETE')
   const at = source.indexOf('DELETE FROM "activity_logs"')
   assert.ok(source.indexOf('RETAINED_ACTIONS', at) !== -1, 'the exemption must apply to the deleting statement')

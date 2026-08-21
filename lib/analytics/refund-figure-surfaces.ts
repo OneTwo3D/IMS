@@ -345,6 +345,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'Unearned-revenue account resolution. Ledger account.',
   },
   {
+    file: 'lib/cost-layers.ts',
+    figures: ['revenueDeferredDate'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Not a figure: `revenueDeferredDate` is a TIMESTAMP marking that an order’s revenue recognition was deferred, and it appears in this file only inside the o3d-3zgy proof that the shipment-journal enqueue cannot race a hard delete. No refund line moves a date, and this file computes no revenue, profit or margin.',
+  },
+  {
     file: 'lib/connectors/quickbooks/daily-sync.ts',
     figures: ['proportionalRevenue', 'quickbooks_unearned_revenue_account', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueProportion', 'revenueRecognizedAmount', 'runningRevenue', 'totalRevenue', 'totalRevenueDeferred', 'unearnedRevenueAmount'],
     treatment: 'not-refund-sensitive',
