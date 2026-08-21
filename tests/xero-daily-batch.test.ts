@@ -422,7 +422,9 @@ test('o3d-0i5y r7: Group A2 posts exactly the entries it writes, and reads no sh
     'and never values a shipment as a whole, which is what re-posted the pinned part of a mixed one',
   )
   assert.ok(
-    block.includes('...recorded,') && block.includes('takeShipmentAccountedEntries('),
+    // o3d-0i5y r9: written onto the row STAMPED with what this pass valued them at, which is the
+    // record every reversal path reads instead of the pin a revaluation rewrites.
+    block.includes('...recorded.map(withPostedUnitCost),') && block.includes('takeShipmentAccountedEntries('),
     'while still writing those units onto the row',
   )
   assert.equal(

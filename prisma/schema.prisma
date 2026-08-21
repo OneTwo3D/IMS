@@ -199,6 +199,11 @@ enum AccountingSyncType {
   // rounding residue (same guard — sub-penny swept, material gaps flagged never swept).
   DAILY_BATCH_TRANSIT_RECONCILIATION
   UNEARNED_REV_REVERSAL
+  // o3d-0i5y r9: reverses the part of a Group A2 Allocated-Inventory debit that an allocation
+  // rewrite has ORPHANED — units A2 posted for that no longer sit on any allocation row, so no
+  // dispatch will ever credit them and no refund will ever reach them. DR Inventory /
+  // CR Allocated Inventory, raised inside the same transaction as the rewrite that orphaned them.
+  ALLOCATION_REVERSAL
   BILL_PAYMENT
   REALISED_FX_JOURNAL
   UNREALISED_FX_JOURNAL

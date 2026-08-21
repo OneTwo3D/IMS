@@ -1488,3 +1488,38 @@ test('landed-cost adjustment event keys normalize equivalent decimal input shape
 
   assert.equal(new Set(eventKeys).size, 1)
 })
+
+test('a revaluation rewrites the LIVE pin and leaves the POSTED amount alone (o3d-0i5y r9)', async () => {
+  // The invariant the orphaned-allocation reversal rests on. A landed cost arriving late rewrites
+  // `unitCostBase` on every snapshot that names the layer — including the allocation rows Group A2
+  // posted against — and posts to COGS/Inventory, never to Allocated Inventory. So the pounds
+  // standing in Allocated Inventory for those units do not move, and the entry has to keep saying
+  // what they were. Were `postedUnitCostBase` dropped or patched here, every shrink reversal would
+  // credit the revalued figure instead: £9 a unit against a £4 debit.
+  const updates: Array<Array<Record<string, unknown>>> = []
+  const tx = {
+    $queryRawUnsafe: async (_sql: string, containsCostLayer: string) => (
+      containsCostLayer === JSON.stringify([{ costLayerId: 'layer-a' }])
+        ? [{
+          id: 'alloc-row',
+          costLayerSnapshot: [
+            { costLayerId: 'layer-a', qty: '10.000000', unitCostBase: '4.000000', postedUnitCostBase: '4.000000' },
+          ],
+        }]
+        : []
+    ),
+    $executeRawUnsafe: async (_sql: string, snapshotJson: string) => {
+      updates.push(JSON.parse(snapshotJson))
+      return 1
+    },
+    activityLog: { create: async () => ({ id: 'activity-1' }) },
+  }
+
+  await updateSnapshotsForCostLayerChange(tx as never, 'layer-a', new Prisma.Decimal('9'))
+
+  assert.ok(updates.length > 0, 'the revaluation rewrote the snapshot')
+  for (const snapshot of updates) {
+    assert.equal(snapshot[0].unitCostBase, '9.000000', 'the live pin follows the layer')
+    assert.equal(snapshot[0].postedUnitCostBase, '4.000000', 'what was POSTED does not')
+  }
+})

@@ -35,15 +35,28 @@ type ShipmentRow = {
   lines: Array<{ id: string; lineId: string; productId: string; qty: number; costLayerSnapshot: unknown }>
 }
 
-/** The A2 window row this run will see; replaced per test. */
-let a2Order: {
+type A2OrderRow = {
   id: string
   orderNumber: string
   externalOrderNumber: string | null
   status: string
   allocations: AllocationRow[]
   shipments: ShipmentRow[]
-} | null = null
+}
+
+/** The A2 window row this run will see; replaced per test. */
+let a2Order: A2OrderRow | null = null
+
+/**
+ * o3d-0i5y r9: what a PRE-TRANSACTION, UNLOCKED read of the same order would have returned. Group
+ * A2 must never see this — it selects and locks inside the transaction it writes in — so wiring it
+ * to the outside-the-transaction `db` handle is what makes "the plan is made under the lock"
+ * observable as a journal amount rather than as a source-text assertion.
+ */
+let staleA2Order: A2OrderRow | null = null
+
+/** Ordered log of the calls A2 makes on the TRANSACTION client, for the lock-ordering assertion. */
+const txCalls: string[] = []
 
 /** Cost layers on the shelf, per `productId|warehouseId`. */
 let shelfLayers: Array<{ id: string; remainingQty: number; unitCostBase: number }> = []
@@ -53,6 +66,8 @@ const allocationUpdates: Array<{ id: string; costLayerSnapshot: unknown }> = []
 const orderUpdates: Array<{ id: string; data: Record<string, unknown> }> = []
 
 function resetRun(): void {
+  staleA2Order = null
+  txCalls.length = 0
   created.length = 0
   allocationUpdates.length = 0
   orderUpdates.length = 0
@@ -71,7 +86,15 @@ const tx = {
     },
   },
   salesOrder: {
-    findMany: async () => [],
+    // o3d-0i5y r9: A2 now selects its window INSIDE the transaction and under the orders' row
+    // locks, so this mock has to answer BOTH asks — the id-only candidate probe and the full
+    // re-read under the lock. Answering only one of them would make every A2 test here vacuous.
+    findMany: async (args?: { select?: Record<string, unknown> }) => {
+      txCalls.push(args?.select?.allocations ? 'salesOrder.findMany:full' : 'salesOrder.findMany:ids')
+      if (!a2Order) return []
+      if (args?.select?.allocations) return [a2Order]
+      return [{ id: a2Order.id }]
+    },
     update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
       orderUpdates.push({ id: where.id, data })
       return { id: where.id }
@@ -91,7 +114,19 @@ const tx = {
     },
   },
   activityLog: { create: async () => ({ id: 'activity-1' }) },
-  $queryRaw: async () => [],
+  $queryRaw: async (...args: unknown[]) => {
+    // Two call shapes reach here: `Prisma.sql` objects (the sales-order and cost-layer row locks)
+    // and a plain tagged template. Both are flattened to their SQL text so the ORDER of the locks
+    // against the reads can be asserted.
+    const first = args[0]
+    const text = first && typeof first === 'object' && 'sql' in (first as Record<string, unknown>)
+      ? String((first as { sql: unknown }).sql)
+      : Array.isArray(first)
+      ? first.join(' ')
+      : String(first)
+    txCalls.push(`$queryRaw:${text.replace(/\s+/g, ' ').trim()}`)
+    return []
+  },
 }
 
 mock.module('@/lib/db', {
@@ -101,8 +136,12 @@ mock.module('@/lib/db', {
       salesOrder: {
         // A1's window, A2's window and the orphan sweeps all land here. Only A2 asks for the
         // allocation rows, which is what makes this dispatch exact rather than positional.
+        // o3d-0i5y r9: this is the handle OUTSIDE any transaction. Group A2 no longer reads through
+        // it at all, so it answers with the STALE row — a read that happened before the lock was
+        // taken. Any pass that still plans or stamps from here posts the stale figure, and the
+        // lock test below is exactly that difference in pounds.
         findMany: async (args: { select?: Record<string, unknown> }) => (
-          args?.select?.allocations && a2Order ? [a2Order] : []
+          args?.select?.allocations ? (staleA2Order ? [staleA2Order] : []) : []
         ),
       },
       shipment: { findMany: async () => [] },
@@ -381,6 +420,15 @@ test('Xero live Group A2 values a SECOND dispatch at its own layers, never at th
     ],
     'and the row records each dispatch once, against the line that dispatched it',
   )
+  // o3d-0i5y r9: and each entry THIS pass valued records the amount it was valued at, which is the
+  // only thing that can price a later reversal — `unitCostBase` beside it is rewritten in place by
+  // a landed-cost revaluation that never touches Allocated Inventory.
+  assert.deepEqual(
+    written.map((entry) => String(entry.postedUnitCostBase)),
+    ['undefined', '2.000000'],
+    'the entry the EARLIER pass recorded keeps its own posted amount (it had none); the one this '
+    + 'pass valued is stamped with the £2 it posted, not re-stamped at anything current',
+  )
 })
 
 test('Xero live Group A2 owes only the residual on a row whose record MOVED warehouse with it (o3d-0i5y r8)', async () => {
@@ -401,7 +449,7 @@ test('Xero live Group A2 owes only the residual on a row whose record MOVED ware
       costLayerSnapshot: [{ costLayerId: 'layer-w2', qty: '10.000000', unitCostBase: '5.000000' }],
     }],
     [{ ...destination, qty: new Prisma.Decimal(14) }],
-  ).get(allocationScopeKey(destination))?.write ?? null
+  ).records.get(allocationScopeKey(destination))?.write ?? null
 
   a2Order = {
     id: 'order-1',
@@ -438,4 +486,153 @@ test('Xero live Group A2 owes only the residual on a row whose record MOVED ware
     'A2 debits Allocated Inventory £20 — the 4 new units only',
   )
   assert.equal(orderUpdates[0]?.data.allocationBatchAmount, 20)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-0i5y r9 (Codex round 9) — THE TWO REMAINING ROUTES INTO A DOUBLE POST, BOTH ON THE AMOUNT.
+//
+//   the RECORD was erased by an undeclared allocation change, so A2 read an empty row and posted
+//   the whole order again;
+//   the PLAN was made from an unlocked pre-transaction snapshot, so what A2 stamped described a
+//   state of the order that no longer held.
+//
+// Both are asserted on the real writer and on the journal it posts, because both are differences
+// in pounds and nothing at plan level can see one.
+// ---------------------------------------------------------------------------------------------
+
+test('Xero live Group A2 posts only the INCREMENT after an undeclared allocation change (o3d-0i5y r9)', async () => {
+  resetRun()
+  // THE ROW IS NOT A LITERAL. It is whatever survives `resetAllocationAccountingIfStaged` on the
+  // path an UNDECLARED caller takes — `updateAllocation`, `addAllocation`, a teardown release —
+  // which is the path that cannot say what the order will be left holding. That path used to null
+  // every row's `costLayerSnapshot` alongside the stamp; strip r9 and this fixture arrives blank.
+  const { resetAllocationAccountingIfStaged } = await import('@/lib/domain/sales/allocation-service')
+  const store: { record: unknown } = {
+    record: [{ costLayerId: 'layer-1', qty: '10.000000', unitCostBase: '5.000000', postedUnitCostBase: '5.000000' }],
+  }
+  const resetTx = {
+    salesOrder: {
+      findUnique: async () => ({ inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z') }),
+      update: async () => ({}),
+    },
+    shipment: { findFirst: async () => null },
+    orderAllocation: {
+      findMany: async () => [{
+        lineId: 'line-1',
+        productId: 'prod-1',
+        warehouseId: 'wh-1',
+        costLayerSnapshot: store.record,
+      }],
+      updateMany: async ({ data }: { data: Record<string, unknown> }) => {
+        if ('costLayerSnapshot' in data) store.record = null
+        return { count: 1 }
+      },
+    },
+  }
+  await resetAllocationAccountingIfStaged(
+    resetTx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+  )
+
+  // One more unit was allocated. A2 owes that unit and nothing else: the other ten are recorded,
+  // and £50 of them is already sitting in Allocated Inventory.
+  a2Order = {
+    id: 'order-1',
+    orderNumber: 'SO-1',
+    externalOrderNumber: null,
+    status: 'ALLOCATED',
+    allocations: [{
+      id: 'alloc-1',
+      lineId: 'line-1',
+      productId: 'prod-1',
+      warehouseId: 'wh-1',
+      qty: 11,
+      costLayerSnapshot: store.record,
+    }],
+    shipments: [],
+  }
+  shelfLayers = [{ id: 'layer-1', remainingQty: 11, unitCostBase: 5 }]
+
+  const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
+  const result = await runDailyBatchSync()
+
+  assert.deepEqual(result.errors, [])
+  const journal = a2Journal()
+  assert.ok(journal, 'A2 posted a reclassification journal')
+  assert.deepEqual(
+    journal.payload.lines,
+    [
+      { accountCode: '631', description: 'Daily inventory allocation — 1 order(s)', debit: 5 },
+      { accountCode: '630', description: 'Daily inventory allocation — 1 order(s)', credit: 5 },
+    ],
+    'A2 debits £5 — the one new unit. With the record erased it saw eleven unaccounted units and '
+    + 'posted £55, £50 of it a second time for units already in Allocated Inventory',
+  )
+  assert.equal(orderUpdates[0]?.data.allocationBatchAmount, 5)
+})
+
+test('Xero live Group A2 plans and stamps from the LOCKED row, not a pre-transaction snapshot (o3d-0i5y r9)', async () => {
+  resetRun()
+  // The same order, read twice. Outside the transaction it still looks like ten unaccounted units
+  // on a blank row — £50 to post. Inside the transaction, under its row lock, it is fourteen units
+  // of which ten are already recorded and posted — £20 to post. A re-allocation landing in that gap
+  // is not exotic: it is the 15-minute sweep, a stock movement, or an operator pressing Re-Allocate.
+  staleA2Order = {
+    id: 'order-1',
+    orderNumber: 'SO-1',
+    externalOrderNumber: null,
+    status: 'ALLOCATED',
+    allocations: [{
+      id: 'alloc-1',
+      lineId: 'line-1',
+      productId: 'prod-1',
+      warehouseId: 'wh-1',
+      qty: 10,
+      costLayerSnapshot: null,
+    }],
+    shipments: [],
+  }
+  a2Order = {
+    ...staleA2Order,
+    allocations: [{
+      id: 'alloc-1',
+      lineId: 'line-1',
+      productId: 'prod-1',
+      warehouseId: 'wh-1',
+      qty: 14,
+      costLayerSnapshot: [{
+        costLayerId: 'layer-1',
+        qty: '10.000000',
+        unitCostBase: '5.000000',
+        postedUnitCostBase: '5.000000',
+      }],
+    }],
+  }
+  shelfLayers = [{ id: 'layer-1', remainingQty: 14, unitCostBase: 5 }]
+
+  const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
+  const result = await runDailyBatchSync()
+
+  assert.deepEqual(result.errors, [])
+  const journal = a2Journal()
+  assert.ok(journal, 'A2 posted a reclassification journal')
+  assert.deepEqual(
+    journal.payload.lines,
+    [
+      { accountCode: '631', description: 'Daily inventory allocation — 1 order(s)', debit: 20 },
+      { accountCode: '630', description: 'Daily inventory allocation — 1 order(s)', credit: 20 },
+    ],
+    'A2 debits £20 — the four units the LOCKED row leaves unaccounted. Planning from the '
+    + 'pre-transaction read posts £50 and overwrites the record that proves the first £50 posted',
+  )
+
+  // And the lock is taken BEFORE anything is read off the rows it protects — a plan made after the
+  // lock is only worth what the ordering makes it worth.
+  const lockIndex = txCalls.findIndex((call) => (
+    call.startsWith('$queryRaw:') && call.includes('sales_orders') && call.includes('FOR UPDATE')
+  ))
+  const readIndex = txCalls.indexOf('salesOrder.findMany:full')
+  assert.ok(lockIndex >= 0, 'A2 row-locks the orders it is about to post')
+  assert.ok(readIndex >= 0, 'and reads them through the transaction client')
+  assert.ok(lockIndex < readIndex, 'the lock comes first, so the read cannot describe a state that has already moved')
 })

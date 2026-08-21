@@ -1,5 +1,37 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { mock } from 'node:test'
+
+// o3d-0i5y r9 — THE ORPHANED-ALLOCATION REVERSAL IS A JOURNAL, so the only assertion worth making
+// about it is the AMOUNT it posts. `@/lib/accounting` is the connector-agnostic enqueue the
+// allocator reaches for (dynamically, at call time, which is why registering the mock here works);
+// capturing it gives the tests below the journal lines production would have written, rather than a
+// plan-level proxy that cannot tell £16 from £36.
+const queuedAccountingSyncs: Array<{
+  type: string
+  referenceType: string
+  referenceId: string
+  payload: { lines?: Array<{ accountCode: string; debit?: number; credit?: number }> }
+}> = []
+
+mock.module('@/lib/accounting', {
+  namedExports: {
+    getAccountingSettings: async () => ({
+      inventoryAccount: '630',
+      allocatedInventoryAccount: '631',
+    }),
+    queueAccountingSyncTx: async (_tx: unknown, params: {
+      type: string
+      referenceType: string
+      referenceId: string
+      payload: { lines?: Array<{ accountCode: string; debit?: number; credit?: number }> }
+    }) => {
+      queuedAccountingSyncs.push(params)
+      return true
+    },
+    isAccountingSyncTypeEnabled: async () => true,
+    isDailyBatchPostingEnabled: async () => true,
+  },
+})
 
 import { Prisma } from '@/app/generated/prisma/client'
 
@@ -2194,6 +2226,152 @@ test('o3d-0i5y r8: a move with nothing new to account keeps the A2 stamp — the
   assert.equal(state.order.allocationBatchAmount, 50, 'and so does the amount A2 recorded posting')
 })
 
+/**
+ * o3d-0i5y r9 — A SHRUNK RECORD IS A DEBIT TO REVERSE, NOT A FLOOR TO TOLERATE.
+ *
+ * WORKED, and this is the whole finding. Line L is allocated 10 units at warehouse-1. Group A2
+ * pins them and posts DR Allocated Inventory / CR Inventory £40 — 10 x £4 — and records the pin and
+ * the £4 a unit it posted on the row. The customer then drops the line to 6, and the re-allocation
+ * leaves the row holding 6.
+ *
+ *   BEFORE (r8)  the row still records 10 units, which the accounted-quantity floor tolerates. The
+ *                floor's job is to stop those units being posted a SECOND time and it does that
+ *                perfectly. It says nothing about the money: Group B credits Allocated Inventory
+ *                6 x £4 = £24 when the 6 ship, no refund exists to credit the other 4, and £16 of a
+ *                real debit stays in Allocated Inventory for ever with Inventory £16 understated.
+ *                Nothing in IMS ever names that £16 again.
+ *   AFTER  (r9)  the record is trimmed to the 6 units the row will hold, and the 4 orphaned units
+ *                are reversed at the £4 a unit A2 RECORDED posting — DR Inventory £16 /
+ *                CR Allocated Inventory £16, in the same transaction as the rewrite. Allocated
+ *                Inventory is left holding exactly the £24 Group B will relieve.
+ */
+function shrunkState(options: {
+  lineQty: number
+  record: Array<Record<string, string>> | null
+}): ReturnType<typeof baseState> {
+  const product = { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE' as const, oversellAllowed: false }
+  return baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      // A2 has run and posted: 10 units, £40.
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+      allocationBatchAmount: 40,
+      lines: [{ id: 'line-1', productId: 'product-1', qty: options.lineQty, sku: 'SKU-1', description: 'Product 1', product }],
+    },
+    warehouses: [
+      { id: 'warehouse-1', code: 'MAIN', name: 'Main', active: true, availableForSale: true, isDefault: true, syncToStore: false },
+    ],
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 },
+    ],
+    allocations: [{
+      id: 'alloc-w1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 10,
+      costLayerSnapshot: options.record,
+    }],
+  })
+}
+
+/** What A2 wrote when it posted: the pin, AND the amount it posted for each unit. */
+const POSTED_TEN_AT_FOUR = [{
+  costLayerId: 'layer-1',
+  qty: '10.000000',
+  unitCostBase: '4.000000',
+  postedUnitCostBase: '4.000000',
+}]
+
+test('o3d-0i5y r9: shrinking a recorded allocation REVERSES the part of the A2 debit nothing will relieve', async () => {
+  const state = shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR })
+  queuedAccountingSyncs.length = 0
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  const rows = (state.allocations ?? []).filter((row) => row.orderId === 'order-1')
+  assert.deepEqual(rows.map((row) => `${row.warehouseId}:${Number(row.qty)}`), ['warehouse-1:6'])
+  assert.equal(
+    sumCostLayerSnapshotQty(parseCostLayerSnapshot(rows[0].costLayerSnapshot)).toString(),
+    '6',
+    'the record is trimmed to the units the row will actually hold',
+  )
+
+  assert.equal(queuedAccountingSyncs.length, 1, 'a reversal journal is raised for the 4 units that left')
+  const reversal = queuedAccountingSyncs[0]
+  assert.equal(reversal.type, 'ALLOCATION_REVERSAL')
+  assert.equal(reversal.referenceType, 'SalesOrder')
+  assert.equal(reversal.referenceId, 'order-1')
+  assert.deepEqual(
+    reversal.payload.lines?.map((line) => [line.accountCode, line.debit ?? null, line.credit ?? null]),
+    [
+      ['630', 16, null],
+      ['631', null, 16],
+    ],
+    'CR Allocated Inventory £16, DR Inventory £16 — 4 units at the £4 A2 recorded posting',
+  )
+})
+
+test('o3d-0i5y r9: the reversal is valued at what A2 POSTED, never at the pin a revaluation rewrote', async () => {
+  // The same 4 orphaned units, but a landed cost has since arrived and
+  // `updateSnapshotsForCostLayerChange` has rewritten `unitCostBase` on this very row from £4 to
+  // £9. That revaluation posted to COGS/Inventory and never touched Allocated Inventory, so the
+  // debit standing against these units is still £4 a unit. Reversing the live pin would move £36
+  // out of an account that only ever received £40 for ten units — and £12 out of it had the layers
+  // fallen instead.
+  const state = shrunkState({
+    lineQty: 6,
+    record: [{ costLayerId: 'layer-1', qty: '10.000000', unitCostBase: '9.000000', postedUnitCostBase: '4.000000' }],
+  })
+  queuedAccountingSyncs.length = 0
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(queuedAccountingSyncs.length, 1)
+  assert.deepEqual(
+    queuedAccountingSyncs[0].payload.lines?.map((line) => [line.accountCode, line.debit ?? null, line.credit ?? null]),
+    [
+      ['630', 16, null],
+      ['631', null, 16],
+    ],
+    'still £16 — the recorded amount, not 4 x the revalued £9',
+  )
+})
+
+test('o3d-0i5y r9: a record that cannot say what was posted for it reverses NOTHING, and is reported', async () => {
+  // Every entry written before r9 is this shape, and so is any entry a future path forgets to
+  // stamp. A reversal posted wrongly is as bad as the original, so this path needs POSITIVE
+  // evidence of the original — and the pin is not it, because a revaluation rewrites the pin
+  // without ever touching Allocated Inventory. Fail closed and tell someone.
+  const state = shrunkState({
+    lineQty: 6,
+    record: [{ costLayerId: 'layer-1', qty: '10.000000', unitCostBase: '4.000000' }],
+  })
+  queuedAccountingSyncs.length = 0
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs, [], 'no journal is invented from the live pin')
+  const reported = activityLogWrites.filter((row) => row.action === 'allocation_reversal_unevidenced')
+  assert.equal(reported.length, 1, 'and the units that left are named for a human to settle by hand')
+  assert.match(String(reported[0].description), /4 recorded unit\(s\)/)
+  assert.match(String(reported[0].description), /layer-1/)
+})
+
+test('o3d-0i5y r9: a rewrite that orphans NOTHING raises no reversal at all', async () => {
+  // The guard against the opposite failure: a reversal fired on an ordinary re-allocation would
+  // credit Allocated Inventory for units that are still on the order and still going to ship.
+  const state = shrunkState({ lineQty: 10, record: POSTED_TEN_AT_FOUR })
+  state.stockLevels[0].quantity = 20
+  queuedAccountingSyncs.length = 0
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs, [])
+})
+
 test('o3d-0i5y r8: a record moving onto a scope that SURVIVES is added to the record already there', async () => {
   // The in-place half of the carry: warehouse-1 already holds 2 posted units of its own and takes
   // warehouse-2's 10 as well. Adding them is the point — writing only the arrivals would drop the
@@ -2652,7 +2830,12 @@ test('resetAllocationAccountingIfStaged clears inventoryAllocatedBatchRef in the
     allocationBatchConnector: null,
     allocationBatchAccountCode: null,
   })
-  assert.equal(allocationUpdates.length, 1, 'and the cost snapshots are still nulled alongside it')
+  // o3d-0i5y r9: this assertion used to read `allocationUpdates.length === 1` — "and the cost
+  // snapshots are still nulled alongside it" — which pinned the DESTRUCTIVE rewrite as the
+  // requirement. It is the opposite of the requirement. The stamp says what still has to be DONE
+  // and is cleared; the row records say what has already been POSTED, and erasing them is what
+  // makes the next A2 pass post the whole order a second time.
+  assert.equal(allocationUpdates.length, 0, 'and the posted records are LEFT ALONE')
 })
 
 test('resetAllocationAccountingIfStaged KEEPS the stamp and the recorded debit when A2 posted (o3d-o97 r4)', async () => {

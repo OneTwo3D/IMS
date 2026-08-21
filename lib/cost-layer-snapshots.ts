@@ -9,6 +9,26 @@ export type CostLayerSnapshotEntry = {
   orderAllocationId?: string
   shipmentLineId?: string
   source?: CostLayerSnapshotSource
+  /**
+   * THE AMOUNT A POSTING RECORDED FOR THIS ENTRY, per unit (o3d-0i5y r9).
+   *
+   * `unitCostBase` is the layer's cost as it stands NOW, and it is REWRITTEN IN PLACE whenever a
+   * landed-cost correction revalues the layer (`updateSnapshotsForCostLayerChange` patches every
+   * `costLayerSnapshot` in the database, this one included). That makes it useless as evidence of
+   * what a journal moved: a revaluation posts to COGS/Inventory and never to Allocated Inventory,
+   * so the pounds Group A2 debited stay exactly what they were while the pin underneath them
+   * changes.
+   *
+   * So the pass that VALUES an entry stamps what it valued it at, in the same statement that
+   * writes the entry and the same transaction that raises the journal — and nothing downstream
+   * rewrites it. An entry carrying this field is therefore POSITIVE EVIDENCE that a journal was
+   * raised for it, at this amount; an entry without one says nothing, and a path that reverses
+   * must fail closed on it rather than reverse the revalued pin. This is the same rule
+   * `o3d-batch-cancelrb` applied on the refund side with `SalesOrder.allocationBatchAmount` — the
+   * record is written BY the posting it stands for — at the grain the record has to survive at
+   * here, which is the UNIT, because the units move between rows.
+   */
+  postedUnitCostBase?: DecimalInput
 }
 
 export type SerializableCostLayerSnapshotEntry = Omit<CostLayerSnapshotEntry, 'qty' | 'unitCostBase'> & {
@@ -16,9 +36,10 @@ export type SerializableCostLayerSnapshotEntry = Omit<CostLayerSnapshotEntry, 'q
   unitCostBase: DecimalInput
 }
 
-export type SerializedCostLayerSnapshotEntry = Omit<CostLayerSnapshotEntry, 'qty' | 'unitCostBase'> & {
+export type SerializedCostLayerSnapshotEntry = Omit<CostLayerSnapshotEntry, 'qty' | 'unitCostBase' | 'postedUnitCostBase'> & {
   qty: string
   unitCostBase: string
+  postedUnitCostBase?: string
 }
 
 // Snapshot JSON is intentionally precision-bounded to the 6-decimal scale used
@@ -34,6 +55,12 @@ export function serializeCostLayerSnapshotEntry(
     ...(entry.orderAllocationId ? { orderAllocationId: entry.orderAllocationId } : {}),
     ...(entry.shipmentLineId ? { shipmentLineId: entry.shipmentLineId } : {}),
     ...(entry.source ? { source: entry.source } : {}),
+    // o3d-0i5y r9: carried through serialization untouched, INCLUDING by the revaluation rewrite
+    // — which re-serializes each patched entry from a spread of the stored row, so the posted
+    // amount survives the very rewrite that changes `unitCostBase` out from under it.
+    ...(entry.postedUnitCostBase != null
+      ? { postedUnitCostBase: roundQuantity(entry.postedUnitCostBase, 6).toFixed(6) }
+      : {}),
   }
   return serialized satisfies SerializedCostLayerSnapshotEntry
 }
@@ -93,8 +120,49 @@ export function parseCostLayerSnapshot(value: unknown): CostLayerSnapshotEntry[]
       orderAllocationId: typeof row.orderAllocationId === 'string' ? row.orderAllocationId : undefined,
       shipmentLineId: typeof row.shipmentLineId === 'string' ? row.shipmentLineId : undefined,
       source: isSnapshotSource(row.source) ? row.source : undefined,
+      postedUnitCostBase: parsePostedUnitCostBase(row.postedUnitCostBase),
     }]
   })
+}
+
+/**
+ * o3d-0i5y r9: a missing/unparseable posted amount is NOT zero and NOT the live pin — it is
+ * "this entry cannot say what was posted for it", which every reversal path has to see as such.
+ */
+function parsePostedUnitCostBase(value: unknown): string | undefined {
+  if (value == null) return undefined
+  try {
+    const parsed = roundQuantity(value as DecimalInput, 6)
+    return parsed.lt(0) ? undefined : parsed.toFixed(6)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Value a set of entries AT WHAT WAS POSTED FOR THEM, and say which of them could not answer
+ * (o3d-0i5y r9).
+ *
+ * {@link sumCostLayerSnapshot} answers "what are these units worth today", which is the right
+ * question for pricing a new posting and the wrong one for reversing an old one. A reversal
+ * posted wrongly is as bad as the original, so this one splits the answer: `posted` covers only
+ * the entries that carry their own record of what a journal moved, and `unevidenced` is
+ * everything else, for the caller to report rather than guess at.
+ */
+export function sumPostedCostLayerSnapshot(entries: CostLayerSnapshotEntry[]): {
+  posted: Decimal
+  unevidenced: CostLayerSnapshotEntry[]
+} {
+  let posted = toDecimal(0)
+  const unevidenced: CostLayerSnapshotEntry[] = []
+  for (const entry of entries) {
+    if (entry.postedUnitCostBase == null) {
+      unevidenced.push(entry)
+      continue
+    }
+    posted = addMoney(posted, multiplyMoney(entry.qty, entry.postedUnitCostBase))
+  }
+  return { posted, unevidenced }
 }
 
 export function sumCostLayerSnapshot(entries: CostLayerSnapshotEntry[]): Decimal {
@@ -240,6 +308,10 @@ export function takeFromSnapshotEntries(
       orderAllocationId: decorate?.orderAllocationId ?? entry.orderAllocationId,
       shipmentLineId: decorate?.shipmentLineId ?? entry.shipmentLineId,
       source: decorate?.source ?? entry.source,
+      // o3d-0i5y r9: this function REBUILDS each entry field by field, so anything not named here
+      // is dropped. The posted amount is carried through every take — the record has to follow the
+      // units when a rewrite moves them between rows, and this is the only path they move by.
+      postedUnitCostBase: decorate?.postedUnitCostBase ?? entry.postedUnitCostBase,
     })
     remainingQty = remainingQty.sub(take)
   }

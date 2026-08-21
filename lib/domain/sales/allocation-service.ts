@@ -52,6 +52,7 @@ import {
   reduceSnapshotByQty,
   serializeCostLayerSnapshot,
   sumCostLayerSnapshotQty,
+  sumPostedCostLayerSnapshot,
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
   type SerializedCostLayerSnapshotEntry,
@@ -508,6 +509,19 @@ export type AccountedRecordPlanEntry = {
 /** Keyed by {@link allocationScopeKey} of the row in the NEXT set. */
 export type AccountedRecordPlan = Map<string, AccountedRecordPlanEntry>
 
+export type AccountedRecordCarryOver = {
+  /** Where each surviving posted record lives once the caller has written its set. */
+  records: AccountedRecordPlan
+  /**
+   * o3d-0i5y r9: recorded units NO row in the new set can hold — the part of Group A2's
+   * Allocated-Inventory debit this rewrite orphans. Nothing downstream will ever relieve it (the
+   * units will not ship, so Group B never credits; they were not refunded, so the refund reversal
+   * never sees them), which makes it a reversal the caller owes, not a rounding detail. Valued by
+   * {@link sumPostedCostLayerSnapshot} at what was POSTED, never at the pin as it stands now.
+   */
+  orphaned: CostLayerSnapshotEntry[]
+}
+
 /**
  * WHERE EACH POSTED RECORD LIVES AFTER THIS REWRITE (o3d-0i5y r8).
  *
@@ -527,12 +541,32 @@ export type AccountedRecordPlan = Map<string, AccountedRecordPlanEntry>
  *   the next A2 pass posts another £50 for the SAME 10 units. Allocated Inventory now holds £100.
  *
  * So the record follows the units instead of following the row. A scope the new set keeps holds its
- * own record untouched; a scope it drops hands its record to the new scopes of the same (line,
- * product), oldest warehouse first, filling each to its quantity and giving any remainder to the
- * last — a shrunk row legitimately records more than it holds, exactly as
- * {@link unaccountedAllocationQty}'s floor already allows. A record whose (line, product) has no row
- * left at all is not carried: those units are off the order (a deallocation, a cancellation, a full
- * refund), nothing will re-allocate them, and A2 will never look at them again.
+ * own record; a scope it drops hands its record to the new scopes of the same (line, product),
+ * oldest warehouse first, filling each up to its quantity.
+ *
+ * AND WHAT NO SURVIVING ROW CAN HOLD IS NOT SILENTLY LEFT ON A ROW — IT IS HANDED BACK AS A DEBIT
+ * TO REVERSE (o3d-0i5y r9). r8 filled the last destination with whatever was left over and let a
+ * kept-but-SHRUNK row go on recording more units than it holds, on the reading that
+ * {@link unaccountedAllocationQty}'s floor already tolerates that. The floor does — and the floor
+ * is the wrong instrument, because it only stops the units being posted AGAIN. It says nothing
+ * about the pounds already sitting in Allocated Inventory for units that have left the order:
+ *
+ *   line L allocated 10 at w1. A2 pins and posts 10 x £4 = £40 into Allocated Inventory.
+ *   the customer drops the line to 6, so the rewrite leaves the w1 row holding 6.
+ *   r8: the row still records 10. Group B relieves 6 x £4 = £24 when they ship, a refund relieves
+ *       nothing (the 4 units were never invoiced), and £16 of a real debit stays in Allocated
+ *       Inventory for ever, with Inventory understated by the same £16.
+ *   r9: the record is trimmed to the 6 units the row will hold, and the 4 orphaned units are
+ *       returned to the caller to REVERSE at the £4 a unit A2 recorded posting — CR Allocated £16,
+ *       DR Inventory £16. Allocated Inventory then holds exactly the £24 Group B will relieve.
+ *
+ * A record whose (line, product) has no row left at all is orphaned in full, for the same reason:
+ * those units are off the order (a deallocation, a cancellation, a full refund), nothing will
+ * re-allocate them, and nothing else will ever relieve their debit either.
+ *
+ * The orphaned entries are valued by the caller AT WHAT WAS POSTED FOR THEM
+ * ({@link sumPostedCostLayerSnapshot}), never at the pin as it stands now — see
+ * `postedUnitCostBase`. A reversal posted wrongly is as bad as the original.
  *
  * This is the same rule as {@link resetAllocationAccountingIfStaged}'s: what has been posted is a
  * recorded FACT. A reset means "come back to A2 for whatever is NEW", never "forget what was posted".
@@ -540,54 +574,194 @@ export type AccountedRecordPlan = Map<string, AccountedRecordPlanEntry>
 export function planAccountedRecordCarryOver(
   existing: ReadonlyArray<{ lineId: string; productId: string; warehouseId: string; costLayerSnapshot?: Prisma.JsonValue | null }>,
   next: ReadonlyArray<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }>,
-): AccountedRecordPlan {
-  const nextKeys = new Set(next.map((row) => allocationScopeKey(row)))
+): AccountedRecordCarryOver {
+  const nextQtyByKey = new Map<string, Prisma.Decimal>()
+  for (const row of next) {
+    const key = allocationScopeKey(row)
+    nextQtyByKey.set(key, (nextQtyByKey.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(row.qty)))
+  }
+
   const plan: AccountedRecordPlan = new Map()
-  const strandedByLineProduct = new Map<string, CostLayerSnapshotEntry[]>()
+  const orphaned: CostLayerSnapshotEntry[] = []
+  const poolByLineProduct = new Map<string, CostLayerSnapshotEntry[]>()
+  const addToPool = (lineId: string, productId: string, entries: CostLayerSnapshotEntry[]) => {
+    if (entries.length === 0) return
+    const lineProduct = `${lineId}|${productId}`
+    poolByLineProduct.set(lineProduct, [...(poolByLineProduct.get(lineProduct) ?? []), ...entries])
+  }
 
   for (const row of existing) {
     const entries = parseCostLayerSnapshot(row.costLayerSnapshot ?? null)
     if (entries.length === 0) continue
     const key = allocationScopeKey(row)
-    if (nextKeys.has(key)) {
+    const surviving = nextQtyByKey.get(key)
+    if (surviving === undefined) {
+      addToPool(row.lineId, row.productId, entries)
+      continue
+    }
+    const recordedQty = sumCostLayerSnapshotQty(entries)
+    // Compared against the allocation epsilon, not exactly: `persistedAllocations` is canonicalised
+    // to numeric(12,4) and can land half an ulp below the record it covers exactly. Trimming half a
+    // millionth of a unit off a record — and raising a reversal for it — would be noise, not a fix.
+    if (recordedQty.lte(surviving.add(ALLOCATION_EPSILON_DECIMAL))) {
       plan.set(key, { entries, write: null })
       continue
     }
-    const lineProduct = `${row.lineId}|${row.productId}`
-    strandedByLineProduct.set(lineProduct, [...(strandedByLineProduct.get(lineProduct) ?? []), ...entries])
+    // FIFO from the FRONT, so the units this row keeps are the ones recorded earliest — which is
+    // where A2 writes its `source: 'shipment'` entries, the record of units that have already left.
+    // Trimming those off would re-present dispatched units as never accounted.
+    const { taken } = takeFromSnapshotEntries(entries, surviving.toNumber())
+    plan.set(key, { entries: taken, write: serializeCostLayerSnapshot(taken) })
+    addToPool(row.lineId, row.productId, reduceSnapshotByQty(entries, sumCostLayerSnapshotQty(taken)))
   }
 
-  for (const [lineProduct, stranded] of strandedByLineProduct) {
+  for (const [lineProduct, stranded] of poolByLineProduct) {
     const destinations = next
       .filter((row) => `${row.lineId}|${row.productId}` === lineProduct)
       .slice()
       .sort((a, b) => (a.warehouseId === b.warehouseId ? 0 : a.warehouseId < b.warehouseId ? -1 : 1))
-    // The units are off the order entirely. Nothing will re-allocate them and A2 will never be
-    // asked about them again, so there is no double post to prevent by carrying the record.
-    if (destinations.length === 0) continue
 
     let pool = stranded
-    for (let index = 0; index < destinations.length; index += 1) {
+    for (const destination of destinations) {
       if (pool.length === 0) break
-      const destination = destinations[index]
       const key = allocationScopeKey(destination)
       const held = plan.get(key)?.entries ?? []
-      const isLast = index === destinations.length - 1
-      // The last destination takes whatever is left, so a record is never dropped for want of
-      // headroom — dropping it is the double post this function exists to prevent.
-      const headroom = isLast
-        ? sumCostLayerSnapshotQty(pool)
-        : toDecimal(destination.qty).sub(sumCostLayerSnapshotQty(held))
-      if (headroom.lte(0)) continue
+      const headroom = (nextQtyByKey.get(key) ?? toDecimal(0)).sub(sumCostLayerSnapshotQty(held))
+      if (headroom.lte(ALLOCATION_EPSILON_DECIMAL)) continue
       const { taken } = takeFromSnapshotEntries(pool, headroom.toNumber())
       if (taken.length === 0) continue
       pool = reduceSnapshotByQty(pool, sumCostLayerSnapshotQty(taken))
       const entries = [...held, ...taken]
       plan.set(key, { entries, write: serializeCostLayerSnapshot(entries) })
     }
+
+    // NOT dumped on the last destination the way r8 dumped it. A row cannot hold a record for units
+    // it does not have without the floor quietly absorbing a debit nobody will ever relieve; these
+    // units are off the order, and what they are owed is a REVERSAL.
+    if (sumCostLayerSnapshotQty(pool).gt(ALLOCATION_EPSILON_DECIMAL)) orphaned.push(...pool)
   }
 
-  return plan
+  return { records: plan, orphaned }
+}
+
+/**
+ * REVERSE THE PART OF GROUP A2'S DEBIT THIS REWRITE ORPHANED (o3d-0i5y r9).
+ *
+ * Group A2 posts DR Allocated Inventory / CR Inventory for the units an order has allocated. Two
+ * things relieve that debit and only two: Group B credits Allocated Inventory for the units a
+ * shipment dispatches, and a refund credits it for the units it takes back. A rewrite that removes
+ * recorded units from the order reaches NEITHER — the units will not ship and were not refunded —
+ * so their share of the debit sits in Allocated Inventory for ever, with Inventory understated by
+ * the same amount. r8 named this itself: a shrunk row's over-posted value needs a REVERSAL, not a
+ * floor. This is the reversal.
+ *
+ * THE AMOUNT IS THE ONE A2 RECORDED, AND THE RECORD IS THE EVIDENCE THAT IT POSTED.
+ * `o3d-batch-cancelrb` established the rule tonight on the refund side of this same contra, and
+ * both halves of it apply here:
+ *
+ *   * A reversal posted wrongly is as bad as the original, so this needs POSITIVE evidence that
+ *     the original posted — never the absence of evidence against it, and never a stamp. The
+ *     evidence used here is `postedUnitCostBase`: an amount A2 WROTE onto the entry, in the same
+ *     statement that wrote the entry and the same transaction that raised the journal for it. An
+ *     entry that carries one was valued by a pass whose batch total was therefore positive, which
+ *     is a pass that created a journal. An entry WITHOUT one — every entry written before r9, and
+ *     any entry a future path forgets to stamp — says nothing about what was posted, so it
+ *     contributes NOTHING and is reported instead, exactly as the sibling reports a stamp with no
+ *     recorded amount.
+ *   * It reverses what was recorded, never the pin revalued since. `unitCostBase` on these very
+ *     entries is rewritten in place by `updateSnapshotsForCostLayerChange` when a landed cost
+ *     arrives late, and that revaluation posts to COGS/Inventory and never to Allocated Inventory.
+ *     Valuing the reversal from the live pin would credit £12 against a £30 debit when layers fell,
+ *     or £42 when they rose. `sumPostedCostLayerSnapshot` consults no layer cost at all.
+ *
+ * THE SIBLING'S RULE IS REUSED; ITS CODE IS NOT, and deliberately. That path answers a LEDGER
+ * BALANCE for a whole order — how many pounds of a debit nobody will relieve — from a per-order
+ * amount, because a refund can fire long after the rows have been deleted and re-created. This one
+ * answers a much smaller question at a much finer grain: these specific units, identified as they
+ * leave, in the same transaction that removes them. Re-deriving an order-level balance here would
+ * be the second notion of "what was posted" the rule warns against.
+ *
+ * NO IDEMPOTENCY KEY, on purpose. The enqueue is inside the caller's transaction, alongside the
+ * row rewrite that orphaned the units, so it commits or rolls back with it — a retry re-does both
+ * or neither. A key would instead make two genuinely separate shrinks of the same units at
+ * different times collapse into one reversal, which is a silent under-reversal.
+ */
+async function reverseOrphanedAllocationPosting(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  orphaned: CostLayerSnapshotEntry[],
+): Promise<void> {
+  if (orphaned.length === 0) return
+
+  const { posted, unevidenced } = sumPostedCostLayerSnapshot(orphaned)
+  if (unevidenced.length > 0) {
+    // Not silently dropped, and not guessed at either: a human has to decide whether a legacy
+    // debit needs reversing by hand, and cannot if nothing says the units left.
+    await tx.activityLog.create({
+      data: {
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'allocation_reversal_unevidenced',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `Re-allocation removed ${sumCostLayerSnapshotQty(unevidenced).toString()} recorded unit(s) `
+          + `from order ${orderId} that carry no record of what Group A2 posted for them `
+          + `(cost layer(s) ${[...new Set(unevidenced.map((entry) => entry.costLayerId))].join(', ')}). `
+          + 'No Allocated Inventory reversal was raised for them — the amount cannot be established '
+          + 'from the allocation pin, which a landed-cost revaluation rewrites. Reverse by hand if '
+          + 'the debit is real.',
+      },
+    })
+  }
+
+  const amount = roundQuantity(posted, 2).toNumber()
+  if (amount <= 0) return
+
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  // Caught, not thrown, exactly as `queueShipmentCogsRevaluationSync` catches it: a settings read
+  // that fails must not roll back the ALLOCATION. The un-postable branch below then reports the
+  // orphaned amount instead of losing it silently.
+  const settings = await getAccountingSettings().catch(() => null)
+  if (!settings?.allocatedInventoryAccount || !settings.inventoryAccount) {
+    await tx.activityLog.create({
+      data: {
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'allocation_reversal_unpostable',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `Re-allocation orphaned £${amount.toFixed(2)} of Group A2 Allocated Inventory on order `
+          + `${orderId}, but the allocated-inventory/inventory accounts are not configured, so no `
+          + 'reversal journal could be raised.',
+      },
+    })
+    return
+  }
+
+  const order = await tx.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { orderNumber: true, externalOrderNumber: true },
+  })
+  const orderRef = order?.orderNumber ?? order?.externalOrderNumber ?? orderId
+
+  await queueAccountingSyncTx(tx, {
+    type: 'ALLOCATION_REVERSAL',
+    referenceType: 'SalesOrder',
+    referenceId: orderId,
+    payload: {
+      date: new Date().toISOString().slice(0, 10),
+      reference: `Allocation reversal: ${orderRef}`,
+      narration:
+        `Allocation reversal — re-allocation of order ${orderRef} removed `
+        + `${sumCostLayerSnapshotQty(orphaned).toString()} unit(s) Group A2 had already reclassified`,
+      lines: [
+        { accountCode: settings.inventoryAccount, description: `Allocation reversal: ${orderRef}`, debit: amount },
+        { accountCode: settings.allocatedInventoryAccount, description: `Allocation reversal: ${orderRef}`, credit: amount },
+      ],
+    },
+  })
 }
 
 /**
@@ -723,8 +897,10 @@ async function declaresUnaccountedAllocationQty(
  * The permit is CALLER-DECLARED, in the same sense as r2's completion authority: `nextAllocations`
  * is the caller stating what it is about to write, and this function checks it against the
  * database's own record of what was posted. A caller that declares nothing — `updateAllocation`,
- * `addAllocation`, the cancellation and teardown releases — is refused exactly as before, because
- * none of them can show what the order will be left holding.
+ * `addAllocation`, the cancellation and teardown releases — is refused the JOURNAL-SAFE PATH
+ * exactly as before, because none of them can show what the order will be left holding. It is no
+ * longer refused the record: since r9 the blanket reset clears the stamp alone and leaves every
+ * row's posted evidence where it stands.
  *
  * A permitted change also SKIPS THE UN-STAGE. That is not laziness, it is the only correct answer
  * here: A2 derives a shipped order's allocated value from its SHIPMENT snapshots and writes an
@@ -794,9 +970,7 @@ export async function resetAllocationAccountingIfStaged(
   // pass, finding empty records, posted the whole order a second time. Nothing reverses the first.
   //
   // The record therefore stays wherever the caller's own plan puts it, and the stamp is cleared
-  // exactly when the declared set leaves quantity nothing has reclassified. A caller that declares
-  // NOTHING still gets the blanket reset: it cannot say what the order will be left holding, so
-  // "come back and re-derive everything" is the only answer available to it.
+  // exactly when the declared set leaves quantity nothing has reclassified.
   if (options.nextAllocations) {
     if (await declaresUnaccountedAllocationQty(tx, orderId, options.nextAllocations, options.accountedRecords)) {
       await unstage()
@@ -823,6 +997,25 @@ export async function resetAllocationAccountingIfStaged(
   // NOT a reversal. Where the order is then cancelled outright the debit still stands unrelieved;
   // that needs a reversal journal of its own, and keeping the record is what leaves that repair
   // possible instead of impossible.
+  //
+  // o3d-0i5y r9, SUPERSEDED BY THE ABOVE (rebase onto o3d-o97 / PR #635). r9 argued the opposite
+  // split for this same site: clear the STAMP alone and KEEP every row's `costLayerSnapshot`, on
+  // the reading that the stamp is a claim about work still TO BE DONE while the record states what
+  // already HAPPENED — so an undeclared caller may clear the first and must not touch the second,
+  // because A2 reading an empty row posts the WHOLE order a second time.
+  //
+  // The premise was right and the conclusion no longer follows, because the merged rule removes the
+  // re-post r9 was defending against: where the debit STANDS the stamp is kept, and Group A2 selects
+  // only on `inventoryAllocatedDate: null`, so it never looks at this order again and cannot re-post
+  // anything — with or without the row records. The only branch that DOES clear the record is the
+  // one `resolveStagedAllocationDebit` proves is not standing, and that is either "A2 never staged
+  // this order" (unreachable here — the early return above requires a stamp) or "A2 recorded a debit
+  // of exactly £0.00". Clearing an empty record is not a deletion of evidence.
+  //
+  // Kept from r9 is the half the merged rule does not cover: the row is not the only place the
+  // record can die. Where the row itself is DESTROYED — the deallocation teardown, the manual
+  // editor, the rebalancer — the units are orphaned and their debit is stranded, so those paths
+  // raise `reverseOrphanedAllocationPosting` rather than relying on a record that no longer exists.
   const stagedDebit = await resolveStagedAllocationDebit(tx, so)
   if (stagedDebit.standing) {
     await tx.activityLog.create({
@@ -2540,7 +2733,12 @@ export async function allocateSalesOrder(
       // o3d-0i5y r8: computed BEFORE the first write, from the rows as they still stand, and used
       // twice — by the reset to decide whether anything is genuinely unaccounted, and by the
       // rewrite below to put each record on the row that inherits its units.
-      const accountedRecords = planAccountedRecordCarryOver(existingAllocs, persistedAllocations)
+      // o3d-0i5y r9: and it says what the new set CANNOT hold, which is a debit to reverse rather
+      // than a record to file — see `reverseOrphanedAllocationPosting`.
+      const { records: accountedRecords, orphaned: orphanedRecord } = planAccountedRecordCarryOver(
+        existingAllocs,
+        persistedAllocations,
+      )
 
       await resetAllocationAccountingIfStaged(tx, orderId, {
         nextAllocations: persistedAllocations,
@@ -2671,6 +2869,11 @@ export async function allocateSalesOrder(
       // next run will expand the current graph for it — and until then every reader would be
       // answering from the pin it no longer has any commitment behind (o3d-kouj).
       await clearDormantFulfillmentPinsInTx(tx, orderId)
+
+      // o3d-0i5y r9: raised AFTER the rows are written, so the journal and the state it describes
+      // commit together — and inside this transaction, under the order row lock this path already
+      // holds, which is what `queueAccountingSyncTx` requires of an order-scoped enqueue.
+      await reverseOrphanedAllocationPosting(tx, orderId, orphanedRecord)
 
       // o3d-4kfh r6 (Codex finding 2): THE RESERVE DELTA COMES FROM THE ROWS AS PERSISTED.
       //
