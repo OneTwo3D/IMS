@@ -60,6 +60,8 @@ import {
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { decideInvoicePaymentRegistration } from '@/lib/domain/accounting/invoice-payment-registration'
+import { invoiceNumberIsExternallySupplied, resolveSalesInvoiceNumberForPost } from '@/lib/domain/accounting/sales-invoice-number'
+import { decideChargebackDiscountLine, readPostedSalesInvoiceDiscountForOrder } from '@/lib/domain/accounting/posted-document-discount'
 import {
   aggregatePaymentSyncRows,
   effectivePaymentSyncRows,
@@ -1289,6 +1291,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       pricesIncludeVat: true,
       discountAmount: true,
       accountingInvoiceId: true,
+      invoiceNumber: true,
       lines: {
         select: {
           sku: true,
@@ -1354,8 +1357,17 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   // the order (matching WC import), so it can be passed through directly.
   const discountForeign = roundDecimalNumber(so.discountAmount ?? 0, 2)
 
+  // o3d-k26m.1: prefer the number already recorded on the order over one derived here. See
+  // lib/domain/accounting/sales-invoice-number.ts — the create is an upsert on InvoiceNumber, so
+  // two routes deriving two numbers for one order post two documents.
+  const { invoiceNumber: accountingInvoiceNumber } = resolveSalesInvoiceNumberForPost({
+    persistedInvoiceNumber: so.invoiceNumber,
+    fallbackPrefix: manualPrefix,
+    orderReference: orderNumber,
+  })
+
   const payload = {
-    invoiceNumber: `${manualPrefix}${orderNumber}`,
+    invoiceNumber: accountingInvoiceNumber,
     contactName: so.customerName ?? 'Unknown',
     contactEmail: so.customerEmail ?? undefined,
     date: new Date().toISOString().slice(0, 10),
@@ -2485,33 +2497,54 @@ export async function raiseChargebackForReversedOrder(
   // discount combined with prior partial refunds makes the remaining discount basis
   // ambiguous. Safe-skip both edge cases to manual; otherwise pass the discount through
   // as its own mirrored line (in BASE currency = discountAmount / fxRateToBase).
+  //
+  // o3d-356o: WHICH discount the invoice actually posted is a property of the DOCUMENT, not of
+  // today's settings. `decideChargebackDiscountLine` reads the mirrored POSTED sales-invoice
+  // event and only falls back to the live-setting proxy for orders that have no such event.
   let discountInput: { totalBase: number } | undefined
   if (decimalToNumber(order.discountAmount) > 0) {
     const cbSettings = await getAccountingSettings().catch(() => null)
-    // The invoice only posts a separate discount line when a discount account is
-    // configured (otherwise it posted full goods, no discount line). Without one we
-    // can't mirror it — safe-skip to manual. (Prior-refund orders were already skipped.)
-    if (!cbSettings?.discountAccount) {
+    const postedDiscount = await readPostedSalesInvoiceDiscountForOrder(db.accountingEvent, orderId)
+    const decision = decideChargebackDiscountLine({
+      orderDiscountAmount: decimalToNumber(order.discountAmount),
+      configuredDiscountAccount: cbSettings?.discountAccount,
+      posted: postedDiscount,
+    })
+    if (decision.action === 'manual') {
       await logActivity({
         entityType: 'SALES_ORDER',
         entityId: orderId,
         action: 'chargeback_requires_manual_handling',
         tag: 'accounting',
         level: 'WARNING',
-        description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount but no discount account is configured — auto-chargeback skipped; raise the credit note manually.`,
+        description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount, but ${decision.reason} — auto-chargeback skipped; raise the credit note manually.`,
         resolveUser: false,
       })
-      return { raised: false, reason: 'order-level discount but no discount account — manual chargeback required' }
+      return { raised: false, reason: `order-level discount: ${decision.reason} — manual chargeback required` }
     }
-    // Convert to the NET (ex-VAT) basis the credit note posts on (lineAmountsIncludeTax
-    // is false). discountAmount is stored in the order's inclusive/exclusive convention,
-    // so strip VAT when the order is tax-inclusive, then to base currency.
-    const fxRate = decimalToNumber(order.fxRateToBase) || 1
-    const vatPct = decimalToNumber(order.taxRatePercent)
-    const discountForeignNet = order.pricesIncludeVat && vatPct > 0
-      ? decimalToNumber(order.discountAmount) / (1 + vatPct)
-      : decimalToNumber(order.discountAmount)
-    discountInput = { totalBase: discountForeignNet / fxRate }
+    if (decision.action === 'mirror-discount') {
+      // Convert to the NET (ex-VAT) basis the credit note posts on (lineAmountsIncludeTax
+      // is false). discountAmount is stored in the order's inclusive/exclusive convention,
+      // so strip VAT when the order is tax-inclusive, then to base currency.
+      const fxRate = decimalToNumber(order.fxRateToBase) || 1
+      const vatPct = decimalToNumber(order.taxRatePercent)
+      const discountForeignNet = order.pricesIncludeVat && vatPct > 0
+        ? decimalToNumber(order.discountAmount) / (1 + vatPct)
+        : decimalToNumber(order.discountAmount)
+      discountInput = { totalBase: discountForeignNet / fxRate }
+    } else {
+      // no-discount-line: the invoice charged the full goods value, so the credit note must
+      // reverse the full goods value. Mirroring a discount line here would under-credit by it.
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'chargeback_discount_line_omitted',
+        tag: 'accounting',
+        level: 'INFO',
+        description: `Chargeback for order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} omits the order-level discount line: ${decision.reason}.`,
+        resolveUser: false,
+      })
+    }
   }
 
   const lines = buildChargebackRefundLines({
@@ -2984,9 +3017,26 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
     const numbering = await getNumberingFormats()
     const result = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, id)
-      const so = await tx.salesOrder.findUnique({ where: { id }, select: { externalOrderNumber: true, orderNumber: true, invoiceNumber: true } })
+      const so = await tx.salesOrder.findUnique({
+        where: { id },
+        select: {
+          externalOrderNumber: true,
+          orderNumber: true,
+          invoiceNumber: true,
+          shoppingLinks: { select: { connector: true } },
+        },
+      })
       if (!so) throw new Error('Order not found')
       if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: getSalesOrderReference({ id, ...so }) }
+      // o3d-k26m.1: for a storefront that supplies its own invoice number, this column is where
+      // that number is recorded — minting into it posts the order to the ledger under a number
+      // the customer's invoice does not carry, and blocks the backfill that would have captured
+      // the real one. Refuse rather than fill the gap. Returned as a plain refusal, not thrown:
+      // the on-shipped trigger calls this for every order and a WooCommerce order having no IMS
+      // number is the normal case, not a failure to log.
+      if (invoiceNumberIsExternallySupplied(so.shoppingLinks.map((l) => l.connector))) {
+        return { externallySupplied: true as const, orderNumber: getSalesOrderReference({ id, ...so }) }
+      }
       const invNum = await nextDocumentNumber(tx, {
         key: 'invoice',
         prefix: numbering.inv_prefix,
@@ -2994,6 +3044,12 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
       await tx.salesOrder.update({ where: { id }, data: { invoiceNumber: invNum, invoicedAt: new Date() } })
       return { invoiceNumber: invNum, orderNumber: getSalesOrderReference({ id, ...so }) }
     })
+    if ('externallySupplied' in result) {
+      return {
+        success: false,
+        error: `Order ${result.orderNumber} takes its invoice number from the storefront (WooCommerce PDF Invoices). IMS will not generate one — the number appears once WooCommerce has created the invoice.`,
+      }
+    }
     revalidatePath(`/sales/${id}`)
     if (!options?.skipLog) {
       await logActivity({

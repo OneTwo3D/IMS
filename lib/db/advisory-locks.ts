@@ -169,10 +169,31 @@ export const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
  */
 export const BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE = 411_220_868
 
+/**
+ * Per-invoice-NUMBER serialization of the Xero sales-invoice post slot (o3d-k26m.5 round 5).
+ *
+ * `POST /Invoices` is update-or-create on the invoice number, so two IMS workers posting under the
+ * same number produce ONE document and the second silently replaces the first. Round 4 excluded
+ * them by writing a timestamp and comparing stamps; round 5 replaced that with this lock, because a
+ * comparison of two HOST clocks decides the wrong way under skew — see `takeInvoiceNumberPostSlot`.
+ *
+ * Keyed on `hashtext(<the number's ledger identity>)`, which is the scope the exclusion is about:
+ * two workers contend if and only if they are about to write the same document. A `hashtext`
+ * collision between two different numbers collapses to one id, which over-serializes two unrelated
+ * invoices for the length of one look-then-stamp — harmless, and in the safe direction.
+ *
+ * Held for the transaction that reads the in-flight rows and writes this row's stamp, and NOT
+ * across the post itself: an advisory lock cannot span an HTTP request that may take minutes, and
+ * holding one across a remote call is how a crashed worker wedges a queue. What survives the
+ * transaction is the stamp, and its lease is what fences the number while the post is in flight.
+ */
+export const XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE = 411_220_869
+
 
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
   REFUND_RELEASE_WARNING_LOCK_NAMESPACE,
   BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE,
+  XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
 } as const

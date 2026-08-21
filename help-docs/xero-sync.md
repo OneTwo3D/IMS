@@ -626,6 +626,26 @@ Refunds create a Xero credit note in all cases. Additional reversal journals dep
 | Allocated but not shipped | Credit note + DR Unearned / CR Sales + DR Inventory / CR Allocated |
 | Partially or fully shipped | Credit note + DR Inventory / CR COGS (shipped portion) + unearned reversal (unshipped portion) |
 
+### Chargebacks and the order-level discount
+
+When the payment poller sees a payment reversed, IMS raises a **chargeback** credit note that
+unwinds the whole remaining order. Whether that credit note carries an order-level discount line is
+decided by **what the sales invoice actually posted**, not by the current Account Mapping:
+
+| What the posted invoice carried | What the chargeback does |
+|---|---|
+| A discount line, to an account that is still the configured Discount account | Mirrors the discount line |
+| A discount line, but the Discount account has since been removed or changed | Refuses — raise the credit note manually (logged as `chargeback_requires_manual_handling`) |
+| No discount line (the invoice charged the full goods value) | Credits the full goods value, no discount line (logged as `chargeback_discount_line_omitted`) |
+| Unreadable | Refuses — raise the credit note manually |
+
+Orders with no recorded accounting document for the invoice fall back to the older rule: the
+Discount account being configured is taken as the signal that a discount line was posted.
+
+This is why it matters: if the Discount account was configured *after* an invoice posted, that
+invoice charged the full goods value. Reversing it with a discount line would credit less than was
+charged and silently leave the difference on the customer's account.
+
 ## Transaction Types
 
 Configure which documents are synced to Xero under **Integrations → Xero → Transaction Types**. Each type can be set to **Off**, **Draft**, or **Submitted** (AUTHORISED in Xero):
@@ -639,6 +659,111 @@ Configure which documents are synced to Xero under **Integrations → Xero → T
 | COGS Reversals | Reverse COGS on stock returns |
 | Inventory Adjustments | Journal for manual stock adjustments |
 | Manufacturing Journal | Capitalise per-run overhead (labour, machine, etc.) on assembly/disassembly: DR Inventory / CR Manufacturing Overhead. Includes the retro-recalc reclass (`MANUFACTURING_RECLASS`) when cost lines are edited after completion. |
+
+## Invoice Numbers
+
+**IMS supplies the invoice number; Xero does not allocate it.** The number sent as `InvoiceNumber`
+is the one already recorded on the sales order:
+
+| Order origin | Number sent to Xero |
+|---|---|
+| WooCommerce | `_wcpdf_invoice_number` from the WooCommerce order, verbatim — the same number printed on the customer's PDF |
+| Manual / IMS-created | The order's own invoice number if one has been generated, otherwise the Invoice Prefix from Settings → Company → Document Numbering plus the order reference |
+
+Two things follow from this, and both matter.
+
+**One order, one number.** The create is an *update-or-create on `InvoiceNumber`*, so re-posting the
+same order replaces its own document instead of adding a second one. That property only holds while
+every route posts the *same* number for an order — which is why the number recorded on the sales
+order always wins over one derived at push time.
+
+**A missing number stops the post.** If a WooCommerce order has no `_wcpdf_invoice_number`, nothing
+is queued and a warning is logged; IMS never substitutes a number of its own. See
+`docs/woocommerce.md` § When WooCommerce has not numbered the invoice yet.
+
+### The ownership check before every sales-invoice create
+
+Because the create upserts on `InvoiceNumber`, posting under a number Xero already holds does not
+produce a duplicate — it **replaces** the document that holds it. IMS therefore asks Xero who holds
+the number immediately before every sales-invoice create, and posts only when the answer is
+*nobody*, or *a document this order is already linked to*.
+
+Anything else is refused. Nothing is sent, the sales order stays un-invoiced, and the reason is on
+the sync row and in the activity log as `sales_invoice_number_not_ours`:
+
+| What the check found | What IMS does | What you do |
+|---|---|---|
+| Nobody holds the number | Posts, after recording on the sync row which number it is about to post under | — |
+| The document this order is linked to holds it | Posts (this is a re-post of our own invoice) | — |
+| **Another document holds it, and IMS does not own that document** | Refuses | This is the cutover case: xeroom almost certainly already invoiced this order. If the existing Xero invoice is the right one, leave it and cancel the IMS sync row. If this order genuinely has no Xero document, link the correct one to the order (or void the wrong one in Xero) and re-queue |
+| The order is linked to one document but a *different* one holds the number | Refuses | Either the link or the number is wrong. Establish which document belongs to this order before anything is posted |
+| A **voided or deleted** document holds it | Refuses | Xero will not accept a modification of a voided document. Resolve it in Xero, then re-queue |
+| **More than one live document** holds it | Refuses | Which one an update-or-create would replace cannot be established from outside Xero — not even when one of them is yours. Void or renumber all but one, then re-queue |
+| **Xero could not be asked** (disconnected, rate-limited, network) | Refuses, and retries by itself | Nothing — the row re-runs once the connection is healthy. If it persists, fix the connection |
+| **Xero's answer could not be shown to be complete** (a full page of documents came back) | Refuses, and retries by itself | Nothing automatic. If it persists, look for the pile of documents sharing that number in Xero — the check will not guess past a result it cannot see the end of |
+| **The number contains a comma** | Refuses, permanently | Xero's number filter reads a comma as the separator between two numbers, so IMS cannot ask who holds *this* one — and "no documents" is exactly the answer that would let it overwrite. Change the number in WooCommerce (it is taken verbatim from `_wcpdf_invoice_number`, so this is usually a prefix or suffix in the PDF plugin's number format) and re-queue, or post the invoice in Xero by hand and link it to the order |
+| **Another IMS sync row is already posting under the same number** | Refuses, and retries by itself | Nothing — the other row settles within seconds and this one retries. If it keeps happening, two queued invoices genuinely carry one number: cancel the duplicate. Logged as `sales_invoice_number_in_flight_elsewhere`. Numbers are compared the way Xero compares them, so `INV-1` and `inv-1` count as the same number here |
+| **Building the invoice took longer than 15 minutes** | Refuses, and retries by itself | Nothing — the next run asks Xero again from scratch. Preparing an invoice makes one Xero call for the contact and one per distinct product, so a very large or heavily rate-limited invoice can outlast the answer that authorised it, and IMS will not post on an answer that old. Logged as `sales_invoice_number_answer_stale` |
+
+The refusals other than the last are verdicts about what is in Xero, not transient errors. The row
+still retries a handful of times before it settles as FAILED with the reason on it — and those
+retries are how a resolved refusal picks itself up: once you have linked the correct Xero document
+to the order (or voided the wrong one), the next retry sees the number as ours and posts. If it
+runs out of retries first, re-queue the invoice from the sales order. Either way, **a refused post
+is recoverable and an overwritten live invoice is not.**
+
+**What this protects, and what it cannot do.** The documents at risk are not a rival system's
+future posts — xeroom is *removed* at cutover, not run alongside. They are the **~14,415 invoices
+xeroom already posted**, which stay in Xero under exactly the numbers IMS now takes from
+`_wcpdf_invoice_number`. They are always there when the check asks, so the check sees them — and
+after cutover there is no second system left to notice if it ever failed to. That is why the check
+refuses whenever it cannot show that it read Xero's answer in full.
+
+What it cannot do is see a document that appears between the check and the post. With xeroom gone,
+only two things can land there. **A second IMS worker is now fenced off:** immediately before the
+create leaves — not before IMS starts building it — the sync row takes an exclusive slot on the
+number, and a row that finds another row already in flight under the same number stands down rather
+than posting. So two queued invoices carrying one number produce one document and one retry, not one
+document and a silent overwrite.
+
+Three details of that fence matter if you are reading a refusal:
+
+* **The slot is taken at the last possible moment — and re-taken for every send attempt.** Preparing
+  an invoice calls Xero once for the customer contact and once per distinct product, and those calls
+  are rate-limited, so preparation can take minutes. A slot taken before all of that could have
+  expired by the time the invoice was sent, which is why it is now taken after it. Sending is not
+  instant either: if Xero rate-limits the create, IMS waits and tries again, and a wait can outlast
+  the slot. So the slot is checked and renewed inside each attempt, immediately before the request
+  goes out. A retry that finds the number taken in the meantime stands down instead of sending.
+* **Numbers are matched the way Xero matches them.** Case and surrounding spaces are ignored, because
+  Xero treats `INV-1` and `inv-1` as one document; if IMS treated them as two, both workers would
+  think they were alone.
+* **Nothing depends on the servers' clocks agreeing.** Which worker gets the slot is decided by a
+  database lock, and the fifteen-minute expiry on an abandoned slot is measured by the database, not
+  by the machine running the sync.
+
+What remains is somebody typing an invoice into Xero by hand in the same second, which no check
+inside IMS can see.
+
+IMS deliberately does **not** treat "I was about to post under this number" as proof that the
+document now holding it is mine: that reasoning would only ever be used when the number *is* held,
+which after cutover means the check missed one of the historical documents — so it would repeat an
+overwrite instead of reporting it. See o3d-k26m.8.
+
+One consequence worth knowing in advance: if a post reaches Xero and the *response* is lost, the
+order's invoice is not re-posted automatically any more. The next attempt sees the number held by a
+document IMS cannot recognise and refuses. Open the invoice in Xero, confirm it is the one for this
+order, link it to the order, and the next retry updates it instead of replacing it.
+
+And the check costs one extra Xero API call per sales-invoice create, which counts against the
+1,000-call rolling daily limit.
+
+> **Cutover note.** Xeroom posts the *same* numbers to the *same* Xero organisation, and it is being
+> removed rather than run alongside IMS — so the check above is not there to referee two live
+> systems. It is there for what xeroom leaves behind: every order it has already invoiced keeps a
+> real document under the number IMS would post. Expect a refusal for each of those if it is
+> re-imported, backfilled or re-queued, and treat a refusal as the system working. Switch xeroom off
+> for the orders IMS will handle before enabling Sales Invoices against the live organisation.
 
 ## Multi-Currency FX Rates
 

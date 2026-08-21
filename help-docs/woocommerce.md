@@ -97,7 +97,67 @@ With the initial import complete, new and updated WooCommerce orders are importe
 - Multi-currency orders are converted to the IMS base currency using the FX rate from `frankfurter.dev` (ECB) at import time. The same rate is stamped on the order's `fxRateToBase` field and forwarded to Xero as `CurrencyRate` on the resulting invoice — so the WooCommerce store, IMS, and Xero all see the same base-currency total for the order. See `docs/xero-sync.md` § Multi-Currency FX Rates.
 - Tax rates are resolved using the tax rate mappings you configure (see Tax Rates below)
 - The order number uses your configured WooCommerce prefix (e.g. `WC-1234`, set in Settings > Company > Document Numbering)
+- **The accounting invoice number comes from WooCommerce, not from IMS.** IMS reads `_wcpdf_invoice_number` — the number WooCommerce PDF Invoices & Packing Slips assigned and printed on the customer's PDF — and uses it *verbatim* as both the IMS invoice number and the `InvoiceNumber` on the Xero invoice. No prefix is added, so the Xero document, the customer's PDF and the WooCommerce order all carry the same number. The **Invoice Prefix** field for WooCommerce under Settings > Company > Document Numbering no longer affects it
 - Stock is auto-allocated from warehouses marked **Sync to Store**
+
+#### When WooCommerce has not numbered the invoice yet
+
+The PDF plugin assigns `_wcpdf_invoice_number` when it first creates the invoice document, which can
+happen slightly after IMS imports the order. When the number is missing, **IMS does not invent one
+and does not post anything to the accounting system.** The order still imports normally; the
+accounting sales invoice is held back and a warning appears in the activity log
+(`sales_invoice_number_unavailable`), naming the order and the meta key it looked for.
+
+This is deliberate. The accounting sales-invoice create is an *update-or-create on the invoice
+number*, so a document posted under a stand-in number cannot be renumbered later — a second post
+under the real number would create a **second invoice** rather than replacing the first. Holding the
+order back is recoverable; a wrongly numbered document in a live ledger is not.
+
+**It clears itself.** The invoice IMS would have posted is kept against the order, waiting for the
+number. As soon as WooCommerce assigns one and the order resyncs — a webhook redelivery, or the next
+order poll, which picks the order up precisely because writing that meta touches it — IMS records
+the number and queues the accounting invoice automatically, using the payload it built at import
+time (so the invoice date, tax treatment and payment registration are exactly what they would have
+been). The activity log shows `sales_invoice_number_captured`.
+
+There is nothing to do unless an order *stays* here. If one does, the order is not being resynced:
+check that WooCommerce actually generated the invoice document for it, and that order sync is
+running. You can always queue the sales invoice from the sales order by hand once the number shows.
+
+One case is called out separately, because the release can be a no-op through no fault of the order:
+if the accounting connector is disconnected, its sync is switched off, or Sales Invoices are set to
+**off**, queueing the released invoice does nothing at all. IMS checks that the accounting sync row
+really exists before it closes the hold, so the order stays held, its queue row says why, and the
+activity log gets `sales_invoice_release_not_queued`.
+
+**That one does not wait for the storefront.** Waiting for another order sync would be waiting for
+nothing: the event that would have caused one — WooCommerce writing the number — has already
+happened. Instead the WooCommerce reconcile job retries every held order that has a number and no
+accounting document, on its own schedule, so switching the connector or the Sales Invoices setting
+back on is enough — the invoices queue themselves on the next run without anyone touching the
+orders. While orders are stuck this way you get one `sales_invoice_release_still_stuck` warning per
+run naming the total, rather than one per order. Holds that can never be released — the sales order
+was deleted, or it has since been invoiced another way — are closed with a reason instead of being
+retried forever.
+
+#### If WooCommerce changes an order's invoice number
+
+IMS follows the storefront **until something has committed to the number** — that is, until an
+accounting document exists for the order, or a sales-invoice sync has been queued for it. Before
+that point a changed `_wcpdf_invoice_number` simply replaces the stored one (logged as
+`sales_invoice_number_corrected`).
+
+After that point the number is frozen and IMS keeps what it has, logging
+`sales_invoice_number_correction_refused` with both numbers. Renumbering then is not a correction:
+the accounting create is update-or-create on the number, so posting the new one would add a *second*
+document rather than renumber the first. The order's invoice in the accounting system and the
+customer's PDF have genuinely diverged, and somebody has to decide which is right.
+
+The same applies to orders that have **no** number recorded but already carry an accounting
+document — every WooCommerce order invoiced before this change is in that state, with a document
+numbered `INWC-…` in Xero. IMS does not fill the blank for those either (logged as
+`sales_invoice_number_capture_refused`): doing so would make the next invoice update try to renumber
+a live document onto the storefront's number.
 
 **WooCommerce "completed" orders** receive special handling: the system auto-allocates stock, creates shipments, applies any tracking information from the WC order meta (AST plugin), and transitions the shipments through to Shipped status.
 

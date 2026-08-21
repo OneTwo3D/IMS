@@ -2326,6 +2326,30 @@ model AccountingSyncLog {
   // Not a candidate-query predicate: an unstamped row is a candidate already. It only widens the
   // "back-reference done, follow-ups outstanding" pass that used to be FAILED-only.
   backReferenceFollowUpsPendingAt DateTime?
+  // o3d-k26m.5: the invoice number THIS row SET OUT TO POST under, written immediately before the
+  // request left and only once a live lookup had said the ledger did not hold that number yet.
+  //
+  // IT IS NOT A CLAIM OF OWNERSHIP, and round 2's version of this column was (Codex round 3). The
+  // inference it carried — "nobody held this number when the row set out, somebody holds it now,
+  // therefore the holder is ours" — cannot identify a holder: it is a fact about the LOOKUP's
+  // moment. And it would only ever be consulted when the number IS held, which — once xeroom is
+  // removed and the only remaining holders are the ~14,415 documents it left behind — means the
+  // lookup MISSED one. So the licence would fire exactly where the fence has already failed,
+  // repeating the overwrite and removing the refusal that would have exposed it. It licenses
+  // nothing.
+  //
+  // Two jobs remain, both honest:
+  //   * it is written BEFORE an irreversible remote write, and a failure to write it refuses the
+  //     post — a create whose local record cannot be written is a create whose OUTCOME cannot be
+  //     recorded either, which is precisely the lost-response state;
+  //   * a later refusal can say "this row already set out under this number", which is the
+  //     difference between a refusal an operator can diagnose and one they cannot.
+  //
+  // The NUMBER is stored, not a bare flag, so a row whose payload number later changes cannot be
+  // described with an attempt taken for a different one. Scope is the row, deliberately: a freshly
+  // enqueued row for the same order does not inherit it.
+  attemptedInvoiceNumber   String?   @map("attempted_invoice_number")
+  attemptedInvoiceNumberAt DateTime? @map("attempted_invoice_number_at")
 
   // o3d-o97 r6 — THE ONE FACT THAT MAKES A CANCELLED ROW EVIDENCE ABOUT POUNDS.
   //
