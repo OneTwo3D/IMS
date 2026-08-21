@@ -1903,6 +1903,7 @@ test('o3d-0i5y r11: the record lock is taken BEFORE the first allocation-row wri
   assert.ok(lockIndex < firstRowWrite, 'the lock comes first, so nothing can revalue the base between the two')
   const orderLock = state.txCalls.findIndex((call) => call.includes('sales_orders') && call.includes('FOR UPDATE'))
   assert.ok(orderLock >= 0 && orderLock < lockIndex, 'and the ORDER lock still comes before it — one ordering, unchanged')
+})
 
 // ---------------------------------------------------------------------------
 // o3d-i4qd — THE INTEGRITY CHECKS MUST NOT REFUSE THE ROWS THE ALLOCATOR JUST WROTE.

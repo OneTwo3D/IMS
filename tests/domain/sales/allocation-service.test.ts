@@ -5139,6 +5139,7 @@ test('o3d-0i5y r11: a warehouse move KEEPS a landed-cost correction that lands b
     + 'reaching cost of sales',
   )
   assert.deepEqual(queuedAccountingSyncs, [], 'nothing left the order, so nothing is reversed')
+})
 
 // o3d-aqke (Codex r1 finding 2) — THE ALLOCATOR MUST NOT PLAN A ROW ITS OWN STORAGE REFUSES.
 //
