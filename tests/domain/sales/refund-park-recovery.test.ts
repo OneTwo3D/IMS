@@ -8,12 +8,14 @@ import {
   buildRefundParkDismissData,
   buildRefundParkReassignData,
   describeRefundParkRecoverability,
+  describeRefundReadDisagreement,
   isDismissedRefundPark,
   normalizeRefundParkRecoveryAssertion,
   refundParkRecoveryNote,
   refuseDismiss,
   refuseOnLookupFailure,
   refuseReassign,
+  refuseUnstableRefundList,
   type RefundParkView,
   type WcOrderRefundEvidence,
 } from '@/lib/domain/sales/refund-park-recovery'
@@ -64,6 +66,84 @@ test('a row with no refund id or no order is not a refund park and is refused wi
   const noOrder = describeRefundParkRecoverability({ status: 'FAILED', externalId: '7001', entityId: null })
   assert.equal(noOrder.recoverable, false)
   assert.match(noOrder.notRecoverableReason ?? '', /not attached to an order/)
+})
+
+// ---------------------------------------------------------------------------
+// TWO READS OF A COLLECTION THAT CAN ONLY BE ADDRESSED BY POSITION
+//
+// A single walk over offset pages cannot establish that it saw everything: a refund deleted behind
+// the cursor shifts every later row down one place, so a row falls between two pages while the list
+// still carries the id of the row that was deleted — the same length, the same stated total, one
+// refund missing. Two walks are compared instead, and only agreement is evidence.
+// ---------------------------------------------------------------------------
+
+test('two reads of the same refunds agree, whatever order the store served them in', () => {
+  // A store is free to order a page differently between two requests, and an order that is not a
+  // difference in CONTENT is not evidence that anything moved. Refusing on it would make the whole
+  // dismissal unreachable on a perfectly stable store.
+  assert.equal(
+    describeRefundReadDisagreement(
+      { refundIds: [7001, 7002, 7003], statedTotal: 3 },
+      { refundIds: [7003, 7001, 7002], statedTotal: 3 },
+    ),
+    null,
+  )
+})
+
+test('a refund in one read and not the other is named, and says which read had it', () => {
+  // The signature of the case no single walk can see: the first read carries a refund that has since
+  // been DELETED (so the second cannot serve it), and the second carries the refund that fell through
+  // the gap the deletion opened. Both halves are reported, because an operator reading "the list
+  // changed" needs to know it changed around the very refund they are deciding about.
+  const detail = describeRefundReadDisagreement(
+    { refundIds: [8005, 8006, 8007], statedTotal: 3 },
+    { refundIds: [8006, 8007, 7001], statedTotal: 3 },
+  )
+  assert.match(detail ?? '', /the first read listed refund 8005 and the second did not/)
+  assert.match(detail ?? '', /the second read listed refund 7001 and the first did not/)
+})
+
+test('a long disagreement is summarised rather than dumped', () => {
+  const detail = describeRefundReadDisagreement(
+    { refundIds: [1, 2, 3, 4, 5, 6, 7], statedTotal: 7 },
+    { refundIds: [], statedTotal: 0 },
+  )
+  assert.match(detail ?? '', /refunds 1, 2, 3, 4, 5 and 2 more/)
+})
+
+test('the same refunds with a DIFFERENT stated total is still a collection that moved', () => {
+  // The store telling us 250 once and 251 the next time is a plain statement that it changed, even
+  // when the two walks happened to bank the same ids — a refund can be created and served on neither.
+  const detail = describeRefundReadDisagreement(
+    { refundIds: [7001, 7002], statedTotal: 2 },
+    { refundIds: [7002, 7001], statedTotal: 3 },
+  )
+  assert.match(detail ?? '', /a total of 2 on the first read and a total of 3 on the second/)
+})
+
+test('a store that states no total at all agrees with itself, and a store that starts stating one does not', () => {
+  // "No total" is not zero and not a claim; two reads of a silent store must not refuse for ever.
+  assert.equal(
+    describeRefundReadDisagreement({ refundIds: [7001], statedTotal: null }, { refundIds: [7001], statedTotal: null }),
+    null,
+  )
+  const detail = describeRefundReadDisagreement(
+    { refundIds: [7001], statedTotal: null },
+    { refundIds: [7001], statedTotal: 1 },
+  )
+  assert.match(detail ?? '', /no total at all on the first read and a total of 1 on the second/)
+})
+
+test('a list that moved is refused as a list that MOVED, not as a store that could not be asked', () => {
+  // Two different remedies. "Could not be asked" sends an operator to look for an outage; this one
+  // tells them the answer was changing while it was being given, and that trying again is the fix.
+  const refusal = refuseUnstableRefundList(2002, 'the second read listed refund 7001 and the first did not')
+  assert.equal(refusal.code, 'wc_refund_list_unstable')
+  assert.match(refusal.message, /refund list for order 2002 changed while this check was reading it/)
+  assert.match(refusal.message, /the second read listed refund 7001 and the first did not/)
+  assert.match(refusal.message, /nothing was changed and the park is exactly as it was/)
+  assert.match(refusal.message, /one page at a time BY POSITION/)
+  assert.match(refusal.message, /try this recovery again in a moment/)
 })
 
 // ---------------------------------------------------------------------------

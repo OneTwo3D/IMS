@@ -409,11 +409,30 @@ As a second guard, if the store states how many refunds the order has (the `X-WP
 serves fewer than that, the check is refused: that is the signature of a page trimmed in transit,
 which no rule about page lengths can catch.
 
+**And a list that changes while it is being read is refused as well.** WooCommerce serves refunds a
+page at a time *by position* — "rows 100 to 199 of whatever is there when you ask" — so a refund
+created or deleted on that order in the middle of the read shifts every later row along, and a refund
+can slip through the gap between two pages without any page looking short. Nothing in the pages
+themselves reveals it, and the totals do not either: the list still carries the refund that was
+deleted, so it is one too long by exactly as much as it is one too short.
+
+Two things catch it. If the same refund is served twice, on different pages, the read is refused —
+that only happens when the list has moved. And **before a park is dismissed, the whole list is read a
+second time and the two answers must match**, refund for refund. The refund that goes missing goes
+missing because another one was deleted, and the store cannot serve that deleted refund again, so the
+two reads disagree and the dismissal is refused. If it keeps happening, that order is being refunded
+right now; leave the park alone until it settles.
+
+This is only required for **dismissing** a park, and doubles the requests that check makes.
+Reassigning is allowed by WooCommerce *listing* the refund on the order you named, and a list that is
+short can only fail to show something — it can never invent it. Dismissing is allowed by the refund
+being *absent*, and a list that is short produces absence out of nothing.
+
 If the read cannot be completed — the store errors, an order carries more refunds than the check will
 read, the list never ends within the pages the check reads, the store serves fewer refunds than it
-says the order has, or a refund comes back with no readable id — the recovery is **refused and
-nothing is changed**, rather than treating a list that might be short as proof the refund is
-missing.
+says the order has, the list changes while it is being read, or a refund comes back with no readable
+id — the recovery is **refused and nothing is changed**, rather than treating a list that might be
+short as proof the refund is missing.
 
 ## Invoice Notes and Customer PDF Downloads
 

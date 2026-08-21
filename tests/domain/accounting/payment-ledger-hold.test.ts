@@ -10,6 +10,7 @@ import {
   assertedReversalNote,
   buildAssertedReversalData,
   buildVerifiedReversalData,
+  canonicalCurrencyCode,
   canonicalLedgerAmount,
   describeAttemptUndecidedRefusal,
   describeLedgerHoldRefusal,
@@ -18,6 +19,7 @@ import {
   ledgerReversalNote,
   normalizeAssertedPaymentReference,
   refuseAssertedPaymentAmountMismatch,
+  refuseAssertedPaymentCurrencyMismatch,
   refuseAssertedPaymentNotOnInvoice,
   refuseAssertedPaymentStillOnInvoice,
   refuseAssertedPaymentUnattributable,
@@ -26,6 +28,7 @@ import {
   refuseUnverifiableConnector,
   registrationLedgerStanding,
   sameLedgerAmount,
+  sameLedgerCurrency,
   sameLedgerIdentifier,
   splitPaymentRegistrations,
   type PaymentRegistrationRow,
@@ -269,6 +272,41 @@ test('anything that is not plain decimal text is unreadable, never zero', () => 
     assert.equal(canonicalLedgerAmount(value), null, `${String(value)} must be unreadable`)
   }
   assert.ok(!sameLedgerAmount(NaN, NaN), 'and two unreadable amounts are not "the same amount"')
+})
+
+// ---------------------------------------------------------------------------
+// AND AN AMOUNT IS NOT A UNIT EITHER (round 5)
+// ---------------------------------------------------------------------------
+
+test('the same currency written differently is one currency', () => {
+  assert.equal(canonicalCurrencyCode('gbp'), 'GBP')
+  assert.equal(canonicalCurrencyCode(' GBP '), 'GBP')
+  assert.ok(sameLedgerCurrency('gbp', 'GBP'))
+})
+
+test('anything that is not a three-letter code is unreadable, never the base currency', () => {
+  // Read as a default instead, two receipts with no currency would "agree" — which is how a
+  // comparison of numbers becomes a comparison of money that was never checked.
+  for (const value of ['', '  ', 'GB', 'GBPX', '£', '826', 826, null, undefined, {}, ['GBP']]) {
+    assert.equal(canonicalCurrencyCode(value), null, `${String(value)} must be unreadable`)
+  }
+  assert.ok(!sameLedgerCurrency(null, null), 'and two unknowns are not "the same currency"')
+  assert.ok(!sameLedgerCurrency('', ''), 'nor two blanks')
+})
+
+test('two currencies that differ are not the same money, whatever the numbers say', () => {
+  assert.ok(!sameLedgerCurrency('GBP', 'EUR'))
+  // The point of the whole check, stated as an assertion: the amounts agree and the money does not.
+  assert.ok(sameLedgerAmount('100.00', 100), 'the NUMBERS are equal')
+  assert.ok(!sameLedgerCurrency('GBP', 'EUR'), 'and that says nothing about whether the MONEY is')
+})
+
+test('a ledger holding this money in another currency refuses, and names both sides', () => {
+  const refusal = refuseAssertedPaymentCurrencyMismatch('PAY-9', 'SO-1001', 'EUR', 'GBP')
+  assert.equal(refusal.code, 'asserted_payment_currency_mismatch')
+  assert.match(refusal.message, /holds the invoice for SO-1001 in EUR, and this receipt is recorded in GBP/)
+  assert.match(refusal.message, /the same figure in two currencies is not the same money/)
+  assert.match(refusal.message, /Nothing was changed, and nothing was deleted/)
 })
 
 test('a payment still standing on the invoice for this amount refuses, and says which one', () => {

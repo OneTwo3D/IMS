@@ -42,11 +42,13 @@ import {
   buildRefundParkDismissData,
   buildRefundParkReassignData,
   describeRefundParkRecoverability,
+  describeRefundReadDisagreement,
   normalizeRefundParkRecoveryAssertion,
   refundParkRecoveryNote,
   refuseDismiss,
   refuseOnLookupFailure,
   refuseReassign,
+  refuseUnstableRefundList,
   type RefundParkRecoveryOutcome,
   type RefundParkRecoveryRefusal,
   type RefundParkRecoveryRefusalCode,
@@ -1057,6 +1059,31 @@ export type RecoverRefundSyncParkResult =
  * The `x-wp-totalpages` header is still read for the one thing it CAN do: fail fast and cheaply when
  * the store says up front there is more here than this check will read.
  *
+ * AND NONE OF THAT IS ABOUT THE COLLECTION — only about the pages cut out of it. That is Codex round
+ * 4's first finding, and the last thing a positional pager gets wrong. `?page=N&per_page=100` asks
+ * for "rows 100N to 100N+99 OF WHATEVER IS THERE WHEN YOU ASK", so a refund DELETED behind the cursor
+ * shifts every later row down one place and the row that was going to open the next page is served to
+ * nobody. Every page is full, the walk ends on an empty one, and the list is one row short.
+ *
+ * THE STATED-TOTAL GUARD CANNOT SEE THAT, and it is worth being exact about why, because it looks as
+ * though it should: the list still carries the id of the row that was DELETED — banked before the
+ * delete — so it is one id too long by precisely the amount it is one id too short. The count balances
+ * because two errors of one cancel. Deleting two rows cancels twice. No arithmetic over a single walk
+ * recovers the difference, and the walk terminates honestly the whole time.
+ *
+ * SO THE WALK NO LONGER CLAIMS COMPLETENESS BY ITSELF. It reports what it read and what the store
+ * said, and TWO further things decide whether that may be used as evidence of ABSENCE:
+ *
+ *   • A REPEATED ID INSIDE ONE WALK REFUSES, here. A stable collection cannot serve one row on two
+ *     pages — the offsets do not overlap — so a repeat is proof the collection moved. It is what a
+ *     CREATED refund looks like (newest first, so the new row takes offset 0 and pushes a row we have
+ *     read onto the next page). That direction loses nothing, but the trace it leaves is not wasted:
+ *     the same motion running the other way is the one that loses a row in silence.
+ *   • AND THE DISMISSAL PATH RUNS THE WHOLE WALK TWICE, requiring the two answers to agree — see
+ *     `readConfirmedWcOrderRefundIds`. The row a deletion hides is hidden BECAUSE another row was
+ *     deleted, and that row is still in the first list; the store cannot serve it again, so the second
+ *     read comes back without it and the lists differ.
+ *
  * AND AN UNREADABLE ROW REFUSES TOO. An entry whose `id` is not a usable integer used to be dropped
  * silently, which is the same error in miniature: a list with a row we cannot read cannot establish
  * that a particular refund is missing from it.
@@ -1064,10 +1091,16 @@ export type RecoverRefundSyncParkResult =
 const WC_REFUND_PAGE_SIZE = 100
 const WC_REFUND_MAX_PAGES = 10
 
+/** Why a read could not produce a usable list. `moved` = WooCommerce answered, but the list shifted. */
+type WcRefundReadFailure = { error: string; moved?: boolean }
+
 async function readWcOrderRefundIds(
   wcOrderId: number,
-): Promise<{ evidence: WcOrderRefundEvidence } | { error: string }> {
+): Promise<{ evidence: WcOrderRefundEvidence; statedTotal: number | null } | WcRefundReadFailure> {
   const ids: number[] = []
+  // Every id banked so far, so a REPEATED one is caught. See the note above: a repeat is not a
+  // WooCommerce quirk, it is the signature of a collection that shifted under a positional read.
+  const seen = new Set<number>()
   // The SMALLEST refund count the store stated anywhere in this walk, or null if it never stated one
   // (a store that omits `x-wp-total` arrives here as 0, which is not a claim about anything).
   let statedTotal: number | null = null
@@ -1091,6 +1124,19 @@ async function readWcOrderRefundIds(
       if (typeof candidate !== 'number' || !Number.isSafeInteger(candidate)) {
         return { error: 'WooCommerce listed a refund on that order with no readable id, so this check cannot say which refunds it holds' }
       }
+      // THE SAME REFUND TWICE. A stable collection cannot serve one row on two pages: the offsets do
+      // not overlap. It happens when a refund is CREATED mid-walk — WooCommerce lists refunds newest
+      // first, so the new row takes offset 0 and pushes the row we have already read onto the next
+      // page. Nothing is lost in that direction, but the same shift running the other way (a DELETE)
+      // loses a row silently and leaves no trace at all, so the trace that DOES exist is not spent.
+      if (seen.has(candidate)) {
+        return {
+          moved: true,
+          error: `WooCommerce served refund ${candidate} twice, on different pages, so its refund list `
+            + 'moved between two requests of this read',
+        }
+      }
+      seen.add(candidate)
       ids.push(candidate)
     }
     // THE ONLY PROOF OF AN ENDING. Checked first, so an order with no refunds at all still costs one
@@ -1103,7 +1149,7 @@ async function readWcOrderRefundIds(
             + 'so this check cannot say which refunds it holds',
         }
       }
-      return { evidence: { wcOrderId, refundIds: ids, fetchedAt: new Date() } }
+      return { evidence: { wcOrderId, refundIds: ids, fetchedAt: new Date() }, statedTotal }
     }
   }
   // The list never ended. It is not known to be complete and must not be used to prove a refund
@@ -1114,6 +1160,52 @@ async function readWcOrderRefundIds(
     error: `this check read ${ids.length} refunds over ${WC_REFUND_MAX_PAGES} pages of that order without `
       + 'reaching the end of the list, which is more than this check will read',
   }
+}
+
+/**
+ * The read a DISMISSAL is made on: the same walk, run TWICE, with both answers required to agree.
+ *
+ * WHY A SECOND READ AND NOT A BETTER FIRST ONE. There is no better first one. Every property of a
+ * positional page has now been used — an empty page to end the walk, no length rule at all, and the
+ * store's own count against what it served — and a refund deleted behind the cursor defeats all of
+ * them at once, because the id it removes was already banked and pays for the row it hides. The
+ * arithmetic of a single walk simply cannot see it.
+ *
+ * WHAT THE SECOND READ ADDS. The row that goes missing goes missing BECAUSE some other row was
+ * deleted, and that deleted row is sitting in the first read's list. The store cannot serve it
+ * again, so the second read comes back without it and the two lists differ — refusing exactly the
+ * case that no single walk can detect. It also catches the ordinary version of the same hazard: an
+ * order being refunded WHILE an operator is deciding whether to write a refund off.
+ *
+ * WHAT IT COSTS. Twice the requests on the dismissal path — four for the ordinary order with a page
+ * or less of refunds, where it was two. Paid because a refusal is retryable and a dismissal is not.
+ *
+ * WHAT IT IS NOT. It is not a snapshot and does not claim to be one. Two agreeing reads say the
+ * collection was not changing across them, which is the strongest statement available to a client of
+ * a collection it can only address by position.
+ */
+async function readConfirmedWcOrderRefundIds(
+  wcOrderId: number,
+): Promise<{ evidence: WcOrderRefundEvidence } | WcRefundReadFailure> {
+  const first = await readWcOrderRefundIds(wcOrderId)
+  if ('error' in first) return first
+  const second = await readWcOrderRefundIds(wcOrderId)
+  if ('error' in second) return second
+  const disagreement = describeRefundReadDisagreement(
+    { refundIds: first.evidence.refundIds, statedTotal: first.statedTotal },
+    { refundIds: second.evidence.refundIds, statedTotal: second.statedTotal },
+  )
+  if (disagreement) return { moved: true, error: disagreement }
+  // The SECOND read's evidence: same ids by construction, and the later `fetchedAt` is the honest
+  // one to record — it is the moment the answer was last confirmed, not first guessed.
+  return { evidence: second.evidence }
+}
+
+/** A read failure as the refusal an operator sees: a store that could not answer, or one that moved. */
+function refuseOnRefundReadFailure(wcOrderId: number, failure: WcRefundReadFailure): RefundParkRecoveryRefusal {
+  return failure.moved
+    ? refuseUnstableRefundList(wcOrderId, failure.error)
+    : refuseOnLookupFailure(wcOrderId, failure.error)
 }
 
 export async function recoverRefundSyncPark(
@@ -1197,9 +1289,14 @@ export async function recoverRefundSyncPark(
     let targetOrderId: string | null = null
 
     if (assertion.outcome === 'REASSIGN') {
+      // ONE walk, and the asymmetry is deliberate. A reassign is authorised by PRESENCE — WooCommerce
+      // lists this refund on the order the operator named — and an incomplete list cannot manufacture
+      // presence, only withhold it. The worst a short read does here is refuse a reassign that should
+      // have been allowed, which the operator retries. A DISMISS is authorised by ABSENCE, where a
+      // short list IS the wrong answer, so that path pays for a confirmed read and this one does not.
       const lookup = await readWcOrderRefundIds(assertion.wcOrderId)
       if ('error' in lookup) {
-        const refused = refuseOnLookupFailure(assertion.wcOrderId, lookup.error)
+        const refused = refuseOnRefundReadFailure(assertion.wcOrderId, lookup)
         return { success: false, error: refused.message, code: refused.code }
       }
       evidence = lookup.evidence
@@ -1223,9 +1320,12 @@ export async function recoverRefundSyncPark(
       const parkedWcOrderId = parkedLink ? Number(parkedLink.externalOrderId) : NaN
       let parkedEvidence: WcOrderRefundEvidence | null = null
       if (parkedLink && Number.isSafeInteger(parkedWcOrderId) && parkedWcOrderId > 0) {
-        const lookup = await readWcOrderRefundIds(parkedWcOrderId)
+        // TWICE, and both answers must agree. This list is about to be read as EVIDENCE OF ABSENCE and
+        // a dismissal writes a refund off, so it is the one place where "the collection may have moved
+        // under the pager" is not an acceptable residual risk.
+        const lookup = await readConfirmedWcOrderRefundIds(parkedWcOrderId)
         if ('error' in lookup) {
-          const refused = refuseOnLookupFailure(parkedWcOrderId, lookup.error)
+          const refused = refuseOnRefundReadFailure(parkedWcOrderId, lookup)
           return { success: false, error: refused.message, code: refused.code }
         }
         parkedEvidence = lookup.evidence
@@ -1335,6 +1435,10 @@ export async function recoverRefundSyncPark(
         wcOrderId: evidence.wcOrderId,
         wcRefundIds: [...evidence.refundIds],
         wcFetchedAt: evidence.fetchedAt.toISOString(),
+        // How many complete walks the evidence had to survive. A dismissal is made on two that agreed;
+        // a reassign on one, because presence cannot be produced by a short list. Recorded so the
+        // recovery can be re-judged later on the standard of proof it was actually held to.
+        wcEvidenceReads: assertion.outcome === 'DISMISS' ? 2 : 1,
         priorStatus: park.status,
         userId: session.user.id,
       },

@@ -32,8 +32,10 @@ import {
   isReversedInLedger,
   ledgerReversalNote,
   normalizeAssertedPaymentReference,
+  canonicalCurrencyCode,
   canonicalLedgerAmount,
   refuseAssertedPaymentAmountMismatch,
+  refuseAssertedPaymentCurrencyMismatch,
   refuseAssertedPaymentNotOnInvoice,
   refuseAssertedPaymentStillOnInvoice,
   refuseAssertedPaymentUnattributable,
@@ -3821,12 +3823,16 @@ export type ReverseLedgerPaymentResult =
  * document, so the delete refused again, with the same words, and there was nowhere else to go.
  *
  * The missing fact is small and the operator is holding it: WHICH payment. So they may name it, and
- * naming it settles nothing on its own — IMS asks Xero about that payment and requires three things
- * of the answer before any local row is touched: it is on THIS order's ledger invoice, it is for
- * THIS receipt's amount, and it is DELETED. A mistyped reference, a payment from another invoice, a
- * payment that is still standing: each refused by its own name. The operator supplies the question;
- * the ledger still supplies the answer. Exactly the division `recoverRefundSyncPark` draws in
- * app/actions/sync-exceptions.ts, and the opposite of accepting "I reversed it".
+ * naming it settles nothing on its own — IMS asks Xero about that payment AND about the invoice it
+ * claims to be on, and requires FIVE things of the answers before any local row is touched: the
+ * payment is on THIS order's ledger invoice; that invoice is denominated in THIS receipt's currency,
+ * so the figures on either side are quantities of the same money; it is for THIS receipt's amount,
+ * exactly; it is DELETED; and no payment for that same amount is STILL STANDING on the invoice. A
+ * mistyped reference, a payment from another invoice, an invoice in another currency, a payment that
+ * is still standing, a second payment of the same value: each refused by its own name. The operator
+ * supplies the question; the ledger still supplies the answer. Exactly the division
+ * `recoverRefundSyncPark` draws in app/actions/sync-exceptions.ts, and the opposite of accepting
+ * "I reversed it".
  */
 export async function reverseLedgerPayment(
   paymentId: string,
@@ -3843,7 +3849,9 @@ export async function reverseLedgerPayment(
 
     const payment = await db.payment.findUnique({
       where: { id: paymentId },
-      select: { orderId: true, refundId: true, amount: true },
+      // `currency` because `amount` is denominated in it: an amount without its unit cannot be
+      // compared with anything the ledger says, and comparing it anyway is Codex round 5's finding.
+      select: { orderId: true, refundId: true, amount: true, currency: true },
     })
     if (!payment || payment.orderId !== orderId) {
       return { success: false, code: 'payment_missing', error: 'That receipt no longer exists on this order, so nothing was changed.' }
@@ -3930,7 +3938,7 @@ export async function reverseLedgerPayment(
       }
       const ledgerInvoiceId = orderForReference.accountingInvoiceId
       const response = await xeroGet<{
-        Payments?: Array<{ PaymentID?: string; Status?: string; Amount?: number; Invoice?: { InvoiceID?: string } }>
+        Payments?: Array<{ PaymentID?: string; Status?: string; Amount?: number; Invoice?: { InvoiceID?: string; CurrencyCode?: string } }>
       }>(`Payments/${encodeURIComponent(assertedReference)}`)
       if (!response.ok) {
         const refusal = refuseLedgerLookupFailure(assertedReference, response.error)
@@ -3947,55 +3955,31 @@ export async function reverseLedgerPayment(
         const refusal = refuseAssertedPaymentNotOnInvoice(assertedReference, orderReference, invoiceId)
         return { success: false, code: refusal.code, error: refusal.message }
       }
-      // FACT TWO: it is for this receipt's amount — EXACTLY, and not within a tolerance.
-      //
-      // A tolerance was Codex round 3's second finding and it deserved it: `|ledger - receipt| <= 0.005`
-      // admits a payment that is not even the same value, on the one path whose output deletes a
-      // receipt. Both sides are reduced to canonical decimal text instead, so `100`, `100.00` and the
-      // stored `Decimal(18, 4)` compare equal while `100.005` does not, and an amount neither side can
-      // state as a plain decimal is refused rather than coerced into a comparison.
-      //
-      // AND THE AMOUNT IS A FILTER, NOT AN IDENTIFIER. Equality here only rules candidates OUT; FACT
-      // FOUR is what stops a DIFFERENT payment of the same value from standing in for this receipt's.
+
+      // WHAT IMS ITSELF HOLDS, read before the ledger is troubled a second time. Both are facts about
+      // the local receipt, both can be unreadable, and neither is a question for Xero — so a receipt
+      // IMS cannot state the currency or the amount of refuses here, with the invoice never asked.
+      const receiptCurrency = canonicalCurrencyCode(payment.currency)
+      if (receiptCurrency === null) {
+        const refusal = refuseLedgerLookupFailure(assertedReference, 'IMS cannot read this receipt\'s own currency, so no ledger amount can be matched to it')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
       const receiptAmount = canonicalLedgerAmount(payment.amount)
       if (receiptAmount === null) {
         const refusal = refuseLedgerLookupFailure(assertedReference, 'IMS cannot read this receipt\'s own amount as a plain decimal, so no payment can be matched to it')
         return { success: false, code: refusal.code, error: refusal.message }
       }
-      const ledgerAmount = canonicalLedgerAmount(found.Amount)
-      if (ledgerAmount === null) {
-        const refusal = refuseLedgerLookupFailure(assertedReference, 'the accounting system reported no amount for that payment, so it cannot be matched to this receipt')
-        return { success: false, code: refusal.code, error: refusal.message }
-      }
-      if (ledgerAmount !== receiptAmount) {
-        const refusal = refuseAssertedPaymentAmountMismatch(assertedReference, ledgerAmount, receiptAmount)
-        return { success: false, code: refusal.code, error: refusal.message }
-      }
-      // FACT THREE: it really is gone — the same test the checkable rows face, and the reason this is
-      // a verification rather than an acceptance of "I have reversed it".
-      if (!isReversedInLedger(found.Status)) {
-        const refusal = refuseLedgerStillHolds(assertedReference, found.Status ?? 'unknown')
-        return { success: false, code: refusal.code, error: refusal.message }
-      }
 
-      // FACT FOUR: NOTHING THIS PAYMENT COULD BE CONFUSED WITH IS STILL STANDING ON THE INVOICE.
-      //
-      // Facts one to three are all satisfied by ANY deleted payment of this value on this invoice —
-      // including one that has nothing to do with this receipt. The case that costs money is exactly
-      // one shape: this receipt's own payment is STILL on the invoice, the operator names a different
-      // deleted payment of the same value, and IMS retires the registration and deletes the receipt
-      // while the ledger goes on showing the invoice settled. Nothing local is then left to contradict
-      // it, which is the state o3d-1vuv exists to make unreachable.
-      //
-      // That shape is visible from the invoice, so the invoice is asked. Any standing payment for this
-      // receipt's amount refuses — IMS cannot tell which of the two the reference describes, and the
-      // amount is the only thing it had to tell them apart with.
+      // THE INVOICE ITSELF, read once and used for the two facts that need it: WHAT UNIT this money is
+      // in, and WHAT IS STILL STANDING on the document. Read BEFORE any number is compared — round 4
+      // compared amounts first and asked the invoice afterwards, which meant the only comparison on the
+      // path ran before anything had established that the two sides were even denominated alike.
       //
       // ONE EXTRA REQUEST, on the asserted path only. The rows IMS wrote document ids for never come
       // through here: their id was recorded by the processor from Xero's own response, so there is
       // nothing to disambiguate. This is the price of accepting an id a human typed.
       const invoiceResponse = await xeroGet<{
-        Invoices?: Array<{ InvoiceID?: string; Payments?: Array<{ PaymentID?: string; Amount?: number }> }>
+        Invoices?: Array<{ InvoiceID?: string; CurrencyCode?: string; Payments?: Array<{ PaymentID?: string; Amount?: number }> }>
       }>(`Invoices/${encodeURIComponent(ledgerInvoiceId)}`)
       if (!invoiceResponse.ok) {
         const refusal = refuseLedgerLookupFailure(ledgerInvoiceId, invoiceResponse.error)
@@ -4012,6 +3996,83 @@ export async function reverseLedgerPayment(
         )
         return { success: false, code: refusal.code, error: refusal.message }
       }
+
+      // FACT TWO: EVERY AMOUNT BELOW IS IN THE SAME UNIT AS THIS RECEIPT.
+      //
+      // Codex round 5's second finding, and the branch's own flag from round 4: comparing two decimal
+      // strings says nothing about whether they are the same MONEY. 100 GBP and 100 EUR are the same
+      // number. A Xero payment carries no currency of its own — it is denominated in ITS INVOICE'S
+      // currency, which is why the invoice is the thing asked — and `payments.amount` is denominated
+      // in `payments.currency`. When those two disagree, the exact comparison below is comparing
+      // quantities of different things, and the standing-payment fact after it is doing the same.
+      //
+      // Refused rather than converted. IMS has an FX rate and could turn one into the other, but a
+      // converted amount is an ESTIMATE, and an estimate is exactly what an exact comparison was
+      // introduced to eliminate. A receipt whose currency does not match its invoice is a defect in
+      // one of the two records, and the remedy is to correct it, not to reconcile around it.
+      const invoiceCurrency = canonicalCurrencyCode(ledgerInvoice.CurrencyCode)
+      if (invoiceCurrency === null) {
+        const refusal = refuseLedgerLookupFailure(
+          ledgerInvoiceId,
+          'the accounting system did not say what currency that invoice is in, so IMS cannot tell whether the payment on it is in this receipt\'s currency',
+        )
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      if (invoiceCurrency !== receiptCurrency) {
+        const refusal = refuseAssertedPaymentCurrencyMismatch(assertedReference, orderReference, invoiceCurrency, receiptCurrency)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      // AND THE PAYMENT'S OWN ACCOUNT OF ITS INVOICE, where the response gives one. It is the same
+      // document, so it can only agree; a ledger that contradicts itself about the denomination of
+      // this money is not a basis for deleting a receipt either. Absent, it is simply not asked — a
+      // nested object that omits the field states nothing, and treating silence as disagreement would
+      // make the whole remedy unreachable.
+      const paymentInvoiceCurrency = canonicalCurrencyCode(found.Invoice?.CurrencyCode)
+      if (paymentInvoiceCurrency !== null && paymentInvoiceCurrency !== receiptCurrency) {
+        const refusal = refuseAssertedPaymentCurrencyMismatch(assertedReference, orderReference, paymentInvoiceCurrency, receiptCurrency)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+
+      // FACT THREE: it is for this receipt's amount — EXACTLY, and not within a tolerance.
+      //
+      // A tolerance was Codex round 3's second finding and it deserved it: `|ledger - receipt| <= 0.005`
+      // admits a payment that is not even the same value, on the one path whose output deletes a
+      // receipt. Both sides are reduced to canonical decimal text instead, so `100`, `100.00` and the
+      // stored `Decimal(18, 4)` compare equal while `100.005` does not, and an amount neither side can
+      // state as a plain decimal is refused rather than coerced into a comparison.
+      //
+      // AND THE AMOUNT IS A FILTER, NOT AN IDENTIFIER. Equality here only rules candidates OUT; FACT
+      // FIVE is what stops a DIFFERENT payment of the same value from standing in for this receipt's.
+      const ledgerAmount = canonicalLedgerAmount(found.Amount)
+      if (ledgerAmount === null) {
+        const refusal = refuseLedgerLookupFailure(assertedReference, 'the accounting system reported no amount for that payment, so it cannot be matched to this receipt')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      if (ledgerAmount !== receiptAmount) {
+        const refusal = refuseAssertedPaymentAmountMismatch(assertedReference, ledgerAmount, receiptAmount)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      // FACT FOUR: it really is gone — the same test the checkable rows face, and the reason this is
+      // a verification rather than an acceptance of "I have reversed it".
+      if (!isReversedInLedger(found.Status)) {
+        const refusal = refuseLedgerStillHolds(assertedReference, found.Status ?? 'unknown')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+
+      // FACT FIVE: NOTHING THIS PAYMENT COULD BE CONFUSED WITH IS STILL STANDING ON THE INVOICE.
+      //
+      // Facts one to four are all satisfied by ANY deleted payment of this value on this invoice —
+      // including one that has nothing to do with this receipt. The case that costs money is exactly
+      // one shape: this receipt's own payment is STILL on the invoice, the operator names a different
+      // deleted payment of the same value, and IMS retires the registration and deletes the receipt
+      // while the ledger goes on showing the invoice settled. Nothing local is then left to contradict
+      // it, which is the state o3d-1vuv exists to make unreachable.
+      //
+      // That shape is visible from the invoice, so the invoice was asked. Any standing payment for this
+      // receipt's amount refuses — IMS cannot tell which of the two the reference describes, and the
+      // amount is the only thing it had to tell them apart with. Those amounts are in the invoice's
+      // currency, which FACT TWO has already required to be this receipt's, so the comparison is
+      // between two quantities of the same money.
       for (const standing of standingPayments) {
         const standingId = typeof standing?.PaymentID === 'string' ? standing.PaymentID : ''
         // The named payment itself, still listed as standing on the invoice. It contradicts the

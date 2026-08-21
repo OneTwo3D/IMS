@@ -258,13 +258,20 @@ You resolve it, in this order:
 2. **If a payment is there**, the attempt landed. Reverse (delete) it there, then copy its **payment
    reference** into the box on the refusal and use **"Check that payment and delete"**. You are only
    telling One Two Inventory *which payment to ask about* — it then asks the accounting system and
-   requires all four of these before anything is removed here: the payment is on **this order's
-   invoice**, it is for **exactly this receipt's amount** (to the penny — a near-miss is refused, not
-   rounded), it really is **gone**, and **no other payment for that same amount is still standing on
-   that invoice**. A mistyped reference, a payment belonging to another invoice, or one that is still
-   standing is refused by name, and you can correct it and try again.
+   requires all five of these before anything is removed here: the payment is on **this order's
+   invoice**; that invoice is in **the same currency as this receipt** — otherwise the figures on
+   either side are not the same money and cannot be compared at all; it is for **exactly this
+   receipt's amount** (to the penny — a near-miss is refused, not rounded); it really is **gone**; and
+   **no other payment for that same amount is still standing on that invoice**. A mistyped reference,
+   a payment belonging to another invoice, an invoice raised in another currency, or a payment that is
+   still standing is refused by name, and you can correct it and try again.
 
-   The last of the four is the one that surprises people, so it is worth saying plainly: if the
+   The currency one only ever fires when something is already wrong: a receipt recorded in one
+   currency against an invoice raised in another. One Two Inventory will not convert between them
+   here — a converted figure is an estimate, and this check exists to avoid deleting a receipt on an
+   approximation. Correct whichever of the two records is wrong, then reverse it.
+
+   The last of the five is the one that surprises people, so it is worth saying plainly: if the
    invoice still shows a payment for this receipt's amount, the check is refused even when the
    payment you named really is deleted. An amount cannot tell two payments apart, and the case being
    guarded against is the expensive one — the receipt's *own* payment still sitting on the invoice

@@ -67,7 +67,18 @@ const state = {
    * the end" — every page it served would be the same size, and the rule would look sound.
    */
   wcTrimmedPages: new Map<number, number>(),
-  /** Runs after each refund request is served, with the page that was served — to move the store under the walk. */
+  /**
+   * Runs after each refund request is served, with the page that was served — the seam that lets a
+   * test MOVE THE STORE UNDER THE WALK, which is the only way finding 1 can be falsified at all.
+   *
+   * It hands the test the live array, so both directions are modelled honestly and neither is
+   * simulated: `splice` DELETES a refund (rows after it shift DOWN an offset, and a row can be
+   * skipped between two pages), `unshift` CREATES one at the front the way WooCommerce's newest-first
+   * ordering does (rows shift UP, and one gets served twice), and `push` appends without moving
+   * anything. The pager is real, so what those do to the pages is whatever WooCommerce's own offset
+   * arithmetic does to them — a double that produced the SYMPTOM directly would be agreeing with the
+   * fix rather than testing it.
+   */
   wcAfterRequest: null as ((page: number) => void) | null,
   /** Refund ids the store returns with an unusable `id`, e.g. a string where a number belongs. */
   wcUnreadableIds: new Set<number>(),
@@ -447,8 +458,9 @@ test('a store that caps per_page below what we ask for cannot end the walk on it
   assert.equal((result as { code?: string }).code, 'wc_confirms_current_owner')
   assert.equal(stored().status, 'FAILED', 'the park survives')
   // FOUR requests for three pages of content: the twenty-five rows end on a short page, and a short
-  // page ends nothing. Only the empty fourth one does.
-  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2', '3', '4'])
+  // page ends nothing. Only the empty fourth one does. TWICE, because this is the dismissal path and
+  // the two walks have to agree before an absence may be acted on.
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2', '3', '4', '1', '2', '3', '4'])
   assert.equal(state.wcCalls[0].params.per_page, '100', 'we still ASK for the maximum — we just do not believe it')
 })
 
@@ -462,7 +474,7 @@ test('a page that is full for the store and short for the request still only end
   state.wcRefundsByOrder.set(2002, Array.from({ length: 10 }, (_, i) => 8000 + i))
   const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
   assert.equal((result as { success: boolean }).success, true, 'a genuinely complete list still resolves')
-  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2'])
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2', '1', '2'])
 })
 
 test('an EMPTY page ends the walk whatever size the store is serving', async () => {
@@ -475,7 +487,7 @@ test('an EMPTY page ends the walk whatever size the store is serving', async () 
   state.wcRefundsByOrder.set(2002, [9001, 9002, 9003, 9004])
   const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
   assert.equal((result as { success: boolean }).success, true)
-  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2'])
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2', '1', '2'])
   assert.match(stored().errorMessage ?? '', /did NOT list refund 7001/)
 })
 
@@ -509,7 +521,9 @@ test('a page the store TRIMS mid-walk cannot end the walk — a granted size is 
   assert.equal((result as { code?: string }).code, 'wc_confirms_current_owner')
   assert.equal(stored().status, 'FAILED', 'the park survives')
   // Four requests for three pages of content, and the fourth is the only proof of an ending there is.
-  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2', '3', '4'])
+  // Both walks trim the same way — a store that lies identically twice is not a collection that moved,
+  // and the second read is not claimed to catch it (the count guard and this refusal do).
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2', '3', '4', '1', '2', '3', '4'])
 })
 
 test('a store that serves FEWER refunds than it says the order has refuses, whatever the pages looked like', async () => {
@@ -540,15 +554,118 @@ test('a refund created DURING the walk does not turn a complete read into a refu
   // Taking the latest instead would refuse every order that gains a refund while it is being read.
   //
   // 150 refunds over two full-ish pages, and the 151st arrives after the second page has been
-  // served: the empty third page then reports 151 against the 150 rows actually banked.
+  // served: the empty third page then reports 151 against the 150 rows actually banked. Asserted on
+  // the REASSIGN path, which reads once — the dismissal path's second read is a different rule with
+  // a different answer (below), and this one is about the total, not about the second read.
   const recover = await loadAction()
-  state.wcRefundsByOrder.set(2002, Array.from({ length: 150 }, (_, i) => 8000 + i))
+  const many = Array.from({ length: 150 }, (_, i) => 8000 + i)
+  many[149] = 7001
+  state.wcRefundsByOrder.set(1001, many)
   state.wcAfterRequest = (page) => {
-    if (page === 2) state.wcRefundsByOrder.get(2002)!.push(9999)
+    if (page === 2) state.wcRefundsByOrder.get(1001)!.push(9999)
+  }
+  const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'REASSIGN', wcOrderId: 1001 })
+  assert.deepEqual(result, { success: true, outcome: 'REASSIGN', targetOrderId: 'order-A' }, 'a complete read still resolves')
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2', '3'])
+})
+
+// ---------------------------------------------------------------------------
+// OFFSET PAGING OVER A LIVE COLLECTION IS NOT A SNAPSHOT (Codex round 4, finding 1)
+//
+// Every rule above is about the PAGES. None of them is about the collection the pages are cut out
+// of, and WooCommerce cuts them BY POSITION: "rows 100 to 199 of whatever is there when you ask".
+// So the collection moving under the walk is a separate hazard from anything a page can reveal.
+// ---------------------------------------------------------------------------
+
+test('a refund DELETED behind the cursor hides a row that no page and no count can catch', async () => {
+  // THE DEFECT ROUND 4 LEFT BEHIND, and the one that dismisses a live park.
+  //
+  // 101 refunds, and the parked refund 7001 is the LAST of them. Page one serves rows 0-99. Then a
+  // refund that has ALREADY BEEN READ is deleted in WooCommerce — a hundred rows remain, so page two
+  // (offsets 100+) comes back EMPTY, and 7001, which slid from offset 100 to offset 99, is served to
+  // nobody at all.
+  //
+  // Every guard on this path is satisfied, and that is the point of the numbers chosen:
+  //   • the walk ended on an EMPTY page — the only unconditional proof of an ending there is;
+  //   • no page was short of anything, so no length rule has anything to say;
+  //   • and the STATED-TOTAL GUARD BALANCES EXACTLY. The store has a hundred refunds by the time it
+  //     is asked how many, and exactly a hundred rows were banked — because the list still carries
+  //     the id of the refund that was DELETED. It is one id too long by precisely the amount it is
+  //     one id too short, so the arithmetic agrees with itself while the answer is wrong.
+  //
+  // So the read reports "WooCommerce does not list refund 7001 on this order", which is the whole of
+  // what authorises writing the refund off. What catches it is the SECOND read: the deleted refund
+  // cannot be served again, so the two answers cannot agree.
+  const recover = await loadAction()
+  const held = Array.from({ length: 101 }, (_, i) => 8000 + i)
+  held[100] = 7001
+  state.wcRefundsByOrder.set(2002, held)
+  let deleted = false
+  state.wcAfterRequest = (page) => {
+    if (page !== 1 || deleted) return
+    deleted = true
+    // Behind the cursor: a row page one has already served. That is the direction that LOSES a row.
+    state.wcRefundsByOrder.get(2002)!.splice(5, 1)
   }
   const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
-  assert.equal((result as { success: boolean }).success, true, 'a complete read still resolves')
-  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2', '3'])
+  assert.equal((result as { code?: string }).code, 'wc_refund_list_unstable')
+  assert.match((result as { error: string }).error, /the first read listed refund 8005 and the second did not/)
+  assert.match((result as { error: string }).error, /the second read listed refund 7001 and the first did not/)
+  // And the message says WHY a client cannot do better, so the operator is not sent hunting for a fault.
+  assert.match((result as { error: string }).error, /one page at a time BY POSITION/)
+  assert.equal(stored().status, 'FAILED', 'the park survives')
+  assert.equal(stored().entityId, 'order-B')
+  assert.equal(state.transactions, 0, 'and nothing is opened, let alone written')
+})
+
+test('the same refund served twice is proof the list moved, and the read refuses on the spot', async () => {
+  // The other direction, and the one a single walk CAN see. WooCommerce lists refunds newest first,
+  // so a refund CREATED mid-walk takes offset 0 and pushes everything down — page two then re-serves
+  // the row that ended page one. Nothing is lost that way, but the trace is not spent: a collection
+  // that can shift down can shift up, and the shift up is invisible.
+  //
+  // On the REASSIGN path deliberately, which reads ONCE: this guard lives in the walk itself, not in
+  // the dismissal's second read, and reassign is the path that would otherwise have succeeded here.
+  const recover = await loadAction()
+  const many = Array.from({ length: 150 }, (_, i) => 8000 + i)
+  many[149] = 7001
+  state.wcRefundsByOrder.set(1001, many)
+  let created = false
+  state.wcAfterRequest = (page) => {
+    if (page !== 1 || created) return
+    created = true
+    state.wcRefundsByOrder.get(1001)!.unshift(9999)
+  }
+  const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'REASSIGN', wcOrderId: 1001 })
+  assert.equal((result as { code?: string }).code, 'wc_refund_list_unstable')
+  assert.match((result as { error: string }).error, /served refund 8099 twice, on different pages/)
+  assert.equal(stored().entityId, 'order-B', 'the park does not move')
+  assert.equal(stored().status, 'FAILED')
+  assert.equal(state.transactions, 0)
+})
+
+test('a refund created on the parked order between the two reads stops the dismissal', async () => {
+  // The ordinary version of the same hazard, and the reason the second read is worth its requests
+  // even when nothing was lost: this order is BEING REFUNDED while an operator is deciding whether
+  // to write a refund off it. The first read is complete and the second is complete, and they are
+  // answers about two different collections — so the absence the first one established is not a fact
+  // about the store as it now is.
+  const recover = await loadAction()
+  state.wcRefundsByOrder.set(2002, Array.from({ length: 4 }, (_, i) => 8000 + i))
+  let created = false
+  state.wcAfterRequest = (page) => {
+    // BETWEEN the two reads, not inside either: the first walk is complete and honest, and so is the
+    // second. Neither the empty-page rule nor the count guard has anything to object to.
+    if (page !== 2 || created) return
+    created = true
+    state.wcRefundsByOrder.get(2002)!.unshift(9999)
+  }
+  const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
+  assert.equal((result as { code?: string }).code, 'wc_refund_list_unstable')
+  assert.match((result as { error: string }).error, /the second read listed refund 9999 and the first did not/)
+  assert.match((result as { error: string }).error, /try this recovery again in a moment/)
+  assert.equal(stored().status, 'FAILED', 'the park survives')
+  assert.equal(state.transactions, 0)
 })
 
 // ---------------------------------------------------------------------------
@@ -610,8 +727,9 @@ test('a store that reports no page total cannot dismiss a refund sitting on page
   assert.equal((result as { code?: string }).code, 'wc_confirms_current_owner')
   assert.equal(stored().status, 'FAILED', 'the park survives')
   assert.equal(stored().entityId, 'order-B')
-  // 150 refunds at a hundred a page: pages one and two hold them all, and page three proves it.
-  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2', '3'])
+  // 150 refunds at a hundred a page: pages one and two hold them all, and page three proves it —
+  // and the dismissal path reads the lot twice.
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2', '3', '1', '2', '3'])
 })
 
 test('a FULL page always advances, so completeness comes from the body and not from a header', async () => {
@@ -673,7 +791,10 @@ test('an order with no refunds at all is still a COMPLETE answer, and dismisses'
   state.wcRefundsByOrder.set(2002, [])
   const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
   assert.equal((result as { success: boolean }).success, true)
-  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1'])
+  // Two requests, not one: the whole walk again, and both answers agreeing that there is nothing
+  // there. That is the cost of a dismissal, and it is the cheapest order there is.
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '1'])
+  assert.equal(state.activity[0]?.metadata && (state.activity[0].metadata as { wcEvidenceReads?: number }).wcEvidenceReads, 2)
 })
 
 test('a reassign to an order WooCommerce says has no such refund is refused, and writes nothing', async () => {

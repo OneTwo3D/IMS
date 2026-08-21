@@ -58,7 +58,7 @@ const state = {
    * `omit` models an `ok` response carrying no payment at all, which is neither an error nor an
    * answer — and must not be read as one.
    */
-  xeroPaymentDetails: new Map<string, { invoiceId?: string | null; amount?: number | null; omit?: boolean }>(),
+  xeroPaymentDetails: new Map<string, { invoiceId?: string | null; amount?: number | null; currency?: string | null; omit?: boolean }>(),
   xeroError: null as string | null,
   /**
    * What the INVOICE says is still standing on it — the fourth fact an operator-supplied reference
@@ -69,6 +69,13 @@ const state = {
    * an answer of "nothing" — a double that always sent `[]` could not tell those apart.
    */
   xeroInvoicePayments: [] as Array<{ PaymentID?: string; Amount?: number | null }> | null,
+  /**
+   * THE UNIT every amount on that invoice is denominated in, because a Xero payment has none of its
+   * own — it is an amount in ITS INVOICE'S currency. Defaulted to the order's own GBP, which is the
+   * ordinary case; `null` models an invoice that states no currency at all, which is a fact the
+   * ledger did not supply rather than a licence to assume the base currency.
+   */
+  xeroInvoiceCurrency: 'GBP' as string | null,
   /** The invoice GET fails while the payment GET succeeds — they are separate calls and can fail apart. */
   xeroInvoiceError: null as string | null,
   /** An `ok` response listing no invoice at all. */
@@ -228,6 +235,7 @@ mock.module('@/lib/connectors/xero/api', {
           data: {
             Invoices: [{
               InvoiceID: invoiceId,
+              ...(state.xeroInvoiceCurrency === null ? {} : { CurrencyCode: state.xeroInvoiceCurrency }),
               ...(state.xeroInvoicePayments === null ? {} : {
                 Payments: state.xeroInvoicePayments.map((entry) => ({
                   ...(entry.PaymentID === undefined ? {} : { PaymentID: entry.PaymentID }),
@@ -246,6 +254,11 @@ mock.module('@/lib/connectors/xero/api', {
       if (detail.omit) return { ok: true, status: 200, data: { Payments: [] } }
       const invoiceId = detail.invoiceId === undefined ? state.order.accountingInvoiceId : detail.invoiceId
       const amount = detail.amount === undefined ? 100 : detail.amount
+      // The nested invoice Xero returns on a payment is an ABBREVIATED one, and whether it carries
+      // CurrencyCode is not ours to decide — so the double serves it only when a test says so
+      // (`currency`), and omits it otherwise. Code that required it would be untestable against the
+      // response Xero actually sends; code that ignored a stated one would miss a contradiction.
+      const nestedCurrency = detail.currency
       return {
         ok: true,
         status: 200,
@@ -254,7 +267,12 @@ mock.module('@/lib/connectors/xero/api', {
             PaymentID: id,
             Status: status,
             ...(amount === null ? {} : { Amount: amount }),
-            ...(invoiceId === null ? {} : { Invoice: { InvoiceID: invoiceId } }),
+            ...(invoiceId === null ? {} : {
+              Invoice: {
+                InvoiceID: invoiceId,
+                ...(nestedCurrency === undefined || nestedCurrency === null ? {} : { CurrencyCode: nestedCurrency }),
+              },
+            }),
           }],
         },
       }
@@ -324,6 +342,7 @@ test.beforeEach(() => {
   state.xeroPaymentDetails = new Map()
   state.xeroError = null
   state.xeroInvoicePayments = []
+  state.xeroInvoiceCurrency = 'GBP'
   state.xeroInvoiceError = null
   state.xeroInvoiceMissing = false
   state.xeroCalls = []
@@ -594,6 +613,111 @@ test('a named payment for a DIFFERENT amount is refused — an invoice can carry
     assert.match((result as { error: string }).error, /for 40 and this receipt is for 100/)
     assert.ok(paymentStillThere())
   })()
+})
+
+// ---------------------------------------------------------------------------
+// AN AMOUNT IS A NUMBER AND A UNIT (Codex round 5, finding 2)
+//
+// Round 4 made the amount comparison exact and left it comparing decimal TEXT — which establishes
+// that two numbers are the same number and nothing whatever about whether they are the same money.
+// 100 GBP and 100 EUR pass it identically to two payments of 100 GBP, and passing it is one of the
+// facts that permits deleting a local receipt while the ledger goes on showing the invoice settled.
+//
+// A Xero payment has no currency of its own — it is an amount in ITS INVOICE'S currency — so the
+// unit of every figure the ledger states here is the invoice's, and the unit of the receipt is its
+// own column. The invoice is asked, and a disagreement refuses.
+// ---------------------------------------------------------------------------
+
+test('a payment on an invoice in ANOTHER currency is refused, however exactly the numbers match', async () => {
+  // THE DEFECT, at its most expensive. Every round-4 fact passes: PAY-42 is on this order's invoice,
+  // it is for "100", it is DELETED, and nothing for 100 is standing on the invoice. But the invoice
+  // is in EUR and the receipt is £100, so PAY-42 is a payment of ONE HUNDRED EUROS and has nothing to
+  // do with this receipt. Accepting it retires the registration and deletes a £100 receipt on the
+  // strength of a number that happens to be spelled the same way.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroInvoiceCurrency = 'EUR'
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'asserted_payment_currency_mismatch')
+  assert.match((result as { error: string }).error, /holds the invoice for SO-1001 in EUR, and this receipt is recorded in GBP/)
+  assert.ok(paymentStillThere(), 'the receipt must survive')
+  assert.equal(state.order.paidAt !== null, true, 'and the order stays paid')
+  assert.equal(row('log-7').status, 'FAILED', 'and the attempt stays undecided')
+  assert.equal(row('log-7').externalTransactionId, null, 'and no id is written onto it')
+})
+
+test('the same currency written differently is the SAME currency, so a genuine match is not refused', async () => {
+  // The other half of the check: exactness must not become pedantry here either. A ledger that
+  // states `gbp` and a receipt that states `GBP` are the same money, and refusing that would be a
+  // refusal with no remedy — the operator cannot change how Xero cases its currency codes.
+  const { reverseLedgerPayment } = await loadActions()
+  state.payments = [{ id: 'pay-1', orderId: 'order-1', refundId: null, amount: 100, currency: ' gbp ' }]
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroInvoiceCurrency = 'gbp'
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { success: boolean }).success, true)
+  assert.ok(!paymentStillThere())
+})
+
+test('a payment whose OWN account of its invoice currency disagrees is refused too', async () => {
+  // The invoice is the authority, but where the payment response names a currency as well it is the
+  // SAME document being described twice — so the two can only agree. A ledger contradicting itself
+  // about the denomination of this money is not a basis for deleting a receipt, and taking the
+  // invoice's word alone would let a payment stating USD through on a GBP invoice.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroPaymentDetails.set('PAY-42', { currency: 'USD' })
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'asserted_payment_currency_mismatch')
+  assert.match((result as { error: string }).error, /in USD, and this receipt is recorded in GBP/)
+  assert.ok(paymentStillThere())
+  assert.equal(row('log-7').status, 'FAILED')
+})
+
+test('a payment that AGREES with its invoice about the currency is not a contradiction', async () => {
+  // A response that states the currency and states it correctly must not be treated as a second,
+  // stricter hurdle — the check is "everything the ledger says about this money is in the receipt's
+  // currency", not "the payment must say nothing".
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroPaymentDetails.set('PAY-42', { currency: 'GBP' })
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { success: boolean }).success, true)
+  assert.ok(!paymentStillThere())
+})
+
+test('an invoice that does not say what currency it is in cannot settle the unit, so it refuses', async () => {
+  // Xero states a currency on every invoice, so this is a malformed or truncated answer — and the
+  // only alternative to refusing is to ASSUME the base currency, which is precisely the assumption
+  // that makes a number stand in for money. It refuses as a lookup that could not be completed.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroInvoiceCurrency = null
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'ledger_lookup_failed')
+  assert.match((result as { error: string }).error, /did not say what currency that invoice is in/)
+  assert.ok(paymentStillThere())
+  assert.equal(row('log-7').status, 'FAILED')
+})
+
+test('a receipt whose OWN currency cannot be read matches nothing, and the invoice is never asked', async () => {
+  // The local side can be unreadable too, and it is checked BEFORE Xero is troubled a second time:
+  // an empty currency column is a fact IMS does not have, not a licence to compare the numbers
+  // anyway. Same treatment as an unreadable receipt amount, for the same reason.
+  const { reverseLedgerPayment } = await loadActions()
+  state.payments = [{ id: 'pay-1', orderId: 'order-1', refundId: null, amount: 100, currency: '' }]
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'ledger_lookup_failed')
+  assert.match((result as { error: string }).error, /cannot read this receipt's own currency/)
+  assert.ok(paymentStillThere())
+  assert.deepEqual(state.xeroCalls, ['Payments/PAY-42'], 'and the invoice is never asked')
 })
 
 // ---------------------------------------------------------------------------

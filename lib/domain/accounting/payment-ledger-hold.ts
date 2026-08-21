@@ -318,6 +318,8 @@ export type LedgerReversalRefusalCode =
   | 'asserted_payment_unattributable'
   /** The named payment is not the one on this invoice. */
   | 'asserted_payment_not_on_invoice'
+  /** The ledger holds this money in a DIFFERENT CURRENCY from the receipt, so no amount is comparable. */
+  | 'asserted_payment_currency_mismatch'
   /** The named payment is on this invoice but not for this receipt's amount. */
   | 'asserted_payment_amount_mismatch'
   /** A payment for this receipt's amount is STILL on the invoice, so the reference cannot be pinned to this receipt. */
@@ -414,15 +416,21 @@ export function refuseLedgerStillHolds(externalId: string, status: string): Ledg
 //
 // WHAT IS ASSERTED AND WHAT IS VERIFIED, because the difference is the whole design. The operator
 // asserts ONE thing — "the payment my attempt created is this one" — and nothing follows from
-// saying it. IMS asks Xero about that payment and then requires FOUR facts before a receipt is
-// removed: it is attached to THIS invoice, it is for EXACTLY this receipt's amount, it is DELETED,
-// and — read off the invoice itself — NO payment for that same amount is still standing on it. A
-// reference that fails any of them is refused by name, so a mistyped or mis-copied id cannot become
-// a delete. Compare `recoverRefundSyncPark`: the operator says which order to ask about, WooCommerce
+// saying it. IMS asks Xero about that payment AND about the invoice, and then requires FIVE facts
+// before a receipt is removed: it is attached to THIS invoice; that invoice is denominated in THIS
+// receipt's currency, WITHOUT WHICH NO AMOUNT BELOW MEANS ANYTHING; it is for EXACTLY this receipt's
+// amount; it is DELETED; and — read off the invoice itself — NO payment for that same amount is
+// still standing on it. A reference that fails any of them is refused by name, so a mistyped or
+// mis-copied id cannot become a delete. Compare `recoverRefundSyncPark`: the operator says which order to ask about, WooCommerce
 // says who owns the refund.
 //
-// WHY THE FOURTH FACT IS NOT OPTIONAL EITHER (round 4). The first three are satisfied by ANY deleted
-// payment of that value on that invoice. Two payments against one invoice is the situation this area
+// WHY THE CURRENCY FACT IS NOT OPTIONAL (round 5). An exact comparison of two decimal strings says
+// nothing about whether they are the same UNIT — 100 GBP and 100 EUR compare equal — and a Xero
+// payment carries no currency of its own, only its invoice's. See
+// `refuseAssertedPaymentCurrencyMismatch`.
+//
+// WHY THE STANDING-PAYMENT FACT IS NOT OPTIONAL EITHER (round 4). The others are satisfied by ANY
+// deleted payment of that value on that invoice. Two payments against one invoice is the situation this area
 // exists for, so "same amount" identifies nothing on its own — see
 // `refuseAssertedPaymentStillOnInvoice`.
 //
@@ -466,6 +474,70 @@ export function refuseAssertedPaymentNotOnInvoice(
       + '. Nothing was changed, and nothing was deleted. Check the reference against the payment shown on '
       + `the invoice for ${orderReference}: a payment on another document says nothing about this one.`,
   }
+}
+
+/**
+ * o3d-54p round 5 — AN AMOUNT IS A NUMBER AND A UNIT, AND ONLY ONE OF THEM WAS BEING COMPARED.
+ *
+ * WHAT WAS WRONG. Round 4 made the amount comparison exact, on canonical decimal text, and said so at
+ * length. It compared `100` with `100` and called them the same amount. THEY ARE THE SAME NUMBER. A
+ * receipt for 100 EUR and a Xero payment of 100 GBP pass that test identically to two payments of
+ * 100 GBP, and on this path passing it is one of the four facts that permits a local receipt to be
+ * deleted while the ledger goes on showing the invoice settled.
+ *
+ * WHY IT IS REACHABLE. `payments.amount` is denominated in `payments.currency`, and the registration
+ * posts that number to Xero as a bare `Amount` on the invoice — Xero has no currency field on a
+ * payment, because A PAYMENT IS IN ITS INVOICE'S CURRENCY. So the unit of everything the ledger says
+ * about this money is the INVOICE's currency, and the unit of the receipt is its own column. On a
+ * correctly posted order those agree. When they do not, every number either side states is in a
+ * different unit and the comparison is meaningless — which is precisely when it must not be trusted.
+ *
+ * SO THE UNIT IS ESTABLISHED BEFORE ANY NUMBER IS COMPARED. The invoice is read (it is read anyway,
+ * for the standing-payments fact), its `CurrencyCode` must equal the receipt's currency, and where the
+ * payment response also names its invoice's currency that must agree too — a ledger contradicting
+ * itself about the denomination of this money is not a basis for deleting a receipt either.
+ *
+ * AND AN UNSTATED CURRENCY IS NOT AN ASSUMED ONE. A currency neither side states as a plain three
+ * letter code returns null from `canonicalCurrencyCode`, and every caller must treat null as "cannot
+ * be compared" rather than defaulting to the base currency — the whole failure being closed here is
+ * a number treated as though its unit were known.
+ */
+export function refuseAssertedPaymentCurrencyMismatch(
+  externalId: string,
+  orderReference: string,
+  ledgerCurrency: string,
+  receiptCurrency: string,
+): LedgerReversalRefusal {
+  return {
+    code: 'asserted_payment_currency_mismatch',
+    message:
+      `The accounting system holds the invoice for ${orderReference} in ${ledgerCurrency}, and this receipt `
+      + `is recorded in ${receiptCurrency}. Payment ${externalId} is therefore an amount in `
+      + `${ledgerCurrency}, and IMS will not treat it as this receipt's just because the two numbers `
+      + 'match — the same figure in two currencies is not the same money. Nothing was changed, and '
+      + 'nothing was deleted. Fix the currency on the receipt or on the invoice so the two describe the '
+      + 'same money, then reverse it.',
+  }
+}
+
+/**
+ * A currency as a canonical ISO-style code, or null if it cannot be read as one.
+ *
+ * Trimmed and upper-cased, because `gbp`, ` GBP ` and `GBP` are one currency. Anything that is not
+ * exactly three letters — an empty string, a symbol, a number, an object, a missing field — is NOT a
+ * currency this comparison can use, and returns null rather than a guess.
+ */
+export function canonicalCurrencyCode(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const code = value.trim().toUpperCase()
+  return /^[A-Z]{3}$/.test(code) ? code : null
+}
+
+/** Two currencies are the same only when BOTH are readable and identical. Unknown never matches. */
+export function sameLedgerCurrency(a: unknown, b: unknown): boolean {
+  const left = canonicalCurrencyCode(a)
+  const right = canonicalCurrencyCode(b)
+  return left !== null && right !== null && left === right
 }
 
 export function refuseAssertedPaymentAmountMismatch(

@@ -108,6 +108,8 @@ export type RefundParkRecoveryRefusalCode =
   | 'asserted_order_is_parked_order'
   /** WooCommerce could not be asked. Nothing was changed. */
   | 'wc_lookup_failed'
+  /** WooCommerce's refund list for that order MOVED while it was being read, so it proves nothing. */
+  | 'wc_refund_list_unstable'
   /** WooCommerce lists this refund on the parked order after all — the park is not stale. */
   | 'wc_confirms_current_owner'
   /** WooCommerce does not list this refund on the order the operator named. */
@@ -207,8 +209,10 @@ export function describeRefundParkRecoveryCaveat(outcome: RefundParkRecoveryOutc
       + 'retryable there — the refund itself has still not been applied, and the credit note and restock '
       + 'have still not posted.'
   }
-  return 'IMS will ask WooCommerce which refunds THIS order actually has, right now, and refuse if this '
-    + 'refund is still one of them. Dismissing only removes a park WooCommerce contradicts — it does not '
+  return 'IMS will ask WooCommerce which refunds THIS order actually has, right now — twice, refusing if '
+    + 'the two answers differ, because WooCommerce pages that list by position and a refund created or '
+    + 'deleted mid-read can fall between two pages — and refuse if this refund is still one of them. '
+    + 'Dismissing only removes a park WooCommerce contradicts — it does not '
     + 'apply the refund anywhere. If the money did leave the business, the refund still has to reach its '
     + 'true order, so reassign it instead wherever that order is known.'
 }
@@ -225,6 +229,122 @@ export function refuseOnLookupFailure(wcOrderId: number, error: string | undefin
       + `exactly as it was${error ? ` (${error})` : ''}. This recovery is only ever made against a fresh `
       + 'answer from WooCommerce — it will not fall back to the payload stored on the park, which is the '
       + 'evidence that is in doubt.',
+  }
+}
+
+/**
+ * o3d-54p round 5 — OFFSET PAGING OVER A LIVE COLLECTION IS NOT A SNAPSHOT.
+ *
+ * WHAT THE PAGE RULES CANNOT REACH. The walk in app/actions/sync-exceptions.ts is now careful about
+ * every property of a page it can observe: only an EMPTY page ends it, a non-empty page of any
+ * length advances, and banking fewer rows than the store itself said exist refuses. All of that is
+ * about the pages. NONE of it is about the collection they are cut out of.
+ *
+ * WooCommerce serves that collection BY POSITION — `?page=2&per_page=100` means "rows 100 to 199 of
+ * whatever is there when you ask". So the moment a refund is created or deleted between two
+ * requests, every later row moves to a different offset, and a row can pass through the boundary
+ * unserved:
+ *
+ *   • A REFUND DELETED BEHIND THE CURSOR shifts everything after it DOWN one place. The row that was
+ *     going to be first on the next page is now last on the page already read, and NOBODY EVER SERVES
+ *     IT. Every page is full, the walk ends cleanly on an empty page, and the list is one row short.
+ *   • AND THE STATED-TOTAL GUARD CANNOT SEE IT. The list still holds the id of the row that was
+ *     deleted — it was banked before the delete — so it is one id too long by exactly the amount it
+ *     is one id too short. 250 rows stated, 250 rows banked, one of them gone from the store and one
+ *     of them never read. The arithmetic balances precisely because two errors of one cancel.
+ *   • A REFUND CREATED shifts the other way (WooCommerce lists refunds newest first) and produces the
+ *     opposite artefact: a row served TWICE. That one loses nothing — but it is proof that the
+ *     collection moved under the read, and the read that moves one way can move the other.
+ *
+ * SO COMPLETENESS IS NOT ESTABLISHED FROM ONE WALK AT ALL, and the honest statement is that it
+ * cannot be: no property of a sequence of offset pages distinguishes "this is the whole collection"
+ * from "this is the whole collection minus the row that moved past me". Two things establish it
+ * instead, and a DISMISSAL — the one outcome that turns an absence into a write-off — requires them:
+ *
+ *   1. A REPEATED ID INSIDE ONE WALK REFUSES. It is direct proof of motion, from the walk itself.
+ *   2. THE WALK IS RUN TWICE AND THE TWO ANSWERS MUST AGREE, id for id and count for count. A read
+ *      that lost a row lost it BECAUSE another row was deleted, and the deleted row is still in its
+ *      list; the second read cannot serve a refund the store no longer has, so the two lists differ
+ *      and the recovery refuses. Agreement is not a snapshot either, but it is the strongest thing a
+ *      client of a position-paged collection can obtain: it says the collection was not changing.
+ *
+ * WHAT IT DELIBERATELY DOES NOT CLAIM. A store that trims the same middle page on EVERY read and
+ * states no total is still undetectable — both reads agree, both are short, and nothing in either
+ * answer says so. That residue was flagged in round 4 and is unchanged: it is a store that lies the
+ * same way twice, not a collection that moved.
+ *
+ * WHY ONLY THE DISMISSAL PAYS FOR THIS. A REASSIGN is authorised by PRESENCE — "WooCommerce lists
+ * this refund on the order you named". A short list can only fail to contain something, so the worst
+ * an incomplete read can do to a reassign is refuse one that should have been allowed, which the
+ * operator can retry. A DISMISS is authorised by ABSENCE, and an incomplete list produces absence
+ * out of nothing.
+ */
+export type WcOrderRefundRead = {
+  /** Every id banked by ONE walk, in the order the store served them. */
+  refundIds: readonly number[]
+  /** The smallest count that walk saw the store state, or null if it never stated one. */
+  statedTotal: number | null
+}
+
+function describeIdSample(ids: readonly number[]): string {
+  const shown = ids.slice(0, 5)
+  const tail = ids.length > shown.length ? ` and ${ids.length - shown.length} more` : ''
+  return `${ids.length === 1 ? 'refund' : 'refunds'} ${shown.join(', ')}${tail}`
+}
+
+function describeStatedTotal(total: number | null): string {
+  return total === null ? 'no total at all' : `a total of ${total}`
+}
+
+/**
+ * Whether two reads of one order's refunds agree, and how they differ when they do not.
+ *
+ * Sets, not sequences: WooCommerce is free to order a page differently between two requests, and an
+ * order that is not a difference in CONTENT is not evidence that anything moved. The stated total is
+ * compared too — a store that says 250 once and 251 the next time is telling us plainly that the
+ * collection changed between them, even when both walks happened to serve the same ids.
+ */
+export function describeRefundReadDisagreement(
+  first: WcOrderRefundRead,
+  second: WcOrderRefundRead,
+): string | null {
+  const firstIds = new Set(first.refundIds)
+  const secondIds = new Set(second.refundIds)
+  const onlyFirst = [...firstIds].filter((id) => !secondIds.has(id)).sort((a, b) => a - b)
+  const onlySecond = [...secondIds].filter((id) => !firstIds.has(id)).sort((a, b) => a - b)
+  if (onlyFirst.length > 0 || onlySecond.length > 0) {
+    const parts: string[] = []
+    if (onlyFirst.length > 0) parts.push(`the first read listed ${describeIdSample(onlyFirst)} and the second did not`)
+    if (onlySecond.length > 0) parts.push(`the second read listed ${describeIdSample(onlySecond)} and the first did not`)
+    return parts.join(', and ')
+  }
+  if (first.statedTotal !== second.statedTotal) {
+    return `both reads listed the same ${first.refundIds.length} refunds, but WooCommerce stated `
+      + `${describeStatedTotal(first.statedTotal)} on the first read and `
+      + `${describeStatedTotal(second.statedTotal)} on the second`
+  }
+  return null
+}
+
+/**
+ * The refusal for a refund list that MOVED while it was being read.
+ *
+ * Deliberately NOT refuseOnLookupFailure: WooCommerce answered every request, and telling an
+ * operator it "could not be asked" would send them to look for an outage that is not there. What
+ * happened is that the thing they are asking about changed while the question was being answered,
+ * and the remedy is to ask again rather than to fix anything.
+ */
+export function refuseUnstableRefundList(wcOrderId: number, detail: string): RefundParkRecoveryRefusal {
+  return {
+    code: 'wc_refund_list_unstable',
+    message:
+      `WooCommerce's refund list for order ${wcOrderId} changed while this check was reading it `
+      + `(${detail}), so nothing was changed and the park is exactly as it was. WooCommerce serves that `
+      + 'list one page at a time BY POSITION, so a refund created or deleted mid-read shifts every later '
+      + 'page — and a refund can fall through the gap without any page looking short. A list that is not '
+      + 'being changed reads the same way twice, so try this recovery again in a moment; if it keeps '
+      + 'happening, that order is being refunded right now and the park should be left alone until it '
+      + 'settles.',
   }
 }
 
