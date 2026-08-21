@@ -41,20 +41,57 @@ import {
   advanceCheckpoint,
   classifyRegisteredPayment,
   CURSOR_OVERLAP_MS,
+  databaseLedgerFence,
   drainInvoicesModifiedSince,
   idsWhere,
   parseLedgerAmount,
   partitionPaymentReversals,
   zeroPaidIsProvenReversal,
+  type LedgerReadFence,
   type PaymentReversalReading,
   type RegisteredPaymentRow,
   type RegisteredPaymentVerdict,
   type XeroInvoice,
   type XeroInvoicesResponse,
 } from './invoice-delta'
+import type { ActivityEntityType } from '@/app/generated/prisma/client'
 
 /** A Xero reversal can only ever speak about rows Xero itself issued. */
 const XERO_CONNECTOR = 'xero'
+
+/**
+ * THE INSTANT THE LEDGER WAS ASKED, READ FROM THE DATABASE (o3d-clxw round 4).
+ *
+ * This is one half of the fence that decides whether a registration's absence from a Xero snapshot
+ * proves the payment was removed; the other half is `accounting_sync_logs."syncedAt"`, stamped by
+ * `stampSyncedAtFromDatabaseClock` with the SAME expression on the SAME server. Round 3 had this end
+ * as `new Date()` on the poll host and the other end as `new Date()` on the sync-processor host, and
+ * an ordering that rests on two machines agreeing is not an ordering: with the poller's clock ahead,
+ * a payment posted AFTER the snapshot reads as posted before it, its absence reads as proof, `paidAt`
+ * is cleared, Mark Paid re-arms and the supplier is paid twice.
+ *
+ * MUST be read BEFORE the ledger request goes out. That ordering is this function returning before
+ * `xeroGet` is called — program order inside one process — not a comparison of any two clock values.
+ *
+ * NULL ON FAILURE, and null means NOTHING IS DECIDED (see classifyRegisteredPayment): with no fence
+ * every registration might have landed after the snapshot, so every document with one withholds.
+ * Fail-closed also keeps the o3d-batch-payidx algebra: the decided set only ever shrinks.
+ */
+async function readDatabaseLedgerFence(): Promise<LedgerReadFence | null> {
+  try {
+    const rows = await db.$queryRaw<Array<{ fence: Date | string | null }>>`SELECT clock_timestamp() AT TIME ZONE 'UTC' AS fence`
+    const fence = rows?.[0]?.fence
+    // Normalised rather than `instanceof`-checked: a raw query can hand back a driver Date, a Date
+    // from another realm, or a string, and none of those is a reason to lose the ordering. An
+    // unreadable value still is.
+    if (fence == null) return null
+    const at = new Date(fence as string | Date).getTime()
+    if (!Number.isFinite(at)) return null
+    return databaseLedgerFence(new Date(at))
+  } catch {
+    return null
+  }
+}
 
 // A detected payment reversal / chargeback needs a human to reconcile (dispute the
 // chargeback, revert fulfilment, chase re-payment). Broadcast a warning to active
@@ -193,6 +230,12 @@ async function alertAdmins(params: { title: string; message: string; actionUrl: 
  *
  * The error is not decorative: `processDeltaChunk`'s caller stops the drain on any new error, which is
  * what keeps the cursor behind an unsignalled disagreement.
+ *
+ * ON A RECHECK (o3d-clxw round 4) the alert is deliberately NOT re-raised: the operator was already
+ * told when the verdict was first withheld, that alert is durable, and re-alerting every recheck
+ * interval for a document nobody can resolve today turns the signal into noise. The activity row IS
+ * still rewritten, because it is what carries the recheck timer — a row that fails to land leaves the
+ * previous marker as the latest one, which leaves the document due, which is the behaviour we want.
  */
 async function signalWithheldReversal(
   entry: {
@@ -201,18 +244,39 @@ async function signalWithheldReversal(
     alert: { title: string; message: string; actionUrl: string }
   },
   result: PollResult,
+  mode: WithheldSignalMode,
 ): Promise<void> {
   const logged = await logActivityPersisted(entry.activity)
-  const alerted = await alertAdmins(entry.alert)
+  const alerted = mode.recheck ? true : await alertAdmins(entry.alert)
   if (logged && alerted) return
   const failures = [logged ? null : 'the activity warning', alerted ? null : 'the operator alert']
     .filter((f): f is string => f !== null)
     .join(' and ')
   result.errors.push(
     `Withheld payment reversal for ${entry.label} left no durable signal: ${failures} could not be written. `
-    + `Holding the poll cursor so the disagreement is re-derived on the next poll instead of being `
-    + `checkpointed past.`,
+    + (mode.recheck
+      ? `The recheck marker was not refreshed, so the document stays due and will be reconsidered on `
+        + `the next poll.`
+      : `Holding the poll cursor so the disagreement is re-derived on the next poll instead of being `
+        + `checkpointed past.`),
   )
+}
+
+/**
+ * How a withheld verdict is being signalled, and who wants to know it happened.
+ *
+ * `observe` is how the recheck pass learns that a document it re-asked about is STILL withheld. It is
+ * called for every withheld document whether or not the record landed, because "we could not write it
+ * down" must never be mistaken for "the disagreement is over".
+ */
+type WithheldSignalMode = {
+  recheck: boolean
+  observe?: (entityKey: string) => void
+}
+
+/** The key a withheld document is tracked by — the same pair its activity rows are written under. */
+function withheldEntityKey(entityType: ActivityEntityType, entityId: string): string {
+  return `${entityType}:${entityId}`
 }
 
 // ---------------------------------------------------------------------------
@@ -275,8 +339,9 @@ function emptyResidual<T>(): ResidualReading<T> {
  *                                                      like, so a registration this read cannot speak
  *                                                      for withholds it. See zeroPaidIsProvenReversal.
  *
- * `ledgerObservedBefore` is the instant Xero was asked; see classifyRegisteredPayment for why a
- * registration that finished after it cannot be decided by this read.
+ * `ledgerObservedBefore` is the instant Xero was asked AS THE DATABASE MEASURED IT; see
+ * classifyRegisteredPayment for why a registration that finished after it cannot be decided by this
+ * read, and why a null fence decides nothing at all.
  */
 async function readResidualVerdicts<T extends { id: string; accountingInvoiceId: string | null }>(
   docs: T[],
@@ -284,7 +349,7 @@ async function readResidualVerdicts<T extends { id: string; accountingInvoiceId:
   zeroPaidInvoiceIds: ReadonlySet<string>,
   registrationType: 'BILL_PAYMENT' | 'INVOICE_PAYMENT',
   referenceType: 'PurchaseInvoice' | 'SalesOrder',
-  ledgerObservedBefore: Date,
+  ledgerObservedBefore: LedgerReadFence | null,
 ): Promise<ResidualReading<T>> {
   const out = emptyResidual<T>()
   if (docs.length === 0) return out
@@ -386,9 +451,14 @@ function billWithheldDescription(bill: WithheldBillDoc, invoice: XeroInvoice, re
   }
 }
 
-async function signalWithheldBillReversals(residual: ResidualReading<WithheldBillDoc>, result: PollResult): Promise<void> {
+async function signalWithheldBillReversals(
+  residual: ResidualReading<WithheldBillDoc>,
+  result: PollResult,
+  mode: WithheldSignalMode,
+): Promise<void> {
   for (const { doc: bill, invoice, verdict, reason } of residual.withheld) {
     result.billReversalsWithheld++
+    mode.observe?.(withheldEntityKey('PURCHASE_ORDER', bill.poId))
     const description = billWithheldDescription(bill, invoice, reason) + registrationText(verdict, reason)
 
     await signalWithheldReversal({
@@ -415,7 +485,7 @@ async function signalWithheldBillReversals(residual: ResidualReading<WithheldBil
         message: description,
         actionUrl: `/purchasing/${bill.poId}`,
       },
-    }, result)
+    }, result, mode)
   }
 }
 
@@ -445,10 +515,15 @@ function salesWithheldDescription(ref: string, invoice: XeroInvoice, reason: Wit
   }
 }
 
-async function signalWithheldSalesReversals(residual: ResidualReading<WithheldOrderDoc>, result: PollResult): Promise<void> {
+async function signalWithheldSalesReversals(
+  residual: ResidualReading<WithheldOrderDoc>,
+  result: PollResult,
+  mode: WithheldSignalMode,
+): Promise<void> {
   for (const { doc: order, invoice, verdict, reason } of residual.withheld) {
     const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
     result.salesReversalsWithheld++
+    mode.observe?.(withheldEntityKey('SALES_ORDER', order.id))
     const description = salesWithheldDescription(ref, invoice, reason) + registrationText(verdict, reason)
 
     await signalWithheldReversal({
@@ -476,7 +551,7 @@ async function signalWithheldSalesReversals(residual: ResidualReading<WithheldOr
         message: description,
         actionUrl: `/sales/${order.id}`,
       },
-    }, result)
+    }, result, mode)
   }
 }
 
@@ -493,6 +568,15 @@ type PollResult = {
    */
   salesReversalsWithheld: number
   billReversalsWithheld: number
+  /**
+   * Withheld reversals this poll went back and RECONSIDERED (o3d-clxw round 4), and how many of them
+   * the reconsideration closed — either because the disagreement was resolved (the reversal was
+   * finally admitted, the ledger caught up, or the document is no longer held as paid) or because
+   * there is no longer anything to decide. `withheldRechecked - withheldResolved` is what is still
+   * open and will be asked again after the next interval.
+   */
+  withheldRechecked: number
+  withheldResolved: number
   errors: string[]
   skipped?: string
 }
@@ -512,7 +596,13 @@ type PollResult = {
 async function processDeltaChunk(
   changed: XeroInvoice[],
   result: PollResult,
-  { windowStart, ledgerObservedBefore }: { windowStart: Date; ledgerObservedBefore: Date },
+  { windowStart, ledgerObservedBefore, withheldMode = { recheck: false } }: {
+    windowStart: Date
+    /** Database-measured instant the ledger was asked; null = nothing this read can decide. */
+    ledgerObservedBefore: LedgerReadFence | null
+    /** Set by the withheld-recheck pass so it can tell "still withheld" from "resolved". */
+    withheldMode?: WithheldSignalMode
+  },
 ): Promise<void> {
   const paidSalesIds = idsWhere(changed, 'ACCREC', ['PAID'])
   // NOT `idsWhere(..., ['AUTHORISED', 'VOIDED'])` any more (o3d-clxw). AUTHORISED means "approved and
@@ -750,7 +840,7 @@ async function processDeltaChunk(
   // Reported in its own pass so a reporting failure cannot lose a reversal that DID reconcile, and a
   // reversal pass that threw still leaves the withheld ones described.
   try {
-    await signalWithheldSalesReversals(salesResidual, result)
+    await signalWithheldSalesReversals(salesResidual, result, withheldMode)
   } catch (e) {
     result.errors.push(`Sales withheld-reversal reporting error: ${String(e)}`)
   }
@@ -820,9 +910,269 @@ async function processDeltaChunk(
   }
 
   try {
-    await signalWithheldBillReversals(billResidual, result)
+    await signalWithheldBillReversals(billResidual, result, withheldMode)
   } catch (e) {
     result.errors.push(`Bills withheld-reversal reporting error: ${String(e)}`)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A WITHHELD VERDICT IS A QUESTION THAT MUST BE ASKED AGAIN (o3d-clxw round 4)
+// ---------------------------------------------------------------------------
+//
+// Round 2 made a withheld verdict DURABLE: if the warning did not land, the cursor is held and the
+// window re-read. Round 3 widened what withholds. Neither gave the successful case a way BACK.
+//
+// A withheld reversal that WAS reported is checkpointed like any other outcome, and the delta only
+// ever returns an invoice that CHANGES. But the thing that will settle the question is usually not a
+// change in Xero at all — it is IMS's own registration finishing, or an operator cancelling a FAILED
+// one. Neither of those touches the invoice, so nothing ever puts it back in front of the poller. The
+// document then sits `paidAt`-set for ever against a ledger that says it is not paid: on the bill side
+// a supplier who was never actually paid reads as settled, and on the sales side a real chargeback is
+// never recognised. The FAILED case round 3 named is the same defect one step on — a FAILED
+// registration never becomes SYNCED, so on its own it withholds for ever.
+//
+// So the verdict goes ON A TIMER, driven by the poll it already runs inside:
+//
+//   THE WORK ITEM IS THE RECORD ITSELF. The durable warning round 2 insisted on IS the queue entry —
+//   there is no second store to get out of step with it, and an entry can only exist if an operator
+//   was actually told. The latest `sync`-tagged activity row for a document decides its state: a
+//   withheld/deferred action means open, a cleared action means closed.
+//
+//   TERMINAL ROWS ARE CLOSED, NOT RE-SCANNED. When a recheck settles a document — the reversal is
+//   finally admitted, the ledger caught up, or IMS no longer holds it as paid — a `..._cleared` row
+//   is written and the document leaves the candidate set for good. An oldest-first bounded page that
+//   rows can never leave is a page that starves.
+//
+//   AND A DOCUMENT THAT IS STILL WITHHELD DOES NOT STARVE THE PAGE EITHER, because every recheck
+//   rewrites its marker. Oldest-first therefore means "least recently reconsidered first", which is a
+//   round robin, not a queue with a permanent head.
+//
+// Failure is always towards asking again: a marker that could not be rewritten stays as it was, which
+// leaves the document due; a Xero read that fails re-asks nothing and closes nothing.
+
+/** Actions whose presence as the LATEST row means the disagreement is still open. */
+const WITHHELD_OPEN_ACTIONS = [
+  'bill_payment_reversal_withheld',
+  'payment_reversal_withheld',
+  'bill_payment_reversal_recheck_deferred',
+  'payment_reversal_recheck_deferred',
+] as const
+
+/** Actions whose presence as the LATEST row means the document has left the candidate set. */
+const WITHHELD_CLOSED_ACTIONS = [
+  'bill_payment_reversal_withheld_cleared',
+  'payment_reversal_withheld_cleared',
+] as const
+
+/** How long a withheld verdict rests before it is reconsidered. */
+export const WITHHELD_RECHECK_INTERVAL_MS = 60 * 60 * 1000
+
+/** How far back through the withheld/cleared history one poll reads to rebuild the open set. */
+const WITHHELD_MARKER_SCAN = 400
+
+/**
+ * How old a marker may be and still be believed.
+ *
+ * Bounds the scan against the `createdAt` index instead of walking an activity log that is mostly
+ * something else. It cannot lose work: an OPEN marker is rewritten every time it is reconsidered, so
+ * one can only be older than this if the poll has not run for a month — and the daily reconcile keeps
+ * reporting those documents as suspect advances regardless.
+ */
+const WITHHELD_MARKER_HORIZON_MS = 30 * 24 * 60 * 60 * 1000
+
+/** How many documents one poll reconsiders. Bounds both the DB work and the extra Xero calls. */
+const WITHHELD_RECHECK_PAGE = 40
+
+/** Invoice ids per `Invoices?IDs=` request — Xero takes a comma-separated list. */
+const WITHHELD_RECHECK_BATCH = 40
+
+type WithheldMarker = {
+  entityType: ActivityEntityType
+  entityId: string
+  action: string
+  createdAt: Date
+}
+
+function isOpenAction(action: string): boolean {
+  return (WITHHELD_OPEN_ACTIONS as readonly string[]).includes(action)
+}
+
+/**
+ * The documents whose withheld verdict is due to be asked again, oldest reconsideration first.
+ *
+ * Reduced from the activity log rather than a queue table: a document is open when its newest OPEN
+ * marker is newer than any closure written for it, and due when that marker has rested a full
+ * interval. Open and closed rows are read separately so neither can crowd the other out of a bounded
+ * scan — the open scan wants the OLDEST rows (that is where the overdue work is) and the closure scan
+ * wants the NEWEST (that is what settles a document).
+ *
+ * Note the two clocks that appear here are BOTH scheduling, not ordering — `createdAt` is the
+ * database's and `now` is this host's, and disagreement between them can only make a recheck happen
+ * earlier or later. It cannot change a verdict; the verdict's own fence is `readDatabaseLedgerFence`.
+ */
+export function dueWithheldMarkers(
+  openMarkers: WithheldMarker[],
+  closureMarkers: WithheldMarker[],
+  now: number,
+): WithheldMarker[] {
+  const newest = (into: Map<string, WithheldMarker>, rows: WithheldMarker[]): Map<string, WithheldMarker> => {
+    for (const row of rows) {
+      const key = withheldEntityKey(row.entityType, row.entityId)
+      const held = into.get(key)
+      if (!held || held.createdAt.getTime() < row.createdAt.getTime()) into.set(key, row)
+    }
+    return into
+  }
+  const open = newest(new Map(), openMarkers.filter((m) => isOpenAction(m.action)))
+  const closed = newest(new Map(), closureMarkers)
+
+  return [...open.entries()]
+    .filter(([key, marker]) => {
+      const closure = closed.get(key)
+      if (closure && closure.createdAt.getTime() >= marker.createdAt.getTime()) return false
+      return marker.createdAt.getTime() <= now - WITHHELD_RECHECK_INTERVAL_MS
+    })
+    .map(([, marker]) => marker)
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+    .slice(0, WITHHELD_RECHECK_PAGE)
+}
+
+async function closeWithheldMarker(marker: WithheldMarker, resolution: string, description: string): Promise<void> {
+  await logActivity({
+    entityType: marker.entityType,
+    entityId: marker.entityId,
+    action: marker.entityType === 'PURCHASE_ORDER'
+      ? 'bill_payment_reversal_withheld_cleared'
+      : 'payment_reversal_withheld_cleared',
+    tag: 'sync',
+    level: 'INFO',
+    description,
+    metadata: { resolution },
+    resolveUser: false,
+  })
+}
+
+async function deferWithheldMarker(marker: WithheldMarker, reason: string): Promise<void> {
+  await logActivity({
+    entityType: marker.entityType,
+    entityId: marker.entityId,
+    action: marker.entityType === 'PURCHASE_ORDER'
+      ? 'bill_payment_reversal_recheck_deferred'
+      : 'payment_reversal_recheck_deferred',
+    tag: 'sync',
+    level: 'WARNING',
+    description:
+      `The withheld payment reversal for this document could not be reconsidered this time: ${reason}. `
+      + `It stays open and will be asked again.`,
+    metadata: { reason },
+    resolveUser: false,
+  })
+}
+
+/**
+ * Go back and re-ask every withheld reversal that has rested long enough.
+ *
+ * Reads the invoices by ID rather than waiting for them to re-enter the delta — the whole point is
+ * that they never will. The answer is then produced by exactly the same passes the delta uses, with a
+ * fresh database fence, so a recheck cannot reach a verdict the delta would not have reached.
+ */
+async function recheckWithheldReversals(
+  result: PollResult,
+  windowStart: Date,
+  fetchInvoices: (path: string) => Promise<{ ok: boolean; data?: XeroInvoicesResponse; error?: string; status?: number }>,
+): Promise<void> {
+  const horizon = new Date(Date.now() - WITHHELD_MARKER_HORIZON_MS)
+  const scan = (actions: readonly string[], order: 'asc' | 'desc') => db.activityLog.findMany({
+    where: { tag: 'sync', action: { in: [...actions] }, entityId: { not: null }, createdAt: { gte: horizon } },
+    orderBy: { createdAt: order },
+    take: WITHHELD_MARKER_SCAN,
+    select: { entityType: true, entityId: true, action: true, createdAt: true },
+  })
+  // OPEN oldest-first (the overdue end), CLOSURES newest-first (the settling end).
+  const [openRows, closureRows] = await Promise.all([
+    scan(WITHHELD_OPEN_ACTIONS, 'asc'),
+    scan(WITHHELD_CLOSED_ACTIONS, 'desc'),
+  ])
+  const named = (rows: typeof openRows): WithheldMarker[] =>
+    rows.flatMap((m) => (m.entityId == null ? [] : [{ ...m, entityId: m.entityId }]))
+
+  const due = dueWithheldMarkers(named(openRows), named(closureRows), Date.now())
+  if (due.length === 0) return
+  result.withheldRechecked += due.length
+
+  const poIds = due.filter((m) => m.entityType === 'PURCHASE_ORDER').map((m) => m.entityId)
+  const soIds = due.filter((m) => m.entityType === 'SALES_ORDER').map((m) => m.entityId)
+
+  // Only documents IMS STILL holds as paid have a disagreement left to settle. One PO can carry more
+  // than one bill, which is why the bill side is keyed by poId and may map to several invoices.
+  const bills = poIds.length === 0 ? [] : await db.purchaseInvoice.findMany({
+    where: { poId: { in: poIds }, paidAt: { not: null }, accountingInvoiceId: { not: null } },
+    select: { poId: true, accountingInvoiceId: true },
+  })
+  const orders = soIds.length === 0 ? [] : await db.salesOrder.findMany({
+    where: { id: { in: soIds }, paidAt: { not: null }, accountingInvoiceId: { not: null } },
+    select: { id: true, accountingInvoiceId: true },
+  })
+
+  const invoiceIdsByEntity = new Map<string, string[]>()
+  const add = (key: string, invoiceId: string | null): void => {
+    if (!invoiceId) return
+    invoiceIdsByEntity.set(key, [...(invoiceIdsByEntity.get(key) ?? []), invoiceId])
+  }
+  for (const bill of bills) add(withheldEntityKey('PURCHASE_ORDER', bill.poId), bill.accountingInvoiceId)
+  for (const order of orders) add(withheldEntityKey('SALES_ORDER', order.id), order.accountingInvoiceId)
+
+  const wanted = [...new Set([...invoiceIdsByEntity.values()].flat())]
+  const fetched = new Map<string, XeroInvoice>()
+  // The fence is read BEFORE the ledger request goes out, and one fence covers every batch: a fence
+  // EARLIER than the read it guards only ever decides FEWER registrations, which is the safe side.
+  const ledgerObservedBefore = await readDatabaseLedgerFence()
+  for (let i = 0; i < wanted.length; i += WITHHELD_RECHECK_BATCH) {
+    const batch = wanted.slice(i, i + WITHHELD_RECHECK_BATCH)
+    const res = await fetchInvoices(`Invoices?IDs=${batch.join(',')}`)
+    if (!res.ok) {
+      // Nothing is closed and nothing is deferred: every due document keeps the marker it already
+      // has, so the whole page is still due on the next poll.
+      result.errors.push(`Withheld-reversal recheck could not read Xero: ${res.error ?? `HTTP ${res.status}`}`)
+      return
+    }
+    for (const invoice of res.data?.Invoices ?? []) fetched.set(invoice.InvoiceID, invoice)
+  }
+
+  const stillWithheld = new Set<string>()
+  if (fetched.size > 0) {
+    await processDeltaChunk([...fetched.values()], result, {
+      windowStart,
+      ledgerObservedBefore,
+      withheldMode: { recheck: true, observe: (key) => stillWithheld.add(key) },
+    })
+  }
+
+  for (const marker of due) {
+    const key = withheldEntityKey(marker.entityType, marker.entityId)
+    // Still withheld — the signal pass has already rewritten the marker, which is what restarts its
+    // timer. If that write failed the OLD marker stands, and the document simply stays due.
+    if (stillWithheld.has(key)) continue
+
+    const invoiceIds = invoiceIdsByEntity.get(key)
+    if (!invoiceIds || invoiceIds.length === 0) {
+      result.withheldResolved++
+      await closeWithheldMarker(marker, 'no-paid-document',
+        `IMS no longer holds a paid, Xero-linked document for this record, so the withheld payment `
+        + `reversal has nothing left to decide and is closed.`)
+      continue
+    }
+    // A read that did not come back cannot close anything. Deferring rewrites the marker so this
+    // document goes to the BACK of the oldest-first page instead of holding its head for ever.
+    if (!invoiceIds.every((id) => fetched.has(id))) {
+      await deferWithheldMarker(marker, 'Xero did not return the invoice')
+      continue
+    }
+    result.withheldResolved++
+    await closeWithheldMarker(marker, 'settled',
+      `The withheld payment reversal for this document was reconsidered against a fresh Xero read and `
+      + `is no longer withheld — it was either reversed, or the ledger and IMS now agree. Closed.`)
   }
 }
 
@@ -838,6 +1188,7 @@ export async function pollXeroPayments(): Promise<PollResult> {
     return {
       salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0,
       salesReversalsWithheld: 0, billReversalsWithheld: 0,
+      withheldRechecked: 0, withheldResolved: 0,
       errors: [], skipped: 'backlog reconcile held the payment-write lock',
     }
   }
@@ -848,6 +1199,7 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
   const result = {
     salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0,
     salesReversalsWithheld: 0, billReversalsWithheld: 0,
+    withheldRechecked: 0, withheldResolved: 0,
     errors: [] as string[],
   }
 
@@ -895,6 +1247,21 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
   //
   // Clamping to a monotonic maximum keeps the overlap doing its job (the records ARE re-read and
   // re-processed, idempotently) while making the checkpoint one-way.
+  // THE FENCE, READ BEFORE THE LEDGER IS ASKED, FROM THE DATABASE (o3d-clxw round 4).
+  //
+  // Not `pollStartedAt`. `pollStartedAt` is this host's clock and it bounds the delta WINDOW, which is
+  // all it was ever fit for. The registration fence is an ORDERING against stamps written by a
+  // different host, and the only way two stamps can be ordered is if one authority wrote both — so
+  // both now come from the database. One fence covers every chunk of the drain: a fence earlier than
+  // the read it guards decides strictly fewer registrations, which is the direction that withholds.
+  const ledgerObservedBefore = await readDatabaseLedgerFence()
+  if (ledgerObservedBefore === null) {
+    result.errors.push(
+      `The database clock could not be read, so no payment registration can be ordered against this `
+      + `Xero read; every reversal that depends on one is withheld for this poll.`,
+    )
+  }
+
   let checkpoint = lastPollDate
   const drain = await drainInvoicesModifiedSince(
     since,
@@ -905,9 +1272,9 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
       await processDeltaChunk(invoices, result, {
         windowStart: lastPollDate,
         // The instant Xero WAS ASKED, not the start of the window it covers: "had this registration
-        // already posted when the ledger gave us this answer?" is a question about the READ. Stamped
-        // before the fetch, so every chunk is read after it.
-        ledgerObservedBefore: pollStartedAt,
+        // already posted when the ledger gave us this answer?" is a question about the READ. Read
+        // from the database before the fetch, so every chunk is read after it.
+        ledgerObservedBefore,
       })
       // A pass that errored may have left work undone inside this chunk, so the chunk is not
       // checkpointed and the drain stops here — the same "hold the cursor on error" rule as before,
@@ -963,8 +1330,17 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
     })
   }
 
+  // Reconsider withheld verdicts AFTER the drain, so a recheck failure can never be mistaken for a
+  // reason to hold the poll cursor: by here the cursor has already been decided.
+  try {
+    await recheckWithheldReversals(result, lastPollDate, (path) => xeroGet<XeroInvoicesResponse>(path))
+  } catch (e) {
+    result.errors.push(`Withheld-reversal recheck error: ${String(e)}`)
+  }
+
   const withheld = result.salesReversalsWithheld + result.billReversalsWithheld
-  if (result.salesPaid > 0 || result.billsPaid > 0 || result.salesReversed > 0 || result.billsReversed > 0 || withheld > 0) {
+  if (result.salesPaid > 0 || result.billsPaid > 0 || result.salesReversed > 0 || result.billsReversed > 0
+    || withheld > 0 || result.withheldRechecked > 0) {
     await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_payment_poll',
@@ -976,6 +1352,10 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
         (withheld > 0
           ? `, ${withheld} reversal(s) WITHHELD because the ledger still holds a payment (or did not say) — ` +
             `see the per-document warnings`
+          : '') +
+        (result.withheldRechecked > 0
+          ? `, ${result.withheldRechecked} previously-withheld reversal(s) reconsidered ` +
+            `(${result.withheldResolved} closed)`
           : ''),
       metadata: result,
       resolveUser: false,

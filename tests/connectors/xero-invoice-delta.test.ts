@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   classifyRegisteredPayment,
+  databaseLedgerFence,
   zeroPaidIsProvenReversal,
   drainInvoicesModifiedSince,
   fetchInvoicesModifiedSince,
@@ -581,7 +582,10 @@ test('parseLedgerAmount refuses to turn an empty field into zero', () => {
 // and leaves a smaller one behind — and the first question then hides the removal for ever.
 // ---------------------------------------------------------------------------
 
-const READ_AT = new Date('2026-08-20T12:00:00.000Z')
+// Every one of these is a reading of the DATABASE clock: the fence is minted by databaseLedgerFence
+// and the registration stamps are what `clock_timestamp()` wrote into `synced_at`. No host clock has
+// any part in these comparisons any more (o3d-clxw round 4).
+const READ_AT = databaseLedgerFence(new Date('2026-08-20T12:00:00.000Z'))
 const BEFORE_READ = new Date('2026-08-20T11:00:00.000Z')
 const AFTER_READ = new Date('2026-08-20T12:00:01.000Z')
 
@@ -697,10 +701,10 @@ test('a registration that synced at the very instant of the read is undecided, m
   // called it undecided — two components disagreeing about one supplier payment.
   const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0, Payments: [] })
   assert.deepEqual(
-    classifyRegisteredPayment(invoice, [postedRegistration({ syncedAt: READ_AT })], READ_AT),
+    classifyRegisteredPayment(invoice, [postedRegistration({ syncedAt: READ_AT.databaseClock })], READ_AT),
     { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] })
   // One millisecond earlier is decidable, so the fence is strict rather than simply broken.
   assert.deepEqual(
-    classifyRegisteredPayment(invoice, [postedRegistration({ syncedAt: new Date(READ_AT.getTime() - 1) })], READ_AT),
+    classifyRegisteredPayment(invoice, [postedRegistration({ syncedAt: new Date(READ_AT.databaseClock.getTime() - 1) })], READ_AT),
     { verdict: 'GONE', paymentIds: ['PAY-1'] })
 })

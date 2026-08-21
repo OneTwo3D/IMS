@@ -21,7 +21,15 @@ import test, { mock } from 'node:test'
 import type { XeroInvoice } from '@/lib/connectors/xero/invoice-delta'
 
 type Row = Record<string, unknown>
-type LoggedActivity = { action?: string; level?: string; description?: string; metadata?: Record<string, unknown> }
+type LoggedActivity = {
+  entityType?: string
+  entityId?: string | null
+  action?: string
+  tag?: string
+  level?: string
+  description?: string
+  metadata?: Record<string, unknown>
+}
 
 const state = {
   invoices: [] as XeroInvoice[],
@@ -40,6 +48,60 @@ const state = {
   /** Set to make the activity-log / notification write REPORT failure, as the real ones do. */
   activityWriteFails: false,
   notificationWriteFails: false,
+  // --- o3d-clxw round 4 -----------------------------------------------------
+  /**
+   * THE DATABASE'S clock, which is now the ONLY clock the reversal fence is allowed to read: the
+   * poller selects `clock_timestamp()` from it before asking Xero, and the sync processor stamps
+   * `synced_at` with it after posting a payment. Deliberately independent of whatever the poll HOST's
+   * `new Date()` says — see withHostClockSkew.
+   */
+  dbClockSkewMs: 0,
+  /** Make `SELECT clock_timestamp()` fail, so the poll has no ordering at all. */
+  dbClockFails: false,
+  /** Persisted activity rows, as `db.activityLog.findMany` would return them. */
+  activityRows: [] as Row[],
+  /** Invoices `Invoices?IDs=` returns to the withheld-reversal recheck. */
+  recheckInvoices: [] as XeroInvoice[],
+  /** Every `Invoices?IDs=` path the recheck asked for. */
+  recheckFetches: [] as string[],
+  /** Make the recheck's Xero read fail. */
+  recheckFetchFails: false,
+}
+
+/** The unpatched clock, so the database double keeps real time while a HOST clock is skewed. */
+const RealDate = Date
+const realNow = (): number => RealDate.now()
+
+/** What `SELECT clock_timestamp()` (and the sync processor's `synced_at` stamp) would return. */
+function databaseNow(offsetMs = 0): Date {
+  // `realNow()` is the DATABASE's clock here — deliberately unaffected by whatever the host running
+  // the poll believes the time is. Constructed through the ambient `Date` so the value still behaves
+  // like one while withHostClockSkew has the constructor replaced.
+  return new Date(realNow() + state.dbClockSkewMs + offsetMs)
+}
+
+/**
+ * Run the poll on a HOST whose wall clock is `skewMs` out.
+ *
+ * This is the whole point of round 4: the sync processor and the payment poller run on different app
+ * instances, and round 3 fenced a supplier payment on those two clocks agreeing. Every registration
+ * stamp in these tests comes from `databaseNow()`, so skewing the poll host here reproduces exactly
+ * the disagreement that used to decide whether a supplier got paid twice.
+ */
+async function withHostClockSkew<T>(skewMs: number, fn: () => Promise<T>): Promise<T> {
+  class SkewedDate extends RealDate {
+    constructor(...args: unknown[]) {
+      if (args.length === 0) super(realNow() + skewMs)
+      else super(...(args as ConstructorParameters<typeof RealDate>))
+    }
+    static now(): number { return realNow() + skewMs }
+  }
+  ;(globalThis as { Date: unknown }).Date = SkewedDate
+  try {
+    return await fn()
+  } finally {
+    ;(globalThis as { Date: unknown }).Date = RealDate
+  }
 }
 
 function reset(): void {
@@ -56,6 +118,12 @@ function reset(): void {
   state.settingUpserts = []
   state.activityWriteFails = false
   state.notificationWriteFails = false
+  state.dbClockSkewMs = 0
+  state.dbClockFails = false
+  state.activityRows = []
+  state.recheckInvoices = []
+  state.recheckFetches = []
+  state.recheckFetchFails = false
 }
 
 /** Just enough Prisma `where` to answer the poller's own queries honestly. */
@@ -83,12 +151,25 @@ function rowMatches(row: Row, where: Row | undefined): boolean {
 
 // Both real helpers SWALLOW their write failures and report them through the *Persisted variants —
 // the doubles do the same, so a test can make the write fail without making the call throw.
+function recordActivity(entry: LoggedActivity): void {
+  state.activity.push(entry)
+  // The activity log is not just a firehose here: the withheld-reversal recheck reads its own
+  // warnings back as the work queue, so the double has to PERSIST them the way the real one does.
+  state.activityRows.push({
+    entityType: entry.entityType ?? null,
+    entityId: entry.entityId ?? null,
+    action: entry.action ?? '',
+    tag: entry.tag ?? '',
+    createdAt: databaseNow(),
+  })
+}
+
 mock.module('@/lib/activity-log', {
   namedExports: {
-    logActivity: async (entry: LoggedActivity) => { if (!state.activityWriteFails) state.activity.push(entry) },
+    logActivity: async (entry: LoggedActivity) => { if (!state.activityWriteFails) recordActivity(entry) },
     logActivityPersisted: async (entry: LoggedActivity) => {
       if (state.activityWriteFails) return false
-      state.activity.push(entry)
+      recordActivity(entry)
       return true
     },
   },
@@ -112,8 +193,16 @@ mock.module('@/lib/connectors/xero/payment-write-lock', {
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
     xeroHttpAttemptCount: () => state.attempts,
-    xeroGet: async () => {
+    xeroGet: async (path: string) => {
       state.attempts += 1
+      // The withheld-reversal recheck asks for specific invoices by id, precisely because they will
+      // never come back through the modified-since delta on their own.
+      if (typeof path === 'string' && path.startsWith('Invoices?IDs=')) {
+        state.recheckFetches.push(path)
+        if (state.recheckFetchFails) return { ok: false, status: 503, error: 'Xero unavailable' }
+        const ids = path.slice('Invoices?IDs='.length).split(',')
+        return { ok: true, status: 200, data: { Invoices: state.recheckInvoices.filter((i) => ids.includes(i.InvoiceID)) } }
+      }
       // One short page: walkPages treats it as the last, so the whole window is one chunk.
       return { ok: true, status: 200, data: { Invoices: state.invoices } }
     },
@@ -130,6 +219,29 @@ mock.module('@/app/actions/sales', {
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      // `SELECT clock_timestamp() AT TIME ZONE 'UTC'` — the fence end of the ordering. Answers from
+      // the DATABASE clock, never from whatever `new Date()` says on the host running the poll.
+      $queryRaw: async () => {
+        if (state.dbClockFails) throw new Error('database clock unavailable')
+        return [{ fence: databaseNow() }]
+      },
+      activityLog: {
+        findMany: async (
+          { where, take, orderBy }:
+          { where: Row; take?: number; orderBy?: { createdAt?: 'asc' | 'desc' } },
+        ) => {
+          const actions = (where.action as { in?: string[] } | undefined)?.in ?? null
+          const since = (where.createdAt as { gte?: Date } | undefined)?.gte ?? null
+          const direction = orderBy?.createdAt === 'asc' ? 1 : -1
+          return state.activityRows
+            .filter((r) => (where.tag == null || r.tag === where.tag))
+            .filter((r) => (actions == null || actions.includes(r.action as string)))
+            .filter((r) => r.entityId != null)
+            .filter((r) => since == null || (r.createdAt as Date).getTime() >= since.getTime())
+            .sort((a, b) => direction * ((a.createdAt as Date).getTime() - (b.createdAt as Date).getTime()))
+            .slice(0, take ?? undefined)
+        },
+      },
       setting: {
         findUnique: async () => ({ key: 'xero_last_payment_poll', value: new Date(Date.now() - 60_000).toISOString() }),
         upsert: async (args: unknown) => { state.settingUpserts.push(args); return {} },
@@ -158,9 +270,11 @@ mock.module('@/lib/db', {
   },
 })
 
-async function poll() {
+async function poll(hostClockSkewMs = 0) {
   const { pollXeroPayments } = await import('@/lib/connectors/xero/payment-poller')
-  return pollXeroPayments()
+  return hostClockSkewMs === 0
+    ? pollXeroPayments()
+    : withHostClockSkew(hostClockSkewMs, () => pollXeroPayments())
 }
 
 function bill(overrides: Partial<XeroInvoice> = {}): XeroInvoice {
@@ -336,7 +450,8 @@ function billRegistration(overrides: Row = {}): Row {
     referenceId: 'pi_1',
     status: 'SYNCED',
     externalTransactionId: 'PAY-OURS',
-    syncedAt: new Date(Date.now() - 5 * 60_000),
+    // Stamped by `clock_timestamp()` in the sync processor's own transaction (round 4).
+    syncedAt: databaseNow(-5 * 60_000),
     ...overrides,
   }
 }
@@ -350,7 +465,8 @@ function salesRegistration(overrides: Row = {}): Row {
     referenceId: 'so_1',
     status: 'SYNCED',
     externalTransactionId: 'PAY-OURS-S',
-    syncedAt: new Date(Date.now() - 5 * 60_000),
+    // Stamped by `clock_timestamp()` in the sync processor's own transaction (round 4).
+    syncedAt: databaseNow(-5 * 60_000),
     ...overrides,
   }
 }
@@ -403,7 +519,7 @@ test('a registration that finished AFTER the Xero read cannot be declared gone b
   // and declaring a reversal there re-arms Mark Paid over a payment that was just made.
   state.invoices = [bill({ AmountPaid: 20, AmountDue: 480, Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })]
   state.purchaseInvoices = [paidBillRow()]
-  state.syncLogs = [billRegistration({ syncedAt: new Date(Date.now() + 60_000) })]
+  state.syncLogs = [billRegistration({ syncedAt: databaseNow(60_000) })]
 
   const result = await poll()
 
@@ -583,7 +699,7 @@ test('a zero-paid bill whose registration SYNCED after the Xero read is not reve
   // was taken in between. Its emptiness says nothing about a payment created after it.
   state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
   state.purchaseInvoices = [paidBillRow()]
-  state.syncLogs = [billRegistration({ syncedAt: new Date(Date.now() + 60_000) })]
+  state.syncLogs = [billRegistration({ syncedAt: databaseNow(60_000) })]
 
   const result = await poll()
 
@@ -745,4 +861,259 @@ test('a ledger that lists our payment while stating nothing is paid withholds ra
   assert.match(withheld?.description ?? '', /while also stating that nothing has been paid/)
   assert.doesNotMatch(withheld?.description ?? '', /genuine PART payment/,
     'a zero has no reading as a part payment')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-clxw ROUND 4 — AN ORDERING MUST NOT REST ON TWO HOSTS AGREEING
+//
+// Round 3's fence was `syncedAt < ledgerObservedBefore`, and both were application clocks: `syncedAt`
+// came from `new Date()` on whichever instance ran the sync processor, `ledgerObservedBefore` from
+// `new Date()` on whichever instance ran the poll. IMS runs more than one instance.
+//
+// One skew direction merely withholds. The other pays a supplier twice: with the poll host running
+// ahead, a payment posted AFTER the ledger snapshot carries a stamp BELOW the fence, the fence calls
+// it decided, its (correct) absence from the older snapshot reads as proof of removal, paidAt is
+// cleared and Mark Paid re-arms over a payment that has already left the bank.
+//
+// Both ends are now `clock_timestamp()` from the SAME database, ordered by the poller's own program
+// order — SELECT the fence, THEN ask Xero. These tests make the two hosts disagree by five minutes in
+// BOTH directions and require the verdict to be identical, which is the only way to show that no host
+// takes part in it.
+// ---------------------------------------------------------------------------
+
+const HOST_SKEWS: Array<[string, number]> = [
+  ['the poll host runs five minutes FAST', 5 * 60_000],
+  ['the poll host runs five minutes SLOW', -5 * 60_000],
+]
+
+test('a payment posted AFTER the ledger read stays undecided however the two hosts disagree (o3d-clxw r4)', async () => {
+  for (const [label, skew] of HOST_SKEWS) {
+    reset()
+    // The database — the one clock either end is allowed to read — says the registration completed
+    // THIRTY SECONDS AFTER the snapshot. The snapshot therefore cannot see the payment, and its
+    // absence proves nothing whatsoever.
+    state.invoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
+    state.purchaseInvoices = [paidBillRow()]
+    state.syncLogs = [billRegistration({ syncedAt: databaseNow(30_000) })]
+
+    const result = await poll(skew)
+
+    assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [],
+      `${label}: the payment landed after the read — clearing paidAt here re-arms Mark Paid over money already sent`)
+    assert.equal(result.billsReversed, 0, label)
+    assert.equal(result.billReversalsWithheld, 1, label)
+    const withheld = state.activity.find((a) => a.action === 'bill_payment_reversal_withheld')
+    assert.equal(withheld?.metadata?.registrationVerdict, 'REGISTRATION_UNDECIDED', label)
+    assert.equal(withheld?.metadata?.reason, 'zero-paid-unproven', label)
+  }
+})
+
+test('a payment posted BEFORE the ledger read stays decidable however the two hosts disagree (o3d-clxw r4)', async () => {
+  for (const [label, skew] of HOST_SKEWS) {
+    reset()
+    // The mirror image: the database says the registration completed thirty seconds BEFORE the
+    // snapshot, so the snapshot DOES speak for it — and it lists somebody else's payment, not ours.
+    // Withholding here is the failure that hides a deleted supplier payment for ever.
+    state.invoices = [bill({ AmountPaid: 20, AmountDue: 480, Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })]
+    state.purchaseInvoices = [paidBillRow()]
+    state.syncLogs = [billRegistration({ syncedAt: databaseNow(-30_000) })]
+
+    const result = await poll(skew)
+
+    assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates).map((u) => u.id), ['pi_1'], label)
+    assert.equal(result.billsReversed, 1, label)
+    assert.equal(result.billReversalsWithheld, 0, label)
+    const detected = state.activity.find((a) => a.action === 'bill_payment_reversal_detected')
+    assert.match(detected?.description ?? '', /PAY-OURS/, label)
+  }
+})
+
+test('a poll that cannot read the database clock orders nothing, so every registration withholds', async () => {
+  reset()
+  // No fence, no ordering. The fail-closed reading of "no ordering" is that any registration might
+  // have landed after the snapshot — including this one, which is five minutes old and would
+  // otherwise be decidable.
+  state.dbClockFails = true
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration()]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [])
+  assert.equal(result.billsReversed, 0)
+  assert.equal(result.billReversalsWithheld, 1)
+  assert.equal(
+    state.activity.find((a) => a.action === 'bill_payment_reversal_withheld')?.metadata?.registrationVerdict,
+    'REGISTRATION_UNDECIDED')
+  assert.ok(result.errors.some((e) => /database clock could not be read/.test(e)),
+    'losing the ordering is an error, not a silent downgrade')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-clxw ROUND 4 — A WITHHELD VERDICT IS RECONSIDERED, NOT FILED AWAY
+//
+// A withheld reversal that WAS reported is checkpointed like any other outcome, and the delta only
+// returns an invoice that CHANGES. What settles the question is usually not a change in Xero at all —
+// it is IMS's own registration finishing, or an operator cancelling a FAILED one. Neither touches the
+// invoice, so nothing ever puts it back in front of the poller.
+// ---------------------------------------------------------------------------
+
+function withheldMarker(overrides: Row = {}): Row {
+  return {
+    entityType: 'PURCHASE_ORDER',
+    entityId: 'po_1',
+    action: 'bill_payment_reversal_withheld',
+    tag: 'sync',
+    createdAt: databaseNow(-2 * 60 * 60_000),
+    ...overrides,
+  }
+}
+
+test('a withheld reversal is asked again on a timer, and a cancelled registration finally lets it through', async () => {
+  reset()
+  // NOTHING is in the delta: the invoice has not changed since it was withheld, and it never will.
+  state.invoices = []
+  state.activityRows = [withheldMarker()]
+  state.purchaseInvoices = [paidBillRow()]
+  // The operator cancelled the stuck registration, which is exactly what the withheld warning told
+  // them to do. CANCELLED asserts nothing was sent, so the zero is now the whole story.
+  state.syncLogs = [billRegistration({ status: 'CANCELLED', externalTransactionId: null, syncedAt: null })]
+  state.recheckInvoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
+
+  const result = await poll()
+
+  assert.equal(result.withheldRechecked, 1, 'the withheld verdict must be re-asked, not left filed')
+  assert.deepEqual(state.recheckFetches, ['Invoices?IDs=XB1'],
+    'the invoice is read by ID precisely because it will never re-enter the modified-since delta')
+  assert.equal(result.billsReversed, 1)
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates).map((u) => u.id), ['pi_1'])
+  assert.equal(result.withheldResolved, 1)
+  const cleared = state.activity.find((a) => a.action === 'bill_payment_reversal_withheld_cleared')
+  assert.ok(cleared, 'a settled document must LEAVE the candidate set, not be re-scanned for ever')
+  assert.equal(cleared.metadata?.resolution, 'settled')
+})
+
+test('a reversal that is still withheld has its marker rewritten, so it cannot hold the head of the queue', async () => {
+  reset()
+  state.invoices = []
+  state.activityRows = [withheldMarker()]
+  state.purchaseInvoices = [paidBillRow()]
+  // A FAILED registration is not proof that nothing posted, so it withholds — and on its own it
+  // withholds for ever, because it never becomes SYNCED.
+  state.syncLogs = [billRegistration({ status: 'FAILED', externalTransactionId: null, syncedAt: null })]
+  state.recheckInvoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
+
+  const result = await poll()
+
+  assert.equal(result.withheldRechecked, 1)
+  assert.equal(result.withheldResolved, 0, 'nothing was settled, so nothing may be closed')
+  assert.equal(result.billsReversed, 0)
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [])
+  assert.equal(state.activity.some((a) => a.action === 'bill_payment_reversal_withheld_cleared'), false)
+  const refreshed = state.activity.filter((a) => a.action === 'bill_payment_reversal_withheld')
+  assert.equal(refreshed.length, 1,
+    'the marker is REWRITTEN, which restarts its timer and sends it to the back of the oldest-first page')
+  assert.equal(refreshed[0]?.metadata?.registrationVerdict, 'REGISTRATION_UNDECIDED')
+  assert.equal(state.notifications.filter((n) => n.title === 'Bill payment reversal withheld').length, 0,
+    'the operator was alerted when the verdict was first withheld; re-alerting every interval is noise, not signal')
+})
+
+test('a withheld reversal younger than the recheck interval is left to rest', async () => {
+  reset()
+  state.invoices = []
+  state.activityRows = [withheldMarker({ createdAt: databaseNow(-60_000) })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.recheckInvoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
+
+  const result = await poll()
+
+  assert.equal(result.withheldRechecked, 0)
+  assert.deepEqual(state.recheckFetches, [], 'a fresh verdict costs no Xero budget')
+})
+
+test('a withheld marker whose document IMS no longer holds as paid is closed, not re-asked for ever', async () => {
+  reset()
+  state.invoices = []
+  state.activityRows = [withheldMarker()]
+  state.purchaseInvoices = [{ ...paidBillRow(), paidAt: null }]
+
+  const result = await poll()
+
+  assert.equal(result.withheldRechecked, 1)
+  assert.equal(result.withheldResolved, 1)
+  assert.deepEqual(state.recheckFetches, [], 'there is no document left to ask Xero about')
+  assert.equal(
+    state.activity.find((a) => a.action === 'bill_payment_reversal_withheld_cleared')?.metadata?.resolution,
+    'no-paid-document')
+})
+
+test('a marker that has already been cleared is not re-opened by its own history', async () => {
+  reset()
+  state.invoices = []
+  state.activityRows = [
+    withheldMarker({ createdAt: databaseNow(-3 * 60 * 60_000) }),
+    withheldMarker({ action: 'bill_payment_reversal_withheld_cleared', createdAt: databaseNow(-2 * 60 * 60_000) }),
+  ]
+  state.purchaseInvoices = [paidBillRow()]
+  state.recheckInvoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
+
+  const result = await poll()
+
+  assert.equal(result.withheldRechecked, 0, 'the LATEST row decides the state, and it says closed')
+  assert.deepEqual(state.recheckFetches, [])
+})
+
+test('a recheck whose Xero read fails closes nothing and leaves the document due', async () => {
+  reset()
+  state.invoices = []
+  state.activityRows = [withheldMarker()]
+  state.purchaseInvoices = [paidBillRow()]
+  state.recheckFetchFails = true
+
+  const result = await poll()
+
+  assert.equal(result.withheldResolved, 0)
+  assert.equal(state.activity.some((a) => a.action === 'bill_payment_reversal_withheld_cleared'), false)
+  assert.equal(state.activity.some((a) => a.action === 'bill_payment_reversal_recheck_deferred'), false,
+    'a read that never happened is not a deferral of THIS document; the marker it already has keeps it due')
+  assert.ok(result.errors.some((e) => /recheck could not read Xero/.test(e)))
+})
+
+test('a document Xero did not return is deferred rather than closed', async () => {
+  reset()
+  state.invoices = []
+  state.activityRows = [withheldMarker()]
+  state.purchaseInvoices = [paidBillRow()]
+  state.recheckInvoices = [] // asked for XB1, Xero returned nothing
+
+  const result = await poll()
+
+  assert.deepEqual(state.recheckFetches, ['Invoices?IDs=XB1'])
+  assert.equal(result.withheldResolved, 0, 'a read that came back empty settles nothing')
+  assert.equal(state.activity.some((a) => a.action === 'bill_payment_reversal_withheld_cleared'), false)
+  assert.equal(state.activity.some((a) => a.action === 'bill_payment_reversal_recheck_deferred'), true,
+    'the marker is rewritten anyway, or this document holds the head of an oldest-first page for ever')
+})
+
+test('the due set is oldest-reconsidered-first, latest row wins, and it is bounded', async () => {
+  const { dueWithheldMarkers, WITHHELD_RECHECK_INTERVAL_MS } =
+    await import('@/lib/connectors/xero/payment-poller')
+  const old = (minutes: number) => new Date(Date.now() - WITHHELD_RECHECK_INTERVAL_MS - minutes * 60_000)
+  const marker = (entityId: string, action: string, createdAt: Date) =>
+    ({ entityType: 'PURCHASE_ORDER' as const, entityId, action, createdAt })
+
+  const due = dueWithheldMarkers([
+    marker('po_b', 'bill_payment_reversal_withheld', old(10)),
+    marker('po_a', 'bill_payment_reversal_withheld', old(30)),
+    // po_c still has an open row in the scan, but it has since been closed.
+    marker('po_c', 'bill_payment_reversal_withheld', old(40)),
+    // po_d was re-asked one minute ago, so it is not due again yet.
+    marker('po_d', 'bill_payment_reversal_recheck_deferred', new Date(Date.now() - 60_000)),
+  ], [
+    marker('po_c', 'bill_payment_reversal_withheld_cleared', old(5)),
+  ], Date.now())
+
+  assert.deepEqual(due.map((m) => m.entityId), ['po_a', 'po_b'],
+    'least recently reconsidered first — a round robin, not a queue with a permanent head')
 })

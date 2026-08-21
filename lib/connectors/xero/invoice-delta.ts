@@ -1020,8 +1020,80 @@ export type RegisteredPaymentRow = {
   status: string
   /** The ledger's id for the payment this registration created, if it got that far. */
   externalTransactionId: string | null
-  /** When IMS recorded the registration as complete. */
+  /**
+   * When the registration became complete, AS THE DATABASE MEASURED IT.
+   *
+   * Written by `stampSyncedAtFromDatabaseClock` in the sync processor as `clock_timestamp()`, in the
+   * same transaction that sets SYNCED and strictly after the POST to Xero returned. It is NOT the
+   * processor host's `new Date()` any more — see LedgerReadFence for why that mattered.
+   */
   syncedAt: Date | null
+}
+
+// ---------------------------------------------------------------------------
+// THE FENCE THAT ORDERS THE REVERSAL, AND WHY NO HOST PARTICIPATES (o3d-clxw round 4)
+// ---------------------------------------------------------------------------
+//
+// Round 3 fenced the verdict on `syncedAt < ledgerObservedBefore`, and both sides of that comparison
+// were APPLICATION clocks: `syncedAt` was `new Date()` on whichever app instance ran the sync
+// processor, and `ledgerObservedBefore` was `new Date()` on whichever instance ran the poll. IMS runs
+// more than one instance, so those are two machines, and nothing keeps their clocks together.
+//
+// Skew in ONE direction is merely wasteful — the fence reads a finished registration as unfinished
+// and the reversal is withheld. Skew in the OTHER direction moves money: if the poller's clock runs
+// AHEAD of the processor's, a registration that posted its payment AFTER the ledger snapshot was
+// taken still carries a `syncedAt` below `ledgerObservedBefore`. The fence calls it decided, the
+// payment is (correctly) absent from the older snapshot, the verdict is GONE, `paidAt` is cleared,
+// Mark Paid re-arms, and the supplier is paid a second time. That is the exact defect this branch
+// exists to prevent, reintroduced by the guard meant to prevent it. A tie-break cannot repair it,
+// because there is no true order to break the tie towards.
+//
+// So the clock is taken out of the decision. BOTH ENDS ARE NOW READ FROM THE DATABASE:
+//
+//   the row end     `accounting_sync_logs.synced_at`, written as `clock_timestamp()` inside the same
+//                   transaction that marks the registration SYNCED — which runs strictly after the
+//                   POST to Xero returned, so the stamp is an upper bound on when the payment
+//                   reached the ledger.
+//   the fence end   `clock_timestamp()` selected from the same database immediately BEFORE the
+//                   ledger was asked, so the fence is a lower bound on the snapshot's age.
+//
+// Two readings of ONE clock, ordered by the poller's own program order (SELECT returns, THEN Xero is
+// called). No application host's clock appears on either side, so making any host fast or slow — or
+// swapping which one is fast — cannot change the answer.
+//
+// `now()` would NOT do: PostgreSQL's `now()`/`CURRENT_TIMESTAMP` is TRANSACTION-START time, so a
+// registration whose transaction opened before its POST would be stamped before the payment existed.
+// `clock_timestamp()` is read at the statement, which is after.
+//
+// Residual, stated plainly: a row stamped by the PREVIOUS release still carries a host clock, and a
+// single clock stepped backwards by NTP can still misorder two of its own readings. Both are far
+// smaller than free-running skew between two machines, and neither is repairable without a schema
+// change to carry a monotonic generation instead of a timestamp.
+
+declare const DATABASE_CLOCK_BRAND: unique symbol
+
+/**
+ * The instant the ledger was asked, measured by the DATABASE — the only value `classifyRegisteredPayment`
+ * will accept as a fence.
+ *
+ * Branded on purpose. The bug this replaces was a plain `Date` flowing in from `new Date()`, and a
+ * plain `Date` parameter cannot tell the two apart. Only `databaseLedgerFence` can mint one, so
+ * "which clock is this?" is answered at the type level rather than in a comment.
+ */
+export type LedgerReadFence = {
+  /** `SELECT clock_timestamp()`, taken before the ledger read. */
+  readonly databaseClock: Date
+  readonly [DATABASE_CLOCK_BRAND]: 'accounting_sync_logs.synced_at'
+}
+
+/**
+ * Wrap a `clock_timestamp()` reading taken from the application database BEFORE the ledger read.
+ *
+ * The ONLY correct argument is a value the database produced. Passing `new Date()` here is the
+ * defect, not a shortcut around it.
+ */
+export function databaseLedgerFence(clockTimestamp: Date): LedgerReadFence {
+  return { databaseClock: clockTimestamp } as LedgerReadFence
 }
 
 export type RegisteredPaymentVerdict =
@@ -1039,13 +1111,22 @@ export type RegisteredPaymentVerdict =
 /**
  * Is the payment IMS registered still in the ledger?
  *
- * `ledgerObservedBefore` is the instant Xero WAS ASKED. A registration that finished after it may
- * have created a payment this snapshot never saw, so its absence from the list proves nothing — and
- * that case is the dangerous one, because it is exactly the fifteen minutes between Mark Paid setting
- * `paidAt` locally and the worker posting the payment. Declaring a reversal there would clear the
- * flag over a payment that had just been made and invite a second one. It is the same fence, on the
- * same clock, that the registration retirement on the o3d-batch-payidx sibling uses, deliberately so:
- * the two decisions must not be able to disagree about which registrations a read can speak for.
+ * `ledgerObservedBefore` is the instant Xero WAS ASKED, as the DATABASE measured it. A registration
+ * that finished after it may have created a payment this snapshot never saw, so its absence from the
+ * list proves nothing — and that case is the dangerous one, because it is exactly the fifteen minutes
+ * between Mark Paid setting `paidAt` locally and the worker posting the payment. Declaring a reversal
+ * there would clear the flag over a payment that had just been made and invite a second one.
+ *
+ * Both ends of the comparison are `clock_timestamp()` readings of the SAME database (see
+ * LedgerReadFence): no application host's clock takes part, so host skew cannot flip a verdict.
+ *
+ * NULL FENCE = NOTHING IS DECIDED. If the database clock could not be read, the poll has no ordering
+ * at all, and the fail-closed reading of "no ordering" is that every registration might have landed
+ * after the snapshot. Everything withholds. That is also what keeps the o3d-batch-payidx algebra
+ * intact: this function's decided set only ever SHRINKS relative to the sibling's
+ * `OR: [{ syncedAt: null }, { syncedAt: { gte: fence.databaseClock } }]` undecidable predicate — it
+ * is never allowed to grow, so a bill this branch admits is still one the sibling has nothing
+ * undecidable for.
  *
  * Undecided beats everything: one registration this read cannot account for withholds the whole
  * verdict, because the document is one document and paidAt is one flag.
@@ -1053,7 +1134,7 @@ export type RegisteredPaymentVerdict =
 export function classifyRegisteredPayment(
   invoice: XeroInvoice,
   registrations: RegisteredPaymentRow[],
-  ledgerObservedBefore: Date,
+  ledgerObservedBefore: LedgerReadFence | null,
 ): RegisteredPaymentVerdict {
   const undecided: string[] = []
   const posted: string[] = []
@@ -1068,11 +1149,14 @@ export function classifyRegisteredPayment(
       && typeof row.externalTransactionId === 'string'
       && row.externalTransactionId.trim() !== ''
       && row.syncedAt != null
+      // No fence, no decision: see the NULL FENCE note above.
+      && ledgerObservedBefore != null
       // STRICTLY before, matching the sibling's `OR: [{ syncedAt: null }, { syncedAt: { gte:
-      // ledgerObservedBefore } }]` undecidable predicate EXACTLY. At the tie the two would otherwise
+      // fence.databaseClock } }]` undecidable predicate EXACTLY. At the tie the two would otherwise
       // give opposite answers about the same row, and the safe side of a tie about a supplier payment
-      // is "this read cannot speak for it".
-      && row.syncedAt.getTime() < ledgerObservedBefore.getTime()
+      // is "this read cannot speak for it". Both sides of this `<` are database readings — the
+      // comparison is meaningless, and was actively dangerous, between two hosts.
+      && row.syncedAt.getTime() < ledgerObservedBefore.databaseClock.getTime()
     ) {
       posted.push(row.externalTransactionId.trim())
       continue

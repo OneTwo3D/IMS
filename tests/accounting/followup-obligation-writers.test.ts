@@ -233,6 +233,16 @@ const db = {
   async $transaction(fn: (tx: unknown) => Promise<unknown>) {
     return fn(db)
   },
+  // o3d-clxw r4: the SYNCED write stamps `syncedAt` from the DATABASE's clock rather than this
+  // host's, in the same transaction, so the payment poller's reversal fence compares two readings of
+  // one clock instead of two machines' wall clocks.
+  async $executeRaw(strings: TemplateStringsArray, ...values: unknown[]) {
+    const sql = strings.join('?')
+    if (!/UPDATE accounting_sync_logs/.test(sql)) throw new Error(`fake db: unexpected raw statement ${sql}`)
+    const row = state.syncRows.find((candidate) => candidate.id === values[0])
+    if (row) row.syncedAt = new Date()
+    return 1
+  },
 }
 
 mock.module('@/lib/db', { namedExports: { db } })

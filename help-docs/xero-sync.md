@@ -753,17 +753,39 @@ still queued, on the wire, **failed**, or finished after this Xero read was take
 A *failed* attempt counts as unresolved deliberately: the connector posts before it records the
 outcome, so a lost response is written down identically to a rejection.
 
-Such a bill decides itself: a registration that really did post modified the invoice in Xero, so the
-invoice reappears in a later delta and the verdict completes on its own. One that genuinely never
-posted will not, and the bill stays marked paid with the warning repeating — reconcile it in Xero and
-**cancel** the named sync entry, which takes it out of the question without destroying the evidence
-that an attempt was made.
+**A withheld verdict is asked again on a timer.** It cannot be left to resolve itself: the delta
+returns an invoice only when it *changes*, and what usually settles a withheld verdict is not a change
+in Xero at all — it is the IMS's own registration finishing, or somebody cancelling a failed one.
+Neither touches the invoice. So every hour the poll takes the withheld documents that have rested
+longest, reads those invoices **by id** (bypassing the delta entirely) and re-runs exactly the same
+decision. When the disagreement is settled — the reversal is finally acted on, the ledger catches up,
+or the IMS no longer holds the document as paid — the record is **closed** and the document leaves the
+queue for good. While it is still withheld the warning is simply rewritten, which restarts its timer
+and sends it to the back of the queue, so one stuck document can never crowd out the others. The
+operator alert is raised once, when the verdict is first withheld, not on every recheck.
 
-**A withheld verdict is now an alert, not just a log line.** Withholding writes nothing to the
+A registration that genuinely never posted stays undecided for ever on its own, and that is what the
+recheck keeps visible: reconcile the bill in Xero and **cancel** the named sync entry, which takes it
+out of the question without destroying the evidence that an attempt was made. The next recheck then
+lets the verdict through.
+
+**A withheld verdict is an alert, not just a log line.** Withholding writes nothing to the
 database, so the warning is its only record — and the poll then moves its cursor past the invoice,
 which the delta returns only when it changes again. Each withheld verdict therefore raises a
 notification to every active admin as well as the activity warning, and if either write fails the poll
 **holds its cursor** so the disagreement is re-derived on the next poll rather than lost.
+
+**"Had this payment posted yet?" is answered by the database's clock, not by any server's.** Deciding
+that a payment was *removed* rests on knowing whether the IMS's own registration had already reached
+Xero when the snapshot was taken. The IMS runs on more than one instance, and comparing the clock of
+the instance that posted the payment against the clock of the instance running the poll is not an
+ordering at all: if the polling instance ran even a little ahead, a payment posted *after* the snapshot
+looked as though it had posted *before* it, and its (perfectly correct) absence read as proof of
+removal — clearing `paidAt` and re-arming **Mark Paid** over money that had already left the bank.
+Both ends are now timestamps taken from the database itself: the registration is stamped by the
+database when it completes, and the poll asks the database for the time immediately before asking
+Xero. If the database cannot answer, the poll orders nothing and withholds every reversal that would
+have depended on it.
 
 All four checks are answered by a **single** request that asks Xero only for invoices changed since
 the last successful poll, using the `If-Modified-Since` header. The poll advances its cursor only
