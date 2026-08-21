@@ -3257,9 +3257,10 @@ async function guardSalesInvoiceNumberOwnership(
   referenceId: string,
   payload: SyncPayload,
   /**
-   * The claim this worker HOLDS — the fence's own writes are conditioned on it. A holder rather than
-   * the instant (o3d-550x): the slot stamp below is written some way after this guard is entered,
-   * and a snapshot taken here would fence on a claim that may since have moved.
+   * The claim this worker HOLDS — the fence's own writes are conditioned on it. A holder, not the
+   * instant: on this branch the claim is RENEWED before every remote mutation, and the slot stamp
+   * below is written some way after this guard is entered, so a snapshot taken here would fence on
+   * a claim that has since moved and would match nothing at all.
    */
   held: HeldClaim,
 ): Promise<{ post: true; beforePost: BeforeRemoteWrite } | { post: false; result: EntryResult }> {
@@ -3446,7 +3447,9 @@ async function processClaimedEntry(
       // o3d-k26m.5: the number must be ours to post under. Refusing is recoverable; overwriting a
       // live invoice is not. Runs AFTER the cancelled-order backstop (no point asking the ledger
       // about an order that must not be invoiced at all) and BEFORE anything is sent.
-      const numberFence = await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload, held)
+      // THE LEASE, not a snapshot: it satisfies `HeldClaim` structurally, so the slot stamp is fenced
+      // on the claim as renewed by the fence immediately before the post (o3d-xl63 r5/r6).
+      const numberFence = await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload, lease)
       if (!numberFence.post) return numberFence.result
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice', payload)
       // r5 #1: the claim is re-taken HERE, after the scope read and the cancelled-order guard, not once at the top of the entry.

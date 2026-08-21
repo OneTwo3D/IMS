@@ -194,6 +194,20 @@ mock.module('@/lib/activity-log', {
 mock.module('@/lib/connectors/xero/auth', {
   namedExports: {
     getGrantedScopes: async () => { state.onScopes?.(); return null },
+    // o3d-k26m.5 (merged into development after this double was written): before a sales-invoice
+    // CREATE is sent, the processor asks the LEDGER who holds the invoice number, and that lookup
+    // resolves the connection itself. A double without this made the lookup throw, and the fence
+    // FAILS CLOSED — so every test in this file refused before it posted, and the lease properties
+    // they exist to prove were never reached.
+    getAccessToken: async () => ({ accessToken: 'access-1', tenantId: 'tenant-A' }),
+  },
+})
+// The ledger's answer: NOBODY holds this number, from the organisation this worker is connected to.
+// Mocked rather than driven through the HTTP layer because this file is about the claim lease, not
+// about number ownership — that fence is pinned in tests/connectors/xero-invoice-number-post-slot.
+mock.module('@/lib/connectors/xero/invoice-number-claim', {
+  namedExports: {
+    lookupXeroInvoiceNumberClaim: async () => ({ ok: true, claims: [], tenantId: 'tenant-A' }),
   },
 })
 mock.module('@/lib/connectors/xero/invoices', {

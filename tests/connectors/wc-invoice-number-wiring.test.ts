@@ -264,11 +264,11 @@ function salesInvoiceCase(): string {
 
 test('the sales-invoice CREATE asks who owns the number before it sends anything', () => {
   const body = salesInvoiceCase()
-  // `held`, not `claimedAt`: o3d-k26m.5's own `heldClaimWhere` and o3d-550x's collapsed into one
+  // `lease`, not `claimedAt`: o3d-k26m.5's own `heldClaimWhere` and o3d-xl63's collapsed into one
   // definition (development's copy said in as many words to keep one if both landed), and the
-  // surviving one takes a HOLDER asked for its instant at the point of use. The ORDER this test
-  // pins — fence before post — is unchanged; only the name of what is threaded through it moved.
-  const fence = body.indexOf('await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload, held)')
+  // surviving one takes a HOLDER asked for its instant at the point of use — which on this branch is
+  // the renewing remote-write lease. The ORDER this test pins — fence before post — is unchanged.
+  const fence = body.indexOf('await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload, lease)')
   const push = body.indexOf('await pushSalesInvoice({')
   assert.ok(fence > 0, 'the create must consult the ownership fence')
   assert.ok(fence < push, 'the fence must run BEFORE the post, not after it')
