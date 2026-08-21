@@ -5,11 +5,12 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
-import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
+import { isMaskedSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
 import {
   getActiveSettingEnvOverrides,
   getSettingValue,
   getSettingValues,
+  maskSettingSecret,
   serializeSettingValue,
 } from '@/lib/settings-store'
 import { validateWooCommerceBaseUrl } from '@/lib/connectors/woocommerce/url-safety'
@@ -29,9 +30,11 @@ import {
   buildWooCommerceConnectionFingerprint,
   evaluateWooCommerceEnableConnectionGate,
 } from '@/lib/connectors/woocommerce/connection-test-gate'
+import { normaliseWcOrderStatus } from '@/lib/connectors/woocommerce/order-status-filter'
 
-// All mutating exports in this file require the `sync` permission.
-async function requireAdmin() {
+// All mutating exports in this file require the `sync` permission. Renamed from `requireAdmin`,
+// which shadowed the ADMIN-only helper of that name in @/lib/auth/server.
+async function requireSyncPermission() {
   return requirePermission('sync')
 }
 
@@ -120,7 +123,7 @@ const SYNC_DEFAULTS: WcSyncSettings = {
 }
 
 export async function getWcSyncSettings(): Promise<WcSyncSettings> {
-  await requireAdmin()
+  await requireSyncPermission()
   const map = await getSettingValues(SYNC_SETTING_KEYS)
   const result = { ...SYNC_DEFAULTS }
   for (const k of Object.keys(result) as (keyof WcSyncSettings)[]) {
@@ -202,6 +205,52 @@ async function validateWooStoreBaseCurrency(credentials?: { url: string; key: st
   return { ok: true, storeCurrency, baseCurrency }
 }
 
+/**
+ * o3d-tj6v follow-up: refuse to STORE an empty order-status selection.
+ *
+ * `wc_sync_order_statuses` holds a JSON array of WooCommerce statuses. Unticking every box
+ * in Settings -> Sync -> WooCommerce writes `[]`, and `[]` is not a usable configuration on
+ * any route: the sweeps turn the selection into a `?status=<list>` query, and an EMPTY
+ * `status=` means ANY status to the WooCommerce REST API — so "import nothing" was read by
+ * the store as "import everything", the exact inversion of the request. Honouring it as
+ * "import nothing" instead is correct at read time, but then every sweep run reports a
+ * configuration error for a state the operator was allowed to save in the first place.
+ *
+ * So it is rejected HERE, at the persistence boundary, the same way a WC->SHIPPED status
+ * mapping is (o3d-gz6). Disabling order sync is what "import nothing" is for, and it is one
+ * checkbox away.
+ *
+ * DELIBERATELY NARROW. Only a well-formed array that selects nothing is refused:
+ *
+ *   - a MISSING key means a partial save that is not touching this setting;
+ *   - a BLANK value means "unset", which every reader resolves to the default selection;
+ *   - a non-array or otherwise malformed value is a corrupt row, not an expressed choice,
+ *     and readers already fall back to the default for it.
+ *
+ * Only emptiness is decided here — normalisation (`wc-processing` -> `processing`, de-duping)
+ * belongs to the readers, and is not re-implemented in this gate.
+ */
+function rejectEmptyWcOrderStatusSelection(raw: string | undefined): string | null {
+  if (raw === undefined) return null
+  if (raw.trim() === '') return null
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!Array.isArray(parsed)) return null
+
+  const selected = parsed.filter((entry) => typeof entry === 'string' && entry.trim() !== '')
+  if (selected.length > 0) return null
+
+  return 'Select at least one WooCommerce order status to import. '
+    + 'An empty selection cannot be saved: it is not a filter WooCommerce can be asked for, '
+    + 'and it would leave every order sweep reporting a configuration error. '
+    + 'To stop importing orders entirely, turn off "Enable order sync" instead.'
+}
+
 async function getCurrentWcConnectionFingerprint(): Promise<string> {
   const [url, key, secret] = await Promise.all([
     getSettingValue('wc_url'),
@@ -216,7 +265,7 @@ async function getCurrentWcConnectionFingerprint(): Promise<string> {
 }
 
 export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
-  await requireAdmin()
+  await requireSyncPermission()
   if (shouldFreshGateSecretWrite(data, 'wc_webhook_secret')) {
     // audit-ohou: return the structured fresh-auth failure so the client can
     // prompt step-up re-auth and retry, instead of throwing an opaque 500 that
@@ -228,6 +277,13 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
       if (freshAuthFailure) return freshAuthFailure
       throw e
     }
+  }
+  // Cheap, local and specific, so it is decided before the remote currency probe and the
+  // connection gate: an operator who unticked every status should be told that, not handed
+  // whichever unrelated check happens to fail first.
+  const emptyStatusSelection = rejectEmptyWcOrderStatusSelection(data.wc_sync_order_statuses)
+  if (emptyStatusSelection) {
+    return { success: false, error: emptyStatusSelection, code: 'wc_no_order_statuses_selected' }
   }
   if (data.wc_sync_enabled === 'true') {
     const validation = await validateWooStoreBaseCurrency()
@@ -551,7 +607,7 @@ export async function testWcCredentials(url: string, key: string, secret: string
 }
 
 export async function getWcCredentials(): Promise<{ url: string; key: string; secret: string; secretMasked: boolean; envOverrides: Record<string, string>; connectionTest: IntegrationConnectionTestState }> {
-  await requireAdmin()
+  await requireSyncPermission()
   const [map, connectionTest] = await Promise.all([
     getSettingValues(['wc_url', 'wc_consumer_key', 'wc_consumer_secret']),
     getIntegrationConnectionTestState('woocommerce'),
@@ -560,10 +616,21 @@ export async function getWcCredentials(): Promise<{ url: string; key: string; se
   const secret = map.get('wc_consumer_secret') ?? ''
   return {
     url: map.get('wc_url') ?? '',
-    // Never send full credentials to client — mask them
-    key: maskSecret(key, 7),
-    secret: maskSecret(secret, 7),
+    // Never send full credentials to client — mask them.
+    // maskSettingSecret (not maskSecret) so the key each mask covers is declared
+    // against SENSITIVE_SETTING_KEYS: masking here IS the statement that the value
+    // is a credential, and it must reach the gate on getSetting too (o3d-512h).
+    key: maskSettingSecret('wc_consumer_key', key, 7),
+    secret: maskSettingSecret('wc_consumer_secret', secret, 7),
     secretMasked: !!secret,
+    // Deliberately computed rather than hardcoded to `{}`: WC_CONSUMER_KEY / WC_CONSUMER_SECRET are
+    // install-time SEEDS, not overrides (o3d-ecbj), so this is normally empty — but if either is ever
+    // put back into SETTING_ENV_FALLBACKS, the Connection banner starts telling the operator again
+    // instead of quietly lying about which credential is in force.
+    //
+    // wc_url is absent for the SAME reason and by the same decision, reached separately (o3d-tj6v r2):
+    // WC_STORE_URL seeds the setting at install time and never overrides it, so there is no override
+    // to warn about. Round 1 of this branch briefly wired it up and round 2 took it back out.
     envOverrides: getActiveSettingEnvOverrides(['wc_consumer_key', 'wc_consumer_secret']),
     connectionTest,
   }
@@ -585,7 +652,7 @@ export type TaxRateMappingRow = {
 }
 
 export async function getShoppingTaxRateMappings(): Promise<TaxRateMappingRow[]> {
-  await requireAdmin()
+  await requireSyncPermission()
   const rows = await db.shoppingTaxRateMapping.findMany({
     where: { connector: 'woocommerce' },
     include: { taxRate: { select: { name: true } } },
@@ -607,7 +674,7 @@ export async function updateShoppingTaxRateMapping(
   externalTaxRateId: string,
   taxRateId: string,
 ): Promise<{ success: boolean }> {
-  await requireAdmin()
+  await requireSyncPermission()
   await db.shoppingTaxRateMapping.update({
     where: {
       connector_externalTaxRateId: {
@@ -622,7 +689,7 @@ export async function updateShoppingTaxRateMapping(
 }
 
 export async function deleteShoppingTaxRateMapping(id: string): Promise<{ success: boolean }> {
-  await requireAdmin()
+  await requireSyncPermission()
   await db.shoppingTaxRateMapping.delete({ where: { id } })
   revalidatePath('/sync')
   return { success: true }
@@ -637,7 +704,7 @@ export async function importWcTaxRatesFromApi(): Promise<{
   error?: string
 }> {
   try {
-    await requireAdmin()
+    await requireSyncPermission()
     const { importWcTaxRates } = await import('@/lib/connectors/woocommerce/sync/taxes')
     const result = await importWcTaxRates()
 
@@ -674,7 +741,7 @@ export type StatusMappingRow = {
 }
 
 export async function getShoppingStatusMappings(): Promise<StatusMappingRow[]> {
-  await requireAdmin()
+  await requireSyncPermission()
   const rows = await db.shoppingStatusMapping.findMany({
     where: { connector: 'woocommerce' },
     orderBy: { externalStatus: 'asc' },
@@ -683,7 +750,7 @@ export async function getShoppingStatusMappings(): Promise<StatusMappingRow[]> {
 }
 
 export async function upsertShoppingStatusMapping(externalStatus: string, imsStatus: string): Promise<{ success: boolean }> {
-  await requireAdmin()
+  await requireSyncPermission()
   // o3d-gz6: never let a WooCommerce status map to SHIPPED. SHIPPED must reflect a REAL dispatch (a
   // shipment row), not a storefront status — importWcOrder writes this mapping straight into
   // SalesOrder.status, so a WC->SHIPPED mapping mints "false-SHIPPED" orders (SHIPPED with no shipment)
@@ -693,14 +760,21 @@ export async function upsertShoppingStatusMapping(externalStatus: string, imsSta
       'A WooCommerce status cannot map to SHIPPED — SHIPPED is set only by a real dispatch, not a '
       + 'storefront status (o3d-gz6).')
   }
+  // o3d-tj6v r4: store the CANONICAL slug. WooCommerce reports `on-hold`; the Sync page lets an
+  // operator type `wc-on-hold`, and every reader compared raw strings, so the mapping silently
+  // never matched — while the "Import order statuses" selection, which normalises, treated the two
+  // as the same status. Normalising at the write boundary means the table can only hold one
+  // spelling from here on; `findWcStatusMapping` still reads the older spellings already stored.
+  const canonicalStatus = normaliseWcOrderStatus(externalStatus)
+  if (!canonicalStatus) throw new Error('A WooCommerce status mapping needs a status slug.')
   await db.shoppingStatusMapping.upsert({
     where: {
       connector_externalStatus: {
         connector: 'woocommerce',
-        externalStatus,
+        externalStatus: canonicalStatus,
       },
     },
-    create: { connector: 'woocommerce', externalStatus, imsStatus: imsStatus as never },
+    create: { connector: 'woocommerce', externalStatus: canonicalStatus, imsStatus: imsStatus as never },
     update: { imsStatus: imsStatus as never },
   })
   revalidatePath('/sync')
@@ -724,7 +798,7 @@ export type SyncLogRow = {
 }
 
 export async function getShoppingSyncLogs(limit = 50): Promise<SyncLogRow[]> {
-  await requireAdmin()
+  await requireSyncPermission()
   const rows = await db.shoppingSyncLog.findMany({
     where: { connector: 'woocommerce' },
     orderBy: { createdAt: 'desc' },
@@ -763,7 +837,7 @@ export async function createWcWebhooks(): Promise<{
   existing: number
   errors: string[]
 }> {
-  await requireAdmin()
+  await requireSyncPermission()
 
   const appUrl = await getPublicAppUrl()
   if (!appUrl) return { success: false, created: 0, existing: 0, errors: ['Public app URL is not configured'] }
@@ -833,7 +907,7 @@ export async function createWcWebhooks(): Promise<{
  * the UI will simply fall back to free-text entry or historical combos.
  */
 export async function getWcActivePaymentGateways(): Promise<Array<{ id: string; title: string }>> {
-  await requireAdmin()
+  await requireSyncPermission()
   try {
     const { wcFetch } = await import('@/lib/connectors/woocommerce/api')
     const { data, error } = await wcFetch('/payment_gateways')
@@ -856,13 +930,13 @@ export async function probeFxHelperPluginAction(): Promise<{
   httpStatus?: number
   message: string
 }> {
-  await requireAdmin()
+  await requireSyncPermission()
   const { probeFxHelperPlugin } = await import('@/lib/connectors/woocommerce/fx-rates')
   return probeFxHelperPlugin()
 }
 
 export async function pushFxRatesToWcNow(): Promise<{ success: boolean; pushed: number; supported: boolean; error?: string }> {
-  await requireAdmin()
+  await requireSyncPermission()
   try {
     const { pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
     const result = await pushCurrentFxRatesToWc()
@@ -897,7 +971,7 @@ export async function pushFxRatesToWcNow(): Promise<{ success: boolean; pushed: 
 }
 
 export async function triggerManualSync(type: 'orders' | 'products' | 'stock'): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  await requireAdmin()
+  await requireSyncPermission()
   try {
     if (type === 'orders') {
       const { syncNewWcOrders } = await import('@/lib/connectors/woocommerce/sync/order-import')

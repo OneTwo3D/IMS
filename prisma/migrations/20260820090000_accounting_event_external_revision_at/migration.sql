@@ -1,0 +1,39 @@
+-- o3d-cvj9 r3 (Codex r2 finding 1): record the EXTERNAL system's own revision stamp, because no
+-- local timestamp orders a document's edits.
+--
+-- Round 2 ordered two competing revisions by `accounting_events."createdAt"`, arguing the row is
+-- written at ENQUEUE and so the stamps are in edit order. The column default is CURRENT_TIMESTAMP,
+-- which in PostgreSQL is TRANSACTION START time, not the time the row was written. Verified against
+-- onetwo3d_ims_dev inside a rolled-back transaction:
+--
+--   BEGIN;
+--     SELECT now() = transaction_timestamp();               -- t
+--     SELECT pg_sleep(0.75);
+--     CREATE TEMP TABLE p (id int, created_at timestamptz DEFAULT now());
+--     INSERT INTO p (id) VALUES (1);
+--     SELECT created_at = transaction_timestamp(),          -- t
+--            clock_timestamp() - created_at;                -- 00:00:00.774525
+--   ROLLBACK;
+--
+-- So a long enqueueing transaction that BEGAN earlier but committed later stamps its row EARLIER
+-- than an edit enqueued (and committed) after it. Enqueue order is not commit order, commit order
+-- is not the order the edits landed at Xero, and only the last of those decides what the document
+-- now says. The row `id` tie-break r2 added on top of that stamp inherited the same defect and is
+-- removed with it.
+--
+-- Xero stamps `Invoice.UpdatedDateUTC` on the document as it applies each write and returns it in
+-- the response to that write. Two writes to one invoice are serialised by Xero, on one clock, so
+-- their stamps ARE the order the edits were applied. That is the ordering this column carries.
+--
+-- Nullable with no backfill and no default, deliberately: there is no honest value for a row that
+-- posted before this column existed, and inventing one (its createdAt, its sync log's syncedAt)
+-- would mix two clocks inside one comparison key. NULL means "not established", and an unordered
+-- pair is REFUSED rather than guessed at, which keeps the underlying P2002 fatal and visible.
+-- Adding a nullable column with no default is metadata-only on Postgres (no table rewrite).
+--
+-- A revision whose HOLDER is the document's CREATE needs no stamp at all: a document must exist
+-- before it can be revised, so the create's write provably precedes every revision's write. That
+-- rule, not this column, carries the ordinary create -> first-edit handover, which is why existing
+-- documents keep working with every pre-existing row left NULL.
+ALTER TABLE "accounting_events"
+  ADD COLUMN "externalRevisionAt" TIMESTAMP(3);

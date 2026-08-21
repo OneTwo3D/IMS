@@ -1,133 +1,95 @@
 'use server'
 
-import { execFile } from 'child_process'
 import { existsSync, readFileSync } from 'fs'
 import os from 'os'
-import path from 'path'
-import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
-import { getAllCronJobs } from '@/lib/cron-jobs'
 import { getCronSecret } from '@/lib/cron-secret'
 import {
-  buildOtiCrontabBlock,
   emulateRuntimeSecretExtraction,
-  isCronSafePath,
   parseOtiCrontabStatus,
-  spliceOtiBlock,
-  type CrontabSecretRef,
   type OtiCrontabStatus,
 } from '@/lib/crontab-sync'
-import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
-import { getPublicAppUrl } from '@/lib/public-app-url'
-
-function readOwnCrontab(): Promise<string> {
-  return new Promise<string>((resolve) => {
-    execFile('crontab', ['-l'], { timeout: 5000 }, (err, stdout) => {
-      resolve(err ? '' : stdout)
-    })
-  })
-}
+import { reconcileCrontab, readOwnCrontab } from '@/lib/crontab-reconcile'
+import { serializeSettingValue } from '@/lib/settings-store'
+import { runPostCommit } from '@/lib/domain/post-commit'
+import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
 
 /**
- * Prefer cron lines that read CRON_SECRET from the app's .env at RUNTIME
- * (ryxy: an embedded literal silently 401'd every managed job after a secret
- * rotation) — but ONLY when the Node-side emulation of the exact shell
- * pipeline proves the .env yields the ACTIVE process secret byte-for-byte
- * (Codex: line presence alone chose runtime mode even when the .env value was
- * stale, exotic, or shadowed by a service-manager override). Everything else
- * embeds the current literal, which is always correct at sync time.
- */
-function resolveSecretRef(secret: string): CrontabSecretRef {
-  const envFilePath = path.join(process.cwd(), '.env')
-  try {
-    if (
-      isCronSafePath(envFilePath)
-      && existsSync(envFilePath)
-      && emulateRuntimeSecretExtraction(readFileSync(envFilePath, 'utf8')) === secret
-    ) {
-      return { kind: 'env-file', envFilePath }
-    }
-  } catch {
-    // unreadable .env → embedded fallback below
-  }
-  return { kind: 'literal', secret }
-}
-
-/**
- * Reads all cron_* settings from the DB, generates the crontab block between
- * OTI markers, and writes it via `crontab -` (safe, no shell injection).
- * Writes the CALLING OS user's crontab — i.e. the user the app runs as.
+ * Reconcile the OS crontab from the stored cron_* settings, behind the permission gate.
+ *
+ * The gate and the work are separate modules now (o3d-osl8 round 9, finding 4): the work lives in
+ * lib/crontab-reconcile.ts, and callers that have ALREADY run this same permission check call it
+ * directly rather than re-entering a gate whose failure mode is a thrown `NEXT_REDIRECT`.
+ *
+ * NO UI CALLS THIS TODAY, stated rather than implied. The operator recovery for a crontab that is
+ * behind is Settings -> System -> Scheduler -> Save & Apply, which goes through
+ * `saveCronJobSettings` below; the drift warnings on that page say so. The rounds 7-8 warning text
+ * said "use Sync crontab there", naming a button that was never built (corrected in
+ * lib/domain/integrations/scheduler-followup.ts). This export is kept as the gated entry point for
+ * an explicit re-sync, and it is the ONLY server action wrapping the ungated reconciliation.
  */
 export async function syncCrontab(): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
+  return reconcileCrontab()
+}
 
-  const secret = await getCronSecret()
-  if (!secret) {
-    return { success: false, error: 'Cron secret is not configured.' }
-  }
+export type CronJobSettingInput = {
+  settingKey: string
+  enabled: boolean
+  schedule: string
+}
 
-  const baseUrl = await getPublicAppUrl()
-  if (!baseUrl) {
-    return { success: false, error: 'Public app URL is not configured.' }
-  }
-  const pluginState = await getIntegrationPluginState()
-  const jobs = getAllCronJobs().filter((job) => isIntegrationModuleVisible(job.module, pluginState))
+/**
+ * SAVE EVERY SCHEDULED-JOB SETTING IN ONE TRANSACTION, THEN RECONCILE (o3d-osl8 round 9, finding 1).
+ *
+ * The scheduled-jobs editor used to fire `2 x jobs` parallel `setSetting` calls through
+ * `Promise.all`, then call `syncCrontab`. Two defects, one shape:
+ *
+ *   * PARTIAL COMMIT. `Promise.all` rejects on the first failure while the rest keep going, so a
+ *     failed save could leave an ARBITRARY SUBSET of the editor's rows stored — a crontab derived
+ *     from half of one operator edit — and the screen reported the whole save as failed.
+ *   * A COMMITTED WRITE REPORTED AS A FAILED SAVE. `setSetting` committed its upsert and then
+ *     awaited `logActivity` and `revalidatePath`; either rejecting rejected the action, and the
+ *     screen's outer catch rendered that as "an error occurred" over rows that are in the database.
+ *
+ * One transaction removes the first. The post-commit guard removes the second: nothing after the
+ * commit — the audit row, the cache revalidation, the crontab write — may reject this action.
+ */
+export async function saveCronJobSettings(jobs: CronJobSettingInput[]): Promise<SettingSaveResult> {
+  await requirePermission('settings.company')
 
-  // Read enabled/schedule settings for every registered job, plus legacy keys
-  const settingKeys = jobs.flatMap((j) => [
-    `cron_${j.settingKey}_enabled`,
-    `cron_${j.settingKey}_schedule`,
+  const entries: Array<[string, string]> = jobs.flatMap((job) => [
+    [`cron_${job.settingKey}_enabled`, String(job.enabled)] as [string, string],
+    [`cron_${job.settingKey}_schedule`, job.schedule] as [string, string],
   ])
-  const legacyKeys = jobs
-    .filter((j) => j.legacyEnabledKey)
-    .map((j) => j.legacyEnabledKey!)
+  if (entries.length === 0) return { status: 'saved' }
 
-  const rows = await db.setting.findMany({
-    where: { key: { in: [...settingKeys, ...legacyKeys] } },
-  })
-  const settings = new Map(rows.map((r) => [r.key, r.value]))
-
-  const logPath = process.env.OTI_CRON_LOG_PATH?.trim() || undefined
-  const block = buildOtiCrontabBlock({ jobs, settings, secretRef: resolveSecretRef(secret), baseUrl, logPath })
-  if (!block.ok) return { success: false, error: block.error }
-
-  const existingCrontab = await readOwnCrontab()
-  const newCrontab = spliceOtiBlock(existingCrontab, block.lines)
-
-  // Write via `crontab -` (stdin pipe, no shell injection)
-  const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
-    const proc = execFile('crontab', ['-'], { timeout: 5000 }, (err) => {
-      if (err) {
-        resolve({ success: false, error: `crontab write failed: ${err.message}` })
-      } else {
-        resolve({ success: true })
-      }
-    })
-    proc.stdin?.write(newCrontab)
-    proc.stdin?.end()
+  await db.$transaction(async (tx) => {
+    for (const [key, value] of entries) {
+      await tx.setting.upsert({
+        where: { key },
+        create: { key, value: serializeSettingValue(key, value) },
+        update: { value: serializeSettingValue(key, value) },
+      })
+    }
   })
 
-  if (result.success) {
+  // POST-COMMIT. Split in two so the warning sentence stays true about WHICH artefact lags.
+  const local = await runPostCommit(async () => {
     await logActivity({
-      entityType: 'SYSTEM',
-      tag: 'system',
-      action: 'crontab_sync',
-      description: `Crontab synced from scheduled jobs settings (user ${os.userInfo().username})`,
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      description: `Updated scheduled job settings (${jobs.length} jobs)`,
     })
-  } else {
-    await logActivity({
-      entityType: 'SYSTEM',
-      tag: 'system',
-      action: 'crontab_sync',
-      level: 'ERROR',
-      description: `Crontab sync failed: ${result.error}`,
-    })
-  }
+  }, 'Failed to record the scheduled-job change')
+  if (local.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: local.error }
 
-  revalidatePath('/settings/system')
-  return result
+  const scheduler = await runPostCommit(reconcileCrontab, 'Failed to sync crontab')
+  if (scheduler.status === 'failed') return { status: 'post-commit-failed', step: 'scheduler', error: scheduler.error }
+  return { status: 'saved' }
 }
 
 export type CrontabDriftStatus = OtiCrontabStatus & {

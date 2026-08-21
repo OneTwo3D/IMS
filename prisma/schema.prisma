@@ -165,6 +165,25 @@ enum ProductionOrderStatus {
   CANCELLED
 }
 
+/**
+ * o3d-wf86 — how a local document came to hold an external accounting document id.
+ *
+ * Ordered by how much the link can be TRUSTED, which is the only thing a later reader wants:
+ *
+ *   BILL_KEYED_SYNC  the sync row named this exact bill, so the link is what the connector itself
+ *                    reported. Authoritative; allowed to overwrite a guess.
+ *   PO_KEYED_REPAIR  a legacy PurchaseOrder-keyed row was attributed to this bill by the repair
+ *                    sweep. Carefully guarded, but still a deduction from the local population
+ *                    rather than something the ledger said.
+ *   MANUAL           an operator released a stale claim and re-linked it by hand, having confirmed
+ *                    the holder was stale (scripts/release-accounting-external-id-claim.ts).
+ */
+enum AccountingLinkSource {
+  BILL_KEYED_SYNC
+  PO_KEYED_REPAIR
+  MANUAL
+}
+
 enum AccountingSyncType {
   PURCHASE_INVOICE
   PURCHASE_INVOICE_UPDATE
@@ -200,6 +219,11 @@ enum AccountingSyncType {
   // rounding residue (same guard — sub-penny swept, material gaps flagged never swept).
   DAILY_BATCH_TRANSIT_RECONCILIATION
   UNEARNED_REV_REVERSAL
+  // o3d-0i5y r9: reverses the part of a Group A2 Allocated-Inventory debit that an allocation
+  // rewrite has ORPHANED — units A2 posted for that no longer sit on any allocation row, so no
+  // dispatch will ever credit them and no refund will ever reach them. DR Inventory /
+  // CR Allocated Inventory, raised inside the same transaction as the rewrite that orphaned them.
+  ALLOCATION_REVERSAL
   BILL_PAYMENT
   REALISED_FX_JOURNAL
   UNREALISED_FX_JOURNAL
@@ -568,7 +592,7 @@ model TaxRateComponent {
 
 model Warehouse {
   id                    String        @id @default(cuid())
-  code                  String        @unique // EAR2, CBG, RES, QUA
+  code                  String        @unique // e.g. MIL1, CBG, RES, QUA (o3d-0o3y: EAR2/Earith retired when Fulfillable moved us to MIL1/Mildenhall)
   name                  String
   type                  WarehouseType @default(STANDARD)
   availableForSale      Boolean       @default(true)
@@ -1445,6 +1469,17 @@ model PurchaseInvoice {
   // Postgres does not treat NULLs as equal, so this is precisely a partial unique index over the
   // bills that HAVE an external id: any number of bills may be unlinked.
   accountingInvoiceId String?  @unique @map("accounting_invoice_id")
+  // o3d-wf86: HOW this bill acquired that id. NULL means "nobody recorded it" — every row written
+  // before this column existed, and that unknown is exactly the state that makes a conflict
+  // unadjudicable, so it is left honest rather than backfilled with a guess.
+  //
+  // The authoritative bill-keyed sync and the legacy newest-unlinked-bill repair used to write the
+  // same column the same way, so nothing downstream could tell a PROVEN link from a GUESSED one and
+  // the sweep could only ever refuse (EXTERNAL_ID_LINKED_ELSEWHERE). Recording the source is half of
+  // what an automatic resolution would need; the other half is connector-side confirmation — GET the
+  // remote bill and compare it against the local one — which does not exist, so the sweep still
+  // refuses and still names a manual action. This makes the refusal INFORMATIVE, not automatic.
+  accountingInvoiceIdSource AccountingLinkSource? @map("accounting_invoice_id_source")
   paidAt          DateTime?
   paymentAccountId   String?   // connector account id (e.g. Xero bank AccountID) used to pay this bill
   paymentAccountName String?   // snapshot of the bank account name at payment time
@@ -1732,6 +1767,61 @@ model SalesOrder {
   // back to deriving from the stamp.
   revenueDeferredBatchRef    String?            @map("accounting_revenue_deferred_batch_ref")
   inventoryAllocatedBatchRef String?            @map("accounting_inventory_allocated_batch_ref")
+  // o3d-o97 r3 — WHAT A2 ACTUALLY RAISED, AND WHERE.
+  //
+  // `allocationBatchAmount` above says how many pounds A2 VALUED this order at. It does NOT say a
+  // journal was ever created (the batch log is raised only when the window's ROUNDED total is
+  // positive, while the amount is written for every member row), it does not say that journal
+  // reached a ledger, and it names no ledger and no account. A refund crediting Allocated
+  // Inventory off that number alone can credit an account that was never debited, or the wrong
+  // ledger entirely after a connector switch.
+  //
+  // These three are written in the SAME UPDATE as the stamp and the amount, and only when the A2
+  // journal row was actually created:
+  //
+  //   syncLogId   the AccountingSyncLog row's own id — a value that cannot exist unless
+  //               `createPendingSyncLog` created the row, so an amount can no longer imply a
+  //               journal. It is also the handle the refund resolves to read that row's STATUS:
+  //               queued is not posted, and CANCELLED/FAILED is not posted at all.
+  //   connector   which LEDGER the journal was raised into. A reversal is raised on the connector
+  //               that is active NOW; if that is not the one A2 debited, the credit lands in a
+  //               ledger with no matching debit.
+  //   accountCode the exact Allocated Inventory account A2 DEBITED. The reversal credits whatever
+  //               the settings name today, which is not necessarily the same account.
+  //
+  // NULL on rows staged before these columns existed: there is nothing that can retroactively
+  // prove a 2025 batch posted, so those rows keep the older amount-implies-posting inference.
+  allocationBatchSyncLogId   String?            @map("accounting_allocation_batch_sync_log_id")
+  allocationBatchConnector   String?            @map("accounting_allocation_batch_connector")
+  allocationBatchAccountCode String?            @map("accounting_allocation_batch_account_code")
+  // o3d-0i5y r12 — THE POUNDS ALREADY CREDITED BACK OUT OF ALLOCATED INVENTORY BY AN
+  // ALLOCATION_REVERSAL, ON A ROW RETENTION CANNOT REACH.
+  //
+  // Group A2 debits Allocated Inventory; exactly three things credit it. Group B credits what a
+  // shipment dispatches, a refund credits what it takes back, and — since this branch — an
+  // ALLOCATION_REVERSAL credits units that were ORPHANED off the order and will do neither.
+  // o3d-o97's open-balance arithmetic subtracts the first two from `allocationBatchAmount` and
+  // knew nothing of the third, so a cancelled-then-refunded order would have credited the same
+  // units TWICE (o3d-xlk7).
+  //
+  // The relief is proved from the reversal journals' own lines, netted, exactly as o3d-o97 proves
+  // the other two. This column is the record those journals cannot be, because
+  // `retention_sync_logs_months` HARD-DELETES an AccountingSyncLog row the moment it is terminal
+  // and past the cutoff — and an orphaning can precede its order's refund by many months. A
+  // reversal swept away would read as no relief at all, which is the double-credit again, later
+  // and quieter.
+  //
+  // It is a RUNNING TOTAL, because there is no per-orphaning business row to hang it on and one
+  // order can be trimmed many times. It is written in the same transaction as the enqueue that
+  // raised the journal, so it commits or rolls back with it. It is deliberately NOT reduced from
+  // `allocationBatchAmount`: that figure is what A2 POSTED, it is what
+  // `recreateMissingDailyBatchLogs` rebuilds the batch from, and `resolveStagedAllocationDebit`
+  // reads a recorded ZERO as positive proof that no debit stands — so netting a reversal into it
+  // would let a fully-reversed order clear its stamp and be posted all over again.
+  //
+  // NULL means "no ALLOCATION_REVERSAL has ever been raised for this order", which on and before
+  // deploy day is every row.
+  allocationReversalAmount   Decimal?  @db.Decimal(18, 4) @map("accounting_allocation_reversal_amount")
 
   notes             String?     // customer-visible notes
   internalNotes     String?     // private/staff notes
@@ -1782,6 +1872,22 @@ model SalesOrderLine {
   totalForeign    Decimal    @db.Decimal(18, 4)
   totalBase        Decimal    @db.Decimal(18, 4)
   cogsBase         Decimal?   @db.Decimal(18, 4) // set on dispatch
+  /// o3d-kouj: THE IMMUTABLE FULFILMENT-REQUIREMENT SNAPSHOT — the flat leaf requirement set for ONE
+  /// unit of this line's product, as expanded from the component graph at the moment this line first
+  /// acquired in-flight state (an allocation row). While the line holds an allocation row or a
+  /// committed shipment line it is never rewritten, so a later component-graph edit cannot change
+  /// what this order requires, what its picked set is judged against, or what its refund reverses.
+  ///
+  /// NULL means "no pinned recipe": the line has never been allocated, or predates this column. Every
+  /// reader resolves through `lineFulfillmentRequirements`, which falls back to expanding the current
+  /// graph — exactly the pre-snapshot behaviour — so there is ONE rule rather than a snapshot-aware
+  /// and a live-graph population that disagree about the same order.
+  ///
+  /// Shape: { version, productId, graphVersion, capturedAt, requirements: [{ productId, factor }] }
+  /// with `factor` an exact decimal STRING. See lib/products/fulfillment-requirement-snapshot.ts,
+  /// which is the only thing allowed to parse it and refuses rather than falling back when the
+  /// payload is present but unreadable.
+  fulfillmentRequirements Json? @map("fulfillment_requirements")
 
   order           SalesOrder @relation(fields: [orderId], references: [id])
   product         Product?   @relation(fields: [productId], references: [id])
@@ -1818,6 +1924,19 @@ model SalesOrderRefund {
   source          String?
   accountingRetryRequired Boolean @default(false) @map("accounting_retry_required")
   accountingWarning String?   @map("accounting_warning")
+  // o3d-o97 r3: THE CR ALLOCATED INVENTORY THIS REFUND'S OWN REVERSAL JOURNAL RAISED, written in
+  // the same transaction that decides it. A later refund on the same order must subtract what
+  // earlier refunds already relieved, and its only previous source was the earlier refund's
+  // UNEARNED_REV_REVERSAL sync payload — a row `retention_sync_logs_months` HARD-DELETES once it
+  // terminalises. With the row gone the relief reads ZERO and the residue reverses the whole A2
+  // debit a second time. Refund rows are never deleted by retention.
+  allocatedReliefAmount Decimal? @db.Decimal(18, 4) @map("accounting_allocated_relief_amount")
+  // o3d-o97 r3: why this refund could NOT account for the order's A2 debit, or null when it could.
+  // A refusal has to leave a remedy an operator can actually perform: the un-stage below is
+  // SUPPRESSED whenever this is set, so the A2 stamp survives and the standing A2 invariants keep
+  // reporting the order — and this string says, on a row that outlives the order's stamps, which
+  // record was missing and how many pounds are still sitting in Allocated Inventory.
+  allocationBasisUnresolved String? @map("accounting_allocation_basis_unresolved")
   accountingRetrySyncs Json?  @map("accounting_retry_syncs")
   // scjz.70: revenue-only chargeback — credit note reverses recognised revenue
   // against AR, but COGS reversal + inventory restock are suppressed (cost kept as
@@ -2174,8 +2293,51 @@ model AccountingSyncLog {
   payload               Json? // what was sent
   errorMessage          String?
   retryCount            Int                  @default(0)
+  /// o3d-e2mz: the identity of the CURRENT attempt on this row. Bumped by the processor every time
+  /// it claims the row (PENDING/stale-PROCESSING -> PROCESSING), and by any operator decision that
+  /// terminalises it. Status cannot identify an attempt: every path returns the row to a status it
+  /// already held (retryFailed* drives FAILED -> PENDING -> FAILED, a stale reclaim drives
+  /// PROCESSING -> PROCESSING), and retryCount is reset to 0 by retryFailed*, so neither is
+  /// monotonic. This is, so a decision taken about what was read can compare-and-swap on it and be
+  /// refused when the row has moved on to a different attempt.
+  ///
+  /// 0 means "no processor that participates in the fence has ever claimed this row" — the claim
+  /// bump makes the first attempt 1. A non-PENDING row still at 0 therefore cannot be fenced at all
+  /// and must be refused rather than guessed at (see lib/domain/accounting/sync-log-attempt.ts).
+  attemptRevision       Int                  @default(0) @map("attempt_revision")
+  /// o3d-nf9i r3 — HOW this row's terminal status was reached, when it was not reached by the
+  /// connector. NULL is the ordinary case: the status is whatever the processor's own writeback
+  /// wrote, so it is a CONNECTOR CONFIRMATION. 'OPERATOR_ASSERTION' means a human asserted the
+  /// outcome (app/actions/accounting-settlement.ts) and IMS verified NOTHING about it — no call was
+  /// made, no figure was compared, only a document id was typed in.
+  ///
+  /// It exists because a verdict has to carry its basis. Without this column a settled row is
+  /// byte-identical to a connector-confirmed one, and every reader that asks "did this post?" —
+  /// most importantly lib/domain/accounting/settlement-status.ts, which then compares the amount
+  /// IMS INTENDED to send against the document total — answers as if the ledger had confirmed it.
+  /// Xero will accept a payment for less than the invoice as a PART payment, so a matching pair of
+  /// local numbers is not evidence of anything on an asserted row. Readers must fail closed on it.
+  settlementBasis       String?              @map("settlement_basis")
   processingStartedAt   DateTime?
   syncedAt              DateTime?
+  // o3d-clxw r5 finding 1: the same instant as `syncedAt`, written by the same statement from a
+  // SINGLE evaluation of `clock_timestamp()` (stampSyncedAtFromDatabaseClock). The payment poller's
+  // reversal fence accepts a registration as ordered against the ledger read only when this column
+  // is present AND equal to `syncedAt` — so a row whose `syncedAt` came from an application host's
+  // wall clock (an old build during a deploy, either creating the row or rewriting it) is
+  // DISTINGUISHABLE from one the database stamped, and withholds instead of deciding. NULL is not a
+  // missing value here, it is "this row's completion time cannot be ordered against anything", and
+  // it is never backfilled: copying `syncedAt` into it would be the database vouching for a stamp it
+  // did not produce. See the migration for the full argument.
+  //
+  // r6 finding 1: the equality is a rule the DATABASE enforces, not one the reader can check. A
+  // trigger in the same migration clears this column whenever a statement changes `status`,
+  // `syncedAt`, `externalTransactionId` or `processingStartedAt` without minting a new marker in the
+  // same statement, and refuses one supplied by an INSERT — so a writer that does not know about the
+  // scheme (the previous release, a script, psql) destroys provenance rather than inheriting it,
+  // whatever millisecond it happens to land on. Triggers are invisible to this schema; the migration
+  // is where the rule lives.
+  syncedAtDatabaseClock DateTime?
   createdAt             DateTime             @default(now())
   // o3d-9kek: when the back-reference repair sweep last REACHED A VERDICT on this row
   // (its document is linked, or the row can never be attributed automatically). NULL =
@@ -2232,6 +2394,57 @@ model AccountingSyncLog {
   // Not a candidate-query predicate: an unstamped row is a candidate already. It only widens the
   // "back-reference done, follow-ups outstanding" pass that used to be FAILED-only.
   backReferenceFollowUpsPendingAt DateTime?
+  // o3d-k26m.5: the invoice number THIS row SET OUT TO POST under, written immediately before the
+  // request left and only once a live lookup had said the ledger did not hold that number yet.
+  //
+  // IT IS NOT A CLAIM OF OWNERSHIP, and round 2's version of this column was (Codex round 3). The
+  // inference it carried — "nobody held this number when the row set out, somebody holds it now,
+  // therefore the holder is ours" — cannot identify a holder: it is a fact about the LOOKUP's
+  // moment. And it would only ever be consulted when the number IS held, which — once xeroom is
+  // removed and the only remaining holders are the ~14,415 documents it left behind — means the
+  // lookup MISSED one. So the licence would fire exactly where the fence has already failed,
+  // repeating the overwrite and removing the refusal that would have exposed it. It licenses
+  // nothing.
+  //
+  // Two jobs remain, both honest:
+  //   * it is written BEFORE an irreversible remote write, and a failure to write it refuses the
+  //     post — a create whose local record cannot be written is a create whose OUTCOME cannot be
+  //     recorded either, which is precisely the lost-response state;
+  //   * a later refusal can say "this row already set out under this number", which is the
+  //     difference between a refusal an operator can diagnose and one they cannot.
+  //
+  // The NUMBER is stored, not a bare flag, so a row whose payload number later changes cannot be
+  // described with an attempt taken for a different one. Scope is the row, deliberately: a freshly
+  // enqueued row for the same order does not inherit it.
+  attemptedInvoiceNumber   String?   @map("attempted_invoice_number")
+  attemptedInvoiceNumberAt DateTime? @map("attempted_invoice_number_at")
+
+  // o3d-o97 r6 — THE ONE FACT THAT MAKES A CANCELLED ROW EVIDENCE ABOUT POUNDS.
+  //
+  // r5 established, in three places, that `status = CANCELLED` proves nothing: it records that a
+  // sweep or an operator ABANDONED the row, and the processors POST BEFORE persisting SYNCED and the
+  // external id, so an abandoned row may already have reached the ledger. That left
+  // `recreateMissingDailyBatchLogs` — which re-raises a journal when it can see no live log — reading
+  // the same status as proof that the batch MUST be posted again. Two readers, opposite conclusions,
+  // one fact; and the recreate side's conclusion costs a DUPLICATE journal in a real ledger.
+  //
+  // The reconciliation is not to pick a winner but to record the thing the status was standing in
+  // for. ONE canceller can prove there was no remote call: the cross-connector orphan sweep
+  // (`cancelOrphanedRowsUnderLock`) matches `status = PENDING` only, and its own comment states why
+  // — "A PENDING row is provably PRE-CALL: nothing was sent". That writer, and only that writer,
+  // sets this to true in the same UPDATE as the status.
+  //
+  //   true    nothing was ever sent for this row. Its journal is NOT in any ledger, so recreate may
+  //           rebuild it and a relief/debit record naming it moved zero pounds.
+  //   null    everything else — every other canceller, every pre-r6 cancelled row, and every row
+  //           that was never cancelled at all. NOT "a call was made": "not on record", which every
+  //           reader treats as unproved, exactly as it treats a null attribution column.
+  //
+  // Nullable, no DEFAULT and NOT BACKFILLED for the same reason as the o97 attribution columns: a
+  // default is a value, and `false` would assert that a historical cancelled row HAD made its call —
+  // manufacturing the confidence this column exists to stop being assumed. It is never written on
+  // any path that posts, so it can only ever be set by a writer that knows the negative.
+  abandonedBeforeRemoteCall Boolean? @map("abandoned_before_remote_call")
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
@@ -2256,6 +2469,29 @@ model AccountingEvent {
   currency         String
   externalSystem   String?
   externalId       String?
+  // o3d-cvj9 r3: the EXTERNAL system's own revision stamp for the document this event posted —
+  // Xero's `Invoice.UpdatedDateUTC`, taken from the response to the very write we made. It is the
+  // only ordering that is true of the order in which edits were APPLIED to the document, so it is
+  // what decides which of two competing revisions may hold `externalId`. Null means "not
+  // established" (the connector returned none, the row predates this column, or an administrative
+  // backfill wrote it) and is never guessed at — see resolveDocumentRevisionOrder.
+  externalRevisionAt DateTime?
+  // o3d-cvj9 r4/r5: on what basis this row can be ordered against another revision of the same
+  // document when there is no `externalRevisionAt` to compare. A CATEGORY, never a clock. Two
+  // values are written, both by the code that made (or repaired) the write, and both cleared the
+  // moment a live write records a real stamp on the row:
+  //   historical_backfill_repair — the administrative backfill repaired a write its sync log had
+  //     already recorded complete, and that row TOOK the document id. See
+  //     HISTORICAL_BACKFILL_REVISION_ORDER_BASIS.
+  //   live_write_unstamped — the connector wrote in this attempt and returned no readable stamp, so
+  //     the wiped `externalRevisionAt` must not be read as "this row never wrote". See
+  //     LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS.
+  // o3d-cvj9 r6: NEITHER value orders its row against another write on its own — the first says
+  // nothing about when the arriving write landed, and the second says a write happened, not when and
+  // not whether it was a re-post. Both feed rules that ASSUME an order and return it labelled as an
+  // assumption, which the live mirror acts on (and audits) and the backfill declines.
+  // Null everywhere else — including on the enqueue-time row of every live revision.
+  revisionOrderBasis String?
   reversalOfId     String?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
@@ -2282,6 +2518,12 @@ model AccountingEventLog {
   accountingEvent   AccountingEvent @relation(fields: [accountingEventId], references: [id], onDelete: Cascade)
 
   @@index([accountingEventId, createdAt])
+  // o3d-cvj9 r7: the accounting reconciliation report selects this table by ACTION — the handovers
+  // the live mirror made on an order nothing established (`superseded_by_assumed_order`) — bounded
+  // by its lookback. Without this index that is a scan of the largest audit table in the schema on
+  // every run. The existing index is keyed by event, which that query has no value for: the whole
+  // point is to find the entries without knowing which events they hang off.
+  @@index([action, createdAt])
   @@map("accounting_event_logs")
 }
 
@@ -2339,6 +2581,54 @@ model AccountingToken {
   // by the token endpoint. NULL = never recorded (a token stored before this existed),
   // which validation treats as UNKNOWN and lets through — not as "granted nothing".
   grantedScopes String?
+  // o3d-9tbz: Xero's own IsDemoCompany for this organisation, read from GET /Organisation at the
+  // consent that established this connection. NULL = never read (a token stored before this
+  // existed, or one that arrived inside a restored dump), which XERO_REQUIRE_DEMO_ORG treats as
+  // UNVERIFIED and refuses — not as "not a demo company", which is a different refusal with a
+  // different remedy.
+  tenantIsDemo Boolean?
+  // o3d-9tbz r5: which CONSENT this row belongs to. Re-minted on every binding, carried
+  // unchanged through every refresh, and named in the WHERE clause of the refresh UPDATE,
+  // so a refresh that began under one connection cannot write over the one that replaced
+  // it. NULL = a row written before this column existed (its generation is "the one with
+  // no generation", which the same predicate matches until something rebinds).
+  connectionGeneration String?
+  // o3d-9tbz r6: set ONLY by the documented Demo-reset recovery
+  // (scripts/provision-xero-demo.ts --clear-tenant-pin), which deletes the pin and stamps this
+  // column in ONE transaction. It is what separates a pin that was deliberately released from a
+  // pin that was DELETED or lost: with `connectionGeneration` present the token row proves a
+  // binding once wrote a pin beside it, so an absent pin means the pin went away on its own and
+  // the sync halts. NULL = never released. Cleared by the next binding, which writes a pin again.
+  pinReleasedAt DateTime?
+  // o3d-9tbz r7: WHAT that release was for. A bare timestamp says only "a release happened once",
+  // so it outlives the connection it released — a token row restored from a dump taken while a
+  // release was outstanding carries the exemption onto whatever binding is there now, which is the
+  // same cross-backup restore r6 exists to catch, arriving through the receipt instead of round it.
+  // These two say WHICH state was released: the generation the token row carried at the moment the
+  // pin was deleted, and the organisation that deleted pin named. The release counts only while
+  // BOTH still describe this row, so any rebinding, any restored token and any tenant change makes
+  // it stale by construction rather than by a clock. NULL alongside a NULL pinReleasedAt means
+  // "never released".
+  //
+  // o3d-9tbz r8: NOT backfilled. Filling these in from the row's own values for releases outstanding
+  // at the deploy would have qualified, in the same migration, every receipt the pre-r7 recovery
+  // stamped for a pin it never deleted — those are indistinguishable from a genuine outstanding
+  // release by the row they sit on, which is what made them a laundering path. A receipt with neither
+  // qualifier therefore exempts nothing; a rig mid-recovery finishes with Disconnect-then-connect.
+  // These are also only the half of the receipt that travels with the row: the release is witnessed
+  // in `settings` too (key xero_pin_release_witness), so a wholesale-restored row cannot corroborate
+  // itself.
+  //
+  // o3d-9tbz r9: CLEARED BY THE DATABASE whenever a pin is written, not only by bindXeroTenant. All
+  // three columns above are wiped — and the witness row deleted — by the trigger installed in
+  // 20260819210000_xero_pin_write_consumes_release, which fires on any INSERT or UPDATE of the
+  // `xero_expected_tenant_id` settings row. r7 gave the receipt no expiry on the ground that "the next
+  // binding consumes it"; the pin has other writers (provision-xero-demo.ts re-pins directly), so a
+  // completed re-provision left a row pinned AND carrying an outstanding release — one hand-run DELETE
+  // away from the exemption r6 closed. The rule now belongs to the pin rather than to a call site,
+  // which is why a writer that never heard of these columns cannot leave one behind.
+  pinReleasedGeneration String?
+  pinReleasedTenantId   String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -2383,6 +2673,22 @@ model ShoppingWebhookEvent {
   topic           String?
   payloadHash     String
   payloadJson     Json
+  /// o3d-wgl6: which STORE sent this delivery, as the store itself stated it at receipt
+  /// (`store:<host>[/<path>]`, or `store-under:` for a resource URL known only to sit beneath
+  /// the site root), or one of the `unproven:*` markers saying positively why no store could
+  /// be recorded. The payload is frozen at receipt, so a retry after a credential rebind would
+  /// otherwise import the previous store's data under the new store's credentials with every
+  /// settings version the import observes consistently pointing at the new one. Recorded here
+  /// rather than in payloadJson because idempotency hashes the body. NOT NULL: a nullable
+  /// column would mean both "pre-migration" and "nothing found", and the pre-migration rows
+  /// would silently read as fine.
+  /// The DEFAULT is deliberate and load-bearing: during a deploy the migration is already live
+  /// while the PREVIOUS build is still inserting rows that name no such column, and without a
+  /// default every webhook delivered in that window would fail NOT NULL and 500 until
+  /// WooCommerce disabled the webhook. It defaults to a marker distinct from the backfill, so a
+  /// row written by that older writer is never mistaken for one current code wrote.
+  /// See lib/connectors/webhook-origin.ts.
+  originAttestation String    @default("unproven:legacy-writer")
   status          String
   attempts        Int       @default(0)
   nextAttemptAt   DateTime?
@@ -3366,6 +3672,14 @@ model OrderAllocation {
   /// when it no longer matches the product's current version — see the note on Product.
   fulfillmentGraphVersion Int @default(0) @map("fulfillment_graph_version")
   costLayerSnapshot Json?
+  // o3d-o97 r3: THE POUNDS GROUP A2 DEBITED FOR THIS ROW, written in the same transaction as the
+  // order's stamp. `costLayerSnapshot` beside it is the row's PINNED LAYERS, and landed-cost
+  // revaluation rewrites their unitCostBase in place (updateSnapshotsForCostLayerChange) — so
+  // valuing a partial refund's reversal from the snapshot reverses today's price for a debit
+  // raised at yesterday's. This is the posted basis, and `qty` divides it into a posted unit cost
+  // that no downstream revaluation can move. NULL on rows created after A2 stamped the order (the
+  // rebalancer re-pins), where no posting was raised for the row at all.
+  allocationBatchAmount Decimal? @db.Decimal(18, 4) @map("accounting_allocation_batch_amount")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
@@ -3398,6 +3712,42 @@ model Shipment {
   // o3d-0qoo: exact Group B batch referenceId this shipment was staged into. See the same
   // pair of columns on SalesOrder for why identity is persisted rather than re-derived.
   shipmentJournalBatchRef String?                @map("accounting_shipment_journal_batch_ref")
+  // o3d-o97 r3: THE CR ALLOCATED INVENTORY THIS SHIPMENT'S GROUP B JOURNAL RAISED, written in the
+  // same UPDATE as `shipmentJournalDate`. Group B posts DR COGS / CR Allocated for exactly this
+  // shipment's dispatch COGS, so this is the relief the allocated contra received.
+  //
+  // Deliberately NOT `cogsBatchAmount` beside it, which landed-cost revaluation REWRITES IN PLACE
+  // (refreshShipmentCogsForCostLayerChange) while posting only to COGS/Inventory — the Allocated
+  // relief never moves. And deliberately not re-derived from the CogsEntry dispatch rows either:
+  // those are HARD-DELETED by `retention_stock_movements_months`, after which the derivation
+  // silently returns the CURRENT layer cost, or zero for a shipment with no stored line snapshot.
+  // A record that survives the crash and then expires is not evidence; retention deletes stock
+  // movements and sync logs, it does not delete shipments.
+  allocatedReliefAmount   Decimal?  @db.Decimal(18, 4) @map("accounting_allocated_relief_amount")
+  // o3d-o97 r4 — AND WHETHER THAT RELIEF WAS EVER RAISED, AND WHERE.
+  //
+  // r3 recorded the amount alone, which is the very inference it had just destroyed on the A2 side
+  // one field along: `allocatedReliefAmount` above is written for EVERY shipment the batch stamps,
+  // while the CR Allocated Inventory line only exists when the window's ROUNDED COGS total is
+  // positive — and even then the log is created PENDING, in a transaction that ends before the
+  // remote call, so it can finish CANCELLED with nothing credited anywhere.
+  //
+  // Reading a queued (or never-raised) figure as relief SHRINKS the open balance, so the refund
+  // reverses less than the account holds and a FULL refund — which closes both batch windows for
+  // ever — strands the difference permanently. These three make the amount resolvable:
+  //
+  //   syncLogId   the AccountingSyncLog row's own id, null unless that row was created AND
+  //               carried a CR Allocated Inventory line. Resolving it reads the row's STATUS,
+  //               so queued is never read as posted.
+  //   connector   which LEDGER the credit was raised into.
+  //   accountCode the exact Allocated Inventory account it credited.
+  //
+  // NULL together on shipments journaled before these columns existed, where
+  // `allocatedReliefAmount` is also null and the CogsEntry derivation (which refuses rather than
+  // degrades) still answers.
+  allocatedReliefSyncLogId   String? @map("accounting_allocated_relief_sync_log_id")
+  allocatedReliefConnector   String? @map("accounting_allocated_relief_connector")
+  allocatedReliefAccountCode String? @map("accounting_allocated_relief_account_code")
 
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt

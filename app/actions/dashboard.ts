@@ -9,18 +9,57 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { normalizeLineDiscountBase, normalizeOrderDiscountBase } from '@/lib/sales-currency'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
+import { marginFigureBound, netLinearFigureBound, refundLineBucket, type DerivedFigureBound } from '@/lib/domain/sales/refund-basis-analytics'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * o3d-iigc round 5: BEST SELLERS WAS THE SIXTH REFUND-BLIND SURFACE.
+ *
+ * Rounds 1-4 each declared an enumeration complete and each missed one. Round 4's own note reached
+ * this figure and filed it as a NAMING problem — "`netRevenue` never subtracts refunds at all" —
+ * which is exactly backwards: a figure called net revenue that has never seen a refund is the same
+ * defect as one that subtracted a credit in the wrong unit, only louder. It was published bare, it
+ * ranked the list, and the card links straight to the sales-statistics report where the same
+ * product's net revenue IS refund-aware, so the two surfaces disagreed by the whole credit.
+ *
+ * It is now built exactly like that report's rows: refund LINES bucketed by their stamped basis,
+ * only the NET bucket subtracted, the other two carried beside the figure, and the figure marked.
+ * `qtyRefunded`/`netQty` are EXACT and carry no marker — quantity is basis-independent, so netting
+ * it off needs no conversion and refusing it would be this branch's other failure mode.
+ */
 export type TopProduct = {
   productId: string
   sku: string
   name: string
+  /**
+   * Ex-VAT line revenue less its discounts less its NET-BASIS credits only. When
+   * `refundBasisComplete` is false this is an UPPER BOUND, too high by at most
+   * `refundsGrossBasis + refundsUnknownBasis` — and note that the LIST ORDER inherits that, since
+   * the ranking is by this figure.
+   */
   netRevenue: number
+  /** NET-basis refund value, the only kind subtracted from `netRevenue`. */
+  refundsNetBasis: number
+  /** Refund value recorded on the GROSS basis. Reported, never subtracted from an ex-VAT figure. */
+  refundsGrossBasis: number
+  /** Refund value whose basis was never proved. Reported, never guessed at. */
+  refundsUnknownBasis: number
+  /** False when any of this product's credit could not be placed on the net basis. */
+  refundBasisComplete: boolean
+  /** Which way `netRevenue`'s error runs. `netRevenue - k` for non-negative k, so it is linear. */
+  netRevenueBound: DerivedFigureBound
+  /** Units sold in the period, BEFORE returns. */
   qtySold: number
+  /** Units credited back. Basis-independent, so this is exact whatever the credits' basis. */
+  qtyRefunded: number
+  /** `qtySold - qtyRefunded`. Exact — never marked. */
+  netQty: number
   marginPct: number
+  /** Margin is a RATIO: see marginFigureBound. Never derived from `refundBasisComplete`. */
+  marginPctBound: DerivedFigureBound
 }
 
 export type KpiSummary = {
@@ -28,18 +67,43 @@ export type KpiSummary = {
   ordersCurrent: number
   grossSalesCurrent: number
   discountsCurrent: number
+  /**
+   * NET-basis refund value only. o3d-iigc: this used to be every refund's totalBase regardless of
+   * basis, subtracted from an ex-VAT sales figure — so a legacy GROSS credit removed its VAT too.
+   */
   refundsCurrent: number
+  /** Refund value recorded on the GROSS basis. EXCLUDED from netSalesCurrent — it is not net. */
+  refundsGrossBasisCurrent: number
+  /** Refund value whose basis was never proved. EXCLUDED rather than guessed at. */
+  refundsUnknownBasisCurrent: number
+  /**
+   * False when the period carried refund value that could not be placed on the net basis. The
+   * figures that move ONE-FOR-ONE with net sales — netSalesCurrent, profitCurrent, avgOrderValue —
+   * are then UPPER BOUNDS, too high by at most refundsGrossBasisCurrent + refundsUnknownBasisCurrent.
+   * marginCurrent is a RATIO and is NOT covered by this flag: see marginBoundCurrent.
+   */
+  refundBasisCompleteCurrent: boolean
   netSalesCurrent: number
   cogsCurrent: number
   profitCurrent: number
   marginCurrent: number
+  /**
+   * o3d-iigc round 4: which way marginCurrent's error runs, or that it is not established. Marking
+   * a ratio `≤` because its denominator is bounded is a claim the arithmetic does not support —
+   * marginFigureBound carries the case analysis.
+   */
+  marginBoundCurrent: DerivedFigureBound
   shippingCurrent: number
   // Comparison period
   ordersComparison: number
   grossSalesComparison: number
+  /** As refundBasisCompleteCurrent, for the comparison period. */
+  refundBasisCompleteComparison: boolean
   netSalesComparison: number
   cogsComparison: number
   marginComparison: number
+  /** As marginBoundCurrent, for the comparison period. */
+  marginBoundComparison: DerivedFigureBound
   // Other KPIs
   totalProducts: number
   activeProducts: number
@@ -59,9 +123,24 @@ export type ChartPoint = {
   netSales: number
   cogs: number
   marginPct: number
+  /**
+   * o3d-iigc: false when this bucket held refund value that is not on the net basis. netSales is
+   * then an upper bound — the unplaceable credit was left out rather than subtracted in the wrong
+   * unit. It says NOTHING about marginPct; that is marginPctBound's job.
+   */
+  netSalesUpperBound: boolean
+  /**
+   * o3d-iigc round 4: the bucket's own margin classification. Carried PER BUCKET rather than taken
+   * from the period, because a period whose margin is a sound upper bound can contain a day whose
+   * margin is indeterminate, and the chart tooltip reads the bucket.
+   */
+  marginPctBound: DerivedFigureBound
   compNetSales: number
   compCogs: number
   compMarginPct: number
+  compNetSalesUpperBound: boolean
+  /** As marginPctBound, for the comparison bucket. */
+  compMarginPctBound: DerivedFigureBound
 }
 
 export type IncomingPO = {
@@ -191,12 +270,17 @@ export async function getDashboardData(
         totalBase: true, subtotalBase: true, shippingBase: true, discountAmount: true, fxRateToBase: true, pricesIncludeVat: true, taxRatePercent: true,
         shoppingLinks: { select: { connector: true } },
         lines: { select: { cogsBase: true, qty: true, totalBase: true, discountAmount: true, productId: true, sku: true, description: true, taxRate: { select: { rate: true } } } },
-        refunds: { select: { totalBase: true } },
+        // o3d-iigc round 5: the refund LINES are what Best Sellers needs — the header total says
+        // nothing about which product was credited. `totalsBasis` lives on the header and governs
+        // its lines (verified in round 2: the basis audit requires header/line reconciliation).
+        refunds: { select: { totalsBasis: true, totalBase: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
       },
       orderBy: { createdAt: 'desc' },
     }),
     db.product.findMany({
-      select: { id: true, lifecycleStatus: true, stockLevels: { select: { quantity: true, reservedQty: true } } },
+      // o3d-iigc round 5: sku/name are read by the Best Sellers list so a product that appears there
+      // ONLY through a refund line still has a label. Without them such a row rendered blank.
+      select: { id: true, sku: true, name: true, lifecycleStatus: true, stockLevels: { select: { quantity: true, reservedQty: true } } },
     }),
     // Open POs KPI (o3d-1di): the canonical COMMITTED-incoming set (includes SHIPPED, excludes the
     // RFQ_SENT/QUOTE_RECEIVED quote pipeline) so this agrees with the incoming card and the
@@ -245,21 +329,37 @@ export async function getDashboardData(
   // Period helpers
   function ordersInRange(from: Date, to: Date) { return orders.filter((o) => o.createdAt >= from && o.createdAt <= to) }
 
-  type OrderAgg = { gross: number; discounts: number; refunds: number; net: number; cogs: number; shipping: number }
+  type OrderAgg = {
+    gross: number; discounts: number; refunds: number
+    refundsGrossBasis: number; refundsUnknownBasis: number; refundBasisComplete: boolean
+    net: number; cogs: number; shipping: number
+  }
   function aggregate(list: typeof orders): OrderAgg {
     let gross = 0, discounts = 0, refunds = 0, cogs = 0, shipping = 0
+    let refundsGrossBasis = 0, refundsUnknownBasis = 0, refundBasisComplete = true
     for (const o of list) {
       const lineTotal = o.lines.reduce((s, l) => s + Number(l.totalBase), 0)
       const lineDisc = o.lines.reduce((sum, line) => sum + normalizeLineDiscountBase(o, line.discountAmount, line.taxRate?.rate), 0)
       const orderDisc = normalizeOrderDiscountBase(o, o.lines)
       gross += lineTotal + lineDisc + orderDisc
       discounts += lineDisc + orderDisc
-      refunds += o.refunds.reduce((s, r) => s + Number(r.totalBase), 0)
+      // o3d-iigc: `gross` and `discounts` above are built from ex-VAT line totals, so `net` is a NET
+      // figure and only a NET-basis refund is the same unit. A GROSS credit over-subtracts by its
+      // whole VAT and an unstamped one cannot be placed at all; both are counted separately and left
+      // OUT of `net`, which is then flagged as an upper bound rather than quietly wrong.
+      for (const r of o.refunds) {
+        const amount = Number(r.totalBase)
+        const placement = refundLineBucket(r.totalsBasis, r.totalBase)
+        if (placement.bucket === 'net') refunds += amount
+        else if (placement.bucket === 'gross') refundsGrossBasis += amount
+        else refundsUnknownBasis += amount
+        if (!placement.placeableOnNetBasis) refundBasisComplete = false
+      }
       cogs += o.lines.reduce((s, l) => s + Number(l.cogsBase ?? 0), 0)
       shipping += Number(o.shippingBase ?? 0)
     }
     const net = gross - discounts - refunds
-    return { gross, discounts, refunds, net, cogs, shipping }
+    return { gross, discounts, refunds, refundsGrossBasis, refundsUnknownBasis, refundBasisComplete, net, cogs, shipping }
   }
 
   const currentOrders = ordersInRange(periodFrom, periodTo)
@@ -274,16 +374,30 @@ export async function getDashboardData(
     grossSalesCurrent: r2(cur.gross),
     discountsCurrent: r2(cur.discounts),
     refundsCurrent: r2(cur.refunds),
+    refundsGrossBasisCurrent: r2(cur.refundsGrossBasis),
+    refundsUnknownBasisCurrent: r2(cur.refundsUnknownBasis),
+    refundBasisCompleteCurrent: cur.refundBasisComplete,
     netSalesCurrent: r2(cur.net),
     cogsCurrent: r2(cur.cogs),
     profitCurrent: r2(cur.net - cur.cogs),
     marginCurrent: cur.net > 0 ? Math.round(((cur.net - cur.cogs) / cur.net) * 1000) / 10 : 0,
+    marginBoundCurrent: marginFigureBound({
+      netRevenue: cur.net, cogs: cur.cogs,
+      unplacedCredit: cur.refundsGrossBasis + cur.refundsUnknownBasis,
+      basisComplete: cur.refundBasisComplete,
+    }),
     shippingCurrent: r2(cur.shipping),
     ordersComparison: compOrders.length,
     grossSalesComparison: r2(comp.gross),
+    refundBasisCompleteComparison: comp.refundBasisComplete,
     netSalesComparison: r2(comp.net),
     cogsComparison: r2(comp.cogs),
     marginComparison: comp.net > 0 ? Math.round(((comp.net - comp.cogs) / comp.net) * 1000) / 10 : 0,
+    marginBoundComparison: marginFigureBound({
+      netRevenue: comp.net, cogs: comp.cogs,
+      unplacedCredit: comp.refundsGrossBasis + comp.refundsUnknownBasis,
+      basisComplete: comp.refundBasisComplete,
+    }),
     totalProducts: products.length,
     activeProducts: products.filter((p) => p.lifecycleStatus === 'ACTIVE').length,
     inventoryValue: r2(inventoryValue),
@@ -318,8 +432,20 @@ export async function getDashboardData(
       label,
       grossSales: r2(c.gross), netSales: r2(c.net), cogs: r2(c.cogs),
       marginPct: c.net > 0 ? Math.round(((c.net - c.cogs) / c.net) * 1000) / 10 : 0,
+      netSalesUpperBound: !c.refundBasisComplete,
+      marginPctBound: marginFigureBound({
+        netRevenue: c.net, cogs: c.cogs,
+        unplacedCredit: c.refundsGrossBasis + c.refundsUnknownBasis,
+        basisComplete: c.refundBasisComplete,
+      }),
       compNetSales: r2(p.net), compCogs: r2(p.cogs),
       compMarginPct: p.net > 0 ? Math.round(((p.net - p.cogs) / p.net) * 1000) / 10 : 0,
+      compNetSalesUpperBound: !p.refundBasisComplete,
+      compMarginPctBound: marginFigureBound({
+        netRevenue: p.net, cogs: p.cogs,
+        unplacedCredit: p.refundsGrossBasis + p.refundsUnknownBasis,
+        basisComplete: p.refundBasisComplete,
+      }),
     }
   }
 
@@ -360,20 +486,79 @@ export async function getDashboardData(
   // Top 10 products (in selected period)
   // ---------------------------------------------------------------------------
   const productMap = new Map<string, TopProduct & { totalCogs: number }>()
+  const productLabels = new Map(products.map((p) => [p.id, p]))
+  function topProductRow(productId: string, sku: string, name: string): TopProduct & { totalCogs: number } {
+    const existing = productMap.get(productId)
+    // A row created by a refund line before its sales line was seen (or with no sales line at all)
+    // starts unlabelled; fill the label in the moment one becomes available rather than leaving the
+    // blank row the first writer happened to create.
+    if (existing) {
+      if (!existing.sku && sku) existing.sku = sku
+      if (!existing.name && name) existing.name = name
+      return existing
+    }
+    const info = productLabels.get(productId)
+    const created: TopProduct & { totalCogs: number } = {
+      productId, sku: sku || info?.sku || '', name: name || info?.name || '',
+      netRevenue: 0, refundsNetBasis: 0, refundsGrossBasis: 0, refundsUnknownBasis: 0,
+      refundBasisComplete: true, netRevenueBound: 'exact',
+      qtySold: 0, qtyRefunded: 0, netQty: 0, marginPct: 0, marginPctBound: 'exact', totalCogs: 0,
+    }
+    productMap.set(productId, created)
+    return created
+  }
   for (const o of currentOrders) {
     for (const l of o.lines) {
       if (!l.productId) continue
-      if (!productMap.has(l.productId)) {
-        productMap.set(l.productId, { productId: l.productId, sku: l.sku ?? '', name: l.description, netRevenue: 0, qtySold: 0, marginPct: 0, totalCogs: 0 })
-      }
-      const row = productMap.get(l.productId)!
+      const row = topProductRow(l.productId, l.sku ?? '', l.description)
       row.netRevenue += Number(l.totalBase)
       row.qtySold += Number(l.qty)
       row.totalCogs += Number(l.cogsBase ?? 0)
     }
+    // o3d-iigc round 5. `netRevenue` above is a sum of ex-VAT line totals, so only a NET-basis
+    // credit is the same unit. A GROSS one carries its whole VAT; an unstamped one cannot be placed
+    // at all. Neither is converted — on a mixed-rate order the rate that produced the gross figure
+    // is not recoverable — so both are bucketed beside the figure and the row is flagged.
+    //
+    // A refund line for a product with NO sales line in this period creates its own row rather than
+    // being dropped: dropping it would silently restore the blindness for exactly the product whose
+    // whole period was credited back, and a product that is all returns is precisely what a
+    // best-sellers list must not rank on gross sales alone.
+    for (const refund of o.refunds) {
+      for (const rl of refund.lines) {
+        if (!rl.productId) continue
+        const row = topProductRow(rl.productId, '', '')
+        row.qtyRefunded += Number(rl.qty)
+        const amount = Number(rl.totalBase)
+        const placement = refundLineBucket(refund.totalsBasis, rl.totalBase)
+        if (placement.bucket === 'net') { row.refundsNetBasis += amount; row.netRevenue -= amount }
+        else if (placement.bucket === 'gross') row.refundsGrossBasis += amount
+        else row.refundsUnknownBasis += amount
+        if (!placement.placeableOnNetBasis) row.refundBasisComplete = false
+      }
+    }
   }
   const topProducts = Array.from(productMap.values())
-    .map((p) => ({ ...p, netRevenue: Math.round(p.netRevenue * 100) / 100, marginPct: p.netRevenue > 0 ? Math.round(((p.netRevenue - p.totalCogs) / p.netRevenue) * 1000) / 10 : 0 }))
+    .map((p) => ({
+      ...p,
+      // Classified from the UNROUNDED figures: the classification is about which side of the
+      // published number the truth lies on, not about its last penny.
+      netRevenueBound: netLinearFigureBound({
+        basisComplete: p.refundBasisComplete,
+        unplacedCredit: p.refundsGrossBasis + p.refundsUnknownBasis,
+      }),
+      marginPctBound: marginFigureBound({
+        netRevenue: p.netRevenue, cogs: p.totalCogs,
+        unplacedCredit: p.refundsGrossBasis + p.refundsUnknownBasis,
+        basisComplete: p.refundBasisComplete,
+      }),
+      netQty: Math.round((p.qtySold - p.qtyRefunded) * 1000) / 1000,
+      netRevenue: r2(p.netRevenue),
+      refundsNetBasis: r2(p.refundsNetBasis),
+      refundsGrossBasis: r2(p.refundsGrossBasis),
+      refundsUnknownBasis: r2(p.refundsUnknownBasis),
+      marginPct: p.netRevenue > 0 ? Math.round(((p.netRevenue - p.totalCogs) / p.netRevenue) * 1000) / 10 : 0,
+    }))
     .sort((a, b) => b.netRevenue - a.netRevenue)
     .slice(0, 10)
 

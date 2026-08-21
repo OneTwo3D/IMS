@@ -172,10 +172,91 @@ it will **not** restore stage on the new owner's behalf.
   is caught, not hidden. This trafficless store only delivers when WP-Cron is nudged (the
   harness does this); a single order commonly arrives as **two** `order.updated` deliveries.
 - Xero's **redirect URI** for the rig's app must be registered in the Xero developer portal.
+- **The rig's `.env` must constrain it to a Xero DEMO organisation** (o3d-9tbz), and since o3d-iaqy this
+  is enforced rather than advised: with `E2E_TEST_MODE=1` set and none of `XERO_REQUIRE_DEMO_ORG` /
+  `XERO_ALLOWED_TENANT_IDS` / `XERO_BLOCKED_TENANT_IDS` configured, the rig refuses to connect to Xero at
+  all and refuses to use a Xero token it already has. `XERO_ALLOWED_TENANT_NAMES` alone does **not**
+  satisfy it. A run in that state fails at the Xero steps with the refusal quoted in the sync log rather
+  than posting anywhere:
+
+  ```
+  XERO_REQUIRE_DEMO_ORG=true                      # the rig's primary tenant control
+  XERO_BLOCKED_TENANT_IDS=<the LIVE organisation's tenantId>   # belt and braces
+  XERO_ALLOWED_TENANT_NAMES=Demo Company (UK)     # optional, and NOT sufficient on its own
+  ```
+
+  The database pin (`xero_expected_tenant_id`) does not survive a rebuilt or restored database, and it
+  was its absence that let this rig connect to the LIVE organisation and post 150 invoices into it
+  (o3d-t74p). Env is the only tenant control a database reset cannot erase: with it set, a consent that
+  offers a non-demo org is refused with nothing stored, and a restored production database is refused at
+  every sync instead of at no point at all.
+
+  **`XERO_REQUIRE_DEMO_ORG` is the control that actually fits this rig, and it replaced the deny-list as
+  the primary one.** It is proven from Xero's own `IsDemoCompany` on `GET /Organisation` — a call the
+  connection callback already makes — so it costs nothing, and it is a fact about how the organisation
+  was created rather than a label anyone can adopt. That means it survives the Demo company's ~28-day
+  re-creation with **no edit at all**, which `XERO_ALLOWED_TENANT_IDS=<demo tenantId>` does not (a
+  control that needs re-editing every cycle gets switched off, which protects nothing).
+
+  **Keep `XERO_BLOCKED_TENANT_IDS=<live org>`, but stop treating it as the answer.** A deny-list refuses
+  the organisations somebody remembered to list. A **third** organisation — a bookkeeper's sandbox, a
+  second company, anything else the person consenting can reach — is neither blocked nor allow-listed
+  and would connect. Blocking the live id constrains the rig *away from one ledger*; it never
+  constrained it *to* Demo.
+
+  `XERO_ALLOWED_TENANT_NAMES` is a convenience that **narrows** the consent to Demo; it is **not** an
+  identity and must not be the rig's only tenant control. A Xero organisation name is neither unique nor
+  fixed — anyone administering an organisation can rename it — so a name-only guard is defeated by a
+  rename, and IMS logs `xero_tenant_guard_name_only` in the activity log while it stays that way.
+  `XERO_REQUIRE_DEMO_ORG=true` counts as an anchor and clears that warning.
+
+  **After restoring a production dump onto the rig, the Xero connection is refused as UNVERIFIED** until
+  it is re-consented: the restored token carries no proof that its organisation is a demo one, and under
+  this key unproven is refused. That is the intended behaviour — it is precisely the state the incident
+  ran in for days. Disconnect on `/sync` and reconnect to Demo.
 - The **Demo company resets ~every 28 days**, which drops the OAuth grant. After a reset:
-  re-consent the connection (Settings → Accounting → Xero → Connect) and re-run the **Demo
-  provisioner** so the accounts/currencies/bank accounts/VAT rates the specs expect exist
-  again (o3d-lgo.9).
+  1. **Disconnect Xero on `/sync`.** The database pin still names the *retired* Demo tenantId, so
+     reconnecting without this is refused with `pinned to Xero tenantId …, which this consent did not
+     include`. Disconnecting clears the pin; neither `XERO_REQUIRE_DEMO_ORG` nor
+     `XERO_BLOCKED_TENANT_IDS` needs an edit. Re-consent from **one** tab: two callbacks in flight at
+     once bind one organisation and the other is refused, telling you to disconnect and retry.
+
+     If you clear the pin from the database instead, use
+     `provision-xero-demo.ts --clear-tenant-pin` — it deletes the pin **and** records the release on
+     the token row in one transaction. Deleting the `xero_expected_tenant_id` row by hand does not,
+     and IMS halts the sync on a token that has outlived its pin (o3d-9tbz r6): an absent pin used to
+     be an exemption from the split-binding refusal, i.e. a way to switch it off.
+
+     Run the flag **before** the pin goes. The release is recorded only when that statement is the one
+     deleting the pin, and the receipt names the connection and the pin it released, so it stops
+     applying the moment either changes (o3d-9tbz r7). On a rig whose pin has already vanished the flag
+     records nothing and does not lift the halt — press **Disconnect** on `/sync`, which clears both
+     halves. `full-chain-preflight` names each of these states explicitly rather than letting the run
+     discover them on the first posting spec.
+
+     The release is written **twice in one transaction** (o3d-9tbz r8): on the token row, and as a
+     `xero_pin_release_witness` settings row beside the pin it deletes. A release counts only while both
+     halves describe it, so restoring `accounting_tokens` alone from a rig backup — a token row that
+     brings its own receipt and its own connection marker — is halted here rather than inherited. A copy
+     of the whole database brings both and is *not* detected: on this rig that case is what
+     `XERO_BLOCKED_TENANT_IDS` and `XERO_REQUIRE_DEMO_ORG` are for, and neither may be switched off.
+
+     A release recorded by a build older than r7 carries only a timestamp and is **not** backfilled into
+     a qualified one — the old flag stamped a release even when it deleted no pin, so the two shapes are
+     indistinguishable. A rig that was mid-recovery across the upgrade is halted: **Disconnect**, then
+     re-consent, which is the step it was waiting for.
+
+     **A release ends when a pin comes back, whoever writes it** (o3d-9tbz r9). Both halves are cleared
+     by the database on any write of the `xero_expected_tenant_id` row — the re-consent in step 2, the
+     provisioner's re-pin in step 3, or anything else that writes that row. Until r9 only the re-consent
+     did it, so a rig re-provisioned while a release was outstanding stayed pinned with a live receipt
+     under the pin, and the next hand-run `DELETE` of that row read as a deliberate release instead of
+     halting. Nothing to do about it on the rig: the migration clears any receipt sitting under a pin,
+     and no step of this runbook changes.
+  2. Re-consent the connection (Settings → Accounting → Xero → Connect).
+  3. Re-run the **Demo provisioner** so the accounts/currencies/bank accounts/VAT rates the specs
+     expect exist again (o3d-lgo.9). It re-pins the new tenantId, and that re-pin consumes any
+     outstanding release with it, in one transaction.
 
 ## Rate budget
 

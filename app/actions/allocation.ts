@@ -4,18 +4,22 @@ import { revalidatePath } from 'next/cache'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { auth } from '@/lib/auth'
-import { requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { decimalToNumber } from '@/lib/decimal'
-import { requirementsMapToRows, type FulfillmentRequirement } from '@/lib/products/fulfillment-coverage'
 import {
-  expandFulfillmentRequirementsDecimal,
-  getFulfillmentAvailableQtyDecimal,
-  listFulfillmentLeafProductIds,
-  loadFulfillmentProductGraph,
-} from '@/lib/products/kit-fulfillment'
+  availableQtyFromRequirements,
+  scaleFulfillmentRequirements,
+  type FulfillmentRequirement,
+} from '@/lib/products/fulfillment-coverage'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import {
+  captureFulfillmentRequirementSnapshot,
+  lineFulfillmentRequirements,
+  parseFulfillmentRequirementSnapshot,
+  selectCapturableLineIds,
+} from '@/lib/products/fulfillment-requirement-snapshot'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
@@ -24,8 +28,13 @@ import {
   applyAllocationReservationDelta,
   buildAvailableStockMap,
   canonicalAllocationQty,
+  clearDormantFulfillmentPinsInTx,
+  lockAccountedRecordsForScope,
+
+  floorAvailableStockMapToCanonicalScale,
   lockSalesOrder,
   lockStockLevels,
+  refileAccountedRecordsForScope,
   releaseOrderAllocationsForDeallocationInTx,
   resetAllocationAccountingIfStaged,
   validateAllocationIntegrity,
@@ -41,6 +50,7 @@ import {
   discardCancelledOrderShipmentsInTx,
   reconcileOrderAfterShipment,
   transitionShipmentStatus,
+  type OrderCompletionAuthority,
 } from '@/lib/domain/sales/shipment-service'
 import {
   allocationScopeKey,
@@ -115,11 +125,15 @@ async function logShipmentStatusFailure(
   })
 }
 
-async function requireAuth() {
-  const session = await auth()
-  if (!session?.user?.id) throw new Error('Unauthorized')
-  return session
-}
+// o3d-512h round 3 — a module-local `requireAuth` used to live here, shadowing the
+// import of the same name. It called `auth()` and checked only that a user id
+// existed: no sessionInvalidReason check (so a session revoked by a password change
+// or a role change still passed), no 2FA check (so a session that had not cleared
+// its TOTP challenge still passed), and of course no role check. The three exports
+// below were credited as guarded by every reviewer and by the scanner, because both
+// only ever saw the NAME. They now call the real gate; the shadow is deleted, and
+// the scanner's guard rule resolves a callee to its declaration instead of matching
+// its name (tests/security/module-graph.ts).
 
 /**
  * o3d-4kfh r5 (Codex finding 7): THE RETIREMENT ENTRY IS NO LONGER WRITTEN HERE.
@@ -187,7 +201,7 @@ export type FulfillmentRequirementRow = {
 // ---------------------------------------------------------------------------
 
 export async function getOrderAllocations(orderId: string): Promise<AllocationRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.orderAllocation.findMany({
     where: { orderId },
     include: {
@@ -219,7 +233,7 @@ export async function getOrderAllocations(orderId: string): Promise<AllocationRo
 // ---------------------------------------------------------------------------
 
 export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.shipment.findMany({
     where: { orderId },
     include: {
@@ -259,11 +273,14 @@ export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]>
 export async function getOrderFulfillmentRequirements(
   orderId: string,
 ): Promise<FulfillmentRequirementRow[]> {
-  await requireAuth()
+  await requireInternalUser()
 
   const lines = await db.salesOrderLine.findMany({
     where: { orderId, productId: { not: null } },
-    select: { id: true, productId: true },
+    // o3d-kouj: the fulfilment panel shows what the order requires, and for an in-flight order that
+    // is the PINNED recipe. Showing the current graph here while the allocator, the picker and the
+    // dispatch cap all use the snapshot would make the screen disagree with the refusal messages.
+    select: { id: true, productId: true, fulfillmentRequirements: true },
   })
 
   const graph = await loadFulfillmentProductGraph(
@@ -273,9 +290,10 @@ export async function getOrderFulfillmentRequirements(
 
   return lines.map((line) => ({
     lineId: line.id,
-    requirements: requirementsMapToRows(
-      expandFulfillmentRequirementsDecimal(line.productId!, 1, graph),
-    ),
+    requirements: lineFulfillmentRequirements(line, graph).map((requirement) => ({
+      productId: requirement.productId,
+      factor: requirement.factor.toNumber(),
+    })),
   }))
 }
 
@@ -331,8 +349,14 @@ export async function autoAllocateOrder(
   // stranded-reservation failure; a post-commit throw must NOT raise a false stale-reservation warning.
   let allocationCommitted = false
   try {
+    // o3d-6zr2: the acting user for the in-transaction pending-shipment retirement record, which
+    // `reconcilePendingShipments` writes through the transaction client and so cannot resolve a
+    // session for itself. The internal-bypass callers (the reallocation sweep, stock-event re-runs,
+    // the backorder allocator) genuinely have no user and stay null.
+    let actingUserId: string | null = null
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
-      await requirePermission('sales.process')
+      const session = await requirePermission('sales.process')
+      actingUserId = session.user.id ?? null
     }
     const allocationResult = await allocateSalesOrder(db, {
       orderId,
@@ -340,6 +364,7 @@ export async function autoAllocateOrder(
       refuseIfCommittedShipmentsExist: options?.refuseIfCommittedShipmentsExist,
       onReconciledInTx: options?.onReconciledInTx,
       requireStatusUnderLock: options?.requireStatusUnderLock,
+      userId: actingUserId,
     })
     allocationCommitted = true
 
@@ -513,6 +538,7 @@ export async function updateAllocation(
       }
 
       await resetAllocationAccountingIfStaged(tx, locked.orderId)
+
       await lockStockLevels(tx, [locked.productId], Array.from(new Set([locked.warehouseId, newWarehouseId])))
 
       const stockLevels = await tx.stockLevel.findMany({
@@ -613,6 +639,47 @@ export async function updateAllocation(
         qty: releaseQty,
       }], 'release')
 
+      // -------------------------------------------------------------------------------------
+      // o3d-0i5y r11 (Codex round 11, finding 1) — WHERE GROUP A2'S POSTED RECORD STANDS, READ
+      // UNDER THE LOCK THIS WRITE IS ABOUT TO TAKE ANYWAY.
+      //
+      // r10 read it at the top of the action and wrote the plan drawn from it at the bottom, which
+      // is the same defect r10 had just fixed in Group A2 one file away: the record it plans from is
+      // rewritten in place by `updateSnapshotsForCostLayerChange` when a landed cost lands late, and
+      // that sweep takes NO sales-order lock (it selects by cost layer, across every table carrying
+      // a snapshot). So it commits freely in that window and the plan writes it straight back out.
+      //
+      //   the row holds 10 units A2 pinned and posted at £4 (£40 into Allocated Inventory,
+      //   `postedUnitCostBase` 4.000000). The operator reduces it to 6. Mid-edit a landed cost
+      //   reprices that layer £4 -> £5: the correction rewrites `unitCostBase` to 5.000000 on this
+      //   very row and posts the £10 to COGS/Inventory, never to Allocated Inventory — which is why
+      //   `postedUnitCostBase` stays at £4.
+      //   BEFORE r11: the trim is serialized from the £4 array read at the top, so the row is
+      //     written back at £4 and the correction is gone. The row says 6 x £4 = £24 where the
+      //     corrected pin says 6 x £5 = £30, Group B relieves those six at £4 when they ship, and
+      //     £6 of real cost never reaches cost of sales — permanently, and a later refund reverses
+      //     the same £6 short.
+      //   AFTER r11: the base is re-read under the row lock and the trim lands on the CORRECTED
+      //     entry, so the row keeps 6 x £5 = £30. The reversal is unchanged at £16 — 4 units at the
+      //     £4 A2 recorded posting — because no revaluation touches `postedUnitCostBase`.
+      //
+      // TAKEN HERE, NOT AT THE TOP OF THE TRANSACTION, and deliberately: see
+      // `lockAccountedRecordsForScope`. This is the statement before the first allocation-row write,
+      // which is where these rows are locked in any case, so no new lock ordering is created.
+      //
+      // Scoped to this (line, product) because that is the grain the carry-over pools at, and the
+      // only grain this action can honestly speak for: it edits ONE row, and the units it moves can
+      // only ever land on a row of the same line and product. Every other row on the order is
+      // untouched, so including them would be inventing a claim about a set nobody declared — the
+      // exact thing `resetAllocationAccountingIfStaged`'s undeclared-caller path refuses to do.
+      // -------------------------------------------------------------------------------------
+      const lockedScopeRecords = await lockAccountedRecordsForScope(
+        tx,
+        locked.orderId,
+        locked.lineId,
+        locked.productId,
+      )
+
       // o3d-4kfh r7: the DELETE test is on the quantised value, because that is the quantity the
       // row would hold. `newQty === 0` let 0.00004 through to a row Postgres stores as 0.0000 —
       // an allocation row claiming nothing, which every structural check then reads as a component
@@ -700,6 +767,52 @@ export async function updateAllocation(
         userId: session.user.id,
       })
 
+      // o3d-kouj: an edit that took this line's last allocation row away (a reduction to zero, or a
+      // merge that emptied the source) leaves its pin dormant — a recipe that certifies nothing, and
+      // that the next allocation has already decided not to use. Retired here, so no reader is left
+      // answering from it.
+      await clearDormantFulfillmentPinsInTx(tx, locked.orderId)
+
+      // -------------------------------------------------------------------------------------
+      // o3d-0i5y r10 (Codex round 10, finding 1) — THE MANUAL EDITOR CARRIES AND REVERSES TOO.
+      //
+      // r9 gave the carry-over and the orphan reversal to `allocateSalesOrder`, the one caller that
+      // DECLARES its next set, and left this path out on the reading that an undeclared caller has
+      // nothing to declare. That reading was about the STAMP, and it was right about the stamp. It
+      // was never right about the record, and this action is the single most direct way a recorded
+      // unit leaves an order: an operator types a smaller number into the allocation editor.
+      //
+      // Worked example — the same shape r9 fixed for the allocator, arriving through the UI:
+      //   line L holds 10 units at W1. A2 pinned them at £4 and posted DR Allocated / CR Inventory
+      //   £40, stamping `postedUnitCostBase` 4.000000 on the entry.
+      //   the operator edits the allocation to 6. Nothing is refused: no shipment is committed.
+      //   BEFORE r10: the row keeps a record of 10 units. `unaccountedAllocationQty`'s floor stops
+      //     A2 posting them again — and that is all it does. Group B will credit Allocated
+      //     Inventory 6 x £4 = £24 when the six ship, no refund ever sees the other four (they were
+      //     never invoiced), and £16 of a real debit sits in Allocated Inventory for ever with
+      //     Inventory understated by the same £16.
+      //   AFTER r10: the record is trimmed to the 6 units the row will hold (£24) and the 4 units
+      //     that left the order raise CR Allocated £16.00 / DR Inventory £16.00. Allocated
+      //     Inventory holds exactly the £24 Group B will relieve.
+      //
+      // A reduction to zero is the same thing at its limit: the row is deleted, all 10 units are
+      // orphaned, and £40 is reversed. A warehouse MOVE, by contrast, keeps every unit on the
+      // order — the carry-over moves the record onto the destination row and there is nothing to
+      // reverse, which is exactly what the merge branch above needs, because it DELETES the source
+      // row and its record with it.
+      //
+      // o3d-0i5y r11: the plan is drawn from `lockedScopeRecords` — the base read under the row
+      // lock this action holds from before its first row write until commit — and the rows it
+      // writes onto are read back AS PERSISTED. One implementation, shared with the rebalancer:
+      // see `refileAccountedRecordsForScope`.
+      // -------------------------------------------------------------------------------------
+      await refileAccountedRecordsForScope(
+        tx,
+        locked.orderId,
+        { lineId: locked.lineId, productId: locked.productId },
+        lockedScopeRecords,
+      )
+
       const integrityError = await validateAllocationIntegrity(tx, locked.orderId, [locked.lineId])
       if (integrityError) throw new Error(integrityError)
     }, STOCK_TX_OPTIONS)
@@ -741,24 +854,110 @@ export async function addAllocation(
     await requirePermission('sales.process')
     if (qty <= 0) return { success: false, error: 'Quantity must be positive' }
 
+    // o3d-kouj: the leaves whose reservedQty this action actually moved, carried OUT of the
+    // transaction for the storefront sync below. Re-deriving them from the current graph afterwards
+    // would miss a component that the line's PINNED recipe requires and the current recipe no longer
+    // mentions — precisely the component whose reservation just changed.
+    const reservedLeafProductIds: string[] = []
+
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
       await resetAllocationAccountingIfStaged(tx, orderId)
       const graph = await loadFulfillmentProductGraph(tx, [productId])
-      const leafProductIds = listFulfillmentLeafProductIds([productId], graph)
+
+      // o3d-kouj: THE LINE MUST BELONG TO THE ORDER WE LOCKED.
+      //
+      // `lineId` arrives from the caller and nothing above ties it to `orderId`. The lock is taken on
+      // the ORDER, so a lineId belonging to a DIFFERENT order is outside it entirely — and every
+      // in-flight fact this action then reads is scoped to the wrong pair: `orderAllocation` is
+      // queried by `{ orderId, lineId }` and `shipmentLine` by `{ lineId, shipment: { orderId } }`,
+      // so another order's fully-allocated, half-picked line reads as holding NOTHING. It is then
+      // judged capturable, and the capture below OVERWRITES the pinned recipe that order was
+      // allocated and picked against — while the allocation rows written above attach that foreign
+      // line to this order.
+      //
+      // Scoped in the SELECT rather than checked afterwards, so there is no version of this where
+      // the fact is read and the check is forgotten. `findFirst` with both keys: absent means either
+      // no such line or not ours, and the two want the same answer — refuse.
+      const linePinState = await tx.salesOrderLine.findFirst({
+        where: { id: lineId, orderId },
+        select: { id: true, productId: true, fulfillmentRequirements: true },
+      })
+      if (!linePinState) {
+        throw new Error(
+          `Line ${lineId} does not belong to order ${orderId} — refusing to allocate against it. `
+          + 'An allocation is only ever meaningful for a line of the order it is raised on.',
+        )
+      }
+      const [lineAllocations, lineCommittedShipments] = await Promise.all([
+        tx.orderAllocation.findMany({ where: { orderId, lineId }, select: { lineId: true } }),
+        tx.shipmentLine.findMany({
+          where: { lineId, shipment: { orderId, status: { not: 'PENDING' } } },
+          select: { lineId: true },
+        }),
+      ])
+      const lineIsCapturable = selectCapturableLineIds({
+        lineIds: [lineId],
+        lineIdsHoldingAllocations: lineAllocations.map((row) => row.lineId),
+        lineIdsHoldingCommittedShipments: lineCommittedShipments.map((row) => row.lineId),
+      }).length === 1
+      // A capturable line's stored snapshot describes an in-flight life it no longer has, so this
+      // action expands the CURRENT graph for it — which is exactly what the capture below records.
+      //
+      // The product is the CALLER'S `productId`, not the line's, because that is the only product
+      // `graph` was loaded for: resolving against a product the graph does not contain would treat
+      // it as a leaf. The two disagree only if the caller named a product the line does not
+      // reference, and then the pin — captured for the line's own product — simply does not match
+      // and the current graph answers, which is what this action did before o3d-kouj.
+      const resolvableLine = {
+        id: lineId,
+        productId,
+        fulfillmentRequirements: lineIsCapturable ? null : linePinState.fulfillmentRequirements,
+      }
+      const lineRequirements = lineFulfillmentRequirements(resolvableLine, graph)
+
+      // o3d-kouj: THE VERSION THESE ROWS WERE EXPANDED FROM — the pin's, whenever the pin is what
+      // answered.
+      //
+      // The column's meaning is fixed and the same rule `allocateSalesOrder` follows: it records the
+      // graph version the rows came from, never "the version that happens to be current". A pinned
+      // line's rows are expanded from the pin, so stamping the CURRENT version leaves the row
+      // claiming a provenance it does not have — and, worse, certifying itself as current: if the
+      // pin were ever lost, the CAS (which is skipped per line while a pin exists) would come back
+      // and find a row that agrees with a recipe it was never expanded from.
+      //
+      // `parseFulfillmentRequirementSnapshot` re-reads the same payload `lineFulfillmentRequirements`
+      // just resolved through, and it is pure — so the two cannot disagree — and the productId test
+      // is the same one the seam applies, because a pin for a different product did not answer here.
+      const activePin = lineIsCapturable
+        ? null
+        : parseFulfillmentRequirementSnapshot(linePinState.fulfillmentRequirements, lineId)
+      const expansionGraphVersion = activePin && activePin.productId === productId
+        ? activePin.graphVersion
+        : graph.get(productId)?.fulfillmentGraphVersion ?? 0
+
+      const leafProductIds = lineRequirements.map((requirement) => requirement.productId)
       await lockStockLevels(tx, leafProductIds, [warehouseId])
 
       const stockLevels = await tx.stockLevel.findMany({
         where: { productId: { in: leafProductIds }, warehouseId: { in: [warehouseId] } },
         select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
       })
-      const stockMap = buildAvailableStockMap(stockLevels)
+      // o3d-aqke (Codex r1 finding 2): floored to the canonical scale, for the same reason
+      // `allocateSalesOrder` floors its own map. `updateAllocation` needs no such floor — the
+      // quantity it checks IS the quantity it writes — but this action expands a KIT, so the
+      // per-leaf `canonicalAllocationQty` below happens AFTER the feasibility test and can round a
+      // leaf half an ulp above the stock the kit-unit test was measured against. The reserve then
+      // breaches the VALIDATED `stock_levels_reserved_qty_lte_quantity` constraint and aborts the
+      // transaction, which is a crash rather than a refusal: nothing is written, and the operator
+      // gets a constraint name instead of "only N available".
+      const stockMap = floorAvailableStockMapToCanonicalScale(buildAvailableStockMap(stockLevels))
       // o3d-4kfh r7 (Codex finding 4): quantised BEFORE feasibility, as in `updateAllocation`.
       const requestedQty = canonicalAllocationQty(toDecimal(qty))
       if (requestedQty.lte(0)) {
         throw new Error('Quantity must be at least 0.0001 — allocations are stored to four decimal places')
       }
-      const avail = getFulfillmentAvailableQtyDecimal(productId, warehouseId, graph, stockMap)
+      const avail = availableQtyFromRequirements(lineRequirements, warehouseId, stockMap)
       if (requestedQty.gt(avail)) throw new Error(`Only ${avail.toString()} available`)
       // o3d-4kfh r7: EVERY LEAF QUANTISED, once, here — the single point the rest of this action
       // reads. A KIT expansion multiplies by component factors, so even a whole-number kit quantity
@@ -767,13 +966,16 @@ export async function addAllocation(
       // apart on a shared aggregate, which the transaction's own integrity check cannot see because
       // it reads allocation rows and never stock.
       //
-      // Rounded per leaf, matching what `allocateSalesOrder` does to its merged rows. It can put a
-      // fractional-KIT set marginally out of proportion; `validateAllocationIntegrity` at the end
-      // of this action reads the WRITTEN rows, so that fails the action closed rather than
-      // committing a set the checks disagree with (o3d-i4qd — the atomic per-set canonicalisation
-      // is that issue, not this one).
+      // Rounded per leaf, matching what `allocateSalesOrder` does to its merged rows. It puts a
+      // fractional-KIT set marginally out of proportion — 0.5 kits of a 0.3333 component is
+      // 0.16665 and the column holds 0.1667 — and that is unavoidable, not a defect in this write:
+      // no rounding policy makes an unrepresentable requirement representable. o3d-i4qd made the
+      // READERS judge these rows at the scale they are stored at, so `validateAllocationIntegrity`
+      // at the end of this action no longer refuses the set this action just wrote. It still fails
+      // the action closed on a set that is disproportionate by more than the column's own
+      // rounding.
       const requirements = new Map(
-        [...expandFulfillmentRequirementsDecimal(productId, requestedQty, graph)]
+        [...scaleFulfillmentRequirements(lineRequirements, requestedQty)]
           .map(([leafProductId, requiredQty]) => [leafProductId, canonicalAllocationQty(requiredQty)] as const),
       )
 
@@ -807,14 +1009,16 @@ export async function addAllocation(
               warehouseId,
               qty: requiredQty,
               // o3d-4kfh r6: stamp the graph version this expansion came from, out of the SAME
-              // statement that loaded the components (`loadFulfillmentProductGraph` above).
+              // statement that loaded the components (`loadFulfillmentProductGraph` above) — or,
+              // for a pinned line, the version the PIN records, because the pin is what the
+              // expansion came from (o3d-kouj, see `expansionGraphVersion`).
               //
               // The `update` branch above deliberately leaves an existing row's stamp alone. If
               // that stamp is stale the whole row stays stale, `validateAllocationIntegrity` below
               // refuses this action, and the operator is told to re-allocate — which is right:
               // re-stamping a row we only ADDED to would bless the part of it that was expanded
               // from a recipe that no longer exists.
-              fulfillmentGraphVersion: graph.get(productId)?.fulfillmentGraphVersion ?? 0,
+              fulfillmentGraphVersion: expansionGraphVersion,
             },
           })
         }
@@ -827,6 +1031,35 @@ export async function addAllocation(
       // Reserving the in-memory figure instead is what leaves `reservedQty` and `OrderAllocation`
       // two books that disagree — and the reconciliation of that disagreement is what takes units
       // out of another order's share of the shared (product, warehouse) aggregate.
+      // o3d-kouj: pin the recipe now that this line holds rows. Written from the SAME graph the rows
+      // above were expanded from, in the same transaction and under the same order lock.
+      //
+      // Only when the caller's product IS the line's product. `graph` was loaded for the caller's
+      // product, so that is the only thing this transaction can honestly capture — and a snapshot
+      // recorded under a product the line does not reference is not a pin at all: every reader would
+      // see the mismatch, warn, and fall back to the live graph, leaving the line unprotected while
+      // its row claims otherwise. Better to leave it unpinned, which is exactly what it was.
+      const pinnableProduct = productId === linePinState.productId
+      if (lineIsCapturable && requirements.size > 0 && pinnableProduct) {
+        await tx.salesOrderLine.update({
+          where: { id: lineId },
+          data: {
+            fulfillmentRequirements: captureFulfillmentRequirementSnapshot(
+              resolvableLine.productId,
+              graph,
+            ) as never,
+          },
+        })
+      } else if (lineIsCapturable && requirements.size > 0) {
+        console.warn(
+          `[allocation] manual allocation on line ${lineId} named product ${productId} but the line `
+          + `references ${linePinState.productId ?? '(none)'} — the line was left unpinned rather than `
+          + 'stamped with a recipe that is not about it.',
+        )
+      }
+
+      reservedLeafProductIds.push(...requirements.keys())
+
       const writtenRows = await tx.orderAllocation.findMany({
         where: { lineId, warehouseId, productId: { in: [...requirements.keys()] } },
         select: { productId: true, qty: true },
@@ -847,9 +1080,7 @@ export async function addAllocation(
 
     revalidatePath(`/sales/${orderId}`)
     try {
-      const graph = await loadFulfillmentProductGraph(db, [productId])
-      const syncTargets = [...new Set(listFulfillmentLeafProductIds([productId], graph))]
-      await enqueueStockSync(syncTargets, 'IMS_CHANGE')
+      await enqueueStockSync([...new Set(reservedLeafProductIds)], 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }
@@ -883,7 +1114,18 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
         userId: session.user.id,
       })
 
-      if (so.status === 'ALLOCATED') {
+      // o3d-e2mz r8: THE DEMOTION IS DECIDED ON THE STATUS READ UNDER THIS LOCK, NEVER ON `so.status`.
+      //
+      // `so` is read at the top of this action, OUTSIDE the transaction and before the lock. Deciding
+      // on it and then writing `where: { id: orderId }` — no status predicate — is a check/use race
+      // with nothing serialising the two, and CANCELLED is where it hurts: the sales-order state
+      // machine has `CANCELLED: []`, no transition out at all, yet an order cancelled between that
+      // read and this lock was demoted straight back to PROCESSING. `validateSalesOrderStatusTransition`
+      // could not object, because it was being shown the stale ALLOCATED. The order came back to life
+      // with its accounting work live again, which is exactly what the cancellation was for.
+      const lockedOrder = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
+      if (!lockedOrder) throw new Error('Order not found')
+      if (lockedOrder.status === 'ALLOCATED') {
         // Re-read rather than assume: the guard above has already established there is no
         // non-PENDING shipment under this lock, so this count is 0 by construction. Kept as a
         // belt-and-braces read so the status demotion can never outlive the guard that justifies it.
@@ -891,9 +1133,11 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
           where: { orderId, status: { not: 'PENDING' } },
         })
         if (activeShipmentCount === 0) {
-          const transition = validateSalesOrderStatusTransition(so.status, 'PROCESSING')
+          const transition = validateSalesOrderStatusTransition(lockedOrder.status, 'PROCESSING')
           if (!transition.success) throw new Error(transition.error)
-          await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'PROCESSING' } })
+          // Scoped to the status the decision was taken on, so the write cannot land on a row that
+          // moved after the read even if the lock were ever lost or not taken.
+          await tx.salesOrder.updateMany({ where: { id: orderId, status: 'ALLOCATED' }, data: { status: 'PROCESSING' } })
         }
       }
 
@@ -1037,7 +1281,16 @@ export async function updateShipmentStatus(
   shipmentId: string,
   targetStatus: string,
   extra?: { trackingNumber?: string; shippingService?: string },
-  options?: { internalBypassToken?: symbol },
+  options?: {
+    internalBypassToken?: symbol
+    /**
+     * o3d-0i5y r2: who owns the "is the ORDER fulfilled?" decision for this dispatch — see
+     * `OrderCompletionAuthority`. Omitted (the default) means IMS is working the order and the
+     * completion check below derives the answer from the shipment rows. `applyExternalFulfillmentUpdate`
+     * passes `EXTERNAL`, because the storefront/WMS driving it has already made that decision.
+     */
+    completionAuthority?: OrderCompletionAuthority
+  },
 ): Promise<{ success: boolean; error?: string }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
@@ -1058,7 +1311,34 @@ export async function updateShipmentStatus(
     }
 
     if (targetStatus === 'SHIPPED') {
-      const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra)
+      const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra, {
+        completionAuthority: options?.completionAuthority ?? 'IMS',
+      })
+      // o3d-0i5y: every shipment raised on this order has now shipped, but the order still owes
+      // quantity, so it was deliberately left in its pre-shipment status instead of being declared
+      // complete. Only ever set under IMS completion authority — an externally fulfilled order is
+      // completed by the storefront/WMS that shipped it, and reporting it short here would be a
+      // false warning on EVERY external dispatch. Nothing re-allocates such an order automatically
+      // (both allocation sweeps exclude orders holding shipments), so this WARNING is the operator
+      // queue for it — same pattern as the paid_without_invoice warning. Logged on EVERY shipped
+      // transition, not only the one that first exposed the shortfall, so a retry after a crashed
+      // log still surfaces it.
+      if (reconciliation.shortfall) {
+        const orderRef = result.shipment.order.orderNumber ?? result.shipment.order.externalOrderNumber
+        const outstandingSummary = reconciliation.shortfall
+          .map((line) => `${line.label} (${line.outstandingQty} outstanding)`)
+          .join(', ')
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: reconciliation.orderId,
+          action: 'shipped_short',
+          tag: 'sales',
+          level: 'WARNING',
+          description: `Order ${orderRef} has despatched every shipment raised against it but is still short: ${outstandingSummary}. `
+            + 'It has NOT been marked SHIPPED. Allocate and ship the remainder, or set the order to SHIPPED explicitly to close it short.',
+          metadata: { orderNumber: orderRef, shortfall: reconciliation.shortfall },
+        })
+      }
       if (reconciliation.shouldGenerateInvoice) {
         const { generateInvoiceNumber } = await import('./sales')
         await generateInvoiceNumber(reconciliation.orderId)

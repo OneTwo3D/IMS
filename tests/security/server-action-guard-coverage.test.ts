@@ -1,17 +1,43 @@
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import ts from 'typescript'
+import {
+  createRepoGraph,
+  guardWriteSurface,
+  prismaSurfaceOf,
+  scanActionsDir,
+  scanAuthenticationOnlyActions,
+  scanSecretReadingActions,
+  scanSource,
+  scanTreeForInlineServerActions,
+  scanUseServerOutsideActions,
+  useServerModulesOutsideScanRoots,
+} from './server-action-guard-scan'
 
 // Regression guard for onetwo3d-ims-mgq1: every exported async function in a
 // 'use server' module is a callable RPC endpoint, so it must either enforce an
 // auth/authorization guard directly, or be explicitly listed here as public or
 // as a facade that delegates to another guarded action. A NEW unguarded export
 // fails this test until it is fixed or (with justification) allowlisted.
+//
+// The detection rules live in ./server-action-guard-scan.ts and are themselves
+// tested in ./server-action-guard-detector.test.ts (o3d-hic9). This file owns
+// only the policy: the allowlist, the inventory, and the tree they are applied to.
+//
+// o3d-512h round 3: every rule below is handed a resolving MODULE GRAPH
+// (./module-graph.ts). "Delegates to a guarded action" is now something the rule
+// checked rather than something the allowlist asserted, which is why six entries
+// could be deleted outright this round rather than reworded again.
 
-const ACTIONS_DIR = path.join(process.cwd(), 'app', 'actions')
+const ROOT = process.cwd()
+const SCAN_ROOTS = ['app', 'lib', 'components']
+const ACTIONS_DIR = path.join(ROOT, 'app', 'actions')
+const ACTIONS_KEY_PREFIX = 'app/actions'
+
+const graph = createRepoGraph(ROOT, SCAN_ROOTS)
 
 // Identifiers that establish an auth/authorization boundary.
 const GUARD_IDENTIFIERS = new Set([
@@ -19,14 +45,13 @@ const GUARD_IDENTIFIERS = new Set([
   'requirePermission', 'requireFreshPermission', 'requireApiAuth', 'requireApiAdmin',
   'requireApiFreshAdmin', 'requireSupplier', 'assertSupplierOwnsResource',
   'requireMintsoftReadAccess', 'requireMintsoftWriteAccess', 'requireFreshMintsoftWriteAccess',
-  'requireMintsoftReturnsWriteAccess', 'requireShoppingAdmin', 'requireFreshShoppingAdmin',
+  'requireMintsoftReturnsWriteAccess', 'requireSyncPermission', 'requireFreshShoppingAdmin',
   'getVerifiedSession', 'consumeDestructiveActionCode', 'validateImportFile',
 ])
 
 // Exports intentionally without a direct guard. Each entry needs a reason.
 const ALLOWLIST: Record<string, string> = {
-  // Pre-auth by design (authentication / account recovery entry points).
-  'auth.ts:*': 'authentication entry points run before a session exists',
+  // Pre-auth by design (account recovery / login ceremonies).
   'password-reset.ts:*': 'password reset is pre-auth; rate-limited + anti-enumeration',
   'passkey.ts:getPasskeyAuthenticationOptions': 'pre-auth passkey login ceremony',
   'passkey.ts:verifyPasskeyAuthentication': 'pre-auth passkey login ceremony (one-time token bound)',
@@ -35,95 +60,527 @@ const ALLOWLIST: Record<string, string> = {
   // Public, static (non-sensitive) connector catalogue.
   'company.ts:getShoppingConnectors': 'returns static connector id/label/available metadata only',
 
-  // Connector-facade modules: thin routers that resolve the active connector and
-  // delegate to a guarded connector action (verified in the 2026-07 security
-  // review). A deeper pass to give each facade getter its own guard is tracked in
-  // onetwo3d-ims-mgq1. Core business-logic modules are NOT allowlisted.
-  'accounting-sync.ts:*': 'connector facade → guarded xero/quickbooks actions',
-  'accounting-batch.ts:*': 'connector facade → guarded daily-batch actions',
-  'xero-sync.ts:*': 'connector facade → guarded xero actions',
-  'quickbooks-sync.ts:*': 'connector facade → guarded quickbooks actions',
-  'quickbooks-daily-batch.ts:*': 'connector facade → guarded daily-batch actions',
-  'shopping-sync.ts:*': 'connector facade → guarded wc-sync actions',
-  'wms-sync.ts:*': 'connector facade → guarded mintsoft/shiphero actions',
-  'wms-asn.ts:*': 'connector facade → guarded mintsoft/shiphero ASN actions',
-  'wms-onboarding.ts:*': 'connector facade → guarded mintsoft/shiphero onboarding actions',
-}
+  // o3d-512h round 3 — SIX ENTRIES DELETED, none of them by rewording.
+  //
+  //   * 'auth.ts:*' matched nothing: app/actions/auth.ts does not exist and has
+  //     not for some time. A stale entry is a standing invitation to create a file
+  //     with that name and inherit a blanket exemption nobody reviewed — so the
+  //     "no dead entries" test below now fails the build on one.
+  //   * 'shopping-sync.ts:getShoppingSyncLogsForConnector' claimed "dispatcher →
+  //     guarded shopify/wc sync-log actions; no unguarded arm". True, as it
+  //     happens — and now VERIFIED, by resolution, so the claim does not need to
+  //     be taken on trust or re-checked by hand each round.
+  //   * 'quickbooks-daily-batch.ts:*' said "verified: both getters gate on
+  //     requirePermission(sync) and refresh delegates to one". Also true, also now
+  //     machine-checked, so the exemption suppresses nothing and is gone. That the
+  //     rule below FOUND it is the point: three of these six were only visible
+  //     once something checked whether each entry was still about live code.
+  //   * 'wms-sync.ts:*', 'wms-asn.ts:*' and 'wms-onboarding.ts:*' each carried a
+  //     reason that admitted, in as many words, that the no-connector arm returns
+  //     UNGUARDED. That is the accounting-sync defect in Mintsoft's dispatchers,
+  //     and an allowlist entry describing a hole is not a reason, it is a bug
+  //     report filed against yourself. All six endpoints now carry their own
+  //     delegate's gate — 'sync' for the three reads, 'purchasing.receive' and
+  //     'stock_control.transfer' for the two ASN creates, which do NOT share a
+  //     permission and would have been wrong to gate alike.
+  //
+  // Nothing about accounting-sync.ts or accounting-batch.ts belongs here again
+  // either: every dispatcher carries its delegate's gate (see the note at the top
+  // of app/actions/accounting-sync.ts).
 
-/**
- * A thin facade whose body just returns a call to another (guarded) action —
- * e.g. `return getWcSyncSettings()`. The guard lives in the delegate. Recognised
- * so the many connector facades don't each need an allowlist entry; the delegate
- * itself is still subject to this test (if it lives in app/actions) or is a
- * connector action assumed guarded.
- */
-function isDelegatingFacade(fn: ts.FunctionDeclaration): boolean {
-  const statements = fn.body?.statements ?? []
-  if (statements.length !== 1) return false
-  const only = statements[0]
-  if (!ts.isReturnStatement(only) || !only.expression) return false
-  let expr: ts.Expression = only.expression
-  if (ts.isAwaitExpression(expr)) expr = expr.expression
-  return ts.isCallExpression(expr)
-}
+  // o3d-512h — REASON NARROWED. An allowlist reason is a claim about code, and
+  // this one claimed more than the code does. What is actually true is stated
+  // here; what is NOT verified is stated as not verified, because "connector
+  // facade → guarded X actions" reads as a coverage guarantee and was being taken
+  // as one.
+  //
+  // quickbooks-sync.ts is not a facade at all: six of its exports
+  // (getQuickBooksSettingsMasked, getQuickBooksConnectionStatus,
+  // getQuickBooksAccounts, fetchQuickBooksTaxCodes, getQuickBooksSyncLogs,
+  // getQuickBooksSyncReadiness) carry NO guard and read Prisma or the QuickBooks
+  // API directly. They are separately addressable endpoints. QuickBooks is out of
+  // scope for this branch by owner instruction, so they are left as they are —
+  // but this entry no longer asserts they are guarded.
+  'quickbooks-sync.ts:*':
+    'OUT OF SCOPE (QuickBooks, owner instruction) — NOT verified as guarded: six exports carry no guard; reachable via accounting-sync.ts only behind its dispatcher gate',
 
-function collectActionFiles(): string[] {
-  return readdirSync(ACTIONS_DIR)
-    .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
-    .map((f) => path.join(ACTIONS_DIR, f))
-}
-
-function isUseServer(source: string): boolean {
-  return /^\s*['"]use server['"]/.test(source)
-}
-
-function bodyReferencesGuard(node: ts.Node): boolean {
-  let found = false
-  const visit = (n: ts.Node) => {
-    if (found) return
-    if (ts.isIdentifier(n) && GUARD_IDENTIFIERS.has(n.text)) { found = true; return }
-    ts.forEachChild(n, visit)
-  }
-  ts.forEachChild(node, visit)
-  return found
-}
-
-function isAllowlisted(file: string, name: string): boolean {
-  return ALLOWLIST[`${file}:${name}`] !== undefined || ALLOWLIST[`${file}:*`] !== undefined
+  // o3d-512h round 7, Codex finding 1 — THE ONE RESIDUAL IN THE TREE.
+  //
+  // The collector is now exhaustive: every name a 'use server' module publishes
+  // produces an entry, and anything not established to be an async function is
+  // NOT VERIFIED rather than dropped. This is the only export in 55 'use server'
+  // modules that lands there, and it needs an entry BY NAME — a `file:*` wildcard
+  // cannot clear an unverified export any more (isUnverifiedAllowlisted).
+  //
+  // WHAT IS VERIFIED: the name resolves through the graph to
+  // lib/products/categories.ts:buildProductCategoryPathDisplay, a SYNCHRONOUS,
+  // pure string function over its own arguments. It reads no database, no
+  // session and no setting, so there is no data for a guard to protect.
+  //
+  // WHAT IS NOT VERIFIED, and cannot be from here: whether Next's action protocol
+  // publishes it. `next build` compiles this tree (round 6), so the usual
+  // "a 'use server' module may only export async functions" build error does not
+  // fire on a sync RE-export, and this scanner deliberately does not decide a
+  // question only the compiler can answer. If it IS published, the endpoint hands
+  // an unauthenticated caller a formatted string built from the argument they
+  // sent.
+  'categories.ts:buildProductCategoryPathDisplay':
+    'sync re-export of a pure string helper (lib/products/categories.ts); touches no data, session or setting. NOT verified: whether Next publishes a sync re-export from a `use server` module — a next build question, flagged rather than assumed either way',
 }
 
 test('every exported server action enforces an auth guard or is allowlisted', () => {
-  const violations: string[] = []
-
-  for (const filePath of collectActionFiles()) {
-    const source = readFileSync(filePath, 'utf8')
-    if (!isUseServer(source)) continue
-    const file = path.basename(filePath)
-    const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
-
-    ts.forEachChild(sf, (node) => {
-      // exported `async function name() {}`
-      const isExported = (n: ts.Node): boolean =>
-        !!(ts.canHaveModifiers(n) && ts.getModifiers(n)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword))
-
-      if (
-        ts.isFunctionDeclaration(node) &&
-        node.name &&
-        node.body &&
-        isExported(node) &&
-        node.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)
-      ) {
-        const name = node.name.text
-        if (!bodyReferencesGuard(node) && !isDelegatingFacade(node) && !isAllowlisted(file, name)) {
-          violations.push(`${file}:${name}`)
-        }
-      }
-    })
-  }
+  const violations = scanActionsDir(ACTIONS_DIR, ALLOWLIST, scanSource, graph, ACTIONS_KEY_PREFIX)
 
   assert.deepEqual(
     violations,
     [],
     `Unguarded exported server action(s) found — add a guard or allowlist with a reason:\n${violations.join('\n')}`,
   )
+})
+
+/**
+ * o3d-512h round 3 — an allowlist entry is a claim about code that exists.
+ *
+ * 'auth.ts:*' sat in the list above naming a file that had been gone for
+ * releases. Nothing failed, because a suppression that suppresses nothing is
+ * invisible — and the day someone adds app/actions/auth.ts, every export in it is
+ * exempt on a reason written for different code. The same goes for a per-export
+ * entry whose export was renamed.
+ *
+ * So the allowlist is checked against the tree: every entry must currently
+ * suppress something. This is the same rule the branch applies to prose — a
+ * justification that cannot be shown to be about live code does not get to stand.
+ */
+test('every allowlist entry actually suppresses a live violation — no dead exemptions', () => {
+  const unsuppressed = new Set(scanActionsDir(ACTIONS_DIR, {}, scanSource, graph, ACTIONS_KEY_PREFIX))
+  const dead: string[] = []
+
+  for (const entry of Object.keys(ALLOWLIST)) {
+    const [file, name] = splitEntry(entry)
+    const covers = name === '*'
+      ? [...unsuppressed].some((v) => v.startsWith(`${file}:`))
+      : unsuppressed.has(entry)
+    if (!covers) dead.push(entry)
+  }
+
+  assert.deepEqual(
+    dead,
+    [],
+    'Allowlist entries that suppress nothing. Either the export gained a real guard '
+    + '(delete the entry — that is the good direction), or the file/export was renamed '
+    + 'or removed and the exemption is now a trap set for whoever recreates the name:\n'
+    + dead.join('\n'),
+  )
+})
+
+test('every allowlist entry states a reason', () => {
+  for (const [entry, reason] of Object.entries(ALLOWLIST)) {
+    assert.ok(reason.trim().length > 0, `${entry} needs a stated reason`)
+  }
+})
+
+/**
+ * o3d-hic9: the directive, not the directory, is what creates the endpoint.
+ * Scanning only app/actions/ left every `'use server'` module elsewhere
+ * unexamined — which is how lib/connectors/woocommerce/products.ts came to
+ * export an unauthenticated WooCommerce SKU probe.
+ */
+const OUTSIDE_ACTIONS_ALLOWLIST: Record<string, string> = {}
+
+test('every `use server` export OUTSIDE app/actions enforces an auth guard or is allowlisted', () => {
+  const violations = scanUseServerOutsideActions(
+    ROOT,
+    SCAN_ROOTS,
+    OUTSIDE_ACTIONS_ALLOWLIST,
+    scanSource,
+    graph,
+  )
+
+  assert.deepEqual(
+    violations,
+    [],
+    `Unguarded exported server action(s) found outside app/actions:\n${violations.join('\n')}`,
+  )
+})
+
+/**
+ * o3d-512h round 7, Codex finding 1 — THE INLINE ACTION.
+ *
+ * The two rules above both begin by asking whether the FILE carries the
+ * directive. An inline server action lives in a file that does not:
+ *
+ *   async function save(form: FormData) { 'use server'; await db.thing.update(…) }
+ *
+ * declared inside a page component is a registered server reference with a public
+ * id, callable by anyone who ever loaded the page, with every declared parameter
+ * under their control. It was outside the scanners' INPUT entirely — not judged
+ * leniently, not seen.
+ *
+ * The tree has none today. That is the reason to add the rule now rather than the
+ * reason not to: the first one written must land red, not be discovered by the
+ * next review round.
+ */
+const INLINE_ACTION_ALLOWLIST: Record<string, string> = {}
+
+test('every INLINE `use server` function enforces an auth guard', () => {
+  const violations = scanTreeForInlineServerActions(ROOT, SCAN_ROOTS, INLINE_ACTION_ALLOWLIST, graph)
+
+  assert.deepEqual(
+    violations,
+    [],
+    'Inline `use server` function(s) with no verified guard. An inline action is a public HTTP '
+    + 'endpoint exactly as an exported one is — its id ships to the browser and its arguments come '
+    + 'off the wire. Gate it, or move it into app/actions where the rest of the rules apply:\n'
+    + violations.join('\n'),
+  )
+})
+
+/**
+ * o3d-512h round 7, Codex finding 3 — WHAT THE GUARDS THEMSELVES WRITE.
+ *
+ * The write-ordering rule exempts a pinned guard's own writes, because a denial
+ * that records itself is still a denial. Round 6 read that exemption off the
+ * DECLARATION, so a guard that also deleted rows carried the deletion past every
+ * later check. It is now a statement about MODELS
+ * (AUDITED_CONTROL_WRITE_MODELS) — and this pin makes even an exempt write
+ * visible, because today the honest answer is that no pinned guard writes
+ * anything at all.
+ *
+ * An empty object is the expected state. A guard acquiring a write shows up here
+ * as a diff to argue about, whether or not the exemption still covers it.
+ */
+test('no pinned guard mutates anything — the write exemption is currently vacuous', () => {
+  assert.deepEqual(
+    guardWriteSurface(graph),
+    {},
+    'A pinned auth guard now WRITES. If the write is part of the control (a denial audit row, a '
+    + 'session touch) it must be named in AUDITED_CONTROL_WRITE_MODELS with a reason; anything '
+    + 'else is a business write, and the guard will stop exempting it — every check placed after '
+    + 'that guard loses its credit. Either way this is a decision, not a refresh.',
+  )
+})
+
+/**
+ * o3d-512h: authentication is not an answer to an authorization question.
+ *
+ * The two rules above ask only "is there a guard at all", and that is precisely
+ * how the first sweep of this branch walked past
+ * app/actions/company.ts:getEmailSettings — it held `requireAuth`, so it was
+ * never a violation, while handing the decrypted SMTP configuration to every
+ * signed-in role including SUPPLIER. The generic `getSetting` sibling was found
+ * and fixed because it had NO guard; the one that had the wrong guard did not
+ * register.
+ *
+ * This third rule is what makes a repeat cost a red build rather than another
+ * review round: an endpoint that reaches the settings-store readers (which
+ * decrypt SENSITIVE_SETTING_KEYS) must hold an authorization guard, not just an
+ * authentication one.
+ *
+ * The allowlists are empty and should stay that way — an endpoint reading a
+ * credential under authentication only is the defect, not a shape to excuse.
+ */
+const SECRET_READ_ALLOWLIST: Record<string, string> = {}
+
+test('every server action reading a stored secret holds an authorization guard, not just requireAuth', () => {
+  const violations = scanActionsDir(
+    ACTIONS_DIR,
+    SECRET_READ_ALLOWLIST,
+    scanSecretReadingActions,
+    graph,
+    ACTIONS_KEY_PREFIX,
+  )
+
+  assert.deepEqual(
+    violations,
+    [],
+    `Server action(s) reading stored settings behind authentication only — these decrypt SENSITIVE_SETTING_KEYS, so they need requirePermission/requireRole:\n${violations.join('\n')}`,
+  )
+})
+
+test('the same secret-read rule applies OUTSIDE app/actions', () => {
+  const violations = scanUseServerOutsideActions(
+    ROOT,
+    SCAN_ROOTS,
+    SECRET_READ_ALLOWLIST,
+    scanSecretReadingActions,
+    graph,
+  )
+
+  assert.deepEqual(
+    violations,
+    [],
+    `Secret-reading 'use server' export(s) behind authentication only, outside app/actions:\n${violations.join('\n')}`,
+  )
+})
+
+/**
+ * o3d-512h — the AUTHENTICATION-ONLY inventory.
+ *
+ * ROUND 3 CHANGED WHAT THIS MEANS. It used to be a 78-line list of business
+ * reads, defended as "requireAuth is the right answer for most of these". It was
+ * not: `requireAuth` answers "is someone signed in", and SUPPLIER — an external
+ * company we issue a login to — is signed in. Every entry on that list was a
+ * supplier-reachable endpoint, and purchase-orders.ts:getPurchaseOrder was
+ * handing a supplier any other supplier's order by id.
+ *
+ * Those 70-odd endpoints now hold `requireInternalUser`, which is an
+ * authorization gate, so they are simply not on this list any more. What is left
+ * is the set for which authentication genuinely IS the whole answer: endpoints
+ * that are SELF-SCOPED by session.user.id — your own profile, your own passkeys.
+ * A supplier reaching those reaches only its own row, which is the property that
+ * makes the gate sufficient.
+ *
+ * Adding an entry therefore means asserting that new claim, in the diff:
+ * this endpoint is self-scoped to the caller, and an external principal reading
+ * it reads nothing but its own.
+ */
+const AUTHENTICATION_ONLY_ACTIONS: string[] = [
+  'passkey.ts:deletePasskey',
+  'passkey.ts:getPasskeyRegistrationOptions',
+  'passkey.ts:listPasskeys',
+  'passkey.ts:renamePasskey',
+  'passkey.ts:verifyPasskeyRegistration',
+  'profile.ts:changePassword',
+  'profile.ts:getProfileData',
+  'profile.ts:updatePictureUrl',
+  'profile.ts:updateProfile',
+]
+
+/**
+ * o3d-512h round 3, Codex finding 3 — WHAT each of those endpoints reaches.
+ *
+ * The inventory pinned WHICH endpoints are authentication-only and said nothing
+ * about what they return, so an endpoint could start serving privileged rows
+ * without ever leaving the list — which is the exact question the inventory
+ * exists to force. Worse, it could not have caught the class it was written for:
+ * settings.ts:getAccountCodes and purchase-orders.ts:getBillPaymentAccounts
+ * reached the stored chart of accounts through a helper two modules away, and
+ * nothing in their own source looked like an accounting read.
+ *
+ * The module graph resolves through those helpers, so the pin can be about the
+ * DATA SURFACE: the Prisma models each endpoint reaches, transitively, through
+ * every callee that resolves. A self-scoped profile read that starts touching
+ * `supplier`, `purchaseOrder` or `setting` turns the build red on the line that
+ * names the model, whatever its gate still says.
+ *
+ * `activityLog` appears on the mutations because logActivity writes one; that is
+ * a write of the caller's own action, not a read of anyone's data.
+ *
+ * WHAT THIS PIN DOES NOT DO — Codex round 4, finding 4.
+ *
+ * Round 3 presented this as covering the supplier-isolation class. It does not.
+ * It pins WHICH models an endpoint reaches; the inventory's whole justification
+ * is that each endpoint is SCOPED TO THE CALLER, and scope is not a property of
+ * the model list. `db.user.findUnique` looks identical whether the filter is the
+ * session's own id or an id from the request, so the escalation the inventory
+ * exists to prevent — an endpoint every signed-in principal may call starting to
+ * return somebody else's row — can happen without this pin moving a character.
+ * Anything pinned here in the name of self-scoping would be a proxy for the
+ * property, and a proxy accepted as the property is the defect this whole branch
+ * has been unwinding.
+ *
+ * So it is not pinned here. It is EXECUTED, in
+ * tests/security/authentication-only-self-scoping.test.ts: every endpoint on the
+ * list below is called as an external SUPPLIER principal, with foreign ids where
+ * it takes one, and every query it issues is inspected for the caller's own id.
+ * That file also asserts its coverage is exactly this inventory, so a new
+ * authentication-only endpoint cannot arrive with the self-scoping claim merely
+ * assumed. The two pins answer different questions and neither substitutes for
+ * the other: this one is static reach, that one is observed scope.
+ */
+const AUTHENTICATION_ONLY_PRISMA_SURFACE: Record<string, string[]> = {
+  'passkey.ts:deletePasskey': ['$transaction', 'activityLog', 'passkey', 'user'],
+  'passkey.ts:getPasskeyRegistrationOptions': ['oneTimeToken', 'setting', 'user'],
+  'passkey.ts:listPasskeys': ['passkey'],
+  'passkey.ts:renamePasskey': ['activityLog', 'passkey'],
+  'passkey.ts:verifyPasskeyRegistration': ['$transaction', 'activityLog', 'oneTimeToken', 'passkey', 'setting', 'user'],
+  'profile.ts:changePassword': ['activityLog', 'user'],
+  'profile.ts:getProfileData': ['user'],
+  'profile.ts:updatePictureUrl': ['activityLog', 'user'],
+  'profile.ts:updateProfile': ['activityLog', 'user'],
+}
+
+const AUTHENTICATION_ONLY_OUTSIDE_ACTIONS: string[] = []
+
+test('the set of server actions gated on AUTHENTICATION ONLY is exactly the pinned inventory', () => {
+  const found = scanActionsDir(
+    ACTIONS_DIR,
+    {},
+    scanAuthenticationOnlyActions,
+    graph,
+    ACTIONS_KEY_PREFIX,
+  ).sort()
+
+  assert.deepEqual(
+    found,
+    [...AUTHENTICATION_ONLY_ACTIONS].sort(),
+    'An endpoint moved into or out of authentication-only gating. If you ADDED one, say in the '
+    + 'diff why an EXTERNAL principal — a SUPPLIER session — may call it, which for an '
+    + 'authentication-only endpoint means showing it is scoped to that caller\'s own row. '
+    + 'If you REMOVED one by giving it a real authorization gate, just delete the line.',
+  )
+})
+
+test('the pinned inventory also pins WHAT each endpoint reaches, not only its gate', () => {
+  const surface = prismaSurfaceOf(
+    AUTHENTICATION_ONLY_ACTIONS.map((entry) => {
+      const [file, name] = splitEntry(entry)
+      return { key: entry, file: `${ACTIONS_KEY_PREFIX}/${file}`, name }
+    }),
+    graph,
+  )
+
+  assert.deepEqual(
+    surface,
+    AUTHENTICATION_ONLY_PRISMA_SURFACE,
+    'The DATA SURFACE of an authentication-only endpoint changed. The gate did not have to '
+    + 'move for this to be a privilege escalation: an endpoint every signed-in principal may '
+    + 'call, including SUPPLIER, now reaches a different set of tables. Justify the new model '
+    + 'in the diff — or give the endpoint an authorization gate, which removes it from the '
+    + 'inventory and from this pin.',
+  )
+})
+
+test('the authentication-only inventory covers `use server` modules OUTSIDE app/actions too', () => {
+  const found = scanUseServerOutsideActions(
+    ROOT,
+    SCAN_ROOTS,
+    {},
+    scanAuthenticationOnlyActions,
+    graph,
+  ).sort()
+
+  assert.deepEqual(
+    found,
+    [...AUTHENTICATION_ONLY_OUTSIDE_ACTIONS].sort(),
+    'An endpoint outside app/actions moved into or out of authentication-only gating.',
+  )
+})
+
+test('the pinned inventory names no endpoint this branch gave an authorization gate', () => {
+  // The ones this branch moved off requireAuth, across all three rounds. If any
+  // reappears above, a later edit put it back on authentication only — which is
+  // the regression, not a stale list to refresh.
+  const regated = [
+    'company.ts:getEmailSettings',
+    'settings.ts:getAccountCodes',
+    'settings.ts:getSetting',
+    'settings.ts:getUsers',
+    'purchase-orders.ts:getBillPaymentAccounts',
+    'purchase-orders.ts:getPurchaseOrder',
+    'purchase-orders.ts:getPurchaseOrders',
+    'purchase-orders.ts:getSupplierLastPrices',
+    'purchase-orders.ts:getGoodsPosForLinking',
+    'purchase-orders.ts:getLinkedFreightPos',
+    'allocation.ts:getOrderAllocations',
+    'allocation.ts:getOrderShipments',
+    'allocation.ts:getOrderFulfillmentRequirements',
+  ]
+  for (const name of regated) {
+    assert.ok(
+      !AUTHENTICATION_ONLY_ACTIONS.includes(name),
+      `${name} was gated on a permission by o3d-512h; it must not be back on requireAuth`,
+    )
+  }
+})
+
+function splitEntry(entry: string): [string, string] {
+  const sep = entry.lastIndexOf(':')
+  return [entry.slice(0, sep), entry.slice(sep + 1)]
+}
+
+// ---------------------------------------------------------------------------
+// Round 8, Codex finding 1 — THE FILE NOBODY OWNED, AND THE ROOTS NOBODY CHECKED
+// ---------------------------------------------------------------------------
+
+/**
+ * Two filters described the same boundary in different words, and a file fell
+ * between them. `scanActionsDir` took `.ts`; `scanUseServerOutsideActions` took
+ * `.ts` and `.tsx` and then skipped anything sitting directly in app/actions
+ * because "it is covered by scanActionsDir". So `app/actions/wipe.tsx` — a
+ * `'use server'` module in the directory this whole file is named after,
+ * publishing an unguarded `deleteMany` — was covered by NEITHER, and every rule
+ * here returned green on it.
+ *
+ * Round 7 argued that a scanner which cannot see an endpoint reports it green
+ * forever and then answered it for directives behind comments and for inline
+ * actions. This is the same sentence about the INPUT WALK, which is the one place
+ * that argument had not been applied.
+ *
+ * Built on disk rather than in a fixture graph on purpose: the defect was in the
+ * directory walkers, and a walker can only be tested against directories.
+ */
+test('a `use server` module in app/actions is scanned WHATEVER its extension', () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'o3d-512h-'))
+  try {
+    mkdirSync(path.join(tmp, 'app', 'actions'), { recursive: true })
+    mkdirSync(path.join(tmp, 'lib', 'auth'), { recursive: true })
+    writeFileSync(
+      path.join(tmp, 'lib/auth/server.ts'),
+      'export async function requirePermission(p: string) { void p }\n',
+    )
+    const unguarded = `'use server'
+import { db } from '@/lib/db'
+export async function wipeEverything(id: string) {
+  await db.purchaseOrder.deleteMany({ where: { id } })
+}
+`
+    for (const name of ['wipe.tsx', 'wipe.mts', 'wipe.js', 'wipe.jsx']) {
+      writeFileSync(path.join(tmp, 'app', 'actions', name), unguarded)
+    }
+    // A test file next to them must still be ignored, or the rule has just
+    // started scanning its own fixtures.
+    writeFileSync(path.join(tmp, 'app', 'actions', 'wipe.test.tsx'), unguarded)
+
+    const found = [
+      ...scanActionsDir(path.join(tmp, 'app', 'actions'), {}, scanSource, undefined, 'app/actions'),
+      ...scanUseServerOutsideActions(tmp, ['app', 'lib'], {}, scanSource, undefined),
+    ].sort()
+
+    assert.deepEqual(
+      found,
+      ['wipe.js:wipeEverything', 'wipe.jsx:wipeEverything', 'wipe.mts:wipeEverything', 'wipe.tsx:wipeEverything'],
+      'a `use server` module in app/actions must be scanned whatever it is named — and a .test file must not be',
+    )
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+/**
+ * SCAN_ROOTS is a three-name array at the top of this file, and until round 8
+ * nothing asserted it covered anything. A `'use server'` module under `types/`,
+ * `scripts/`, `proxy.ts` at the repo root, or a directory created next week is
+ * compiled and published by Next exactly like one under `app/` — while every rule
+ * here walks somewhere else.
+ *
+ * The fix is not a longer root list, which decays the same way. It is that the
+ * residue is enumerated and pinned: anything mentioning `use server` outside the
+ * roots must appear below with a reason, and a new one fails this test with its
+ * own path in the message. Unrecognised fails; it does not pass.
+ */
+const USE_SERVER_OUTSIDE_SCAN_ROOTS: Record<string, string> = {
+  'scripts/check-server-action-auth-bypass.mjs':
+    'a CHECKER, not an endpoint: it greps the tree for the directive. Ships nothing to Next.',
+}
+
+test('no `use server` module hides outside the scanned roots', () => {
+  const outside = useServerModulesOutsideScanRoots(ROOT, SCAN_ROOTS).filter(
+    (f) => !f.startsWith('tests/') && !f.startsWith('e2e/'),
+  )
+
+  assert.deepEqual(
+    outside,
+    Object.keys(USE_SERVER_OUTSIDE_SCAN_ROOTS).sort(),
+    'A module outside app/ lib/ components/ mentions `use server`. The directive creates the '
+    + 'endpoint, not the directory — so either bring the directory into SCAN_ROOTS (and let every '
+    + 'rule in this file judge it), or list it above with a reason it publishes nothing. '
+    + '"There is nothing there today" is the argument this file exists to stop anyone from making.',
+  )
+})
+
+test('every outside-the-roots exemption states a reason', () => {
+  for (const [file, reason] of Object.entries(USE_SERVER_OUTSIDE_SCAN_ROOTS)) {
+    assert.ok(reason.trim().length > 0, `${file} needs a stated reason`)
+  }
 })

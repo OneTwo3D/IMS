@@ -89,6 +89,7 @@ function wcWebhookEvent(overrides: Partial<{
     topic: overrides.topic ?? 'order.created',
     payloadHash: 'hash',
     payloadJson: overrides.payloadJson ?? { id: 123 },
+    originAttestation: 'unproven:not-applicable',
     status: WC_WEBHOOK_EVENT_STATUS.pending,
     attempts: 0,
     nextAttemptAt: null,
@@ -156,6 +157,14 @@ function makeMintsoftDependencies(
   overrides: Partial<MintsoftBookedInWebhookRouteDependencies> = {},
 ): MintsoftBookedInWebhookRouteDependencies {
   return {
+    // o3d-hl8l: the route is now fenced by maintenance mode. These auth-behaviour cases run with
+    // the flag OFF, which is the state every one of them is about.
+    async getMaintenanceModeResponse() {
+      return null
+    },
+    recordMaintenanceRefusal() {
+      throw new Error('the fence must not fire with maintenance mode off')
+    },
     async getMintsoftApiConfiguration() {
       return mintsoftConfig()
     },

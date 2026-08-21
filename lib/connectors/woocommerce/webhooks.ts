@@ -15,6 +15,8 @@ import {
   shouldSuppressWcWebhookEcho,
 } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
+import { judgeWebhookOrigin, type WebhookOriginJudgement } from '@/lib/connectors/webhook-origin'
+import { readWcDeliveryOrigin } from '@/lib/connectors/woocommerce/webhook-origin'
 import {
   createShoppingWebhookEventRepository,
   persistWcWebhookEvent,
@@ -23,6 +25,7 @@ import {
 } from '@/lib/connectors/woocommerce/webhook-inbox'
 import type { WcFullOrder, WcFullProduct, WcRefund } from '@/lib/connectors/woocommerce/sync/types'
 import type { ShoppingWebhookResource } from '@/lib/shopping'
+import { getSettingValue } from '@/lib/settings-store'
 
 type JsonParseResult<T> =
   | { ok: true; value: T }
@@ -42,7 +45,7 @@ export type WcWebhookDependencies = {
   persistWebhookEvent: typeof persistWcWebhookEvent
   webhookEventRepository: ShoppingWebhookEventRepository
   handleOrderWebhook: (payload: unknown, topic: string | null) => Promise<Response>
-  handleProductWebhook: (payload: unknown) => Promise<Response>
+  handleProductWebhook: (payload: unknown, originAttestation: string) => Promise<Response>
   handleRefundWebhook: (payload: unknown) => Promise<Response>
 }
 
@@ -136,8 +139,21 @@ export function shouldLogInitialImportPendingSkip(
   lastLoggedAtIso: string | null | undefined,
   nowMs: number,
 ): boolean {
+  return shouldLogThrottledWebhookSkip(lastLoggedAtIso, nowMs)
+}
+
+/**
+ * The same throttle, for any webhook skip that ACKs 200 and drops the delivery. Shared rather than
+ * copied so a second silent-drop site cannot pick a different window by accident. Fails toward
+ * VISIBILITY: no prior record or an unparseable one logs.
+ */
+export function shouldLogThrottledWebhookSkip(
+  lastLoggedAtIso: string | null | undefined,
+  nowMs: number,
+  throttleMs: number = INITIAL_IMPORT_SKIP_LOG_THROTTLE_MS,
+): boolean {
   const lastMs = lastLoggedAtIso ? Date.parse(lastLoggedAtIso) : NaN
-  return !Number.isFinite(lastMs) || nowMs - lastMs >= INITIAL_IMPORT_SKIP_LOG_THROTTLE_MS
+  return !Number.isFinite(lastMs) || nowMs - lastMs >= throttleMs
 }
 
 /**
@@ -167,6 +183,61 @@ async function logInitialImportPendingSkip(): Promise<void> {
     })
   } catch (e) {
     console.error('o3d-mqz: failed to log initial-import-pending skip', e)
+  }
+}
+
+// o3d-tj6v r3: throttle key for the "status not selected" order-webhook skip. Separate from the
+// initial-import key so one silent drop cannot mask the other, sharing the same window.
+// r5: one key PER REASON, for the same reason the initial-import key is separate — a store with a
+// permanently excluded status would otherwise hold the window open and hide the first order whose
+// WooCommerce status IMS has no mapping for, which is a different problem with a different fix.
+const STATUS_NOT_ADMITTED_LOG_KEY = 'wc_order_webhook_status_not_admitted_last_logged_at'
+const STATUS_NOT_MAPPED_LOG_KEY = 'wc_order_webhook_status_not_mapped_last_logged_at'
+
+/**
+ * Make the admission refusal visible. The delivery is ACKed, so without this the boundary would be
+ * enforced exactly as silently as it was previously ignored — and an operator who unticked a status
+ * months ago has no other way to find out why a particular order is missing. Throttled like the
+ * initial-import skip, because an excluded status on a busy store is a high-volume event. Never
+ * throws: telemetry must not turn an acknowledged skip into a retried failure.
+ */
+async function logWcOrderWebhookNotAdmitted(
+  wcOrder: WcFullOrder,
+  topic: string | null,
+  reason: 'status_not_admitted' | 'status_not_mapped',
+  configured: string[],
+): Promise<void> {
+  const notAdmitted = reason === 'status_not_admitted'
+  const key = notAdmitted ? STATUS_NOT_ADMITTED_LOG_KEY : STATUS_NOT_MAPPED_LOG_KEY
+  try {
+    const last = await db.setting.findUnique({ where: { key } })
+    if (!shouldLogThrottledWebhookSkip(last?.value, Date.now())) return
+    await db.setting.upsert({
+      where: { key },
+      create: { key, value: new Date().toISOString() },
+      update: { value: new Date().toISOString() },
+    })
+    await logActivity({
+      entityType: 'SYNC',
+      action: notAdmitted ? 'wc_order_webhook_status_not_admitted' : 'wc_order_webhook_status_not_mapped',
+      tag: 'sync',
+      level: 'INFO',
+      description: notAdmitted
+        ? `WooCommerce pushed order #${wcOrder.number} with status "${wcOrder.status}", which is not `
+          + 'in the "Import order statuses" selection under Sync -> WooCommerce -> Order Sync '
+          + `(currently ${configured.length > 0 ? configured.join(', ') : 'none selected'}), so it was not imported. `
+          + 'It is queued for retry BY ORDER ID and imported by the next sweep after you tick that status — '
+          + 'it does not depend on WooCommerce sending this order again. Further skips are logged at most hourly.'
+        : `WooCommerce pushed order #${wcOrder.number} with status "${wcOrder.status}", which IMS has no reading `
+          + 'of: there is no status mapping row for it and it is not one of WooCommerce\'s own statuses. It was '
+          + 'NOT imported, because creating it would mean inventing a lifecycle status for it — the same answer '
+          + 'the status sync gives for an order IMS already holds. Add a mapping under Sync -> WooCommerce -> '
+          + 'Status Mappings; the order is queued for retry by order id. Further skips are logged at most hourly.',
+      metadata: { externalOrderId: wcOrder.id, topic, status: wcOrder.status, reason, configured },
+      resolveUser: false,
+    })
+  } catch (e) {
+    console.error('o3d-tj6v r3: failed to log a not-admitted order webhook', e)
   }
 }
 
@@ -238,6 +309,27 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
 
   const wcOrder = payload as WcFullOrder
 
+  // `wc_sync_order_statuses` IS consulted here (o3d-tj6v r3). Round 2 exempted the webhook and
+  // stated the exemption in the UI; a control that is advertised and then not enforced is the very
+  // thing this branch exists to remove, and with webhooks enabled this is how nearly every order
+  // arrives — so "Import order statuses" governed almost nothing.
+  //
+  // It governs the webhook as an ADMISSION boundary, not as a filter on every event: an order IMS
+  // ALREADY HAS is never gated (that is what stops IMS silently disagreeing with the store about an
+  // order it holds), while an order IMS has never seen is created only if the status it currently
+  // carries is admitted. An excluded order that later moves into an admitted status is imported by
+  // THAT update, from its own full payload — it never needed an `order.created` behind it.
+  //
+  // NOTHING IS RESOLVED HERE AT ALL (r5). Round 3 read the order link here; round 4 replaced that
+  // with a settings read here and passed the answer down. Both are the same mistake in different
+  // sizes — a decision taken in this handler and acted on inside `importWcOrder`, with a withdrawal
+  // fence and a live-store read in between. `importWcOrder` is gated BY DEFAULT and resolves the
+  // selection itself, at the read that decides create-versus-update, so this handler carries no
+  // admission answer that could be stale by the time it is used, and no ingress path can be built
+  // that forgets to ask.
+  //
+  // Kept in step with app/(dashboard)/sync/sync-client.tsx and docs/installation.md.
+
   const failures: string[] = []
   // Failures a stable business rule caused. Re-delivering the identical payload re-hits the identical
   // rule, so these are acknowledged rather than retried into the dead-letter queue (o3d-bx9).
@@ -250,10 +342,12 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
   // suppression check or the post-import compensation (o3d-d82p).
   let suppressionHandled = false
   if (topic === 'order.created' || topic === 'order.updated') {
-    const guarded = await importWcOrderGuarded(
-      wcOrder,
-      () => importWcOrder(wcOrder),
-    )
+    // The withdrawal wrapper runs for an excluded order TOO, and deliberately: its tombstone is
+    // the fence that stops a withdrawn order being pushed to the warehouse, and an order the
+    // operator excluded from import still must not ship. Only the CREATE is withheld, and it is
+    // withheld INSIDE `importWcOrder` — the check the wrapper cannot make and this handler must
+    // not make early.
+    const guarded = await importWcOrderGuarded(wcOrder, () => importWcOrder(wcOrder))
     if (guarded.outcome === 'skipped-withdrawal') {
       return NextResponse.json({ ok: true, skipped: 'unlinked-withdrawal' })
     }
@@ -273,6 +367,27 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       // land. Acknowledging would leave the IMS lifecycle wrong until an
       // independent reconciliation, so fail the delivery and let WC redeliver.
       failures.push('withdrawal compensation failed for a raced import — the order is live and withdrawn')
+    }
+    if (guarded.result.skipped) {
+      await logWcOrderWebhookNotAdmitted(wcOrder, topic, guarded.result.skipped, guarded.result.configured ?? [])
+      // ACK 200. WooCommerce's retries are finite and a redelivery re-hits the identical rule, so a
+      // non-2xx here would burn them down to a dead letter for an order the operator EXCLUDED. The
+      // cursor is deliberately NOT advanced: this delivery imported nothing, so it must not stand in
+      // for the poll sweep's progress.
+      //
+      // NOT ADVANCING THE CURSOR IS NOT THE RECOVERY, and round 4 treated it as half of one. The
+      // very next ADMITTED delivery advances the cursor past this order, and acknowledging THIS
+      // delivery means WooCommerce never sends it again — so the only routes left are cursor-based
+      // and both can miss. `importWcOrder` has already written the durable by-id row that
+      // `drainWcOrderAdmissionRefusals` re-reads on the fifteen-minute sweep, plus the watermark
+      // that rewinds the cursors on a widening. The queue is the guarantee; the rewind is the
+      // cheap bulk case.
+      return NextResponse.json({
+        ok: true,
+        skipped: guarded.result.skipped === 'status_not_admitted'
+          ? 'status_not_selected_for_import'
+          : 'status_not_mapped',
+      })
     }
     if (!guarded.result.success) {
       failures.push(`importWcOrder: ${guarded.result.error ?? 'unknown error'}`)
@@ -332,7 +447,15 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       }
     }
     try {
-      await syncRefundsForOrder(wcOrder.id)
+      // An INCOMPLETE refund read is a failure of this delivery, not a detail of it. The refunds
+      // that were read are already applied, but acknowledging the delivery would retire the only
+      // prompt to come back for the rest — and the missing ones are demand the external-fulfilment
+      // coverage check never nets, so a complete 3PL dispatch is refused until they land. A
+      // retried delivery re-reads the order from page one, so this is self-clearing (o3d-ecbj r5).
+      const refundSweep = await syncRefundsForOrder(wcOrder.id)
+      if (!refundSweep.complete) {
+        failures.push(`syncRefundsForOrder: incomplete refund read — ${refundSweep.error ?? 'unknown error'}`)
+      }
     } catch (e) {
       failures.push(`syncRefundsForOrder: ${e instanceof Error ? e.message : String(e)}`)
     }
@@ -369,8 +492,69 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
   return NextResponse.json({ ok: false, failures }, { status: 500 })
 }
 
-async function handleProductWebhook(payload: unknown) {
+/**
+ * o3d-wgl6: is this delivery from the store we are bound to RIGHT NOW?
+ *
+ * Read WITHOUT the advisory lock, on purpose. A rebind committing concurrently with this read
+ * either lands first — we see the new store and refuse, the fail-safe direction — or lands
+ * after, in which case the import that follows takes the lock itself, re-checks
+ * `wc_settings_version` inside its write transaction, and abandons everything it is holding
+ * (o3d-mlc7). Both orderings are already covered, so an exclusive-lock wait here would buy
+ * nothing and would serialise the inbox drain behind every settings write.
+ */
+async function judgeWcDeliveryOrigin(originAttestation: string): Promise<WebhookOriginJudgement> {
+  return judgeWebhookOrigin(originAttestation, await getSettingValue('wc_url'))
+}
+
+async function handleProductWebhook(payload: unknown, originAttestation: string) {
   const productPayload = payload as Partial<WcFullProduct> & { stock_quantity?: number | null }
+
+  // o3d-wgl6: settled BEFORE anything else, because a delivery that does not describe this
+  // store must not reach the import, the shape warning, or the forced stock correction.
+  //
+  // `stock_quantity` in a foreign body is the OTHER store's figure, and the correction pushes
+  // it with force:true — which bypasses the echo dedupe and reopens completed stock rows. That
+  // is the same cross-store write the import fence exists to prevent, arriving by a second
+  // door, so the refusal has to cover both.
+  const origin = await judgeWcDeliveryOrigin(originAttestation)
+  if (origin.verdict === 'foreign-store' || origin.verdict === 'unproven') {
+    // ACKNOWLEDGED, not retried. The payload was captured at receipt and is frozen: no retry
+    // can make a store-A body describe store B, so all ~24 attempts would reach this identical
+    // refusal and dead-letter. Nothing is lost — a product that exists in the store we are
+    // bound to now is re-imported by the reconcile sweep against the current credentials.
+    //
+    // ERROR, because this is also how a WRONG rebind announces itself: a burst that does not
+    // stop means a store the operator believes they have left is still sending webhooks.
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_product_webhook_foreign_store',
+      tag: 'sync',
+      level: 'ERROR',
+      description: origin.verdict === 'foreign-store'
+        ? `WooCommerce product webhook for ${productPayload.sku} was sent by ${origin.deliveryStore}, which is not the `
+          + `store this installation is bound to (${origin.boundStore}). Nothing was imported and no stock was `
+          + 'corrected; the delivery is acknowledged rather than retried against a store it does not describe. '
+          + 'The reconcile sync re-imports this product from the current store.'
+        : `WooCommerce product webhook for ${productPayload.sku} did not say which store sent it `
+          + `(${origin.attestation}), so it cannot be shown to describe the store this installation is bound to. `
+          + 'Nothing was imported and no stock was corrected. The reconcile sync re-imports this product from '
+          + 'the current store.',
+      metadata: {
+        externalId: productPayload.id,
+        sku: productPayload.sku,
+        verdict: origin.verdict,
+        originAttestation: origin.attestation,
+        deliveryStore: origin.deliveryStore,
+        boundStore: origin.boundStore,
+        originScope: origin.scope,
+      },
+    })
+    return NextResponse.json({ ok: true, foreignStore: true, verdict: origin.verdict })
+  }
+  // 'binding-unreadable' falls through DELIBERATELY: the delivery named a store, and it is our
+  // own `wc_url` that is missing or malformed. Refusing here would acknowledge — permanently
+  // discard — deliveries that are perfectly valid, over a misconfiguration an operator fixes in
+  // minutes. The import fails "not configured" instead, which retries and self-heals.
   const canSyncProduct =
     typeof productPayload.id === 'number'
     && typeof productPayload.sku === 'string'
@@ -388,6 +572,14 @@ async function handleProductWebhook(payload: unknown) {
   let productSyncError: string | null = null
 
   if (canSyncProduct) {
+    // No `observedVersion` is passed, and that is not an omission (o3d-wgl6). That argument
+    // fences a payload the CALLER fetched against a rebind that landed since; the origin check
+    // above already answers that question for a webhook, using the sending store's own identity
+    // instead of a version number, and it answers it without the two false positives a version
+    // carries — a same-store key rotation and a product-id cache reset both bump the version
+    // while leaving the store exactly where it was. A rebind that lands mid-import is a
+    // different question, and `syncWcProductToIms` still fences that itself, under the advisory
+    // lock, from the version it snapshotted (o3d-mlc7).
     const result = await syncWcProductToIms(productPayload as WcFullProduct)
     if (result.success) {
       await db.setting.upsert({
@@ -396,18 +588,25 @@ async function handleProductWebhook(payload: unknown) {
         update: { value: new Date().toISOString() },
       })
     } else if (result.permanent) {
-      // A deterministic mapping conflict: the GTIN, the WC id, or the SKU itself already belongs
-      // to a different IMS product (o3d-gtk, o3d-fsi). Re-delivering this payload reaches the
-      // identical conclusion, so the delivery is ACKNOWLEDGED rather than retried ~24 times into
-      // the dead-letter queue — and logged at ERROR, because nothing will import this product
-      // until an operator resolves the duplicate. `error` carries which claim collided.
+      // A deterministic conflict, of one of two kinds:
+      //   - MAPPING (o3d-gtk, o3d-fsi): the GTIN, the WC id, or the SKU itself already belongs to
+      //     a different IMS product.
+      //   - STRUCTURE (o3d-y89x): applying this payload would have destroyed IMS-owned structure,
+      //     so WooCommerce objects went unimported. That one also leaves a row on
+      //     /sync/exceptions with the specific SKUs.
+      // Either way, re-delivering this payload reaches the identical conclusion, so the delivery
+      // is ACKNOWLEDGED rather than retried ~24 times into the dead-letter queue — and logged at
+      // ERROR, because nothing will import this product until an operator acts. The description
+      // names both remedies rather than only the duplicate one, which would send an operator
+      // hunting a duplicate SKU that does not exist; `error` carries the specific conflict.
       await logActivity({
         entityType: 'SYNC',
         action: 'wc_product_webhook_rejected',
         tag: 'sync',
         level: 'ERROR',
-        description: `WooCommerce product webhook for ${productPayload.sku} hit a permanent mapping conflict; `
-          + 'acknowledged rather than retried — resolve the duplicate SKU / barcode / WooCommerce id in IMS',
+        description: `WooCommerce product webhook for ${productPayload.sku} hit a permanent mapping or structure conflict; `
+          + 'acknowledged rather than retried — resolve the duplicate SKU / barcode / WooCommerce id in IMS, '
+          + 'or the product-structure conflict listed on /sync/exceptions',
         metadata: {
           externalId: productPayload.id,
           sku: productPayload.sku,
@@ -531,6 +730,13 @@ export async function processWcWebhookPayload(
     resource: ShoppingWebhookResource
     topic: string | null
     payload: unknown
+    /**
+     * What the delivery said about the store that sent it, recorded at RECEIPT (o3d-wgl6).
+     * REQUIRED, with no default: a caller that cannot say where a delivery came from has to
+     * say THAT, using one of the `unproven:*` markers, rather than leave it blank and have the
+     * blank read as consent.
+     */
+    originAttestation: string
   },
   dependencies: Pick<WcWebhookDependencies, 'handleOrderWebhook' | 'handleProductWebhook' | 'handleRefundWebhook'> = defaultDependencies,
 ) {
@@ -538,7 +744,7 @@ export async function processWcWebhookPayload(
     case 'orders':
       return dependencies.handleOrderWebhook(input.payload, input.topic)
     case 'products':
-      return dependencies.handleProductWebhook(input.payload)
+      return dependencies.handleProductWebhook(input.payload, input.originAttestation)
     case 'refunds':
       return dependencies.handleRefundWebhook(input.payload)
   }
@@ -594,6 +800,13 @@ export async function handleWcWebhook(
   const parsed = parseWebhookJson<unknown>(body)
   if (!parsed.ok) return parsed.response
 
+  // o3d-wgl6: what the STORE said about itself, taken from the delivery in hand. Recorded at
+  // receipt because the request is the only place it exists — the parsed payload alone reaches
+  // the inbox, and by the time a retry runs, the headers are long gone and every setting has
+  // moved on. No database read: the answer is entirely the store's own statement, which is what
+  // makes it survive a rebind that happens afterwards.
+  const originAttestation = readWcDeliveryOrigin(request, parsed.value)
+
   const result: PersistWcWebhookEventResult = await dependencies.persistWebhookEvent(
     dependencies.webhookEventRepository,
     {
@@ -602,6 +815,7 @@ export async function handleWcWebhook(
       externalEventId,
       rawBody: body,
       payload: parsed.value,
+      originAttestation,
     },
   )
 

@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getBaseCurrencyCode, getFallbackCurrencyMeta } from '@/lib/base-currency'
 import { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
 
@@ -27,7 +27,7 @@ export type CurrencyRow = {
 // ---------------------------------------------------------------------------
 
 export async function getCurrencies(activeOnly = true): Promise<CurrencyRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const baseCurrency = await getBaseCurrencyCode()
   const rows = await db.currency.findMany({
     where: activeOnly ? { active: true } : undefined,
@@ -68,7 +68,7 @@ export async function getCurrencies(activeOnly = true): Promise<CurrencyRow[]> {
 
 /** Returns map: { BASE: 1, EUR: 1.17, USD: 1.27, ... } */
 export async function getCurrencyRateMap(): Promise<Record<string, number>> {
-  await requireAuth()
+  await requireInternalUser()
   const baseCurrency = await getBaseCurrencyCode()
   const currencies = await getCurrencies(true)
   const map: Record<string, number> = { [baseCurrency]: 1 }
@@ -195,7 +195,7 @@ export type FxRateRow = {
 
 /** Latest rate per active non-base currency, with provenance flags. */
 export async function getLatestFxRates(): Promise<FxRateRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const baseCurrency = await getBaseCurrencyCode()
   const rows = await db.$queryRaw<Array<{ toCurrency: string; rate: string; fetchedAt: Date; source: string; manualOverride: boolean }>>`
     SELECT DISTINCT ON ("toCurrency")
@@ -324,7 +324,7 @@ export type FxHealth = {
  * push, and a count of currencies currently held under manual override.
  */
 export async function getFxHealth(): Promise<FxHealth> {
-  await requireAuth()
+  await requireInternalUser()
   const baseCurrency = await getBaseCurrencyCode()
 
   const [
@@ -390,7 +390,7 @@ function splitSettingList(value: string | null | undefined): string[] {
 }
 
 export async function getFxPushLog(limit = 20): Promise<FxPushLogRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.fxRatePushLog.findMany({
     orderBy: { pushedAt: 'desc' },
     take: Math.min(Math.max(limit, 1), 100),

@@ -61,6 +61,13 @@ mock.module('@/lib/db', {
       salesOrder: noopDelegate(),
       purchaseOrder: noopDelegate(),
       customer: noopDelegate(),
+      // q66in.7.4: the WMS retention passes added to purgeExpiredData run unconditionally on
+      // their own defaults, so this harness has to answer for their delegates too. Inert here —
+      // their behaviour is asserted in tests/data-retention-wms-events.test.ts.
+      wmsInboundReceiptEvent: noopDelegate(),
+      wmsWebhookEvent: noopDelegate(),
+      wmsSyncJob: noopDelegate(),
+      externalWmsBinding: noopDelegate(),
       shoppingWebhookEvent: noopDelegate(),
     },
   },
@@ -168,7 +175,6 @@ test('[o3d-9kek r2 f2] retention still deletes everything the sweep has SETTLED 
   // Deliberately abandoned (audit-46ry), and types that carry no back-reference at all.
   assert.equal(matches(row({ status: 'CANCELLED' }), where), true)
   assert.equal(matches(row({ type: 'COGS_JOURNAL' }), where), true)
-  assert.equal(matches(row({ type: 'INVOICE_PAYMENT' }), where), true)
   // Age is still the primary rule: nothing inside the retention window is deleted.
   assert.equal(matches(row({ createdAt: NOW }), where), false)
 })
@@ -242,4 +248,153 @@ test('[o3d-9kek r3 f3] the tombstone keeps the attribution and drops the persona
   // evidence, not a verdict, and stamping it checked would also make it deletable next run.
   assert.equal('backReferenceCheckedAt' in compact.data, false)
   assert.equal('status' in compact.data, false)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-nepa — retention must not delete the row that is the only local guard against moving the
+// same money twice.
+//
+// The back-reference exemption above is about DOCUMENTS: rows carrying an external id whose local
+// link is missing. It requires `externalTransactionId IS NOT NULL` and one of four document types,
+// so it says nothing about the follow-up rows whose bare EXISTENCE is what suppresses a second
+// remote call:
+//
+//   • hasExistingSyncLog counts PENDING/PROCESSING/SYNCED for the scope — a SYNCED INVOICE_PAYMENT
+//     is the entire suppression, and for an imported order it is the only record anywhere that the
+//     ledger was told (decideInvoicePaymentRegistration says so in as many words);
+//   • reenqueueMissingCreditNoteAllocations treats a PURCHASE_CREDIT_NOTE_ALLOCATION row of ANY
+//     status, terminal ones included, as ownership evidence and skips the credit note;
+//   • latestBillPaymentSyncRows derives a bill's settlement status from its newest BILL_PAYMENT row.
+//
+// None of those guards FAILS when its row is deleted. Each answers "nothing has been sent" and
+// means it — and Xero's idempotency key expired six minutes after the original call, so nothing
+// remote catches the second one.
+// ---------------------------------------------------------------------------
+
+test('[o3d-nepa] a SETTLED payment registration is never deleted by age', async () => {
+  const where = await captureDeletePredicate()
+
+  // SYNCED with no external id is the ordinary shape for these — and the back-reference exemption
+  // above cannot see it, because that one requires an external id.
+  assert.equal(matches(row({ type: 'INVOICE_PAYMENT', status: 'SYNCED', externalTransactionId: null }), where), false)
+  assert.equal(matches(row({ type: 'INVOICE_PAYMENT', status: 'SYNCED', externalTransactionId: 'XPAY-1' }), where), false)
+  // ...and CANCELLED, which every status-based exemption releases the moment the row terminalises.
+  assert.equal(matches(row({ type: 'INVOICE_PAYMENT', status: 'CANCELLED', externalTransactionId: null }), where), false)
+  // A stamped verdict does not release it either: backReferenceCheckedAt is about a LINK, and these
+  // rows are not evidence of a link — they are evidence that a call was made.
+  assert.equal(matches(row({ type: 'INVOICE_PAYMENT', status: 'SYNCED', externalTransactionId: null, backReferenceCheckedAt: OLD }), where), false)
+})
+
+test('[o3d-nepa] an applied credit-note allocation is never deleted by age, at ANY status', async () => {
+  const where = await captureDeletePredicate()
+
+  // The re-enqueue sweep reads CANCELLED rows as ownership too, so a status-scoped exemption would
+  // miss the case that duplicates an allocation (o3d-nepa round 1 finding 4).
+  for (const status of ['SYNCED', 'CANCELLED', 'FAILED']) {
+    assert.equal(
+      matches(row({ type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', status, externalTransactionId: null }), where),
+      false,
+      `a ${status} allocation row still keeps its credit note out of the re-enqueue sweep`,
+    )
+  }
+})
+
+test('[o3d-nepa] a sent bill payment is never deleted by age', async () => {
+  const where = await captureDeletePredicate()
+  assert.equal(matches(row({ type: 'BILL_PAYMENT', status: 'SYNCED', externalTransactionId: 'XPAY-2' }), where), false)
+})
+
+test('[o3d-nepa] the exemption is scoped to money, not applied to every follow-up', async () => {
+  const where = await captureDeletePredicate()
+
+  // A duplicate PDF, email or WooCommerce note is not a financial error, and a retention policy that
+  // never deletes anything is not a retention policy. These still expire.
+  for (const type of ['INVOICE_PDF', 'INVOICE_EMAIL', 'WC_INVOICE_NOTE', 'BILL_ATTACHMENT', 'COGS_JOURNAL']) {
+    assert.equal(matches(row({ type, status: 'SYNCED', externalTransactionId: null }), where), true, `${type} expires normally`)
+  }
+})
+
+test('[o3d-nepa] money-evidence rows are NOT compacted either — a blanked payload cannot be pinned', async () => {
+  const { compact } = await runRetention()
+
+  // The compaction pass is scoped to the back-reference document types, and it must stay that way:
+  // compaction writes `payload: {}`, and the follow-up planner would then have a money row whose
+  // stored body can neither prove anything nor be re-sent. That exact shape made money-moving
+  // retries permanently unusable in o3d-nepa's own parked attempt (round 1 finding 2).
+  assert.equal(matches(row({ type: 'INVOICE_PAYMENT', status: 'SYNCED', externalTransactionId: 'XPAY-1' }), compact.where), false)
+  assert.equal(matches(row({ type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', status: 'SYNCED', externalTransactionId: 'XALLOC-1' }), compact.where), false)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-nepa, THE P1 ITSELF (Codex r10 #2) — retention must not delete accounting work that can
+// STILL BE POSTED.
+//
+// An earlier revision of this branch left this to PR #618 and shipped only the money-type
+// exemption, calling it "a sibling key that merges cleanly". Both halves were wrong: the P1
+// behaviour was simply absent (a PENDING SALES_INVOICE was deleted by age, payload and all), and
+// the change conflicts with #618 in this very file. The status list is now the SAME shared
+// constant #618 introduces, byte for byte, so whichever lands first the other is an identical add
+// and the two readers cannot drift.
+//
+// Asserted behaviourally against the captured predicate for the same reason as everything above: a
+// production version that imported the constant and stopped applying it would still pass a
+// shape comparison.
+// ---------------------------------------------------------------------------
+
+test('[o3d-nepa] a PENDING accounting job is never deleted by age', async () => {
+  const where = await captureDeletePredicate()
+
+  // PENDING carries no external id at all, so the back-reference exemption cannot see it and the
+  // money-type exemption does not cover a document type. Nothing retained this row before.
+  assert.equal(matches(row({ type: 'SALES_INVOICE', status: 'PENDING', externalTransactionId: null }), where), false)
+  assert.equal(matches(row({ type: 'PURCHASE_INVOICE', status: 'PENDING', externalTransactionId: null }), where), false)
+  assert.equal(matches(row({ type: 'COGS_JOURNAL', status: 'PENDING', externalTransactionId: null }), where), false)
+})
+
+test('[o3d-nepa] a claimed PROCESSING row is never deleted underneath its worker', async () => {
+  const where = await captureDeletePredicate()
+
+  // Both processors read the row and its payload BEFORE the conditional claim, so a worker can be
+  // holding this payload while retention removes the row; the remote call still happens and the
+  // status write-back then fails against a row that is gone.
+  assert.equal(matches(row({ type: 'SALES_INVOICE', status: 'PROCESSING', externalTransactionId: null }), where), false)
+})
+
+test('[o3d-nepa] a FAILED row that never posted is never deleted by age', async () => {
+  const where = await captureDeletePredicate()
+
+  // o3d-ju8t: FAILED does NOT prove nothing was posted. With no external id the back-reference
+  // exemption does not apply, so before the status clause this row expired silently — and it is
+  // the hard-delete guard's only evidence that a document may exist in the ledger.
+  assert.equal(matches(row({ type: 'SALES_INVOICE', status: 'FAILED', externalTransactionId: null }), where), false)
+  assert.equal(matches(row({ type: 'COGS_JOURNAL', status: 'FAILED', externalTransactionId: null }), where), false)
+})
+
+test('[o3d-nepa] the exemption RELEASES the moment the row terminalises', async () => {
+  const where = await captureDeletePredicate()
+
+  // The bound on unbounded growth: what is retained is the outstanding-work backlog, not history.
+  // SYNCED and CANCELLED rows that are neither money evidence nor unresolved back-reference
+  // evidence expire by age exactly as before.
+  assert.equal(matches(row({ type: 'COGS_JOURNAL', status: 'SYNCED', externalTransactionId: null }), where), true)
+  assert.equal(matches(row({ type: 'COGS_JOURNAL', status: 'CANCELLED', externalTransactionId: null }), where), true)
+  // ...and age is still the primary rule for a postable row: nothing inside the window was ever
+  // eligible, so the exemption must not be read as the only thing protecting it.
+  assert.equal(matches(row({ type: 'COGS_JOURNAL', status: 'PENDING', createdAt: NOW }), where), false)
+})
+
+test('[o3d-nepa] an unfinished job keeps its PAYLOAD — it is not compacted either', async () => {
+  const { compact } = await runRetention()
+
+  // Compaction writes `payload: {}`. For a row a worker will still post from, that destroys the
+  // request while leaving the row claiming the work is owed — the delete's exemption would then be
+  // protecting an empty shell. PENDING/PROCESSING are in NEITHER pass, deliberately.
+  assert.equal(matches(row({ type: 'SALES_INVOICE', status: 'PENDING', externalTransactionId: null }), compact.where), false)
+  assert.equal(matches(row({ type: 'SALES_INVOICE', status: 'PROCESSING', externalTransactionId: null }), compact.where), false)
+  assert.equal(matches(row({ type: 'SALES_INVOICE', status: 'FAILED', externalTransactionId: null }), compact.where), false)
+
+  // A FAILED row that DID post is the deliberate overlap: retained by the status clause and
+  // compacted by this pass, because its document already exists and both processors short-circuit
+  // to the follow-ups instead of re-posting when externalTransactionId is set.
+  assert.equal(matches(row({ type: 'SALES_INVOICE', status: 'FAILED', externalTransactionId: 'XINV-1' }), compact.where), true)
 })

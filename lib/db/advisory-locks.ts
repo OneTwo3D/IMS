@@ -86,6 +86,29 @@ export const SWEEP_CURSOR_LOCK_KEY = 918_273_912
 export const COMPONENT_GRAPH_WRITE_LOCK_KEY = 918_274_101
 
 /**
+ * ACCOUNTING CONNECTOR SELECTION domain (o3d-osl8 round 5, finding 2).
+ *
+ * Serializes "which accounting connector is active" against every reader that
+ * DECIDES something from it and then writes. Today that is exactly two writers:
+ * the plugin-state save (saveIntegrationPluginState / saveOnboardingPluginState)
+ * and the orphan cancel (cancelOrphanedAccountingSyncRows).
+ *
+ * WHY IT IS NOT ENOUGH ON ITS OWN, and why the cancel also re-checks the
+ * selection inside its transaction: the lock only binds writers that take it. A
+ * settings write that reaches the plugin rows by some other path would not, and
+ * the failure mode there is not a slow query — it is a cancel that marks the
+ * NEWLY active connector's PENDING queue CANCELLED, which no later read can
+ * restore. Lock to serialize; re-read and abort to be safe if serialization
+ * fails.
+ *
+ * Deliberately its OWN domain rather than sharing ACCOUNTING_WRITE_LOCK_KEY: a
+ * connector switch has no overlap with refund posting or the daily batch, and
+ * folding it in would make an admin toggling a plugin wait behind (or block) an
+ * accounting batch for no correctness gain.
+ */
+export const ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY = 918_274_233
+
+/**
  * Every single-bigint domain above, for the uniqueness test. A new lock MUST be
  * declared here — the test fails on any module that writes its own key literal.
  */
@@ -95,6 +118,7 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
   WC_SYNC_ADVISORY_LOCK_KEY,
   SWEEP_CURSOR_LOCK_KEY,
   COMPONENT_GRAPH_WRITE_LOCK_KEY,
+  ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY,
 } as const
 
 /**
@@ -145,10 +169,31 @@ export const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
  */
 export const BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE = 411_220_868
 
+/**
+ * Per-invoice-NUMBER serialization of the Xero sales-invoice post slot (o3d-k26m.5 round 5).
+ *
+ * `POST /Invoices` is update-or-create on the invoice number, so two IMS workers posting under the
+ * same number produce ONE document and the second silently replaces the first. Round 4 excluded
+ * them by writing a timestamp and comparing stamps; round 5 replaced that with this lock, because a
+ * comparison of two HOST clocks decides the wrong way under skew — see `takeInvoiceNumberPostSlot`.
+ *
+ * Keyed on `hashtext(<the number's ledger identity>)`, which is the scope the exclusion is about:
+ * two workers contend if and only if they are about to write the same document. A `hashtext`
+ * collision between two different numbers collapses to one id, which over-serializes two unrelated
+ * invoices for the length of one look-then-stamp — harmless, and in the safe direction.
+ *
+ * Held for the transaction that reads the in-flight rows and writes this row's stamp, and NOT
+ * across the post itself: an advisory lock cannot span an HTTP request that may take minutes, and
+ * holding one across a remote call is how a crashed worker wedges a queue. What survives the
+ * transaction is the stamp, and its lease is what fences the number while the post is in flight.
+ */
+export const XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE = 411_220_869
+
 
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
   REFUND_RELEASE_WARNING_LOCK_NAMESPACE,
   BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE,
+  XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
 } as const

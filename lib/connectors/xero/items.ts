@@ -10,7 +10,9 @@
  */
 
 import { db } from '@/lib/db'
-import { activeAccountingIdProvenance, accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
+import {
+  accountingIdProvenanceFor, accountingIdProvenanceMatches, activeAccountingIdProvenance,
+} from '@/lib/connectors/accounting-id-provenance'
 import { xeroGet, xeroPost } from './api'
 
 const XERO_CONNECTOR = 'xero'
@@ -56,16 +58,24 @@ async function getStoredItemId(code: string): Promise<string | null> {
  * up until the daily call budget is gone; that invisibility is the whole reason this column exists.
  * So swallow the failure and say so.
  */
-async function storeItemId(code: string, itemId: string): Promise<void> {
+async function storeItemId(code: string, itemId: string, issuedByTenantId: string | undefined): Promise<void> {
   if (!itemId) return
+  // o3d-gfh, closed: the provenance is the tenant this id was ISSUED BY — the one that went out in the
+  // request's own Xero-Tenant-Id header, established before the call — not a fresh read of the token row
+  // after it. The old resample stamped whatever organisation was connected by the time the response came
+  // back, so a disconnect-and-reconnect landing during the call (rate-limit retries widen that to tens of
+  // seconds) wrote 'xero:B' onto an id realm A had issued, and the exact-match read guard then TRUSTED it
+  // for good — a false positive is far worse here than the miss it replaced.
+  //
+  // Nothing checks the issuer against the currently-active connection before writing, and deliberately
+  // so: if they differ, this stamp records the truth and `getStoredItemId`'s exact-match test rejects the
+  // id on the next read, which is the same outcome a discard would produce and one fewer place to be
+  // wrong. A null issuer (no request was made) stamps null, which also re-resolves.
+  const provenance = accountingIdProvenanceFor(XERO_CONNECTOR, issuedByTenantId)
   try {
     await db.product.updateMany({
       where: { sku: code },
-      // RACE (o3d-gfh): provenance is sampled here, after the API call that issued the id. A reconnect to a
-      // different tenant mid-call could stamp the new tenant on an old-tenant id. Same root cause as the
-      // read-side race — needs the API response to carry its issuing tenant. No worse than pre-o3d-6nd,
-      // which stored the id with no provenance and read it unconditionally.
-      data: { accountingItemId: itemId, accountingItemProvenance: await activeAccountingIdProvenance(XERO_CONNECTOR) },
+      data: { accountingItemId: itemId, accountingItemProvenance: provenance },
     })
   } catch (e) {
     console.warn(
@@ -104,7 +114,7 @@ export async function findOrCreateItem(
 
   if (res.ok && res.data?.Items?.length) {
     const itemId = res.data.Items[0].ItemID
-    await storeItemId(code, itemId)
+    await storeItemId(code, itemId, res.tenantId)
     return { success: true, itemId }
   }
 
@@ -124,7 +134,7 @@ export async function findOrCreateItem(
     const retryRes = await xeroGet<XeroItemResponse>(where)
     if (retryRes.ok && retryRes.data?.Items?.length) {
       const itemId = retryRes.data.Items[0].ItemID
-      await storeItemId(code, itemId)
+      await storeItemId(code, itemId, retryRes.tenantId)
       return { success: true, itemId }
     }
   }
@@ -133,6 +143,6 @@ export async function findOrCreateItem(
   }
 
   const itemId = createRes.data.Items[0].ItemID
-  await storeItemId(code, itemId)
+  await storeItemId(code, itemId, createRes.tenantId)
   return { success: true, itemId }
 }

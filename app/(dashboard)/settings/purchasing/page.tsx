@@ -1,3 +1,5 @@
+import { AccessDenied } from '@/components/auth/access-denied'
+import { authorizePage } from '@/lib/auth/server'
 import type { Metadata } from 'next'
 import { PackageOpen, Ship } from 'lucide-react'
 import { Card } from '@/components/ui/card'
@@ -8,6 +10,13 @@ import { LandedCostMethodSetting } from '@/components/settings/landed-cost-metho
 export const metadata: Metadata = { title: 'Purchasing Settings' }
 
 export default async function PurchasingSettingsPage() {
+  // o3d-512h: page-level authorization. The (dashboard) layout establishes only
+  // AUTHENTICATION, and the sidebar hiding a link is not a boundary — without
+  // this, any authenticated role that types the URL renders the page and its
+  // reads run. Must stay the FIRST statement so a denial performs no read.
+  const gate = await authorizePage('settings.company')
+  if (!gate.authorized) return <AccessDenied permission={gate.permission} />
+
   const [purchaseUnits, landedCostMethod] = await Promise.all([
     getPurchaseUnits(false),
     getSetting('default_landed_cost_method'),

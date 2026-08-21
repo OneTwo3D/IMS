@@ -123,6 +123,49 @@ async function queueShipmentCogsRevaluationSync(
   const isEnabled = options.isReversalPostingEnabled ?? (() => isAccountingSyncTypeEnabled('COGS_REVERSAL'))
   if (!(await isEnabled())) return false
 
+  // o3d-zpa7: THE PRECONDITION THAT MAKES THE UNLOCKED ENQUEUE SAFE, checked rather than argued.
+  //
+  // This is the one order-scoped enqueue that cannot hoist `lockSalesOrder` (see the reason string
+  // below), so o3d-3zgy left it acknowledged and open: a hard delete of the sales order concurrent
+  // with this write would orphan an AccountingSyncLog row against a reference nothing resolves.
+  //
+  // It turns out no lock is needed, because THE ORDER CANNOT BE HARD-DELETED AT ALL. The chain, each
+  // link a where-clause in a different file:
+  //
+  //   this enqueue runs only for a shipment with shipmentJournalDate set (the caller's branch)
+  //     -> shipmentJournalDate is written only by daily-batch Group B, whose selection requires
+  //        `order.revenueDeferredDate != null` (xero/daily-sync.ts, quickbooks/daily-sync.ts)
+  //     -> revenueDeferredDate is stamped only by Group A1, whose selection requires
+  //        `accountingInvoiceId != null`
+  //     -> deleteSalesOrder refuses UNCONDITIONALLY on a non-null accountingInvoiceId
+  //        (order-delete-guard.ts, blocker 0), and that field is never set back to null.
+  //
+  // Blocker 0 is read off the ORDER ROW, so unlike every other delete blocker it does not depend on an
+  // AccountingSyncLog row surviving retention. The race is therefore unreachable, not merely narrow.
+  //
+  // Asserting the LAST link makes the argument load-bearing instead of a comment: if a future change to
+  // A1/Group B ever lets an un-invoiced order reach this point, the enqueue REFUSES rather than
+  // silently writing an unprotected row. Refusing is safe and loses no money — returning false is the
+  // established "this revaluation did not post here" signal (audit-3aph), and the caller then keeps the
+  // delta in its own retrospective COGS journal instead of dropping it.
+  //
+  // The read takes NO lock, so it cannot invert lockSalesOrder-then-lockStockLevels: it is a plain
+  // SELECT, and what it reads is monotonic (accountingInvoiceId is only ever set, never cleared), so
+  // there is nothing for a concurrent writer to invalidate.
+  const deleteProtection = await tx.shipment.findUnique({
+    where: { id: input.shipmentId },
+    select: { order: { select: { id: true, accountingInvoiceId: true } } },
+  })
+  if (!deleteProtection?.order?.accountingInvoiceId) {
+    console.warn(
+      `queueShipmentCogsRevaluationSync: refusing to enqueue COGS_REVERSAL for shipment ${input.shipmentId} — `
+      + `its sales order ${deleteProtection?.order?.id ?? '(missing)'} carries no accountingInvoiceId, so it is NOT `
+      + 'protected from a hard delete and this enqueue cannot take the order lock (o3d-zpa7). The revaluation '
+      + 'delta stays in the caller\'s COGS journal.',
+    )
+    return false
+  }
+
   const revaluationIdempotencyKey = `shipment-cogs-revalue:${input.shipmentId}:${input.costLayerId}:${payload.oldCogsBase}:${payload.newCogsBase}${options.recalcRunId ? `:${options.recalcRunId}` : ''}`
   await (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, {
     type: 'COGS_REVERSAL',
@@ -130,16 +173,17 @@ async function queueShipmentCogsRevaluationSync(
     referenceId: input.shipmentId,
     idempotencyKey: revaluationIdempotencyKey,
     payload,
-    // o3d-3zgy: the ONE acknowledged gap. This runs inside a purchasing/manufacturing landed-cost
-    // transaction (propagateLandedCostToOutputs -> refreshShipmentCogsForCostLayerChange), which
-    // discovers the affected shipments — and therefore their sales orders — by querying
-    // costLayerSnapshot MID-transaction, after cost-layer and stock rows are already locked. Taking
-    // the sales-order lock at that point inverts the lockSalesOrder-then-lockStockLevels ordering
-    // allocation-service establishes and can deadlock against the allocation path, trading a rare
-    // race for a routine hang. Closing it properly means restructuring that transaction to resolve
-    // and lock the affected orders up front — tracked as o3d-zpa7.
+    // o3d-3zgy: this runs inside a purchasing/manufacturing landed-cost transaction
+    // (propagateLandedCostToOutputs -> refreshShipmentCogsForCostLayerChange), which discovers the
+    // affected shipments — and therefore their sales orders — by querying costLayerSnapshot
+    // MID-transaction, after cost-layer and stock rows are already locked. Taking the sales-order lock
+    // at that point inverts the lockSalesOrder-then-lockStockLevels ordering allocation-service
+    // establishes and can deadlock against the allocation path, trading a rare race for a routine hang.
+    // o3d-zpa7: what makes the unlocked write safe anyway is asserted immediately above — the order is
+    // provably undeletable — so this acknowledgement now records WHY no lock is taken, not an open gap.
     unlockedOrderScopeReason:
-      'landed-cost revaluation discovers affected shipments mid-transaction, after stock locks (o3d-zpa7)',
+      'landed-cost revaluation discovers affected shipments mid-transaction, after stock locks; the order is '
+      + 'provably undeletable (accountingInvoiceId asserted above) so no lock is needed (o3d-zpa7)',
   })
   // khdw: record the net COGS-account movement of this revaluation (reverse old +
   // repost new → net debit = newCogs − oldCogs, both 2dp) in the COGS subledger

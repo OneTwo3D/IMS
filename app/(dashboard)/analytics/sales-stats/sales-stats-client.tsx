@@ -14,6 +14,8 @@ import { saveView, type SalesStatRow, type SalesStatSummary, type ShipmentRow, t
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
+import { filterAndSortRows } from '@/lib/analytics/table-filter-sort'
+import { boundSuffix, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 
 type Tab = 'products' | 'shipments' | 'details' | 'invoices' | 'refunds' | 'aging'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -58,6 +60,10 @@ const PRODUCT_FIELDS: FieldDef[] = [
   { key: 'grossRevenue', label: 'Gross Revenue', type: 'number' },
   { key: 'discounts', label: 'Discounts', type: 'number' },
   { key: 'refunds', label: 'Refunds', type: 'number' },
+  // o3d-iigc: refund value the ex-VAT revenue cannot absorb. Opt-in, so the default view is
+  // unchanged for the overwhelming majority of products that have neither.
+  { key: 'refundsGrossBasis', label: 'Refunds (gross)', type: 'number' },
+  { key: 'refundsUnknownBasis', label: 'Refunds (basis ?)', type: 'number' },
   { key: 'netRevenue', label: 'Net Revenue', type: 'number' },
   { key: 'cogs', label: 'COGS', type: 'number' },
   { key: 'grossProfit', label: 'Gross Profit', type: 'number' },
@@ -125,6 +131,7 @@ const REFUND_FIELDS: FieldDef[] = [
   { key: 'salesRep', label: 'Sales Rep', type: 'text' },
   { key: 'qty', label: 'Qty', type: 'number' },
   { key: 'totalBase', label: 'Total', type: 'number' },
+  { key: 'totalsBasis', label: 'Basis', type: 'select', options: ['NET', 'GROSS', 'UNKNOWN'] },
   { key: 'pctOfSale', label: '% of Sale', type: 'number' },
   { key: 'reason', label: 'Reason', type: 'text' },
   { key: 'customerName', label: 'Customer', type: 'text' },
@@ -138,7 +145,11 @@ const AGING_FIELDS: FieldDef[] = [
   { key: 'createdAt', label: 'Date', type: 'text' },
   { key: 'salesTotal', label: 'Sales', type: 'number' },
   { key: 'refundsTotal', label: 'Refunds', type: 'number' },
+  // o3d-lvk offered this same fact as `refundsBasis`; o3d-iigc's `netTotalBasis` below is the one
+  // the row actually carries, and it names the figure the basis qualifies.
   { key: 'netTotal', label: 'Net Total', type: 'number' },
+  // o3d-iigc: which total Net Total IS. Opt-in — every order without credits reads NONE.
+  { key: 'netTotalBasis', label: 'Net Total Basis', type: 'select', options: ['NONE', 'NET', 'GROSS', 'UNKNOWN'] },
   { key: 'dueAmount', label: 'Due', type: 'number' },
   { key: 'avgDso', label: 'Avg DSO', type: 'number' },
   { key: 'overdue0_30', label: '0-30d', type: 'number' },
@@ -146,6 +157,81 @@ const AGING_FIELDS: FieldDef[] = [
   { key: 'overdue61_90', label: '61-90d', type: 'number' },
   { key: 'overdue91plus', label: '91d+', type: 'number' },
 ]
+
+/**
+ * o3d-iigc: what an upper-bounded figure means, in one place so every bounded cell says the same
+ * thing. The bound is loose by AT MOST the row's gross-basis + unknown-basis refund value, which is
+ * shown in its own two columns.
+ */
+const BOUND_TITLE = 'Upper bound: some of this product\u2019s refunds are on the gross basis or have no proven basis, so they are not subtracted here'
+
+/**
+ * The same statement for a WHOLE-PERIOD figure, where the loose refunds may belong to any product.
+ */
+const BOUND_TITLE_SUMMARY = 'Upper bound: some refunds in this period are on the gross basis or have no proven basis, so they are not subtracted from this total'
+
+/**
+ * o3d-iigc round 4: MARGIN IS A RATIO AND `≤` WAS THE WRONG RELATION FOR IT.
+ *
+ * Rounds 1-3 marked Margin with the same `≤` as Net Revenue and Profit, reasoning that it moves with
+ * revenue. It does — but it moves with revenue in BOTH the numerator and the denominator, and where
+ * COGS exceeds the published net revenue the report's own `netRevenue > 0` guard puts the true margin
+ * at 0% while the published figure is negative. 0% is not "at most -50%": the mark was a false claim.
+ *
+ * marginFigureBound classifies which of the three it is. `indeterminate` still PUBLISHES the number —
+ * withholding a figure whose basis IS establishable is this branch's failure mode in the other
+ * direction — and withholds only the RELATION.
+ */
+const MARGIN_INDETERMINATE_TITLE = 'Direction not established: margin divides two figures that BOTH move with the refunds this product could not subtract, so the true margin may be either side of this one. The figure is shown; the relation is not claimed.'
+const MARGIN_INDETERMINATE_TITLE_SUMMARY = 'Direction not established: margin divides two figures that BOTH move with the refunds this period could not subtract, so the true margin may be either side of this one. The figure is shown; the relation is not claimed.'
+
+function marginBoundTitle(bound: DerivedFigureBound, summary = false): string | undefined {
+  if (bound === 'exact') return undefined
+  if (bound === 'indeterminate') return summary ? MARGIN_INDETERMINATE_TITLE_SUMMARY : MARGIN_INDETERMINATE_TITLE
+  return summary ? BOUND_TITLE_SUMMARY : BOUND_TITLE
+}
+
+/**
+ * o3d-iigc round 2 (Codex finding 1): A SUMMARY CARD IS THE FIGURE PEOPLE ACTUALLY READ, and on a
+ * card an upper bound was indistinguishable from a measurement — the marks the table cells carry
+ * were on the columns hardly anyone scrolls to, while the five cards above them printed the same
+ * bounded totals as if they were exact.
+ *
+ * A bounded card therefore carries the table's own marks — the `≤`, and the bound colour INSTEAD
+ * of any colouring that would read as a verdict — plus, because a card has no "Refunds (gross)"
+ * column beside it to reveal how loose the bound is, the looseness in words underneath.
+ */
+function SummaryCard({ label, value, bound = 'exact', boundedBy, valueClass }: {
+  label: string
+  /** Already formatted: money through fmtBase, a percentage with its sign. */
+  value: string
+  /**
+   * How this figure relates to the one a complete refund basis would have produced. o3d-iigc round 4
+   * widened this from a boolean: `upper` and `indeterminate` are DIFFERENT claims and a card that
+   * cannot tell them apart will print the wrong one.
+   */
+  bound?: DerivedFigureBound
+  /** Formatted refund value the figure could not absorb — how loose the bound is. */
+  boundedBy?: string
+  /** Colouring that reads as a verdict on the figure. Dropped whenever the figure is not exact. */
+  valueClass?: string
+}) {
+  const marked = bound !== 'exact'
+  const title = bound === 'indeterminate' ? MARGIN_INDETERMINATE_TITLE_SUMMARY : bound === 'upper' ? BOUND_TITLE_SUMMARY : undefined
+  return (
+    <div className="rounded-md border p-3">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className={`text-xl font-bold ${marked ? 'text-orange-600' : valueClass ?? ''}`} title={title}>
+        {value}{boundSuffix(bound)}
+      </p>
+      {marked && (
+        <p className="text-[10px] leading-tight text-orange-600" title={title}>
+          {bound === 'indeterminate' ? 'Direction not established' : 'Upper bound'} &mdash; {boundedBy} of refunds not subtracted
+        </p>
+      )}
+    </div>
+  )
+}
 
 const TAB_FIELDS: Record<Tab, FieldDef[]> = {
   products: PRODUCT_FIELDS,
@@ -196,31 +282,6 @@ function getOperators(fields: FieldDef[], fieldKey: string) {
 
 function getFieldOptions(fields: FieldDef[], fieldKey: string) {
   return fields.find((pf) => pf.key === fieldKey)?.options
-}
-
-function applyFilter(value: string | number | null | boolean | undefined, rule: FilterRule): boolean {
-  const v = value == null ? '' : String(value).toLowerCase()
-  const rv = rule.value.toLowerCase()
-  switch (rule.operator) {
-    case 'contains': return v.includes(rv)
-    case 'equals': case 'is': return v === rv
-    case 'starts_with': return v.startsWith(rv)
-    case 'not_contains': return !v.includes(rv)
-    case 'is_not': return v !== rv
-    case '>': return Number(value) > Number(rule.value)
-    case '>=': return Number(value) >= Number(rule.value)
-    case '<': return Number(value) < Number(rule.value)
-    case '<=': return Number(value) <= Number(rule.value)
-    case '=': return Number(value) === Number(rule.value)
-    case '!=': return Number(value) !== Number(rule.value)
-    default: return true
-  }
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function getVal(row: any, field: string): string | number | null {
-  const v = row[field]
-  return v === undefined ? null : v
 }
 
 // ---------------------------------------------------------------------------
@@ -391,24 +452,22 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
     setFilterRules(view.filters.map((f) => ({ ...f, id: makeId() })))
   }
 
-  // Generic filter + sort for any tab data
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  function filterAndSort<T extends Record<string, any>>(data: T[]): T[] {
-    let result = data
-    for (const rule of filterRules) {
-      if (!rule.value) continue
-      result = result.filter((row) => applyFilter(getVal(row, rule.field), rule))
-    }
-    if (sortCol) {
-      result = [...result].sort((a, b) => {
-        const va = getVal(a, sortCol) ?? 0
-        const vb = getVal(b, sortCol) ?? 0
-        const cmp = typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb))
-        return sortDir === 'asc' ? cmp : -cmp
-      })
-    }
-    return result
+  // Generic filter + sort for any tab data. o3d-iigc round 2: the rules live in
+  // lib/analytics/table-filter-sort so a WITHHELD figure (a null net total, an unestablished % of
+  // sale) is not sorted or filtered as if it were zero — on any of the six tabs, or on the two
+  // sibling stat pages that share the module.
+  function filterAndSort<T extends object>(data: T[]): T[] {
+    return filterAndSortRows(data, filterRules, sortCol, sortDir)
   }
+
+  // How loose the bounded summary figures are: every refund the ex-VAT revenue could not absorb,
+  // which is exactly the two columns the products table reports beside the figure. Rounded once,
+  // here, because both totals are themselves sums of rounded rows.
+  const summaryIsBounded = !summary.refundBasisComplete
+  // The verdict for the figures that move ONE-FOR-ONE with net revenue. Avg Margin does NOT use it —
+  // it carries its own, because a ratio's error can run the other way (o3d-iigc round 4).
+  const summaryLinearBound: DerivedFigureBound = summaryIsBounded ? 'upper' : 'exact'
+  const summaryBoundedBy = fmtBase(Math.round((summary.totalRefundsGrossBasis + summary.totalRefundsUnknownBasis) * 100) / 100)
 
   // Filtered data per tab
   const filteredProducts = filterAndSort(rows)
@@ -442,13 +501,21 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
     netQty: { label: 'Net Qty', align: 'right', render: (r) => <span className="tabular-nums text-xs font-medium">{r.netQty}</span> },
     grossRevenue: { label: moneyLabel('Gross Rev'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtBase(r.grossRevenue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtBase(summary.totalGrossRevenue)}</span> },
     discounts: { label: moneyLabel('Discounts'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-destructive">{r.discounts > 0 ? fmtBase(r.discounts) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-destructive">{fmtBase(summary.totalDiscounts)}</span> },
-    refunds: { label: moneyLabel('Refunds'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-orange-600">{r.refunds > 0 ? fmtBase(r.refunds) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-orange-600">{fmtBase(summary.totalRefunds)}</span> },
-    netRevenue: { label: moneyLabel('Net Revenue'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono font-medium">{fmtBase(r.netRevenue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtBase(summary.totalNetRevenue)}</span> },
+    refunds: { label: moneyLabel('Refunds'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value on the NET basis — the only credit that is the same unit as this row's ex-VAT revenue">{r.refunds > 0 ? fmtBase(r.refunds) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-orange-600">{fmtBase(summary.totalRefunds)}</span> },
+    refundsGrossBasis: { label: moneyLabel('Refunds (gross)'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value recorded on the GROSS basis — not comparable with this row's ex-VAT revenue, so it is excluded from it">{r.refundsGrossBasis > 0 ? fmtBase(r.refundsGrossBasis) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-orange-600">{fmtBase(summary.totalRefundsGrossBasis)}</span> },
+    refundsUnknownBasis: { label: moneyLabel('Refunds (basis ?)'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value whose basis was never proved — excluded from net revenue rather than guessed at">{r.refundsUnknownBasis > 0 ? fmtBase(r.refundsUnknownBasis) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-orange-600">{fmtBase(summary.totalRefundsUnknownBasis)}</span> },
+    // o3d-iigc: when the row's refunds could not all be placed on the net basis, this figure and
+    // everything derived from it are UPPER BOUNDS — marked, not presented as exact.
+    netRevenue: { label: moneyLabel('Net Revenue'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono font-medium ${r.refundBasisComplete ? '' : 'text-orange-600'}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(r.netRevenue)}{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.refundBasisComplete ? '' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(summary.totalNetRevenue)}{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
     cogs: { label: moneyLabel('COGS'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.cogs > 0 ? fmtBase(r.cogs) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-muted-foreground">{fmtBase(summary.totalCogs)}</span> },
-    grossProfit: { label: moneyLabel('Profit'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${r.grossProfit >= 0 ? 'text-green-600' : 'text-destructive'}`}>{fmtBase(r.grossProfit)}</span>, footer: () => <span className="tabular-nums font-mono text-green-600">{fmtBase(summary.totalGrossProfit)}</span> },
-    marginPct: { label: 'Margin', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${r.marginPct < 0 ? 'text-destructive' : ''}`}>{r.marginPct}%</span>, footer: () => <span className="tabular-nums">{summary.avgMarginPct}%</span> },
+    // A bounded profit/margin DROPS the green/red colouring: that colouring reads as a verdict, and
+    // an upper bound does not support one.
+    grossProfit: { label: moneyLabel('Profit'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${!r.refundBasisComplete ? 'text-orange-600' : r.grossProfit >= 0 ? 'text-green-600' : 'text-destructive'}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(r.grossProfit)}{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.refundBasisComplete ? 'text-green-600' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(summary.totalGrossProfit)}{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
+    // o3d-iigc round 4: Margin reads marginPctBound, NOT refundBasisComplete. The other three
+    // net-derived columns keep refundBasisComplete because they move one-for-one with net revenue.
+    marginPct: { label: 'Margin', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${r.marginPctBound !== 'exact' ? 'text-orange-600' : r.marginPct < 0 ? 'text-destructive' : ''}`} title={marginBoundTitle(r.marginPctBound)}>{r.marginPct}%{boundSuffix(r.marginPctBound)}</span>, footer: () => <span className={`tabular-nums ${summary.avgMarginPctBound !== 'exact' ? 'text-orange-600' : ''}`} title={marginBoundTitle(summary.avgMarginPctBound, true)}>{summary.avgMarginPct}%{boundSuffix(summary.avgMarginPctBound)}</span> },
     orderCount: { label: 'Orders', align: 'right', render: (r) => <span className="tabular-nums text-xs text-muted-foreground">{r.orderCount}</span>, footer: () => <span className="tabular-nums text-muted-foreground">{summary.totalOrders}</span> },
-    avgOrderValue: { label: moneyLabel('Avg Order'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtBase(r.avgOrderValue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtBase(summary.avgOrderValue)}</span> },
+    avgOrderValue: { label: moneyLabel('Avg Order'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${r.refundBasisComplete ? '' : 'text-orange-600'}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(r.avgOrderValue)}{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.refundBasisComplete ? '' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(summary.avgOrderValue)}{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
     salesPrice: { label: moneyLabel('List Price'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{r.salesPrice != null ? fmtBase(r.salesPrice) : '—'}</span> },
     weight: { label: 'Weight', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.weight != null ? `${r.weight}kg` : '—'}</span> },
     currentStock: { label: 'On Hand', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.currentStock}</span> },
@@ -490,13 +557,26 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
       if (key === 'orderNumber') return <Link href={`/sales/${row.orderId}`} className="hover:underline font-mono text-xs">{row.orderNumber}</Link>
       if (key === 'refundedAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
       if (key === 'totalBase') return <span className="tabular-nums text-xs font-mono text-destructive">{fmtBase(v)}</span>
-      if (key === 'pctOfSale') return <span className="tabular-nums text-xs text-muted-foreground">{v}%</span>
+      // o3d-lvk: what the credit's stored total MEANS, rendered the same way the aging tab renders
+      // `netTotalBasis`. It is the stated cause of the dash in `% of Sale` below, so the reader is
+      // not left with an unexplained gap when they are not hovering.
+      if (key === 'totalsBasis') return <span className="text-xs text-muted-foreground">{v}</span>
+      // o3d-iigc: null means the credit's basis is unproven (or no comparable order total exists),
+      // so no proportion is established. A 0% here would read as "refunded nothing".
+      if (key === 'pctOfSale') return v == null ? <span className="text-xs text-muted-foreground" title="No proportion is established: this credit's basis is unproven, so there is no order total it is comparable with">—</span> : <span className="tabular-nums text-xs text-muted-foreground">{v}%</span>
       if (key === 'qty') return <span className="tabular-nums text-xs">{v}</span>
     }
     if (tabKey === 'aging') {
       if (key === 'orderNumber') return <Link href={`/sales/${row.orderId}`} className="hover:underline font-mono text-xs">{row.orderNumber}</Link>
       if (key === 'createdAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
-      if (key === 'salesTotal' || key === 'netTotal') return <span className="tabular-nums text-xs font-mono font-medium">{fmtBase(v)}</span>
+      if (key === 'salesTotal') return <span className="tabular-nums text-xs font-mono font-medium">{fmtBase(v)}</span>
+      // o3d-iigc: withheld when the order's credits are not all on one proven basis. The gross
+      // invoice total minus a NET credit understated the credit by its VAT; a mixed set is not a
+      // subtraction at all. Neither is converted, so the figure is refused rather than invented.
+      if (key === 'netTotal') return v == null
+        ? <span className="text-xs text-muted-foreground" title={`Withheld: this order's credits are not all on one proven basis (${row.netTotalBasis}), and converting between bases needs a rate that is not recoverable`}>—</span>
+        : <span className="tabular-nums text-xs font-mono font-medium" title={row.netTotalBasis === 'NET' ? 'Ex-VAT: this order\u2019s credits are on the NET basis, so the figure is the ex-VAT order total less them' : row.netTotalBasis === 'GROSS' ? 'VAT-inclusive: this order\u2019s credits are on the GROSS basis' : undefined}>{fmtBase(v)}</span>
+      if (key === 'netTotalBasis') return <span className="text-xs text-muted-foreground">{v}</span>
       if (key === 'refundsTotal') return <span className="tabular-nums text-xs font-mono text-orange-600">{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0.01 ? 'text-orange-600 font-medium' : ''}`}>{v > 0.01 ? fmtBase(v) : '—'}</span>
       if (key === 'avgDso') return <span className="tabular-nums text-xs text-muted-foreground">{v > 0 ? `${v}d` : '—'}</span>
@@ -558,13 +638,17 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
       <div className="flex items-center justify-between">
       </div>
 
-      {/* Summary cards */}
+      {/* Summary cards. Three of the five are derived from net revenue, so when a refund could not
+          be placed on the net basis they are UPPER BOUNDS and say so (o3d-iigc round 2). COGS and
+          Orders/Qty are basis-independent — quantity nets off every refund line whatever its
+          basis — so they are never marked. */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Net Revenue</p><p className="text-xl font-bold">{fmtBase(summary.totalNetRevenue)}</p></div>
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">COGS</p><p className="text-xl font-bold">{fmtBase(summary.totalCogs)}</p></div>
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Gross Profit</p><p className="text-xl font-bold text-green-600">{fmtBase(summary.totalGrossProfit)}</p></div>
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Avg Margin</p><p className="text-xl font-bold">{summary.avgMarginPct}%</p></div>
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Orders / Qty</p><p className="text-xl font-bold">{summary.totalOrders} / {summary.totalQtySold}</p></div>
+        <SummaryCard label="Net Revenue" value={fmtBase(summary.totalNetRevenue)} bound={summaryLinearBound} boundedBy={summaryBoundedBy} />
+        <SummaryCard label="COGS" value={fmtBase(summary.totalCogs)} />
+        <SummaryCard label="Gross Profit" value={fmtBase(summary.totalGrossProfit)} bound={summaryLinearBound} boundedBy={summaryBoundedBy} valueClass="text-green-600" />
+        {/* o3d-iigc round 4: Avg Margin takes its OWN verdict, not the period's linear one. */}
+        <SummaryCard label="Avg Margin" value={`${summary.avgMarginPct}%`} bound={summary.avgMarginPctBound} boundedBy={summaryBoundedBy} />
+        <SummaryCard label="Orders / Qty" value={`${summary.totalOrders} / ${summary.totalQtySold}`} />
       </div>
 
       {/* Tabs + actions */}

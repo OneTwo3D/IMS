@@ -1,5 +1,6 @@
 import 'dotenv/config'
 import { db } from '../lib/db/index.ts'
+import { lockIntegrationPluginSelection } from '../lib/integration-plugin-selection-lock.ts'
 import { importWcOrder } from '../lib/connectors/woocommerce/sync/order-import.ts'
 import type { WcFullOrder, WcRefund } from '../lib/connectors/woocommerce/sync/types.ts'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '../lib/domain/math/decimal.ts'
@@ -16,10 +17,30 @@ async function upsertSetting(key: string, value: string) {
   })
 }
 
+/**
+ * The plugin flags, under the connector-selection lock (o3d-osl8 round 6, finding 2).
+ *
+ * These decide which accounting connector is ACTIVE, and cancelOrphanedAccountingSyncRows discards
+ * a non-active connector's queue from that answer. A fixture that flipped them with a bare upsert
+ * was a writer that took no lock — one of the several concrete bypasses (this, the sibling
+ * landed-cost fixture, the full-chain quiesce harness, the e2e mintsoft route and the full database
+ * reset) that made the sweep's generation check the only thing standing between a concurrent cancel
+ * and the live queue, and a check that verifies then commits is not a fence. Fixtures
+ * run against a disposable database, but the point of routing them through the same helper is that
+ * "this writer is special" is exactly how the bypass got there in the first place.
+ */
+async function seedPluginFlags(flags: Record<string, boolean>) {
+  await db.$transaction(async (tx) => {
+    await lockIntegrationPluginSelection(tx)
+    for (const [key, value] of Object.entries(flags)) {
+      await tx.setting.upsert({ where: { key }, update: { value: String(value) }, create: { key, value: String(value) } })
+    }
+  })
+}
+
 async function seedAccountingSettings() {
+  await seedPluginFlags({ plugin_xero_enabled: true, plugin_woocommerce_enabled: true })
   await Promise.all([
-    upsertSetting('plugin_xero_enabled', 'true'),
-    upsertSetting('plugin_woocommerce_enabled', 'true'),
     upsertSetting('xero_sync_enabled', 'true'),
     upsertSetting('xero_daily_batch_enabled', 'true'),
     upsertSetting('xero_sales_account', '200'),
@@ -661,7 +682,11 @@ async function importWcFeeScenario() {
     refunds: [],
   }
 
-  const result = await importWcOrder(wcOrder)
+  // o3d-tj6v r5: the fixture builds its own WooCommerce payloads, so there is no `?status=`
+  // query behind them and the default gate would judge them against whatever the fixture
+  // database's "Import order statuses" setting happens to be. Preauthorised: the fixture IS
+  // the status filter for its own orders.
+  const result = await importWcOrder(wcOrder, { createAdmission: 'preauthorised-by-status-query' })
   if (!result.success || !result.orderId) {
     throw new Error(result.error ?? 'Failed to import WC fee order')
   }
@@ -952,7 +977,11 @@ async function seedWcFxCogsFlowScenario() {
     refunds: [],
   }
 
-  const result = await importWcOrder(wcOrder)
+  // o3d-tj6v r5: the fixture builds its own WooCommerce payloads, so there is no `?status=`
+  // query behind them and the default gate would judge them against whatever the fixture
+  // database's "Import order statuses" setting happens to be. Preauthorised: the fixture IS
+  // the status filter for its own orders.
+  const result = await importWcOrder(wcOrder, { createAdmission: 'preauthorised-by-status-query' })
   if (!result.success || !result.orderId) {
     throw new Error(result.error ?? 'Failed to import WC FX COGS order')
   }
@@ -1496,7 +1525,11 @@ async function importWcDiscountScenario() {
     refunds: [],
   }
 
-  const result = await importWcOrder(wcOrder)
+  // o3d-tj6v r5: the fixture builds its own WooCommerce payloads, so there is no `?status=`
+  // query behind them and the default gate would judge them against whatever the fixture
+  // database's "Import order statuses" setting happens to be. Preauthorised: the fixture IS
+  // the status filter for its own orders.
+  const result = await importWcOrder(wcOrder, { createAdmission: 'preauthorised-by-status-query' })
   if (!result.success || !result.orderId) {
     throw new Error(result.error ?? 'Failed to import WC discount order')
   }

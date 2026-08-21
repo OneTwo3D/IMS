@@ -37,10 +37,10 @@ fully down during the security review. `ims-stage.service` replaces it.
 4. **Environment**: place the real `.env` at `/opt/ims/onetwo3d-ims/.env`, owned
    `ims:ims`, mode `600`. It must set a strong `AUTH_SECRET`
    (`openssl rand -base64 32` — see `onetwo3d-ims-ey8j`) and
-   `SETTINGS_ENCRYPTION_KEY`. `BACKUP_DIR` and `XERO_TOKEN_PATH` are pointed at the
-   managed `StateDirectory` by the unit; leave temp dirs (`PDF_TEMP_DIR`,
-   `UPLOAD_TEMP_DIR`) under `/tmp` — `PrivateTmp=true` gives the service a private
-   `/tmp`.
+   `SETTINGS_ENCRYPTION_KEY`. `BACKUP_DIR` is pointed at the managed
+   `StateDirectory` by the unit. Xero tokens are encrypted in Postgres, not on
+   disk, so nothing under `StateDirectory` needs to be scoped around them
+   (o3d-esha).
 
 5. **Confirm the reverse proxy** terminates TLS for the public hostname and
    forwards to `127.0.0.1:3000`. The app no longer listens on `0.0.0.0`.

@@ -27,6 +27,7 @@ import {
   type AccountingSyncLogRow,
   type AccountingSyncReadiness,
 } from '@/app/actions/accounting-sync'
+import { accountingRetryDuplicateCaution } from '@/lib/domain/accounting/idempotency-retention'
 import {
   refreshAccountingBatchPreview,
   type AccountingBatchPreview,
@@ -43,6 +44,8 @@ import {
 import { updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
+import { describeSyncRowSettleability } from '@/lib/domain/accounting/sync-row-settlement'
+import { SettleSyncRowControl } from './settle-sync-row-control'
 
 type AccountingAccount = { id: string; externalAccountId: string; code: string | null; name: string; type: string }
 
@@ -52,6 +55,10 @@ export type AccountingConnectorClientProps = {
   settings: AccountingConnectorSettings & { secretMasked: boolean }
   connected: boolean
   tenantName?: string
+  /** Why a stored connection is refused, when it is — see isConnected() in lib/connectors/xero/auth.ts. */
+  blockedReason?: string
+  /** A token row exists even though `connected` is false: Disconnect must stay on screen (o3d-9tbz). */
+  hasStoredToken?: boolean
   connectionTest: IntegrationConnectionTestState
   accounts: AccountingAccount[]
   logs: AccountingSyncLogRow[]
@@ -110,7 +117,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
   return JSON.stringify(map)
 }
 
-export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, connectionTest, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: AccountingConnectorClientProps) {
+export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, blockedReason, hasStoredToken: initHasStoredToken, connectionTest, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: AccountingConnectorClientProps) {
   const router = useRouter()
   const formatDateTime = useFormatDateTime()
   const { promptReauth, stepUpDialog } = useStepUpReauth()
@@ -126,11 +133,16 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
   const [connected, setConnected] = useState(initConnected)
+  // Tracks whether a token ROW exists, which is not the same question as whether the connection is
+  // usable. A blocked connection is unusable but very much still stored, and the refusal tells the
+  // operator to disconnect it — so the button has to stay on screen (o3d-9tbz).
+  const [hasStoredToken, setHasStoredToken] = useState(initHasStoredToken ?? initConnected)
   const [tenantName, setTenantName] = useState(initTenant)
   const [clientId, setClientId] = useState(init.client_id ?? init.xero_client_id ?? init.quickbooks_client_id ?? '')
   const [clientSecret, setClientSecret] = useState(init.client_secret ?? init.xero_client_secret ?? init.quickbooks_client_secret ?? '')
   const [msg, setMsg] = useState<string | null>(null)
   const [connectMsg, setConnectMsg] = useState<string | null>(null)
+  const [connectMsgTone, setConnectMsgTone] = useState<'info' | 'error'>('info')
   const [syncMsg, setSyncMsg] = useState<string | null>(null)
   const [accountsMsg, setAccountsMsg] = useState<string | null>(null)
   const [accountsMsgLevel, setAccountsMsgLevel] = useState<'info' | 'warning' | 'error'>('info')
@@ -175,10 +187,13 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     setSavingConnection(false)
     if (success) {
       setConnected(true)
+      setHasStoredToken(true)
       setTenantName(success)
+      setConnectMsgTone('info')
       setConnectMsg(`Connected to ${success}`)
       window.history.replaceState({}, '', `/sync?connector=${connectorId}`)
     } else if (error) {
+      setConnectMsgTone('error')
       setConnectMsg(`${connectorLabel} error: ${error}`)
       window.history.replaceState({}, '', `/sync?connector=${connectorId}`)
     }
@@ -222,6 +237,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   }
 
   async function handleSaveConnection() {
+    setConnectMsgTone('info')
     setConnectMsg(null)
     setSavingConnection(true)
     const result = await withStepUp(() => saveAccountingConnectionSettings(clientId, clientSecret))
@@ -230,12 +246,14 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       setConnectMsg(result.message ?? 'Connection settings saved.')
       router.refresh()
     } else {
+      setConnectMsgTone('error')
       setConnectMsg(`Failed: ${result.error}`)
     }
   }
 
   async function handleConnect() {
-    if (!clientId || !clientSecret) { setConnectMsg('Enter Client ID and Client Secret.'); return }
+    if (!clientId || !clientSecret) { setConnectMsgTone('error'); setConnectMsg('Enter Client ID and Client Secret.'); return }
+    setConnectMsgTone('info')
     setConnectMsg(null)
     setConnecting(true)
     const result = await withStepUp(() => connectAccountingConnector(clientId, clientSecret, window.location.origin))
@@ -244,11 +262,13 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       setConnectMsg(`Redirecting to ${connectorLabel}…`)
       window.location.href = result.redirectUrl
     } else {
+      setConnectMsgTone('error')
       setConnectMsg(`Failed: ${result.error}`)
     }
   }
 
   async function handleTestConnection() {
+    setConnectMsgTone('info')
     setConnectMsg(null)
     setTestingConnection(true)
     try {
@@ -257,6 +277,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         setConnectMsg(result.message ?? `${connectorLabel} connection test passed.`)
         router.refresh()
       } else {
+        setConnectMsgTone('error')
         setConnectMsg(`Failed: ${result.error ?? `${connectorLabel} connection test failed.`}`)
       }
     } finally {
@@ -266,16 +287,19 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
 
   async function handleDisconnect() {
     if (!confirm(`Disconnect from ${connectorLabel}? Pending sync entries will not be processed until reconnected.`)) return
+    setConnectMsgTone('info')
     setConnectMsg(null)
     setConnecting(true)
     const result = await disconnectAccountingConnector()
     setConnecting(false)
     if (result.success) {
       setConnected(false)
+      setHasStoredToken(false)
       setTenantName(undefined)
       setConnectMsg(`Disconnected from ${connectorLabel}.`)
       router.refresh()
     } else {
+      setConnectMsgTone('error')
       setConnectMsg(`Error: ${result.error}`)
     }
   }
@@ -379,10 +403,12 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     })
   }
 
-  async function handleRetryOne(entryId: string) {
+  // o3d-e2mz: a per-row retry carries the attempt the operator is looking at, so the server can refuse
+  // it if the row has moved on to a different attempt since this list was rendered.
+  async function handleRetryOne(entryId: string, attemptRevision: number | undefined) {
     setRetryMsg(null)
     setRetryingId(entryId)
-    const result = await retryFailedAccountingSync(entryId)
+    const result = await retryFailedAccountingSync(entryId, attemptRevision)
     setRetryingId(null)
     if (result.success) {
       setRetryMsg(`Reset ${result.reset} entry for retry.`)
@@ -450,6 +476,18 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             )}
           </div>
 
+          {blockedReason && hasStoredToken && (
+            // A stored token the allow-list forbids used to render as a green "connected" badge while
+            // every sync failed (o3d-9tbz). It is now reported as NOT connected, and the reason is put
+            // where the operator is already looking rather than only in a notification they have to
+            // go and find. Disconnect stays available below, because this text tells them to use it.
+            // Gated on hasStoredToken as well so that pressing Disconnect clears it immediately rather
+            // than leaving "sync is halted" on screen until the server round-trip lands.
+            <p className="text-xs text-destructive break-words whitespace-pre-line max-w-3xl" role="alert">
+              {blockedReason}
+            </p>
+          )}
+
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-1.5">
               <Label htmlFor="xero_client_id">Client ID</Label>
@@ -481,7 +519,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
               {testingConnection ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
               Test Connection
             </Button>
-            {connected ? (
+            {hasStoredToken ? (
               <Button variant="outline" size="sm" onClick={handleDisconnect} disabled={connecting || savingConnection}>
                 {connecting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2Off className="h-3 w-3 mr-1" />}
                 Disconnect
@@ -492,8 +530,16 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                 {`Connect to ${connectorLabel}`}
               </Button>
             )}
-            {connectMsg && <span className="text-xs text-muted-foreground">{connectMsg}</span>}
           </div>
+          {connectMsg && (
+            // A refusal from the callback (o3d-9tbz) is a paragraph, not a word: it names every
+            // organisation the consent offered, with ids, and what to do next. Rendered on its own line
+            // and allowed to wrap — squeezed into the button row it was unreadable, and an operator who
+            // cannot read the remedy has not been given one.
+            <p className={`text-xs break-words whitespace-pre-line max-w-3xl ${connectMsgTone === 'error' ? 'text-destructive' : 'text-muted-foreground'}`}>
+              {connectMsg}
+            </p>
+          )}
           {connectionTest.status !== 'never' && (
             <p className={`text-xs ${connectionTest.status === 'success' ? 'text-green-600' : 'text-destructive'}`}>
               Last connection test: {connectionTest.status === 'success' ? 'passed' : 'failed'}
@@ -969,6 +1015,10 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
               </div>
             </div>
             {syncMsg && <p className="text-xs text-muted-foreground">{syncMsg}</p>}
+            {/* o3d-wahn: what "Retry All Failed" actually costs if the first attempt landed. */}
+            {hasFailedEntries && (
+              <p className="text-xs text-muted-foreground">{accountingRetryDuplicateCaution('xero')}</p>
+            )}
             {retryMsg && <p className="text-xs text-muted-foreground">{retryMsg}</p>}
             {logs.length === 0 ? (
               <p className="text-sm text-muted-foreground">No sync entries yet.</p>
@@ -989,6 +1039,16 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                   <TableBody>
                     {pagedLogs.map(log => {
                       const badge = STATUS_BADGE[log.status] ?? { variant: 'outline' as const, label: log.status }
+                      // Computed ONCE per row, from the same shared helper the stranded-row list uses.
+                      const settlement = describeSyncRowSettleability({
+                        status: log.status,
+                        type: log.type,
+                        attemptRevision: log.attemptRevision,
+                      })
+                      // Only the two statuses a settlement could ever apply to get a control (or a
+                      // reason). Rendering "not settleable" against every SYNCED row would be noise
+                      // that buries the rows an operator actually has to act on.
+                      const settlementApplies = log.status === 'FAILED' || log.status === 'PROCESSING'
                       return (
                         <TableRow key={log.id}>
                           <TableCell className="font-mono text-xs">{log.type.replace(/_/g, ' ')}</TableCell>
@@ -1003,18 +1063,45 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                             {log.errorMessage ?? '—'}
                           </TableCell>
                           <TableCell>
-                            {log.status === 'FAILED' && (
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="h-7 w-7 p-0"
-                                title="Retry this entry"
-                                onClick={() => handleRetryOne(log.id)}
-                                disabled={retryingId === log.id}
-                              >
-                                {retryingId === log.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
-                              </Button>
-                            )}
+                            <div className="flex items-center gap-0.5">
+                              {log.status === 'FAILED' && (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 w-7 p-0"
+                                  title="Retry this entry"
+                                  onClick={() => handleRetryOne(log.id, log.attemptRevision)}
+                                  disabled={retryingId === log.id}
+                                >
+                                  {retryingId === log.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+                                </Button>
+                              )}
+                              {/*
+                                o3d-nf9i — the settlement control, beside Retry rather than instead of it.
+                                The two are opposites and the operator has to be able to choose: Retry
+                                re-attempts work the system already decided to do, and o3d-0m56 REFUSES it
+                                when several rows for one reference posted under different idempotency
+                                tokens. Until now that refusal was a dead end — "resolve these rows
+                                manually" with no manual path in the app. This is that path.
+                                Rendered only where a settlement could actually land: the helper returns
+                                `settleable: false` for PENDING/terminal rows, DAILY_BATCH types and rows
+                                at attempt revision 0, and the component then shows the reason instead.
+                              */}
+                              {settlementApplies && (
+                                <SettleSyncRowControl
+                                  syncLogId={log.id}
+                                  status={log.status}
+                                  attemptRevision={log.attemptRevision ?? 0}
+                                  type={log.type}
+                                  referenceType={log.referenceType}
+                                  referenceId={log.referenceId}
+                                  settleable={settlement.settleable}
+                                  notSettleableReason={settlement.notSettleableReason}
+                                  caveat={settlement.settlementCaveat}
+                                  onSettled={() => router.refresh()}
+                                />
+                              )}
+                            </div>
                           </TableCell>
                         </TableRow>
                       )
@@ -1402,7 +1489,7 @@ function HistoryEntryRow({
     setRetryMsg(null)
     setRetrying(true)
     try {
-      const res = await retryFailedAccountingSync(entry.id)
+      const res = await retryFailedAccountingSync(entry.id, entry.attemptRevision)
       if (res.success) {
         setRetryMsg(`Reset ${res.reset} entry — will retry on next sync cycle`)
         router.refresh()
@@ -1451,6 +1538,10 @@ function HistoryEntryRow({
         <div className="text-[11px] text-destructive">
           Error (attempt {entry.retryCount}): {entry.errorMessage}
         </div>
+      )}
+      {canRetry && (
+        // o3d-wahn: the per-row half of the same caution — Xero's key is six minutes old at most.
+        <div className="text-[11px] text-muted-foreground">{accountingRetryDuplicateCaution('xero')}</div>
       )}
       {retryMsg && (
         <div className={`text-[11px] ${retryMsg.startsWith('Error') ? 'text-destructive' : 'text-green-600 dark:text-green-400'}`}>

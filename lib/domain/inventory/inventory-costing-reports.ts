@@ -15,6 +15,7 @@ import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUt
 import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import { getAccountingSettings, getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots } from '@/lib/accounting'
 import { cache } from 'react'
+import { REFUND_BLIND_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -1368,6 +1369,10 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
       allRows.some((row) => !row.revenueCaptured)
         ? 'Revenue and margin are shown only where COGS movement references can be matched to a sales order line for the same product.'
         : '',
+      // o3d-iigc round 5: this report's revenue is the ORIGINAL sales line behind each dispatch, so
+      // a credited sale keeps its full revenue and margin here. Declared and disclosed rather than
+      // silently blind; the refund-aware version is filed.
+      REFUND_BLIND_NOTICE_COGS_MARGIN,
     ].filter(Boolean),
   }
 }

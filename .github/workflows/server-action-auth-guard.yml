@@ -1,0 +1,61 @@
+# o3d-hic9 — Server Action authorization guards.
+#
+# These two guards protect the same defect class from opposite ends:
+#   * check:server-action-auth-bypass     — a Server Action must not accept a
+#     SERIALIZABLE option that suppresses its permission check (o3d-43oz).
+#   * check:server-action-guard-coverage  — every exported async function in a
+#     'use server' module must enforce a guard, delegate to something that does,
+#     or be allowlisted with a stated reason (o3d-1fel); plus the fixtures that
+#     pin the DETECTOR itself, because a rule whose own tests run somewhere else
+#     can be quietly weakened until it reports nothing (o3d-512h); plus the
+#     fixtures for the module RESOLVER those rules are now built on, since a
+#     resolver that silently stops resolving turns every rule above green at once
+#     (o3d-512h round 3).
+#   * check:server-action-authorization   — the executable proofs that the gates
+#     actually refuse the principals they claim to: which role, which named
+#     permission, and that no read ran on the refused path (o3d-512h). Includes
+#     the supplier-isolation proofs: an EXTERNAL principal must be refused by the
+#     internal surface, and scoped to its own rows on its own surface — two
+#     different controls that are not substitutes for each other.
+#
+# Both were reachable only via `npm run check:all`, which NO workflow invoked;
+# the coverage test additionally ran inside `npm run test:unit`, but that lives
+# in the Production Readiness `validate` job, which is conditional on
+# `classify_changes.outputs.run_expensive`. A security gate that a change
+# classifier can switch off is not a gate, so this workflow deliberately has
+# neither a `paths:` filter nor a job-level `if:` — it runs on every pull
+# request and on every push to development.
+name: Server Action Auth Guard
+
+on:
+  pull_request:
+    branches:
+      - development
+  push:
+    branches:
+      - development
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-action-auth-guard-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server-action-auth-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # check:server-action-auth-bypass builds a full ts.Program and resolves
+      # parameter types through the TypeChecker. Without the generated Prisma
+      # client those resolve to `any`, which would weaken the guard silently
+      # rather than fail it.
+      - run: npx prisma generate --schema prisma/schema.prisma
+      - run: npm run check:server-action-guards

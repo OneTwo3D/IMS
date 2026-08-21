@@ -40,13 +40,29 @@ mock.module('@/lib/db', {
     },
   },
 })
+/**
+ * The organisation the API layer says each REQUEST was addressed to (o3d-gfh).
+ *
+ * Separate from `activeTenantId`, which is what the token row says at the moment the stamp is written,
+ * because the whole defect is that those two can differ: a disconnect and reconnect landing while a call
+ * is in flight. A double where the response has no issuer at all cannot express that state — it can only
+ * ever agree with the database — so it would pass whatever the production code stamped.
+ */
+let issuingTenantId: string | null = 'tenant-A'
+
+/** Every Xero response now carries the tenant its request went out to, exactly as `xeroFetchWithAuth` does. */
+function withIssuer(response: unknown): unknown {
+  if (typeof response !== 'object' || response === null) return response
+  return { ...(response as Record<string, unknown>), tenantId: issuingTenantId ?? undefined }
+}
+
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
     xeroGet: async (path: string) => {
       getPaths.push(path)
-      return getResponses.length > 1 ? getResponses.shift() : (getResponses[0] ?? noItems)
+      return withIssuer(getResponses.length > 1 ? getResponses.shift() : (getResponses[0] ?? noItems))
     },
-    xeroPost: async (path: string) => { postPaths.push(path); return postResponse },
+    xeroPost: async (path: string) => { postPaths.push(path); return withIssuer(postResponse) },
   },
 })
 
@@ -71,6 +87,7 @@ const findOrCreateItem: FindOrCreateItem = async (...args) => {
 function reset() {
   storedProduct = null
   activeTenantId = 'tenant-A'
+  issuingTenantId = 'tenant-A'
   updateManyCalls.length = 0
   getPaths.length = 0
   postPaths.length = 0
@@ -190,4 +207,42 @@ test('the write is an updateMany, so a code that is not a product cannot throw',
 
   assert.equal(updateManyCalls.length, 1)
   assert.deepEqual(updateManyCalls[0].where, { sku: 'Shipping' })
+})
+
+
+test('o3d-gfh: the stamp is the tenant that ISSUED the id, not the one connected when it came back', async () => {
+  // The race: the lookup goes out to tenant-A, an operator disconnects and reconnects to tenant-B while
+  // it is in flight (rate-limit retries make that window tens of seconds wide), and the id comes back.
+  // The old code asked the database at that point and stamped 'xero:tenant-B' onto an id tenant-A had
+  // issued — and getStoredItemId's exact-match guard then TRUSTED it, forever, against the wrong ledger.
+  reset()
+  storedProduct = { accountingItemId: null }
+  issuingTenantId = 'tenant-A'
+  activeTenantId = 'tenant-B'
+  getResponses = [{ ok: true, status: 200, data: { Items: [{ ItemID: 'issued-by-A', Code: 'SKU-1', Name: 'Widget' }] } }]
+
+  const res = await findOrCreateItem('SKU-1', 'Widget', '200')
+
+  assert.deepEqual(res, { success: true, itemId: 'issued-by-A' })
+  assert.deepEqual(updateManyCalls, [{
+    where: { sku: 'SKU-1' },
+    data: { accountingItemId: 'issued-by-A', accountingItemProvenance: 'xero:tenant-A' },
+  }], 'stamped with the issuer — so the next read, which compares against tenant-B, rejects it')
+})
+
+test('o3d-gfh: a response with no issuer stamps NULL, which re-resolves rather than being trusted', async () => {
+  // `tenantId` is undefined only when no request was actually made. Defaulting to the active connection
+  // there would be the resample again, in its most dangerous form: a value invented for a call that
+  // never happened.
+  reset()
+  storedProduct = { accountingItemId: null }
+  issuingTenantId = null
+  getResponses = [{ ok: true, status: 200, data: { Items: [{ ItemID: 'unattributed', Code: 'SKU-1', Name: 'Widget' }] } }]
+
+  await findOrCreateItem('SKU-1', 'Widget', '200')
+
+  assert.deepEqual(updateManyCalls, [{
+    where: { sku: 'SKU-1' },
+    data: { accountingItemId: 'unattributed', accountingItemProvenance: null },
+  }])
 })

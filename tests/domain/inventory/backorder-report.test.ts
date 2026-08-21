@@ -464,6 +464,11 @@ test('collector uses the order-scoped query shapes and expands kit requirements'
       sku: true,
       description: true,
       qty: true,
+      // o3d-kouj: the line's PINNED fulfilment recipe. Asserted in the shape, not merely allowed,
+      // because the report's whole arithmetic is "ordered minus covered" and the allocation rows it
+      // subtracts were written in the units of this recipe — a collector that stopped selecting it
+      // would silently go back to measuring demand against the current graph.
+      fulfillmentRequirements: true,
       product: {
         select: {
           id: true,

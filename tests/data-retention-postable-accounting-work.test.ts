@@ -59,7 +59,7 @@ function noopDelegate() {
 type Where = {
   createdAt?: { lt: Date }
   status?: { notIn?: string[]; in?: string[] }
-  type?: { in: string[] }
+  type?: { in?: string[]; notIn?: string[] }
   externalTransactionId?: { not: null }
   backReferenceCheckedAt?: null
   backReferenceEvidenceCompactedAt?: null
@@ -79,7 +79,13 @@ function matches(row: SyncRow, where: Where): boolean {
   if (where.createdAt && !(row.createdAt.getTime() < where.createdAt.lt.getTime())) return false
   if (where.status?.notIn && where.status.notIn.includes(row.status)) return false
   if (where.status?.in && !where.status.in.includes(row.status)) return false
-  if (where.type && !where.type.in.includes(row.type ?? '')) return false
+  // o3d-nepa added `type: { notIn: REMOTE_MONEY_EVIDENCE_TYPES }` to the delete predicate, while
+  // o3d-9kek's back-reference clause uses `type: { in: … }`. The double understood only `in`, so
+  // the merged predicate made it read `undefined.includes` and every test here died — which is the
+  // benign failure. The dangerous one was ignoring the unknown operator and reporting the same
+  // survivors whether the money-evidence clause was present or not.
+  if (where.type?.in && !where.type.in.includes(row.type ?? '')) return false
+  if (where.type?.notIn && where.type.notIn.includes(row.type ?? '')) return false
   if (where.externalTransactionId && row.externalTransactionId == null) return false
   if ('backReferenceCheckedAt' in where && (row.backReferenceCheckedAt ?? null) !== null) return false
   if ('backReferenceEvidenceCompactedAt' in where && (row.backReferenceEvidenceCompactedAt ?? null) !== null) {
@@ -121,6 +127,14 @@ mock.module('@/lib/db', {
       purchaseOrder: noopDelegate(),
       customer: noopDelegate(),
       shoppingWebhookEvent: noopDelegate(),
+      // Tables purgeExpiredData grew AFTER this double was written (q66in.7.4 WMS inbound-event
+      // compaction and sync-run deletion, o3d-osl8's binding sweep). They are no-ops rather than
+      // modelled because nothing in this file asserts about them — but they must EXIST, or the
+      // function dies on the first one and every accounting assertion below never runs.
+      wmsInboundReceiptEvent: noopDelegate(),
+      wmsWebhookEvent: noopDelegate(),
+      wmsSyncJob: noopDelegate(),
+      externalWmsBinding: noopDelegate(),
     },
   },
 })

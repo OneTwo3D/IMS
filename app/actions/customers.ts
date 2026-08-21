@@ -5,7 +5,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
   createCsvImportExecutionResult,
@@ -153,7 +153,7 @@ function mapCustomer(c: {
 }
 
 export async function getCustomers(activeOnly = true): Promise<CustomerRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.customer.findMany({
     where: {
       archived: { not: true },
@@ -171,7 +171,7 @@ export async function getCustomers(activeOnly = true): Promise<CustomerRow[]> {
 }
 
 export async function getCustomer(id: string): Promise<CustomerRow | null> {
-  await requireAuth()
+  await requireInternalUser()
   const c = await db.customer.findUnique({
     where: { id },
     include: { _count: { select: { salesOrders: true } } },
@@ -198,7 +198,7 @@ export type CustomerDetail = CustomerRow & {
 }
 
 export async function getCustomerDetail(id: string): Promise<CustomerDetail | null> {
-  await requireAuth()
+  await requireInternalUser()
   const c = await db.customer.findUnique({
     where: { id },
     include: {

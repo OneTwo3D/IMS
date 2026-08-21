@@ -1,3 +1,5 @@
+import { AccessDenied } from '@/components/auth/access-denied'
+import { authorizePage } from '@/lib/auth/server'
 import type { Metadata } from 'next'
 import Link from 'next/link'
 import { headers } from 'next/headers'
@@ -35,6 +37,13 @@ export default async function SystemSettingsPage({
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>
 }) {
+  // o3d-512h: page-level authorization. The (dashboard) layout establishes only
+  // AUTHENTICATION, and the sidebar hiding a link is not a boundary — without
+  // this, any authenticated role that types the URL renders the page and its
+  // reads run. Must stay the FIRST statement so a denial performs no read.
+  const gate = await authorizePage('settings')
+  if (!gate.authorized) return <AccessDenied permission={gate.permission} />
+
   const params = await searchParams
   const raw = typeof params.tab === 'string' ? params.tab : undefined
   const activeTab: Tab = TABS.some((t) => t.key === raw) ? (raw as Tab) : 'releases'
@@ -244,6 +253,8 @@ export default async function SystemSettingsPage({
               stockMovementsValue={retentionData.drMovements ?? '0'}
               syncLogsValue={retentionData.drSyncLogs ?? '6'}
               webhookEventsValue={retentionData.drWebhookEvents ?? '3'}
+              wmsEventsValue={retentionData.drWmsEvents ?? '3'}
+              wmsSyncJobsValue={retentionData.drWmsSyncJobs ?? '12'}
             />
           </Card>
         </div>
@@ -318,7 +329,7 @@ async function loadCronJobs(): Promise<CronJobState[]> {
 }
 
 async function loadRetentionData() {
-  const [retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents] = await Promise.all([
+  const [retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents, drWmsEvents, drWmsSyncJobs] = await Promise.all([
     getSetting('activity_log_retention_info'),
     getSetting('activity_log_retention_warning'),
     getSetting('activity_log_retention_error'),
@@ -328,6 +339,8 @@ async function loadRetentionData() {
     getSetting('retention_stock_movements_months'),
     getSetting('retention_sync_logs_months'),
     getSetting('retention_webhook_events_months'),
+    getSetting('retention_wms_events_months'),
+    getSetting('retention_wms_sync_jobs_months'),
   ])
-  return { retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents }
+  return { retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents, drWmsEvents, drWmsSyncJobs }
 }

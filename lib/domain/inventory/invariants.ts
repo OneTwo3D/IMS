@@ -1,7 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { parseCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
-import { toDecimal } from '@/lib/domain/math/decimal'
+import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 // decimal-boundary-ok: report-only (inventory invariant finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import {
@@ -10,6 +10,12 @@ import {
 } from '@/lib/domain/inventory/reservation-breakdown'
 import { RESERVATION_RELEASING_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { HISTORICAL_IMPORT_REFERENCE_TYPES } from '@/lib/domain/inventory/stock-movement-value'
+import {
+  findDisproportionateFulfillmentComponent,
+  type DecimalFulfillmentRequirement,
+} from '@/lib/products/fulfillment-coverage'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 
 export type InventoryInvariantSeverity = 'info' | 'warning' | 'critical'
 
@@ -205,6 +211,39 @@ export type InventoryInvariantSqlClient = {
   $queryRaw<T = unknown>(query: Prisma.Sql): Promise<T>
 }
 
+/**
+ * The capability {@link collectDisproportionateCommittedKitFindings} needs (o3d-aqke): committed
+ * shipment lines WITH their sales line's product, and the product read the fulfilment graph walk
+ * issues. Declared as its own type rather than folded into `InventoryInvariantClient` so a fixture
+ * that cannot answer it is a compile error at the call site instead of a silently skipped census.
+ */
+export type InventoryInvariantKitGraphClient = {
+  shipmentLine: {
+    findMany(args: unknown): Promise<Array<{
+      lineId: string
+      productId: string
+      qty: DecimalInput
+      product: { sku: string }
+      line: {
+        productId: string | null
+        sku: string | null
+        description: string
+        /**
+         * o3d-kouj's per-line pin (PR #625), selected unconditionally. Optional only so a double
+         * may omit it: an absent pin is the pre-snapshot state, which
+         * {@link lineFulfillmentRequirements} answers from the current graph, exactly as this
+         * census did before the column existed.
+         */
+        fulfillmentRequirements?: unknown
+      } | null
+      shipment: { orderId: string; warehouseId: string }
+    }>>
+  }
+  product: {
+    findMany(args: unknown): Promise<unknown[]>
+  }
+}
+
 type InventoryInvariantSqlFindingRow = {
   sortKey: string
   severity: InventoryInvariantSeverity
@@ -379,6 +418,16 @@ function sumReservationSources(
     totals.set(key, current)
   }
   return totals
+}
+
+/**
+ * Can this client answer the KIT proportionality census? Production's `db` always can; a hand-rolled
+ * fixture may not, and the report says so in the return value rather than quietly dropping a check.
+ */
+function isKitGraphInvariantClient(client: unknown): client is InventoryInvariantKitGraphClient {
+  const candidate = client as Partial<InventoryInvariantKitGraphClient> | null
+  return typeof candidate?.shipmentLine?.findMany === 'function'
+    && typeof candidate?.product?.findMany === 'function'
 }
 
 function isSqlInventoryInvariantClient(client: unknown): client is InventoryInvariantSqlClient {
@@ -1971,6 +2020,225 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
   `
 }
 
+/**
+ * THE KIT HALF OF THE COMMITTED-COVERAGE CENSUS (o3d-aqke).
+ *
+ * WHAT WAS MISSING. `allocation_committed_shipment_uncovered` — both the SQL branch and the
+ * row-mode branch above — is FLAT: it compares committed quantity against the allocation row per
+ * (lineId, warehouseId, productId) and never expands the fulfilment graph. A KIT committed as
+ * 2xA + 1xB against a 2xA + 2xB recipe is covered product-by-product on every one of those pairs
+ * while being HALF A KIT. The transition seams catch it — `findUncoveredCommittedShipment` runs at
+ * every shipment status change including dispatch, and the component editor refuses the mutation
+ * that creates it — but the scheduled census reported nothing, so a set that got in by any other
+ * route (direct SQL, a future writer, a repaired row) stayed invisible until someone tried to ship.
+ *
+ * WHY NOT THE `WITH RECURSIVE` CTE THE ISSUE SKETCHED. It would put a SECOND implementation of the
+ * fulfilment expansion into the codebase, in a second language, and that expansion is not a
+ * one-liner: the KIT/BOM split (a BOM is a fulfilment LEAF), `sortOrder`, cycle handling, the
+ * non-positive-quantity rule and the `?? 0` defaults would all have to be restated in SQL and kept
+ * in step with the TypeScript by hand — the same argument `loadFulfillmentProductGraph` already
+ * makes for not expressing the WALK as a CTE. It is also the version that could not be tested:
+ * a recursive CTE cannot run in a mock-based unit suite, which is exactly why this issue sat
+ * blocked. Reusing the ONE expander keeps the census and the enforcement seams answering the same
+ * question by construction, and makes the pass testable with the same doubles everything else uses.
+ *
+ * SO THIS RUNS IN BOTH COLLECTION MODES, as a pass of its own rather than a branch of either
+ * collector: SQL mode reaches it because it is wired in `runInventoryInvariantReport`, not because
+ * the query grew.
+ *
+ * SCOPED TO KIT LINES AT THE DATABASE. A line whose product is SIMPLE, VARIANT or BOM expands to a
+ * single requirement of factor 1 and is proportional by construction, so only sales lines on a KIT
+ * product are read at all. That is what keeps an unpaged read affordable.
+ *
+ * JUDGED AT THE PERSISTED SCALE (o3d-i4qd). `ShipmentLine.qty` is `Decimal(12,4)` and a kit
+ * requirement is a product of `Decimal(12,4)` factors, so an exact proportionality test would
+ * report every fractional kit ever shipped. Same helper, same bands, as the seams.
+ *
+ * IT ASKS THE PIN, NOT THE CURRENT GRAPH, WHERE ONE EXISTS (o3d-aqke, Codex r1 finding 3). Every
+ * row this census reads belongs to a COMMITTED shipment, and a line holding one is a line o3d-kouj
+ * has pinned: its requirements were frozen at allocation and cannot move again. Expanding the
+ * current graph for such a line therefore judges the shipment against a recipe it was never
+ * allocated from — reporting healthy rows as broken after any component edit, and (the money
+ * direction) reporting a genuinely half-shipped kit as proportional after a uniform rescale, which
+ * is the precise escape o3d-kouj exists to close. The pin is read through o3d-kouj's own seam,
+ * `lineFulfillmentRequirements` — imported, not re-implemented and not injected, so this census
+ * cannot drift from the thirteen other readers of the same question — and NOTHING here quantises
+ * it: the stored side is a set of factors, the computed side is the band, and the single rounding
+ * stays where o3d-i4qd put it. A line with no pin is answered from the current graph by that same
+ * function, which is exactly what this census did before the column existed.
+ *
+ * WHAT IT STILL DOES NOT REPORT: a STALE GRAPH STAMP. `findStaleFulfillmentGraphAllocation` catches
+ * a uniform rescale, which is proportional on the numbers and therefore invisible to this pass too;
+ * surfacing it here needs the allocation rows joined to their products and is not attempted.
+ */
+export async function collectDisproportionateCommittedKitFindings(
+  client: InventoryInvariantKitGraphClient,
+  options: { warehouseId?: string } = {},
+): Promise<InventoryInvariantFinding[]> {
+  const shipmentLines = await client.shipmentLine.findMany({
+    where: {
+      shipment: {
+        status: { not: 'PENDING' },
+        ...(options.warehouseId ? { warehouseId: options.warehouseId } : {}),
+      },
+      // Only a KIT sales line can be disproportionate; everything else is one requirement of 1.
+      line: { product: { type: 'KIT' } },
+    },
+    select: {
+      lineId: true,
+      productId: true,
+      qty: true,
+      product: { select: { sku: true } },
+      line: {
+        select: {
+          productId: true,
+          sku: true,
+          description: true,
+          // Unconditional: the column shipped with o3d-kouj (PR #625), so every client this census
+          // can be handed has it. It was briefly selected only when a resolver was injected, which
+          // is a conditional this branch removed along with the seam.
+          fulfillmentRequirements: true,
+        },
+      },
+      shipment: { select: { orderId: true, warehouseId: true } },
+    },
+  })
+  if (shipmentLines.length === 0) return []
+
+  const rootProductIds = [
+    ...new Set(shipmentLines.map((row) => row.line?.productId).filter((id): id is string => !!id)),
+  ]
+
+  const unreadablePinFindings: InventoryInvariantFinding[] = []
+  let requirementsByLine: Map<string, DecimalFulfillmentRequirement[]>
+  try {
+    const graph = await loadFulfillmentProductGraph(
+      client as unknown as Parameters<typeof loadFulfillmentProductGraph>[0],
+      rootProductIds,
+    )
+    requirementsByLine = new Map()
+    // One finding per LINE, not per shipment row: a line with four committed component rows would
+    // otherwise report the same unreadable pin four times, and the pin is a property of the line.
+    const unreadablePinLineIds = new Set<string>()
+    for (const row of shipmentLines) {
+      if (!row.line?.productId) continue
+      if (requirementsByLine.has(row.lineId) || unreadablePinLineIds.has(row.lineId)) continue
+      try {
+        requirementsByLine.set(
+          row.lineId,
+          lineFulfillmentRequirements(
+            { id: row.lineId, productId: row.line.productId, fulfillmentRequirements: row.line.fulfillmentRequirements },
+            graph,
+          ),
+        )
+      } catch (error) {
+        // A line whose pin cannot be read is NOT judged against the current graph — that is the
+        // exact substitution o3d-kouj forbids, and it would be made silently, on the one line that
+        // already has something wrong with it. It is reported instead, and left out of the census.
+        unreadablePinLineIds.add(row.lineId)
+        unreadablePinFindings.push({
+          severity: 'warning',
+          code: 'allocation_committed_kit_pin_unreadable',
+          warehouseId: row.shipment.warehouseId,
+          message: `The pinned fulfilment requirements for sales line ${row.line.sku || row.line.description || row.lineId} could not be read, so its committed components were not judged`,
+          details: {
+            orderId: row.shipment.orderId,
+            lineId: row.lineId,
+            lineSku: row.line.sku ?? null,
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        })
+      }
+    }
+  } catch (error) {
+    // A census must not take the whole report down because the catalogue is mid-edit or too deep
+    // to walk. Report the gap instead of throwing — a silent skip is how a check stops being one.
+    return [{
+      severity: 'warning',
+      code: 'allocation_committed_kit_census_unavailable',
+      warehouseId: options.warehouseId,
+      message: 'The committed-kit proportionality census could not expand the component graph',
+      details: {
+        reason: error instanceof Error ? error.message : String(error),
+        rootProductCount: rootProductIds.length,
+      },
+    }]
+  }
+
+  // Per (line, warehouse) — the grain a kit is shipped at: one shipment belongs to one warehouse,
+  // and its component lines are only a complete kit together.
+  const groups = new Map<string, {
+    lineId: string
+    warehouseId: string
+    orderId: string
+    lineLabel: string
+    quantities: Map<string, Prisma.Decimal>
+    // o3d-aqke (Codex r1 finding 1): how many separately rounded `ShipmentLine.qty` rows each
+    // component's total is the sum of. A component shipped across three partials is three
+    // roundings, and the one-ulp band that describes a single row does not describe their sum.
+    rowCounts: Map<string, number>
+    skuByProductId: Map<string, string>
+  }>()
+  for (const row of shipmentLines) {
+    if (!requirementsByLine.has(row.lineId)) continue
+    const key = `${row.lineId}|${row.shipment.warehouseId}`
+    const group = groups.get(key) ?? {
+      lineId: row.lineId,
+      warehouseId: row.shipment.warehouseId,
+      orderId: row.shipment.orderId,
+      lineLabel: row.line?.sku || row.line?.description || row.lineId,
+      quantities: new Map<string, Prisma.Decimal>(),
+      rowCounts: new Map<string, number>(),
+      skuByProductId: new Map<string, string>(),
+    }
+    group.quantities.set(
+      row.productId,
+      (group.quantities.get(row.productId) ?? new Prisma.Decimal(0)).add(toDecimal(row.qty)),
+    )
+    group.rowCounts.set(row.productId, (group.rowCounts.get(row.productId) ?? 0) + 1)
+    group.skuByProductId.set(row.productId, row.product.sku)
+    groups.set(key, group)
+  }
+
+  const findings: InventoryInvariantFinding[] = [...unreadablePinFindings]
+  for (const group of groups.values()) {
+    const requirements = requirementsByLine.get(group.lineId) ?? []
+    if (requirements.length === 0) continue
+    const breach = findDisproportionateFulfillmentComponent(
+      requirements,
+      group.quantities,
+      group.rowCounts,
+    )
+    if (!breach) continue
+    findings.push({
+      severity: 'critical',
+      code: 'allocation_committed_kit_disproportionate',
+      productId: breach.productId,
+      warehouseId: group.warehouseId,
+      message: `Committed shipment components for ${group.lineLabel} in warehouse ${group.warehouseId} are not a complete kit`,
+      details: {
+        orderId: group.orderId,
+        lineId: group.lineId,
+        lineSku: group.lineLabel,
+        shortComponentId: breach.productId,
+        shortComponentSku: group.skuByProductId.get(breach.productId) ?? null,
+        conflictsWithComponentId: breach.conflictsWithProductId,
+        components: requirements.map((requirement) => ({
+          productId: requirement.productId,
+          sku: group.skuByProductId.get(requirement.productId) ?? null,
+          requiredPerKit: requirement.factor.toString(),
+          committedQty: decimalToNumber(group.quantities.get(requirement.productId) ?? new Prisma.Decimal(0)),
+        })),
+      },
+    })
+  }
+
+  return findings.sort((left, right) => (
+    `${left.code}:${left.details && typeof left.details === 'object' && 'lineId' in left.details ? String((left.details as { lineId: unknown }).lineId) : ''}:${left.warehouseId}`
+      .localeCompare(`${right.code}:${right.details && typeof right.details === 'object' && 'lineId' in right.details ? String((right.details as { lineId: unknown }).lineId) : ''}:${right.warehouseId}`)
+  ))
+}
+
 export async function collectSqlInventoryInvariantFindingsPage(
   client: InventoryInvariantSqlClient = db as unknown as InventoryInvariantSqlClient,
   options: InventoryInvariantSqlCollectorOptions = {},
@@ -2090,11 +2358,39 @@ export async function runInventoryInvariantReport(options: {
           nextCursor: null,
         }
 
+  // o3d-aqke: the KIT half of the committed-coverage census, run in BOTH modes because it is a
+  // pass over the fulfilment graph rather than a branch of either collector.
+  //
+  // NOT run under a `productId` filter, deliberately: proportionality is a property of a COMPLETE
+  // component set, so answering it from a set filtered down to one component would be answering a
+  // different question — and answering it wrongly, since every other component would read as zero.
+  // A warehouse filter is safe (the grain is already per (line, warehouse)) and is passed through.
+  //
+  // NOT subject to the paging cap either. The read is scoped to committed shipment lines on KIT
+  // sales lines, which is a small fraction of the census's other inputs; capping it would mean a
+  // truncated first page could hide every kit finding behind a wall of cost-layer noise.
+  //
+  // Run against the SAME object the collection used — `options.sqlClient` in SQL mode, the row
+  // client otherwise — never against the module-level `db` behind a caller's back. A caller that
+  // supplied only a `$queryRaw` double is asking for that double to answer the whole report; going
+  // around it to the real database would be a surprise, and in a test it is a live connection.
+  const kitGraphClient = collectionMode === 'sql' ? (options.sqlClient ?? client) : client
+  const kitFindings = options.severity != null && options.severity !== 'critical'
+    ? []
+    : options.productId == null && isKitGraphInvariantClient(kitGraphClient)
+      ? await collectDisproportionateCommittedKitFindings(kitGraphClient, {
+        warehouseId: options.warehouseId,
+      })
+      : []
+  const findings = kitFindings.length > 0
+    ? [...collection.findings, ...kitFindings]
+    : collection.findings
+
   return {
     checkedAt: new Date().toISOString(),
-    findings: collection.findings,
+    findings,
     truncated: collection.truncated,
     nextCursor: collection.nextCursor,
-    summary: buildSummary(collection.findings),
+    summary: buildSummary(findings),
   }
 }

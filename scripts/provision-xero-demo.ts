@@ -28,13 +28,28 @@
  *
  *   1. NODE_OPTIONS='--import tsx' node --env-file=.env \
  *        scripts/provision-xero-demo.ts --clear-tenant-pin
- *      The pin is ENFORCED on connect (selectTenantConnection() matches on
- *      tenantId), so a pin left over from the previous Demo makes the reconnect
- *      find no tenant. Clearing it first is not optional.
+ *      The pin is ENFORCED on connect (selectXeroTenant() matches on tenantId),
+ *      so a pin left over from the previous Demo makes the reconnect find no
+ *      tenant. Clearing it first is not optional. This RELEASES the connection:
+ *      it deletes the pin and stamps accounting_tokens.pinReleasedAt in one
+ *      transaction, which is what tells IMS the pin's absence was deliberate.
+ *      Deleting the settings row by hand does NOT do that and halts the sync
+ *      (o3d-9tbz r6) — use this flag, or press Disconnect on /sync, which
+ *      clears both halves and needs no script at all.
+ *      RUN IT BEFORE THE PIN IS GONE. The release is recorded only when this is
+ *      the statement that deletes the pin, and the receipt names the connection
+ *      and the pin it released so it stops applying the moment either changes
+ *      (o3d-9tbz r7). On an instance whose pin has already vanished it records
+ *      nothing and does not lift the halt — that is Disconnect's job.
  *   2. A human re-consents at <public_app_url>/sync?connector=xero and picks
  *      "Demo Company (UK)". OAuth is interactive; it cannot be scripted.
  *   3. Re-run this script normally. It rebuilds the org and RE-PINS the new
- *      tenantId automatically.
+ *      tenantId automatically — and re-pinning CONSUMES the release from step 1,
+ *      both halves of it, in the same transaction (o3d-9tbz r9). A release is a
+ *      receipt for having no pin; it must not outlive the pin coming back, or a
+ *      later `DELETE FROM settings` reads as a deliberate release instead of
+ *      halting the sync. Step 2 normally consumes it first; this is what makes
+ *      the state impossible whichever of the two happens.
  *
  * SAFETY: refuses to run unless the connected tenant is literally
  * 'Demo Company (UK)', re-read live from GET /Organisation — a stale token row is
@@ -56,6 +71,7 @@ import { readFileSync } from 'node:fs'
 import { xeroGet, xeroPost, xeroPut } from '../lib/connectors/xero/api.ts'
 import { syncChartOfAccounts } from '../lib/connectors/xero/accounts.ts'
 import { xeroReportTaxType } from '../lib/connectors/xero/tax-rate-report-type.ts'
+import { serializeXeroReleaseWitness, xeroPinEstablishmentStatements } from '../lib/connectors/xero/tenant-guard.ts'
 
 const REQUIRED_TENANT = 'Demo Company (UK)'
 const TEMPLATE_PATH = new URL('./xero-demo-template.json', import.meta.url).pathname
@@ -127,20 +143,39 @@ async function guardTenant(db: Client) {
   // Re-pin from the LIVE connection every run. The Demo company resets ~4-weekly
   // and is re-created with a NEW tenantId, so a pin captured on a previous run goes
   // stale by design. That matters because the pin is ENFORCED on connect:
-  // selectTenantConnection() (lib/connectors/xero/auth.ts:134) does
-  // `find(c => c.tenantId === expected) ?? null`, so a stale pin makes the next
-  // reconnect fail to find any tenant — the safety feature locks you out of the very
-  // org it is protecting. Re-pinning here keeps it correct without weakening it: we
+  // selectXeroTenant() (lib/connectors/xero/tenant-guard.ts) refuses a consent that
+  // does not offer the pinned organisation, so a stale pin makes the next reconnect
+  // fail — the safety feature locks you out of the very org it is protecting. The
+  // callback now writes the pin and the token together in one transaction, so this
+  // only ever re-asserts a value that already matches the stored token's tenantId; it
+  // is kept because --clear-tenant-pin exists and a half-provisioned rig may have
+  // neither. Re-pinning here keeps it correct without weakening it: we
   // only reach this line after asserting the LIVE org name is REQUIRED_TENANT, so
   // the pin can never be moved onto a production org.
   // Never move another instance's pin: --remap-only may target stage.
+  //
+  // AND RE-PINNING ENDS ANY OUTSTANDING RELEASE (o3d-9tbz r9). This used to be a bare INSERT of the
+  // settings row, which is a different route to the pin from `bindXeroTenant` — and `bindXeroTenant`
+  // was the only writer clearing the release receipt and its witness. So a completed provision left
+  // this rig PINNED and still carrying a receipt for a pin that is no longer missing: invisible while
+  // the pin is there, and one `DELETE FROM settings` from being read as a deliberate release, which is
+  // the exemption r6/r7/r8 spent three rounds narrowing. The statements come from tenant-guard.ts so
+  // that the pin write and the consumption cannot be separated by a writer that forgets one of them,
+  // and they run in ONE transaction because a pin written without them is the state being removed.
+  // The database enforces the same rule on every writer (migration 20260819210000); this is what makes
+  // the script correct against an instance whose migrations predate it, and visible to whoever reads it.
   if (!DRY_RUN && !REMAP_ONLY) {
-    await db.query(
-      `insert into settings (key, value, "updatedAt") values ('xero_expected_tenant_id', $1, now())
-         on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
-      [tenantId],
-    )
-    log(`tenant pin refreshed -> ${tenantId}`)
+    await db.query('begin')
+    try {
+      for (const statement of xeroPinEstablishmentStatements(tenantId)) {
+        await db.query(statement.text, statement.values)
+      }
+      await db.query('commit')
+    } catch (e) {
+      await db.query('rollback')
+      throw e
+    }
+    log(`tenant pin refreshed -> ${tenantId} (any outstanding pin release is consumed with it)`)
   }
 
   return live.BaseCurrency
@@ -223,19 +258,126 @@ async function remapOnly(db: Client) {
 }
 
 /**
- * Clear the tenant pin so a human can re-consent after a Demo reset.
+ * RELEASE the tenant pin so a human can re-consent after a Demo reset.
+ *
  * Needed because the pin is enforced on connect against a tenantId that no longer
- * exists; without clearing it the reconnect silently finds no tenant.
+ * exists; without clearing it the reconnect finds no tenant and is refused.
+ *
+ * TWO STATEMENTS, ONE TRANSACTION (o3d-9tbz r6). Deleting the pin on its own is
+ * indistinguishable from the pin having been LOST — a settings table restored from a
+ * different backup than accounting_tokens, or a hand-run delete — and IMS now halts
+ * the sync in that state rather than treating an absent pin as permission. What makes
+ * this release legitimate is the receipt it leaves on the token row: `pinReleasedAt`
+ * is stamped in the same transaction that removes the pin, so the two either both
+ * happen or neither does, and a crash between them cannot leave the rig halted with
+ * nothing to explain it. The receipt is cleared by the next connect, which writes a
+ * pin again — the exemption lasts exactly as long as the state it describes.
+ *
+ * THE RECEIPT NAMES WHAT IT RELEASED (o3d-9tbz r7), and it is stamped ONLY when this
+ * statement is the thing that removes the pin. Two changes, both closing the same
+ * shape of hole — a receipt that outlives its state:
+ *
+ *   - It records the connection generation the token row carried and the tenant id the
+ *     DELETED pin named, so IMS can check the receipt still describes the row it is on.
+ *     A token row restored from a dump taken while a release was outstanding lands on a
+ *     different connection and is refused as a stale release instead of being believed.
+ *   - No pin deleted, no receipt. Running this flag against an instance whose pin is
+ *     ALREADY gone used to stamp a release for a pin it had not removed, which turned a
+ *     halted (tamper-evident) rig into an exempt one — i.e. the very bypass r6 closed,
+ *     reachable by running the documented recovery. It now reports that there was
+ *     nothing to release and changes nothing.
+ *
+ * A re-run is idempotent for the same reason: the second run finds no pin, so it stamps
+ * nothing and leaves the outstanding release exactly where it was.
+ *
+ * ON A SPLIT BINDING it deliberately does NOT unlock the sync. If the pin named one
+ * organisation and the token another, the receipt records the pin's organisation, which
+ * does not match the token's — so IMS keeps refusing. Deleting one half of a
+ * contradiction does not resolve it, and the remedy for that state is Disconnect.
+ *
+ * AND THE RELEASE IS WITNESSED IN BOTH TABLES (o3d-9tbz r8). Everything r7 checks the
+ * receipt against — the connection generation, the token's own tenant — is a column on
+ * the SAME ROW as the receipt, so an accounting_tokens row restored from a dump taken
+ * while a release was outstanding arrives carrying its own corroboration and passes.
+ * The receipt cannot be the only witness to itself, so this transaction writes a third
+ * statement: the `xero_pin_release_witness` settings row, naming the same connection and
+ * the same released pin. It stays with the INSTANCE — a copied token row cannot bring it
+ * — and IMS honours a release only when both halves describe the same one. It is deleted
+ * by the connect that writes a pin again, and by Disconnect.
+ *
+ * Three statements, still one transaction, still all-or-nothing: a crash cannot leave a
+ * receipt with no witness (a halt nobody caused) or a witness with no receipt (a
+ * half-record waiting for a token row to corroborate).
  */
 async function clearTenantPin(db: Client) {
-  const before = await db.query<{ value: string }>(
-    `select value from settings where key = 'xero_expected_tenant_id'`,
+  await db.query('begin')
+  let cleared: string | null = null
+  let stampedRows: Array<{ tenantId: string; pinReleasedTenantId: string | null; pinReleasedGeneration: string | null }> = []
+  try {
+    const before = await db.query<{ value: string }>(
+      `delete from settings where key = 'xero_expected_tenant_id' returning value`,
+    )
+    cleared = before.rows.length ? before.rows[0].value : null
+    if (cleared !== null) {
+      // The receipt describes THIS release: when, on which connection, and for which pin. The
+      // generation is copied from the row's own column inside the same statement, so it cannot be a
+      // value read a moment ago and gone stale; the tenant id is the pin that was actually deleted,
+      // taken from the DELETE's own RETURNING rather than from anything this script assumes.
+      const stamped = await db.query<{ tenantId: string; pinReleasedTenantId: string | null; pinReleasedGeneration: string | null }>(
+        `update accounting_tokens
+            set "pinReleasedAt" = now(),
+                "pinReleasedGeneration" = "connectionGeneration",
+                "pinReleasedTenantId" = $1,
+                "updatedAt" = now()
+          where connector = 'xero'
+          returning "tenantId", "pinReleasedTenantId", "pinReleasedGeneration"`,
+        [cleared],
+      )
+      stampedRows = stamped.rows
+      // The half that stays behind. Built from what the UPDATE actually wrote rather than from
+      // anything this script assumed, and serialised by the same function the guard parses with, so
+      // the two cannot drift into disagreeing about the format. No token row means no receipt to
+      // witness — and nothing halted, because the halt is a question about a token row.
+      for (const row of stamped.rows) {
+        await db.query(
+          `insert into settings (key, value, "updatedAt") values ('xero_pin_release_witness', $1, now())
+             on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+          [serializeXeroReleaseWitness({ generation: row.pinReleasedGeneration, tenantId: cleared })],
+        )
+      }
+    }
+    await db.query('commit')
+  } catch (e) {
+    await db.query('rollback')
+    throw e
+  }
+
+  console.log(
+    cleared === null
+      ? 'tenant pin already absent — nothing to clear, and NO release was recorded. A release is only\n' +
+        'meaningful when this is the statement that removes the pin; stamping one for a pin that was\n' +
+        'already gone would turn a halted instance into an exempt one. If the sync is halted, the\n' +
+        'remedy is Disconnect on /sync, which clears both halves together.'
+      : `cleared stale tenant pin (was ${cleared}).`,
   )
-  if (!before.rows.length) {
-    console.log('tenant pin already absent — nothing to clear.')
-  } else {
-    await db.query(`delete from settings where key = 'xero_expected_tenant_id'`)
-    console.log(`cleared stale tenant pin (was ${before.rows[0].value}).`)
+  const split = stampedRows.filter((row) => row.tenantId !== row.pinReleasedTenantId)
+  console.log(
+    stampedRows.length > 0
+      ? 'recorded the release in BOTH halves — on the Xero token row (accounting_tokens.pinReleasedAt,\n' +
+        'and the connection and pin it released) and beside the deleted pin (settings\n' +
+        'xero_pin_release_witness) — so IMS treats the missing pin as deliberate instead of halting the\n' +
+        'sync. A token row copied elsewhere does not carry the second half, and is not exempt there.'
+      : cleared === null
+        ? 'nothing was released.'
+        : 'no Xero token row to record the release on — there is no connection, so nothing was halted.',
+  )
+  for (const row of split) {
+    console.warn(
+      `  ! the pin released (${row.pinReleasedTenantId}) named a DIFFERENT organisation from the stored\n` +
+        `    token (${row.tenantId}). This instance's binding was already split, and releasing one half\n` +
+        '    does not resolve it: IMS will keep refusing until you press Disconnect on /sync, which\n' +
+        '    clears the token and the pin together.',
+    )
   }
   console.log(
     '\nNext: reconnect at <public_app_url>/sync?connector=xero, choose "Demo Company (UK)",\n' +

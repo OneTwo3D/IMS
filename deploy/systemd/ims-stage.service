@@ -33,10 +33,10 @@ Environment=PORT=3000
 # proxy, which forwards to 127.0.0.1:3000. Do not use 0.0.0.0.
 Environment=HOSTNAME=127.0.0.1
 
-# Persist backups / connector tokens under the managed StateDirectory below,
-# not under the (read-only) app tree.
+# Persist backups under the managed StateDirectory below, not under the
+# (read-only) app tree. Xero tokens are encrypted in Postgres, so there is no
+# token file to place here (o3d-esha).
 Environment=BACKUP_DIR=/var/lib/onetwoinventory/backups
-Environment=XERO_TOKEN_PATH=/var/lib/onetwoinventory/xero-token.json
 
 # Requires a prior `next build` (see deploy/README.md). Fails fast if the build
 # output is missing rather than silently falling back to dev.

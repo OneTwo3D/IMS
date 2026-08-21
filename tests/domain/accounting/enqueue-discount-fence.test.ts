@@ -195,6 +195,13 @@ mock.module('@/lib/db', {
     db: {
       $transaction: async (fn: (tx: never) => Promise<unknown>) => runTx(fn),
       accountingSyncLog: { findFirst: async () => null },
+      // o3d-s36z (#632, merged after this file): queueXeroSync now stamps the CONNECTION the payload
+      // was composed against, via activeAccountingIdProvenance -> db.accountingToken.findUnique.
+      // Modelled as CONNECTED on purpose. Returning null would compile and pass, but it would model a
+      // DISCONNECTED instance — a different one of s36z's four never-conflated states — and this file
+      // is about a producer racing the backfill on a live connection, not about enqueueing with no
+      // connector attached. That substitution is the exact double defect #632 found four times.
+      accountingToken: { findUnique: async () => ({ tenantId: 'tenant-A' }) },
     },
   },
 })

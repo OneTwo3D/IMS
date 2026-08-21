@@ -18,6 +18,14 @@
  * SECOND payment lands against the same invoice. Per-entry idempotency is real; it just
  * does not survive regenerating the entry.
  *
+ * HOW LONG "REAL" LASTS (o3d-wahn r2 #1). Xero stores an Idempotency-Key for SIX MINUTES from
+ * the first call; a re-enqueue happens minutes-to-days later, so by the time the pinned token
+ * goes out the remote system has forgotten it and treats it as a new request. Pinning is still
+ * the right thing — it costs nothing, it is correct inside the window, and rotating a token is
+ * strictly worse — but it is NOT what makes a re-post safe. That is the `refuse` branch below:
+ * where several tokens could each have committed, this module stops and asks for a human. Read
+ * lib/domain/accounting/idempotency-retention.ts before adding any claim of remote dedupe here.
+ *
  * THE FIX. Stop deriving the token from anything that can change, and WRITE IT DOWN.
  *
  *  1. A new follow-up is stamped with a `_followUpIdempotencyKey` derived from its LOGICAL
@@ -46,6 +54,11 @@
  * exists to close (Codex review, r1 blocker). A separate field is only ever set by this
  * module, so a pre-existing row keeps deriving its token exactly as it did before.
  */
+
+import {
+  accountingOriginRecordsMatch,
+  carryAccountingOriginRecord,
+} from '@/lib/connectors/accounting-connection-provenance'
 
 export type FollowUpPayload = Record<string, unknown>
 
@@ -88,6 +101,33 @@ function asPayload(value: unknown): FollowUpPayload | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as FollowUpPayload)
     : null
+}
+
+/**
+ * Carry the EXISTING row's record of which organisation it was raised against onto a rebuilt body
+ * (o3d-19gy / Codex r1 finding 2, CRITICAL).
+ *
+ * THE DEFECT THIS REMOVES. The connectors stamp the freshly-rebuilt follow-up payload with whatever
+ * connection is live NOW, and then handed that payload to this planner for BOTH outcomes — creating a
+ * row, and reviving an existing FAILED one. On a revival the stamp is not a fact about the new work; the
+ * row already carries a record of the organisation its earlier attempt was made against, and that record
+ * is the only evidence the post-time guard has. Overwriting it with the current tenant does not merely
+ * lose the evidence — it FORGES agreement, so a payment first attempted against organisation A, revived
+ * while connected to organisation B, and still pinned to A's idempotency token, sails through a guard
+ * that is comparing B against B.
+ *
+ * cvj9's rule, applied literally: a marker may only be written by the row that actually took the action.
+ * A repair writes no marker. If the stored row recorded nothing (a row from before stamping shipped),
+ * this carries the ABSENCE forward rather than inventing an origin for an attempt it did not witness —
+ * and since Codex r3 finding 2 the post-time verdict refuses that (`no-origin-recorded`) rather than
+ * waving it through, so the carried nothing is now load-bearing rather than merely honest.
+ *
+ * The mechanism itself lives in `carryAccountingOriginRecord`, beside the reader and the verdict, and is
+ * shared with the connectors' CREATE path (r3 finding 1). Two implementations of "inherit, never mint"
+ * is two places for one of them to start minting again.
+ */
+function withStoredOriginRecord(body: FollowUpPayload, storedPayload: unknown): FollowUpPayload {
+  return carryAccountingOriginRecord(body, storedPayload)
 }
 
 function anchorOf(payload: FollowUpPayload, field: string): string {
@@ -193,6 +233,18 @@ const REQUIRED_BODY_FIELDS: Record<string, readonly { field: string; kind: 'id' 
     { field: 'bankAccountId', kind: 'id' },
     { field: 'amount', kind: 'amount' },
   ],
+  // The SUPPLIER side of the same guard, verified against both connectors rather than assumed from
+  // the sales one: xero/sync-processor.ts and quickbooks/sync-processor.ts each open their
+  // BILL_PAYMENT case with the identical
+  //   if (!accountingInvoiceId || !bankAccountId || amount == null)
+  // and return before building any request. Without this entry a FAILED BILL_PAYMENT row would be
+  // permanently unknowable even when its stored body could never have been sent, which is the one
+  // case that IS provable (o3d-a3wx round 4 #5).
+  BILL_PAYMENT: [
+    { field: 'accountingInvoiceId', kind: 'id' },
+    { field: 'bankAccountId', kind: 'id' },
+    { field: 'amount', kind: 'amount' },
+  ],
   PURCHASE_CREDIT_NOTE_ALLOCATION: [
     { field: 'creditNoteId', kind: 'id' },
     { field: 'accountingInvoiceId', kind: 'id' },
@@ -213,11 +265,68 @@ function fieldIsPresent(value: unknown, kind: 'id' | 'amount'): boolean {
   return kind === 'amount' ? value !== undefined && value !== null : Boolean(value)
 }
 
+/**
+ * Could this stored body be SENT — i.e. would the connector build a request from it rather than
+ * reject it out of hand? Used to choose which body to pin, so `null` (unreadable, but it was a real
+ * request once) answers true and falls through to the fresh-body branch, while a body missing a
+ * required field answers false because pinning it would strand the payment behind a request that
+ * can never succeed.
+ */
 function bodyCouldHaveReachedTheLedger(type: string, stored: FollowUpPayload | null): boolean {
   const required = REQUIRED_BODY_FIELDS[type]
   if (!required) return true
   if (stored === null) return true
   return required.every(({ field, kind }) => fieldIsPresent(stored[field], kind))
+}
+
+/**
+ * PROOF that a stored attempt never reached the ledger — the opposite question, and deliberately
+ * NOT the negation of `bodyCouldHaveReachedTheLedger` (o3d-qsbs).
+ *
+ * The two differ on exactly the cases where "no information" must not be read as "no call". A
+ * `null` payload is unreadable, and an EMPTY one is indistinguishable from a payload retention
+ * compacted away; neither proves anything about what left the process, so neither is proof. Only a
+ * body that is present, readable and missing a field the connector rejects PRE-CALL proves it —
+ * both connectors validate before they build a request, which is the one sound "this did not post"
+ * signal available here, since errorMessage carries no provenance (r3 blocker A) and o3d-ju8t
+ * established that FAILED alone proves nothing.
+ *
+ * Negating `bodyCouldHaveReachedTheLedger` instead would turn a compacted `{}` into a claim that
+ * the attempt provably never posted — retention manufacturing evidence about a remote call, which
+ * is the one direction that ends in a duplicate payment.
+ */
+function bodyProvesNoCallLeft(type: string, stored: FollowUpPayload | null): boolean {
+  const required = REQUIRED_BODY_FIELDS[type]
+  if (!required) return false
+  if (stored === null) return false
+  if (Object.keys(stored).length === 0) return false
+  return !required.every(({ field, kind }) => fieldIsPresent(stored[field], kind))
+}
+
+/**
+ * DID THIS STORED ATTEMPT MAYBE REACH THE LEDGER? The one answer in this tree, over a raw payload.
+ *
+ * Exported so the POST-TIME capacity guards — `invoice-payment-capacity.ts` on the sales side and
+ * `payment-reversal.ts` on the supplier side — decide what a FAILED money row means using THIS
+ * definition rather than a second copy of it. There is exactly one sound "nothing was sent" signal in
+ * the system, and two guards deriving it differently would disagree about whether a document still has
+ * capacity, which for money is the whole question.
+ *
+ * IT IS BUILT ON `bodyProvesNoCallLeft`, NOT ON `bodyCouldHaveReachedTheLedger` (o3d-m5qk). Both
+ * branches that arrived at this merge had a version of the question and they answer differently on one
+ * input: an EMPTY `{}` body. `bodyCouldHaveReachedTheLedger` reads it as "could not have been sent",
+ * because it is missing every required field; `bodyProvesNoCallLeft` refuses to read it that way,
+ * because retention compacts a payload to `{}` and a compacted body says nothing whatever about what
+ * left the process. For choosing which body to PIN the first reading is right and harmless — an empty
+ * body genuinely cannot be re-sent. For deciding whether an invoice still has CAPACITY it is a claim
+ * that a payment provably never posted, made on evidence retention destroyed, and it ends in a second
+ * payment. So this reader takes the stricter one: unproven means it counts against capacity.
+ *
+ * Returns TRUE for an unreadable, absent or compacted payload: not knowing what was sent is not
+ * evidence that nothing was.
+ */
+export function storedBodyMayHaveReachedTheLedger(type: string, payload: unknown): boolean {
+  return !bodyProvesNoCallLeft(type, asPayload(payload))
 }
 
 /** Fields whose value defines the remote request, so a divergence is worth reporting. */
@@ -298,7 +407,19 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // several rows share one token, whichever committed committed under that same token, and
   // pinning it is unambiguous. Refusing on count alone stranded exactly that case -- reruns
   // of one QuickBooks receipt all carry `invoice-payment:payment:<id>` (Codex r5 #3).
-  const candidateTokens = new Set(couldHaveCommitted.map((row) => row.effectiveToken))
+  //
+  // ...and only among attempts that could have SENT anything (o3d-qsbs). A stored body missing a
+  // field its connector validates before building a request never reached the ledger, so its token
+  // was never used remotely and it is not a candidate for "one of these may have committed".
+  // Counting it was how an anchorless legacy row — anchorless precisely because it lacks
+  // `accountingInvoiceId`, which is also one of the fields that proves it never posted — could make
+  // a scope REFUSE for ever, so a genuinely new payment against a replacement invoice was blocked
+  // by history that could not have touched it. `carried` is added unconditionally: it is a token
+  // this very call has already committed to posting under, not a historical attempt.
+  const mayHaveCommitted = couldHaveCommitted.filter(
+    (row) => !bodyProvesNoCallLeft(input.type, asPayload(row.payload)),
+  )
+  const candidateTokens = new Set(mayHaveCommitted.map((row) => row.effectiveToken))
   if (carried) candidateTokens.add(carried)
   if (candidateTokens.size > 1 && moneyMoving) {
     return {
@@ -314,7 +435,23 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // it FIRST is the request that stands — pinning a newer row's materially different body
   // (amount, bank account, date) would record a settlement the ledger never made (Codex r6).
   // failedRows arrive newest-first, so the oldest match is the last one.
-  const pinnedTokenValue = carried ?? couldHaveCommitted[0]?.effectiveToken
+  //
+  // AND THE TOKEN IS CHOSEN FROM THE SAME SET THE REFUSAL COUNTS (o3d-qsbs, Codex r10 #1). The two
+  // predicates are deliberately not negations of each other, and the consequence for TOKEN SELECTION
+  // was missed: `couldHaveCommitted[0]` is the NEWEST surviving row whether or not it could ever
+  // have sent anything. So a newer row that PROVABLY never posted — a legacy body missing
+  // `accountingInvoiceId`, or a body missing `bankAccountId` — displaced the token of an older row
+  // that MAY have committed. Nothing refused, because the unsendable row's token is (correctly) not
+  // a candidate for having committed; the retry then went out under a token the ledger has never
+  // seen while a payment posted under the OTHER token may already stand. That is the duplicate
+  // payment this module exists to prevent, reintroduced one branch below the fix for it.
+  //
+  // So: prefer the newest attempt that may have committed. Falling back to `couldHaveCommitted[0]`
+  // only when NONE of them may have — every surviving token was then proven never to leave the
+  // process, so any of them reproduces a remote key the ledger has never seen and pinning the
+  // newest keeps the row-id reuse (and the `{}`-compacted case, which is never proof, in the
+  // may-have-committed set where it belongs).
+  const pinnedTokenValue = carried ?? mayHaveCommitted[0]?.effectiveToken ?? couldHaveCommitted[0]?.effectiveToken
   const sameToken = couldHaveCommitted.filter((row) => row.effectiveToken === pinnedTokenValue)
   // ...but only among bodies that could actually have reached the ledger. An incomplete body
   // is rejected pre-call by both connectors, so it provably never posted and pinning it
@@ -343,7 +480,21 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     // under a token the remote system has already seen returns the ORIGINAL payment, and we
     // would record a settlement for an amount never posted — local evidence that disagrees
     // with the ledger (Codex r1 #3).
-    if (stored && moneyMoving) {
+    //
+    // UNLESS THAT BODY CANNOT BE SENT (o3d-qsbs). `pinnable` falls back to the oldest same-token
+    // row when NONE of them is postable, and pinning an incomplete body there re-sent a request the
+    // connector rejects before it builds anything — for ever, on every retry, with the payment
+    // stranded behind it. That fallback contradicted the rule stated two branches up, which is that
+    // an incomplete body provably never posted. It provably never posted, so the token it carries
+    // was never seen remotely and the RECOMPUTED body is safe to send under it: the token stays
+    // pinned (nothing is rotated), only the unusable body is replaced.
+    //
+    // o3d-gfh: when the stored body IS pinned, `stored` is the existing row's payload, so its origin
+    // record travels with it and the freshly-stamped one in `input.payload` is discarded — which is
+    // the correct direction. If the row was raised against another organisation the post-time verdict
+    // now sees A against B and refuses; before, it saw B against B, because the stamp had been
+    // rewritten by the repair itself.
+    if (stored && moneyMoving && bodyCouldHaveReachedTheLedger(input.type, stored)) {
       return {
         action: 'reuse',
         syncLogId: pinnable.id,
@@ -355,12 +506,16 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     }
 
     // Non-money follow-ups (PDF, email, note, attachment) are safe to re-drive with fresh
-    // inputs; only the token is carried back.
+    // inputs; only the token is carried back. A money-moving row whose stored body could never have
+    // been sent lands here too, for the reason given just above.
+    //
+    // o3d-gfh: since a token is carried, so is the row's record of the organisation that token was
+    // spent against. The BODY is fresh; the ORIGIN is the row's own and is not the caller's to rewrite.
     const { [FOLLOW_UP_IDEMPOTENCY_KEY]: _discarded, ...rest } = input.payload
     return {
       action: 'reuse',
       syncLogId: pinnable.id,
-      payload: pin(rest),
+      payload: pin(withStoredOriginRecord(rest, pinnable.payload)),
       tokenDisposition: 'pinned',
       bodyDisposition: 'fresh',
       divergedFields,
@@ -370,7 +525,19 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // Nothing surviving could have committed this document, so the recomputed request goes out
   // under a freshly derived token. Reuse a spent row when one exists rather than accumulating
   // replacements; its id no longer carries the token, so reuse is bookkeeping, not safety.
-  const rowToReuse = input.failedRows[0]
+  // Reuse a spent row ONLY when it recorded the same origin the new work was raised against.
+  //
+  // Nothing is carried back on this branch — the token is freshly derived and the body is recomputed —
+  // so the row is a container rather than evidence about this attempt, and restamping it is honest FOR
+  // THE NEW WORK. What is not honest is doing that when the container still holds a different
+  // organisation's record: that record is the only surviving trace that an attempt was made against
+  // organisation A, and bookkeeping tidiness is not a reason to erase it. A brand-new row costs one
+  // insert, keeps A's row intact for reconciliation, and lets B's work proceed — whereas carrying A's
+  // stamp onto B's work would strand it behind a post-time refusal it can never satisfy.
+  const spentRow = input.failedRows[0]
+  const rowToReuse = spentRow && accountingOriginRecordsMatch(spentRow.payload, input.payload)
+    ? spentRow
+    : undefined
   const freshPayload = withFollowUpIdempotencyKey(input)
   if (rowToReuse) {
     const stored = asPayload(rowToReuse.payload)
@@ -391,4 +558,28 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     }
   }
   return { action: 'create', payload: freshPayload }
+}
+
+/**
+ * DOES THIS LIVE ROW ALREADY OWN THE FOLLOW-UP WE ARE ABOUT TO ENQUEUE? (o3d-hbgo)
+ *
+ * `hasExistingSyncLog` decided that from (connector, type, referenceType, referenceId) alone, and the
+ * partial unique index was scoped the same way — neither consulted the external document the follow-up
+ * TARGETS. So a SalesOrder whose invoice was deleted and re-posted kept the SYNCED INVOICE_PAYMENT row
+ * from the FIRST invoice, the payment follow-up for the SECOND was skipped as already handled, and the
+ * new invoice was never settled. Silently: a skip logs nothing.
+ *
+ * o3d-h2wx had already made the remote TOKEN anchor-aware, so a follow-up targeting a different
+ * accountingInvoiceId derives a different Idempotency-Key rather than being deduped by the ledger. This
+ * closes the same gap one level down, using the SAME anchors — a row-level dedup that names less than
+ * the token it would post under can only ever throw away work the token was ready to distinguish.
+ *
+ * An unanchored stored payload counts as MATCHING, exactly as `couldHaveCommittedThis` treats it: we
+ * cannot tell what it targeted, and skipping a possibly-duplicate payment is recoverable where posting
+ * one is not. That is the OPPOSITE of the database index's null handling — the index groups unanchored
+ * rows into their own slot — and deliberately so: the application guard may be stricter than the
+ * constraint that backs it, never laxer.
+ */
+export function liveRowOccupiesFollowUpSlot(storedPayload: unknown, freshPayload: FollowUpPayload): boolean {
+  return couldHaveCommittedThis(asPayload(storedPayload), anchorsOf(freshPayload))
 }

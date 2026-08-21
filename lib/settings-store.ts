@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { maskSecret } from '@/lib/security/secret-mask'
 import {
   decryptSettingValue,
   encryptSettingValue,
@@ -18,11 +19,63 @@ export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
   shopify_admin_api_access_token: 'SHOPIFY_ADMIN_API_ACCESS_TOKEN',
   shopify_invoice_pdf_secret: 'SHOPIFY_INVOICE_PDF_SECRET',
   shopify_webhook_secret: 'SHOPIFY_WEBHOOK_SECRET',
-  wc_consumer_key: 'WC_CONSUMER_KEY',
-  wc_consumer_secret: 'WC_CONSUMER_SECRET',
   wc_invoice_pdf_secret: 'WC_INVOICE_PDF_SECRET',
   wc_webhook_secret: 'WC_WEBHOOK_SECRET',
 }
+
+// `wc_consumer_key` and `wc_consumer_secret` are deliberately NOT in the map above
+// (o3d-ecbj). They were, and the override was only HALF APPLIED:
+//
+//   - getSettingValue/getSettingValues PREFER the environment, so
+//     lib/connectors/woocommerce/api.ts getWcCredentials() — the order import, the FX push,
+//     the partial-shipment push, links.ts, delivery.ts — followed WC_CONSUMER_KEY /
+//     WC_CONSUMER_SECRET;
+//   - while snapshotSyncContext (sync/stock-sync.ts) and snapshotProductSyncContext
+//     (sync/product-sync.ts) read the settings ROWS inside their advisory-lock transaction
+//     — they must, or the credentials and wc_settings_version could not be captured
+//     together (o3d-mlc7) — and followed the database.
+//
+// A stale secret left in .env after a rotation therefore made one installation import
+// orders under one credential and push stock under another. Neither half errors: the
+// losing one just collects 401s that the sync reports as an ordinary transient WC API
+// error and retries forever.
+//
+// Wiring the override up on BOTH sides was rejected for the same reason it was rejected
+// for wc_url and WC_SYNC_STATUSES: scripts/install.sh writes these lines into every .env,
+// and env-wins would pin an installation to whatever was typed at install time, making the
+// Settings fields inert and silently repointing an operator who had since rotated the key.
+//
+// WC_CONSUMER_KEY / WC_CONSUMER_SECRET still have a job: scripts/provision-instance.mjs
+// SEEDS the two settings rows from them at install time (insert-only, so a re-run cannot
+// clobber the operator's value), exactly like WC_STORE_URL and the SMTP_* variables. After
+// that the Settings UI is the single source of truth, and
+// lib/connectors/woocommerce/credentials.ts is the single resolver both paths build from.
+//
+// `wc_url` is deliberately NOT in the map above, and WC_STORE_URL is deliberately
+// not an override (o3d-esha, reconsidered).
+//
+// An earlier pass added it, reasoning that install.sh prompts for WC_STORE_URL
+// alongside the three WooCommerce secrets and that the env path is only complete
+// with all four. That is the same argument this sweep REJECTED for
+// WC_SYNC_STATUSES — the installer writes the line into every install, so wiring
+// it pins every existing installation to whatever was typed at install time and
+// makes the Settings field inert — and it applies here with more force, not less:
+//
+//   - getSettingValue prefers the environment, so an install set up years ago
+//     against one store and since repointed in Settings -> Sync -> Connection
+//     would silently revert to the old store the moment it upgraded. Orders would
+//     be imported from, and stock pushed to, a store the operator had abandoned.
+//   - the override would only be half-applied. getWcCredentials (the order
+//     import, FX push and partial-shipment paths) resolves wc_url through
+//     getSettingValues and would follow the environment, while
+//     product-sync.ts / stock-sync.ts / lib/shopping.ts read the settings ROW
+//     directly inside their advisory-lock snapshots and would follow the
+//     database. One installation, two stores, no error anywhere.
+//
+// WC_STORE_URL still has a job: scripts/provision-instance.mjs SEEDS the wc_url
+// setting from it at install time (insert-only, so a re-run cannot clobber the
+// operator's value), exactly like the SMTP_* variables. After that the Settings
+// UI is the single source of truth.
 
 export const SENSITIVE_SETTING_KEYS = new Set([
   'backup_s3_secret_key',
@@ -45,6 +98,13 @@ export const SENSITIVE_SETTING_KEYS = new Set([
   'shopify_invoice_pdf_secret',
   'shopify_webhook_secret',
   'trackship_api_key',
+  // o3d-512h: the WooCommerce consumer KEY, not only the secret. getWcCredentials
+  // has always masked it before returning it to the client (app/actions/wc-sync.ts),
+  // i.e. the product already treats it as a credential — but it was absent from this
+  // set, so the generic `getSetting('wc_consumer_key')` endpoint returned it in clear
+  // to any authenticated principal and it was stored in plaintext at rest. The set is
+  // the single authority for BOTH facts, which is why the drift was invisible.
+  'wc_consumer_key',
   'wc_consumer_secret',
   'wc_invoice_pdf_secret',
   'wc_webhook_secret',
@@ -205,4 +265,33 @@ export function deserializeSettingValue(key: string, value: string): string {
 export function serializeSettingValue(key: string, value: string): string {
   if (!SENSITIVE_SETTING_KEYS.has(key) || !value) return value
   return encryptSettingValue(key, value)
+}
+
+/**
+ * Mask a SETTING value for display, declaring the key it belongs to (o3d-512h).
+ *
+ * Masking a value is a getter stating "this is a credential". That statement used
+ * to live only in the getter, while the authorization gate on the generic
+ * `getSetting` endpoint read SENSITIVE_SETTING_KEYS — two independent lists, and
+ * they drifted: `wc_consumer_key` was masked by getWcCredentials for as long as it
+ * has existed and was never in the set, so the endpoint served it in clear.
+ *
+ * Routing the maskers through here makes the set the single authority instead of
+ * the second opinion: masking a key that is not in it fails immediately. Every call
+ * site passes a string literal, so this can only fire for a key a developer is
+ * adding right now — never on production data.
+ */
+export function maskSettingSecret(
+  key: string,
+  value: string | null | undefined,
+  visibleChars = 4,
+): string {
+  if (!SENSITIVE_SETTING_KEYS.has(key)) {
+    throw new Error(
+      `maskSettingSecret called for '${key}', which is not in SENSITIVE_SETTING_KEYS. `
+      + 'A masked setting is a credential: add the key to that set so it is encrypted '
+      + 'at rest AND gated on the generic getSetting endpoint.',
+    )
+  }
+  return maskSecret(value, visibleChars)
 }

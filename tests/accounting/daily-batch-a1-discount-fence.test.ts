@@ -88,7 +88,21 @@ const tx = {
   },
   salesOrder: {
     // The fence's re-read: the LIVE row, i.e. after any correction that committed in the gap.
-    findMany: async () => {
+    //
+    // It MUST discriminate on the where. When this double was written, Group A2 selected its
+    // candidates through `db`, so an unconditional answer here could only ever be the A1 fence's
+    // re-read. o3d-o97 / o3d-0i5y moved A2's candidate read and its locked re-read INSIDE the
+    // transaction, and an unconditional answer then handed A2 an A1-shaped row with no `shipments`
+    // and no `allocations` — reported as "Group A2 error: order.shipments is not iterable", which
+    // looks like a Group B problem and is really this double.
+    //
+    // The fence re-reads by ID ALONE (`{ id: { in: batch } }` — see assertRevenueDeferralsUnchanged);
+    // every other in-transaction reader carries eligibility clauses as well. So an `id`-only where is
+    // the fence and nothing else is, which keeps this file's promise that ONLY the A1 window is
+    // populated now that more than one group reads through `tx`.
+    findMany: async ({ where }: { where?: Record<string, unknown> } = {}) => {
+      const clauses = Object.keys(where ?? {})
+      if (clauses.length !== 1 || clauses[0] !== 'id') return []
       world.fenceRead += 1
       return [orderRow(world.liveDiscount)]
     },
@@ -126,6 +140,11 @@ mock.module('@/lib/db', {
       },
       shipment: { findMany: async () => [] },
       accountingSyncLog: { count: async () => 0, findMany: async () => [] },
+      // o3d-s36z (#632): the enqueue now stamps the connection the payload was composed against,
+      // read through activeAccountingIdProvenance -> db.accountingToken.findUnique. CONNECTED, not
+      // null: a null models a DISCONNECTED instance, and this file's control case is a normal batch
+      // run on a live connection.
+      accountingToken: { findUnique: async () => ({ tenantId: 'tenant-A' }) },
       $transaction: async (fn: (client: unknown) => Promise<unknown>) => fn(tx),
     },
   },

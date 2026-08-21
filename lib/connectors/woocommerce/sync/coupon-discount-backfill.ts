@@ -753,6 +753,11 @@ export function decideWcCouponBackfill(
   const { orderLevelDiscount } = resolveWcOrderLevelDiscount({
     couponTotalForeign: row.storedOrderDiscount,
     lineDiscountTotalForeign: row.lineDiscountTotal,
+    // o3d-5tf: the allocation-rounding tolerance is HALF A MINOR UNIT OF THIS ORDER'S CURRENCY, not
+    // a hard-coded 0.005. Passing the order's own currency is what keeps the backfill's residual
+    // identical to the one order-import derives; a second tolerance here would be a second answer to
+    // "is this rounding or real discount", and the whole backfill is a subtraction against it.
+    currency: row.currency,
   })
   const clearedBy = money(row.storedOrderDiscount - orderLevelDiscount)
   if (clearedBy <= 0) {
@@ -1421,6 +1426,10 @@ export async function applyWcCouponCorrection(
   const { orderLevelDiscount } = resolveWcOrderLevelDiscount({
     couponTotalForeign: live,
     lineDiscountTotalForeign: liveLines,
+    // o3d-5tf. The REVIEWED currency, like every other input this re-derivation is checked against:
+    // the amount and the lines above are compared entry-against-live and decline on a mismatch, so
+    // the tolerance must be measured in the same minor unit the reviewer's figures were.
+    currency: entry.currency,
   })
   const keptOrderLevel = money(orderLevelDiscount)
   if (keptOrderLevel !== entry.keptOrderLevel) {
@@ -1760,7 +1769,9 @@ export async function reprintWcCouponLedgerHandoff(
   const corrected = row.discountModel === WC_COUPON_DISCOUNT_MODEL
   const keptOrderLevel = corrected
     ? live
-    : money(resolveWcOrderLevelDiscount({ couponTotalForeign: live, lineDiscountTotalForeign: liveLines }).orderLevelDiscount)
+    // o3d-5tf: same currency-scaled tolerance as apply, so a reprint reports the residual apply
+    // would keep rather than one derived on a different minor unit.
+    : money(resolveWcOrderLevelDiscount({ couponTotalForeign: live, lineDiscountTotalForeign: liveLines, currency: order.currency }).orderLevelDiscount)
 
   const posted = await readLivePostedEvidence(client, order.orderId, row)
   const handoff = wcCouponCorrectionNeedsLedgerAdjustment(posted)

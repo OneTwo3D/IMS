@@ -14,13 +14,35 @@
  * path remembering to clear the column.
  */
 
-import { db } from '@/lib/db'
+/**
+ * The provenance string for an id a KNOWN connection issued (o3d-gfh).
+ *
+ * The same `"<connector>:<tenantId>"` shape `activeAccountingIdProvenance` produces, built from a tenant
+ * the caller already holds instead of from another read of the token row. It exists so that the tenant
+ * an id was ISSUED BY can be stamped rather than the tenant that happens to be connected once the call
+ * has returned: those are the same value except in exactly the case provenance exists to catch, and the
+ * resample silently prefers the wrong one. Callers get the issuing tenant from `XeroResponse.tenantId`,
+ * which is the id that went out in the request's own `Xero-Tenant-Id` header.
+ *
+ * Returns null for a blank/absent tenant, so "no request was made" cannot be stamped as a provenance —
+ * a null column re-resolves on the next read, which is the safe direction.
+ */
+export function accountingIdProvenanceFor(connector: string, tenantId: string | null | undefined): string | null {
+  const tenant = (tenantId ?? '').trim()
+  return tenant ? `${connector}:${tenant}` : null
+}
 
 /**
  * The provenance string for a connector's currently-connected tenant/realm, or `null` when that connector
  * has no token (so nothing can legitimately match — a stored id is treated as stale).
  */
 export async function activeAccountingIdProvenance(connector: string): Promise<string | null> {
+  // Imported HERE rather than at module scope so that the two PURE functions in this file —
+  // `accountingIdProvenanceFor` and `accountingIdProvenanceMatches` — can be reached without
+  // constructing a Prisma client. `lib/domain/accounting/followup-idempotency.ts` is a pure planner
+  // whose whole point is being decidable without a database, and it now needs the connection
+  // comparison; a static `import { db }` here would drag Prisma into it and into its tests.
+  const { db } = await import('@/lib/db')
   const token = await db.accountingToken.findUnique({
     where: { connector },
     select: { tenantId: true },

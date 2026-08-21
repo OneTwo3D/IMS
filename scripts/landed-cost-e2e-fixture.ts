@@ -1,6 +1,7 @@
 import 'dotenv/config'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../app/generated/prisma/client.ts'
+import { lockIntegrationPluginSelection } from '../lib/integration-plugin-selection-lock.ts'
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! })
 const db = new PrismaClient({ adapter })
@@ -19,9 +20,23 @@ async function upsertSetting(key: string, value: string) {
   })
 }
 
+/**
+ * The plugin flags, under the connector-selection lock (o3d-osl8 round 6, finding 2) — see the
+ * longer note in scripts/commerce-accounting-e2e-fixture.ts. A bare upsert here was a plugin-key
+ * writer that took no lock, and those are what the orphan-cancel sweep's row locks now fence.
+ */
+async function seedPluginFlags(flags: Record<string, boolean>) {
+  await db.$transaction(async (tx) => {
+    await lockIntegrationPluginSelection(tx)
+    for (const [key, value] of Object.entries(flags)) {
+      await tx.setting.upsert({ where: { key }, update: { value: String(value) }, create: { key, value: String(value) } })
+    }
+  })
+}
+
 async function seedAccountingSettings() {
+  await seedPluginFlags({ plugin_xero_enabled: true })
   await Promise.all([
-    upsertSetting('plugin_xero_enabled', 'true'),
     upsertSetting('xero_sync_enabled', 'true'),
     upsertSetting('xero_sync_purchase_invoice', 'submitted'),
     upsertSetting('xero_sync_cogs_journal', 'submitted'),

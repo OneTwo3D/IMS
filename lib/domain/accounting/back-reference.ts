@@ -1,4 +1,4 @@
-import type { AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
+import type { AccountingLinkSource, AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { isUniqueConstraintViolation, uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 
@@ -31,6 +31,66 @@ export type BackReferenceParams = {
   referenceId: string
   externalId: string
   invoiceNumber?: string
+  /**
+   * The BUSINESS DATE to stamp on SalesOrder.invoicedAt — the date the document was invoiced,
+   * never the moment this write happens (o3d-r5pj).
+   *
+   * Three states, and the difference between the last two is the whole issue:
+   *
+   *   • ABSENT — the LIVE post path. `now` genuinely IS the business date there: the document was
+   *     created in the ledger seconds ago. Unchanged behaviour, and the only caller allowed to
+   *     omit it.
+   *   • a Date — a REPAIR that recovered the posted document's own date (from the payload that was
+   *     sent). This is what makes a repair reproduce the original write instead of re-dating it.
+   *   • NULL — a repair that could NOT recover it. Nothing is written: `invoicedAt` keeps whatever
+   *     it has, including nothing.
+   *
+   * WHY `new Date()` WAS WRONG ON THE REPAIR PATH. This function serves both, and the sweep runs
+   * an arbitrary time after the post — hours, or months for a row that exhausted its retries. VAT
+   * and currency reporting select on `invoicedAt`, so stamping repair time silently MOVES a sale
+   * into a later reporting period, and the further behind the repair is the worse the move. A
+   * repair is a reconstruction of a write that already happened; it must not invent a business
+   * fact that the original write did not have.
+   *
+   * NULL is not a soft option either — a sale with no `invoicedAt` is in NO period rather than the
+   * wrong one — which is why the sweep announces it rather than settling in silence. What it must
+   * never do is guess.
+   */
+  invoicedAt?: Date | null
+  /**
+   * Override the provenance stamped on a bill's link (o3d-wf86). Omitted, each writer records what
+   * it structurally IS — the bill-keyed branch BILL_KEYED_SYNC, the PO-keyed branch
+   * PO_KEYED_REPAIR — which is the only correct answer for a sync or a sweep, neither of which has
+   * any other way to have got here.
+   *
+   * The one caller that passes it is the operator release-and-relink, whose act is neither: a human
+   * looked at both documents and said which one is right, and recording that as a sync would lose
+   * the single strongest piece of provenance there is.
+   */
+  linkSource?: AccountingLinkSource
+}
+
+/**
+ * The BUSINESS DATE the document was actually posted with, read back out of the request the
+ * connector sent (o3d-r5pj). `null` when the row cannot tell us — a compacted tombstone, or a
+ * legacy/malformed payload.
+ *
+ * `payload.date` is the field every sales-invoice builder fills and the field the connector's own
+ * `processEntry` hands to the ledger, so it is the document's date BY CONSTRUCTION rather than by
+ * convention: if it were wrong, the invoice in the ledger would carry the wrong date too. That is
+ * what makes it a sound source for a repair, and it is the only one available locally — the
+ * alternative is re-reading the document from the connector, which this sweep deliberately does
+ * not do (see o3d-r5pj option 1, still open).
+ *
+ * Date-only strings ("2026-01-05") parse as UTC midnight, which is exactly what was queued.
+ * Anything unparseable reads as "unknown", never as a fallback date — the entire point is that a
+ * repair does not invent one.
+ */
+export function recoverPostedBusinessDate(payload: Record<string, unknown>): Date | null {
+  const raw = payload.date
+  if (typeof raw !== 'string' || raw.trim() === '') return null
+  const parsed = new Date(raw.trim())
+  return Number.isNaN(parsed.getTime()) ? null : parsed
 }
 
 /** What applyBackReference actually did — so a caller can log a refusal to guess. */
@@ -99,7 +159,14 @@ export type PurchaseOrderAttributionDeps = {
      * external id already held by a bill of another order is a conflict, and the PO-scoped
      * version of this question could not see it at all (o3d-9kek r2 finding 1).
      */
-    findFirst(args: { where: Record<string, unknown>; orderBy?: Record<string, unknown>; select: { id: true; poId?: true } }): Promise<{ id: string; poId?: string } | null>
+    findFirst(args: {
+      where: Record<string, unknown>
+      orderBy?: Record<string, unknown>
+      // o3d-wf86: the holder's PROVENANCE travels with the refusal, so the double has to be able to
+      // return it. A structural type that could not would let production read a column the tests
+      // never see.
+      select: { id: true; poId?: true; accountingInvoiceIdSource?: true }
+    }): Promise<{ id: string; poId?: string; accountingInvoiceIdSource?: AccountingLinkSource | null } | null>
     findMany(args: { where: Record<string, unknown>; orderBy?: Record<string, unknown>; select: { id: true }; take?: number }): Promise<Array<{ id: string }>>
   }
 }
@@ -168,6 +235,15 @@ export type AmbiguousPurchaseOrderAttribution = {
   linkedPurchaseInvoiceId?: string
   /** EXTERNAL_ID_LINKED_ELSEWHERE only: the PurchaseOrder that bill belongs to, if known. */
   linkedPurchaseOrderId?: string | null
+  /**
+   * EXTERNAL_ID_LINKED_ELSEWHERE only: HOW the blocking bill got its link (o3d-wf86).
+   *
+   * `null` is a real answer and the commonest one — every bill linked before the column existed
+   * says it, and it means "unproven", not "fine". It is reported rather than resolved: an operator
+   * who is told the id is held by a PO_KEYED_REPAIR or by an unrecorded legacy link is being told
+   * which of the two candidates to check FIRST, which is a different thing from IMS deciding.
+   */
+  linkedAccountingInvoiceIdSource?: AccountingLinkSource | null
 }
 
 /**
@@ -363,7 +439,12 @@ export async function resolvePurchaseOrderBackReference(
   if (params.externalId) {
     const holder = await deps.purchaseInvoice.findFirst({
       where: { accountingInvoiceId: params.externalId },
-      select: { id: true, poId: true },
+      // accountingInvoiceIdSource is read for the REFUSAL, not for the decision (o3d-wf86). Nothing
+      // below branches on it, deliberately: adjudicating a conflict needs the remote document as
+      // well, and a rule that preferred one provenance over another would be the newest-unlinked-
+      // bill guess wearing better clothes. It travels out with the warning so the human doing the
+      // adjudicating knows which link is the unproven one.
+      select: { id: true, poId: true, accountingInvoiceIdSource: true },
     })
     if (holder) {
       if (holder.poId === params.purchaseOrderId) return { outcome: 'already-linked', purchaseInvoiceId: holder.id }
@@ -374,6 +455,7 @@ export async function resolvePurchaseOrderBackReference(
         unlinkedBillCount: null,
         linkedPurchaseInvoiceId: holder.id,
         linkedPurchaseOrderId: holder.poId ?? null,
+        linkedAccountingInvoiceIdSource: holder.accountingInvoiceIdSource ?? null,
       }
     }
   }
@@ -456,7 +538,7 @@ export const BACK_REFERENCE_PAIRS: ReadonlyArray<{
   { type: 'CREDIT_NOTE', referenceTypes: ['SalesOrderRefund'], holder: { model: 'SalesOrderRefund', column: 'accountingCreditNoteId' } },
   // PurchaseOrder is the LEGACY keying (pre-o3d-9oq): the row names the order, not the bill, and is
   // attributed by resolvePurchaseOrderBackReference or refused.
-  { type: 'PURCHASE_INVOICE', referenceTypes: ['PurchaseInvoice', 'PurchaseOrder'], holder: { model: 'PurchaseInvoice', column: 'accountingInvoiceId' } },
+  { type: 'PURCHASE_INVOICE', referenceTypes: ['PurchaseInvoice', 'PurchaseOrder'], holder: { model: 'PurchaseInvoice', column: 'accountingInvoiceId', sourceColumn: 'accountingInvoiceIdSource' } },
   { type: 'PURCHASE_CREDIT_NOTE', referenceTypes: ['SupplierCreditNote'], holder: { model: 'SupplierCreditNote', column: 'accountingCreditNoteId' } },
 ]
 
@@ -603,7 +685,7 @@ export async function releaseFollowUpObligation(
  */
 async function resolveAndApplyPurchaseOrderBackReference(
   tx: BackReferenceDeps,
-  params: { connector: string; purchaseOrderId: string; externalId: string },
+  params: { connector: string; purchaseOrderId: string; externalId: string; linkSource?: AccountingLinkSource },
 ): Promise<BackReferenceApplyOutcome> {
   const attribution = await resolvePurchaseOrderBackReference(tx, params)
   if (attribution.outcome === 'ambiguous') return { outcome: 'ambiguous', attribution }
@@ -614,7 +696,12 @@ async function resolveAndApplyPurchaseOrderBackReference(
 
   const written = await tx.purchaseInvoice.updateMany({
     where: { id: attribution.purchaseInvoiceId, accountingInvoiceId: null },
-    data: { accountingInvoiceId: params.externalId },
+    // STAMPED AS A DEDUCTION (o3d-wf86). This branch reached its bill by elimination over the PO's
+    // population — the sync row named the ORDER — and however well guarded that is, it is not
+    // something the ledger told us. Written in the SAME statement as the id: a provenance recorded
+    // separately could fail on its own and leave a guess indistinguishable from an authoritative
+    // link, which is the state this column exists to end.
+    data: { accountingInvoiceId: params.externalId, accountingInvoiceIdSource: params.linkSource ?? 'PO_KEYED_REPAIR' },
   })
   if (written.count !== 1) return { outcome: 'contended', purchaseInvoiceId: attribution.purchaseInvoiceId }
   return { outcome: 'applied', referenceType: 'PurchaseInvoice', referenceId: attribution.purchaseInvoiceId }
@@ -628,6 +715,10 @@ async function resolveAndApplyPurchaseOrderBackReference(
 export async function applyBackReference(deps: BackReferenceDeps, params: BackReferenceParams): Promise<BackReferenceApplyOutcome> {
   const { connector, type, referenceType, referenceId, externalId, invoiceNumber } = params
   if (!externalId) return { outcome: 'nothing-to-apply' }
+  // `undefined` means "leave the column alone" to Prisma, which is exactly what a NULL
+  // `invoicedAt` must do — see the field's contract on BackReferenceParams. An ABSENT field keeps
+  // the live path's `now`.
+  const invoicedAt = params.invoicedAt === undefined ? new Date() : (params.invoicedAt ?? undefined)
 
   // o3d-9kek r6 finding 3: the three sales-side columns are globally unique too, so each of these
   // writes can now be REFUSED by the database — and each one classifies and re-describes the
@@ -641,7 +732,7 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
         data: {
           accountingInvoiceId: externalId,
           invoiceNumber: invoiceNumber ?? undefined,
-          invoicedAt: new Date(),
+          invoicedAt,
         },
       })
     } catch (error) {
@@ -693,7 +784,10 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
     try {
       await deps.purchaseInvoice.update({
         where: { id: referenceId },
-        data: { accountingInvoiceId: externalId },
+        // THE AUTHORITATIVE LINK (o3d-wf86): the sync row named this exact bill, so this is what the
+        // connector itself reported rather than anything deduced locally. That is why this branch is
+        // allowed to overwrite a legacy guess — and now the overwrite is visible as one.
+        data: { accountingInvoiceId: externalId, accountingInvoiceIdSource: params.linkSource ?? 'BILL_KEYED_SYNC' },
       })
     } catch (error) {
       if (!isExternalBillIdConflict(error)) throw error
@@ -712,7 +806,7 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
     // play. Attribute it only when the whole population for that PO leaves exactly one
     // possibility; otherwise refuse and let the caller log it for manual attribution.
     // (New rows are keyed on the bill since o3d-9oq — this path is for legacy rows.)
-    const resolveAndApply = { connector, purchaseOrderId: referenceId, externalId }
+    const resolveAndApply = { connector, purchaseOrderId: referenceId, externalId, linkSource: params.linkSource }
     if (typeof deps.$transaction === 'function') {
       try {
         return await deps.$transaction(async (tx) => {
@@ -852,12 +946,24 @@ export async function backReferenceIsMissing(deps: BackReferenceDeps, params: Ba
 // recorded is bad; two posted documents are worse.
 // ---------------------------------------------------------------------------
 
-/** The four local models that can hold an accounting external document id, and the column they use. */
+/**
+ * The four local models that can hold an accounting external document id, and the column they use.
+ *
+ * `sourceColumn` is the PROVENANCE column beside it, where one exists (o3d-wf86). Only PurchaseInvoice
+ * has one, and that asymmetry is the honest state of the world rather than an omission: the PO-keyed
+ * repair is the only writer in the system that DEDUCES which local document an external id belongs
+ * to, so it is the only place where "how did this link get here" has more than one possible answer.
+ * The other three are named directly by their sync row and can only ever have been linked one way.
+ *
+ * Carried on the pair table so the release path can clear the id and its provenance together without
+ * knowing which model it is holding — the alternative is a second per-model list, and a restated
+ * list is how PURCHASE_CREDIT_NOTE fell out of the sweep in r6 finding 2.
+ */
 export type ExternalDocumentIdHolder =
-  | { model: 'SalesOrder'; column: 'accountingInvoiceId' }
-  | { model: 'SalesOrderRefund'; column: 'accountingCreditNoteId' }
-  | { model: 'PurchaseInvoice'; column: 'accountingInvoiceId' }
-  | { model: 'SupplierCreditNote'; column: 'accountingCreditNoteId' }
+  | { model: 'SalesOrder'; column: 'accountingInvoiceId'; sourceColumn?: undefined }
+  | { model: 'SalesOrderRefund'; column: 'accountingCreditNoteId'; sourceColumn?: undefined }
+  | { model: 'PurchaseInvoice'; column: 'accountingInvoiceId'; sourceColumn: 'accountingInvoiceIdSource' }
+  | { model: 'SupplierCreditNote'; column: 'accountingCreditNoteId'; sourceColumn?: undefined }
 
 /** The Prisma delegate surface the claim lookup and release need. Structural, so a double satisfies it. */
 type ExternalDocumentIdClaimDelegate = {
@@ -1264,13 +1370,22 @@ export async function releaseAndRelinkExternalDocumentId(
 
       const released = await table.updateMany({
         where: { id: params.confirmedHolderId, [holder.column]: params.externalId },
-        data: { [holder.column]: null },
+        // The PROVENANCE goes with the id (o3d-wf86). A bill that no longer holds a link must not
+        // keep a record of how it acquired one — leaving BILL_KEYED_SYNC behind on an unlinked bill
+        // would read, to the next conflict report, as an authoritative claim to an id it does not
+        // have. Written in the same statement, so the pair can never come apart. Harmless on the
+        // three models that have no such column: Prisma ignores an undefined field.
+        data: { [holder.column]: null, ...(holder.sourceColumn ? { [holder.sourceColumn]: null } : {}) },
       })
       if (released.count !== 1) throw new ExternalDocumentIdReleaseAbort({ outcome: 'contended', holderId: params.confirmedHolderId })
 
       // STRIPPED, so the re-link joins this transaction instead of nesting one inside it (Codex r9
       // finding 2). Everything else on this path keeps using `tx` directly.
-      const applied = await applyBackReference(withoutNestedTransaction(tx), params)
+      // MANUAL, not whatever the branch would have recorded (o3d-wf86). An operator confirmed which
+      // of two documents the ledger's bill actually is and released the loser's claim; recording
+      // that as BILL_KEYED_SYNC or PO_KEYED_REPAIR would throw away the strongest provenance in the
+      // system and describe a human decision as a machine one.
+      const applied = await applyBackReference(withoutNestedTransaction(tx), { ...params, linkSource: 'MANUAL' })
       if (applied.outcome !== 'applied') {
         throw new ExternalDocumentIdReleaseAbort({ outcome: 'not-relinked', applyOutcome: applied.outcome })
       }

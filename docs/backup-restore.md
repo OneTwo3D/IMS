@@ -52,6 +52,128 @@ Restore uploads default to a 50 MiB SQL-file cap. Override with `DATABASE_RESTOR
 
 Every generated backup has a `.manifest.json` sidecar containing the manifest schema version, backup filename, database size, critical IMS table names, and advisory post-dump row counts. Stored and uploaded restores reject manifests missing FIFO, COGS, stock movement, accounting sync, payment, shipment, or audit-log critical tables. Row counts are an operator diagnostic and are not a snapshot-consistent equality check against the dump.
 
+### What the restore refuses in the SQL file
+
+Before anything is locked or spawned, the uploaded (or stored) `.sql` file is lexed. The replay runs
+under `psql --single-transaction --set ON_ERROR_STOP=1`, so a failure anywhere in a well-formed dump
+rolls the whole restore back — but only if the file cannot end that transaction itself. A restore is
+therefore refused when the file contains:
+
+- **top-level transaction control** — `BEGIN`, `COMMIT`, `ROLLBACK`, `END`, `ABORT`,
+  `START TRANSACTION`, `SAVEPOINT`, `RELEASE`, `PREPARE TRANSACTION`. Accepting one of these would
+  split the replay into several transactions, so a later failure would leave the database
+  **partially restored** while the endpoint reported the restore as failed;
+- **psql metacommands**, other than the `\restrict` / `\unrestrict` pair that `pg_dump` 17.6+ emits
+  around every plain dump. A `\connect`, for example, would move the replay to another database
+  entirely;
+- **anything the lexer cannot fully account for** — a file ending inside a string, a dollar-quoted
+  block, a comment or a `COPY … FROM stdin` data block, a file that turns
+  `standard_conforming_strings` off, one containing `U&'…'` literals, or a plain literal containing
+  a backslash-escaped quote (`'a\''`), where the two escaping modes disagree about where the
+  literal ends. Ambiguity is refused rather than replayed.
+
+`BEGIN`/`COMMIT` **inside** a PL/pgSQL function body, a string literal, a comment or COPY data are
+normal in a `pg_dump` file and are accepted — the check understands SQL structure rather than
+matching lines. A backup produced by this application always passes.
+
+Two classes of transaction control cannot be detected by reading the file: one executed indirectly
+(a procedure whose body commits) and a statement that cannot run inside a transaction block at all.
+Neither can produce a partial restore — PostgreSQL raises an error for both under
+`--single-transaction`, and `ON_ERROR_STOP=1` turns that into a clean rollback.
+
+### Concurrency during a restore
+
+For its whole duration a restore holds the accounting connector-selection advisory lock on a
+dedicated PostgreSQL session, so a connector switch or an orphaned-sync-row cancellation cannot
+interleave with the replay. If the lock cannot be taken within 60 seconds the restore fails
+immediately, having changed nothing, and says another restore or connector change is in progress.
+
+The lock has no expiry: it is released when the restore finishes, not on a timer. If `psql` overruns
+its five-minute ceiling it is killed, its database backend is terminated from the lock-holding
+session, and only then is the lock released — so "the restore has stopped writing" is observed
+rather than assumed. The lock is bound to the holder's session, so a dropped connection or a
+database restart still releases it while `psql` runs on. Nothing else covers that window: see
+"What maintenance mode does and does not stop" below.
+
+The backend is identified by `(pid, backend_start)`, captured from `pg_stat_activity` immediately
+after `psql` is spawned and **before any of the dump is streamed to it**. Neither value can be
+changed by SQL, so a dump that sets its own `application_name` cannot make itself invisible to the
+termination check. If the backend cannot be identified in that window — it never appears, or two
+sessions answer to the same name — the restore is refused before a single byte is replayed, so
+nothing has been changed.
+
+### What maintenance mode does and does not stop
+
+A restore enables maintenance mode for its duration. Maintenance mode is **not an application-wide
+write fence**. It is consulted by:
+
+- the scheduled-job endpoints under `/api/cron/*`,
+- the WooCommerce webhook entry point, and
+- the Mintsoft ASN booked-in webhook.
+
+It is **not** consulted by interactive server actions, by the ShipHero webhook route, by the
+accounting OAuth callback, by any other API route, or by anything holding a direct database
+connection. Ordinary dashboard writes continue during a restore.
+
+#### Warehouse callbacks refused during the window
+
+A booked-in callback that arrives while maintenance mode is on gets a `503` with `Retry-After: 300`
+and **no row is written** — the fence runs before the signature is verified, and anything written
+into the window is being replayed over. Recovery is by re-checking the ASNs afterwards, which
+reconstructs the trigger and applies only what is still outstanding (an ASN with nothing owed books
+nothing in):
+
+- **Automatically.** Ending a maintenance window stamps `wms_booked_in_recheck_due_since`, and the
+  Mintsoft webhook sweeper (every five minutes, enabled by default) drains that stamp by re-checking
+  every open ASN — purchase-order and stock-transfer alike.
+- **On demand.** *Sync → Exceptions → Maintenance window → Run the re-check now*, for an
+  installation whose sweeper cron is disabled or whose scheduler is down. It refuses while
+  maintenance mode is still on, because a re-check issued into the window is stopped at the same
+  gate the callbacks were.
+- **Per ASN.** The **Re-check** button on the ASN table of the purchase order or the stock transfer.
+
+A re-check pass **stops if a restore starts while it is running.** The gate is re-read before the
+pass, before each ASN, and again — under a row lock, together with "is this still the marker we
+drained" — before the stamp is cleared. A pass stopped that way keeps the stamp and reports
+`window_reopened`, so the next tick after the window closes repeats it; a stamp that a *newer*
+window restamped mid-pass is left alone (`recheck_marker_moved`) because that window is owed a
+re-check this pass established nothing about. Being told "0 attempted" is never ambiguous: a refusal
+is always named.
+
+#### When a restore times out and the backend cannot be confirmed gone
+
+The endpoint keeps the connector-selection lock rather than releasing it, leaves maintenance mode on,
+and records a **maintenance hold** naming the backend's pid and `backend_start`. The hold appears in
+*Sync → Exceptions → Maintenance window* and in the exception count on the Integrations page.
+Recovery, in this order:
+
+1. **Take the application out of service.** Interactive writes are not fenced by anything, and this
+   is the only way to stop them.
+2. Check `pg_stat_activity` for the pid and `backend_start` named in the hold, and
+   `pg_terminate_backend` it if it is still there.
+3. **Only then restart.** Restarting earlier drops the lock-holding session, which releases the
+   advisory lock while the restore backend may still be replaying.
+4. **End the hold from the exception inbox.** It re-reads the flag and the hold record under a row
+   lock, re-checks that the named backend is gone from `pg_stat_activity` at that moment, and
+   refuses — naming which precondition failed — if any of them has moved. Ending it there also
+   stamps the booked-in re-check described above.
+
+The action ends **the hold the page showed you**, not whichever hold happens to be recorded when the
+click lands. The button carries the record's pid, `backend_start` and `heldAt`, and the transition
+refuses with *hold_superseded* if the row under the lock is a different restore's — reload the inbox
+and read the new hold before ending it. A **starting restore deletes any hold recorded by the
+previous window**, in the same transaction that turns the flag on, so a second restore beginning
+between the render and the click turns the click into *no_hold_recorded* (the refusal that means "a
+restore is still running") rather than into an unfenced database.
+
+Do **not** clear the `system_maintenance_mode` row by hand. It ends the window without scheduling the
+re-check, so any callbacks refused during it are left to the WMS watchdog's days-scale alert. The
+inbox action is the supported clear; the raw row exists only as a fallback if the hold record was
+lost with the restore's rollback, in which case use the per-ASN **Re-check** button.
+
+The backend check proves the restore backend has **detached**, not that the application is quiet —
+step 1 is still yours.
+
 Denied restore attempts are written to the activity log as `WARNING` entries with action `backup_restore_denied` and a machine-readable `metadata.reason`, such as `production_restore_disabled`, `production_upload_restore_disabled`, or `cross_origin_restore_request`.
 
 ## Remote Storage

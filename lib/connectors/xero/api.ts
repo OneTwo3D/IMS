@@ -2,11 +2,31 @@
  * Xero HTTP client with automatic token refresh and rate-limit handling.
  */
 
-import { getAccessToken } from './auth'
+import { getAccessToken, getStoredTenantBlockReason } from './auth'
 import { connectorFetch } from '@/lib/security/connector-fetch'
+import { accountingPostingIntentRefusal } from '@/lib/connectors/accounting-posting-intent'
+import { accountingEgressRefusal } from '@/lib/connectors/accounting-egress-authorization'
+import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
-const XERO_MAX_RETRIES = 3
+const XERO_CONNECTOR = 'xero'
+
+/**
+ * The status `performRequest` reports when it REFUSED TO SEND (o3d-gfh / Codex r1 finding 3, and
+ * o3d-k26m.5 r6 — both refusals report it).
+ *
+ * Zero, and deliberately not an HTTP code: nothing was sent, so there is no HTTP status to report,
+ * and borrowing one (403, 409) would make the row's errorMessage claim Xero answered when Xero was
+ * never asked. It matches the `status: 0` that `notConnectedResponse` already uses for the same
+ * reason, so "0 means nothing left this process" is one rule across the module rather than two.
+ */
+const XERO_NOT_SENT_STATUS = 0
+
+/**
+ * In-request 429 retries. Exported because it is half of the only retry Xero's six-minute
+ * Idempotency-Key window actually covers — see lib/domain/accounting/idempotency-retention.ts.
+ */
+export const XERO_MAX_RETRIES = 3
 const XERO_MINUTE_LIMIT = 55 // Xero's is 60/min, rolling
 
 /**
@@ -32,7 +52,27 @@ const XERO_DAY_LIMIT = 950
  * the caller defer the work (the outbox already re-queues with backoff), because a job that
  * returns is one an operator can see (o3d-2it).
  */
-const XERO_MAX_RETRY_AFTER_MS = 90_000
+export const XERO_MAX_RETRY_AFTER_MS = 90_000
+
+/**
+ * THE IN-REQUEST RETRY BUDGET, AND WHY IT IS THE IDEMPOTENCY WINDOW (o3d-wahn r3 #4).
+ *
+ * `idempotency-retention.ts` says the in-request 429 loop is the one retry Xero's Idempotency-Key
+ * still covers, and round 2 "proved" it by multiplying XERO_MAX_RETRIES by XERO_MAX_RETRY_AFTER_MS:
+ * 3 x 90s = 4m30s, inside six minutes. THAT PRODUCT IS NOT THE LOOP. `performRequest` also awaits
+ * `waitForBudget` before EVERY attempt, and a minute-limit wait there sleeps up to 60s — so the real
+ * worst case between the first HTTP call and the last is 3 x 90s of Retry-After plus 3 x 60s of
+ * minute-limit waiting = 7m30s, comfortably OUTSIDE the window the comment claimed it was inside.
+ *
+ * Rather than correct the prose down to "usually inside", the loop now ENFORCES the bound: no wait is
+ * taken that would put the next attempt past this budget, measured from the first HTTP call, which is
+ * where Xero starts the key's clock. Past it the call hands back a 429 and the outbox defers the work
+ * — which is strictly better than blocking a cron for another minute to send a header Xero has
+ * forgotten. `tests/accounting/idempotency-retention.test.ts` drives the real loop and measures the
+ * gap between first and last attempt, so the claim is a measurement rather than an arithmetic
+ * coincidence between two constants.
+ */
+export const XERO_IN_REQUEST_RETRY_BUDGET_MS = XERO_IDEMPOTENCY_KEY_RETENTION_MS
 
 const minuteBuckets = new Map<string, number[]>()
 const dayBuckets = new Map<string, number[]>()
@@ -52,6 +92,36 @@ export type XeroResponse<T = unknown> = {
   status: number
   data?: T
   error?: string
+  /**
+   * The Xero organisation this request was actually ADDRESSED TO — the tenantId that went out in the
+   * `Xero-Tenant-Id` header, resolved BEFORE the request was made (o3d-gfh, o3d-s36z).
+   *
+   * WHY THE RESPONSE CARRIES IT. Everything that caches an id Xero issued used to answer "which
+   * organisation issued this?" by asking the database AFTER the call returned
+   * (`activeAccountingIdProvenance`). That is a resample, not a record: a disconnect and reconnect to a
+   * different organisation landing during the in-flight call — and rate-limit retries widen that window
+   * to tens of seconds — stamps the NEW organisation onto an id the OLD one issued, and the exact-match
+   * guard then trusts the false provenance for good. o3d-s36z's own list of what a next attempt must do
+   * differently leads with "issuer identity must be established BEFORE the remote call can corrupt
+   * anything, not observed during it"; this is that, and it costs nothing because the auth was already
+   * resolved to build the request.
+   *
+   * `undefined` ONLY when no request was made (not connected / blocked token). A caller that treats
+   * undefined as "the current tenant" has reintroduced the resample.
+   *
+   * WHICH ORGANISATION ANSWERED (o3d-k26m.5 r7, finding 2).
+   *
+   * A Xero response is only evidence about the ledger it came from, and which ledger that is is
+   * decided per call by `getAccessToken()` — a reconnect, a tenant re-pin or a refresh that lands
+   * elsewhere all change it between one call and the next. A caller that holds an answer across a
+   * later WRITE therefore has to be able to say which organisation the answer is about; the
+   * invoice-number fence does exactly that, and without this field its "nobody holds this number"
+   * was an unattributed sentence that any organisation could be made to satisfy.
+   *
+   * Undefined only where no tenant was ever resolved — a disconnected call, which is already a
+   * failure. Present on failures too, deliberately: a failed read is still a fact about one org.
+   */
+  tenantId?: string
 }
 
 function sleep(ms: number) {
@@ -77,8 +147,30 @@ function pushRequestTimestamp(bucket: Map<string, number[]>, key: string, now: n
  * the local bucket ever filled, so the day branch was dead code. Correcting the limit to 950
  * makes it live, so it has to report exhaustion instead of sleeping on it. Callers turn this
  * into a 429 and let the outbox defer with backoff.
+ *
+ * EXPORTED so its refusal can be driven directly (o3d-wahn r3 #4). This minute-limit sleep is the
+ * third wait in `performRequest` and the one round 2's `MAX_RETRIES x MAX_RETRY_AFTER` arithmetic
+ * left out; a test that cannot reach it cannot prove the budget covers it.
  */
-async function waitForBudget(tenantId: string): Promise<{ ok: true } | { ok: false; waitMs: number }> {
+export async function waitForBudget(
+  tenantId: string,
+  /**
+   * The most this may sleep in total. Not a nicety: the minute-limit wait is the third sleep in the
+   * retry loop and the one round 2's arithmetic forgot, so it has to answer to the same budget as the
+   * Retry-After sleeps do (o3d-wahn r3 #4). Infinity before the first HTTP call, when no key clock is
+   * running yet.
+   */
+  budgetMs: number = Number.POSITIVE_INFINITY,
+): Promise<{ ok: true } | { ok: false; reason: 'day' | 'budget'; waitMs: number }> {
+  /**
+   * AN ABSOLUTE DEADLINE, NOT A RUNNING TOTAL OF INTENDED SLEEPS (o3d-xl63 r5 #3).
+   *
+   * The previous shape accumulated `sleptMs += minuteWait` — the sleep it ASKED for, not the one it
+   * got. `setTimeout` is a floor, not a promise: an event loop busy with another tenant's response
+   * wakes this one late, and every millisecond of that overrun was invisible to the budget. Reading
+   * the real clock each time round makes an overslept timer cost what it actually cost.
+   */
+  const deadlineAt = Number.isFinite(budgetMs) ? Date.now() + budgetMs : Number.POSITIVE_INFINITY
   while (true) {
     const now = Date.now()
     const minute = (minuteBuckets.get(tenantId) ?? []).filter((ts) => ts >= now - 60_000)
@@ -88,11 +180,20 @@ async function waitForBudget(tenantId: string): Promise<{ ok: true } | { ok: fal
 
     // Day first: no amount of waiting inside this request will fix it.
     if (day.length >= XERO_DAY_LIMIT) {
-      return { ok: false, waitMs: 86_400_000 - (now - day[0]) }
+      return { ok: false, reason: 'day', waitMs: 86_400_000 - (now - day[0]) }
     }
 
     const minuteWait = minute.length >= XERO_MINUTE_LIMIT ? 60_000 - (now - minute[0]) : 0
     if (minuteWait <= 0) return { ok: true }
+    /**
+     * REFUSED AT EQUALITY, because equality is already outside (o3d-xl63 r5 #3).
+     *
+     * `>` let a sleep land the next attempt on the deadline exactly. Six minutes is not the last
+     * instant the key is good for — `isWithinXeroIdempotencyWindow` is `age < RETENTION`, so an
+     * attempt sent AT six minutes is one the retention predicate itself calls expired. A budget whose
+     * boundary case is the one the rest of the codebase treats as unprotected is not a bound.
+     */
+    if (now + minuteWait >= deadlineAt) return { ok: false, reason: 'budget', waitMs: minuteWait }
     await sleep(minuteWait)
   }
 }
@@ -183,10 +284,66 @@ function parseRetryAfterMs(value: string | null): number {
 
 async function performRequest(auth: { accessToken: string; tenantId: string }, init: RequestInit, url: string) {
   let lastRateLimitMs = 0
+  /**
+   * When Xero started this request's Idempotency-Key clock. Null until the first attempt actually
+   * goes out: waiting for minute budget BEFORE the first call costs nothing from the window, because
+   * the key has not been sent yet.
+   */
+  let firstCallAt: number | null = null
+  /** What is left of XERO_IN_REQUEST_RETRY_BUDGET_MS, from the first call. */
+  const budgetRemainingMs = () =>
+    firstCallAt === null ? Number.POSITIVE_INFINITY : XERO_IN_REQUEST_RETRY_BUDGET_MS - (Date.now() - firstCallAt)
+  const outOfBudgetResponse = (waitMs: number, elapsedMs: number) => ({
+    ok: false,
+    status: 429,
+    text: async () =>
+      `Rate limited; the next in-request retry would wait ${Math.round(waitMs / 1000)}s, which puts it ` +
+      `past the ${XERO_IN_REQUEST_RETRY_BUDGET_MS / 1000}s Xero remembers an Idempotency-Key for ` +
+      `(${Math.round(elapsedMs / 1000)}s already spent on this call). Not waiting — the work must be ` +
+      `deferred, where the local record of the external id is what prevents a duplicate.`,
+  } as Response)
+  /**
+   * THE ATTEMPT THAT WAS ABOUT TO GO OUT AT OR PAST THE LINE (o3d-xl63 r5 #3).
+   *
+   * Distinct from the refusal above, and it has to be: that one is decided BEFORE a wait, from the
+   * wait's intended length. This one is decided AFTER every await, from the clock — the case where the
+   * waits were each individually affordable and the elapsed total still reached the deadline, whether
+   * by an exact-boundary sleep or by a timer that woke late. Its own message, so a test can tell which
+   * of the two refused and an operator can tell which bound was hit.
+   */
+  const budgetSpentResponse = (elapsedMs: number) => ({
+    ok: false,
+    status: 429,
+    text: async () =>
+      `Rate limited; the ${XERO_IN_REQUEST_RETRY_BUDGET_MS / 1000}s Xero remembers an Idempotency-Key ` +
+      `for was ALREADY SPENT (${Math.round(elapsedMs / 1000)}s) at the moment this attempt was about to ` +
+      `be sent, so it was not sent. At or past that line Xero treats the key as a new request, which is ` +
+      `exactly how a retry becomes a second document. The work must be deferred, where the local record ` +
+      `of the external id is what prevents a duplicate.`,
+  } as Response)
+
+  // THE ONE PLACE the queued row's connection is authorised, and the last statement before anything
+  // leaves this process (o3d-gfh, Codex r1 finding 3).
+  //
+  // Here rather than at the top of `processEntry` because `auth.tenantId` is the string that goes into
+  // this request's own `Xero-Tenant-Id` header: the value checked and the value used are one object, so
+  // no rebinding can land between them. The processor's earlier read of the token row was a SECOND,
+  // independent selection of the same thing, and a check at T1 says nothing about a request sent at T2.
+  //
+  // Every Xero egress in this file funnels through here — xeroFetchWithAuth, xeroGetRaw and
+  // xeroUploadAttachment all call it — so there is no arm left to forget it. Evaluated once rather than
+  // per retry attempt on purpose: `auth` is fixed for the whole call, so the verdict cannot change
+  // across the retry loop, and re-asking would be a second evaluation of a settled permission.
+  const intentRefusal = accountingPostingIntentRefusal(XERO_CONNECTOR, auth.tenantId)
+  if (intentRefusal) {
+    return { ok: false, status: XERO_NOT_SENT_STATUS, text: async () => intentRefusal } as Response
+  }
 
   for (let attempt = 0; attempt <= XERO_MAX_RETRIES; attempt++) {
-    const budget = await waitForBudget(auth.tenantId)
+    const remainingBeforeCall = budgetRemainingMs()
+    const budget = await waitForBudget(auth.tenantId, remainingBeforeCall)
     if (!budget.ok) {
+      if (budget.reason === 'budget') return outOfBudgetResponse(budget.waitMs, XERO_IN_REQUEST_RETRY_BUDGET_MS - remainingBeforeCall)
       return {
         ok: false,
         status: 429,
@@ -196,7 +353,54 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
           `the work must be deferred. (Xero's real cap is 1,000/org/rolling-24h since 2026-03-02.)`,
       } as Response
     }
+
+    // THE LAST STATEMENT BEFORE THE SOCKET, AND THE ONE PLACE ANY PRE-EGRESS PERMISSION IS SPENT
+    // (o3d-k26m.5 r6).
+    //
+    // INSIDE THE LOOP, AND AFTER `waitForBudget`, ON PURPOSE. Everything above this line can block:
+    // the budget wait sleeps until the tenant's minute window clears, and a 429 sleeps up to
+    // XERO_MAX_RETRY_AFTER_MS before coming back round. A permission evaluated before the loop would
+    // be spent on an attempt that leaves minutes later — which is the same "true when taken, false
+    // when spent" defect one layer down, and is exactly why "immediately before `xeroPost`" was not
+    // immediately before the write. See accounting-egress-authorization.ts for why per-attempt rather
+    // than per-call, and for how the sibling branch's tenant verdict collapses into this same call.
+    //
+    // BEFORE `noteRequest` because a refusal consumes no Xero budget: nothing is sent, so nothing may
+    // be counted against the rolling day cap. Nothing between here and `connectorFetch` awaits.
+    //
+    // AND IT IS ASKED ABOUT THIS REQUEST, NOT ABOUT REQUESTS IN GENERAL (r7, finding 2). `auth` is the
+    // resolution this very request was built from — `init.headers['Xero-Tenant-Id']` is that same
+    // string — so an authorisation holding an answer obtained from some earlier call can compare the
+    // organisation it asked against the organisation about to be written to, here, with no second
+    // token resolution able to intervene. That comparison used to be impossible to make correctly at
+    // any other point, so it was not made at all.
+    const egressRefusal = await accountingEgressRefusal(XERO_CONNECTOR, { tenantId: auth.tenantId })
+    if (egressRefusal) {
+      return { ok: false, status: XERO_NOT_SENT_STATUS, text: async () => egressRefusal } as Response
+    }
+
+    /**
+     * RE-READ THE CLOCK BEFORE THE REQUEST GOES OUT, NOT BEFORE THE WAIT (o3d-xl63 r5 #3).
+     *
+     * `waitForBudget` decides from the wait it is ABOUT to take; between that decision and this line
+     * lies the wait itself, and at the bottom of the loop a Retry-After sleep. Both can overrun, and
+     * an exact-boundary wait lands here precisely ON the deadline. Deciding again HERE — from
+     * `Date.now()`, immediately before `noteRequest` records an attempt and `connectorFetch` sends
+     * one — is the only check that sees what actually elapsed. Strict: at the line the key is already
+     * expired as far as `isWithinXeroIdempotencyWindow` is concerned.
+     *
+     * AFTER the egress refusal above, and that order is the one that satisfies BOTH rules. This read
+     * is SYNCHRONOUS, so placing it second leaves the egress check's "nothing between here and
+     * `connectorFetch` awaits" true, while placing it first would put that check's `await` between
+     * this clock reading and the send — the very gap this re-read exists to eliminate.
+     */
+    const remainingAtSend = budgetRemainingMs()
+    if (remainingAtSend <= 0) {
+      return budgetSpentResponse(XERO_IN_REQUEST_RETRY_BUDGET_MS - remainingAtSend)
+    }
+
     noteRequest(auth.tenantId)
+    firstCallAt ??= Date.now()
 
     const res = await connectorFetch(url, init, { connectorName: 'Xero' })
     noteLimitHeaders(auth.tenantId, res)
@@ -207,6 +411,20 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     // Give up rather than sleep out a daily limit. Retry-After is measured in seconds for the
     // minute limit and in HOURS for the daily one; waiting out the latter hangs this request
     // (and its cron) with nothing to show for it. Hand the 429 back and let the caller defer.
+    // The wait must fit the window as well as the per-sleep cap: a retry sent after Xero has forgotten
+    // the key is a NEW request to Xero, so blocking a cron for it buys nothing (o3d-wahn r3 #4).
+    //
+    // THIS HALF IS DEFENSIVE AT TODAY'S CONSTANTS and says so rather than pretending to be load-bearing:
+    // XERO_MAX_RETRIES x XERO_MAX_RETRY_AFTER_MS is 270s, inside the 360s budget, so the Retry-After
+    // sleeps alone cannot exhaust it — only the minute-limit waits above can, which is why THEY are
+    // what the tests drive. It exists so that raising either constant cannot silently reintroduce the
+    // overrun; the test pins that relationship so the day it stops holding, this becomes live.
+    const remaining = budgetRemainingMs()
+    // `>=`, not `>` (r5 #3): a sleep exactly as long as what is left lands the next attempt ON the
+    // deadline, which the retention predicate already calls expired.
+    if (lastRateLimitMs >= remaining && attempt !== XERO_MAX_RETRIES) {
+      return outOfBudgetResponse(lastRateLimitMs, XERO_IN_REQUEST_RETRY_BUDGET_MS - remaining)
+    }
     if (lastRateLimitMs > XERO_MAX_RETRY_AFTER_MS || attempt === XERO_MAX_RETRIES) {
       return {
         ok: false,
@@ -242,6 +460,16 @@ export function formatIfModifiedSince(value: Date | string): string {
   return date.toISOString().slice(0, 19)
 }
 
+/**
+ * "Not connected to Xero" is the truth but rarely the whole of it: when the stored connection has been
+ * refused by the XERO_ALLOWED_TENANT_IDS/_NAMES allow-list (o3d-9tbz) the operator needs to know THAT,
+ * or they go looking for a lost token. Only consulted on the already-failing path.
+ */
+async function notConnectedResponse<T = unknown>(): Promise<XeroResponse<T>> {
+  const blocked = await getStoredTenantBlockReason().catch(() => null)
+  return { ok: false, status: 0, error: blocked ?? 'Not connected to Xero' }
+}
+
 async function xeroFetch<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
@@ -249,7 +477,7 @@ async function xeroFetch<T = unknown>(
   opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string },
 ): Promise<XeroResponse<T>> {
   const auth = await getAccessToken()
-  if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+  if (!auth) return await notConnectedResponse()
   return xeroFetchWithAuth<T>(auth, method, path, body, opts)
 }
 
@@ -289,8 +517,13 @@ async function xeroFetchWithAuth<T = unknown>(
   }
 
   const res = await performRequest(auth, init, url)
+  // Refused before sending. Reported verbatim rather than falling through to the `!res.ok` branch,
+  // which would prefix it with "HTTP 0:" and so describe a reply Xero never made.
+  if (res.status === XERO_NOT_SENT_STATUS) {
+    return { ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text(), tenantId: auth.tenantId }
+  }
   if (res.status === 429) {
-    return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited') }
+    return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited'), tenantId: auth.tenantId }
   }
 
   if (!res.ok) {
@@ -324,11 +557,11 @@ async function xeroFetchWithAuth<T = unknown>(
     } catch {
       errorMessage += ': ' + (rawBody.slice(0, 1000) || 'Unknown error (empty response body)')
     }
-    return { ok: false, status: res.status, error: errorMessage }
+    return { ok: false, status: res.status, error: errorMessage, tenantId: auth.tenantId }
   }
 
   const data = await res.json() as T
-  return { ok: true, status: res.status, data }
+  return { ok: true, status: res.status, data, tenantId: auth.tenantId }
 }
 
 /**
@@ -396,7 +629,7 @@ export async function xeroGetCached<T = unknown>(
   // disconnected — no read from and no write to a 'no-tenant' key, so a disconnected call can neither
   // serve nor create connected data.
   const auth = await getAccessToken()
-  if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+  if (!auth) return await notConnectedResponse()
 
   const key = `${auth.tenantId}:${path}`
   const now = Date.now()
@@ -440,7 +673,7 @@ export async function xeroGetRaw(
   accept: string = 'application/pdf',
 ): Promise<{ ok: boolean; status: number; buffer?: Buffer; error?: string }> {
   const auth = await getAccessToken()
-  if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+  if (!auth) return await notConnectedResponse()
 
   const url = path.startsWith('http') ? path : `${XERO_BASE_URL}/${path}`
 
@@ -452,6 +685,10 @@ export async function xeroGetRaw(
       'Accept': accept,
     },
   }, url)
+
+  if (res.status === XERO_NOT_SENT_STATUS) {
+    return { ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text() }
+  }
 
   if (res.status === 429) {
     return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited') }
@@ -478,7 +715,7 @@ export async function xeroUploadAttachment(
   contentType: string,
 ): Promise<XeroResponse> {
   const auth = await getAccessToken()
-  if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+  if (!auth) return await notConnectedResponse()
 
   const url = `${XERO_BASE_URL}/${endpoint}/${objectId}/Attachments/${encodeURIComponent(filename)}`
 
@@ -492,6 +729,10 @@ export async function xeroUploadAttachment(
     },
     body: new Uint8Array(fileBuffer),
   }, url)
+
+  if (res.status === XERO_NOT_SENT_STATUS) {
+    return { ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text() }
+  }
 
   if (res.status === 429) {
     return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited') }

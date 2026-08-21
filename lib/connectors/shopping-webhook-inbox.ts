@@ -2,6 +2,7 @@ import { createHash } from 'crypto'
 
 import type { Prisma, PrismaClient } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { WEBHOOK_ORIGIN_NOT_APPLICABLE } from '@/lib/connectors/webhook-origin'
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import type { ShoppingWebhookResource } from '@/lib/shopping'
 
@@ -31,6 +32,14 @@ export type ShoppingWebhookEventRow = {
   topic: string | null
   payloadHash: string
   payloadJson: unknown
+  /**
+   * Which STORE sent this delivery, as the delivery itself stated it at receipt (o3d-wgl6):
+   * `store:<host>[/<path>]` / `store-under:<host>/<path>`, or one of the `unproven:*` markers
+   * in lib/connectors/webhook-origin.ts. Never null and never blank — a row that could not
+   * name a store says so explicitly, and says which era failed to name it, including the
+   * column DEFAULT that catches an INSERT from the build running during a deploy.
+   */
+  originAttestation: string
   status: string
   attempts: number
   nextAttemptAt: Date | null
@@ -48,6 +57,13 @@ export type PersistShoppingWebhookEventInput = {
   externalEventId?: string | null
   rawBody: string
   payload: unknown
+  /**
+   * What the delivery said about the store that sent it (o3d-wgl6). Supplied by the
+   * connector's webhook handler, because only it knows where its deliveries carry that.
+   * Omitted means this connector has no store identity in its deliveries at all, which is
+   * recorded as WEBHOOK_ORIGIN_NOT_APPLICABLE — a positive statement, not a blank.
+   */
+  originAttestation?: string
 }
 
 export type PersistWcWebhookEventInput = PersistShoppingWebhookEventInput
@@ -98,6 +114,7 @@ const eventSelect = {
   topic: true,
   payloadHash: true,
   payloadJson: true,
+  originAttestation: true,
   status: true,
   attempts: true,
   nextAttemptAt: true,
@@ -173,6 +190,7 @@ export function createShoppingWebhookEventRepository(
           topic: input.topic,
           payloadHash: input.payloadHash,
           payloadJson: input.payload as Prisma.InputJsonValue,
+          originAttestation: input.originAttestation ?? WEBHOOK_ORIGIN_NOT_APPLICABLE,
           status: WC_WEBHOOK_EVENT_STATUS.pending,
           attempts: 0,
           nextAttemptAt: null,
@@ -239,6 +257,7 @@ export function createShoppingWebhookEventRepository(
           "topic",
           "payloadHash",
           "payloadJson",
+          "originAttestation",
           "status",
           "attempts",
           "nextAttemptAt",

@@ -56,6 +56,29 @@ test('a REJECTED payment is a discrepancy, and names the reason', () => {
   assert.match(v.detail, /still shows the amount outstanding/)
 })
 
+test('a rejection that NAMES a payment points at that payment, not at an outstanding balance', () => {
+  // The processor calls the ledger before it writes the result down, so a FAILED row carrying a
+  // document id is a failure recorded in front of a payment that exists. Telling an operator the
+  // ledger "still shows the amount outstanding" over one of those is how a second payment gets
+  // registered — making the sentence true twice over.
+  const v = settlementStatus({
+    ...base,
+    payment: row({ status: 'FAILED', externalTransactionId: 'PAY-9', errorMessage: 'socket hang up' }),
+  })
+  assert.equal(v.status, 'LEDGER_REJECTED')
+  assert.equal(v.discrepancy, true, 'IMS\'s own record is unresolved either way')
+  assert.match(v.detail, /PAY-9/)
+  assert.match(v.detail, /before registering another/)
+  assert.ok(!/still shows the amount outstanding/.test(v.detail), 'which is exactly what nobody knows here')
+})
+
+test('a rejection with no reference still warns that a failure is not proof', () => {
+  const v = settlementStatus({ ...base, payment: row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'rejected' }) })
+  assert.equal(v.status, 'LEDGER_REJECTED')
+  assert.match(v.detail, /names no payment reference/)
+  assert.match(v.detail, /called before the result is written down/)
+})
+
 test('a payment that was never queued is the QUIETEST failure, and still a discrepancy', () => {
   // addPayment records a manual sales receipt without queueing an INVOICE_PAYMENT at all, and
   // markBillPaid swallows a queue error. Either way there is no FAILED row to notice — the absence is
@@ -251,20 +274,28 @@ test('a tax-exclusive invoice posts at the order total', () => {
   }
 })
 
-test('an IMPORTED tax-inclusive invoice posts at the NET total (o3d-cyn), which is what a payment must match', () => {
-  // Not a claim that net is correct — o3d-cyn is the defect that builds it that way. But a payment that
-  // matches the invoice IMS really posted is not a SETTLEMENT fault, and reporting it as one would send
-  // an operator to the payment when the invoice is what is wrong.
-  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, importedFromShop: true }), 100)
-  const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows([row({ amount: 100 })])!, totalForeign: 100 })
+test('an IMPORTED tax-inclusive invoice now posts at GROSS too, so the receipt it must match is the gross one (o3d-cyn)', () => {
+  // This used to answer 100 — the net total, because the importer sent Woo's ex-tax amounts flagged
+  // tax-inclusive and Xero extracted the VAT back out of them. The importer now sends every component
+  // ex-tax on both conventions and Xero adds the tax, so the invoice totals to the order's 120 and a
+  // gross receipt of 120 settles it exactly. Answering 100 here would refuse that ordinary receipt as
+  // an over-payment.
+  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, importedFromShop: true }), 120)
+  const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows([row({ amount: 120 })])!, totalForeign: 120 })
   assert.equal(v.status, 'SETTLED')
 })
 
-test('a tax-inclusive order raised IN IMS posts at GROSS — the receipt it must match is the gross one', () => {
-  // queueSalesInvoiceSync sends the gross unit prices (and grosses shipping up) before flagging them
-  // inclusive, so o3d-cyn does not touch this path. Keying on pricesIncludeVat alone understated the
-  // invoice, and the over-pay guard then refused every ordinary VAT receipt it exists to allow.
+test('a tax-inclusive order raised IN IMS posts at GROSS — unchanged, and now the same rule as an import', () => {
+  // queueSalesInvoiceForOrder sends the gross unit prices (and grosses shipping up) before flagging them
+  // inclusive. Keying on pricesIncludeVat alone understated the invoice, and the over-pay guard then
+  // refused every ordinary VAT receipt it exists to allow.
   assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, importedFromShop: false }), 120)
+})
+
+test('a PART-registered receipt is still measured against the ledger total, not waved through', () => {
+  // The collapse must not have turned the comparison off: 60 of a 120 invoice is still a part payment.
+  const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows([row({ amount: 60 })])!, totalForeign: 120 })
+  assert.equal(v.status, 'PARTIALLY_SETTLED')
 })
 
 // ---------------------------------------------------------------------------
@@ -288,12 +319,55 @@ test('a payment still on its way also counts as the ledger holding it', () => {
   }
 })
 
-test('a rejected or cancelled payment leaves an unclaimed order genuinely unpaid', () => {
-  for (const status of ['FAILED', 'CANCELLED'] as const) {
-    const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status, externalTransactionId: null }) })
-    assert.equal(v.status, 'UNPAID', status)
-    assert.equal(v.discrepancy, false, status)
-  }
+test('a CANCELLED payment leaves an unclaimed order genuinely unpaid', () => {
+  // CANCELLED keeps its old reading, and the distinction from FAILED below is the entire point:
+  // CANCELLED is the one status IMS only ever writes where "nothing stands in the ledger" has
+  // ALREADY been established — a queued row retired before any call was made, or a registration
+  // retired after Xero was asked and answered DELETED. Nothing is unknown about it.
+  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'CANCELLED', externalTransactionId: null }) })
+  assert.equal(v.status, 'UNPAID')
+  assert.equal(v.discrepancy, false)
+})
+
+test('an ATTEMPT nobody can speak for is not "unpaid" — it is undecided, and it is a discrepancy', () => {
+  // THE ERASURE. This case used to return a flat, undiscrepant UNPAID: the verdict had two answers
+  // for the ledger — holds / does not hold — and a FAILED row naming no document satisfied neither,
+  // so it fell into "does not hold". deletePayment gained a third answer for exactly this row (it
+  // REFUSES to delete a receipt over it, because the ledger is called before the result is written
+  // down and a lost response is recorded as a failure in front of a real payment) while the verdict
+  // went on painting the same order as needing no attention. Two modules, opposite readings, and the
+  // one on screen was the permissive one.
+  const v = settlementStatus({
+    ...base,
+    paidLocally: false,
+    payment: row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'socket hang up' }),
+  })
+  assert.equal(v.status, 'LEDGER_UNDECIDED')
+  assert.equal(v.discrepancy, true, 'the alarm this branch exists to raise must be raised for it')
+  assert.match(v.detail, /ATTEMPTED/)
+  assert.match(v.detail, /socket hang up/)
+  // It must claim NEITHER of the two things nobody knows.
+  assert.ok(!/never told|never learn/.test(v.detail), 'it must not say nothing was sent')
+  assert.ok(!/shows it settled/.test(v.detail), 'nor that the ledger holds a payment')
+})
+
+test('a FAILED row that NAMES a document is a ledger hold even on the unpaid side', () => {
+  // Post evidence outranks status, which the hand-written status list on this side could not express:
+  // it read every FAILED row as holding nothing, so a payment that reached Xero and then failed its
+  // writeback showed as an ordinary unpaid order. That is the o3d-ju8t reading, and it was still here.
+  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'FAILED', externalTransactionId: 'PAY-9' }) })
+  assert.equal(v.status, 'LEDGER_UNMATCHED')
+  assert.equal(v.discrepancy, true)
+  assert.match(v.detail, /PAY-9/)
+})
+
+test('a CANCELLED row that still names the payment it reversed does NOT alarm for ever', () => {
+  // The one place post evidence is deliberately outranked. A verified reversal writes CANCELLED and
+  // KEEPS the document id, precisely so the row remains a complete account of a payment that existed
+  // and was undone — so reading that id as a live hold would turn the fix into a permanent alarm.
+  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'CANCELLED', externalTransactionId: 'PAY-9' }) })
+  assert.equal(v.status, 'UNPAID')
+  assert.equal(v.discrepancy, false)
 })
 
 test('an order with no payment at all is simply unpaid', () => {
@@ -368,4 +442,107 @@ test('an exact settlement inside the rounding tolerance is still settled', () =>
   const v = settlementStatus({ ...base, payment: row({ externalTransactionId: 'PAY-1', amount: 100.004 }), totalForeign: 100 })
   assert.equal(v.status, 'SETTLED')
   assert.equal(v.discrepancy, false)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-nf9i r3, Codex finding 1 — AN OPERATOR ASSERTION IS NOT A LEDGER CONFIRMATION.
+//
+// settleAccountingSyncRow lets a human record "this DID post, here is the document id". That writes
+// status=SYNCED + externalTransactionId, which is byte-identical to what the connector's own
+// writeback produces after a real, successful call. The verdict below is the money-path reader of
+// that column pair, and it used to compare `p.amount` (what IMS INTENDED to send) against the
+// document total and return a green SETTLED when the two agreed.
+//
+// On an asserted row those two numbers agreeing proves only that the assertion is self-consistent.
+// Xero accepts a payment smaller than the invoice as a PART payment and hands back a perfectly valid
+// payment id, so the asserted id can name a part payment while IMS's local figures match exactly.
+// The comparison is monetary-only, and a monetary-only comparison on an unverified basis must FAIL
+// CLOSED — which is what the basis marker is for.
+// ---------------------------------------------------------------------------
+
+test('an operator-asserted payment whose amount MATCHES the total is NOT settled — it is ASSERTED_UNVERIFIED', () => {
+  // The fixture can reach the defect: this is exactly the shape the settlement action writes on a
+  // POSTED assertion (SYNCED, an id, and the payload amount the row was queued with), and 100 === 100
+  // is the branch that returned `SETTLED, discrepancy: false` before the basis was read.
+  const v = settlementStatus({
+    ...base,
+    payment: row({ amount: 100, settlementBasis: 'OPERATOR_ASSERTION' }),
+    totalForeign: 100,
+  })
+  assert.equal(v.status, 'ASSERTED_UNVERIFIED')
+  assert.equal(v.basis, 'OPERATOR_ASSERTION')
+  assert.equal(v.discrepancy, true)
+  assert.match(v.detail, /never made the call/)
+  assert.match(v.detail, /PAY-1/)
+  // The remedy is nameable and an operator can perform it — no refusal may be a dead end.
+  assert.match(v.detail, /confirm its amount against the/)
+})
+
+test('the SAME row with the connector as its basis is still SETTLED — the guard is the basis, not the amount', () => {
+  // The other half of the pair: identical figures, identical id, only the basis differs. Without
+  // this, "fail closed" could be satisfied by breaking full settlement for everybody.
+  const v = settlementStatus({ ...base, payment: row({ amount: 100 }), totalForeign: 100 })
+  assert.equal(v.status, 'SETTLED')
+  assert.equal(v.basis, 'LEDGER_CONFIRMED')
+  assert.equal(v.discrepancy, false)
+})
+
+test('a part payment the CONNECTOR posted is still reported on its figures, not swallowed by the basis check', () => {
+  const v = settlementStatus({ ...base, payment: row({ amount: 1 }), totalForeign: 1000 })
+  assert.equal(v.status, 'PARTIALLY_SETTLED')
+  assert.equal(v.basis, 'LEDGER_CONFIRMED')
+  assert.match(v.detail, /PART payment of 1 against a total of 1000/)
+})
+
+test('one ASSERTED leg among several makes the whole aggregate unverified — the marker survives aggregation', () => {
+  // Reachable: a sales order carries several INVOICE_PAYMENT rows (part payments, a manual receipt on
+  // top of an imported one). aggregatePaymentSyncRows reduces them to ONE row, and dropping the basis
+  // there would have re-laundered the assertion one function further along — the aggregate would have
+  // arrived at settlementStatus looking connector-confirmed.
+  const aggregate = aggregatePaymentSyncRows([
+    { status: 'SYNCED', externalTransactionId: 'PAY-2', amount: 60, settlementBasis: 'OPERATOR_ASSERTION' },
+    { status: 'SYNCED', externalTransactionId: 'PAY-1', amount: 40 },
+  ])
+  assert.ok(aggregate)
+  assert.equal(aggregate.settlementBasis, 'OPERATOR_ASSERTION')
+  assert.equal(aggregate.amount, 100)
+  const v = settlementStatus({ ...base, payment: aggregate, totalForeign: 100 })
+  assert.equal(v.status, 'ASSERTED_UNVERIFIED')
+  assert.equal(v.basis, 'OPERATOR_ASSERTION')
+})
+
+test('an aggregate of purely connector-confirmed legs carries NO assertion basis', () => {
+  const aggregate = aggregatePaymentSyncRows([
+    { status: 'SYNCED', externalTransactionId: 'PAY-2', amount: 60 },
+    { status: 'SYNCED', externalTransactionId: 'PAY-1', amount: 40 },
+  ])
+  assert.ok(aggregate)
+  assert.equal(aggregate.settlementBasis, null)
+  assert.equal(settlementStatus({ ...base, payment: aggregate, totalForeign: 100 }).status, 'SETTLED')
+})
+
+test('an asserted payment against a document IMS does NOT show as paid names the assertion, not the ledger', () => {
+  // The disagreement pointing the other way. Before the basis was carried, this told the operator the
+  // ledger held a payment — when all that exists is a colleague's statement that it does.
+  const v = settlementStatus({
+    paidLocally: false,
+    syncEnabled: true,
+    documentPosted: true,
+    payment: row({ amount: 100, settlementBasis: 'OPERATOR_ASSERTION' }),
+    totalForeign: 100,
+  })
+  assert.equal(v.status, 'LEDGER_UNMATCHED')
+  assert.equal(v.basis, 'OPERATOR_ASSERTION')
+  assert.match(v.detail, /OPERATOR ASSERTION, not something the ledger confirmed/)
+})
+
+test('an asserted SYNCED row with no document id is still the unverifiable case, and says which basis', () => {
+  const v = settlementStatus({
+    ...base,
+    payment: row({ externalTransactionId: null, amount: 100, settlementBasis: 'OPERATOR_ASSERTION' }),
+    totalForeign: 100,
+  })
+  assert.equal(v.status, 'AWAITING_LEDGER')
+  assert.equal(v.basis, 'OPERATOR_ASSERTION')
+  assert.equal(v.discrepancy, true)
 })

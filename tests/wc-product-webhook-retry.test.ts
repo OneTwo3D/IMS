@@ -31,7 +31,14 @@ mock.module('@/lib/connectors/woocommerce/sync/stock-sync-jobs', {
 mock.module('@/lib/db', {
   namedExports: {
     db: {
-      setting: { upsert: async (args: unknown) => { upsertCalls.push(args) } },
+      setting: {
+        // o3d-wgl6: the handler reads the bound store URL to decide whether the delivery
+        // describes THIS store. These tests are about retry classification, so every delivery
+        // below names the store that is bound.
+        findUnique: async ({ where }: { where: { key: string } }) =>
+          where.key === 'wc_url' ? { key: 'wc_url', value: 'https://shop.example.com' } : null,
+        upsert: async (args: unknown) => { upsertCalls.push(args) },
+      },
       // Any stock-path lookup finds a product, so the stock correction WOULD run if reached.
       product: { findFirst: async () => ({ id: 'prod-1', sku: 'SKU-42' }) },
     },
@@ -40,7 +47,12 @@ mock.module('@/lib/db', {
 
 async function processProduct(payload: unknown) {
   const { processWcWebhookPayload } = await import('@/lib/connectors/woocommerce/webhooks')
-  return processWcWebhookPayload({ resource: 'products', topic: 'product.updated', payload })
+  return processWcWebhookPayload({
+    resource: 'products',
+    topic: 'product.updated',
+    payload,
+    originAttestation: 'store:shop.example.com',
+  })
 }
 
 const basePayload = { id: 42, sku: 'SKU-42', type: 'simple', name: 'Widget', status: 'publish' }

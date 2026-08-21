@@ -25,6 +25,7 @@ import {
   type ShoppingSyncSettings,
   type ShoppingTaxRateMappingRow,
 } from '@/app/actions/shopping-sync'
+import { parseWcSyncOrderStatuses } from '@/lib/connectors/woocommerce/order-status-filter'
 import { UnifiedTaxRateMapper } from '@/components/settings/unified-tax-rate-mapper'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
@@ -892,8 +893,12 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
     })
   }
 
-  let orderStatuses: string[] = []
-  try { orderStatuses = JSON.parse(s.wc_sync_order_statuses) } catch { orderStatuses = ['processing'] }
+  // Parsed by the SAME function the importer uses, so what the checkboxes show
+  // and what gets fetched cannot disagree — including the empty case, which the
+  // old inline JSON.parse rendered as "nothing ticked" while the fetch read it
+  // as "every status".
+  const orderStatuses = parseWcSyncOrderStatuses(s.wc_sync_order_statuses)
+  const noOrderStatusesSelected = orderStatuses.length === 0
 
   // Only show non-connection tabs when WC is configured
   const visibleTabs = wcConfigured ? TABS : TABS.filter((t) => t.id === 'connection')
@@ -1050,8 +1055,17 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
             ) : (
               <div className="space-y-3">
                 <p className="text-xs text-muted-foreground">
-                  Import active WooCommerce orders (processing, pending, on-hold) as sales orders. This does not create demand data or accounting entries. Historical sales data for forecasting can be imported from the Forecast page.
+                  Import WooCommerce orders as sales orders, using the statuses selected under Order
+                  Sync below{noOrderStatusesSelected ? '' : <> — currently <strong>{orderStatuses.join(', ')}</strong></>}.
+                  This does not create demand data or accounting entries. Historical sales data for
+                  forecasting can be imported from the Forecast page.
                 </p>
+                {noOrderStatusesSelected && (
+                  <p className="text-xs text-destructive">
+                    No import order statuses are selected under Order Sync below, so this import has
+                    nothing to fetch. Tick at least one status and save before running it.
+                  </p>
+                )}
                 <Button size="sm" onClick={handleStartInitialImport} disabled={importStarting}>
                   {importStarting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Download className="h-3 w-3 mr-1" />}
                   Import Active Orders
@@ -1086,6 +1100,30 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                     </label>
                   ))}
                 </div>
+                <p className="text-xs text-muted-foreground">
+                  Decides which orders IMS <strong>takes on</strong>. It applies to every import that
+                  fetches orders from WooCommerce — Import Active Orders above, the polling sweep and the
+                  backup reconciliation — and to orders pushed by the order webhook, which are imported
+                  only if they arrive in a selected status. Reconciliation also fetches{' '}
+                  <code>completed</code> so a finished order is never stranded, and customer withdrawal
+                  statuses are always included.
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  An order in an unselected status is skipped, not lost: if it later moves into a
+                  selected status it is imported then, and every skipped order is remembered by its
+                  WooCommerce order number and re-checked every 15 minutes — so when you tick a
+                  status, the orders that were skipped while it was unticked are imported within the
+                  next quarter of an hour whether or not WooCommerce ever sends them again. Once IMS
+                  has an order it keeps following it whatever status it moves to afterwards — this
+                  setting never stops updates to an order
+                  you already have.
+                </p>
+                {noOrderStatusesSelected && (
+                  <p className="text-xs text-destructive">
+                    No statuses selected — nothing will be imported, by fetch or by webhook. Tick at
+                    least one status and save.
+                  </p>
+                )}
               </div>
               <div className="space-y-1.5">
                 <Label className={orderWebhookActive ? 'text-muted-foreground' : ''}>Polling interval (minutes)</Label>

@@ -89,7 +89,7 @@ function normalizeShopifyStoreDomain(value: string): string | null {
   }
 }
 
-async function requireShoppingAdmin() {
+async function requireSyncPermission() {
   return requirePermission('sync')
 }
 
@@ -124,6 +124,9 @@ function mapSyncLogRows(
 }
 
 export async function getShoppingIntegrationConnector() {
+  // o3d-1fel: the delegate (getActiveShoppingConnectorInfo) is a lib helper with
+  // no guard of its own, so the gate has to live here.
+  await requirePermission('sync')
   return getActiveShoppingConnectorInfo()
 }
 
@@ -200,7 +203,7 @@ export async function probeShoppingFxHelperPlugin() {
 }
 
 export async function getShopifySyncSettings(): Promise<ShopifySyncSettings> {
-  await requireShoppingAdmin()
+  await requireSyncPermission()
   const map = await getSettingValues([...SHOPIFY_SYNC_SETTING_KEYS])
   const result = { ...SHOPIFY_SYNC_DEFAULTS }
   for (const key of Object.keys(result) as (keyof ShopifySyncSettings)[]) {
@@ -211,7 +214,7 @@ export async function getShopifySyncSettings(): Promise<ShopifySyncSettings> {
 }
 
 export async function saveShopifySyncSettings(data: Partial<ShopifySyncSettings>): Promise<{ success: boolean; error?: string }> {
-  await requireShoppingAdmin()
+  await requireSyncPermission()
   const operations = Object.entries(data)
     .filter(([key]) => SHOPIFY_SYNC_SETTING_KEYS.includes(key as (typeof SHOPIFY_SYNC_SETTING_KEYS)[number]))
     .map(([key, value]) => (
@@ -238,7 +241,7 @@ export async function saveShopifySyncSettings(data: Partial<ShopifySyncSettings>
 }
 
 export async function getShopifyConnectorCredentials(): Promise<ShopifyConnectorCredentials> {
-  await requireShoppingAdmin()
+  await requireSyncPermission()
   const map = await getSettingValues([
     'shopify_store_domain',
     'shopify_admin_api_access_token',
@@ -358,7 +361,7 @@ export async function saveShopifyConnectorCredentials(
 }
 
 export async function getShopifySyncLogs(limit = 50): Promise<ShoppingSyncLogRow[]> {
-  await requireShoppingAdmin()
+  await requireSyncPermission()
   const rows = await db.shoppingSyncLog.findMany({
     where: { connector: 'shopify' },
     orderBy: { createdAt: 'desc' },
@@ -370,7 +373,7 @@ export async function getShopifySyncLogs(limit = 50): Promise<ShoppingSyncLogRow
 export async function triggerShopifyManualSync(
   type: 'orders' | 'products' | 'stock',
 ): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  await requireShoppingAdmin()
+  await requireSyncPermission()
 
   if (type !== 'stock') {
     return {

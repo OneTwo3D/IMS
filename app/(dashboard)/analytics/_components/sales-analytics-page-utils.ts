@@ -58,7 +58,7 @@ export const salesAnalyticsEmptyTotals = {
   sales: { revenue: '0', tax: '0', shipping: '0', discount: '0' },
   customers: { revenueBase: '0', grossProfitBase: '0', arExposureBase: '0' },
   margin: { revenueBase: '0', cogsBase: '0', grossProfitBase: '0', marginPct: '0' },
-  returns: { refundValueBase: '0', returnedQty: '0' },
+  returns: { refundValueBase: '0', refundValueBasis: 'NONE', refundValueNetBasis: '0', refundValueGrossBasis: '0', refundValueUnknownBasis: '0', returnedQty: '0' },
   fulfillment: { shippedOrders: '0', shippedQty: '0' },
   throughput: { orders: '0', shipments: '0', lines: '0', queueDepth: '0' },
 } as const satisfies Record<string, Record<string, string>>

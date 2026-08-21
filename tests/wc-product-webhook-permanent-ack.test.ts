@@ -37,7 +37,10 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       setting: {
-        findUnique: async () => null,
+        // o3d-wgl6: the handler reads the bound store URL first; these tests are about the
+        // permanent/transient split, so every delivery names the store that is bound.
+        findUnique: async ({ where }: { where: { key: string } }) =>
+          where.key === 'wc_url' ? { key: 'wc_url', value: 'https://shop.example.com' } : null,
         upsert: async ({ where }: { where: { key: string } }) => {
           settingUpserts.push(where.key)
           return {}
@@ -66,7 +69,12 @@ const PRODUCT_PAYLOAD = {
 
 async function processProductWebhook() {
   const { processWcWebhookPayload } = await import('@/lib/connectors/woocommerce/webhooks')
-  return processWcWebhookPayload({ resource: 'products', topic: 'product.updated', payload: PRODUCT_PAYLOAD })
+  return processWcWebhookPayload({
+    resource: 'products',
+    topic: 'product.updated',
+    payload: PRODUCT_PAYLOAD,
+    originAttestation: 'store:shop.example.com',
+  })
 }
 
 function reset() {
@@ -91,7 +99,13 @@ test('a PERMANENT mapping conflict is acknowledged and logged as rejected, not r
   assert.equal(rejected.level, 'ERROR', 'nothing will import this product until the duplicate is resolved')
   assert.equal(rejected.metadata?.permanent, true)
   assert.equal(rejected.metadata?.sku, 'WIDGET-1')
-  assert.match(String(rejected.description), /permanent mapping conflict/i)
+  // Two kinds of permanent conflict reach this branch — a mapping collision (o3d-gtk/o3d-fsi)
+  // and a structure refusal (o3d-y89x) — so the operator-facing line must name both remedies
+  // rather than sending them hunting a duplicate SKU that may not exist.
+  assert.match(String(rejected.description), /permanent mapping or structure conflict/i)
+  assert.match(String(rejected.description), /\/sync\/exceptions/, 'and points at the inbox')
+  assert.equal(rejected.metadata?.error, 'Unique constraint failed on the fields: (`barcode`)',
+    'the specific conflict still travels in the metadata')
 
   assert.equal(
     activityLog.some((entry) => entry.action === 'wc_product_webhook'),

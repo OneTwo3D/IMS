@@ -1,0 +1,2 @@
+-- AlterEnum
+ALTER TYPE "AccountingSyncType" ADD VALUE 'ALLOCATION_REVERSAL';

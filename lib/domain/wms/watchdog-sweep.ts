@@ -23,6 +23,37 @@ import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
  * breach re-alerts.
  */
 
+/**
+ * o3d-hl8l r3 (Codex r2 finding 1): the alert has to name the REMEDY, not just the breach.
+ *
+ * A booked-in callback refused by the maintenance-mode fence (or dropped by a sender that does not
+ * retry) leaves no receipt-event row at all, so the exception inbox — which re-drives rows that
+ * exist — cannot reach it, and "chase the callback in the WMS" sends the reader looking for
+ * something that is not there. `enqueueMintsoftBookedInRecheckForAsn`, surfaced as "Re-check" on the
+ * ASN table of the purchase order, reconstructs the TRIGGER and re-reads the quantities from the
+ * warehouse, so it is the action this alert is asking for. This alert is the only push that a
+ * refused callback ever produces, so it is the only place the remedy can be said.
+ */
+/**
+ * o3d-hl8l r4 (Codex r3 finding 1): the remedy has to name a control the reader can actually REACH.
+ *
+ * The single sentence above said "purchase order → ASNs" for every breach, and this processor serves
+ * stock-transfer ASNs too — for which that screen does not exist, and (until this round) neither did
+ * any Re-check control. An operator following the alert for a transfer ASN was sent to a page that
+ * has nothing to do with it, which is worse than saying nothing: it reads as though the remedy had
+ * been tried and failed. The remedy and the notification's `actionUrl` are now both derived from the
+ * ASN's own `sourceType`, so they cannot drift apart from which screens carry the button.
+ */
+export function describeAsnRecheckRemedy(sourceType: string): { remedy: string; actionUrl: string } {
+  const transfer = sourceType.startsWith('STOCK_TRANSFER')
+  const where = transfer ? 'stock transfer → WMS ASN' : 'purchase order → ASNs'
+  return {
+    remedy: ` If no callback is coming, use "Re-check" on this ASN (${where}):`
+      + ' it re-reads the receipt from the WMS and books in only what is still outstanding.',
+    actionUrl: transfer ? '/stock-control/transfers' : '/purchase-orders',
+  }
+}
+
 /** Grace after the ETA before an open ASN counts as overdue. */
 export const ASN_OVERDUE_GRACE_MS = 24 * 60 * 60 * 1000
 /** Without an ETA, an open ASN with NO callback at all is overdue after this age. */
@@ -95,6 +126,7 @@ async function notifyActiveAdmins(
   tx: Pick<typeof db, 'user' | 'notification'>,
   title: string,
   message: string,
+  actionUrl = '/sync',
 ): Promise<void> {
   const admins = await tx.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
   if (admins.length === 0) throw new NoActiveAdminsError('no active ADMIN users to notify')
@@ -104,9 +136,46 @@ async function notifyActiveAdmins(
       type: 'warning',
       title,
       message,
-      actionUrl: '/sync',
+      actionUrl,
     })),
   })
+}
+
+/**
+ * Pure: the two halves of an overdue-ASN alert's text.
+ *
+ * Describe the ACTUAL breach (Codex r5): a renewed-silence breach is "no further callback since the
+ * last one" — anchoring its text on the ETA produced materially false incident context (even "past
+ * its ETA" while the ETA was still in the future).
+ */
+export function describeAsnOverdueBreach(
+  asn: { eta: Date | null; lastCallbackAt: Date | null; createdAt: Date },
+  creditLines: Array<{ sku: string }>,
+  now: Date,
+): { breach: string; creditNote: string } {
+  const daysSince = (from: Date) => Math.round((now.getTime() - from.getTime()) / 86_400_000)
+  return {
+    creditNote: creditLines.length > 0
+      ? ` ${creditLines.length} line(s) carry unreconciled alignment credits (e.g. ${creditLines[0].sku}) — until the booked-in callback arrives, REAL receipts for those lines are silently suppressed.`
+      : '',
+    breach: asn.lastCallbackAt
+      ? `is still open with no further booked-in callback for ${daysSince(asn.lastCallbackAt)} days (last callback ${asn.lastCallbackAt.toISOString().slice(0, 10)})`
+      : asn.eta
+        ? `is past its ETA (${asn.eta.toISOString().slice(0, 10)}) with no booked-in callback`
+        : `has been open for ${daysSince(asn.createdAt)} days with no booked-in callback`,
+  }
+}
+
+/** The full notification text an overdue open ASN produces — breach, blast radius, and remedy. */
+export function buildAsnOverdueAlertMessage(input: {
+  externalAsnId: string
+  warehouseCode: string
+  breach: string
+  creditNote: string
+  sourceType: string
+}): string {
+  const { remedy } = describeAsnRecheckRemedy(input.sourceType)
+  return `ASN ${input.externalAsnId} (${input.warehouseCode}) ${input.breach}.${input.creditNote}${remedy}`
 }
 
 export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
@@ -157,6 +226,7 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
     select: {
       id: true,
       externalAsnId: true,
+      sourceType: true,
       eta: true,
       lastCallbackAt: true,
       createdAt: true,
@@ -167,19 +237,7 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
   for (const asn of openAsns) {
     if (!isAsnOverdue(asn, now)) continue
     const creditLines = asn.lines.filter((line) => Number(line.qtyAccountedViaSnapshot) > Number(line.lastProcessedReceivedQty))
-    const creditNote = creditLines.length > 0
-      ? ` ${creditLines.length} line(s) carry unreconciled alignment credits (e.g. ${creditLines[0].sku}) — until the booked-in callback arrives, REAL receipts for those lines are silently suppressed.`
-      : ''
-    // Describe the ACTUAL breach (Codex r5): a renewed-silence breach is "no
-    // further callback since the last one" — anchoring its text on the ETA
-    // produced materially false incident context (even "past its ETA" while
-    // the ETA was still in the future).
-    const daysSince = (from: Date) => Math.round((now.getTime() - from.getTime()) / 86_400_000)
-    const breach = asn.lastCallbackAt
-      ? `is still open with no further booked-in callback for ${daysSince(asn.lastCallbackAt)} days (last callback ${asn.lastCallbackAt.toISOString().slice(0, 10)})`
-      : asn.eta
-        ? `is past its ETA (${asn.eta.toISOString().slice(0, 10)}) with no booked-in callback`
-        : `has been open for ${daysSince(asn.createdAt)} days with no booked-in callback`
+    const { creditNote, breach } = describeAsnOverdueBreach(asn, creditLines, now)
 
     // Claim the dedupe stamp AND insert the notifications in ONE transaction
     // (Codex r6): stamping first and delivering second left a crash window in
@@ -200,7 +258,16 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
         await notifyActiveAdmins(
           tx,
           'WMS ASN overdue',
-          `ASN ${asn.externalAsnId} (${asn.warehouse.code}) ${breach}.${creditNote} Chase the shipment / callback in the WMS.`,
+          buildAsnOverdueAlertMessage({
+            externalAsnId: asn.externalAsnId,
+            warehouseCode: asn.warehouse.code,
+            breach,
+            creditNote,
+            sourceType: asn.sourceType,
+          }),
+          // The alert links to the screen that carries THIS ASN's Re-check control, not a blanket
+          // /sync that has none.
+          describeAsnRecheckRemedy(asn.sourceType).actionUrl,
         )
         return true
       })
@@ -228,6 +295,7 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
       metadata: {
         asnMapId: asn.id,
         externalAsnId: asn.externalAsnId,
+        sourceType: asn.sourceType,
         connector: connectorId,
         eta: asn.eta?.toISOString() ?? null,
         lastCallbackAt: asn.lastCallbackAt?.toISOString() ?? null,

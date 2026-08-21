@@ -98,7 +98,7 @@ registerCronJobs([
     module: 'system',
     moduleLabel: 'System',
     label: 'Reallocation Sweep',
-    description: 'Re-runs allocation for PROCESSING orders left with outstanding demand — e.g. a paid order whose allocation failed transiently in a payment poller and would otherwise never be retried (o3d-9lx).',
+    description: 'Re-runs allocation for PROCESSING orders left with outstanding demand — e.g. a paid order whose allocation failed transiently in a payment poller and would otherwise never be retried (o3d-9lx). Also finishes the allocation-coverage check for orders a storefront created directly at Picking or Packing, which no status transition examines (o3d-z82a).',
     defaultSchedule: '*/15 * * * *',
     defaultEnabled: true,
   },

@@ -1,0 +1,33 @@
+-- o3d-k26m.5: the invoice number a sync row SET OUT TO POST under.
+--
+-- Xero's sales-invoice create is `POST /Invoices`, which is update-or-create on InvoiceNumber.
+-- Since o3d-k26m.1 the number is WooCommerce's own `_wcpdf_invoice_number` — the same number the
+-- outgoing xeroom plugin is posting to the same live organisation today — so a create for an
+-- already-invoiced order does not duplicate, it silently REPLACES xeroom's invoice. The fence that
+-- stops that asks the ledger who holds the number and refuses unless the answer is "nobody" or "a
+-- document IMS already owns".
+--
+-- WHAT THIS COLUMN IS NOT. Round 2 added it as a CLAIM: written before the first attempt, only
+-- after a lookup said the number was unclaimed, and read back on a retry as proof that the document
+-- now holding the number must be ours. Codex round 3 rejected that inference and it is gone. The
+-- record is a fact about the LOOKUP's moment, not about the holder's identity. Worse, it is only
+-- consulted when the number IS held — and once xeroom is removed, the only documents that can hold
+-- one of these numbers are the ~14,415 it already posted, so "held now, unclaimed then" means the
+-- lookup missed one. The licence would fire exactly where the fence had already failed. A lost
+-- response therefore settles as a REFUSAL an operator clears by linking the document, which is
+-- recoverable, instead of a re-post that is not.
+--
+-- WHAT IT IS FOR. Two things, both honest. It is written immediately BEFORE an irreversible remote
+-- write and a failure to write it refuses the post — a create whose local record cannot be written
+-- is a create whose outcome cannot be recorded either. And a later refusal can tell the operator
+-- that this row had already set out under this number, so they check whether the holder is ours
+-- rather than assuming it is xeroom's.
+--
+-- SCOPE IS THE ROW, DELIBERATELY. A freshly enqueued row for the same order does not inherit it.
+-- And the NUMBER is stored rather than a bare timestamp, so a row whose payload number later
+-- changes cannot be described with an attempt taken for a different one.
+--
+-- NOTHING IS BACKFILLED. Existing rows arrive NULL, which is the honest answer for every one of
+-- them: no lookup was ever made before those posts.
+ALTER TABLE "accounting_sync_logs" ADD COLUMN "attempted_invoice_number" TEXT;
+ALTER TABLE "accounting_sync_logs" ADD COLUMN "attempted_invoice_number_at" TIMESTAMP(3);

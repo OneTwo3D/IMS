@@ -13,7 +13,17 @@
  * let Xero answer"; only a grant we have positively read and found wanting stops anything.
  */
 
-/** Every scope the consent screen asks for. The single source of truth for the authorization URL. */
+/**
+ * Every scope the consent screen asks for. The single source of truth for the authorization URL.
+ *
+ * These are Xero's GRANULAR per-endpoint scopes, and that is not merely a style choice: the broader
+ * `accounting.transactions` family is REJECTED for this app. Probed against the live authorize
+ * endpoint (o3d-t74p), `accounting.transactions`, `accounting.transactions.read`,
+ * `accounting.journals.read` and `accounting.reports.read` all return invalid_scope, while every
+ * scope below — and its `.read` variant — is accepted. So reaching for the documented
+ * `accounting.transactions.read` to build a read-only client fails at the consent screen with a
+ * 500 page that does not say which scope was at fault. Use `<scope>.read` of one of these instead.
+ */
 export const XERO_REQUESTED_SCOPES = [
   'openid',
   'profile',
@@ -64,6 +74,7 @@ const SCOPE_BY_SYNC_TYPE: Record<string, string> = {
   DAILY_BATCH_COGS_RECONCILIATION: JOURNALS,
   DAILY_BATCH_TRANSIT_RECONCILIATION: JOURNALS,
   UNEARNED_REV_REVERSAL: JOURNALS,
+  ALLOCATION_REVERSAL: JOURNALS,
   REALISED_FX_JOURNAL: JOURNALS,
   UNREALISED_FX_JOURNAL: JOURNALS,
   MANUFACTURING_JOURNAL: JOURNALS,

@@ -15,6 +15,7 @@ import { saveView, type SavedView } from '@/app/actions/sales-stats'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
+import { filterAndSortRows } from '@/lib/analytics/table-filter-sort'
 
 type Tab = 'products' | 'received' | 'bills' | 'aging' | 'details'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -65,7 +66,7 @@ const BILL_FIELDS: FieldDef[] = [
 const AGING_FIELDS: FieldDef[] = [
   { key: 'supplierName', label: 'Supplier', type: 'text' }, { key: 'grossAmount', label: 'Gross Amount', type: 'number' },
   { key: 'discounts', label: 'Discounts', type: 'number' }, { key: 'refunds', label: 'Refunds', type: 'number' },
-  { key: 'netAmount', label: 'Net Amount', type: 'number' }, { key: 'landedCosts', label: 'Landed Costs', type: 'number' },
+  { key: 'netAmount', label: 'Net Amount (ex-VAT)', type: 'number' }, { key: 'landedCosts', label: 'Landed Costs', type: 'number' },
   { key: 'tax', label: 'Tax', type: 'number' }, { key: 'totalAmount', label: 'Total', type: 'number' },
   { key: 'billedAmount', label: 'Billed', type: 'number' }, { key: 'dueAmount', label: 'Due', type: 'number' },
   { key: 'overdue0_30', label: '0-30d', type: 'number' }, { key: 'overdue31_60', label: '31-60d', type: 'number' },
@@ -108,14 +109,6 @@ const SEL_OPS = [{ value: 'is', label: 'is' }, { value: 'is_not', label: 'is not
 
 function getOps(fields: FieldDef[], k: string) { const f = fields.find((p) => p.key === k); return f?.type === 'number' ? NUM_OPS : f?.type === 'select' ? SEL_OPS : TEXT_OPS }
 function getOpts(fields: FieldDef[], k: string) { return fields.find((p) => p.key === k)?.options }
-function applyF(val: unknown, r: FilterRule): boolean { const v = String(val ?? '').toLowerCase(); const rv = r.value.toLowerCase(); switch (r.operator) { case 'contains': return v.includes(rv); case 'equals': case 'is': return v === rv; case 'is_not': return v !== rv; case '>': return Number(val) > Number(r.value); case '>=': return Number(val) >= Number(r.value); case '<': return Number(val) < Number(r.value); case '<=': return Number(val) <= Number(r.value); case '=': return Number(val) === Number(r.value); default: return true } }
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function getVal(row: any, field: string): string | number | null {
-  const v = row[field]
-  return v === undefined ? null : v
-}
-
 function FilterDialog({ fields, rules, onApply, onClose }: { fields: FieldDef[]; rules: FilterRule[]; onApply: (r: FilterRule[]) => void; onClose: () => void }) {
   const [l, setL] = useState<FilterRule[]>(rules.length ? [...rules] : [])
   return (<Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-xl sm:max-w-xl"><DialogHeader><DialogTitle>Filters</DialogTitle></DialogHeader>
@@ -179,23 +172,11 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
     setFilterRules(v.filters.map((f) => ({ ...f, id: makeId() })))
   }
 
-  // Generic filter + sort for any tab data
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  function filterAndSort<T extends Record<string, any>>(data: T[]): T[] {
-    let result = data
-    for (const rule of filterRules) {
-      if (!rule.value) continue
-      result = result.filter((row) => applyF(getVal(row, rule.field), rule))
-    }
-    if (sortCol) {
-      result = [...result].sort((a, b) => {
-        const va = getVal(a, sortCol) ?? 0
-        const vb = getVal(b, sortCol) ?? 0
-        const cmp = typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb))
-        return sortDir === 'asc' ? cmp : -cmp
-      })
-    }
-    return result
+  // Generic filter + sort for any tab data — shared with the sales and inventory stat pages, so a
+  // supplier with NO established average lead time is not ordered as if it were the fastest
+  // (o3d-iigc round 2).
+  function filterAndSort<T extends object>(data: T[]): T[] {
+    return filterAndSortRows(data, filterRules, sortCol, sortDir)
   }
 
   const fp = filterAndSort(products)
@@ -275,9 +256,15 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
       if (key === 'supplierInvoiceUrl') return v ? <a href={`/api${v}`} target="_blank" rel="noopener" className="text-blue-600 hover:underline text-xs flex items-center gap-0.5"><FileText className="h-3 w-3" />View</a> : null
     }
     if (tabKey === 'aging') {
-      if (key === 'grossAmount' || key === 'netAmount' || key === 'totalAmount') return <span className="tabular-nums text-xs font-mono font-medium">{fmtBase(v)}</span>
+      if (key === 'grossAmount' || key === 'totalAmount') return <span className="tabular-nums text-xs font-mono font-medium" title="VAT-inclusive committed spend (goods + VAT + direct freight)">{fmtBase(v)}</span>
+      // o3d-iigc round 2: WHICH total this is, on the figure itself — 'net' beside a Gross column
+      // and a Tax column otherwise reads as either net-of-VAT or net-of-returns, and it is both.
+      if (key === 'netAmount') return <span className="tabular-nums text-xs font-mono font-medium" title="Ex-VAT: the gross total less its own VAT, less returns valued at the ex-VAT line cost AFTER the order's header discount">{fmtBase(v)}</span>
       if (key === 'discounts') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'refunds') return <span className="tabular-nums text-xs font-mono text-orange-600">{v > 0 ? fmtBase(v) : '—'}</span>
+      // o3d-iigc round 4: this is the credit AS THE NET AMOUNT SUBTRACTS IT — scaled onto the order's
+      // post-header-discount goods value — so the three columns a reader can see (Gross, Tax,
+      // Refunds) still subtract to the Net Amount printed beside them.
+      if (key === 'refunds') return <span className="tabular-nums text-xs font-mono text-orange-600" title="Return credit at the ex-VAT line cost, reduced by the order's header discount so it is on the same basis as the Net Amount it is subtracted from">{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'landedCosts' || key === 'tax') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'billedAmount') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
       if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>

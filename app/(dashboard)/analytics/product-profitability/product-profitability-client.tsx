@@ -11,6 +11,7 @@ import { ProductLink } from '@/components/inventory/product-link'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatMoney } from '@/lib/utils'
 import type { ProfitabilityRow, ProfitabilitySummary } from '@/app/actions/product-profitability'
+import { netLinearFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 
 type Props = {
   data: { rows: ProfitabilityRow[]; summary: ProfitabilitySummary }
@@ -34,8 +35,8 @@ const PAGE_SIZE = 50
 
 type ColKey = 'sku' | 'name' | 'type' | 'lifecycleStatus' | 'totalStock'
   | 'salesPrice' | 'salePrice' | 'latestCogs' | 'unitMarginPct'
-  | 'currentFyRevenue' | 'currentFyCogs' | 'currentFyProfit' | 'currentFyQtySold'
-  | 'previousFyRevenue' | 'previousFyCogs' | 'previousFyProfit' | 'previousFyQtySold'
+  | 'currentFyRevenue' | 'currentFyRefundsGrossBasis' | 'currentFyRefundsUnknownBasis' | 'currentFyCogs' | 'currentFyProfit' | 'currentFyQtySold'
+  | 'previousFyRevenue' | 'previousFyRefundsGrossBasis' | 'previousFyRefundsUnknownBasis' | 'previousFyCogs' | 'previousFyProfit' | 'previousFyQtySold'
 
 type ColDef = { key: ColKey; label: string; shortLabel?: string; align?: 'right'; group?: string }
 
@@ -50,10 +51,16 @@ const ALL_COLUMNS: ColDef[] = [
   { key: 'latestCogs', label: 'Latest COGS', align: 'right' },
   { key: 'unitMarginPct', label: 'Margin %', align: 'right' },
   { key: 'currentFyRevenue', label: 'Revenue', shortLabel: 'Revenue (Current)', align: 'right', group: 'current' },
+  // o3d-iigc: refund value the ex-VAT revenue above cannot absorb. Opt-in columns, so the default
+  // view stays as it was for the overwhelming majority of products that have neither.
+  { key: 'currentFyRefundsGrossBasis', label: 'Refunds (gross)', shortLabel: 'Refunds gross-basis (Current)', align: 'right', group: 'current' },
+  { key: 'currentFyRefundsUnknownBasis', label: 'Refunds (basis ?)', shortLabel: 'Refunds basis unknown (Current)', align: 'right', group: 'current' },
   { key: 'currentFyCogs', label: 'COGS', shortLabel: 'COGS (Current)', align: 'right', group: 'current' },
   { key: 'currentFyProfit', label: 'Profit', shortLabel: 'Profit (Current)', align: 'right', group: 'current' },
   { key: 'currentFyQtySold', label: 'Qty', shortLabel: 'Qty (Current)', align: 'right', group: 'current' },
   { key: 'previousFyRevenue', label: 'Revenue', shortLabel: 'Revenue (Previous)', align: 'right', group: 'previous' },
+  { key: 'previousFyRefundsGrossBasis', label: 'Refunds (gross)', shortLabel: 'Refunds gross-basis (Previous)', align: 'right', group: 'previous' },
+  { key: 'previousFyRefundsUnknownBasis', label: 'Refunds (basis ?)', shortLabel: 'Refunds basis unknown (Previous)', align: 'right', group: 'previous' },
   { key: 'previousFyCogs', label: 'COGS', shortLabel: 'COGS (Previous)', align: 'right', group: 'previous' },
   { key: 'previousFyProfit', label: 'Profit', shortLabel: 'Profit (Previous)', align: 'right', group: 'previous' },
   { key: 'previousFyQtySold', label: 'Qty', shortLabel: 'Qty (Previous)', align: 'right', group: 'previous' },
@@ -214,9 +221,15 @@ export function ProductProfitabilityClient({ data }: Props) {
   const filteredSummary = useMemo(() => {
     return {
       currentFyRevenue: filtered.reduce((s, r) => s + r.currentFyRevenue, 0),
+      currentFyRefundsGrossBasis: filtered.reduce((s, r) => s + r.currentFyRefundsGrossBasis, 0),
+      currentFyRefundsUnknownBasis: filtered.reduce((s, r) => s + r.currentFyRefundsUnknownBasis, 0),
+      currentFyRefundBasisComplete: filtered.every((r) => r.currentFyRefundBasisComplete),
       currentFyCogs: filtered.reduce((s, r) => s + r.currentFyCogs, 0),
       currentFyProfit: filtered.reduce((s, r) => s + r.currentFyProfit, 0),
       previousFyRevenue: filtered.reduce((s, r) => s + r.previousFyRevenue, 0),
+      previousFyRefundsGrossBasis: filtered.reduce((s, r) => s + r.previousFyRefundsGrossBasis, 0),
+      previousFyRefundsUnknownBasis: filtered.reduce((s, r) => s + r.previousFyRefundsUnknownBasis, 0),
+      previousFyRefundBasisComplete: filtered.every((r) => r.previousFyRefundBasisComplete),
       previousFyCogs: filtered.reduce((s, r) => s + r.previousFyCogs, 0),
       previousFyProfit: filtered.reduce((s, r) => s + r.previousFyProfit, 0),
     }
@@ -224,15 +237,26 @@ export function ProductProfitabilityClient({ data }: Props) {
 
   // CSV export (all filtered rows, not just current page)
   function handleExport() {
+    // o3d-iigc round 4: this page has NO server export route — this browser-built file IS its only
+    // export, and it carried the same defect the analytics route did: ONE bound column, named after
+    // Revenue, standing in front of a Profit column that is equally bounded and said nothing. Each
+    // bounded figure now carries its own verdict immediately to its right, in the same vocabulary
+    // the server CSV uses ('exact' / 'upper' / 'indeterminate'), so the two files read alike.
+    // `Margin %` here is unitMarginPct — list price against latest COGS — which no refund touches,
+    // so it is deliberately NOT marked.
     const header = ['SKU', 'Name', 'Type', 'Status', 'Stock', 'List Price', 'Sale Price', 'Latest COGS', 'Unit Margin', 'Margin %',
-      `Revenue (${summary.fyLabel})`, `COGS (${summary.fyLabel})`, `Profit (${summary.fyLabel})`, `Qty (${summary.fyLabel})`,
-      `Revenue (${summary.prevFyLabel})`, `COGS (${summary.prevFyLabel})`, `Profit (${summary.prevFyLabel})`, `Qty (${summary.prevFyLabel})`]
-    const csvRows = filtered.map((r) => [
-      r.sku, `"${r.name.replace(/"/g, '""')}"`, r.type, r.lifecycleStatus, r.totalStock,
-      r.salesPrice ?? '', r.salePrice ?? '', r.latestCogs ?? '', r.unitMargin ?? '', r.unitMarginPct ?? '',
-      r.currentFyRevenue, r.currentFyCogs, r.currentFyProfit, r.currentFyQtySold,
-      r.previousFyRevenue, r.previousFyCogs, r.previousFyProfit, r.previousFyQtySold,
-    ])
+      `Revenue (${summary.fyLabel})`, `Revenue bound (${summary.fyLabel})`, `Refunds gross-basis (${summary.fyLabel})`, `Refunds basis unknown (${summary.fyLabel})`, `COGS (${summary.fyLabel})`, `Profit (${summary.fyLabel})`, `Profit bound (${summary.fyLabel})`, `Qty (${summary.fyLabel})`,
+      `Revenue (${summary.prevFyLabel})`, `Revenue bound (${summary.prevFyLabel})`, `Refunds gross-basis (${summary.prevFyLabel})`, `Refunds basis unknown (${summary.prevFyLabel})`, `COGS (${summary.prevFyLabel})`, `Profit (${summary.prevFyLabel})`, `Profit bound (${summary.prevFyLabel})`, `Qty (${summary.prevFyLabel})`]
+    const csvRows = filtered.map((r) => {
+      const currentBound = netLinearFigureBound({ basisComplete: r.currentFyRefundBasisComplete, unplacedCredit: r.currentFyRefundsGrossBasis + r.currentFyRefundsUnknownBasis })
+      const previousBound = netLinearFigureBound({ basisComplete: r.previousFyRefundBasisComplete, unplacedCredit: r.previousFyRefundsGrossBasis + r.previousFyRefundsUnknownBasis })
+      return [
+        r.sku, `"${r.name.replace(/"/g, '""')}"`, r.type, r.lifecycleStatus, r.totalStock,
+        r.salesPrice ?? '', r.salePrice ?? '', r.latestCogs ?? '', r.unitMargin ?? '', r.unitMarginPct ?? '',
+        r.currentFyRevenue, currentBound, r.currentFyRefundsGrossBasis, r.currentFyRefundsUnknownBasis, r.currentFyCogs, r.currentFyProfit, currentBound, r.currentFyQtySold,
+        r.previousFyRevenue, previousBound, r.previousFyRefundsGrossBasis, r.previousFyRefundsUnknownBasis, r.previousFyCogs, r.previousFyProfit, previousBound, r.previousFyQtySold,
+      ]
+    })
     const csv = [header.join(','), ...csvRows.map((r) => r.join(','))].join('\n')
     const blob = new Blob([csv], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
@@ -292,19 +316,25 @@ export function ProductProfitabilityClient({ data }: Props) {
       case 'salePrice': return <span className="tabular-nums text-xs font-mono">{r.salePrice != null ? fmtBase(r.salePrice) : '—'}</span>
       case 'latestCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.latestCogs != null ? fmtBase(r.latestCogs) : '—'}</span>
       case 'unitMarginPct': return <MarginBadge row={r} />
-      case 'currentFyRevenue': return <span className="tabular-nums text-xs font-mono font-medium">{r.currentFyRevenue > 0 ? fmtBase(r.currentFyRevenue) : '—'}</span>
+      // o3d-iigc: when the row's FY refunds could not all be placed on the net basis, this figure
+      // is an UPPER BOUND — marked, not presented as exact.
+      case 'currentFyRevenue': return <span className={`tabular-nums text-xs font-mono font-medium ${r.currentFyRefundBasisComplete ? '' : 'text-orange-600'}`} title={r.currentFyRefundBasisComplete ? undefined : 'Upper bound: some of this product\u2019s refunds this FY are on the gross basis or have no proven basis, so they are not subtracted here'}>{r.currentFyRevenue > 0 ? fmtBase(r.currentFyRevenue) : '—'}{r.currentFyRefundBasisComplete ? '' : ' ≤'}</span>
+      case 'currentFyRefundsGrossBasis': return <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value recorded on the GROSS basis — not comparable with this row's ex-VAT revenue, so it is excluded from it">{r.currentFyRefundsGrossBasis > 0 ? fmtBase(r.currentFyRefundsGrossBasis) : '—'}</span>
+      case 'currentFyRefundsUnknownBasis': return <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value whose basis was never proved — excluded from revenue rather than guessed at">{r.currentFyRefundsUnknownBasis > 0 ? fmtBase(r.currentFyRefundsUnknownBasis) : '—'}</span>
       case 'currentFyCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.currentFyCogs > 0 ? fmtBase(r.currentFyCogs) : '—'}</span>
       case 'currentFyProfit': return (
-        <span className={`tabular-nums text-xs font-mono ${r.currentFyProfit > 0 ? 'text-green-600' : r.currentFyProfit < 0 ? 'text-destructive' : ''}`}>
-          {r.currentFyRevenue > 0 || r.currentFyCogs > 0 ? fmtBase(r.currentFyProfit) : '—'}
+        <span className={`tabular-nums text-xs font-mono ${!r.currentFyRefundBasisComplete ? 'text-orange-600' : r.currentFyProfit > 0 ? 'text-green-600' : r.currentFyProfit < 0 ? 'text-destructive' : ''}`} title={r.currentFyRefundBasisComplete ? undefined : 'Upper bound: derived from a revenue that does not subtract this product\u2019s gross-basis or unproven-basis refunds'}>
+          {r.currentFyRevenue > 0 || r.currentFyCogs > 0 ? fmtBase(r.currentFyProfit) : '—'}{r.currentFyRefundBasisComplete ? '' : ' ≤'}
         </span>
       )
       case 'currentFyQtySold': return <span className="tabular-nums text-xs">{r.currentFyQtySold > 0 ? r.currentFyQtySold : '—'}</span>
-      case 'previousFyRevenue': return <span className="tabular-nums text-xs font-mono">{r.previousFyRevenue > 0 ? fmtBase(r.previousFyRevenue) : '—'}</span>
+      case 'previousFyRevenue': return <span className={`tabular-nums text-xs font-mono ${r.previousFyRefundBasisComplete ? '' : 'text-orange-600'}`} title={r.previousFyRefundBasisComplete ? undefined : 'Upper bound: some of this product\u2019s refunds that FY are on the gross basis or have no proven basis, so they are not subtracted here'}>{r.previousFyRevenue > 0 ? fmtBase(r.previousFyRevenue) : '—'}{r.previousFyRefundBasisComplete ? '' : ' ≤'}</span>
+      case 'previousFyRefundsGrossBasis': return <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value recorded on the GROSS basis — not comparable with this row's ex-VAT revenue, so it is excluded from it">{r.previousFyRefundsGrossBasis > 0 ? fmtBase(r.previousFyRefundsGrossBasis) : '—'}</span>
+      case 'previousFyRefundsUnknownBasis': return <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value whose basis was never proved — excluded from revenue rather than guessed at">{r.previousFyRefundsUnknownBasis > 0 ? fmtBase(r.previousFyRefundsUnknownBasis) : '—'}</span>
       case 'previousFyCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.previousFyCogs > 0 ? fmtBase(r.previousFyCogs) : '—'}</span>
       case 'previousFyProfit': return (
-        <span className={`tabular-nums text-xs font-mono ${r.previousFyProfit > 0 ? 'text-green-600' : r.previousFyProfit < 0 ? 'text-destructive' : ''}`}>
-          {r.previousFyRevenue > 0 || r.previousFyCogs > 0 ? fmtBase(r.previousFyProfit) : '—'}
+        <span className={`tabular-nums text-xs font-mono ${!r.previousFyRefundBasisComplete ? 'text-orange-600' : r.previousFyProfit > 0 ? 'text-green-600' : r.previousFyProfit < 0 ? 'text-destructive' : ''}`} title={r.previousFyRefundBasisComplete ? undefined : 'Upper bound: derived from a revenue that does not subtract this product\u2019s gross-basis or unproven-basis refunds'}>
+          {r.previousFyRevenue > 0 || r.previousFyCogs > 0 ? fmtBase(r.previousFyProfit) : '—'}{r.previousFyRefundBasisComplete ? '' : ' ≤'}
         </span>
       )
       case 'previousFyQtySold': return <span className="tabular-nums text-xs">{r.previousFyQtySold > 0 ? r.previousFyQtySold : '—'}</span>
@@ -313,19 +343,31 @@ export function ProductProfitabilityClient({ data }: Props) {
 
   // Footer totals mapping
   const FOOTER_COLS: Partial<Record<ColKey, (s: typeof filteredSummary) => string>> = {
-    currentFyRevenue: (s) => fmtBase(s.currentFyRevenue),
+    currentFyRevenue: (s) => `${fmtBase(s.currentFyRevenue)}${s.currentFyRefundBasisComplete ? '' : ' ≤'}`,
+    currentFyRefundsGrossBasis: (s) => fmtBase(s.currentFyRefundsGrossBasis),
+    currentFyRefundsUnknownBasis: (s) => fmtBase(s.currentFyRefundsUnknownBasis),
     currentFyCogs: (s) => fmtBase(s.currentFyCogs),
-    currentFyProfit: (s) => fmtBase(s.currentFyProfit),
-    previousFyRevenue: (s) => fmtBase(s.previousFyRevenue),
+    currentFyProfit: (s) => `${fmtBase(s.currentFyProfit)}${s.currentFyRefundBasisComplete ? '' : ' ≤'}`,
+    previousFyRevenue: (s) => `${fmtBase(s.previousFyRevenue)}${s.previousFyRefundBasisComplete ? '' : ' ≤'}`,
+    previousFyRefundsGrossBasis: (s) => fmtBase(s.previousFyRefundsGrossBasis),
+    previousFyRefundsUnknownBasis: (s) => fmtBase(s.previousFyRefundsUnknownBasis),
     previousFyCogs: (s) => fmtBase(s.previousFyCogs),
-    previousFyProfit: (s) => fmtBase(s.previousFyProfit),
+    previousFyProfit: (s) => `${fmtBase(s.previousFyProfit)}${s.previousFyRefundBasisComplete ? '' : ' ≤'}`,
   }
 
   const FOOTER_TONE: Partial<Record<ColKey, (s: typeof filteredSummary) => string>> = {
     currentFyCogs: () => 'text-muted-foreground',
     previousFyCogs: () => 'text-muted-foreground',
-    currentFyProfit: (s) => s.currentFyProfit >= 0 ? 'text-green-600' : 'text-destructive',
-    previousFyProfit: (s) => s.previousFyProfit >= 0 ? 'text-green-600' : 'text-destructive',
+    currentFyRefundsGrossBasis: () => 'text-orange-600',
+    currentFyRefundsUnknownBasis: () => 'text-orange-600',
+    previousFyRefundsGrossBasis: () => 'text-orange-600',
+    previousFyRefundsUnknownBasis: () => 'text-orange-600',
+    // o3d-iigc: an upper-bounded total is not a profit/loss verdict, so it does not get the
+    // green/red treatment that would read as one.
+    currentFyRevenue: (s) => s.currentFyRefundBasisComplete ? '' : 'text-orange-600',
+    previousFyRevenue: (s) => s.previousFyRefundBasisComplete ? '' : 'text-orange-600',
+    currentFyProfit: (s) => !s.currentFyRefundBasisComplete ? 'text-orange-600' : s.currentFyProfit >= 0 ? 'text-green-600' : 'text-destructive',
+    previousFyProfit: (s) => !s.previousFyRefundBasisComplete ? 'text-orange-600' : s.previousFyProfit >= 0 ? 'text-green-600' : 'text-destructive',
   }
 
   const activeCols = ALL_COLUMNS.filter((c) => colSet.has(c.key))
@@ -348,7 +390,10 @@ export function ProductProfitabilityClient({ data }: Props) {
         <div className="rounded-md border p-3">
           <p className="text-[11px] text-muted-foreground">{summary.fyLabel}</p>
           <p className="text-xs text-muted-foreground mt-0.5">Revenue</p>
-          <p className="text-lg font-bold">{fmtBase(filteredSummary.currentFyRevenue)}</p>
+          <p className={`text-lg font-bold ${filteredSummary.currentFyRefundBasisComplete ? '' : 'text-orange-600'}`} title={filteredSummary.currentFyRefundBasisComplete ? undefined : 'Upper bound: refunds on the gross basis or with no proven basis are not subtracted here'}>{fmtBase(filteredSummary.currentFyRevenue)}{filteredSummary.currentFyRefundBasisComplete ? '' : ' ≤'}</p>
+          {!filteredSummary.currentFyRefundBasisComplete && (
+            <p className="text-[11px] text-orange-600 mt-0.5" title="Refund value that is not on the net basis. Reported rather than folded in, because subtracting a VAT-inclusive credit from ex-VAT revenue removes the VAT twice and an unstamped credit cannot be placed at all.">Not subtracted: {fmtBase(filteredSummary.currentFyRefundsGrossBasis)} gross &middot; {fmtBase(filteredSummary.currentFyRefundsUnknownBasis)} basis ?</p>
+          )}
         </div>
         <div className="rounded-md border p-3">
           <p className="text-[11px] text-muted-foreground">{summary.fyLabel}</p>
@@ -358,12 +403,15 @@ export function ProductProfitabilityClient({ data }: Props) {
         <div className="rounded-md border p-3">
           <p className="text-[11px] text-muted-foreground">{summary.fyLabel}</p>
           <p className="text-xs text-muted-foreground mt-0.5">Profit</p>
-          <p className={`text-lg font-bold ${filteredSummary.currentFyProfit >= 0 ? 'text-green-600' : 'text-destructive'}`}>{fmtBase(filteredSummary.currentFyProfit)}</p>
+          <p className={`text-lg font-bold ${!filteredSummary.currentFyRefundBasisComplete ? 'text-orange-600' : filteredSummary.currentFyProfit >= 0 ? 'text-green-600' : 'text-destructive'}`} title={filteredSummary.currentFyRefundBasisComplete ? undefined : 'Upper bound: derived from a revenue that does not subtract gross-basis or unproven-basis refunds'}>{fmtBase(filteredSummary.currentFyProfit)}{filteredSummary.currentFyRefundBasisComplete ? '' : ' ≤'}</p>
         </div>
         <div className="rounded-md border p-3">
           <p className="text-[11px] text-muted-foreground">{summary.prevFyLabel}</p>
           <p className="text-xs text-muted-foreground mt-0.5">Revenue</p>
-          <p className="text-lg font-bold">{fmtBase(filteredSummary.previousFyRevenue)}</p>
+          <p className={`text-lg font-bold ${filteredSummary.previousFyRefundBasisComplete ? '' : 'text-orange-600'}`} title={filteredSummary.previousFyRefundBasisComplete ? undefined : 'Upper bound: refunds on the gross basis or with no proven basis are not subtracted here'}>{fmtBase(filteredSummary.previousFyRevenue)}{filteredSummary.previousFyRefundBasisComplete ? '' : ' ≤'}</p>
+          {!filteredSummary.previousFyRefundBasisComplete && (
+            <p className="text-[11px] text-orange-600 mt-0.5" title="Refund value that is not on the net basis. Reported rather than folded in, because subtracting a VAT-inclusive credit from ex-VAT revenue removes the VAT twice and an unstamped credit cannot be placed at all.">Not subtracted: {fmtBase(filteredSummary.previousFyRefundsGrossBasis)} gross &middot; {fmtBase(filteredSummary.previousFyRefundsUnknownBasis)} basis ?</p>
+          )}
         </div>
         <div className="rounded-md border p-3">
           <p className="text-[11px] text-muted-foreground">{summary.prevFyLabel}</p>
@@ -373,7 +421,7 @@ export function ProductProfitabilityClient({ data }: Props) {
         <div className="rounded-md border p-3">
           <p className="text-[11px] text-muted-foreground">{summary.prevFyLabel}</p>
           <p className="text-xs text-muted-foreground mt-0.5">Profit</p>
-          <p className={`text-lg font-bold ${filteredSummary.previousFyProfit >= 0 ? 'text-green-600' : 'text-destructive'}`}>{fmtBase(filteredSummary.previousFyProfit)}</p>
+          <p className={`text-lg font-bold ${!filteredSummary.previousFyRefundBasisComplete ? 'text-orange-600' : filteredSummary.previousFyProfit >= 0 ? 'text-green-600' : 'text-destructive'}`} title={filteredSummary.previousFyRefundBasisComplete ? undefined : 'Upper bound: derived from a revenue that does not subtract gross-basis or unproven-basis refunds'}>{fmtBase(filteredSummary.previousFyProfit)}{filteredSummary.previousFyRefundBasisComplete ? '' : ' ≤'}</p>
         </div>
       </div>
 

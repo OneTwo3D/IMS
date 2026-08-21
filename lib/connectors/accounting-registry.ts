@@ -49,6 +49,14 @@ export type AccountingConnectorSettingsMasked = AccountingConnectorSettings & { 
 export type AccountingConnectionStatus = {
   connected: boolean
   tenantName?: string
+  /**
+   * Why a stored connection is unusable, when it is (o3d-9tbz). Set together with `connected: false`
+   * and `hasStoredToken: true` — an allow-list-blocked token is NOT a connection, but it is also not
+   * the same thing as never having connected, and the operator has to be told which they are looking at.
+   */
+  blockedReason?: string
+  /** A token row exists, so /sync must keep offering Disconnect — the refusal text tells them to use it. */
+  hasStoredToken?: boolean
 }
 
 export type AccountingSyncReadiness = {
@@ -99,7 +107,13 @@ export type AccountingConnector = AccountingConnectorDef & {
   ): Promise<MissingTaxRateGenerateResult>
   getSyncLogs(limit?: number): Promise<AccountingSyncLogRow[]>
   triggerSync(): Promise<{ success: boolean; result?: unknown; error?: string }>
-  retryFailedSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }>
+  /**
+   * o3d-e2mz: `expectedAttemptRevision` is the attempt the operator was looking at when they asked for
+   * this ONE row to be retried. A connector whose processor stamps attempt revisions fences the retry on
+   * it and refuses a request that names none; a connector that stamps none ignores it. Omitted for the
+   * bulk ("Retry All") form, which is not a decision about any particular attempt.
+   */
+  retryFailedSync(entryId?: string, expectedAttemptRevision?: number): Promise<{ success: boolean; reset: number; error?: string }>
   getSyncReadiness(): Promise<AccountingSyncReadiness>
 }
 
@@ -205,6 +219,9 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
         return triggerQuickBooksSync()
       },
       async retryFailedSync(entryId) {
+        // o3d-e2mz: this connector's processor stamps no attempt revision, so there is no attempt to
+        // fence a per-row retry on and the parameter is deliberately ignored. Out of scope by owner
+        // instruction; the retry stays exactly as unfenced as it was.
         const { retryFailedQuickBooksSync } = await import('@/app/actions/quickbooks-sync')
         return retryFailedQuickBooksSync(entryId)
       },
@@ -304,6 +321,7 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
         externalTransactionId: row.externalTransactionId,
         errorMessage: row.errorMessage,
         retryCount: row.retryCount,
+        attemptRevision: row.attemptRevision,
         syncedAt: row.syncedAt,
         createdAt: row.createdAt,
       }))
@@ -312,9 +330,9 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
       const { triggerXeroSync } = await import('@/app/actions/xero-sync')
       return triggerXeroSync()
     },
-    async retryFailedSync(entryId) {
+    async retryFailedSync(entryId, expectedAttemptRevision) {
       const { retryFailedXeroSync } = await import('@/app/actions/xero-sync')
-      return retryFailedXeroSync(entryId)
+      return retryFailedXeroSync(entryId, expectedAttemptRevision)
     },
     async getSyncReadiness() {
       const { getXeroSyncReadiness } = await import('@/app/actions/xero-sync')

@@ -6,7 +6,7 @@ import { redirect } from 'next/navigation'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { toIsoCountryCode } from '@/lib/countries'
@@ -144,7 +144,7 @@ export async function listProducts(params: {
   sort?: SortField
   dir?: SortDir
 }): Promise<ProductListResult> {
-  await requireAuth()
+  await requireInternalUser()
   const page = Math.max(1, params.page ?? 1)
   const pageSize = params.pageSize ?? 50
   const sortField = params.sort ?? 'sku'
@@ -331,7 +331,7 @@ export async function listProducts(params: {
 }
 
 export async function getProduct(id: string): Promise<ProductDetail | null> {
-  await requireAuth()
+  await requireInternalUser()
   const categoryNodes = await listProductCategoryNodes()
   const categoryPathById = new Map(categoryNodes.map((n) => [n.id, n.path] as const))
   const [p, activeOrderLines, inTransferLines, openPoLines] = await Promise.all([
@@ -607,7 +607,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
 }
 
 export async function getVariableProducts() {
-  await requireAuth()
+  await requireInternalUser()
   return db.product.findMany({
     where: { type: 'VARIABLE', lifecycleStatus: { in: COMPONENT_PRODUCT_STATUSES } },
     select: { id: true, sku: true, name: true },
@@ -618,14 +618,14 @@ export async function getVariableProducts() {
 export async function listProductCategories(): Promise<ProductCategoryNode[]> {
   // Internal inventory/admin surface only. Re-check ownership/portal semantics
   // before reusing product reporting categories in supplier- or customer-facing UI.
-  await requireAuth()
+  await requireInternalUser()
   return listProductCategoryNodes()
 }
 
 export type ProductSupplierOption = { id: string; name: string }
 
 export async function listProductSupplierOptions(): Promise<ProductSupplierOption[]> {
-  await requireAuth()
+  await requireInternalUser()
   return db.supplier.findMany({
     where: { active: true },
     select: { id: true, name: true },
@@ -1114,7 +1114,7 @@ export type ProductSupplierRow = {
 }
 
 export async function getProductSuppliers(productId: string): Promise<ProductSupplierRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.supplierProduct.findMany({
     where: { productId },
     include: {
@@ -1318,7 +1318,7 @@ async function findMatchingProductComponentConfigurations(
 }
 
 export async function getProductComponents(productId: string): Promise<ProductComponentRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.productComponent.findMany({
     where: { productId },
     include: { component: { select: { id: true, sku: true, name: true } } },
@@ -1501,7 +1501,7 @@ export type KitStockRow = {
 }
 
 export async function getKitStock(productId: string): Promise<KitStockRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const components = await db.productComponent.findMany({
     where: { productId },
     include: { component: { select: { id: true, sku: true } } },
@@ -1566,7 +1566,7 @@ export type ProductOptionRow = {
 }
 
 export async function getProductOptions(productId: string): Promise<ProductOptionRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   return db.productOption.findMany({
     where: { productId },
     orderBy: { sortOrder: 'asc' },
@@ -1948,7 +1948,7 @@ export type AllocationDetail = {
 }
 
 export async function getAllocationDetails(productId: string, warehouseId: string): Promise<AllocationDetail[]> {
-  await requireAuth()
+  await requireInternalUser()
   const [salesAllocs, moOrders] = await Promise.all([
     // Sales order allocations for this product from this warehouse
     db.orderAllocation.findMany({
@@ -2080,7 +2080,7 @@ export type IncomingDetail = {
 }
 
 export async function getIncomingDetails(productId: string, warehouseId: string): Promise<IncomingDetail[]> {
-  await requireAuth()
+  await requireInternalUser()
   const [poLines, transferLines] = await Promise.all([
     // PO lines incoming to this warehouse
     db.purchaseOrderLine.findMany({

@@ -44,6 +44,32 @@ For full Proxmox + Cloudflare + OpenLiteSpeed tenant rollout, see [Automated Ten
 
 The installer asks for the following values during setup. Press Enter to accept the default shown in brackets.
 
+**Re-running the installer keeps what the previous run configured.** Every prompt whose value is
+written to `.env` defaults to the value already there, so an upgrade run accepting the defaults
+re-writes the same configuration rather than the factory one. That applies to `REDIS_URL` and its
+credential, `REDIS_KEY_PREFIX`, and to `AUTH_SECRET`, `CRON_SECRET` and `SETTINGS_ENCRYPTION_KEY`,
+which are generated on a first install and never re-minted afterwards — re-minting
+`SETTINGS_ENCRYPTION_KEY` would make every encrypted Setting already in the database (Xero tokens,
+connector secrets) permanently undecryptable. Supplying a value explicitly — at the prompt, or as an
+environment variable under `--non-interactive` — still overrides the preserved one, so rotation works
+as before. A preserved credential is never echoed as the prompt default: the URL is shown redacted and
+a preserved password is shown as `[unchanged]`.
+
+**A `.env` the installer cannot read is not a `.env` with no secrets.** Only a path with *nothing* at
+all on it is a first install. If `${APP_DIR}/.env` exists but is a directory, a dangling symlink, or
+a file this process cannot open or read to the end, the installer **stops** rather than minting fresh
+secrets over a live database. The same applies to a `.env` that was read but is missing any of
+`AUTH_SECRET`, `SETTINGS_ENCRYPTION_KEY` or `CRON_SECRET`: this installer writes all three on every
+run, so a file missing one was truncated or hand-edited, and minting a replacement for
+`SETTINGS_ENCRYPTION_KEY` is irreversible. Restore the missing line from your backup or from the
+running service's environment — or, if this really is a fresh start and the existing data is
+expendable, re-run with `IMS_INSTALL_REMINT_SECRETS=yes`, which mints them and says out loud what it
+just destroyed.
+
+Prompts NOT preserved across a re-run: the WooCommerce, Xero, Turnstile and SMTP values, and the
+database prompts. Supply them again (or as environment variables) on an upgrade run, or the re-written
+`.env` will blank them.
+
 ### Application
 - **Domain name** — the hostname for your installation (e.g. `ims.yourdomain.com`)
 - **Internal port** — the port the app listens on (default: `3000`)
@@ -59,13 +85,49 @@ After installation, sign in and set the organisation base currency in **Settings
 - **Database password** — auto-generated if not provided
 
 ### Redis
-- **Redis URL** (default: `redis://localhost:6379`)
+- **Install Redis on this server** — install and configure a local Redis, or point at one you already run
+- **Redis URL** (default: `redis://localhost:6379`) — only asked when Redis is not installed here
 - **Redis password** — leave blank if not required
 - **Redis key prefix** — optional namespace for Redis-backed features
+
+The password you enter is placed **inside `REDIS_URL`**, percent-encoded, and the `REDIS_PASSWORD`
+line in `.env` is left empty. `REDIS_URL` is what the application authenticates with; a password that
+reaches only `REDIS_PASSWORD` never reaches `AUTH`, and because the login rate-limit buckets fail
+closed, a Redis answering `NOAUTH` does not look like a Redis fault — it looks like nobody can sign in.
+This applies to both branches: a locally installed Redis, and a Redis you already run.
+
+If the `REDIS_URL` you supply already carries a credential of its own, it is left exactly as you typed
+it and a password entered at the prompt is ignored with a warning — the URL wins, and an operator's
+connection string is never rewritten. "Already carries one" means an `@` in the **authority** — the
+text between `://` and the first `/`, `?` or `#` — where an `@` can only be the userinfo separator. An
+`@` further along, in a path or a query string, is none of the installer's business and does **not**
+stop your password being placed in the URL.
+
+If the authority is neither of those things — neither a `host[:port]` nor something carrying a
+credential — the installer **stops**. That shape is what an unencoded `/` inside a password looks
+like (`redis://:pa/ss@host:6379`, whose authority reads as `:pa`), and it cannot be told apart from a
+malformed host: guessing one way splices a *second* credential in front of yours, and guessing the
+other drops your password entirely. Percent-encode the password inside `REDIS_URL` (a `/` is `%2F`)
+and leave the Redis password prompt blank, or give a plain `redis://host:port[/db]` and let the
+installer place the password. The port, if present, must be numeric — that is what makes the two
+readings distinguishable at all.
+
+If you supply a password alongside a `REDIS_URL` with no `://` at all, the installer stops rather
+than proceeding with a password it cannot place.
+
+For a locally installed Redis, the same password is written to `/etc/redis/redis.conf` as a quoted
+`\xHH` string literal, built from the same byte-by-byte walk as the URL encoding. `redis.conf` is
+parsed by redis's own `sdssplitargs()`, which splits on whitespace and opens a quoted section on a
+quote character anywhere in a token, so a password containing whitespace, a quote or a backslash cannot
+be written into it literally — the server would either refuse to start or require different bytes than
+the client sends.
 
 ### WooCommerce (Optional)
 - Store URL, consumer key, consumer secret, webhook secret
 - Can be configured later in Settings
+- The store URL is a **seed**: the installer writes it into the `wc_url` setting once, and
+  **Settings > Sync > Connection** owns it from then on. The three secrets are **overrides** —
+  while they are set in `.env` they win over anything saved in the UI
 
 ### Xero (Optional)
 - Client ID and client secret
@@ -218,9 +280,9 @@ Scheduled tasks are configured automatically:
 | 03:00 | `/api/cron/activity-cleanup` | Purge activity log entries past their retention period |
 | 04:00 | `/api/cron/wc-reconcile` | WooCommerce backup reconciliation for orders/products plus stock retry draining |
 | Every 15 min | `/api/cron/delivery-status` | Poll delivery tracking providers for shipment status updates |
-| Every 15 min | `/api/cron/wc-withdrawal-sweep` | Durable backstop: re-check WooCommerce orders refused as EU withdrawals, so one whose request was rejected back to a status the poll does not query is still imported |
+| Every 15 min | `/api/cron/wc-withdrawal-sweep` | Durable backstop: re-check WooCommerce orders refused as EU withdrawals, so one whose request was rejected back to a status the poll does not query is still imported. Also screens a rotating slice of already-pushed, dispatch-eligible orders against the storefront, so a withdrawal whose webhook was missed is known locally before the warehouse's despatch is reconciled |
 | Every 15 min | `/api/cron/refund-reservation-release` | Durable backstop: re-run allocation to release stock reservations for refunded units when the immediate post-refund release was bypassed or lost |
-| Every 5 min | `/api/cron/mintsoft-webhook-sweeper` | Drain persisted Mintsoft ASN booked-in webhook events |
+| Every 5 min | `/api/cron/mintsoft-webhook-sweeper` | Drain persisted Mintsoft ASN booked-in webhook events; also drains the post-maintenance re-check marker (`wms_booked_in_recheck_due_since`) by re-checking every open ASN after a maintenance window closes |
 | Every 15 min | `/api/cron/mintsoft-dispatch-sync` | Poll pushed Mintsoft orders for despatch and progress the IMS shipment + tracking |
 | 06:00 | `/api/cron/fx-rates` | Fetch latest exchange rates from frankfurter.dev |
 
@@ -230,6 +292,7 @@ For WooCommerce specifically:
 
 - real-time order/product intake should come from webhooks
 - `/api/cron/wc-reconcile` is the daily backup reconcile path for orders/products and also runs the stock catch-up plus queued retry drain
+- the **Import order statuses** selection (Settings > Sync > WooCommerce) decides which orders IMS takes on. It governs every route that *fetches* orders — the one-off active-order import and the poll/reconcile sweeps, each of which turns the selection into a WooCommerce `?status=` query — and **every route that receives an order without asking for a status**: the order webhook, the withdrawal-recovery sweep and the pending-FX retry queue. Those are gated inside the importer itself, at the read that decides create-versus-update, so a new ingress path is gated by default rather than when someone remembers to add the check. It is an **admission** rule: an order IMS has never seen is created only if it arrives in a selected status, and one that later moves into a selected status is imported by that update. An order IMS already holds is never gated, so it keeps following the store whatever status it moves to afterwards. Reconciliation additionally fetches `completed` so a finished order is never stranded, and the customer-withdrawal statuses are always included. An empty selection imports nothing, on every route. IMS also declines to create an order whose WooCommerce status it has no reading of — no status-mapping row and not one of WooCommerce's own statuses — rather than inventing `PROCESSING` for it, which used to allocate stock and queue an invoice off a status nothing had defined. **A refused order is never lost.** Each refusal writes a durable row naming the order id, and `/api/cron/wc-withdrawal-sweep` re-reads those orders by id every 15 minutes and puts them back through the same gate, so an order is imported as soon as you tick its status or add its mapping — with no dependence on WooCommerce ever pushing it again (the delivery was acknowledged, so it will not) or on a sweep cursor still reaching back to it. Widening the selection additionally rewinds the poll/reconcile cursor to the earliest order the selection had turned away, which imports a whole excluded status in one sweep instead of one by-id read at a time (logged as `wc_order_sync_cursor_rewound`; the by-id drain logs `wc_order_admission_refusal_drained`). The Sync page states all of this next to the checkboxes
 
 For Mintsoft specifically:
 
@@ -237,6 +300,8 @@ For Mintsoft specifically:
 - `/api/cron/mintsoft-webhook-sweeper` applies the pending stock and purchase-order effects asynchronously
 - booked-in processing uses direct ASN lookup by default; `MINTSOFT_USE_BULK_ASN_LOOKUP=true` temporarily restores the legacy list-and-match path if Mintsoft endpoint discovery proves the direct path incompatible
 - the sweeper drains up to `MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE` persisted events per run; the default is `250`
+- the same sweeper also carries the **post-maintenance re-check**: when a maintenance window closes, `disableMaintenanceMode` stamps `wms_booked_in_recheck_due_since`, and the next sweeper run re-checks every open ASN (both purchase-order and stock-transfer, up to 100 per tick, oldest first) so callbacks the maintenance fence refused recover without an operator. The stamp is kept until a full pass completes. See [`mintsoft.md`](./mintsoft.md#maintenance-mode-fence-o3d-hl8l)
+- `wms-watchdog` (hourly) is **enabled by default**: it is the days-scale backstop that alerts admins on an open ASN with no booked-in callback, and on a binding whose stock sync went quiet
 - `/api/cron/mintsoft-dispatch-sync` polls already-pushed orders (`WmsOrderPushLink.state` in `SYNCED`/`MERGED`, not yet shipped) for a despatched status and feeds the despatch into the IMS shipment via `applyExternalFulfillmentUpdate`, carrying the Mintsoft tracking number/courier through to the shipment + customer notifications; it is idempotent (a dispatched order leaves the poll set once reconciled to SHIPPED). It also handles:
   - **Split orders** — when Mintsoft splits an order into parts, each despatched part is pushed to the storefront as a partial shipment (via the onetwoInventory Helper plugin) and the IMS order is marked SHIPPED only once every part has despatched.
   - **Merged orders** — when Mintsoft merges an order into a survivor (combined `a+b` OrderNumber), the push link is repointed to the survivor and parked `MERGED` (so the order-push sweep no longer amends it), then reconciled. A merged-and-split survivor is completed atomically without per-part partial shipments (its parts mix several original orders).
@@ -383,18 +448,19 @@ Key variables in the `.env` file:
 | `XERO_DAILY_BATCH_LIMIT` | Maximum entities per group per daily batch run. Default `1000`, hard cap `5000`. Larger tenants whose daily volume exceeds the cap get multiple deterministic-reference journals per date. |
 | `WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD` | When the WooCommerce pending-FX retry queue reaches this depth, notify active admins. Default `5`. The queue accumulates when WC orders arrive in a currency without a stored FX rate; it drains automatically after the next FX-rate refresh. |
 | `BD_GIT_HOOK` / `BEADS_HOOK_TIMEOUT` | Beads (bd) integration hook settings, used only when bd issue tracking is enabled in the working tree. Not required for runtime. |
+| `IMS_INSTANCE_ROLE` | What this deployment **is**: `production`, `stage`, `development` or `e2e`. `NODE_ENV` cannot answer this — it is set by the build, so `next start` reports `production` on a stage server, a second production-shaped copy and the end-to-end rig alike, and controls that exempt production therefore exempt all of them (o3d-l89a). Set it on **every** instance. Production preflight warns while it is absent and fails when it is present and says anything other than `production` (or when `E2E_TEST_MODE=1` contradicts it). Absence currently falls back to the old `NODE_ENV`/`E2E_TEST_MODE` reading; once production carries the line, absence becomes non-production everywhere. |
 | `INVOICE_PDF_STORAGE_DIR` | Persistent storage directory for connector-downloaded invoice PDFs served through signed links. Defaults locally to `./data/invoices`; required by production preflight. Relative paths resolve against the process working directory, so production values should be absolute |
 | `SETTINGS_ENCRYPTION_KEY` | 32-byte raw key, or base64 value that decodes to 32 bytes, used to encrypt sensitive Setting values stored in the database (auto-generated) |
 | `ENCRYPTION_KEY` | Legacy fallback for older installs; if needed during migration, it must also be a 32-byte raw key or base64 value that decodes to 32 bytes |
 | `AUTH_URL` | Authentication callback URL (same as app URL) |
 | `DATABASE_URL` | PostgreSQL connection string |
 | `PREFLIGHT_DB_CONNECT` | Optional production preflight database connectivity probe. Set `true` during rollout when the preflight process can reach Postgres; default `false` for build-only CI jobs |
-| `REDIS_URL` | Redis connection URL |
-| `REDIS_PASSWORD` | Redis password (if required) |
-| `REDIS_KEY_PREFIX` | Optional Redis namespace prefix for tenant- or instance-scoped keys |
-| `WC_STORE_URL` | WooCommerce store URL |
-| `WC_CONSUMER_KEY` | WooCommerce API consumer key |
-| `WC_CONSUMER_SECRET` | WooCommerce API consumer secret |
+| `REDIS_URL` | Redis connection URL, and the canonical place a Redis credential lives: `redis://:PASSWORD@host:port/db` (percent-encode the password). It is what the client connects with, and it is the only form that can express a Redis 6 ACL username. `scripts/install.sh` writes it this way for BOTH a locally provisioned Redis and one you already run, and leaves `REDIS_PASSWORD` empty when it does |
+| `REDIS_PASSWORD` | Compatibility fallback, used only when `REDIS_URL` carries no credential of its own — for hosts whose URL predates the rule above. Set one or the other, not both: two different values are a configuration error and are refused rather than resolved by precedence. A Redis that answers `NOAUTH` does not look like a Redis fault, because the login rate-limit buckets fail closed — it looks like nobody can sign in |
+| `REDIS_KEY_PREFIX` | Optional Redis namespace prefix for tenant- or instance-scoped keys. Rate-limit keys become `<prefix>:rate-limit:<key>` |
+| `WC_STORE_URL` | WooCommerce store URL. Install-time seed only: `scripts/provision-instance.mjs` writes it into the `wc_url` setting on a fresh install (insert-only) and it never overrides the value saved in **Settings > Sync > Connection** |
+| `WC_CONSUMER_KEY` | WooCommerce API consumer key. Install-time seed only — the live value is the `wc_consumer_key` setting |
+| `WC_CONSUMER_SECRET` | WooCommerce API consumer secret. Install-time seed only — the live value is the `wc_consumer_secret` setting |
 | `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks and WooCommerce helper-plugin FX pushes |
 | `WC_INVOICE_PDF_SECRET` | Separate secret used only by the WooCommerce helper plugin to sign customer-visible invoice PDF proxy requests to IMS |
 | `SHOPIFY_INVOICE_PDF_SECRET` | Separate secret used only for Shopify customer-visible invoice PDF proxy requests to IMS |
@@ -405,15 +471,16 @@ Key variables in the `.env` file:
 | `OUTBOX_RETRY_BASE_MS` | Base delay for retryable IntegrationOutbox failures. Default `300000` (5 minutes). |
 | `OUTBOX_RETRY_MAX_MS` | Maximum delay cap for retryable IntegrationOutbox failures. Default `3600000` (1 hour). |
 | `OUTBOX_RETRY_JITTER_MS` | Maximum tail jitter added to retryable IntegrationOutbox failures. Default `30000` (30 seconds); a 5% base-delay floor applies even when set to `0`. |
-| `XERO_CLIENT_ID` | Xero OAuth client ID |
-| `XERO_CLIENT_SECRET` | Xero OAuth client secret |
-| `FX_BASE_CURRENCY` | Installer/default base currency seed for first-run setup. In normal use, the live system base currency is set once in **Settings > Company**. |
-| `PDF_TEMP_DIR` | Temporary directory for PDF generation |
+| `XERO_TENANT_ID` | **Deprecated** single-organisation form of `XERO_ALLOWED_TENANT_IDS`, kept because it was documented for years while nothing read it — an operator who set it believed the tenant was pinned and was not protected. It is now enforced identically. Prefer `XERO_ALLOWED_TENANT_IDS`; setting both to different values refuses every Xero connection rather than preferring one. It is **not** auto-populated after OAuth. |
+| `XERO_ALLOWED_TENANT_IDS` | Comma-separated allow-list of Xero tenant ids (organisation ids) this instance may connect to — the only key that can **allow** an organisation. Blank/absent means unrestricted. When set, a consent offering no allowed organisation is refused at the callback with nothing stored, and a stored token for a disallowed organisation halts every Xero sync. Requires a restart. |
+| `XERO_BLOCKED_TENANT_IDS` | Comma-separated tenant ids this instance may **never** use, applied before every other check, at the callback and on every use of the stored token. The maintenance-free control for a test rig: block the live organisation's id (which never changes) instead of allow-listing a test organisation whose id is re-issued when it is re-created. Listing the same id here and on the allow-list is refused as a contradiction rather than resolved silently. |
+| `XERO_REQUIRE_DEMO_ORG` | `true`/`false` (default false). When true, this instance may only connect to — and only keep a stored token for — a Xero **demo** organisation, proven from Xero's own `IsDemoCompany` flag on `GET /Organisation`. It costs no extra API call (the callback already reads that endpoint) and is the right control for a test rig: a deny-list refuses only the organisations someone remembered to list, so a third organisation still passes, while an id allow-list has to be re-edited every time the Demo company is re-created with a new tenantId. Enforced at the callback and on every use of the stored token, so a production database restored onto a rig is halted; a stored token whose demo status was never recorded counts as **unverified** and is refused until the connection is re-consented. A value that is neither yes nor no refuses every Xero connection rather than silently meaning off. Requires a restart. |
+| `XERO_ALLOWED_TENANT_IDS` / `XERO_BLOCKED_TENANT_IDS` / `XERO_REQUIRE_DEMO_ORG` (any one) | **Required on a non-production instance.** An instance where `NODE_ENV` is not `production` (including absent) or `E2E_TEST_MODE=1` refuses to connect to Xero, and refuses to use a stored Xero token, until one of these three is set — "nothing is configured" is the state that let the e2e rig invoice into the live organisation, so it may not read as "any ledger is allowed". `XERO_ALLOWED_TENANT_NAMES` does **not** satisfy it (a rename defeats a name check). Production is exempt; a production server that hits this refusal should set `NODE_ENV=production` rather than a weaker guard. There is deliberately no key that disables it. |
+| `XERO_ALLOWED_TENANT_NAMES` | Organisation names that **narrow** `XERO_ALLOWED_TENANT_IDS`, matched case-insensitively. It is *not* a union and *not* an identity: a Xero organisation name is neither unique nor fixed, so a name can never admit an organisation the id list excludes, a name matching two organisations on one consent is refused rather than used to pick one, and a configuration whose only tenant control is a name is recorded in the activity log as weaker than it looks. An organisation whose name contains a comma cannot be expressed here at all. Set an **id-based** control on every non-production instance — env is the only tenant control that survives a database reset. |
 | `BACKUP_DIR` | Local backup storage directory |
 | `ALLOW_DATABASE_RESTORE` | Production restore kill switch; leave `false` except during a supervised restore window |
 | `ALLOW_DATABASE_RESTORE_UPLOAD` | Additional kill switch for uploaded SQL restore files; leave `false` except during a supervised restore window |
 | `DATABASE_RESTORE_MAX_FILE_BYTES` | Maximum uploaded SQL restore file size in bytes. Defaults to `52428800` (50 MiB); uploaded restores also require the matching `.manifest.json` sidecar. |
-| `UPLOAD_MAX_SIZE_MB` | Maximum upload file size in MB (default: `10`) |
 | `UPLOAD_STORAGE_DIR` | Persistent private upload root. Defaults locally to `./uploads` when unset |
 | `PUBLIC_UPLOAD_STORAGE_DIR` | Persistent branding/avatar upload root. Defaults locally to `./public/uploads` when unset |
 | `FILE_SCAN_MODE` | Invoice PDF scan mode: `disabled` or `command` |
@@ -429,10 +496,21 @@ Key variables in the `.env` file:
 | `REQUIRE_TRUSTED_PROXY_CONFIG` | Set to `true` on proxied production deployments so preflight fails when `TRUSTED_PROXY_IPS` / `TRUSTED_PROXY_CIDRS` are empty |
 | `INVARIANT_CHECK_PAGE_SIZE` | Optional page size for the scheduled invariant check inventory SQL collector. Default `500`; raise temporarily only for production triage. |
 | `INVARIANT_CHECK_MAX_FINDINGS` | Optional maximum inventory invariant findings collected by the scheduled invariant check. Default `5000`; when the cap is hit, the report adds a critical truncation finding. |
-| `SMTP_HOST` | SMTP server hostname if you choose to manage mail via env rather than app settings |
+| `SMTP_HOST` | SMTP server hostname. Install-time seed only - see below |
 | `SMTP_PORT` | SMTP server port |
 | `SMTP_USER` | SMTP authentication username |
 | `SMTP_PASS` | SMTP authentication password |
+| `SMTP_FROM_EMAIL` | From address on outgoing mail |
+| `SMTP_FROM_NAME` | From name on outgoing mail |
+| `SMTP_SECURE` | Encryption: `tls`, `ssl` or `none` |
+| `SMTP_REPLY_TO` | Reply-to address on outgoing mail |
+
+The `SMTP_*` variables are an **install-time seed only**. `scripts/provision-instance.mjs` reads
+them once and writes them into the `settings` table (`email_smtp_*`); at runtime `lib/mailer.ts`
+reads those settings and never the environment. Mail cannot be managed by env - change it in
+**Settings > Email**. Xero OAuth client credentials, the base currency, PDF/upload temp
+directories and the upload size cap are likewise not environment variables; see `CLAUDE.md` for
+where each of those actually lives (o3d-esha).
 
 IMS-session invoice PDF links intentionally bind to the current session and client IP. This limits copied-link replay, but users who switch networks, reconnect a VPN, or resume a tab after their IP changes may need to return to the invoice page and request a fresh link. Customer-facing shopping invoice downloads avoid this IMS session/IP binding by using the shopping platform ownership check plus the short-lived `/api/shopping/{connector}/invoice-pdf` server-to-server handoff.
 
@@ -446,7 +524,12 @@ Run a one-shot migration after deploying the key to avoid waiting for low-traffi
 npm run cli -- migrate-encrypted-settings
 ```
 
-Environment variables for connector secrets take precedence over database settings. For example, when `WC_CONSUMER_SECRET` is non-empty, WooCommerce sync uses that value even if an operator saves a different value in the UI. Clear the environment variable and restart the app to use the database value. The connector settings UI shows a warning banner when an environment override is active.
+Environment variables for connector secrets take precedence over database settings — for the connectors that still have an environment fallback (`WC_WEBHOOK_SECRET`, `WC_INVOICE_PDF_SECRET`, the Mintsoft credentials). When such a variable is non-empty, the connector uses that value even if an operator saves a different value in the UI. Clear the environment variable and restart the app to use the database value. The connector settings UI shows a warning banner when an environment override is active.
+
+`WC_CONSUMER_KEY` and `WC_CONSUMER_SECRET` are **not** in that group. They are install-time **seeds**: `scripts/provision-instance.mjs` writes them into the settings table only if no value is there yet, and Settings → Sync → WooCommerce → Connection owns them from then on. Editing them in `.env` after installation changes nothing — rotate the credential in the UI. (Environment precedence was removed because it was only half applied: the order import followed the environment while the stock and product syncs followed the database, so a stale `.env` secret made one installation talk to WooCommerce under two different credentials.)
+
+`WC_STORE_URL` is never read at runtime either. The live store URL is always the `wc_url` setting, entered in Settings → Sync → WooCommerce → Connection; `WC_STORE_URL` seeds that row once on a fresh install and nothing reads it afterwards. If the credentials are stored but no store URL is, the installer says so and the connector cannot reach the store until the URL is entered.
+`WC_STORE_URL` is not one of them either, and for the same reason with more force: the installer writes it into every `.env`, so making it an override would repoint an installation that had since been moved to a different store back to the old one on its next upgrade — and only part of the code resolves `wc_url` through the settings store, so order import and stock push would end up targeting different shops. It seeds the setting once at install time instead (`scripts/provision-instance.mjs`, insert-only).
 
 To rotate from the legacy global key to the settings key, first deploy with both the old key as `ENCRYPTION_KEY` and the new key as `SETTINGS_ENCRYPTION_KEY`, then run `npm run cli -- migrate-encrypted-settings` or save each connector settings page so sensitive values are rewritten as `enc:setting:v1:` with the new key. After confirming no `enc:v1` values remain in the `settings` table, remove the legacy `ENCRYPTION_KEY`.
 

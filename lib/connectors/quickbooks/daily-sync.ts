@@ -203,7 +203,7 @@ async function createPendingSyncLog(
     payload: Record<string, unknown>
     currency: string
   },
-): Promise<void> {
+): Promise<string> {
   const log = await tx.accountingSyncLog.create({
     data: {
       connector: QBO_CONNECTOR,
@@ -235,6 +235,9 @@ async function createPendingSyncLog(
       description: `Daily-batch sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
     },
   }).then(() => undefined))
+  // o3d-o97 r3: parity with the Xero batch — the row's own id, so a caller can record a
+  // journal's identity rather than only the amount it carried.
+  return log.id
 }
 
 async function lockCostLayers(
@@ -329,7 +332,17 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
     select: { revenueDeferredDate: true, revenueDeferredBatchRef: true, unearnedRevenueAmount: true },
   })
   const orphanA2Orders = await db.salesOrder.findMany({
-    where: { inventoryAllocatedDate: journaledDateFilter },
+    where: {
+      inventoryAllocatedDate: journaledDateFilter,
+      // o3d-o97 r3: NEVER rebuild an A2 journal for a fully-refunded order. Group A2's own window
+      // excludes `refundStatus: FULL` permanently, and so does Group B, so a debit re-posted here
+      // has nothing left in IMS that will ever relieve it. The case is now reachable: a refund
+      // that CANNOT account for the A2 debit deliberately keeps the order's A2 stamp so the
+      // standing invariants stay able to report it (see refund-service.ts), and a CANCELLED A2 log
+      // does not count as live — so without this filter the very orders held open for a human to
+      // resolve would have a fresh, permanently unrelievable debit posted under them.
+      refundStatus: { not: 'FULL' },
+    },
     select: { inventoryAllocatedDate: true, inventoryAllocatedBatchRef: true, allocationBatchAmount: true },
   })
   const orphanBShipments = await db.shipment.findMany({
@@ -612,6 +625,9 @@ export async function runDailyBatchSync(): Promise<{
         orderNumber: true,
         externalOrderNumber: true,
         status: true,
+        // o3d-0i5y r5 (rebase onto o3d-o97): what earlier A2 passes already recorded posting for
+        // this order — the running total the write below adds to. See the Xero batch.
+        allocationBatchAmount: true,
         allocations: {
           select: {
             id: true,
@@ -681,8 +697,10 @@ export async function runDailyBatchSync(): Promise<{
         }
 
         const totalAllocatedValueNumber = round2Decimal(totalAllocatedValue)
+        // o3d-o97 r3: null when the rounded window total raised no journal. See the Xero batch.
+        let a2SyncLogId: string | null = null
         if (totalAllocatedValueNumber > 0) {
-          await createPendingSyncLog(tx, {
+          a2SyncLogId = await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_INVENTORY_ALLOC',
             referenceId,
             currency: baseCurrency,
@@ -701,10 +719,15 @@ export async function runDailyBatchSync(): Promise<{
 
         for (const order of orders) {
           for (const alloc of order.allocations) {
+            const allocationSnapshot = allocationSnapshots.get(alloc.id) ?? []
             await tx.orderAllocation.update({
               where: { id: alloc.id },
               data: {
-                costLayerSnapshot: (allocationSnapshots.get(alloc.id) ?? []) as never,
+                costLayerSnapshot: allocationSnapshot as never,
+                // o3d-o97 r3: the pounds this row contributed to the DR. See the Xero batch.
+                allocationBatchAmount: a2SyncLogId
+                  ? roundQuantity(sumCostLayerSnapshot(allocationSnapshot), 4).toNumber()
+                  : null,
               },
             })
           }
@@ -713,7 +736,20 @@ export async function runDailyBatchSync(): Promise<{
             data: {
               inventoryAllocatedDate: new Date(),
               inventoryAllocatedBatchRef: referenceId,
-              allocationBatchAmount: orderValues.get(order.id) ?? 0,
+              // o3d-o97 r3 + o3d-0i5y r5: ACCUMULATED, not replaced — a stamped order can be handed
+              // back for an INCREMENT now, so the order-level record is the running total of what
+              // A2 has debited. See the Xero batch for the worked strand.
+              allocationBatchAmount: roundQuantity(
+                addMoney(
+                  toDecimal(order.allocationBatchAmount ?? 0),
+                  toDecimal(orderValues.get(order.id) ?? 0),
+                ),
+                4,
+              ).toNumber(),
+              // o3d-o97 r3: the journal's identity and DESTINATION. See the Xero batch.
+              allocationBatchSyncLogId: a2SyncLogId,
+              allocationBatchConnector: a2SyncLogId ? QBO_CONNECTOR : null,
+              allocationBatchAccountCode: a2SyncLogId ? settings.quickbooks_allocated_inventory_account : null,
             },
           })
         }
@@ -1164,8 +1200,14 @@ export async function runDailyBatchSync(): Promise<{
       // re-derived from shipmentJournalDate (written later, possibly on the next UTC day).
       const referenceId = `B-${today}`
 
+      // o3d-o97 r4: null unless a journal row was created AND it carried a CR Allocated Inventory
+      // line. Two different guards: no lines at all means no log, and — separately — a window whose
+      // ROUNDED COGS total is zero still raises a revenue-only journal crediting Allocated Inventory
+      // NOTHING, while `allocatedReliefAmount` below is stamped on every member shipment regardless.
+      // Mirrors the Xero batch; see the note there.
+      let groupBSyncLogId: string | null = null
       if (journalLines.length > 0) {
-        await createPendingSyncLog(tx, {
+        const createdLogId = await createPendingSyncLog(tx, {
           type: 'DAILY_BATCH_GROUP_B',
           referenceId,
           currency: baseCurrency,
@@ -1177,6 +1219,7 @@ export async function runDailyBatchSync(): Promise<{
             _postingMode: 'submitted',
           },
         })
+        if (totalCogsNumber > 0) groupBSyncLogId = createdLogId
       }
 
       // Only mark shipments that were successfully processed. Failed
@@ -1204,6 +1247,15 @@ export async function runDailyBatchSync(): Promise<{
             shipmentJournalBatchRef: referenceId,
             cogsBatchAmount: resultForShipment.cogs,
             revenueRecognizedAmount: resultForShipment.revenue,
+            // o3d-o97 r3: the CR Allocated Inventory this shipment's journal raised, recorded once
+            // and never revalued. See the Xero batch.
+            allocatedReliefAmount: resultForShipment.cogs,
+            // o3d-o97 r4: and which journal raised it, on which ledger, against which account — all
+            // null when no CR Allocated Inventory line was raised. Resolving the id reads that
+            // row's STATUS, so a queued or cancelled Group B journal is never counted as relief.
+            allocatedReliefSyncLogId: groupBSyncLogId,
+            allocatedReliefConnector: groupBSyncLogId ? QBO_CONNECTOR : null,
+            allocatedReliefAccountCode: groupBSyncLogId ? settings.quickbooks_allocated_inventory_account : null,
           },
         })
       }

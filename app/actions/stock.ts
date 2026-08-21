@@ -5,7 +5,7 @@ import { cache } from 'react'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import { getAccountingSettings } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
@@ -375,7 +375,7 @@ export type AdjustmentMovementRow = {
 }
 
 export async function getAdjustmentHistory(limit = 200): Promise<AdjustmentMovementRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.stockMovement.findMany({
     where: { type: 'ADJUSTMENT' },
     orderBy: { createdAt: 'desc' },
@@ -757,7 +757,7 @@ export async function fetchWcImage(
 // ---------------------------------------------------------------------------
 
 export async function getWarehouses() {
-  await requireAuth()
+  await requireInternalUser()
   return db.warehouse.findMany({
     where: { active: true },
     select: { id: true, code: true, name: true, type: true, country: true, contactName: true, email: true, phone: true, addressLine1: true, addressLine2: true, city: true, postcode: true, isDefault: true },
@@ -794,7 +794,7 @@ const readScopedStockLevelMap = cache(async (
 })
 
 export async function getScopedStockLevelMap(scope: StockLevelMapScope = {}): Promise<StockLevelMap> {
-  await requireAuth()
+  await requireInternalUser()
   if (isEmptyStockLevelMapScope(scope)) return {}
 
   const normalized = normalizeStockLevelMapScope(scope)
@@ -817,7 +817,7 @@ export async function getScopedStockLevelMap(scope: StockLevelMapScope = {}): Pr
  * risk). Anything that posts to accounting must use the Decimal engine instead.
  */
 export async function getAvgCogsMap(): Promise<Record<string, number>> {
-  await requireAuth()
+  await requireInternalUser()
   const layers = await db.costLayer.findMany({
     where: { remainingQty: { gt: 0 } },
     select: { productId: true, remainingQty: true, unitCostBase: true },
@@ -848,7 +848,7 @@ export type AdjustmentReasonOption = {
 }
 
 export async function getActiveAdjustmentReasons(): Promise<AdjustmentReasonOption[]> {
-  await requireAuth()
+  await requireInternalUser()
   return db.adjustmentReason.findMany({
     where: { active: true },
     orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
@@ -893,7 +893,7 @@ export async function getProductStockFlow(
   filters?: StockFlowFilters,
   limit = 500
 ): Promise<StockFlowRow[]> {
-  await requireAuth()
+  await requireInternalUser()
 
   const where: Prisma.StockMovementWhereInput = { productId, referenceType: { notIn: ['WcHistorical', 'WcInitialImport', 'CsvHistorical'] } }
   if (filters?.types?.length) {

@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import { setSetting } from '@/app/actions/settings'
+import { setSettings } from '@/app/actions/settings'
 import { fetchAllFxRates } from '@/app/actions/currencies'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
@@ -28,10 +28,13 @@ export function FxScheduleSettings({ enabled, intervalHours, lastFetched }: Prop
   function handleSave() {
     setSaved(false)
     startTransition(async () => {
-      await Promise.all([
-        setSetting('fx_schedule_enabled', isEnabled ? 'true' : 'false'),
-        setSetting('fx_schedule_interval_hours', hours),
-      ])
+      // ONE transaction, not a Promise.all of independent writes (o3d-osl8 round 9, finding 1):
+      // the first rejection there left the rest still committing, so a "failed" save could store
+      // an arbitrary subset of one edit.
+      await setSettings({
+        fx_schedule_enabled: isEnabled ? 'true' : 'false',
+        fx_schedule_interval_hours: hours,
+      })
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
     })

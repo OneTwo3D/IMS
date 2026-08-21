@@ -267,7 +267,7 @@ async function generateManufacturingOrderPreview(branding: Branding, today: stri
 
   doc.font('Helvetica').fontSize(9).fillColor('#333')
   doc.text('Product: PLA-BLK-1KG — PLA Filament Black 1kg', 50, doc.y)
-  doc.text('Warehouse: Main Warehouse (EAR2)', 50, doc.y)
+  doc.text('Warehouse: Main Warehouse (MIL1)', 50, doc.y)
   doc.text('Quantity: 50', 50, doc.y)
   doc.text('Type: Assembly', 50, doc.y)
   doc.y += 12

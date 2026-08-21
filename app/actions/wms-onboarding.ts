@@ -1,5 +1,6 @@
 'use server'
 
+import { requirePermission } from '@/lib/auth/server'
 import { getActiveWmsConnectorId } from '@/lib/connectors/wms/active-connector'
 import { getWmsConnectorDef } from '@/lib/connectors/wms/registry'
 import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/types'
@@ -21,6 +22,11 @@ export type WmsOnboardingConnectionData = {
 }
 
 export async function getWmsOnboardingConnectionData(): Promise<WmsOnboardingConnectionData> {
+  // o3d-512h round 3 — the no-connector arm answered from this module, after
+  // getActiveWmsConnectorId had already read plugin state, to any authenticated
+  // principal. Delegate: mintsoft-sync.ts:getMintsoftOnboardingConnectionData →
+  // requireMintsoftReadAccess() → requirePermission('sync').
+  await requirePermission('sync')
   const connectorId = (await getActiveWmsConnectorId()) ?? WMS_CONNECTOR_IDS[0]
 
   if (connectorId === 'mintsoft') {

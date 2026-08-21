@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
+import { refundLineBucket } from '@/lib/domain/sales/refund-basis-analytics'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,12 +26,30 @@ export type ProfitabilityRow = {
   unitMargin: number | null
   unitMarginPct: number | null
   // Current FY
+  /**
+   * Revenue net of NET-BASIS refunds only. o3d-iigc: this is built from ex-VAT line totals, so a
+   * GROSS-basis credit is not the same unit and an unstamped one cannot be placed at all; both are
+   * reported in the two fields below and left OUT of this figure rather than subtracted on a guess.
+   */
   currentFyRevenue: number
+  /** Refund value on the GROSS basis, NOT subtracted from currentFyRevenue. */
+  currentFyRefundsGrossBasis: number
+  /** Refund value with no proven basis, NOT subtracted from currentFyRevenue. */
+  currentFyRefundsUnknownBasis: number
+  /**
+   * False when this product carried FY refund value that could not be placed on the net basis.
+   * currentFyRevenue and currentFyProfit are then UPPER BOUNDS, too high by at most
+   * currentFyRefundsGrossBasis + currentFyRefundsUnknownBasis.
+   */
+  currentFyRefundBasisComplete: boolean
   currentFyCogs: number
   currentFyProfit: number
   currentFyQtySold: number
   // Previous FY
   previousFyRevenue: number
+  previousFyRefundsGrossBasis: number
+  previousFyRefundsUnknownBasis: number
+  previousFyRefundBasisComplete: boolean
   previousFyCogs: number
   previousFyProfit: number
   previousFyQtySold: number
@@ -38,10 +57,18 @@ export type ProfitabilityRow = {
 
 export type ProfitabilitySummary = {
   totalProducts: number
+  /** NET-basis refunds only — see ProfitabilityRow.currentFyRevenue. */
   currentFyRevenue: number
+  currentFyRefundsGrossBasis: number
+  currentFyRefundsUnknownBasis: number
+  /** False when ANY row's FY refunds could not all be placed on the net basis. */
+  currentFyRefundBasisComplete: boolean
   currentFyCogs: number
   currentFyProfit: number
   previousFyRevenue: number
+  previousFyRefundsGrossBasis: number
+  previousFyRefundsUnknownBasis: number
+  previousFyRefundBasisComplete: boolean
   previousFyCogs: number
   previousFyProfit: number
   fyLabel: string       // e.g. "May 2025 – Apr 2026"
@@ -131,7 +158,7 @@ export async function getProductProfitability(): Promise<{
         fxRateToBase: true, discountAmount: true, pricesIncludeVat: true, taxRatePercent: true,
         shoppingLinks: { select: { connector: true } },
         lines: { select: { productId: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true, taxRate: { select: { rate: true } } } },
-        refunds: { select: { lines: { select: { productId: true, qty: true, totalBase: true } } } },
+        refunds: { select: { totalsBasis: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
       },
     }),
     db.salesOrder.findMany({
@@ -140,20 +167,23 @@ export async function getProductProfitability(): Promise<{
         fxRateToBase: true, discountAmount: true, pricesIncludeVat: true, taxRatePercent: true,
         shoppingLinks: { select: { connector: true } },
         lines: { select: { productId: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true, taxRate: { select: { rate: true } } } },
-        refunds: { select: { lines: { select: { productId: true, qty: true, totalBase: true } } } },
+        refunds: { select: { totalsBasis: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
       },
     }),
   ])
 
   // 5. Aggregate by product for each FY
-  type FyAgg = { revenue: number; cogs: number; qtySold: number }
+  type FyAgg = {
+    revenue: number; cogs: number; qtySold: number
+    refundsGrossBasis: number; refundsUnknownBasis: number; refundBasisComplete: boolean
+  }
   function aggregateOrders(orders: typeof currentFyOrders): Map<string, FyAgg> {
     const map = new Map<string, FyAgg>()
     for (const order of orders) {
       const orderDiscountAllocations = allocateOrderDiscountBase(order, order.lines)
       for (const [lineIndex, line] of order.lines.entries()) {
         if (!line.productId) continue
-        const agg = map.get(line.productId) ?? { revenue: 0, cogs: 0, qtySold: 0 }
+        const agg = map.get(line.productId) ?? { revenue: 0, cogs: 0, qtySold: 0, refundsGrossBasis: 0, refundsUnknownBasis: 0, refundBasisComplete: true }
         agg.revenue += Number(line.totalBase)
         agg.cogs += Number(line.cogsBase ?? 0)
         agg.qtySold += Number(line.qty)
@@ -162,13 +192,26 @@ export async function getProductProfitability(): Promise<{
         agg.revenue -= orderDiscountAllocations[lineIndex] ?? 0
         map.set(line.productId, agg)
       }
-      // Subtract refunds
+      // Subtract refunds.
+      //
+      // o3d-iigc: `revenue` above is built from ex-VAT line totals, so only a NET-basis refund is
+      // the same unit. A GROSS one carries its VAT and would over-subtract; an unstamped one cannot
+      // be placed at all. Neither is converted — on a mixed-rate order the rate that produced the
+      // gross figure is not recoverable — so both are bucketed beside the revenue and the row is
+      // flagged, making `revenue` an upper bound rather than a number that is wrong in an
+      // undisclosed direction. Quantity is basis-independent, so qtySold keeps netting off every
+      // refund line.
       for (const refund of order.refunds) {
         for (const rl of refund.lines) {
           if (!rl.productId) continue
           const agg = map.get(rl.productId)
           if (agg) {
-            agg.revenue -= Number(rl.totalBase)
+            const amount = Number(rl.totalBase)
+            const placement = refundLineBucket(refund.totalsBasis, rl.totalBase)
+            if (placement.bucket === 'net') agg.revenue -= amount
+            else if (placement.bucket === 'gross') agg.refundsGrossBasis += amount
+            else agg.refundsUnknownBasis += amount
+            if (!placement.placeableOnNetBasis) agg.refundBasisComplete = false
             agg.qtySold -= Number(rl.qty)
           }
         }
@@ -217,10 +260,17 @@ export async function getProductProfitability(): Promise<{
       unitMargin: unitMargin != null ? Math.round(unitMargin * 100) / 100 : null,
       unitMarginPct: unitMarginPct != null ? Math.round(unitMarginPct * 10) / 10 : null,
       currentFyRevenue,
+      currentFyRefundsGrossBasis: Math.round((cfy?.refundsGrossBasis ?? 0) * 100) / 100,
+      currentFyRefundsUnknownBasis: Math.round((cfy?.refundsUnknownBasis ?? 0) * 100) / 100,
+      // A product with no sales at all in the window has nothing unplaceable, so it stays complete.
+      currentFyRefundBasisComplete: cfy?.refundBasisComplete ?? true,
       currentFyCogs,
       currentFyProfit: Math.round((currentFyRevenue - currentFyCogs) * 100) / 100,
       currentFyQtySold: Math.round((cfy?.qtySold ?? 0) * 100) / 100,
       previousFyRevenue,
+      previousFyRefundsGrossBasis: Math.round((pfy?.refundsGrossBasis ?? 0) * 100) / 100,
+      previousFyRefundsUnknownBasis: Math.round((pfy?.refundsUnknownBasis ?? 0) * 100) / 100,
+      previousFyRefundBasisComplete: pfy?.refundBasisComplete ?? true,
       previousFyCogs,
       previousFyProfit: Math.round((previousFyRevenue - previousFyCogs) * 100) / 100,
       previousFyQtySold: Math.round((pfy?.qtySold ?? 0) * 100) / 100,
@@ -232,9 +282,15 @@ export async function getProductProfitability(): Promise<{
   const summary: ProfitabilitySummary = {
     totalProducts: rows.length,
     currentFyRevenue: rows.reduce((s, r) => s + r.currentFyRevenue, 0),
+    currentFyRefundsGrossBasis: rows.reduce((s, r) => s + r.currentFyRefundsGrossBasis, 0),
+    currentFyRefundsUnknownBasis: rows.reduce((s, r) => s + r.currentFyRefundsUnknownBasis, 0),
+    currentFyRefundBasisComplete: rows.every((r) => r.currentFyRefundBasisComplete),
     currentFyCogs: rows.reduce((s, r) => s + r.currentFyCogs, 0),
     currentFyProfit: rows.reduce((s, r) => s + r.currentFyProfit, 0),
     previousFyRevenue: rows.reduce((s, r) => s + r.previousFyRevenue, 0),
+    previousFyRefundsGrossBasis: rows.reduce((s, r) => s + r.previousFyRefundsGrossBasis, 0),
+    previousFyRefundsUnknownBasis: rows.reduce((s, r) => s + r.previousFyRefundsUnknownBasis, 0),
+    previousFyRefundBasisComplete: rows.every((r) => r.previousFyRefundBasisComplete),
     previousFyCogs: rows.reduce((s, r) => s + r.previousFyCogs, 0),
     previousFyProfit: rows.reduce((s, r) => s + r.previousFyProfit, 0),
     fyLabel,

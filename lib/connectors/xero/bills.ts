@@ -4,6 +4,7 @@
 
 import { xeroPost, xeroPut } from './api'
 import { findOrCreateContact } from './contacts'
+import { xeroDocumentRevisionAt } from './document-revision'
 import { imsRateToXeroCurrencyRate } from './fx'
 import type { BillData, InvoiceLine } from '../types'
 
@@ -12,6 +13,9 @@ type XeroInvoiceResponse = {
     InvoiceID: string
     InvoiceNumber: string
     Status: string
+    // o3d-cvj9 r3: Xero's own revision stamp for the bill, applied by THIS write — the ordering key
+    // for two competing revisions of one document. See xeroDocumentRevisionAt.
+    UpdatedDateUTC?: string
   }>
 }
 
@@ -121,7 +125,7 @@ export async function pushPurchaseBill(
   data: BillData,
   status: string = 'AUTHORISED',
   opts?: { idempotencyKey?: string; supplierId?: string; supplierEmail?: string },
-): Promise<{ success: boolean; invoiceId?: string; error?: string }> {
+): Promise<{ success: boolean; invoiceId?: string; externalRevisionAt?: Date | null; error?: string }> {
   const prepared = await preparePurchaseBillPayload(data, status, opts)
   if (!prepared.success) return prepared
 
@@ -130,7 +134,11 @@ export async function pushPurchaseBill(
     return { success: false, error: res.error ?? 'Failed to create bill' }
   }
 
-  return { success: true, invoiceId: res.data.Invoices[0].InvoiceID }
+  return {
+    success: true,
+    invoiceId: res.data.Invoices[0].InvoiceID,
+    externalRevisionAt: xeroDocumentRevisionAt(res.data.Invoices[0]),
+  }
 }
 
 export async function updatePurchaseBill(
@@ -138,7 +146,7 @@ export async function updatePurchaseBill(
   data: BillData,
   status: string = 'AUTHORISED',
   opts?: { idempotencyKey?: string; supplierId?: string; supplierEmail?: string },
-): Promise<{ success: boolean; invoiceId?: string; error?: string }> {
+): Promise<{ success: boolean; invoiceId?: string; externalRevisionAt?: Date | null; error?: string }> {
   const prepared = await preparePurchaseBillPayload(data, status, opts)
   if (!prepared.success) return prepared
 
@@ -147,5 +155,9 @@ export async function updatePurchaseBill(
     return { success: false, error: res.error ?? 'Failed to update bill' }
   }
 
-  return { success: true, invoiceId: res.data.Invoices[0].InvoiceID }
+  return {
+    success: true,
+    invoiceId: res.data.Invoices[0].InvoiceID,
+    externalRevisionAt: xeroDocumentRevisionAt(res.data.Invoices[0]),
+  }
 }

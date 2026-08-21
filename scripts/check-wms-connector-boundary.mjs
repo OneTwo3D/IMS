@@ -93,6 +93,10 @@ const ALLOWLIST = [
   'lib/security/route-auth-policy.ts',
   'lib/security/public-route-security-policy.ts',
   'lib/integration-plugins.ts',
+  // The plugin setting keys, split out of lib/integration-plugins.ts so the full-chain quiesce
+  // harness can name them without importing Prisma (o3d-osl8 round 6). Same registry, same reason
+  // for the allowance: it IS the id→key map, so it necessarily spells every connector id.
+  'lib/integration-plugin-keys.ts',
   'app/actions/onboarding.ts',
   'lib/integration-connection-test-gate.ts',
   'lib/settings-store.ts',
