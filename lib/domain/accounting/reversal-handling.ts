@@ -68,7 +68,8 @@ export type ReversalOutcome = 'reversed' | 'chargeback-failed'
  *  1. Determine whether a recent WC refund already owns the revenue reversal.
  *  2. Raise the chargeback credit note only when revenue was recognised, the
  *     invoice is still live (a VOIDED invoice already had AR/revenue reversed by
- *     Xero), and no recent WC refund covers it. A failed chargeback HOLDS paidAt.
+ *     Xero), no recent WC refund covers it, and the ledger is not still holding a
+ *     payment against the invoice. A failed chargeback HOLDS paidAt.
  *  3. Clear paidAt unconditionally (payment is gone in Xero) once no chargeback is
  *     owed or the chargeback succeeded.
  *  4. Alert + audit ALWAYS fire (status is never auto-reverted). A WC-handled
@@ -77,14 +78,28 @@ export type ReversalOutcome = 'reversed' | 'chargeback-failed'
  */
 export async function handleDetectedReversal(
   order: DetectedReversalOrder,
-  opts: { invoiceVoided: boolean },
+  opts: {
+    invoiceVoided: boolean
+    /**
+     * The reversal was established by the PAYMENT'S IDENTITY — the payment IMS registered is gone from
+     * the invoice — while the ledger still holds a payment against it, or did not state what it holds
+     * (o3d-clxw round 2).
+     *
+     * paidAt is still cleared: the payment IMS recorded really has gone. The CHARGEBACK is not raised,
+     * because it reverses the WHOLE recognised revenue against AR, and doing that to an invoice the
+     * ledger is still holding money for unwinds more than was reversed. That is round 1's rule
+     * unchanged — no automatic credit note against a payment the ledger is still holding — reaching
+     * the one case round 1 could not see, and the alert says the decision is a human's.
+     */
+    ledgerStillHoldsPayment?: boolean
+  },
   effects: ReversalEffects,
 ): Promise<{ outcome: ReversalOutcome; wcHandled: boolean; error?: string }> {
   const wcHandled = await effects.wasHandledByRecentWcRefund(order.id)
 
   // Revenue unwind — skipped when a recent WC refund already reversed revenue (no
   // double credit note), the invoice is VOIDED, or no revenue was recognised.
-  if (order.revenueDeferredDate && !opts.invoiceVoided && !wcHandled) {
+  if (order.revenueDeferredDate && !opts.invoiceVoided && !wcHandled && !opts.ledgerStillHoldsPayment) {
     let error: string | undefined
     try {
       const chargeback = await effects.raiseChargeback(order.id)

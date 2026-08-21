@@ -2187,6 +2187,24 @@ model AccountingSyncLog {
   retryCount            Int                  @default(0)
   processingStartedAt   DateTime?
   syncedAt              DateTime?
+  // o3d-clxw r5 finding 1: the same instant as `syncedAt`, written by the same statement from a
+  // SINGLE evaluation of `clock_timestamp()` (stampSyncedAtFromDatabaseClock). The payment poller's
+  // reversal fence accepts a registration as ordered against the ledger read only when this column
+  // is present AND equal to `syncedAt` — so a row whose `syncedAt` came from an application host's
+  // wall clock (an old build during a deploy, either creating the row or rewriting it) is
+  // DISTINGUISHABLE from one the database stamped, and withholds instead of deciding. NULL is not a
+  // missing value here, it is "this row's completion time cannot be ordered against anything", and
+  // it is never backfilled: copying `syncedAt` into it would be the database vouching for a stamp it
+  // did not produce. See the migration for the full argument.
+  //
+  // r6 finding 1: the equality is a rule the DATABASE enforces, not one the reader can check. A
+  // trigger in the same migration clears this column whenever a statement changes `status`,
+  // `syncedAt`, `externalTransactionId` or `processingStartedAt` without minting a new marker in the
+  // same statement, and refuses one supplied by an INSERT — so a writer that does not know about the
+  // scheme (the previous release, a script, psql) destroys provenance rather than inheriting it,
+  // whatever millisecond it happens to land on. Triggers are invisible to this schema; the migration
+  // is where the rule lives.
+  syncedAtDatabaseClock DateTime?
   createdAt             DateTime             @default(now())
   // o3d-9kek: when the back-reference repair sweep last REACHED A VERDICT on this row
   // (its document is linked, or the row can never be attributed automatically). NULL =

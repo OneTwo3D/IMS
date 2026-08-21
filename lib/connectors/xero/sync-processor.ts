@@ -24,6 +24,7 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { applyBackReference, followUpObligationClaim, releaseFollowUpObligation } from '@/lib/domain/accounting/back-reference'
+import { stampSyncedAtFromDatabaseClock } from './synced-at-clock'
 import {
   DEFAULT_BACK_REFERENCE_SWEEP_LIMIT,
   createBackReferenceSweepCursorStore,
@@ -873,6 +874,11 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
               ...followUpObligationClaim(),
             },
           })
+          // The registration's completion time is stamped by the DATABASE, in this transaction and
+          // strictly after the POST returned (o3d-clxw round 4). The payment poller fences its
+          // reversal verdict on this value against a `clock_timestamp()` it reads from the same
+          // database, so no application host's clock can order — or misorder — a supplier payment.
+          await stampSyncedAtFromDatabaseClock(tx, entry.id)
           await updateMirroredEventForSyncLog(tx, {
             syncLogId: entry.id,
             type: entry.type,
@@ -951,6 +957,11 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
               ...followUpObligationClaim(),
             },
           })
+          // The registration's completion time is stamped by the DATABASE, in this transaction and
+          // strictly after the POST returned (o3d-clxw round 4). The payment poller fences its
+          // reversal verdict on this value against a `clock_timestamp()` it reads from the same
+          // database, so no application host's clock can order — or misorder — a supplier payment.
+          await stampSyncedAtFromDatabaseClock(tx, entry.id)
           await updateMirroredEventForSyncLog(tx, {
             syncLogId: entry.id,
             type: entry.type,
@@ -1166,6 +1177,11 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
               ...followUpObligationClaim(),
             },
           })
+          // The registration's completion time is stamped by the DATABASE, in this transaction and
+          // strictly after the POST returned (o3d-clxw round 4). The payment poller fences its
+          // reversal verdict on this value against a `clock_timestamp()` it reads from the same
+          // database, so no application host's clock can order — or misorder — a supplier payment.
+          await stampSyncedAtFromDatabaseClock(tx, entry.id)
           await updateMirroredEventForSyncLog(tx, {
             syncLogId: entry.id,
             type: entry.type,
@@ -1251,6 +1267,11 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
               ...followUpObligationClaim(),
             },
           })
+          // The registration's completion time is stamped by the DATABASE, in this transaction and
+          // strictly after the POST returned (o3d-clxw round 4). The payment poller fences its
+          // reversal verdict on this value against a `clock_timestamp()` it reads from the same
+          // database, so no application host's clock can order — or misorder — a supplier payment.
+          await stampSyncedAtFromDatabaseClock(tx, entry.id)
           await updateMirroredEventForSyncLog(tx, {
             syncLogId: entry.id,
             type: entry.type,

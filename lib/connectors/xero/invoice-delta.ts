@@ -18,6 +18,34 @@ export type XeroInvoice = {
    * fails closed rather than guessing.
    */
   UpdatedDateUTC?: string
+  /**
+   * What the ledger HOLDS against this invoice, gross. Xero returns both on every invoice in the
+   * Invoices collection, and they are the difference between a payment that was REMOVED and one that
+   * merely did not cover the whole bill — a distinction Status alone cannot make, because AUTHORISED
+   * means "approved and not fully paid" and says nothing about what has been paid (o3d-clxw).
+   *
+   * Optional only because the fixtures predate them. A reversal verdict that needs them and does not
+   * have them is WITHHELD rather than guessed — see partitionPaymentReversals.
+   *
+   * AmountCredited is deliberately not read: an allocated credit note is not a payment, and `paidAt`
+   * records a payment.
+   */
+  AmountPaid?: number | string
+  AmountDue?: number | string
+  /**
+   * The payments the ledger CURRENTLY HOLDS against this invoice, each carrying the id Xero issued
+   * when it created it. Returned by the Invoices LIST endpoint — the same response shape
+   * `scripts/audit-xero-live-e2e-footprint.ts` reads against the live tenant to find which payments
+   * must be released before an invoice can be voided.
+   *
+   * THIS IS THE ONLY FIELD THAT CAN ANSWER THE QUESTION THAT MATTERS (o3d-clxw round 2). AmountPaid
+   * answers "does the ledger hold ANY payment"; this answers "is the payment IMS REGISTERED still
+   * here". They are the same question only while there is exactly one payment, and they diverge the
+   * moment somebody in Xero deletes ours and leaves a smaller one behind.
+   *
+   * Optional, and absence is never read as emptiness: see listedLedgerPaymentIds.
+   */
+  Payments?: Array<{ PaymentID?: string } | null>
 }
 
 export type XeroInvoicesResponse = {
@@ -805,4 +833,494 @@ export function idsWhere(
   return new Set(
     invoices.filter((i) => i.Type === type && statuses.includes(i.Status)).map((i) => i.InvoiceID),
   )
+}
+
+// ---------------------------------------------------------------------------
+// WHAT COUNTS AS A PAYMENT REVERSAL (o3d-clxw)
+// ---------------------------------------------------------------------------
+//
+// `idsWhere(changed, type, ['AUTHORISED', 'VOIDED'])` was the reversal set for both passes, and
+// AUTHORISED is not "unpaid". It is Xero's status for an approved invoice that is NOT FULLY paid,
+// which includes one carrying a real PART payment — Xero only moves an invoice to PAID when the
+// outstanding amount reaches zero.
+//
+// So a payment that landed as a part payment read as a payment REMOVAL. On the bill side that
+// cleared `paidAt`, logged "no longer present in Xero", and re-armed Mark Paid over a supplier
+// payment that had genuinely been made: the operator, seeing IMS say unpaid and the log say the
+// payment is gone, presses it again and the supplier is paid a second time (markBillPaid sends no
+// idempotency key and BILL_PAYMENT sits outside every live-row dedupe, so nothing downstream
+// refuses it). On the sales side the same reading additionally raises an automatic chargeback
+// credit note, unwinding revenue against a payment that is still in the ledger.
+//
+// The ordinary cause is not exotic: the IMS bill total is below the Xero total because the bill was
+// edited in Xero after IMS posted it, so the full-total payment IMS sends leaves a balance.
+//
+// A REVERSAL IS A FALL TO ZERO PAID, NOT A STATUS THAT IS MERELY NOT-PAID. The delta payload
+// already carries the number that says so, and this is where it is read.
+
+/**
+ * Money the ledger reports, or null when the payload does not state it.
+ *
+ * Xero serialises invoice amounts as JSON numbers, but a string is accepted rather than coerced
+ * blindly: `Number('')` is 0, and a zero conjured out of an empty field is exactly the "no payment
+ * is present" answer that clears paidAt and re-arms a second supplier payment.
+ */
+export function parseLedgerAmount(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (trimmed === '') return null
+    const parsed = Number(trimmed)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+/**
+ * Below this, the ledger holds no payment. Xero rounds money to 2dp, so half a penny is well inside
+ * the gap between "nothing" and "the smallest payment that can exist".
+ */
+export const PAYMENT_PRESENT_EPSILON = 0.005
+
+export type PaymentReversalReading = {
+  /**
+   * VOIDED invoices, and ONLY those. An unconditional reversal that needs no further evidence: Xero
+   * requires every payment to be removed before an invoice can be voided and refuses a payment
+   * against a voided one, so re-arming a voided document cannot move money twice.
+   */
+  voided: Set<string>
+  /**
+   * AUTHORISED with a STATED zero paid. The ledger says it holds nothing — which is what a removed
+   * payment looks like, AND ALSO WHAT A PAYMENT IMS POSTED SECONDS AGO LOOKS LIKE (o3d-clxw round 3).
+   *
+   * So this is NOT a reversal on its own. It is a reversal only once the registration reading says
+   * IMS holds no payment of its own that this read cannot speak for — see zeroPaidIsProvenReversal.
+   * The two readings are separate because they answer different questions: this one is about the
+   * LEDGER, and it cannot see a payment that has not reached the ledger yet.
+   */
+  zeroPaid: XeroInvoice[]
+  /**
+   * No longer PAID, but the ledger STILL HOLDS A PAYMENT — a part payment, or a bill edited upward
+   * after being paid. Not a reversal, and the IMS document must stay paid: clearing it re-arms the
+   * UI over money that has already moved.
+   */
+  partPaid: XeroInvoice[]
+  /**
+   * No longer PAID, and the payload does not say what the ledger holds. UNKNOWN IS NOT A REVERSAL:
+   * the cost of withholding is a document IMS still shows as paid, which a human can correct; the
+   * cost of guessing the other way is a second payment to a supplier, which nobody can.
+   */
+  unverifiable: XeroInvoice[]
+}
+
+/**
+ * Split one delta slice into the four answers the reversal passes may act on.
+ *
+ * THE ZERO IS NOT SELF-EVIDENT (o3d-clxw round 3). Round 1 replaced "AUTHORISED means unpaid" with
+ * "AUTHORISED and nothing paid means the payment was removed", and put that straight into the
+ * reversal set. But an AUTHORISED bill reading zero paid is also the ordinary shape of a bill IMS
+ * marked paid MOMENTS AGO: Mark Paid sets paidAt locally and queues a BILL_PAYMENT registration, and
+ * until the worker posts it the ledger holds nothing. A poll landing in that gap read its own
+ * in-flight payment as a reversal, cleared paidAt, and re-armed the button over a payment that was
+ * about to land — the branch's own thesis turned on it.
+ *
+ * `voided` is therefore the only bucket this function can settle by itself. The zero is handed on as
+ * a QUESTION, to be answered against the registrations IMS holds and the instant the ledger was read.
+ */
+export function partitionPaymentReversals(
+  invoices: XeroInvoice[],
+  type: 'ACCREC' | 'ACCPAY',
+): PaymentReversalReading {
+  const voided = new Set<string>()
+  const zeroPaid: XeroInvoice[] = []
+  const partPaid: XeroInvoice[] = []
+  const unverifiable: XeroInvoice[] = []
+
+  for (const invoice of invoices) {
+    if (invoice.Type !== type) continue
+    if (invoice.Status === 'VOIDED') {
+      voided.add(invoice.InvoiceID)
+      continue
+    }
+    if (invoice.Status !== 'AUTHORISED') continue
+
+    const amountPaid = parseLedgerAmount(invoice.AmountPaid)
+    if (amountPaid === null) {
+      unverifiable.push(invoice)
+      continue
+    }
+    // ABS, not `> 0`: a negative AmountPaid is not a number this code understands, and "the ledger
+    // holds something we cannot explain" is not permission to declare the payment gone.
+    if (Math.abs(amountPaid) > PAYMENT_PRESENT_EPSILON) {
+      partPaid.push(invoice)
+      continue
+    }
+    zeroPaid.push(invoice)
+  }
+
+  return { voided, zeroPaid, partPaid, unverifiable }
+}
+
+// ---------------------------------------------------------------------------
+// WHOSE PAYMENT IS GONE? (o3d-clxw round 2)
+// ---------------------------------------------------------------------------
+//
+// Round 1 fixed a reading that treated "not fully paid" as "the payment was removed". It replaced it
+// with "does the ledger hold ANY payment", which is right whenever the invoice has only ever had one.
+// It is WRONG the moment a second one exists, and then it fails in the direction that hides money:
+//
+//   IMS registers a supplier payment of 500 (Xero creates payment P1). Somebody in Xero deletes P1 —
+//   wrong bank account, wrong bill, a duplicate they are unwinding — and applies a 20 payment, P2, in
+//   its place. The invoice is AUTHORISED with AmountPaid 20. Round 1 sees a payment, calls it a PART
+//   payment, and keeps `paidAt`. The 500 IMS believes it paid is GONE and IMS will never say so: the
+//   cursor moves past the invoice, the bill reads settled for ever, and the supplier is never paid.
+//
+// The residual payment is not evidence about OUR payment. It is evidence about somebody else's. So
+// the reversal question is asked against the identity IMS recorded — the PaymentID Xero returned when
+// the BILL_PAYMENT / INVOICE_PAYMENT registration posted, stored on the sync row as
+// externalTransactionId — and answered against the payments the ledger LISTS on the invoice.
+//
+// Everything here still fails closed. A reversal verdict re-arms Mark Paid, and pressing it pays a
+// supplier twice, so "our payment is gone" must be PROVED, never inferred: proof needs a registration
+// that certainly posted before the ledger was read, and a ledger answer that certainly enumerates the
+// payments it holds. Anything less stays withheld exactly as round 1 left it.
+
+/**
+ * The payment ids the ledger states it holds against this invoice, or NULL when the payload does not
+ * state them.
+ *
+ * NULL AND EMPTY ARE DIFFERENT ANSWERS, and conflating them is the same mistake `Number('') === 0`
+ * was: an absent array means "Xero did not tell us", and reading that as "Xero holds no payments"
+ * would manufacture the proof this module exists to demand. An array containing an entry with no
+ * usable PaymentID is also NULL — a list we cannot fully read cannot establish that a particular id
+ * is missing from it.
+ *
+ * Ids are lower-cased: Xero serialises GUIDs in lower case, but a stored id that came back from a
+ * POST is compared against one that came back from a GET, and a case difference between the two must
+ * not read as "a different payment".
+ */
+export function listedLedgerPaymentIds(invoice: XeroInvoice): Set<string> | null {
+  if (!Array.isArray(invoice.Payments)) return null
+  const ids = new Set<string>()
+  for (const entry of invoice.Payments) {
+    if (entry == null || typeof entry !== 'object') return null
+    const id = (entry as { PaymentID?: unknown }).PaymentID
+    if (typeof id !== 'string') return null
+    const trimmed = id.trim()
+    if (trimmed === '') return null
+    ids.add(trimmed.toLowerCase())
+  }
+  return ids
+}
+
+/** One payment registration IMS holds for a document, reduced to what the verdict depends on. */
+export type RegisteredPaymentRow = {
+  /** The sync-log row id, so a withheld verdict can name the entry an operator has to look at. */
+  id: string
+  status: string
+  /** The ledger's id for the payment this registration created, if it got that far. */
+  externalTransactionId: string | null
+  /**
+   * When the registration became complete — CLAIMED. Which clock produced it is not visible here.
+   *
+   * `stampSyncedAtFromDatabaseClock` writes `clock_timestamp()`, but an application host's `new
+   * Date()` lands in the same column and is indistinguishable once stored. `syncedAtDatabaseClock`
+   * is what tells the two apart; nothing may be decided from this field alone.
+   */
+  syncedAt: Date | null
+  /**
+   * The provenance marker for `syncedAt`: the same instant, written by the same statement from one
+   * evaluation of the database's `clock_timestamp()`.
+   *
+   * NULL, or any value other than `syncedAt`, means the completion time was NOT minted by the
+   * database — an old build wrote it, or moved `syncedAt` out from under a marker it did not know
+   * about. See `databaseStampedCompletion`.
+   *
+   * What makes a present-and-equal pair mean anything is NOT this reader: it is the trigger in
+   * 20260821090000, which clears this column whenever a statement changes the completion facts it
+   * was minted with and does not mint a new one. Without that, equality is only a statement about
+   * two millisecond values, and any writer can produce it.
+   */
+  syncedAtDatabaseClock: Date | null
+}
+
+/**
+ * The instant this registration completed AS THE DATABASE MEASURED IT, or null if no such instant
+ * can be produced from the row.
+ *
+ * MIXED-VERSION FENCE (o3d-clxw round 5, Codex finding 1). Round 4 made both ends of the reversal
+ * comparison readings of one clock — the database's — and noted one residual it could not close: a
+ * row written by the PREVIOUS release still carries the processor host's `new Date()`, and comparing
+ * THAT against a database fence is precisely the cross-host comparison round 4 removed, reintroduced
+ * by the deploy rather than by the code. During any rollout both builds run at once, so this is not a
+ * historical curiosity; it is the state of the table for as long as the deploy takes, and it enables
+ * the exact failure this branch exists to prevent — flag clears, Mark Paid re-arms, supplier paid
+ * twice. Round 4's proposal was to let those rows age past any plausible skew, and ageing out is not
+ * a fence: "plausible skew" is the assumption the branch spent four rounds deleting.
+ *
+ * The sibling branch o3d-batch-wcfix answered the same shape of question the same way — make an old
+ * build's write DETECTABLE by carrying the marker inside the value it writes, so a build that strips
+ * it announces itself, and on disagreement apply no change at all rather than guess which side is
+ * right. Here the value is the timestamp and the marker is a second column holding the SAME instant
+ * from the SAME single evaluation of `clock_timestamp()`:
+ *
+ *   marker absent      an old build created the row. It never wrote the column, so it is NULL.
+ *   marker disagrees   an old build rewrote `syncedAt` from its host clock and left the marker where
+ *                      the database had put it. The row now states two different completion times.
+ *   marker equal       the pair was written by one statement of the current build, which is the only
+ *                      writer that can produce it, so the instant IS the database's.
+ *
+ * Only the third is an instant this fence may order against `LedgerReadFence`. The first two withhold
+ * — they do not fall back to `syncedAt`, do not tie-break, and do not age out. An undecided
+ * registration is work the poller comes back to (the withheld-reversal recheck), whereas a wrong
+ * decision here is a second supplier payment.
+ *
+ * This can only ever SHRINK the decided set relative to round 4, which is what keeps the
+ * o3d-batch-payidx merge algebra intact: `billpay` still withholds everywhere the sibling's
+ * `OR: [{ syncedAt: null }, { syncedAt: { gte: fence } }]` calls a row undecidable, and now in
+ * strictly more places besides.
+ *
+ * WHAT THE EQUALITY ACTUALLY RESTS ON (o3d-clxw round 6, Codex finding 1). Round 5's third line —
+ * "the only writer that can produce it" — was false, and this function cannot repair it. `syncedAt`
+ * is `TIMESTAMP(3)`: any writer that lands a value on the same stored millisecond satisfies the
+ * equality, and the old build's completion write does not even need luck to do it, because it is a
+ * read-modify-write that can carry the database's own stamp forward onto a registration that
+ * completed later. A laundered pair is bit-identical to a minted one, so THERE IS NOTHING FOR A
+ * READER TO SEE. The rule had to move to write time, and to a place that binds writers this
+ * repository does not contain:
+ *
+ *   the trigger in prisma/migrations/20260821090000_accounting_sync_log_synced_at_database_clock
+ *   clears this column whenever a statement changes `status`, `syncedAt`, `externalTransactionId`
+ *   or `processingStartedAt` without minting a new marker in the same statement — and refuses one
+ *   supplied by an INSERT altogether.
+ *
+ * So an old build invalidates provenance because of WHAT IT TOUCHED, never because of what value it
+ * happened to write (its re-sync must claim the row first, and the claim alone is enough). This
+ * function is then what it always claimed to be: a check that the pair the database left behind is
+ * still the pair it minted. It is deliberately kept as well — a row from a database where the
+ * trigger is somehow absent still has to answer for itself, and the answer is "undecided".
+ */
+export function databaseStampedCompletion(row: Pick<RegisteredPaymentRow, 'syncedAt' | 'syncedAtDatabaseClock'>): Date | null {
+  const { syncedAt, syncedAtDatabaseClock } = row
+  if (syncedAt == null || syncedAtDatabaseClock == null) return null
+  // Equality, not "the marker exists": a stale marker under a host-clock rewrite would otherwise
+  // vouch for an instant that is no longer this row's. What makes the equality PROOF rather than a
+  // coincidence is the database refusing to let anyone but the stamp leave the pair agreeing.
+  if (syncedAt.getTime() !== syncedAtDatabaseClock.getTime()) return null
+  return syncedAtDatabaseClock
+}
+
+// ---------------------------------------------------------------------------
+// THE FENCE THAT ORDERS THE REVERSAL, AND WHY NO HOST PARTICIPATES (o3d-clxw round 4)
+// ---------------------------------------------------------------------------
+//
+// Round 3 fenced the verdict on `syncedAt < ledgerObservedBefore`, and both sides of that comparison
+// were APPLICATION clocks: `syncedAt` was `new Date()` on whichever app instance ran the sync
+// processor, and `ledgerObservedBefore` was `new Date()` on whichever instance ran the poll. IMS runs
+// more than one instance, so those are two machines, and nothing keeps their clocks together.
+//
+// Skew in ONE direction is merely wasteful — the fence reads a finished registration as unfinished
+// and the reversal is withheld. Skew in the OTHER direction moves money: if the poller's clock runs
+// AHEAD of the processor's, a registration that posted its payment AFTER the ledger snapshot was
+// taken still carries a `syncedAt` below `ledgerObservedBefore`. The fence calls it decided, the
+// payment is (correctly) absent from the older snapshot, the verdict is GONE, `paidAt` is cleared,
+// Mark Paid re-arms, and the supplier is paid a second time. That is the exact defect this branch
+// exists to prevent, reintroduced by the guard meant to prevent it. A tie-break cannot repair it,
+// because there is no true order to break the tie towards.
+//
+// So the clock is taken out of the decision. BOTH ENDS ARE NOW READ FROM THE DATABASE:
+//
+//   the row end     `accounting_sync_logs.synced_at`, written as `clock_timestamp()` inside the same
+//                   transaction that marks the registration SYNCED — which runs strictly after the
+//                   POST to Xero returned, so the stamp is an upper bound on when the payment
+//                   reached the ledger.
+//   the fence end   `clock_timestamp()` selected from the same database immediately BEFORE the
+//                   ledger was asked, so the fence is a lower bound on the snapshot's age.
+//
+// Two readings of ONE clock, ordered by the poller's own program order (SELECT returns, THEN Xero is
+// called). No application host's clock appears on either side, so making any host fast or slow — or
+// swapping which one is fast — cannot change the answer.
+//
+// `now()` would NOT do: PostgreSQL's `now()`/`CURRENT_TIMESTAMP` is TRANSACTION-START time, so a
+// registration whose transaction opened before its POST would be stamped before the payment existed.
+// `clock_timestamp()` is read at the statement, which is after.
+//
+// ROUND 5 CLOSED THE ROLLOUT HOLE THIS PARAGRAPH USED TO WAVE AT. A row stamped by the PREVIOUS
+// release carries a host clock, and comparing that against a database fence is the same cross-host
+// comparison, put back by the deploy. It is no longer allowed to be compared at all: the stamp now
+// carries a provenance marker inside the value (`syncedAtDatabaseClock`, see
+// `databaseStampedCompletion`), and a row that cannot prove the database minted its completion time
+// is UNDECIDABLE rather than aged past a plausible skew.
+//
+// Residual, stated plainly: a single clock stepped backwards by NTP can still misorder two of its own
+// readings. That is far smaller than free-running skew between two machines, and closing it needs a
+// monotonic generation rather than a timestamp.
+
+declare const DATABASE_CLOCK_BRAND: unique symbol
+
+/**
+ * The instant the ledger was asked, measured by the DATABASE — the only value `classifyRegisteredPayment`
+ * will accept as a fence.
+ *
+ * Branded on purpose. The bug this replaces was a plain `Date` flowing in from `new Date()`, and a
+ * plain `Date` parameter cannot tell the two apart. Only `databaseLedgerFence` can mint one, so
+ * "which clock is this?" is answered at the type level rather than in a comment.
+ */
+export type LedgerReadFence = {
+  /** `SELECT clock_timestamp()`, taken before the ledger read. */
+  readonly databaseClock: Date
+  readonly [DATABASE_CLOCK_BRAND]: 'accounting_sync_logs.synced_at'
+}
+
+/**
+ * Wrap a `clock_timestamp()` reading taken from the application database BEFORE the ledger read.
+ *
+ * The ONLY correct argument is a value the database produced. Passing `new Date()` here is the
+ * defect, not a shortcut around it.
+ */
+export function databaseLedgerFence(clockTimestamp: Date): LedgerReadFence {
+  return { databaseClock: clockTimestamp } as LedgerReadFence
+}
+
+export type RegisteredPaymentVerdict =
+  /** Every payment IMS registered has been proved absent from the ledger's own list. A REVERSAL. */
+  | { verdict: 'GONE'; paymentIds: string[] }
+  /** At least one payment IMS registered is still listed on the invoice. Not a reversal. */
+  | { verdict: 'STILL_HELD'; paymentIds: string[] }
+  /** IMS never told the ledger about a payment, so it holds no opinion about the residual one. */
+  | { verdict: 'NOTHING_REGISTERED' }
+  /** The payload did not enumerate the payments, so absence cannot be established from it. */
+  | { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }
+  /** A registration exists whose effect on the ledger this read cannot speak for. */
+  | { verdict: 'REGISTRATION_UNDECIDED'; entryIds: string[] }
+
+/**
+ * Is the payment IMS registered still in the ledger?
+ *
+ * `ledgerObservedBefore` is the instant Xero WAS ASKED, as the DATABASE measured it. A registration
+ * that finished after it may have created a payment this snapshot never saw, so its absence from the
+ * list proves nothing — and that case is the dangerous one, because it is exactly the fifteen minutes
+ * between Mark Paid setting `paidAt` locally and the worker posting the payment. Declaring a reversal
+ * there would clear the flag over a payment that had just been made and invite a second one.
+ *
+ * Both ends of the comparison are `clock_timestamp()` readings of the SAME database (see
+ * LedgerReadFence): no application host's clock takes part, so host skew cannot flip a verdict.
+ *
+ * NULL FENCE = NOTHING IS DECIDED. If the database clock could not be read, the poll has no ordering
+ * at all, and the fail-closed reading of "no ordering" is that every registration might have landed
+ * after the snapshot. Everything withholds. That is also what keeps the o3d-batch-payidx algebra
+ * intact: this function's decided set only ever SHRINKS relative to the sibling's
+ * `OR: [{ syncedAt: null }, { syncedAt: { gte: fence.databaseClock } }]` undecidable predicate — it
+ * is never allowed to grow, so a bill this branch admits is still one the sibling has nothing
+ * undecidable for.
+ *
+ * Undecided beats everything: one registration this read cannot account for withholds the whole
+ * verdict, because the document is one document and paidAt is one flag.
+ */
+export function classifyRegisteredPayment(
+  invoice: XeroInvoice,
+  registrations: RegisteredPaymentRow[],
+  ledgerObservedBefore: LedgerReadFence | null,
+): RegisteredPaymentVerdict {
+  const undecided: string[] = []
+  const posted: string[] = []
+
+  for (const row of registrations) {
+    // CANCELLED is the one status this tree only ever asserts where "nothing was sent" is true, so it
+    // holds no payment and blocks nothing.
+    if (row.status === 'CANCELLED') continue
+    // The completion instant the DATABASE minted, or null when the row cannot prove which clock wrote
+    // it — an old build's host-clock stamp is not a fence, it is the defect (round 5, finding 1).
+    const completedAt = databaseStampedCompletion(row)
+    // SYNCED with an id, finished before the ledger was read: the ledger's answer covers it.
+    if (
+      row.status === 'SYNCED'
+      && typeof row.externalTransactionId === 'string'
+      && row.externalTransactionId.trim() !== ''
+      && completedAt != null
+      // No fence, no decision: see the NULL FENCE note above.
+      && ledgerObservedBefore != null
+      // STRICTLY before, matching the sibling's `OR: [{ syncedAt: null }, { syncedAt: { gte:
+      // fence.databaseClock } }]` undecidable predicate EXACTLY. At the tie the two would otherwise
+      // give opposite answers about the same row, and the safe side of a tie about a supplier payment
+      // is "this read cannot speak for it". Both sides of this `<` are database readings — the
+      // comparison is meaningless, and was actively dangerous, between two hosts.
+      && completedAt.getTime() < ledgerObservedBefore.databaseClock.getTime()
+    ) {
+      posted.push(row.externalTransactionId.trim())
+      continue
+    }
+    // Everything else is a registration whose ledger effect is unknown to THIS read: PENDING (about
+    // to be sent), PROCESSING (may be on the wire now), FAILED (attempted, outcome unknown — the
+    // processor posts before it persists, so a lost response is written down as a rejection), SYNCED
+    // with no id (posted, but we do not know what it created), SYNCED after the read, and SYNCED with
+    // a completion time no clock will vouch for (an old build's stamp, round 5 finding 1).
+    undecided.push(row.id)
+  }
+
+  if (undecided.length > 0) return { verdict: 'REGISTRATION_UNDECIDED', entryIds: undecided }
+  if (posted.length === 0) return { verdict: 'NOTHING_REGISTERED' }
+
+  const listed = listedLedgerPaymentIds(invoice)
+  if (listed === null) return { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }
+
+  const stillHeld = posted.filter((id) => listed.has(id.toLowerCase()))
+  // ALL of them, not any: with two registrations a bill can have one payment removed and one intact,
+  // and clearing paidAt there re-arms Mark Paid for the WHOLE total on top of the surviving payment.
+  if (stillHeld.length > 0) return { verdict: 'STILL_HELD', paymentIds: stillHeld }
+  return { verdict: 'GONE', paymentIds: posted }
+}
+
+/**
+ * MAY A ZERO-PAID DOCUMENT CLEAR `paidAt`? (o3d-clxw round 3)
+ *
+ * The ledger saying it holds nothing is one of two very different facts, and it looks identical
+ * either way:
+ *
+ *   the payment was REMOVED         — a genuine reversal, and `paidAt` must be cleared.
+ *   the payment HAS NOT LANDED YET  — IMS marked the bill paid and the worker has not posted the
+ *                                     registration. Clearing `paidAt` re-arms Mark Paid over a
+ *                                     payment that is on its way, and the operator presses it. Xero's
+ *                                     idempotency key expires after six minutes, BILL_PAYMENT sits
+ *                                     outside every live-row dedupe, and markBillPaid sends no key at
+ *                                     all — so nothing downstream refuses the second payment.
+ *
+ * The ledger CANNOT distinguish them, because the distinguishing fact is not in the ledger: it is in
+ * IMS's own registration rows and the instant the ledger was read. So the amount reading proposes and
+ * this decides.
+ *
+ * Verdict by verdict, and every one of them fails towards withholding:
+ *
+ *   GONE                        our registered payment was posted before the read and is absent from
+ *                               a list we could read fully. Removed. REVERSAL.
+ *   NOTHING_REGISTERED          IMS never told the ledger about a payment here (or every registration
+ *                               is CANCELLED, which asserts nothing was sent), so there is no payment
+ *                               of ours to be in flight and the zero is the whole story. REVERSAL.
+ *                               `paidAt` came from the forward pass or the reconcile, and the ledger
+ *                               has since been emptied.
+ *   LEDGER_DID_NOT_LIST_PAYMENTS  the payload withheld `Payments[]`, but it STATED a zero total. An
+ *                               aggregate of zero needs no list: if the ledger holds no money at all,
+ *                               it is not holding ours either, whatever its id. REVERSAL.
+ *   REGISTRATION_UNDECIDED      THE DEFECT THIS FUNCTION EXISTS FOR. A PENDING, PROCESSING or FAILED
+ *                               registration, or one that synced after the read, may have created a
+ *                               payment this snapshot never saw. WITHHELD.
+ *   STILL_HELD                  the ledger lists our payment on an invoice it says is unpaid. That is
+ *                               a contradiction IMS cannot settle from one read — Xero can list a
+ *                               payment that has since been deleted — and an unsettled contradiction
+ *                               is not proof. WITHHELD.
+ *
+ * Note what the withheld answers cost, because it is the asymmetry the whole module turns on: a
+ * document IMS keeps showing as paid, loudly warned about on every poll that sees it, which a human
+ * can correct in a minute. The other direction costs a second supplier payment, which nobody can.
+ */
+export function zeroPaidIsProvenReversal(verdict: RegisteredPaymentVerdict): boolean {
+  switch (verdict.verdict) {
+    case 'GONE':
+    case 'NOTHING_REGISTERED':
+    case 'LEDGER_DID_NOT_LIST_PAYMENTS':
+      return true
+    case 'REGISTRATION_UNDECIDED':
+    case 'STILL_HELD':
+      return false
+  }
 }

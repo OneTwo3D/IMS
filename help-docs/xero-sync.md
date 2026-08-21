@@ -700,6 +700,131 @@ When enabled, the IMS polls Xero every 15 minutes for:
 - **Paid purchase bills** (all POs — detects when a bill is paid via bank feed)
 - **Reversed payments** on either (payment removed or invoice voided — clears `paidAt`)
 
+**A part payment is not a reversal.** Xero moves an invoice back to *AUTHORISED* whenever it is no
+longer *fully* paid — which includes a bill that carries a real **part** payment, the ordinary cause
+being an IMS bill total lower than Xero's (a line or freight added in Xero after IMS posted it). The
+poll therefore reads what the ledger actually **holds** (`AmountPaid`), not just the status: `paidAt`
+is cleared only when nothing is paid against the document any more *and* the IMS has no payment
+registration of its own that this Xero read cannot speak for (see below), or the invoice was voided.
+A **voided** invoice is the one unconditional reversal — Xero requires every payment to be removed
+before a void and refuses a payment against a voided invoice, so re-arming there cannot move money
+twice.
+
+When the document is no longer fully paid but the ledger still holds a payment — or Xero's answer did
+not say how much is paid — the reversal is **withheld** and a WARNING is logged against the order or
+purchase order instead (*"…is AUTHORISED in Xero (not fully paid), but the ledger still holds a
+payment of …"*). Nothing is cleared and, on the sales side, no chargeback credit note is raised. This
+matters most on bills: clearing `paidAt` re-arms **Mark Paid** in the UI, and pressing it registers a
+**second** supplier payment on top of the part payment. Settle the balance in Xero, or correct the
+bill total in IMS.
+
+**But a payment that is present need not be *ours*.** If somebody in Xero deletes the payment the IMS
+registered and applies a different one in its place, the ledger still holds *a* payment — and reading
+only the amount would keep the bill marked paid for ever, with the supplier never actually paid. So
+every withheld document is asked the narrower question as well: is the payment **the IMS registered**
+still listed on the invoice? The IMS records the Xero payment id when its registration posts, and
+compares it against the payments Xero lists. Only when every payment the IMS registered is provably
+absent is the reversal acted on — `paidAt` is cleared, and the log names the payment id that vanished
+and the residual amount that is somebody else's.
+
+Everything else stays withheld, and the warning now says why: the registered payment is still there
+(a genuine part payment), the IMS never registered one, Xero did not list the payments, or a
+registration had not finished when Xero was asked — the last being the few seconds between **Mark
+Paid** setting the flag and the payment actually posting, where "not listed yet" must never be read as
+"removed".
+
+On the sales side a reversal established this way clears `paidAt` but raises **no** chargeback credit
+note: a chargeback unwinds the whole recognised revenue, and the invoice still carries a payment. The
+alert says so — unwind revenue by hand if that is what the removal means.
+
+**And a ledger holding *nothing* is not proof either.** "Nothing paid against this bill" is what a
+removed payment looks like — and it is equally what a payment the IMS registered *seconds ago* looks
+like, because **Mark Paid** sets `paidAt` at once and the worker posts the payment to Xero afterwards.
+A poll landing in that gap used to clear `paidAt`, re-arm **Mark Paid** over the IMS's own in-flight
+payment, and invite a second supplier payment: nothing downstream would refuse it, since Xero's
+idempotency key expires after six minutes.
+
+So a zero-paid document is put to the *same* registration question as a part-paid one before anything
+is cleared. It is treated as reversed only when the IMS can account for every payment registration it
+holds against the document — the registration posted before Xero was asked (so the empty ledger covers
+it), or there is no registration at all, or every one of them is cancelled. If any registration is
+still queued, on the wire, **failed**, or finished after this Xero read was taken, the reversal is
+**withheld** exactly as a part payment would be, and the warning names the sync entry in question.
+A *failed* attempt counts as unresolved deliberately: the connector posts before it records the
+outcome, so a lost response is written down identically to a rejection.
+
+**A withheld verdict is asked again on a timer.** It cannot be left to resolve itself: the delta
+returns an invoice only when it *changes*, and what usually settles a withheld verdict is not a change
+in Xero at all — it is the IMS's own registration finishing, or somebody cancelling a failed one.
+Neither touches the invoice. So every hour the poll takes the withheld documents that have rested
+longest, reads those invoices **by id** (bypassing the delta entirely) and re-runs exactly the same
+decision. When the disagreement is settled — the reversal is finally acted on, the ledger catches up,
+or the IMS no longer holds the document as paid — the record is **closed** and the document leaves the
+queue for good. While it is still withheld the warning is simply rewritten, which restarts its timer
+and sends it to the back of the queue, so one stuck document can never crowd out the others — the
+queue is built one entry per **document**, from each document's most recent warning, so a document
+that has been withheld for weeks cannot fill the page with its own history and hide the ones behind
+it. Documents that have already been **closed** are dropped before the queue is cut to size, for the
+same reason: a settled document keeps its old warning for the rest of the thirty-day window and that
+warning never moves again, so counting it would let weeks of finished work occupy every place in the
+round and leave the documents that still need an answer permanently unasked. The operator alert is
+raised once, when the verdict is first withheld, not on every recheck.
+
+A recheck that could not be completed **closes nothing**. If Xero does not answer, or does not return
+one of the invoices, or a database read fails while the answer is being turned into a verdict, the
+document is deferred — asked again on the next round — rather than treated as settled. "We could not
+decide" and "there is nothing left to decide" look the same from outside, and only one of them is
+safe to act on.
+
+A registration that genuinely never posted stays undecided for ever on its own, and that is what the
+recheck keeps visible: reconcile the bill in Xero and **cancel** the named sync entry, which takes it
+out of the question without destroying the evidence that an attempt was made. The next recheck then
+lets the verdict through.
+
+**A withheld verdict is an alert, not just a log line.** Withholding writes nothing to the
+database, so the warning is its only record — and the poll then moves its cursor past the invoice,
+which the delta returns only when it changes again. Each withheld verdict therefore raises a
+notification to every active admin as well as the activity warning, and if either write fails the poll
+**holds its cursor** so the disagreement is re-derived on the next poll rather than lost.
+
+**"Had this payment posted yet?" is answered by the database's clock, not by any server's.** Deciding
+that a payment was *removed* rests on knowing whether the IMS's own registration had already reached
+Xero when the snapshot was taken. The IMS runs on more than one instance, and comparing the clock of
+the instance that posted the payment against the clock of the instance running the poll is not an
+ordering at all: if the polling instance ran even a little ahead, a payment posted *after* the snapshot
+looked as though it had posted *before* it, and its (perfectly correct) absence read as proof of
+removal — clearing `paidAt` and re-arming **Mark Paid** over money that had already left the bank.
+Both ends are now timestamps taken from the database itself: the registration is stamped by the
+database when it completes, and the poll asks the database for the time immediately before asking
+Xero. If the database cannot answer, the poll orders nothing and withholds every reversal that would
+have depended on it.
+
+**And a stamp whose clock cannot be identified is not used at all.** During a deploy both builds run
+side by side, so a worker still on the previous release goes on stamping registrations from its own
+server's clock — and once stored, that value is indistinguishable from one the database produced. The
+completion time is therefore now written together with a marker that only the database can produce, by
+a single statement, and the reversal fence accepts a registration only while the two still agree. A
+registration written by an older build — or one an older build rewrote afterwards — reads as
+**undecidable**: its document's reversal is withheld and reported for somebody to reconcile by hand,
+rather than decided from a clock nobody can identify. Nothing has to be drained or sequenced around a
+release for this to hold: an older instance keeps writing exactly as it did, and its rows simply never
+qualify. The cost is deliberate — registrations that predate this change never become decidable on
+their own, because filling the marker in for them would be the database vouching for a stamp it did
+not make.
+
+**The database is what keeps that marker honest.** Two matching timestamps are not by themselves proof
+of who wrote them: the column is stored to the millisecond, so any writer that lands on the same
+millisecond matches — and an older build's completion write reads the row, posts to Xero and writes it
+back, so it can carry the database's own stamp forward onto a registration that finished later. There
+is nothing left in such a row for the poll to notice. The rule therefore lives in the database itself,
+as a trigger on the sync log: any statement that changes what a registration says it did — its status,
+its completion time, the payment id it created, or a re-claim — **clears the marker** unless that same
+statement mints a new one, and a marker supplied when a row is first inserted is refused outright. An
+older build cannot avoid this, because it must claim the row before it can re-post, and the claim
+alone is enough. The rule can only ever take provenance away, so the worst it can do is withhold a
+reversal for a human to check. Restoring a database backup clears the markers on the restored rows for
+the same reason, and their reversals are withheld until a fresh registration is stamped.
+
 All four checks are answered by a **single** request that asks Xero only for invoices changed since
 the last successful poll, using the `If-Modified-Since` header. The poll advances its cursor only
 when it succeeds, and deliberately re-reads the last couple of minutes each time, so a payment can

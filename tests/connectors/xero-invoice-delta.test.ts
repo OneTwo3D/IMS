@@ -2,9 +2,16 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  classifyRegisteredPayment,
+  databaseLedgerFence,
+  zeroPaidIsProvenReversal,
   drainInvoicesModifiedSince,
   fetchInvoicesModifiedSince,
   idsWhere,
+  parseLedgerAmount,
+  partitionPaymentReversals,
+  listedLedgerPaymentIds,
+  PAYMENT_PRESENT_EPSILON,
   MAX_CHUNKS_PER_POLL,
   MAX_PAGES,
   PAGE_SIZE,
@@ -463,4 +470,292 @@ test('one poll never drains more than MAX_CHUNKS_PER_POLL chunks', async () => {
 
   assert.equal(res.ok && res.complete, false, 'an unfinished drain must say so')
   assert.ok(chunks <= MAX_CHUNKS_PER_POLL, `drained ${chunks} chunks in one poll`)
+})
+
+// ---------------------------------------------------------------------------
+// A reversal is a fall to ZERO paid, not a status that is merely not-PAID (o3d-clxw)
+// ---------------------------------------------------------------------------
+
+function ledgerInv(id: string, type: 'ACCREC' | 'ACCPAY', status: string, amounts: Partial<XeroInvoice> = {}): XeroInvoice {
+  return { InvoiceID: id, Type: type, Status: status, ...amounts }
+}
+
+test('an AUTHORISED bill still carrying a payment is a PART payment, not a reversal', () => {
+  // The whole of o3d-clxw: read as a reversal, this clears paidAt, re-arms Mark Paid and pays the
+  // supplier a second time on top of the part payment.
+  const reading = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 400, AmountDue: 100 })], 'ACCPAY')
+
+  assert.equal(reading.voided.has('b1'), false, 'a bill the ledger has been paid against must not be called reversed')
+  assert.deepEqual(reading.zeroPaid, [])
+  assert.deepEqual(reading.partPaid.map((i) => i.InvoiceID), ['b1'])
+  assert.deepEqual(reading.unverifiable, [])
+})
+
+test('an AUTHORISED invoice with nothing paid against it is a QUESTION, not a verdict (o3d-clxw r3)', () => {
+  // Round 1 put this straight into the reversal set. A zero is also what a payment IMS registered
+  // moments ago looks like before the worker posts it, so the LEDGER cannot settle it alone: it goes
+  // to zeroPaid, and only the registration reading may promote it.
+  const reading = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0, AmountDue: 500 })], 'ACCPAY')
+
+  assert.deepEqual(reading.zeroPaid.map((i) => i.InvoiceID), ['b1'])
+  assert.deepEqual([...reading.voided], [],
+    'only VOIDED may clear paidAt on the strength of the ledger alone')
+  assert.deepEqual(reading.partPaid, [])
+})
+
+test('VOIDED is a reversal whatever the amounts say', () => {
+  // Xero requires payments to be removed before a void, and refuses a payment against a voided
+  // invoice — so re-arming a voided document cannot move money twice.
+  const reading = partitionPaymentReversals([
+    ledgerInv('v1', 'ACCPAY', 'VOIDED'),
+    ledgerInv('v2', 'ACCREC', 'VOIDED', { AmountPaid: 250 }),
+  ], 'ACCPAY')
+
+  assert.deepEqual([...reading.voided], ['v1'])
+  assert.deepEqual(partitionPaymentReversals([ledgerInv('v2', 'ACCREC', 'VOIDED', { AmountPaid: 250 })], 'ACCREC').voided.has('v2'), true)
+})
+
+test('an AmountPaid the payload does not state is UNVERIFIABLE, never a reversal', () => {
+  const reading = partitionPaymentReversals([
+    ledgerInv('b1', 'ACCPAY', 'AUTHORISED'),
+    ledgerInv('b2', 'ACCPAY', 'AUTHORISED', { AmountPaid: '' }),
+    ledgerInv('b3', 'ACCPAY', 'AUTHORISED', { AmountPaid: 'not a number' }),
+    ledgerInv('b4', 'ACCPAY', 'AUTHORISED', { AmountPaid: null as unknown as number }),
+  ], 'ACCPAY')
+
+  assert.equal(reading.voided.size, 0, 'unknown must not read as "nothing is paid" — that is the answer that pays twice')
+  assert.deepEqual(reading.zeroPaid, [], 'an unstated amount is not a zero')
+  assert.deepEqual(reading.unverifiable.map((i) => i.InvoiceID), ['b1', 'b2', 'b3', 'b4'])
+})
+
+test('a numeric string AmountPaid is read, not discarded', () => {
+  const reading = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: '12.50' })], 'ACCPAY')
+  assert.deepEqual(reading.partPaid.map((i) => i.InvoiceID), ['b1'])
+})
+
+test('rounding dust is not a payment, but a penny is', () => {
+  const dust = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: PAYMENT_PRESENT_EPSILON / 2 })], 'ACCPAY')
+  assert.deepEqual(dust.zeroPaid.map((i) => i.InvoiceID), ['b1'])
+
+  const penny = partitionPaymentReversals([ledgerInv('b2', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0.01 })], 'ACCPAY')
+  assert.deepEqual(penny.partPaid.map((i) => i.InvoiceID), ['b2'])
+})
+
+test('a negative AmountPaid is not read as "nothing is paid"', () => {
+  const reading = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: -50 })], 'ACCPAY')
+  assert.equal(reading.voided.has('b1'), false, 'a figure this code does not understand is not permission to declare the payment gone')
+  assert.deepEqual(reading.zeroPaid, [])
+  assert.deepEqual(reading.partPaid.map((i) => i.InvoiceID), ['b1'])
+})
+
+test('PAID and DRAFT rows are not reversal candidates at all, and types do not cross', () => {
+  const rows = [
+    ledgerInv('b-paid', 'ACCPAY', 'PAID', { AmountPaid: 500, AmountDue: 0 }),
+    ledgerInv('b-draft', 'ACCPAY', 'DRAFT', { AmountPaid: 0 }),
+    ledgerInv('s-auth', 'ACCREC', 'AUTHORISED', { AmountPaid: 0 }),
+  ]
+  const bills = partitionPaymentReversals(rows, 'ACCPAY')
+  assert.equal(bills.voided.size, 0)
+  assert.equal(bills.zeroPaid.length, 0)
+  assert.equal(bills.partPaid.length, 0)
+  assert.equal(bills.unverifiable.length, 0)
+  assert.deepEqual(partitionPaymentReversals(rows, 'ACCREC').zeroPaid.map((i) => i.InvoiceID), ['s-auth'])
+})
+
+test('parseLedgerAmount refuses to turn an empty field into zero', () => {
+  assert.equal(parseLedgerAmount(''), null)
+  assert.equal(parseLedgerAmount('   '), null)
+  assert.equal(parseLedgerAmount(undefined), null)
+  assert.equal(parseLedgerAmount(null), null)
+  assert.equal(parseLedgerAmount(Number.NaN), null)
+  assert.equal(parseLedgerAmount({}), null)
+  assert.equal(parseLedgerAmount(0), 0)
+  assert.equal(parseLedgerAmount('0'), 0)
+  assert.equal(parseLedgerAmount(' 42.5 '), 42.5)
+})
+
+// ---------------------------------------------------------------------------
+// WHOSE payment is gone (o3d-clxw round 2)
+//
+// "Does the ledger hold ANY payment" and "is the payment IMS registered still here" are the same
+// question only while there is exactly one payment. They diverge the moment somebody deletes ours
+// and leaves a smaller one behind — and the first question then hides the removal for ever.
+// ---------------------------------------------------------------------------
+
+// Every one of these is a reading of the DATABASE clock: the fence is minted by databaseLedgerFence
+// and the registration stamps are what `clock_timestamp()` wrote into `synced_at`. No host clock has
+// any part in these comparisons any more (o3d-clxw round 4).
+const READ_AT = databaseLedgerFence(new Date('2026-08-20T12:00:00.000Z'))
+const BEFORE_READ = new Date('2026-08-20T11:00:00.000Z')
+const AFTER_READ = new Date('2026-08-20T12:00:01.000Z')
+
+const postedRegistration = (
+  overrides: Partial<Parameters<typeof classifyRegisteredPayment>[1][number]> = {},
+): Parameters<typeof classifyRegisteredPayment>[1][number] => {
+  const row = { id: 'log_1', status: 'SYNCED', externalTransactionId: 'PAY-1', syncedAt: BEFORE_READ, ...overrides }
+  // Written by ONE statement of the current build, so the completion time and its provenance marker
+  // are the same instant (o3d-clxw round 5). A case that wants an old build's row overrides the
+  // marker explicitly — see the mixed-version tests below.
+  return { syncedAtDatabaseClock: row.syncedAt, ...row }
+}
+
+test('a listed payments array with an unreadable entry states nothing at all', () => {
+  assert.equal(listedLedgerPaymentIds({ InvoiceID: 'i', Type: 'ACCPAY', Status: 'AUTHORISED' }), null,
+    'an ABSENT array is "Xero did not tell us", never "Xero holds no payments"')
+  assert.equal(listedLedgerPaymentIds({ InvoiceID: 'i', Type: 'ACCPAY', Status: 'AUTHORISED', Payments: [{}] }), null,
+    'a list we cannot fully read cannot establish that a particular id is missing from it')
+  assert.equal(listedLedgerPaymentIds({ InvoiceID: 'i', Type: 'ACCPAY', Status: 'AUTHORISED', Payments: [null] }), null)
+  assert.equal(listedLedgerPaymentIds({ InvoiceID: 'i', Type: 'ACCPAY', Status: 'AUTHORISED', Payments: [{ PaymentID: ' ' }] }), null)
+  // An EMPTY array is a real answer: the ledger listed its payments and there are none.
+  assert.deepEqual([...listedLedgerPaymentIds({ InvoiceID: 'i', Type: 'ACCPAY', Status: 'AUTHORISED', Payments: [] })!], [])
+})
+
+test('our payment absent from a list we could read fully is GONE, even with a residual payment present', () => {
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', {
+    AmountPaid: 20, AmountDue: 480, Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }],
+  })
+  assert.deepEqual(classifyRegisteredPayment(invoice, [postedRegistration()], READ_AT),
+    { verdict: 'GONE', paymentIds: ['PAY-1'] })
+})
+
+test('our payment still listed is STILL_HELD, whatever else the invoice carries', () => {
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', {
+    AmountPaid: 420, AmountDue: 80, Payments: [{ PaymentID: 'pay-1' }, { PaymentID: 'PAY-OTHER' }],
+  })
+  // Case-insensitive: the stored id came back from a POST, the listed one from a GET.
+  assert.deepEqual(classifyRegisteredPayment(invoice, [postedRegistration()], READ_AT),
+    { verdict: 'STILL_HELD', paymentIds: ['PAY-1'] })
+})
+
+test('one surviving registration of two keeps the whole document held', () => {
+  // Clearing paidAt here re-arms Mark Paid for the WHOLE total on top of the surviving payment.
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-2' }] })
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [
+      postedRegistration(),
+      postedRegistration({ id: 'log_2', externalTransactionId: 'PAY-2' }),
+    ], READ_AT),
+    { verdict: 'STILL_HELD', paymentIds: ['PAY-2'] })
+})
+
+test('a registration this read cannot speak for withholds the whole verdict', () => {
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
+  const cases: Array<[string, Parameters<typeof classifyRegisteredPayment>[1][number]]> = [
+    ['still queued', postedRegistration({ status: 'PENDING', externalTransactionId: null, syncedAt: null })],
+    ['on the wire', postedRegistration({ status: 'PROCESSING', externalTransactionId: null, syncedAt: null })],
+    ['attempted, outcome unknown', postedRegistration({ status: 'FAILED', externalTransactionId: null, syncedAt: null })],
+    ['posted, but we do not know what it created', postedRegistration({ externalTransactionId: null })],
+    ['finished after the ledger was read', postedRegistration({ syncedAt: AFTER_READ })],
+  ]
+  for (const [label, row] of cases) {
+    assert.deepEqual(classifyRegisteredPayment(invoice, [row], READ_AT),
+      { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] }, label)
+  }
+  // And one undecided registration beats a proved-absent one: the document is one document.
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration(), postedRegistration({ id: 'log_2', syncedAt: AFTER_READ })], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_2'] })
+})
+
+test('CANCELLED holds no payment and blocks nothing', () => {
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration({ id: 'log_x', status: 'CANCELLED' }), postedRegistration()], READ_AT),
+    { verdict: 'GONE', paymentIds: ['PAY-1'] })
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration({ id: 'log_x', status: 'CANCELLED' })], READ_AT),
+    { verdict: 'NOTHING_REGISTERED' })
+})
+
+test('a payload that does not list its payments cannot prove ours is absent', () => {
+  assert.deepEqual(
+    classifyRegisteredPayment(ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 20 }), [postedRegistration()], READ_AT),
+    { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' })
+})
+
+// ---------------------------------------------------------------------------
+// A ZERO IS NOT A REVERSAL ON ITS OWN (o3d-clxw round 3)
+//
+// Round 1's reversal verdict was "AUTHORISED and nothing paid". A payment IMS registered and has not
+// posted yet reads EXACTLY like that — so the poller could clear paidAt, re-arm Mark Paid, and invite
+// a second supplier payment over its own in-flight one. The ledger cannot tell the two apart, because
+// the distinguishing fact is in IMS's registration rows, not in Xero.
+// ---------------------------------------------------------------------------
+
+test('a zero-paid document with a registration this read cannot speak for is NOT a proven reversal', () => {
+  assert.equal(
+    zeroPaidIsProvenReversal({ verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] }), false,
+    'the payment may be on the wire right now — clearing paidAt here is what pays the supplier twice')
+})
+
+test('a zero-paid document whose own payment the ledger still lists is not a proven reversal either', () => {
+  // The ledger contradicting itself (lists our payment, states nothing paid) is not proof of anything.
+  assert.equal(zeroPaidIsProvenReversal({ verdict: 'STILL_HELD', paymentIds: ['PAY-1'] }), false)
+})
+
+test('a zero-paid document IMS can fully account for IS a reversal', () => {
+  assert.equal(zeroPaidIsProvenReversal({ verdict: 'GONE', paymentIds: ['PAY-1'] }), true)
+  assert.equal(zeroPaidIsProvenReversal({ verdict: 'NOTHING_REGISTERED' }), true,
+    'no registration of ours can be in flight, so the zero is the whole story')
+  assert.equal(zeroPaidIsProvenReversal({ verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }), true,
+    'an aggregate of zero needs no list: a ledger holding no money is not holding ours')
+})
+
+// ---------------------------------------------------------------------------
+// A DEPLOY MUST NOT PUT THE SECOND CLOCK BACK (o3d-clxw round 5, Codex finding 1)
+//
+// Round 4 made both ends of the fence readings of the database's clock. It could not make the
+// PREVIOUS release stop writing `syncedAt` from its own host's `new Date()` — and during every
+// rollout both builds are running, so the new poller is handed host-clock rows and compares them
+// against a database fence. That is the cross-host comparison this branch exists to remove,
+// reintroduced by the release. It is now DETECTABLE — the stamp carries its provenance inside the
+// value — and an undetectable one withholds rather than being aged out.
+// ---------------------------------------------------------------------------
+
+test('a registration an OLD BUILD stamped from its host clock is undecidable, however old it looks (r5)', () => {
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0, Payments: [] })
+  // An hour before the ledger read — comfortably outside any skew anybody would call plausible, and
+  // round 4 would have called it decided on exactly that reasoning.
+  const oldBuildRow = postedRegistration({ syncedAt: BEFORE_READ, syncedAtDatabaseClock: null })
+  assert.deepEqual(classifyRegisteredPayment(invoice, [oldBuildRow], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] },
+    'no clock will vouch for this completion time, so it orders nothing — ageing out is not a fence')
+
+  // The other half of a mixed deploy: the database stamped the row, then an old build rewrote
+  // `syncedAt` from its host clock and left the marker where it was. The row states two different
+  // completion times, which is the disagreement, and a disagreement decides nothing.
+  const rewrittenByOldBuild = postedRegistration({
+    syncedAt: new Date(BEFORE_READ.getTime() + 90_000),
+    syncedAtDatabaseClock: BEFORE_READ,
+  })
+  assert.deepEqual(classifyRegisteredPayment(invoice, [rewrittenByOldBuild], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] })
+})
+
+test('one old-build registration withholds a document the database-stamped ones would have decided (r5)', () => {
+  // The mixed-version table: one row written by each build. The document is ONE document and paidAt is
+  // ONE flag, so the row nothing can order withholds the whole verdict — it is not out-voted by the
+  // row that can be ordered.
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [
+      postedRegistration({ id: 'log_new' }),
+      postedRegistration({ id: 'log_old', externalTransactionId: 'PAY-2', syncedAtDatabaseClock: null }),
+    ], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_old'] },
+    'GONE here clears paidAt, re-arms Mark Paid, and pays the supplier a second time')
+})
+
+test('a registration that synced at the very instant of the read is undecided, matching o3d-batch-payidx', () => {
+  // The sibling retires registrations on `OR: [{ syncedAt: null }, { syncedAt: { gte:
+  // ledgerObservedBefore } }]` = undecidable. A `<=` here would call the tie decided while the sibling
+  // called it undecided — two components disagreeing about one supplier payment.
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0, Payments: [] })
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration({ syncedAt: READ_AT.databaseClock })], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] })
+  // One millisecond earlier is decidable, so the fence is strict rather than simply broken.
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration({ syncedAt: new Date(READ_AT.databaseClock.getTime() - 1) })], READ_AT),
+    { verdict: 'GONE', paymentIds: ['PAY-1'] })
 })
