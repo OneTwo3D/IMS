@@ -37,6 +37,7 @@ import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
 import {
+  BACK_REFERENCE_REPAIRABLE_STATUSES,
   applyBackReference,
   backReferenceIsMissing,
   followUpObligationClaim,
@@ -57,6 +58,7 @@ import {
   createBackReferenceSweepCursorStore,
   repairAccountingBackReferences,
   type BackReferenceRepairResult,
+  type BackReferenceSweepRelease,
 } from '@/lib/domain/accounting/back-reference-sweep'
 import {
   liveRowOccupiesFollowUpSlot,
@@ -2313,6 +2315,11 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
   DAILY_BATCH_COGS_RECONCILIATION: POST_EFFECT_JOURNAL,
   DAILY_BATCH_TRANSIT_RECONCILIATION: POST_EFFECT_JOURNAL,
   UNEARNED_REV_REVERSAL: POST_EFFECT_JOURNAL,
+  // Added by the compiler, not by hand: this Record is exhaustive over AccountingSyncType on
+  // purpose (o3d-e2mz r4), so a type merged since — o3d-0i5y's allocation reversal — fails the
+  // type-check here rather than silently inheriting the invoice wording. It goes through
+  // `pushManualJournal` beside the other reversals, so it is a journal.
+  ALLOCATION_REVERSAL: POST_EFFECT_JOURNAL,
   REALISED_FX_JOURNAL: POST_EFFECT_JOURNAL,
   UNREALISED_FX_JOURNAL: POST_EFFECT_JOURNAL,
   MANUFACTURING_JOURNAL: POST_EFFECT_JOURNAL,
@@ -2366,6 +2373,26 @@ function postEffectFor(type: AccountingSyncType, payload: SyncPayload): { effect
 }
 
 /**
+ * THE ONE `referenceType` WHOSE ROW BELONGS TO A SALE THAT CAN BE CANCELLED (o3d-e2mz r8).
+ *
+ * `referenceId` IS the sales order id for these rows, so the cancellation state is one locked read
+ * away. Every other reference the sweep and the recovery carry resolves to something a sales-order
+ * cancellation does not speak for, and must NOT be gated on one:
+ *
+ *  • `PurchaseInvoice` / `PurchaseOrder` — a supplier bill. No sale is involved at all.
+ *  • `SalesOrderRefund` (the CREDIT_NOTE rows) — a refund credit note is very often the DIRECT
+ *    CONSEQUENCE of the cancellation. Refusing to finish its back-reference because the order is
+ *    cancelled would strand exactly the document the cancellation created, which is the opposite of
+ *    the harm this gate exists to stop: crediting a cancelled sale is right, invoicing it is wrong.
+ *
+ * One constant, consumed by the locked read below and by the sweep's gate, for the same reason
+ * `BACK_REFERENCE_SWEEP_STATUSES` is one constant: two copies of "which rows belong to a sale" could
+ * disagree, and the disagreement would be invisible.
+ */
+const SALE_SCOPED_REFERENCE_TYPE = 'SalesOrder'
+
+/**
+ * IS THERE STILL A SALE FOR THIS WORK TO BELONG TO? (o3d-e2mz r5, Codex finding 1)
  * o3d-e2mz: DID AN OPERATOR DECIDE ABOUT THIS ATTEMPT WHILE IT WAS POSTING?
  *
  * ESCALATION ONLY. It writes NOTHING to the sync row, and that is the whole of this branch's rebase
@@ -2380,6 +2407,39 @@ function postEffectFor(type: AccountingSyncType, payload: SyncPayload): { effect
  * WHAT THE REVISION STILL BUYS, AND NOTHING ELSE DOES: an operator who settled attempt N as "did not
  * post" has to be TOLD that attempt N posted. `heldClaimWhere` cannot see that — `applyFencedAttemptDecision`
  * moves the revision, and a decision can leave the claim instant untouched — so this asks the row.
+ *
+ * One indexed read per posted document, on the post path only. A row that is GONE escalates too:
+ * retention deleted the only record of an attempt whose document is in the ledger.
+ */
+async function readSaleCancellationStateUnderLock(
+  tx: Prisma.TransactionClient,
+  entry: { referenceType: string; referenceId: string },
+): Promise<'LIVE' | 'CANCELLED'> {
+  if (entry.referenceType !== SALE_SCOPED_REFERENCE_TYPE) return 'LIVE'
+  await lockSalesOrder(tx, entry.referenceId)
+  const so = await tx.salesOrder.findUnique({
+    where: { id: entry.referenceId },
+    select: { status: true },
+  })
+  // A deleted order cannot have its work continued either, and nothing downstream would find it.
+  if (!so) return 'CANCELLED'
+  return so.status === 'CANCELLED' ? 'CANCELLED' : 'LIVE'
+}
+
+/**
+ * o3d-e2mz: DID AN OPERATOR DECIDE ABOUT THIS ATTEMPT WHILE IT WAS POSTING?
+ *
+ * ESCALATION ONLY. It writes NOTHING to the sync row, and that is this branch's rebase onto o3d-550x.
+ * An earlier round fenced the SYNCED write itself on the attempt revision and then recovered from
+ * losing that fence by writing the external id anyway — a SECOND implementation of the posted-document
+ * record. There is exactly one: `recordPostedSyncResult`, reached here through
+ * `recordPostedDocumentDurably` / `persistPostedXeroDocument`. It records the post unconditionally,
+ * its only precondition being that the row does not already name a DIFFERENT document, precisely
+ * because evidence of a post must never be conditional on winning a race.
+ *
+ * WHAT THE REVISION STILL BUYS, AND NOTHING ELSE DOES: an operator who settled attempt N as "did not
+ * post" has to be TOLD that attempt N posted. `heldClaimWhere` cannot see that — a decision moves the
+ * revision and can leave the claim instant untouched — so this asks the row.
  *
  * One indexed read per posted document, on the post path only. A row that is GONE escalates too:
  * retention deleted the only record of an attempt whose document is in the ledger.
@@ -4644,6 +4704,63 @@ async function updateBackReference(
 export type { BackReferenceRepairResult }
 
 /**
+ * THE LOCKED HALF OF THE SWEEP'S CANCELLED-SALE GATE (o3d-e2mz r8).
+ *
+ * The GATE — when it is asked, what the three answers mean, what is counted and logged — is in the
+ * shared sweep, once. This is only what that gate cannot do from a connector-agnostic module: read the
+ * sale UNDER ITS ROW LOCK and, if it is cancelled, retire the row in the SAME transaction.
+ *
+ * The lock is the one `cancelSalesOrderFulfillmentState` opens with, so a cancellation either commits
+ * first and is seen here, or waits behind the decision it would have invalidated.
+ *
+ * The retirement's precondition IS THE FACT IT PROTECTS — the row names a document and is in the
+ * sweep's candidate status set — so it is self-guarding against a row that moved between the candidate
+ * read and here: a row no longer in the shape needs no retiring. And a writer that retires a row must
+ * advance the fence, or a concurrent run could still win a compare-and-swap on the revision it read;
+ * revision 0 stays 0, because bumping it would forge an attempt a later decision could believe in.
+ *
+ * ONLY `SalesOrder` rows are gated. `referenceId` IS the sales order id for those, so the state is one
+ * locked read away. Every other reference resolves to something a sales-order cancellation does not
+ * speak for — a supplier bill is not a sale at all, and a refund CREDIT NOTE is very often the direct
+ * CONSEQUENCE of the cancellation, so refusing to finish it would strand the document the cancellation
+ * created. Crediting a cancelled sale is right; invoicing it is wrong.
+ */
+async function decideSaleRelease(row: {
+  id: string
+  referenceType: string
+  referenceId: string
+  attemptRevision?: number
+}): Promise<BackReferenceSweepRelease> {
+  if (row.referenceType !== SALE_SCOPED_REFERENCE_TYPE) return { release: 'RELEASE' }
+  try {
+    return await db.$transaction(async (tx): Promise<BackReferenceSweepRelease> => {
+      if (await readSaleCancellationStateUnderLock(tx, row) !== 'CANCELLED') return { release: 'RELEASE' }
+      await tx.accountingSyncLog.updateMany({
+        where: {
+          id: row.id,
+          externalTransactionId: { not: null },
+          status: { in: [...BACK_REFERENCE_REPAIRABLE_STATUSES] },
+        },
+        data: {
+          status: 'CANCELLED',
+          syncedAt: null,
+          ...(row.attemptRevision === undefined || row.attemptRevision === UNCLAIMED_ATTEMPT_REVISION
+            ? {}
+            : { attemptRevision: { increment: 1 } }),
+          errorMessage: 'Retired by the Xero back-reference sweep: the row named a document and was in the sweep\'s '
+            + 'candidate shape while THE SALE IT BELONGS TO IS CANCELLED. The document id is kept — the order delete '
+            + 'guard reads it whatever the status — but the back-reference was NOT written onto the cancelled order '
+            + 'and none of its follow-ups (PDF, email, storefront note, PAYMENT) were enqueued.',
+        },
+      })
+      return { release: 'RETIRED' }
+    })
+  } catch (error) {
+    return { release: 'SALE_UNREADABLE', error: String(error) }
+  }
+}
+
+/**
  * audit-H3 repair sweep, Xero binding. The implementation is connector-agnostic
  * (lib/domain/accounting/back-reference-sweep) — o3d-9kek fixed its starvation and its
  * page-local PO ambiguity check there, once, so a second connector cannot inherit the
@@ -4661,6 +4778,11 @@ export async function repairXeroBackReferences(limit = DEFAULT_BACK_REFERENCE_SW
     // the strength of having warned about it, and logActivity cannot tell it whether the warning
     // was written (o3d-9kek r2 finding 3).
     logActivity: logActivityPersisted,
+    // o3d-e2mz r8: the sweep is the CONSUMER — the only place a cancelled sale's work is actually
+    // released — so the gate lives IN the sweep (see `decideSaleRelease` on BackReferenceSweepDeps).
+    // What the connector supplies is only the part the connector-agnostic module cannot hold: the
+    // locked read and the retirement, in one transaction on the Xero database handle.
+    decideSaleRelease,
     enqueueFollowUps: (entryId, type, referenceType, referenceId, payload, syncResult) =>
       enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult),
   }, { limit })

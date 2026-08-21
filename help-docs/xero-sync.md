@@ -1722,6 +1722,18 @@ posting, and a settlement that reported success over a contradiction would leave
 disagreeing with nobody told. Check both ids in Xero: if the one already recorded is the real one
 there is nothing to settle, and if it is not, reverse it in Xero before recording the other.
 
+**And the back-reference repair sweep now asks the same question itself.** It is the sweep — not the row that fed it — that actually restarts a sale's work: it writes the Xero id onto the order and re-enqueues the invoice's PDF, email, WooCommerce note and **payment**. Gating only the paths that *produce* its candidate rows could never be complete, because the ordinary success path reads no sales order at all: an invoice that posted and then failed its back-reference or its follow-up enqueue is marked `FAILED` with its Xero id intact, which is precisely the sweep's candidate shape, with nobody having asked about the sale. So before it releases anything, the sweep reads the sales order under that order's row lock and:
+
+- **live** — repairs it, exactly as before;
+- **cancelled** — retires the row to `CANCELLED` instead, writes nothing onto the order, enqueues no follow-ups, and raises an ERROR naming the Xero document that is now the only thing left to undo;
+- **unreadable** — defers: nothing is written, nothing is retired, the row keeps its status and the next sweep asks again. A WARNING records the deferral.
+
+Only rows whose reference is a **sales order** are gated this way. A supplier bill has no sale behind it, and a refund credit note is very often the direct consequence of the cancellation — refusing to finish *that* back-reference would strand the very document the cancellation created.
+
+The sweep result (returned by the cron endpoint and by manual sync) reports these as `retiredCancelledSale`, alongside `checked` / `repaired` / `failed` / `skippedAmbiguous`.
+
+What remains is a cancellation that commits **after** the sweep has read the order and released the lock — the same sub-second window the pre-post order check has, and bounded by the same lock. What is gone is the open-ended version of it: a sale cancelled hours or days ago whose row still sat in the candidate shape and was released afresh on every single sweep run.
+
 One posting can be mirrored under **either of two keys** — the one tied to this sync row, and an
 older form shared by every attempt at the same document on the same day — and *both* are checked.
 An earlier attempt's real document sitting on the second key refuses the settlement exactly as one

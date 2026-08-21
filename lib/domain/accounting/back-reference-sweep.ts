@@ -462,7 +462,12 @@ export type BackReferenceSweepActivity = {
   entityType: 'SYSTEM'
   action: string
   tag: string
-  level: 'INFO' | 'WARNING'
+  /**
+   * ERROR is reachable (o3d-e2mz r8): retiring a row because its sale is cancelled leaves a real
+   * document in the ledger that only a person can undo, which is not a warning about something that
+   * may resolve itself. Every other entry this sweep writes is still INFO or WARNING.
+   */
+  level: 'INFO' | 'WARNING' | 'ERROR'
   description: string
   metadata: Record<string, unknown>
 }
@@ -500,6 +505,29 @@ export type BackReferenceSweepDeps = {
     syncResult: { externalId?: string; invoiceNumber?: string },
   ) => Promise<void>
   now?: () => Date
+  /**
+   * IS THE SALE THIS ROW BELONGS TO STILL LIVE — and if not, retire the row (o3d-e2mz r8).
+   *
+   * THE GATE ITSELF LIVES HERE, in the sweep, and this is only the locked read it needs. That
+   * placement is the whole finding. Rounds 5–7 of o3d-e2mz closed the cancellation window one
+   * PRODUCER at a time and each ended with the same flag: the sweep has no cancellation check. This
+   * sweep is not a bystander that inherits whatever shape a row was left in — it is the CONSUMER,
+   * and the only place a cancelled sale's work is actually released: `accountingInvoiceId` +
+   * `invoicedAt` stamped onto the order, and INVOICE_PDF / INVOICE_EMAIL / WC_INVOICE_NOTE /
+   * INVOICE_PAYMENT enqueued off it. Gating producers can only ever cover the producers that were
+   * thought of, and the ORDINARY settle path is a counterexample needing no bug at all: a post that
+   * succeeds and then fails its back-reference or its follow-up enqueue is left FAILED with its id
+   * intact — this sweep's candidate shape, reached with nobody having asked about the sale.
+   *
+   * Why it is a dependency and not code in this file: the answer must be read UNDER THE SALES ORDER'S
+   * ROW LOCK, in the transaction that retires, and this module is deliberately free of both a
+   * transaction handle and the sales-order locking primitive. The connector binding owns those. What
+   * it must NOT own is the decision of where to ask, what the three answers mean, or what is counted
+   * and logged — all of that is below, once, so a second connector cannot inherit a different gate.
+   *
+   * Optional: a binding that supplies none releases exactly as it did before.
+   */
+  decideSaleRelease?: (row: BackReferenceSweepRow) => Promise<BackReferenceSweepRelease>
 }
 
 export type BackReferenceRepairResult = {
@@ -535,7 +563,28 @@ export type BackReferenceRepairResult = {
    * that clears them.
    */
   skippedUnverified: number
+  /**
+   * Rows RETIRED instead of released, because the SALE they belong to is cancelled (o3d-e2mz r8).
+   *
+   * Its own number, and not folded into `skippedAmbiguous` or `failed`, for the same reason
+   * `skippedUnverified` is: nothing failed and nothing is waiting to resolve itself. A decision was
+   * taken — this sale's work stops here — and the population it produces is the one an operator has
+   * to go and undo in the ledger.
+   */
+  retiredCancelledSale: number
 }
+
+/**
+ * What the sweep may do with ONE candidate row, decided under the sale's own row lock (o3d-e2mz r8).
+ *
+ * `SALE_UNREADABLE` carries WHY. A lock timeout, a deadlock and a genuinely broken read all end the
+ * same way — nothing released — but they need different operator responses, and a bare "could not be
+ * read" every fifteen minutes is a line nobody can act on.
+ */
+export type BackReferenceSweepRelease =
+  | { release: 'RELEASE' }
+  | { release: 'RETIRED' }
+  | { release: 'SALE_UNREADABLE'; error: string }
 
 export type BackReferenceCandidateCursor = { createdAt: Date; id: string }
 
@@ -691,6 +740,7 @@ export async function repairAccountingBackReferences(
 
   const result: BackReferenceRepairResult = {
     scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, followUpsDiscarded: 0, skippedUnverified: 0,
+    retiredCancelledSale: 0,
   }
   // One cutoff for the whole run, so every page of the scan agrees on which deferred rows
   // are due — a per-page `new Date()` would let a row fall on both sides of the boundary.
@@ -1277,6 +1327,71 @@ export async function repairAccountingBackReferences(
         if (isOperatorAssertedSettlement(row.settlementBasis) && (missing || followUpsOnly)) {
           await reportUnverifiedAssertion(row, missing ? 'the back-reference' : 'the follow-ups')
           continue
+        }
+
+        // o3d-e2mz r8 — IS THERE STILL A SALE FOR THIS WORK TO BELONG TO? See `decideSaleRelease`.
+        //
+        // Placed HERE, after the probe and immediately before the first write, on purpose. A row that
+        // releases nothing needs no decision, and taking the order's row lock for every candidate on
+        // every run — most of them already reconciled — would contend with live allocation and
+        // cancellation work to decide nothing. It gates exactly the two branches that RELEASE:
+        // `missing` (the id write, which creates the ledger link) and `followUpsOnly` (the PDF,
+        // attachment and PAYMENT built from it). It deliberately does not gate the fall-through, which
+        // stamps a row whose document is already linked and releases nothing.
+        //
+        // A residual, stated: `settleOutstandingFollowUpsOnly` above handles rows that carry NO
+        // external id (an INVOICE_PDF with nested email/note) and is NOT gated, because a row without
+        // a document id was never in the population this finding is about. It is a narrower window
+        // than the one being closed, not a second gate that thinks this one is handling it.
+        if (deps.decideSaleRelease && (missing || followUpsOnly)) {
+          const release = await deps.decideSaleRelease(row)
+          if (release.release === 'RETIRED') {
+            result.retiredCancelledSale++
+            await deps.logActivity({
+              entityType: 'SYSTEM',
+              action: `${prefix}_backreference_repair_cancelled_sale`,
+              tag: 'sync',
+              level: 'ERROR',
+              description: `Did NOT repair the ${connectorLabel} back-reference for ${row.referenceType} ${row.referenceId}: `
+                + `the sale is CANCELLED. The document ${row.externalTransactionId} exists in ${connectorLabel} and is `
+                + `still named on sync row ${row.id}, but writing its id onto the cancelled order would have enqueued `
+                + "that sale's follow-ups — PDF, email, storefront note and PAYMENT. The row is retired instead; the "
+                + 'document in the ledger is real and is now the only thing left to undo — void or credit-note it.',
+              metadata: {
+                syncLogId: row.id,
+                type: row.type,
+                referenceType: row.referenceType,
+                referenceId: row.referenceId,
+                externalId: row.externalTransactionId,
+              },
+            })
+            continue
+          }
+          if (release.release === 'SALE_UNREADABLE') {
+            // FAIL CLOSED: release nothing, retire nothing, and count it as a failure — that is what
+            // it is, this pass could not establish the one fact it needs. Retiring would be a
+            // RETRACTION, and a retraction needs proof. The row stays in the candidate shape (it is
+            // NOT stamped), so the next sweep asks again having released nothing in between.
+            result.failed++
+            await deps.logActivity({
+              entityType: 'SYSTEM',
+              action: `${prefix}_backreference_repair_sale_unreadable`,
+              tag: 'sync',
+              level: 'WARNING',
+              description: `Deferred the ${connectorLabel} back-reference repair for ${row.referenceType} `
+                + `${row.referenceId}: the sales order could not be read, so it could not be proved live: `
+                + `${release.error}. Nothing was written onto the order and no follow-ups were enqueued; the next `
+                + 'sweep asks again.',
+              metadata: {
+                syncLogId: row.id,
+                type: row.type,
+                referenceType: row.referenceType,
+                referenceId: row.referenceId,
+                error: release.error,
+              },
+            })
+            continue
+          }
         }
 
         if (!missing && !followUpsOnly) {
