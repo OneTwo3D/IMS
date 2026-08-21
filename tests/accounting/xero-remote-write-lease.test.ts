@@ -32,6 +32,8 @@ const state = {
   posted: [] as string[],
   activity: [] as Array<{ action?: string; level?: string; description?: string; metadata?: Record<string, unknown> }>,
   mirroredEventWrites: 0,
+  /** Raw statements run inside a transaction — the database-clock stamp (o3d-batch-billpay). */
+  databaseClockStamps: 0,
   /** Called when processEntry reads the granted scopes — i.e. after the lease opens, before any fence. */
   onScopes: null as (null | (() => void)),
   /** Called from inside the mocked push, i.e. after the document has "reached Xero". */
@@ -149,6 +151,15 @@ function makeDbDouble(): Record<string, unknown> {
         }
       }
       if (key === 'then') return undefined
+      // o3d-batch-billpay (o3d-clxw r4), merged into development after this double was written: the
+      // settling transaction stamps `syncedAt` from the DATABASE's clock straight after the fenced
+      // write. `$executeRaw` is used as a TAGGED TEMPLATE and so must be a FUNCTION — the permissive
+      // proxy below hands back a value only for METHOD access, so an un-taught double died on
+      // "$executeRaw is not a function" inside the persist and the re-drive assertions read as a
+      // pool failure. Counted, so the stamp's presence is observable here too.
+      if (key === '$executeRaw' || key === '$executeRawUnsafe') {
+        return async () => { state.databaseClockStamps += 1; return 1 }
+      }
       if (key === 'accountingSyncLog') return syncLog
       if (key === 'accountingEvent' || key === 'accountingEventLog') return events
       if (key === 'integrationOutbox') {
@@ -218,6 +229,7 @@ function reset(): void {
   state.posted = []
   state.activity = []
   state.mirroredEventWrites = 0
+  state.databaseClockStamps = 0
   state.onScopes = null
   state.onPost = null
   state.pendingServed = false
