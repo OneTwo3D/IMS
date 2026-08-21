@@ -139,6 +139,15 @@ function record(op: string, data?: Record<string, unknown>, where?: Record<strin
 
 const syncLogClient = {
   async findMany(args: { where: Record<string, unknown> }) {
+    // THE INJECTION POINT MOVED WITH THE CODE (o3d-m5qk / o3d-hbgo). `hasExistingSyncLog` — the first
+    // thing the follow-up enqueue does — used to be a `count`, and this failure was injected there.
+    // It is now a `findMany`, because the live-row check has to read each row's PAYLOAD to compare the
+    // external document the follow-up targets; a per-reference COUNT cannot answer that. Left on
+    // `count`, the injection stopped firing and three tests passed while asserting nothing.
+    if ('referenceId' in args.where && state.failFollowUpsFor.has(state.syncRows[0]?.id ?? '')) {
+      record('followups.attempted-and-failed')
+      throw new Error('transient: follow-up lookup failed')
+    }
     return state.syncRows.filter((row) => matches(row, args.where)).map((row) => ({ ...row }))
   },
   async findUnique(args: { where: { id: string } }) {
@@ -146,13 +155,8 @@ const syncLogClient = {
     return row ? { ...row } : null
   },
   async count(args: { where: Record<string, unknown> }) {
-    // Scoped to the per-reference lookup (hasExistingSyncLog, the first thing the follow-up enqueue
-    // does) so the failure is a realistic transient database error INSIDE enqueueFollowUps rather
-    // than a stubbed-out throw — and so it does not also break the run's unrelated tail count.
-    if ('referenceId' in args.where && state.failFollowUpsFor.has(state.syncRows[0]?.id ?? '')) {
-      record('followups.attempted-and-failed')
-      throw new Error('transient: follow-up lookup failed')
-    }
+    // Kept honest but no longer the injection point — see findMany above. It stays scoped-free so the
+    // run's unrelated tail count is unaffected.
     return state.syncRows.filter((row) => matches(row, args.where)).length
   },
   async create(args: { data: Record<string, unknown> }) {

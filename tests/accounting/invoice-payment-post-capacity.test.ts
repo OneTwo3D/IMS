@@ -319,30 +319,45 @@ test('a FAILED sibling whose stored body the connector would have rejected pre-c
   assert.equal(result.post, true)
 })
 
-test('an imported tax-inclusive invoice is measured NET of VAT, so a gross receipt is refused', async () => {
-  // o3d-cyn: only an IMPORTED tax-inclusive order posts to the ledger at NET. Measuring the gross
-  // receipt against the gross order total would let a payment through that Xero itself will reject.
+test('a tax-inclusive invoice is measured at GROSS however the order arrived, so a gross receipt fits', async () => {
+  // SUPERSEDED ASSERTION (o3d-m5qk). This test used to be
+  //   'an imported tax-inclusive invoice is measured NET of VAT, so a gross receipt is refused'
+  // and required ledgerTotal 100 with post:false. o3d-cyn round 4 (merged as #631) removed the NET
+  // construction path entirely: BOTH paths now post the order's gross, and `ledgerSalesInvoiceTotalForeign`
+  // returns `totalForeign` whatever the tax flags say. The old expectation is not merely stale — asserting
+  // it would demand the guard refuse every ordinary VAT receipt on an imported order, which is the
+  // regression o3d-cyn's own counter-test exists to prevent.
+  //
+  // What this still pins is the thing the original was protecting: the guard measures the receipt against
+  // whatever the LEDGER holds, taken from one function, rather than recomputing a total of its own.
+  const imported = mockClient({
+    order: { totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, imported: true },
+    logs: [],
+  })
+  const raisedInIms = mockClient({
+    order: { totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, imported: false },
+    logs: [],
+  })
+
+  const importedResult = await guardInvoicePaymentCapacity(imported.client as never, { ...GUARD_PARAMS, amount: 120 })
+  const imsResult = await guardInvoicePaymentCapacity(raisedInIms.client as never, { ...GUARD_PARAMS, amount: 120 })
+
+  assert.equal(importedResult.post, true)
+  assert.equal(imsResult.post, true, 'and the two agree — provenance no longer changes the ledger total')
+})
+
+test('a receipt that exceeds the gross invoice is still refused, and the refusal names the ledger total', async () => {
+  // The counter-guard the pair above needs: "measured at gross" must not become "measured against
+  // nothing". A penny over the whole invoice, with no other registration, still refuses.
   const { client } = mockClient({
     order: { totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, imported: true },
     logs: [],
   })
 
-  const result = await guardInvoicePaymentCapacity(client as never, { ...GUARD_PARAMS, amount: 120 })
+  const result = await guardInvoicePaymentCapacity(client as never, { ...GUARD_PARAMS, amount: 120.02 })
 
   assert.equal(result.post, false)
-  assert.equal(result.post === false && result.kind === 'refused' && result.ledgerTotal, 100)
-})
-
-test('the same order raised IN IMS posts gross, so the same receipt is allowed', () => {
-  // Guards against the fix becoming "refuse every VAT receipt".
-  return (async () => {
-    const { client } = mockClient({
-      order: { totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, imported: false },
-      logs: [],
-    })
-    const result = await guardInvoicePaymentCapacity(client as never, { ...GUARD_PARAMS, amount: 120 })
-    assert.equal(result.post, true)
-  })()
+  assert.equal(result.post === false && result.kind === 'refused' && result.ledgerTotal, 120)
 })
 
 test('the capacity read is scoped to this connector, this type and this order', async () => {

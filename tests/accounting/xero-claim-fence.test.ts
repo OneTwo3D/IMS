@@ -726,7 +726,20 @@ test('o3d-550x: neither runner writes the sync row except to CLAIM it or through
         at = block.indexOf(call, at + 1)
       }
     }
-    assert.equal(claimSites, 1, `the ${name} runner takes exactly one claim, and that is its only direct row write`)
+    // SUPERSEDED ASSERTION (o3d-m5qk). This used to be
+    //   assert.equal(claimSites, 1, 'the runner takes exactly one claim, and that is its only direct row write')
+    // — written when the claim was an inline `updateMany` in each runner. o3d-a3wx round 4 moved the
+    // claim itself into `claimAccountingSyncLog`, because an order-scoped INVOICE_PAYMENT must take it
+    // under the order row lock TOGETHER with the "is anything else for this order posting?" test, and
+    // two runners electing from their own snapshots is not exclusion. So the runners now have ZERO
+    // direct row writes, which is STRICTLY STRONGER than "exactly one", and that is what is asserted —
+    // plus that the claim is still taken, through the one helper, so the rule cannot be satisfied by a
+    // runner that simply stopped claiming.
+    assert.equal(claimSites, 0, `the ${name} runner must make NO direct row write at all`)
+    assert.ok(
+      block.includes('claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff)'),
+      `the ${name} runner must still take its claim, and only through the one helper`,
+    )
 
     // And the releases it DOES perform go through the shared statements, which carry the fence.
     assert.ok(
@@ -746,6 +759,46 @@ test('o3d-550x: neither runner writes the sync row except to CLAIM it or through
         + 'owning the transaction, and an unwritable record then reads as an ordinary sync failure',
     )
   }
+})
+
+test('o3d-m5qk: the claim helper is the ONLY writer of the claim predicate, and it fences the row it takes', () => {
+  // The counterpart to the rule above. Moving the claim out of the runners is only an improvement while
+  // the helper it moved into cannot itself write the row on any other terms — otherwise "zero direct
+  // writes in the runner" is satisfied by a helper that writes whatever it likes.
+  const src = stripComments(readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8'))
+  const helper = src.slice(
+    src.indexOf('async function claimAccountingSyncLog('),
+    src.indexOf('export function invoicePaymentDeferralMessage('),
+  )
+  assert.ok(helper.length > 0, 'the claim helper must be found')
+
+  const WRITE_CALLS = ['accountingSyncLog.update(', 'accountingSyncLog.updateMany(', 'accountingSyncLog.upsert(']
+  let writes = 0
+  for (const call of WRITE_CALLS) {
+    let at = helper.indexOf(call)
+    while (at !== -1) {
+      const args = callArgs(helper, at + call.length - 1)
+      assert.ok(
+        args.includes('accountingSyncLogClaimWhere('),
+        `the claim helper wrote the row on terms other than the claim predicate:\n${args.slice(0, 300)}`,
+      )
+      writes++
+      at = helper.indexOf(call, at + 1)
+    }
+  }
+  assert.equal(writes, 2, 'exactly two claim writes: the unlocked path and the order-locked one')
+
+  // The order lock and the exclusion test must both be INSIDE the transaction that takes the claim,
+  // and the claim write must come after them — otherwise the read that authorises the claim and the
+  // claim itself can be interleaved by another runner, which is the whole defect.
+  const txAt = helper.indexOf('db.$transaction(')
+  assert.ok(txAt > 0, 'the order-scoped claim must be taken in a transaction')
+  const lockAt = helper.indexOf('lockSalesOrder(tx,', txAt)
+  const decideAt = helper.indexOf('decideInvoicePaymentClaim(', txAt)
+  const writeAt = helper.indexOf('tx.accountingSyncLog.updateMany(', txAt)
+  assert.ok(lockAt > txAt, 'the order row lock must be taken inside the transaction')
+  assert.ok(decideAt > lockAt, 'the exclusion test must be evaluated under the lock')
+  assert.ok(writeAt > decideAt, 'and the claim written only after it')
 })
 
 test('Codex r1 HIGH: no runner escalates an unrecordable document through the best-effort logger', () => {

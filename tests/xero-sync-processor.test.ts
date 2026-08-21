@@ -773,12 +773,40 @@ test('o3d-a3wx r6: neither runner releases a claim with an unfenced write', () =
   // The r6 version was wrong by inspecting nothing and passing. These bounds make that failure loud:
   // if the call shape moves again, the scan finds too few sites and this test fails instead of going
   // quietly vacuous.
+  //
+  // SUPERSEDED NUMBER (o3d-m5qk): this required 8. It was 8 because eight inline release statements
+  // were spelt out across the two runners — which is precisely what o3d-550x deleted, folding all of
+  // them into the ONE fenced statement `releaseClaimForRetry`. Six of the eight therefore no longer
+  // exist in this file, and demanding them back would be demanding the copies whose existence was the
+  // defect. The rule is unchanged and is still enforced on every site that IS here; what changed is
+  // that most sites moved, so the shared statement they moved into is asserted below rather than
+  // trusted.
   assert.equal(
     fencedReleases,
-    8,
-    `expected to reach all 8 claim-release sites; found ${fencedReleases}. Either a release was added ` +
-      `(raise this number and confirm it is fenced) or the call shape moved and this test is inspecting nothing`,
+    2,
+    `expected to reach both remaining in-file claim-release sites; found ${fencedReleases}. Either a ` +
+      `release was added (raise this number and confirm it is fenced) or the call shape moved and this ` +
+      `test is inspecting nothing`,
   )
   assert.equal(revivals, 1, `expected exactly the one FAILED→PENDING revival; found ${revivals}`)
   assert.equal(exempt, 1, `expected exactly the one deliberately unfenced writer; found ${exempt}`)
+
+  // WHERE THE OTHER SIX WENT, asserted rather than assumed. If `releaseClaimForRetry` ever stopped
+  // carrying the fence, this file's scan would still pass while every deferral and backoff in both
+  // runners quietly released unfenced — the exact silent-vacuity failure the bounds above exist for.
+  const shared = readFileSync(join(process.cwd(), 'lib/domain/accounting/sync-claim-fence.ts'), 'utf8')
+  const release = shared.slice(shared.indexOf('export async function releaseClaimForRetry('))
+  assert.ok(release.length > 0, 'the one shared non-terminal release must exist')
+  assert.ok(
+    release.includes('accountingSyncLog.updateMany('),
+    'the shared release must write through updateMany, which is what can carry a predicate',
+  )
+  assert.ok(
+    release.includes('where: heldClaimWhere(entryId, claim)'),
+    'the shared release must fence on the claim the caller holds, read at the point of the write',
+  )
+  assert.ok(
+    release.includes("status: 'PENDING'"),
+    'and it must be the statement that actually hands the row back, not a wrapper around another one',
+  )
 })

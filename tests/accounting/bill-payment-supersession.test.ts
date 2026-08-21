@@ -13,6 +13,7 @@ import {
   markBillPaidSupersedingStaleRegistrations,
   planBillPaymentSupersession,
   retireBillPaymentRegistrationsReversedInLedger,
+  reversalIsProven,
 } from '@/lib/domain/accounting/payment-reversal'
 import { databaseLedgerFence } from '@/lib/connectors/xero/invoice-delta'
 
@@ -395,6 +396,7 @@ test('a posted registration that finished AFTER the ledger read is REPORTED, not
     connector: 'xero',
     invoiceId: 'inv-1',
     ledgerStatus: 'VOIDED',
+    classifierProof: null,
     ledgerObservedBefore: observedBefore,
   })
 
@@ -439,6 +441,7 @@ test('a completion time the database did not mint is UNDECIDABLE, however early 
     invoiceId: 'inv-1',
     // VOIDED, so the round-8 proof gate is satisfied and the fence is what decides this.
     ledgerStatus: 'VOIDED',
+    classifierProof: null,
     ledgerObservedBefore: observedBefore,
   })
 
@@ -461,6 +464,7 @@ test('a NULL fence decides nothing at all, even for a row stamped long ago', asy
     connector: 'xero',
     invoiceId: 'inv-1',
     ledgerStatus: 'VOIDED',
+    classifierProof: null,
     ledgerObservedBefore: null,
   })
 
@@ -486,6 +490,7 @@ test('one undecidable registration withholds the whole bill, including its decid
     connector: 'xero',
     invoiceId: 'inv-1',
     ledgerStatus: 'VOIDED',
+    classifierProof: null,
     ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
   })
 
@@ -505,6 +510,7 @@ test('a reversed bill retires only SYNCED rows that had already posted when the 
     connector: 'xero',
     invoiceId: 'inv-1',
     ledgerStatus: 'VOIDED',
+    classifierProof: null,
     ledgerObservedBefore: observedBefore,
   })
 
@@ -553,6 +559,7 @@ test('an AUTHORISED bill is REFUSED by the retirement, and nothing is even read 
     connector: 'xero',
     invoiceId: 'inv-1',
     ledgerStatus: 'AUTHORISED',
+    classifierProof: null,
     ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
   })
 
@@ -582,6 +589,7 @@ test('a ledger status the read could not produce is not a proof either', async (
     connector: 'xero',
     invoiceId: 'inv-1',
     ledgerStatus: null,
+    classifierProof: null,
     ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
   })
 
@@ -611,6 +619,77 @@ test('VOIDED is the ONLY status that settles a reversal on its own', () => {
   assert.equal(ledgerAloneProvesTheReversal('voided'), false)
 })
 
+test('o3d-m5qk: the MERGED classifier\'s verdict is admissible proof, so a proved reversal is not stranded', async () => {
+  // Round 8 said an AUTHORISED bill "is not decidable from anything this branch reads", and that the
+  // widening — a stated zero paid whose registrations the read can account for, or a registered
+  // PaymentID proved absent from the invoice's own list — "belongs to ITS classifier, handed in here as
+  // further admissible proofs". That classifier is o3d-clxw, merged as #634, and this is the hand-in.
+  //
+  // WITHOUT IT the two answers collide in the worst direction: a bill whose supplier payment really was
+  // deleted — proved by the ledger's own payment list — reads as REVERSAL_UNPROVEN for ever, its posted
+  // registration is never retired, and every future Mark Paid on it is refused. AUTHORISED is the status
+  // on both of these, because Xero's AUTHORISED is simply "approved and not fully paid".
+  for (const proof of ['REGISTERED_PAYMENT_ABSENT', 'ZERO_PAID_REGISTRATIONS_ACCOUNTED'] as const) {
+    const { client, updates } = retirementClient([stamped('log-posted', '2026-08-20T09:00:00.000Z')])
+    const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
+      connector: 'xero',
+      invoiceId: 'inv-1',
+      ledgerStatus: 'AUTHORISED',
+      classifierProof: proof,
+      ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
+    })
+    assert.equal(outcome.decided, true, `${proof} is a proof this retirement must accept`)
+    assert.equal(updates.length, 1)
+  }
+})
+
+test('o3d-m5qk: the fence still applies to a classifier-proved reversal — proof of WHAT, not of WHEN', async () => {
+  // The two questions are independent and both must be answered. The classifier proves the payment is
+  // gone from the ledger; it says nothing about whether a registration of ours finished after the
+  // snapshot was taken. A registration this read cannot speak for still withholds the whole bill.
+  const { client, updates } = retirementClient([stamped('log-late', '2026-08-20T09:46:00.000Z')])
+
+  const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
+    connector: 'xero',
+    invoiceId: 'inv-1',
+    ledgerStatus: 'AUTHORISED',
+    classifierProof: 'REGISTERED_PAYMENT_ABSENT',
+    ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
+  })
+
+  assert.equal(outcome.decided, false)
+  assert.equal(outcome.decided === false && outcome.withheld, 'REGISTRATION_UNDECIDED')
+  assert.equal(updates.length, 0)
+})
+
+test('o3d-m5qk: reversalIsProven is the ONE place both kinds of evidence are weighed', () => {
+  // A caller with neither proof gets the round-8 answer unchanged, so nothing became weaker by the
+  // widening: an AUTHORISED bill nobody has classified is still refused.
+  assert.equal(reversalIsProven({ ledgerStatus: 'AUTHORISED', classifierProof: null }), false)
+  assert.equal(reversalIsProven({ ledgerStatus: null, classifierProof: null }), false)
+  // Either kind on its own is enough, and the status rule is untouched.
+  assert.equal(reversalIsProven({ ledgerStatus: 'VOIDED', classifierProof: null }), true)
+  assert.equal(reversalIsProven({ ledgerStatus: 'AUTHORISED', classifierProof: 'REGISTERED_PAYMENT_ABSENT' }), true)
+  assert.equal(reversalIsProven({ ledgerStatus: null, classifierProof: 'ZERO_PAID_REGISTRATIONS_ACCOUNTED' }), true)
+})
+
+test('o3d-m5qk: the poller NAMES the classifier bucket rather than letting the retirement re-derive it', () => {
+  // "It must never be re-derived at a call site" cuts both ways: the poller does not decide what its
+  // buckets prove (that is reversalIsProven), and the retirement does not go back to the ledger to
+  // work out which bucket a bill came from. The poller passes the two sets it is already iterating.
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/payment-poller.ts'), 'utf8')
+  const blockStart = src.indexOf('--- Purchase bill payment reversals')
+  const block = stripComments(src.slice(blockStart, src.indexOf('export async function pollXeroPayments', blockStart)))
+
+  assert.ok(block.includes('classifierProof,'), 'the retirement must be told which bucket the bill came from')
+  assert.ok(block.includes("billResidual.provenGone.has("), 'from the same provenGone map the loop already reads')
+  assert.ok(block.includes('billResidual.zeroPaidReversed.has('), 'and the same zeroPaidReversed set')
+  assert.ok(
+    !block.includes('reversalIsProven') && !block.includes('ledgerAloneProvesTheReversal'),
+    'but the poller must not weigh the evidence itself — that is the domain module\'s one job',
+  )
+})
+
 test('a VOIDED bill still retires, so the proof gate did not just switch the pass off', async () => {
   // The counter-test. A gate that refused everything would also pass every assertion above, and would
   // strand every genuine reversal behind a refusal markBillPaid can never clear.
@@ -620,6 +699,7 @@ test('a VOIDED bill still retires, so the proof gate did not just switch the pas
     connector: 'xero',
     invoiceId: 'inv-1',
     ledgerStatus: 'VOIDED',
+    classifierProof: null,
     ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
   })
 
@@ -640,6 +720,7 @@ test('the two withheld causes are distinct verdicts, because they ask the operat
       connector: 'xero',
       invoiceId: 'inv-1',
       ledgerStatus: 'VOIDED',
+      classifierProof: null,
       ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
     },
   )
@@ -649,6 +730,7 @@ test('the two withheld causes are distinct verdicts, because they ask the operat
       connector: 'xero',
       invoiceId: 'inv-1',
       ledgerStatus: 'AUTHORISED',
+      classifierProof: null,
       ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
     },
   )
@@ -805,9 +887,22 @@ test('the poller fences the retirement on when XERO WAS ASKED, not on the start 
   // the window start, every registration that posted during the preceding poll interval counted as
   // unreadable — and on a cold cursor that interval is the 24h default.
   const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/payment-poller.ts'), 'utf8')
+  // SUPERSEDED ASSERTION (o3d-m5qk). This used to require `ledgerObservedBefore: pollStartedAt`, and
+  // `pollStartedAt` is `new Date()` on whichever instance runs the poll. o3d-clxw round 4 (#634)
+  // established that a HOST clock may not appear on either end of this comparison at all — the row end
+  // is `clock_timestamp()` written by the database, and comparing the two across machines is what
+  // clears paidAt over a payment still in flight. The requirement the original was reaching for — the
+  // instant XERO WAS ASKED, not the start of the window it covers — is unchanged and is what is
+  // asserted now; only the clock it is read from has moved, and `pollStartedAt` is now the thing that
+  // must NOT be passed.
   assert.ok(
-    src.includes('ledgerObservedBefore: pollStartedAt'),
-    'the observation instant handed to the chunk must be the pre-fetch stamp',
+    src.includes('const ledgerObservedBefore = await readDatabaseLedgerFence()'),
+    'the observation instant must be minted from the DATABASE clock before the fetch',
+  )
+  assert.equal(
+    src.indexOf('ledgerObservedBefore: pollStartedAt'),
+    -1,
+    'this host\'s clock must never stand in for the instant the ledger was asked',
   )
   assert.ok(src.includes('windowStart: lastPollDate'), 'the WooCommerce refund window is still the delta window')
   const blockStart = src.indexOf('--- Purchase bill payment reversals')

@@ -227,6 +227,45 @@ export function ledgerAloneProvesTheReversal(ledgerStatus: string | null | undef
 }
 
 /**
+ * THE FURTHER ADMISSIBLE PROOFS, NOW THAT THE CLASSIFIER HAS LANDED (o3d-m5qk; o3d-clxw merged as #634).
+ *
+ * Round 8 wrote that AUTHORISED "is not decidable from anything this branch reads", and that the
+ * widening "belongs to ITS classifier, handed in here as further admissible proofs — it must never be
+ * re-derived at a call site". Both halves are now true at once, so this is that hand-in: the caller
+ * names WHICH of the classifier's buckets the document came out of, and nothing about the ledger is
+ * re-read or re-judged here.
+ *
+ * Each value is a verdict `partitionPaymentReversals` + `classifyRegisteredPayment` +
+ * `zeroPaidIsProvenReversal` already reached, and each is at least as strong as the status rule:
+ *
+ *   ZERO_PAID_REGISTRATIONS_ACCOUNTED  the ledger STATED it holds nothing, and this read could account
+ *                                      for every registration IMS has — so the zero is not a payment of
+ *                                      ours that has yet to land. (A zero with an in-flight or
+ *                                      unstamped registration is in NO bucket; it is withheld.)
+ *   REGISTERED_PAYMENT_ABSENT          the ledger listed its payments and the PaymentID IMS registered
+ *                                      is not among them. It holds money, but not ours.
+ *
+ * `null` = the caller has no classifier verdict, and then only the status decides. That is the state
+ * this branch shipped in, so nothing gets weaker by a caller staying silent.
+ */
+export type LedgerClassifierProof =
+  | 'ZERO_PAID_REGISTRATIONS_ACCOUNTED'
+  | 'REGISTERED_PAYMENT_ABSENT'
+
+/**
+ * The ONE place that decides whether a reversal is proved, over everything the caller has.
+ *
+ * Still one definition, still applied at the destructive write so no caller can skip it — the change
+ * is what counts as evidence, not who weighs it.
+ */
+export function reversalIsProven(evidence: {
+  ledgerStatus: string | null
+  classifierProof: LedgerClassifierProof | null
+}): boolean {
+  return ledgerAloneProvesTheReversal(evidence.ledgerStatus) || evidence.classifierProof != null
+}
+
+/**
  * RETIRE THE REGISTRATIONS A LEDGER READ HAS JUST DISPROVED (Codex round 3 #1).
  *
  * Called from the payment poller's reversal pass, in the SAME transaction that clears the bill's
@@ -237,12 +276,13 @@ export function ledgerAloneProvesTheReversal(ledgerStatus: string | null | undef
  *
  * FENCED FOUR WAYS, AND THE FIRST ONE IS NEW (Codex round 8):
  *
- *  - `ledgerStatus` — the reversal itself has to be PROVED before anything is read, let alone written.
- *    Rounds 3–7 took "the caller selected this bill into its reversal set" as the observation, and the
- *    caller's set was `AUTHORISED` ∪ `VOIDED` — which is "not fully paid", not "the payment is gone".
- *    A part-paid bill therefore walked into the destructive path. See the note above
- *    `LEDGER_SETTLED_REVERSAL_STATUSES`; anything this status does not settle alone is WITHHELD, and
- *    it is checked FIRST so an unproven bill never even reaches the registration query.
+ *  - `reversalIsProven` — the reversal itself has to be PROVED before anything is read, let alone
+ *    written. Rounds 3–7 took "the caller selected this bill into its reversal set" as the
+ *    observation, and the caller's set was `AUTHORISED` ∪ `VOIDED` — which is "not fully paid", not
+ *    "the payment is gone". A part-paid bill therefore walked into the destructive path. The proof is
+ *    now either the ledger's own status (`LEDGER_SETTLED_REVERSAL_STATUSES`, i.e. VOIDED) or a verdict
+ *    the merged classifier reached (`LedgerClassifierProof`); anything else is WITHHELD, and it is
+ *    checked FIRST so an unproven bill never even reaches the registration query.
  *  - `status: 'SYNCED'` — only a row that finished. A PENDING row is a re-payment somebody has already
  *    queued and a PROCESSING row may be posting this instant; neither is the payment the poller just
  *    failed to find, and cancelling either is round 1's defect over again.
@@ -290,6 +330,12 @@ export async function retireBillPaymentRegistrationsReversedInLedger(
      */
     ledgerStatus: string | null
     /**
+     * Which of the merged classifier's proved-reversal buckets this document came from, or null when
+     * the caller has no such verdict and only the status may decide. Never re-derived here — see
+     * `reversalIsProven`.
+     */
+    classifierProof: LedgerClassifierProof | null
+    /**
      * The instant the ledger was asked, AS THE DATABASE MEASURED IT — never a host `Date`, which is
      * why this is the branded `LedgerReadFence` and not a plain one (o3d-clxw round 4, #634). NULL
      * means the database clock could not be read at all, and then this observation can be ordered
@@ -301,7 +347,10 @@ export async function retireBillPaymentRegistrationsReversedInLedger(
   // PROVE THE REVERSAL BEFORE READING ANYTHING (Codex round 8). Ordered first on purpose: an
   // unproven bill must not reach the registration query, so there is no path on which an AUTHORISED
   // bill's rows are surveyed, let alone cancelled.
-  if (!ledgerAloneProvesTheReversal(params.ledgerStatus)) {
+  //
+  // The caller's own selection is deliberately NOT the proof (that was the defect), but the caller's
+  // CLASSIFIER VERDICT is admissible and is named here rather than inferred — see reversalIsProven.
+  if (!reversalIsProven({ ledgerStatus: params.ledgerStatus, classifierProof: params.classifierProof })) {
     return { decided: false, withheld: 'REVERSAL_UNPROVEN', ledgerStatus: params.ledgerStatus ?? null }
   }
 

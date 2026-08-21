@@ -36,6 +36,7 @@ import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import {
   detectPaymentReversals,
   retireBillPaymentRegistrationsReversedInLedger,
+  type LedgerClassifierProof,
 } from '@/lib/domain/accounting/payment-reversal'
 import { handleDetectedReversal, type DetectedReversalOrder } from '@/lib/domain/accounting/reversal-handling'
 import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
@@ -944,6 +945,25 @@ async function processDeltaChunk(
         // rather than adding a second answer at this call site.
         const ledgerStatus = (bill.accountingInvoiceId ? invoiceById.get(bill.accountingInvoiceId)?.Status : null) ?? null
 
+        // AND WHICH CLASSIFIER BUCKET PUT IT HERE (o3d-m5qk). Round 8 said an AUTHORISED bill "is not
+        // decidable from anything this branch reads" and that the widening belonged to the sibling's
+        // classifier, "handed in here as further admissible proofs". That classifier is now merged and
+        // is what built `reversedBillIds`, so this names the bucket instead of leaving the retirement
+        // to re-decide from a status that cannot see it. Nothing is re-derived: these are the same two
+        // sets the loop is iterating over.
+        //
+        // Without this the two answers collide in the WORST direction for the operator: a bill whose
+        // supplier payment really was deleted — proved, by the ledger's own payment list — would be
+        // reported as REVERSAL_UNPROVEN for ever, its posted registration never retired, and every
+        // future Mark Paid on it refused.
+        const invoiceKey = bill.accountingInvoiceId ?? ''
+        const classifierProof: LedgerClassifierProof | null =
+          billResidual.provenGone.has(invoiceKey)
+            ? 'REGISTERED_PAYMENT_ABSENT'
+            : billResidual.zeroPaidReversed.has(invoiceKey)
+              ? 'ZERO_PAID_REGISTRATIONS_ACCOUNTED'
+              : null
+
         // THE ONE PLACE THAT CAN RETIRE A POSTED REGISTRATION (Codex round 3 #1).
         //
         // markBillPaid used to call a SYNCED BILL_PAYMENT row "stale" from its status alone, which is
@@ -982,6 +1002,7 @@ async function processDeltaChunk(
             connector: XERO_CONNECTOR,
             invoiceId: bill.id,
             ledgerStatus,
+            classifierProof,
             ledgerObservedBefore,
           })
           // The clear is written only on a decided verdict, and inside the same transaction as the
