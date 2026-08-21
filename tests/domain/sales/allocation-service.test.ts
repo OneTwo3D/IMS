@@ -41,6 +41,7 @@ function resetAccountingQueue(outcome: 'writes' | 'silent-no-op' = 'writes'): vo
   queuedAccountingSyncs.length = 0
   accountingSyncRows.length = 0
   accountingEnqueueOutcome = outcome
+  lockedAllocationRecords = null
 }
 
 mock.module('@/lib/accounting', {
@@ -249,6 +250,19 @@ const writeCounts = { allocationCreates: 0, allocationDeletes: 0, allocationUpda
  * written after the rows it describes have already gone.
  */
 const activityLogWrites: Array<Record<string, unknown>> = []
+/**
+ * o3d-0i5y r11: what the LOCKED re-read of the order's allocation rows sees, keyed
+ * `lineId|warehouseId|productId`.
+ *
+ * This is how a test models the ONE writer the sales-order lock does not cover:
+ * `updateSnapshotsForCostLayerChange` rewrites `unitCostBase` in place on `order_allocations` when a
+ * landed cost lands late, and takes no order lock. Setting an entry here leaves the ORDINARY reads
+ * answering the pre-correction array while the FOR UPDATE read answers the corrected one — the only
+ * way a revert of the fix can be seen to write the stale value back out. null = the live rows.
+ */
+let lockedAllocationRecords: Record<string, unknown> | null = null
+/** Every statement the transaction issued, in order. */
+const txStatements: string[] = []
 const txWriteOrder: string[] = []
 /** o3d-kouj: every fulfilment-requirement pin the run wrote, in order. */
 const salesOrderLineSnapshotWrites: Array<{ lineId: string; payload: unknown }> = []
@@ -259,6 +273,10 @@ function createClient(state: MemoryState): AllocationServiceClient {
   writeCounts.allocationUpdateManys = 0
   activityLogWrites.length = 0
   txWriteOrder.length = 0
+  txStatements.length = 0
+  // Cleared per client, so a fixture that models a mid-flight revaluation cannot leak into the next
+  // test. Tests therefore set it AFTER `createClient`.
+  lockedAllocationRecords = null
   salesOrderLineSnapshotWrites.length = 0
   const allocations = state.allocations ?? []
   // The column is NOT NULL DEFAULT 0; normalise in place so a seeded row and a written row are
@@ -270,7 +288,43 @@ function createClient(state: MemoryState): AllocationServiceClient {
   const shipmentLines = state.shipmentLines ?? []
   const refundLines = state.refundLines ?? []
   const client = {
-    $queryRaw: async () => [],
+    /**
+     * o3d-0i5y r11: TWO call shapes reach here and they are not the same question. `lockSalesOrder`
+     * and `lockStockLevels` take a lock and want nothing back; `lockAccountedRecordsForOrder` is a
+     * ROW-RETURNING lock — it hands back the record each row holds AS OF THE LOCK, which is the base
+     * the carry-over re-authors. Answering it with `[]`, as this double did while every raw statement
+     * here was only ever a lock, hands the rewrite an EMPTY BASE: no record to carry, nothing
+     * orphaned, no reversal — which made NINE existing tests in this file decide nothing.
+     */
+    $queryRaw: async (...args: unknown[]) => {
+      const first = args[0]
+      const text = first && typeof first === 'object' && 'sql' in (first as Record<string, unknown>)
+        ? String((first as { sql: unknown }).sql)
+        : Array.isArray(first)
+        ? first.join(' ')
+        : String(first)
+      const sql = text.replace(/\s+/g, ' ').trim()
+      txStatements.push(`$queryRaw:${sql}`)
+      if (sql.includes('order_allocations') && sql.includes('FOR UPDATE')) {
+        // Honours the orderId predicate: a double that returned every row would hand the carry-over
+        // another order's records to pool.
+        const [orderId] = ((first as { values?: unknown[] }).values ?? []) as string[]
+        return allocations
+          .filter((row) => orderId == null || row.orderId === orderId)
+          .map((row) => {
+            const key = `${row.lineId}|${row.warehouseId}|${row.productId}`
+            return {
+              lineId: row.lineId,
+              productId: row.productId,
+              warehouseId: row.warehouseId,
+              costLayerSnapshot: lockedAllocationRecords && key in lockedAllocationRecords
+                ? lockedAllocationRecords[key]
+                : row.costLayerSnapshot ?? null,
+            }
+          })
+      }
+      return []
+    },
     $transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(client),
     salesOrder: {
       findUnique: async ({ where }: { where: { id: string } }) => {
@@ -383,6 +437,9 @@ function createClient(state: MemoryState): AllocationServiceClient {
         where: { orderId: string; lineId?: string; productId?: string; warehouseId?: string }
       }) => {
         writeCounts.allocationDeletes += 1
+        // o3d-0i5y r11: recorded in the interleaving, because "the evidence is preserved before the
+        // rows carrying it are destroyed" is a claim about ORDER, not just about a row existing.
+        txWriteOrder.push('orderAllocation.deleteMany')
         const before = allocations.length
         for (let index = allocations.length - 1; index >= 0; index -= 1) {
           const row = allocations[index]
@@ -4794,4 +4851,150 @@ test('o3d-kouj: a line that never carried a pin is not written to at all', async
     writesBefore,
     'no snapshot write of any kind for a line that had nothing pinned',
   )
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-0i5y r11 (Codex round 11, finding 3) — A CANCELLATION KEEPS THE EVIDENCE OF WHAT A2 POSTED,
+// AND STILL RAISES NO REVERSAL.
+//
+// The cancel path un-stages the order (clearing `inventoryAllocatedDate`, its batch ref and
+// `allocationBatchAmount`) and then `deleteMany`s every allocation row — so both copies of the
+// record die in one committed transaction and nothing anywhere says the pounds standing in
+// Allocated Inventory for this order exist.
+//
+// It does NOT reverse, deliberately: `o3d-batch-cancelrb` owns this contra on the refund side, its
+// open balance is `SalesOrder.allocationBatchAmount` less relief it can prove from Group B's and
+// earlier refunds' own journal lines, and an ALLOCATION_REVERSAL raised here is neither of those —
+// so a cancelled-then-refunded order would credit Allocated Inventory twice for the same units.
+// A record cannot double-count; a journal can.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-0i5y r11: cancelling an order RECORDS the Group A2 debit its deleted rows were the only evidence of', async () => {
+  resetAccountingQueue()
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    stockLevels: [{ productId: 'product-a', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }],
+    allocations: [{
+      id: 'alloc-a',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-a',
+      warehouseId: 'warehouse-1',
+      qty: 10,
+      // 10 units A2 pinned and posted at £4 — £40 of DR Allocated Inventory / CR Inventory.
+      costLayerSnapshot: [{
+        costLayerId: 'layer-1',
+        qty: '10.000000',
+        unitCostBase: '4.000000',
+        postedUnitCostBase: '4.000000',
+      }],
+    }],
+  })
+  const client = createClient(state)
+
+  const result = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' })
+
+  assert.equal(result.previousStatus, 'ALLOCATED')
+  assert.deepEqual(state.allocations, [], 'the rows are gone, as cancellation requires')
+  const recorded = activityLogWrites.filter((row) => row.action === 'allocation_debit_standing_on_cancel')
+  assert.equal(recorded.length, 1, 'and what they recorded is not gone with them')
+  assert.equal(recorded[0].level, 'WARNING')
+  assert.equal(recorded[0].tag, 'accounting')
+  assert.match(
+    String(recorded[0].description),
+    /£40\.00 of DR Allocated Inventory \/ CR Inventory stands against this order/,
+    'the exact amount A2 recorded posting — 10 units at £4 — which nothing else can now say',
+  )
+  assert.equal(
+    (recorded[0].metadata as { postedAmountBase: number }).postedAmountBase,
+    40,
+    'and machine-readable, so a later repair does not have to parse prose',
+  )
+  assert.deepEqual(
+    queuedAccountingSyncs,
+    [],
+    'and NO reversal journal is raised here: the refund side of this contra owns it, and its open '
+    + 'balance cannot see an ALLOCATION_REVERSAL, so one raised here would be credited a second time',
+  )
+  const recordIndex = txWriteOrder.indexOf('activityLog.create')
+  const deleteIndex = txWriteOrder.indexOf('orderAllocation.deleteMany')
+  assert.ok(recordIndex >= 0 && deleteIndex >= 0)
+  assert.ok(
+    recordIndex < deleteIndex,
+    'written BEFORE the delete — after it there is nothing left to read the amount from',
+  )
+})
+
+test('o3d-0i5y r11: a cancellation whose record cannot say what was posted names those units instead of valuing them', async () => {
+  // The bound on the rule, and the same one the reversal path applies: an entry with no
+  // `postedUnitCostBase` — every entry written before r9 — is not evidence of £0, it is evidence of
+  // nothing. Valuing it from the pin would report an amount a landed-cost revaluation has rewritten.
+  resetAccountingQueue()
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    stockLevels: [{ productId: 'product-a', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }],
+    allocations: [{
+      id: 'alloc-a',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-a',
+      warehouseId: 'warehouse-1',
+      qty: 10,
+      costLayerSnapshot: [
+        { costLayerId: 'layer-1', qty: '6.000000', unitCostBase: '4.000000', postedUnitCostBase: '4.000000' },
+        // Pinned by a pre-r9 pass: the pin says £9 today, and says nothing about what was posted.
+        { costLayerId: 'layer-2', qty: '4.000000', unitCostBase: '9.000000' },
+      ],
+    }],
+  })
+  const client = createClient(state)
+
+  await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' })
+
+  const recorded = activityLogWrites.filter((row) => row.action === 'allocation_debit_standing_on_cancel')
+  assert.equal(recorded.length, 1)
+  assert.match(
+    String(recorded[0].description),
+    /£24\.00 of DR Allocated Inventory/,
+    'only the 6 evidenced units are valued — 6 x £4 — and emphatically not 6 x £4 + 4 x £9 = £60',
+  )
+  assert.match(
+    String(recorded[0].description),
+    /4 of those unit\(s\) carry no record of what was posted for them \(cost layer\(s\) layer-2\)/,
+    'the rest are NAMED, with their layer, so a human can decide rather than a guess being filed',
+  )
+  assert.equal((recorded[0].metadata as { unevidencedQty: string }).unevidencedQty, '4')
+  assert.deepEqual(queuedAccountingSyncs, [])
+})
+
+test('o3d-0i5y r11: a warehouse move KEEPS a landed-cost correction that lands between the plan and the rewrite', async () => {
+  // The fourth caller of the carry-over rule, and the same defect r10 fixed in Group A2 and r11
+  // fixed in the manual editor: the plan was drawn from `existingAllocs`, read at the top of the
+  // transaction, and the rewrite serialized it back out. `updateSnapshotsForCostLayerChange` takes
+  // no sales-order lock, so it commits freely in that window.
+  //
+  // 10 units posted at warehouse-2 and pinned at £5 a unit; while the re-allocation runs, a landed
+  // cost reprices that layer £5 -> £7 (the correction posts the £20 to COGS/Inventory and never to
+  // Allocated Inventory). The whole claim then moves to warehouse-1.
+  resetAccountingQueue()
+  const state = movedState(10)
+  const client = createClient(state)
+  lockedAllocationRecords = {
+    'line-1|warehouse-2|product-1': [{ costLayerId: 'layer-w2', qty: '10.000000', unitCostBase: '7.000000' }],
+  }
+
+  await allocateSalesOrder(client, { orderId: 'order-1' })
+
+  const rows = (state.allocations ?? []).filter((row) => row.orderId === 'order-1')
+  assert.deepEqual(rows.map((row) => `${row.warehouseId}:${Number(row.qty)}`), ['warehouse-1:10'])
+  const record = parseCostLayerSnapshot(rows[0].costLayerSnapshot)
+  assert.equal(sumCostLayerSnapshotQty(record).toString(), '10', 'the 10 posted units still move with the units')
+  assert.equal(
+    sumCostLayerSnapshot(record).toString(),
+    '70',
+    'and they arrive at the CORRECTED £7 a unit. Carried off the plan they would land at £5 = £50, the '
+    + 'correction would be gone, and Group B would relieve those ten at £5 — £20 of real cost never '
+    + 'reaching cost of sales',
+  )
+  assert.deepEqual(queuedAccountingSyncs, [], 'nothing left the order, so nothing is reversed')
 })

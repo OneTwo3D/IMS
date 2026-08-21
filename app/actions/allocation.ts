@@ -30,12 +30,12 @@ import {
   buildAvailableStockMap,
   canonicalAllocationQty,
   clearDormantFulfillmentPinsInTx,
+  lockAccountedRecordsForScope,
   lockSalesOrder,
   lockStockLevels,
-  planAccountedRecordCarryOver,
+  refileAccountedRecordsForScope,
   releaseOrderAllocationsForDeallocationInTx,
   resetAllocationAccountingIfStaged,
-  reverseOrphanedAllocationPosting,
   validateAllocationIntegrity,
   type AllocationUnallocatedLine,
 } from '@/lib/domain/sales/allocation-service'
@@ -534,19 +534,6 @@ export async function updateAllocation(
 
       await resetAllocationAccountingIfStaged(tx, locked.orderId)
 
-      // o3d-0i5y r10 (Codex round 10, finding 1): WHERE GROUP A2'S POSTED RECORD STANDS RIGHT NOW,
-      // read before this action's first write, from the rows as they still are.
-      //
-      // Scoped to this (line, product) because that is the grain the carry-over pools at, and it is
-      // the only grain this action can honestly speak for: it edits ONE row, and the units it moves
-      // can only ever land on a row of the same line and product. Every other row on the order is
-      // untouched, so including them would be inventing a claim about a set nobody declared — the
-      // exact thing `resetAllocationAccountingIfStaged`'s undeclared-caller path refuses to do.
-      const existingScopeRecords = await tx.orderAllocation.findMany({
-        where: { orderId: locked.orderId, lineId: locked.lineId, productId: locked.productId },
-        select: { lineId: true, productId: true, warehouseId: true, costLayerSnapshot: true },
-      })
-
       await lockStockLevels(tx, [locked.productId], Array.from(new Set([locked.warehouseId, newWarehouseId])))
 
       const stockLevels = await tx.stockLevel.findMany({
@@ -646,6 +633,47 @@ export async function updateAllocation(
         warehouseId: locked.warehouseId,
         qty: releaseQty,
       }], 'release')
+
+      // -------------------------------------------------------------------------------------
+      // o3d-0i5y r11 (Codex round 11, finding 1) — WHERE GROUP A2'S POSTED RECORD STANDS, READ
+      // UNDER THE LOCK THIS WRITE IS ABOUT TO TAKE ANYWAY.
+      //
+      // r10 read it at the top of the action and wrote the plan drawn from it at the bottom, which
+      // is the same defect r10 had just fixed in Group A2 one file away: the record it plans from is
+      // rewritten in place by `updateSnapshotsForCostLayerChange` when a landed cost lands late, and
+      // that sweep takes NO sales-order lock (it selects by cost layer, across every table carrying
+      // a snapshot). So it commits freely in that window and the plan writes it straight back out.
+      //
+      //   the row holds 10 units A2 pinned and posted at £4 (£40 into Allocated Inventory,
+      //   `postedUnitCostBase` 4.000000). The operator reduces it to 6. Mid-edit a landed cost
+      //   reprices that layer £4 -> £5: the correction rewrites `unitCostBase` to 5.000000 on this
+      //   very row and posts the £10 to COGS/Inventory, never to Allocated Inventory — which is why
+      //   `postedUnitCostBase` stays at £4.
+      //   BEFORE r11: the trim is serialized from the £4 array read at the top, so the row is
+      //     written back at £4 and the correction is gone. The row says 6 x £4 = £24 where the
+      //     corrected pin says 6 x £5 = £30, Group B relieves those six at £4 when they ship, and
+      //     £6 of real cost never reaches cost of sales — permanently, and a later refund reverses
+      //     the same £6 short.
+      //   AFTER r11: the base is re-read under the row lock and the trim lands on the CORRECTED
+      //     entry, so the row keeps 6 x £5 = £30. The reversal is unchanged at £16 — 4 units at the
+      //     £4 A2 recorded posting — because no revaluation touches `postedUnitCostBase`.
+      //
+      // TAKEN HERE, NOT AT THE TOP OF THE TRANSACTION, and deliberately: see
+      // `lockAccountedRecordsForScope`. This is the statement before the first allocation-row write,
+      // which is where these rows are locked in any case, so no new lock ordering is created.
+      //
+      // Scoped to this (line, product) because that is the grain the carry-over pools at, and the
+      // only grain this action can honestly speak for: it edits ONE row, and the units it moves can
+      // only ever land on a row of the same line and product. Every other row on the order is
+      // untouched, so including them would be inventing a claim about a set nobody declared — the
+      // exact thing `resetAllocationAccountingIfStaged`'s undeclared-caller path refuses to do.
+      // -------------------------------------------------------------------------------------
+      const lockedScopeRecords = await lockAccountedRecordsForScope(
+        tx,
+        locked.orderId,
+        locked.lineId,
+        locked.productId,
+      )
 
       // o3d-4kfh r7: the DELETE test is on the quantised value, because that is the quantity the
       // row would hold. `newQty === 0` let 0.00004 through to a row Postgres stores as 0.0000 —
@@ -768,40 +796,17 @@ export async function updateAllocation(
       // reverse, which is exactly what the merge branch above needs, because it DELETES the source
       // row and its record with it.
       //
-      // Read from the rows AS PERSISTED, the same rule the reservation delta above follows: the
-      // database is the authority on what its own `numeric(12,4)` column stored, and a record
-      // trimmed against anything else would disagree with the quantity the row actually holds.
-      //
-      // The reversal is raised LAST, after every row write, so the journal and the state it
-      // describes commit together (the r9 rebase decision), and inside this transaction, under the
-      // order row lock taken at the top — which is what `queueAccountingSyncTx` requires of an
-      // order-scoped enqueue.
+      // o3d-0i5y r11: the plan is drawn from `lockedScopeRecords` — the base read under the row
+      // lock this action holds from before its first row write until commit — and the rows it
+      // writes onto are read back AS PERSISTED. One implementation, shared with the rebalancer:
+      // see `refileAccountedRecordsForScope`.
       // -------------------------------------------------------------------------------------
-      const writtenScopeRows = await tx.orderAllocation.findMany({
-        where: { orderId: locked.orderId, lineId: locked.lineId, productId: locked.productId },
-        select: { lineId: true, productId: true, warehouseId: true, qty: true },
-      })
-      const { records: accountedRecords, orphaned: orphanedRecord } = planAccountedRecordCarryOver(
-        existingScopeRecords,
-        writtenScopeRows.map((row) => ({ ...row, qty: toDecimal(row.qty) })),
+      await refileAccountedRecordsForScope(
+        tx,
+        locked.orderId,
+        { lineId: locked.lineId, productId: locked.productId },
+        lockedScopeRecords,
       )
-      for (const row of writtenScopeRows) {
-        // `write` is null for a row that already holds its own record and must simply be left
-        // alone; re-writing it would serialize a value nothing asked to change.
-        const carriedRecord = accountedRecords.get(allocationScopeKey(row))?.write
-        if (!carriedRecord) continue
-        await tx.orderAllocation.update({
-          where: {
-            lineId_warehouseId_productId: {
-              lineId: row.lineId,
-              warehouseId: row.warehouseId,
-              productId: row.productId,
-            },
-          },
-          data: { costLayerSnapshot: carriedRecord as Prisma.InputJsonValue },
-        })
-      }
-      await reverseOrphanedAllocationPosting(tx, locked.orderId, orphanedRecord)
 
       const integrityError = await validateAllocationIntegrity(tx, locked.orderId, [locked.lineId])
       if (integrityError) throw new Error(integrityError)

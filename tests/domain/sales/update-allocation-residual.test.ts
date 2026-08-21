@@ -104,6 +104,22 @@ const state = {
    * and could lose a purchased label's identity after the rows were already gone.
    */
   txActivity: [] as Record<string, unknown>[],
+  /**
+   * o3d-0i5y r11: what the LOCKED re-read of the (line, product) scope sees, keyed by warehouseId.
+   *
+   * This is how a test models the ONE writer the sales-order lock does not cover:
+   * `updateSnapshotsForCostLayerChange` rewrites `unitCostBase` in place on `order_allocations` when
+   * a landed cost lands late, and takes no order lock. Setting an entry here leaves the ORDINARY
+   * reads (`orderAllocation.findMany`) answering the pre-correction array while the FOR UPDATE read
+   * answers the corrected one — exactly the interleaving, and the only way a revert of the fix can
+   * be seen to write the stale value back out. null = every read sees the live row.
+   */
+  lockedScopeRecords: null as Record<string, unknown> | null,
+  /**
+   * Every statement the transaction issued, in order, so the ORDER of the record lock against the
+   * row writes can be asserted rather than assumed.
+   */
+  txCalls: [] as string[],
 }
 
 function decimalLikeToNumber(value: unknown): number {
@@ -173,7 +189,41 @@ mock.module('@/lib/shopping', {
 })
 
 const tx = {
-  $queryRaw: async () => [],
+  /**
+   * o3d-0i5y r11: TWO call shapes reach here and they are not the same question. `lockSalesOrder`
+   * takes a lock and wants nothing back; `lockAccountedRecordsForScope` is a ROW-RETURNING lock —
+   * it hands back the record each row of the (line, product) scope holds AS OF THE LOCK, which is
+   * the base the carry-over re-authors. Answering it with `[]` (as this double did while every raw
+   * statement here was only ever a lock) hands the writer an EMPTY BASE, so every record and
+   * reversal assertion in this file decides nothing.
+   */
+  $queryRaw: async (...args: unknown[]) => {
+    const first = args[0]
+    const text = first && typeof first === 'object' && 'sql' in (first as Record<string, unknown>)
+      ? String((first as { sql: unknown }).sql)
+      : Array.isArray(first)
+      ? first.join(' ')
+      : String(first)
+    const sql = text.replace(/\s+/g, ' ').trim()
+    state.txCalls.push(`$queryRaw:${sql}`)
+    if (sql.includes('order_allocations') && sql.includes('FOR UPDATE')) {
+      // Honours the (orderId, lineId, productId) predicate in the order the statement binds them,
+      // because the scope is the whole point: a double that returned every row would let the
+      // carry-over pool a record across lines it has no business speaking for.
+      const [orderId, lineId, productId] = ((first as { values?: unknown[] }).values ?? []) as string[]
+      return state.allocations
+        .filter((row) => row.orderId === orderId && row.lineId === lineId && row.productId === productId)
+        .map((row) => ({
+          lineId: row.lineId,
+          productId: row.productId,
+          warehouseId: row.warehouseId,
+          costLayerSnapshot: state.lockedScopeRecords && row.warehouseId in state.lockedScopeRecords
+            ? state.lockedScopeRecords[row.warehouseId]
+            : row.costLayerSnapshot ?? null,
+        }))
+    }
+    return []
+  },
   // o3d-0i5y r10: the post-enqueue verification asks the DATABASE for the row the enqueue was
   // supposed to create, under that enqueue's own predicate. It really searches the rows the enqueue
   // wrote and really honours the `_reversalToken` JSON-path filter, so the answer is decided in
@@ -463,6 +513,7 @@ const tx = {
           && candidate.productId === key!.productId
         ))
       if (!row) throw new Error('allocation not found')
+      state.txCalls.push(`orderAllocation.update:${row.id}:${'costLayerSnapshot' in data ? 'record' : 'row'}`)
       // The WRITTEN VALUE is honoured, never forced to null: forcing it would assert a destructive
       // rewrite as a requirement and make the carry-over unobservable (o3d-0i5y r8's lesson).
       // Round-trips through JSON as jsonb does.
@@ -490,6 +541,7 @@ const tx = {
       return row
     },
     delete: async ({ where }: { where: { id: string } }) => {
+      state.txCalls.push(`orderAllocation.delete:${where.id}`)
       const index = state.allocations.findIndex((row) => row.id === where.id)
       if (index >= 0) state.allocations.splice(index, 1)
       return {}
@@ -554,6 +606,8 @@ function seedLines(qty: number) {
   queuedAccountingSyncs.length = 0
   accountingSyncRows.length = 0
   accountingEnqueueOutcome = 'writes'
+  state.lockedScopeRecords = null
+  state.txCalls.length = 0
 }
 
 /**
@@ -1744,4 +1798,108 @@ test('o3d-0i5y r10: a manual reduction whose reversal the queue DROPPED is detec
     /Allocation reversal of £16\.00 on order order-1 was NOT queued/,
     'the exact amount a human now has to post by hand',
   )
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-0i5y r11 (Codex round 11, finding 1) — THE MANUAL EDITOR'S WRITE, NOT ITS PLAN.
+//
+// r10 gave this action the carry-over and the reversal, and read the record it plans from at the
+// TOP of the transaction — the same defect r10 had just fixed in Group A2 one file away. The
+// sales-order lock this action holds does not cover `order_allocations`, and one writer touches
+// them without it: `updateSnapshotsForCostLayerChange`, the late-landed-cost correction, which
+// selects by cost layer across every table carrying a snapshot and takes no order lock at all.
+//
+// `state.lockedScopeRecords` is that interleaving: the ordinary reads still answer the array the
+// plan was drawn from, the FOR UPDATE read answers the corrected one.
+// ---------------------------------------------------------------------------------------------
+
+/** Total VALUE a row's record pins right now, read back through production's own parser. */
+async function recordedValueAt(warehouseId: string): Promise<string> {
+  const { parseCostLayerSnapshot, sumCostLayerSnapshot } = await import('@/lib/cost-layer-snapshots')
+  const row = state.allocations.find((candidate) => candidate.warehouseId === warehouseId)
+  return sumCostLayerSnapshot(parseCostLayerSnapshot(row?.costLayerSnapshot ?? null)).toString()
+}
+
+test('o3d-0i5y r11: a manual reduction KEEPS a landed-cost correction that lands between the plan and the write', async () => {
+  // 10 units pinned and posted by A2 at £4 — £40 into Allocated Inventory, `postedUnitCostBase`
+  // 4.000000. While the operator is editing, a landed cost reprices that layer £4 -> £5: the
+  // correction rewrites `unitCostBase` in place on this very row and posts the £10 difference to
+  // COGS/Inventory, never to Allocated Inventory — which is why `postedUnitCostBase` stays at £4.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-a',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+  }]
+  // Committed after this action's ordinary reads and before its write.
+  state.lockedScopeRecords = {
+    'warehouse-1': [{
+      costLayerId: 'layer-1',
+      qty: '10.000000',
+      unitCostBase: '5.000000',
+      postedUnitCostBase: '4.000000',
+    }],
+  }
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(state.allocations[0].qty, 6)
+  assert.equal(await recordedUnitsAt('warehouse-1'), '6', 'the record is still trimmed to the units the row holds')
+  assert.equal(
+    await recordedValueAt('warehouse-1'),
+    '30',
+    'and it is trimmed off the CORRECTED entry: 6 x £5. Written back off the plan it would say 6 x £4 = £24, '
+    + 'the correction would be gone, and Group B would relieve those six at £4 — £6 of real cost never '
+    + 'reaching cost of sales',
+  )
+  assert.equal(queuedAccountingSyncs.length, 1)
+  assert.deepEqual(
+    reversalLines(),
+    [
+      ['630', 16, null],
+      ['631', null, 16],
+    ],
+    'while the REVERSAL is unmoved at £16 — 4 units at the £4 A2 recorded posting. A revaluation '
+    + 'rewrites the pin and never `postedUnitCostBase`, so the two answers move independently and both are right',
+  )
+})
+
+test('o3d-0i5y r11: the record lock is taken BEFORE the first allocation-row write', async () => {
+  // Where the lock is taken is the whole of the fix: taken after the write it protects nothing, and
+  // taken at the top of the transaction it would run order_allocations -> stock_levels/cost_layers
+  // against the correction's cost_layers -> order_allocations, which is a real deadlock cycle.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-a',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+  }]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  const lockIndex = state.txCalls.findIndex((call) => (
+    call.startsWith('$queryRaw:') && call.includes('order_allocations') && call.includes('FOR UPDATE')
+  ))
+  const firstRowWrite = state.txCalls.findIndex((call) => call === 'orderAllocation.update:alloc-a:row')
+  assert.ok(lockIndex >= 0, 'the scope\'s records are row-locked')
+  assert.ok(firstRowWrite >= 0, 'and the row really is rewritten')
+  assert.ok(lockIndex < firstRowWrite, 'the lock comes first, so nothing can revalue the base between the two')
+  const orderLock = state.txCalls.findIndex((call) => call.includes('sales_orders') && call.includes('FOR UPDATE'))
+  assert.ok(orderLock >= 0 && orderLock < lockIndex, 'and the ORDER lock still comes before it — one ordering, unchanged')
 })

@@ -30,6 +30,13 @@ type AllocationRow = {
   productId: string
   warehouseId: string
   qty: number
+  /**
+   * o3d-0i5y r11: Group A2's RECORD — the units it has debited Allocated Inventory for and, through
+   * `postedUnitCostBase`, the amount it debited. `undefined` is the NULL of a row A2 never posted
+   * for. Absent from this double entirely until r11, which is why the sweep's treatment of it could
+   * not be observed here at all.
+   */
+  costLayerSnapshot?: unknown
   order: {
     id: string
     orderNumber: string | null
@@ -85,6 +92,14 @@ const state = {
   /** Set when the fixture wants a journaled (Group B posted) shipment on the order. */
   journaledShipment: null as Row | null,
   deletedAllocationIds: [] as string[],
+  /**
+   * o3d-0i5y r11: what the LOCKED re-read of a (line, product) scope sees, keyed by warehouseId —
+   * the late-landed-cost correction committing between this sweep's reads and its write. null =
+   * every read sees the live row.
+   */
+  lockedScopeRecords: null as Record<string, unknown> | null,
+  /** Every statement the transaction issued, in order. */
+  txCalls: [] as string[],
 }
 
 function reset() {
@@ -102,6 +117,10 @@ function reset() {
   state.stockLevels.length = 0
   state.deletedAllocationIds.length = 0
   state.journaledShipment = null
+  state.lockedScopeRecords = null
+  state.txCalls.length = 0
+  queuedAccountingSyncs.length = 0
+  accountingSyncRows.length = 0
 }
 
 mock.module('next/cache', {
@@ -110,6 +129,41 @@ mock.module('next/cache', {
 
 mock.module('@/lib/activity-log', {
   namedExports: { logActivity: async (entry: Row) => { state.activity.push(entry) } },
+})
+
+/**
+ * o3d-0i5y r11 — THE REVERSAL IS A JOURNAL, so the only assertion worth making about it is the
+ * amount. `@/lib/accounting` is the connector-agnostic enqueue `reverseOrphanedAllocationPosting`
+ * reaches for, dynamically at call time.
+ *
+ * The ATTEMPT and the ROW it writes are recorded separately, because production's
+ * `queueAccountingSyncTx` writes nothing and throws nothing when no active connector posts the type,
+ * when the posting is suppressed, or when the order went away under it. A double whose enqueue could
+ * only ever succeed cannot exercise the verification that follows it.
+ */
+type QueuedAccountingSync = {
+  type: string
+  referenceType: string
+  referenceId: string
+  payload: {
+    _reversalToken?: string
+    lines?: Array<{ accountCode: string; debit?: number; credit?: number }>
+  }
+}
+const queuedAccountingSyncs: QueuedAccountingSync[] = []
+const accountingSyncRows: QueuedAccountingSync[] = []
+
+mock.module('@/lib/accounting', {
+  namedExports: {
+    getAccountingSettings: async () => ({ inventoryAccount: '630', allocatedInventoryAccount: '631' }),
+    queueAccountingSyncTx: async (_tx: unknown, params: QueuedAccountingSync) => {
+      queuedAccountingSyncs.push(params)
+      accountingSyncRows.push(params)
+      return true
+    },
+    isAccountingSyncTypeEnabled: async () => true,
+    isDailyBatchPostingEnabled: async () => true,
+  },
 })
 
 // Dynamically imported by the reconcile pass at the end of releaseOverallocations; stubbed so
@@ -138,7 +192,63 @@ function decimalLikeToNumber(value: unknown): number {
 }
 
 const tx = {
-  $queryRaw: async () => [],
+  /**
+   * o3d-0i5y r11: THREE call shapes reach here and they are not the same question. The sales-order
+   * and stock-level locks want nothing back; `lockAccountedRecordsForScope` is a ROW-RETURNING lock
+   * that hands back the record each row of a (line, product) scope holds AS OF THE LOCK — the base
+   * the re-filing re-authors. Answering it with `[]`, as this double did while every raw statement
+   * here was only ever a lock, hands the writer an EMPTY BASE: no record to trim, nothing orphaned,
+   * and every reversal assertion below would decide nothing.
+   */
+  $queryRaw: async (...args: unknown[]) => {
+    const first = args[0]
+    const text = first && typeof first === 'object' && 'sql' in (first as Record<string, unknown>)
+      ? String((first as { sql: unknown }).sql)
+      : Array.isArray(first)
+      ? first.join(' ')
+      : String(first)
+    const sql = text.replace(/\s+/g, ' ').trim()
+    state.txCalls.push(`$queryRaw:${sql}`)
+    if (sql.includes('order_allocations') && sql.includes('FOR UPDATE')) {
+      const [orderId, lineId, productId] = ((first as { values?: unknown[] }).values ?? []) as string[]
+      return state.allocations
+        .filter((row) => row.orderId === orderId && row.lineId === lineId && row.productId === productId)
+        .map((row) => ({
+          lineId: row.lineId,
+          productId: row.productId,
+          warehouseId: row.warehouseId,
+          costLayerSnapshot: state.lockedScopeRecords && row.warehouseId in state.lockedScopeRecords
+            ? state.lockedScopeRecords[row.warehouseId]
+            : row.costLayerSnapshot ?? null,
+        }))
+    }
+    return []
+  },
+  // o3d-0i5y r11: the post-enqueue verification asks the DATABASE for the row the enqueue was
+  // supposed to create, under that enqueue's own predicate — really searching the rows the enqueue
+  // wrote and really honouring the `_reversalToken` JSON-path filter.
+  accountingSyncLog: {
+    findFirst: async ({ where }: {
+      where: {
+        type?: string
+        referenceType?: string
+        referenceId?: string
+        payload?: { path: string[]; equals: unknown }
+      }
+    }) => accountingSyncRows.find((row) => {
+      if (where.type != null && row.type !== where.type) return false
+      if (where.referenceType != null && row.referenceType !== where.referenceType) return false
+      if (where.referenceId != null && row.referenceId !== where.referenceId) return false
+      if (where.payload != null) {
+        const value = where.payload.path.reduce<unknown>(
+          (node, key) => (node == null ? undefined : (node as Record<string, unknown>)[key]),
+          row.payload,
+        )
+        if (value !== where.payload.equals) return false
+      }
+      return true
+    }) ?? null,
+  },
   // o3d-4kfh r5 (finding 7): reconcilePendingShipments writes its audit row through the tx client,
   // before the delete. A double without this throws, which is the correct failure for a production
   // change that stopped writing it in-transaction.
@@ -286,11 +396,26 @@ const tx = {
     // `{ orderId }`. A double that ignored the predicate would hand the reconciler another order's
     // rows and make an unbacked draft look backed.
     findMany: async ({ where }: {
-      where: { productId?: string; warehouseId?: string; orderId?: string; order?: { status: { in: string[] } } }
+      where: {
+        productId?: string
+        warehouseId?: string
+        orderId?: string
+        // o3d-0i5y r11: BOTH shapes, and they are different questions. The re-filing reads the rows
+        // of ONE (line, product) scope as persisted (`lineId: string`); the dormant-pin sweep asks
+        // which of a SET of pinned lines still holds a row (`{ in: [...] }`). Handling only the
+        // string form silently answered the sweep with nothing, so every pinned line on the order
+        // read as empty and had its recipe retired.
+        lineId?: string | { in: string[] }
+        order?: { status: { in: string[] } }
+      }
     }) => state.allocations
       .filter((row) => where.productId == null || row.productId === where.productId)
       .filter((row) => where.warehouseId == null || row.warehouseId === where.warehouseId)
       .filter((row) => where.orderId == null || row.orderId === where.orderId)
+      .filter((row) => {
+        if (where.lineId == null) return true
+        return typeof where.lineId === 'string' ? row.lineId === where.lineId : where.lineId.in.includes(row.lineId)
+      })
       .filter((row) => where.order == null || where.order.status.in.includes(row.order.status))
       .slice()
       .sort((a, b) => (a.order.createdAt < b.order.createdAt ? 1 : -1))
@@ -299,9 +424,33 @@ const tx = {
       state.allocationUpdates.push(data)
       return { count: 1 }
     },
-    update: async ({ where, data }: { where: { id: string }; data: { qty: unknown } }) => {
-      const row = state.allocations.find((candidate) => candidate.id === where.id)
+    update: async ({ where, data }: {
+      where: {
+        id?: string
+        // o3d-0i5y r11: the record write addresses the row by the compound unique, exactly as the
+        // manual editor does. A double that understood only `{ id }` would throw on it.
+        lineId_warehouseId_productId?: { lineId: string; warehouseId: string; productId: string }
+      }
+      data: { qty?: unknown; costLayerSnapshot?: unknown }
+    }) => {
+      const key = where.lineId_warehouseId_productId
+      const row = where.id
+        ? state.allocations.find((candidate) => candidate.id === where.id)
+        : state.allocations.find((candidate) => (
+          candidate.lineId === key!.lineId
+          && candidate.warehouseId === key!.warehouseId
+          && candidate.productId === key!.productId
+        ))
       if (!row) throw new Error('allocation not found')
+      state.txCalls.push(`orderAllocation.update:${row.id}:${'costLayerSnapshot' in data ? 'record' : 'row'}`)
+      // The WRITTEN VALUE is honoured, never forced to null — forcing it would assert a destructive
+      // rewrite as a requirement and make the trim unobservable. Round-trips through JSON as jsonb does.
+      if ('costLayerSnapshot' in data) {
+        row.costLayerSnapshot = data.costLayerSnapshot == null
+          ? null
+          : JSON.parse(JSON.stringify(data.costLayerSnapshot))
+      }
+      if (data.qty === undefined) return row
       // o3d-4kfh r7: `OrderAllocation.qty` is `@db.Decimal(12,4)` and Postgres rounds half-up on
       // write. Storing the caller's full precision let the double show a row IMS cannot hold, which
       // made "the row and reservedQty disagree by half an ulp" — the whole of Codex finding 4 —
@@ -310,6 +459,7 @@ const tx = {
       return row
     },
     delete: async ({ where }: { where: { id: string } }) => {
+      state.txCalls.push(`orderAllocation.delete:${where.id}`)
       state.deletedAllocationIds.push(where.id)
       const index = state.allocations.findIndex((row) => row.id === where.id)
       if (index >= 0) state.allocations.splice(index, 1)
@@ -924,4 +1074,167 @@ test('o3d-kouj: the rebalancer retires the pin on a line it emptied, and leaves 
     ['line-a'],
     'and exactly one line was written to',
   )
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-0i5y r11 (Codex round 11, finding 2) — THE UNITS THIS SWEEP REMOVES TAKE THEIR SHARE OF
+// GROUP A2'S DEBIT WITH THEM.
+//
+// r10 stopped this sweep ERASING the record (its private copy of the old blanket reset nulled
+// `costLayerSnapshot` on every row of the order, so one unit released off ten re-posted all ten)
+// and left the debit of the removed units stranded, naming the prerequisite: the sweep row-locked
+// `sales_orders` with raw SQL rather than through `lockSalesOrder`, so `queueAccountingSyncTx`'s
+// hoisted-lock assertion would have refused the enqueue.
+//
+// Every assertion below is on the AMOUNT, because that is what the defect is: pounds sitting in
+// Allocated Inventory that nothing downstream will ever relieve — Group B credits only what ships,
+// and a refund credits only what is taken back.
+// ---------------------------------------------------------------------------------------------
+
+/** What A2 wrote when it posted these units: the pin, AND the amount it posted for each one. */
+const POSTED_AT_FOUR = (qty: string) => [{
+  costLayerId: 'layer-1',
+  qty,
+  unitCostBase: '4.000000',
+  postedUnitCostBase: '4.000000',
+}]
+
+async function recordedUnitsOn(allocationId: string): Promise<string> {
+  const { parseCostLayerSnapshot, sumCostLayerSnapshotQty } = await import('@/lib/cost-layer-snapshots')
+  const row = state.allocations.find((candidate) => candidate.id === allocationId)
+  return sumCostLayerSnapshotQty(parseCostLayerSnapshot(row?.costLayerSnapshot ?? null)).toString()
+}
+
+function reversalLines(): Array<[string, number | null, number | null]> | undefined {
+  return queuedAccountingSyncs[0]?.payload.lines?.map((line) => [line.accountCode, line.debit ?? null, line.credit ?? null])
+}
+
+test('o3d-0i5y r11: a PARTIAL over-allocation release reverses the A2 debit of the units it removed', async () => {
+  // Product P at W1: 10 units allocated to SO-1, pinned and posted by A2 at £4 — £40 of DR Allocated
+  // / CR Inventory. A stock adjustment drops the shelf to 6, so this sweep releases 4.
+  //
+  // BEFORE r11 the row was trimmed to 6 and still RECORDED 10: Group B credits Allocated 6 x £4 =
+  // £24 when those six ship, the other four are never invoiced so no refund ever sees them, and £16
+  // of a real debit sits in Allocated Inventory for ever with Inventory understated by the same £16.
+  reset()
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 6, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-1',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+    order: order('order-1', { inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z') }),
+  }]
+  state.lines = [{ id: 'line-1', orderId: 'order-1' }]
+  const { releaseOverallocations } = await loadRebalancer()
+
+  await releaseOverallocations(
+    [{ productId: 'product-1', warehouseId: 'warehouse-1' }],
+    { source: 'stock_adjustment', referenceId: 'adj-1' },
+  )
+
+  assertNoSwallowedFailure()
+  assert.equal(state.allocations[0].qty, 6, 'the row keeps the six units the shelf can still back')
+  assert.equal(state.stockLevels[0].reservedQty, 6, 'and the reservation follows it')
+  assert.equal(await recordedUnitsOn('alloc-1'), '6', 'the record is trimmed to the units the row still holds')
+  assert.equal(queuedAccountingSyncs.length, 1, 'and the four units that left are reversed')
+  assert.equal(queuedAccountingSyncs[0].type, 'ALLOCATION_REVERSAL')
+  assert.equal(queuedAccountingSyncs[0].referenceId, 'order-1')
+  assert.deepEqual(
+    reversalLines(),
+    [
+      ['630', 16, null],
+      ['631', null, 16],
+    ],
+    'DR Inventory £16 / CR Allocated Inventory £16 — 4 units at the £4 A2 recorded posting, leaving '
+    + 'exactly the £24 Group B will relieve when the remaining six ship',
+  )
+})
+
+test('o3d-0i5y r11: a WHOLE-ROW release reverses the whole posted debit', async () => {
+  // The limiting case: the shelf goes to nothing, the row is deleted outright and the record dies
+  // with it, so before r11 nothing surviving could even say the £40 had been posted.
+  //
+  // The order carries NO A2 stamp here, deliberately and reachably: an earlier release on the same
+  // order cleared the stamp alone (r10) and left the record standing. The evidence a reversal needs
+  // is the RECORD — `postedUnitCostBase`, written by the posting it stands for — never the stamp,
+  // which is a claim about what remains to be done.
+  reset()
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 0, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-1',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+    order: order('order-1'),
+  }]
+  state.lines = [{ id: 'line-1', orderId: 'order-1' }]
+  const { releaseOverallocations } = await loadRebalancer()
+
+  await releaseOverallocations(
+    [{ productId: 'product-1', warehouseId: 'warehouse-1' }],
+    { source: 'stock_adjustment', referenceId: 'adj-2' },
+  )
+
+  assertNoSwallowedFailure()
+  assert.deepEqual(state.deletedAllocationIds, ['alloc-1'], 'the row is gone')
+  assert.equal(state.stockLevels[0].reservedQty, 0)
+  assert.equal(queuedAccountingSyncs.length, 1)
+  assert.deepEqual(
+    reversalLines(),
+    [
+      ['630', 40, null],
+      ['631', null, 40],
+    ],
+    'DR Inventory £40 / CR Allocated Inventory £40 — the whole recorded debit, at what A2 recorded posting',
+  )
+  assert.equal(
+    state.txCalls.indexOf('orderAllocation.delete:alloc-1') >= 0
+    && state.txCalls.findIndex((call) => call.includes('order_allocations') && call.includes('FOR UPDATE'))
+      < state.txCalls.indexOf('orderAllocation.delete:alloc-1'),
+    true,
+    'and the record was read under its row lock BEFORE the delete — after it, the record is unreadable',
+  )
+})
+
+test('o3d-0i5y r11: the sweep hoists the order lock through lockSalesOrder, which is what lets it enqueue', async () => {
+  // The raw `SELECT ... FOR UPDATE` this replaced took the same lock and told nothing. The registry
+  // `queueAccountingSyncTx` asserts against is in-process and only `lockSalesOrder` writes to it, so
+  // without this the enqueue refuses by design — and the refusal is swallowed by the per-item catch,
+  // which is why the failure log is asserted empty rather than trusted.
+  reset()
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 6, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-1',
+    orderId: 'order-lock',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+    order: order('order-lock'),
+  }]
+  state.lines = [{ id: 'line-1', orderId: 'order-lock' }]
+  const { releaseOverallocations } = await loadRebalancer()
+  const { hasLockedSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+
+  await releaseOverallocations(
+    [{ productId: 'product-1', warehouseId: 'warehouse-1' }],
+    { source: 'stock_adjustment', referenceId: 'adj-3' },
+  )
+
+  assertNoSwallowedFailure()
+  assert.equal(
+    hasLockedSalesOrder(tx as unknown as never, 'order-lock'),
+    true,
+    'the order is recorded as locked BY THIS TRANSACTION, which is the fact the enqueue assertion reads',
+  )
+  assert.equal(queuedAccountingSyncs.length, 1, 'so the reversal is actually queued rather than refused')
+  assert.deepEqual(reversalLines(), [['630', 16, null], ['631', null, 16]])
 })

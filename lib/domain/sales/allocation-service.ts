@@ -646,6 +646,265 @@ export function planAccountedRecordCarryOver(
   return { records: plan, orphaned }
 }
 
+/** One (line, product) scope's rows, with the record each held AS OF THE LOCK. */
+export type LockedAccountedRecordRow = {
+  lineId: string
+  productId: string
+  warehouseId: string
+  costLayerSnapshot: Prisma.JsonValue | null
+}
+
+/**
+ * ROW-LOCK THE RECORDS OF ONE (line, product) SCOPE AND HAND BACK WHAT THEY HOLD AS OF THE LOCK
+ * (o3d-0i5y r11 — Codex round 11, finding 1).
+ *
+ * The sales-order lock does not cover `order_allocations`, and there is exactly one writer that
+ * touches them without it: `updateSnapshotsForCostLayerChange`, the late-landed-cost correction. It
+ * selects rows by `costLayerSnapshot @> [{costLayerId}] FOR UPDATE` across every table that carries
+ * a snapshot and takes no order lock at all, because it is a purchasing-side sweep that does not
+ * know which orders it will touch. So it is the one writer that can move a row a re-filing pass has
+ * already read.
+ *
+ * The two locks answer two different questions and both are needed:
+ *
+ *   THE ORDER LOCK stops rows APPEARING OR DISAPPEARING in the scope — every writer of allocation
+ *   rows takes it (the allocator, `addAllocation`, the manual editor, the rebalancer), and the
+ *   correction only ever UPDATEs.
+ *   THIS ROW LOCK stops the RECORD ON A ROW being revalued underneath the plan. Held from here to
+ *   commit, so a correction that arrives after it waits, then patches the array this pass wrote.
+ *
+ * TAKEN AT THE WRITE, NOT EARLIER, and for round 10's reason. The correction runs
+ * cost_layers -> order_allocations; a pass that locked these rows before its own cost-layer or
+ * stock work would run order_allocations -> (cost_layers | stock_levels) and close a real deadlock
+ * cycle between two writers that both matter. Taken at the point the caller's own UPDATE/DELETE
+ * would take the row lock anyway, the ordering is unchanged and nothing new can wait on anything
+ * new.
+ *
+ * Ordered by id so two lockers of the same set queue rather than interleave.
+ */
+export async function lockAccountedRecordsForScope(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  lineId: string,
+  productId: string,
+): Promise<LockedAccountedRecordRow[]> {
+  return tx.$queryRaw<LockedAccountedRecordRow[]>(
+    Prisma.sql`
+      SELECT "lineId", "productId", "warehouseId", "costLayerSnapshot"
+      FROM "order_allocations"
+      WHERE "orderId" = ${orderId} AND "lineId" = ${lineId} AND "productId" = ${productId}
+      ORDER BY id
+      FOR UPDATE
+    `,
+  )
+}
+
+/**
+ * The same lock, for a caller that rewrites a WHOLE ORDER's rows rather than one scope's
+ * (o3d-0i5y r11). See {@link lockAccountedRecordsForScope} for why it is taken where it is taken.
+ */
+export async function lockAccountedRecordsForOrder(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<LockedAccountedRecordRow[]> {
+  return tx.$queryRaw<LockedAccountedRecordRow[]>(
+    Prisma.sql`
+      SELECT "lineId", "productId", "warehouseId", "costLayerSnapshot"
+      FROM "order_allocations"
+      WHERE "orderId" = ${orderId}
+      ORDER BY id
+      FOR UPDATE
+    `,
+  )
+}
+
+/**
+ * A BASE WHOSE QUANTITY MOVED IS REFUSED BY NAME (o3d-0i5y r11, r10's rule for Group A2).
+ *
+ * The landed-cost correction maps each entry to itself: it rewrites `unitCostBase` and can change
+ * neither the recorded quantity nor the entry count. So a locked base recording a different quantity
+ * than the read this pass planned from means a writer nothing here can account for, and the plan
+ * built on that read — which scope inherits which units, and how many are orphaned — is describing
+ * rows that no longer exist.
+ *
+ * It cannot be reached today: every path that changes WHICH units are recorded takes the order row
+ * lock this pass holds. It fails closed rather than trusting that to stay true.
+ */
+function assertAccountedRecordBaseUnmoved(
+  planned: ReadonlyArray<{ lineId: string; productId: string; warehouseId: string; costLayerSnapshot?: Prisma.JsonValue | null }>,
+  locked: ReadonlyArray<LockedAccountedRecordRow>,
+): void {
+  const qtyByScope = (rows: ReadonlyArray<{ lineId: string; productId: string; warehouseId: string; costLayerSnapshot?: Prisma.JsonValue | null }>) => {
+    const map = new Map<string, Prisma.Decimal>()
+    for (const row of rows) {
+      const key = allocationScopeKey(row)
+      const qty = sumCostLayerSnapshotQty(parseCostLayerSnapshot(row.costLayerSnapshot ?? null))
+      map.set(key, (map.get(key) ?? toDecimal(0)).add(qty))
+    }
+    return map
+  }
+  const plannedQty = qtyByScope(planned)
+  const lockedQty = qtyByScope(locked)
+  for (const key of new Set([...plannedQty.keys(), ...lockedQty.keys()])) {
+    const before = plannedQty.get(key) ?? toDecimal(0)
+    const after = lockedQty.get(key) ?? toDecimal(0)
+    if (!before.eq(after)) {
+      throw new Error(
+        `Allocation scope ${key} recorded ${before.toString()} unit(s) when this pass planned from it `
+        + `and ${after.toString()} unit(s) under the write lock — Group A2's record moved underneath `
+        + 'the re-allocation and the plan built on it cannot be trusted',
+      )
+    }
+  }
+}
+
+/**
+ * RE-FILE GROUP A2'S RECORD ONTO THE ROWS THIS CHANGE LEFT BEHIND, AND REVERSE WHAT NOTHING CAN
+ * HOLD (o3d-0i5y r11).
+ *
+ * ONE implementation, for the same reason {@link reverseOrphanedAllocationPosting} is exported: the
+ * manual editor and the over-allocation rebalancer both take recorded units off a single
+ * (line, product) scope, and a second copy of this sequence is a second thing to get wrong. The
+ * allocator keeps its own call to {@link planAccountedRecordCarryOver} because it declares a whole
+ * ORDER's next set in one pass and interleaves the record write with the row rewrite it is already
+ * doing.
+ *
+ * `base` is what {@link lockAccountedRecordsForScope} read UNDER THE LOCK, before the caller's first
+ * row write. It is not re-derived here: by the time this runs the source row may have been deleted
+ * outright (a reduction to zero, a merge), and its record — which the surviving rows inherit — would
+ * be unreadable.
+ *
+ * A2 APPENDS AND SO IT REBASES; THIS PATH RE-AUTHORS, SO IT PLANS FROM A BASE NOTHING CAN HAVE
+ * MOVED. Round 10 gave A2 the append rule ("it appends, it does not re-author what it merely read")
+ * because A2's own entries are additions to a record it has no business rewriting. A carry-over
+ * cannot append: trimming a row to the units it keeps, and moving the remainder to the scopes that
+ * inherit those units, is re-authoring by definition. So the equivalent guarantee is taken on the
+ * other side — the base is read under a lock held to commit, so the correction cannot land between
+ * the read and the write at all, and the entries this writes carry the CORRECTED `unitCostBase`
+ * rather than the one the plan was drawn from.
+ *
+ * The reversal amount is unaffected either way: it comes from `postedUnitCostBase`, which no
+ * revaluation rewrites. What the lock protects is the PIN the surviving rows keep, which Group B
+ * relieves against when those units ship.
+ */
+export async function refileAccountedRecordsForScope(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  scope: { lineId: string; productId: string },
+  base: ReadonlyArray<LockedAccountedRecordRow>,
+): Promise<void> {
+  const writtenRows = await tx.orderAllocation.findMany({
+    where: { orderId, lineId: scope.lineId, productId: scope.productId },
+    select: { lineId: true, productId: true, warehouseId: true, qty: true },
+  })
+  const { records, orphaned } = planAccountedRecordCarryOver(
+    base,
+    writtenRows.map((row) => ({ ...row, qty: toDecimal(row.qty) })),
+  )
+  for (const row of writtenRows) {
+    // `write` is null for a row that already holds its own record and must simply be left alone;
+    // re-writing it would serialize a value nothing asked to change.
+    const carried = records.get(allocationScopeKey(row))?.write
+    if (!carried) continue
+    await tx.orderAllocation.update({
+      where: {
+        lineId_warehouseId_productId: {
+          lineId: row.lineId,
+          warehouseId: row.warehouseId,
+          productId: row.productId,
+        },
+      },
+      data: { costLayerSnapshot: carried as Prisma.InputJsonValue },
+    })
+  }
+  // LAST, after every row write, so the journal and the state it describes commit together (the r9
+  // rebase decision), and inside the caller's transaction under the order row lock it already holds
+  // — which is what `queueAccountingSyncTx` requires of an order-scoped enqueue.
+  await reverseOrphanedAllocationPosting(tx, orderId, orphaned)
+}
+
+/**
+ * PRESERVE WHAT GROUP A2 POSTED FOR AN ORDER BEING CANCELLED — AND DO NOT REVERSE IT HERE
+ * (o3d-0i5y r11 — Codex round 11, finding 3).
+ *
+ * A whole-order cancellation `deleteMany`s every allocation row, and each row's `costLayerSnapshot`
+ * is Group A2's record that it DEBITED Allocated Inventory for those units and (through
+ * `postedUnitCostBase`) the amount it debited. The un-stage a few statements earlier has already
+ * cleared the order-level stamp, its batch ref and `allocationBatchAmount`. So after this
+ * transaction commits there is nothing anywhere — not on the order, not on a row — that says the
+ * pounds standing in Allocated Inventory for this order exist. That is the same "the debit is
+ * stranded AND the record it could have been reconstructed from is gone, in one committed
+ * transaction" failure r10 refused on the hard-delete path.
+ *
+ * SO THE EVIDENCE IS KEPT, AND ONLY THE EVIDENCE. r10 left this site alone reasoning that
+ * `o3d-batch-cancelrb` owns this contra and that reversing here would risk a double reversal when
+ * that branch lands. Re-checked against that branch as it now stands, the reasoning holds and is
+ * in fact stronger than when it was written:
+ *
+ *   * THAT BRANCH STILL DOES NOT REVERSE ON CANCELLATION. Its own words, in
+ *     `lib/domain/accounting/allocated-inventory-debit.ts`: "What is deliberately NOT attempted here
+ *     is REVERSING the debit when the order's allocations shrink or the order is cancelled
+ *     outright... keeping the record is what makes that repair possible later instead of
+ *     impossible." What it reverses is the residual contra on a REFUND.
+ *   * AND ITS ARITHMETIC CANNOT SEE OUR JOURNAL. That refund reversal opens at the order's recorded
+ *     debit (`SalesOrder.allocationBatchAmount`) and subtracts relief it can PROVE from the journals'
+ *     own lines — Group B's per-shipment `allocatedReliefAmount` and each earlier refund's own
+ *     `allocatedReliefAmount`. An `ALLOCATION_REVERSAL` this branch raises is neither of those, so it
+ *     is invisible to that subtraction. Raise one here and a cancelled-then-refunded order credits
+ *     Allocated Inventory twice for the same units — which is exactly the collision r10 named, now
+ *     demonstrable rather than merely suspected.
+ *
+ * A RECORD CANNOT DOUBLE-COUNT: nothing is queued, nothing is posted, no relief is claimed. It is
+ * additive against both branches, and it is the input the sibling's mechanism needs to exist — its
+ * design turns on the order-level record surviving the rows, and this is the one path that destroys
+ * every copy of it.
+ *
+ * The units that cannot say what was posted for them are named separately, on the same rule the
+ * reversal path applies: an entry with no `postedUnitCostBase` is not evidence of £0, it is evidence
+ * of nothing, and a human decides.
+ */
+async function recordStandingAllocationDebitOnCancel(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  records: CostLayerSnapshotEntry[],
+): Promise<void> {
+  if (records.length === 0) return
+  const { posted, unevidenced } = sumPostedCostLayerSnapshot(records)
+  const amount = roundQuantity(posted, 2)
+  if (amount.lte(0) && unevidenced.length === 0) return
+
+  const unevidencedQty = sumCostLayerSnapshotQty(unevidenced)
+  await tx.activityLog.create({
+    data: {
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'allocation_debit_standing_on_cancel',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `Order ${orderId} was cancelled holding ${sumCostLayerSnapshotQty(records).toString()} unit(s) `
+        + `Group A2 had already reclassified. £${amount.toFixed(2)} of DR Allocated Inventory / CR `
+        + 'Inventory stands against this order and nothing downstream will relieve it: the units will '
+        + 'not ship (Group B credits only what dispatches) and they were not refunded. The allocation '
+        + 'rows carrying that record are deleted by this cancellation, so it is recorded here instead. '
+        + 'NO reversal journal was raised — the refund side of this contra owns it (o3d-batch-cancelrb) '
+        + 'and raising one here would be credited a second time by that path’s open-balance '
+        + 'arithmetic, which cannot see it. Reverse by hand, or through a refund, if the debit is real.'
+        + (unevidenced.length > 0
+          ? ` ${unevidencedQty.toString()} of those unit(s) carry no record of what was posted for them `
+            + `(cost layer(s) ${[...new Set(unevidenced.map((entry) => entry.costLayerId))].join(', ')}) `
+            + 'and are NOT included in the amount above.'
+          : ''),
+      metadata: {
+        postedAmountBase: amount.toNumber(),
+        recordedQty: sumCostLayerSnapshotQty(records).toString(),
+        unevidencedQty: unevidencedQty.toString(),
+        costLayerIds: [...new Set(records.map((entry) => entry.costLayerId))],
+      },
+    },
+  })
+}
+
 /**
  * REVERSE THE PART OF GROUP A2'S DEBIT THIS REWRITE ORPHANED (o3d-0i5y r9).
  *
@@ -1708,7 +1967,10 @@ export async function cancelSalesOrderFulfillmentState(
   await resetAllocationAccountingIfStaged(tx, input.orderId)
   const currentAllocs = await tx.orderAllocation.findMany({
     where: { orderId: input.orderId },
-    select: { productId: true, warehouseId: true, qty: true },
+    // o3d-0i5y r11 (Codex round 11, finding 3): the RECORD is selected with the rows, because the
+    // `deleteMany` below destroys the only statement of what Group A2 debited for this order. See
+    // `recordStandingAllocationDebitOnCancel` for why it is preserved here and not reversed here.
+    select: { productId: true, warehouseId: true, qty: true, costLayerSnapshot: true },
   })
   const releasedReservationScopes = uniqueReservationScopes(currentAllocs)
   await lockStockLevels(
@@ -1727,6 +1989,13 @@ export async function cancelSalesOrderFulfillmentState(
   // read is small, and it verifies the actual database delta rather than only
   // trusting the requested decrement shape.
   await applyAllocationReservationDelta(tx, currentAllocs, 'release')
+  // o3d-0i5y r11: written BEFORE the delete, from the rows as they still stand, so a failure to
+  // record the evidence cannot leave the rows gone and the debit undescribed.
+  await recordStandingAllocationDebitOnCancel(
+    tx,
+    input.orderId,
+    currentAllocs.flatMap((alloc) => parseCostLayerSnapshot(alloc.costLayerSnapshot)),
+  )
   await tx.orderAllocation.deleteMany({ where: { orderId: input.orderId } })
 
   const deletedShipments = await tx.shipment.deleteMany({
@@ -2887,8 +3156,25 @@ export async function allocateSalesOrder(
       // rewrite below to put each record on the row that inherits its units.
       // o3d-0i5y r9: and it says what the new set CANNOT hold, which is a debit to reverse rather
       // than a record to file — see `reverseOrphanedAllocationPosting`.
+      // o3d-0i5y r11 (Codex round 11, finding 1, applied to the fourth caller of this rule): THE
+      // PLAN IS DRAWN FROM THE ROWS AS LOCKED, not from `existingAllocs`.
+      //
+      // Everything the write does with a record — trimming a kept-but-shrunk scope, moving a dropped
+      // scope's record onto the scopes that inherit its units — REWRITES the entries it read. The
+      // sales-order lock this pass holds does not cover `order_allocations`, and
+      // `updateSnapshotsForCostLayerChange` writes them without it (it selects by cost layer, across
+      // every table carrying a snapshot, because it does not know which orders it will touch). So a
+      // landed cost landing between `existingAllocs` and the rewrite below was written straight back
+      // out at its old `unitCostBase`, and Group B then relieved those units at a cost the ledger had
+      // already corrected — the same shape r10 fixed in Group A2 and r11 fixed in the manual editor.
+      //
+      // ONE plan, from the locked base, feeding both the un-stage decision and the write: the reset
+      // asks a QUANTITY question, which a revaluation cannot move, so drawing it from the same plan
+      // keeps a single notion of where each record lives rather than two that can drift.
+      const lockedRecordBase = await lockAccountedRecordsForOrder(tx, orderId)
+      assertAccountedRecordBaseUnmoved(existingAllocs, lockedRecordBase)
       const { records: accountedRecords, orphaned: orphanedRecord } = planAccountedRecordCarryOver(
-        existingAllocs,
+        lockedRecordBase,
         persistedAllocations,
       )
 

@@ -2,7 +2,13 @@ import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { canonicalAllocationQty, clearDormantFulfillmentPinsInTx } from '@/lib/domain/sales/allocation-service'
+import {
+  canonicalAllocationQty,
+  clearDormantFulfillmentPinsInTx,
+  lockAccountedRecordsForScope,
+  lockSalesOrder,
+  refileAccountedRecordsForScope,
+} from '@/lib/domain/sales/allocation-service'
 import { resolveStagedAllocationDebit } from '@/lib/domain/accounting/allocated-inventory-debit'
 import { reconcilePendingShipments } from '@/lib/domain/sales/pending-shipment-reconciliation'
 
@@ -84,9 +90,17 @@ export async function releaseOverallocations(
       const txOutcome: TxOutcome = await db.$transaction(async (tx) => {
         const pending: TxOutcome = { releases: [], skipped: 0 }
 
-        await tx.$queryRaw(
-          Prisma.sql`SELECT id FROM "sales_orders" WHERE id IN (${Prisma.join(lockOrderIds)}) FOR UPDATE`,
-        )
+        // o3d-0i5y r11 (Codex round 11, finding 2) — THROUGH THE SHARED HELPER, NOT RAW SQL.
+        //
+        // This took the same row lock by hand, which locked the rows and told nothing: `lockSalesOrder`
+        // also records the order in the per-transaction registry `queueAccountingSyncTx` asserts
+        // against (o3d-3zgy). Without that record the assertion cannot tell "forgot to hoist the lock"
+        // from "hoisted it in a way I cannot see", so it refuses — and refusing is what kept this
+        // sweep from raising the Allocated-Inventory reversal it owes for the units it removes.
+        //
+        // Still one order at a time in ASC order, which is what the deterministic ordering above is
+        // for: the lock set and its order are unchanged, only the bookkeeping is added.
+        for (const lockOrderId of lockOrderIds) await lockSalesOrder(tx, lockOrderId)
         await tx.$queryRaw(
           Prisma.sql`SELECT id FROM "stock_levels" WHERE "productId" = ${item.productId} AND "warehouseId" = ${item.warehouseId} FOR UPDATE`,
         )
@@ -222,8 +236,14 @@ export async function releaseOverallocations(
             //
             // What survives from r10 unchanged is the other half: the units this sweep RELEASES are
             // orphaned — they will not ship and were not refunded — so their share of the A2 debit
-            // is stranded and is reversed explicitly. See `releaseOverallocations`' reversal below
-            // and `reverseOrphanedAllocationPosting`.
+            // is stranded.
+            //
+            // o3d-0i5y r11: and it is REVERSED rather than left standing — see the re-filing below.
+            // r10 left it stranded and said why: the sweep row-locked `sales_orders` with raw SQL
+            // rather than through `lockSalesOrder`, so the enqueue's hoisted-lock assertion would
+            // have refused it. That prerequisite is fixed at the lock above, so the reversal is
+            // raised here rather than absorbed by `unaccountedAllocationQty`'s floor — which only
+            // ever stops units being posted AGAIN and says nothing about the pounds already there.
           }
 
           const allocQty = Number(alloc.qty)
@@ -244,6 +264,19 @@ export async function releaseOverallocations(
           // A release the column cannot represent is not a release: the row would be rewritten to
           // its own value and `reservedQty` decremented for a reduction that never happened.
           if (release <= 0) continue
+
+          // o3d-0i5y r11 — THE RECORD AS IT STANDS, READ UNDER THE LOCK THIS WRITE TAKES ANYWAY.
+          //
+          // Read at this statement and not earlier, for the reason `lockAccountedRecordsForScope`
+          // gives: the late-landed-cost correction runs cost_layers -> order_allocations, so a pass
+          // that locked these rows before its own stock work would close a real deadlock cycle. Here
+          // it is the statement before the delete/update, which locks the row in any case.
+          const lockedScopeRecords = await lockAccountedRecordsForScope(
+            tx,
+            alloc.orderId,
+            alloc.lineId,
+            item.productId,
+          )
 
           if (wholeRow) {
             await tx.orderAllocation.delete({ where: { id: alloc.id } })
@@ -266,6 +299,40 @@ export async function releaseOverallocations(
           if (remainingForOrder === 0 && alloc.order.status === 'ALLOCATED') {
             await tx.salesOrder.update({ where: { id: alloc.orderId }, data: { status: 'PROCESSING' } })
           }
+
+          // -------------------------------------------------------------------------------------
+          // o3d-0i5y r11 (Codex round 11, finding 2) — THE UNITS THIS SWEEP TAKES OFF THE ORDER
+          // TAKE THEIR SHARE OF GROUP A2'S DEBIT WITH THEM.
+          //
+          // r10 stopped this sweep ERASING the record (its private copy of the old blanket reset
+          // nulled `costLayerSnapshot` on every row of the order, so one unit released off ten
+          // re-posted all ten) and left the other half open: the record then over-stated what the
+          // trimmed row holds, and the debit of the units that left was stranded in Allocated
+          // Inventory with nothing that would ever relieve it. Group B credits only what SHIPS and
+          // a refund credits only what is TAKEN BACK; a released over-allocation is neither.
+          //
+          // Worked. Product P at W1 holds 10 units on order SO-1, pinned and posted by A2 at £4 —
+          // £40 of DR Allocated / CR Inventory, `postedUnitCostBase` 4.000000 on the entry. A
+          // stock adjustment drops the shelf to 6, so this sweep releases 4:
+          //   BEFORE r11: the row is trimmed to 6 and still RECORDS 10. Group B credits Allocated
+          //     6 x £4 = £24 when those six ship, the other £16 is never invoiced so no refund ever
+          //     sees it, and £16 of a real debit sits in Allocated Inventory for ever with Inventory
+          //     understated by the same £16.
+          //   AFTER r11: the record is trimmed to the 6 units the row holds (£24) and the 4 orphaned
+          //     units raise CR Allocated £16.00 / DR Inventory £16.00. Allocated Inventory holds
+          //     exactly the £24 Group B will relieve.
+          // A WHOLE-ROW release is the same at its limit: the row is deleted, all 10 units are
+          // orphaned and £40 is reversed.
+          //
+          // Through the SAME implementation the manual editor uses, and after every row and stock
+          // write for this release, so the journal and the state it describes commit together.
+          // -------------------------------------------------------------------------------------
+          await refileAccountedRecordsForScope(
+            tx,
+            alloc.orderId,
+            { lineId: alloc.lineId, productId: item.productId },
+            lockedScopeRecords,
+          )
 
           excess -= release
           const orderRef = alloc.order.orderNumber ?? alloc.order.externalOrderNumber ?? alloc.orderId.slice(0, 8)
