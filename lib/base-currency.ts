@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import type { PrismaClient } from '@/app/generated/prisma/client'
 import type { CurrencySymbolPos } from '@/app/generated/prisma/enums'
 
 export const DEFAULT_BASE_CURRENCY = 'GBP'
@@ -22,9 +23,20 @@ export function getFallbackCurrencyMeta(code: string): { name: string; symbol: s
   return FALLBACK_CURRENCY_META[code] ?? { name: code, symbol: code, symbolPosition: 'PREFIX' }
 }
 
-export async function getBaseCurrencyCode(): Promise<string> {
-  const org = await db.organisation.findFirst({ select: { baseCurrency: true } })
+/**
+ * The base currency, read through a CALLER-SUPPLIED client so a domain check running inside a
+ * transaction resolves it from the same snapshot — and by the same rule, including the fallback — as
+ * the credit-note payload builder that reads it with `getBaseCurrencyCode()` (o3d-w00, Codex r10 #3).
+ * Two definitions of "is this order in the base currency?" is two answers to "what does this credit
+ * note post".
+ */
+export async function resolveBaseCurrencyCode(client: Pick<PrismaClient, 'organisation'>): Promise<string> {
+  const org = await client.organisation.findFirst({ select: { baseCurrency: true } })
   return org?.baseCurrency ?? DEFAULT_BASE_CURRENCY
+}
+
+export async function getBaseCurrencyCode(): Promise<string> {
+  return resolveBaseCurrencyCode(db)
 }
 
 export async function getBaseCurrencyDisplay(): Promise<BaseCurrencyDisplay> {
