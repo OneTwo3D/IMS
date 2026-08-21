@@ -761,8 +761,16 @@ longest, reads those invoices **by id** (bypassing the delta entirely) and re-ru
 decision. When the disagreement is settled — the reversal is finally acted on, the ledger catches up,
 or the IMS no longer holds the document as paid — the record is **closed** and the document leaves the
 queue for good. While it is still withheld the warning is simply rewritten, which restarts its timer
-and sends it to the back of the queue, so one stuck document can never crowd out the others. The
-operator alert is raised once, when the verdict is first withheld, not on every recheck.
+and sends it to the back of the queue, so one stuck document can never crowd out the others — the
+queue is built one entry per **document**, from each document's most recent warning, so a document
+that has been withheld for weeks cannot fill the page with its own history and hide the ones behind
+it. The operator alert is raised once, when the verdict is first withheld, not on every recheck.
+
+A recheck that could not be completed **closes nothing**. If Xero does not answer, or does not return
+one of the invoices, or a database read fails while the answer is being turned into a verdict, the
+document is deferred — asked again on the next round — rather than treated as settled. "We could not
+decide" and "there is nothing left to decide" look the same from outside, and only one of them is
+safe to act on.
 
 A registration that genuinely never posted stays undecided for ever on its own, and that is what the
 recheck keeps visible: reconcile the bill in Xero and **cancel** the named sync entry, which takes it
@@ -786,6 +794,19 @@ Both ends are now timestamps taken from the database itself: the registration is
 database when it completes, and the poll asks the database for the time immediately before asking
 Xero. If the database cannot answer, the poll orders nothing and withholds every reversal that would
 have depended on it.
+
+**And a stamp whose clock cannot be identified is not used at all.** During a deploy both builds run
+side by side, so a worker still on the previous release goes on stamping registrations from its own
+server's clock — and once stored, that value is indistinguishable from one the database produced. The
+completion time is therefore now written together with a marker that only the database can produce, by
+a single statement, and the reversal fence accepts a registration only while the two still agree. A
+registration written by an older build — or one an older build rewrote afterwards — reads as
+**undecidable**: its document's reversal is withheld and reported for somebody to reconcile by hand,
+rather than decided from a clock nobody can identify. Nothing has to be drained or sequenced around a
+release for this to hold: an older instance keeps writing exactly as it did, and its rows simply never
+qualify. The cost is deliberate — registrations that predate this change never become decidable on
+their own, because filling the marker in for them would be the database vouching for a stamp it did
+not make.
 
 All four checks are answered by a **single** request that asks Xero only for invoices changed since
 the last successful poll, using the `If-Modified-Since` header. The poll advances its cursor only

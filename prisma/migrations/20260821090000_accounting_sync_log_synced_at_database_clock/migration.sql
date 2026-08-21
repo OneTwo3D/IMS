@@ -1,0 +1,44 @@
+-- o3d-clxw round 5, Codex finding 1: A ROW STAMPED BY A HOST CLOCK MUST BE TELLABLE FROM ONE
+-- STAMPED BY THE DATABASE.
+--
+-- Round 4 removed the two application clocks from the payment-reversal fence: the registration end
+-- (`accounting_sync_logs."syncedAt"`) became `clock_timestamp()` written inside the SYNCED
+-- transaction, and the poller end became `clock_timestamp()` read from the same database before the
+-- ledger was asked. Two readings of one clock.
+--
+-- THE ROLLOUT PUTS THE SECOND CLOCK BACK. During a deploy both builds run at once, and a worker on
+-- the OLD build still writes `syncedAt` from its own host's `new Date()`. A poller on the NEW build
+-- compares that value against a database fence — which is the cross-host comparison round 4 deleted,
+-- reintroduced by the release rather than by the code. Its dangerous direction is the one this whole
+-- branch exists to prevent: the fence reads an in-flight registration as finished, the ledger's
+-- (correct) silence about it is read as proof the payment was removed, `paidAt` is cleared, Mark Paid
+-- re-arms, and the supplier is paid a second time.
+--
+-- Round 4 wrote the residual down and proposed to let it age out. Ageing out is not a fence: it is an
+-- assumption about how far apart two clocks can be, which is exactly the assumption that was removed.
+--
+-- SO THE MARKER RIDES INSIDE THE VALUE. This column holds the SAME instant as `syncedAt`, written by
+-- the same statement from a SINGLE evaluation of `clock_timestamp()`. The reader accepts a
+-- registration as fenced only when this column is present AND equal to `syncedAt`; anything else
+-- withholds and decides nothing at all. That makes both mixed-version writes announce themselves:
+--
+--   an old build creating the row      never sets this column, so it is NULL — undecidable.
+--   an old build REWRITING `syncedAt`  moves `syncedAt` and leaves this column where it was, so the
+--                                      two disagree — undecidable.
+--
+-- A separate column that could be read on its own would not do either job: a stale value left behind
+-- by a host-clock rewrite of `syncedAt` would vouch for an instant that is no longer the row's. It is
+-- the EQUALITY that is the marker, not the column's presence.
+--
+-- NULLABLE, AND DELIBERATELY NOT BACKFILLED. `UPDATE ... SET "syncedAtDatabaseClock" = "syncedAt"`
+-- would be the database vouching for a value it did not produce — every historical host-clock stamp
+-- promoted to a database stamp in one statement, which is the defect this column exists to detect,
+-- applied to the entire table. Existing rows therefore stay undecidable for good, which means a
+-- reversal on a bill whose registration predates this release is WITHHELD and reported for a human to
+-- reconcile instead of being decided from a clock nobody can identify. That is the intended cost.
+--
+-- Nothing reads this column except the reversal fence, and no write path other than
+-- `stampSyncedAtFromDatabaseClock` sets it, so an old build deployed on top of this schema behaves
+-- exactly as it did before: it writes `syncedAt`, ignores this column, and its rows read as
+-- undecidable to any new poller.
+ALTER TABLE "accounting_sync_logs" ADD COLUMN "syncedAtDatabaseClock" TIMESTAMP(3);

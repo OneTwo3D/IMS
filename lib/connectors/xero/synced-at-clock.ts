@@ -32,10 +32,31 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * session's TimeZone. Both ends of the fence use this identical expression (see
  * `readDatabaseLedgerFence` in the poller), so the two readings are directly comparable whatever the
  * session is set to.
+ *
+ * TWO COLUMNS, ONE READING OF THE CLOCK (o3d-clxw round 5, Codex finding 1).
+ *
+ * Round 4 left one clock in the system that it could not remove: during a deploy, a worker still
+ * running the PREVIOUS build writes `syncedAt` from its own host's `new Date()`, and a poller on the
+ * new build compares that against a database fence. That is the cross-host comparison this file
+ * exists to delete, put back by the rollout. Round 4 proposed to let such rows age past any plausible
+ * skew; ageing out is not a fence, it is the same assumption about clock distance under another name.
+ *
+ * So the stamp now carries its own provenance, and it rides INSIDE the value rather than beside it:
+ * `syncedAtDatabaseClock` gets the SAME instant as `syncedAt`, and the reader
+ * (`databaseStampedCompletion` in invoice-delta.ts) accepts the row only while the two are equal.
+ * A build that does not know about the marker cannot write `syncedAt` without breaking that equality
+ * — it either never writes the marker at all (NULL) or moves `syncedAt` out from under a marker that
+ * stays where it was. Either way the row announces itself and the verdict is withheld.
+ *
+ * `FROM (SELECT clock_timestamp() ...) s` and not `clock_timestamp()` written twice: `clock_timestamp()`
+ * is evaluated per call, so two calls in one UPDATE yield two different instants, the equality never
+ * holds, and every registration this process ever stamps would read as undecidable. One evaluation,
+ * assigned to both columns, is the whole mechanism. (Both columns are `TIMESTAMP(3)`, so both round
+ * the one value identically and the equality is exact rather than approximate.)
  */
 export async function stampSyncedAtFromDatabaseClock(
   tx: Pick<Prisma.TransactionClient, '$executeRaw'>,
   syncLogId: string,
 ): Promise<void> {
-  await tx.$executeRaw`UPDATE accounting_sync_logs SET "syncedAt" = clock_timestamp() AT TIME ZONE 'UTC' WHERE id = ${syncLogId}`
+  await tx.$executeRaw`UPDATE accounting_sync_logs AS l SET "syncedAt" = s.stamp, "syncedAtDatabaseClock" = s.stamp FROM (SELECT clock_timestamp() AT TIME ZONE 'UTC' AS stamp) AS s WHERE l.id = ${syncLogId}`
 }

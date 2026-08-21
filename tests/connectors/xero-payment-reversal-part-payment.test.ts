@@ -66,6 +66,12 @@ const state = {
   recheckFetches: [] as string[],
   /** Make the recheck's Xero read fail. */
   recheckFetchFails: false,
+  /**
+   * Make the REGISTRATION read fail — the database read inside the decision pass, the one that
+   * answers "is our payment still there?". Transient by nature: a dropped connection, a pool
+   * timeout, a statement cancelled under load (o3d-clxw round 5, finding 2).
+   */
+  registrationReadFails: false,
 }
 
 /** The unpatched clock, so the database double keeps real time while a HOST clock is skewed. */
@@ -124,6 +130,7 @@ function reset(): void {
   state.recheckInvoices = []
   state.recheckFetches = []
   state.recheckFetchFails = false
+  state.registrationReadFails = false
 }
 
 /** Just enough Prisma `where` to answer the poller's own queries honestly. */
@@ -226,6 +233,9 @@ mock.module('@/lib/db', {
         return [{ fence: databaseNow() }]
       },
       activityLog: {
+        // The pre-round-5 scan: marker ROWS, ordered and bounded as rows. Production does not call
+        // this any more — it is kept because it is the harness the starvation test's revert evidence
+        // needs, and a double that cannot run the old query cannot show what the old query did.
         findMany: async (
           { where, take, orderBy }:
           { where: Row; take?: number; orderBy?: { createdAt?: 'asc' | 'desc' } },
@@ -239,6 +249,48 @@ mock.module('@/lib/db', {
             .filter((r) => r.entityId != null)
             .filter((r) => since == null || (r.createdAt as Date).getTime() >= since.getTime())
             .sort((a, b) => direction * ((a.createdAt as Date).getTime() - (b.createdAt as Date).getTime()))
+            .slice(0, take ?? undefined)
+        },
+        // Prisma's groupBy, reduced to what the withheld-marker scan asks of it: one entry per
+        // document, ordered by an aggregate of its markers, bounded in DOCUMENTS. It really groups —
+        // a double that returned rows and called them groups would make the starvation test vacuous,
+        // because grouping is the entire fix (o3d-clxw round 5, finding 3). BOTH `_max` and `_min`
+        // are computed and either may be ordered on, because WHICH aggregate the scan reads is
+        // itself one of the things under test: `_min` would time a document from its FIRST marker,
+        // which is the history-reading the round robin exists to stop.
+        groupBy: async (
+          { where, orderBy, take }:
+          {
+            by: string[]
+            where: Row
+            orderBy?: { _max?: { createdAt?: 'asc' | 'desc' }; _min?: { createdAt?: 'asc' | 'desc' } }
+            take?: number
+          },
+        ) => {
+          const actions = (where.action as { in?: string[] } | undefined)?.in ?? null
+          const since = (where.createdAt as { gte?: Date } | undefined)?.gte ?? null
+          const onlyIds = (where.entityId as { in?: string[] } | undefined)?.in ?? null
+          const orderKey = orderBy?._min ? '_min' as const : '_max' as const
+          const direction = (orderBy?._max?.createdAt ?? orderBy?._min?.createdAt) === 'asc' ? 1 : -1
+          const groups = new Map<string, { entityType: unknown; entityId: unknown; _max: { createdAt: Date }; _min: { createdAt: Date } }>()
+          for (const row of state.activityRows) {
+            if (where.tag != null && row.tag !== where.tag) continue
+            if (actions != null && !actions.includes(row.action as string)) continue
+            if (row.entityId == null) continue
+            if (onlyIds != null && !onlyIds.includes(row.entityId as string)) continue
+            const at = row.createdAt as Date
+            if (since != null && at.getTime() < since.getTime()) continue
+            const key = `${String(row.entityType)}:${String(row.entityId)}`
+            const held = groups.get(key)
+            if (!held) {
+              groups.set(key, { entityType: row.entityType, entityId: row.entityId, _max: { createdAt: at }, _min: { createdAt: at } })
+              continue
+            }
+            if (held._max.createdAt.getTime() < at.getTime()) held._max = { createdAt: at }
+            if (held._min.createdAt.getTime() > at.getTime()) held._min = { createdAt: at }
+          }
+          return [...groups.values()]
+            .sort((a, b) => direction * (a[orderKey].createdAt.getTime() - b[orderKey].createdAt.getTime()))
             .slice(0, take ?? undefined)
         },
       },
@@ -257,7 +309,12 @@ mock.module('@/lib/db', {
         },
       },
       accountingSyncLog: {
-        findMany: async ({ where }: { where: Row }) => state.syncLogs.filter((r) => rowMatches(r, where)),
+        findMany: async ({ where }: { where: Row }) => {
+          // The real one throws; `processDeltaChunk` catches it and records the failure on the poll
+          // result rather than letting it escape.
+          if (state.registrationReadFails) throw new Error('connection terminated unexpectedly')
+          return state.syncLogs.filter((r) => rowMatches(r, where))
+        },
       },
       purchaseInvoice: {
         findMany: async ({ where }: { where: Row }) => state.purchaseInvoices.filter((r) => rowMatches(r, where)),
@@ -440,9 +497,18 @@ test('a sales invoice whose payment really is gone is still reversed and charged
 // reads settled until a human happens to reconcile it.
 // ---------------------------------------------------------------------------
 
+/**
+ * A registration written by the CURRENT build: `syncedAt` and its provenance marker are the same
+ * instant, because one statement stamped both from one reading of `clock_timestamp()` (round 5).
+ * A row that models an OLD build overrides `syncedAtDatabaseClock` explicitly.
+ */
+function databaseStamped(row: Row): Row {
+  return { syncedAtDatabaseClock: row.syncedAt, ...row }
+}
+
 /** A BILL_PAYMENT registration IMS holds against bill pi_1. */
 function billRegistration(overrides: Row = {}): Row {
-  return {
+  return databaseStamped({
     id: 'log_1',
     connector: 'xero',
     type: 'BILL_PAYMENT',
@@ -453,11 +519,11 @@ function billRegistration(overrides: Row = {}): Row {
     // Stamped by `clock_timestamp()` in the sync processor's own transaction (round 4).
     syncedAt: databaseNow(-5 * 60_000),
     ...overrides,
-  }
+  })
 }
 
 function salesRegistration(overrides: Row = {}): Row {
-  return {
+  return databaseStamped({
     id: 'log_s1',
     connector: 'xero',
     type: 'INVOICE_PAYMENT',
@@ -468,7 +534,7 @@ function salesRegistration(overrides: Row = {}): Row {
     // Stamped by `clock_timestamp()` in the sync processor's own transaction (round 4).
     syncedAt: databaseNow(-5 * 60_000),
     ...overrides,
-  }
+  })
 }
 
 test('OUR supplier payment deleted with a smaller one left behind IS a reversal, not a part payment (o3d-clxw r2)', async () => {
@@ -1096,24 +1162,193 @@ test('a document Xero did not return is deferred rather than closed', async () =
     'the marker is rewritten anyway, or this document holds the head of an oldest-first page for ever')
 })
 
-test('the due set is oldest-reconsidered-first, latest row wins, and it is bounded', async () => {
+test('the due set is oldest-reconsidered-first, latest marker wins, and it is bounded', async () => {
   const { dueWithheldMarkers, WITHHELD_RECHECK_INTERVAL_MS } =
     await import('@/lib/connectors/xero/payment-poller')
   const old = (minutes: number) => new Date(Date.now() - WITHHELD_RECHECK_INTERVAL_MS - minutes * 60_000)
-  const marker = (entityId: string, action: string, createdAt: Date) =>
-    ({ entityType: 'PURCHASE_ORDER' as const, entityId, action, createdAt })
+  // One entry per document per side, which is what the grouped scan hands it (round 5, finding 3):
+  // the action that classified a marker is the query's business, and history is not in here at all.
+  const marker = (entityId: string, createdAt: Date) =>
+    ({ entityType: 'PURCHASE_ORDER' as const, entityId, createdAt })
 
   const due = dueWithheldMarkers([
-    marker('po_b', 'bill_payment_reversal_withheld', old(10)),
-    marker('po_a', 'bill_payment_reversal_withheld', old(30)),
-    // po_c still has an open row in the scan, but it has since been closed.
-    marker('po_c', 'bill_payment_reversal_withheld', old(40)),
+    marker('po_b', old(10)),
+    marker('po_a', old(30)),
+    // po_c is still open as far as the open side can see, but it has since been closed.
+    marker('po_c', old(40)),
     // po_d was re-asked one minute ago, so it is not due again yet.
-    marker('po_d', 'bill_payment_reversal_recheck_deferred', new Date(Date.now() - 60_000)),
+    marker('po_d', new Date(Date.now() - 60_000)),
   ], [
-    marker('po_c', 'bill_payment_reversal_withheld_cleared', old(5)),
+    marker('po_c', old(5)),
   ], Date.now())
 
   assert.deepEqual(due.map((m) => m.entityId), ['po_a', 'po_b'],
     'least recently reconsidered first — a round robin, not a queue with a permanent head')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-clxw ROUND 5 — THE DEPLOY MUST NOT PUT THE SECOND CLOCK BACK (Codex finding 1)
+//
+// Round 4 removed both application clocks from the fence. What it could not remove is the PREVIOUS
+// RELEASE: during a rollout both builds run at once, and a worker on the old one still stamps
+// `syncedAt` from its own host's `new Date()`. A poller on the new build comparing THAT against a
+// database fence is the same cross-host comparison, reintroduced by the release rather than by the
+// code — and its dangerous direction is the one this branch exists to prevent.
+//
+// A host-clock stamp is now DISTINGUISHABLE, because the database writes the completion time and its
+// provenance marker in one statement from one reading of the clock. A row that cannot prove which
+// clock produced it decides nothing at all.
+// ---------------------------------------------------------------------------
+
+test('an OLD BUILD row and a database-stamped row in one poll: only the one with a provable clock decides (r5)', async () => {
+  reset()
+  // Two bills, both zero-paid, both with a registration that completed five minutes before the read.
+  // The ONLY difference is which build wrote the stamp.
+  state.invoices = [
+    bill({ InvoiceID: 'XB1', AmountPaid: 0, AmountDue: 500 }),
+    bill({ InvoiceID: 'XB2', AmountPaid: 0, AmountDue: 500 }),
+  ]
+  state.purchaseInvoices = [
+    paidBillRow(),
+    { ...paidBillRow(), id: 'pi_2', accountingInvoiceId: 'XB2', poId: 'po_2', po: { reference: 'PO-0002', status: 'RECEIVED' } },
+  ]
+  state.syncLogs = [
+    // Written by a worker still on the previous release: `syncedAt` is that host's wall clock, and
+    // nothing in the row says so. Round 4 would have called this decided — it is five minutes old,
+    // which is "outside any plausible skew" — and that reasoning is the defect.
+    billRegistration({ id: 'log_old', syncedAtDatabaseClock: null }),
+    // Written by this build: one statement, one reading of `clock_timestamp()`, both columns.
+    billRegistration({ id: 'log_new', referenceId: 'pi_2', externalTransactionId: 'PAY-OURS-2' }),
+  ]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates).map((u) => u.id), ['pi_2'],
+    'the host-clock row must NOT clear paidAt: clearing it re-arms Mark Paid over a payment that may '
+    + 'still be in flight, and the second press pays the supplier again')
+  assert.equal(result.billsReversed, 1)
+  assert.equal(result.billReversalsWithheld, 1)
+  const withheld = state.activity.filter((a) => a.action === 'bill_payment_reversal_withheld')
+  assert.equal(withheld.length, 1)
+  assert.equal(withheld[0]?.metadata?.accountingInvoiceId, 'XB1')
+  assert.equal(withheld[0]?.metadata?.registrationVerdict, 'REGISTRATION_UNDECIDED')
+  assert.match(withheld[0]?.description ?? '', /log_old/,
+    'the withheld warning names the registration a human has to look at')
+})
+
+test('an old build REWRITING syncedAt under the marker announces itself, and the verdict withholds (r5)', async () => {
+  reset()
+  // The other half of a mixed deploy: the database stamped this row, then a worker on the previous
+  // release re-synced it and wrote `syncedAt` from its host clock, leaving the marker where it was.
+  // The row now states two different completion times, and a row that contradicts itself orders
+  // nothing.
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration({
+    syncedAt: databaseNow(-2 * 60_000),
+    syncedAtDatabaseClock: databaseNow(-9 * 60_000),
+  })]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [])
+  assert.equal(result.billsReversed, 0)
+  assert.equal(result.billReversalsWithheld, 1)
+  assert.equal(
+    state.activity.find((a) => a.action === 'bill_payment_reversal_withheld')?.metadata?.registrationVerdict,
+    'REGISTRATION_UNDECIDED')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-clxw ROUND 5 — A FAILED RECONSIDERATION IS NOT A SETTLED ONE (Codex finding 2)
+// ---------------------------------------------------------------------------
+
+test('a transient failure on the decision path DEFERS the recheck instead of closing it for ever (r5)', async () => {
+  reset()
+  state.invoices = []
+  state.activityRows = [withheldMarker()]
+  state.purchaseInvoices = [paidBillRow()]
+  state.recheckInvoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
+  // Xero answered. The DATABASE read that turns that answer into a verdict did not — one dropped
+  // connection, lasting a second. No document in this chunk was reconsidered, so nothing in it may be
+  // treated as reconsidered-and-settled.
+  state.registrationReadFails = true
+
+  const result = await poll()
+
+  assert.deepEqual(state.recheckFetches, ['Invoices?IDs=XB1'])
+  assert.equal(result.withheldResolved, 0, 'nothing was decided, so nothing may be counted as resolved')
+  assert.equal(state.activity.some((a) => a.action === 'bill_payment_reversal_withheld_cleared'), false,
+    'closing here retires the recheck permanently on a cause that lasted a second, leaving paidAt set '
+    + 'against a ledger that disagrees and no marker left to bring the question back')
+  const deferred = state.activity.find((a) => a.action === 'bill_payment_reversal_recheck_deferred')
+  assert.ok(deferred, 'the marker is rewritten so the document stays open and goes to the back of the page')
+  assert.match(String(deferred.metadata?.reason ?? ''), /reconsideration pass could not complete/)
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [])
+  assert.ok(result.errors.some((e) => /registered-payment reading error/.test(e)))
+})
+
+// ---------------------------------------------------------------------------
+// o3d-clxw ROUND 5 — MARKER HISTORY MUST NOT OWN THE PAGE (Codex finding 3)
+// ---------------------------------------------------------------------------
+
+test('one document\'s marker HISTORY cannot starve another document out of the recheck page (r5)', async () => {
+  reset()
+  state.invoices = []
+  // po_1 has been withheld for a month and reconsidered all the way through it. Every reconsideration
+  // APPENDED a marker, so its history alone is larger than the whole scan — and an oldest-row-first
+  // page of a bounded size fills with it. Its own newest marker is three hours old.
+  const day = 24 * 60 * 60_000
+  const oldest = -29 * day
+  const newest = -3 * 60 * 60_000
+  const step = (newest - oldest) / 499
+  for (let i = 0; i < 500; i += 1) {
+    state.activityRows.push(withheldMarker({ createdAt: databaseNow(oldest + i * step) }))
+  }
+  // po_2 became withheld two hours ago and has exactly one marker. Under a page bounded by ROWS it is
+  // invisible — and being invisible means never being reconsidered, which means never writing a newer
+  // marker, so it never becomes visible either. Permanent, and self-sustaining.
+  state.activityRows.push(withheldMarker({ entityId: 'po_2', createdAt: databaseNow(-2 * 60 * 60_000) }))
+  state.purchaseInvoices = [
+    paidBillRow(),
+    { ...paidBillRow(), id: 'pi_2', accountingInvoiceId: 'XB2', poId: 'po_2', po: { reference: 'PO-0002', status: 'RECEIVED' } },
+  ]
+  state.recheckInvoices = [
+    bill({ InvoiceID: 'XB1', AmountPaid: 0, AmountDue: 500 }),
+    bill({ InvoiceID: 'XB2', AmountPaid: 0, AmountDue: 500 }),
+  ]
+
+  const result = await poll()
+
+  assert.equal(result.withheldRechecked, 2,
+    'the page is bounded in DOCUMENTS, not in marker rows — one document occupies one place in it')
+  assert.deepEqual(state.recheckFetches, ['Invoices?IDs=XB1,XB2'])
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates).map((u) => u.id).sort(), ['pi_1', 'pi_2'])
+  assert.equal(result.withheldResolved, 2)
+})
+
+test('the due order is each document\'s LAST reconsideration, not its first (r5)', async () => {
+  reset()
+  state.invoices = []
+  // po_1 was first withheld four hours ago and reconsidered thirty minutes ago; po_2 was withheld two
+  // hours ago and not touched since. Read from history, po_1 looks the more overdue and is asked
+  // again while it is still resting. Read from each document's LAST marker, po_1 is not due at all.
+  state.activityRows = [
+    withheldMarker({ createdAt: databaseNow(-4 * 60 * 60_000) }),
+    withheldMarker({ action: 'bill_payment_reversal_recheck_deferred', createdAt: databaseNow(-30 * 60_000) }),
+    withheldMarker({ entityId: 'po_2', createdAt: databaseNow(-2 * 60 * 60_000) }),
+  ]
+  state.purchaseInvoices = [
+    paidBillRow(),
+    { ...paidBillRow(), id: 'pi_2', accountingInvoiceId: 'XB2', poId: 'po_2', po: { reference: 'PO-0002', status: 'RECEIVED' } },
+  ]
+  state.recheckInvoices = [
+    bill({ InvoiceID: 'XB1', AmountPaid: 0, AmountDue: 500 }),
+    bill({ InvoiceID: 'XB2', AmountPaid: 0, AmountDue: 500 }),
+  ]
+
+  const result = await poll()
+
+  assert.equal(result.withheldRechecked, 1, 'a document reconsidered half an hour ago is still resting')
+  assert.deepEqual(state.recheckFetches, ['Invoices?IDs=XB2'])
 })

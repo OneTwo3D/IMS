@@ -589,9 +589,15 @@ const READ_AT = databaseLedgerFence(new Date('2026-08-20T12:00:00.000Z'))
 const BEFORE_READ = new Date('2026-08-20T11:00:00.000Z')
 const AFTER_READ = new Date('2026-08-20T12:00:01.000Z')
 
-const postedRegistration = (overrides: Partial<Parameters<typeof classifyRegisteredPayment>[1][number]> = {}) => ({
-  id: 'log_1', status: 'SYNCED', externalTransactionId: 'PAY-1', syncedAt: BEFORE_READ, ...overrides,
-})
+const postedRegistration = (
+  overrides: Partial<Parameters<typeof classifyRegisteredPayment>[1][number]> = {},
+): Parameters<typeof classifyRegisteredPayment>[1][number] => {
+  const row = { id: 'log_1', status: 'SYNCED', externalTransactionId: 'PAY-1', syncedAt: BEFORE_READ, ...overrides }
+  // Written by ONE statement of the current build, so the completion time and its provenance marker
+  // are the same instant (o3d-clxw round 5). A case that wants an old build's row overrides the
+  // marker explicitly — see the mixed-version tests below.
+  return { syncedAtDatabaseClock: row.syncedAt, ...row }
+}
 
 test('a listed payments array with an unreadable entry states nothing at all', () => {
   assert.equal(listedLedgerPaymentIds({ InvoiceID: 'i', Type: 'ACCPAY', Status: 'AUTHORISED' }), null,
@@ -693,6 +699,51 @@ test('a zero-paid document IMS can fully account for IS a reversal', () => {
     'no registration of ours can be in flight, so the zero is the whole story')
   assert.equal(zeroPaidIsProvenReversal({ verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }), true,
     'an aggregate of zero needs no list: a ledger holding no money is not holding ours')
+})
+
+// ---------------------------------------------------------------------------
+// A DEPLOY MUST NOT PUT THE SECOND CLOCK BACK (o3d-clxw round 5, Codex finding 1)
+//
+// Round 4 made both ends of the fence readings of the database's clock. It could not make the
+// PREVIOUS release stop writing `syncedAt` from its own host's `new Date()` — and during every
+// rollout both builds are running, so the new poller is handed host-clock rows and compares them
+// against a database fence. That is the cross-host comparison this branch exists to remove,
+// reintroduced by the release. It is now DETECTABLE — the stamp carries its provenance inside the
+// value — and an undetectable one withholds rather than being aged out.
+// ---------------------------------------------------------------------------
+
+test('a registration an OLD BUILD stamped from its host clock is undecidable, however old it looks (r5)', () => {
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0, Payments: [] })
+  // An hour before the ledger read — comfortably outside any skew anybody would call plausible, and
+  // round 4 would have called it decided on exactly that reasoning.
+  const oldBuildRow = postedRegistration({ syncedAt: BEFORE_READ, syncedAtDatabaseClock: null })
+  assert.deepEqual(classifyRegisteredPayment(invoice, [oldBuildRow], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] },
+    'no clock will vouch for this completion time, so it orders nothing — ageing out is not a fence')
+
+  // The other half of a mixed deploy: the database stamped the row, then an old build rewrote
+  // `syncedAt` from its host clock and left the marker where it was. The row states two different
+  // completion times, which is the disagreement, and a disagreement decides nothing.
+  const rewrittenByOldBuild = postedRegistration({
+    syncedAt: new Date(BEFORE_READ.getTime() + 90_000),
+    syncedAtDatabaseClock: BEFORE_READ,
+  })
+  assert.deepEqual(classifyRegisteredPayment(invoice, [rewrittenByOldBuild], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] })
+})
+
+test('one old-build registration withholds a document the database-stamped ones would have decided (r5)', () => {
+  // The mixed-version table: one row written by each build. The document is ONE document and paidAt is
+  // ONE flag, so the row nothing can order withholds the whole verdict — it is not out-voted by the
+  // row that can be ordered.
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [
+      postedRegistration({ id: 'log_new' }),
+      postedRegistration({ id: 'log_old', externalTransactionId: 'PAY-2', syncedAtDatabaseClock: null }),
+    ], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_old'] },
+    'GONE here clears paidAt, re-arms Mark Paid, and pays the supplier a second time')
 })
 
 test('a registration that synced at the very instant of the read is undecided, matching o3d-batch-payidx', () => {

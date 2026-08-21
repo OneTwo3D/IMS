@@ -361,7 +361,13 @@ async function readResidualVerdicts<T extends { id: string; accountingInvoiceId:
       referenceType,
       referenceId: { in: docs.map((d) => d.id) },
     },
-    select: { id: true, referenceId: true, status: true, externalTransactionId: true, syncedAt: true },
+    // `syncedAtDatabaseClock` is selected WITH `syncedAt` and never instead of it: the fence is the
+    // two agreeing, which is what makes a stamp written by an old build's host clock visible as one
+    // (o3d-clxw round 5, finding 1 — see databaseStampedCompletion).
+    select: {
+      id: true, referenceId: true, status: true, externalTransactionId: true,
+      syncedAt: true, syncedAtDatabaseClock: true,
+    },
   })
   const byDocument = new Map<string, RegisteredPaymentRow[]>()
   for (const row of rows) {
@@ -371,6 +377,7 @@ async function readResidualVerdicts<T extends { id: string; accountingInvoiceId:
       status: row.status,
       externalTransactionId: row.externalTransactionId,
       syncedAt: row.syncedAt,
+      syncedAtDatabaseClock: row.syncedAtDatabaseClock,
     })
     byDocument.set(row.referenceId, list)
   }
@@ -946,10 +953,16 @@ async function processDeltaChunk(
 //
 //   AND A DOCUMENT THAT IS STILL WITHHELD DOES NOT STARVE THE PAGE EITHER, because every recheck
 //   rewrites its marker. Oldest-first therefore means "least recently reconsidered first", which is a
-//   round robin, not a queue with a permanent head.
+//   round robin, not a queue with a permanent head. THAT ONLY HOLDS WHILE A DOCUMENT OCCUPIES ONE
+//   PLACE IN THE ORDERING (round 5, finding 3): rewriting a marker appends a row rather than moving
+//   one, so a page bounded by ROWS fills with the histories of the longest-withheld documents and
+//   starves every newer one permanently. The candidate set is therefore built by GROUPING the markers
+//   per document and taking each document's newest — see `recheckWithheldReversals`.
 //
 // Failure is always towards asking again: a marker that could not be rewritten stays as it was, which
-// leaves the document due; a Xero read that fails re-asks nothing and closes nothing.
+// leaves the document due; a Xero read that fails re-asks nothing and closes nothing; and a
+// reconsideration that hit an error DEFERS rather than closes, because "we could not decide" must
+// never be spent as "there is nothing left to decide" (round 5, finding 2).
 
 /** Actions whose presence as the LATEST row means the disagreement is still open. */
 const WITHHELD_OPEN_ACTIONS = [
@@ -968,7 +981,13 @@ const WITHHELD_CLOSED_ACTIONS = [
 /** How long a withheld verdict rests before it is reconsidered. */
 export const WITHHELD_RECHECK_INTERVAL_MS = 60 * 60 * 1000
 
-/** How far back through the withheld/cleared history one poll reads to rebuild the open set. */
+/**
+ * How many DOCUMENTS one poll rebuilds the open set from — not how many marker rows it reads.
+ *
+ * The distinction is the whole of round 5's finding 3: markers accumulate (reconsidering appends a
+ * row), so a bound on rows is a bound that one long-running document's own history can consume,
+ * while a bound on documents is not.
+ */
 const WITHHELD_MARKER_SCAN = 400
 
 /**
@@ -987,15 +1006,18 @@ const WITHHELD_RECHECK_PAGE = 40
 /** Invoice ids per `Invoices?IDs=` request — Xero takes a comma-separated list. */
 const WITHHELD_RECHECK_BATCH = 40
 
+/**
+ * A document's LAST marker of one kind — the newest open row, or the newest closure.
+ *
+ * No `action` field (round 5, finding 3): the two kinds now arrive from two queries whose own
+ * predicates do the classifying, so an action carried through to be re-checked here would be a
+ * restatement of the query rather than a fact about the document. Each side is at most one entry per
+ * document, which is the property the round robin needs.
+ */
 type WithheldMarker = {
   entityType: ActivityEntityType
   entityId: string
-  action: string
   createdAt: Date
-}
-
-function isOpenAction(action: string): boolean {
-  return (WITHHELD_OPEN_ACTIONS as readonly string[]).includes(action)
 }
 
 /**
@@ -1003,9 +1025,14 @@ function isOpenAction(action: string): boolean {
  *
  * Reduced from the activity log rather than a queue table: a document is open when its newest OPEN
  * marker is newer than any closure written for it, and due when that marker has rested a full
- * interval. Open and closed rows are read separately so neither can crowd the other out of a bounded
- * scan — the open scan wants the OLDEST rows (that is where the overdue work is) and the closure scan
- * wants the NEWEST (that is what settles a document).
+ * interval. Open and closed markers are read separately so neither can crowd the other out of a
+ * bounded scan — the open side wants the documents whose last reconsideration is OLDEST (that is
+ * where the overdue work is) and the closure side wants each document's NEWEST closure (that is what
+ * settles it).
+ *
+ * Each list holds at most one entry per document, because the queries group by document. That is
+ * load-bearing rather than tidy: the caller's page is bounded, and a list of raw marker ROWS lets one
+ * document's history fill it and starve every other document for ever (finding 3).
  *
  * Note the two clocks that appear here are BOTH scheduling, not ordering — `createdAt` is the
  * database's and `now` is this host's, and disagreement between them can only make a recheck happen
@@ -1024,7 +1051,7 @@ export function dueWithheldMarkers(
     }
     return into
   }
-  const open = newest(new Map(), openMarkers.filter((m) => isOpenAction(m.action)))
+  const open = newest(new Map(), openMarkers)
   const closed = newest(new Map(), closureMarkers)
 
   return [...open.entries()]
@@ -1083,21 +1110,58 @@ async function recheckWithheldReversals(
   fetchInvoices: (path: string) => Promise<{ ok: boolean; data?: XeroInvoicesResponse; error?: string; status?: number }>,
 ): Promise<void> {
   const horizon = new Date(Date.now() - WITHHELD_MARKER_HORIZON_MS)
-  const scan = (actions: readonly string[], order: 'asc' | 'desc') => db.activityLog.findMany({
-    where: { tag: 'sync', action: { in: [...actions] }, entityId: { not: null }, createdAt: { gte: horizon } },
-    orderBy: { createdAt: order },
+  // ONE ROW PER DOCUMENT, NOT ONE PER MARKER (o3d-clxw round 5, Codex finding 3).
+  //
+  // Round 4's round robin rests on "oldest first means least recently reconsidered", and that only
+  // holds if a document occupies ONE place in the ordering. It does not: reconsidering a document
+  // APPENDS a marker, the old ones stay in the activity log for the whole thirty-day horizon, and a
+  // bounded scan of ROWS ordered oldest-first therefore fills with the HISTORY of whichever documents
+  // have been withheld longest. One document reconsidered hourly writes seven hundred rows a month on
+  // its own — more than the whole scan — so a document that became withheld yesterday need never
+  // appear in the page at all, and never being in the page means never being reconsidered, which
+  // means never writing a newer marker: the starvation is permanent and self-sustaining. Worse, the
+  // marker such a page DOES yield for the starving document is its oldest row, so the timer that
+  // decides whether it is due is read from history rather than from its last reconsideration.
+  //
+  // Grouping makes the bound a bound on DOCUMENTS, which is what it was always meant to be, and takes
+  // the newest marker per document, which is what "least recently reconsidered" was always meant to
+  // read. History cannot occupy a slot, because a document has exactly one.
+  //
+  // (Cost: the group has to see the whole horizon rather than stopping at the first N rows. In
+  // practice the old query rarely stopped early either — these four actions are a vanishingly small
+  // fraction of activity_logs, so finding N of them already meant scanning most of the window. An
+  // index over (action, entityType, entityId, createdAt) would make this cheap and is worth doing;
+  // it is a separate concurrent-build migration, not part of this correctness fix.)
+  const lastMarkerPerDocument = (
+    actions: readonly string[],
+    order: 'asc' | 'desc',
+    onlyEntityIds?: string[],
+  ) => db.activityLog.groupBy({
+    by: ['entityType', 'entityId'],
+    where: {
+      tag: 'sync',
+      action: { in: [...actions] },
+      entityId: onlyEntityIds ? { in: onlyEntityIds } : { not: null },
+      createdAt: { gte: horizon },
+    },
+    _max: { createdAt: true },
+    orderBy: { _max: { createdAt: order } },
     take: WITHHELD_MARKER_SCAN,
-    select: { entityType: true, entityId: true, action: true, createdAt: true },
   })
-  // OPEN oldest-first (the overdue end), CLOSURES newest-first (the settling end).
-  const [openRows, closureRows] = await Promise.all([
-    scan(WITHHELD_OPEN_ACTIONS, 'asc'),
-    scan(WITHHELD_CLOSED_ACTIONS, 'desc'),
-  ])
-  const named = (rows: typeof openRows): WithheldMarker[] =>
-    rows.flatMap((m) => (m.entityId == null ? [] : [{ ...m, entityId: m.entityId }]))
+  const named = (groups: Awaited<ReturnType<typeof lastMarkerPerDocument>>): WithheldMarker[] =>
+    groups.flatMap((g) => (g.entityId == null || g._max.createdAt == null
+      ? []
+      : [{ entityType: g.entityType, entityId: g.entityId, createdAt: g._max.createdAt }]))
 
-  const due = dueWithheldMarkers(named(openRows), named(closureRows), Date.now())
+  // OPEN documents least-recently-reconsidered first (the overdue end). Their closures are then read
+  // FOR THOSE DOCUMENTS ONLY: a closure that decides one of these documents can no longer be crowded
+  // out of a bounded page by unrelated closures, which would have re-opened a settled document.
+  const openMarkers = named(await lastMarkerPerDocument(WITHHELD_OPEN_ACTIONS, 'asc'))
+  const closureMarkers = openMarkers.length === 0
+    ? []
+    : named(await lastMarkerPerDocument(WITHHELD_CLOSED_ACTIONS, 'desc', openMarkers.map((m) => m.entityId)))
+
+  const due = dueWithheldMarkers(openMarkers, closureMarkers, Date.now())
   if (due.length === 0) return
   result.withheldRechecked += due.length
 
@@ -1141,6 +1205,28 @@ async function recheckWithheldReversals(
   }
 
   const stillWithheld = new Set<string>()
+  // WHAT THE DECISION PASS COULD NOT ANSWER MUST NOT BE READ AS AN ANSWER (round 5, finding 2).
+  //
+  // `stillWithheld` is positive evidence of one thing only — that a document was re-asked and is
+  // withheld again. Its ABSENCE is not evidence of the opposite. The registered-payment reading is a
+  // database read inside `processDeltaChunk`, and when it throws — a dropped connection, a pool
+  // timeout, a statement cancelled under load — that chunk's residual reading is empty, no document
+  // in it is signalled as withheld, and every one of them would fall through to the `settled` close
+  // below. A transient fault would then permanently retire the recheck for documents nobody
+  // reconsidered at all, leaving `paidAt` set against a ledger that disagrees with it and no marker
+  // left to bring the question back. Permanent, from a cause that lasted a second.
+  //
+  // `processDeltaChunk` does not throw — it records what it could not do on `result.errors`, which is
+  // exactly what its own caller uses to refuse to checkpoint the cursor past a chunk it could not
+  // fully answer. The recheck's equivalent of refusing to checkpoint is refusing to CLOSE, so it
+  // watches the same signal. Errors are counted rather than inspected on purpose: any error raised
+  // while these documents were being decided means this pass did not decide them all, and which
+  // document a given error belongs to is not always recoverable from the message.
+  //
+  // Coarse in the safe direction, and only in the safe direction: an unrelated error inside the same
+  // chunk defers documents that were in fact settled, which costs one activity row and one more
+  // reconsideration an hour later. The opposite mistake costs a supplier payment.
+  const errorsBeforeDecision = result.errors.length
   if (fetched.size > 0) {
     await processDeltaChunk([...fetched.values()], result, {
       windowStart,
@@ -1148,6 +1234,7 @@ async function recheckWithheldReversals(
       withheldMode: { recheck: true, observe: (key) => stillWithheld.add(key) },
     })
   }
+  const decisionIncomplete = result.errors.length > errorsBeforeDecision
 
   for (const marker of due) {
     const key = withheldEntityKey(marker.entityType, marker.entityId)
@@ -1156,6 +1243,8 @@ async function recheckWithheldReversals(
     if (stillWithheld.has(key)) continue
 
     const invoiceIds = invoiceIdsByEntity.get(key)
+    // Grounded in IMS's own state and in nothing the ledger said, so an error in the decision pass
+    // below has no bearing on it: there is no disagreement left to decide either way.
     if (!invoiceIds || invoiceIds.length === 0) {
       result.withheldResolved++
       await closeWithheldMarker(marker, 'no-paid-document',
@@ -1167,6 +1256,12 @@ async function recheckWithheldReversals(
     // document goes to the BACK of the oldest-first page instead of holding its head for ever.
     if (!invoiceIds.every((id) => fetched.has(id))) {
       await deferWithheldMarker(marker, 'Xero did not return the invoice')
+      continue
+    }
+    // The read came back, but the pass that turns it into a verdict reported a failure. Nothing here
+    // is evidence that this document settled, so it is deferred — asked again — not closed.
+    if (decisionIncomplete) {
+      await deferWithheldMarker(marker, 'the reconsideration pass could not complete')
       continue
     }
     result.withheldResolved++

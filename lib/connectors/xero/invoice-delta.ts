@@ -1021,13 +1021,67 @@ export type RegisteredPaymentRow = {
   /** The ledger's id for the payment this registration created, if it got that far. */
   externalTransactionId: string | null
   /**
-   * When the registration became complete, AS THE DATABASE MEASURED IT.
+   * When the registration became complete — CLAIMED. Which clock produced it is not visible here.
    *
-   * Written by `stampSyncedAtFromDatabaseClock` in the sync processor as `clock_timestamp()`, in the
-   * same transaction that sets SYNCED and strictly after the POST to Xero returned. It is NOT the
-   * processor host's `new Date()` any more — see LedgerReadFence for why that mattered.
+   * `stampSyncedAtFromDatabaseClock` writes `clock_timestamp()`, but an application host's `new
+   * Date()` lands in the same column and is indistinguishable once stored. `syncedAtDatabaseClock`
+   * is what tells the two apart; nothing may be decided from this field alone.
    */
   syncedAt: Date | null
+  /**
+   * The provenance marker for `syncedAt`: the same instant, written by the same statement from one
+   * evaluation of the database's `clock_timestamp()`.
+   *
+   * NULL, or any value other than `syncedAt`, means the completion time was NOT minted by the
+   * database — an old build wrote it, or moved `syncedAt` out from under a marker it did not know
+   * about. See `databaseStampedCompletion`.
+   */
+  syncedAtDatabaseClock: Date | null
+}
+
+/**
+ * The instant this registration completed AS THE DATABASE MEASURED IT, or null if no such instant
+ * can be produced from the row.
+ *
+ * MIXED-VERSION FENCE (o3d-clxw round 5, Codex finding 1). Round 4 made both ends of the reversal
+ * comparison readings of one clock — the database's — and noted one residual it could not close: a
+ * row written by the PREVIOUS release still carries the processor host's `new Date()`, and comparing
+ * THAT against a database fence is precisely the cross-host comparison round 4 removed, reintroduced
+ * by the deploy rather than by the code. During any rollout both builds run at once, so this is not a
+ * historical curiosity; it is the state of the table for as long as the deploy takes, and it enables
+ * the exact failure this branch exists to prevent — flag clears, Mark Paid re-arms, supplier paid
+ * twice. Round 4's proposal was to let those rows age past any plausible skew, and ageing out is not
+ * a fence: "plausible skew" is the assumption the branch spent four rounds deleting.
+ *
+ * The sibling branch o3d-batch-wcfix answered the same shape of question the same way — make an old
+ * build's write DETECTABLE by carrying the marker inside the value it writes, so a build that strips
+ * it announces itself, and on disagreement apply no change at all rather than guess which side is
+ * right. Here the value is the timestamp and the marker is a second column holding the SAME instant
+ * from the SAME single evaluation of `clock_timestamp()`:
+ *
+ *   marker absent      an old build created the row. It never wrote the column, so it is NULL.
+ *   marker disagrees   an old build rewrote `syncedAt` from its host clock and left the marker where
+ *                      the database had put it. The row now states two different completion times.
+ *   marker equal       the pair was written by one statement of the current build, which is the only
+ *                      writer that can produce it, so the instant IS the database's.
+ *
+ * Only the third is an instant this fence may order against `LedgerReadFence`. The first two withhold
+ * — they do not fall back to `syncedAt`, do not tie-break, and do not age out. An undecided
+ * registration is work the poller comes back to (the withheld-reversal recheck), whereas a wrong
+ * decision here is a second supplier payment.
+ *
+ * This can only ever SHRINK the decided set relative to round 4, which is what keeps the
+ * o3d-batch-payidx merge algebra intact: `billpay` still withholds everywhere the sibling's
+ * `OR: [{ syncedAt: null }, { syncedAt: { gte: fence } }]` calls a row undecidable, and now in
+ * strictly more places besides.
+ */
+export function databaseStampedCompletion(row: Pick<RegisteredPaymentRow, 'syncedAt' | 'syncedAtDatabaseClock'>): Date | null {
+  const { syncedAt, syncedAtDatabaseClock } = row
+  if (syncedAt == null || syncedAtDatabaseClock == null) return null
+  // Equality, not "the marker exists": a stale marker under a host-clock rewrite would otherwise
+  // vouch for an instant that is no longer this row's.
+  if (syncedAt.getTime() !== syncedAtDatabaseClock.getTime()) return null
+  return syncedAtDatabaseClock
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,10 +1119,16 @@ export type RegisteredPaymentRow = {
 // registration whose transaction opened before its POST would be stamped before the payment existed.
 // `clock_timestamp()` is read at the statement, which is after.
 //
-// Residual, stated plainly: a row stamped by the PREVIOUS release still carries a host clock, and a
-// single clock stepped backwards by NTP can still misorder two of its own readings. Both are far
-// smaller than free-running skew between two machines, and neither is repairable without a schema
-// change to carry a monotonic generation instead of a timestamp.
+// ROUND 5 CLOSED THE ROLLOUT HOLE THIS PARAGRAPH USED TO WAVE AT. A row stamped by the PREVIOUS
+// release carries a host clock, and comparing that against a database fence is the same cross-host
+// comparison, put back by the deploy. It is no longer allowed to be compared at all: the stamp now
+// carries a provenance marker inside the value (`syncedAtDatabaseClock`, see
+// `databaseStampedCompletion`), and a row that cannot prove the database minted its completion time
+// is UNDECIDABLE rather than aged past a plausible skew.
+//
+// Residual, stated plainly: a single clock stepped backwards by NTP can still misorder two of its own
+// readings. That is far smaller than free-running skew between two machines, and closing it needs a
+// monotonic generation rather than a timestamp.
 
 declare const DATABASE_CLOCK_BRAND: unique symbol
 
@@ -1143,12 +1203,15 @@ export function classifyRegisteredPayment(
     // CANCELLED is the one status this tree only ever asserts where "nothing was sent" is true, so it
     // holds no payment and blocks nothing.
     if (row.status === 'CANCELLED') continue
+    // The completion instant the DATABASE minted, or null when the row cannot prove which clock wrote
+    // it — an old build's host-clock stamp is not a fence, it is the defect (round 5, finding 1).
+    const completedAt = databaseStampedCompletion(row)
     // SYNCED with an id, finished before the ledger was read: the ledger's answer covers it.
     if (
       row.status === 'SYNCED'
       && typeof row.externalTransactionId === 'string'
       && row.externalTransactionId.trim() !== ''
-      && row.syncedAt != null
+      && completedAt != null
       // No fence, no decision: see the NULL FENCE note above.
       && ledgerObservedBefore != null
       // STRICTLY before, matching the sibling's `OR: [{ syncedAt: null }, { syncedAt: { gte:
@@ -1156,7 +1219,7 @@ export function classifyRegisteredPayment(
       // give opposite answers about the same row, and the safe side of a tie about a supplier payment
       // is "this read cannot speak for it". Both sides of this `<` are database readings — the
       // comparison is meaningless, and was actively dangerous, between two hosts.
-      && row.syncedAt.getTime() < ledgerObservedBefore.databaseClock.getTime()
+      && completedAt.getTime() < ledgerObservedBefore.databaseClock.getTime()
     ) {
       posted.push(row.externalTransactionId.trim())
       continue
@@ -1164,7 +1227,8 @@ export function classifyRegisteredPayment(
     // Everything else is a registration whose ledger effect is unknown to THIS read: PENDING (about
     // to be sent), PROCESSING (may be on the wire now), FAILED (attempted, outcome unknown — the
     // processor posts before it persists, so a lost response is written down as a rejection), SYNCED
-    // with no id (posted, but we do not know what it created), and SYNCED after the read.
+    // with no id (posted, but we do not know what it created), SYNCED after the read, and SYNCED with
+    // a completion time no clock will vouch for (an old build's stamp, round 5 finding 1).
     undecided.push(row.id)
   }
 
