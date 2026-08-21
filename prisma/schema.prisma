@@ -2267,6 +2267,29 @@ model AccountingEvent {
   currency         String
   externalSystem   String?
   externalId       String?
+  // o3d-cvj9 r3: the EXTERNAL system's own revision stamp for the document this event posted —
+  // Xero's `Invoice.UpdatedDateUTC`, taken from the response to the very write we made. It is the
+  // only ordering that is true of the order in which edits were APPLIED to the document, so it is
+  // what decides which of two competing revisions may hold `externalId`. Null means "not
+  // established" (the connector returned none, the row predates this column, or an administrative
+  // backfill wrote it) and is never guessed at — see resolveDocumentRevisionOrder.
+  externalRevisionAt DateTime?
+  // o3d-cvj9 r4/r5: on what basis this row can be ordered against another revision of the same
+  // document when there is no `externalRevisionAt` to compare. A CATEGORY, never a clock. Two
+  // values are written, both by the code that made (or repaired) the write, and both cleared the
+  // moment a live write records a real stamp on the row:
+  //   historical_backfill_repair — the administrative backfill repaired a write its sync log had
+  //     already recorded complete, and that row TOOK the document id. See
+  //     HISTORICAL_BACKFILL_REVISION_ORDER_BASIS.
+  //   live_write_unstamped — the connector wrote in this attempt and returned no readable stamp, so
+  //     the wiped `externalRevisionAt` must not be read as "this row never wrote". See
+  //     LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS.
+  // o3d-cvj9 r6: NEITHER value orders its row against another write on its own — the first says
+  // nothing about when the arriving write landed, and the second says a write happened, not when and
+  // not whether it was a re-post. Both feed rules that ASSUME an order and return it labelled as an
+  // assumption, which the live mirror acts on (and audits) and the backfill declines.
+  // Null everywhere else — including on the enqueue-time row of every live revision.
+  revisionOrderBasis String?
   reversalOfId     String?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
@@ -2293,6 +2316,12 @@ model AccountingEventLog {
   accountingEvent   AccountingEvent @relation(fields: [accountingEventId], references: [id], onDelete: Cascade)
 
   @@index([accountingEventId, createdAt])
+  // o3d-cvj9 r7: the accounting reconciliation report selects this table by ACTION — the handovers
+  // the live mirror made on an order nothing established (`superseded_by_assumed_order`) — bounded
+  // by its lookback. Without this index that is a scan of the largest audit table in the schema on
+  // every run. The existing index is keyed by event, which that query has no value for: the whole
+  // point is to find the entries without knowing which events they hang off.
+  @@index([action, createdAt])
   @@map("accounting_event_logs")
 }
 

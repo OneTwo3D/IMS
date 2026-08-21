@@ -5,6 +5,7 @@
 import { xeroPost } from './api'
 import { findOrCreateContact } from './contacts'
 import { findOrCreateItem } from './items'
+import { xeroDocumentRevisionAt } from './document-revision'
 import { imsRateToXeroCurrencyRate } from './fx'
 import type { InvoiceData, InvoiceLine } from '../types'
 
@@ -15,6 +16,9 @@ type XeroInvoiceResponse = {
     Status: string
     Total?: number
     AmountDue?: number
+    // o3d-cvj9 r3: Xero's own revision stamp for the document, applied by THIS write. It is what
+    // orders two competing revisions of one invoice — see xeroDocumentRevisionAt.
+    UpdatedDateUTC?: string
   }>
 }
 
@@ -169,7 +173,7 @@ export async function pushSalesInvoice(
   data: InvoiceData,
   status: string = 'AUTHORISED',
   opts?: { idempotencyKey?: string; customerId?: string },
-): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; error?: string }> {
+): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; externalRevisionAt?: Date | null; error?: string }> {
   const prepared = await prepareSalesInvoicePayload(data, status, opts)
   if (!prepared.success) return prepared
 
@@ -179,7 +183,13 @@ export async function pushSalesInvoice(
   }
 
   const inv = res.data.Invoices[0]
-  return { success: true, invoiceId: inv.InvoiceID, invoiceNumber: inv.InvoiceNumber, total: inv.Total }
+  return {
+    success: true,
+    invoiceId: inv.InvoiceID,
+    invoiceNumber: inv.InvoiceNumber,
+    total: inv.Total,
+    externalRevisionAt: xeroDocumentRevisionAt(inv),
+  }
 }
 
 export async function updateSalesInvoice(
@@ -187,7 +197,7 @@ export async function updateSalesInvoice(
   data: InvoiceData,
   status: string = 'AUTHORISED',
   opts?: { idempotencyKey?: string; customerId?: string },
-): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; error?: string }> {
+): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; externalRevisionAt?: Date | null; error?: string }> {
   const prepared = await prepareSalesInvoicePayload(data, status, opts)
   if (!prepared.success) return prepared
 
@@ -197,5 +207,11 @@ export async function updateSalesInvoice(
   }
 
   const inv = res.data.Invoices[0]
-  return { success: true, invoiceId: inv.InvoiceID, invoiceNumber: inv.InvoiceNumber, total: inv.Total }
+  return {
+    success: true,
+    invoiceId: inv.InvoiceID,
+    invoiceNumber: inv.InvoiceNumber,
+    total: inv.Total,
+    externalRevisionAt: xeroDocumentRevisionAt(inv),
+  }
 }
