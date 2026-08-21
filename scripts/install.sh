@@ -67,6 +67,144 @@ urlencode() {
   printf '%s' "$out"
 }
 
+# Byte-wise inverse of urlencode (o3d-tsc0).
+#
+# It exists so that RE-RUNNING this installer keeps the Redis that is already
+# working. REDIS_URL is canonical, so the credential a previous run committed to is
+# the one encoded in that URL, and recovering it is what lets an operator press
+# Enter through an upgrade without silently swapping a working password for a
+# default. LC_ALL=C for the same reason as the encoder: %C3%A4 has to come back as
+# the two bytes the server was configured with, not as one codepoint.
+urldecode() {
+  local LC_ALL=C string="$1" out="" i c hex byte
+  for (( i = 0; i < ${#string}; i++ )); do
+    c="${string:i:1}"
+    hex="${string:i+1:2}"
+    if [[ "$c" == "%" && "$hex" =~ ^[0-9A-Fa-f]{2}$ ]]; then
+      printf -v byte '%b' "\\x${hex}"
+      out+="$byte"
+      i=$(( i + 2 ))
+    else
+      out+="$c"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+# Render a value as a redis.conf string literal.
+#
+# THE OTHER HALF OF THE SAME DEFECT. urlencode settles what the CLIENT sends;
+# this settles what the SERVER is configured to expect, and unless both are the same
+# byte sequence the install is dead on arrival — and dead in the way that is hardest
+# to diagnose, because the auth rate-limit buckets fail CLOSED, so a Redis answering
+# NOAUTH surfaces as nobody being able to sign in to the server just installed.
+#
+# redis.conf is NOT read by a shell. Redis parses each line with sdssplitargs(),
+# which splits on whitespace and opens a quoted section on a `"` or a `'` ANYWHERE in
+# a token. So `requirepass my pass` is a wrong-number-of-arguments error at startup,
+# `requirepass a"b` swallows the rest of the line, and `requirepass a\` escapes the
+# newline. Emitting EVERY byte as \xHH inside double quotes removes all of those at
+# once — there is no byte whose meaning depends on its neighbours — and it walks the
+# string with the same LC_ALL=C byte loop as urlencode, so the two ends are encoding
+# one identical byte sequence rather than two encodings that merely agree on ASCII.
+redis_conf_quote() {
+  local LC_ALL=C string="$1" out='"' i
+  for (( i = 0; i < ${#string}; i++ )); do
+    out+="$(printf '\\x%02X' "'${string:i:1}")"
+  done
+  printf '%s"' "$out"
+}
+
+# Replace the requirepass directive in a redis.conf WITHOUT handing the password to
+# sed. In a sed replacement `&` means the whole match, `\1` is a backreference and the
+# delimiter ends the expression, so an interpolated password is stored as a different
+# byte sequence than the one that was typed — the same class of bug as the config
+# quoting above, one layer out. The old directives are therefore matched by PATTERN
+# and dropped, and the new line is appended verbatim. The file is rewritten with
+# `cat >` rather than `mv` so redis.conf keeps its own owner and mode.
+redis_conf_set_requirepass() {
+  local conf="$1" line="$2" tmp status=0
+  tmp="$(mktemp)"
+  grep -vE '^[[:space:]]*#*[[:space:]]*requirepass([[:space:]]|$)' "${conf}" > "${tmp}" || status=$?
+  if (( status > 1 )); then
+    rm -f "${tmp}"
+    die "Could not rewrite ${conf} to set requirepass."
+  fi
+  printf '%s\n' "${line}" >> "${tmp}"
+  cat "${tmp}" > "${conf}"
+  rm -f "${tmp}"
+}
+
+# Print the shape of a URL, never the secret in it. Character-for-character the same
+# function as the one in scripts/provision-ims-tenant.sh, for the same reason the
+# encoder is duplicated: the two scripts share no shell library, and this installer
+# now both reads and displays a URL that carries a credential.
+#
+# THE CUT IS AT THE LAST `@`, NOT THE FIRST. A URL this script BUILT has a
+# percent-encoded password and holds exactly one `@`, so either cut lands in the same
+# place — but an operator-supplied REDIS_URL is taken verbatim, and
+# `redis://:se@cret@host:6379` cut at the first `@` prints `redis://***@cret@host:6379`,
+# which puts the tail of the secret into the very log this function exists to keep it
+# out of. Cutting at the last `@` cannot do that for any input. The obvious
+# alternative — find the authority by taking everything up to the first `/` — is a
+# TRAP: a password containing a slash ends that scan early, so the `@` is never seen
+# and the WHOLE url is printed. The cost of the last-`@` rule is over-redaction of a
+# credential-free URL that happens to contain an `@`, which is the direction to be
+# wrong in: an over-redacted line is cosmetic, an under-redacted one is a secret in a
+# file somebody keeps.
+redact_url_credentials() {
+  local url="$1" rest
+  case "$url" in
+    *"://"*"@"*)
+      rest="${url#*://}"
+      printf '%s://***@%s' "${url%%://*}" "${rest##*@}"
+      ;;
+    *) printf '%s' "$url" ;;
+  esac
+}
+
+# A prompt default is echoed to the terminal and captured by any typescript of the
+# install, so a credential recovered from an existing .env is NEVER the thing shown.
+# Pressing Enter still keeps the real value.
+mask_secret() {
+  if [[ -n "${1:-}" ]]; then
+    printf 'unchanged'
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# What an earlier run of this installer already committed to (o3d-tsc0)
+# ---------------------------------------------------------------------------
+# An upgrade run that breaks a working install is worse than a bad first install: the
+# operator has no reason to suspect the installer, and the failure is total. The .env
+# is written by an UNQUOTED heredoc, so `KEY=VALUE` to end of line is exactly what a
+# previous run wrote and reading it back the same way round-trips byte for byte.
+declare -A EXISTING_ENV=()
+
+load_existing_env() {
+  local file="$1" line key value
+  [[ -f "${file}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "${line}" == *=* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    EXISTING_ENV["${key}"]="${value}"
+  done < "${file}"
+}
+
+# The value the previous run wrote, or the supplied fallback on a first install.
+existing_env() {
+  local key="$1" fallback="${2:-}"
+  if [[ -n "${EXISTING_ENV[${key}]-}" ]]; then
+    printf '%s' "${EXISTING_ENV[${key}]}"
+  else
+    printf '%s' "${fallback}"
+  fi
+}
+
 run_as_user() {
   local user="$1"
   shift
@@ -172,31 +310,45 @@ NON_INTERACTIVE=false
 # ---------------------------------------------------------------------------
 # Helper: prompt with default
 # ---------------------------------------------------------------------------
+# A fifth argument overrides what is DISPLAYED as the default, without changing what
+# Enter selects. Defaults are now recovered from an existing .env (see below), and a
+# recovered credential must not be echoed to the terminal or into a typescript of the
+# install just because it is the default.
+#
+# The assignment is `printf -v`, not `eval`. `eval` re-parsed the default and the
+# operator's own keystrokes as shell source, so a preserved value containing a quote,
+# a `$` or a backtick was either mangled or executed — which is the same "stored as
+# one byte sequence, used as another" failure this issue is about, in the one place
+# that would run it.
 prompt() {
-  local varname="$1" question="$2" default="$3" secret="${4:-}"
+  local varname="$1" question="$2" default="$3" secret="${4:-}" shown current
+  shown="${default}"
+  [[ $# -lt 5 ]] || shown="$5"
   if $NON_INTERACTIVE; then
-    eval "$varname=\"\${$varname:-$default}\""
+    current="${!varname-}"
+    printf -v "$varname" '%s' "${current:-${default}}"
     return
   fi
   if [[ "$secret" == "secret" ]]; then
-    read -r -s -p "$(echo -e "${BOLD}${question}${RESET} [${default}]: ")" input
+    read -r -s -p "$(echo -e "${BOLD}${question}${RESET} [${shown}]: ")" input
     echo ""
   else
-    read -r -p "$(echo -e "${BOLD}${question}${RESET} [${default}]: ")" input
+    read -r -p "$(echo -e "${BOLD}${question}${RESET} [${shown}]: ")" input
   fi
-  eval "$varname=\"\${input:-$default}\""
+  printf -v "$varname" '%s' "${input:-${default}}"
 }
 
 prompt_yn() {
-  local varname="$1" question="$2" default="${3:-y}"
+  local varname="$1" question="$2" default="${3:-y}" current
   if $NON_INTERACTIVE; then
-    eval "$varname=\"\${$varname:-$default}\""
+    current="${!varname-}"
+    printf -v "$varname" '%s' "${current:-${default}}"
     return
   fi
   local options="[Y/n]"; [[ "$default" == "n" ]] && options="[y/N]"
   read -r -p "$(echo -e "${BOLD}${question}${RESET} ${options}: ")" input
   input="${input:-$default}"
-  eval "$varname=\"${input,,}\""
+  printf -v "$varname" '%s' "${input,,}"
 }
 
 # ---------------------------------------------------------------------------
@@ -238,8 +390,23 @@ success "Pre-flight checks passed."
 # ---------------------------------------------------------------------------
 header "Configuration"
 
+# Running the installer a SECOND time must not undo the first run (o3d-tsc0). Every
+# preserved prompt below defaults to what the previous run committed to
+# ${APP_DIR}/.env, so accepting the defaults on an upgrade re-writes the same values
+# rather than the factory ones. Before this, a re-run replaced a working REDIS_URL
+# with `redis://localhost:6379`, dropped the password, and minted a fresh
+# AUTH_SECRET, CRON_SECRET and SETTINGS_ENCRYPTION_KEY. That is a worse failure than
+# a bad first install: the operator has no reason to suspect the installer, the
+# Redis half fails CLOSED so it reads as "nobody can sign in", and a re-minted
+# SETTINGS_ENCRYPTION_KEY makes every encrypted Setting already in the database
+# permanently undecryptable.
+load_existing_env "${APP_DIR}/.env"
+
 echo -e "${YELLOW}Please provide the following configuration values."
 echo -e "Press Enter to accept the default shown in brackets.${RESET}"
+if (( ${#EXISTING_ENV[@]} > 0 )); then
+  echo -e "${YELLOW}An existing ${APP_DIR}/.env was found — its values are the defaults.${RESET}"
+fi
 echo ""
 
 # App source
@@ -299,11 +466,47 @@ fi
 echo ""
 info "--- Redis ---"
 prompt_yn INSTALL_REDIS "Install Redis on this server?" "n"
+
+# What an EARLIER run already made work, recovered before anything is prompted.
+# REDIS_URL is canonical, so the credential to keep is the one encoded in the URL —
+# not the compatibility line, which this installer deliberately leaves empty whenever
+# the URL carries the secret. Decoding it back means an operator who presses Enter
+# through an upgrade keeps BOTH ends: the same bytes go back into redis.conf and back
+# into the URL. The userinfo ends at the LAST `@` for the same reason the redaction
+# cuts there (see redact_url_credentials): any earlier `@` may be part of the
+# credential itself.
+EXISTING_REDIS_URL="$(existing_env REDIS_URL)"
+EXISTING_REDIS_USERINFO=""
+case "${EXISTING_REDIS_URL}" in
+  *"://"*"@"*)
+    EXISTING_REDIS_USERINFO="${EXISTING_REDIS_URL#*://}"
+    EXISTING_REDIS_USERINFO="${EXISTING_REDIS_USERINFO%@*}"
+    ;;
+esac
+EXISTING_REDIS_USERNAME=""
+EXISTING_REDIS_PASSWORD=""
+if [[ -n "${EXISTING_REDIS_USERINFO}" ]]; then
+  # Percent-encoding guarantees the password's own `:` is escaped, so the FIRST colon
+  # is the user/password delimiter and nothing here has to guess.
+  if [[ "${EXISTING_REDIS_USERINFO}" == *":"* ]]; then
+    EXISTING_REDIS_USERNAME="$(urldecode "${EXISTING_REDIS_USERINFO%%:*}")"
+    EXISTING_REDIS_PASSWORD="$(urldecode "${EXISTING_REDIS_USERINFO#*:}")"
+  else
+    EXISTING_REDIS_USERNAME="$(urldecode "${EXISTING_REDIS_USERINFO}")"
+  fi
+fi
+# The compatibility line is consulted only when the URL carried no credential at all.
+if [[ -z "${EXISTING_REDIS_PASSWORD}" ]]; then
+  EXISTING_REDIS_PASSWORD="$(existing_env REDIS_PASSWORD)"
+fi
+
 REDIS_USERINFO=""
+REDIS_URL_HAS_CREDENTIAL=n
 if [[ "$INSTALL_REDIS" == "y" ]]; then
   REDIS_HOST="localhost"
   prompt REDIS_PORT     "Redis port" "6379"
-  prompt REDIS_PASSWORD "Redis password (leave blank if none)" ""
+  prompt REDIS_PASSWORD "Redis password (leave blank if none)" "${EXISTING_REDIS_PASSWORD}" "secret" \
+    "$(mask_secret "${EXISTING_REDIS_PASSWORD}")"
   # The password has to go INTO the URL, because REDIS_URL is what the
   # application connects with (o3d-tsc0). This line used to build the URL
   # credential-free while the block further down wrote `requirepass` into
@@ -315,24 +518,66 @@ if [[ "$INSTALL_REDIS" == "y" ]]; then
   # rather than carrying a second copy of the same secret.
   if [[ -n "${REDIS_PASSWORD}" ]]; then
     REDIS_USERINFO=":$(urlencode "${REDIS_PASSWORD}")@"
+    if [[ -n "${EXISTING_REDIS_USERNAME}" ]]; then
+      # A Redis 6 ACL username this installer never prompts for, but which a previous
+      # run or a hand edit may have put in the URL. Dropping it on a re-run turns
+      # `AUTH <user> <pass>` into `AUTH <pass>`, which the server refuses — the same
+      # lockout by a different route, so carry it through.
+      REDIS_USERINFO="$(urlencode "${EXISTING_REDIS_USERNAME}"):$(urlencode "${REDIS_PASSWORD}")@"
+    fi
+    REDIS_URL_HAS_CREDENTIAL=y
   fi
   REDIS_URL="redis://${REDIS_USERINFO}${REDIS_HOST}:${REDIS_PORT}"
 else
-  prompt REDIS_URL      "Redis URL (redis://host:port[/db])" "redis://localhost:6379"
-  prompt REDIS_PASSWORD "Redis password (leave blank if none)" ""
+  prompt REDIS_URL      "Redis URL (redis://host:port[/db])" \
+    "$(existing_env REDIS_URL 'redis://localhost:6379')" "" \
+    "$(redact_url_credentials "$(existing_env REDIS_URL 'redis://localhost:6379')")"
+  prompt REDIS_PASSWORD "Redis password (leave blank if none)" "${EXISTING_REDIS_PASSWORD}" "secret" \
+    "$(mask_secret "${EXISTING_REDIS_PASSWORD}")"
+  # THE EXTERNAL-REDIS OPERATOR WAS STILL IN THE PRE-FIX STATE. Round one put the
+  # credential in the URL only on the local-install path; an operator pointing this
+  # installer at a Redis they already run typed a password at the prompt above that
+  # NOTHING READS — the client connects with REDIS_URL — so they were handed a server
+  # nobody can sign in to, exactly as before. The password goes where it is read.
+  if [[ -n "${REDIS_PASSWORD}" ]]; then
+    if [[ "${REDIS_URL}" == *"://"*"@"* ]]; then
+      # The URL already carries a credential, so it WINS and is left verbatim: an
+      # inline credential already beats any environment fallback at runtime, and
+      # rewriting an operator's own connection string is how you end up
+      # authenticating with something nobody typed. The test for "already has one" is
+      # deliberately the same over-broad `@`-anywhere test the redaction uses. The
+      # precise-looking alternative — the authority is everything up to the first `/`
+      # — is a TRAP: a password containing a slash ends that scan before the `@`, so
+      # a URL that already has a credential reads as having none and gets a SECOND one
+      # spliced in front of it. Refusing to inject when an `@` appears in a path or
+      # query costs a warning; getting it wrong costs the install.
+      REDIS_URL_HAS_CREDENTIAL=y
+      if [[ "${REDIS_URL}" != "${EXISTING_REDIS_URL}" || "${REDIS_PASSWORD}" != "${EXISTING_REDIS_PASSWORD}" ]]; then
+        # Silent when a re-run changed NOTHING: there the "ignored" password IS the
+        # one recovered from that very URL, and a warning printed on every ordinary
+        # upgrade is a warning operators learn to skip past.
+        warn "REDIS_URL already carries a credential, so the password entered at the Redis prompt is ignored — the application authenticates with REDIS_URL. Clear one of the two if that is not what you meant."
+      fi
+    elif [[ "${REDIS_URL}" == *"://"* ]]; then
+      REDIS_URL="${REDIS_URL%%://*}://:$(urlencode "${REDIS_PASSWORD}")@${REDIS_URL#*://}"
+      REDIS_URL_HAS_CREDENTIAL=y
+    else
+      die "REDIS_URL must be of the form redis://host:port[/db] so the Redis password can be placed inside it. The application authenticates with REDIS_URL, and a password that never reaches AUTH takes sign-in down with it, because the login rate-limit buckets fail closed."
+    fi
+  fi
 fi
-prompt REDIS_KEY_PREFIX "Redis key prefix (leave blank for none)" ""
-# What the compatibility line in .env gets. When the installer put the credential
-# INTO REDIS_URL above, this stays EMPTY on purpose: writing the same secret to
-# two places is what this issue removed, and it is not a tidiness argument. The
-# raw value would go into .env unquoted, so a password containing `#`, a quote or
-# whitespace arrives at the runtime as something OTHER than what is encoded in
-# the URL — and a REDIS_URL/REDIS_PASSWORD disagreement is refused outright
-# rather than resolved by precedence (o3d-uqz0), which would take the rate
+prompt REDIS_KEY_PREFIX "Redis key prefix (leave blank for none)" "$(existing_env REDIS_KEY_PREFIX)"
+# What the compatibility line in .env gets. When the credential is IN REDIS_URL —
+# whether this installer put it there or the operator did — this stays EMPTY on
+# purpose: writing the same secret to two places is what this issue removed, and it is
+# not a tidiness argument. The raw value would go into .env unquoted, so a password
+# containing `#`, a quote or whitespace arrives at the runtime as something OTHER than
+# what is encoded in the URL — and a REDIS_URL/REDIS_PASSWORD disagreement is refused
+# outright rather than resolved by precedence (o3d-uqz0), which would take the rate
 # limiter down on a host whose URL was actually correct. REDIS_PASSWORD itself is
 # untouched and still configures `requirepass` further down.
 REDIS_PASSWORD_ENV="${REDIS_PASSWORD}"
-if [[ -n "${REDIS_USERINFO}" ]]; then
+if [[ "${REDIS_URL_HAS_CREDENTIAL}" == "y" ]]; then
   REDIS_PASSWORD_ENV=""
 fi
 
@@ -495,14 +740,23 @@ if [[ "$INSTALL_REDIS" == "y" ]]; then
     sed -i -E "s/^port .*/port ${REDIS_PORT}/" "${REDIS_CONF}"
     sed -i -E "s/^bind .*/bind 127.0.0.1 ::1/" "${REDIS_CONF}" || true
     sed -i -E "s/^protected-mode .*/protected-mode yes/" "${REDIS_CONF}" || true
+    # THE SERVER SIDE OF THE CREDENTIAL. What goes in here must be the same bytes the
+    # client sends in REDIS_URL, or the install is dead on arrival in the way that is
+    # hardest to diagnose: the auth rate-limit buckets fail CLOSED, so a Redis that
+    # answers NOAUTH looks like nobody being able to sign in rather than like Redis.
+    #
+    # It used to be written through shell interpolation into a sed replacement (`&` is
+    # the whole match there, `\1` a backreference, `|` the delimiter) or appended raw
+    # into a file redis parses with sdssplitargs (whitespace splits the token, and a
+    # `"` or `'` anywhere in it opens a quoted section). Either way a password
+    # containing a quote, a hash, a backslash or a space was STORED as one byte
+    # sequence and SENT as another. redis_conf_quote emits every byte as \xHH from the
+    # same LC_ALL=C byte walk as urlencode, and redis_conf_set_requirepass never lets
+    # sed see the password at all.
     if [[ -n "${REDIS_PASSWORD}" ]]; then
-      if grep -qE '^[#[:space:]]*requirepass ' "${REDIS_CONF}"; then
-        sed -i -E "s|^[#[:space:]]*requirepass .*|requirepass ${REDIS_PASSWORD}|" "${REDIS_CONF}"
-      else
-        printf '\nrequirepass %s\n' "${REDIS_PASSWORD}" >> "${REDIS_CONF}"
-      fi
+      redis_conf_set_requirepass "${REDIS_CONF}" "requirepass $(redis_conf_quote "${REDIS_PASSWORD}")"
     else
-      sed -i -E "s|^[#[:space:]]*requirepass .*|# requirepass foobared|" "${REDIS_CONF}" || true
+      redis_conf_set_requirepass "${REDIS_CONF}" "# requirepass foobared"
     fi
   fi
 
@@ -692,9 +946,16 @@ chmod 600 "${DEPLOY_META_FILE}"
 # ---------------------------------------------------------------------------
 header "Writing .env configuration"
 
-AUTH_SECRET="$(openssl rand -base64 32)"
-SETTINGS_ENCRYPTION_KEY="$(openssl rand -base64 32)"
-CRON_SECRET="$(openssl rand -hex 32)"
+# Minted on a FIRST install and KEPT on every run after it (o3d-tsc0). Re-minting
+# these on an upgrade is not a fresh start, it is a break, and a silent one:
+# AUTH_SECRET invalidates every existing session, CRON_SECRET makes the crontab this
+# same script wrote unauthorised against the app it points at, and a new
+# SETTINGS_ENCRYPTION_KEY makes every encrypted Setting already in the database —
+# Xero tokens, connector secrets — permanently undecryptable. openssl is still run on
+# a first install; existing_env only answers when the previous .env had the line.
+AUTH_SECRET="$(existing_env AUTH_SECRET "$(openssl rand -base64 32)")"
+SETTINGS_ENCRYPTION_KEY="$(existing_env SETTINGS_ENCRYPTION_KEY "$(openssl rand -base64 32)")"
+CRON_SECRET="$(existing_env CRON_SECRET "$(openssl rand -hex 32)")"
 
 cat > "${APP_DIR}/.env" <<EOF
 # One Two Inventory — generated by install.sh on $(date -u +"%Y-%m-%d %H:%M:%S UTC")

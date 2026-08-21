@@ -44,6 +44,21 @@ For full Proxmox + Cloudflare + OpenLiteSpeed tenant rollout, see [Automated Ten
 
 The installer asks for the following values during setup. Press Enter to accept the default shown in brackets.
 
+**Re-running the installer keeps what the previous run configured.** Every prompt whose value is
+written to `.env` defaults to the value already there, so an upgrade run accepting the defaults
+re-writes the same configuration rather than the factory one. That applies to `REDIS_URL` and its
+credential, `REDIS_KEY_PREFIX`, and to `AUTH_SECRET`, `CRON_SECRET` and `SETTINGS_ENCRYPTION_KEY`,
+which are generated on a first install and never re-minted afterwards — re-minting
+`SETTINGS_ENCRYPTION_KEY` would make every encrypted Setting already in the database (Xero tokens,
+connector secrets) permanently undecryptable. Supplying a value explicitly — at the prompt, or as an
+environment variable under `--non-interactive` — still overrides the preserved one, so rotation works
+as before. A preserved credential is never echoed as the prompt default: the URL is shown redacted and
+a preserved password is shown as `[unchanged]`.
+
+Prompts NOT preserved across a re-run: the WooCommerce, Xero, Turnstile and SMTP values, and the
+database prompts. Supply them again (or as environment variables) on an upgrade run, or the re-written
+`.env` will blank them.
+
 ### Application
 - **Domain name** — the hostname for your installation (e.g. `ims.yourdomain.com`)
 - **Internal port** — the port the app listens on (default: `3000`)
@@ -59,9 +74,29 @@ After installation, sign in and set the organisation base currency in **Settings
 - **Database password** — auto-generated if not provided
 
 ### Redis
-- **Redis URL** (default: `redis://localhost:6379`)
+- **Install Redis on this server** — install and configure a local Redis, or point at one you already run
+- **Redis URL** (default: `redis://localhost:6379`) — only asked when Redis is not installed here
 - **Redis password** — leave blank if not required
 - **Redis key prefix** — optional namespace for Redis-backed features
+
+The password you enter is placed **inside `REDIS_URL`**, percent-encoded, and the `REDIS_PASSWORD`
+line in `.env` is left empty. `REDIS_URL` is what the application authenticates with; a password that
+reaches only `REDIS_PASSWORD` never reaches `AUTH`, and because the login rate-limit buckets fail
+closed, a Redis answering `NOAUTH` does not look like a Redis fault — it looks like nobody can sign in.
+This applies to both branches: a locally installed Redis, and a Redis you already run.
+
+If the `REDIS_URL` you supply already carries a credential of its own, it is left exactly as you typed
+it and a password entered at the prompt is ignored with a warning — the URL wins, and an operator's
+connection string is never rewritten. If you supply a password alongside a `REDIS_URL` that is not of
+the form `redis://host:port[/db]`, the installer stops rather than proceeding with a password it cannot
+place.
+
+For a locally installed Redis, the same password is written to `/etc/redis/redis.conf` as a quoted
+`\xHH` string literal, built from the same byte-by-byte walk as the URL encoding. `redis.conf` is
+parsed by redis's own `sdssplitargs()`, which splits on whitespace and opens a quoted section on a
+quote character anywhere in a token, so a password containing whitespace, a quote or a backslash cannot
+be written into it literally — the server would either refuse to start or require different bytes than
+the client sends.
 
 ### WooCommerce (Optional)
 - Store URL, consumer key, consumer secret, webhook secret
@@ -390,7 +425,7 @@ Key variables in the `.env` file:
 | `AUTH_URL` | Authentication callback URL (same as app URL) |
 | `DATABASE_URL` | PostgreSQL connection string |
 | `PREFLIGHT_DB_CONNECT` | Optional production preflight database connectivity probe. Set `true` during rollout when the preflight process can reach Postgres; default `false` for build-only CI jobs |
-| `REDIS_URL` | Redis connection URL, and the canonical place a Redis credential lives: `redis://:PASSWORD@host:port/db` (percent-encode the password). It is what the client connects with, and it is the only form that can express a Redis 6 ACL username. `scripts/install.sh` writes it this way when it provisions Redis locally |
+| `REDIS_URL` | Redis connection URL, and the canonical place a Redis credential lives: `redis://:PASSWORD@host:port/db` (percent-encode the password). It is what the client connects with, and it is the only form that can express a Redis 6 ACL username. `scripts/install.sh` writes it this way for BOTH a locally provisioned Redis and one you already run, and leaves `REDIS_PASSWORD` empty when it does |
 | `REDIS_PASSWORD` | Compatibility fallback, used only when `REDIS_URL` carries no credential of its own — for hosts whose URL predates the rule above. Set one or the other, not both: two different values are a configuration error and are refused rather than resolved by precedence. A Redis that answers `NOAUTH` does not look like a Redis fault, because the login rate-limit buckets fail closed — it looks like nobody can sign in |
 | `REDIS_KEY_PREFIX` | Optional Redis namespace prefix for tenant- or instance-scoped keys |
 | `WC_STORE_URL` | WooCommerce store URL |
