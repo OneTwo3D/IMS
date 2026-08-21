@@ -37,6 +37,30 @@ const notifications: Array<{ userId?: string | null; title?: string; message?: s
 let syncLogWriteError: string | null = null
 
 /**
+ * Set to make every `updateMany` on shopping_sync_logs THROW.
+ *
+ * The other way a write does not land. `updateMany` matching nothing is already
+ * expressible (resolve or replace the row mid-ring); a database that refuses the
+ * statement outright is not, and the two have to reach the caller as the same
+ * answer — the row does not record what we decided — or "we gave up" gets
+ * reported off the back of a write that never happened (o3d-xnwu round 6).
+ */
+let syncLogUpdateError: string | null = null
+
+/**
+ * Fires ONCE, inside the `create` that files a refusal, with the row just
+ * pushed.
+ *
+ * This is the concurrent-refusal window and there is no other way to stand in
+ * it: two refusals of the same order each run `deleteMany` then `create`, and
+ * when the second's delete runs before the first's create commits, both deletes
+ * match nothing and both creates land. Setting up a second row BEFORE the call
+ * would model a recurring refusal, which is a different thing entirely — the
+ * re-file reads it and carries its state forward.
+ */
+let onRefusalCreated: ((row: SyncLogRow) => void) | null = null
+
+/**
  * Which admin ids `notify` REFUSES to write a row for (o3d-xnwu round 3).
  *
  * `notify` swallows its own errors and reports nothing, which is the whole
@@ -132,6 +156,14 @@ function matches(row: SyncLogRow, where: Record<string, unknown>): boolean {
     if (value !== null && typeof value === 'object' && 'path' in (value as Record<string, unknown>)) {
       return matchesJsonPath(row[key], value as { path: string[]; equals: unknown })
     }
+    // `{ id: { in: [...] } }`. Honoured rather than compared by reference, so a
+    // delete of the duplicate rows a concurrent refusal left behind can be
+    // observed to hit exactly those rows — and, just as importantly, can be
+    // observed NOT to hit the survivor.
+    if (value !== null && typeof value === 'object' && 'in' in (value as Record<string, unknown>)) {
+      const wanted = (value as { in: unknown }).in
+      return Array.isArray(wanted) && wanted.includes(row[key])
+    }
     return row[key] === value
   })
 }
@@ -159,6 +191,11 @@ mock.module('@/lib/db', {
           // guess at — and the guess is what would be under test.
           const row = { ...data, id: `syncLog-${nextSyncLogId++}`, createdAt: new Date() }
           syncLogs.push(row)
+          if (onRefusalCreated) {
+            const hook = onRefusalCreated
+            onRefusalCreated = null
+            hook(row)
+          }
           return row
         },
         findFirst: async ({ where }: { where: Record<string, unknown> }) =>
@@ -172,7 +209,7 @@ mock.module('@/lib/db', {
         findMany: async ({ where, take, orderBy }: {
           where: Record<string, unknown>
           take?: number
-          orderBy?: { createdAt?: 'asc' | 'desc' }
+          orderBy?: { createdAt?: 'asc' | 'desc'; id?: 'asc' | 'desc' }
         }) => {
           // `take` is honoured below, and it is what makes the queue's shape
           // observable: a double that returned everything would ring the row
@@ -182,9 +219,17 @@ mock.module('@/lib/db', {
           if (orderBy?.createdAt === 'asc') {
             found.sort((a, b) => Number(a.createdAt as Date) - Number(b.createdAt as Date))
           }
+          // Text order on the id column, which is what Postgres gives for a
+          // String id. A double that returned insertion order would make the
+          // survivor rule unfalsifiable: every racer would "agree" simply because
+          // the test happened to create its row last.
+          if (orderBy?.id === 'asc') {
+            found.sort((a, b) => String(a.id).localeCompare(String(b.id)))
+          }
           return take === undefined ? found : found.slice(0, take)
         },
         updateMany: async ({ where, data }: { where: Record<string, unknown>; data: SyncLogRow }) => {
+          if (syncLogUpdateError) throw new Error(syncLogUpdateError)
           // Honours the FULL where clause, id and refusal predicate alike. A
           // double that matched on id alone could not observe the fence at all,
           // and the fence is the point: between the read and this write the row
@@ -224,6 +269,8 @@ function reset() {
   fulfillmentCalls.length = 0
   notifications.length = 0
   syncLogWriteError = null
+  syncLogUpdateError = null
+  onRefusalCreated = null
   notifyFailsFor = new Set()
   notifyFailsForOrder = new Set()
   onFirstNotify = null
@@ -901,4 +948,308 @@ test('an exhausted bell rings again when the order is refused afresh', async () 
 
   assert.deepEqual(notifications.map((row) => row.userId), ['admin-1', 'admin-2'], 'the bell rings again')
   assert.equal(belled(), true)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu round 6, finding 1 — WHAT IS REPORTED IS WHAT WAS WRITTEN.
+//
+// Round 5 made exhaustion a THIRD state so that a row could leave the sweep
+// while still saying plainly that nobody was told. A report of an exhaustion
+// that was never persisted breaks exactly that: the count tells the operator,
+// once and loudly, that we gave up on an order no row records giving up on —
+// and the row goes on being retried underneath that report. The loudness and
+// the durability have to agree.
+// ---------------------------------------------------------------------------
+
+test('giving up is reported only when the row RECORDS it — a fresh refusal mid-ring means it does not (o3d-xnwu r6, finding 1)', async () => {
+  reset()
+  const WC_REFUSAL_BELL_ATTEMPT_LIMIT = await bellAttemptLimit()
+  await refuseWithFailedBell()
+  const staleId = openRefusals()[0].id as string
+  for (let attempt = 2; attempt < WC_REFUSAL_BELL_ATTEMPT_LIMIT; attempt++) await runBellRetry()
+  assert.equal(
+    payloadOf(staleId).adminBellAttempts,
+    WC_REFUSAL_BELL_ATTEMPT_LIMIT - 1,
+    'precondition: one attempt of budget left, so the next sweep is the one that would give up',
+  )
+
+  // The order is refused again while that last attempt is mid-ring. The re-file
+  // deletes the row and creates a replacement with a NEW id and a fresh budget,
+  // so the write that would have recorded "we gave up" fences off a row that no
+  // longer exists — and the order is, in fact, still being rung.
+  onFirstNotify = () => {
+    const kept = syncLogs.filter((row) => row.id !== staleId)
+    syncLogs.splice(0, syncLogs.length, ...kept)
+    parkRefusal({ id: 'refiled', orderId: 'so-1', orderNumber: '4242', createdAt: new Date() })
+  }
+  activityLog.length = 0
+  const sweep = await runBellRetry()
+
+  assert.equal(syncLogs.find((row) => row.id === staleId), undefined, 'precondition: the row we were ringing was replaced')
+  assert.equal(sweep.exhausted, 0, 'nothing recorded that we gave up, so nothing may report that we did')
+  assert.equal(sweep.stillUndelivered, 1, 'it is counted as a row still being tried, because that is what it is')
+  assert.equal(
+    activityLog.find((entry) => entry.action === 'wc_completion_refusal_bell_exhausted'),
+    undefined,
+    'and the one loud line is not written over a state the table does not contain',
+  )
+  assert.equal(payloadOf('refiled').adminNotified, false, 'the fresh row still asks to be rung, with its own budget')
+})
+
+test('a giving-up whose write THREW is not reported either, and is asked again (o3d-xnwu r6, finding 1)', async () => {
+  reset()
+  const WC_REFUSAL_BELL_ATTEMPT_LIMIT = await bellAttemptLimit()
+  await refuseWithFailedBell()
+  const rowId = openRefusals()[0].id as string
+  for (let attempt = 2; attempt < WC_REFUSAL_BELL_ATTEMPT_LIMIT; attempt++) await runBellRetry()
+
+  // The other way a write does not land. `updateMany` matching nothing and
+  // `updateMany` throwing have to reach the caller as the same answer.
+  syncLogUpdateError = 'connection terminated unexpectedly'
+  activityLog.length = 0
+  const failed = await runBellRetry()
+
+  assert.equal(failed.exhausted, 0, 'a decision that reached no row is not a state anybody can be told about')
+  assert.equal(failed.stillUndelivered, 1)
+  assert.equal(
+    activityLog.find((entry) => entry.action === 'wc_completion_refusal_bell_exhausted'),
+    undefined,
+  )
+  assert.equal(payloadOf(rowId).adminNotified, false, 'the old marker stands, so failure is always towards asking again')
+  assert.equal(
+    payloadOf(rowId).adminBellAttempts,
+    WC_REFUSAL_BELL_ATTEMPT_LIMIT - 1,
+    'and the attempt whose result could not be written did not spend budget either',
+  )
+
+  // The database comes back. NOW the row records it, so now — and only now — it
+  // is reported, and once.
+  syncLogUpdateError = null
+  const recorded = await runBellRetry()
+
+  assert.equal(recorded.exhausted, 1)
+  assert.equal(payloadOf(rowId).adminNotified, 'exhausted')
+  assert.equal(
+    activityLog.filter((entry) => entry.action === 'wc_completion_refusal_bell_exhausted').length,
+    1,
+    'the loud line follows the write, and there is exactly one of it',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu round 6, finding 2 — TWO REFUSALS AT ONCE MUST NOT BECOME TWO ROWS
+// AND TWO BELL LADDERS.
+//
+// The re-file is `deleteMany` then `create`, and two concurrent refusals of the
+// same order have nothing to contend on: each delete matches nothing and each
+// create lands. That defeats both invariants at once — the pile of identical
+// QUARANTINED rows the dedupe exists to prevent, and one bell ladder per row
+// aimed at the same admins every fifteen minutes for three hours.
+// ---------------------------------------------------------------------------
+
+/** The row a RACING refusal of the same order committed while we were filing ours. */
+function raceRefusal(opts: { id: string; deliveredTo?: string[] }) {
+  syncLogs.push({
+    id: opts.id,
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    status: 'QUARANTINED',
+    entityType: 'SalesOrderFulfillment',
+    entityId: 'so-1',
+    externalId: '4242',
+    errorMessage: 'External fulfillment requires physical stock',
+    payload: {
+      wcStatus: 'completed',
+      wcOrderNumber: '4242',
+      adminNotified: false,
+      adminBellDeliveredTo: opts.deliveredTo ?? [],
+      adminBellAttempts: opts.deliveredTo?.length ? 1 : 0,
+    },
+    createdAt: new Date(),
+  })
+}
+
+function refuseForStock() {
+  fulfillmentResult = {
+    success: false,
+    reason: 'insufficient-stock',
+    error: 'External fulfillment requires physical stock — order has 3 unit(s) on backorder',
+  }
+}
+
+test('two refusals filed at once leave ONE open row, and one bell per admin (o3d-xnwu r6, finding 2)', async () => {
+  reset()
+  refuseForStock()
+  // The racing refusal commits between our delete (which matched nothing) and
+  // our create. It has already rung admin-1. Its id sorts BEFORE ours, so the
+  // agreed survivor is ours.
+  let ourId = ''
+  onRefusalCreated = (row) => {
+    ourId = String(row.id)
+    raceRefusal({ id: 'aaa-racer', deliveredTo: ['admin-1'] })
+  }
+
+  await runCompletion()
+
+  const open = openRefusals()
+  assert.equal(open.length, 1, 'one order, one row on /sync/exceptions — a pile is the defect the dedupe exists for')
+  assert.equal(open[0].id, ourId, 'the id order decides it, and every racer reads the same order')
+  assert.deepEqual(
+    notifications.map((row) => row.userId),
+    ['admin-2'],
+    'admin-1 was told by the racer, so the survivor rings only the admin nobody has reached',
+  )
+  assert.deepEqual(
+    payloadOf(ourId).adminBellDeliveredTo,
+    ['admin-1', 'admin-2'],
+    'and the surviving row carries the UNION, so no later sweep re-rings either of them',
+  )
+  assert.equal(payloadOf(ourId).adminNotified, true, 'every active admin has a row, counted across both racers')
+
+  const deduped = activityLog.find((entry) => entry.action === 'wc_completion_refusal_deduped')
+  assert.ok(deduped, 'a self-heal nobody can see is indistinguishable from a defect nobody noticed')
+  assert.equal(deduped.level, 'WARNING')
+  assert.equal(deduped.metadata?.duplicates, 1)
+})
+
+test('the racer whose row does NOT survive stays silent, and the bell is not lost (o3d-xnwu r6, finding 2)', async () => {
+  reset()
+  refuseForStock()
+  // This time the racing row sorts AFTER ours, so ours is the duplicate.
+  let racerId = ''
+  onRefusalCreated = (row) => {
+    racerId = `${String(row.id)}-racer`
+    raceRefusal({ id: racerId })
+  }
+
+  await runCompletion()
+
+  const open = openRefusals()
+  assert.equal(open.length, 1)
+  assert.equal(open[0].id, racerId, 'the later id survives; ours was the duplicate and was merged away')
+  assert.equal(
+    notifications.length,
+    0,
+    'the losing racer rings nobody — two rows must not become two ladders at the same admins',
+  )
+  assert.equal(
+    payloadOf(racerId).adminNotified,
+    false,
+    'and staying silent is not a dropped bell: the surviving row still asks to be rung',
+  )
+
+  // Which the driver does, once, without the order being refused again.
+  const sweep = await runBellRetry()
+  assert.equal(sweep.delivered, 1)
+  assert.deepEqual(notifications.map((row) => row.userId), ['admin-1', 'admin-2'])
+})
+
+test('a merge that could not be written leaves BOTH rows rather than deleting the evidence (o3d-xnwu r6, finding 2)', async () => {
+  reset()
+  refuseForStock()
+  onRefusalCreated = () => {
+    raceRefusal({ id: 'aaa-racer', deliveredTo: ['admin-1'] })
+    syncLogUpdateError = 'connection terminated unexpectedly'
+  }
+
+  await runCompletion()
+
+  assert.equal(
+    openRefusals().length,
+    2,
+    'two visible rows for one order is untidy; a deleted last row is a refusal nobody can see',
+  )
+  assert.deepEqual(
+    payloadOf('aaa-racer').adminBellDeliveredTo,
+    ['admin-1'],
+    'and the racer\'s record of who it had already told is still there to be merged next time',
+  )
+  assert.equal(
+    activityLog.find((entry) => entry.action === 'wc_completion_refusal_deduped'),
+    undefined,
+    'nothing announces a merge that did not happen',
+  )
+  assert.deepEqual(
+    notifications.map((row) => row.userId),
+    ['admin-1', 'admin-2'],
+    'and with the union unwritten the bell errs towards ringing admin-1 twice, never towards telling nobody',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// A BOUND NO TEST EVER REACHES IS NOT A BOUND (o3d-xnwu round 6).
+//
+// The sibling branch found its short-page bound was unfalsifiable — every case
+// it had was one the reported total alone would have ended. The same question
+// asked here: every sweep test parks a handful of rows, so the per-run window
+// was never the thing that ended a run, and deleting it entirely left all of
+// them green.
+// ---------------------------------------------------------------------------
+
+test('the sweep takes a WINDOW per run, and the rows beyond it are reached by the next one', async () => {
+  reset()
+  const { WC_REFUSAL_BELL_RETRY_LIMIT } = await import('@/lib/connectors/woocommerce/sync/completion-flow')
+  // One more than a full window, all deliverable — and filed NEWEST FIRST, so
+  // that insertion order is the opposite of the order the sweep claims to take
+  // them in. Parking them oldest-first would let a sweep with no `orderBy` at
+  // all pass this test: which row is left behind is the only observable the
+  // ordering has, and it has to be the newest.
+  for (let index = WC_REFUSAL_BELL_RETRY_LIMIT; index >= 0; index--) {
+    parkRefusal({
+      id: `parked-${String(index).padStart(3, '0')}`,
+      orderId: `so-${index}`,
+      orderNumber: String(9000 + index),
+      createdAt: new Date(1_000 + index),
+    })
+  }
+
+  // NO limit passed: the default window is the one under test.
+  const first = await runBellRetry()
+
+  assert.equal(first.scanned, WC_REFUSAL_BELL_RETRY_LIMIT, 'one run rings a window, not the whole table')
+  assert.equal(first.delivered, WC_REFUSAL_BELL_RETRY_LIMIT)
+  assert.equal(
+    payloadOf(`parked-${String(WC_REFUSAL_BELL_RETRY_LIMIT).padStart(3, '0')}`).adminNotified,
+    false,
+    'the newest refusal is behind the window and was not rung — an unbounded run would have taken it',
+  )
+  assert.equal(
+    payloadOf('parked-000').adminNotified,
+    true,
+    'and the OLDEST was rung first, though it was filed last: a refusal must not wait behind newer ones',
+  )
+
+  const second = await runBellRetry()
+
+  assert.equal(second.scanned, 1, 'and the next run reaches it, because the rung rows have left the selection')
+  assert.equal(second.delivered, 1)
+  assert.equal(payloadOf(`parked-${String(WC_REFUSAL_BELL_RETRY_LIMIT).padStart(3, '0')}`).adminNotified, true)
+})
+
+test('a bell that LANDS on its last attempt is delivered, not given up on (o3d-xnwu r6)', async () => {
+  reset()
+  const WC_REFUSAL_BELL_ATTEMPT_LIMIT = await bellAttemptLimit()
+  await refuseWithFailedBell()
+  const rowId = openRefusals()[0].id as string
+  for (let attempt = 2; attempt < WC_REFUSAL_BELL_ATTEMPT_LIMIT; attempt++) await runBellRetry()
+
+  // The admins become reachable on the very attempt that spends the last of the
+  // budget. Delivery and exhaustion are mutually exclusive readings of one
+  // attempt, and counting it as both makes `stillUndelivered` NEGATIVE and
+  // writes an ERROR saying we gave up on the bell that has just landed.
+  notifyFailsFor = new Set()
+  activityLog.length = 0
+  const sweep = await runBellRetry()
+
+  assert.equal(sweep.delivered, 1, 'every admin has a row, on the last attempt there was')
+  assert.equal(sweep.exhausted, 0, 'so there is nothing to give up on')
+  assert.equal(sweep.stillUndelivered, 0, 'and the three counts still partition the rows scanned')
+  assert.equal(payloadOf(rowId).adminNotified, true, 'delivered — not the third state')
+  assert.equal(payloadOf(rowId).adminBellAttempts, WC_REFUSAL_BELL_ATTEMPT_LIMIT)
+  assert.equal(
+    activityLog.find((entry) => entry.action === 'wc_completion_refusal_bell_exhausted'),
+    undefined,
+    'nothing announces giving up on an order the operator has just been told about',
+  )
+  assert.deepEqual(notifications.map((row) => row.userId), ['admin-1', 'admin-2'])
 })

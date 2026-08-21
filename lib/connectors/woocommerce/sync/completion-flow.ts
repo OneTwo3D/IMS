@@ -127,7 +127,26 @@ function bellAttempts(payload: Record<string, unknown>): number {
 export type WcRefusalBellOutcome = {
   /** Every active admin now has a notification row for this refusal. */
   complete: boolean
-  /** The attempt budget ran out on this attempt, and the sweep will not select the row again. */
+  /**
+   * The attempt budget ran out on this attempt AND the row now records that we
+   * gave up, so the sweep will not select it again.
+   *
+   * o3d-xnwu round 6, finding 1. This is deliberately the WRITTEN state and not
+   * the decision: round 5 made exhaustion a third state precisely so a row could
+   * leave the queue while still saying plainly that nobody was told, and a
+   * giving-up that no row records says nothing to anybody. Reporting it anyway
+   * would make the loudness and the durability disagree — the operator would be
+   * told, once and loudly, about a state the table does not contain, and the row
+   * would go on being retried underneath that report.
+   *
+   * The write can fail to land in two ways, and both mean the same thing here:
+   * the update threw, or its fence matched nothing because the row was resolved
+   * or replaced by a fresh refusal mid-ring. In either case the row still says
+   * `false` — either this one or the fresh one — so the sweep will select it
+   * again, which is the same direction round 5 chose for the delivery write: a
+   * record that fails to write leaves the old marker standing, so failure is
+   * always towards asking again.
+   */
   exhausted: boolean
   /** Active ADMIN users at the moment of the attempt. */
   admins: number
@@ -183,7 +202,9 @@ async function ringWcCompletionRefusalBell(row: WcRefusalBellRow): Promise<WcRef
   // because it is a record of who was told and not a list of who to tell.
   const delivered = admins.filter((admin) => deliveredTo.has(admin.id)).length
   const complete = admins.length > 0 && delivered === admins.length
-  const exhausted = !complete && attempts >= WC_REFUSAL_BELL_ATTEMPT_LIMIT
+  // The DECISION to give up. Whether we may REPORT it depends on the write
+  // below landing — see `WcRefusalBellOutcome.exhausted`.
+  const givingUp = !complete && attempts >= WC_REFUSAL_BELL_ATTEMPT_LIMIT
 
   // Written on EVERY attempt, not only on full success (o3d-xnwu round 5). The
   // partial progress is the whole point: losing it means the admin who WAS
@@ -195,12 +216,12 @@ async function ringWcCompletionRefusalBell(row: WcRefusalBellRow): Promise<WcRef
   // `updateMany` matching nothing is the correct outcome there, and `update` by
   // id alone would either throw or stamp a row whose delivery state we never
   // actually established.
-  await db.shoppingSyncLog.updateMany({
+  const recorded = await db.shoppingSyncLog.updateMany({
     where: { id: row.id, ...buildExternalFulfillmentRefusalWhere(row.entityId ?? undefined) },
     data: {
       payload: JSON.parse(JSON.stringify({
         ...payload,
-        adminNotified: complete ? true : (exhausted ? 'exhausted' : false),
+        adminNotified: complete ? true : (givingUp ? 'exhausted' : false),
         adminBellDeliveredTo: [...deliveredTo],
         adminBellAttempts: attempts,
       })),
@@ -208,9 +229,15 @@ async function ringWcCompletionRefusalBell(row: WcRefusalBellRow): Promise<WcRef
   // The bell WAS rung; failing to write that down must not undo it. The cost
   // of losing this write is one duplicate bell next time, which is the right
   // direction to err.
-  }).catch(() => {})
+  //
+  // `count === 1` and not `catch`-only: the fence carries an id, so the update
+  // matches one row or none, and NONE is not an error — it is the row having
+  // been resolved or replaced while we rang. Both readings of "it did not land"
+  // have to reach the caller, because what the caller may report about giving up
+  // is exactly what this write put in the table.
+  }).then((result) => result.count === 1).catch(() => false)
 
-  return { complete, exhausted, admins: admins.length, delivered }
+  return { complete, exhausted: givingUp && recorded, admins: admins.length, delivered }
 }
 
 /**
@@ -327,6 +354,119 @@ export async function retryUnnotifiedWcCompletionRefusalBells(
 }
 
 /**
+ * ONE open row per order, decided AFTER every racing create is visible.
+ *
+ * o3d-xnwu round 6, finding 2. `recordWcCompletionRefusal` deletes the open row
+ * and creates a replacement, and there is nothing for those two statements to
+ * contend on: with no open row to lock, two concurrent refusals of the same
+ * order — the webhook and the daily reconcile arriving together — each delete
+ * NOTHING and each create a row. The result defeats both invariants at once. Two
+ * QUARANTINED rows for one order is the pile the dedupe exists to prevent, and
+ * each row carries its own delivery set, so each runs its own bell ladder: the
+ * same admin is rung twice at the refusal and twice more every fifteen minutes
+ * for three hours.
+ *
+ * WHY THIS IS NOT A LOCK. A per-order lock over the delete-and-create would
+ * guarantee the one row, and would still ring twice: the racers would file one
+ * after the other, and the SECOND one reads the first row's delivery set BEFORE
+ * the first has finished notifying, so it carries an empty set forward and rings
+ * everybody again. The window that has to be covered is the create AND the
+ * ringing, and a lock held across the notification writes is a transaction held
+ * open while another connection writes — trading a rare duplicate bell for a
+ * pool hazard on every refusal. (o3d-tj6v reached the same conclusion from the
+ * other side: a lock across a pivot that does not span the whole window covers
+ * none of it, and it closed its race by making the refusal non-terminal and
+ * re-driving it instead.)
+ *
+ * So arbitrate LATE rather than early. Every racer re-reads the open rows after
+ * its own create has landed, and they all pick the same survivor. That is
+ * strictly better than a lock for the bell: in the case where both creates land
+ * before either rings — the common one, because notifying is the slow part —
+ * only the racer that owns the survivor rings at all, so there is exactly one
+ * bell where a lock would have produced two.
+ *
+ * THE SURVIVOR IS CHOSEN BY ID, not by a timestamp. Any total order every racer
+ * agrees on will do, and the ids are one; `createdAt` is not, because whether it
+ * is stamped by the database or by the client is not something this module can
+ * see, and two hosts' clocks deciding which refusal is "later" is the failure
+ * mode this branch has spent five rounds removing. The rows are milliseconds
+ * apart, so WHICH one survives is immaterial — that every racer picks the SAME
+ * one is the whole content of the rule.
+ *
+ * Nothing is dropped by the merge. The losers' delivered sets are unioned into
+ * the survivor FIRST, and the losers are deleted only if that union actually
+ * landed: a merge that failed to write leaves the duplicates standing, because
+ * two visible rows for one order is a tidiness defect and a deleted last row is
+ * a refusal nobody can see.
+ *
+ * Returns the surviving row when it is the caller's OWN create — the caller
+ * rings it — and `null` otherwise. `null` is not a dropped bell: the surviving
+ * row still says `adminNotified: false`, so the fifteen-minute sweep re-drives
+ * it by id even if the racer that owns it dies between its create and its ring.
+ */
+async function convergeOpenWcCompletionRefusals(
+  orderId: string,
+  createdId: string,
+): Promise<{ id: string; payload: unknown } | null> {
+  const rows = await db.shoppingSyncLog.findMany({
+    where: buildExternalFulfillmentRefusalWhere(orderId),
+    orderBy: { id: 'asc' },
+    select: { id: true, payload: true },
+  })
+  if (rows.length === 0) return null
+  const survivor = rows[rows.length - 1]
+  const mine = survivor.id === createdId
+  // The ordinary path: our create is the only open row. Not ours means a racer
+  // replaced it between our create and this read — theirs stands, and theirs rings.
+  if (rows.length === 1) return mine ? survivor : null
+
+  const losers = rows.slice(0, -1)
+  const merged = refusalPayload(survivor.payload)
+  const deliveredTo = bellDeliveredTo(merged)
+  // `true` wins over `false`. A racer that read the PREVIOUS row after its bell
+  // landed and carried `true` forward is holding the later, truer reading of the
+  // same fact; discarding it would re-ring admins already told. Only `true` ever
+  // silences a bell, so `'exhausted'` and `false` both leave it ringing.
+  let notified = wasAdminBellDelivered(survivor.payload)
+  for (const loser of losers) {
+    for (const admin of bellDeliveredTo(refusalPayload(loser.payload))) deliveredTo.add(admin)
+    if (wasAdminBellDelivered(loser.payload)) notified = true
+  }
+  merged.adminNotified = notified
+  merged.adminBellDeliveredTo = [...deliveredTo]
+
+  const unionWritten = await db.shoppingSyncLog.updateMany({
+    where: { id: survivor.id, ...buildExternalFulfillmentRefusalWhere(orderId) },
+    data: { payload: JSON.parse(JSON.stringify(merged)) },
+  }).then((result) => result.count === 1).catch(() => false)
+  // The report follows the write here too. Deleting the losers before knowing
+  // the union landed can delete the only record that an admin was already told,
+  // and — if the survivor was resolved between the read and the write — the only
+  // record of the refusal itself.
+  if (!unionWritten) return mine ? survivor : null
+
+  await db.shoppingSyncLog.deleteMany({
+    where: { id: { in: losers.map((loser) => loser.id) }, ...buildExternalFulfillmentRefusalWhere(orderId) },
+  }).catch(() => {})
+
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'wc_completion_refusal_deduped',
+    tag: 'sync',
+    level: 'WARNING',
+    description:
+      `Two or more refusals of WooCommerce order ${orderId} were filed at once, so ${rows.length} exception rows existed`
+      + ' for it. They have been merged into one: the surviving row carries the union of the admins already told, and'
+      + ' the duplicates were removed. Nothing about the refusal itself changed, and no bell was lost.',
+    metadata: { duplicates: losers.length, survivingRow: survivor.id },
+    resolveUser: false,
+  }).catch(() => {})
+
+  return mine ? { id: survivor.id, payload: merged } : null
+}
+
+/**
  * Park a refusal where an operator is already looking (/sync/exceptions).
  *
  * ONE open row per order: a refusal that recurs (the daily reconcile, another
@@ -335,6 +475,11 @@ export async function retryUnnotifiedWcCompletionRefusalBells(
  * follow. Deleting and re-creating rather than updating deliberately re-stamps
  * `createdAt`, so the timestamp reads as "last refused", which is what an
  * operator triaging the list needs.
+ *
+ * The delete-and-create cannot enforce that on its own when two refusals of the
+ * same order arrive together — nothing serializes two deletes that both match
+ * nothing — so `convergeOpenWcCompletionRefusals` settles it after the fact, and
+ * decides which row rings.
  */
 async function recordWcCompletionRefusal(orderId: string, wcOrder: WcFullOrder, error: string): Promise<void> {
   // Read the open row BEFORE replacing it, because the one thing that must
@@ -387,14 +532,27 @@ async function recordWcCompletionRefusal(orderId: string, wcOrder: WcFullOrder, 
   //
   // Individually, never broadcast (userId null): the message names a customer
   // order, which READONLY/SUPPLIER users must not be shown.
-  if (alreadyBelled) return
+  //
+  // Rung against the SURVIVING row rather than blindly against the one we just
+  // created (o3d-xnwu round 6, finding 2). Two refusals filed at once leave two
+  // rows and, unresolved, two independent bell ladders aimed at the same admins;
+  // only the racer whose create survived rings, and it rings from the merged
+  // delivery set, so an admin another racer already told is not told again.
+  const surviving = await convergeOpenWcCompletionRefusals(orderId, created.id)
+  // Somebody else's row stands, or the refusal was resolved while we were
+  // filing. Either way this is not the row that rings, and the one that does is
+  // reachable without us: it says `adminNotified: false` and the sweep drives it.
+  if (!surviving) return
+  // Read from the SURVIVOR, not from the pre-transaction read: the merge may
+  // have carried a delivery the racer recorded after we took ours.
+  if (wasAdminBellDelivered(surviving.payload)) return
 
   const { complete, delivered, admins } = await ringWcCompletionRefusalBell({
-    id: created.id,
+    id: surviving.id,
     entityId: orderId,
     externalId: String(wcOrder.id),
     errorMessage: error,
-    payload: created.payload,
+    payload: surviving.payload,
   })
   if (complete) return
 
