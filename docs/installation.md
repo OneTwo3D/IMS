@@ -44,6 +44,32 @@ For full Proxmox + Cloudflare + OpenLiteSpeed tenant rollout, see [Automated Ten
 
 The installer asks for the following values during setup. Press Enter to accept the default shown in brackets.
 
+**Re-running the installer keeps what the previous run configured.** Every prompt whose value is
+written to `.env` defaults to the value already there, so an upgrade run accepting the defaults
+re-writes the same configuration rather than the factory one. That applies to `REDIS_URL` and its
+credential, `REDIS_KEY_PREFIX`, and to `AUTH_SECRET`, `CRON_SECRET` and `SETTINGS_ENCRYPTION_KEY`,
+which are generated on a first install and never re-minted afterwards — re-minting
+`SETTINGS_ENCRYPTION_KEY` would make every encrypted Setting already in the database (Xero tokens,
+connector secrets) permanently undecryptable. Supplying a value explicitly — at the prompt, or as an
+environment variable under `--non-interactive` — still overrides the preserved one, so rotation works
+as before. A preserved credential is never echoed as the prompt default: the URL is shown redacted and
+a preserved password is shown as `[unchanged]`.
+
+**A `.env` the installer cannot read is not a `.env` with no secrets.** Only a path with *nothing* at
+all on it is a first install. If `${APP_DIR}/.env` exists but is a directory, a dangling symlink, or
+a file this process cannot open or read to the end, the installer **stops** rather than minting fresh
+secrets over a live database. The same applies to a `.env` that was read but is missing any of
+`AUTH_SECRET`, `SETTINGS_ENCRYPTION_KEY` or `CRON_SECRET`: this installer writes all three on every
+run, so a file missing one was truncated or hand-edited, and minting a replacement for
+`SETTINGS_ENCRYPTION_KEY` is irreversible. Restore the missing line from your backup or from the
+running service's environment — or, if this really is a fresh start and the existing data is
+expendable, re-run with `IMS_INSTALL_REMINT_SECRETS=yes`, which mints them and says out loud what it
+just destroyed.
+
+Prompts NOT preserved across a re-run: the WooCommerce, Xero, Turnstile and SMTP values, and the
+database prompts. Supply them again (or as environment variables) on an upgrade run, or the re-written
+`.env` will blank them.
+
 ### Application
 - **Domain name** — the hostname for your installation (e.g. `ims.yourdomain.com`)
 - **Internal port** — the port the app listens on (default: `3000`)
@@ -59,9 +85,42 @@ After installation, sign in and set the organisation base currency in **Settings
 - **Database password** — auto-generated if not provided
 
 ### Redis
-- **Redis URL** (default: `redis://localhost:6379`)
+- **Install Redis on this server** — install and configure a local Redis, or point at one you already run
+- **Redis URL** (default: `redis://localhost:6379`) — only asked when Redis is not installed here
 - **Redis password** — leave blank if not required
 - **Redis key prefix** — optional namespace for Redis-backed features
+
+The password you enter is placed **inside `REDIS_URL`**, percent-encoded, and the `REDIS_PASSWORD`
+line in `.env` is left empty. `REDIS_URL` is what the application authenticates with; a password that
+reaches only `REDIS_PASSWORD` never reaches `AUTH`, and because the login rate-limit buckets fail
+closed, a Redis answering `NOAUTH` does not look like a Redis fault — it looks like nobody can sign in.
+This applies to both branches: a locally installed Redis, and a Redis you already run.
+
+If the `REDIS_URL` you supply already carries a credential of its own, it is left exactly as you typed
+it and a password entered at the prompt is ignored with a warning — the URL wins, and an operator's
+connection string is never rewritten. "Already carries one" means an `@` in the **authority** — the
+text between `://` and the first `/`, `?` or `#` — where an `@` can only be the userinfo separator. An
+`@` further along, in a path or a query string, is none of the installer's business and does **not**
+stop your password being placed in the URL.
+
+If the authority is neither of those things — neither a `host[:port]` nor something carrying a
+credential — the installer **stops**. That shape is what an unencoded `/` inside a password looks
+like (`redis://:pa/ss@host:6379`, whose authority reads as `:pa`), and it cannot be told apart from a
+malformed host: guessing one way splices a *second* credential in front of yours, and guessing the
+other drops your password entirely. Percent-encode the password inside `REDIS_URL` (a `/` is `%2F`)
+and leave the Redis password prompt blank, or give a plain `redis://host:port[/db]` and let the
+installer place the password. The port, if present, must be numeric — that is what makes the two
+readings distinguishable at all.
+
+If you supply a password alongside a `REDIS_URL` with no `://` at all, the installer stops rather
+than proceeding with a password it cannot place.
+
+For a locally installed Redis, the same password is written to `/etc/redis/redis.conf` as a quoted
+`\xHH` string literal, built from the same byte-by-byte walk as the URL encoding. `redis.conf` is
+parsed by redis's own `sdssplitargs()`, which splits on whitespace and opens a quoted section on a
+quote character anywhere in a token, so a password containing whitespace, a quote or a backslash cannot
+be written into it literally — the server would either refuse to start or require different bytes than
+the client sends.
 
 ### WooCommerce (Optional)
 - Store URL, consumer key, consumer secret, webhook secret
@@ -383,14 +442,15 @@ Key variables in the `.env` file:
 | `XERO_DAILY_BATCH_LIMIT` | Maximum entities per group per daily batch run. Default `1000`, hard cap `5000`. Larger tenants whose daily volume exceeds the cap get multiple deterministic-reference journals per date. |
 | `WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD` | When the WooCommerce pending-FX retry queue reaches this depth, notify active admins. Default `5`. The queue accumulates when WC orders arrive in a currency without a stored FX rate; it drains automatically after the next FX-rate refresh. |
 | `BD_GIT_HOOK` / `BEADS_HOOK_TIMEOUT` | Beads (bd) integration hook settings, used only when bd issue tracking is enabled in the working tree. Not required for runtime. |
+| `IMS_INSTANCE_ROLE` | What this deployment **is**: `production`, `stage`, `development` or `e2e`. `NODE_ENV` cannot answer this — it is set by the build, so `next start` reports `production` on a stage server, a second production-shaped copy and the end-to-end rig alike, and controls that exempt production therefore exempt all of them (o3d-l89a). Set it on **every** instance. Production preflight warns while it is absent and fails when it is present and says anything other than `production` (or when `E2E_TEST_MODE=1` contradicts it). Absence currently falls back to the old `NODE_ENV`/`E2E_TEST_MODE` reading; once production carries the line, absence becomes non-production everywhere. |
 | `INVOICE_PDF_STORAGE_DIR` | Persistent storage directory for connector-downloaded invoice PDFs served through signed links. Defaults locally to `./data/invoices`; required by production preflight. Relative paths resolve against the process working directory, so production values should be absolute |
 | `SETTINGS_ENCRYPTION_KEY` | 32-byte raw key, or base64 value that decodes to 32 bytes, used to encrypt sensitive Setting values stored in the database (auto-generated) |
 | `ENCRYPTION_KEY` | Legacy fallback for older installs; if needed during migration, it must also be a 32-byte raw key or base64 value that decodes to 32 bytes |
 | `AUTH_URL` | Authentication callback URL (same as app URL) |
 | `DATABASE_URL` | PostgreSQL connection string |
 | `PREFLIGHT_DB_CONNECT` | Optional production preflight database connectivity probe. Set `true` during rollout when the preflight process can reach Postgres; default `false` for build-only CI jobs |
-| `REDIS_URL` | Redis connection URL |
-| `REDIS_PASSWORD` | Redis password (if required) |
+| `REDIS_URL` | Redis connection URL, and the canonical place a Redis credential lives: `redis://:PASSWORD@host:port/db` (percent-encode the password). It is what the client connects with, and it is the only form that can express a Redis 6 ACL username. `scripts/install.sh` writes it this way for BOTH a locally provisioned Redis and one you already run, and leaves `REDIS_PASSWORD` empty when it does |
+| `REDIS_PASSWORD` | Compatibility fallback, used only when `REDIS_URL` carries no credential of its own — for hosts whose URL predates the rule above. Set one or the other, not both: two different values are a configuration error and are refused rather than resolved by precedence. A Redis that answers `NOAUTH` does not look like a Redis fault, because the login rate-limit buckets fail closed — it looks like nobody can sign in |
 | `REDIS_KEY_PREFIX` | Optional Redis namespace prefix for tenant- or instance-scoped keys |
 | `WC_STORE_URL` | WooCommerce store URL |
 | `WC_CONSUMER_KEY` | WooCommerce API consumer key |
