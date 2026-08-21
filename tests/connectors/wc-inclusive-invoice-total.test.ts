@@ -74,6 +74,13 @@ async function buildInvoiceForWcOrder(order: {
   shippingForeign: number
   /** The STORE convention. Every assertion below must hold for BOTH values. */
   pricesIncludeVat: boolean
+  /**
+   * The ORDER currency. Added when o3d-5tf merged after this branch was cut: the coupon-allocation
+   * tolerance is half a MINOR UNIT of this currency rather than a hard-coded half-penny, so the
+   * caller has to say which. Defaulted to GBP so the existing fixtures keep the tolerance they were
+   * written against, and stated per-fixture so a 0- or 3-decimal currency can be exercised here.
+   */
+  currency?: string
 }): Promise<Record<string, unknown>> {
   const { mapWcLineItems, resolveWcOrderLevelDiscount, mapWcOrderDiscount } = await fieldMapping()
   const { resolveWcAccountingAmountConvention } = await orderImport()
@@ -84,6 +91,11 @@ async function buildInvoiceForWcOrder(order: {
   const { orderLevelDiscount } = resolveWcOrderLevelDiscount({
     couponTotalForeign: couponTotal,
     lineDiscountTotalForeign: mapped.reduce((sum, l) => sum + l.discountAmount, 0),
+    // o3d-5tf (merged after this branch was cut): the coupon-allocation tolerance is half a MINOR
+    // UNIT of the order's currency, not a hard-coded half-penny, so the caller must say which
+    // currency. Passed from the fixture's own `currency` rather than hard-coding 'GBP', so a
+    // fixture written in a 0- or 3-decimal currency exercises the tolerance it actually gets.
+    currency: order.currency ?? 'GBP',
   })
   const { lineAmountsIncludeTax, shippingAmount, discountAmount } = resolveWcAccountingAmountConvention({
     pricesIncludeVat: order.pricesIncludeVat,
