@@ -23,6 +23,19 @@ export type SyncLogRow = {
   processingStartedAt: Date | null
   syncedAt: Date | null
   createdAt: Date
+  /**
+   * The back-reference sweep's own bookkeeping columns (o3d-9kek, o3d-p5j3, o3d-nepa, o3d-nf9i).
+   *
+   * Carried here because the SHARED sweep selects and filters on every one of them: a double that
+   * answered `undefined` would make `backReferenceCheckedAt: null` match nothing (no candidate at
+   * all) and `!== null` tests read the wrong way round, so a sweep test would be about a run that
+   * never looked at the row.
+   */
+  backReferenceCheckedAt: Date | null
+  backReferenceAmbiguousLoggedAt: Date | null
+  backReferenceEvidenceCompactedAt: Date | null
+  backReferenceFollowUpsPendingAt: Date | null
+  settlementBasis: string | null
 }
 
 export function syncLogRow(overrides: Partial<SyncLogRow> & { id: string }): SyncLogRow {
@@ -40,6 +53,11 @@ export function syncLogRow(overrides: Partial<SyncLogRow> & { id: string }): Syn
     processingStartedAt: null,
     syncedAt: null,
     createdAt: new Date('2026-08-19T09:00:00.000Z'),
+    backReferenceCheckedAt: null,
+    backReferenceAmbiguousLoggedAt: null,
+    backReferenceEvidenceCompactedAt: null,
+    backReferenceFollowUpsPendingAt: null,
+    settlementBasis: null,
     ...overrides,
   }
 }
@@ -149,13 +167,24 @@ export function createSyncLogStore(initial: SyncLogRow[] = []): SyncLogStore {
   const updateManyWheres: Array<Record<string, unknown>> = []
 
   const delegate = {
-    findMany: async ({ where, orderBy, take }: { where?: Record<string, unknown>; orderBy?: Record<string, 'asc' | 'desc'>; take?: number } = {}) => {
+    findMany: async ({ where, orderBy, take }: {
+      where?: Record<string, unknown>
+      orderBy?: Record<string, 'asc' | 'desc'> | Array<Record<string, 'asc' | 'desc'>>
+      take?: number
+    } = {}) => {
       let found = rows.filter((row) => matchesWhere(row, where))
-      const [field, direction] = Object.entries(orderBy ?? {})[0] ?? []
-      if (field) {
+      // The shared back-reference sweep keyset-paginates and orders by TWO columns, so the array
+      // form has to be honoured: collapsing it to the first term would make `createdAt` ties order
+      // arbitrarily and the cursor would skip or repeat rows.
+      const terms = (Array.isArray(orderBy) ? orderBy : orderBy ? [orderBy] : [])
+        .flatMap((term) => Object.entries(term))
+      if (terms.length > 0) {
         found = [...found].sort((a, b) => {
-          const delta = compare((a as unknown as Record<string, unknown>)[field], (b as unknown as Record<string, unknown>)[field])
-          return direction === 'desc' ? -delta : delta
+          for (const [field, direction] of terms) {
+            const delta = compare((a as unknown as Record<string, unknown>)[field], (b as unknown as Record<string, unknown>)[field])
+            if (delta !== 0) return direction === 'desc' ? -delta : delta
+          }
+          return 0
         })
       }
       return (take ? found.slice(0, take) : found).map((row) => ({ ...row }))

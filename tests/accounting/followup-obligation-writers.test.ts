@@ -37,6 +37,8 @@ type SyncRow = {
   status: string
   payload: Record<string, unknown>
   retryCount: number
+  /** o3d-e2mz: the per-attempt identity the claim compare-and-swaps on and every write fences on. */
+  attemptRevision: number
   processingStartedAt: Date | null
   syncedAt: Date | null
   errorMessage: string | null
@@ -58,6 +60,10 @@ const SYNC_COLUMNS = new Set([
   'id', 'connector', 'type', 'referenceType', 'referenceId', 'externalTransactionId', 'status',
   'payload', 'retryCount', 'processingStartedAt', 'syncedAt', 'errorMessage', 'createdAt',
   'backReferenceCheckedAt', 'backReferenceFollowUpsPendingAt', 'backReferenceEvidenceCompactedAt',
+  // o3d-e2mz: the per-attempt identity every processor write is now fenced on. Listed here rather
+  // than tolerated, because this matcher's whole contract is to throw on a predicate it cannot
+  // honour — silently ignoring the fence would turn these assertions into assertions about nothing.
+  'attemptRevision',
 ])
 
 /**
@@ -301,6 +307,10 @@ function blankRow(): SyncRow {
     // early return, so "the follow-ups ran" is observable as a created row.
     payload: { supplierInvoicePath: 'uploads/bill-1.pdf' },
     retryCount: 0,
+    // o3d-e2mz: an unclaimed row starts at 0 — the claim compare-and-swaps on the value it read and
+    // writes one higher. A double that omitted it would answer `undefined` to the claim's predicate,
+    // no row would ever be claimed, and every assertion below would be about a run that did nothing.
+    attemptRevision: 0,
     processingStartedAt: null,
     syncedAt: null,
     errorMessage: null,

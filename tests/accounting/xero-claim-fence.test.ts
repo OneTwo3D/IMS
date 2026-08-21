@@ -294,7 +294,10 @@ test('Codex r1 medium 2: the cancellation retirement COMPOSES the fence, it does
   // which is exactly why it is dangerous. What must be true is that the predicate is not written out a
   // second time — so the source is read, with comments stripped so a commented example cannot satisfy it.
   const src = stripComments(readFileSync(join(process.cwd(), 'lib/domain/accounting/cancel-order-invoice-sync.ts'), 'utf8'))
-  assert.ok(src.includes('heldClaimWhere(syncLogId, held)'), 'the retirement must compose the shared fence')
+  // o3d-e2mz: the entry id now arrives as part of the ATTEMPT the worker claimed, so the composed
+  // call names `attempt.id` rather than a separate `syncLogId`. What this pins is unchanged and is
+  // the whole point: the ownership half is COMPOSED from the shared predicate, not re-spelt.
+  assert.ok(src.includes('heldClaimWhere(attempt.id, held)'), 'the retirement must compose the shared fence')
   assert.ok(
     !/processingStartedAt:\s*(claimedAt|held\.heldFrom\(\))/.test(src),
     'and must not hand-spell the claim instant into a where clause of its own',

@@ -236,7 +236,10 @@ test('both sweep paths open the lease before posting and anchor the persist to t
       `the remote write at line ${index + 1} must open the lease (which re-takes the claim) first`)
     assert.match(before, /if \(!lease\)/,
       `and must post NOTHING when the claim is already gone (line ${index + 1})`)
-    assert.match(lines[index], /payload, lease\)/,
+    // o3d-e2mz: the call now carries the ATTEMPT as well as the lease — two fences answering two
+    // different questions (do I still own this row / is this still the attempt I claimed). The lease
+    // must still be there, and must still be the LEASE rather than a snapshot of it.
+    assert.match(lines[index], /payload, lease, attempt\)/,
       `and everything downstream must fence on the lease, not on the claim taken before the deferral checks`)
   }
 

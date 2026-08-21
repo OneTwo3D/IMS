@@ -124,6 +124,14 @@ const dbStub = {
     findUnique: async () => null,
     update: async () => { throw new Error('unused') },
   },
+  /**
+   * The sweep's keyset cursor (o3d-9kek r3 finding 4), merged since this file was written. It lives
+   * in ONE Setting row; an absent one means "start at the head", which is what every test here wants.
+   */
+  setting: {
+    findUnique: async () => null,
+    upsert: async () => ({}),
+  },
   // lockSalesOrder issues `SELECT id FROM "sales_orders" WHERE id = $1 FOR UPDATE`.
   $queryRaw: async (query: { values?: unknown[] }) => {
     journal.push(`lock:${String(query?.values?.[0] ?? '')}`)
@@ -142,6 +150,18 @@ mock.module('@/lib/activity-log', {
     logActivity: async (entry: { action: string; level?: string; description: string; metadata?: Record<string, unknown> }) => {
       activity.push(entry)
     },
+    /**
+     * The shared sweep is wired to `logActivityPersisted`, NOT `logActivity` (o3d-9kek r2 finding 3):
+     * it defers an ambiguous row on the strength of having warned, and `logActivity` swallows
+     * persistence errors, so awaiting it proves nothing. A double that omitted this would leave the
+     * sweep calling an undefined export and every assertion here would be about a thrown run.
+     */
+    logActivityPersisted: async (entry: { action: string; level?: string; description: string; metadata?: Record<string, unknown> }) => {
+      activity.push(entry)
+      return true
+    },
+    redactActivityLogText: (value: string) => value,
+    sanitizeActivityLogMetadata: (value: unknown) => value,
   },
 })
 // The mirrored accounting event is a separate table with its own tests; this is about the sweep.
@@ -237,7 +257,10 @@ test('o3d-e2mz r8: the sweep RETIRES a candidate whose SALE is cancelled instead
   assert.equal(row?.syncedAt, null)
   assert.equal(row?.attemptRevision, 5, 'a writer that retires a row advances the fence, so a concurrent sweep cannot settle it')
 
-  assert.deepEqual(result, { checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, retiredCancelledSale: 1 })
+  assert.deepEqual(result, {
+    scanned: 1, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 1,
+  })
   const escalation = activity.find((entry) => entry.action === 'xero_backreference_repair_cancelled_sale')
   assert.equal(escalation?.level, 'ERROR')
   assert.match(escalation?.description ?? '', /the sale is CANCELLED/)
@@ -259,7 +282,10 @@ test('o3d-e2mz r8: the SAME candidate on a LIVE sale is still repaired — the s
     'and its follow-ups — including the PAYMENT the cancelled case must never reach',
   )
   assert.equal(store.get('log-1')?.status, 'SYNCED', 'a SYNCED row stays SYNCED')
-  assert.deepEqual(result, { checked: 1, repaired: 1, failed: 0, skippedAmbiguous: 0, retiredCancelledSale: 0 })
+  assert.deepEqual(result, {
+    scanned: 1, checked: 1, repaired: 1, failed: 0, skippedAmbiguous: 0,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 0,
+  })
 })
 
 test('o3d-e2mz r8: the sale is read UNDER ITS ROW LOCK, after the probe and before any write', async () => {
@@ -272,7 +298,10 @@ test('o3d-e2mz r8: the sale is read UNDER ITS ROW LOCK, after the probe and befo
 
   assert.deepEqual(
     journal,
-    ['probe:order-1', 'lock:order-1', 'read-status:order-1', 'order-update:order-1'],
+    // The trailing probe is the shared sweep's own post-write verification (o3d-9kek), merged since
+    // this test was written. What this pins is the PREFIX: nothing is written before the lock and the
+    // status read behind it.
+    ['probe:order-1', 'lock:order-1', 'read-status:order-1', 'order-update:order-1', 'probe:order-1'],
     'probe, then LOCK, then the status read, and only then the first write',
   )
 })
@@ -297,7 +326,10 @@ test('o3d-e2mz r8: a LOCK the sweep cannot take DEFERS the repair — nothing re
   assert.equal(row?.externalTransactionId, 'XERO-INV-1')
   assert.equal(salesOrders.get('order-1')?.accountingInvoiceId, null, 'nothing is written onto the order')
   assert.deepEqual(followUpRows(), [], 'and nothing is released while the sale cannot be proved live')
-  assert.deepEqual(result, { checked: 0, repaired: 0, failed: 1, skippedAmbiguous: 0, retiredCancelledSale: 0 })
+  assert.deepEqual(result, {
+    scanned: 1, checked: 0, repaired: 0, failed: 1, skippedAmbiguous: 0,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 0,
+  })
   const deferral = activity.find((entry) => entry.action === 'xero_backreference_repair_sale_unreadable')
   assert.equal(deferral?.level, 'WARNING')
   assert.match(deferral?.description ?? '', /could not be read/)
@@ -325,7 +357,10 @@ test('o3d-e2mz r8: a locked status read that fails defers in the same way, and n
   assert.equal(salesOrders.get('order-1')?.accountingInvoiceId, null)
   assert.deepEqual(followUpRows(), [])
   assert.equal(store.get('log-1')?.status, 'SYNCED')
-  assert.deepEqual(result, { checked: 0, repaired: 0, failed: 1, skippedAmbiguous: 0, retiredCancelledSale: 0 })
+  assert.deepEqual(result, {
+    scanned: 1, checked: 0, repaired: 0, failed: 1, skippedAmbiguous: 0,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 0,
+  })
   assert.deepEqual(journal, ['probe:order-1', 'lock:order-1', 'read-status:order-1'])
 })
 
@@ -344,7 +379,10 @@ test('o3d-e2mz r8: a DELETED sales order is treated as cancelled, not as licence
   assert.deepEqual(journal, ['probe:order-1', 'lock:order-1', 'read-status:order-1'], 'the gate really ran')
   assert.deepEqual(followUpRows(), [])
   assert.equal(store.get('log-1')?.status, 'CANCELLED')
-  assert.deepEqual(result, { checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, retiredCancelledSale: 1 })
+  assert.deepEqual(result, {
+    scanned: 1, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 1,
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -364,7 +402,10 @@ test('o3d-e2mz r8: a FAILED row whose back-reference is already applied is retir
   assert.deepEqual(followUpRows(), [], 'the follow-ups-only pass releases nothing for a cancelled sale')
   assert.equal(store.get('log-1')?.status, 'CANCELLED')
   assert.equal(store.get('log-1')?.attemptRevision, 5)
-  assert.deepEqual(result, { checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, retiredCancelledSale: 1 })
+  assert.deepEqual(result, {
+    scanned: 1, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 1,
+  })
 })
 
 test('o3d-e2mz r8: the same FAILED row on a LIVE sale still gets its outstanding follow-ups', async () => {
@@ -376,7 +417,10 @@ test('o3d-e2mz r8: the same FAILED row on a LIVE sale still gets its outstanding
 
   assert.deepEqual(followUpRows().map((row) => row.type).sort(), ['INVOICE_PAYMENT', 'INVOICE_PDF'])
   assert.equal(store.get('log-1')?.status, 'SYNCED', 'and the reconciled row is settled')
-  assert.deepEqual(result, { checked: 1, repaired: 0, failed: 0, skippedAmbiguous: 0, retiredCancelledSale: 0 })
+  assert.deepEqual(result, {
+    scanned: 1, checked: 1, repaired: 0, failed: 0, skippedAmbiguous: 0,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 0,
+  })
   assert.ok(activity.some((entry) => entry.action === 'xero_backreference_followups_recovered'))
 })
 

@@ -17,6 +17,8 @@ let store: SyncLogStore = createSyncLogStore([])
 let interleave: (() => void) | null = null
 const activity: Array<{ action: string; level?: string; metadata?: Record<string, unknown> }> = []
 const outboxCalls: string[] = []
+/** Activity rows written INSIDE a transaction — the conflict evidence, not the ordinary log. */
+const activityRows: Array<Record<string, unknown>> = []
 
 const accountingSyncLog = new Proxy({}, {
   get: (_target, prop: string) => (args: never) => (store.delegate[prop] as (a: never) => Promise<unknown>)(args),
@@ -24,6 +26,24 @@ const accountingSyncLog = new Proxy({}, {
 
 const dbStub = {
   accountingSyncLog,
+  /**
+   * o3d-550x / o3d-clxw r4, merged since this file was written: the posted-document record is ONE
+   * shared writer that files its conflict evidence in the same transaction and stamps `syncedAt`
+   * from the DATABASE clock through raw SQL. Without these delegates the writer throws, the job is
+   * handed back for retry, and every assertion below is about a run that recorded nothing.
+   */
+  activityLog: {
+    // The conflict evidence is written INSIDE the transaction that observed it (o3d-550x r2), so it
+    // arrives here as a row rather than through `logActivity`. Recorded so it can be asserted on.
+    create: async ({ data }: { data: Record<string, unknown> }) => {
+      activityRows.push(data)
+      return { id: `activity-${activityRows.length}` }
+    },
+    findFirst: async () => null,
+  },
+  accountingEvent: { findMany: async () => [], updateMany: async () => ({ count: 0 }), findFirst: async () => null },
+  accountingEventLog: { createMany: async () => ({ count: 0 }) },
+  $executeRaw: async () => 1,
   $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
     const hook = interleave
     interleave = null
@@ -52,6 +72,12 @@ mock.module('@/lib/db', { namedExports: { db: dbStub } })
 mock.module('@/lib/activity-log', {
   namedExports: {
     logActivity: async (entry: { action: string; level?: string; metadata?: Record<string, unknown> }) => { activity.push(entry) },
+    logActivityPersisted: async (entry: { action: string; level?: string; metadata?: Record<string, unknown> }) => {
+      activity.push(entry)
+      return true
+    },
+    redactActivityLogText: (value: string) => value,
+    sanitizeActivityLogMetadata: (value: unknown) => value,
   },
 })
 mock.module('@/lib/domain/accounting/accounting-event-mirror', {
@@ -92,6 +118,7 @@ function reset(rows: Parameters<typeof createSyncLogStore>[0]) {
   store = createSyncLogStore(rows)
   interleave = null
   activity.length = 0
+  activityRows.length = 0
   outboxCalls.length = 0
 }
 
@@ -132,7 +159,17 @@ test('the outbox loop does not overwrite a decision that landed on its attempt',
   assert.equal(store.get('log-1')?.status, 'CANCELLED')
   assert.equal(store.get('log-1')?.externalTransactionId, 'XERO-OPERATOR-VERIFIED')
   assert.equal(result.failed, 1)
-  assert.ok(activity.some((entry) => entry.action === 'xero_sync_post_fenced_out' && entry.level === 'ERROR'))
-  // The remote work is done, so the job must complete rather than churn a re-post.
-  assert.deepEqual(outboxCalls, ['success'])
+  // SUPERSEDED ASSERTIONS, REWRITTEN WITH THE REASON. This used to expect `xero_sync_post_fenced_out`
+  // and a COMPLETED job, because the branch's own recovery owned both the refusal and the report.
+  // The decision here names a DIFFERENT document from the one this attempt posted, and o3d-550x's
+  // shared writer (merged since) treats that as its own, stronger conflict: it refuses the record —
+  // the only thing it ever refuses — and files `xero_posted_document_unrecorded` naming BOTH ids,
+  // inside the transaction that observed the conflict. The job is then buried PERMANENTLY rather than
+  // completed, because a retry could only post a second document. The property this test exists for is
+  // unchanged and is asserted above: the operator's decision survives the worker's writeback.
+  assert.ok(
+    activityRows.some((row) => row.action === 'xero_posted_document_unrecorded' && row.level === 'ERROR'),
+    'a post that cannot be recorded because another document is named must be reported, naming both',
+  )
+  assert.deepEqual(outboxCalls, ['permanent'])
 })

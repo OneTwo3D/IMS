@@ -50,6 +50,17 @@ let queryRawFailures = 0
 
 const dbStub = {
   accountingSyncLog,
+  /**
+   * o3d-550x / o3d-clxw r4, merged since this file was written: the posted-document record is ONE
+   * shared writer (`recordPostedSyncResult`) that files its conflict evidence in the same transaction
+   * and stamps `syncedAt` from the DATABASE clock through raw SQL. A harness without these delegates
+   * makes that writer throw, and every fence-loss test below would then be about a run that never
+   * recorded anything.
+   */
+  activityLog: { create: async () => ({ id: 'activity-1' }), findFirst: async () => null },
+  accountingEvent: { findMany: async () => [], updateMany: async () => ({ count: 0 }), findFirst: async () => null },
+  accountingEventLog: { createMany: async () => ({ count: 0 }) },
+  $executeRaw: async () => 1,
   salesOrder: {
     findUnique: async ({ where }: { where: { id: string } }) => {
       orderLockLog.push(`read:${where.id}`)
@@ -83,6 +94,12 @@ mock.module('@/lib/activity-log', {
     logActivity: async (entry: { action: string; level?: string; description: string; metadata?: Record<string, unknown> }) => {
       activity.push(entry)
     },
+    logActivityPersisted: async (entry: { action: string; level?: string; description: string; metadata?: Record<string, unknown> }) => {
+      activity.push(entry)
+      return true
+    },
+    redactActivityLogText: (value: string) => value,
+    sanitizeActivityLogMetadata: (value: unknown) => value,
   },
 })
 // The mirrored accounting event is a separate table with its own tests; the fence is about the row.
@@ -136,37 +153,30 @@ test('claiming a row mints a new attempt: the claim CASes on the revision it rea
   assert.equal(store.get('log-1')?.status, 'SYNCED')
 })
 
-test('a decision landing between the claim and the writeback is NOT overwritten, and is reported', async () => {
+/**
+ * SUPERSEDED AND REWRITTEN ON THE REBASE, WITH THE REASON.
+ *
+ * Seven tests stood here, pinning the round-1..r3 behaviour of `recordSyncLogPosted` (the SYNCED
+ * write fenced on the attempt revision) and `recordPostedDocumentEvidence` (a five-then-seven-way
+ * outcome enum describing what the recovery managed to persist).
+ *
+ * Neither function exists any more, and NOT because this branch changed its mind: o3d-550x merged
+ * ONE shared posted-document writer, `recordPostedSyncResult`, reached here through
+ * `recordPostedDocumentDurably`. It records the post UNCONDITIONALLY — its only precondition is that
+ * the row does not already name a DIFFERENT document — and files its own conflict evidence inside the
+ * transaction that observed the conflict. That is the same end state this branch's r2 recovery
+ * arrived at by a longer route ("evidence of a post must never be conditional on winning a race"),
+ * reached in one write instead of two, and re-adding the fenced writer beside it would be a second
+ * implementation of the SYNCED write.
+ *
+ * What the attempt revision still buys is what these replacements pin: an operator who decided about
+ * attempt N has to be TOLD that attempt N posted. `heldClaimWhere` cannot see that — a decision moves
+ * the revision and can leave the claim instant untouched.
+ */
+
+test('a decision landing between the claim and the writeback is REPORTED, and the document is still recorded', async () => {
   // The o3d-osl8 race: the operator settles the PROCESSING row as "did not post" while this worker
-  // holds the attempt. Settlement bumps the revision, so the worker's writeback must find nothing.
-  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
-  interleave = () => {
-    Object.assign(store.get('log-1')!, {
-      status: 'CANCELLED',
-      attemptRevision: 5,
-      errorMessage: 'Operator verified: never posted',
-    })
-  }
-
-  const result = await (await loadProcessor())()
-
-  assert.equal(store.get('log-1')?.status, 'CANCELLED', 'the settlement must survive the worker writeback')
-  assert.equal(store.get('log-1')?.attemptRevision, 5)
-  assert.equal(result.succeeded, 0)
-  assert.equal(result.failed, 1)
-
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.ok(escalation, 'losing the fence after a post must be reported, not swallowed')
-  assert.equal(escalation.level, 'ERROR')
-  assert.equal(escalation.metadata?.externalId, 'XERO-1')
-  assert.equal(escalation.metadata?.claimedAttemptRevision, 4)
-  assert.equal(escalation.metadata?.currentAttemptRevision, 5)
-  assert.match(escalation.description, /XERO-1/)
-})
-
-test('a settled row whose document DID post gets the external id recorded, loudly', async () => {
-  // Same race, but the operator's assertion is now known to be wrong and the row names no document.
-  // The posted invoice must become visible to the order delete guard rather than being lost.
+  // holds the attempt. The settlement bumps the revision — and the worker's post is nonetheless real.
   reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
   interleave = () => {
     Object.assign(store.get('log-1')!, {
@@ -183,18 +193,37 @@ test('a settled row whose document DID post gets the external id recorded, loudl
   const row = store.get('log-1')
   assert.equal(row?.externalTransactionId, 'XERO-1', 'the document that exists must be named on the row')
   assert.equal(row?.status, 'SYNCED', 'the delete guard must see a posted document, not a cancelled row')
-  assert.equal(row?.attemptRevision, 6, 'recording the correction must itself move the attempt on')
-  assert.match(row?.errorMessage ?? '', /Posted to Xero as XERO-1 on attempt 4/)
+
   const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.level, 'ERROR')
-  assert.equal(escalation?.metadata?.evidence, 'RECORDED')
-  assert.match(escalation?.description ?? '', /now recorded on the sync row/)
+  assert.ok(escalation, 'losing the fence after a post must be reported, not swallowed')
+  assert.equal(escalation.level, 'ERROR')
+  assert.equal(escalation.metadata?.externalId, 'XERO-1')
+  assert.equal(escalation.metadata?.claimedAttemptRevision, 4, 'the attempt the operator judged')
+  assert.equal(escalation.metadata?.currentAttemptRevision, 5, 'and the attempt the row had moved to')
+  assert.match(escalation.description, /XERO-1/)
 })
 
-test('a SECOND fence loss does not discard the id of a document that is known to have posted', async () => {
-  // o3d-e2mz Finding 2. Round 1 fenced the recording write on the revision it had just read, so a row
-  // that moved AGAIN between that read and that write refused it — the mechanism built to protect the
-  // evidence destroying the only durable record of the document, in exactly the case it exists for.
+test('an attempt that has NOT moved is not escalated — the ordinary post says nothing', async () => {
+  // The counter-guard. Without it the test above would pass with the revision comparison deleted and
+  // an ERROR raised on every single successful post.
+  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
+
+  const result = await (await loadProcessor())()
+
+  assert.equal(result.succeeded, 1)
+  assert.equal(store.get('log-1')?.status, 'SYNCED')
+  assert.equal(
+    activity.find((entry) => entry.action === 'xero_sync_post_fenced_out'),
+    undefined,
+    'nothing moved, so there is nobody to tell',
+  )
+})
+
+test('a SECOND move of the row does not discard the id of a document that is known to have posted', async () => {
+  // o3d-e2mz Finding 2, restated against the merged writer. Round 1 fenced the recording write on the
+  // revision it had just read, so a row that moved AGAIN between that read and that write refused it —
+  // the mechanism built to protect the evidence destroying the only durable record of the document.
+  // `recordPostedSyncResult` cannot do that: it never asks about the revision at all.
   reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
   interleave = () => {
     Object.assign(store.get('log-1')!, {
@@ -203,7 +232,7 @@ test('a SECOND fence loss does not discard the id of a document that is known to
       externalTransactionId: null,
       errorMessage: 'Operator verified: never posted',
     })
-    // ...and the row moves a SECOND time, between the escalation's read and the recording write.
+    // ...and the row moves a SECOND time, before the escalation reads it.
     interleave = () => {
       Object.assign(store.get('log-1')!, { attemptRevision: 9, errorMessage: 'Reset by an operator' })
     }
@@ -214,114 +243,8 @@ test('a SECOND fence loss does not discard the id of a document that is known to
   const row = store.get('log-1')
   assert.equal(row?.externalTransactionId, 'XERO-1', 'the id of a document known to exist must not depend on winning a race')
   assert.equal(row?.status, 'SYNCED')
-  assert.equal(row?.attemptRevision, 10, 'recording the evidence still advances the fence, it just never depends on it')
   const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.evidence, 'RECORDED')
-})
-
-test('a document whose row has vanished is reported as unrecordable, without claiming to be its only record', async () => {
-  // The one case where the id genuinely cannot be recorded on the row. o3d-e2mz r3: what the failed
-  // write establishes is that NOTHING KEYED ON THE ROW can see the document — not that this log entry
-  // is the only record of it anywhere, which it cannot know (an earlier attempt may have left a
-  // mirrored event or a back-reference).
-  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
-  interleave = () => {
-    Object.assign(store.get('log-1')!, { status: 'CANCELLED', attemptRevision: 5, externalTransactionId: null })
-    interleave = () => { store.rows.length = 0 }
-  }
-
-  await (await loadProcessor())()
-
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.level, 'ERROR')
-  assert.equal(escalation?.metadata?.evidence, 'ROW_MISSING')
-  assert.match(escalation?.description ?? '', /nothing keyed on that row will see this document/)
-  assert.doesNotMatch(
-    escalation?.description ?? '',
-    /ONLY record/,
-    'the write establishes what the row can show, never what other records exist',
-  )
-  assert.match(escalation?.description ?? '', /XERO-1/)
-})
-
-test('a settled row that already names a document is left exactly as the decision left it', async () => {
-  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
-  interleave = () => {
-    Object.assign(store.get('log-1')!, {
-      status: 'SYNCED',
-      attemptRevision: 5,
-      externalTransactionId: 'XERO-OPERATOR-VERIFIED',
-      errorMessage: 'Operator verified: posted',
-    })
-  }
-
-  await (await loadProcessor())()
-
-  assert.equal(store.get('log-1')?.externalTransactionId, 'XERO-OPERATOR-VERIFIED', 'a recorded document id must never be renamed')
-  assert.equal(store.get('log-1')?.attemptRevision, 5)
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.evidence, 'ALREADY_NAMED')
-  // The ids genuinely differ, so the operator is told to check BOTH.
-  assert.match(escalation?.description ?? '', /DIFFERENT document/)
-  assert.match(escalation?.description ?? '', /XERO-1/)
-})
-
-test('o3d-e2mz r3: a row that already names THE SAME document is not reported as a second document', async () => {
-  // Round 2 returned ALREADY_NAMED for every miss on a surviving row — "a DIFFERENT document ...
-  // check the accounting system for BOTH ids" — without ever reading which document the row names.
-  // The ordinary case is that it names the one we just posted (a replay, or a writeback that landed
-  // after all), and that reading sent an operator hunting for an invoice that does not exist.
-  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
-  interleave = () => {
-    Object.assign(store.get('log-1')!, {
-      status: 'SYNCED',
-      attemptRevision: 5,
-      // The SAME document this attempt posted.
-      externalTransactionId: 'XERO-1',
-      errorMessage: 'Recorded by another attempt',
-    })
-  }
-
-  await (await loadProcessor())()
-
-  assert.equal(store.get('log-1')?.externalTransactionId, 'XERO-1')
-  assert.equal(store.get('log-1')?.attemptRevision, 5, 'nothing was written, so nothing advanced the attempt')
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.evidence, 'ALREADY_RECORDED')
-  assert.match(escalation?.description ?? '', /THIS SAME document/)
-  assert.match(escalation?.description ?? '', /no second document is implied/)
-  assert.doesNotMatch(
-    escalation?.description ?? '',
-    /DIFFERENT document/,
-    'the ids match, so nothing may claim they do not',
-  )
-})
-
-test('o3d-e2mz r3: RECORDED does not promise a delete guard that may not apply to this entry', async () => {
-  // The note claimed "the order cannot be deleted while it exists". The delete guard keys on
-  // externalTransactionId for entries keyed to a SalesOrder or a Shipment; this row is a COGS_JOURNAL
-  // keyed to a CogsEntry, which the guard never looks at.
-  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
-  interleave = () => {
-    Object.assign(store.get('log-1')!, {
-      status: 'CANCELLED',
-      attemptRevision: 5,
-      externalTransactionId: null,
-      errorMessage: 'Operator verified: never posted',
-    })
-  }
-
-  await (await loadProcessor())()
-
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.evidence, 'RECORDED')
-  assert.match(escalation?.description ?? '', /now recorded on the sync row/)
-  assert.match(
-    escalation?.description ?? '',
-    /where this entry is keyed to a sales order or shipment/,
-    'the guard is stated as conditional on the reference, because that is what it is',
-  )
-  assert.doesNotMatch(escalation?.description ?? '', /the order cannot be deleted/)
+  assert.equal(escalation?.level, 'ERROR', 'and the move is still reported')
 })
 
 test('a stale PROCESSING claim is reclaimed onto a new attempt, so the old holder cannot write', async () => {
@@ -390,52 +313,18 @@ test('a follow-up failure from an attempt that was settled mid-flight does not r
   assert.equal(outcome.finalFailure, false)
 })
 
-test('o3d-e2mz r3: a lost evidence write on a row still naming NO document is reported as not recorded', async () => {
-  // The third thing a missed evidence write can mean, and the one r2 could not say. Its predicate is
-  // "the row names no document"; r2 read a miss on a surviving row as proof that the row now names
-  // one, and reported a DIFFERENT document. If the row still names none, neither reading is true —
-  // something moved it in between, and the id was simply not recorded.
-  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
-  interleave = () => {
-    Object.assign(store.get('log-1')!, {
-      status: 'CANCELLED',
-      attemptRevision: 5,
-      externalTransactionId: null,
-      errorMessage: 'Operator verified: never posted',
-    })
-  }
-  // Only the evidence write is made to match nothing — it is the one keyed on "names no document".
-  const inner = store.delegate.updateMany as (args: never) => Promise<unknown>
-  store.delegate.updateMany = (async (args: { where?: Record<string, unknown> }) => {
-    if (args?.where && args.where.externalTransactionId === null) return { count: 0 }
-    return inner(args as never)
-  }) as never
+/**
+ * SUPERSEDED, WITH THE REASON. A test stood here pinning `NOT_RECORDED` — one of the seven outcomes
+ * the round-3 evidence enum could report. The enum went with `recordPostedDocumentEvidence`; the
+ * merged writer answers the same question with `PostedSyncRecord` (`recorded` / `ROW_MISSING` /
+ * `ANOTHER_DOCUMENT_NAMED`) and files the evidence itself, and its outcomes are covered by
+ * tests/accounting/xero-claim-fence.test.ts, which is where that writer lives.
+ */
 
-  await (await loadProcessor())()
-
-  const row = store.get('log-1')
-  assert.equal(row?.externalTransactionId, null, 'nothing was recorded, and the report must say only that')
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.evidence, 'NOT_RECORDED')
-  assert.match(escalation?.description ?? '', /was NOT recorded on it/)
-  assert.doesNotMatch(escalation?.description ?? '', /DIFFERENT document/)
-  assert.match(escalation?.description ?? '', /XERO-1/)
-})
-
-// ---------------------------------------------------------------------------
-// o3d-e2mz r4 (Codex finding 3) — THE ESCALATION MUST NOT PRESCRIBE A REMEDY FOR A DOCUMENT THAT
-// DOES NOT EXIST.
-//
-// `recordPostAfterFenceLoss` used to end every escalation with the same sentence: "The document is
-// in the ledger: reverse or credit-note it there if it should not exist." That is true of an
-// invoice and false of most of the queue — INVOICE_PDF saves a file, INVOICE_EMAIL sends an email,
-// WC_INVOICE_NOTE writes a note on the WooCommerce order, BILL_ATTACHMENT attaches a file,
-// PURCHASE_CREDIT_NOTE_ALLOCATION applies a credit note that already existed. Telling an operator
-// to credit-note one of those is worse than saying nothing: the nearest matching document is a real
-// receivable or payable, and that is what they will reach for.
-// ---------------------------------------------------------------------------
-
-/** Bump the row out from under the worker, so its writeback CAS misses and the escalation runs. */
+/**
+ * Move the row onto a DIFFERENT attempt between the claim and the writeback — the fence loss the
+ * escalation below reports on. (It stood beside the r1–r3 tests that have been replaced above.)
+ */
 function fenceOutOnWriteback() {
   interleave = () => {
     Object.assign(store.get('log-1')!, { status: 'CANCELLED', attemptRevision: 9 })
@@ -509,7 +398,11 @@ test('o3d-e2mz r4: a fence loss on a type that creates NO document says so, and 
     'and it must not imply a document was created whose id went missing',
   )
   assert.equal(escalation.metadata?.externalId, null)
-  assert.equal(escalation.metadata?.evidence, 'NO_EXTERNAL_ID')
+  // SUPERSEDED ASSERTION, REWRITTEN: this used to read `metadata.evidence === 'NO_EXTERNAL_ID'`, one
+  // member of the round-3 evidence enum that went with `recordPostedDocumentEvidence` (see the block
+  // comment above). What it was really pinning is that a type creating no document is described as
+  // one — which is `postEffect`, and is asserted from the type table rather than from an outcome enum.
+  assert.equal(escalation.metadata?.postEffect, 'ADDED an invoice note to the WooCommerce order')
 })
 
 // ---------------------------------------------------------------------------
@@ -540,187 +433,25 @@ function wouldBeSweptForRepair(row: { status: string; externalTransactionId: str
   return !!row && row.externalTransactionId !== null && (row.status === 'SYNCED' || row.status === 'FAILED')
 }
 
-test('o3d-e2mz r5: a fence loss on a CANCELLED sale records the document but does NOT hand the sweep its work', async () => {
-  // The window itself: the cancellation sweep retired this claimed row and bumped the attempt while
-  // the worker was mid-post. Under r4 the row came back SYNCED and the back-reference sweep then
-  // wrote the invoice id onto the cancelled order and enqueued its payment.
-  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
-  salesOrders = new Map([['order-1', { status: 'CANCELLED' }]])
-  interleave = () => {
-    Object.assign(store.get('log-1')!, {
-      status: 'CANCELLED',
-      attemptRevision: 9,
-      externalTransactionId: null,
-      errorMessage: 'Cancelled: order cancelled before this invoice posted (no revenue to recognise).',
-    })
-  }
-
-  await (await loadProcessor())()
-
-  const row = store.get('log-1')
-  assert.equal(row?.externalTransactionId, 'XERO-INV-1', 'the document that exists is still named on the row')
-  assert.equal(row?.status, 'CANCELLED', 'and the row is NOT promoted to SYNCED')
-  assert.equal(
-    wouldBeSweptForRepair(row),
-    false,
-    'so repairXeroBackReferences will never pick it up and enqueue the cancelled sale\'s follow-ups',
-  )
-  assert.equal(row?.syncedAt, null, 'a cancelled sale has no successful sync to date-stamp')
-
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.level, 'ERROR')
-  assert.equal(escalation?.metadata?.evidence, 'RECORDED_ON_CANCELLED_SALE')
-  assert.match(escalation?.description ?? '', /SALE IT BELONGS TO IS CANCELLED/)
-  assert.match(escalation?.description ?? '', /none of its follow-ups \(PDF, email, payment, attachment\) are enqueued/)
-})
-
-test('o3d-e2mz r5: a fence loss on a LIVE sale still settles the row, so the legitimate repair is untouched', async () => {
-  // THE COUNTER-GUARD. The other reason a row reads CANCELLED is an operator settling it as "did not
-  // post" — and for that row the sweep's back-reference and follow-ups ARE the correct repair. A fix
-  // that keyed on the ROW's status instead of the SALE's would have stopped this one too.
-  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
-  interleave = () => {
-    Object.assign(store.get('log-1')!, {
-      status: 'CANCELLED',
-      attemptRevision: 9,
-      externalTransactionId: null,
-      errorMessage: 'Operator verified: never posted',
-    })
-  }
-
-  await (await loadProcessor())()
-
-  const row = store.get('log-1')
-  assert.equal(row?.status, 'SYNCED', 'the sale is live, so the document is a real posting to reconcile')
-  assert.equal(wouldBeSweptForRepair(row), true, 'and the back-reference sweep must still be able to finish the job')
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.evidence, 'RECORDED')
-})
-
-test('o3d-e2mz r5: a sale that cannot be read fails CLOSED — the work is held, not released', async () => {
-  // Same rule guardCancelledSalesOrderInvoice applies: a transient read outage must not become
-  // permission to carry on for a sale that may not exist.
-  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
-  salesOrders = null
-  interleave = () => {
-    Object.assign(store.get('log-1')!, { status: 'CANCELLED', attemptRevision: 9, externalTransactionId: null })
-  }
-
-  await (await loadProcessor())()
-
-  const row = store.get('log-1')
-  assert.equal(row?.externalTransactionId, 'XERO-INV-1')
-  assert.equal(row?.status, 'CANCELLED')
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.evidence, 'RECORDED_SALE_UNREADABLE')
-  // r6: and the note no longer sends the operator to a button that refuses them. retryFailedXeroSync
-  // fences on `expectedStatus: 'FAILED'` and "Retry All" filters on it too, so a CANCELLED row is
-  // refused by BOTH entry points. The affordance that would release it is filed as o3d-psvi.
-  assert.match(escalation?.description ?? '', /NO self-service action does that yet/)
-  assert.match(escalation?.description ?? '', /o3d-psvi/)
-  assert.doesNotMatch(
-    escalation?.description ?? '',
-    /retry the row from the sync log/,
-    'a remedy the retry path refuses is worse than no remedy: it reads as a dead end after the click',
-  )
-})
-
-// ---------------------------------------------------------------------------
-// o3d-e2mz r6 — A STALE SALE READ RE-PROMOTED A CONCURRENTLY CANCELLED ROW.
-//
-// r5 read the sale to decide whether the fence-loss recovery may settle the row, which is the right
-// question — but it asked it BEFORE the transaction and outside it, so the answer was already history
-// by the time the write used it. A cancellation committing in that gap left the row SYNCED with an
-// external id, which is repairXeroBackReferences' candidate shape, and the sweep then did the
-// cancelled sale's work: back-reference, PDF, email, storefront note, PAYMENT. Exactly what r5 closed
-// for a sale cancelled a moment EARLIER.
-//
-// The read now happens inside the writing transaction, under the same `lockSalesOrder` row lock that
-// `cancelSalesOrderFulfillmentState` opens with, so the two serialise: the cancellation either
-// commits first and is seen, or waits for the decision it would have invalidated.
-// ---------------------------------------------------------------------------
-
-test('o3d-e2mz r6: a sale cancelled AFTER the worker read it still holds the row, instead of being re-promoted', async () => {
-  // The window r5 left. `salesOrders` says LIVE for the whole of r5's pre-transaction read; the
-  // cancellation lands at the start of the transaction that writes the evidence — which is precisely
-  // where a real one can land, because r5 took no lock over that gap.
-  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
-  interleave = () => {
-    Object.assign(store.get('log-1')!, {
-      status: 'CANCELLED',
-      attemptRevision: 9,
-      externalTransactionId: null,
-      errorMessage: 'Cancelled: order cancelled before this invoice posted (no revenue to recognise).',
-    })
-    // ...and the SALE is cancelled between the worker's read and its write.
-    interleave = () => { salesOrders = new Map([['order-1', { status: 'CANCELLED' }]]) }
-  }
-
-  await (await loadProcessor())()
-
-  const row = store.get('log-1')
-  assert.equal(row?.externalTransactionId, 'XERO-INV-1', 'the document that exists is still named on the row')
-  assert.equal(row?.status, 'CANCELLED', 'the row is NOT promoted to SYNCED on a sale that is cancelled by now')
-  assert.equal(
-    wouldBeSweptForRepair(row),
-    false,
-    'so the back-reference sweep never gets handed the cancelled sale\'s follow-ups — PDF, email, note, PAYMENT',
-  )
-  assert.equal(row?.syncedAt, null)
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.evidence, 'RECORDED_ON_CANCELLED_SALE')
-  assert.match(escalation?.description ?? '', /SALE IT BELONGS TO IS CANCELLED/)
-})
-
-test('o3d-e2mz r6: the sale is read under the order row lock, taken before the read and inside the write', async () => {
-  // WHY the test above can be trusted: the decision and the write are one locked section. A read
-  // taken before the lock — or before the transaction, as r5 did — is a read a cancellation can
-  // overtake, however close to the write it is moved.
-  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
-  interleave = () => {
-    Object.assign(store.get('log-1')!, {
-      status: 'CANCELLED',
-      attemptRevision: 9,
-      externalTransactionId: null,
-      errorMessage: 'Operator verified: never posted',
-    })
-  }
-
-  await (await loadProcessor())()
-
-  assert.deepEqual(orderLockLog, ['lock:order-1', 'read:order-1'], 'the row lock is taken FIRST, then the status is read')
-  // And the live-sale behaviour is unchanged by the lock: this row IS the legitimate repair.
-  assert.equal(store.get('log-1')?.status, 'SYNCED')
-  assert.equal(wouldBeSweptForRepair(store.get('log-1')), true)
-})
-
-test('o3d-e2mz r6: a sale that cannot be read still records the document, without the read holding the write hostage', async () => {
-  // The locked read is the first statement in the transaction, so a read failure is a transaction
-  // that wrote nothing. The retry writes fail-closed with no read at all, which keeps r5's unreadable
-  // outcome AND keeps the id on the row rather than only in the escalation log.
-  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
-  salesOrders = null
-  interleave = () => {
-    Object.assign(store.get('log-1')!, { status: 'CANCELLED', attemptRevision: 9, externalTransactionId: null })
-  }
-
-  await (await loadProcessor())()
-
-  const row = store.get('log-1')
-  assert.equal(row?.externalTransactionId, 'XERO-INV-1', 'the id survives a failed sale read')
-  assert.equal(row?.status, 'CANCELLED')
-  assert.equal(wouldBeSweptForRepair(row), false)
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.evidence, 'RECORDED_SALE_UNREADABLE')
-})
-
-// ---------------------------------------------------------------------------
-// o3d-e2mz r5 (Codex finding 2) — A DRAFT JOURNAL IS NOT REVERSED, IT IS DELETED.
-//
-// `_postingMode: 'draft'` sends the journal to Xero as DRAFT, which moves no balances. "Post a
-// reversing journal" is then the most dangerous sentence in the remedy table: the reversal DOES post,
-// so an operator following it moves the accounts by exactly the amount the draft never moved.
-// ---------------------------------------------------------------------------
+/**
+ * SUPERSEDED AND MOVED, WITH THE REASON — the r5/r6 block that stood here.
+ *
+ * Six tests pinned the fence-loss recovery terminalising its row as CANCELLED when the SALE behind it
+ * was cancelled, so that the back-reference sweep would not then release that sale's work. Rounds 5,
+ * 6 and 7 each closed one PRODUCER of that shape, and each closed with the same flag: the SWEEP still
+ * has no cancellation check.
+ *
+ * Two merged changes settle it, and both are stronger than gating this producer:
+ *
+ *  • o3d-7o0 makes a cancellation REFUSE outright while a sales-invoice post is in flight, under the
+ *    order's row lock. The schedule these tests dramatise — cancel commits, worker posts — cannot
+ *    happen for a fresh claim at all; no document is created rather than one being created and held.
+ *  • round 8's gate now lives on the CONSUMER, in the shared back-reference sweep, where it covers
+ *    every producer including the ordinary settle path that reads no sale at all. Its tests are in
+ *    tests/accounting/xero-backreference-sweep-cancelled-sale.test.ts, driving the real sweep.
+ *
+ * So the property is still pinned; it is pinned where the decision is now taken.
+ */
 
 test('o3d-e2mz r5: a DRAFT journal fence loss says DELETE THE DRAFT, and never says post a reversing journal', async () => {
   reset([syncLogRow({
@@ -773,99 +504,13 @@ test('o3d-e2mz r5: a SUBMITTED journal keeps the reversing-journal remedy', asyn
 // id. Retiring is now its own statement, with its own precondition, fired only by a PROVEN cancellation.
 // ---------------------------------------------------------------------------
 
-test('o3d-e2mz r7: a cancelled sale RETIRES a row that already names its document, instead of leaving it to the sweep', async () => {
-  // The row carries its external id already (the loop's "already posted, just record it" branch), and
-  // the concurrent writer settles it SYNCED without clearing that id — which is what a real writer
-  // does: nothing erases the evidence of a posted document.
-  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
-  salesOrders = new Map([['order-1', { status: 'CANCELLED' }]])
-  interleave = () => {
-    Object.assign(store.get('log-1')!, { status: 'SYNCED', attemptRevision: 9, syncedAt: new Date() })
-  }
+/**
+ * SUPERSEDED, WITH THE REASON — the r7 block that stood here.
+ *
+ * Four tests pinned the fence-loss recovery RETIRING a row that already named its document, as a
+ * statement separate from the recording write. That retirement was a producer-side gate on the shape
+ * the back-reference sweep selects; round 8 moved the decision onto the sweep itself, where it also
+ * covers rows this recovery never touches. See the block comment above, and
+ * tests/accounting/xero-backreference-sweep-cancelled-sale.test.ts.
+ */
 
-  await (await loadProcessor())()
-
-  const row = store.get('log-1')
-  assert.equal(row?.externalTransactionId, 'XERO-INV-1', 'the document that exists is still named on the row')
-  assert.equal(row?.status, 'CANCELLED', 'and the row is retired out of the sweep\'s shape')
-  assert.equal(row?.syncedAt, null, 'a cancelled sale has no successful sync to date-stamp')
-  assert.equal(
-    wouldBeSweptForRepair(row),
-    false,
-    'so repairXeroBackReferences never writes the id onto the cancelled order or enqueues its PAYMENT',
-  )
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.evidence, 'ALREADY_RECORDED', 'nothing was recorded — the id was already there')
-  assert.equal(escalation?.metadata?.retiredFromSweep, true, 'but something WAS done, and it is reported')
-  assert.match(escalation?.description ?? '', /ALSO RETIRED to CANCELLED/)
-})
-
-test('o3d-e2mz r7: a failed row LOCK re-takes the decision rather than declaring the sale unreadable', async () => {
-  // r6 sent every failure of that transaction to the read-free fallback, which can neither settle the
-  // row nor retire it. A lock that timed out — or lost a deadlock to the cancellation itself — says
-  // nothing about whether the sale is readable, and the second attempt proves it by reading it.
-  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
-  salesOrders = new Map([['order-1', { status: 'CANCELLED' }]])
-  queryRawFailures = 1
-  interleave = () => {
-    Object.assign(store.get('log-1')!, { status: 'SYNCED', attemptRevision: 9, syncedAt: new Date() })
-  }
-
-  await (await loadProcessor())()
-
-  assert.deepEqual(
-    orderLockLog,
-    ['lock:order-1', 'lock:order-1', 'read:order-1'],
-    'the lock is attempted, fails, and the whole decision is taken again in a fresh transaction',
-  )
-  const row = store.get('log-1')
-  assert.equal(row?.status, 'CANCELLED', 'so the cancelled sale is still seen, and the row still retired')
-  assert.equal(wouldBeSweptForRepair(row), false)
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.retiredFromSweep, true)
-})
-
-test('o3d-e2mz r7: a failed row LOCK on a LIVE sale still settles the row, instead of stranding it as CANCELLED', async () => {
-  // The same change from the other side: r6 answered a lock failure with the unreadable branch, which
-  // terminalises a LIVE sale's row as CANCELLED — a state no self-service action releases (o3d-psvi).
-  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
-  queryRawFailures = 1
-  interleave = () => {
-    Object.assign(store.get('log-1')!, {
-      status: 'CANCELLED',
-      attemptRevision: 9,
-      externalTransactionId: null,
-      errorMessage: 'Operator verified: never posted',
-    })
-  }
-
-  await (await loadProcessor())()
-
-  const row = store.get('log-1')
-  assert.equal(row?.status, 'SYNCED', 'the live sale IS the legitimate repair, and the second read proves it')
-  assert.equal(row?.externalTransactionId, 'XERO-INV-1')
-  assert.equal(wouldBeSweptForRepair(row), true, 'so the sweep may finish the live sale\'s work')
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.evidence, 'RECORDED')
-  assert.equal(escalation?.metadata?.retiredFromSweep, false)
-})
-
-test('o3d-e2mz r7: an UNREADABLE sale does NOT retract a row that is already settled', async () => {
-  // The counter-guard, and the reason the retirement fires only on a PROVEN cancellation. Failing
-  // closed means refusing to RELEASE work; it is not permission to retract a release a successful read
-  // justified. A transient order-read outage must not demote every settled row it touches.
-  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
-  salesOrders = null
-  interleave = () => {
-    Object.assign(store.get('log-1')!, { status: 'SYNCED', attemptRevision: 9, syncedAt: new Date() })
-  }
-
-  await (await loadProcessor())()
-
-  const row = store.get('log-1')
-  assert.equal(row?.status, 'SYNCED', 'the settled row stands: this pass proved nothing about the sale')
-  assert.equal(row?.externalTransactionId, 'XERO-INV-1')
-  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
-  assert.equal(escalation?.metadata?.evidence, 'ALREADY_RECORDED')
-  assert.equal(escalation?.metadata?.retiredFromSweep, false, 'and the escalation does not claim a retirement')
-})
