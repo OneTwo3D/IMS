@@ -390,8 +390,8 @@ Key variables in the `.env` file:
 | `AUTH_URL` | Authentication callback URL (same as app URL) |
 | `DATABASE_URL` | PostgreSQL connection string |
 | `PREFLIGHT_DB_CONNECT` | Optional production preflight database connectivity probe. Set `true` during rollout when the preflight process can reach Postgres; default `false` for build-only CI jobs |
-| `REDIS_URL` | Redis connection URL |
-| `REDIS_PASSWORD` | Redis password (if required) |
+| `REDIS_URL` | Redis connection URL, and the canonical place a Redis credential lives: `redis://:PASSWORD@host:port/db` (percent-encode the password). It is what the client connects with, and it is the only form that can express a Redis 6 ACL username. `scripts/install.sh` writes it this way when it provisions Redis locally |
+| `REDIS_PASSWORD` | Compatibility fallback, used only when `REDIS_URL` carries no credential of its own — for hosts whose URL predates the rule above. Set one or the other, not both: two different values are a configuration error and are refused rather than resolved by precedence. A Redis that answers `NOAUTH` does not look like a Redis fault, because the login rate-limit buckets fail closed — it looks like nobody can sign in |
 | `REDIS_KEY_PREFIX` | Optional Redis namespace prefix for tenant- or instance-scoped keys |
 | `WC_STORE_URL` | WooCommerce store URL |
 | `WC_CONSUMER_KEY` | WooCommerce API consumer key |

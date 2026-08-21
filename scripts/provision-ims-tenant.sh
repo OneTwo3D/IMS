@@ -77,10 +77,30 @@ urlencode() {
 # provisioning logs, and REDIS_URL now carries a credential (o3d-tsc0). Print the
 # shape, never the secret. Pure bash parameter expansion — no external process
 # gets the password on its argv either.
+#
+# THE CUT IS AT THE LAST `@`, NOT THE FIRST, and that is the whole correctness
+# argument. A URL this script BUILT has a percent-encoded password, so it holds
+# exactly one `@` and either cut lands in the same place. But a caller-supplied
+# REDIS_URL is left verbatim by design (see the Redis block below), and an
+# operator who typed `redis://:se@cret@host:6379/0` gets the first cut landing
+# INSIDE the password — `redis://***@cret@host:6379/0` puts the tail of the
+# secret straight into the provisioning log, which is the one thing this
+# function exists to prevent. Cutting at the last `@` cannot do that for any
+# input: the userinfo ends at some `@`, the last `@` is at or after it, so no
+# byte of the userinfo survives.
+#
+# The cost of that choice is over-redaction when an `@` appears in the path or
+# query of a URL that has no credentials at all, which prints an unhelpful
+# `redis://***@<tail>`. That is deliberate and it is the direction to be wrong
+# in: an over-redacted summary line is cosmetic, an under-redacted one is a
+# leaked credential in a file somebody keeps.
 redact_url_credentials() {
-  local url="$1"
+  local url="$1" rest
   case "$url" in
-    *"://"*"@"*) printf '%s://***@%s' "${url%%://*}" "${url#*@}" ;;
+    *"://"*"@"*)
+      rest="${url#*://}"
+      printf '%s://***@%s' "${url%%://*}" "${rest##*@}"
+      ;;
     *) printf '%s' "$url" ;;
   esac
 }

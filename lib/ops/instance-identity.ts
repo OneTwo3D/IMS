@@ -30,9 +30,11 @@
  *     `production`, which no existing host can be. An absent declaration falls back to exactly the
  *     `E2E_TEST_MODE`/`NODE_ENV` reading described above, so no caller's behaviour changes today.
  *   Step 2 (after production's `.env` carries the line). Flip `INSTANCE_ROLE_DECLARATION_REQUIRED` to
- *     true, and the fallback stops applying: undeclared becomes non-production everywhere that passes
- *     `requireDeclaration`. `instanceIsNonProduction` already takes both paths, and both are tested, so
- *     step 2 is the constant and nothing else.
+ *     true, and the fallback stops applying: undeclared becomes non-production for every caller of
+ *     `instanceIsNonProduction`, all at once. `instanceIsNonProduction` already takes both paths, and
+ *     both are tested, so step 2 is the constant and nothing else — which is precisely why a caller
+ *     must not hard-code `requireDeclaration: true` and reach step 2 on its own. See the rules on
+ *     `instanceIsNonProduction` for that, and for which kinds of caller this verdict is safe for at all.
  *
  * THE VERDICT IS NOT A BOOLEAN, IT IS A BOOLEAN PLUS ITS BASIS. `readInstanceIdentity` reports HOW it
  * decided, because "this instance is production" reached by falling back to `NODE_ENV` is a materially
@@ -179,6 +181,47 @@ export function readInstanceIdentity(env: Record<string, string | undefined>): I
  * non-production and the o3d-l89a hole is closed. Both paths are exercised by
  * `tests/ops/instance-identity.test.ts`, so flipping `INSTANCE_ROLE_DECLARATION_REQUIRED` does not
  * arrive untested.
+ *
+ * ---------------------------------------------------------------------------------------------------
+ * WHO MAY CALL THIS, AND WITH WHAT. Two rules, both of which a caller can get wrong in a way that
+ * looks harmless in review.
+ *
+ * 1. FAIL-SAFE CONSUMERS ONLY. This verdict is safe for a caller that APPLIES a control when the answer
+ *    is "non-production" — the o3d-iaqy tenant guard is the shape it is written for: not-production
+ *    therefore name a ledger. It is NOT a drop-in for the repo's other `NODE_ENV`/`E2E_TEST_MODE`
+ *    readers (`lib/security/external-url-safety.ts`, `lib/security/connector-fetch.ts`,
+ *    `lib/cron-rate-limit.ts`, `lib/testing/e2e-route-guard.ts`), because those WIDEN on the same
+ *    answer — they unlock plaintext loopback HTTP, a raised rate-limit ceiling, or a test-only route.
+ *    Those readers spell the question as `E2E_TEST_MODE === '1' && NODE_ENV !== 'production'`, and the
+ *    AND is the point: it is what stops a leaked `E2E_TEST_MODE` on the production host from unlocking
+ *    anything by itself. Here, `E2E_TEST_MODE=1` OVERRIDES the declaration and makes `isProduction`
+ *    false on purpose (see `InstanceIdentityBasis.e2e-test-mode`), so substituting this function into
+ *    one of those readers collapses its AND to a single leakable flag. Converting them is a widening
+ *    and is not what o3d-l89a asked for.
+ *
+ * 2. PASS NO OPTIONS. The delegation filed as o3d-c413 — replacing the module-private
+ *    `readInstanceIsNonProduction` in `lib/connectors/xero/tenant-guard.ts` (branch o3d-batch-realm)
+ *    with a call to this function — is `instanceIsNonProduction(env)` and nothing else. That pointer
+ *    comment currently names `instanceIsNonProduction(env, { requireDeclaration: true })`, and passing
+ *    the option is wrong twice over:
+ *
+ *      - It ships step 2 on the day the sibling merges. Production is UNDECLARED today, so
+ *        `requireDeclaration: true` makes the live production instance read as non-production
+ *        immediately, and `unguardedInstance` is `instanceIsNonProduction && !hasIdentityAnchor` — so a
+ *        production host that has not also set `XERO_ALLOWED_TENANT_IDS` starts refusing its own Xero
+ *        connector. Taking production's connector offline in one commit is the exact outcome the
+ *        two-step rollout exists to prevent, and the pointer's own gate ("after IMS_INSTANCE_ROLE is on
+ *        the live server") is a gate on the CONSTANT, which a hard-coded option bypasses.
+ *      - It makes step 2 per-call-site. `INSTANCE_ROLE_DECLARATION_REQUIRED` is deliberately one
+ *        reviewed constant for everyone; a caller that hard-codes `true` is a second answer to the
+ *        question of whether the declaration is mandatory, which is the same defect in a smaller box.
+ *
+ *    With no options the delegation is provably behaviour-preserving on every host alive today: for an
+ *    undeclared environment this returns exactly what the sibling's hand-rolled body returns, which
+ *    `tests/ops/instance-identity.test.ts` pins character for character against that body. It differs
+ *    only when a declaration is PRESENT — which is the hole being closed, and which no host has yet.
+ *    The option stays on the signature for the tests that prove step 2 works before it is switched on.
+ * ---------------------------------------------------------------------------------------------------
  */
 export function instanceIsNonProduction(
   env: Record<string, string | undefined>,

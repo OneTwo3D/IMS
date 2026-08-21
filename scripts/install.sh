@@ -38,6 +38,35 @@ warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
 error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 die()     { error "$*"; exit 1; }
 
+# Percent-encode a value for the userinfo section of a URL (o3d-tsc0).
+#
+# REDIS_URL is the canonical place a Redis credential lives, because it is what
+# the client connects with, it is the only form that can express a Redis 6 ACL
+# username, and an inline credential already wins over any environment fallback.
+# This installer is the second artefact that disagreed with that: it wrote
+# `requirepass` into redis.conf and then built a CREDENTIAL-FREE REDIS_URL, so
+# the only password an operator can supply through the installer never reached
+# AUTH. That is not visible as a Redis fault — the auth rate-limit buckets fail
+# CLOSED, so the symptom is that nobody can sign in to the server that was just
+# installed.
+#
+# LC_ALL=C makes bash walk the string BYTE by byte, so a multi-byte password is
+# encoded as the bytes the server will receive rather than as codepoints. Kept
+# character-for-character identical to the one in scripts/provision-ims-tenant.sh:
+# the two scripts share no shell library, and a percent-encoder that only agrees
+# with itself is exactly the defect that made this a two-sided problem.
+urlencode() {
+  local LC_ALL=C string="$1" out="" i c
+  for (( i = 0; i < ${#string}; i++ )); do
+    c="${string:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) out+="$(printf '%%%02X' "'$c")" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 run_as_user() {
   local user="$1"
   shift
@@ -270,16 +299,42 @@ fi
 echo ""
 info "--- Redis ---"
 prompt_yn INSTALL_REDIS "Install Redis on this server?" "n"
+REDIS_USERINFO=""
 if [[ "$INSTALL_REDIS" == "y" ]]; then
   REDIS_HOST="localhost"
   prompt REDIS_PORT     "Redis port" "6379"
   prompt REDIS_PASSWORD "Redis password (leave blank if none)" ""
-  REDIS_URL="redis://${REDIS_HOST}:${REDIS_PORT}"
+  # The password has to go INTO the URL, because REDIS_URL is what the
+  # application connects with (o3d-tsc0). This line used to build the URL
+  # credential-free while the block further down wrote `requirepass` into
+  # redis.conf, so choosing a Redis password here produced a server that
+  # answered NOAUTH to its own installer's application — and the auth rate-limit
+  # buckets fail CLOSED, so that surfaces as nobody being able to sign in.
+  # The URL becomes the ONE place the credential lives: see REDIS_PASSWORD_ENV
+  # below for why the .env compatibility line is then deliberately left empty
+  # rather than carrying a second copy of the same secret.
+  if [[ -n "${REDIS_PASSWORD}" ]]; then
+    REDIS_USERINFO=":$(urlencode "${REDIS_PASSWORD}")@"
+  fi
+  REDIS_URL="redis://${REDIS_USERINFO}${REDIS_HOST}:${REDIS_PORT}"
 else
   prompt REDIS_URL      "Redis URL (redis://host:port[/db])" "redis://localhost:6379"
   prompt REDIS_PASSWORD "Redis password (leave blank if none)" ""
 fi
 prompt REDIS_KEY_PREFIX "Redis key prefix (leave blank for none)" ""
+# What the compatibility line in .env gets. When the installer put the credential
+# INTO REDIS_URL above, this stays EMPTY on purpose: writing the same secret to
+# two places is what this issue removed, and it is not a tidiness argument. The
+# raw value would go into .env unquoted, so a password containing `#`, a quote or
+# whitespace arrives at the runtime as something OTHER than what is encoded in
+# the URL — and a REDIS_URL/REDIS_PASSWORD disagreement is refused outright
+# rather than resolved by precedence (o3d-uqz0), which would take the rate
+# limiter down on a host whose URL was actually correct. REDIS_PASSWORD itself is
+# untouched and still configures `requirepass` further down.
+REDIS_PASSWORD_ENV="${REDIS_PASSWORD}"
+if [[ -n "${REDIS_USERINFO}" ]]; then
+  REDIS_PASSWORD_ENV=""
+fi
 
 echo ""
 info "--- WooCommerce (optional — can be configured later in Settings) ---"
@@ -658,7 +713,7 @@ NEXT_PUBLIC_APP_URL=https://${APP_DOMAIN}
 AUTH_URL=https://${APP_DOMAIN}
 
 REDIS_URL=${REDIS_URL}
-REDIS_PASSWORD=${REDIS_PASSWORD}
+REDIS_PASSWORD=${REDIS_PASSWORD_ENV}
 REDIS_KEY_PREFIX=${REDIS_KEY_PREFIX}
 
 WC_STORE_URL=${WC_STORE_URL}

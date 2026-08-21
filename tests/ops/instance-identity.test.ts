@@ -16,6 +16,7 @@ import {
   runProductionPreflight,
   type PreflightResult,
 } from '../../lib/ops/production-preflight.ts'
+import { validateExternalBaseUrl } from '../../lib/security/external-url-safety.ts'
 
 /**
  * o3d-l89a. `NODE_ENV` is set by the BUILD, so `next start` reports `production` on the real
@@ -264,4 +265,104 @@ test('preflight PASSES when the instance declares itself production', async () =
     assert.equal(check.message, 'Instance is declared as production.')
     assert.equal(result.ok, true)
   })
+})
+
+// ---------------------------------------------------------------------------
+// The delegation this module exists to be the answer to (o3d-c413).
+//
+// `lib/connectors/xero/tenant-guard.ts` on branch o3d-batch-realm keeps a module-private
+// `readInstanceIsNonProduction` with a single call site, precisely so that pointing it here stays a
+// one-line change. These tests pin what that one line must be, and what it must NOT be — because both
+// mistakes available at that call site look harmless in review and neither is.
+// ---------------------------------------------------------------------------
+
+test('the delegation is behaviour-preserving for every host alive today: undeclared matches the hand-rolled reading', () => {
+  // The body being replaced is, verbatim:
+  //   if ((env.E2E_TEST_MODE ?? '').trim() === '1') return true
+  //   return (env.NODE_ENV ?? '').trim() !== 'production'
+  // Written out again here on purpose. This is an EQUIVALENCE assertion between two independently
+  // written expressions, and its entire value is catching the day they stop agreeing — which is the day
+  // the "one-line delegation" silently stops being one.
+  const handRolled = (env: Record<string, string | undefined>): boolean => {
+    if ((env.E2E_TEST_MODE ?? '').trim() === '1') return true
+    return (env.NODE_ENV ?? '').trim() !== 'production'
+  }
+
+  const environments: Array<Record<string, string | undefined>> = []
+  for (const nodeEnv of [undefined, '', 'production', ' production ', 'development', 'test', 'Production']) {
+    for (const e2e of [undefined, '', '0', '1', ' 1 ', 'true']) {
+      environments.push({ NODE_ENV: nodeEnv, E2E_TEST_MODE: e2e })
+    }
+  }
+
+  for (const env of environments) {
+    assert.equal(
+      instanceIsNonProduction(env),
+      handRolled(env),
+      `undeclared instances must be answered identically: ${JSON.stringify(env)}`,
+    )
+  }
+})
+
+test('the delegation still closes the hole: a declared instance is answered by its declaration, not by the build', () => {
+  // The only environments where the two disagree — which is the point of the change, and which no host
+  // alive today is in, because none of them sets the variable.
+  const stage = { NODE_ENV: 'production', [INSTANCE_ROLE_ENV_VAR]: 'stage' }
+  assert.equal(instanceIsNonProduction(stage), true, 'stage is what the build cannot tell apart from production')
+
+  const typo = { NODE_ENV: 'production', [INSTANCE_ROLE_ENV_VAR]: 'prodcution' }
+  assert.equal(instanceIsNonProduction(typo), true, 'a typo must not read as a promotion')
+
+  const declaredProduction = { NODE_ENV: 'production', [INSTANCE_ROLE_ENV_VAR]: 'production' }
+  assert.equal(instanceIsNonProduction(declaredProduction), false)
+})
+
+test('passing requireDeclaration at a call site would ship step 2 early and take production\'s guard down with it', () => {
+  // Production is UNDECLARED today. A caller that hard-codes the option therefore reads the live
+  // production instance as non-production the moment it merges — and the o3d-iaqy guard is
+  // `instanceIsNonProduction && !hasIdentityAnchor`, so a production host that has not also set
+  // XERO_ALLOWED_TENANT_IDS starts refusing its own Xero connector. This test is what makes that
+  // consequence visible at the call site rather than in the incident.
+  const productionToday = { NODE_ENV: 'production' }
+
+  assert.equal(instanceIsNonProduction(productionToday), false, 'the call the delegation must make')
+  assert.equal(
+    instanceIsNonProduction(productionToday, { requireDeclaration: true }),
+    true,
+    'the call it must not make until the constant is flipped',
+  )
+  assert.equal(
+    INSTANCE_ROLE_DECLARATION_REQUIRED,
+    false,
+    'while this is false, an option hard-coded to true is a caller reaching step 2 on its own',
+  )
+})
+
+test('this verdict is not a drop-in for the readers that WIDEN on it — the rig flag alone must still unlock nothing', () => {
+  // `E2E_TEST_MODE=1` overrides a declaration of production HERE on purpose, because a rig handed a
+  // copy of production's .env carries that declaration with it. That is the right answer for a
+  // fail-safe caller (not production, therefore name a ledger) and exactly the wrong one for the
+  // repo's other NODE_ENV/E2E_TEST_MODE readers, which unlock plaintext loopback HTTP, a raised
+  // rate-limit ceiling or a test-only route on the same answer. They spell it as an AND for a reason:
+  // it is what stops a leaked E2E_TEST_MODE on the production host from unlocking anything by itself.
+  const leakedRigFlagOnProduction = { NODE_ENV: 'production', E2E_TEST_MODE: '1' }
+
+  assert.equal(
+    instanceIsNonProduction(leakedRigFlagOnProduction),
+    true,
+    'the identity module deliberately lets the rig flag win',
+  )
+
+  const verdict = validateExternalBaseUrl('http://localhost:3000', {
+    connectorName: 'Test',
+    allowE2eLocalHttp: true,
+    env: leakedRigFlagOnProduction,
+  })
+
+  assert.equal(
+    verdict.ok,
+    false,
+    'converting this reader to instanceIsNonProduction would collapse its AND to one leakable flag',
+  )
+  assert.match(String((verdict as { error?: string }).error), /must use https/)
 })

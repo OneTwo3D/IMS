@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
-import net from 'node:net'
 import path from 'node:path'
 import test from 'node:test'
 import { promisify } from 'node:util'
 
-import { RedisRateLimitBackend } from '@/lib/security/rate-limit-redis'
+import {
+  AWKWARD_PASSWORD,
+  commandsSentFor,
+  sliceBlock,
+  sliceRange,
+} from './redis-url-wire-harness.ts'
 
 const execFileAsync = promisify(execFile)
 
@@ -35,28 +39,13 @@ async function readScript(): Promise<string> {
   return readFile(path.join(SCRIPT), 'utf8')
 }
 
-/** Cut a function out of the script by its opening line and the first closing brace, so SHIPPED text runs. */
-function sliceBlock(source: string, startsWith: string): string {
-  const lines = source.split('\n')
-  const start = lines.findIndex((line) => line.startsWith(startsWith))
-  assert.notEqual(start, -1, `could not find a line starting with ${JSON.stringify(startsWith)}`)
-  const end = lines.findIndex((line, index) => index >= start && line === '}')
-  assert.notEqual(end, -1, `could not find the closing brace for ${JSON.stringify(startsWith)}`)
-  return lines.slice(start, end + 1).join('\n')
-}
-
 /**
  * Cut the Redis resolution block. Both bounds are lines that exist in every version of the script, so
  * reverting the change under test runs the OLD block rather than making the slice unfindable — a test
  * that only proves a marker moved proves nothing.
  */
 function sliceRedisBlock(source: string): string {
-  const lines = source.split('\n')
-  const start = lines.findIndex((line) => line.startsWith('REDIS_KEY_PREFIX="${REDIS_KEY_PREFIX'))
-  assert.notEqual(start, -1, 'could not find the start of the Redis resolution block')
-  const end = lines.findIndex((line, index) => index > start && line.startsWith('CLOUDFLARE_PROXIED='))
-  assert.notEqual(end, -1, 'could not find the end of the Redis resolution block')
-  return lines.slice(start, end).join('\n')
+  return sliceRange(source, 'REDIS_KEY_PREFIX="${REDIS_KEY_PREFIX', 'CLOUDFLARE_PROXIED=')
 }
 
 type ShellResult = { url: string; display: string; stderr: string }
@@ -84,100 +73,6 @@ async function runRedisBlock(source: string, env: string): Promise<ShellResult> 
   assert.ok(display, `the block did not report a display URL: ${stdout}`)
   return { url: url[1], display: display[1], stderr }
 }
-
-// ---------------------------------------------------------------------------
-// A Redis-speaking socket. It parses RESP arrays the way the server does and
-// reports the commands verbatim, so the assertion is on wire bytes.
-// ---------------------------------------------------------------------------
-
-function parseCommands(buffer: Buffer): { commands: string[][]; rest: Buffer } {
-  const commands: string[][] = []
-  let offset = 0
-  for (;;) {
-    if (offset >= buffer.length || buffer[offset] !== 0x2a) break
-    const headEnd = buffer.indexOf('\r\n', offset)
-    if (headEnd === -1) break
-    const count = Number(buffer.toString('utf8', offset + 1, headEnd))
-    let cursor = headEnd + 2
-    const parts: string[] = []
-    let complete = true
-    for (let index = 0; index < count; index += 1) {
-      if (buffer[cursor] !== 0x24) { complete = false; break }
-      const lengthEnd = buffer.indexOf('\r\n', cursor)
-      if (lengthEnd === -1) { complete = false; break }
-      const length = Number(buffer.toString('utf8', cursor + 1, lengthEnd))
-      const start = lengthEnd + 2
-      if (buffer.length < start + length + 2) { complete = false; break }
-      parts.push(buffer.toString('utf8', start, start + length))
-      cursor = start + length + 2
-    }
-    if (!complete) break
-    commands.push(parts)
-    offset = cursor
-  }
-  return { commands, rest: buffer.subarray(offset) }
-}
-
-type FakeRedis = {
-  port: number
-  received: Promise<string[][]>
-  close(): Promise<void>
-}
-
-async function startFakeRedis(): Promise<FakeRedis> {
-  const seen: string[][] = []
-  let resolveReceived: (value: string[][]) => void = () => undefined
-  const received = new Promise<string[][]>((resolve) => { resolveReceived = resolve })
-
-  const server = net.createServer((socket) => {
-    let buffer = Buffer.alloc(0)
-    socket.on('data', (chunk) => {
-      buffer = Buffer.concat([buffer, chunk])
-      const { commands, rest } = parseCommands(buffer)
-      buffer = Buffer.from(rest)
-      for (const command of commands) {
-        seen.push(command)
-        if (command[0]?.toUpperCase() === 'EVAL') {
-          // {allowed, count, retryAfterMs} — one allowed request.
-          socket.write('*3\r\n:1\r\n:1\r\n:0\r\n')
-          resolveReceived(seen)
-          socket.end()
-        } else {
-          socket.write('+OK\r\n')
-        }
-      }
-    })
-    socket.on('error', () => undefined)
-  })
-
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
-  const address = server.address()
-  assert.ok(address && typeof address === 'object', 'fake Redis did not bind')
-
-  return {
-    port: address.port,
-    received,
-    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
-  }
-}
-
-/** Run one real rate-limit check through the production client and report the commands it sent. */
-async function commandsSentFor(redisUrl: string): Promise<string[][]> {
-  const redis = await startFakeRedis()
-  try {
-    const backend = new RedisRateLimitBackend(redisUrl.replace('__PORT__', String(redis.port)))
-    const result = await backend.check('login:o3d-tsc0', 5, 60_000)
-    assert.equal(result.allowed, true)
-    return await redis.received
-  } finally {
-    await redis.close()
-  }
-}
-
-// A password made of every character that has ever broken one of these encoders:
-// URL delimiters, a percent, a quote, a backslash, whitespace, and a multi-byte
-// character so the encoder is proven to walk BYTES rather than codepoints.
-const AWKWARD_PASSWORD = 'p@ss:w/o?r#d %25&+=" \\tail ä'
 
 // ---------------------------------------------------------------------------
 
@@ -272,4 +167,72 @@ test('a credential-free URL is shown unchanged, so the redaction cannot hide a m
   const { display } = await runRedisBlock(source, 'REDIS_MODE=local; REDIS_PASSWORD=')
 
   assert.equal(display, 'redis://localhost:6379/0')
+})
+
+// ---------------------------------------------------------------------------
+// The redaction has to survive a URL this script did NOT build (Codex r1).
+//
+// The script encodes the passwords it builds, so its own URLs hold exactly one `@`. But a
+// caller-supplied REDIS_URL is left verbatim BY DESIGN — rewriting an operator's connection string is
+// how you end up authenticating with something nobody typed — and an operator who typed the password
+// straight into the URL did not percent-encode it. The redaction is what stands between that string
+// and a provisioning log, so it is the redaction that has to cope, not the operator.
+// ---------------------------------------------------------------------------
+
+test('a raw @ inside a caller-supplied password does not put the tail of the secret in the log', async () => {
+  const source = await readScript()
+  const { url, display } = await runRedisBlock(
+    source,
+    'REDIS_MODE=external; REDIS_HOST=cache.internal; REDIS_URL=redis://:se@cr/et@cache.internal:6379/0',
+  )
+
+  assert.equal(url, 'redis://:se@cr/et@cache.internal:6379/0', "the operator's string is still untouched")
+  assert.equal(
+    display,
+    'redis://***@cache.internal:6379/0',
+    'the cut must be at the LAST @, or it lands inside the password',
+  )
+  assert.ok(
+    !display.includes('cr') && !display.includes('et@'),
+    'no fragment of the password may survive: cutting at the first @ printed "***@cr/et@cache.internal"',
+  )
+  assert.equal(
+    (display.match(/@/g) ?? []).length,
+    1,
+    'a second @ in the redacted output is the password still being there',
+  )
+})
+
+// The two below still pass with the redaction reverted, on purpose. The first-@ cut happens to get a
+// `/`-bearing password right, so this one is not a witness against THAT bug — it is a guard against the
+// obvious wrong fix, which is to locate the authority by cutting at the first `/` and then look for an
+// @ inside it. That reads the password's own slash as the end of the authority, finds no @, and prints
+// the whole URL. The third pins the deliberate cost of cutting at the last @.
+test('a raw / inside a caller-supplied password is redacted too, and the host survives it', async () => {
+  const source = await readScript()
+  const { display } = await runRedisBlock(
+    source,
+    'REDIS_MODE=external; REDIS_HOST=cache.internal; REDIS_URL=redis://opsuser:pa/ss@cache.internal:6379/2',
+  )
+
+  assert.equal(
+    display,
+    'redis://***@cache.internal:6379/2',
+    'the ACL username goes with the password — the summary reports the shape, and the shape is the host',
+  )
+  assert.ok(!display.includes('opsuser') && !display.includes('pa/ss'))
+})
+
+test('a URL whose only @ is outside the credentials is over-redacted, never under-redacted', async () => {
+  // Pinning the cost of cutting at the last @, so the trade is reviewed rather than discovered. A
+  // credential-free URL with an @ later in it prints an unhelpful shape. That is the direction to be
+  // wrong in: an over-redacted summary line is cosmetic, an under-redacted one is a secret in a file
+  // somebody keeps.
+  const source = await readScript()
+  const { display } = await runRedisBlock(
+    source,
+    'REDIS_MODE=external; REDIS_HOST=cache.internal; REDIS_URL=redis://cache.internal:6379/0?tag=a@b',
+  )
+
+  assert.equal(display, 'redis://***@b')
 })
