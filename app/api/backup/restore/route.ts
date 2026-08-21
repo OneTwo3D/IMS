@@ -11,7 +11,7 @@ import type { ReadableStream as NodeReadableStream } from 'stream/web'
 import { logActivity, redactActivityLogText } from '@/lib/activity-log'
 import { requireApiFreshAdmin } from '@/lib/auth/server'
 import { getBackupDir } from '@/lib/backup-storage'
-import { disableMaintenanceMode, enableMaintenanceMode } from '@/lib/maintenance-mode'
+import { disableMaintenanceMode, enableMaintenanceMode, recordMaintenanceHold } from '@/lib/maintenance-mode'
 import { sendEmail } from '@/lib/mailer'
 import { consumeAuthToken, deleteAuthToken, setAuthToken } from '@/lib/auth/token-store'
 import { db } from '@/lib/db'
@@ -71,6 +71,7 @@ export type BackupRestoreHandlerDeps = {
   deleteRestoreToken?: typeof deleteAuthToken
   enableMaintenance?: typeof enableMaintenanceMode
   disableMaintenance?: typeof disableMaintenanceMode
+  recordMaintenanceHold?: typeof recordMaintenanceHold
   runRestoreFile?: typeof runRestore
   validateBackupManifest?: typeof validateBackupManifestForFile
   getAvailableDiskBytes?: typeof getAvailableDiskBytes
@@ -616,7 +617,7 @@ export type RestoreLockContext = {
  * `enqueueMintsoftBookedInRecheckForAsn` ("Re-check" on the purchase order's ASN table), which
  * reconstructs the trigger and re-reads the quantities from the warehouse.
  *
- * ROUND 4, FINDING 1 — AND THE FOURTH CONSECUTIVE ROUND IN WHICH THIS PARAGRAPH OVERSTATED THE
+ * ROUND 4, FINDING 1 — THE FOURTH CONSECUTIVE ROUND IN WHICH THIS PARAGRAPH OVERSTATED THE
  * RECOVERY. Round 3 listed three bounds and called them a bound. Every one of them was conditional,
  * and on a DEFAULT INSTALLATION none of them held: the sender may not retry (its behaviour, not
  * ours); the "Re-check" control existed on the purchase-order ASN table ONLY, while stock-transfer
@@ -629,7 +630,10 @@ export type RestoreLockContext = {
  *   • AT REFUSAL — the process log, and nothing else. `recordMaintenanceRefusal` in the webhook
  *     route emits a line naming the route and the remedy. It writes NO database row, deliberately:
  *     a row written into this window is being replayed over, and the fence runs before signature
- *     verification, so persisting would mean writing rows from unauthenticated callers.
+ *     verification, so persisting would mean writing rows from unauthenticated callers. THE ROW
+ *     THAT IS WRITTEN INSTEAD is about the WINDOW, not the callback — see the hold record below —
+ *     because the window is a thing this endpoint knows and is authenticated to record, while the
+ *     refusals are neither.
  *   • THE 503 carries `Retry-After: 300`, so a sender that retries at all has a defined schedule
  *     rather than whatever its own backoff decides.
  *   • AUTOMATICALLY, WITHIN MINUTES OF THE WINDOW CLOSING — `disableMaintenanceMode` stamps
@@ -658,14 +662,39 @@ export type RestoreLockContext = {
  * operator action on either kind of ASN, and alerted on a scale of days if it is still open for some
  * other reason.
  *
- * THE ONE PATH THAT IS STILL NOT AUTOMATIC, stated rather than left to be discovered: the stamp is
- * written by `disableMaintenanceMode`, and the unconfirmed-backend branch below deliberately never
- * calls it — the flag stays on and an operator clears it in the `settings` table by hand (there is
- * no UI; `hasOperatorControl` is false). A window ended THAT way leaves no stamp, so its refused
- * callbacks fall back to the watchdog and the manual Re-check. That is the same branch that already
- * requires an operator to quiesce the application and verify a database backend is gone, so it is
- * not a path anybody walks unattended — but it is not covered by the automatic re-check, and the
- * operator message below is where that would have to be said if it ever needs to be.
+ * ROUND 5, FINDING 1 — AND THE PATH ROUND 4 NAMED AS "NOT AUTOMATIC" WAS THE ONE THAT MATTERED.
+ *
+ * Round 4 closed the ordinary window and then wrote off the held one: the stamp is written by
+ * `disableMaintenanceMode`, the unconfirmed-backend branch below never calls it, so the operator
+ * cleared `system_maintenance_mode` by hand and no stamp was ever written. It said this was
+ * acceptable because nobody walks that path unattended. That reasoning is backwards. The held branch
+ * is the branch where the window lasts LONGEST — a timed-out restore plus however long it takes
+ * somebody to notice, quiesce the application and verify a backend — so it is the branch most likely
+ * to have refused callbacks, and it was the only one with no automatic recovery at all. "The remedy
+ * exists but this path skips it" is not a bound; it is the defect.
+ *
+ * WHAT CLOSES IT (lib/domain/system/maintenance-recovery.ts):
+ *   • THE HOLD IS RECORDED. `recordMaintenanceHold` writes `system_maintenance_hold` — why, when,
+ *     and the `(pid, backend_start)` that has to be gone — from the handler's catch, after the
+ *     decision to hold the gate and best-effort, because this write is to the database whose restore
+ *     just failed. A lost record degrades to round 4's behaviour, not to anything worse.
+ *   • THE EXCEPTION INBOX RENDERS IT, and counts it in the /sync banner total, so a held window is
+ *     visible from the application instead of only in a log line and an HTTP response nobody kept.
+ *   • "END THE HOLD" IS AN OPERATOR ACTION, and it is now the ONLY sanctioned clear. It re-reads the
+ *     flag and the record `FOR UPDATE`, re-checks the backend against `pg_stat_activity` at the
+ *     moment of the click, refuses by name if any precondition has moved — and STAMPS
+ *     `wms_booked_in_recheck_due_since` in the same transaction. That last part is the whole point:
+ *     the hand-written UPDATE ended the window and scheduled nothing.
+ *   • "RUN THE RE-CHECK NOW" drains that stamp on demand, for an installation whose five-minute cron
+ *     is disabled or whose scheduler is down — which is not a rare state on the day a restore was
+ *     needed. It refuses while the flag is still on, because a re-check issued into the window is
+ *     stopped at the same gate the callbacks were.
+ *
+ * WHAT IS STILL NOT CLAIMED. The backend check proves the backend has DETACHED, not that the
+ * application is quiet — the inbox row says so in those words, and the fence inventory below is
+ * still the honest statement of what maintenance mode reaches. And if the hold record is lost with
+ * the restore's rollback, there is no inbox row: the window is then ended the old way, by hand, and
+ * its refused callbacks fall back to the watchdog and the per-ASN Re-check.
  *
  * So ONE inbound webhook entry point and one OAuth callback still write to the database throughout
  * a held restore, and the operator message below names them.
@@ -721,14 +750,28 @@ export const MAINTENANCE_MODE_REACH = {
     { route: 'app/api/webhooks/shiphero/[event]', fenced: 'no' },
     { route: 'app/api/accounting/callback', fenced: 'no' },
   ] as const,
-  /** There is no UI for the flag: clearing it after a held restore is a database operation. */
-  hasOperatorControl: false,
+  /**
+   * o3d-hl8l r5 (Codex r4 finding 1): there IS a control now — Sync → Exceptions → "Maintenance
+   * window" — and it is the only clear that also stamps the booked-in re-check. It refuses unless
+   * the flag is really on, a hold was really recorded, and the named backend is really gone.
+   */
+  hasOperatorControl: true,
 } as const
 
 export class RestoreBackendNotConfirmedError extends Error {
-  constructor(message: string) {
+  /**
+   * The backend the operator has to see gone before the hold can be ended (o3d-hl8l r5).
+   *
+   * Carried on the error rather than recorded where it is thrown, because the recovery row is the
+   * HANDLER's to write: only the handler knows the redacted message, and only it is downstream of
+   * the decision to hold the gate — which must never be downstream of a database write.
+   */
+  readonly identity: RestoreBackendIdentity & { applicationName: string }
+
+  constructor(message: string, identity: RestoreBackendIdentity & { applicationName: string }) {
     super(message)
     this.name = 'RestoreBackendNotConfirmedError'
+    this.identity = identity
   }
 }
 
@@ -1120,11 +1163,13 @@ export async function runRestore(
           + 'application out of service to stop those. Do NOT '
           + 'restart yet: restarting releases the held lock. Confirm in pg_stat_activity that pid '
           + `${identified.identity.pid} with backend_start ${identified.identity.backendStart} is gone `
-          + '(terminate it if not), then restart, then clear maintenance mode — it is the '
-          + "`system_maintenance_mode` row in `settings` and there is no screen for it, so it stays "
-          + 'on until an operator sets it to false.'
+          + '(terminate it if not), then restart, then end the hold from Sync → Exceptions → '
+          + '"Maintenance window". That control re-checks this backend before it clears anything, '
+          + 'and clearing it there ALSO schedules the re-check for the warehouse callbacks refused '
+          + 'during the window — editing the `system_maintenance_mode` row in `settings` by hand '
+          + 'does neither.'
         lock.retainLock(reason)
-        throw new RestoreBackendNotConfirmedError(reason)
+        throw new RestoreBackendNotConfirmedError(reason, { ...identified.identity, applicationName })
       }
 
       throw new Error(
@@ -1167,6 +1212,7 @@ function withDefaults(deps: BackupRestoreHandlerDeps = {}): RequiredRestoreDeps 
     deleteRestoreToken: deps.deleteRestoreToken ?? deleteAuthToken,
     enableMaintenance: deps.enableMaintenance ?? enableMaintenanceMode,
     disableMaintenance: deps.disableMaintenance ?? disableMaintenanceMode,
+    recordMaintenanceHold: deps.recordMaintenanceHold ?? recordMaintenanceHold,
     runRestoreFile: deps.runRestoreFile ?? runRestore,
     validateBackupManifest: deps.validateBackupManifest ?? validateBackupManifestForFile,
     getAvailableDiskBytes: deps.getAvailableDiskBytes ?? getAvailableDiskBytes,
@@ -1423,13 +1469,37 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       if (backendUnconfirmed) holdMaintenance = true
 
       const message = redactRestoreErrorMessage(error instanceof Error ? error.message : String(error), resolvedDeps.env)
+
+      // o3d-hl8l r5 (Codex r4 finding 1): MAKE THE HELD WINDOW SOMETHING AN OPERATOR CAN SEE AND
+      // END. Until now this branch left the flag on with no screen and no record, so the only
+      // available clear was a hand-written UPDATE — which never stamped the booked-in re-check, so
+      // every callback the fence refused during the LONGEST kind of window fell back to a
+      // days-scale alert. This row is what the exception inbox renders and what the "End the hold"
+      // action re-checks the backend against before it clears anything.
+      //
+      // AFTER the gate decision above and best-effort by contract (`recordMaintenanceHold` catches
+      // its own failures): the database this writes to is the one whose restore just failed, so it
+      // is among the likeliest writes to be rejected here, and a protective decision must never be
+      // downstream of the thing it is protecting against.
+      let holdRecorded = false
+      if (error instanceof RestoreBackendNotConfirmedError) {
+        holdRecorded = await resolvedDeps.recordMaintenanceHold({
+          reason: message,
+          backendPid: error.identity.pid,
+          backendStart: error.identity.backendStart,
+          applicationName: error.identity.applicationName,
+        })
+      }
+
       try {
         await resolvedDeps.log({
           entityType: 'SYSTEM',
           tag: 'system',
           action: 'backup_restored',
           level: 'ERROR',
-          metadata: backendUnconfirmed ? { error: message, backendUnconfirmed: true, maintenanceModeHeld: true } : { error: message },
+          metadata: backendUnconfirmed
+            ? { error: message, backendUnconfirmed: true, maintenanceModeHeld: true, holdRecorded }
+            : { error: message },
           description: `Failed to restore backup: ${message}`,
         })
       } catch {

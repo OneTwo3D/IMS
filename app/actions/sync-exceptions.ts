@@ -4,6 +4,20 @@ import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { mergeStuckDispatchRows } from '@/lib/domain/wms/exception-inbox'
+import {
+  buildMaintenanceRecoveryState,
+  claimPostMaintenanceRecheck,
+  countMaintenanceRecovery,
+  endMaintenanceHold,
+  MAINTENANCE_RECOVERY_REFUSALS,
+  type MaintenanceRecoveryState,
+} from '@/lib/domain/system/maintenance-recovery'
+import {
+  MAINTENANCE_ENABLED_KEY,
+  MAINTENANCE_HOLD_KEY,
+  WMS_BOOKED_IN_RECHECK_DUE_KEY,
+} from '@/lib/maintenance-mode'
+import { runPostMaintenanceRecheckForActiveConnector } from '@/lib/domain/wms/post-maintenance-recheck'
 import { eligibleCohortDigest, isolatableLinkWhere, loadUnresolvedDriftIncidents, readRawDriftState, unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugins'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
@@ -176,6 +190,12 @@ export type UnresolvedDriftRow = {
 }
 
 export type ExceptionInboxSummary = {
+  /**
+   * o3d-hl8l r5: a held maintenance window, and/or a booked-in re-check that a closed one still
+   * owes. Counted in the inbox total because a refusal nobody can see is a silent failure, and
+   * these are the only surface a refused warehouse callback has.
+   */
+  maintenanceRecovery: number
   wmsPushDeadLetters: number
   outboxFailures: number
   deadReceiptEvents: number
@@ -190,6 +210,7 @@ export type ExceptionInboxSummary = {
 
 export type ExceptionInboxData = {
   summary: ExceptionInboxSummary
+  maintenanceRecovery: MaintenanceRecoveryState
   wmsPushDeadLetters: WmsPushDeadLetterRow[]
   outboxFailures: OutboxFailureRow[]
   deadReceiptEvents: DeadReceiptEventRow[]
@@ -402,6 +423,19 @@ async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
   }))
 }
 
+/**
+ * o3d-hl8l r5: the maintenance-recovery state, read unlocked because this is a render. Both actions
+ * re-read every one of these rows `FOR UPDATE` before acting, so a stale page can only ever cause a
+ * refusal — never a wrong write.
+ */
+async function loadMaintenanceRecoveryState(): Promise<MaintenanceRecoveryState> {
+  const rows = await db.setting.findMany({
+    where: { key: { in: [MAINTENANCE_ENABLED_KEY, MAINTENANCE_HOLD_KEY, WMS_BOOKED_IN_RECHECK_DUE_KEY] } },
+    select: { key: true, value: true },
+  })
+  return buildMaintenanceRecoveryState(new Map(rows.map((row) => [row.key, row.value])))
+}
+
 /** True per-source totals — never capped by the display limit (Codex r3/r5). */
 async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents] = await Promise.all([
@@ -420,8 +454,10 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     getEnabledWmsConnectorId().then((id) => (id ? loadUnresolvedDriftIncidents([id]) : [])),
   ])
 
+  const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
   const deadReceiptEvents = deadReceipts + deadWebhooks
   return {
+    maintenanceRecovery,
     wmsPushDeadLetters,
     outboxFailures,
     deadReceiptEvents,
@@ -431,8 +467,8 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     orderReconcileDrift,
     productStructureConflicts,
     unresolvedDrift: driftIncidents.length,
-    total: wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks + stuckDispatches
-      + pennyMismatches + orderReconcileDrift + productStructureConflicts + driftIncidents.length,
+    total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
+      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + driftIncidents.length,
   }
 }
 
@@ -584,7 +620,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     )
   }
 
-  const data: Omit<ExceptionInboxData, 'summary'> = {
+  const data: Omit<ExceptionInboxData, 'summary' | 'maintenanceRecovery'> = {
     wmsPushDeadLetters: pushLinks.map((link) => ({
       orderId: link.orderId,
       orderNumber: link.order.orderNumber,
@@ -668,6 +704,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
 
   return {
     ...data,
+    maintenanceRecovery: await loadMaintenanceRecoveryState(),
     // Codex r5: real totals, not the capped list lengths — the client renders
     // "showing N of M" when a section is capped at SECTION_LIMIT.
     summary: counts,
@@ -1281,6 +1318,184 @@ export async function retryUnresolvedDriftCohort(connector: string, version: str
       return { success: false, error: 'A dispatch sweep is running right now — try again in a moment.' }
     }
     return outcome
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+// -------------------------------------------------------------------------------------------------
+// o3d-hl8l r5 (Codex r4 finding 1) — WHAT AN OPERATOR CAN DO ABOUT A REFUSED CALLBACK.
+//
+// The maintenance fence refuses inbound booked-in callbacks with a 503 and writes no row, which is
+// deliberate and unavoidable: it runs before signature verification, and rows written into the
+// window are being replayed over. Round 4 made the ordinary window recover itself — the close is
+// stamped and a five-minute cron drains the stamp by re-checking every open ASN. But the branch the
+// fence exists FOR, a restore whose backend could not be confirmed gone, never closes that way: it
+// holds the flag, never calls `disableMaintenanceMode`, and so never stamps anything. The remedy was
+// an UPDATE typed at a database prompt by hand, which ends the window and schedules nothing.
+// (Deliberately not naming the client binary: tests/accounting/plugin-selection-lock.test.ts scans
+// for that name to find files that SHELL OUT to it, and this file does not — every statement here
+// runs inside an app transaction. Classifying it there would assert a database-execution path that
+// does not exist.)
+//
+// These two actions are that branch's remedy, and neither trusts the button that invoked it: each
+// re-reads the settings rows `FOR UPDATE` and refuses, by name, when the precondition it depends on
+// does not hold at the moment of the click.
+// -------------------------------------------------------------------------------------------------
+
+/** Human wording for each refusal, so the operator is told what to do rather than what failed. */
+const MAINTENANCE_REFUSAL_MESSAGES: Record<string, string> = {
+  [MAINTENANCE_RECOVERY_REFUSALS.notInMaintenance]:
+    'Maintenance mode is already off — the window has been ended already (possibly by someone else). Nothing was changed.',
+  [MAINTENANCE_RECOVERY_REFUSALS.noHoldRecorded]:
+    'Maintenance mode is on but no held restore was recorded, which is what a restore that is still RUNNING looks like. '
+    + 'Ending it now would let scheduled jobs and webhooks write into a live restore. Nothing was changed.',
+  [MAINTENANCE_RECOVERY_REFUSALS.holdUnreadable]:
+    'The recorded hold does not name a database backend, so there is nothing to verify before clearing the flag. '
+    + 'Confirm by hand that the restore backend is gone, then clear `system_maintenance_mode` in `settings`.',
+  [MAINTENANCE_RECOVERY_REFUSALS.backendStillRunning]:
+    'The restore’s database backend is STILL ATTACHED — it may still be writing. Terminate it and try again. Nothing was changed.',
+  [MAINTENANCE_RECOVERY_REFUSALS.backendIndeterminate]:
+    'Could not determine whether the restore’s database backend is still attached, so the hold was left in place. Nothing was changed.',
+  [MAINTENANCE_RECOVERY_REFUSALS.maintenanceModeOn]:
+    'Maintenance mode is still on. A re-check run now is fenced at the same gate the callbacks were, so it would do nothing. '
+    + 'End the maintenance window first.',
+  [MAINTENANCE_RECOVERY_REFUSALS.noRecheckDue]:
+    'No maintenance window is waiting to be re-checked — either none has closed since the last run, or the re-check has already drained.',
+}
+
+/**
+ * END A HELD MAINTENANCE WINDOW.
+ *
+ * Refuses unless, re-read under the lock: the flag is on, a hold really was recorded, the record
+ * names a backend, and that backend is GONE from `pg_stat_activity` by `(pid, backend_start)` — the
+ * same pair the restore endpoint identified it by, because a pid alone is reused and
+ * `application_name` is a GUC the replayed SQL can change.
+ *
+ * When it does clear the flag it stamps `wms_booked_in_recheck_due_since` in the SAME transaction,
+ * so this window finally gets the automatic re-check every normally-closed one has had since round
+ * 4. That is the half a hand-written UPDATE always missed, and it is why this action exists at all
+ * rather than a line of documentation telling someone which row to edit.
+ */
+export async function endHeldMaintenanceWindow(): Promise<MutationResult & { recheckDueSince?: string }> {
+  try {
+    const session = await requireFreshPermission('sync')
+
+    const result = await db.$transaction(async (tx) => endMaintenanceHold(tx, {
+      isRestoreBackendAttached: async ({ pid, backendStart }) => {
+        try {
+          // Matched on the pair, and on `backend_start` as TEXT: the restore endpoint captured the
+          // server's own rendering of it and never parsed it into a Date, precisely so this
+          // comparison cannot be lost to a timezone or a rounded microsecond.
+          const rows = await tx.$queryRaw<Array<{ pid: number }>>`
+            SELECT pid FROM pg_stat_activity WHERE pid = ${pid} AND backend_start::text = ${backendStart}`
+          return rows.length > 0
+        } catch (error) {
+          console.error('[maintenance-recovery] could not read pg_stat_activity:', error)
+          return null
+        }
+      },
+    }))
+
+    if (!result.ended) {
+      return {
+        success: false,
+        error: MAINTENANCE_REFUSAL_MESSAGES[result.reason]
+          ?? `The maintenance hold was not ended (${result.reason}). Nothing was changed.`,
+      }
+    }
+
+    await logActivity({
+      entityType: 'SYSTEM',
+      tag: 'system',
+      action: 'maintenance_hold_ended',
+      level: 'WARNING',
+      description:
+        `Ended the held maintenance window from the exception inbox — restore backend pid ${result.hold.backendPid} `
+        + `(started ${result.hold.backendStart}) confirmed gone; a warehouse booked-in re-check is now due`,
+      metadata: {
+        userId: session.user.id,
+        backendPid: result.hold.backendPid,
+        backendStart: result.hold.backendStart,
+        applicationName: result.hold.applicationName,
+        heldAt: result.hold.heldAt,
+        recheckDueSince: result.recheckDueSince,
+      },
+      resolveUser: false,
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true, recheckDueSince: result.recheckDueSince }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * RUN THE POST-MAINTENANCE BOOKED-IN RE-CHECK NOW.
+ *
+ * The automatic drain lives on the warehouse webhook sweeper's five-minute cron. That cron is
+ * `defaultEnabled: true`, but an installation that has disabled it — or whose scheduler is down,
+ * which is not a rare state on the day a restore was needed — has no other way to run it, and "wait
+ * five minutes and see" is not something an operator can verify.
+ *
+ * Refuses while maintenance mode is on (a re-check issued into the window is stopped at the same
+ * gate the callbacks were) and when no window is actually pending. The marker is NOT cleared by the
+ * claim: `runPostMaintenanceBookedInRecheck` clears it only once every open ASN has been attempted,
+ * so claiming it here would drop the retry a truncated page depends on.
+ */
+export async function runPostMaintenanceRecheckNow(): Promise<MutationResult & {
+  attempted?: number
+  failed?: number
+  drained?: boolean
+}> {
+  try {
+    const session = await requireFreshPermission('sync')
+
+    const claim = await db.$transaction((tx) => claimPostMaintenanceRecheck(tx))
+    if (!claim.due) {
+      return {
+        success: false,
+        error: MAINTENANCE_REFUSAL_MESSAGES[claim.reason] ?? `The re-check did not run (${claim.reason}).`,
+      }
+    }
+
+    // Resolved behind the WMS boundary: null means no enabled connector performs a booked-in
+    // re-check, in which case the marker is left alone because it is still owed.
+    const result = await runPostMaintenanceRecheckForActiveConnector()
+    if (!result) {
+      return {
+        success: false,
+        error: 'No enabled warehouse connector performs a booked-in re-check, so nothing was run. '
+          + 'The re-check is still recorded as due.',
+      }
+    }
+
+    await logActivity({
+      entityType: 'SYNC',
+      tag: 'sync',
+      action: 'wms_post_maintenance_recheck_manual',
+      level: result.failed > 0 ? 'WARNING' : 'INFO',
+      description:
+        `Ran the post-maintenance warehouse re-check by hand for the window that ended ${claim.windowEndedAt} — `
+        + `${result.attempted} open ASN(s) attempted`
+        + (result.failed > 0 ? `, ${result.failed} failed and will be retried` : '')
+        + (result.drained ? '' : ' — more remain and the marker was kept'),
+      metadata: {
+        userId: session.user.id,
+        connector: result.connector,
+        windowEndedAt: claim.windowEndedAt,
+        attempted: result.attempted,
+        failed: result.failed,
+        drained: result.drained,
+      },
+      resolveUser: false,
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true, attempted: result.attempted, failed: result.failed, drained: result.drained }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)
     if (freshAuthFailure) return freshAuthFailure

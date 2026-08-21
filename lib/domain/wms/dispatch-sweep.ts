@@ -4,7 +4,13 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
-import { mintsoftDeltaScopeToken, type MintsoftDeltaScope } from '@/lib/connectors/mintsoft/settings/schema'
+import {
+  MINTSOFT_DELTA_GENERATION_KEY,
+  mintsoftDeltaScopeToken,
+  nextMintsoftDeltaGeneration,
+  parseMintsoftDeltaGeneration,
+  type MintsoftDeltaScope,
+} from '@/lib/connectors/mintsoft/settings/schema'
 import {
   lockMintsoftDispatchSettings,
   type MintsoftDispatchSettingsLockTx,
@@ -479,8 +485,16 @@ export type WmsDispatchSweepDeps = {
   // refuse its own write when the scope has moved underneath it; a `getDeltaState` that returns no
   // token asks for no such check, which is what keeps a connector with no scope (or a test double)
   // working unchanged.
-  getDeltaState?(): Promise<{ watermark: string | null; lastReconcile: string | null; scope?: string | null }>
-  saveDeltaState?(state: { watermark?: string; lastReconcile?: string; scope?: string | null }): Promise<void>
+  //
+  // o3d-hl8l r5 (Codex r4 finding 2): `generation` is carried the same way and is now the thing the
+  // write is actually judged against. The token answers "is the scope different now?", which a
+  // scope changed and changed back answers with NO while both resets really happened; the
+  // generation is minted once per committed reset under the dispatch row lock, so a sweep that
+  // spanned either of them is refused. It is round-tripped rather than re-read at save time for the
+  // same reason the token is: the value being compared has to be the one the run's cursors came
+  // from, and only the run knows that.
+  getDeltaState?(): Promise<{ watermark: string | null; lastReconcile: string | null; scope?: string | null; generation?: number | null }>
+  saveDeltaState?(state: { watermark?: string; lastReconcile?: string; scope?: string | null; generation?: number | null }): Promise<void>
   // Active links (same eligibility as listCandidates) whose STABLE
   // externalOrderId is in the given set. This is the primary delta candidate
   // lookup: order numbers can be renamed while the Mintsoft ID remains stable.
@@ -869,18 +883,22 @@ export async function runWmsDispatchSweepCore(
   // in-flight old-scope pass cannot re-write cursors a scope change has since discarded
   // (q66in.7.2 r3). Null when the deps expose no scope — no check is then asked for.
   let deltaScopeToken: string | null = null
+  // The RESET GENERATION the cursors were read at, handed back at save time (o3d-hl8l r5). Null when
+  // the deps expose none — a connector with no delta scope, which asks for no check at all.
+  let deltaGeneration: number | null = null
   // Set when the delta fetch fails: the sweep still fails safe to the per-order
   // reconcile, but the failure is surfaced (job PARTIAL + errors) so a broken
   // primary path can't hide behind a SUCCEEDED job.
   let deltaError: string | null = null
 
   if (deltaActive) {
-    const state: { watermark: string | null; lastReconcile: string | null; scope?: string | null } =
+    const state: { watermark: string | null; lastReconcile: string | null; scope?: string | null; generation?: number | null } =
       deps.getDeltaState
         ? await deps.getDeltaState()
         : { watermark: null, lastReconcile: null }
     // Carried for the whole run and handed back at save time — see `getDeltaState` on the deps.
     deltaScopeToken = state.scope ?? null
+    deltaGeneration = state.generation ?? null
     const overlapMs = (options?.deltaOverlapSeconds ?? DISPATCH_DELTA_DEFAULT_OVERLAP_SECONDS) * 1000
     const lookbackMs = (options?.deltaLookbackSeconds ?? DISPATCH_DELTA_DEFAULT_LOOKBACK_SECONDS) * 1000
     const intervalMs = (options?.reconcileIntervalSeconds ?? DISPATCH_DELTA_DEFAULT_RECONCILE_INTERVAL_SECONDS) * 1000
@@ -1598,6 +1616,9 @@ export async function runWmsDispatchSweepCore(
       await deps.saveDeltaState({
         ...toSave,
         ...(deltaScopeToken !== null ? { scope: deltaScopeToken } : {}),
+        // OMITTED the same way, and for the same reason: a payload that carries no generation is a
+        // caller that never read one, which the repository refuses rather than guesses at.
+        ...(deltaGeneration !== null ? { generation: deltaGeneration } : {}),
       })
     }
   }
@@ -1671,7 +1692,16 @@ export type MintsoftDeltaCursorTx = MintsoftDispatchSettingsLockTx & {
       create: { key: string; value: string }
       update: { value: string }
     }): Promise<unknown>
+    findMany(args: {
+      where: { key: { in: string[] } }
+      select: { key: true; value: true }
+    }): Promise<Array<{ key: string; value: string | null }>>
   }
+}
+
+/** What the RESET needs on top of the write side: it removes the cursor rows outright. */
+export type MintsoftDeltaResetTx = MintsoftDeltaCursorTx & {
+  setting: { deleteMany(args: { where: { key: { in: string[] } } }): Promise<unknown> }
 }
 
 /**
@@ -1689,6 +1719,17 @@ export type MintsoftDeltaCursorReadTx = MintsoftDispatchSettingsLockTx & {
 
 /** The two Setting keys the inbound-delta cursors live in, in the order both sides touch them. */
 export const MINTSOFT_DELTA_CURSOR_KEYS = ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'] as const
+
+/**
+ * The cursor rows PLUS the generation row, read as one set.
+ *
+ * The generation is read in the same `findMany` as the cursors, not in a follow-up query, for the
+ * same reason r4 moved the scope read inside the lock: evidence assembled across two statements can
+ * describe two different moments, and a fence that judges from it is deciding about a state that
+ * never existed. One statement, inside the transaction that already holds the dispatch rows
+ * `FOR UPDATE`, cannot straddle a reset.
+ */
+export const MINTSOFT_DELTA_STATE_KEYS = [...MINTSOFT_DELTA_CURSOR_KEYS, MINTSOFT_DELTA_GENERATION_KEY] as const
 
 /**
  * q66in.7.2 r4 (Codex r3 finding 2) — READ THE CURSORS AND THE SCOPE THEY BELONG TO ATOMICALLY.
@@ -1714,10 +1755,10 @@ export const MINTSOFT_DELTA_CURSOR_KEYS = ['mintsoft_order_delta_since', 'mintso
 export async function readMintsoftDeltaCursors(
   tx: MintsoftDeltaCursorReadTx,
   lockScope: (tx: MintsoftDeltaCursorReadTx) => Promise<MintsoftDeltaScope>,
-): Promise<{ watermark: string | null; lastReconcile: string | null; scope: string }> {
+): Promise<{ watermark: string | null; lastReconcile: string | null; scope: string; generation: number | null }> {
   const scope = mintsoftDeltaScopeToken(await lockScope(tx))
   const rows = await tx.setting.findMany({
-    where: { key: { in: [...MINTSOFT_DELTA_CURSOR_KEYS] } },
+    where: { key: { in: [...MINTSOFT_DELTA_STATE_KEYS] } },
     select: { key: true, value: true },
   })
   const map = new Map(rows.map((row) => [row.key, row.value]))
@@ -1725,26 +1766,99 @@ export async function readMintsoftDeltaCursors(
     watermark: map.get('mintsoft_order_delta_since') || null,
     lastReconcile: map.get('mintsoft_order_reconcile_at') || null,
     scope,
+    generation: parseMintsoftDeltaGeneration(map.get(MINTSOFT_DELTA_GENERATION_KEY) ?? null),
   }
+}
+
+/**
+ * o3d-hl8l r5 (Codex r4 finding 2) — THE RESET, AS ONE OPERATION BOTH SIDES SHARE.
+ *
+ * Clearing the cursors and minting the next generation is a single indivisible fact: cursors gone,
+ * and every sweep that read the old ones now unable to write. Splitting them across the settings
+ * action (which cleared) and this module (which fenced) is how the two drifted into answering
+ * different questions in the first place, so the reset lives here, beside the fence it arms, and
+ * `saveMintsoftOrderDispatchSettings` calls it.
+ *
+ * The caller MUST already hold the five dispatch setting rows `FOR UPDATE` — that lock is what makes
+ * the read-then-increment below a serialized chain rather than a race between two resets. It is not
+ * re-taken here, because taking it twice in one transaction would say the ordering is this
+ * function's to establish when it is the caller's.
+ */
+export async function resetMintsoftDeltaCursors(tx: MintsoftDeltaResetTx): Promise<{ generation: number }> {
+  const rows = await tx.setting.findMany({
+    where: { key: { in: [MINTSOFT_DELTA_GENERATION_KEY] } },
+    select: { key: true, value: true },
+  })
+  const current = parseMintsoftDeltaGeneration(rows[0]?.value ?? null)
+  const generation = nextMintsoftDeltaGeneration(current)
+
+  await tx.setting.deleteMany({ where: { key: { in: [...MINTSOFT_DELTA_CURSOR_KEYS] } } })
+  await tx.setting.upsert({
+    where: { key: MINTSOFT_DELTA_GENERATION_KEY },
+    create: { key: MINTSOFT_DELTA_GENERATION_KEY, value: String(generation) },
+    update: { value: String(generation) },
+  })
+  return { generation }
 }
 
 export type MintsoftDeltaCursorWriteResult =
   | { written: true }
-  | { written: false; reason: 'scope_changed' }
+  | { written: false; reason: 'cursors_reset' | 'generation_unknown' }
 
+/**
+ * o3d-hl8l r5 (Codex r4 finding 2) — REFUSE, RATHER THAN MERGE, AND DECIDE FROM THE GENERATION.
+ *
+ * REFUSAL RATHER THAN MERGE, deliberately. A watermark is not a set of facts that can be combined:
+ * it is one claim — "every changed order up to this instant has been applied" — and a run whose
+ * cursors were reset underneath it never established that claim for the new scope. There is nothing
+ * to merge with the cleared state, and taking the later of the two values would pick precisely the
+ * wrong one, because the RESET is the newer decision and the sweep's watermark is the older one
+ * wearing a fresher timestamp. So the advance is dropped whole and the next pass starts from the
+ * lookback window, which is what the reset asked for.
+ *
+ * WHY THE GENERATION AND NOT THE SCOPE TOKEN — see `MINTSOFT_DELTA_GENERATION_KEY`. The token is a
+ * function of the current scope, so a scope changed and changed back compares equal and the stale
+ * write goes through; the generation is minted once per committed reset under the dispatch row lock,
+ * so it never returns to a value a running sweep can be carrying. The comparison is an equality on
+ * numbers from one serialized writer chain — a lock ordering, not a clock reading, and no host
+ * participates.
+ *
+ * AN UNATTRIBUTABLE WRITE APPLIES NO CHANGE AT ALL. A caller that supplies a scope but NO generation
+ * is a build older than this fence: it read its cursors without ever seeing the generation row, so
+ * nothing about its write can be placed in the chain. It is refused rather than waved through on the
+ * weaker token — guessing here is exactly the ABA hole this replaces. A caller that supplies NEITHER
+ * is a connector with no delta scope at all, which asks for no check and is written unconditionally;
+ * that is an absent question, not an unanswerable one, and the two are kept distinguishable in the
+ * payload precisely so they can be treated differently.
+ */
 export async function saveMintsoftDeltaCursors(
   tx: MintsoftDeltaCursorTx,
-  state: { watermark?: string; lastReconcile?: string; scope?: string | null },
+  state: { watermark?: string; lastReconcile?: string; scope?: string | null; generation?: number | null },
   lockScope: (tx: MintsoftDeltaCursorTx) => Promise<MintsoftDeltaScope>,
 ): Promise<MintsoftDeltaCursorWriteResult> {
-  if (state.scope != null) {
-    const current = mintsoftDeltaScopeToken(await lockScope(tx))
-    if (current !== state.scope) {
+  if (state.scope != null || state.generation != null) {
+    if (state.generation == null) {
       console.warn(
-        '[wms-dispatch-sweep] inbound delta scope changed during this pass — discarding the cursor '
-          + 'advance rather than restoring the cursors the scope change cleared',
+        '[wms-dispatch-sweep] the inbound delta cursor write carries no reset generation, so it '
+          + 'cannot be shown to be current — discarding the cursor advance',
       )
-      return { written: false, reason: 'scope_changed' }
+      return { written: false, reason: 'generation_unknown' }
+    }
+    // The lock is taken for its ORDERING, not for the scope it returns: holding the dispatch rows
+    // is what makes the generation read below and the reset that would move it mutually exclusive.
+    await lockScope(tx)
+    const rows = await tx.setting.findMany({
+      where: { key: { in: [MINTSOFT_DELTA_GENERATION_KEY] } },
+      select: { key: true, value: true },
+    })
+    const current = parseMintsoftDeltaGeneration(rows[0]?.value ?? null)
+    if (current === null || current !== state.generation) {
+      console.warn(
+        '[wms-dispatch-sweep] the inbound delta cursors were reset during this pass (generation '
+          + `${state.generation} → ${current === null ? 'unreadable' : current}) — discarding the `
+          + 'cursor advance rather than restoring the cursors the reset cleared',
+      )
+      return { written: false, reason: 'cursors_reset' }
     }
   }
 
@@ -1921,7 +2035,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
             // at save time wave the stale advance through — see readMintsoftDeltaCursors.
             return db.$transaction((tx) => readMintsoftDeltaCursors(tx, lockMintsoftDispatchSettings))
           },
-          async saveDeltaState(state: { watermark?: string; lastReconcile?: string; scope?: string | null }) {
+          async saveDeltaState(state: { watermark?: string; lastReconcile?: string; scope?: string | null; generation?: number | null }) {
             await db.$transaction((tx) => saveMintsoftDeltaCursors(tx, state, lockMintsoftDispatchSettings))
           },
         }

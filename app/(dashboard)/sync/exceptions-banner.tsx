@@ -15,6 +15,9 @@ export function ExceptionsBanner({ summary }: { summary: ExceptionInboxSummary }
   if (summary.total === 0) return null
 
   const parts = [
+    // o3d-hl8l r5: FIRST, because it is the only one that is a system-wide state rather than a queue
+    // of rows — and because while it is present, inbound warehouse callbacks are being refused.
+    summary.maintenanceRecovery > 0 ? `${summary.maintenanceRecovery} maintenance-window item(s)` : null,
     summary.wmsPushDeadLetters > 0 ? `${summary.wmsPushDeadLetters} dead-lettered order push(es)` : null,
     summary.outboxFailures > 0 ? `${summary.outboxFailures} failed outbox row(s)` : null,
     summary.deadReceiptEvents > 0 ? `${summary.deadReceiptEvents} dead receipt event(s)` : null,

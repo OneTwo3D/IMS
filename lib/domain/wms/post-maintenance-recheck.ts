@@ -1,5 +1,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
+import { enqueueMintsoftBookedInRecheckForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
 import { WMS_BOOKED_IN_RECHECK_DUE_KEY } from '@/lib/maintenance-mode'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
 
@@ -127,4 +129,31 @@ export async function runPostMaintenanceBookedInRecheck(
   }
 
   return { skipped: false, attempted: candidates.length, failed, drained, windowEndedAt }
+}
+
+/**
+ * o3d-hl8l r5 (Codex r4 finding 1) — THE SAME DRAIN, RESOLVED AGAINST THE ACTIVE CONNECTOR.
+ *
+ * The automatic pass is wired by a connector-named cron route, which is where a connector literal
+ * belongs. The OPERATOR path is not connector-named — it is a button on the connector-agnostic
+ * exception inbox — so the resolution lives here, behind the WMS boundary, rather than in
+ * `app/actions/sync-exceptions.ts` where naming a connector would be exactly the leak
+ * `scripts/check-wms-connector-boundary.mjs` exists to stop.
+ *
+ * Returns `null` when no connector that can perform a booked-in re-check is enabled. The marker is
+ * deliberately left alone in that case: it is still owed, and it will be drained when the connector
+ * that owes it is back.
+ */
+export async function runPostMaintenanceRecheckForActiveConnector(
+  options: { pageSize?: number } = {},
+): Promise<(PostMaintenanceRecheckResult & { connector: WmsConnectorId }) | null> {
+  const connectorId = await getEnabledWmsConnectorId()
+  // Only the Mintsoft connector implements a booked-in re-check; ShipHero's inbound path does not go
+  // through this trigger at all, so there is nothing to reconstruct for it.
+  if (connectorId !== 'mintsoft') return null
+
+  const result = await runPostMaintenanceBookedInRecheck(connectorId, {
+    recheckAsn: (externalAsnId, recheckOptions) => enqueueMintsoftBookedInRecheckForAsn(externalAsnId, recheckOptions),
+  }, options)
+  return { ...result, connector: connectorId }
 }

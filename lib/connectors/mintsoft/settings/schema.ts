@@ -234,3 +234,55 @@ export function mintsoftHasAuthMaterial(
       || (settings.mintsoft_username.trim() && settings.mintsoft_password.trim()),
   )
 }
+
+/**
+ * o3d-hl8l r5 (Codex r4 finding 2) — THE DELTA-RESET GENERATION.
+ *
+ * WHY THE SCOPE TOKEN COULD NOT BE THE FENCE. `saveMintsoftDeltaCursors` used to refuse a stale
+ * cursor write by comparing the scope token the run started under against the one held at save time.
+ * That detects "the scope is different now" and NOT "the cursors were reset while I was running" —
+ * and those are not the same question, because the token is a function of the CURRENT scope and can
+ * return to a value it already had. The operator corrects ClientId 89 → 101, sees the mistake and
+ * puts 89 back: two resets, two cleared cursor pairs, and a token that ends exactly where it began.
+ * An in-flight sweep that read its watermark under the first 89 then compares 89 against 89, passes,
+ * and writes an old-scope watermark straight back over BOTH resets. The delta then resumes from a
+ * point before the correction and the orders the correction was made to see never enter it.
+ *
+ * A GENERATION HAS NO VALUE TO RETURN TO. It is incremented once per committed reset, by whichever
+ * transaction holds the five dispatch setting rows `FOR UPDATE`, so every number comes from ONE
+ * SERIALIZED WRITER CHAIN: the lock is held to commit across the read and the increment. The
+ * ordering is therefore A LOCK ORDERING RATHER THAN A CLOCK READING, and no host clock — and no
+ * database clock either — participates. Two resets that restore the original scope still leave the
+ * generation two higher than the sweep is carrying, so the write is refused.
+ *
+ * The scope token is KEPT, because "did the scope move?" is still the question the save asks to
+ * decide whether to reset at all. It is no longer the question the cursor write asks.
+ */
+export const MINTSOFT_DELTA_GENERATION_KEY = 'mintsoft_order_delta_generation'
+
+/**
+ * The stored generation as a number.
+ *
+ * ABSENT (or empty) IS ZERO, not unknown: only the reset writes this row, so no row means no reset
+ * has ever committed, which is a fact and not a gap. A row that is present but NOT a non-negative
+ * integer is `null` — genuinely unattributable — and every caller treats that as "apply no change",
+ * because a value nobody can order cannot establish that a cursor write is current.
+ */
+export function parseMintsoftDeltaGeneration(raw: string | null | undefined): number | null {
+  if (raw == null) return 0
+  const trimmed = String(raw).trim()
+  if (trimmed === '') return 0
+  if (!/^\d+$/.test(trimmed)) return null
+  const parsed = Number.parseInt(trimmed, 10)
+  return Number.isSafeInteger(parsed) ? parsed : null
+}
+
+/**
+ * The generation a committing reset writes. An unreadable current value starts the chain again at 1
+ * rather than propagating the garbage — every run holding the unreadable value is refused anyway
+ * (it carries `null`), and every run holding a real number disagrees with 1 unless the chain really
+ * is that short.
+ */
+export function nextMintsoftDeltaGeneration(current: number | null): number {
+  return (current ?? 0) + 1
+}

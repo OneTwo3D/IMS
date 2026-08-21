@@ -20,6 +20,8 @@ import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from 
 import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
 import {
   clearPennyMismatchFlag,
+  endHeldMaintenanceWindow,
+  runPostMaintenanceRecheckNow,
   replayDeadReceiptEvent,
   replayDeadWebhookEvent,
   replayOutboxException,
@@ -111,6 +113,73 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-8 text-center text-muted-foreground">
           <CheckCircle2 className="h-8 w-8 mx-auto mb-2 text-emerald-600" />
           No open sync exceptions — every queue is clean.
+        </Card>
+      ) : null}
+
+      {data.maintenanceRecovery.hold || data.maintenanceRecovery.recheckDueSince ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`Maintenance window (${data.summary.maintenanceRecovery})`}
+            detail="While maintenance mode is on, inbound warehouse callbacks are refused with a 503 and NOTHING is written — the fence runs before the signature is verified, so a refused callback cannot leave a row. Recovery is by re-checking the ASNs afterwards, which is what these controls schedule and run."
+            shown={data.summary.maintenanceRecovery}
+            total={data.summary.maintenanceRecovery}
+          />
+          {data.maintenanceRecovery.hold ? (
+            <div className="rounded-lg border border-amber-300 bg-amber-50/60 p-3 space-y-2">
+              <p className="text-sm font-medium">
+                Maintenance mode is HELD after a restore whose database backend could not be confirmed gone.
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Held {formatDateTime(data.maintenanceRecovery.hold.heldAt)} · backend pid{' '}
+                <span className="font-mono">{data.maintenanceRecovery.hold.backendPid}</span>, started{' '}
+                <span className="font-mono">{data.maintenanceRecovery.hold.backendStart}</span>
+              </p>
+              <p className="text-xs text-muted-foreground">{data.maintenanceRecovery.hold.reason}</p>
+              <p className="text-xs text-muted-foreground">
+                Ending the hold clears maintenance mode AND schedules a re-check of every open ASN, which is how the
+                callbacks refused during the window are recovered. It refuses unless that backend is gone from
+                pg_stat_activity at the moment you click — but the check only proves the backend has detached, not that
+                the application is quiet. Take the application out of service first if it is not already.
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={isPending}
+                onClick={() => runAction(
+                  endHeldMaintenanceWindow,
+                  'Ended the held maintenance window — a warehouse booked-in re-check is now due.',
+                )}
+              >
+                <RotateCcw className="h-3 w-3 mr-1" />End the hold
+              </Button>
+            </div>
+          ) : null}
+          {data.maintenanceRecovery.recheckDueSince ? (
+            <div className="rounded-lg border p-3 space-y-2">
+              <p className="text-sm font-medium">
+                A booked-in re-check is due for the maintenance window that ended{' '}
+                {formatDateTime(data.maintenanceRecovery.recheckDueSince)}.
+              </p>
+              <p className="text-xs text-muted-foreground">
+                The warehouse webhook sweeper drains this automatically about every five minutes. Run it here if that
+                job is disabled or the scheduler is down. A re-check reconstructs the callback trigger and applies only
+                what is still outstanding, so an ASN with nothing owed books nothing in.
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={isPending}
+                onClick={() => runAction(
+                  runPostMaintenanceRecheckNow,
+                  'Re-checked the open ASNs for the closed maintenance window.',
+                )}
+              >
+                <RotateCcw className="h-3 w-3 mr-1" />Run the re-check now
+              </Button>
+            </div>
+          ) : null}
         </Card>
       ) : null}
 

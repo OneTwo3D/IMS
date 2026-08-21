@@ -1,8 +1,35 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 
-const MAINTENANCE_ENABLED_KEY = 'system_maintenance_mode'
-const MAINTENANCE_REASON_KEY = 'system_maintenance_reason'
+export const MAINTENANCE_ENABLED_KEY = 'system_maintenance_mode'
+export const MAINTENANCE_REASON_KEY = 'system_maintenance_reason'
+
+/**
+ * o3d-hl8l r5 (Codex r4 finding 1) — THE ROW THAT MAKES A HELD WINDOW SOMETHING AN OPERATOR CAN
+ * SEE AND END.
+ *
+ * `disableMaintenanceMode` is not called when a restore times out and its database backend cannot be
+ * confirmed gone: the flag deliberately stays on, because releasing the fences while a backend may
+ * still be replaying is the state they exist to prevent. Until now that left NOTHING to act on. The
+ * flag was a bare `'true'` in `settings` with no screen, so the recovery was an operator finding the
+ * error text, reasoning about what it meant, and running SQL — and because the flag was then cleared
+ * OUTSIDE `disableMaintenanceMode`, no `wms_booked_in_recheck_due_since` marker was ever stamped, so
+ * every callback the fence refused during that window fell all the way back to the watchdog's
+ * days-scale alert. The one branch that most needed the recovery was the one branch it skipped.
+ *
+ * This row is that branch's durable record: WHY the flag is held, WHEN, and — the part that makes
+ * ending it checkable rather than a guess — WHICH database backend has to be gone first. The
+ * exception inbox renders it and offers the action; the action re-reads this row under a lock,
+ * re-checks the backend against `pg_stat_activity`, and refuses if either has moved. See
+ * lib/domain/system/maintenance-recovery.ts.
+ *
+ * IT IS BEST-EFFORT, and the code that writes it says so. It is written after the restore's database client has
+ * been SIGKILLed, so `--single-transaction` means the backend rolls back rather than commits — but
+ * "rather than commits" is not "cannot still be replaying", and a write issued into that window can
+ * be lost. A lost row is a held window with no inbox entry, which is exactly the position this
+ * branch was already in, so it degrades to the old behaviour rather than to something worse.
+ */
+export const MAINTENANCE_HOLD_KEY = 'system_maintenance_hold'
 
 /**
  * o3d-hl8l r4 (Codex r3 finding 1) — THE MARKER THAT MAKES A REFUSED CALLBACK RECOVER ITSELF.
@@ -59,6 +86,33 @@ export async function disableMaintenanceMode() {
       await tx.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
     }
   })
+}
+
+/**
+ * Persist the hold record described on `MAINTENANCE_HOLD_KEY`. Best-effort by contract: the caller
+ * is on a failure path whose whole premise is that the database may still be being written to, and
+ * losing the record must not replace the operator's diagnosis with a second failure.
+ */
+export async function recordMaintenanceHold(detail: {
+  reason: string
+  backendPid: number
+  backendStart: string
+  applicationName: string
+  heldAt?: string
+}): Promise<boolean> {
+  try {
+    await setSetting(MAINTENANCE_HOLD_KEY, JSON.stringify({
+      heldAt: detail.heldAt ?? new Date().toISOString(),
+      reason: detail.reason,
+      backendPid: detail.backendPid,
+      backendStart: detail.backendStart,
+      applicationName: detail.applicationName,
+    }))
+    return true
+  } catch (error) {
+    console.error('[maintenance-mode] could not record the maintenance hold:', error)
+    return false
+  }
 }
 
 export async function getMaintenanceModeState(): Promise<{ enabled: boolean; reason: string | null }> {

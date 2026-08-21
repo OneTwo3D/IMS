@@ -300,6 +300,14 @@ test('saving the order dispatch settings audits the delta-scope move and the cur
   assert.equal(entry.metadata?.scopeChanged, true)
   assert.equal(entry.metadata?.cursorsReset, true)
   assert.deepEqual(deletedSettingKeys, ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'])
+  // o3d-hl8l r5: deleting the rows was never the whole reset. Unless the save also MINTS the next
+  // generation, an in-flight sweep re-upserts the cursors it read and the reset is undone — and the
+  // audit entry above then claims a reset that did not survive the minute it was written in.
+  assert.equal(
+    settingRows.get('mintsoft_order_delta_generation'),
+    '1',
+    'the reset arms the fence in the same transaction that clears the cursors',
+  )
   assert.equal(entry.level, 'WARNING')
   assert.match(entry.description, /delta cursors reset/)
 })
@@ -326,6 +334,12 @@ test('an order-dispatch save that leaves the delta scope alone is INFO with no c
   assert.equal(entry.level, 'INFO')
   assert.equal(entry.metadata?.scopeChanged, false)
   assert.equal(entry.metadata?.cursorsReset, false)
+  assert.equal(
+    settingRows.get('mintsoft_order_delta_generation'),
+    undefined,
+    'a save that resets nothing must not move the generation — every bump refuses a sweep that is '
+      + 'in flight, so bumping without a reset throws away a legitimate advance for nothing',
+  )
   assert.deepEqual(deletedSettingKeys, [], 'an unchanged scope must not restart the delta watermark')
   assert.deepEqual(entry.metadata?.changed, ['defaultCourierServiceId'])
   assert.deepEqual(entry.metadata?.before, { defaultCourierServiceId: '12' })

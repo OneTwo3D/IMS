@@ -9,6 +9,7 @@ import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { alignmentDryRunEvidenceQuery } from '@/lib/domain/wms/alignment-dry-run'
 import { lockMintsoftCourierServiceMap, lockMintsoftDispatchSettings } from '@/lib/connectors/mintsoft/settings/dispatch-settings-lock'
+import { resetMintsoftDeltaCursors } from '@/lib/domain/wms/dispatch-sweep'
 import {
   configChangeMetadata,
   describeConfigChange,
@@ -1013,9 +1014,18 @@ export async function saveMintsoftOrderDispatchSettings(input: {
       })
     }
 
-    // Reset the delta cursors when the scope changed (no-op count when they don't exist).
+    // Reset the delta cursors when the scope changed (no-op when they don't exist).
+    //
+    // o3d-hl8l r5 (Codex r4 finding 2): DELETING THE ROWS WAS NEVER THE WHOLE RESET. A sweep already
+    // running under the old scope re-upserts them from its own run and the reset is silently undone
+    // — which r3 tried to stop with a scope-token compare-and-swap at the write, and could not,
+    // because a scope corrected and then corrected BACK (89 → 101 → 89) leaves the token exactly
+    // where it started while both resets really happened. `resetMintsoftDeltaCursors` mints a
+    // monotonic generation in the same transaction, under the five-row lock already held above, and
+    // the cursor write is judged against THAT: it never returns to a value an in-flight sweep can be
+    // carrying, so neither reset can be written over.
     if (changed) {
-      await tx.setting.deleteMany({ where: { key: { in: ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'] } } })
+      await resetMintsoftDeltaCursors(tx)
     }
 
     return {

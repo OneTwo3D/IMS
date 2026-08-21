@@ -102,6 +102,8 @@ function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
     deleteToken: 0,
     enableMaintenance: 0,
     disableMaintenance: 0,
+    // o3d-hl8l r5: what the held branch recorded for the operator to act on.
+    maintenanceHolds: [] as Array<{ reason: string; backendPid: number; backendStart: string; applicationName: string }>,
     runRestore: 0,
     getTargetDatabaseTimestamp: 0,
   }
@@ -138,6 +140,10 @@ function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
     },
     disableMaintenance: async () => {
       calls.disableMaintenance += 1
+    },
+    recordMaintenanceHold: async (detail) => {
+      calls.maintenanceHolds.push(detail as { reason: string; backendPid: number; backendStart: string; applicationName: string })
+      return true
     },
     runRestoreFile: async () => {
       calls.runRestore += 1
@@ -1345,6 +1351,7 @@ test('an unconfirmed restore backend leaves MAINTENANCE MODE ON as well as the l
         throw new RestoreBackendNotConfirmedError(
           'Restore timed out and its database backend could NOT be confirmed gone. The '
           + 'connector-selection lock is being HELD, not released. Maintenance mode stays ON.',
+          { pid: 4242, backendStart: '2026-07-15 11:00:00+00', applicationName: 'ims_restore_abc123' },
         )
       },
     })
@@ -1364,6 +1371,24 @@ test('an unconfirmed restore backend leaves MAINTENANCE MODE ON as well as the l
     assert.ok(failureLog, 'the failure is still audited')
     assert.equal((failureLog.metadata as { maintenanceModeHeld?: unknown }).maintenanceModeHeld, true)
     assert.equal((failureLog.metadata as { backendUnconfirmed?: unknown }).backendUnconfirmed, true)
+
+    // o3d-hl8l r5 (Codex r4 finding 1). THE HELD BRANCH MUST LEAVE SOMETHING TO ACT ON. Without
+    // this record the window is a bare `'true'` in `settings` with no screen: the operator clears
+    // it by hand, no re-check marker is ever stamped, and every warehouse callback the fence
+    // refused during the LONGEST kind of window is left to a days-scale alert.
+    assert.deepEqual(calls.maintenanceHolds, [{
+      reason: 'Restore timed out and its database backend could NOT be confirmed gone. The '
+        + 'connector-selection lock is being HELD, not released. Maintenance mode stays ON.',
+      backendPid: 4242,
+      backendStart: '2026-07-15 11:00:00+00',
+      applicationName: 'ims_restore_abc123',
+    }], 'the record names the exact backend the operator action re-checks before it clears anything')
+    assert.equal(
+      (failureLog.metadata as { holdRecorded?: unknown }).holdRecorded,
+      true,
+      'and whether it landed is audited — a lost record means no inbox row, which the operator has '
+        + 'no other way to discover',
+    )
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -1402,7 +1427,10 @@ test('an audit-log failure cannot switch maintenance mode off while the backend 
       },
       runRestoreFile: async () => {
         calls.runRestore += 1
-        throw new RestoreBackendNotConfirmedError('backend pid 4242 could NOT be confirmed gone')
+        throw new RestoreBackendNotConfirmedError(
+          'backend pid 4242 could NOT be confirmed gone',
+          { pid: 4242, backendStart: '2026-07-15 11:00:00+00', applicationName: 'ims_restore_abc123' },
+        )
       },
     })
     const handler = createBackupRestorePostHandler(deps)
@@ -2388,17 +2416,26 @@ test('the reach of maintenance mode is what the restore path SAYS it is, measure
   // restore overlaps every dashboard write there is.
   const actions = consulting.filter((rel) => rel.startsWith('app/actions/'))
   assert.deepEqual(actions, [], 'no server action consults maintenance mode — so it fences none of them')
-  assert.equal(MAINTENANCE_MODE_REACH.hasOperatorControl, false)
 
-  // ...and there is no screen for the flag either, which is why the recovery in the message is a
-  // database operation and not "turn it off in Settings".
-  const uiReferences: string[] = []
-  for (const file of await filesUnder(path.join(repo, 'app'))) {
-    const rel = path.relative(repo, file)
-    if (!rel.startsWith('app/(dashboard)') && !rel.startsWith('app/settings')) continue
-    if (/system_maintenance_mode|MaintenanceMode/.test(await readFile(file, 'utf8'))) uiReferences.push(rel)
+  // o3d-hl8l r5 (Codex r4 finding 1). THIS ASSERTION USED TO SAY `false`, AND IT WAS PINNING THE
+  // DEFECT: the flag had no control, so the held branch was cleared by a hand-written UPDATE that
+  // stamped no re-check marker, and every callback the fence refused during the longest kind of
+  // window was left to a days-scale alert. The control exists now, and it is measured — not
+  // asserted as prose — by finding the action that clears the flag.
+  assert.equal(MAINTENANCE_MODE_REACH.hasOperatorControl, true)
+
+  const clearingActions: string[] = []
+  for (const file of await filesUnder(path.join(repo, 'app', 'actions'))) {
+    const source = await readFile(file, 'utf8')
+    if (/endMaintenanceHold/.test(source)) clearingActions.push(path.relative(repo, file))
   }
-  assert.deepEqual(uiReferences, [], 'no dashboard screen can clear it')
+  assert.deepEqual(
+    clearingActions,
+    ['app/actions/sync-exceptions.ts'],
+    'EXACTLY ONE action may end a held window, and it is the one that re-reads the flag under a '
+      + 'lock, re-checks the backend, and stamps the booked-in re-check as it clears. A second '
+      + 'clearing path is a path that skips one of those.',
+  )
 })
 
 test('the unconfirmed-restore message describes only the protection that exists', async () => {
@@ -2432,8 +2469,15 @@ test('the unconfirmed-restore message describes only the protection that exists'
   // advisory lock, so the instructed recovery destroyed the one real protection.
   assert.doesNotMatch(message, /Maintenance mode stays ON\./, 'that clause implied the application was down')
   assert.match(message, /Do NOT restart yet: restarting releases the held lock/)
-  assert.match(message, /clear maintenance mode/, 'and the flag it leaves behind has a named recovery')
-  assert.match(message, /system_maintenance_mode/)
+  // o3d-hl8l r5 (Codex r4 finding 1). "Clear the `system_maintenance_mode` row" was a remedy that
+  // WORKED and still lost data: it ends the window without stamping the booked-in re-check, so the
+  // callbacks the fence refused stay nobody's. The message now names the control that does both,
+  // and says why the hand edit is not equivalent — a refusal is only as good as the remedy it
+  // points at.
+  assert.match(message, /end the hold from Sync → Exceptions → "Maintenance window"/)
+  assert.match(message, /re-checks this backend before it clears anything/, 'the control is not a rubber stamp')
+  assert.match(message, /schedules the re-check for the warehouse callbacks refused during the window/)
+  assert.match(message, /editing the `system_maintenance_mode` row in `settings` by hand does neither/)
 })
 
 test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag readers', async () => {
