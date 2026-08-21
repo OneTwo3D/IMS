@@ -1014,11 +1014,32 @@ export type RecoverRefundSyncParkResult =
  * from one reporting a single page — both arrive as `totalPages: 1`. Ending the walk on that number
  * would take "the store said nothing" for "the store said there is no more", which is the exact
  * shape of the defect this function exists to avoid, moved one layer out. So the header is never
- * trusted to end the walk. Only a SHORT PAGE ends it: a page holding fewer rows than were asked for
- * cannot have been truncated, so it proves the end of the collection whatever any header claims. A
- * FULL page always advances, even when the header says there is nothing after it — the cost is one
- * extra request on an order whose refund count is an exact multiple of a hundred, and the benefit is
- * that completeness is established by the response body rather than asserted by a header.
+ * trusted to end the walk: completeness is established from the RESPONSE BODY.
+ *
+ * AND THE BODY IS MEASURED AGAINST WHAT THE SERVER GRANTED, NOT AGAINST WHAT WE ASKED FOR. That
+ * distinction is the whole of Codex round 2's first finding, and without it the walk had a page-one
+ * blind spot big enough to authorise a dismissal on its own. `per_page` is a REQUEST: WooCommerce's
+ * collection default is ten, its cap is a hundred, and a store that caps lower — a hosting filter on
+ * `woocommerce_rest_orders_per_page`, a security plugin, a proxy — does not error when asked for
+ * more. It quietly serves its own size. Ending on "shorter than the hundred we asked for" therefore
+ * ended on the FIRST page of every capped store, and a first page of ten refunds was read as the
+ * complete list of an order that has forty.
+ *
+ * So the granted size is LEARNED rather than assumed, and only two things end the walk:
+ *
+ *   • AN EMPTY PAGE. Whatever the granted size is, a page with nothing on it lies past the end of
+ *     the collection, so everything the collection holds has already been banked. This is the one
+ *     unconditional proof of an ending, and it costs one extra request — paid on every order,
+ *     deliberately, because the alternative is trusting a number the server never agreed to.
+ *   • A PAGE SHORTER THAN THE FIRST FULL ONE. The first page the store fills tells us the size it is
+ *     actually serving (it is `min(what we asked for, what it grants)`, and it is only ever an
+ *     over-estimate when the collection itself ran out — in which case the next page is empty and
+ *     the rule above ends the walk anyway). A later page shorter than that size cannot have been
+ *     truncated, so it proves the end whatever any header claims.
+ *
+ * PAGE ONE NEVER ENDS THE WALK ON ITS OWN LENGTH, because on page one there is nothing to compare
+ * against: "ten rows" is a complete collection of ten and a capped page of a longer one, and the
+ * response cannot tell them apart. Only the next request can.
  *
  * The reported total is still read, for the one thing it CAN do: fail fast and cheaply when the
  * store says up front there is more here than this check will read.
@@ -1034,6 +1055,9 @@ async function readWcOrderRefundIds(
   wcOrderId: number,
 ): Promise<{ evidence: WcOrderRefundEvidence } | { error: string }> {
   const ids: number[] = []
+  // The page size the STORE is serving, learned from the first page it fills. Null until then, and
+  // never assumed to be WC_REFUND_PAGE_SIZE: that is what we asked for, not what we were given.
+  let grantedPageSize: number | null = null
   for (let page = 1; page <= WC_REFUND_MAX_PAGES; page += 1) {
     const { data, totalPages: reported, error } = await wcFetch(
       `/orders/${wcOrderId}/refunds`,
@@ -1053,15 +1077,26 @@ async function readWcOrderRefundIds(
       }
       ids.push(candidate)
     }
-    // THE ONLY PROOF OF THE END. A page shorter than the one asked for cannot have been truncated.
-    if (data.length < WC_REFUND_PAGE_SIZE) {
+    // THE UNCONDITIONAL PROOF OF THE END: a page past the end of the collection, whatever size the
+    // store is serving. Checked first, so an order with no refunds at all still costs one request.
+    if (data.length === 0) {
+      return { evidence: { wcOrderId, refundIds: ids, fetchedAt: new Date() } }
+    }
+    if (grantedPageSize === null) {
+      // PAGE ONE ONLY MEASURES. A short first page is exactly as consistent with a capped server as
+      // with a short collection, so it ends nothing — it just says how much this store hands over.
+      grantedPageSize = data.length
+    } else if (data.length < grantedPageSize) {
+      // Shorter than a page this same store filled, so it cannot have been truncated: the end.
       return { evidence: { wcOrderId, refundIds: ids, fetchedAt: new Date() } }
     }
   }
   // Every page this walk is willing to read came back FULL, so there may well be another. The list
-  // is not known to be complete and must not be used to prove a refund absent.
+  // is not known to be complete and must not be used to prove a refund absent. Counted from what was
+  // actually read rather than from pages × requested size — under a capped store those differ, and
+  // quoting the size we asked for would put a number in front of the operator that never existed.
   return {
-    error: `that order has more than ${WC_REFUND_MAX_PAGES * WC_REFUND_PAGE_SIZE} refunds, more than this check will read`,
+    error: `that order holds more than the ${ids.length} refunds this check read, more than this check will read`,
   }
 }
 

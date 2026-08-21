@@ -390,13 +390,19 @@ Either way the WooCommerce answer it acted on — the order asked, the refunds r
 is recorded in the activity log alongside who did it.
 
 Both checks need WooCommerce's answer to be **complete**, because "this refund is not on that order"
-is what they turn on. One Two Inventory reads every page of an order's refunds and stops only once a
-page comes back short, which is the point at which there provably is no more; it does not take the
-store's page-count header for an answer, since a store that sends no header is indistinguishable from
-one reporting a single page. If the read cannot be completed — the store errors, an order carries
-more refunds than the check will read, or a refund comes back with no readable id — the recovery is
-**refused and nothing is changed**, rather than treating a list that might be short as proof the
-refund is missing.
+is what they turn on. One Two Inventory reads every page of an order's refunds and works out where
+the collection ends **from the pages themselves**. It does not take the store's page-count header for
+an answer, since a store that sends no header is indistinguishable from one reporting a single page.
+Nor does it compare a page against the size it *asked* for: `per_page` is a request, and a store
+configured to serve fewer (a hosting limit, a security plugin, a proxy) answers a request for a
+hundred with its own smaller page and no error at all — so "shorter than we asked for" would end the
+walk on the very first page of such a store and call a tenth of the refunds the whole list. The end
+is established either by a page that comes back **empty**, or by one shorter than a page the same
+store has already filled. This costs one extra request per check and is deliberate.
+
+If the read cannot be completed — the store errors, an order carries more refunds than the check will
+read, or a refund comes back with no readable id — the recovery is **refused and nothing is changed**,
+rather than treating a list that might be short as proof the refund is missing.
 
 ## Invoice Notes and Customer PDF Downloads
 

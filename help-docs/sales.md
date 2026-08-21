@@ -243,8 +243,8 @@ note rather than the invoice, so this check does not apply to it.
 #### When the registration was tried and failed
 
 A registration that was **attempted and recorded as failed, with no payment reference**, also
-refuses the deletion — and there is no "check and delete" button for it, because there is nothing to
-check.
+refuses the deletion — and it refuses differently, because there is no document id for One Two
+Inventory to look up on its own.
 
 A failure does not mean nothing was posted. The accounting system is called *before* the result is
 written down, so a timeout, a dropped response or a worker that died mid-call is recorded as a
@@ -255,10 +255,31 @@ payment was removed or never arrived.
 You resolve it, in this order:
 
 1. Open the invoice in the accounting system and look at its payments.
-2. **If a payment is there**, the attempt landed — reverse it there, then delete the receipt here.
+2. **If a payment is there**, the attempt landed. Reverse (delete) it there, then copy its **payment
+   reference** into the box on the refusal and use **"Check that payment and delete"**. You are only
+   telling One Two Inventory *which payment to ask about* — it then asks the accounting system and
+   requires all three of these before anything is removed here: the payment is on **this order's
+   invoice**, it is for **this receipt's amount**, and it really is **gone**. A mistyped reference, a
+   payment belonging to another invoice, or one that is still standing is refused by name, and you
+   can correct it and try again. When it passes, the failed entry is retired with that reference
+   written onto it, so the order's history stops saying "outcome unknown" and starts saying which
+   payment existed and was undone — noted as identified by you and confirmed with the ledger.
 3. **If there is no payment**, retry the entry under **Sync → Xero**. When it posts, One Two
-   Inventory records the payment reference, and from then on the receipt falls under the ordinary
-   refusal above, which *can* check the reversal for you.
+   Inventory records the payment reference itself, and from then on the receipt falls under the
+   ordinary refusal above, which *can* check the reversal for you.
+
+If the order has no accounting invoice recorded, or more than one attempt failed without a
+reference, the check is refused instead: there is nothing to attribute the payment to in the first
+case, and no way to tell which attempt a single reference belongs to in the second.
+
+### "LEDGER OUTCOME UNKNOWN"
+
+An order (or a supplier bill) that is **not** marked paid here but carries one of these failed,
+reference-less attempts shows a red **LEDGER OUTCOME UNKNOWN** badge rather than reading as an
+ordinary unpaid document. It is not the same as "the ledger rejected it" and not the same as
+"nothing was sent": a payment may be sitting on the invoice in your accounting system with nothing
+here to match it. Check the invoice there before recording or registering another payment against
+it.
 
 ## Invoice Generation
 

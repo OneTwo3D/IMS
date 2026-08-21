@@ -45,6 +45,14 @@ const state = {
   wcRefundsByOrder: new Map<number, number[]>(),
   /** Whether the fake store sends `x-wp-totalpages` at all. See the wcFetch double. */
   reportTotalPages: true,
+  /**
+   * The page size this store actually SERVES, whatever is asked for. WooCommerce's own ceiling is a
+   * hundred, and that is the default here — but a store may cap lower (a hosting filter on
+   * `woocommerce_rest_orders_per_page`, a security plugin, a proxy) and it does NOT error when asked
+   * for more: it quietly serves its own size. A double that always served what it was asked for
+   * could not tell a capped page from a complete collection, which is the blind spot under test.
+   */
+  wcServerPageCap: 100,
   /** Refund ids the store returns with an unusable `id`, e.g. a string where a number belongs. */
   wcUnreadableIds: new Set<number>(),
   wcError: null as string | null,
@@ -219,6 +227,10 @@ mock.module('@/lib/connectors/woocommerce/api', {
      *    and code that asks for more than a hundred still gets a hundred. A double that served
      *    whatever was asked for would let a one-page read pass as exhaustive, and the pre-fix code
      *    would agree with it — a double written to agree with the code cannot falsify it.
+     *  - AND THE CEILING IS THE STORE'S TO CHOOSE (`state.wcServerPageCap`). A store that caps below
+     *    a hundred answers a request for a hundred with its own size and no error at all, so every
+     *    page it serves is "shorter than we asked for". Code that reads that as an ending reads the
+     *    FIRST page of such a store as the whole collection.
      *  - `x-wp-totalpages` is a HEADER, and `wcFetch` reads a missing header as `parseInt('1')`. So a
      *    store that does not report a total is INDISTINGUISHABLE, at this seam, from one reporting a
      *    single page. `reportTotalPages: false` reproduces that exactly, by answering 1 — not 0, not
@@ -232,7 +244,7 @@ mock.module('@/lib/connectors/woocommerce/api', {
       if (state.wcCalls.length > 40) throw new Error(`the refund read did not terminate: ${state.wcCalls.length} requests`)
       const all = state.wcRefundsByOrder.get(Number(match[1])) ?? []
       const requested = Number(params.per_page ?? '10')
-      const perPage = Math.min(Number.isFinite(requested) && requested > 0 ? requested : 10, 100)
+      const perPage = Math.min(Number.isFinite(requested) && requested > 0 ? requested : 10, state.wcServerPageCap)
       const page = Number(params.page ?? '1')
       const totalPages = state.reportTotalPages ? Math.max(1, Math.ceil(all.length / perPage)) : 1
       const slice = all.slice((page - 1) * perPage, page * perPage)
@@ -295,6 +307,7 @@ test.beforeEach(() => {
   state.rawSql = []
   state.wcRefundsByOrder = new Map([[1001, [7001]], [2002, [9001]]])
   state.reportTotalPages = true
+  state.wcServerPageCap = 100
   state.wcUnreadableIds = new Set()
   state.wcError = null
   state.wcCalls = []
@@ -377,6 +390,65 @@ test('a refund on the SECOND page of WooCommerce refunds is still found', async 
   assert.deepEqual(result, { success: true, outcome: 'REASSIGN', targetOrderId: 'order-A' })
   assert.ok(state.wcCalls.length >= 2, 'the second page must actually be requested')
   assert.equal(state.wcCalls[0].params.per_page, '100')
+})
+
+// ---------------------------------------------------------------------------
+// A SERVER-SIDE CAP MUST NOT TURN PAGE ONE INTO PROOF (Codex round 2, finding 1)
+// ---------------------------------------------------------------------------
+
+test('a store that caps per_page below what we ask for cannot end the walk on its first page', async () => {
+  // THE BLIND SPOT. `per_page` is a REQUEST. A store capping at ten answers our hundred with ten and
+  // no error, so EVERY page it serves is "shorter than we asked for" — and a walk that ends on that
+  // comparison ends on page one, always, having read a tenth of the collection. Its output then says
+  // "WooCommerce does not list refund 7001 on this order", which is the whole of what authorises a
+  // DISMISSAL: the park is written off over money that has already left the business, on a list that
+  // never contained the page the refund was on.
+  //
+  // Twenty-five refunds behind a ten-row cap, with 7001 the twenty-first — page THREE. Paired with a
+  // store that sends no page-count header, which is the arrangement round 1 already established is
+  // indistinguishable from "one page".
+  const recover = await loadAction()
+  state.wcServerPageCap = 10
+  state.reportTotalPages = false
+  const held = Array.from({ length: 25 }, (_, i) => 8000 + i)
+  held[20] = 7001
+  state.wcRefundsByOrder.set(2002, held)
+  const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
+  assert.equal((result as { success?: boolean }).success, false)
+  // WooCommerce does list the refund on this order, so the dismissal is contradicted rather than
+  // granted — the opposite verdict to the one a page-one read produces.
+  assert.equal((result as { code?: string }).code, 'wc_confirms_current_owner')
+  assert.equal(stored().status, 'FAILED', 'the park survives')
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2', '3'])
+  assert.equal(state.wcCalls[0].params.per_page, '100', 'we still ASK for the maximum — we just do not believe it')
+})
+
+test('the granted page size is measured from the store, not assumed from the request', async () => {
+  // The mechanism, asserted on its own. Ten refunds behind a ten-row cap is a FULL page for this
+  // store and a short one for the request — the two readings disagree about whether anything more
+  // exists, and only the store's own size is evidence. The walk must go on to page two and find it
+  // empty before it can call the list complete.
+  const recover = await loadAction()
+  state.wcServerPageCap = 10
+  state.reportTotalPages = false
+  state.wcRefundsByOrder.set(2002, Array.from({ length: 10 }, (_, i) => 8000 + i))
+  const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
+  assert.equal((result as { success: boolean }).success, true, 'a genuinely complete list still resolves')
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2'])
+})
+
+test('an EMPTY page ends the walk whatever size the store is serving', async () => {
+  // The rule that makes a capped store terminable at all: with the granted size unknown on page one,
+  // the only unconditional proof of an ending is a page lying past the end of the collection. Four
+  // refunds behind a ten-row cap — page one is short by BOTH readings, and page two settles it.
+  const recover = await loadAction()
+  state.wcServerPageCap = 10
+  state.reportTotalPages = false
+  state.wcRefundsByOrder.set(2002, [9001, 9002, 9003, 9004])
+  const result = await recover('log-1', { observedOrderId: 'order-B', outcome: 'DISMISS' })
+  assert.equal((result as { success: boolean }).success, true)
+  assert.deepEqual(state.wcCalls.map((call) => call.params.page), ['1', '2'])
+  assert.match(stored().errorMessage ?? '', /did NOT list refund 7001/)
 })
 
 // ---------------------------------------------------------------------------

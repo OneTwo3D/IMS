@@ -19,18 +19,26 @@ import {
   READABLE_REGISTRATION_STATUSES,
   REGISTRATION_IN_FLIGHT_REFUSAL,
   RETIRABLE_REGISTRATION_STATUSES,
+  UNDECIDED_ATTEMPTS_AMBIGUOUS_REFUSAL,
   UNDECIDED_ATTEMPT_REVERSAL_REFUSAL,
   UNVERIFIABLE_IN_FLIGHT_REFUSAL,
   VERIFIABLE_REVERSAL_CONNECTORS,
+  assertedReversalNote,
+  buildAssertedReversalData,
   buildVerifiedReversalData,
   describeAttemptUndecidedRefusal,
   describeLedgerHoldRefusal,
   hasPostEvidence,
   isReversedInLedger,
   ledgerReversalNote,
+  normalizeAssertedPaymentReference,
+  refuseAssertedPaymentAmountMismatch,
+  refuseAssertedPaymentNotOnInvoice,
+  refuseAssertedPaymentUnattributable,
   refuseLedgerLookupFailure,
   refuseLedgerStillHolds,
   refuseUnverifiableConnector,
+  sameLedgerIdentifier,
   splitPaymentRegistrations,
   type LedgerReversalRefusalCode,
   type PaymentDeleteRefusalCode,
@@ -3802,23 +3810,51 @@ export type ReverseLedgerPaymentResult =
  * rather than complement it. This is the read-only half, which needs none of it and is complete on
  * its own: the operator can always finish the job, and IMS never destroys local state on an
  * unchecked claim.
+ *
+ * `assertedPaymentReference` — THE UNDECIDED ATTEMPT'S WAY OUT (Codex round 2, finding 3).
+ *
+ * A FAILED registration naming no document refuses the delete, and round 1 offered the operator two
+ * branches: retry it, or "if a payment IS there, reverse it and delete this receipt". The second
+ * branch was a circle. Reversing a payment in Xero changes nothing about a row that names no
+ * document, so the delete refused again, with the same words, and there was nowhere else to go.
+ *
+ * The missing fact is small and the operator is holding it: WHICH payment. So they may name it, and
+ * naming it settles nothing on its own — IMS asks Xero about that payment and requires three things
+ * of the answer before any local row is touched: it is on THIS order's ledger invoice, it is for
+ * THIS receipt's amount, and it is DELETED. A mistyped reference, a payment from another invoice, a
+ * payment that is still standing: each refused by its own name. The operator supplies the question;
+ * the ledger still supplies the answer. Exactly the division `recoverRefundSyncPark` draws in
+ * app/actions/sync-exceptions.ts, and the opposite of accepting "I reversed it".
  */
-export async function reverseLedgerPayment(paymentId: string, orderId: string): Promise<ReverseLedgerPaymentResult> {
+export async function reverseLedgerPayment(
+  paymentId: string,
+  orderId: string,
+  assertedPaymentReference?: string,
+): Promise<ReverseLedgerPaymentResult> {
   try {
     // FRESH permission, unlike deletePayment's plain one. Deleting a receipt the ledger does not hold
     // is an ordinary correction; retiring a registration for a document that DID post is a statement
     // about a ledger, so it takes a session re-verified in the last 15 minutes.
     const session = await requireFreshPermission('sales.refund')
 
+    const asserted = normalizeAssertedPaymentReference(assertedPaymentReference)
+
     const payment = await db.payment.findUnique({
       where: { id: paymentId },
-      select: { orderId: true, refundId: true },
+      select: { orderId: true, refundId: true, amount: true },
     })
     if (!payment || payment.orderId !== orderId) {
       return { success: false, code: 'payment_missing', error: 'That receipt no longer exists on this order, so nothing was changed.' }
     }
     if (payment.refundId) {
       return { success: false, code: NO_LEDGER_HOLD_REFUSAL.code, error: NO_LEDGER_HOLD_REFUSAL.message }
+    }
+    const orderForReference = await db.salesOrder.findUnique({
+      where: { id: orderId },
+      select: { id: true, orderNumber: true, externalOrderNumber: true, accountingInvoiceId: true },
+    })
+    if (!orderForReference) {
+      return { success: false, code: 'payment_missing', error: 'That order no longer exists, so nothing was changed.' }
     }
 
     const registrations = await readPaymentRegistrations(db, orderId, paymentId)
@@ -3828,13 +3864,25 @@ export async function reverseLedgerPayment(paymentId: string, orderId: string): 
     // payment for this receipt" — a confident statement of exactly the fact nobody knows — and send
     // the operator back to the ordinary delete, which now refuses. Two contradictory answers to one
     // question is worse than either of them.
+    //
+    // What CAN resolve it is a payment reference the operator read off the invoice. Without one there
+    // is still nothing to look up, so the refusal stands exactly as before.
+    const assertedUndecided: PaymentRegistrationRow[] = []
     if (undecided.length > 0) {
-      return { success: false, code: UNDECIDED_ATTEMPT_REVERSAL_REFUSAL.code, error: UNDECIDED_ATTEMPT_REVERSAL_REFUSAL.message }
+      if (!asserted) {
+        return { success: false, code: UNDECIDED_ATTEMPT_REVERSAL_REFUSAL.code, error: UNDECIDED_ATTEMPT_REVERSAL_REFUSAL.message }
+      }
+      // ONE reference cannot speak for two attempts, and guessing which it belongs to would retire a
+      // row on evidence about a different one.
+      if (undecided.length > 1) {
+        return { success: false, code: UNDECIDED_ATTEMPTS_AMBIGUOUS_REFUSAL.code, error: UNDECIDED_ATTEMPTS_AMBIGUOUS_REFUSAL.message }
+      }
+      assertedUndecided.push(...undecided)
     }
-    if (ledgerHold.length === 0) {
+    if (ledgerHold.length === 0 && assertedUndecided.length === 0) {
       return { success: false, code: NO_LEDGER_HOLD_REFUSAL.code, error: NO_LEDGER_HOLD_REFUSAL.message }
     }
-    const unsupported = ledgerHold.find((row) => !(VERIFIABLE_REVERSAL_CONNECTORS as readonly string[]).includes(row.connector))
+    const unsupported = [...ledgerHold, ...assertedUndecided].find((row) => !(VERIFIABLE_REVERSAL_CONNECTORS as readonly string[]).includes(row.connector))
     if (unsupported) {
       const refusal = refuseUnverifiableConnector(unsupported.connector)
       return { success: false, code: refusal.code, error: refusal.message }
@@ -3863,6 +3911,59 @@ export async function reverseLedgerPayment(paymentId: string, orderId: string): 
       }
     }
 
+    // AND ASK ABOUT THE PAYMENT THE OPERATOR NAMED. Same GET, a heavier burden of proof: the rows
+    // above were checked against a document id IMS WROTE DOWN ITSELF when the ledger returned it,
+    // and this one is checked against a reference a human typed. So the answer has to establish that
+    // the payment is the right one before it can establish that it is gone — anything less and the
+    // remedy becomes a way to delete a receipt by naming any deleted payment in the tenant.
+    const assertedReference = assertedUndecided.length > 0 ? asserted : null
+    if (assertedReference) {
+      const orderReference = getSalesOrderReference(orderForReference)
+      // WITHOUT A LEDGER INVOICE THERE IS NOTHING TO ATTRIBUTE THE PAYMENT TO. Refused rather than
+      // waved through: "it is deleted" is not evidence about THIS receipt unless it was on THIS
+      // document, and an unposted invoice cannot have carried it.
+      if (!orderForReference.accountingInvoiceId) {
+        const refusal = refuseAssertedPaymentUnattributable(orderReference)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      const response = await xeroGet<{
+        Payments?: Array<{ PaymentID?: string; Status?: string; Amount?: number; Invoice?: { InvoiceID?: string } }>
+      }>(`Payments/${encodeURIComponent(assertedReference)}`)
+      if (!response.ok) {
+        const refusal = refuseLedgerLookupFailure(assertedReference, response.error)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      const found = response.data?.Payments?.[0]
+      if (!found) {
+        const refusal = refuseLedgerLookupFailure(assertedReference, 'the accounting system returned no payment with that reference')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      // FACT ONE: it is on this order's invoice.
+      const invoiceId = found.Invoice?.InvoiceID ?? null
+      if (!sameLedgerIdentifier(invoiceId, orderForReference.accountingInvoiceId)) {
+        const refusal = refuseAssertedPaymentNotOnInvoice(assertedReference, orderReference, invoiceId)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      // FACT TWO: it is for this receipt. An invoice may carry several payments, and retiring this
+      // attempt on evidence about a DIFFERENT one of them would leave the attempt's own payment
+      // standing with nothing local left to contradict it.
+      const receiptAmount = Number(payment.amount)
+      if (typeof found.Amount !== 'number' || !Number.isFinite(found.Amount)) {
+        const refusal = refuseLedgerLookupFailure(assertedReference, 'the accounting system reported no amount for that payment, so it cannot be matched to this receipt')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      if (Math.abs(found.Amount - receiptAmount) > 0.005) {
+        const refusal = refuseAssertedPaymentAmountMismatch(assertedReference, found.Amount, receiptAmount)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      // FACT THREE: it really is gone — the same test the checkable rows face, and the reason this is
+      // a verification rather than an acceptance of "I have reversed it".
+      if (!isReversedInLedger(found.Status)) {
+        const refusal = refuseLedgerStillHolds(assertedReference, found.Status ?? 'unknown')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+    }
+
     const now = new Date()
     const note = ledgerReversalNote(ledgerHold.map((row) => row.externalTransactionId ?? ''), now)
 
@@ -3884,8 +3985,14 @@ export async function reverseLedgerPayment(paymentId: string, orderId: string): 
       // post it and record a failure with no document id. Deleting the receipt on top of that is the
       // same defect as before, arrived at through a race instead of a misclassification. Re-read
       // under the order lock and abandon if the answer has changed shape.
+      //
+      // "ACCOUNTED FOR" IS NOT "NONE". The asserted row is itself undecided and is expected to be
+      // here; what must not have appeared is an undecided attempt this call never checked with the
+      // ledger. Comparing by ID rather than by count, because a row that vanished and a row that
+      // arrived can leave the count unchanged.
+      const accountedFor = new Set(assertedUndecided.map((row) => row.id))
       const freshUndecided = splitPaymentRegistrations(await readPaymentRegistrations(tx, orderId, paymentId)).undecided
-      if (freshUndecided.length > 0) {
+      if (freshUndecided.some((row) => !accountedFor.has(row.id))) {
         throw new PaymentTransactionRefusal(HOLD_MOVED_REFUSAL.code, HOLD_MOVED_REFUSAL.message)
       }
 
@@ -3907,6 +4014,25 @@ export async function reverseLedgerPayment(paymentId: string, orderId: string): 
         // THROWN, so any row retired earlier in this loop rolls back with it. A `return` would commit
         // a partial retirement while reporting that nothing changed.
         if (moved.count !== 1) throw new PaymentTransactionRefusal(HOLD_MOVED_REFUSAL.code, HOLD_MOVED_REFUSAL.message)
+      }
+      // THE ASSERTED ROW, fenced the same way and on the ABSENCE of a document id as well as on the
+      // status. A retry that posted while Xero was being asked writes an id onto this row, and that
+      // id is a payment nobody has checked — the compare-and-swap misses, the whole thing rolls back,
+      // and the operator is told to look again rather than told the ledger is clear.
+      for (const row of assertedUndecided) {
+        const reference = assertedReference as string
+        const decided = await tx.accountingSyncLog.updateMany({
+          where: {
+            id: row.id,
+            status: row.status as Prisma.AccountingSyncLogWhereInput['status'],
+            externalTransactionId: null,
+          },
+          data: buildAssertedReversalData(
+            reference,
+            assertedReversalNote(reference, orderForReference.accountingInvoiceId ?? '', now),
+          ),
+        })
+        if (decided.count !== 1) throw new PaymentTransactionRefusal(HOLD_MOVED_REFUSAL.code, HOLD_MOVED_REFUSAL.message)
       }
       if (retirable.length > 0) {
         const retired = await tx.accountingSyncLog.updateMany({
@@ -3943,16 +4069,22 @@ export async function reverseLedgerPayment(paymentId: string, orderId: string): 
       level: 'WARNING',
       description:
         `Deleted the receipt on ${getSalesOrderReference(outcome.so)} after confirming with the accounting `
-        + `system that its payment was reversed there (${ledgerHold.map((row) => row.externalTransactionId).join(', ')})`,
+        + `system that its payment was reversed there (${[...ledgerHold.map((row) => row.externalTransactionId), ...(assertedReference ? [`${assertedReference} — identified by the operator`] : [])].join(', ')})`,
       metadata: {
         orderNumber: getSalesOrderReference(outcome.so),
         paymentId,
         // Both ends: which rows were retired, and the document ids the ledger was asked about. The
         // ids stay on the rows too — a CANCELLED row that still names a document is a complete
         // account of a payment that existed and was undone.
-        accountingSyncLogIds: ledgerHold.map((row) => row.id),
+        accountingSyncLogIds: [...ledgerHold.map((row) => row.id), ...assertedUndecided.map((row) => row.id)],
         externalTransactionIds: ledgerHold.map((row) => row.externalTransactionId),
-        priorStatuses: ledgerHold.map((row) => row.status),
+        priorStatuses: [...ledgerHold.map((row) => row.status), ...assertedUndecided.map((row) => row.status)],
+        // WHOSE FACT IT WAS. A reference IMS read back off its own registration and one a human typed
+        // are different kinds of evidence, and an audit trail that cannot tell them apart cannot
+        // answer "who said this payment was the right one" a year later.
+        assertedPaymentReference: assertedReference,
+        assertedUndecidedLogIds: assertedUndecided.map((row) => row.id),
+        ledgerInvoiceId: assertedReference ? orderForReference.accountingInvoiceId : undefined,
         verifiedAt: now.toISOString(),
         userId: session.user.id,
       },

@@ -871,6 +871,15 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
    * deletePayment was DISCARDED entirely, so the refusal would not have appeared anywhere at all.
    */
   const [paymentRefusal, setPaymentRefusal] = useState<{ paymentId: string; message: string; code?: string } | null>(null)
+  // o3d-1vuv: the payment reference an operator read off the invoice in the accounting system, for a
+  // registration that failed without recording one. IMS asks about THAT payment; it does not take the
+  // typing of it as a claim that anything was reversed.
+  const [assertedPaymentReference, setAssertedPaymentReference] = useState('')
+  // WHICH receipt is being resolved this way, held separately from the refusal CODE on purpose: the
+  // code changes with every answer the ledger gives ("that payment is on another invoice", "it is
+  // still AUTHORISED"), and a field that vanished on the first correctable mistake would put the
+  // operator straight back into the dead end this whole path exists to remove.
+  const [undecidedAttempt, setUndecidedAttempt] = useState<string | null>(null)
   const [allocations, setAllocations] = useState<AllocationRow[]>(initialAllocations)
   const [shipments, setShipments] = useState<ShipmentRow[]>(initialShipments)
   const requirementsByLine = new Map(fulfillmentRequirements.map((row) => [row.lineId, row.requirements]))
@@ -1039,6 +1048,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     : settlement.status === 'NOT_SENT' ? ' · NOT SENT TO LEDGER'
     : settlement.status === 'PARTIALLY_SETTLED' ? ' · PART PAID IN LEDGER'
     : settlement.status === 'LEDGER_UNMATCHED' ? ' · PAID IN LEDGER ONLY'
+    // Not "rejected" and not "not sent": an attempt was made and what the ledger did with it was
+    // never recorded. Naming it as either of the other two sends someone to the wrong place.
+    : settlement.status === 'LEDGER_UNDECIDED' ? ' · LEDGER OUTCOME UNKNOWN'
     : settlement.status === 'OVER_SETTLED' ? ' · OVER-PAID IN LEDGER'
     // o3d-nf9i r3: an operator's assertion is not the ledger's word. Shown as its own state so the
     // badge never reads the same as a confirmed settlement.
@@ -1142,7 +1154,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             title={settlement.detail}
           >
             {settlement.discrepancy && <AlertTriangle className="h-3.5 w-3.5" />}
-            {settlement.status === 'LEDGER_UNMATCHED' ? 'PAID IN LEDGER ONLY' : `Paid${settlementSuffix}`}
+            {settlement.status === 'LEDGER_UNMATCHED' ? 'PAID IN LEDGER ONLY'
+              // NOT prefixed "Paid": nothing here is paid, and the whole point of the state is that
+              // nobody can say what the ledger holds.
+              : settlement.status === 'LEDGER_UNDECIDED' ? 'LEDGER OUTCOME UNKNOWN'
+              : `Paid${settlementSuffix}`}
           </span>
         )}
 
@@ -1652,6 +1668,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                           onClick={() => {
                             if (!confirm('Delete this payment?')) return
                             setPaymentRefusal(null)
+                            setUndecidedAttempt(null)
                             startTransition(async () => {
                               // o3d-1vuv: the result used to be DISCARDED, so a refusal — and before
                               // this change, the "reverse this in the ledger by hand" warning — reached
@@ -1659,6 +1676,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                               const result = await deletePayment(p.id, so.id)
                               if (result.success) { router.refresh(); return }
                               setPaymentRefusal({ paymentId: p.id, message: result.error ?? 'Failed to delete the payment.', code: result.code })
+                              setUndecidedAttempt(result.code === 'registration_attempt_undecided' ? p.id : null)
                             })
                           }}
                           className="text-muted-foreground hover:text-destructive"
@@ -1694,6 +1712,60 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                             {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Undo2 className="h-3 w-3 mr-1" />}
                             I have reversed it — check and delete
                           </Button>
+                        )}
+                        {undecidedAttempt === p.id && (
+                          /*
+                            THE UNDECIDED ATTEMPT'S WAY OUT. Round 1 showed no control here at all,
+                            on the grounds that there is nothing to check — true of IMS acting alone,
+                            and it left the "a payment IS there" half of the remedy walking back into
+                            this same refusal. The missing fact is WHICH payment, and the operator is
+                            looking at it. So they may name it, and naming it decides nothing: IMS
+                            asks the accounting system about that payment and requires it to be on
+                            this invoice, for this amount, and gone. No reference, no button.
+                          */
+                          <div className="space-y-2">
+                            <label className="block text-[11px] text-muted-foreground" htmlFor={`asserted-ref-${p.id}`}>
+                              Payment reference from the accounting system (the payment you reversed on this invoice)
+                            </label>
+                            <input
+                              id={`asserted-ref-${p.id}`}
+                              type="text"
+                              value={assertedPaymentReference}
+                              onChange={(e) => setAssertedPaymentReference(e.target.value)}
+                              placeholder="e.g. 2f1c9b3e-0d4a-4e7b-9c2f-8a6d5e4b3c21"
+                              className="w-full rounded border bg-background px-2 py-1 text-xs font-mono"
+                            />
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-6 text-xs"
+                              disabled={isPending || assertedPaymentReference.trim().length === 0}
+                              onClick={() => startTransition(async () => {
+                                const reference = assertedPaymentReference.trim()
+                                const run = () => reverseLedgerPayment(p.id, so.id, reference)
+                                let result = await run()
+                                if (isFreshAuthFailure(result) && await promptReauth()) result = await run()
+                                if (isFreshAuthFailure(result)) {
+                                  setPaymentRefusal({ paymentId: p.id, message: 'Sign in again to confirm a ledger reversal.', code: paymentRefusal.code })
+                                  return
+                                }
+                                if (result.success) {
+                                  setPaymentRefusal(null)
+                                  setAssertedPaymentReference('')
+                                  setUndecidedAttempt(null)
+                                  router.refresh()
+                                  return
+                                }
+                                // The refusal is REPLACED by whatever the ledger said — "that payment
+                                // is on another invoice", "it is still AUTHORISED" — and the field is
+                                // kept, because the next thing the operator does is correct it.
+                                setPaymentRefusal({ paymentId: p.id, message: result.error, code: result.code })
+                              })}
+                            >
+                              {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Undo2 className="h-3 w-3 mr-1" />}
+                              Check that payment and delete
+                            </Button>
+                          </div>
                         )}
                       </div>
                     )}

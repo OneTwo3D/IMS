@@ -4,17 +4,26 @@ import test from 'node:test'
 import {
   LEDGER_HELD_REGISTRATION_STATUSES,
   READABLE_REGISTRATION_STATUSES,
+  UNDECIDED_ATTEMPTS_AMBIGUOUS_REFUSAL,
   UNDECIDED_ATTEMPT_REVERSAL_REFUSAL,
   UNDECIDED_REGISTRATION_STATUSES,
+  assertedReversalNote,
+  buildAssertedReversalData,
   buildVerifiedReversalData,
   describeAttemptUndecidedRefusal,
   describeLedgerHoldRefusal,
   hasPostEvidence,
   isReversedInLedger,
   ledgerReversalNote,
+  normalizeAssertedPaymentReference,
+  refuseAssertedPaymentAmountMismatch,
+  refuseAssertedPaymentNotOnInvoice,
+  refuseAssertedPaymentUnattributable,
   refuseLedgerLookupFailure,
   refuseLedgerStillHolds,
   refuseUnverifiableConnector,
+  registrationLedgerStanding,
+  sameLedgerIdentifier,
   splitPaymentRegistrations,
   type PaymentRegistrationRow,
 } from '@/lib/domain/accounting/payment-ledger-hold'
@@ -144,10 +153,121 @@ test('the undecided refusal states what is UNKNOWN, and never that a payment exi
   // And a remedy in two branches, because which branch applies is the fact that is missing.
   assert.match(refusal.message, /look at the payments on it/)
   assert.match(refusal.message, /retry the registration under Sync → Xero/)
+  // BOTH BRANCHES MUST LEAD SOMEWHERE. The "a payment IS there" branch used to say "reverse it
+  // there, then delete this receipt" — and that delete lands on this very refusal again, because
+  // reversing a payment in Xero changes nothing about a FAILED row that names no document. A
+  // remedy that returns the operator to the refusal it came from is a dead end with a door painted
+  // on it. It now ends in a check IMS can actually perform on a reference only they can supply.
+  assert.match(refusal.message, /Check that payment and delete/)
+  assert.match(refusal.message, /copy its payment reference/)
+  assert.match(refusal.message, /belongs to this invoice/)
   // It must NOT claim a payment id it does not have, nor point at the verified-reversal button:
   // there is nothing for that button to check, and offering it would invite the unchecked delete.
   assert.ok(!/payment PAY-/.test(refusal.message))
   assert.ok(!/Reverse in ledger and delete/.test(refusal.message))
+})
+
+// ---------------------------------------------------------------------------
+// ONE CLASSIFIER, so the delete and the settlement verdict cannot answer differently
+// ---------------------------------------------------------------------------
+
+test('registrationLedgerStanding gives the three answers, and CANCELLED is NOTHING even with a document id', () => {
+  // The drift this closes: the delete grew a third answer for a FAILED row naming no document while
+  // the settlement verdict kept two, so the row one module refused to touch was shown by the other
+  // as a plainly unpaid order needing no attention.
+  assert.equal(registrationLedgerStanding({ status: 'SYNCED', externalTransactionId: 'PAY-1' }), 'HELD')
+  assert.equal(registrationLedgerStanding({ status: 'PENDING', externalTransactionId: null }), 'HELD')
+  assert.equal(registrationLedgerStanding({ status: 'PROCESSING', externalTransactionId: null }), 'HELD')
+  // Post evidence outranks status...
+  assert.equal(registrationLedgerStanding({ status: 'FAILED', externalTransactionId: 'PAY-1' }), 'HELD')
+  assert.equal(registrationLedgerStanding({ status: 'FAILED', externalTransactionId: null }), 'UNDECIDED')
+  // ...except against CANCELLED, the one status written only where "nothing stands there" is already
+  // established. A verified reversal KEEPS the document id on purpose, so reading it as a live hold
+  // would make the fix alarm for ever.
+  assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1' }), 'NOTHING')
+  assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: null }), 'NOTHING')
+})
+
+test('the splitter is expressed in those same answers, so it cannot classify a row differently', () => {
+  const rows = [
+    reg({ id: 'held', status: 'SYNCED', externalTransactionId: 'PAY-1' }),
+    reg({ id: 'queued', status: 'PENDING' }),
+    reg({ id: 'unknown', status: 'FAILED' }),
+    reg({ id: 'reversed', status: 'CANCELLED', externalTransactionId: 'PAY-2' }),
+  ]
+  const split = splitPaymentRegistrations(rows)
+  assert.deepEqual(split.ledgerHold.map((r) => r.id), ['held'])
+  assert.deepEqual(split.retirable.map((r) => r.id), ['queued'])
+  assert.deepEqual(split.undecided.map((r) => r.id), ['unknown'])
+  for (const row of rows) {
+    const standing = registrationLedgerStanding(row)
+    const bucketed = split.ledgerHold.includes(row) || split.retirable.includes(row) || split.undecided.includes(row)
+    assert.equal(bucketed, standing !== 'NOTHING', `${row.id} must be bucketed exactly when it stands for something`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// THE UNDECIDED ATTEMPT'S OWN REMEDY: asserted reference, verified answer
+// ---------------------------------------------------------------------------
+
+test('an empty or oversized reference is the same as supplying none', () => {
+  // An empty box must land on "there is nothing to check", not on a lookup for the empty string —
+  // which addresses Xero's WHOLE payment collection rather than one payment.
+  assert.equal(normalizeAssertedPaymentReference(''), null)
+  assert.equal(normalizeAssertedPaymentReference('   '), null)
+  assert.equal(normalizeAssertedPaymentReference(undefined), null)
+  assert.equal(normalizeAssertedPaymentReference(42), null)
+  assert.equal(normalizeAssertedPaymentReference('x'.repeat(101)), null)
+  assert.equal(normalizeAssertedPaymentReference('  PAY-9  '), 'PAY-9')
+})
+
+test('a payment on somebody else\'s invoice is refused by name, and says whose', () => {
+  // Without the invoice check, "any deleted payment in the tenant" would authorise the delete — and
+  // a Xero tenant is full of deleted payments.
+  const refusal = refuseAssertedPaymentNotOnInvoice('PAY-9', 'SO-1001', 'INV-abc')
+  assert.equal(refusal.code, 'asserted_payment_not_on_invoice')
+  assert.match(refusal.message, /PAY-9 is not on the invoice for SO-1001/)
+  assert.match(refusal.message, /belongs to invoice INV-abc/)
+  assert.match(refusal.message, /Nothing was changed/)
+})
+
+test('a payment for the wrong amount is refused, because an invoice can carry several', () => {
+  const refusal = refuseAssertedPaymentAmountMismatch('PAY-9', 40, 100)
+  assert.equal(refusal.code, 'asserted_payment_amount_mismatch')
+  assert.match(refusal.message, /for 40 and this receipt is for 100/)
+})
+
+test('with no ledger invoice recorded there is nothing to attribute the payment to, so it refuses', () => {
+  const refusal = refuseAssertedPaymentUnattributable('SO-1001')
+  assert.equal(refusal.code, 'asserted_payment_unattributable')
+  assert.match(refusal.message, /no accounting invoice recorded for SO-1001/)
+})
+
+test('two undecided attempts cannot be settled by one reference', () => {
+  assert.equal(UNDECIDED_ATTEMPTS_AMBIGUOUS_REFUSAL.code, 'attempt_undecided_ambiguous')
+  assert.match(UNDECIDED_ATTEMPTS_AMBIGUOUS_REFUSAL.message, /MORE THAN ONE/)
+  assert.match(UNDECIDED_ATTEMPTS_AMBIGUOUS_REFUSAL.message, /Nothing was changed/)
+})
+
+test('an asserted reversal DECIDES the row: it writes the reference on, and says where it came from', () => {
+  // The opposite of buildVerifiedReversalData, deliberately. That one must never CLEAR an id it was
+  // given; this one must ADD the id the processor never wrote down — that is the whole value of the
+  // path, because the row stops saying "an attempt, outcome unknown" for ever.
+  const note = assertedReversalNote('PAY-9', 'INV-abc', new Date('2026-08-21T09:00:00.000Z'))
+  const data = buildAssertedReversalData('  PAY-9 ', note)
+  assert.equal(data.status, 'CANCELLED')
+  assert.equal(data.externalTransactionId, 'PAY-9')
+  assert.match(data.errorMessage, /an operator identified this failed attempt as payment PAY-9/)
+  assert.match(data.errorMessage, /IMS confirmed .* it was on invoice INV-abc and was DELETED there/)
+  assert.match(data.errorMessage, /2026-08-21T09:00:00\.000Z/)
+})
+
+test('ledger identifiers compare without case, and never match on emptiness', () => {
+  assert.equal(sameLedgerIdentifier('ABC-1', 'abc-1'), true)
+  assert.equal(sameLedgerIdentifier(' abc-1 ', 'ABC-1'), true)
+  assert.equal(sameLedgerIdentifier(null, null), false, 'two unknowns are not a match')
+  assert.equal(sameLedgerIdentifier('', ''), false)
+  assert.equal(sameLedgerIdentifier('abc-1', 'abc-2'), false)
 })
 
 test('the reversal refuses an undecided attempt too, so the remedy is not a way round the refusal', () => {

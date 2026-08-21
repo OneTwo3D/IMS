@@ -33,7 +33,7 @@ type PaymentRow = { id: string; orderId: string; refundId: string | null; amount
 const state = {
   permissions: new Set<string>(['sales.refund']),
   freshAuthFails: false,
-  order: { id: 'order-1', orderNumber: 'SO-1001', externalOrderNumber: null as string | null, currency: 'GBP', totalForeign: 100, status: 'SHIPPED', paidAt: null as Date | null },
+  order: { id: 'order-1', orderNumber: 'SO-1001', externalOrderNumber: null as string | null, currency: 'GBP', totalForeign: 100, status: 'SHIPPED', paidAt: null as Date | null, accountingInvoiceId: 'INV-abc' as string | null },
   payments: [] as PaymentRow[],
   syncRows: [] as SyncRow[],
   activity: [] as Array<Record<string, unknown>>,
@@ -45,6 +45,15 @@ const state = {
   registrationQueries: [] as Array<Record<string, unknown>>,
   /** Xero's answer per PaymentID. Absent => the GET fails. */
   xeroPayments: new Map<string, string>(),
+  /**
+   * The REST of what Xero returns for a payment — the parts an operator-supplied reference has to be
+   * checked against. Defaulted to "on this order's invoice, for this receipt's amount", because that
+   * is the ordinary case; a test that wants a payment on somebody else's invoice says so here.
+   *
+   * `omit` models an `ok` response carrying no payment at all, which is neither an error nor an
+   * answer — and must not be read as one.
+   */
+  xeroPaymentDetails: new Map<string, { invoiceId?: string | null; amount?: number | null; omit?: boolean }>(),
   xeroError: null as string | null,
   xeroCalls: [] as string[],
   /** Runs once inside the transaction, right after the order lock, to move the world under the write. */
@@ -195,7 +204,22 @@ mock.module('@/lib/connectors/xero/api', {
       const id = decodeURIComponent(path.replace('Payments/', ''))
       const status = state.xeroPayments.get(id)
       if (!status) return { ok: false, status: 404, error: 'not found' }
-      return { ok: true, status: 200, data: { Payments: [{ PaymentID: id, Status: status }] } }
+      const detail = state.xeroPaymentDetails.get(id) ?? {}
+      if (detail.omit) return { ok: true, status: 200, data: { Payments: [] } }
+      const invoiceId = detail.invoiceId === undefined ? state.order.accountingInvoiceId : detail.invoiceId
+      const amount = detail.amount === undefined ? 100 : detail.amount
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          Payments: [{
+            PaymentID: id,
+            Status: status,
+            ...(amount === null ? {} : { Amount: amount }),
+            ...(invoiceId === null ? {} : { Invoice: { InvoiceID: invoiceId } }),
+          }],
+        },
+      }
     },
   },
 })
@@ -253,12 +277,13 @@ function row(id = 'log-1') {
 test.beforeEach(() => {
   state.permissions = new Set(['sales.refund'])
   state.freshAuthFails = false
-  state.order = { id: 'order-1', orderNumber: 'SO-1001', externalOrderNumber: null, currency: 'GBP', totalForeign: 100, status: 'SHIPPED', paidAt: new Date('2026-08-01T00:00:00.000Z') }
+  state.order = { id: 'order-1', orderNumber: 'SO-1001', externalOrderNumber: null, currency: 'GBP', totalForeign: 100, status: 'SHIPPED', paidAt: new Date('2026-08-01T00:00:00.000Z'), accountingInvoiceId: 'INV-abc' }
   state.payments = [{ id: 'pay-1', orderId: 'order-1', refundId: null, amount: 100, currency: 'GBP' }]
   state.syncRows = [syncRow()]
   state.activity = []
   state.registrationQueries = []
   state.xeroPayments = new Map([['PAY-9', 'AUTHORISED']])
+  state.xeroPaymentDetails = new Map()
   state.xeroError = null
   state.xeroCalls = []
   state.mutateUnderLock = null
@@ -470,6 +495,206 @@ test('an undecided attempt is NOT reported as "the ledger holds nothing"', async
   assert.notEqual((result as { code?: string }).code, 'no_ledger_hold')
 })
 
+// ---------------------------------------------------------------------------
+// THE UNDECIDED ATTEMPT'S REMEDY: the operator names the payment, IMS checks it
+//
+// Round 1 left this branch of the remedy pointing back at the refusal it came from: "if a payment IS
+// there, reverse it and delete this receipt" — and that delete refuses again, because reversing a
+// payment in Xero changes nothing about a FAILED row naming no document. The way out cannot be to
+// believe the operator; it is to let them supply the one fact IMS is missing (WHICH payment) and to
+// go on verifying everything that follows from it.
+// ---------------------------------------------------------------------------
+
+test('an operator who NAMES the reversed payment gets it CHECKED, and only then does the receipt go', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { success: boolean }).success, true)
+  assert.deepEqual(state.xeroCalls, ['Payments/PAY-42'], 'the reference is a place to look, and IMS looks')
+  assert.ok(!paymentStillThere())
+  assert.equal(state.order.paidAt, null)
+  // THE ROW IS DECIDED, not merely retired. The id the processor never wrote down is written down
+  // now, sourced and dated, so the row stops saying "an attempt, outcome unknown" for ever.
+  const decided = row('log-7')
+  assert.equal(decided.status, 'CANCELLED')
+  assert.equal(decided.externalTransactionId, 'PAY-42')
+  assert.match(decided.errorMessage ?? '', /an operator identified this failed attempt as payment PAY-42/)
+  assert.match(decided.errorMessage ?? '', /invoice INV-abc/)
+})
+
+test('a named payment sitting on somebody ELSE\'s invoice is refused, and nothing is deleted', async () => {
+  // Without this check the remedy degrades into "name any deleted payment in the tenant" — and a
+  // Xero tenant is full of deleted payments. The reference has to name one that was on THIS invoice.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroPaymentDetails.set('PAY-42', { invoiceId: 'INV-someone-else' })
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'asserted_payment_not_on_invoice')
+  assert.match((result as { error: string }).error, /INV-someone-else/)
+  assert.ok(paymentStillThere())
+  assert.equal(row('log-7').status, 'FAILED', 'and the attempt stays undecided')
+  assert.equal(row('log-7').externalTransactionId, null)
+})
+
+test('a named payment for a DIFFERENT amount is refused — an invoice can carry several', () => {
+  return (async () => {
+    const { reverseLedgerPayment } = await loadActions()
+    state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+    state.xeroPayments.set('PAY-42', 'DELETED')
+    state.xeroPaymentDetails.set('PAY-42', { amount: 40 })
+    const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+    assert.equal((result as { code?: string }).code, 'asserted_payment_amount_mismatch')
+    assert.match((result as { error: string }).error, /for 40 and this receipt is for 100/)
+    assert.ok(paymentStillThere())
+  })()
+})
+
+test('a named payment Xero still reports as AUTHORISED is refused by that name', async () => {
+  // "I have reversed it" is exactly the claim this path must not accept on its own. The check is the
+  // same one the checkable rows face; only the way the id was obtained differs.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'AUTHORISED')
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'ledger_still_holds_payment')
+  assert.match((result as { error: string }).error, /PAY-42 \(status AUTHORISED\)/)
+  assert.ok(paymentStillThere())
+  assert.equal(row('log-7').status, 'FAILED')
+})
+
+test('a reference Xero cannot find is a lookup failure, not a licence to delete', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-TYPO')
+  assert.equal((result as { code?: string }).code, 'ledger_lookup_failed')
+  assert.ok(paymentStillThere())
+})
+
+test('an OK response carrying no payment is not an answer either', async () => {
+  // Neither an error nor a payment. Read as "nothing there", it would delete the receipt on the
+  // absence of evidence — the same move as reading a FAILED row as "nothing posted".
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroPaymentDetails.set('PAY-42', { omit: true })
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'ledger_lookup_failed')
+  assert.ok(paymentStillThere())
+})
+
+test('a payment Xero reports with no amount cannot be matched to this receipt, so it refuses', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.xeroPaymentDetails.set('PAY-42', { amount: null })
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'ledger_lookup_failed')
+  assert.match((result as { error: string }).error, /no amount/)
+  assert.ok(paymentStillThere())
+})
+
+test('with no ledger invoice recorded there is nothing to attribute the payment to', async () => {
+  // "It is deleted" says nothing about THIS receipt unless it was on THIS document, and an invoice
+  // that never posted cannot have carried it. Refused before Xero is troubled at all.
+  const { reverseLedgerPayment } = await loadActions()
+  state.order.accountingInvoiceId = null
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'asserted_payment_unattributable')
+  assert.equal(state.xeroCalls.length, 0)
+  assert.ok(paymentStillThere())
+})
+
+test('TWO undecided attempts cannot be settled by one reference', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [
+    syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null }),
+    syncRow({ id: 'log-8', status: 'FAILED', externalTransactionId: null }),
+  ]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'attempt_undecided_ambiguous')
+  assert.equal(state.xeroCalls.length, 0)
+  assert.ok(paymentStillThere())
+  assert.equal(row('log-7').status, 'FAILED')
+  assert.equal(row('log-8').status, 'FAILED')
+})
+
+test('an empty reference is the same as none, so it lands on the refusal rather than on a lookup', async () => {
+  // A blank box must not become a GET for the empty string, which addresses Xero's WHOLE payment
+  // collection rather than one payment.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  const result = await reverseLedgerPayment('pay-1', 'order-1', '   ')
+  assert.equal((result as { code?: string }).code, 'attempt_undecided')
+  assert.equal(state.xeroCalls.length, 0)
+  assert.ok(paymentStillThere())
+})
+
+test('a reference cannot stand in for a row that HAS a document id of its own', async () => {
+  // The checkable path must not become bypassable by naming a friendlier payment: a row that names
+  // PAY-9 is checked as PAY-9, whatever the operator types.
+  const { reverseLedgerPayment } = await loadActions()
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.deepEqual(state.xeroCalls, ['Payments/PAY-9'])
+  assert.equal((result as { code?: string }).code, 'ledger_still_holds_payment')
+  assert.match((result as { error: string }).error, /PAY-9 \(status AUTHORISED\)/)
+  assert.ok(paymentStillThere())
+})
+
+test('a retry that posts a document id while Xero is being asked aborts the asserted write', async () => {
+  // The row was undecided when the reference was checked and carries a real payment id by the time
+  // the write lands — a payment nobody has looked at. The compare-and-swap is on the ABSENCE of that
+  // id as well as on the status, so the whole thing rolls back.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.mutateUnderLock = () => { row('log-7').externalTransactionId = 'PAY-99' }
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'hold_moved')
+  assert.ok(paymentStillThere())
+  // The mutation itself was made inside the transaction, so the rollback takes it with it — what
+  // matters is that NOTHING this call intended to write survives: no CANCELLED, no asserted note.
+  assert.equal(row('log-7').status, 'FAILED', 'nothing was retired')
+  assert.equal(row('log-7').errorMessage, null, 'and no asserted-reversal note was left behind')
+})
+
+test('a SECOND undecided attempt appearing during the check still aborts the asserted reversal', async () => {
+  // "Accounted for" is not "none": the asserted row is expected to be there, and a row this call
+  // never checked with the ledger is not.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  state.mutateUnderLock = () => {
+    state.syncRows.push(syncRow({ id: 'log-late', status: 'FAILED', externalTransactionId: null }))
+  }
+  const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((result as { code?: string }).code, 'hold_moved')
+  assert.ok(paymentStillThere())
+  assert.equal(row('log-7').status, 'FAILED')
+})
+
+test('the audit says the reference came from a HUMAN, and which invoice it was checked against', async () => {
+  // A reference IMS read off its own registration and one an operator typed are different kinds of
+  // evidence. An audit trail that cannot tell them apart cannot answer "who said this was the right
+  // payment" a year later.
+  const { reverseLedgerPayment } = await loadActions()
+  state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+  state.xeroPayments.set('PAY-42', 'DELETED')
+  await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  const entry = state.activity.find((a) => a.action === 'payment_ledger_reversal_confirmed')
+  assert.ok(entry)
+  const metadata = entry.metadata as Record<string, unknown>
+  assert.equal(metadata.assertedPaymentReference, 'PAY-42')
+  assert.deepEqual(metadata.assertedUndecidedLogIds, ['log-7'])
+  assert.equal(metadata.ledgerInvoiceId, 'INV-abc')
+  assert.match(entry.description as string, /identified by the operator/)
+})
+
 test('a failed attempt appearing DURING the reversal aborts it rather than deleting over it', async () => {
   // The per-row compare-and-swap can only fence rows this call already knows about. The Xero GETs
   // take as long as Xero takes — long enough for the processor to claim a queued sibling, post it,
@@ -566,4 +791,34 @@ test('a reversal refused between two registrations leaves NEITHER of them retire
   assert.ok(paymentStillThere())
   assert.equal(row('log-a').status, 'SYNCED', 'the first row must roll back with the refusal')
   assert.equal(row('log-b').status, 'SYNCED')
+})
+
+// ---------------------------------------------------------------------------
+// THE LAST MILE: the refusal has to be answerable from the screen it appears on
+//
+// Asserted against the source rather than a rendered tree, on the same grounds as the recovery
+// panel's label test in tests/refund-park-recovery-action.test.ts: what is being pinned is whether
+// a control EXISTS and what it is wired to, and a DOM harness for this panel would mostly test the
+// harness. The behaviour behind it is covered by the action tests above.
+// ---------------------------------------------------------------------------
+
+test('the receipt panel offers the undecided attempt somewhere to go, and refuses to submit nothing', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const panel = readFileSync(join(process.cwd(), 'app/(dashboard)/sales/[id]/so-detail-client.tsx'), 'utf8')
+
+  // The control exists, and it is NOT the ledger-hold one: that button promises IMS checked a
+  // document id, and this row has none.
+  assert.match(panel, /Check that payment and delete/)
+  assert.match(panel, /Payment reference from the accounting system/)
+  // Nothing may be submitted without a reference — an empty box would reach the action as "no
+  // reference", which is the refusal the operator is standing in front of.
+  assert.match(panel, /disabled=\{isPending \|\| assertedPaymentReference\.trim\(\)\.length === 0\}/)
+  // And the reference is what the server is given.
+  assert.match(panel, /reverseLedgerPayment\(p\.id, so\.id, reference\)/)
+  // THE FIELD SURVIVES A CORRECTABLE MISTAKE. Rendered on which receipt is being resolved, not on
+  // the refusal CODE — the code changes with every answer the ledger gives ("that payment is on
+  // another invoice"), and a field that disappeared on the first typo would restore the dead end.
+  assert.match(panel, /\{undecidedAttempt === p\.id && \(/)
+  assert.match(panel, /setUndecidedAttempt\(result\.code === 'registration_attempt_undecided' \? p\.id : null\)/)
 })

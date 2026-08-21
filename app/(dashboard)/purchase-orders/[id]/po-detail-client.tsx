@@ -2747,18 +2747,21 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                           {inv.settlement.status === 'OVER_SETTLED' && ' · OVER-PAID IN LEDGER'}
                           {/* o3d-nf9i r3: an operator's assertion is not the ledger's word. */}
                           {inv.settlement.status === 'ASSERTED_UNVERIFIED' && ' · ASSERTED, NOT VERIFIED'}
+                          {inv.settlement.status === 'LEDGER_UNDECIDED' && ' · LEDGER OUTCOME UNKNOWN'}
                         </span>
                       )}
-                      {!inv.paidAt && inv.settlement.status === 'LEDGER_UNMATCHED' && (
-                        /* Not paid HERE, but the ledger holds a payment for it. Without its own chip the
-                           disagreement pointing this way would be the one nobody could see, since the
-                           badge above only renders for a bill IMS believes is paid. */
+                      {!inv.paidAt && (inv.settlement.status === 'LEDGER_UNMATCHED' || inv.settlement.status === 'LEDGER_UNDECIDED') && (
+                        /* Not paid HERE, but the ledger holds a payment for it — or was ASKED to and
+                           never said what happened. Without its own chip the disagreement pointing
+                           this way would be the one nobody could see, since the badge above only
+                           renders for a bill IMS believes is paid. The undecided case is the one that
+                           used to read as an ordinary unpaid bill with nothing to look at. */
                         <span
                           className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium border-red-200 bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300 dark:border-red-800"
                           title={inv.settlement.detail}
                         >
                           <AlertTriangle className="h-3 w-3" />
-                          PAID IN LEDGER ONLY
+                          {inv.settlement.status === 'LEDGER_UNMATCHED' ? 'PAID IN LEDGER ONLY' : 'LEDGER OUTCOME UNKNOWN'}
                         </span>
                       )}
                     </div>
