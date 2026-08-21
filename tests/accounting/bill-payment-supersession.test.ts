@@ -326,7 +326,9 @@ test('a FAILED registration read from the database refuses BEFORE the bill is wr
 })
 
 test('the survey reads the payload, so the FAILED exemption is decided by the shared body test', async () => {
-  // billPaymentBodyCouldHavePosted delegates to storedBodyCouldHaveReachedTheLedger. A survey that
+  // billPaymentBodyCouldHavePosted delegates to storedBodyMayHaveReachedTheLedger (o3d-m5qk: the two
+  // branches' body predicates collapsed onto the merged one, which refuses to read a retention-compacted
+  // `{}` as proof nothing was sent). A survey that
   // selected only id and status could not consult it at all, and the exemption would silently become
   // "every FAILED row blocks" — a different rule that happens to be safe, and so would never be caught
   // by a refusal test.
