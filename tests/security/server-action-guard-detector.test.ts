@@ -2352,3 +2352,229 @@ test('a COMPUTED PROPERTY NAME in a destructuring parameter runs before the body
     [`${F}:doIt`],
   )
 })
+
+// ---------------------------------------------------------------------------
+// Round 10, Codex finding 1 — THE RECOGNISER WAS NARROWER THAN THE LANGUAGE
+// ---------------------------------------------------------------------------
+
+test('BRACKET-NOTATION Prisma write before a guard — round 10, finding 1', () => {
+  assert.deepEqual(
+    scan(`export async function doIt(id: string) {
+  await db['purchaseOrder']['deleteMany']({ where: { id } })
+  await requirePermission('purchasing.manage')
+  return true
+}`),
+    [`${F}:doIt`],
+    'db[\'purchaseOrder\'][\'deleteMany\'] is the same write as db.purchaseOrder.deleteMany',
+  )
+})
+
+test('MIXED notation — a bracketed model with a dotted operation', () => {
+  assert.deepEqual(
+    scan(`export async function doIt(id: string) {
+  await db['purchaseOrder'].deleteMany({ where: { id } })
+  await requirePermission('purchasing.manage')
+  return true
+}`),
+    [`${F}:doIt`],
+  )
+})
+
+test('MIXED notation the other way — a dotted model with a bracketed operation', () => {
+  assert.deepEqual(
+    scan(`export async function doIt(id: string) {
+  await db.purchaseOrder['deleteMany']({ where: { id } })
+  await requirePermission('purchasing.manage')
+  return true
+}`),
+    [`${F}:doIt`],
+  )
+})
+
+test('a NO-SUBSTITUTION TEMPLATE LITERAL is a string literal member name', () => {
+  assert.deepEqual(
+    scan(`export async function doIt(id: string) {
+  await db[\`purchaseOrder\`][\`deleteMany\`]({ where: { id } })
+  await requirePermission('purchasing.manage')
+  return true
+}`),
+    [`${F}:doIt`],
+  )
+})
+
+test('a raw-SQL mutation spelled in brackets is still a mutation', () => {
+  assert.deepEqual(
+    scan(`export async function doIt(id: string) {
+  await db['$executeRawUnsafe']('DELETE FROM "PurchaseOrder" WHERE id = $1', id)
+  await requirePermission('purchasing.manage')
+  return true
+}`),
+    [`${F}:doIt`],
+  )
+})
+
+test('a COMPUTED operation name is UNREADABLE, so it fails closed as a write', () => {
+  // The name is not in the source at all. Reading it as a read is the direction
+  // that grants credit; this file's rule is that unrecognised fails.
+  assert.deepEqual(
+    scan(`export async function doIt(id: string, op: 'deleteMany' | 'findMany') {
+  await db.purchaseOrder[op]({ where: { id } })
+  await requirePermission('purchasing.manage')
+  return true
+}`),
+    [`${F}:doIt`],
+  )
+})
+
+test('a PINNED GUARD laundering a business write through brackets is not exempt either', () => {
+  assert.deepEqual(
+    scanSecrets(`export async function a() {
+      await requireAuth()
+      await requirePermission('settings.read')
+      return getSettingValue('smtp_password')
+    }`, authServerWhere("await db['salesOrder']['deleteMany']({ where: { draft: true } })")),
+    [`${F}:a`],
+    'the model must be nameable through brackets, or the audited-model exemption is a wildcard',
+  )
+})
+
+test('a bracketed READ still leaves the guard after it its credit — the rule did not just get louder', () => {
+  assert.deepEqual(
+    scan(`export async function doIt(id: string) {
+  await db['purchaseOrder']['findMany']({ where: { id } })
+  await requirePermission('purchasing.manage')
+  return true
+}`),
+    [],
+    'findMany is a read whichever notation spells it',
+  )
+})
+
+test('a bracketed call on a NON-Prisma root is not a write — no red build on ordinary code', () => {
+  assert.deepEqual(
+    scan(`import { redis } from '@/lib/redis'
+export async function doIt(id: string) {
+  await redis['del'](id)
+  await requirePermission('purchasing.manage')
+  return true
+}`, {}, { 'lib/redis.ts': 'export const redis = { del: async (k: string) => { void k } }' }),
+    [],
+    'DATA_CLIENT_ROOTS is the gate; a bracketed call into something else is not a Prisma write',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Round 10, the other half — A WRITE IS A REFERENCE, NOT A CALL SHAPE
+// ---------------------------------------------------------------------------
+
+/**
+ * Fixing the NOTATION left the rule keyed on `isCallExpression`, and a
+ * `CallExpression` is one of several ways to invoke a function. The first of
+ * these is not exotic — `db.$executeRaw` is a TAGGED TEMPLATE, the idiomatic
+ * Prisma raw query, used 28 times in this repo, and it was invisible to the write
+ * position in every previous round.
+ */
+const AFTER = "\n  await requirePermission('purchasing.manage')\n  return true\n}"
+const wrap = (write: string) => `export async function doIt(id: string) {\n  ${write}${AFTER}`
+
+test('a TAGGED TEMPLATE raw delete runs before the guard — round 10', () => {
+  assert.deepEqual(
+    scan(wrap('await db.$executeRaw`DELETE FROM "PurchaseOrder" WHERE id = ${id}`')),
+    [`${F}:doIt`],
+    'db.$executeRaw`…` is not a CallExpression, and it is still a delete',
+  )
+})
+
+test('every other way to invoke the same delete is the same write', () => {
+  for (const [name, write] of [
+    ['.call', 'await db.purchaseOrder.deleteMany.call(db.purchaseOrder, { where: { id } })'],
+    ['.apply', 'await db.purchaseOrder.deleteMany.apply(db.purchaseOrder, [{ where: { id } }])'],
+    ['Reflect.apply', 'await Reflect.apply(db.purchaseOrder.deleteMany, db.purchaseOrder, [{ where: { id } }])'],
+    ['.bind', 'await db.purchaseOrder.deleteMany.bind(db.purchaseOrder)({ where: { id } })'],
+    ['a value', 'const wipe = db.purchaseOrder.deleteMany\n  await wipe({ where: { id } })'],
+    ['a bracketed tagged template', 'await db["$executeRaw"]`DELETE FROM x WHERE id = ${id}`'],
+  ] as Array<[string, string]>) {
+    assert.deepEqual(scan(wrap(write)), [`${F}:doIt`], name)
+  }
+})
+
+test('DESTRUCTURING an operation off the client is a write — nothing is left to see', () => {
+  assert.deepEqual(
+    scan(wrap('const { deleteMany } = db.purchaseOrder\n  await deleteMany({ where: { id } })')),
+    [`${F}:doIt`],
+  )
+  assert.deepEqual(
+    scan(wrap('const { purchaseOrder } = db\n  await purchaseOrder.deleteMany({ where: { id } })')),
+    [`${F}:doIt`],
+  )
+  assert.deepEqual(
+    scan(wrap('let deleteMany: unknown\n  ;({ deleteMany } = db.purchaseOrder)\n  await (deleteMany as (a: unknown) => Promise<unknown>)({ where: { id } })')),
+    [`${F}:doIt`],
+    'destructuring spelled as an ASSIGNMENT is the same reach',
+  )
+})
+
+test('an ALIAS of the client is FOLLOWED, not failed closed', () => {
+  assert.deepEqual(
+    scan(wrap('const po = db.purchaseOrder\n  await po.deleteMany({ where: { id } })')),
+    [`${F}:doIt`],
+  )
+  assert.deepEqual(
+    scan(wrap('const a = db\n  const b = a\n  await b.purchaseOrder.deleteMany({ where: { id } })')),
+    [`${F}:doIt`],
+    'aliases are chased to a fixpoint',
+  )
+  assert.deepEqual(
+    scan(wrap('const po = db.purchaseOrder\n  await po.findMany({ where: { id } })')),
+    [],
+    'the same alias reading is still a read — following it beats flagging it',
+  )
+})
+
+test('the reference rule did not just get louder', () => {
+  assert.deepEqual(scan(wrap('await db.$queryRaw`SELECT 1`')), [], 'a raw READ is not a write')
+  assert.deepEqual(
+    scan(wrap('const { name } = (await db.purchaseOrder.findFirst({ where: { id } })) ?? { name: "" }\n  void name')),
+    [],
+    'destructuring a ROW is not destructuring the client',
+  )
+  assert.deepEqual(
+    scan(wrap('await db.purchaseOrder.findMany({ where: { id } })')),
+    [],
+  )
+})
+
+test('a client-TYPED parameter is a data client whatever it is called', () => {
+  // DATA_CLIENT_ROOTS is a list of names, and a rename is not supposed to be able
+  // to hide a write. `PrismaClient`/`TransactionClient` are type names the
+  // generated client exports, so the annotation answers what the name cannot.
+  const PURGE = 'import type { Prisma } from "@/app/generated/prisma/client"\n'
+    + 'export async function purge(c: Prisma.TransactionClient, id: string) {\n'
+    + '  await c.purchaseOrder.deleteMany({ where: { id } })\n'
+    + '}'
+  assert.deepEqual(
+    scan(`import { purge } from '@/lib/purge'
+export async function doIt(id: string) {
+  await db.$transaction(async (t) => purge(t, id))
+  await requirePermission('purchasing.manage')
+  return true
+}`, {}, { 'lib/purge.ts': PURGE }),
+    [`${F}:doIt`],
+    'the helper writes through a parameter nobody named `tx` or `client`',
+  )
+})
+
+test('a parameter typed as something else entirely is NOT a data client', () => {
+  const OK = 'export type WooClient = { purchaseOrder: { deleteMany: (a: unknown) => Promise<void> } }\n'
+    + 'export async function ping(c: WooClient, id: string) { await c.purchaseOrder.deleteMany({ where: { id } }) }'
+  assert.deepEqual(
+    scan(`import { ping } from '@/lib/woo'
+export async function doIt(id: string) {
+  await ping({ purchaseOrder: { deleteMany: async () => {} } }, id)
+  await requirePermission('purchasing.manage')
+  return true
+}`, {}, { 'lib/woo.ts': OK }),
+    [],
+    'a third-party SDK that happens to spell a method `deleteMany` is not a Prisma write',
+  )
+})

@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createRecordingDb, type QueryContext } from './recording-db'
+import {
+  OWNER_KEY_FORMATS,
+  createRecordingDb,
+  ownerKeyFormatComplaint,
+  type QueryContext,
+} from './recording-db'
 
 /**
  * o3d-512h round 3, Codex finding 6 — tests for the RECORDER itself.
@@ -90,4 +95,36 @@ test('$transaction hands the callback a recording client too', async () => {
     await tx.passkey.create({})
   })
   assert.deepEqual(recorder.calls, ['$transaction', 'passkey.create'])
+})
+
+// ---------------------------------------------------------------------------
+// Round 10, Codex finding 2 — THE DECLARATION IS THE ONLY REMAINING JUDGEMENT
+// ---------------------------------------------------------------------------
+
+/**
+ * The self-scoping leaf is now equality against a declared, id-parameterised
+ * format, so the ONE way left to make it credit something that is not the
+ * caller's row is to declare a loose format. That check is a mechanism, and a
+ * mechanism whose own logic is untested is one you are trusting rather than
+ * checking — the same lesson as the recorder above.
+ */
+test('every declared owner key format is a total function of the caller id', () => {
+  const declared = Object.keys(OWNER_KEY_FORMATS)
+  assert.ok(declared.length > 0, 'an empty table would make the check vacuous')
+  for (const format of declared) {
+    assert.equal(ownerKeyFormatComplaint(format), null, format)
+  }
+})
+
+test('the format check REFUSES the shapes that would reopen the prose class', () => {
+  // Each of these, if declared, would credit a value that is not the caller's id.
+  for (const [format, expected] of [
+    ['created by {id}', /whitespace/],
+    ['{id}', /no constant part/],
+    ['passkey_challenge:reg:', /does not contain/],
+    ['{ns}:{id}', /brace outside/],
+  ] as Array<[string, RegExp]>) {
+    const complaint = ownerKeyFormatComplaint(format)
+    assert.ok(complaint !== null && expected.test(complaint), `${format} -> ${complaint}`)
+  }
 })

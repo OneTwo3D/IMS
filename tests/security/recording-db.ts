@@ -197,6 +197,14 @@ export function queryConstraint(ctx: QueryContext): unknown {
  * side: a boundary was any non-identifier character, which made a SPACE a
  * boundary, so `description: 'created by u1'` was proof of scoping in any field
  * at all (finding 4, at stringCarries).
+ *
+ * ROUND 10 THREW THE LEAF RULE AWAY RATHER THAN RETUNING IT A FOURTH TIME. Round
+ * 9's replacement — a segment between one of four declared delimiters — lost the
+ * same way one round later (`see ticket #u1`, `deleted by:u1`,
+ * `https://example.test/u1`), because no delimiter set appears in keys and not in
+ * prose. The leaf no longer asks whether a value CONTAINS the caller's id at all;
+ * it asks whether the value IS the id, or is a DECLARED composition of it. See
+ * OWNER_KEY_FORMATS, below.
  */
 
 /** Operators that restrict every row the query reaches to ones carrying the needle. */
@@ -298,52 +306,128 @@ function isNegationKey(key: string): boolean {
 }
 
 /**
- * o3d-512h round 9, Codex finding 4 — A SEGMENT OF A KEY, NOT A WORD IN A SENTENCE.
+ * o3d-512h round 10, Codex finding 2 — THE SHAPE OF THE RULE, NOT ITS PARAMETERS.
  *
- * Round 8 replaced `value.includes(needle)` with a WHOLE-SEGMENT test, and chose
- * against a bare `===` on a real argument: the one-time-token rows are keyed by a
- * composed string (`passkey_challenge:reg:<userId>`, built in app/actions/
- * passkey.ts and queried by lib/auth/token-store.ts), so equality would have made
- * this predicate refuse the shapes it exists to approve.
+ * THREE ROUNDS, THREE PARAMETERS, THREE LEAKS. This one question — does this
+ * string prove the query reaches only the caller's rows? — has been answered
+ * three times by narrowing WHICH CHARACTERS END A SEGMENT:
  *
- * The way it drew the boundary is what over-credits. A segment ended at any
- * character that is not `[A-Za-z0-9_-]`, which makes a SPACE a boundary, and a
- * `@`, a `,`, a `(`, an `=`. So every value that merely MENTIONS the caller was
- * proof that the query was scoped to them, in any field at all:
+ *   round 7  `value.includes(needle)`            `u1-victim`, `u10`, `xu1`
+ *   round 8  a whole run of `[A-Za-z0-9_-]`      `created by u1`, `u1@example.test`
+ *   round 9  a segment between `: / | #`         `see ticket #u1`, `deleted by:u1`,
+ *                                                `https://example.test/u1`
  *
- *   where: { description: 'created by u1' }
- *   where: { email: 'u1@example.test' }        // somebody else's address
- *   where: { label: 'audit (u1)' }
+ * Each fix was right about the values it was written against and wrong about the
+ * same class, because the class is not "which punctuation". Punctuation is what
+ * SENTENCES are made of too, so any rule that infers "this is a structured key"
+ * from a delimiter will keep crediting prose — there is no delimiter set that
+ * appears in keys and not in English. Round 9 said as much and shipped the set
+ * anyway; that was the fourth parameter change waiting to happen.
  *
- * None of those reaches only the caller's rows, and two of them reach rows that
- * have nothing to do with the caller. The compound-key allowance was for a
- * STRUCTURED key; it was being spent on free text.
+ * The reason a bare `===` kept being rejected is real and unchanged: one-time
+ * token rows are keyed by a COMPOSED string, so equality alone would make this
+ * predicate refuse the one shape it exists to approve. But "the value is composed"
+ * was then answered by GUESSING at generic structure, when the composition is not
+ * a guess at all — it is code in this repo, and there is exactly one of it:
  *
- * So a boundary is now a DELIMITER rather than "not an identifier character":
- * the needle must be the whole value, or a complete segment of a value delimited
- * by one of KEY_DELIMITERS. Everything else — whitespace, punctuation, anything
- * unrecognised — is not a boundary and so does not match.
+ *   app/actions/passkey.ts:86   setChallenge(`reg:${user.id}`, …)
+ *   app/actions/passkey.ts:49   setAuthToken(`passkey_challenge:${key}`, …)
+ *   lib/auth/token-store.ts:29  db.oneTimeToken.upsert({ where: { key }, … })
  *
- * The list is unavoidable here and it fails in the safe direction: a composed key
- * built with a delimiter nobody listed earns NOTHING, which costs a red build on
- * a query that is in fact scoped. The opposite default is what this fixes.
+ * — a swept-for fact, not a recollection: every call site of the token store
+ * (`setAuthToken`/`consumeAuthToken`/`deleteAuthToken`, 16 of them across
+ * password-reset, TOTP, step-up, passkey auth, destructive-action confirm and the
+ * two OAuth state stores) was read, and every other one keys its row by a RANDOM
+ * token, not by the caller's id. `passkey_challenge:reg:<userId>` is the only
+ * composed key in the tree whose content is determined by who is asking.
+ *
+ * So the rule is EQUALITY, and the compound-key allowance is a NAMED FORMAT that
+ * is a total function of the caller's id:
+ *
+ *   value === needle                       // the id itself
+ *   value === format.replace('{id}', needle)   // a declared composition of it
+ *
+ * There is no boundary logic left to widen, and nothing is inferred from the
+ * value's punctuation. `see ticket #u1` is not `u1` and is not
+ * `passkey_challenge:reg:u1`, so it earns nothing — and neither does any other
+ * sentence, in any field, however it is punctuated. That is why this is not a
+ * fourth parameter: the leaks of rounds 7, 8 and 9 were all values that CONTAINED
+ * the id, and containment is no longer a question this code asks.
+ *
+ * WHICH DIRECTION EACH HALF FAILS IN, since both matter:
+ *   * a format that is MISSING costs a red build — the live self-scoping suite
+ *     above runs the real endpoints against the recording db and asserts every
+ *     query it issues carries the caller's id, so a composed key nobody declared
+ *     turns that suite red rather than passing quietly. Completeness is checked
+ *     by execution, not by belief.
+ *   * a format that is TOO LOOSE is a reviewed diff to the table below, and the
+ *     well-formedness assertion refuses the shapes that would reopen the class:
+ *     a format with whitespace in it (`created by {id}`), or with no constant part
+ *     at all, is not a key and is rejected where it is DECLARED — which is a
+ *     constant a reviewer wrote, not an attacker-supplied value. That is the
+ *     difference from every previous round: the judgement about structure has
+ *     moved off the untrusted string and onto the declaration.
  */
-const KEY_DELIMITERS = new Set([':', '/', '|', '#'])
+export const OWNER_KEY_FORMATS: Record<string, string> = {
+  'passkey_challenge:reg:{id}':
+    'the passkey REGISTRATION challenge — app/actions/passkey.ts composes `reg:${user.id}` from the '
+    + 'session and lib/auth/token-store.ts stores it under the `passkey_challenge:` namespace, so the '
+    + 'row is reachable only by the user it belongs to. The AUTHENTICATION challenge (`auth:<email>`, '
+    + '`auth:discoverable`) is deliberately NOT here: it is pre-auth and keyed by an address, not by '
+    + 'the caller.',
+}
 
-/** Does this string carry `needle` as a whole segment of a composed KEY? */
+const ID_PLACEHOLDER = '{id}'
+
+let keyFormatsChecked = false
+
+/**
+ * A declared format must be a TOTAL FUNCTION of the caller's id and must be a
+ * KEY. Checked once, loudly, because a format is the only remaining way to make
+ * this predicate credit something that is not the caller's id.
+ */
+export function ownerKeyFormatComplaint(format: string): string | null {
+  const constant = format.split(ID_PLACEHOLDER).join('')
+  if (!format.includes(ID_PLACEHOLDER)) {
+    return `does not contain ${ID_PLACEHOLDER}, so it is a constant that no caller owns`
+  }
+  if (constant.length === 0) return 'has no constant part, which is bare equality and is already the rule'
+  if (/\s/.test(constant)) return 'contains whitespace, which makes it a sentence rather than a key'
+  if (/[{}]/.test(constant)) {
+    return `contains a brace outside ${ID_PLACEHOLDER}; ${ID_PLACEHOLDER} is the only placeholder`
+  }
+  return null
+}
+
+function assertOwnerKeyFormatsWellFormed(): void {
+  if (keyFormatsChecked) return
+  keyFormatsChecked = true
+  for (const format of Object.keys(OWNER_KEY_FORMATS)) {
+    const complaint = ownerKeyFormatComplaint(format)
+    if (complaint) {
+      throw new Error(
+        `tests/security/recording-db.ts: the owner key format ${JSON.stringify(format)} ${complaint}. `
+        + 'A format is instantiated with the caller\'s id and compared for EQUALITY, so anything it '
+        + 'admits beyond that id is credited as row ownership.',
+      )
+    }
+  }
+}
+
+/**
+ * Is this string the caller's id, or a declared composition of it?
+ *
+ * No substring, no segment, no boundary. The two ways to be the caller's row are
+ * to BE their id and to be a key this tree builds FROM their id.
+ */
 function stringCarries(value: string, needle: string): boolean {
   if (needle.length === 0) return false
-  const isBoundary = (c: string) => c === '' || KEY_DELIMITERS.has(c)
-  let from = 0
-  for (;;) {
-    const at = value.indexOf(needle, from)
-    if (at === -1) return false
-    const before = at === 0 ? '' : value[at - 1]
-    const afterAt = at + needle.length
-    const after = afterAt >= value.length ? '' : value[afterAt]
-    if (isBoundary(before) && isBoundary(after)) return true
-    from = at + 1
+  if (value === needle) return true
+  assertOwnerKeyFormatsWellFormed()
+  for (const format of Object.keys(OWNER_KEY_FORMATS)) {
+    if (format.split(ID_PLACEHOLDER).join(needle) === value) return true
   }
+  return false
 }
 
 /**

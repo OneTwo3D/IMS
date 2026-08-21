@@ -184,6 +184,40 @@
  *     (assertPrismaOperationsClassified, ./installed-prisma.ts), so an operation
  *     on neither side stops the suite by name instead of widening the hole.
  *
+ * ROUND 10 — TWO RECOGNISERS WIDENED, AND ONE LIMIT MEASURED RATHER THAN GUESSED.
+ *   * THE CALL RECOGNISER, NOT THE VOCABULARY. Round 9 derived WHICH operations
+ *     write. It left "is this a call on the data client?" as
+ *     `ts.isPropertyAccessExpression`, which is one of the two spellings the
+ *     language has, so `db['purchaseOrder']['deleteMany'](…)` was not a write at
+ *     all and the guard after it kept full credit. Every member-name question in
+ *     these two files now goes through `accessedMemberName` (./module-graph.ts),
+ *     which reads dot AND subscript notation and returns UNREADABLE_MEMBER — never
+ *     null — for a name that is not in the source.
+ *   * …AND THEN NOT A CALL RECOGNISER AT ALL. Fixing the notation still left the
+ *     rule keyed on `isCallExpression`, and that is one of several ways to invoke
+ *     a function: `db.$executeRaw\`DELETE …\`` (a tagged template, the idiomatic
+ *     Prisma raw query and 28 live uses in this repo), `.call`, `.apply`,
+ *     `Reflect.apply`, `.bind()()`, and `const wipe = db.x.deleteMany; wipe(…)`
+ *     all wrote past a fully credited guard. The set of ways to invoke a value is
+ *     not closed and enumerating it is the move that has lost every round. What is
+ *     closed is the other side — to invoke an operation, something must first READ
+ *     IT OFF THE CLIENT — so the write position is now set by a REFERENCE to a
+ *     writing operation, called or not (isDataMutationAccess). Destructuring off
+ *     the client fails closed; an alias of the client is followed rather than
+ *     failed (dataClientRootsIn).
+ *   * THE UNRESOLVABLE CALLEE, MEASURED. Round 9 ranked this the widest
+ *     credit-granting hole left. Closing it means defaulting an unresolvable
+ *     callee to "might write", and the blast radius of that was measured on this
+ *     tree rather than estimated: 1338 distinct unresolvable callees appear before
+ *     a credited guard in app/actions alone, and 836 of them survive even after
+ *     restricting to callees the graph had a NAME for — `Math.max`, `Object.keys`,
+ *     `Promise.all`, `JSON.parse`, `schema.safeParse`, `.map`/`.filter` on locals.
+ *     Defaulting to "write" would red-build almost every correctly guarded
+ *     endpoint in the repo. Separating those from a real write needs value flow —
+ *     whether the receiver of an unresolvable call can hold the Prisma client —
+ *     which this walk does not have. So the limit STANDS, deliberately, and this
+ *     is the number the next round should argue against rather than re-derive.
+ *
  * Not named *.test.ts on purpose — `npm run test:unit` globs tests/**\/*.test.ts.
  */
 import { readdirSync, readFileSync } from 'node:fs'
@@ -193,6 +227,9 @@ import ts from 'typescript'
 
 import { installedPrismaModelOperations } from './installed-prisma'
 import {
+  UNREADABLE_MEMBER,
+  accessedMemberName,
+  accessedObject,
   calleeRootName,
   createRepoGraph,
   declarationBody,
@@ -675,10 +712,15 @@ function isSymbolSentinel(
   graph: ModuleGraph | undefined,
 ): boolean {
   if (!graph) return false
+  // Round 10, finding 1: resolution reads both notations, so `NS['SENTINEL']`
+  // resolves exactly as `NS.SENTINEL` does. Under-crediting here would cost a
+  // correctly-sentinelled internal caller its exemption rather than grant one.
+  const member = accessedMemberName(expr)
+  const object = accessedObject(expr)
   const decl = ts.isIdentifier(expr)
     ? graph.resolve(file, expr.text, expr)
-    : ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.expression) && ts.isIdentifier(expr.name)
-      ? graph.resolveMember(file, expr.expression.text, expr.name.text, expr.expression)
+    : member !== null && member !== UNREADABLE_MEMBER && object !== null && ts.isIdentifier(object)
+      ? graph.resolveMember(file, object.text, member, object)
       : null
   if (!decl || !ts.isVariableDeclaration(decl.node)) return false
   // A `let` or `var` holding a Symbol can be reassigned to something a client can
@@ -978,15 +1020,191 @@ function assertPrismaOperationsClassified(): void {
 
 const RAW_MUTATION_METHODS = new Set(['$executeRaw', '$executeRawUnsafe'])
 
-/** `db.thing.delete(...)` / `db.$executeRaw(...)` — a call that writes. */
-function isDataMutationCall(call: ts.CallExpression): boolean {
+/**
+ * o3d-512h round 10, Codex finding 1 — THE VOCABULARY WAS DERIVED, THE CALL
+ * RECOGNISER WAS NOT.
+ *
+ * Round 9 made the OPERATION list a fact read off the installed client, so no
+ * operation Prisma has can be missing from it. It left the question one step
+ * earlier untouched: is this expression a call on the data client at all? That
+ * was `ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.name)`,
+ * and JavaScript has a second spelling for member access:
+ *
+ *   await db['purchaseOrder']['deleteMany']({ where: { id } })
+ *   await requirePermission('purchasing.manage')     // kept FULL credit
+ *
+ * The callee is an ElementAccessExpression, the predicate said "not a member
+ * access", the write position stayed at Infinity, and the permission check was
+ * credited over rows that were already gone. A derived vocabulary behind a
+ * recogniser narrower than the language is a complete list of things that are
+ * never looked up.
+ *
+ * So the recogniser is `accessedMemberName` (./module-graph.ts), which reads BOTH
+ * notations and returns UNREADABLE_MEMBER for a name that is not in the source.
+ * An unreadable operation on a data-client root is treated as a WRITE — the same
+ * fail-on-unrecognised rule the classification check applies one level up.
+ *
+ * Why an unreadable name may default to "write" here when round 9 argued an
+ * unrecognised NAME may not: the two defaults answer different questions. Round 9
+ * refused to make every `client.somethingOrdinary()` a write, because a dotted
+ * call with a readable name into an unrelated SDK is everywhere in an ordinary
+ * codebase. `client[expr](…)` — a computed member call on a binding named exactly
+ * `db`/`prisma`/`tx`/`client` — is not. An AST sweep of app/, lib/ and
+ * components/ found ZERO element-access expressions of ANY kind rooted at those
+ * four names, so failing closed costs nothing today, and when it does cost
+ * something it costs a red build on a shape someone had to write on purpose.
+ */
+function isDataMutationAccess(node: ts.Node, roots: ReadonlySet<string>): boolean {
   assertPrismaOperationsClassified()
-  const callee = call.expression
-  if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.name)) return false
-  const root = calleeRootName(callee)
-  if (root === null || !DATA_CLIENT_ROOTS.has(root)) return false
-  if (RAW_MUTATION_METHODS.has(callee.name.text)) return true
-  return MUTATING_PRISMA_OPS.has(callee.name.text)
+  if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false
+  const member = accessedMemberName(node)
+  if (member === null) return false
+  const root = calleeRootName(node)
+  if (root === null || !roots.has(root)) return false
+  if (member === UNREADABLE_MEMBER) return true
+  if (RAW_MUTATION_METHODS.has(member)) return true
+  return MUTATING_PRISMA_OPS.has(member)
+}
+
+/**
+ * o3d-512h round 10 — A WRITE IS A REFERENCE TO A WRITING OPERATION, NOT A CALL
+ * SHAPE.
+ *
+ * Fixing the notation (finding 1) left the rule still keyed on `isCallExpression`,
+ * and a `CallExpression` is only one of the ways JavaScript invokes a function.
+ * Every one of these ran a delete past a guard that kept full credit, and the
+ * first is not exotic at all — it is the idiomatic Prisma raw query, used 28 times
+ * in this repo:
+ *
+ *   await db.$executeRaw`DELETE FROM "PurchaseOrder" WHERE id = ${id}`  // TaggedTemplate
+ *   await db.purchaseOrder.deleteMany.call(db.purchaseOrder, { … })
+ *   await db.purchaseOrder.deleteMany.apply(db.purchaseOrder, [ … ])
+ *   await Reflect.apply(db.purchaseOrder.deleteMany, db.purchaseOrder, [ … ])
+ *   await db.purchaseOrder.deleteMany.bind(db.purchaseOrder)({ … })
+ *   const wipe = db.purchaseOrder.deleteMany; await wipe({ … })
+ *
+ * Enumerating `.call`, `.apply`, `.bind`, `Reflect.apply`, tagged templates and
+ * whatever is next is the losing move this branch keeps re-learning — the list of
+ * ways to invoke a value is not closed. What IS closed is the other side: to
+ * invoke `deleteMany` at all, something must first READ IT OFF THE CLIENT. So the
+ * rule stops asking how the call is spelled and asks only whether a writing
+ * operation is REACHED, called or not.
+ *
+ * The cost is a false positive on a mutating operation mentioned and never
+ * invoked before a guard. On this tree that is zero occurrences — the 28 hits are
+ * all `tx.$executeRaw` tagged templates, which are writes.
+ *
+ * TWO SHAPES REACH AN OPERATION WITHOUT NAMING IT, and both fail closed:
+ *   * DESTRUCTURING (`const { deleteMany } = db.purchaseOrder`, `const { purchaseOrder } = db`)
+ *     pulls a value out of the client with no member access to see. What comes out
+ *     and where it is called cannot be tracked here, so taking any binding pattern
+ *     off a data client is a write. Zero occurrences in this tree.
+ *   * AN ALIAS (`const po = db.purchaseOrder; await po.deleteMany(…)`) moves the
+ *     client into a name this file does not know. That one is not failed closed —
+ *     it is FOLLOWED: `dataClientRootsIn` adds the alias to the root set, so
+ *     `po.deleteMany` is a write and `po.findMany` is still a read. Flagging the
+ *     alias itself would have been a red build on the one live instance
+ *     (lib/connectors/shopping-webhook-inbox.ts) for no gain.
+ */
+function isDataClientDestructure(node: ts.Node, roots: ReadonlySet<string>): boolean {
+  if (!ts.isVariableDeclaration(node) && !ts.isParameter(node) && !ts.isBindingElement(node)) {
+    // `({ deleteMany } = db.purchaseOrder)` — destructuring as an ASSIGNMENT.
+    if (
+      ts.isBinaryExpression(node)
+      && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && (ts.isObjectLiteralExpression(node.left) || ts.isArrayLiteralExpression(node.left))
+    ) {
+      const root = calleeRootName(node.right)
+      return root !== null && roots.has(root) && isBareClientReference(node.right)
+    }
+    return false
+  }
+  if (ts.isIdentifier(node.name) || !node.initializer) return false
+  const root = calleeRootName(node.initializer)
+  return root !== null && roots.has(root) && isBareClientReference(node.initializer)
+}
+
+/**
+ * The expression is the client (or one of its delegates) ITSELF, not a value it
+ * returned. `const { id } = await db.thing.findFirst()` destructures a ROW.
+ */
+function isBareClientReference(expr: ts.Expression): boolean {
+  return ts.isIdentifier(expr) || ts.isPropertyAccessExpression(expr) || ts.isElementAccessExpression(expr)
+}
+
+/**
+ * A binding whose TYPE says it holds a Prisma client.
+ *
+ * `DATA_CLIENT_ROOTS` is a list of NAMES, and this branch's history is lists
+ * losing. It survives here because it is not the only answer: a helper that takes
+ * the client under a name nobody listed —
+ *
+ *   async function purge(c: Prisma.TransactionClient, id: string) {
+ *     await c.purchaseOrder.deleteMany({ where: { id } })
+ *   }
+ *
+ * — is recognised by its ANNOTATION instead. `PrismaClient` and
+ * `TransactionClient` are type names the generated client exports, so this reads
+ * the same source of truth ./installed-prisma.ts does, one level up: whatever the
+ * parameter is called, a thing typed as the client is the client.
+ *
+ * Measured on this tree: every parameter annotated with a Prisma client type is
+ * called `tx` (71) or `client` (2), both already on the name list — so this adds
+ * nothing today and removes the naming CONVENTION as a load-bearing assumption,
+ * which is the part that would otherwise be one rename away from a silent hole.
+ */
+function isPrismaClientTypeNode(type: ts.TypeNode | undefined): boolean {
+  if (!type) return false
+  const text = type.getText()
+  return /\bPrismaClient\b/.test(text) || /\bTransactionClient\b/.test(text)
+}
+
+/**
+ * The names that hold the data client, or one of its delegates, inside this
+ * region — `DATA_CLIENT_ROOTS`, plus every binding TYPED as a client, plus every
+ * local alias of one, to a fixpoint so `const a = db; const b = a` is followed.
+ */
+function dataClientRootsIn(
+  regions: readonly ts.Node[],
+  body?: ts.ConciseBody,
+): ReadonlySet<string> {
+  const roots = new Set(DATA_CLIENT_ROOTS)
+
+  // The enclosing function's OWN parameters are not inside its regions — the
+  // regions are its initializers and its body — so they are read from the body's
+  // parent, which is the function-like declaration itself.
+  const owner = body?.parent
+  if (owner && ts.isFunctionLike(owner)) {
+    for (const param of owner.parameters) {
+      if (ts.isIdentifier(param.name) && isPrismaClientTypeNode(param.type)) roots.add(param.name.text)
+    }
+  }
+
+  for (;;) {
+    let grew = false
+    const add = (name: string) => {
+      if (roots.has(name)) return
+      roots.add(name)
+      grew = true
+    }
+    const visit = (n: ts.Node) => {
+      if ((ts.isParameter(n) || ts.isVariableDeclaration(n)) && ts.isIdentifier(n.name)) {
+        if (isPrismaClientTypeNode(n.type)) add(n.name.text)
+      }
+      if (
+        ts.isVariableDeclaration(n)
+        && ts.isIdentifier(n.name)
+        && n.initializer
+        && isBareClientReference(n.initializer)
+      ) {
+        const root = calleeRootName(n.initializer)
+        if (root !== null && roots.has(root)) add(n.name.text)
+      }
+      ts.forEachChild(n, visit)
+    }
+    for (const region of regions) visit(region)
+    if (!grew) return roots
+  }
 }
 
 /**
@@ -995,16 +1213,20 @@ function isDataMutationCall(call: ts.CallExpression): boolean {
  * but the model cannot be named — which is never on the audited list below, so
  * the unknown fails closed.
  */
-function mutatedModelOfCall(call: ts.CallExpression): string | null {
-  const callee = call.expression
-  if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.name)) return null
-  const root = calleeRootName(callee)
-  if (root === null || !DATA_CLIENT_ROOTS.has(root)) return null
-  if (RAW_MUTATION_METHODS.has(callee.name.text)) return callee.name.text
-  if (!MUTATING_PRISMA_OPS.has(callee.name.text)) return null
-  const owner = callee.expression
-  if (ts.isPropertyAccessExpression(owner) && ts.isIdentifier(owner.name)) return owner.name.text
-  return '<unknown>'
+function mutatedModelOfAccess(node: ts.Node, roots: ReadonlySet<string>): string | null {
+  if (!isDataMutationAccess(node, roots)) return null
+  const access = node as ts.PropertyAccessExpression | ts.ElementAccessExpression
+  const member = accessedMemberName(access)
+  // Round 10, finding 1: an unreadable operation is a mutation, and a mutation
+  // whose model cannot be named is `<unknown>` — never audited, so the pinned-guard
+  // exemption cannot be claimed for it.
+  if (member === null || member === UNREADABLE_MEMBER) return '<unknown>'
+  if (RAW_MUTATION_METHODS.has(member)) return member
+  const owner = accessedObject(access)
+  if (owner === null) return '<unknown>'
+  const model = accessedMemberName(owner)
+  if (model === null || model === UNREADABLE_MEMBER) return '<unknown>'
+  return model
 }
 
 /**
@@ -1099,16 +1321,19 @@ function mutatedModelsOfDeclaration(decl: Declaration, v: Verifier): Set<string>
       v.incompleteModels.add(key)
       return models
     }
-    const visit = (n: ts.Node) => {
-      if (ts.isCallExpression(n)) {
-        const model = mutatedModelOfCall(n)
-        if (model) models.add(model)
-      }
-      ts.forEachChild(n, visit)
-    }
     // The executable region, not the body: a guard whose parameter default
     // initializer writes has written just as permanently (round 9, finding 1).
-    for (const region of executableRegions(body)) visit(region)
+    const regions = executableRegions(body)
+    const clientRoots = dataClientRootsIn(regions, body)
+    const visit = (n: ts.Node) => {
+      const model = mutatedModelOfAccess(n, clientRoots)
+      if (model) models.add(model)
+      // A destructure off the client hands out an operation this walk cannot name
+      // (round 10), so the model it writes is unknown — and unknown is not audited.
+      if (isDataClientDestructure(n, clientRoots)) models.add('<unknown>')
+      ts.forEachChild(n, visit)
+    }
+    for (const region of regions) visit(region)
 
     for (const call of collectCalls(body)) {
       const root = calleeRootName(call.expression)
@@ -1210,11 +1435,16 @@ export function firstDataMutationPosition(body: ts.ConciseBody | undefined): num
 function dataMutationPositions(body: ts.ConciseBody | undefined): number[] {
   if (!body) return []
   const at: number[] = []
+  const regions = executableRegions(body)
+  const clientRoots = dataClientRootsIn(regions, body)
   const visit = (n: ts.Node) => {
-    if (ts.isCallExpression(n) && isDataMutationCall(n)) at.push(n.getStart())
+    // Round 10: a REFERENCE to a writing operation, not a call shape — see
+    // isDataMutationAccess for why the list of ways to invoke a value is not one
+    // this file can close.
+    if (isDataMutationAccess(n, clientRoots) || isDataClientDestructure(n, clientRoots)) at.push(n.getStart())
     ts.forEachChild(n, visit)
   }
-  for (const region of executableRegions(body)) visit(region)
+  for (const region of regions) visit(region)
   return at
 }
 
@@ -2438,13 +2668,14 @@ export function reachedPrismaModels(
   if (!body) return []
 
   const visit = (n: ts.Node) => {
-    if (
-      ts.isPropertyAccessExpression(n)
-      && ts.isIdentifier(n.expression)
-      && DATA_CLIENT_ROOTS.has(n.expression.text)
-      && ts.isIdentifier(n.name)
-    ) {
-      models.add(n.name.text)
+    if (ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) {
+      // Round 10, finding 1: `db['setting']` reaches `setting`, and an unreadable
+      // subscript reaches a table this walk cannot name. The surface is a PINNED
+      // list, so an unnameable model must appear in it rather than vanish from it.
+      if (ts.isIdentifier(n.expression) && DATA_CLIENT_ROOTS.has(n.expression.text)) {
+        const model = accessedMemberName(n)
+        if (model !== null) models.add(model === UNREADABLE_MEMBER ? '<unknown>' : model)
+      }
     }
     ts.forEachChild(n, visit)
   }

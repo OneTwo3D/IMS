@@ -566,17 +566,20 @@ test('a value that merely CONTAINS the caller id does not scope to the caller', 
   }
 })
 
-test('…and the whole-segment forms the tree really issues still scope', () => {
+test('…and the forms the tree really issues still scope', () => {
   // A bare `===` would have been the easy fix and it is the wrong one: the
   // one-time-token rows are keyed by a COMPOSED string, and refusing those would
-  // have made this predicate say no to the shapes it exists to approve.
+  // have made this predicate say no to the shape it exists to approve.
+  //
+  // ROUND 10 changed WHICH composed strings that covers. This test used to also
+  // pin `${CALLER_ID}:reg` — a shape nobody in this tree writes, invented to
+  // exercise the generic segment rule. Pinning an invented shape as evidence is
+  // what kept the generic rule alive through two more leaks, so it is gone; the
+  // key the tree actually composes is declared in OWNER_KEY_FORMATS and pinned
+  // here.
   assert.equal(constraintMentions(q('findUnique', { where: { id: CALLER_ID } }), CALLER_ID), true)
   assert.equal(
     constraintMentions(q('upsert', { where: { key: `passkey_challenge:reg:${CALLER_ID}` }, create: {}, update: {} }), CALLER_ID),
-    true,
-  )
-  assert.equal(
-    constraintMentions(q('findFirst', { where: { key: `${CALLER_ID}:reg` } }), CALLER_ID),
     true,
   )
 })
@@ -712,18 +715,81 @@ test('free text that MENTIONS the caller does not scope to the caller', () => {
   }
 })
 
-test('…and the composed KEYS the tree really issues still scope', () => {
-  // The reason a bare `===` is still not the answer: lib/auth/token-store.ts keys
-  // one-time-token rows by a composed string built in app/actions/passkey.ts.
+test('…and the composed KEY the tree really issues still scopes', () => {
+  // The reason a bare `===` is still not the whole answer: lib/auth/token-store.ts
+  // keys one-time-token rows by a composed string built in app/actions/passkey.ts.
+  //
+  // ROUND 10: the two INVENTED keys this test used to pin as passing —
+  // `${CALLER_ID}:reg` and `a/${CALLER_ID}/b` — were written to demonstrate the
+  // delimiter rule, not to describe this tree. They are now refused, which is the
+  // finding: a generic rule kept alive by generic evidence.
   assert.equal(constraintMentions(q('findUnique', { where: { id: CALLER_ID } }), CALLER_ID), true)
   assert.equal(
     constraintMentions(q('upsert', { where: { key: `passkey_challenge:reg:${CALLER_ID}` }, create: {}, update: {} }), CALLER_ID),
     true,
   )
-  assert.equal(constraintMentions(q('findFirst', { where: { key: `${CALLER_ID}:reg` } }), CALLER_ID), true)
-  assert.equal(constraintMentions(q('delete', { where: { key: `a/${CALLER_ID}/b` } }), CALLER_ID), true)
   // …and the round-8 near-misses stay refused.
   for (const foreign of ['u1x', 'u10', 'u1-victim', 'xu1', 'au1b', 'u1_2']) {
     assert.equal(constraintMentions(q('findMany', { where: { id: foreign } }), CALLER_ID), false, foreign)
   }
+})
+
+// ---------------------------------------------------------------------------
+// Round 10, Codex finding 2 — THE RULE'S SHAPE, NOT ITS PARAMETERS
+// ---------------------------------------------------------------------------
+
+/**
+ * Three rounds, three parameter changes, three leaks: substring (round 7),
+ * whole-run-of-identifier-characters (round 8), whole-segment-between-declared-
+ * delimiters (round 9). Each narrowed WHICH characters end a segment and left the
+ * question "is this string a key or a sentence?" to be answered by punctuation —
+ * and punctuation appears in sentences.
+ *
+ * These are the values the round-9 delimiter set still credited as proof that a
+ * query reached only the caller's rows. Every one of them is free text in an
+ * ordinary field, and none of them constrains a single row to the caller.
+ */
+test('punctuation in prose is not a key delimiter — round 10, finding 2', () => {
+  for (const value of [
+    'see ticket #u1',
+    'deleted by:u1',
+    'audit:u1',
+    'urgent|u1',
+    'https://example.test/u1',
+    'reports/2026/u1',
+    'a/b/u1',
+    'note:u1',
+  ]) {
+    assert.equal(
+      constraintMentions(q('findMany', { where: { description: value } }), CALLER_ID),
+      false,
+      `${JSON.stringify(value)} mentions ${CALLER_ID} after a punctuation mark; that is not ownership`,
+    )
+  }
+})
+
+/**
+ * The invented composed keys round 9 pinned as PASSING are the same guess in the
+ * other direction. `${id}:reg` and `a/${id}/b` are not shapes this tree issues —
+ * they were written to demonstrate the delimiter rule, and a test that pins an
+ * invented shape as evidence is what keeps the generic rule alive. The tree
+ * composes exactly ONE key that carries the caller's id, and it is declared.
+ */
+test('a composed key this tree does not build earns nothing', () => {
+  assert.equal(constraintMentions(q('findFirst', { where: { key: `${CALLER_ID}:reg` } }), CALLER_ID), false)
+  assert.equal(constraintMentions(q('delete', { where: { key: `a/${CALLER_ID}/b` } }), CALLER_ID), false)
+  assert.equal(
+    constraintMentions(q('findFirst', { where: { key: `passkey_challenge:auth:${CALLER_ID}` } }), CALLER_ID),
+    false,
+    'the auth challenge is keyed by EMAIL, pre-auth; it is not a declared owner format',
+  )
+})
+
+test('…and the ONE key format the tree does build still scopes', () => {
+  assert.equal(constraintMentions(q('findUnique', { where: { id: CALLER_ID } }), CALLER_ID), true)
+  assert.equal(
+    constraintMentions(q('upsert', { where: { key: `passkey_challenge:reg:${CALLER_ID}` }, create: {}, update: {} }), CALLER_ID),
+    true,
+    'app/actions/passkey.ts composes `reg:${user.id}`; lib/auth/token-store.ts stores it under `passkey_challenge:`',
+  )
 })

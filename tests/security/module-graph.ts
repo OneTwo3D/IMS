@@ -291,11 +291,69 @@ export function calleeRootName(expr: ts.Expression): string | null {
   return ts.isIdentifier(cur) ? cur.text : null
 }
 
+/**
+ * o3d-512h round 10, Codex finding 1 — ONE READER FOR MEMBER NAMES, IN EVERY
+ * NOTATION THE LANGUAGE HAS.
+ *
+ * Every rule in these files that asks "what member is this?" asked it as
+ * `ts.isPropertyAccessExpression(n) && ts.isIdentifier(n.name)`, which is the
+ * recogniser for exactly ONE of the two spellings JavaScript has for member
+ * access. `db['purchaseOrder']['deleteMany']({…})` is the same write as
+ * `db.purchaseOrder.deleteMany({…})` — TypeScript parses it as an
+ * ElementAccessExpression and every one of those rules answered "not a member
+ * access at all", which is the answer that grants credit.
+ *
+ * `calleeRootName` above has walked BOTH since it was written, so the root was
+ * already being found; it was the LEAF that only one notation could reach. That
+ * asymmetry is the finding.
+ *
+ * So there is one reader, and it distinguishes three answers rather than two:
+ *
+ *   * a NAME — `x.y`, `x['y']`, `x[`y`]`, `x[0]`. A string- or numeric-literal
+ *     subscript is a member name written down, and reading it is not a guess.
+ *   * UNREADABLE_MEMBER — `x[k]`, `x[cond ? 'a' : 'b']`, `x[#p]`. The name is not
+ *     in the source. Every caller must decide what an unreadable name means for
+ *     its own rule, and this file's standing rule is that unrecognised FAILS
+ *     rather than passes.
+ *   * null — not a member access. Only here may a caller conclude "nothing".
+ *
+ * Making the distinction a VALUE rather than a boolean is the part that stops a
+ * fourth notation from mattering: a caller that forgets the unreadable case gets
+ * the sentinel string, which matches no operation name, no model name and no
+ * export name — so it lands in whatever that rule's unrecognised branch is
+ * instead of in its "not a member access" branch.
+ */
+export const UNREADABLE_MEMBER = '\u0000unreadable-member'
+
+/** The member name an access expression names, or UNREADABLE_MEMBER, or null. */
+export function accessedMemberName(expr: ts.Expression): string | null {
+  if (ts.isPropertyAccessExpression(expr)) {
+    // A private name (`x.#p`) is not a Prisma model, an operation or an export,
+    // and it cannot be spelled by any of the rules that consume this.
+    return ts.isIdentifier(expr.name) ? expr.name.text : UNREADABLE_MEMBER
+  }
+  if (ts.isElementAccessExpression(expr)) {
+    const arg = expr.argumentExpression
+    // `isStringLiteralLike` is a StringLiteral OR a NoSubstitutionTemplateLiteral,
+    // so `db[`purchaseOrder`]` reads as the name it plainly is.
+    if (ts.isStringLiteralLike(arg)) return arg.text
+    if (ts.isNumericLiteral(arg)) return arg.text
+    return UNREADABLE_MEMBER
+  }
+  return null
+}
+
+/** The object a member access reads from: `db['thing'].deleteMany` -> `db['thing']`. */
+export function accessedObject(expr: ts.Expression): ts.Expression | null {
+  if (ts.isPropertyAccessExpression(expr) || ts.isElementAccessExpression(expr)) return expr.expression
+  return null
+}
+
 /** The final name in a call target: `ns.requireAuth` -> `requireAuth`. */
 export function calleeLeafName(expr: ts.Expression): string | null {
   if (ts.isIdentifier(expr)) return expr.text
-  if (ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.name)) return expr.name.text
-  return null
+  const member = accessedMemberName(expr)
+  return member === null || member === UNREADABLE_MEMBER ? null : member
 }
 
 // ---------------------------------------------------------------------------
@@ -704,8 +762,13 @@ function createGraph(
       // The callee node carries its own position, so shadowing is always checked
       // here — a caller cannot forget to ask for it.
       if (ts.isIdentifier(callee)) return graph.resolve(file, callee.text, callee)
-      if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression) && ts.isIdentifier(callee.name)) {
-        return graph.resolveMember(file, callee.expression.text, callee.name.text, callee.expression)
+      // Round 10, finding 1: `ns['fn']()` is the same call as `ns.fn()`. An
+      // unresolvable callee is the widest credit-granting hole this walk has, so
+      // every notation that CAN be resolved must be.
+      const member = accessedMemberName(callee)
+      const object = accessedObject(callee)
+      if (member !== null && member !== UNREADABLE_MEMBER && object !== null && ts.isIdentifier(object)) {
+        return graph.resolveMember(file, object.text, member, object)
       }
       return null
     },
@@ -761,15 +824,16 @@ function sourceUsesMember(sf: ts.SourceFile, ns: string, member: string): boolea
   let used = false
   const visit = (n: ts.Node) => {
     if (used) return
-    if (
-      ts.isPropertyAccessExpression(n)
-      && ts.isIdentifier(n.expression)
-      && n.expression.text === ns
-      && ts.isIdentifier(n.name)
-      && n.name.text === member
-    ) {
-      used = true
-      return
+    if (ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) {
+      const name = accessedMemberName(n)
+      // An UNREADABLE subscript on the right namespace (`m[k]`) may be this
+      // member, so it counts as a use: a missed referrer is a caller this pin
+      // cannot see, which is the direction that grants credit.
+      if (ts.isIdentifier(n.expression) && n.expression.text === ns
+        && (name === member || name === UNREADABLE_MEMBER)) {
+        used = true
+        return
+      }
     }
     ts.forEachChild(n, visit)
   }
