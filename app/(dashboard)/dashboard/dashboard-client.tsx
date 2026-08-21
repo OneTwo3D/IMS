@@ -11,6 +11,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { ProductLink } from '@/components/inventory/product-link'
 import type { KpiSummary, ChartPoint, TopProduct, RecentOrder, IncomingPO, Period, CompareMode } from '@/app/actions/dashboard'
 import { getDashboardData } from '@/app/actions/dashboard'
+import { boundSuffix, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { OnboardingBanner } from '@/components/layout/onboarding-banner'
@@ -21,6 +22,79 @@ type Props = {
   recentOrders: RecentOrder[]; incomingPOs: IncomingPO[]
   periodLabel: string; compLabel: string; initialPeriod: Period; initialCompare: CompareMode
   showOnboardingBanner?: boolean
+}
+
+/**
+ * o3d-iigc round 4: THE DASHBOARD WAS THE FOURTH SURFACE. Rounds 1-3 marked the two KPI values that
+ * are literally net sales and net sales less COGS, and left everything ELSE on this page — the
+ * average order value in the Gross Sales card, the comparison period's net sales in the operational
+ * tiles, both series of the Margin % chart, and the Cash Bridge bars — printing figures derived from
+ * the same bounded net as if they were measurements. One page, one vocabulary, stated once here.
+ */
+const UPPER_BOUND_TITLE = 'Upper bound: some refunds in this period are on the gross basis or have no proven basis, so they are not subtracted from the net sales this figure is derived from'
+const UPPER_BOUND_TITLE_COMP = 'Upper bound: some refunds in the comparison period are on the gross basis or have no proven basis, so they are not subtracted from the net sales this figure is derived from'
+/**
+ * Margin is a RATIO of two figures that BOTH move with the unsubtracted credit, so — unlike every
+ * other figure on this page — a bounded net sales does not make it an upper bound. When the arithmetic
+ * cannot establish the direction (marginFigureBound), the figure is published with the direction
+ * withheld rather than with a `≤` the numbers do not support.
+ */
+const MARGIN_INDETERMINATE_TITLE = 'Direction not established: margin divides two figures that BOTH move with the refunds this period could not subtract, so the true margin may be either side of this one. The figure is shown; the relation is not claimed.'
+
+function boundTitle(bound: DerivedFigureBound, comparison = false): string | undefined {
+  if (bound === 'exact') return undefined
+  if (bound === 'indeterminate') return MARGIN_INDETERMINATE_TITLE
+  return comparison ? UPPER_BOUND_TITLE_COMP : UPPER_BOUND_TITLE
+}
+
+/**
+ * o3d-iigc round 4 (Codex finding 2): THE MARGIN % CHART'S TOOLTIP.
+ *
+ * The Net Sales chart's tooltip has said `≤` since round 1. The Margin % chart beside it — the same
+ * bounded net, one bucket at a time — printed a bare percentage, and a chart tooltip is the ONLY
+ * place a chart states a FIGURE rather than a shape, so it is exactly where the bound has to appear.
+ *
+ * The verdict is taken PER BUCKET from the point, not from the period: a period whose margin is a
+ * sound upper bound can contain a day whose margin is indeterminate, and the reader is hovering the
+ * day. Module-level and pure so it can be asserted directly against a real ChartPoint.
+ */
+export function marginChartTooltip(
+  value: unknown,
+  name: unknown,
+  point: ChartPoint | undefined,
+  periodLabel: string,
+  compLabel: string,
+): [string, string] {
+  const isComp = name !== 'marginPct'
+  const bound: DerivedFigureBound = point ? (isComp ? point.compMarginPctBound : point.marginPctBound) : 'exact'
+  const pct = `${Number(value).toFixed(1)}%`
+  const note = bound === 'upper'
+    ? ' ≤ (upper bound — refunds not on the net basis are not subtracted)'
+    : bound === 'indeterminate'
+      ? ' ? (direction not established — the unsubtracted refunds move this ratio\u2019s numerator and denominator together)'
+      : ''
+  return [`${pct}${note}`, isComp ? compLabel : periodLabel]
+}
+
+/**
+ * The Cash Bridge bars. o3d-iigc round 4: two of the six ARE the bounded figures — the bridge's Net
+ * Sales bar is kpi.netSalesCurrent and its 'Margin' bar is kpi.profitCurrent, a MONEY profit rather
+ * than the margin ratio, so that one is a genuine upper bound. Gross Sales, Discounts and COGS are
+ * basis-independent, and the Refunds bar is the NET-basis credit that WAS subtracted, so those four
+ * are never marked. Module-level and pure so the marked set is assertable.
+ */
+export function cashBridgeRows(kpi: KpiSummary): { name: string; value: number; fill: string; bounded: boolean }[] {
+  const bounded = !kpi.refundBasisCompleteCurrent
+  return [
+    { name: 'Gross Sales', value: kpi.grossSalesCurrent, fill: 'hsl(221, 83%, 53%)', bounded: false },
+    { name: 'Discounts', value: -kpi.discountsCurrent, fill: 'hsl(25, 95%, 53%)', bounded: false },
+    // o3d-iigc: NET-basis credits only — the bridge must balance to Net Sales, and the two buckets
+    // it could not absorb are surfaced on the Net Sales card instead.
+    { name: 'Refunds', value: -kpi.refundsCurrent, fill: 'hsl(0, 84%, 60%)', bounded: false },
+    { name: 'Net Sales', value: kpi.netSalesCurrent, fill: 'hsl(221, 83%, 63%)', bounded },
+    { name: 'COGS', value: -kpi.cogsCurrent, fill: 'hsl(0, 72%, 51%)', bounded: false },
+    { name: 'Margin', value: kpi.profitCurrent, fill: 'hsl(142, 71%, 45%)', bounded },
+  ]
 }
 
 function ChangeBadge({ current, previous, comparable = true, incomparableReason }: { current: number; previous: number; comparable?: boolean; incomparableReason?: string }) {
@@ -142,6 +216,8 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
     const amount = fmtBaseFull(Number(value))
     return [bounded ? `${amount} ≤ (upper bound — refunds not on the net basis are not subtracted)` : amount, isComp ? compLabel : periodLabel]
   }
+  const marginTooltipFormatter = (value: unknown, name: unknown, item?: { payload?: ChartPoint }): [string, string] =>
+    marginChartTooltip(value, name, item?.payload, periodLabel, compLabel)
   const [isPending, startTransition] = useTransition()
   const [isNarrow, setIsNarrow] = useState<boolean | null>(null)
   const [period, setPeriod] = useState<Period>(initialPeriod)
@@ -193,17 +269,11 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
     return <div className="h-56 w-full rounded-md bg-muted/30" />
   }
 
-  // Cash bridge data
-  const bridge = [
-    { name: 'Gross Sales', value: kpi.grossSalesCurrent, fill: 'hsl(221, 83%, 53%)' },
-    { name: 'Discounts', value: -kpi.discountsCurrent, fill: 'hsl(25, 95%, 53%)' },
-    // o3d-iigc: NET-basis credits only — the bridge must balance to Net Sales, and the two buckets
-    // below are exactly what was NOT subtracted from it. They are surfaced on the card instead.
-    { name: 'Refunds', value: -kpi.refundsCurrent, fill: 'hsl(0, 84%, 60%)' },
-    { name: 'Net Sales', value: kpi.netSalesCurrent, fill: 'hsl(221, 83%, 63%)' },
-    { name: 'COGS', value: -kpi.cogsCurrent, fill: 'hsl(0, 72%, 51%)' },
-    { name: 'Margin', value: kpi.profitCurrent, fill: 'hsl(142, 71%, 45%)' },
-  ]
+  const bridge = cashBridgeRows(kpi)
+  const bridgeTooltipFormatter = (value: unknown, _name: unknown, item?: { payload?: { bounded?: boolean } }): [string, string] => {
+    const amount = fmtBaseFull(Math.abs(Number(value)))
+    return [item?.payload?.bounded ? `${amount} ≤ (upper bound — refunds not on the net basis are not subtracted)` : amount, '']
+  }
 
   return (
     <div className="space-y-4 md:space-y-5">
@@ -240,7 +310,10 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
             <ChangeBadge current={kpi.grossSalesCurrent} previous={kpi.grossSalesComparison} />
           </div>
           <p className="text-xl sm:text-2xl font-bold mt-1">{fmtBase(kpi.grossSalesCurrent)}</p>
-          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{kpi.ordersCurrent} orders &middot; avg {fmtBaseFull(kpi.avgOrderValue)}</p>
+          {/* o3d-iigc round 4: avgOrderValue is netSalesCurrent / orders (app/actions/dashboard.ts), so
+              it inherits net sales' upper bound EXACTLY — the divisor is a basis-independent count.
+              It sat unmarked on the one card nobody expects to be bounded. */}
+          <p className={`text-[11px] mt-0.5 truncate ${kpi.refundBasisCompleteCurrent ? 'text-muted-foreground' : 'text-orange-600'}`} title={kpi.refundBasisCompleteCurrent ? undefined : UPPER_BOUND_TITLE}>{kpi.ordersCurrent} orders &middot; avg {fmtBaseFull(kpi.avgOrderValue)}{kpi.refundBasisCompleteCurrent ? '' : ' ≤'}</p>
         </Card>
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
@@ -268,7 +341,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
           </div>
           <p className="text-xl sm:text-2xl font-bold mt-1">{fmtBase(kpi.cogsCurrent)}</p>
           {/* o3d-iigc: profit is net sales less COGS, so it inherits net sales' upper bound. */}
-          <p className={`text-[11px] mt-0.5 truncate ${kpi.refundBasisCompleteCurrent ? 'text-muted-foreground' : 'text-orange-600'}`} title={kpi.refundBasisCompleteCurrent ? undefined : 'Upper bound: derived from net sales, which does not subtract this period\u2019s gross-basis or unproven-basis refunds'}>Profit: {fmtBase(kpi.profitCurrent)}{kpi.refundBasisCompleteCurrent ? '' : ' ≤'}</p>
+          <p className={`text-[11px] mt-0.5 truncate ${kpi.refundBasisCompleteCurrent ? 'text-muted-foreground' : 'text-orange-600'}`} title={kpi.refundBasisCompleteCurrent ? undefined : UPPER_BOUND_TITLE}>Profit: {fmtBase(kpi.profitCurrent)}{kpi.refundBasisCompleteCurrent ? '' : ' ≤'}</p>
         </Card>
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
@@ -279,9 +352,14 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
               incomparableReason="Margin is derived from net sales, and one of these periods holds refunds that net sales cannot subtract, so the direction of the change is not established."
             />
           </div>
-          {/* o3d-iigc: margin is (net - COGS) / net, so an upper-bounded net makes it an upper bound too. */}
-          <p className={`text-xl sm:text-2xl font-bold mt-1 ${kpi.refundBasisCompleteCurrent ? '' : 'text-orange-600'}`} title={kpi.refundBasisCompleteCurrent ? undefined : 'Upper bound: derived from net sales, which does not subtract this period\u2019s gross-basis or unproven-basis refunds'}>{kpi.marginCurrent}%{kpi.refundBasisCompleteCurrent ? '' : ' ≤'}</p>
-          <p className={`text-[11px] mt-0.5 truncate ${kpi.refundBasisCompleteComparison ? 'text-muted-foreground' : 'text-orange-600'}`}>Comp: {kpi.marginComparison}%{kpi.refundBasisCompleteComparison ? '' : ' ≤'}</p>
+          {/* o3d-iigc round 4: margin is (net - COGS) / net. Rounds 1-3 marked it `≤` because net is
+              upper-bounded — BUT THE UNSUBTRACTED CREDIT MOVES THE NUMERATOR AND THE DENOMINATOR
+              TOGETHER, and with COGS above net the report's own `net > 0` guard puts the true margin
+              at 0% while the published one is negative. 0% is not "at most -50%". The direction now
+              comes from marginFigureBound, and where it is not established the mark says so instead
+              of claiming a bound the arithmetic refuses. */}
+          <p className={`text-xl sm:text-2xl font-bold mt-1 ${kpi.marginBoundCurrent === 'exact' ? '' : 'text-orange-600'}`} title={boundTitle(kpi.marginBoundCurrent)}>{kpi.marginCurrent}%{boundSuffix(kpi.marginBoundCurrent)}</p>
+          <p className={`text-[11px] mt-0.5 truncate ${kpi.marginBoundComparison === 'exact' ? 'text-muted-foreground' : 'text-orange-600'}`} title={boundTitle(kpi.marginBoundComparison, true)}>Comp: {kpi.marginComparison}%{boundSuffix(kpi.marginBoundComparison)}</p>
         </Card>
       </div>
 
@@ -355,7 +433,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                   <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                   <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={mobileXInterval} angle={0} textAnchor="middle" height={30} />
                   <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => `${v}%`} width={36} domain={[0, 100]} />
-                  <Tooltip formatter={(value, name) => [`${Number(value).toFixed(1)}%`, name === 'marginPct' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
+                  <Tooltip formatter={marginTooltipFormatter} contentStyle={{ fontSize: 11 }} />
                   <Legend formatter={(v) => v === 'marginPct' ? periodLabel : compLabel} wrapperStyle={{ fontSize: 11 }} />
                   <Line type="monotone" dataKey="marginPct" stroke="hsl(142, 71%, 45%)" strokeWidth={2} dot={{ r: 2 }} name="marginPct" />
                   <Line type="monotone" dataKey="compMarginPct" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compMarginPct" />
@@ -367,7 +445,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={xInterval} angle={xAngle} textAnchor={xAnchor} height={xHeight} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => `${v}%`} width={40} domain={[0, 100]} />
-                <Tooltip formatter={(value, name) => [`${Number(value).toFixed(1)}%`, name === 'marginPct' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
+                <Tooltip formatter={marginTooltipFormatter} contentStyle={{ fontSize: 11 }} />
                 <Legend formatter={(v) => v === 'marginPct' ? periodLabel : compLabel} wrapperStyle={{ fontSize: 11 }} />
                 <Line type="monotone" dataKey="marginPct" stroke="hsl(142, 71%, 45%)" strokeWidth={2} dot={{ r: 2 }} name="marginPct" />
                 <Line type="monotone" dataKey="compMarginPct" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compMarginPct" />
@@ -388,7 +466,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                   <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                   <XAxis dataKey="name" tick={{ fontSize: 9 }} interval={0} />
                   <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v < -1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={40} />
-                  <Tooltip formatter={(value) => [fmtBaseFull(Math.abs(Number(value))), '']} contentStyle={{ fontSize: 11 }} />
+                  <Tooltip formatter={bridgeTooltipFormatter} contentStyle={{ fontSize: 11 }} />
                   <ReferenceLine y={0} stroke="hsl(0, 0%, 70%)" />
                   <Bar dataKey="value" radius={[3, 3, 0, 0]}>
                     {bridge.map((entry, i) => <Cell key={i} fill={entry.fill} />)}
@@ -401,7 +479,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="name" tick={{ fontSize: 9 }} interval={0} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v < -1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={45} />
-                <Tooltip formatter={(value) => [fmtBaseFull(Math.abs(Number(value))), '']} contentStyle={{ fontSize: 11 }} />
+                <Tooltip formatter={bridgeTooltipFormatter} contentStyle={{ fontSize: 11 }} />
                 <ReferenceLine y={0} stroke="hsl(0, 0%, 70%)" />
                 <Bar dataKey="value" radius={[3, 3, 0, 0]}>
                   {bridge.map((entry, i) => <Cell key={i} fill={entry.fill} />)}
@@ -490,7 +568,10 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         <Card className="p-3 text-center">
           <p className="text-[10px] text-muted-foreground">Comp. Orders</p>
           <p className="text-lg font-bold">{kpi.ordersComparison}</p>
-          <p className="text-[10px] text-muted-foreground">{fmtBase(kpi.netSalesComparison)}</p>
+          {/* o3d-iigc round 4: the SAME netSalesComparison the Margin card already treats as bounded
+              eight lines above — printed here bare. The order COUNT is basis-independent and stays
+              unmarked; the money beneath it is not. */}
+          <p className={`text-[10px] ${kpi.refundBasisCompleteComparison ? 'text-muted-foreground' : 'text-orange-600'}`} title={kpi.refundBasisCompleteComparison ? undefined : UPPER_BOUND_TITLE_COMP}>{fmtBase(kpi.netSalesComparison)}{kpi.refundBasisCompleteComparison ? '' : ' ≤'}</p>
         </Card>
       </div>
 

@@ -259,9 +259,12 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
       if (key === 'grossAmount' || key === 'totalAmount') return <span className="tabular-nums text-xs font-mono font-medium" title="VAT-inclusive committed spend (goods + VAT + direct freight)">{fmtBase(v)}</span>
       // o3d-iigc round 2: WHICH total this is, on the figure itself — 'net' beside a Gross column
       // and a Tax column otherwise reads as either net-of-VAT or net-of-returns, and it is both.
-      if (key === 'netAmount') return <span className="tabular-nums text-xs font-mono font-medium" title="Ex-VAT: the gross total less its own VAT, less returns valued at the ex-VAT line cost">{fmtBase(v)}</span>
+      if (key === 'netAmount') return <span className="tabular-nums text-xs font-mono font-medium" title="Ex-VAT: the gross total less its own VAT, less returns valued at the ex-VAT line cost AFTER the order's header discount">{fmtBase(v)}</span>
       if (key === 'discounts') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'refunds') return <span className="tabular-nums text-xs font-mono text-orange-600">{v > 0 ? fmtBase(v) : '—'}</span>
+      // o3d-iigc round 4: this is the credit AS THE NET AMOUNT SUBTRACTS IT — scaled onto the order's
+      // post-header-discount goods value — so the three columns a reader can see (Gross, Tax,
+      // Refunds) still subtract to the Net Amount printed beside them.
+      if (key === 'refunds') return <span className="tabular-nums text-xs font-mono text-orange-600" title="Return credit at the ex-VAT line cost, reduced by the order's header discount so it is on the same basis as the Net Amount it is subtracted from">{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'landedCosts' || key === 'tax') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'billedAmount') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
       if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>

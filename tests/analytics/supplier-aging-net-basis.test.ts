@@ -35,7 +35,14 @@ mock.module('@/lib/auth/server', {
 
 type ReturnLine = { qtyReturned: number; unitCostBase: number }
 
-/** One committed PO. `totalBase` is GROSS; `taxBase` is the VAT inside it. */
+/**
+ * One committed PO. `totalBase` is GROSS; `taxBase` is the VAT inside it.
+ *
+ * o3d-iigc round 4 widened the query to select `subtotalBase` and the line totals, so the fixture
+ * carries them too. By default they agree — the ex-VAT goods value with NO header discount, i.e.
+ * gross less VAT less freight — which is what every PO in this file is. The header-discounted case
+ * has its own file (supplier-aging-header-discount.test.ts).
+ */
 function po(opts: {
   totalBase: number
   taxBase: number
@@ -45,10 +52,13 @@ function po(opts: {
   poSentAt?: Date | null
   receivedAt?: Date | null
 }) {
+  const goodsExVat = opts.totalBase - opts.taxBase - (opts.freightBase ?? 0)
   return {
     totalBase: opts.totalBase,
     taxBase: opts.taxBase,
     directFreightBase: opts.freightBase ?? 0,
+    subtotalBase: goodsExVat,
+    lines: [{ totalBase: goodsExVat }],
     poSentAt: opts.poSentAt ?? null,
     receivedAt: opts.receivedAt ?? null,
     invoices: opts.invoices ?? [],

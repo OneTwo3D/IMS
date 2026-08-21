@@ -7,7 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
-import { netOfRefunds, refundLineBucket, refundPctOfSale, type RefundSetBasis } from '@/lib/domain/sales/refund-basis-analytics'
+import { marginFigureBound, netOfRefunds, refundLineBucket, refundPctOfSale, type DerivedFigureBound, type RefundSetBasis } from '@/lib/domain/sales/refund-basis-analytics'
 
 // ---------------------------------------------------------------------------
 // Products tab (line-level)
@@ -43,14 +43,22 @@ export type SalesStatRow = {
   refundsUnknownBasis: number
   /**
    * False when this product carried refund value that could not be placed on the net basis. When
-   * false, `netRevenue`, `grossProfit`, `marginPct` and `avgOrderValue` are UPPER BOUNDS, loose by
-   * at most refundsGrossBasis + refundsUnknownBasis.
+   * false, `netRevenue`, `grossProfit` and `avgOrderValue` are UPPER BOUNDS, loose by at most
+   * refundsGrossBasis + refundsUnknownBasis. `marginPct` is NOT covered by this flag — see
+   * `marginPctBound`.
    */
   refundBasisComplete: boolean
   netRevenue: number
   cogs: number
   grossProfit: number
   marginPct: number
+  /**
+   * o3d-iigc round 4: margin is a RATIO, and an unsubtracted credit moves its numerator and its
+   * denominator together, so `refundBasisComplete === false` does NOT make it an upper bound the way
+   * it does the three figures above. Classified by marginFigureBound; 'indeterminate' means the
+   * figure stands but the direction of its error does not. Never marked from refundBasisComplete.
+   */
+  marginPctBound: DerivedFigureBound
   orderCount: number
   avgOrderValue: number
   salesPrice: number | null
@@ -65,12 +73,17 @@ export type SalesStatSummary = {
   totalRefunds: number
   totalRefundsGrossBasis: number
   totalRefundsUnknownBasis: number
-  /** False when ANY row's refunds could not all be placed on the net basis. */
+  /**
+   * False when ANY row's refunds could not all be placed on the net basis. Governs totalNetRevenue,
+   * totalGrossProfit and avgOrderValue. NOT avgMarginPct — see avgMarginPctBound.
+   */
   refundBasisComplete: boolean
   totalNetRevenue: number
   totalCogs: number
   totalGrossProfit: number
   avgMarginPct: number
+  /** As SalesStatRow.marginPctBound, for the whole-period Avg Margin figure. */
+  avgMarginPctBound: DerivedFigureBound
   avgOrderValue: number
   totalQtySold: number
 }
@@ -126,7 +139,7 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
           weight: info?.weight ? Number(info.weight) : null,
           qtySold: 0, qtyRefunded: 0, netQty: 0, grossRevenue: 0, discounts: 0, refunds: 0,
           refundsGrossBasis: 0, refundsUnknownBasis: 0, refundBasisComplete: true,
-          netRevenue: 0, cogs: 0, grossProfit: 0, marginPct: 0, orderCount: 0, avgOrderValue: 0,
+          netRevenue: 0, cogs: 0, grossProfit: 0, marginPct: 0, marginPctBound: 'exact', orderCount: 0, avgOrderValue: 0,
         })
       }
       const row = productMap.get(pid)!
@@ -170,6 +183,14 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
     row.grossProfit = row.netRevenue - row.cogs
     row.marginPct = row.netRevenue > 0 ? (row.grossProfit / row.netRevenue) * 100 : 0
     row.avgOrderValue = row.orderCount > 0 ? row.netRevenue / row.orderCount : 0
+    // Classified from the UNROUNDED figures, before the roundings below, because the classification
+    // is about which side of the published number the truth lies on, not about its last penny.
+    row.marginPctBound = marginFigureBound({
+      netRevenue: row.netRevenue,
+      cogs: row.cogs,
+      unplacedCredit: row.refundsGrossBasis + row.refundsUnknownBasis,
+      basisComplete: row.refundBasisComplete,
+    })
     row.grossRevenue = Math.round(row.grossRevenue * 100) / 100; row.discounts = Math.round(row.discounts * 100) / 100
     row.refunds = Math.round(row.refunds * 100) / 100; row.netRevenue = Math.round(row.netRevenue * 100) / 100
     row.refundsGrossBasis = Math.round(row.refundsGrossBasis * 100) / 100
@@ -187,10 +208,20 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
     totalRefundsUnknownBasis: rows.reduce((s, r) => s + r.refundsUnknownBasis, 0),
     refundBasisComplete: rows.every((r) => r.refundBasisComplete),
     totalNetRevenue: rows.reduce((s, r) => s + r.netRevenue, 0), totalCogs: rows.reduce((s, r) => s + r.cogs, 0),
-    totalGrossProfit: rows.reduce((s, r) => s + r.grossProfit, 0), avgMarginPct: 0, avgOrderValue: 0,
+    totalGrossProfit: rows.reduce((s, r) => s + r.grossProfit, 0), avgMarginPct: 0, avgMarginPctBound: 'exact', avgOrderValue: 0,
     totalQtySold: rows.reduce((s, r) => s + r.netQty, 0),
   }
   summary.avgMarginPct = summary.totalNetRevenue > 0 ? Math.round((summary.totalGrossProfit / summary.totalNetRevenue) * 1000) / 10 : 0
+  // The whole-period margin is the same ratio over the same two quantities, so it is classified the
+  // same way — from the period's own COGS and its own unplaced credit, NOT by OR-ing the rows'
+  // verdicts: a row whose margin is indeterminate can sit inside a period whose margin is a sound
+  // upper bound, and the reverse.
+  summary.avgMarginPctBound = marginFigureBound({
+    netRevenue: summary.totalNetRevenue,
+    cogs: summary.totalCogs,
+    unplacedCredit: summary.totalRefundsGrossBasis + summary.totalRefundsUnknownBasis,
+    basisComplete: summary.refundBasisComplete,
+  })
   summary.avgOrderValue = summary.totalOrders > 0 ? Math.round((summary.totalNetRevenue / summary.totalOrders) * 100) / 100 : 0
   return { rows, summary }
 }

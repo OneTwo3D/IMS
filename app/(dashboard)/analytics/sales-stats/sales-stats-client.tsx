@@ -15,6 +15,7 @@ import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
 import { filterAndSortRows } from '@/lib/analytics/table-filter-sort'
+import { boundSuffix, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 
 type Tab = 'products' | 'shipments' | 'details' | 'invoices' | 'refunds' | 'aging'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -167,6 +168,27 @@ const BOUND_TITLE = 'Upper bound: some of this product\u2019s refunds are on the
 const BOUND_TITLE_SUMMARY = 'Upper bound: some refunds in this period are on the gross basis or have no proven basis, so they are not subtracted from this total'
 
 /**
+ * o3d-iigc round 4: MARGIN IS A RATIO AND `≤` WAS THE WRONG RELATION FOR IT.
+ *
+ * Rounds 1-3 marked Margin with the same `≤` as Net Revenue and Profit, reasoning that it moves with
+ * revenue. It does — but it moves with revenue in BOTH the numerator and the denominator, and where
+ * COGS exceeds the published net revenue the report's own `netRevenue > 0` guard puts the true margin
+ * at 0% while the published figure is negative. 0% is not "at most -50%": the mark was a false claim.
+ *
+ * marginFigureBound classifies which of the three it is. `indeterminate` still PUBLISHES the number —
+ * withholding a figure whose basis IS establishable is this branch's failure mode in the other
+ * direction — and withholds only the RELATION.
+ */
+const MARGIN_INDETERMINATE_TITLE = 'Direction not established: margin divides two figures that BOTH move with the refunds this product could not subtract, so the true margin may be either side of this one. The figure is shown; the relation is not claimed.'
+const MARGIN_INDETERMINATE_TITLE_SUMMARY = 'Direction not established: margin divides two figures that BOTH move with the refunds this period could not subtract, so the true margin may be either side of this one. The figure is shown; the relation is not claimed.'
+
+function marginBoundTitle(bound: DerivedFigureBound, summary = false): string | undefined {
+  if (bound === 'exact') return undefined
+  if (bound === 'indeterminate') return summary ? MARGIN_INDETERMINATE_TITLE_SUMMARY : MARGIN_INDETERMINATE_TITLE
+  return summary ? BOUND_TITLE_SUMMARY : BOUND_TITLE
+}
+
+/**
  * o3d-iigc round 2 (Codex finding 1): A SUMMARY CARD IS THE FIGURE PEOPLE ACTUALLY READ, and on a
  * card an upper bound was indistinguishable from a measurement — the marks the table cells carry
  * were on the columns hardly anyone scrolls to, while the five cards above them printed the same
@@ -176,26 +198,32 @@ const BOUND_TITLE_SUMMARY = 'Upper bound: some refunds in this period are on the
  * of any colouring that would read as a verdict — plus, because a card has no "Refunds (gross)"
  * column beside it to reveal how loose the bound is, the looseness in words underneath.
  */
-function SummaryCard({ label, value, bounded, boundedBy, valueClass }: {
+function SummaryCard({ label, value, bound = 'exact', boundedBy, valueClass }: {
   label: string
   /** Already formatted: money through fmtBase, a percentage with its sign. */
   value: string
-  /** True when this figure is an upper bound rather than a measurement. */
-  bounded?: boolean
+  /**
+   * How this figure relates to the one a complete refund basis would have produced. o3d-iigc round 4
+   * widened this from a boolean: `upper` and `indeterminate` are DIFFERENT claims and a card that
+   * cannot tell them apart will print the wrong one.
+   */
+  bound?: DerivedFigureBound
   /** Formatted refund value the figure could not absorb — how loose the bound is. */
   boundedBy?: string
-  /** Colouring that reads as a verdict on the figure. Dropped when the figure is bounded. */
+  /** Colouring that reads as a verdict on the figure. Dropped whenever the figure is not exact. */
   valueClass?: string
 }) {
+  const marked = bound !== 'exact'
+  const title = bound === 'indeterminate' ? MARGIN_INDETERMINATE_TITLE_SUMMARY : bound === 'upper' ? BOUND_TITLE_SUMMARY : undefined
   return (
     <div className="rounded-md border p-3">
       <p className="text-xs text-muted-foreground">{label}</p>
-      <p className={`text-xl font-bold ${bounded ? 'text-orange-600' : valueClass ?? ''}`} title={bounded ? BOUND_TITLE_SUMMARY : undefined}>
-        {value}{bounded ? ' \u2264' : ''}
+      <p className={`text-xl font-bold ${marked ? 'text-orange-600' : valueClass ?? ''}`} title={title}>
+        {value}{boundSuffix(bound)}
       </p>
-      {bounded && (
-        <p className="text-[10px] leading-tight text-orange-600" title={BOUND_TITLE_SUMMARY}>
-          Upper bound &mdash; {boundedBy} of refunds not subtracted
+      {marked && (
+        <p className="text-[10px] leading-tight text-orange-600" title={title}>
+          {bound === 'indeterminate' ? 'Direction not established' : 'Upper bound'} &mdash; {boundedBy} of refunds not subtracted
         </p>
       )}
     </div>
@@ -433,6 +461,9 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
   // which is exactly the two columns the products table reports beside the figure. Rounded once,
   // here, because both totals are themselves sums of rounded rows.
   const summaryIsBounded = !summary.refundBasisComplete
+  // The verdict for the figures that move ONE-FOR-ONE with net revenue. Avg Margin does NOT use it —
+  // it carries its own, because a ratio's error can run the other way (o3d-iigc round 4).
+  const summaryLinearBound: DerivedFigureBound = summaryIsBounded ? 'upper' : 'exact'
   const summaryBoundedBy = fmtBase(Math.round((summary.totalRefundsGrossBasis + summary.totalRefundsUnknownBasis) * 100) / 100)
 
   // Filtered data per tab
@@ -477,7 +508,9 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
     // A bounded profit/margin DROPS the green/red colouring: that colouring reads as a verdict, and
     // an upper bound does not support one.
     grossProfit: { label: moneyLabel('Profit'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${!r.refundBasisComplete ? 'text-orange-600' : r.grossProfit >= 0 ? 'text-green-600' : 'text-destructive'}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(r.grossProfit)}{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.refundBasisComplete ? 'text-green-600' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(summary.totalGrossProfit)}{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
-    marginPct: { label: 'Margin', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${!r.refundBasisComplete ? 'text-orange-600' : r.marginPct < 0 ? 'text-destructive' : ''}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{r.marginPct}%{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums ${summary.refundBasisComplete ? '' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{summary.avgMarginPct}%{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
+    // o3d-iigc round 4: Margin reads marginPctBound, NOT refundBasisComplete. The other three
+    // net-derived columns keep refundBasisComplete because they move one-for-one with net revenue.
+    marginPct: { label: 'Margin', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${r.marginPctBound !== 'exact' ? 'text-orange-600' : r.marginPct < 0 ? 'text-destructive' : ''}`} title={marginBoundTitle(r.marginPctBound)}>{r.marginPct}%{boundSuffix(r.marginPctBound)}</span>, footer: () => <span className={`tabular-nums ${summary.avgMarginPctBound !== 'exact' ? 'text-orange-600' : ''}`} title={marginBoundTitle(summary.avgMarginPctBound, true)}>{summary.avgMarginPct}%{boundSuffix(summary.avgMarginPctBound)}</span> },
     orderCount: { label: 'Orders', align: 'right', render: (r) => <span className="tabular-nums text-xs text-muted-foreground">{r.orderCount}</span>, footer: () => <span className="tabular-nums text-muted-foreground">{summary.totalOrders}</span> },
     avgOrderValue: { label: moneyLabel('Avg Order'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${r.refundBasisComplete ? '' : 'text-orange-600'}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(r.avgOrderValue)}{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.refundBasisComplete ? '' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(summary.avgOrderValue)}{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
     salesPrice: { label: moneyLabel('List Price'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{r.salesPrice != null ? fmtBase(r.salesPrice) : '—'}</span> },
@@ -603,10 +636,11 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
           Orders/Qty are basis-independent — quantity nets off every refund line whatever its
           basis — so they are never marked. */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-        <SummaryCard label="Net Revenue" value={fmtBase(summary.totalNetRevenue)} bounded={summaryIsBounded} boundedBy={summaryBoundedBy} />
+        <SummaryCard label="Net Revenue" value={fmtBase(summary.totalNetRevenue)} bound={summaryLinearBound} boundedBy={summaryBoundedBy} />
         <SummaryCard label="COGS" value={fmtBase(summary.totalCogs)} />
-        <SummaryCard label="Gross Profit" value={fmtBase(summary.totalGrossProfit)} bounded={summaryIsBounded} boundedBy={summaryBoundedBy} valueClass="text-green-600" />
-        <SummaryCard label="Avg Margin" value={`${summary.avgMarginPct}%`} bounded={summaryIsBounded} boundedBy={summaryBoundedBy} />
+        <SummaryCard label="Gross Profit" value={fmtBase(summary.totalGrossProfit)} bound={summaryLinearBound} boundedBy={summaryBoundedBy} valueClass="text-green-600" />
+        {/* o3d-iigc round 4: Avg Margin takes its OWN verdict, not the period's linear one. */}
+        <SummaryCard label="Avg Margin" value={`${summary.avgMarginPct}%`} bound={summary.avgMarginPctBound} boundedBy={summaryBoundedBy} />
         <SummaryCard label="Orders / Qty" value={`${summary.totalOrders} / ${summary.totalQtySold}`} />
       </div>
 

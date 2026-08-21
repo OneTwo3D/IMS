@@ -124,10 +124,17 @@ test('cards: a bounded Gross Profit drops the colouring that reads as a verdict 
   assert.match(grossProfit, /Upper bound — £120\.00 of refunds not subtracted/)
 })
 
-test('cards: a bounded Avg Margin is marked too — it is 1 - COGS/revenue, so it moves with it (o3d-iigc)', async () => {
+test('cards: a bounded Avg Margin is marked ≤ ONLY WHERE THAT RELATION HOLDS (o3d-iigc, r4 corrected)', async () => {
   const { summary, html } = await renderPage(GROSS_CREDIT)
   assert.equal(summary.avgMarginPct, 60)
 
+  // Round 2 wrote this test as "margin is 1 - COGS/revenue, so it moves with revenue". It does —
+  // but it moves with revenue in the numerator AND the denominator, so THAT REASONING DOES NOT
+  // ESTABLISH THE DIRECTION (o3d-iigc round 4, Codex finding 1). The `≤` is still correct on THESE
+  // numbers because COGS (£40) is below the published net revenue (£100); flip that and it is not.
+  // The counterexample and the four-branch case analysis live in derived-figure-bounds.test.ts and
+  // margin-bound-surfaces.test.ts.
+  assert.equal(summary.avgMarginPctBound, 'upper')
   assert.match(card(html, 'Avg Margin'), /60% ≤/)
 })
 

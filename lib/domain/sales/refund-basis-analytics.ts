@@ -173,3 +173,89 @@ export function refundLineBucket(
 function round2(value: ReturnType<typeof toDecimal>): number {
   return Math.round(value.mul(100).toNumber()) / 100
 }
+
+// ---------------------------------------------------------------------------
+// o3d-iigc round 4: WHICH DIRECTION a bounded figure is bounded IN.
+// ---------------------------------------------------------------------------
+
+/**
+ * What relation a published figure bears to the figure the report WOULD have published if every
+ * refund's basis were known.
+ *
+ * - `exact`        — nothing was left unsubtracted, or the unsubtracted credit provably cannot move
+ *                    this figure. Publish it unmarked.
+ * - `upper`        — the published figure is greater than or equal to the true one. Mark it `≤`.
+ * - `indeterminate`— the true figure may be either side of the published one. Publishing `≤` here
+ *                    would be a FALSE CLAIM, which is worse than publishing no claim at all.
+ */
+export { boundSuffix, netLinearFigureBound, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import type { DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+
+
+/**
+ * MARGIN IS A RATIO, AND A RATIO IS NOT COVERED BY THE ARGUMENT ABOVE.
+ *
+ * Codex round 3 marked Avg Margin `≤` on the grounds that it "moves with revenue". It does — but an
+ * unsubtracted credit moves the NUMERATOR AND THE DENOMINATOR TOGETHER, and which way the quotient
+ * then moves depends on their relative sizes. Working it through, with `c` = COGS (basis-independent
+ * — no refund line ever reduces it — and therefore fixed), `t` = net revenue, and the report's OWN
+ * margin function:
+ *
+ *     m(t) = t > 0 ? ((t - c) / t) * 100 : 0            // the `netRevenue > 0` guard is part of it
+ *          = 100 * (1 - c/t)     for t > 0
+ *
+ * The published figure is `m(netRevenue)`; the true one is `m(t*)` for an unknown
+ * `t* ∈ [netRevenue - unplacedCredit, netRevenue]`. `m'(t) = c/t²`, so:
+ *
+ *   1. `c < 0` — m is DECREASING. A smaller true revenue gives a LARGER margin: the published figure
+ *      is a lower bound, not an upper one. The exact opposite of the mark round 3 applied.
+ *   2. `c >= 0`, `netRevenue <= 0` — the guard returns 0 across the whole interval, so published and
+ *      true are both 0. EXACT, and marking it would overstate our uncertainty.
+ *   3. `c >= 0`, `netRevenue - unplacedCredit > 0` — the interval sits entirely in `(0, ∞)` where m
+ *      is non-decreasing, so the published figure is the maximum. A genuine UPPER bound.
+ *   4. `c >= 0`, `netRevenue > 0 >= netRevenue - unplacedCredit` — the interval STRADDLES ZERO, so
+ *      the guard's 0 is one of the values the true figure could take. That is above the published
+ *      figure exactly when the published figure is negative, i.e. when `c > netRevenue`:
+ *        - `netRevenue >= c` → published margin >= 0 → still an upper bound.
+ *        - `netRevenue < c`  → INDETERMINATE. Worked: gross revenue 100 (ex-VAT), COGS 150, and a
+ *          £120 gross-basis credit that could not be placed. Published net revenue 100, published
+ *          margin 100*(1 - 150/100) = -50%. Place the credit and net revenue is -20, so the report
+ *          prints margin 0% — and 0% is NOT "at most -50%". Marking that `≤` is a false claim about
+ *          a figure we cannot establish.
+ *
+ * Cases 1 and 4b are why this exists. Note the answer is `indeterminate`, NOT withheld: the number
+ * is still the best available reading of a real period, and refusing to show it at all is this
+ * branch's failure mode in the other direction. What is withheld is the RELATION.
+ */
+export function marginFigureBound(params: {
+  /** The published net revenue the margin was divided by. */
+  netRevenue: number
+  /** COGS — the margin's numerator offset. Basis-independent: refunds never reduce it. */
+  cogs: number
+  /**
+   * Refund value the net revenue could not absorb (gross-basis + unproven-basis), as an AMOUNT.
+   * Never used to decide WHETHER a bound exists — `basisComplete` does that. A sub-penny unstamped
+   * credit rounds this to 0 while still bounding the figure, and reading existence off the amount
+   * would publish that as exact.
+   */
+  unplacedCredit: number
+  /** False when ANY credit could not be placed on the net basis — the producers' existing flag. */
+  basisComplete: boolean
+}): DerivedFigureBound {
+  const { netRevenue, cogs, unplacedCredit, basisComplete } = params
+  if (basisComplete) return 'exact'
+  if (!Number.isFinite(netRevenue) || !Number.isFinite(cogs) || !Number.isFinite(unplacedCredit)) {
+    return 'indeterminate'
+  }
+  if (unplacedCredit < 0) return 'indeterminate' // see netLinearFigureBound
+  if (cogs < 0) return 'indeterminate' // case 1: the quotient moves the OTHER way
+  if (netRevenue <= 0) return 'exact' // case 2: the guard pins both readings to 0
+  if (netRevenue - unplacedCredit > 0) return 'upper' // case 3
+  return netRevenue >= cogs ? 'upper' : 'indeterminate' // case 4
+}
+
+/**
+ * The suffix a figure carries, so the UI cells, the summary cards and the CSV cannot drift apart on
+ * what `≤` versus `?` means. `?` is deliberately NOT `≤`: it says a bound exists but its direction is
+ * not established.
+ */

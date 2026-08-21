@@ -9,7 +9,7 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { normalizeLineDiscountBase, normalizeOrderDiscountBase } from '@/lib/sales-currency'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
-import { refundLineBucket } from '@/lib/domain/sales/refund-basis-analytics'
+import { marginFigureBound, refundLineBucket, type DerivedFigureBound } from '@/lib/domain/sales/refund-basis-analytics'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -39,15 +39,22 @@ export type KpiSummary = {
   /** Refund value whose basis was never proved. EXCLUDED rather than guessed at. */
   refundsUnknownBasisCurrent: number
   /**
-   * False when the period carried refund value that could not be placed on the net basis. Every
-   * figure derived from net sales — netSalesCurrent, profitCurrent, marginCurrent, avgOrderValue —
-   * is then an UPPER BOUND, too high by at most refundsGrossBasisCurrent + refundsUnknownBasisCurrent.
+   * False when the period carried refund value that could not be placed on the net basis. The
+   * figures that move ONE-FOR-ONE with net sales — netSalesCurrent, profitCurrent, avgOrderValue —
+   * are then UPPER BOUNDS, too high by at most refundsGrossBasisCurrent + refundsUnknownBasisCurrent.
+   * marginCurrent is a RATIO and is NOT covered by this flag: see marginBoundCurrent.
    */
   refundBasisCompleteCurrent: boolean
   netSalesCurrent: number
   cogsCurrent: number
   profitCurrent: number
   marginCurrent: number
+  /**
+   * o3d-iigc round 4: which way marginCurrent's error runs, or that it is not established. Marking
+   * a ratio `≤` because its denominator is bounded is a claim the arithmetic does not support —
+   * marginFigureBound carries the case analysis.
+   */
+  marginBoundCurrent: DerivedFigureBound
   shippingCurrent: number
   // Comparison period
   ordersComparison: number
@@ -57,6 +64,8 @@ export type KpiSummary = {
   netSalesComparison: number
   cogsComparison: number
   marginComparison: number
+  /** As marginBoundCurrent, for the comparison period. */
+  marginBoundComparison: DerivedFigureBound
   // Other KPIs
   totalProducts: number
   activeProducts: number
@@ -77,15 +86,23 @@ export type ChartPoint = {
   cogs: number
   marginPct: number
   /**
-   * o3d-iigc: false when this bucket held refund value that is not on the net basis. netSales and
-   * marginPct are then upper bounds — the unplaceable credit was left out rather than subtracted
-   * in the wrong unit.
+   * o3d-iigc: false when this bucket held refund value that is not on the net basis. netSales is
+   * then an upper bound — the unplaceable credit was left out rather than subtracted in the wrong
+   * unit. It says NOTHING about marginPct; that is marginPctBound's job.
    */
   netSalesUpperBound: boolean
+  /**
+   * o3d-iigc round 4: the bucket's own margin classification. Carried PER BUCKET rather than taken
+   * from the period, because a period whose margin is a sound upper bound can contain a day whose
+   * margin is indeterminate, and the chart tooltip reads the bucket.
+   */
+  marginPctBound: DerivedFigureBound
   compNetSales: number
   compCogs: number
   compMarginPct: number
   compNetSalesUpperBound: boolean
+  /** As marginPctBound, for the comparison bucket. */
+  compMarginPctBound: DerivedFigureBound
 }
 
 export type IncomingPO = {
@@ -321,6 +338,11 @@ export async function getDashboardData(
     cogsCurrent: r2(cur.cogs),
     profitCurrent: r2(cur.net - cur.cogs),
     marginCurrent: cur.net > 0 ? Math.round(((cur.net - cur.cogs) / cur.net) * 1000) / 10 : 0,
+    marginBoundCurrent: marginFigureBound({
+      netRevenue: cur.net, cogs: cur.cogs,
+      unplacedCredit: cur.refundsGrossBasis + cur.refundsUnknownBasis,
+      basisComplete: cur.refundBasisComplete,
+    }),
     shippingCurrent: r2(cur.shipping),
     ordersComparison: compOrders.length,
     grossSalesComparison: r2(comp.gross),
@@ -328,6 +350,11 @@ export async function getDashboardData(
     netSalesComparison: r2(comp.net),
     cogsComparison: r2(comp.cogs),
     marginComparison: comp.net > 0 ? Math.round(((comp.net - comp.cogs) / comp.net) * 1000) / 10 : 0,
+    marginBoundComparison: marginFigureBound({
+      netRevenue: comp.net, cogs: comp.cogs,
+      unplacedCredit: comp.refundsGrossBasis + comp.refundsUnknownBasis,
+      basisComplete: comp.refundBasisComplete,
+    }),
     totalProducts: products.length,
     activeProducts: products.filter((p) => p.lifecycleStatus === 'ACTIVE').length,
     inventoryValue: r2(inventoryValue),
@@ -363,9 +390,19 @@ export async function getDashboardData(
       grossSales: r2(c.gross), netSales: r2(c.net), cogs: r2(c.cogs),
       marginPct: c.net > 0 ? Math.round(((c.net - c.cogs) / c.net) * 1000) / 10 : 0,
       netSalesUpperBound: !c.refundBasisComplete,
+      marginPctBound: marginFigureBound({
+        netRevenue: c.net, cogs: c.cogs,
+        unplacedCredit: c.refundsGrossBasis + c.refundsUnknownBasis,
+        basisComplete: c.refundBasisComplete,
+      }),
       compNetSales: r2(p.net), compCogs: r2(p.cogs),
       compMarginPct: p.net > 0 ? Math.round(((p.net - p.cogs) / p.net) * 1000) / 10 : 0,
       compNetSalesUpperBound: !p.refundBasisComplete,
+      compMarginPctBound: marginFigureBound({
+        netRevenue: p.net, cogs: p.cogs,
+        unplacedCredit: p.refundsGrossBasis + p.refundsUnknownBasis,
+        basisComplete: p.refundBasisComplete,
+      }),
     }
   }
 

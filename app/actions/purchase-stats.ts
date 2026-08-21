@@ -3,6 +3,7 @@
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { COMMITTED_PURCHASE_ORDER_WHERE, INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
+import { headerDiscountedReturnCreditBase } from '@/lib/domain/purchasing/return-credit-basis'
 
 // ---------------------------------------------------------------------------
 // Product purchase stats (Products tab)
@@ -294,6 +295,10 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
         where: { type: 'GOODS', ...COMMITTED_PURCHASE_ORDER_WHERE },
         select: {
           totalBase: true, taxBase: true, directFreightBase: true, poSentAt: true, receivedAt: true,
+          // o3d-iigc round 4: subtotalBase and the line totals were not fetched before, so the header
+          // discount was not merely mishandled — it was NOT VISIBLE to this query at all.
+          subtotalBase: true,
+          lines: { select: { totalBase: true } },
           invoices: { select: { totalBase: true, invoiceDate: true } },
           returns: { select: { lines: { select: { qtyReturned: true, poLine: { select: { unitCostBase: true } } } } } },
         },
@@ -311,7 +316,7 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
       grossAmount += Number(po.totalBase)
       tax += Number(po.taxBase)
       landedCosts += Number(po.directFreightBase)
-      refunds += po.returns.reduce((sum, r) => sum + r.lines.reduce((s2, rl) => s2 + Number(rl.qtyReturned) * Number(rl.poLine.unitCostBase), 0), 0)
+      refunds += headerDiscountedReturnCreditBase(po)
       for (const inv of po.invoices) {
         const t = Number(inv.totalBase); billedAmount += t
         const d = Math.round((now - inv.invoiceDate.getTime()) / 86400000)
@@ -345,10 +350,13 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
     // return line, and each line of a PO may carry its own.
     //
     // It still includes direct freight, because `grossAmount` does and `landedCosts` reports that
-    // same freight beside it; only the VAT basis was in question. A SEPARATE, PRE-EXISTING
-    // looseness is left alone and stated: a header order discount reduces the PO's subtotal/tax
-    // but not its line `unitCostBase`, so a return against a header-discounted PO is valued at the
-    // pre-discount cost. That is a discount-allocation defect, not a basis one.
+    // same freight beside it; only the VAT basis was in question.
+    //
+    // o3d-iigc round 4 (Codex finding 4): AND THE HEADER-DISCOUNT LOOSENESS ROUND 3 FLAGGED IS NOW
+    // FIXED, in headerDiscountedReturnCreditBase below — it was the same class of defect as the one
+    // round 3 had just repaired (an order total on one basis, a credit on another), only the
+    // mismatched axis was the DISCOUNT rather than the VAT, so leaving it produced a `netAmount`
+    // that was again neither convention.
     return {
       supplierId: s.id, supplierName: s.name,
       grossAmount: Math.round(grossAmount * 100) / 100, discounts: 0,

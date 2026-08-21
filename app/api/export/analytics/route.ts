@@ -6,6 +6,7 @@ import { generateForecasts } from '@/app/actions/forecasting'
 import { toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
+import { netLinearFigureBound } from '@/lib/domain/sales/refund-basis-analytics'
 
 export async function GET(req: NextRequest) {
   const session = await requireApiAuth()
@@ -22,26 +23,42 @@ export async function GET(req: NextRequest) {
   switch (type) {
     case 'products': {
       const { rows } = await getProductSalesStats(dateFrom, dateTo)
+      // o3d-iigc round 4 (Codex finding 3): THE SAME RULE ROUND 3 APPLIED ONE FILE AWAY, APPLIED HERE.
+      //
+      // Round 3 renamed the supplier-aging column `netAmount` -> `netAmountExVat` for one stated
+      // reason — A FILE READER HAS NO TOOLTIP — and then left the sales-side derived figures
+      // exporting bare. Three of the four figures below are upper bounds whenever a refund could not
+      // be placed on the net basis, and in the CSV that was invisible: one flag column named after
+      // `netRevenue` alone spoke for all four, so `grossProfit`, `marginPct` and `avgOrderValue`
+      // arrived in the spreadsheet indistinguishable from measurements.
+      //
+      // Each figure now carries its OWN bound column, immediately to its right, so a reader who
+      // sorts, filters or charts one column sees that column's own verdict. `netRevenueIsUpperBound`
+      // (yes/no) is REPLACED rather than kept: a two-valued column cannot express `indeterminate`,
+      // and a `no` there would read as "exact" on precisely the figure whose relation we cannot
+      // establish. `cogs`, `orderCount` and the quantity columns are basis-independent and get none.
+      const linearBound = (r: { refundBasisComplete: boolean; refundsGrossBasis: number; refundsUnknownBasis: number }) =>
+        netLinearFigureBound({ basisComplete: r.refundBasisComplete, unplacedCredit: r.refundsGrossBasis + r.refundsUnknownBasis })
       const data = rows.map((r) => ({
         sku: r.sku, name: r.name, type: r.type, stockUnit: r.stockUnit,
         barcode: r.barcode, mpn: r.mpn, lifecycleStatus: r.lifecycleStatus,
         qtySold: r.qtySold, qtyRefunded: r.qtyRefunded, netQty: r.netQty,
         grossRevenue: r.grossRevenue.toFixed(2), discounts: r.discounts.toFixed(2),
-        // o3d-iigc: the error bound travels with the figure. `refunds` is NET-basis credit only,
-        // so netRevenue/grossProfit are upper bounds by at most the two columns beside them — a
-        // reader of the CSV can see how loose the bound is instead of it being invisible outside
-        // the UI.
+        // How loose every bound below is: at most these two columns added together.
         refunds: r.refunds.toFixed(2),
         refundsGrossBasis: r.refundsGrossBasis.toFixed(2),
         refundsUnknownBasis: r.refundsUnknownBasis.toFixed(2),
-        netRevenueIsUpperBound: r.refundBasisComplete ? 'no' : 'yes',
-        netRevenue: r.netRevenue.toFixed(2),
-        cogs: r.cogs.toFixed(2), grossProfit: r.grossProfit.toFixed(2),
-        marginPct: r.marginPct, orderCount: r.orderCount,
-        avgOrderValue: r.avgOrderValue.toFixed(2),
+        netRevenue: r.netRevenue.toFixed(2), netRevenueBound: linearBound(r),
+        cogs: r.cogs.toFixed(2),
+        grossProfit: r.grossProfit.toFixed(2), grossProfitBound: linearBound(r),
+        // NOT linearBound: margin is a ratio whose numerator and denominator both move with the
+        // unsubtracted credit, so it can be `indeterminate` on a row whose other three are `upper`.
+        marginPct: r.marginPct, marginPctBound: r.marginPctBound,
+        orderCount: r.orderCount,
+        avgOrderValue: r.avgOrderValue.toFixed(2), avgOrderValueBound: linearBound(r),
         salesPrice: r.salesPrice?.toFixed(2) ?? '', weight: r.weight ?? '',
       }))
-      const headers = ['sku', 'name', 'type', 'stockUnit', 'barcode', 'mpn', 'lifecycleStatus', 'qtySold', 'qtyRefunded', 'netQty', 'grossRevenue', 'discounts', 'refunds', 'refundsGrossBasis', 'refundsUnknownBasis', 'netRevenueIsUpperBound', 'netRevenue', 'cogs', 'grossProfit', 'marginPct', 'orderCount', 'avgOrderValue', 'salesPrice', 'weight']
+      const headers = ['sku', 'name', 'type', 'stockUnit', 'barcode', 'mpn', 'lifecycleStatus', 'qtySold', 'qtyRefunded', 'netQty', 'grossRevenue', 'discounts', 'refunds', 'refundsGrossBasis', 'refundsUnknownBasis', 'netRevenue', 'netRevenueBound', 'cogs', 'grossProfit', 'grossProfitBound', 'marginPct', 'marginPctBound', 'orderCount', 'avgOrderValue', 'avgOrderValueBound', 'salesPrice', 'weight']
       return csvResponse(toCsv(data, headers), `sales-stats-products-${date}.csv`)
     }
 
@@ -135,7 +152,11 @@ export async function GET(req: NextRequest) {
     }
     case 'po_aging': {
       const rows = await getSupplierAging()
-      const data = rows.map((r) => ({ supplierName: r.supplierName, grossAmount: r.grossAmount.toFixed(2), refunds: r.refunds.toFixed(2),
+      const data = rows.map((r) => ({ supplierName: r.supplierName, grossAmount: r.grossAmount.toFixed(2),
+        // o3d-iigc round 4: `refunds` is the credit ON THE NET AMOUNT'S OWN BASIS — ex-VAT line cost
+        // reduced by the order's header discount — so grossAmount - tax - refunds still reproduces
+        // netAmountExVat in the spreadsheet.
+        refunds: r.refunds.toFixed(2),
         // o3d-iigc round 2: the basis travels with the figure — a CSV reader has no tooltip.
         netAmountExVat: r.netAmount.toFixed(2), landedCosts: r.landedCosts.toFixed(2), tax: r.tax.toFixed(2), totalAmount: r.totalAmount.toFixed(2), billedAmount: r.billedAmount.toFixed(2), dueAmount: r.dueAmount.toFixed(2), overdue0_30: r.overdue0_30.toFixed(2), overdue31_60: r.overdue31_60.toFixed(2), overdue61_90: r.overdue61_90.toFixed(2), overdue91plus: r.overdue91plus.toFixed(2), poCount: r.poCount, avgLeadTimeDays: r.avgLeadTimeDays }))
       return csvResponse(toCsv(data, ['supplierName', 'grossAmount', 'refunds', 'netAmountExVat', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus', 'poCount', 'avgLeadTimeDays']), `supplier-aging-${date}.csv`)

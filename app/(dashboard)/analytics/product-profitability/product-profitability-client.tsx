@@ -11,6 +11,7 @@ import { ProductLink } from '@/components/inventory/product-link'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatMoney } from '@/lib/utils'
 import type { ProfitabilityRow, ProfitabilitySummary } from '@/app/actions/product-profitability'
+import { netLinearFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 
 type Props = {
   data: { rows: ProfitabilityRow[]; summary: ProfitabilitySummary }
@@ -236,18 +237,26 @@ export function ProductProfitabilityClient({ data }: Props) {
 
   // CSV export (all filtered rows, not just current page)
   function handleExport() {
+    // o3d-iigc round 4: this page has NO server export route — this browser-built file IS its only
+    // export, and it carried the same defect the analytics route did: ONE bound column, named after
+    // Revenue, standing in front of a Profit column that is equally bounded and said nothing. Each
+    // bounded figure now carries its own verdict immediately to its right, in the same vocabulary
+    // the server CSV uses ('exact' / 'upper' / 'indeterminate'), so the two files read alike.
+    // `Margin %` here is unitMarginPct — list price against latest COGS — which no refund touches,
+    // so it is deliberately NOT marked.
     const header = ['SKU', 'Name', 'Type', 'Status', 'Stock', 'List Price', 'Sale Price', 'Latest COGS', 'Unit Margin', 'Margin %',
-      // o3d-iigc: the error bound travels with the figure. Revenue is net of NET-BASIS credits
-      // only; these two columns are exactly what it could not subtract, so a reader of the CSV can
-      // see how loose the bound is instead of it being invisible outside the UI.
-      `Revenue (${summary.fyLabel})`, `Refunds gross-basis (${summary.fyLabel})`, `Refunds basis unknown (${summary.fyLabel})`, `Revenue is upper bound (${summary.fyLabel})`, `COGS (${summary.fyLabel})`, `Profit (${summary.fyLabel})`, `Qty (${summary.fyLabel})`,
-      `Revenue (${summary.prevFyLabel})`, `Refunds gross-basis (${summary.prevFyLabel})`, `Refunds basis unknown (${summary.prevFyLabel})`, `Revenue is upper bound (${summary.prevFyLabel})`, `COGS (${summary.prevFyLabel})`, `Profit (${summary.prevFyLabel})`, `Qty (${summary.prevFyLabel})`]
-    const csvRows = filtered.map((r) => [
-      r.sku, `"${r.name.replace(/"/g, '""')}"`, r.type, r.lifecycleStatus, r.totalStock,
-      r.salesPrice ?? '', r.salePrice ?? '', r.latestCogs ?? '', r.unitMargin ?? '', r.unitMarginPct ?? '',
-      r.currentFyRevenue, r.currentFyRefundsGrossBasis, r.currentFyRefundsUnknownBasis, r.currentFyRefundBasisComplete ? 'no' : 'yes', r.currentFyCogs, r.currentFyProfit, r.currentFyQtySold,
-      r.previousFyRevenue, r.previousFyRefundsGrossBasis, r.previousFyRefundsUnknownBasis, r.previousFyRefundBasisComplete ? 'no' : 'yes', r.previousFyCogs, r.previousFyProfit, r.previousFyQtySold,
-    ])
+      `Revenue (${summary.fyLabel})`, `Revenue bound (${summary.fyLabel})`, `Refunds gross-basis (${summary.fyLabel})`, `Refunds basis unknown (${summary.fyLabel})`, `COGS (${summary.fyLabel})`, `Profit (${summary.fyLabel})`, `Profit bound (${summary.fyLabel})`, `Qty (${summary.fyLabel})`,
+      `Revenue (${summary.prevFyLabel})`, `Revenue bound (${summary.prevFyLabel})`, `Refunds gross-basis (${summary.prevFyLabel})`, `Refunds basis unknown (${summary.prevFyLabel})`, `COGS (${summary.prevFyLabel})`, `Profit (${summary.prevFyLabel})`, `Profit bound (${summary.prevFyLabel})`, `Qty (${summary.prevFyLabel})`]
+    const csvRows = filtered.map((r) => {
+      const currentBound = netLinearFigureBound({ basisComplete: r.currentFyRefundBasisComplete, unplacedCredit: r.currentFyRefundsGrossBasis + r.currentFyRefundsUnknownBasis })
+      const previousBound = netLinearFigureBound({ basisComplete: r.previousFyRefundBasisComplete, unplacedCredit: r.previousFyRefundsGrossBasis + r.previousFyRefundsUnknownBasis })
+      return [
+        r.sku, `"${r.name.replace(/"/g, '""')}"`, r.type, r.lifecycleStatus, r.totalStock,
+        r.salesPrice ?? '', r.salePrice ?? '', r.latestCogs ?? '', r.unitMargin ?? '', r.unitMarginPct ?? '',
+        r.currentFyRevenue, currentBound, r.currentFyRefundsGrossBasis, r.currentFyRefundsUnknownBasis, r.currentFyCogs, r.currentFyProfit, currentBound, r.currentFyQtySold,
+        r.previousFyRevenue, previousBound, r.previousFyRefundsGrossBasis, r.previousFyRefundsUnknownBasis, r.previousFyCogs, r.previousFyProfit, previousBound, r.previousFyQtySold,
+      ]
+    })
     const csv = [header.join(','), ...csvRows.map((r) => r.join(','))].join('\n')
     const blob = new Blob([csv], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
