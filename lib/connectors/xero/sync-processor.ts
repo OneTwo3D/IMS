@@ -3783,6 +3783,13 @@ async function processClaimedEntry(
       // permission to create one. Fails closed — a count we cannot read is not a first attempt.
       const attempt = await isFirstPurchaseCreditNoteAttempt(entryId, referenceType, referenceId)
       if (!attempt.ok) return { success: false, error: attempt.error }
+      // o3d-xl63 r5 #1: the fence goes AFTER that read, not before it. The read is awaited, and the whole
+      // point of the fence is that NOTHING AWAITABLE happens between proving the claim and using it — a
+      // claim proven before an await has had that await to lapse in. Both rules survive in this order:
+      // the first-attempt question is still answered before we decide to create, and the claim is still
+      // the last thing established before the socket.
+      const fence = await lease.fenceBeforeRemoteWrite('purchase-credit-note')
+      if (!fence.ok) return fence.result
       return pushPurchaseCreditNote({
         creditNoteNumber: payload.creditNoteNumber as string,
         contactName: payload.contactName as string,
