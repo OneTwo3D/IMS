@@ -53,8 +53,18 @@ const state = {
   activities: [] as Array<{ action: string; level?: string; description?: string; metadata?: Record<string, unknown> }>,
   /** Candidates for the credit-note allocation sweep. */
   creditNotes: [] as Array<{ id: string; accountingCreditNoteId: string | null; amountForeign: number; purchaseInvoice: { accountingInvoiceId: string | null } | null }>,
-  /** The PURCHASE_CREDIT_NOTE rows whose posts issued those credit ids, if any survive. */
-  creditNotePosts: [] as Array<{ referenceId: string; payload: Record<string, unknown> | null }>,
+  /**
+   * The PURCHASE_CREDIT_NOTE rows that survive for those credit notes. `externalTransactionId` is the
+   * DOCUMENT each one's post actually issued — the column round 3's lookup never read, and the whole of
+   * Codex r4 finding 1.
+   */
+  creditNotePosts: [] as Array<{
+    referenceId: string
+    externalTransactionId: string | null
+    status: string
+    syncedAt: Date
+    payload: Record<string, unknown> | null
+  }>,
 }
 
 function pdfRow(payload: Record<string, unknown> | null): SyncRow {
@@ -85,6 +95,7 @@ type FindManyArgs = {
     status?: unknown
     type?: unknown
     referenceId?: { in?: string[] }
+    externalTransactionId?: { in?: string[] }
     OR?: unknown
   }
 }
@@ -98,9 +109,23 @@ const db = {
       // The allocation sweep's "does this credit note already have a row?" probe.
       if (where.type === 'PURCHASE_CREDIT_NOTE_ALLOCATION') return []
       // The allocation sweep's origin lookup: the row whose post ISSUED the credit id.
-      if (where.type === 'PURCHASE_CREDIT_NOTE' && where.status === 'SYNCED') {
-        const ids = where.referenceId?.in ?? []
-        return state.creditNotePosts.filter((row) => ids.includes(row.referenceId)).map((row) => ({ ...row }))
+      //
+      // DELIBERATELY GENERIC — it applies whatever filters the production query actually sends, and pairs
+      // NOTHING. That is what makes the tests below falsifiable: with round 3's query restored
+      // (`status: 'SYNCED'`, no `externalTransactionId` predicate, newest first) this fake returns exactly
+      // what Postgres would have returned for it, so the assertions fail on the WRONG ROW WAS INHERITED
+      // FROM rather than on the fake not recognising the query.
+      if (where.type === 'PURCHASE_CREDIT_NOTE') {
+        const refIds = where.referenceId?.in ?? null
+        const externalIds = where.externalTransactionId?.in ?? null
+        const status = typeof where.status === 'string' ? where.status : null
+        return state.creditNotePosts
+          .filter((row) => (refIds === null || refIds.includes(row.referenceId))
+            && (externalIds === null || externalIds.includes(row.externalTransactionId ?? ''))
+            && (status === null || row.status === status))
+          // `orderBy: syncedAt desc` — modelled, so "newest row wins" really does pick the newest.
+          .sort((a, b) => b.syncedAt.getTime() - a.syncedAt.getTime())
+          .map((row) => ({ ...row }))
       }
       if (where.OR) return state.rows.filter((row) => row.status === 'PENDING').map((row) => ({ ...row }))
       return []
@@ -299,7 +324,13 @@ test('audit-w77e: the allocation sweep inherits the credit note post\'s organisa
     amountForeign: 40,
     purchaseInvoice: { accountingInvoiceId: 'XBILL-1' },
   }]
-  state.creditNotePosts = [{ referenceId: 'cn-1', payload: { [CONNECTION_KEY]: 'xero:tenant-A' } }]
+  state.creditNotePosts = [{
+    referenceId: 'cn-1',
+    externalTransactionId: 'XCN-ISSUED-BY-A',
+    status: 'SYNCED',
+    syncedAt: new Date('2026-01-01T00:00:00Z'),
+    payload: { [CONNECTION_KEY]: 'xero:tenant-A' },
+  }]
   state.tokenTenantId = 'tenant-B'
 
   const { reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
@@ -337,4 +368,240 @@ test('audit-w77e: with no surviving post to inherit from, the sweep records noth
   // And the row it made cannot post to whoever happens to be connected.
   const verdict = await verdictFor(state.created[0].payload, 'xero:tenant-B')
   assert.equal(verdict.mayPost, false)
+})
+
+// --- Codex r4 finding 1: WHICH post issued the id being carried -------------------------------------
+//
+// Round 3 made the sweep inherit rather than mint, and matched the issuing row on connector/type/
+// `referenceId` alone, filtered to SYNCED, newest first. `referenceId` is the CREDIT NOTE, not the
+// document — a supplier credit note that was posted twice has two rows under one reference naming two
+// different documents — so "the newest row" is not "the row that issued the id this allocation carries".
+// Inheriting from the wrong post is inheriting an origin the row did not come from, which the post-time
+// guard believes exactly as readily as an invented one.
+//
+// EVERY TEST BELOW MODELS TWO POSTS OF ONE REFERENCE WITH DIFFERENT IDS, or the finding cannot be
+// falsified. The fake `findMany` applies whatever predicates the production query sends and pairs
+// nothing, so restoring round 3's query really does reproduce round 3's answer here.
+
+/**
+ * The crash-after-post shape this module exists for, applied to the credit itself: the credit posted to
+ * organisation A as XCN-FIRST; later, connected to organisation C, it was posted AGAIN as XCN-SECOND and
+ * the back-reference write never landed. So `SupplierCreditNote.accountingCreditNoteId` still holds
+ * XCN-FIRST — the id the allocation is built from — while the NEWEST sync row names XCN-SECOND.
+ */
+function twoPostsOfOneCreditNote() {
+  state.creditNotes = [{
+    id: 'cn-9',
+    // The id the allocation will carry. Issued by organisation A.
+    accountingCreditNoteId: 'XCN-FIRST',
+    amountForeign: 40,
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-9' },
+  }]
+  state.creditNotePosts = [
+    {
+      referenceId: 'cn-9',
+      externalTransactionId: 'XCN-FIRST',
+      status: 'SYNCED',
+      syncedAt: new Date('2026-01-01T00:00:00Z'),
+      payload: { [CONNECTION_KEY]: 'xero:tenant-A' },
+    },
+    {
+      // Newer, same reference, DIFFERENT document, different organisation. Round 3 would take this one.
+      referenceId: 'cn-9',
+      externalTransactionId: 'XCN-SECOND',
+      status: 'SYNCED',
+      syncedAt: new Date('2026-06-01T00:00:00Z'),
+      payload: { [CONNECTION_KEY]: 'xero:tenant-C' },
+    },
+  ]
+}
+
+test('r4: with two posts of one credit note, the sweep inherits from the post that ISSUED THE ID IT CARRIES', async () => {
+  reset()
+  twoPostsOfOneCreditNote()
+  state.tokenTenantId = 'tenant-C'
+
+  const { reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
+  await reenqueueMissingCreditNoteAllocations()
+
+  assert.equal(state.created.length, 1)
+  assert.equal(state.created[0].payload.creditNoteId, 'XCN-FIRST')
+  assert.equal(
+    state.created[0].payload[CONNECTION_KEY],
+    'xero:tenant-A',
+    'the origin comes from the row whose externalTransactionId IS XCN-FIRST',
+  )
+  assert.notEqual(
+    state.created[0].payload[CONNECTION_KEY],
+    'xero:tenant-C',
+    'not from the newest row of the same reference, which posted a DIFFERENT document',
+  )
+})
+
+test('r4: and the guard can therefore still refuse it — inheriting the newest post made it a tautology', async () => {
+  reset()
+  twoPostsOfOneCreditNote()
+  // The instance is standing in front of organisation C, which is also what the newest post recorded.
+  state.tokenTenantId = 'tenant-C'
+
+  const { reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
+  await reenqueueMissingCreditNoteAllocations()
+
+  // THE ASSERTION THE FINDING IS ABOUT. Inheriting tenant-C would have made the post-time comparison
+  // C-against-C: an allocation carrying organisation A's credit note id would have been posted into
+  // organisation C with nothing able to object — a wrong-tenant post reached through an inherited,
+  // rather than an invented, origin.
+  const verdict = await verdictFor(state.created[0].payload, 'xero:tenant-C')
+  assert.equal(verdict.decision, 'mismatch')
+  assert.equal(verdict.mayPost, false)
+  assert.match(verdict.refusal ?? '', /queued for accounting connection xero:tenant-A/)
+  // ...and it still posts against the organisation that actually issued XCN-FIRST.
+  assert.equal((await verdictFor(state.created[0].payload, 'xero:tenant-A')).mayPost, true)
+  assert.deepEqual(sent, [], 'the sweep sends nothing')
+})
+
+test('r4: a FAILED row that NAMES the document is still the issuing post — status is not the identity', async () => {
+  reset()
+  state.creditNotes = [{
+    id: 'cn-10',
+    accountingCreditNoteId: 'XCN-POSTED-THEN-FAILED',
+    amountForeign: 25,
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-10' },
+  }]
+  state.creditNotePosts = [
+    {
+      // Posted successfully against A, then its FOLLOW-UPS exhausted their retries, so
+      // markSyncLogForFollowUpRetry moved it to FAILED — KEEPING the external id it posted.
+      referenceId: 'cn-10',
+      externalTransactionId: 'XCN-POSTED-THEN-FAILED',
+      status: 'FAILED',
+      syncedAt: new Date('2026-02-01T00:00:00Z'),
+      payload: { [CONNECTION_KEY]: 'xero:tenant-A' },
+    },
+    {
+      // A SYNCED row of the same reference naming a different document, so "newest SYNCED" has
+      // something to wrongly prefer.
+      referenceId: 'cn-10',
+      externalTransactionId: 'XCN-SOMETHING-ELSE',
+      status: 'SYNCED',
+      syncedAt: new Date('2026-07-01T00:00:00Z'),
+      payload: { [CONNECTION_KEY]: 'xero:tenant-C' },
+    },
+  ]
+  state.tokenTenantId = 'tenant-C'
+
+  const { reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
+  await reenqueueMissingCreditNoteAllocations()
+
+  assert.equal(state.created[0].payload[CONNECTION_KEY], 'xero:tenant-A')
+  const reenqueued = state.activities.find((entry) => entry.action === 'xero_credit_note_allocation_reenqueued')
+  assert.equal(reenqueued?.level, 'INFO')
+})
+
+test('r4: when NO row names the document it carries, the sweep records nothing rather than the nearest candidate', async () => {
+  reset()
+  state.creditNotes = [{
+    id: 'cn-11',
+    accountingCreditNoteId: 'XCN-ISSUER-GONE',
+    amountForeign: 15,
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-11' },
+  }]
+  // Retention took the row that posted XCN-ISSUER-GONE. A LATER post of the same credit note survives,
+  // and it is not evidence about XCN-ISSUER-GONE.
+  state.creditNotePosts = [{
+    referenceId: 'cn-11',
+    externalTransactionId: 'XCN-A-DIFFERENT-DOCUMENT',
+    status: 'SYNCED',
+    syncedAt: new Date('2026-07-01T00:00:00Z'),
+    payload: { [CONNECTION_KEY]: 'xero:tenant-C' },
+  }]
+  state.tokenTenantId = 'tenant-C'
+
+  const { reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
+  await reenqueueMissingCreditNoteAllocations()
+
+  assert.equal(state.created.length, 1)
+  assert.equal(
+    CONNECTION_KEY in state.created[0].payload,
+    false,
+    'a row of the same reference is not the row that issued this document',
+  )
+  const verdict = await verdictFor(state.created[0].payload, 'xero:tenant-C')
+  assert.equal(verdict.decision, 'no-origin-recorded')
+  assert.equal(verdict.mayPost, false)
+
+  const reenqueued = state.activities.find((entry) => entry.action === 'xero_credit_note_allocation_reenqueued')
+  assert.equal(reenqueued?.level, 'WARNING')
+  assert.match(reenqueued?.description ?? '', /no surviving sync row records a post of credit note XCN-ISSUER-GONE/)
+  assert.equal((reenqueued?.metadata as { originOutcome?: string } | undefined)?.originOutcome, 'no-issuing-row')
+})
+
+test('r4: two rows claiming ONE document against different organisations resolve to nothing, not to the newest', async () => {
+  reset()
+  state.creditNotes = [{
+    id: 'cn-12',
+    accountingCreditNoteId: 'XCN-CONTESTED',
+    amountForeign: 15,
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-12' },
+  }]
+  state.creditNotePosts = [
+    {
+      referenceId: 'cn-12',
+      externalTransactionId: 'XCN-CONTESTED',
+      status: 'SYNCED',
+      syncedAt: new Date('2026-01-01T00:00:00Z'),
+      payload: { [CONNECTION_KEY]: 'xero:tenant-A' },
+    },
+    {
+      referenceId: 'cn-12',
+      externalTransactionId: 'XCN-CONTESTED',
+      status: 'SYNCED',
+      syncedAt: new Date('2026-07-01T00:00:00Z'),
+      payload: { [CONNECTION_KEY]: 'xero:tenant-C' },
+    },
+  ]
+  state.tokenTenantId = 'tenant-C'
+
+  const { reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
+  await reenqueueMissingCreditNoteAllocations()
+
+  assert.equal(CONNECTION_KEY in state.created[0].payload, false, '"I cannot tell" must not resolve to "take the newest"')
+  const reenqueued = state.activities.find((entry) => entry.action === 'xero_credit_note_allocation_reenqueued')
+  assert.equal(reenqueued?.level, 'WARNING')
+  assert.match(reenqueued?.description ?? '', /two sync rows both claim to have posted credit note XCN-CONTESTED/)
+  assert.deepEqual(
+    (reenqueued?.metadata as { conflictingOrigins?: string[] } | undefined)?.conflictingOrigins,
+    ['xero:tenant-A', 'xero:tenant-C'],
+  )
+})
+
+// --- Codex r4 finding 2: a refusal needs a remedy an operator can perform ---------------------------
+
+test('r4: the warning for an unestablishable origin names a remedy that can actually be performed', async () => {
+  reset()
+  state.creditNotes = [{
+    id: 'cn-13',
+    accountingCreditNoteId: 'XCN-NO-ORIGIN',
+    amountForeign: 15,
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-13' },
+  }]
+  state.creditNotePosts = []
+  state.tokenTenantId = 'tenant-C'
+
+  const { reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
+  await reenqueueMissingCreditNoteAllocations()
+
+  const description = state.activities
+    .find((entry) => entry.action === 'xero_credit_note_allocation_reenqueued')?.description ?? ''
+  // The step that WORKS: do the allocation where the documents are, naming both ids so it can be done.
+  assert.match(description, /allocate it in the accounting system by hand/)
+  assert.match(description, /XCN-NO-ORIGIN/)
+  assert.match(description, /XBILL-13/)
+  // And the step that DOES NOT, explicitly ruled out — round 3's text told the operator to do exactly
+  // this, and it rebuilds the identical evidence-free payload from the identical two columns.
+  assert.match(description, /Do NOT retry or re-queue the row/)
+  assert.match(description, /must not be back-filled/)
+  // What the row does in the meantime, so "leave it" is a decision rather than an oversight.
+  assert.match(description, /sits FAILED in the sync log/)
+  assert.doesNotMatch(description, /Re-queue the allocation from the credit note itself/)
 })

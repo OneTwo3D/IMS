@@ -13,7 +13,11 @@ import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } fr
 import { pushManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
-import { carryAccountingOriginRecord } from '@/lib/connectors/accounting-connection-provenance'
+import {
+  carryAccountingOriginRecord,
+  readAccountingPayloadConnectionStamp,
+  type AccountingConnectionStamp,
+} from '@/lib/connectors/accounting-connection-provenance'
 import { withAccountingPostingIntent } from '@/lib/connectors/accounting-posting-intent'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
@@ -1933,6 +1937,137 @@ export function selectCreditNotesNeedingAllocation(
   return out
 }
 
+/** A `PURCHASE_CREDIT_NOTE` sync row, narrowed to the two columns provenance is resolved from. */
+export type CreditNotePostRow = {
+  /**
+   * The document this row's post RETURNED. This — not the row's status, and not its recency — is what
+   * makes a row the issuing post of a particular credit note.
+   */
+  externalTransactionId: string | null
+  /** The stored payload, verbatim. What gets inherited, stamp or no stamp. */
+  payload: unknown
+}
+
+/** What the rows in hand can say about which organisation issued one specific credit note. */
+export type IssuingPostOrigin =
+  /** One row named this exact document. Its payload travels verbatim — including carrying no stamp. */
+  | { outcome: 'inherited'; payload: unknown }
+  /** No row in hand names this document id. Nothing observed the post; record nothing. */
+  | { outcome: 'no-issuing-row' }
+  /** Two rows claim to have posted this document id against DIFFERENT organisations. Record nothing. */
+  | { outcome: 'conflicting-origins'; recorded: string[] }
+
+/**
+ * WHICH POST ISSUED THIS CREDIT NOTE? (Codex r4 finding 1, HIGH.)
+ *
+ * Round 3 stopped the sweep minting an origin from "whatever is connected when the cron fires" and made
+ * it INHERIT from the post that issued the id it is carrying. The lookup it shipped, though, matched only
+ * (connector, type, referenceType, `referenceId`), filtered to SYNCED, and took the NEWEST row — it never
+ * looked at `externalTransactionId` at all. A supplier credit note that was posted, voided and posted
+ * again has TWO rows under one `referenceId` naming two different documents, and
+ * `SupplierCreditNote.accountingCreditNoteId` holds whichever of them the last back-reference write left
+ * there. Taking the newest row therefore inherits from a post that issued a DIFFERENT document — an origin
+ * the row being created did not come from, which is the same class of defect as inventing one, and would
+ * be believed by the post-time guard exactly as readily.
+ *
+ * So the pair is the identity: a row is the issuing post only if it names the SAME reference AND carries
+ * the SAME `externalTransactionId` as the credit id being allocated.
+ *
+ * AND STATUS IS NOT A PROXY FOR "HAS POSTED". `status: 'SYNCED'` was too narrow in the other direction.
+ * This branch already establishes both halves of that: a row that posted successfully and then failed its
+ * FOLLOW-UPS is sent back to PENDING or, at MAX_RETRIES, to FAILED, *keeping* the external id
+ * (`markSyncLogForFollowUpRetry`); and a row retired to CANCELLED by the orphan sweep keeps it too — which
+ * is precisely why `order-delete-guard` matches on "carries an external id, whatever the status". A row
+ * that names a document posted that document. The id is the evidence; the status is where the row ended up
+ * afterwards. So no status filter is applied here at all.
+ *
+ * WHEN SEVERAL ROWS NAME THE SAME DOCUMENT. They are all describing the same post of the same document, so
+ * the one that RECORDED an organisation is preferred over one that recorded nothing (a retention-compacted
+ * `payload: {}`, or a pre-stamping row). That is not choosing the convenient answer: the rows do not
+ * disagree, one of them simply says less. If two of them do genuinely disagree — two readable stamps naming
+ * DIFFERENT organisations for one document id — nothing here can say which is right, so this reports
+ * `conflicting-origins` and the caller records nothing, exactly as it does for no row at all. "I cannot
+ * tell" must not resolve to "take the newest", which is the habit this whole finding is about.
+ */
+export function selectIssuingPostOriginRecord(rows: CreditNotePostRow[], creditNoteId: string): IssuingPostOrigin {
+  const wanted = creditNoteId.trim()
+  if (wanted === '') return { outcome: 'no-issuing-row' }
+  const issuing = rows.filter((row) => (row.externalTransactionId ?? '').trim() === wanted)
+  if (issuing.length === 0) return { outcome: 'no-issuing-row' }
+
+  // Distinct organisations actually NAMED by rows that issued this document. More than one is a
+  // contradiction no rule here is entitled to settle.
+  const named = new Set<string>()
+  // Prefer the row that recorded the most about the post: a comparable stamp, then the observed
+  // "raised while disconnected", then silence, then an unreadable payload. Every rank below 0 still
+  // refuses at post time — the preference only decides which true statement the operator is shown.
+  const rank = (payload: unknown): number => {
+    const stamp = readAccountingPayloadConnectionStamp(payload)
+    if (stamp.state === 'stamped') {
+      named.add(stamp.provenance)
+      return 0
+    }
+    return stamp.state === 'raised-disconnected' ? 1 : stamp.state === 'absent' ? 2 : 3
+  }
+  const ranked = issuing
+    .map((row) => ({ payload: row.payload, rank: rank(row.payload) }))
+    .sort((a, b) => a.rank - b.rank)
+  if (named.size > 1) return { outcome: 'conflicting-origins', recorded: [...named].sort() }
+  return { outcome: 'inherited', payload: ranked[0].payload }
+}
+
+/** Which of the ways an origin can be unavailable this row hit — one clause, so the log names the case. */
+function describeMissingCreditNoteOrigin(
+  origin: IssuingPostOrigin,
+  inherited: AccountingConnectionStamp | null,
+  creditNoteId: string,
+): string {
+  if (origin.outcome === 'no-issuing-row') {
+    return `no surviving sync row records a post of credit note ${creditNoteId} (retention removed it, or the `
+      + 'credit was posted before this instance recorded which organisation it was posting to)'
+  }
+  if (origin.outcome === 'conflicting-origins') {
+    return `two sync rows both claim to have posted credit note ${creditNoteId}, against DIFFERENT accounting `
+      + `organisations (${origin.recorded.join(' and ')}), and nothing here can say which of them issued it`
+  }
+  if (inherited?.state === 'raised-disconnected') {
+    return `the sync row that posted credit note ${creditNoteId} records that it was raised while this instance `
+      + 'had no accounting connection at all, so nothing vouches for the id even there'
+  }
+  if (inherited?.state === 'unreadable') {
+    return `the sync row that posted credit note ${creditNoteId} has an origin record that cannot be read `
+      + `(${inherited.detail})`
+  }
+  return `the sync row that posted credit note ${creditNoteId} survives but records no organisation itself — it `
+    + 'was queued before origins were recorded, or retention compacted its payload away'
+}
+
+/**
+ * WHAT AN OPERATOR ACTUALLY DOES WITH A ROW WHOSE ORIGIN CANNOT BE ESTABLISHED (Codex r4 finding 2).
+ *
+ * The previous text ended "re-queue the allocation from the credit note itself if it is still owed", which
+ * is not a remedy an operator can perform: re-queueing rebuilds the identical payload out of the identical
+ * two local columns, so it refuses identically — and this sweep skips any credit note that already has an
+ * allocation row of any status, so it would not even be re-created. A refusal that names a step which
+ * cannot work is worse than one that names none, because the operator spends the attempt before finding
+ * out. So the remedy named here is the one that exists: do the allocation where the documents are, in the
+ * ledger, by the one party who can see which organisation they live in.
+ */
+function creditNoteAllocationOriginRemedy(item: { creditNoteId: string; accountingInvoiceId: string }): string {
+  return 'WHAT TO DO: allocate it in the accounting system by hand — open credit note '
+    + `${item.creditNoteId} in the organisation that issued it and apply it to bill ${item.accountingInvoiceId}. `
+    + 'That is exactly the effect this row would have had, decided by someone who can see which organisation '
+    + 'the two documents live in, which nothing in this instance can. Do NOT retry or re-queue the row: it '
+    + 'rebuilds the same payload from the same two local columns (SupplierCreditNote.accountingCreditNoteId '
+    + 'and PurchaseInvoice.accountingInvoiceId), which is exactly the evidence that is missing — and the '
+    + 'origin must not be back-filled, because writing a marker for a post nobody witnessed is the defect '
+    + 'this guard exists to stop. (The refusal on the sync row itself says "cancel and re-queue from the '
+    + 'source document". For an allocation that is not a remedy, for the reason just given.) The row is '
+    + 'inert meanwhile: it sends nothing, and once its retries are spent it sits FAILED in the sync log '
+    + 'carrying the refusal, as a record rather than as outstanding work. Nothing else depends on it, and no '
+    + 'second one will be created.'
+}
+
 /**
  * audit-w77e: backstop for the audit-v08m gap. postSupplierCreditNote only
  * enqueues the PURCHASE_CREDIT_NOTE_ALLOCATION follow-up when the offset bill
@@ -1958,12 +2093,22 @@ export function selectCreditNotesNeedingAllocation(
  * current tenant and could not fail, on exactly the rows nobody watched being made.
  *
  * So the sweep inherits instead. `creditNoteId` is `SupplierCreditNote.accountingCreditNoteId`, which was
- * written by one specific PURCHASE_CREDIT_NOTE sync row's successful post; that row's own origin record
- * is read here and carried onto the allocation verbatim. If no such row survives (retention, or a
- * pre-stamping credit), the allocation is created carrying NO record and refuses at post time — a
- * bounded, one-per-credit-note outcome, since the sweep skips any credit note that already has an
- * allocation row of any status, and it says so in the activity log rather than leaving an operator to
- * discover it from a refusal.
+ * written by one specific PURCHASE_CREDIT_NOTE sync row's successful post; THAT row is found by the pair
+ * (`referenceId`, `externalTransactionId` = the credit id being carried) and its own origin record is
+ * carried onto the allocation verbatim. The pair is the point (Codex r4 finding 1): round 3 matched the
+ * reference alone and took the newest SYNCED row, which for a credit posted twice inherits from the post
+ * of a DIFFERENT document — an origin the row never came from, which is inventing one by another route.
+ * Status is not part of the identity either, because a posted row can be sent back to PENDING/FAILED by a
+ * follow-up failure, or retired to CANCELLED, while keeping the id it posted. See
+ * `selectIssuingPostOriginRecord`.
+ *
+ * If no row names that exact document — retention removed it, or the credit predates origin records — or
+ * if two rows name it against DIFFERENT organisations, the allocation is created carrying NO record and
+ * refuses at post time. That is bounded, one-per-credit-note, since the sweep skips any credit note that
+ * already has an allocation row of any status; it is reported as a WARNING rather than left for an
+ * operator to discover from a refusal; and the warning carries a remedy that can actually be performed —
+ * allocate the credit in the ledger by hand, because re-queueing rebuilds the same evidence-free payload
+ * (`creditNoteAllocationOriginRemedy`, Codex r4 finding 2).
  *
  * AND WHAT THAT RECORD DOES NOT COVER, stated rather than implied. It vouches for `creditNoteId`. The
  * bill id (`accountingInvoiceId`) came from a DIFFERENT post — the whole reason this gap exists is that
@@ -2008,54 +2153,78 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
   const toEnqueue = selectCreditNotesNeedingAllocation(candidates, hasAllocation)
   if (toEnqueue.length === 0) return result
 
-  // The row whose post ISSUED each credit id, so its record of the organisation can be carried onto the
-  // allocation rather than a fresh read of the token row being invented for it. Newest SYNCED row wins:
-  // a credit re-posted after a failure carries the id the latest successful post returned.
+  // The rows whose posts ISSUED these credit ids, so the organisation one of them recorded can be carried
+  // onto the allocation rather than a fresh read of the token row being invented for it.
+  //
+  // BOTH HALVES OF THE PAIR ARE FETCHED, AND THE PAIRING IS DONE IN MEMORY (Codex r4 finding 1). The two
+  // `in` clauses narrow the scan but do NOT pair anything: a row for credit note A carrying credit note
+  // B's document id satisfies both of them, and that cross-match is the whole defect — the id has to be
+  // compared against the id THIS allocation is carrying, per candidate. `selectIssuingPostOriginRecord`
+  // does that. No status filter: a row that names a document posted that document, whatever status it
+  // ended up in (see the header there).
   const creditNotePosts = await db.accountingSyncLog.findMany({
     where: {
       connector: XERO_CONNECTOR,
       type: 'PURCHASE_CREDIT_NOTE',
       referenceType: 'SupplierCreditNote',
       referenceId: { in: toEnqueue.map((item) => item.supplierCreditNoteId) },
-      status: 'SYNCED',
+      externalTransactionId: { in: toEnqueue.map((item) => item.creditNoteId) },
     },
-    orderBy: { syncedAt: 'desc' },
-    select: { referenceId: true, payload: true },
+    // Only for a stable read; the choice among several issuing rows is made by rank, not by order.
+    orderBy: [{ syncedAt: 'desc' }, { createdAt: 'desc' }],
+    select: { referenceId: true, externalTransactionId: true, payload: true },
   })
-  const originRecords = new Map<string, unknown>()
+  const postsByCreditNote = new Map<string, CreditNotePostRow[]>()
   for (const row of creditNotePosts) {
-    if (!originRecords.has(row.referenceId)) originRecords.set(row.referenceId, row.payload)
+    const bucket = postsByCreditNote.get(row.referenceId)
+    if (bucket) bucket.push(row)
+    else postsByCreditNote.set(row.referenceId, [row])
   }
 
   for (const item of toEnqueue) {
     result.checked++
     try {
-      const witnessed = originRecords.has(item.supplierCreditNoteId)
+      const origin = selectIssuingPostOriginRecord(
+        postsByCreditNote.get(item.supplierCreditNoteId) ?? [],
+        item.creditNoteId,
+      )
+      // What the inherited record will MEAN at post time, read from the value actually being carried
+      // rather than assumed from the fact that something was found. An issuing row that survives but
+      // records nothing itself hands on nothing, and that row refuses too — so it gets the same warning
+      // and the same remedy as finding no row at all, with a description that says which it was.
+      const inherited = origin.outcome === 'inherited' ? readAccountingPayloadConnectionStamp(origin.payload) : null
+      const inheritedProvenance = inherited?.state === 'stamped' ? inherited.provenance : null
       await enqueueFollowUpSyncLog('PURCHASE_CREDIT_NOTE_ALLOCATION', 'SupplierCreditNote', item.supplierCreditNoteId, {
         creditNoteId: item.creditNoteId,
         accountingInvoiceId: item.accountingInvoiceId,
         amount: item.amount,
         sourceEntryId: 'reenqueue-sweep',
-      }, witnessed
-        ? { from: 'postedRow', payload: originRecords.get(item.supplierCreditNoteId) }
+      }, origin.outcome === 'inherited'
+        ? { from: 'postedRow', payload: origin.payload }
         : { from: 'unobserved' })
       result.enqueued++
       await logActivity({
         entityType: 'SYSTEM',
         action: 'xero_credit_note_allocation_reenqueued',
         tag: 'sync',
-        level: witnessed ? 'INFO' : 'WARNING',
-        description: witnessed
-          ? `Enqueued a missing supplier-credit-note allocation for ${item.supplierCreditNoteId} (bill synced after the credit posted).`
-          : `Enqueued a missing supplier-credit-note allocation for ${item.supplierCreditNoteId}, but no surviving sync row `
-            + 'records which accounting organisation issued the credit, so the allocation carries no origin and WILL be '
-            + 'refused at post time rather than sent to whichever organisation is connected. Re-queue the allocation from '
-            + 'the credit note itself if it is still owed.',
+        level: inheritedProvenance ? 'INFO' : 'WARNING',
+        description: inheritedProvenance
+          ? `Enqueued a missing supplier-credit-note allocation for ${item.supplierCreditNoteId} (bill synced after the `
+            + `credit posted), carrying the accounting organisation recorded by the sync row that posted credit note `
+            + `${item.creditNoteId} — ${inheritedProvenance}.`
+          : `Enqueued a missing supplier-credit-note allocation for ${item.supplierCreditNoteId}, but `
+            + `${describeMissingCreditNoteOrigin(origin, inherited, item.creditNoteId)}, so the allocation carries no `
+            + 'usable record of which accounting organisation issued the credit and WILL be refused at post time '
+            + 'rather than sent to whichever organisation happens to be connected. '
+            + creditNoteAllocationOriginRemedy(item),
         metadata: {
           supplierCreditNoteId: item.supplierCreditNoteId,
           creditNoteId: item.creditNoteId,
           accountingInvoiceId: item.accountingInvoiceId,
-          originRecordInherited: witnessed,
+          originRecordInherited: inheritedProvenance !== null,
+          originOutcome: origin.outcome,
+          originRecordState: inherited?.state ?? null,
+          ...(origin.outcome === 'conflicting-origins' ? { conflictingOrigins: origin.recorded } : {}),
         },
       })
     } catch (error) {
