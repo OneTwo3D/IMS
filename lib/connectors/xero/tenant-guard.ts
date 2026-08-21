@@ -449,9 +449,21 @@ export function readXeroTenantAllowList(env: Record<string, string | undefined> 
  * (branch o3d-batch-exceptions, unmerged as of this commit) answers it from an `IMS_INSTANCE_ROLE`
  * declaration, returns the verdict PLUS ITS BASIS, and lands in two steps because absence must read as
  * non-production and production is absent today. The remaining edit is a one-line delegation — replace
- * this body with `instanceIsNonProduction(env, { requireDeclaration: true })` — and it is filed as
- * o3d-c413, gated on IMS_INSTANCE_ROLE=production actually being on the live server first (verified by
- * the production preflight) so the flip cannot take production's connector offline. Writing a second
+ * this body with `instanceIsNonProduction(env)`, TAKING NO OPTIONS — and it is filed as o3d-c413.
+ *
+ * DO NOT pass `{ requireDeclaration: true }` here (o3d-2ncq). An earlier draft of this comment named
+ * that form and it would cause the very outage the two-step rollout exists to prevent: IMS_INSTANCE_ROLE
+ * is undeclared on production TODAY, `requireDeclaration` makes an undeclared instance read as
+ * NON-production, and `unguardedInstance` is `instanceIsNonProduction && !hasIdentityAnchor` — so the
+ * live production host, unless it also happens to set XERO_ALLOWED_TENANT_IDS, would begin refusing its
+ * own Xero connector the moment this landed. It also bypasses the rollout's gate, which is the constant
+ * INSTANCE_ROLE_DECLARATION_REQUIRED and not a call-site argument, and it would make step 2 per-call-site
+ * — a second answer to "is the declaration mandatory", which is this comment's own objection in a smaller
+ * box. The no-options form returns, for every undeclared environment, exactly what the body below returns
+ * (pinned on o3d-batch-exceptions by a 42-environment truth table written against this body
+ * independently), so it is behaviour-neutral on every host alive today and differs only where a
+ * declaration is PRESENT — which is the hole. Step 2 then remains the one reviewed constant, gated on
+ * IMS_INSTANCE_ROLE=production actually being on the live server (verified by the production preflight). Writing a second
  * IMS_INSTANCE_ROLE reader on this branch would BE the defect being removed: two answers to one
  * question, diverging the moment either is edited. This function is kept module-private with a single
  * call site precisely so that delegation stays a one-line change.
