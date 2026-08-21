@@ -946,6 +946,10 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             covered by the lexical inventory above.
  *   'pinned-lock-session'   — builds a small dedicated `pg` pool/client to hold ONE advisory lock on
  *                             a connection Prisma will not reassign. Takes a lock; writes nothing.
+ *   'names-the-tools-only'  — touches NO database at all, in any mode. It appears in this inventory
+ *                             because its own prose names `psql` / `prisma migrate` — which is the
+ *                             deliberately generous half of this scan working as intended, and is
+ *                             why the inventory is a classification rather than a filter.
  *   'seed'                  — a standalone client that WRITES this database, run from install.sh.
  *                             It takes no lock and cannot practically be made to (it runs before the
  *                             app is up); what keeps it safe is that it must not write a plugin key,
@@ -961,6 +965,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'provisioning-cli'
   | 'runtime-assembled-sql'
   | 'validates-external-sql'
+  | 'names-the-tools-only'
   | 'app-database-client'
   | 'pinned-lock-session'
   | 'seed'
@@ -986,6 +991,12 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'scripts/landed-cost-e2e-fixture.ts': 'runtime-assembled-sql',
   'scripts/backup.sh': 'dump-only',
   'scripts/check-prisma-drift.mjs': 'schema-diff-only',
+  // o3d-o8cp's documented-vs-read guard. It opens .env.example, CLAUDE.md, docs/ and the repo's
+  // TypeScript, and executes nothing anywhere; it is discovered here purely because its header
+  // explains that a PRIOR guard in this repo fired on `psql` and `prisma migrate` picked out of doc
+  // comments. Rewording that sentence to dodge this scan would delete the lesson to satisfy the
+  // detector, so it is classified instead.
+  'scripts/check-documented-env-vars.mjs': 'names-the-tools-only',
   'scripts/deploy.sh': 'migration-runner',
   'scripts/install.sh': 'migration-runner',
   'scripts/prisma-dev-db.sh': 'migration-runner',

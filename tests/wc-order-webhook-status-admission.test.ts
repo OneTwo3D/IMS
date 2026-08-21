@@ -146,7 +146,11 @@ mock.module('@/lib/connectors/woocommerce/sync/order-status', {
 
 mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
   namedExports: {
-    syncRefundsForOrder: async () => {},
+    // o3d-okbd/o3d-ecbj r5 (merged since): the sweep returns whether it read EVERY page, and the
+    // webhook fails the delivery when it did not. A double answering `undefined` makes
+    // `refundSweep.complete` throw, and the delivery 500s for a reason that has nothing to do with
+    // the admission gate under test.
+    syncRefundsForOrder: async () => ({ synced: 0, complete: true }),
     syncWcRefund: async () => ({ success: true }),
   },
 })

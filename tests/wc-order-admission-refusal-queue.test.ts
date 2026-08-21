@@ -102,85 +102,112 @@ mock.module('@/lib/settings-store', {
   },
 })
 
+/**
+ * Every delegate the importer touches, built once so the top-level client and the TRANSACTION client
+ * are the same store. Two divergent copies is how a create inside a transaction silently failed.
+ */
+function txDelegates() {
+  return {
+  setting: {
+    findUnique: async ({ where }: { where: { key: string } }) => {
+      const value = store.settings.get(where.key)
+      return value === undefined ? null : { key: where.key, value }
+    },
+    upsert: async ({ where, update }: { where: { key: string }; update: { value: string } }) => {
+      // THE PARK. `wc_sync_order_statuses` is read between the pivot and the refusal, but the
+      // read is what has to be delayed, not the write — see setting.findUnique above.
+      store.settings.set(where.key, update.value)
+      return {}
+    },
+  },
+  salesOrder: {
+    findFirst: async ({ where }: { where: Record<string, unknown> }) => {
+      const some = (where as {
+        shoppingLinks?: { some?: { connector?: string; externalOrderId?: string } }
+      }).shoppingLinks?.some
+      if (!some) return { id: [...store.orders.keys()][0] ?? null } as never
+      const orderId = store.links.get(String(some.externalOrderId))
+      return orderId ? { id: orderId } : null
+    },
+    create: async ({ data }: { data: Row }) => {
+      const externalOrderId = String(
+        ((data.shoppingLinks as { create?: { externalOrderId?: string } })?.create)?.externalOrderId,
+      )
+      // The @@unique([connector, externalOrderId]) that arbitrates two concurrent creates.
+      if (store.links.has(externalOrderId)) {
+        const error = new Error('Unique constraint failed') as Error & { code?: string }
+        error.code = 'P2002'
+        throw error
+      }
+      const id = newId('so')
+      store.orders.set(id, { id, status: String(data.status) })
+      store.links.set(externalOrderId, id)
+      return { id }
+    },
+    update: async () => ({}),
+  },
+  shoppingOrderLink: { updateMany: async () => ({ count: 1 }) },
+  shoppingStatusMapping: {
+    findMany: async ({ where }: { where: { OR?: Array<{ externalStatus?: { equals?: string } }> } }) => {
+      const wanted = (where.OR ?? [])
+        .map((clause) => String(clause.externalStatus?.equals ?? '').toLowerCase())
+      return store.statusMappings.filter(
+        (row) => wanted.includes(String(row.externalStatus).toLowerCase()),
+      )
+    },
+  },
+  shoppingSyncLog: {
+    create: async ({ data }: { data: Row }) => {
+      const row = { ...data, id: newId('log'), createdAt: new Date() }
+      store.syncLogs.push(row)
+      return row
+    },
+    update: async ({ where, data }: { where: { id: string }; data: Row }) => {
+      const row = store.syncLogs.find((entry) => entry.id === where.id)
+      if (row) Object.assign(row, data)
+      return row ?? {}
+    },
+    findFirst: async ({ where }: { where: Row }) => matchLogs(where)[0] ?? null,
+    findMany: async ({ where }: { where: Row }) => matchLogs(where),
+    count: async () => 0,
+  },
+  product: { findMany: async () => [] },
+  taxRate: { findMany: async () => [] },
+  warehouse: { findMany: async () => [] },
+  user: { findMany: async () => [] },
+  }
+}
+
+/**
+ * THE TRANSACTION CLIENT IS THE SAME STORE, not a two-delegate stub (merged since this file was
+ * written: o3d-rbyg/o3d-lvk moved the order CREATE inside the transaction that also writes the
+ * shopping link, so the unique constraint arbitrates a concurrent create atomically).
+ *
+ * A stub carrying only `salesOrder.update` made every create inside a transaction throw
+ * "tx.salesOrder.create is not a function", which the importer records as an ordinary FAILED sync
+ * row — so the drain reported `unresolved` and the tests below were about a run that never created
+ * anything. The `update` override stays, because `updatedOrderIds` is what the status-application
+ * assertions read.
+ */
+function txClient() {
+  const base = txDelegates()
+  return {
+    ...base,
+    salesOrder: {
+      ...base.salesOrder,
+      update: async ({ where }: { where: { id: string } }) => {
+        store.updatedOrderIds.push(where.id)
+        return {}
+      },
+    },
+  }
+}
+
 mock.module('@/lib/db', {
   namedExports: {
     db: {
-      setting: {
-        findUnique: async ({ where }: { where: { key: string } }) => {
-          const value = store.settings.get(where.key)
-          return value === undefined ? null : { key: where.key, value }
-        },
-        upsert: async ({ where, update }: { where: { key: string }; update: { value: string } }) => {
-          // THE PARK. `wc_sync_order_statuses` is read between the pivot and the refusal, but the
-          // read is what has to be delayed, not the write — see setting.findUnique above.
-          store.settings.set(where.key, update.value)
-          return {}
-        },
-      },
-      salesOrder: {
-        findFirst: async ({ where }: { where: Record<string, unknown> }) => {
-          const some = (where as {
-            shoppingLinks?: { some?: { connector?: string; externalOrderId?: string } }
-          }).shoppingLinks?.some
-          if (!some) return { id: [...store.orders.keys()][0] ?? null } as never
-          const orderId = store.links.get(String(some.externalOrderId))
-          return orderId ? { id: orderId } : null
-        },
-        create: async ({ data }: { data: Row }) => {
-          const externalOrderId = String(
-            ((data.shoppingLinks as { create?: { externalOrderId?: string } })?.create)?.externalOrderId,
-          )
-          // The @@unique([connector, externalOrderId]) that arbitrates two concurrent creates.
-          if (store.links.has(externalOrderId)) {
-            const error = new Error('Unique constraint failed') as Error & { code?: string }
-            error.code = 'P2002'
-            throw error
-          }
-          const id = newId('so')
-          store.orders.set(id, { id, status: String(data.status) })
-          store.links.set(externalOrderId, id)
-          return { id }
-        },
-        update: async () => ({}),
-      },
-      shoppingOrderLink: { updateMany: async () => ({ count: 1 }) },
-      shoppingStatusMapping: {
-        findMany: async ({ where }: { where: { OR?: Array<{ externalStatus?: { equals?: string } }> } }) => {
-          const wanted = (where.OR ?? [])
-            .map((clause) => String(clause.externalStatus?.equals ?? '').toLowerCase())
-          return store.statusMappings.filter(
-            (row) => wanted.includes(String(row.externalStatus).toLowerCase()),
-          )
-        },
-      },
-      shoppingSyncLog: {
-        create: async ({ data }: { data: Row }) => {
-          const row = { ...data, id: newId('log'), createdAt: new Date() }
-          store.syncLogs.push(row)
-          return row
-        },
-        update: async ({ where, data }: { where: { id: string }; data: Row }) => {
-          const row = store.syncLogs.find((entry) => entry.id === where.id)
-          if (row) Object.assign(row, data)
-          return row ?? {}
-        },
-        findFirst: async ({ where }: { where: Row }) => matchLogs(where)[0] ?? null,
-        findMany: async ({ where }: { where: Row }) => matchLogs(where),
-        count: async () => 0,
-      },
-      product: { findMany: async () => [] },
-      taxRate: { findMany: async () => [] },
-      warehouse: { findMany: async () => [] },
-      user: { findMany: async () => [] },
-      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({
-        shoppingOrderLink: { updateMany: async () => ({ count: 1 }) },
-        salesOrder: {
-          update: async ({ where }: { where: { id: string } }) => {
-            store.updatedOrderIds.push(where.id)
-            return {}
-          },
-        },
-      }),
+      ...txDelegates(),
+      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(txClient()),
     },
   },
 })
@@ -219,7 +246,14 @@ mock.module('@/lib/connectors/woocommerce/sync/order-status', {
   namedExports: { syncWcOrderStatus: async () => ({ success: true }) },
 })
 mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
-  namedExports: { syncRefundsForOrder: async () => {}, syncWcRefund: async () => ({ success: true }) },
+  namedExports: {
+    // o3d-okbd/o3d-ecbj r5 (merged since): the sweep returns whether it read EVERY page, and the
+    // webhook fails the delivery when it did not. A double answering `undefined` makes
+    // `refundSweep.complete` throw, and the delivery 500s for a reason that has nothing to do
+    // with the admission gate under test.
+    syncRefundsForOrder: async () => ({ synced: 0, complete: true }),
+    syncWcRefund: async () => ({ success: true }),
+  },
 })
 mock.module('@/lib/connectors/woocommerce/sync/order-webhook-echo', {
   namedExports: { shouldSuppressWcOrderWebhookEcho: async () => ({ suppress: false }) },

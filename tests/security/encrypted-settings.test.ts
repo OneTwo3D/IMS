@@ -272,21 +272,31 @@ test('the WooCommerce API credentials have no environment override, so both sync
 test('settings-store does NOT let WC_STORE_URL override the saved WooCommerce store URL', () => {
   const previousUrl = process.env.WC_STORE_URL
   const previousKey = process.env.WC_CONSUMER_KEY
+  const previousWebhook = process.env.WC_WEBHOOK_SECRET
   try {
     process.env.WC_STORE_URL = 'https://stale-store-from-an-old-install.example'
     process.env.WC_CONSUMER_KEY = 'env-key'
+    process.env.WC_WEBHOOK_SECRET = 'env-webhook-secret'
 
     assert.equal(getSettingEnvFallbackKey('wc_url'), null)
     assert.equal(getEnvFallback('wc_url'), null)
-    // The credentials ARE overrides and still report themselves as such, so the
-    // Connection tab's "overridden by" banner keeps working for them.
-    assert.deepEqual(getActiveSettingEnvOverrides(['wc_url', 'wc_consumer_key']), {
-      wc_consumer_key: 'WC_CONSUMER_KEY',
+    // SUPERSEDED POSITIVE CONTROL, REWRITTEN WITH THE REASON. This used to prove the point against
+    // `wc_consumer_key`, "which IS an override and still reports itself as such". It is not any
+    // more: o3d-ecbj (merged) removed both WooCommerce credentials from SETTING_ENV_FALLBACKS for
+    // exactly the reason this test states about the store URL — the override was only half applied,
+    // so one installation imported orders under one credential and pushed stock under another.
+    // Asserting the empty object here would have made the whole test vacuous, so the control moved
+    // to a key that really is still an override.
+    assert.equal(getSettingEnvFallbackKey('wc_consumer_key'), null, 'the credentials are seeds too now')
+    assert.deepEqual(getActiveSettingEnvOverrides(['wc_url', 'wc_consumer_key', 'wc_webhook_secret']), {
+      wc_webhook_secret: 'WC_WEBHOOK_SECRET',
     })
   } finally {
     if (previousUrl == null) delete process.env.WC_STORE_URL
     else process.env.WC_STORE_URL = previousUrl
     if (previousKey == null) delete process.env.WC_CONSUMER_KEY
     else process.env.WC_CONSUMER_KEY = previousKey
+    if (previousWebhook == null) delete process.env.WC_WEBHOOK_SECRET
+    else process.env.WC_WEBHOOK_SECRET = previousWebhook
   }
 })

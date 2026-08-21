@@ -47,59 +47,78 @@ mock.module('@/lib/maintenance-mode', { namedExports: { getMaintenanceModeRespon
 mock.module('@/lib/integration-plugins', { namedExports: { isIntegrationPluginEnabled: async () => true } })
 mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
 
+/**
+ * Every delegate the importer touches, built once so the top-level client and the TRANSACTION client
+ * are the SAME store (merged since this file was written: o3d-rbyg/o3d-lvk moved the order create
+ * inside the transaction that writes the shopping link). A tx stub carrying two delegates made every
+ * create inside a transaction throw, which the importer records as an ordinary failure — so the race
+ * test below was about a run that never got as far as the race.
+ */
+function txDelegates() {
+  return {
+  setting: {
+    findUnique: async ({ where }: { where: { key: string } }) => {
+      const value = state.settings.get(where.key)
+      return value === undefined ? null : { key: where.key, value }
+    },
+    upsert: async ({ where, update }: { where: { key: string }; update: { value: string } }) => {
+      state.settingUpserts.push({ key: where.key, value: update.value })
+      state.settings.set(where.key, update.value)
+      return {}
+    },
+  },
+  salesOrder: {
+    findFirst: async () => {
+      state.findFirstCalls++
+      return state.held ? { id: 'so-existing' } : null
+    },
+    // Reached only if a refused create wrongly falls through.
+    create: async () => { state.createdOrders++; return { id: 'so-new' } },
+    update: async () => ({}),
+  },
+  shoppingOrderLink: { updateMany: async () => ({ count: 1 }) },
+  // Models the r5 lookup: canonical slug OR its `wc-` spelling, case-insensitively.
+  shoppingStatusMapping: {
+    findMany: async ({ where }: { where: { OR?: Array<{ externalStatus?: { equals?: string } }> } }) => {
+      const wanted = (where.OR ?? [])
+        .map((clause) => String(clause.externalStatus?.equals ?? '').toLowerCase())
+      return state.statusMappings.filter(
+        (row) => wanted.includes(String(row.externalStatus).toLowerCase()),
+      )
+    },
+  },
+  // The refusal queue and the pending-FX queue share this table and are told apart by the
+  // payload discriminator; the double keeps them together for the same reason production does.
+  shoppingSyncLog: {
+    create: async ({ data }: { data: Row }) => { state.refusalQueue.push(data); return { id: 'log-1' } },
+    update: async ({ data }: { data: Row }) => { state.refusalQueue.push(data); return { id: 'log-1' } },
+    findFirst: async () => null,
+    findMany: async () => [],
+    count: async () => 0,
+  },
+  user: { findMany: async () => [] },
+  }
+}
+
+function txClient() {
+  const base = txDelegates()
+  return {
+    ...base,
+    salesOrder: {
+      ...base.salesOrder,
+      update: async ({ where }: { where: { id: string } }) => {
+        state.updatedOrderIds.push(where.id)
+        return {}
+      },
+    },
+  }
+}
+
 mock.module('@/lib/db', {
   namedExports: {
     db: {
-      setting: {
-        findUnique: async ({ where }: { where: { key: string } }) => {
-          const value = state.settings.get(where.key)
-          return value === undefined ? null : { key: where.key, value }
-        },
-        upsert: async ({ where, update }: { where: { key: string }; update: { value: string } }) => {
-          state.settingUpserts.push({ key: where.key, value: update.value })
-          state.settings.set(where.key, update.value)
-          return {}
-        },
-      },
-      salesOrder: {
-        findFirst: async () => {
-          state.findFirstCalls++
-          return state.held ? { id: 'so-existing' } : null
-        },
-        // Reached only if a refused create wrongly falls through.
-        create: async () => { state.createdOrders++; return { id: 'so-new' } },
-        update: async () => ({}),
-      },
-      shoppingOrderLink: { updateMany: async () => ({ count: 1 }) },
-      // Models the r5 lookup: canonical slug OR its `wc-` spelling, case-insensitively.
-      shoppingStatusMapping: {
-        findMany: async ({ where }: { where: { OR?: Array<{ externalStatus?: { equals?: string } }> } }) => {
-          const wanted = (where.OR ?? [])
-            .map((clause) => String(clause.externalStatus?.equals ?? '').toLowerCase())
-          return state.statusMappings.filter(
-            (row) => wanted.includes(String(row.externalStatus).toLowerCase()),
-          )
-        },
-      },
-      // The refusal queue and the pending-FX queue share this table and are told apart by the
-      // payload discriminator; the double keeps them together for the same reason production does.
-      shoppingSyncLog: {
-        create: async ({ data }: { data: Row }) => { state.refusalQueue.push(data); return { id: 'log-1' } },
-        update: async ({ data }: { data: Row }) => { state.refusalQueue.push(data); return { id: 'log-1' } },
-        findFirst: async () => null,
-        findMany: async () => [],
-        count: async () => 0,
-      },
-      user: { findMany: async () => [] },
-      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({
-        shoppingOrderLink: { updateMany: async () => ({ count: 1 }) },
-        salesOrder: {
-          update: async ({ where }: { where: { id: string } }) => {
-            state.updatedOrderIds.push(where.id)
-            return {}
-          },
-        },
-      }),
+      ...txDelegates(),
+      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(txClient()),
     },
   },
 })
@@ -133,7 +152,14 @@ mock.module('@/lib/connectors/woocommerce/sync/order-status', {
   namedExports: { syncWcOrderStatus: async () => ({ success: true }) },
 })
 mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
-  namedExports: { syncRefundsForOrder: async () => {}, syncWcRefund: async () => ({ success: true }) },
+  namedExports: {
+    // o3d-okbd/o3d-ecbj r5 (merged since): the sweep returns whether it read EVERY page, and the
+    // webhook fails the delivery when it did not. A double answering `undefined` makes
+    // `refundSweep.complete` throw, and the delivery 500s for a reason that has nothing to do
+    // with the admission gate under test.
+    syncRefundsForOrder: async () => ({ synced: 0, complete: true }),
+    syncWcRefund: async () => ({ success: true }),
+  },
 })
 mock.module('@/lib/connectors/woocommerce/sync/order-webhook-echo', {
   namedExports: { shouldSuppressWcOrderWebhookEcho: async () => ({ suppress: false }) },
