@@ -223,11 +223,43 @@ export type XeroTenantAllowList = {
    * a money path. So the disagreement is refused, loudly, naming both values and the one-line fix.
    */
   conflict: string | null
+  /**
+   * True when this instance has declared itself NON-PRODUCTION (o3d-iaqy).
+   *
+   * Two signals, because neither covers the other. `E2E_TEST_MODE=1` is the repo's existing e2e flag and
+   * the ONLY one that works on the full-chain rig, which serves a PRODUCTION build and therefore reports
+   * `NODE_ENV=production` (the same reason `applyE2eMaxOverride` cannot gate on NODE_ENV). `NODE_ENV`
+   * catches the ordinary dev box and the restored-dump-on-a-laptop case, where E2E_TEST_MODE is unset.
+   *
+   * An ABSENT NODE_ENV counts as non-production. "We cannot tell" is not "this is production", and the
+   * whole subject of this file is that a missing signal must not read as permission — production sets
+   * `NODE_ENV=production` explicitly (`.env.example`), so the absent case is never the production one.
+   */
+  instanceIsNonProduction: boolean
+  /**
+   * True when a NON-PRODUCTION instance has no IDENTITY-strength Xero tenant control at all (o3d-iaqy).
+   *
+   * This is the state that produced o3d-t74p: the e2e rig, with nothing configured, connected to the
+   * LIVE organisation and posted 553 objects into it over eleven days. `configured` being false read as
+   * "anything is allowed", which is exactly the reading o3d-iaqy exists to remove — but only on an
+   * instance that has said it is not production. Production may legitimately run with no allow-list (it
+   * IS the organisation everything else is being kept away from), so nothing changes there.
+   *
+   * NAMES DO NOT SATISFY IT. `XERO_ALLOWED_TENANT_NAMES` is not an identity — see `nameOnlyGuard` and
+   * the header — so a name-only rig is exactly as unguarded as one with nothing set, and treating it as
+   * guarded would be the manufactured confidence this file already refuses to sell. Any ONE of an
+   * allowed id, a blocked id or `XERO_REQUIRE_DEMO_ORG=true` clears it; a blocked id counts because
+   * blocking the live organisation's id is precisely "this instance may not talk to the live ledger",
+   * which is this issue's whole sentence.
+   */
+  unguardedInstance: boolean
 }
 
 export type XeroTenantRefusalReason =
   /** Two identity settings disagree. Nothing is allowed until an operator resolves it. */
   | 'config-conflict'
+  /** A non-production instance with no identity-strength tenant control at all (o3d-iaqy). */
+  | 'unguarded-instance'
   /** Xero returned an empty connection list — which is also what a REVOKED authorisation returns (200, []). */
   | 'no-connections'
   /** Every organisation on this consent is on XERO_BLOCKED_TENANT_IDS. */
@@ -375,6 +407,12 @@ export function readXeroTenantAllowList(env: Record<string, string | undefined> 
     }
   }
 
+  // o3d-iaqy. An IDENTITY anchor is an id list, a deny list, or the demo requirement — the three
+  // controls this file already calls identity-strength. Names are excluded for the same reason they can
+  // never widen an id list: a rename satisfies them.
+  const hasIdentityAnchor = effectiveRawIds.length > 0 || blockedIds.length > 0 || demoSwitch.value
+  const instanceIsNonProduction = readInstanceIsNonProduction(env)
+
   return {
     ids: effectiveRawIds.map(normaliseId),
     names: rawNames.map(normaliseName),
@@ -388,7 +426,91 @@ export function readXeroTenantAllowList(env: Record<string, string | undefined> 
       && !demoSwitch.value,
     legacyTenantId,
     conflict,
+    instanceIsNonProduction,
+    unguardedInstance: instanceIsNonProduction && !hasIdentityAnchor,
   }
+}
+
+/**
+ * Has this instance declared itself NON-PRODUCTION? (o3d-iaqy)
+ *
+ * See `XeroTenantAllowList.instanceIsNonProduction` for why it takes two signals and why an absent
+ * NODE_ENV is counted as non-production. Deliberately reads the injected `env` rather than
+ * `process.env` directly, so the question is testable — the o3d-t74p rig is precisely an instance whose
+ * environment nobody could interrogate after the fact.
+ *
+ * KNOWN HOLE, DELIBERATELY NOT PATCHED HERE (o3d-l89a; Codex r1 finding 4). Both signals below are set
+ * by the BUILD, so an instance that serves a production build, sets NODE_ENV=production and does not set
+ * E2E_TEST_MODE is indistinguishable from production to this function — which is what stage is, what a
+ * second production-shaped copy is, and what the o3d-t74p rig became on the day E2E_TEST_MODE fell out
+ * of its .env. Such an instance is therefore still exempt from the o3d-iaqy requirement.
+ *
+ * THE ANSWER ALREADY EXISTS AND IS NOT THIS FUNCTION'S TO WRITE AGAIN. `lib/ops/instance-identity.ts`
+ * (branch o3d-batch-exceptions, unmerged as of this commit) answers it from an `IMS_INSTANCE_ROLE`
+ * declaration, returns the verdict PLUS ITS BASIS, and lands in two steps because absence must read as
+ * non-production and production is absent today. The remaining edit is a one-line delegation — replace
+ * this body with `instanceIsNonProduction(env)`, TAKING NO OPTIONS — and it is filed as o3d-c413.
+ *
+ * DO NOT pass `{ requireDeclaration: true }` here (o3d-2ncq). An earlier draft of this comment named
+ * that form and it would cause the very outage the two-step rollout exists to prevent: IMS_INSTANCE_ROLE
+ * is undeclared on production TODAY, `requireDeclaration` makes an undeclared instance read as
+ * NON-production, and `unguardedInstance` is `instanceIsNonProduction && !hasIdentityAnchor` — so the
+ * live production host, unless it also happens to set XERO_ALLOWED_TENANT_IDS, would begin refusing its
+ * own Xero connector the moment this landed. It also bypasses the rollout's gate, which is the constant
+ * INSTANCE_ROLE_DECLARATION_REQUIRED and not a call-site argument, and it would make step 2 per-call-site
+ * — a second answer to "is the declaration mandatory", which is this comment's own objection in a smaller
+ * box. The no-options form returns, for every undeclared environment, exactly what the body below returns
+ * (pinned on o3d-batch-exceptions by a 42-environment truth table written against this body
+ * independently), so it is behaviour-neutral on every host alive today and differs only where a
+ * declaration is PRESENT — which is the hole. Step 2 then remains the one reviewed constant, gated on
+ * IMS_INSTANCE_ROLE=production actually being on the live server (verified by the production preflight). Writing a second
+ * IMS_INSTANCE_ROLE reader on this branch would BE the defect being removed: two answers to one
+ * question, diverging the moment either is edited. This function is kept module-private with a single
+ * call site precisely so that delegation stays a one-line change.
+ *
+ * Note that o3d-c413 also owns the consequent wording fix in `xeroUnguardedInstanceRefusal`, whose
+ * remedy sentence still names NODE_ENV.
+ */
+function readInstanceIsNonProduction(env: Record<string, string | undefined>): boolean {
+  if ((env.E2E_TEST_MODE ?? '').trim() === '1') return true
+  return (env.NODE_ENV ?? '').trim() !== 'production'
+}
+
+/**
+ * The refusal for a non-production instance with no identity-strength tenant control (o3d-iaqy).
+ *
+ * WHY THIS EXISTS SEPARATELY FROM THE ALLOW-LIST REFUSAL. `isXeroTenantAllowed` answers "may THIS
+ * organisation be used", and with nothing configured its answer is yes — deliberately, because an
+ * unconfigured allow-list is opt-in and production may legitimately have none. o3d-iaqy is the other
+ * question: may this instance connect to ANY organisation it is offered, given what it has said about
+ * itself? A dev or e2e instance that has named no organisation has not been told which ledger is
+ * off-limits, and in o3d-t74p the answer it gave itself was the live one.
+ *
+ * THE REMEDY IS TO STATE AN INTENTION, NOT TO SWITCH THE GUARD OFF. There is deliberately no
+ * "XERO_SKIP_TENANT_GUARD": every way out names an organisation or a kind of organisation, so
+ * performing the remedy leaves a record of which ledger this instance was pointed at. A guard whose
+ * documented escape hatch is a boolean is a guard that is off on every instance that ever hit it.
+ */
+export function xeroUnguardedInstanceRefusal(allowList: XeroTenantAllowList): string {
+  const nameNote = allowList.rawNames.length > 0
+    ? `XERO_ALLOWED_TENANT_NAMES=${allowList.rawNames.join(',')} is set, and it does NOT count: a Xero `
+      + 'organisation name is not unique and can be changed at any time by whoever administers it, so a '
+      + 'name check is satisfied by a rename. '
+    : ''
+  return (
+    'Refused: this IMS instance is not marked as production and has no Xero tenant control set, so it '
+    + 'has not been told which organisations it may write to. '
+    + nameNote
+    + 'That is the exact state that let the e2e rig invoice into the LIVE organisation — 553 objects, '
+    + '150 invoices, 14 payments, over eleven days (o3d-t74p). Nothing was stored and no Xero data was '
+    + 'read or written. Set ONE of these in the server .env and restart IMS: '
+    + 'XERO_ALLOWED_TENANT_IDS=<the tenantId this instance may use>; or XERO_REQUIRE_DEMO_ORG=true, '
+    + "which restricts this instance to a Xero DEMO organisation by Xero's own IsDemoCompany flag and so "
+    + "needs no editing when Demo's tenantId is re-issued at every ~28-day reset; or "
+    + 'XERO_BLOCKED_TENANT_IDS=<the live organisation\'s tenantId>, which fences out that one ledger. '
+    + 'If this IS the production instance, set NODE_ENV=production (and leave E2E_TEST_MODE unset) — '
+    + 'production is exempt because it is the organisation everything else is being kept away from.'
+  )
 }
 
 /**
@@ -400,6 +522,15 @@ export function readXeroTenantAllowList(env: Record<string, string | undefined> 
  */
 export function xeroTenantVerdict(connection: XeroConnectionSummary, allowList: XeroTenantAllowList): XeroTenantVerdict {
   if (allowList.conflict) return 'config-conflict'
+  // o3d-iaqy is deliberately NOT here. This chain answers a question about ONE ORGANISATION — "does
+  // this org survive the configured filters" — and every refusal it produces names the key that removed
+  // that org. "This instance was never entitled to pick any organisation" is a fact about the INSTANCE:
+  // it removes no candidate in particular, it removes the whole question. Folding it in would make
+  // `whyRefused` describe a per-org filter that did not run, and would make `isXeroTenantAllowed` — a
+  // pure predicate over an org and a list — depend on the process environment. It is enforced instead
+  // at the two places that actually admit a connection: `selectXeroTenant` and
+  // `storedXeroConnectionRefusal`, which between them are the only ways a Xero token is established or
+  // used.
   const id = normaliseId(connection.tenantId ?? '')
   if (allowList.blockedIds.includes(id)) return 'blocked'
   if (allowList.ids.length > 0 && !allowList.ids.includes(id)) return 'id-not-allowed'
@@ -612,6 +743,14 @@ export function storedXeroConnectionRefusal(
   // refusal: no remedy below can be carried out while it stands, and offering one would send the
   // operator to do work that cannot take effect.
   if (allowList.conflict) return storedTenantRefusalMessage(stored, allowList)
+
+  // o3d-iaqy, answered on the STORED token as well as at the callback, and for the same two reasons the
+  // allow-list is: in o3d-t74p the callback ran once and eleven days of syncs did the damage, and a
+  // production database restored onto a dev box arrives with a live token already in it and no callback
+  // in sight. It is second only to `conflict` because it is likewise a fact about the configuration —
+  // no binding remedy below can be carried out usefully while this instance still has not said which
+  // ledger it may write to.
+  if (allowList.unguardedInstance) return xeroUnguardedInstanceRefusal(allowList)
 
   // Then the binding itself, BEFORE the allow-list, because a broken binding invalidates the
   // allow-list's own remedy. `storedTenantRefusalMessage` offers "permit the stored organisation in the
@@ -1292,6 +1431,13 @@ export function selectXeroTenant<T extends XeroConnectionSummary>(params: {
   // basis for choosing a ledger, whatever Xero offered.
   if (allowList.conflict) {
     return { ok: false, reason: 'config-conflict', error: allowList.conflict }
+  }
+
+  // o3d-iaqy. Before the connection list too: the point is that this instance may not pick from a list
+  // it was never entitled to be offered, so refusing here means no organisation is even named back to a
+  // rig that should not have been consenting at all.
+  if (allowList.unguardedInstance) {
+    return { ok: false, reason: 'unguarded-instance', error: xeroUnguardedInstanceRefusal(allowList) }
   }
 
   if (connections.length === 0) {

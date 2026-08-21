@@ -4,6 +4,8 @@
  */
 
 import { db } from '@/lib/db'
+import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
+import { stampAccountingPayloadConnection } from '@/lib/connectors/accounting-connection-provenance'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -44,11 +46,15 @@ export async function queueXeroSync(params: {
   const postingMode = settingKey ? settings[settingKey] : 'submitted'
   if (!postingMode || postingMode === 'off') return
 
-  const payload = {
+  // o3d-19gy: which CONNECTION this payload was composed for, recorded beside the posting mode because
+  // it is the same kind of fact — something about the queueing, not about the document. Read here, at
+  // enqueue, from the connection that resolved every id in the payload; the processor compares it
+  // against the connection it is about to post to and refuses a mismatch before anything is sent.
+  const payload = stampAccountingPayloadConnection({
     ...params.payload,
     _postingMode: postingMode,
     ...(params.idempotencyKey ? { _idempotencyKey: params.idempotencyKey } : {}),
-  }
+  }, await activeAccountingIdProvenance('xero'))
 
   if (params.idempotencyKey) {
     const existing = await db.accountingSyncLog.findFirst({

@@ -263,6 +263,32 @@ restored copy): `XERO_REQUIRE_DEMO_ORG=true` when the instance uses a Xero demo 
 `XERO_ALLOWED_TENANT_IDS` to the live organisation or leave it unset — and must **not** set
 `XERO_REQUIRE_DEMO_ORG`, which would refuse its own ledger.
 
+### A non-production instance with no control at all is refused
+
+That instruction used to be advice. It is now enforced: an instance that has **not declared itself
+production** and has **no identity-strength tenant control** refuses to connect to Xero, and refuses to
+use a Xero token it already has. This is the state the e2e rig was in when it invoiced into the live
+organisation — 553 objects, 150 invoices, 14 payments, over eleven days — and "nothing is configured"
+must not read as "any ledger is allowed".
+
+- **"Not production" means** `NODE_ENV` is anything other than `production` (including absent), **or**
+  `E2E_TEST_MODE=1`. Both signals are needed: the full-chain rig serves a production build, so `NODE_ENV`
+  reads `production` there and only the e2e flag distinguishes it.
+- **What clears it:** any one of `XERO_ALLOWED_TENANT_IDS`, `XERO_BLOCKED_TENANT_IDS`,
+  `XERO_REQUIRE_DEMO_ORG=true` (or the deprecated `XERO_TENANT_ID`).
+- **What does not:** `XERO_ALLOWED_TENANT_NAMES`. A Xero organisation name can be changed at any time by
+  whoever administers it, so a name check is satisfied by a rename — the same reason a name can never
+  widen an id list.
+- **Production is exempt**, because production is the organisation every other instance is being kept
+  away from. If a real production server hits this refusal, the fix is `NODE_ENV=production` in its
+  `.env` (with `E2E_TEST_MODE` unset), not a weaker guard.
+- **There is no switch that turns it off.** Every way out names an organisation or a kind of
+  organisation, so performing the remedy leaves a record of which ledger the instance was pointed at.
+
+The refusal is answered at both enforcement points — the OAuth callback (nothing is stored, no Xero data
+is read) and every use of the stored token — so it catches a restored production dump, where no consent
+screen is ever shown.
+
 Refusals are recorded in the **Activity log** (`xero_connect_refused`, `xero_stored_tenant_refused`), so
 a refusal that happened while nobody was watching the browser is still discoverable. A name-only
 configuration is recorded there too, as `xero_tenant_guard_name_only` — once per connected organisation
@@ -282,6 +308,28 @@ token belonging to the organisation you just left cannot land on the connection 
 recorded as `xero_refresh_discarded` in the Activity log and deliberately does *not* raise a
 notification — the connection is healthy, and one sync may simply have to be retried. If you see a
 single Xero failure at the exact moment somebody reconnected, that is what it was.
+
+##### Work that was already queued for the previous organisation
+
+Anything sitting in the sync queue when you reconnect to a **different** organisation was built against
+the one you left. An invoice payment names that organisation's invoice and that organisation's bank
+account; an invoice names its contacts, items, account codes and tax rates. Every one of those is
+meaningless — or, far worse, accidentally meaningful — in the new ledger.
+
+Each queued row therefore records the connection it was composed for, and the sync **refuses to post a
+row whose organisation is no longer the one connected**. Nothing is sent, and the row's error on
+**/sync** names both organisations. Those rows belong to the previous ledger: settle them there, or
+cancel them and re-drive the work from the source document so the payload is rebuilt against the
+organisation that is connected now.
+
+Two limits worth knowing:
+
+- Rows queued **before this shipped** carry no such record and are still posted. Refusing them would
+  have failed every payment already in the queue on the day of the upgrade; the unstamped population
+  only shrinks from there.
+- The check is made immediately **before** the row is posted, not held across the whole operation. A
+  reconnect that lands in the split second between the check and the request is not caught by it — the
+  env allow-list above is what constrains that case.
 
 #### If you already set `XERO_TENANT_ID`
 
@@ -368,6 +416,10 @@ contact ID on each customer/supplier and the Xero item ID on each product. This 
 IDs only mean anything to the organisation that issued them, so keeping them would hand stale IDs to
 the next connection. After reconnecting (to the same org or a different one, or when switching to
 QuickBooks) the IDs are simply resolved again on first use. Nothing needs to be re-entered.
+
+A cached ID also records **which organisation issued it**, taken from the request that produced it — so
+even an ID that survived some other route (a restored database, a connector switch that bypassed
+Disconnect) is ignored and re-resolved rather than used against a ledger that never issued it.
 
 ## Account Mapping
 

@@ -3,7 +3,9 @@
  */
 
 import { db } from '@/lib/db'
-import { activeAccountingIdProvenance, accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
+import {
+  accountingIdProvenanceFor, accountingIdProvenanceMatches, activeAccountingIdProvenance,
+} from '@/lib/connectors/accounting-id-provenance'
 import { xeroGet, xeroPost } from './api'
 
 const XERO_CONNECTOR = 'xero'
@@ -48,10 +50,15 @@ async function getStoredContactId(ref?: ContactRef): Promise<string | null> {
   return row.accountingContactId
 }
 
-async function storeContactId(contactId: string, ref?: ContactRef): Promise<void> {
+async function storeContactId(
+  contactId: string,
+  issuedByTenantId: string | undefined,
+  ref?: ContactRef,
+): Promise<void> {
   if (!contactId) return
-  // RACE (o3d-gfh): provenance sampled after the id-issuing API call — see xero/items.ts.
-  const provenance = await activeAccountingIdProvenance(XERO_CONNECTOR)
+  // o3d-gfh, closed: the ISSUING tenant, taken from the request that produced this id, not a read of the
+  // token row after the fact — see the long note in xero/items.ts for why the resample was unsound.
+  const provenance = accountingIdProvenanceFor(XERO_CONNECTOR, issuedByTenantId)
   if (ref?.customerId) {
     await db.customer.update({
       where: { id: ref.customerId },
@@ -88,7 +95,7 @@ export async function findOrCreateContact(
     )
     if (emailRes.ok && emailRes.data?.Contacts?.length) {
       const contactId = emailRes.data.Contacts[0].ContactID
-      await storeContactId(contactId, ref)
+      await storeContactId(contactId, emailRes.tenantId, ref)
       return { success: true, contactId }
     }
   }
@@ -100,7 +107,7 @@ export async function findOrCreateContact(
 
   if (res.ok && res.data?.Contacts?.length) {
     const contactId = res.data.Contacts[0].ContactID
-    await storeContactId(contactId, ref)
+    await storeContactId(contactId, res.tenantId, ref)
     return { success: true, contactId }
   }
 
@@ -124,7 +131,7 @@ export async function findOrCreateContact(
 
     if (retryRes.ok && retryRes.data?.Contacts?.length) {
       const contactId = retryRes.data.Contacts[0].ContactID
-      await storeContactId(contactId, ref)
+      await storeContactId(contactId, retryRes.tenantId, ref)
       return { success: true, contactId }
     }
   }
@@ -133,6 +140,6 @@ export async function findOrCreateContact(
   }
 
   const contactId = createRes.data.Contacts[0].ContactID
-  await storeContactId(contactId, ref)
+  await storeContactId(contactId, createRes.tenantId, ref)
   return { success: true, contactId }
 }

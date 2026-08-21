@@ -172,7 +172,12 @@ it will **not** restore stage on the new owner's behalf.
   is caught, not hidden. This trafficless store only delivers when WP-Cron is nudged (the
   harness does this); a single order commonly arrives as **two** `order.updated` deliveries.
 - Xero's **redirect URI** for the rig's app must be registered in the Xero developer portal.
-- **The rig's `.env` must constrain it to a Xero DEMO organisation** (o3d-9tbz):
+- **The rig's `.env` must constrain it to a Xero DEMO organisation** (o3d-9tbz), and since o3d-iaqy this
+  is enforced rather than advised: with `E2E_TEST_MODE=1` set and none of `XERO_REQUIRE_DEMO_ORG` /
+  `XERO_ALLOWED_TENANT_IDS` / `XERO_BLOCKED_TENANT_IDS` configured, the rig refuses to connect to Xero at
+  all and refuses to use a Xero token it already has. `XERO_ALLOWED_TENANT_NAMES` alone does **not**
+  satisfy it. A run in that state fails at the Xero steps with the refusal quoted in the sync log rather
+  than posting anywhere:
 
   ```
   XERO_REQUIRE_DEMO_ORG=true                      # the rig's primary tenant control

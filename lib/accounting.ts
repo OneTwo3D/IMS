@@ -296,11 +296,18 @@ export async function queueAccountingSyncTx(
   // Return false: no IMS GL counterpart posts, so callers stay consistent.
   if (isFxGainLossJournalSuppressed(context.connector, params.type)) return false
 
-  const payload = {
+  // o3d-19gy: the CONNECTION this payload was composed for. Stamped for whichever connector is active,
+  // because the defect is not Xero's — every connector resolves ids at enqueue and again at post — but
+  // only the Xero processor ENFORCES it today (the QuickBooks half is o3d-8prh). A stamp nothing reads
+  // yet still costs nothing and means the evidence exists on the rows written from now on, rather than
+  // starting from zero on the day the other half lands.
+  const { activeAccountingIdProvenance } = await import('@/lib/connectors/accounting-id-provenance')
+  const { stampAccountingPayloadConnection } = await import('@/lib/connectors/accounting-connection-provenance')
+  const payload = stampAccountingPayloadConnection({
     ...params.payload,
     _postingMode: context.postingMode,
     ...(params.idempotencyKey ? { _idempotencyKey: params.idempotencyKey } : {}),
-  }
+  }, await activeAccountingIdProvenance(context.connector))
 
   if (params.idempotencyKey) {
     const existing = await tx.accountingSyncLog.findFirst({

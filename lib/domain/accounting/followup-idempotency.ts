@@ -47,6 +47,11 @@
  * module, so a pre-existing row keeps deriving its token exactly as it did before.
  */
 
+import {
+  accountingOriginRecordsMatch,
+  carryAccountingOriginRecord,
+} from '@/lib/connectors/accounting-connection-provenance'
+
 export type FollowUpPayload = Record<string, unknown>
 
 /** Set ONLY by this module. Never conflated with the generic queue's `_idempotencyKey`. */
@@ -88,6 +93,33 @@ function asPayload(value: unknown): FollowUpPayload | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as FollowUpPayload)
     : null
+}
+
+/**
+ * Carry the EXISTING row's record of which organisation it was raised against onto a rebuilt body
+ * (o3d-19gy / Codex r1 finding 2, CRITICAL).
+ *
+ * THE DEFECT THIS REMOVES. The connectors stamp the freshly-rebuilt follow-up payload with whatever
+ * connection is live NOW, and then handed that payload to this planner for BOTH outcomes — creating a
+ * row, and reviving an existing FAILED one. On a revival the stamp is not a fact about the new work; the
+ * row already carries a record of the organisation its earlier attempt was made against, and that record
+ * is the only evidence the post-time guard has. Overwriting it with the current tenant does not merely
+ * lose the evidence — it FORGES agreement, so a payment first attempted against organisation A, revived
+ * while connected to organisation B, and still pinned to A's idempotency token, sails through a guard
+ * that is comparing B against B.
+ *
+ * cvj9's rule, applied literally: a marker may only be written by the row that actually took the action.
+ * A repair writes no marker. If the stored row recorded nothing (a row from before stamping shipped),
+ * this carries the ABSENCE forward rather than inventing an origin for an attempt it did not witness —
+ * and since Codex r3 finding 2 the post-time verdict refuses that (`no-origin-recorded`) rather than
+ * waving it through, so the carried nothing is now load-bearing rather than merely honest.
+ *
+ * The mechanism itself lives in `carryAccountingOriginRecord`, beside the reader and the verdict, and is
+ * shared with the connectors' CREATE path (r3 finding 1). Two implementations of "inherit, never mint"
+ * is two places for one of them to start minting again.
+ */
+function withStoredOriginRecord(body: FollowUpPayload, storedPayload: unknown): FollowUpPayload {
+  return carryAccountingOriginRecord(body, storedPayload)
 }
 
 function anchorOf(payload: FollowUpPayload, field: string): string {
@@ -410,6 +442,12 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     // an incomplete body provably never posted. It provably never posted, so the token it carries
     // was never seen remotely and the RECOMPUTED body is safe to send under it: the token stays
     // pinned (nothing is rotated), only the unusable body is replaced.
+    //
+    // o3d-gfh: when the stored body IS pinned, `stored` is the existing row's payload, so its origin
+    // record travels with it and the freshly-stamped one in `input.payload` is discarded — which is
+    // the correct direction. If the row was raised against another organisation the post-time verdict
+    // now sees A against B and refuses; before, it saw B against B, because the stamp had been
+    // rewritten by the repair itself.
     if (stored && moneyMoving && bodyCouldHaveReachedTheLedger(input.type, stored)) {
       return {
         action: 'reuse',
@@ -424,11 +462,14 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     // Non-money follow-ups (PDF, email, note, attachment) are safe to re-drive with fresh
     // inputs; only the token is carried back. A money-moving row whose stored body could never have
     // been sent lands here too, for the reason given just above.
+    //
+    // o3d-gfh: since a token is carried, so is the row's record of the organisation that token was
+    // spent against. The BODY is fresh; the ORIGIN is the row's own and is not the caller's to rewrite.
     const { [FOLLOW_UP_IDEMPOTENCY_KEY]: _discarded, ...rest } = input.payload
     return {
       action: 'reuse',
       syncLogId: pinnable.id,
-      payload: pin(rest),
+      payload: pin(withStoredOriginRecord(rest, pinnable.payload)),
       tokenDisposition: 'pinned',
       bodyDisposition: 'fresh',
       divergedFields,
@@ -438,7 +479,19 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // Nothing surviving could have committed this document, so the recomputed request goes out
   // under a freshly derived token. Reuse a spent row when one exists rather than accumulating
   // replacements; its id no longer carries the token, so reuse is bookkeeping, not safety.
-  const rowToReuse = input.failedRows[0]
+  // Reuse a spent row ONLY when it recorded the same origin the new work was raised against.
+  //
+  // Nothing is carried back on this branch — the token is freshly derived and the body is recomputed —
+  // so the row is a container rather than evidence about this attempt, and restamping it is honest FOR
+  // THE NEW WORK. What is not honest is doing that when the container still holds a different
+  // organisation's record: that record is the only surviving trace that an attempt was made against
+  // organisation A, and bookkeeping tidiness is not a reason to erase it. A brand-new row costs one
+  // insert, keeps A's row intact for reconciliation, and lets B's work proceed — whereas carrying A's
+  // stamp onto B's work would strand it behind a post-time refusal it can never satisfy.
+  const spentRow = input.failedRows[0]
+  const rowToReuse = spentRow && accountingOriginRecordsMatch(spentRow.payload, input.payload)
+    ? spentRow
+    : undefined
   const freshPayload = withFollowUpIdempotencyKey(input)
   if (rowToReuse) {
     const stored = asPayload(rowToReuse.payload)

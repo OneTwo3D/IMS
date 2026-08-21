@@ -76,6 +76,10 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       setting: { findUnique: async () => null },
+      // o3d-19gy: the daily batch stamps the connection it was composed against onto each queued
+      // payload, so the double has to have one — a batch built against no connection would be a
+      // different scenario from the one these tests are about.
+      accountingToken: { findUnique: async () => ({ tenantId: 'tenant-A' }) },
       salesOrder: {
         findMany: async ({ where }: { where: Record<string, unknown> }) =>
           ('revenueDeferredDate' in where ? salesOrderRows.a1 : salesOrderRows.a2),
