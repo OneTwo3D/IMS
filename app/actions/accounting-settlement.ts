@@ -250,14 +250,23 @@ async function readSaleCancellationStateUnderLock(
 /**
  * Re-read the mirrored event and refuse when it CONTRADICTS the assertion (r3, Codex finding 2).
  *
- * Called on every path where the mirror was NOT written — the guard refused it, another row owns it,
- * or the sale is cancelled — because those are exactly the paths on which round 2 returned
- * `success: true` over a mirrored event naming a different document from the one just recorded. The
- * `updated` path needs no check: the guard only holds for an event that is PENDING/FAILED and names
- * no document, so a written mirror cannot have been contradicting one.
+ * Called on EVERY outcome once this row has a mirror at all, and it checks EVERY key — which is the
+ * round-2 correction (r3 round 2, Codex finding 2).
+ *
+ * The obvious version checks only the paths where the mirror was not written, on the argument that a
+ * written mirror cannot have been contradicting one: the guard holds only for an event that is
+ * PENDING/FAILED and names no document. That reasoning covers the event that WAS written and no
+ * other, and `mirroredAccountingEventIdempotencyKeys` yields up to two — the primary and the legacy,
+ * syncLogId-less form that every attempt on the same day shares.
+ * `updateMirroredAccountingEventStatus` writes the FIRST key that resolves and returns `'updated'`
+ * without consulting the second, so a settlement could record document A over a legacy event that
+ * already names document B and report success. This loop is what makes "no document IMS holds
+ * contradicts this assertion" true of the whole key set rather than of one member of it.
  *
  * The read is inside the transaction and AFTER the write attempt, which is what makes it decisive
- * rather than advisory: a sibling that commits later loses the guarded write, not this refusal.
+ * rather than advisory: a sibling that commits later loses the guarded write, not this refusal. It
+ * is also what makes running it on the `updated` path harmless — the event just written reads back
+ * as exactly what the assertion says, so it can only refuse on some OTHER document.
  */
 async function refusalFromMirroredDocument(
   tx: Prisma.TransactionClient,
@@ -546,9 +555,27 @@ export async function settleAccountingSyncRow(
         //     disagreeing with nothing refusing. `taxinv` is the same shape: a wrong document that
         //     reported success, where the verdict half was worse than the figure.
         //
-        //     Only the paths that did NOT write are checked. `updated` cannot be contradicting: the
-        //     guard holds only for an event that is PENDING/FAILED and names no document.
-        if (mirror === 'refused' || mirror === 'skipped_owned_by_another_row' || mirror === 'skipped_cancelled_sale') {
+        //     EVERY OUTCOME IS CHECKED, INCLUDING `updated` (r3 round 2, Codex finding 2). Round 2
+        //     checked only the three non-write outcomes, on the argument that "`updated` cannot be
+        //     contradicting: the guard holds only for an event that is PENDING/FAILED and names no
+        //     document". That is true OF THE EVENT THAT WAS WRITTEN — and there can be TWO.
+        //
+        //     `mirroredAccountingEventIdempotencyKeys` returns the PRIMARY key and the LEGACY,
+        //     syncLogId-less one, and `updateMirroredAccountingEventStatus` stops at the first key
+        //     that resolves: a primary event that is PENDING with no document id satisfies the guard
+        //     and is written, and the function returns `'updated'` WITHOUT EVER LOOKING AT THE LEGACY
+        //     KEY. If the legacy event — the same logical document, shared by every attempt on the
+        //     same day — already names document B, the operator asserting document A was told their
+        //     assertion had been accepted, the two records were left disagreeing, and nothing
+        //     refused. That is the exact defect round 2 fixed, surviving on the second key.
+        //
+        //     So the check is unconditional on there being a mirror at all. It is safe on the
+        //     `updated` path because the written event is SELF-CONSISTENT WITH THE ASSERTION BY
+        //     CONSTRUCTION and this read happens after the write: a POSTED assertion sets
+        //     `externalId` to the very id being asserted (equal id is a retried click, not a
+        //     contradiction), and a NOT_POSTED assertion sets VOID with a null externalId, which
+        //     contradicts nothing. Only a DIFFERENT document, under either key, refuses.
+        if (mirrorKeys.length > 0) {
           const contradiction = await refusalFromMirroredDocument(tx, mirrorKeys, assertion)
           // THROWN, not returned. Returning here would COMMIT the fenced write above and then report
           // a failure — a settled row and a refusal in the same breath, which is worse than either.

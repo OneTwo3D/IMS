@@ -1386,6 +1386,12 @@ posting, and a settlement that reported success over a contradiction would leave
 disagreeing with nobody told. Check both ids in Xero: if the one already recorded is the real one
 there is nothing to settle, and if it is not, reverse it in Xero before recording the other.
 
+One posting can be mirrored under **either of two keys** — the one tied to this sync row, and an
+older form shared by every attempt at the same document on the same day — and *both* are checked.
+An earlier attempt's real document sitting on the second key refuses the settlement exactly as one
+on the first does, rather than the settlement succeeding because the key it happened to write was
+the empty one.
+
 **A settled row is marked as settled by hand, and stays marked.** IMS never verified it — no call was
 made, no document was read, and no *amount* was compared. That matters most for payments: Xero will
 accept a payment for less than the invoice as a **part payment** and hand back a perfectly valid
@@ -1395,6 +1401,21 @@ other exactly. So the order and bill screens do not show an asserted payment as 
 payment in Xero and check its amount against the document total; once the two really do agree there is
 nothing further to do in IMS, and the flag is there so nobody mistakes a colleague's note for Xero's
 word.
+
+**And the repair sweep will not turn your assertion into the ledger link.** A row you settle as
+"it DID post" looks, on the row itself, exactly like one Xero confirmed — so the back-reference
+repair sweep used to pick it up and stamp the id you typed onto the order or bill. That column is
+what the rest of IMS treats as proof the document exists: the PDF, the attachment and the
+**payment** are built from it, the settlement verdict is measured against it, and the order delete
+guard reads it as evidence. The sweep now **refuses** such a row instead — it writes no link and
+queues no follow-ups — and logs `xero_backreference_unverified_assertion` naming the document and
+the record it would have linked.
+
+That refusal is repeated about once a day until someone acts on it, because the only thing that
+clears it is a person: open the document in Xero, and if it is the right one, **link it to the order
+or bill by hand**. The sweep then finds the document already linked, settles the row and stops
+warning, having taken nothing from the assertion. If the document is *not* the right one, correct
+the sync row — it must not be repaired from.
 
 **Settling a row whose order has been cancelled records the document and stops there.** If you assert
 "it DID post" against a row belonging to a **cancelled** sales order, IMS keeps the document id — the

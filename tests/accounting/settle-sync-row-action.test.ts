@@ -870,3 +870,118 @@ test('with NO connector active, every unresolved row is adoptable — nothing is
   assert.equal(result.success, true)
   assert.equal(stored().attemptRevision, 1)
 })
+
+// ---------------------------------------------------------------------------
+// r3 ROUND 2, Codex finding 2 — THE CONTRADICTION CHECK ONLY LOOKED AT ONE KEY.
+//
+// Round 2 made a contradicting mirror THROW rather than return, and ran the check on the three
+// outcomes where nothing was written, arguing that "`updated` cannot be contradicting: the guard
+// holds only for an event that is PENDING/FAILED and names no document".
+//
+// That is true of the event that WAS written, and there are up to TWO.
+// mirroredAccountingEventIdempotencyKeys returns the PRIMARY key (payload `_idempotencyKey`, else
+// the sync-log id) and the LEGACY, syncLogId-less `<connector>:<type>:<ref>:<date>` form that every
+// attempt on the same day shares. updateMirroredAccountingEventStatus writes the FIRST key that
+// resolves and returns 'updated' WITHOUT LOOKING AT THE SECOND — so the round-2 defect survived
+// intact on the legacy key: settlement records document A, IMS already holds document B for the same
+// logical posting, and the operator is told their assertion was accepted.
+// ---------------------------------------------------------------------------
+
+/** A payload with NO `_idempotencyKey`, which is what makes the primary and legacy keys DIFFER. */
+const TWO_KEY = { type: 'SALES_INVOICE', payload: { date: '2026-08-01' } }
+const PRIMARY_KEY = 'accounting-sync-log:xero:log-1'
+const LEGACY_KEY = 'accounting-sync:xero:sales_invoice:salesorder:order-7:2026-08-01'
+
+test('the two mirror keys really are distinct, or the tests below prove nothing', async () => {
+  const { mirroredAccountingEventIdempotencyKeys } = await import('@/lib/domain/accounting/accounting-event-mirror')
+  assert.deepEqual(
+    mirroredAccountingEventIdempotencyKeys({
+      syncLogId: 'log-1', connector: 'xero', type: 'SALES_INVOICE',
+      referenceType: 'SalesOrder', referenceId: 'order-7', payload: { date: '2026-08-01' },
+    }),
+    [PRIMARY_KEY, LEGACY_KEY],
+    'the primary is tried first and the legacy is the fallback — that ORDER is what let the second key escape',
+  )
+})
+
+test('a SECOND mirror key naming another document refuses, even though the first key was written', async () => {
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...TWO_KEY })]
+  state.events = [
+    // The primary satisfies the guard, so it IS written and the updater returns 'updated'.
+    { id: 'evt-primary', idempotencyKey: PRIMARY_KEY, status: 'PENDING', externalId: null },
+    // The legacy event — the same logical posting, an earlier attempt on the same day — already
+    // names a DIFFERENT document. Round 2 never read it, because it never looked past 'updated'.
+    { id: 'evt-legacy', idempotencyKey: LEGACY_KEY, status: 'POSTED', externalId: 'INV-500' },
+  ]
+
+  const result = await settle('log-1', posted({ externalTransactionId: 'INV-9001' }))
+
+  assert.equal(result.success, false)
+  assert.equal('code' in result ? result.code : null, 'contradicts_mirrored_document')
+  assert.match('error' in result ? result.error : '', /already names document INV-500/)
+  assert.match('error' in result ? result.error : '', /asserts INV-9001/)
+  // AND THE WHOLE TRANSACTION UNWOUND — including the mirror write that had already succeeded.
+  // Returning instead of throwing would have committed a settled row AND reported a failure.
+  assert.deepEqual(
+    { status: stored().status, attempt: stored().attemptRevision, id: stored().externalTransactionId },
+    { status: 'FAILED', attempt: 3, id: null },
+    'the row is exactly as it was',
+  )
+  assert.equal(state.events.find((e) => e.idempotencyKey === PRIMARY_KEY)!.status, 'PENDING',
+    'the mirror write that DID land rolled back with it')
+  assert.equal(state.events.find((e) => e.idempotencyKey === LEGACY_KEY)!.externalId, 'INV-500')
+  assert.equal(settlementAudit().length, 0, 'a refused settlement writes no audit')
+})
+
+test('a NOT_POSTED assertion is refused by a second key that records a posted document', async () => {
+  // The other half of the same contradiction, on the same escaped path: the primary mirror VOIDs
+  // cleanly while the legacy key holds evidence the document DID post.
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...TWO_KEY })]
+  state.events = [
+    { id: 'evt-primary', idempotencyKey: PRIMARY_KEY, status: 'PENDING', externalId: null },
+    { id: 'evt-legacy', idempotencyKey: LEGACY_KEY, status: 'POSTED', externalId: 'INV-500' },
+  ]
+
+  const result = await settle('log-1', notPosted())
+
+  assert.equal(result.success, false)
+  assert.equal('code' in result ? result.code : null, 'contradicts_mirrored_document')
+  assert.match('error' in result ? result.error : '', /Settle this row as POSTED with that id/)
+  assert.equal(stored().status, 'FAILED')
+  assert.equal(state.events.find((e) => e.idempotencyKey === PRIMARY_KEY)!.status, 'PENDING')
+})
+
+test('checking the WRITTEN mirror too never refuses a settlement against itself', async () => {
+  // The check is now unconditional, so it re-reads the event this settlement just wrote. That must
+  // be a no-op in BOTH directions or the action would refuse every ordinary settlement: a POSTED
+  // assertion stamps the very id being asserted (equal id is a retried click, not a contradiction)
+  // and a NOT_POSTED assertion stamps VOID with a null externalId, which contradicts nothing.
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...TWO_KEY })]
+  state.events = [{ id: 'evt-primary', idempotencyKey: PRIMARY_KEY, status: 'PENDING', externalId: null }]
+
+  const result = await settle('log-1', posted({ externalTransactionId: 'INV-9001' }))
+
+  assert.equal(result.success, true)
+  assert.equal('mirror' in result ? result.mirror : null, 'updated')
+  assert.equal(stored().status, 'SYNCED')
+  assert.equal(state.events[0].externalId, 'INV-9001')
+})
+
+test('a second key naming the SAME document is not a contradiction', async () => {
+  // Two records of one posting agreeing with each other is the ordinary state, and refusing it
+  // would make the fix a denial of service on the legacy-key population.
+  const settle = await loadAction()
+  state.rows = [syncRow({ ...TWO_KEY })]
+  state.events = [
+    { id: 'evt-primary', idempotencyKey: PRIMARY_KEY, status: 'PENDING', externalId: null },
+    { id: 'evt-legacy', idempotencyKey: LEGACY_KEY, status: 'POSTED', externalId: 'INV-9001' },
+  ]
+
+  const result = await settle('log-1', posted({ externalTransactionId: 'INV-9001' }))
+
+  assert.equal(result.success, true)
+  assert.equal(stored().externalTransactionId, 'INV-9001')
+})
