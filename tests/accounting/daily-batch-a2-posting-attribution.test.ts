@@ -87,6 +87,12 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       setting: { findUnique: async () => null },
+      // o3d-19gy (merged after this branch was cut): the batch now stamps whose ledger it was composed
+      // against, which reads the stored connection. Without this delegate the read throws INSIDE the
+      // batch and the run reports a Group A2 error — the test then fails for a reason unrelated to
+      // posting attribution. Null is the honest answer here: this fixture models no connected ledger,
+      // and the stamp records that as "raised while disconnected" rather than inventing an organisation.
+      accountingToken: { findUnique: async () => null },
       salesOrder: {
         findMany: async ({ where }: { where?: OrderWhere } = {}) => (isGroupA2Window(where) ? [ORDER] : []),
       },
