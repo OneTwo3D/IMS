@@ -539,8 +539,24 @@ export async function readCreateDispatchAge(
     // statement that reads the marker, so the subtraction happens where both operands live and the
     // time this query itself spends is INSIDE the figure rather than after it. NULL comes back for a
     // row that carries no marker; no row at all comes back for a row that is gone.
+    //
+    // AND BOTH OPERANDS ARE NAIVE UTC, SO THE SESSION'S TIME ZONE CANNOT MOVE THE ANSWER (o3d-jit6
+    // r10, Codex HIGH). `create_dispatched_at` is `TIMESTAMP(3)` WITHOUT time zone and carries the
+    // driver's naive UTC instant; `clock_timestamp()` is `timestamptz`. Subtracting one from the
+    // other makes Postgres promote the naive column to `timestamptz` USING THE SESSION'S `TimeZone`,
+    // so on any session that is not UTC the elapsed figure is wrong by exactly that offset. The
+    // offset is HOURS and the window it is measured against is SIX MINUTES, so this does not skew
+    // the answer, it replaces it: a positive offset reports a window that closed long ago and
+    // refuses every attempt after the first as budget-exhausted, while a negative one reports a
+    // NEGATIVE age, which the ordering test below rejects as `unorderable` — and the caller then
+    // falls back to the entry-anchored bound, which is the over-stated deadline the marker anchor
+    // exists to replace.
+    //
+    // `AT TIME ZONE 'UTC'` demotes the clock into the same naive UTC frame the column already lives
+    // in, and `timestamp - timestamp` consults no session setting at all: the interval is identical
+    // under every `TimeZone`, which is the property the test pins.
     const rows = await client.$queryRaw<Array<{ elapsedMs: number | null }>>`
-      SELECT (EXTRACT(EPOCH FROM (clock_timestamp() - "create_dispatched_at")) * 1000)::double precision
+      SELECT (EXTRACT(EPOCH FROM ((clock_timestamp() AT TIME ZONE 'UTC') - "create_dispatched_at")) * 1000)::double precision
              AS "elapsedMs"
       FROM "accounting_sync_logs"
       WHERE "id" = ${entryId}

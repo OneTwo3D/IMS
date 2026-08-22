@@ -2811,11 +2811,35 @@ export const UNSENT_HANDBACK_RETRY_BASE_DELAY_MS = 250
 export const UNSENT_HANDBACK_RETRY_BUDGET_MS =
   Math.floor((XERO_IDEMPOTENCY_KEY_RETENTION_MS - CREATE_DISPATCH_REPLAY_MARGIN_MS) / 10)
 /**
- * The floor under a single attempt's own bound. A transaction handed a timeout of a millisecond
- * cannot write three rows, so an already-overrun deadline would turn the last permitted attempt into
- * a guaranteed abort — a bound that manufactures the failure it is measuring.
+ * ACQUISITION AND EXECUTION HAVE SEPARATE MINIMA, BECAUSE THEY BUY DIFFERENT THINGS (o3d-jit6 r10,
+ * Codex HIGH).
+ *
+ * r8 wrote down ONE floor and meant it as a floor under EXECUTION: a transaction handed a timeout of
+ * a millisecond cannot write three rows, so an already-overrun deadline would turn the last
+ * permitted attempt into a guaranteed abort — a bound that manufactures the failure it is measuring.
+ * r9 then took the connection wait OUT of that same clamped value, so the floor case was left
+ * running the transaction in HALF the time the floor exists to guarantee it. Each change is right on
+ * its own; together they cancel.
+ *
+ * So the two are named separately and the attempt's floor is their SUM. That is what makes the split
+ * safe: whatever {@link unsentHandBackAttemptBounds} reserves for the wait, execution still ends up
+ * with at least `UNSENT_HANDBACK_MIN_EXECUTION_MS`.
  */
-export const UNSENT_HANDBACK_MIN_ATTEMPT_MS = 1_000
+export const UNSENT_HANDBACK_MIN_EXECUTION_MS = 1_000
+/**
+ * The floor under the connection wait. A `maxWait` of a millisecond fails an attempt against a pool
+ * that would have handed it a connection immediately, so the reservation is never squeezed below
+ * this — a self-inflicted abort is not cheaper than a short wait.
+ */
+export const UNSENT_HANDBACK_MIN_ACQUISITION_MS = 250
+/**
+ * The floor under a single attempt's own bound: the two minima TOGETHER, so that an attempt clamped
+ * to the floor can still wait for a connection AND run its transaction for as long as each of those
+ * actually needs. Clamping to the execution minimum alone — r8's figure — is what r9's split then
+ * halved.
+ */
+export const UNSENT_HANDBACK_MIN_ATTEMPT_MS =
+  UNSENT_HANDBACK_MIN_EXECUTION_MS + UNSENT_HANDBACK_MIN_ACQUISITION_MS
 /** How long an attempt may wait for a connection before it counts as failed; never past its own bound. */
 export const UNSENT_HANDBACK_MAX_WAIT_MS = 2_000
 
@@ -2842,7 +2866,13 @@ export function unsentHandBackDeadline(nowMs: number, age: CreateDispatchAge): U
   return { atMs: nowMs + (UNSENT_HANDBACK_RETRY_BUDGET_MS - age.elapsedMs), anchor: 'dispatch-marker' }
 }
 
-/** What one attempt may spend: the measured remainder, floored so it can work and capped by the budget. */
+/**
+ * What one attempt may spend: the measured remainder, floored so it can work and capped by the budget.
+ *
+ * r10: the floor is `UNSENT_HANDBACK_MIN_ATTEMPT_MS`, which is acquisition's minimum PLUS execution's
+ * — clamped high enough that what {@link unsentHandBackAttemptBounds} reserves for the connection
+ * wait still leaves the transaction its own `UNSENT_HANDBACK_MIN_EXECUTION_MS` to run in.
+ */
 export function unsentHandBackAttemptBudgetMs(remainingMs: number): number {
   return Math.min(Math.max(remainingMs, UNSENT_HANDBACK_MIN_ATTEMPT_MS), UNSENT_HANDBACK_RETRY_BUDGET_MS)
 }
@@ -2859,11 +2889,27 @@ export function unsentHandBackAttemptBudgetMs(remainingMs: number): number {
  *
  * So the acquisition is RESERVED OUT OF the attempt's budget rather than added to it: `maxWait +
  * timeout` is the budget, exactly, whatever the budget is. The reservation is capped at
- * `UNSENT_HANDBACK_MAX_WAIT_MS` so a large budget still gives execution nearly all of it, and at half
- * the budget so a small one cannot leave the transaction with nothing to run in.
+ * `UNSENT_HANDBACK_MAX_WAIT_MS` so a large budget still gives execution nearly all of it.
+ *
+ * AND THE RESERVATION NEVER EATS THE EXECUTION MINIMUM (r10, Codex HIGH). r9's second cap was HALF
+ * the budget, which reads as generous and is the opposite: the budget is clamped UP to a floor
+ * precisely because the transaction needs that much time to RUN, so taking half of that floor for
+ * the connection wait handed the floor case half the execution the clamp was there to guarantee. The
+ * reservation is therefore capped at whatever sits ABOVE `UNSENT_HANDBACK_MIN_EXECUTION_MS`, never
+ * dropping below `UNSENT_HANDBACK_MIN_ACQUISITION_MS` — and because
+ * {@link unsentHandBackAttemptBudgetMs} clamps the total to the SUM of the two minima, the floor
+ * case now splits into exactly `MIN_ACQUISITION` for the wait and `MIN_EXECUTION` for the
+ * transaction, with the two still summing to the budget.
  */
 export function unsentHandBackAttemptBounds(attemptBudgetMs: number): { maxWait: number; timeout: number } {
-  const maxWait = Math.max(1, Math.min(UNSENT_HANDBACK_MAX_WAIT_MS, Math.floor(attemptBudgetMs / 2)))
+  // What the wait may take without pushing execution under its own minimum — but never below the
+  // acquisition minimum, so a budget too small to satisfy both still leaves a usable wait.
+  const reservable = Math.max(
+    UNSENT_HANDBACK_MIN_ACQUISITION_MS,
+    attemptBudgetMs - UNSENT_HANDBACK_MIN_EXECUTION_MS,
+  )
+  // Also held under the budget itself, so the two halves still SUM to it exactly.
+  const maxWait = Math.max(1, Math.min(UNSENT_HANDBACK_MAX_WAIT_MS, reservable, attemptBudgetMs - 1))
   return { maxWait, timeout: Math.max(1, attemptBudgetMs - maxWait) }
 }
 

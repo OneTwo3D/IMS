@@ -8,7 +8,9 @@ import {
   releaseUnsentTransportRefusal,
   retryUnsentHandBack,
   UNSENT_HANDBACK_MAX_ATTEMPTS,
+  UNSENT_HANDBACK_MIN_ACQUISITION_MS,
   UNSENT_HANDBACK_MIN_ATTEMPT_MS,
+  UNSENT_HANDBACK_MIN_EXECUTION_MS,
   UNSENT_HANDBACK_RETRY_BASE_DELAY_MS,
   UNSENT_HANDBACK_COMMIT_ACTION,
   UNSENT_HANDBACK_MAX_WAIT_MS,
@@ -1305,4 +1307,131 @@ test('o3d-jit6 r9: the probe looks for the commit record, not for the evidence r
   const commitAt = body.indexOf('action: UNSENT_HANDBACK_COMMIT_ACTION')
   assert.ok(releaseAt > -1 && commitAt > releaseAt, 'the release result is recorded after the release')
   assert.match(body, /handBackId,\n      released,\n/, 'the identifier and the result on the same record')
+})
+
+/* ------------------------------------------------------------------------------------------------
+ * ROUND 10 — THE AGE WAS MEASURED ACROSS TWO TIMESTAMP TYPES, AND THE SPLIT ATE THE FLOOR IT WAS
+ * SPLITTING.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * o3d-jit6 r10 (Codex HIGH) — THE SESSION'S TIME ZONE WAS AN OPERAND OF THE REPLAY WINDOW.
+ *
+ * `create_dispatched_at` is `TIMESTAMP(3)` WITHOUT time zone and holds the driver's naive UTC
+ * instant. `clock_timestamp()` is `timestamptz`. Subtracting the first from the second makes Postgres
+ * promote the naive column using the SESSION's `TimeZone`, so the elapsed figure is off by exactly
+ * that offset — hours, against a window of six minutes.
+ *
+ * WHAT THIS TEST IS AND IS NOT. It pins the SQL SHAPE: that the clock is demoted into the column's
+ * own naive UTC frame before the subtraction, and that the r9 shape which did not is gone. It is a
+ * WEAKER test than executing the statement, because it asserts the text of the query rather than the
+ * behaviour of a server — a rewrite that preserved the phrase and broke the semantics would pass it.
+ *
+ * The behaviour itself was verified against a real PostgreSQL engine — an ephemeral in-memory PGlite
+ * instance created for the check and discarded, touching no database of ours — by running BOTH
+ * statements against the same row under `SET LOCAL TIME ZONE` for UTC, Europe/London,
+ * America/New_York, Asia/Tokyo and Pacific/Kiritimati. On a marker minted milliseconds earlier the
+ * r9 statement reported 0.002s elapsed under UTC, 3600.004s under Europe/London (deadline 3570s in
+ * the PAST — every attempt after the first refused as budget-exhausted), 32400.006s under Asia/Tokyo,
+ * 50400.007s under Pacific/Kiritimati, and MINUS 14399.995s under America/New_York, which
+ * `readCreateDispatchAge` rejects as `unorderable` so the caller silently falls back to the
+ * entry-anchored bound r8 exists to replace. The fixed statement reported 0.003s–0.008s under all
+ * five — a spread of 5ms, which is the probe's own elapsed time and nothing else. That run is not
+ * reproducible from this suite; the assertions below are what remains under CI.
+ */
+test('o3d-jit6 r10: the age subtracts two NAIVE UTC timestamps, so the session time zone is not an operand', () => {
+  const migration = readFileSync(
+    join(process.cwd(), 'prisma/migrations/20260822090100_accounting_sync_log_create_dispatch_record/migration.sql'),
+    'utf8',
+  )
+  // THE PREMISE, PINNED: the column is `timestamp WITHOUT time zone`. If it ever becomes `timestamptz`
+  // the subtraction below stops needing the demotion — and this assertion is what says so.
+  assert.match(
+    migration,
+    /ADD COLUMN "create_dispatched_at" TIMESTAMP\(3\);/,
+    'the marker is a naive timestamp, which is why the clock must be demoted to match it',
+  )
+  assert.ok(
+    !/create_dispatched_at" TIMESTAMPTZ/i.test(migration),
+    'nothing may quietly turn the marker into a time-zone-aware column without revisiting the read',
+  )
+
+  const source = readFileSync(join(process.cwd(), 'lib/domain/accounting/create-dispatch-record.ts'), 'utf8')
+  const read = source.slice(source.indexOf('export async function readCreateDispatchAge('))
+  const statement = read.slice(0, read.indexOf('const row = rows?.[0]'))
+  assert.ok(statement.length > 0, 'the one statement must be found')
+
+  assert.match(
+    statement,
+    /EXTRACT\(EPOCH FROM \(\(clock_timestamp\(\) AT TIME ZONE 'UTC'\) - "create_dispatched_at"\)\)/,
+    'the clock is demoted into the marker’s own naive UTC frame BEFORE the subtraction',
+  )
+  // THE r9 SHAPE, WHICH IS THE FINDING: a bare `timestamptz - timestamp`, resolved per session.
+  assert.ok(
+    !/EPOCH FROM \(clock_timestamp\(\) - "create_dispatched_at"\)/.test(statement),
+    'a bare timestamptz minus a naive timestamp is resolved in the SESSION time zone — the finding',
+  )
+  // `now()`/`CURRENT_TIMESTAMP` are timestamptz too, and `timezone(...)`/`::timestamp` would be the
+  // same demotion spelt differently; none of them may appear undemoted.
+  assert.ok(
+    !/\b(now\(\)|CURRENT_TIMESTAMP|LOCALTIMESTAMP)\b/.test(statement),
+    'the sample uses clock_timestamp(), not a statement-frozen or session-local clock',
+  )
+})
+
+/**
+ * o3d-jit6 r10 (Codex HIGH) — THE CLAMP AND THE SPLIT CONTRADICTED EACH OTHER.
+ *
+ * r8 clamped the attempt budget UP to a floor because the transaction needs that much time TO RUN.
+ * r9 then reserved the connection wait OUT of the clamped value, capped at half of it — so the floor
+ * case ran the transaction in half the time the floor was clamped to guarantee.
+ */
+test('o3d-jit6 r10: the clamp guarantees EXECUTION its minimum, AFTER acquisition has been reserved', () => {
+  assert.equal(
+    UNSENT_HANDBACK_MIN_ATTEMPT_MS,
+    UNSENT_HANDBACK_MIN_EXECUTION_MS + UNSENT_HANDBACK_MIN_ACQUISITION_MS,
+    'the attempt floor is the two minima together, not the execution minimum standing in for both',
+  )
+
+  // THE FINDING, SPELT OUT: r9's split applied to r8's floor (which WAS the execution minimum).
+  const r9MaxWaitAtItsFloor = Math.max(1, Math.min(UNSENT_HANDBACK_MAX_WAIT_MS, Math.floor(UNSENT_HANDBACK_MIN_EXECUTION_MS / 2)))
+  const r9ExecutionAtItsFloor = UNSENT_HANDBACK_MIN_EXECUTION_MS - r9MaxWaitAtItsFloor
+  assert.ok(
+    r9ExecutionAtItsFloor < UNSENT_HANDBACK_MIN_EXECUTION_MS,
+    'r9 left the floor case with less execution time than the floor exists to guarantee',
+  )
+  assert.equal(r9ExecutionAtItsFloor, UNSENT_HANDBACK_MIN_EXECUTION_MS / 2, 'half of it, precisely')
+
+  // AND WHAT IT IS NOW: the floor splits into exactly one minimum each, summing to the budget.
+  const floorBudget = unsentHandBackAttemptBudgetMs(1)
+  assert.equal(floorBudget, UNSENT_HANDBACK_MIN_ATTEMPT_MS)
+  const atFloor = unsentHandBackAttemptBounds(floorBudget)
+  assert.equal(atFloor.maxWait, UNSENT_HANDBACK_MIN_ACQUISITION_MS, 'the wait gets its minimum')
+  assert.equal(atFloor.timeout, UNSENT_HANDBACK_MIN_EXECUTION_MS, 'and the transaction still gets ALL of its own')
+  assert.equal(atFloor.maxWait + atFloor.timeout, floorBudget, 'with nothing added on top')
+
+  // Across every budget the clamp can actually produce, all four invariants hold at once.
+  for (const remainingMs of [
+    -9_000, 0, 1, 999, 1_000, UNSENT_HANDBACK_MIN_ATTEMPT_MS - 1, UNSENT_HANDBACK_MIN_ATTEMPT_MS,
+    UNSENT_HANDBACK_MIN_ATTEMPT_MS + 1, 2_000, 3_000, 3_001, 5_000,
+    UNSENT_HANDBACK_RETRY_BUDGET_MS, UNSENT_HANDBACK_RETRY_BUDGET_MS * 3,
+  ]) {
+    const budget = unsentHandBackAttemptBudgetMs(remainingMs)
+    const bounds = unsentHandBackAttemptBounds(budget)
+    assert.equal(bounds.maxWait + bounds.timeout, budget, `${remainingMs}: the halves still sum to the budget exactly`)
+    assert.ok(
+      bounds.timeout >= UNSENT_HANDBACK_MIN_EXECUTION_MS,
+      `${remainingMs}: execution keeps its own minimum after the reservation (got ${bounds.timeout})`,
+    )
+    assert.ok(
+      bounds.maxWait >= UNSENT_HANDBACK_MIN_ACQUISITION_MS,
+      `${remainingMs}: acquisition keeps its own minimum (got ${bounds.maxWait})`,
+    )
+    assert.ok(bounds.maxWait <= UNSENT_HANDBACK_MAX_WAIT_MS, `${remainingMs}: the reservation is still capped`)
+  }
+
+  // A LARGE BUDGET STILL GIVES EXECUTION NEARLY ALL OF IT — the r9 property that was worth keeping.
+  const wide = unsentHandBackAttemptBounds(UNSENT_HANDBACK_RETRY_BUDGET_MS)
+  assert.equal(wide.maxWait, UNSENT_HANDBACK_MAX_WAIT_MS)
+  assert.equal(wide.timeout, UNSENT_HANDBACK_RETRY_BUDGET_MS - UNSENT_HANDBACK_MAX_WAIT_MS)
 })
