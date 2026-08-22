@@ -286,10 +286,9 @@ export function decideCreateDispatch(params: {
   return {
     dispatch: false,
     error:
-      `NOTHING WAS SENT. IMS already dispatched a create for ${params.label} at `
-      + `${dispatchedAt.toISOString()} (${age}) and never recorded a document id for it — which is what `
-      + 'happens when the post succeeds and the transaction that would have written the id fails at '
-      + `COMMIT. ${sameKey
+      `NOTHING WAS SENT. IMS recorded a dispatch for ${params.label} at `
+      + `${dispatchedAt.toISOString()} (${age}) and never recorded a document id for it. `
+      + `${CREATE_DISPATCH_UNSETTLED_MEANING} ${sameKey
         ? `Xero forgets an idempotency key after ${Math.round(XERO_IDEMPOTENCY_KEY_RETENTION_MS / 60_000)} `
           + 'minutes, so re-sending the same key now would be processed as a NEW request'
         : 'This attempt would go out under a DIFFERENT idempotency key than the dispatch on record, so '
@@ -298,6 +297,63 @@ export function decideCreateDispatch(params: {
       + `therefore create a SECOND document if the first one landed, and nothing IMS can read says `
       + `whether it did. ${describeCreateDispatchRemedy(params.type)}`,
   }
+}
+
+/**
+ * WHAT A DISPATCH RECORD WITH NO DOCUMENT ID ACTUALLY MEANS — BOTH OF THE THINGS IT MEANS
+ * (o3d-jit6 r3, Codex HIGH).
+ *
+ * The refusal used to say this state "is what happens when the post succeeds and the transaction
+ * that would have written the id fails at COMMIT". That is ONE of its producers, and stating it as
+ * the explanation is the laundering this record's own settlement basis exists to stop, one layer
+ * up: it turns an unknown into a story, and the story sends an operator hunting for a document that
+ * may never have existed — or, on a DAILY_BATCH row, hand-posting a journal to replace one IMS
+ * simply never sent.
+ *
+ * THE SECOND PRODUCER IS THE TRANSPORT. The record is minted by the claim fence, which is the last
+ * statement before `postPreparedManualJournal`; the transport then has four refusals of its own
+ * BELOW it — no usable connection, `accountingPostingIntentRefusal`, the egress authorisations, and
+ * the rate budget. r3 deliberately did not hoist them and the reasons stand: each is evaluated once,
+ * immediately before the socket, against the very auth the request was built from; one may read AND
+ * write the database and one takes an exclusive slot; and o3d-batch-realm deleted precisely such a
+ * pre-check because a refusal produced from a stale read is as wrong as a permission produced from
+ * one. So a refusal there leaves a minted record and NOTHING IN THE LEDGER.
+ *
+ * AND THE ROW CANNOT TELL THEM APART. Making it able to needs a durable column of its own — the
+ * trigger deliberately forbids clearing or moving the pair, which is right, because the pair is a
+ * PROHIBITION and a prohibition that tampering clears hands the tamperer what they wanted. That
+ * column is filed as o3d-gvzu and is not in this branch.
+ *
+ * WHAT IS IN THIS BRANCH is the evidence trail: an attempt that provably sent nothing now reports
+ * itself as `notPosted` rather than as a failure, which logs
+ * `xero_sync_transport_refused_before_post` naming this sync log id. So the refusal points at
+ * something an operator can actually look up before they go looking in the ledger.
+ */
+export const CREATE_DISPATCH_UNSETTLED_MEANING =
+  'TWO THINGS PRODUCE THAT STATE AND IMS CANNOT TELL THEM APART FROM THIS ROW: either the post '
+  + 'landed and the transaction that would have written the id failed at COMMIT (a real document '
+  + 'exists), or IMS recorded the dispatch and its own transport then refused before anything left '
+  + 'the process — no usable connection, a posting-intent refusal, an egress authorisation, or an '
+  + 'exhausted rate budget — in which case NO document exists. Check the activity log for '
+  + '`xero_sync_transport_refused_before_post` against this sync row first: if it is there, IMS '
+  + 'refused to send and the ledger should be empty.'
+
+/**
+ * The message for an attempt that recorded a dispatch and then PROVABLY sent nothing.
+ *
+ * Reported through `notPosted`, so the row is handed back intact instead of spending a retry on a
+ * send that never happened — the treatment a lost claim and an expired lease already get, for the
+ * same reason. It does NOT clear the record: nothing may, and pretending otherwise would be the
+ * prohibition-that-tampering-clears mistake. What it does is make the false marker LOUD and NAMED at
+ * the moment it is created, so the refusal that follows has something to point at.
+ */
+export function describeCreateDispatchNotSent(params: { label: string; error: string }): string {
+  return `NOTHING WAS SENT for ${params.label}: IMS recorded that a create was about to be dispatched `
+    + `and its own transport then refused before the request left this process — ${params.error}. The `
+    + 'dispatch record STANDS (it is write-once by database trigger, and it is a prohibition, so it is '
+    + 'never cleared), which means a later attempt outside Xero\'s idempotency window will be refused '
+    + 'even though no document was created. That refusal is recoverable and names how; this line is the '
+    + 'evidence it will tell an operator to look for.'
 }
 
 /**

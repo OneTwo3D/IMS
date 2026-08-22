@@ -262,7 +262,10 @@ test('o3d-jit6: the retry after that commit failure is REFUSED, not posted a sec
   assert.equal(h.xeroCreates.length, 1, 'THE WHOLE POINT: no second journal in the accounts')
   assert.ok(refusal, 'and the attempt says so rather than failing silently')
   assert.match(refusal, /NOTHING WAS SENT/)
-  assert.match(refusal, /already dispatched a create for COGS_JOURNAL for PurchaseOrder po-1/)
+  // r3: the refusal names the row and the instant, but no longer asserts WHY the id is missing —
+  // a transport refusal below the fence produces the identical row with no document in the ledger,
+  // so both producers are named instead (tests/accounting/xero-manual-journal-dispatch-honesty.test.ts).
+  assert.match(refusal, /recorded a dispatch for COGS_JOURNAL for PurchaseOrder po-1/)
   assert.match(refusal, /no number or reference Xero deduplicates on/)
   // A refusal an operator cannot act on is a stalled row nobody resolves.
   assert.match(refusal, /REMEDY:/)

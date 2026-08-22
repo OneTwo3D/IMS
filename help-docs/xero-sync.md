@@ -1764,6 +1764,29 @@ must never be retried: when several rows for one reference posted under differen
 tokens, IMS refuses the retry outright, because a manual retry is far too late for Xero to
 deduplicate it.
 
+**Journals go further than that, because a journal create has no natural key.** Before a manual
+journal (COGS, inventory adjustment, stock-in-transit, the daily batches and the rest) is put on the
+wire, IMS commits a note on the row saying a create is about to be dispatched, together with the
+idempotency token it will carry. If the post lands and the write-back then fails at commit, that
+note is the only thing left saying a document may exist — so a later attempt is **refused** rather
+than sent, once Xero's six-minute idempotency window has passed.
+
+Read the refusal carefully, because it names **two** things that produce the same row, and IMS
+cannot tell them apart from the row alone:
+
+- the post landed and the write-back failed — **a real journal is in Xero**; or
+- IMS recorded the dispatch and then **refused to send it itself**, before anything left the
+  process: no usable Xero connection, posting paused for the organisation, an egress authorisation
+  refusing the write, or the day's API budget exhausted. **Nothing is in Xero.**
+
+The second case leaves a warning in the Activity log —
+`xero_sync_transport_refused_before_post`, naming the sync row and the reason. **Look for that
+first**: if it is there, IMS refused to send and the ledger should be empty. An attempt refused that
+way does not fail the row or spend a retry; it is handed back and re-run, and only the note it left
+behind persists. The note itself is never cleared — it is a prohibition, and one that could be
+cleared would be no protection at all — so resolve the row with the **Settle** control below, or (for
+an ordinary journal) cancel it and re-queue the work, which raises a fresh row with no note on it.
+
 Rows in that position — and **Processing** rows whose connector was switched off while a worker held
 them — now carry a **Settle** control (the gavel icon) beside Retry, both in the sync log and in the
 stranded-rows banner. It records what *you* found in Xero:

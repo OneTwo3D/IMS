@@ -317,7 +317,12 @@ test('r5 #1: EVERY remote mutation in processEntry is fenced immediately before 
     // o3d-jit6 r2 #1: the journal's own gates were lifted out of the post (`prepareManualJournal`,
     // pure and above the mint), so what remains below the fence is a body that has already cleared
     // every check. The MUTATION is still exactly one call, in exactly one place.
-    'return postPreparedManualJournal(',
+    //
+    // r3: awaited into a local rather than returned directly, because the branch now READS what the
+    // post reports about whether it reached the wire (`reachedTheWire`) before it decides what kind
+    // of failure this was. That is an observation, not a gate: it refuses nothing and it is still
+    // this one call that mutates Xero, still immediately below the fence.
+    'await postPreparedManualJournal(',
     'await putXeroTaxRate(',
   ]
   // The two `xeroPost('Payments'` sites are matched separately: the same text appears twice.

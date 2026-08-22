@@ -34,7 +34,7 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
-import { planCreateDispatch, type CreateDispatchMint } from '@/lib/domain/accounting/create-dispatch-record'
+import { describeCreateDispatchNotSent, planCreateDispatch, type CreateDispatchMint } from '@/lib/domain/accounting/create-dispatch-record'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
@@ -2961,7 +2961,12 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
             ? 'xero_sync_lease_expired_before_post'
             : syncResult.notPosted.reason === 'dispatch-unrecorded'
               ? 'xero_sync_dispatch_unrecorded_before_post'
-              : 'xero_sync_claim_lost_before_post',
+              // o3d-jit6 r3: THE ONLY DURABLE TRACE that a create was recorded and then not sent.
+              // The refusal a later attempt makes names this action and tells an operator to look
+              // for it before they go hunting in the ledger.
+              : syncResult.notPosted.reason === 'transport-refused'
+                ? 'xero_sync_transport_refused_before_post'
+                : 'xero_sync_claim_lost_before_post',
           tag: 'sync',
           level: 'WARNING',
           description: syncResult.notPosted.message,
@@ -3498,7 +3503,12 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             ? 'xero_sync_lease_expired_before_post'
             : syncResult.notPosted.reason === 'dispatch-unrecorded'
               ? 'xero_sync_dispatch_unrecorded_before_post'
-              : 'xero_sync_claim_lost_before_post',
+              // o3d-jit6 r3: THE ONLY DURABLE TRACE that a create was recorded and then not sent.
+              // The refusal a later attempt makes names this action and tells an operator to look
+              // for it before they go hunting in the ledger.
+              : syncResult.notPosted.reason === 'transport-refused'
+                ? 'xero_sync_transport_refused_before_post'
+                : 'xero_sync_claim_lost_before_post',
           tag: 'sync',
           level: 'WARNING',
           description: syncResult.notPosted.message,
@@ -3684,7 +3694,16 @@ type EntryResult = {
    * a failure may have reached Xero, this provably did not, so the row is handed back rather than
    * having its retry count spent. Callers must test this before `skipped` and before `success`.
    */
-  notPosted?: { reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded'; operation: string; message: string }
+  notPosted?: {
+    /**
+     * o3d-jit6 r3: `transport-refused` is the one of these that happens AFTER the dispatch record was
+     * minted — the fence sent nothing because the transport would not. The row is handed back exactly
+     * like the other three, and the marker it left behind is a known, named residual (o3d-gvzu).
+     */
+    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused'
+    operation: string
+    message: string
+  }
 }
 
 /**
@@ -5102,12 +5121,33 @@ async function processClaimedEntry(
       // from (see accounting-egress-authorization.ts): an authorisation may read AND WRITE the
       // database and one of them takes an exclusive slot, so asking twice is not free, and o3d-batch-
       // realm deleted precisely such a pre-check on the ground that a refusal produced from a stale
-      // read is as wrong as a permission produced from one. A refusal there therefore still leaves the
-      // marker standing, and the remedy is the one the refusal already prescribes — the per-row
-      // settlement, which since r2 records itself as an OPERATOR ASSERTION rather than as a
-      // confirmation. Releasing a marker on positive "this never left the process" evidence would need
-      // a durable column of its own; the trigger deliberately forbids clearing the pair, so that is a
-      // separate change and not a comment.
+      // read is as wrong as a permission produced from one.
+      //
+      // r3 (Codex HIGH, round 3 of this finding) — AND MINTING INSIDE THE TRANSPORT IS NOT THE ANSWER
+      // EITHER, WHICH IS WHY THE MARKER IS STILL MINTED HERE. Moving the mint to the statement before
+      // `connectorFetch` was the obvious repair and it fails on three counts. (1) THE CLAIM PROOF
+      // COULD NO LONGER BE ADJACENT: between this fence and that statement lie `waitForBudget`, which
+      // SLEEPS up to a minute, and an awaited egress authorisation — so the claim would be proven up
+      // to a minute before it was used, which is exactly the o3d-xl63 r5 #1 defect a structural test
+      // already forbids. Carrying the lease into the transport instead would put sync-row claim
+      // fencing inside the shared HTTP client that every Xero GET, PDF download, attachment upload
+      // and tax-rate read goes through. (2) THE RETRY LOOP has no single "the" attempt to mint on.
+      // (3) IT WOULD NOT EVEN BE TRUE: `noteRequest` runs before `connectorFetch`, and a connection
+      // that is refused, times out or fails TLS sent nothing either — so the mint would still
+      // sometimes stand over a create nobody made. There is no point at which "minted" implies "sent";
+      // minting before the wire is a deliberate over-claim, and narrowing it is not closing it.
+      //
+      // SO THE MARKER STANDS AFTER A TRANSPORT REFUSAL, AND WHAT CHANGES IS THAT THE ATTEMPT SAYS SO.
+      // `postPreparedManualJournal` reports `reachedTheWire`, measured from the transport's own
+      // monotonic attempt counter rather than from a status code or an error string, and an attempt
+      // that provably sent nothing is returned as `notPosted` — handed back intact, no retry spent,
+      // no FAILED status, and a named WARNING activity row carrying this sync log's id. The refusal a
+      // later attempt makes then names BOTH producers of the state instead of asserting the
+      // commit-failure story, and points at that activity row (see
+      // CREATE_DISPATCH_UNSETTLED_MEANING). CLEARING the marker on that evidence would need a durable
+      // column of its own — the trigger deliberately forbids clearing the pair, and rightly so, since
+      // this marker is a PROHIBITION and one that tampering clears hands the tamperer what they
+      // wanted. That column is o3d-gvzu and is a separate change, not a comment.
       const prepared = prepareManualJournal({
         date: payload.date as string,
         reference: payload.reference as string,
@@ -5145,8 +5185,25 @@ async function processClaimedEntry(
       if (!dispatch.dispatch) return { success: false, error: dispatch.error }
       const fence = await lease.fenceBeforeRemoteWrite('manual-journal', dispatch.mint ?? undefined)
       if (!fence.ok) return fence.result
-      return postPreparedManualJournal(prepared.prepared, { idempotencyKey: journalIdempotencyKey })
-        .then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
+      const posted = await postPreparedManualJournal(prepared.prepared, { idempotencyKey: journalIdempotencyKey })
+      if (!posted.success && !posted.reachedTheWire) {
+        // The transport refused after the fence. Nothing left the process, so this is not a failure
+        // of the row: failing it spends a retry and drives it to FAILED for a reason that is about
+        // the connection, the tenant's posting intent, an egress authorisation or an exhausted rate
+        // budget — none of which the row can do anything about. `notPosted` is the channel that
+        // already exists for "provably nothing was sent", and it is what writes the durable,
+        // named activity row the later refusal tells an operator to look for.
+        const message = describeCreateDispatchNotSent({
+          label: `${type} for ${referenceType} ${referenceId}`,
+          error: posted.error ?? 'the transport gave no reason',
+        })
+        return {
+          success: false,
+          error: message,
+          notPosted: { reason: 'transport-refused', operation: 'manual-journal', message },
+        }
+      }
+      return { success: posted.success, externalId: posted.journalId, error: posted.error }
     }
 
     case 'TAX_RATE_SYNC': {
