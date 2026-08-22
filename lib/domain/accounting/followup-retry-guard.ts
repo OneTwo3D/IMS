@@ -3,7 +3,7 @@ import {
   readFollowUpIdempotencyKey,
   type FollowUpPayload,
 } from './followup-idempotency'
-import { documentAnchorFields } from './money-post-document'
+import { couldBeTheSameDocument } from './money-post-document'
 import {
   classifyLedgerSettlement,
   describeAttempt,
@@ -207,44 +207,16 @@ function asPayload(value: unknown): FollowUpPayload | null {
 }
 
 /**
- * CASE-FOLDED (Codex round 7, HIGH #2). Two rows naming one Xero GUID in different case are the
- * same document — `4d8a…` and `4D8A…` address one invoice — so a byte-exact compare declared them
- * DIFFERENT documents and dropped the rival from the contender list, which is the same double-post
- * this filter exists to prevent, wearing a different spelling. Folding is injective over the ids
- * either connector issues (hex GUIDs, decimal strings), so it cannot merge two real documents;
- * see money-post-document.ts.
- *
- * ANCHORED PER TYPE (Codex round 9, HIGH #1). This used to compare the UNION of every anchor a
- * money payload can hold — `accountingInvoiceId` AND `creditNoteId` — whatever the type. On a
- * PAYMENT, `creditNoteId` is not part of the document: it is in no payment body either connector
- * sends, and neither probe dereferences it on a payment branch. So a rival row that happened to
- * carry one, compared against a row that did not, came out UNEQUAL and was dropped from the
- * contender list — the same split the lock key suffered, ending in the same double post.
- * `documentAnchorFields` is the single definition of what identifies a document, shared with the
- * lock key, the probe cache key and the sibling query's document arms.
- */
-function anchorsOf(type: string, payload: unknown): string[] {
-  const record = asPayload(payload)
-  return documentAnchorFields(type).map((field) => {
-    const value = record?.[field]
-    return typeof value === 'string' ? value.trim().toLowerCase() : ''
-  })
-}
-
-/**
  * Whether two rows could have committed the SAME external document.
  *
- * An attempt against a different invoice cannot have posted the one being retried, so it must
- * not trigger a refusal — refusing on row count alone permanently strands a legitimate payment
- * against a replacement invoice. A row with no recorded anchor is treated as MATCHING, because
- * "unknown target" has to read as "possibly this one" where money is concerned.
+ * The definition MOVED to `money-post-document.ts` (o3d-anu8 round 3) and is imported, not copied.
+ * It is case-folded (Xero matches invoice numbers case-insensitively and its ids are GUIDs),
+ * type-aware (`creditNoteId` identifies a credit-note allocation and nothing else) and treats an
+ * unanchored row as MATCHING, because "unknown target" has to read as "possibly this one" where
+ * money is concerned. It now sits beside `documentAnchorFields`, below both this module and
+ * `followup-idempotency.ts`, so the ENQUEUE PLANNER can reach the same answer without an import
+ * cycle — and therefore without a comparison of its own.
  */
-function couldBeTheSameDocument(type: string, left: unknown, right: unknown): boolean {
-  const a = anchorsOf(type, left)
-  const b = anchorsOf(type, right)
-  if (a.every((value) => value === '') || b.every((value) => value === '')) return true
-  return a.every((value, index) => value === b[index])
-}
 
 /**
  * Exported for the POST fence, which judges the same rival attempts this planner does and must not

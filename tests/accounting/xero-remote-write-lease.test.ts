@@ -89,6 +89,14 @@ function matchesWhere(row: Row, where: Record<string, unknown>): boolean {
       if (!(predicate as Array<Record<string, unknown>>).every((clause) => matchesWhere(row, clause))) return false
       continue
     }
+    // o3d-anu8 r3: `NOT` is a real Prisma operator and the claim/custody statement now uses one —
+    // `stampingCustodyOnClaim` refuses to restore custody to a money row that carries neither
+    // custody nor an attempt stamp. Interpreting it (rather than ignoring it, or throwing) is what
+    // makes these doubles evaluate the predicate production evaluates.
+    if (key === 'NOT') {
+      if (matchesWhere(row, predicate as Record<string, unknown>)) return false
+      continue
+    }
     if (!matchValue(row[key], predicate)) return false
   }
   return true

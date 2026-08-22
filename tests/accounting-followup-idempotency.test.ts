@@ -13,6 +13,7 @@ import {
   storedBodyMayHaveReachedTheLedger,
   withFollowUpIdempotencyKey,
 } from '@/lib/domain/accounting/followup-idempotency'
+import { attemptCouldBeTheSameDocument } from '@/lib/domain/accounting/followup-retry-guard'
 
 /**
  * o3d-h2wx: a follow-up's REMOTE idempotency key must survive regeneration of its
@@ -1677,6 +1678,75 @@ test('[o3d-anu8 r2] an UNANCHORED assertion still counts — unknown reads as po
     plan.action === 'create' ? plan.restsOnAssertion : undefined,
     { assertedNotPostedRowIds: ['log-legacy'] },
   )
+})
+
+test('[o3d-anu8 r3] an assertion about THIS document in a different CASE is still part of what cleared it', () => {
+  // Codex round 3, MEDIUM. XERO MATCHES INVOICE NUMBERS CASE-INSENSITIVELY and its document ids are
+  // GUIDs — `4D8A…` and `4d8a…` address ONE invoice — which is why the repository has a canonical,
+  // case-folded money-document comparison and why the money fence uses it. The round-2 filter
+  // reached for this module's own byte-exact `couldHaveCommittedThis` instead, so an assertion about
+  // the very document being enqueued was dropped from the record: `restsOnAssertion` then said
+  // nothing rested on a human's word when something did, and the audit trail back to the operator
+  // who vouched for it was gone.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: '4D8A1F2B-0000-4000-8000-00000000ABCD' },
+    liveRowExists: false,
+    failedRows: [],
+    assertedNotPostedRows: [{ id: 'log-same-doc', payload: { accountingInvoiceId: '4d8a1f2b-0000-4000-8000-00000000abcd' } }],
+  })
+  assert.deepEqual(
+    plan.action === 'create' ? plan.restsOnAssertion : undefined,
+    { assertedNotPostedRowIds: ['log-same-doc'] },
+    'case is not part of a document\'s identity, so this assertion cleared THIS payment',
+  )
+})
+
+test('[o3d-anu8 r3] a PAYMENT is identified by its invoice — an irrelevant creditNoteId does not split it', () => {
+  // The other half of "canonical". `creditNoteId` identifies a credit-note ALLOCATION and nothing
+  // else: no payment body either connector sends carries it, and neither probe dereferences it on a
+  // payment branch. Comparing the UNION of both anchors — which is what this module's local
+  // comparison does — made a row that happens to hold one come out UNEQUAL to a row that does not,
+  // and the assertion about the same invoice vanished from the record.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [],
+    assertedNotPostedRows: [{ id: 'log-with-cn', payload: { accountingInvoiceId: 'inv-9', creditNoteId: 'cn-3' } }],
+  })
+  assert.deepEqual(
+    plan.action === 'create' ? plan.restsOnAssertion : undefined,
+    { assertedNotPostedRowIds: ['log-with-cn'] },
+    'a payment is identified by the invoice it settles; a stray anchor is not a different document',
+  )
+})
+
+test('[o3d-anu8 r3] the assertion filter and the money fence answer with ONE comparison', () => {
+  // The rule the two tests above are instances of, stated directly: the planner must not have a
+  // comparison of its own. `attemptCouldBeTheSameDocument` is what the POST fence judges rival
+  // attempts with, and a record built from a different answer describes a different question from
+  // the one that was decided.
+  for (const [left, right] of [
+    [{ accountingInvoiceId: '4D8A' }, { accountingInvoiceId: '4d8a' }],
+    [{ accountingInvoiceId: 'inv-9', creditNoteId: 'cn-3' }, { accountingInvoiceId: 'inv-9' }],
+    [{ accountingInvoiceId: 'inv-1' }, { accountingInvoiceId: 'inv-9' }],
+    [{}, { accountingInvoiceId: 'inv-9' }],
+  ] as const) {
+    const plan = planFollowUpEnqueue({
+      ...ORDER,
+      payload: right as Record<string, unknown>,
+      liveRowExists: false,
+      failedRows: [],
+      assertedNotPostedRows: [{ id: 'log-x', payload: left }],
+    })
+    const named = plan.action === 'create' && plan.restsOnAssertion !== undefined
+    assert.equal(
+      named,
+      attemptCouldBeTheSameDocument('INVOICE_PAYMENT', left, right),
+      `the filter disagreed with the fence about ${JSON.stringify(left)} vs ${JSON.stringify(right)}`,
+    )
+  }
 })
 
 test('[o3d-anu8] with no operator-cancelled row the plan carries no such claim', () => {

@@ -141,13 +141,32 @@ const POSTED_ROW = {
   externalTransactionId: 'XERO-1',
 }
 
+
+/**
+ * The claim predicate as ONE object. `stampingCustodyOnClaim` composes the caller's predicate with
+ * the custody refusal as `{ AND: [caller, refusal] }` (o3d-anu8 r3) — AND-ed rather than spread,
+ * because both halves already carry an `OR` and a spread would silently replace one with the other.
+ * Flattening here keeps these assertions about the CALLER's half, which is what they are about.
+ */
+function flattenWhere(where: Record<string, unknown>): Record<string, unknown> {
+  const flat: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(where)) {
+    if (key === 'AND' && Array.isArray(value)) {
+      for (const arm of value as Array<Record<string, unknown>>) Object.assign(flat, flattenWhere(arm))
+      continue
+    }
+    flat[key] = value
+  }
+  return flat
+}
+
 test('claiming a row mints a new attempt: the claim CASes on the revision it read and bumps it', async () => {
   reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
 
   const result = await (await loadProcessor())()
 
   assert.equal(result.processed, 1)
-  const claimWhere = store.updateManyWheres[0]
+  const claimWhere = flattenWhere(store.updateManyWheres[0] as Record<string, unknown>)
   assert.equal(claimWhere.attemptRevision, 3, 'the claim must be a compare-and-swap on the revision that was read')
   assert.equal(store.get('log-1')?.attemptRevision, 4, 'a claim must move the row to a new attempt')
   assert.equal(store.get('log-1')?.status, 'SYNCED')

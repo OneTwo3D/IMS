@@ -75,6 +75,7 @@ import {
   carryAccountingOriginRecord,
 } from '@/lib/connectors/accounting-connection-provenance'
 import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
+import { couldBeTheSameDocument } from '@/lib/domain/accounting/money-post-document'
 
 export type FollowUpPayload = Record<string, unknown>
 
@@ -515,13 +516,25 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // reliance out of nothing: `restsOnAssertion` is precisely the claim "this plan only got here
   // because a human vouched for something", and that would be untrue.
   //
-  // `couldHaveCommittedThis` is the SAME comparison the live-row lookup (`liveRowOccupiesFollowUpSlot`)
-  // and the failed-row history (`couldHaveCommitted`, below) already use — anchors compared
-  // element-wise, an unanchored stored payload counting as MATCHING because unknown must read as
-  // "possibly this one". A second comparison here could disagree with the two that decide, and then
-  // the record would describe a different question from the one that was answered.
+  // AND IT USES THE CANONICAL DOCUMENT IDENTITY, NOT A LOCAL SPELLING OF ONE (Codex round 3, MEDIUM).
+  // The round-2 filter reached for `couldHaveCommittedThis`, which compares this module's own
+  // `ANCHOR_FIELDS` — both id fields, for every type — BYTE-EXACTLY. Neither half is how a document
+  // is identified anywhere that decides: XERO MATCHES INVOICE NUMBERS CASE-INSENSITIVELY and its
+  // document ids are GUIDs, so `4d8a…` and `4D8A…` are one invoice, and `creditNoteId` identifies a
+  // credit-note allocation and nothing else. Compared byte-exactly and over the union, an assertion
+  // about THIS document differing only in case was dropped from the record — `restsOnAssertion`
+  // then says nothing rested on a human's word when something did, which is the direction that
+  // loses an audit trail rather than manufacturing one.
+  //
+  // `couldBeTheSameDocument` is the comparison the MONEY FENCE itself uses (the guard re-exports it
+  // as `attemptCouldBeTheSameDocument`), moved to `money-post-document.ts` so this planner can
+  // import it without the cycle that kept it out (o3d-anu8 r3). It keeps the same conservative
+  // fallback: a payload with no anchors at all counts as matching, because unknown must read as
+  // "possibly this one". There is no third comparison here — the two that already exist are this
+  // module's token-scoped `anchorsOf` and the canonical one, and the record now uses the canonical
+  // one.
   const assertedNotPostedRowIds = (input.assertedNotPostedRows ?? [])
-    .filter((row) => couldHaveCommittedThis(asPayload(row.payload), freshAnchors))
+    .filter((row) => couldBeTheSameDocument(input.type, row.payload, input.payload))
     .map((row) => row.id)
   const restsOnAssertion: SettlementAssertionReliance | undefined =
     moneyMoving && assertedNotPostedRowIds.length > 0 ? { assertedNotPostedRowIds } : undefined

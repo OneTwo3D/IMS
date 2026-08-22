@@ -1598,25 +1598,31 @@ async function claimAccountingSyncLog(
    */
   attempt: AttemptRef,
 ): Promise<SyncLogClaimResult> {
-  const claimData = {
-    status: 'PROCESSING' as const,
-    attemptRevision: attempt.attemptRevision,
-    // o3d-0m56 r10: the claim and attempt-stamping CUSTODY move together, ALWAYS, and they do it
-    // here — in the one object both claim statements below share — rather than at each call site.
-    // A claim is what precedes a post, so the database's forfeit trigger reads a claim that does not
-    // re-assert custody as one made by a binary that does not stamp and takes custody away. Losing it
-    // is silent and permanent for that row: its unset `remoteAttemptedAt` can never again be read as
-    // proof no remote call left it, so the planner will never recycle it. `stampingCustodyOnClaim`
-    // emits `processingStartedAt` and `attemptStampingCustodyAt` from ONE instant, which is the
-    // pairing the trigger checks — spelling either out separately would break it.
-    ...stampingCustodyOnClaim(claimedAt),
-  }
+  // o3d-0m56 r10 / o3d-anu8 r3: the claim, attempt-stamping CUSTODY and the refusal that makes
+  // restoring custody safe are ONE `updateMany` argument, built here — in the one object both claim
+  // statements below share — rather than assembled at each call site.
+  //
+  // A claim is what precedes a post, so the database's forfeit trigger reads a claim that does not
+  // re-assert custody as one made by a binary that does not stamp, and takes custody away. Losing it
+  // is silent and permanent for that row: its unset `remoteAttemptedAt` can never again be read as
+  // proof no remote call left it, so the planner will never recycle it.
+  //
+  // And restoring it is not unconditional. A money row an OLD binary claimed, posted from and left
+  // unstamped carries neither custody nor a stamp, and that pair means "undetermined". Restoring
+  // custody alone would rewrite it into `attemptProvenNeverMade`'s positive proof — a payment that
+  // may have posted, read as certainly not posted. The helper's predicate refuses that row instead;
+  // the repair on the first line of this sweep stamps it, and it claims normally afterwards.
+  const claimStatement = stampingCustodyOnClaim({
+    where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision),
+    processingStartedAt: claimedAt,
+    data: {
+      status: 'PROCESSING' as const,
+      attemptRevision: attempt.attemptRevision,
+    },
+  })
 
   if (entry.type !== 'INVOICE_PAYMENT' || entry.referenceType !== 'SalesOrder') {
-    const claim = await db.accountingSyncLog.updateMany({
-      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision),
-      data: claimData,
-    })
+    const claim = await db.accountingSyncLog.updateMany({ ...claimStatement })
     return claim.count === 0 ? { outcome: 'not-claimable' } : { outcome: 'claimed' }
   }
 
@@ -1636,10 +1642,7 @@ async function claimAccountingSyncLog(
     if (!decision.claim) {
       return { outcome: 'deferred', reason: decision.reason, blockedBy: decision.blockedBy }
     }
-    const claim = await tx.accountingSyncLog.updateMany({
-      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision),
-      data: claimData,
-    })
+    const claim = await tx.accountingSyncLog.updateMany({ ...claimStatement })
     return claim.count === 0 ? { outcome: 'not-claimable' } : { outcome: 'claimed' }
   })
 }
@@ -1719,26 +1722,33 @@ export async function deferUnclaimedPaymentUntilEarlierLogsPost(
 ): Promise<boolean> {
   // A future `processingStartedAt` on a PENDING row is the existing retry gate: it is read as
   // "earliest next claim time", not as a claim.
-  const deferred = await client.accountingSyncLog.updateMany({
+  //
+  // The `data` below carries NO `status` KEY, and that is the whole point — see the header above.
+  // This row was never claimed, so writing the queued status here would stamp over a claim another
+  // runner took in the meantime, un-claiming a request that may already be on the wire. (Spelt that
+  // way deliberately: the structural test in xero-sync-processor.test.ts scans this call's argument
+  // text for a queued-status write, and a comment quoting one reads as the defect itself.) The
+  // where-clause pins the row instead.
+  //
+  // BUT THE CUSTODY STAMP IS STILL REQUIRED, and the two rules are not in tension. The forfeit
+  // trigger fires on ANY update that moves `processingStartedAt` to a new non-null value — it does
+  // not also require the status to change — so this write would silently drop
+  // `attemptStampingCustodyAt` and make the row permanently un-recyclable, however careful it is
+  // about ownership. `stampingCustodyOnClaim` re-asserts it and sets no status of its own, so it
+  // satisfies both fences at once. Custody is a claim about the BINARY that touched the row, not
+  // about who owns it, and a stamping binary is exactly what is touching it here.
+  //
+  // AND THIS IS THE ONE CUSTODY WRITE THAT REACHES A ROW THIS WORKER DOES NOT OWN (o3d-anu8 r3), so
+  // it is the one most able to launder an old binary's unstamped attempt back into custody. The
+  // helper's refusal covers it: an INVOICE_PAYMENT row carrying neither custody nor a stamp is not
+  // re-gated at all, and this reports that the deferral did not land — the closed direction.
+  const deferred = await client.accountingSyncLog.updateMany(stampingCustodyOnClaim({
     where: { id: entry.id, status: 'PENDING' },
+    processingStartedAt: new Date(Date.now() + ORDERING_DEFERRAL_MS),
     data: {
-      // NO `status` KEY, and that is the whole point — see the header above. This row was never
-      // claimed, so writing the queued status here would stamp over a claim another runner took in
-      // the meantime, un-claiming a request that may already be on the wire. (Spelt that way
-      // deliberately: the structural test in xero-sync-processor.test.ts scans this call's argument
-      // text for a queued-status write, and a comment quoting one reads as the defect itself.)
-      //
-      // BUT THE CUSTODY STAMP IS STILL REQUIRED, and the two rules are not in tension. The forfeit
-      // trigger fires on ANY update that moves `processingStartedAt` to a new non-null value — it
-      // does not also require the status to change — so this write would silently drop
-      // `attemptStampingCustodyAt` and make the row permanently un-recyclable, however careful it is
-      // about ownership. `stampingCustodyOnClaim` re-asserts it and sets NO status, so it satisfies
-      // both fences at once. Custody is a claim about the BINARY that touched the row, not about who
-      // owns it, and a stamping binary is exactly what is touching it here.
-      ...stampingCustodyOnClaim(new Date(Date.now() + ORDERING_DEFERRAL_MS)),
       errorMessage: invoicePaymentDeferralMessage(detail),
     },
-  })
+  }))
   return deferred.count > 0
 }
 

@@ -89,10 +89,26 @@ function makeRowStore(
     if (state === null) return false
     for (const [key, expected] of Object.entries(where)) {
       if (key === 'OR') continue
+      // o3d-anu8 r3: `NOT` is a real Prisma operator and the claim/custody statement now uses one —
+      // `stampingCustodyOnClaim` refuses to restore custody to a money row that carries neither
+      // custody nor an attempt stamp. Interpreting it (rather than ignoring it, or throwing) is what
+      // makes these doubles evaluate the predicate production evaluates.
+      if (key === 'AND') {
+        if (!(expected as Array<Record<string, unknown>>).every((clause) => leafMatches(clause))) return false
+        continue
+      }
+      if (key === 'NOT') {
+        if (leafMatches(expected as Record<string, unknown>)) return false
+        continue
+      }
       const actual = (state as unknown as Record<string, unknown>)[key]
       if (expected instanceof Date) {
         if ((actual as Date | null)?.valueOf() !== expected.valueOf()) return false
-      } else if (actual !== expected) return false
+      } else if (expected !== null && typeof expected === 'object') {
+        // `{ in: [...] }` is the only operator the custody refusal introduces here.
+        const ops = expected as Record<string, unknown>
+        if ('in' in ops && !(ops.in as unknown[]).includes(actual)) return false
+      } else if ((actual ?? null) !== expected) return false
     }
     if (Array.isArray(where.OR)) {
       if (!(where.OR as Array<Record<string, unknown>>).some((clause) => leafMatches(clause))) return false
@@ -787,6 +803,10 @@ test('o3d-m5qk: the claim helper is the ONLY writer of the claim predicate, and 
   )
   assert.ok(helper.length > 0, 'the claim helper must be found')
 
+  // RE-POINTED, NOT RELAXED (o3d-anu8 r3). The claim predicate is no longer spelt at each write: both
+  // writes take ONE `updateMany` argument that `stampingCustodyOnClaim` built, because the custody
+  // stamp and the refusal that makes restoring custody safe have to travel with the predicate rather
+  // than be assembled beside it. So each write must carry that shared statement...
   const WRITE_CALLS = ['accountingSyncLog.update(', 'accountingSyncLog.updateMany(', 'accountingSyncLog.upsert(']
   let writes = 0
   for (const call of WRITE_CALLS) {
@@ -794,14 +814,24 @@ test('o3d-m5qk: the claim helper is the ONLY writer of the claim predicate, and 
     while (at !== -1) {
       const args = callArgs(helper, at + call.length - 1)
       assert.ok(
-        args.includes('accountingSyncLogClaimWhere('),
-        `the claim helper wrote the row on terms other than the claim predicate:\n${args.slice(0, 300)}`,
+        args.includes('claimStatement'),
+        `the claim helper wrote the row on terms other than the claim statement:\n${args.slice(0, 300)}`,
       )
       writes++
       at = helper.indexOf(call, at + 1)
     }
   }
   assert.equal(writes, 2, 'exactly two claim writes: the unlocked path and the order-locked one')
+
+  // ...and that statement must be built from the claim predicate, through the helper that welds the
+  // custody stamp and the refusal onto it. Either half missing is the defect this pair replaces.
+  const built = helper.slice(helper.indexOf('const claimStatement = '))
+  assert.ok(built.length > 0, 'the shared claim statement must be built in the helper')
+  const statement = built.slice(0, built.indexOf('\n  })') + 5)
+  assert.match(statement, /stampingCustodyOnClaim\(\{/,
+    'the claim must go through the helper that pairs custody with the refusal, not write the columns itself')
+  assert.match(statement, /where: accountingSyncLogClaimWhere\(/,
+    'and the predicate it is built on must still be the claim predicate')
 
   // The order lock and the exclusion test must both be INSIDE the transaction that takes the claim,
   // and the claim write must come after them — otherwise the read that authorises the claim and the

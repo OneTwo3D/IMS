@@ -181,6 +181,44 @@ export function settlementDocumentAnchorFilters(
 }
 
 /**
+ * THE CANONICAL "COULD THESE TWO ROWS BE THE SAME DOCUMENT?" — one comparison, every reader
+ * (o3d-anu8 round 3, Codex MEDIUM).
+ *
+ * It lived in `followup-retry-guard.ts`, which is where the money fence reads it. It now lives HERE,
+ * beside `documentAnchorFields` — the definition of what makes two rows one document — because the
+ * ENQUEUE PLANNER needs the same answer and cannot import the guard: the guard imports
+ * `followup-idempotency.ts`, so the reverse edge would be a cycle resolved at runtime inside a money
+ * path. Moving the one definition down to the module both already sit above is what stops the
+ * planner growing a third comparison of its own.
+ *
+ * CASE-FOLDED, because Xero matches invoice numbers case-insensitively and its ids are GUIDs:
+ * `4d8a…` and `4D8A…` address one invoice, so a byte-exact compare would call them two documents and
+ * drop a rival from the contender list. Folding is injective over the ids either connector issues
+ * (hex GUIDs, decimal strings), so it cannot merge two real documents — see `documentIdentity`.
+ *
+ * TYPE-AWARE, because `creditNoteId` is part of a credit-note allocation's identity and of nothing
+ * else. Comparing the union of every anchor a money payload can hold made a payment row that
+ * happened to carry one come out UNEQUAL to a payment row that did not — the same split the lock key
+ * suffered, ending in the same double post.
+ *
+ * AND UNANCHORED READS AS MATCHING. A row with no recorded anchor at all could have targeted
+ * anything, and where money is concerned "unknown target" has to read as "possibly this one".
+ *
+ * `documentAnchorsOf` below is the per-type, case-folded anchor tuple the comparison runs over.
+ */
+function documentAnchorsOf(type: string, payload: unknown): string[] {
+  return documentAnchorFields(type).map((field) => documentIdentity(anchorValue(payload, field)))
+}
+
+/** See the block above: the one answer to "could these two rows be the same document?". */
+export function couldBeTheSameDocument(type: string, left: unknown, right: unknown): boolean {
+  const a = documentAnchorsOf(type, left)
+  const b = documentAnchorsOf(type, right)
+  if (a.every((value) => value === '') || b.every((value) => value === '')) return true
+  return a.every((value, index) => value === b[index])
+}
+
+/**
  * The document a money post targets, as one string.
  *
  * Deliberately the SAME value the settlement probe caches on, so the thing the lock excludes and

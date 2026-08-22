@@ -181,7 +181,16 @@ async function runQuickBooks() {
   return (await import('@/lib/connectors/quickbooks/sync-processor')).processPendingQuickBooksSync()
 }
 
-/** The entry under test: a queued QuickBooks receipt of 40 against QBINV-1 for order-1. */
+/**
+ * The entry under test: a queued QuickBooks receipt of 40 against QBINV-1 for order-1.
+ *
+ * IT CARRIES ATTEMPT-STAMPING CUSTODY, because a row THIS binary created does (o3d-anu8 r3):
+ * every `accountingSyncLog.create` in the codebase spreads `stampingCustodyOnCreate()`. Since r3 the
+ * claim REFUSES a money row that carries neither custody nor an attempt stamp — that pair is an old
+ * binary's row, which may already have reached the wire, and granting it custody would rewrite its
+ * silence into proof that nothing was sent. Leaving it null here would model a rolled-back binary's
+ * row, and these tests are about the guards that run AFTER the claim.
+ */
 function queuedPaymentEntry() {
   return syncLogRow({
     id: 'entry-pay',
@@ -192,11 +201,55 @@ function queuedPaymentEntry() {
     referenceId: 'order-1',
     payload: { ...PAYMENT_PAYLOAD },
     createdAt: new Date('2026-08-20T09:00:00.000Z'),
+    attemptStampingCustodyAt: new Date('2026-08-20T09:00:00.000Z'),
   })
 }
 
 /** A 100.00 order raised in IMS, so the ledger invoice total is 100.00. */
 const ORDER_100 = { totalForeign: 100, taxForeign: 0, pricesIncludeVat: false, shoppingLinks: [] }
+
+test('[o3d-anu8 r3] a money row OUTSIDE stamping custody is not claimed at all — a claim would launder it', async () => {
+  // THE DEPLOYMENT OVERLAP THIS MECHANISM EXISTS FOR. An OLD binary claimed this receipt, its
+  // request REACHED QUICKBOOKS, and it recorded nothing: the forfeit trigger took custody and the
+  // old binary never stamps `remoteAttemptedAt`. That pair reads UNDETERMINED, which is correct —
+  // the payment may be in the ledger.
+  //
+  // Claiming it would restore custody unconditionally and leave `custody present, no stamp`, which
+  // `attemptProvenNeverMade` reads as POSITIVE PROOF that nothing was ever sent. The pass-level
+  // repair cannot cover this: it runs once at the top of a sweep, and a row an old binary is still
+  // handling can appear after it. So the claim itself refuses.
+  reset([{ ...queuedPaymentEntry(), attemptStampingCustodyAt: null }])
+  salesOrder = ORDER_100
+
+  await runQuickBooks()
+
+  assert.deepEqual(qboPosts, [], 'nothing may be sent from a row whose history is undetermined')
+  const row = store.get('entry-pay')
+  assert.equal(row?.status, 'PENDING', 'the claim did not land, so the row is untouched')
+  assert.equal(
+    row?.attemptStampingCustodyAt ?? null,
+    null,
+    'and custody was NOT restored — restoring it is what turns the missing stamp into proof',
+  )
+  assert.equal(row?.remoteAttemptedAt ?? null, null, 'nor was anything invented about the attempt')
+})
+
+test('[o3d-anu8 r3] once the row carries an attempt stamp the claim lands again — the refusal is not a dead end', async () => {
+  // The control. `repairMoneyAttemptsOutsideStampingCustody` runs on the first line of every sweep
+  // and converts exactly this population into a conservative `remoteAttemptedAt`; with that stamp
+  // there is no silence left to convert into proof, so the row claims normally. The cost is the
+  // documented one — the row can never be recycled again — never a lost attempt.
+  reset([{
+    ...queuedPaymentEntry(),
+    attemptStampingCustodyAt: null,
+    remoteAttemptedAt: new Date('2026-08-20T08:30:00.000Z'),
+  }])
+  salesOrder = ORDER_100
+
+  await runQuickBooks()
+
+  assert.notEqual(store.get('entry-pay')?.status, 'PENDING', 'the row was claimed')
+})
 
 test('[o3d-anu8] a QuickBooks payment is REFUSED when a sibling registration was only ASSERTED', async () => {
   reset([
@@ -319,6 +372,10 @@ function receiptNeedingCustomerLookup(id: string, amount: number) {
     referenceId: 'order-1',
     payload: { ...withoutCustomerRef, amount },
     createdAt: new Date('2026-08-20T08:00:00.000Z'),
+    // Created INSIDE custody, exactly as `stampingCustodyOnCreate()` does at every creation site —
+    // see queuedPaymentEntry. The claim refuses a money row that carries neither custody nor a
+    // stamp (o3d-anu8 r3), so a row without it would never be claimed and phase 1 would never run.
+    attemptStampingCustodyAt: new Date('2026-08-20T08:00:00.000Z'),
   })
 }
 

@@ -439,7 +439,14 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
 
   for (const entry of pending) {
     const claimedAt = new Date()
-    const claim = await db.accountingSyncLog.updateMany({
+    // The claim, attempt-stamping CUSTODY and the refusal that makes restoring custody safe are ONE
+    // `updateMany` argument (o3d-0m56 r10, o3d-anu8 r3). A claim is what precedes a post, so the
+    // database reads a claim that does not re-assert custody as one made by a binary that does not
+    // stamp, and forfeits it. And custody is not restored to a money row that carries neither
+    // custody nor an attempt stamp: that pair means "an old binary had this and may have posted
+    // from it", and re-granting custody would rewrite it into proof that nothing was ever sent.
+    // See money-attempt-provenance.ts.
+    const claim = await db.accountingSyncLog.updateMany(stampingCustodyOnClaim({
       where: {
         id: entry.id,
         connector: QBO_CONNECTOR,
@@ -458,15 +465,11 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           },
         ],
       },
+      processingStartedAt: claimedAt,
       data: {
         status: 'PROCESSING',
-        // The claim and attempt-stamping CUSTODY move together, always (o3d-0m56 r10). A claim is
-        // what precedes a post, so the database reads a claim that does not re-assert custody as
-        // one made by a binary that does not stamp, and forfeits it — see
-        // money-attempt-provenance.ts.
-        ...stampingCustodyOnClaim(claimedAt),
       },
-    })
+    }))
     if (claim.count === 0) continue
 
     result.processed++
@@ -592,14 +595,14 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
       } else {
         const errorMessage = syncResult.error ?? 'Unknown error'
         if (isRateLimitError(errorMessage)) {
-          await db.accountingSyncLog.update({
+          await db.accountingSyncLog.updateMany(stampingCustodyOnClaim({
             where: { id: entry.id },
+            processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
             data: {
               status: 'PENDING',
               errorMessage,
-              ...stampingCustodyOnClaim(new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage))),
             },
-          })
+          }))
         } else {
           const retryCount = entry.retryCount + 1
           const finalFailure = retryCount >= MAX_RETRIES
@@ -631,14 +634,14 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
     } catch (e) {
       const errorMessage = String(e)
       if (isRateLimitError(errorMessage)) {
-        await db.accountingSyncLog.update({
+        await db.accountingSyncLog.updateMany(stampingCustodyOnClaim({
           where: { id: entry.id },
+          processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
           data: {
             status: 'PENDING',
             errorMessage,
-            ...stampingCustodyOnClaim(new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage))),
           },
-        })
+        }))
       } else {
         const retryCount = entry.retryCount + 1
         const finalFailure = retryCount >= MAX_RETRIES
