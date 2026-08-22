@@ -50,10 +50,11 @@ import {
 } from '@/lib/domain/accounting/payment-ledger-hold'
 import {
   queueAccountingSync,
-  queueAccountingSyncTx,
+  queueAccountingSyncTxWithOutcome,
   getAccountingSettings,
   getActiveAccountingConnectorInfo,
   isAccountingSyncTypeEnabled,
+  type AccountingEnqueueOutcome,
   type AccountingSettings,
 } from '@/lib/accounting'
 import {
@@ -1999,7 +2000,10 @@ async function queueRefundAccountingActions(input: {
 
   for (const sync of input.accountingSyncs) {
     if (sync.type === 'COGS_REVERSAL') {
-      let queuedInTx = false
+      // r8: the WHOLE answer, not a bare boolean — see queueAccountingSyncTxWithOutcome. The default
+      // is a refusal because an obligation whose enqueue never answered is owed, not settled; it is
+      // unreachable while the transaction either assigns or throws.
+      let outcomeInTx: AccountingEnqueueOutcome = { queued: false, reason: 'refused', connector: null }
       // bcz9.4: queue the COGS_REVERSAL journal and record its COGS subledger row in
       // ONE transaction. Recording at queue time (not at refund staging) guarantees the
       // negative ledger row exists only once the GL reversal is durably queued, so the
@@ -2015,11 +2019,15 @@ async function queueRefundAccountingActions(input: {
         await lockSalesOrder(tx, input.orderId)
         // Record based on the queue's OWN decision (not a separate settings recheck) so
         // a connector/setting flip between the two can't desync queue vs ledger (Codex).
-        const queued = await queueAccountingSyncTx(tx, sync)
-        queuedInTx = queued
-        await recordRefundCogsReversalFromSync(tx, sync, queued)
+        // r8: the adapter, which carries out the connector the enqueue itself resolved — the one the
+        // row is written under — so the ledger can apply the same pinned-connector check it applies
+        // to every facade answer. `queued` is the identical boolean the other call sites read, so the
+        // COGS subledger row is still recorded on the queue's OWN decision.
+        const outcome = await queueAccountingSyncTxWithOutcome(tx, sync)
+        outcomeInTx = outcome
+        await recordRefundCogsReversalFromSync(tx, sync, outcome.queued)
       })
-      ledger.accountInTransaction(sync, queuedInTx)
+      ledger.accountInTransaction(sync, outcomeInTx)
     } else {
       ledger.account(sync, await queueAccountingSync(sync))
     }

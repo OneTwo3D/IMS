@@ -126,23 +126,103 @@ test('o3d-2sm1 r7: the connector is PINNED for the whole hand-off — a flip is 
   )
 })
 
-test('o3d-2sm1 r7: the in-transaction arm reads a bare false against the pinned verdict', async () => {
-  // `queueAccountingSyncTx` answers with a boolean shared by fourteen call sites: false means "no GL
-  // counterpart", whether because the type is off or because the enqueue declined. Split it here.
+test('o3d-2sm1 r7: the in-transaction arm reads a no-op against the pinned verdict', async () => {
+  // The transactional enqueue refuses on a deleted order scope and DECIDES when the type is off.
+  // Both wrote nothing; only one of them settles an obligation.
   const declined = await openRefundAccountingObligationLedger([COGS_REVERSAL], postingEnabled())
-  declined.accountInTransaction(COGS_REVERSAL, false)
+  declined.accountInTransaction(COGS_REVERSAL, { queued: false, reason: 'refused', connector: 'xero' })
   assert.throws(() => declined.settle(), /the in-transaction enqueue wrote nothing while COGS_REVERSAL was enabled/)
 
   const switchedOff = await openRefundAccountingObligationLedger([COGS_REVERSAL], {
     activeConnector: async () => 'xero',
     isTypeEnabled: async () => false,
   })
-  switchedOff.accountInTransaction(COGS_REVERSAL, false)
+  switchedOff.accountInTransaction(COGS_REVERSAL, { queued: false, reason: 'not-configured', connector: 'xero' })
   switchedOff.settle()
 
+  // Switched off UNDER the hand-off, having been enabled when it began: the pinned verdict says this
+  // posting was expected to exist, so the no-op is not the decision that was pinned.
+  const switchedOffLate = await openRefundAccountingObligationLedger([COGS_REVERSAL], postingEnabled())
+  switchedOffLate.accountInTransaction(COGS_REVERSAL, { queued: false, reason: 'not-configured', connector: 'xero' })
+  assert.throws(
+    () => switchedOffLate.settle(),
+    /switched off, though it was enabled when the hand-off began/,
+  )
+
   const queued = await openRefundAccountingObligationLedger([COGS_REVERSAL], postingEnabled())
-  queued.accountInTransaction(COGS_REVERSAL, true)
+  queued.accountInTransaction(COGS_REVERSAL, { queued: true, connector: 'xero' })
   queued.settle()
+})
+
+/* ------------------------------------------------------------------------------------------------
+ * ROUND 8 (Codex HIGH) — THE PIN WAS APPLIED IN ONE ARM ONLY.
+ *
+ * r7 pinned the connector for the whole hand-off and checked every FACADE answer against it. The
+ * in-transaction arm took a bare `true`, which cannot say which connector produced it, while
+ * `queueAccountingSyncTx` resolves the active connector for ITSELF — after the pin was taken. So the
+ * one arm that could not see a flip was the one arm that did not have to.
+ * ---------------------------------------------------------------------------------------------- */
+
+test('o3d-2sm1 r8: a connector flip between the pin and the IN-TRANSACTION enqueue leaves the obligation unmet', async () => {
+  const ledger = await openRefundAccountingObligationLedger([COGS_REVERSAL], postingEnabled())
+
+  // THE FLIP. The row was written — `queueAccountingSyncTx` returned true and the COGS subledger row
+  // was recorded beside it — but it was written for QuickBooks, and the credit note that preceded it
+  // went to Xero. Under r7 this bare `true` settled the obligation and the recovery flag came down
+  // over a refund whose postings are split across two ledgers.
+  ledger.accountInTransaction(COGS_REVERSAL, { queued: true, connector: 'quickbooks' })
+
+  assert.throws(
+    () => ledger.settle(),
+    (error: unknown) => {
+      assert.ok(error instanceof RefundAccountingObligationsUnmet)
+      assert.equal(error.unmet.length, 1)
+      assert.match(error.message, /COGS_REVERSAL for SalesOrderRefund refund-1/)
+      assert.match(error.message, /the active accounting connector changed from xero to quickbooks/)
+      assert.match(error.message, /queued against a connector it was not reckoned against/)
+      return true
+    },
+  )
+})
+
+test('o3d-2sm1 r8: the connector going away mid-hand-off is a flip too, in both arms alike', async () => {
+  // ONE RULE, BOTH ARMS: the same sequence of checks, in the same order, over the same outcome shape.
+  // The facade arm has always caught this; the transactional arm now catches it identically.
+  for (const [arm, apply] of [
+    ['facade', (l: Awaited<ReturnType<typeof openRefundAccountingObligationLedger>>) =>
+      l.account(COGS_REVERSAL, { queued: true, connector: null })],
+    ['in-transaction', (l: Awaited<ReturnType<typeof openRefundAccountingObligationLedger>>) =>
+      l.accountInTransaction(COGS_REVERSAL, { queued: true, connector: null })],
+  ] as const) {
+    const ledger = await openRefundAccountingObligationLedger([COGS_REVERSAL], postingEnabled())
+    apply(ledger)
+    assert.throws(
+      () => ledger.settle(),
+      /the active accounting connector changed from xero to none during this hand-off/,
+      `${arm}: a connector that vanished under the hand-off must not settle a queued posting`,
+    )
+  }
+
+  // And the pin is the ONLY thing either arm accepts: the same queued answer under the pinned
+  // connector settles in both.
+  for (const apply of [
+    (l: Awaited<ReturnType<typeof openRefundAccountingObligationLedger>>) =>
+      l.account(COGS_REVERSAL, { queued: true, connector: 'xero' }),
+    (l: Awaited<ReturnType<typeof openRefundAccountingObligationLedger>>) =>
+      l.accountInTransaction(COGS_REVERSAL, { queued: true, connector: 'xero' }),
+  ]) {
+    const ledger = await openRefundAccountingObligationLedger([COGS_REVERSAL], postingEnabled())
+    apply(ledger)
+    ledger.settle()
+  }
+})
+
+test('o3d-2sm1 r8: with no connector pinned at all, an enqueue that names one is still a flip', async () => {
+  // The direction r7 could not express from a boolean: nothing was configured when the hand-off
+  // began — so every obligation was reckoned as "will never post" — and then a connector appeared.
+  const ledger = await openRefundAccountingObligationLedger([COGS_REVERSAL], postingEnabled(null))
+  ledger.accountInTransaction(COGS_REVERSAL, { queued: true, connector: 'xero' })
+  assert.throws(() => ledger.settle(), /the active accounting connector changed from none to xero/)
 })
 
 test('o3d-2sm1 r7: an obligation never handed to an enqueue at all is caught by the count', async () => {
@@ -178,8 +258,17 @@ test('o3d-2sm1 r7: every enqueue in the refund hand-off is accounted for, and it
   for (const call of facadeCalls) {
     assert.match(call[1], /ledger\.account\(\w+, $/, 'every facade enqueue hands its answer to the ledger')
   }
-  assert.match(handoff, /queueAccountingSyncTx\(tx, sync\)/)
-  assert.match(handoff, /ledger\.accountInTransaction\(sync, queuedInTx\)/)
+  // r8: THROUGH THE ADAPTER, which is what carries the enqueue's own resolved connector out to the
+  // ledger. A bare `queueAccountingSyncTx` here would hand back a boolean again and the pinned check
+  // would have nothing to check.
+  assert.match(handoff, /queueAccountingSyncTxWithOutcome\(tx, sync\)/)
+  assert.ok(
+    !/await queueAccountingSyncTx\(tx, sync\)/.test(handoff),
+    'the bare-boolean enqueue must not be what this hand-off accounts for',
+  )
+  assert.match(handoff, /ledger\.accountInTransaction\(sync, outcomeInTx\)/)
+  // And the COGS subledger row is still recorded on the queue's OWN decision, not a second recheck.
+  assert.match(handoff, /recordRefundCogsReversalFromSync\(tx, sync, outcome\.queued\)/)
 
   // AND IT SETTLES LAST: nothing may discharge the obligation unless every answer was met.
   const settleAt = handoff.lastIndexOf('ledger.settle()')
@@ -210,4 +299,42 @@ test('o3d-2sm1 r7: no enqueue path returns without saying what it did', () => {
     assert.deepEqual(bare, [], `${file}: every exit of the enqueue must report an outcome`)
     assert.match(body, /reason: 'not-configured'/, `${file}: and it must be able to say "nothing will post"`)
   }
+})
+
+test('o3d-2sm1 r8: the transactional enqueue names the connector it resolved, on every exit', () => {
+  const source = readFileSync(join(process.cwd(), 'lib/accounting.ts'), 'utf8')
+  const at = source.indexOf('export async function queueAccountingSyncTx(')
+  assert.ok(at > -1, 'the transactional enqueue must be found')
+  const body = source.slice(at, source.indexOf('\n}\n', at))
+
+  // A NAKED BOOLEAN IS THE DEFECT. `return true` is precisely the answer that cannot say which
+  // connector produced it, and it is what the pinned check had nothing to check.
+  const naked = body.split('\n').filter((line) => /(?:^|[ (])return (?:true|false)\b/.test(line))
+  assert.deepEqual(naked, [], 'every exit of the transactional enqueue must answer through the out-channel')
+
+  // AND THE QUEUED ANSWERS NAME `context.connector` — the connector the row is actually written
+  // under — rather than resolving the active connector a second time. A second read could agree with
+  // the pin while the write did not, which is the race being closed, not a check of it.
+  assert.equal(
+    body.split('return answer({ queued: true }, context.connector)').length - 1,
+    3,
+    'the idempotency hit, the create, and the unique-key collision all name the write’s connector',
+  )
+  assert.match(body, /return answer\(\{ queued: false, reason: 'refused' \}\)/, 'a deleted order scope is REFUSED, not decided')
+
+  // The adapter must not resolve the connector for itself either: it exists to carry out the one the
+  // enqueue resolved.
+  const adapterAt = source.indexOf('export async function queueAccountingSyncTxWithOutcome(')
+  assert.ok(adapterAt > -1, 'the adapter must be found')
+  const adapter = source.slice(adapterAt, source.indexOf('\n}\n', adapterAt))
+  assert.ok(
+    !/getActiveAccountingConnectorId|getActiveAccountingConnectorInfo/.test(adapter),
+    'the adapter must not resolve the connector independently — that is the race, not the fix',
+  )
+  // And it refuses rather than guessing when the two answers disagree.
+  assert.match(adapter, /if \(!outcome \|\| outcome\.queued !== queued\) \{/)
+  assert.match(adapter, /return \{ queued: false, reason: 'refused', connector: null \}/)
+
+  // The boolean contract the other call sites read is untouched.
+  assert.match(body, /\): Promise<boolean> \{/)
 })
