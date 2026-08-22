@@ -379,9 +379,27 @@ export async function purgeExpiredData(): Promise<{
     // Both ORs are carried under an explicit `AND` rather than as two `OR` keys, which an object
     // literal cannot hold: the age deferral and the population disjunction are separate conditions
     // and collapsing them into one array would compact a row that satisfied EITHER.
+    // AND THE MONEY EXCLUSION HAS TO BE A CLAUSE, NOT A COMMENT (o3d-nepa, Codex HIGH). It was only
+    // ever true of the DELETE, which spells `type: { notIn: REMOTE_MONEY_EVIDENCE_TYPES }` out. Here
+    // it was left to the shape of the two populations — and the SECOND one does not have that shape.
+    // UNRESOLVED_ABANDONED_CLAIM_WHERE is keyed on status alone (`CANCELLED`, plus an unresolved
+    // abandonment), and a money row is CANCELLED exactly as often as any other: the orphan sweep, the
+    // post-time retirement of a claimed row, an operator. So an expired CANCELLED INVOICE_PAYMENT /
+    // PURCHASE_CREDIT_NOTE_ALLOCATION / BILL_PAYMENT was held back from the delete by the money clause
+    // and then COMPACTED by this pass — the row survived and its payload, which IS the request that
+    // would be re-sent, did not.
+    //
+    // That is the worst of the three outcomes, not a middle one. The retry planner reads the stored
+    // body to decide whether an attempt could have committed and which idempotency token to post
+    // under; on `payload: {}` it can neither prove the attempt never left nor rebuild the request, so
+    // a money follow-up whose row was compacted is permanently unretryable.
+    //
+    // Spelled as the SAME predicate the delete uses, over the SAME shared constant, so the two passes
+    // cannot drift on what a money row is.
     const compactableWhere = {
       createdAt: { lt: cutoff },
       backReferenceEvidenceCompactedAt: null,
+      type: { notIn: [...REMOTE_MONEY_EVIDENCE_TYPES] },
       AND: [
         { OR: [{ syncedAt: null }, { syncedAt: { lt: cutoff } }] },
         { OR: [UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE, UNRESOLVED_ABANDONED_CLAIM_WHERE] },
@@ -432,8 +450,7 @@ export async function purgeExpiredData(): Promise<{
       }
       if (writtenThisPage === 0) break
       if (page.length < BACK_REFERENCE_EVIDENCE_COMPACTION_PAGE_SIZE) break
-    }
-    backReferenceEvidenceCompacted = compacted
+    }    backReferenceEvidenceCompacted = compacted
   }
 
   // Shopping webhook inbox — COMPACT succeeded rows (o3d-ahk). Clear the bulky payloadJson to reclaim

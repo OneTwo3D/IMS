@@ -431,6 +431,65 @@ test('[o3d-nepa] money-evidence rows are NOT compacted either — a blanked payl
 })
 
 // ---------------------------------------------------------------------------
+// Codex, this branch — THE MONEY EXEMPTION HAD TO SURVIVE THE ABANDONED-CLAIM POPULATION.
+//
+// The test above only ever exercised SYNCED money rows, and SYNCED rows fall outside BOTH compaction
+// populations for reasons that have nothing to do with money: the back-reference predicate does not
+// list the money types, and the abandoned-claim predicate is keyed on CANCELLED. So it passed while
+// the money exemption was absent from the compaction pass entirely.
+//
+// CANCELLED is where the two populations meet. A money row is cancelled exactly as often as any
+// other — the orphan sweep, the post-time retirement of a claimed row, an operator — and none of
+// those can see whether the remote call landed, which is what makes it an UNRESOLVED ABANDONED
+// CLAIM and pulls it into this pass by status alone. The delete then correctly refused to remove it
+// and the compaction blanked its payload, which for a money row is the request that would be
+// re-sent: after that the retry planner can neither prove the attempt never left nor rebuild it.
+// ---------------------------------------------------------------------------
+
+test('[o3d-nepa] a CANCELLED money row is UNRESOLVED, kept by the delete — and still not compacted', async () => {
+  const { deleteWhere, compact } = await runRetention()
+
+  for (const type of ['INVOICE_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION', 'BILL_PAYMENT']) {
+    // The ordinary abandonment: nothing on record about whether the call was made.
+    const unrecorded = row({ type, status: 'CANCELLED', externalTransactionId: null })
+    assert.equal(matches(unrecorded, deleteWhere), false, `a CANCELLED ${type} is not deleted`)
+    assert.equal(matches(unrecorded, compact.where), false, `a CANCELLED ${type} is not compacted either`)
+
+    // Explicitly `false` is the same fact as absent, and it reaches this pass the same way.
+    const notPreCall = row({ type, status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: false })
+    assert.equal(matches(notPreCall, compact.where), false, `a CANCELLED ${type} recorded as post-call is not compacted`)
+
+    // Proved pre-call, but the row NAMES A DOCUMENT the ledger returned — which outranks the
+    // abandonment written over it, so this is unresolved too.
+    const named = row({ type, status: 'CANCELLED', externalTransactionId: 'XPAY-9', abandonedBeforeRemoteCall: true })
+    assert.equal(matches(named, compact.where), false, `a CANCELLED ${type} naming a document is not compacted`)
+  }
+})
+
+test('[o3d-nepa] no money-evidence row is compacted at ANY status', async () => {
+  const { compact } = await runRetention()
+
+  // The exemption is a TYPE rule, not a status rule — asserted across the whole status space so a
+  // future population added to this pass cannot re-open the hole through a status nobody thought of.
+  for (const type of ['INVOICE_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION', 'BILL_PAYMENT']) {
+    for (const status of ['PENDING', 'PROCESSING', 'SYNCED', 'FAILED', 'CANCELLED']) {
+      for (const externalTransactionId of [null, 'XPAY-1']) {
+        assert.equal(
+          matches(row({ type, status, externalTransactionId }), compact.where),
+          false,
+          `a ${status} ${type} (${externalTransactionId ? 'posted' : 'no external id'}) must keep its payload`,
+        )
+      }
+    }
+  }
+
+  // ...and the pass still does its job for the document types it exists for, so this is an
+  // exemption rather than a disabled compaction.
+  assert.equal(matches(row({ type: 'SALES_INVOICE', status: 'CANCELLED', externalTransactionId: null }), compact.where), true)
+  assert.equal(matches(row({ type: 'PURCHASE_INVOICE', status: 'SYNCED', externalTransactionId: 'XBILL-1' }), compact.where), true)
+})
+
+// ---------------------------------------------------------------------------
 // o3d-nepa, THE P1 ITSELF (Codex r10 #2) — retention must not delete accounting work that can
 // STILL BE POSTED.
 //

@@ -170,13 +170,67 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
  * The Xero twin of this carries the full argument; the shape here is the same. Thrown rather than
  * branched because both post paths already handle a throw correctly: the obligation marker stays
  * claimed and the entry is retried, which is the right state for work that has not run.
+ *
+ * A DISTINCT CLASS, not a bare Error (Codex, this branch). "Both post paths handle a throw
+ * correctly" was true of the SHORT-CIRCUIT path, which has no catch and lets the throw reach the
+ * outer retry handler — and false of the FRESH-POST path one branch down, whose local catch treats
+ * every follow-up exception as best-effort, logs it and counts the entry SUCCEEDED. That is the
+ * o3d-peh1 defect itself: the parent reported settled while the money-moving child was never
+ * enqueued. The two cases the catch now has to tell apart are genuinely different, which is why the
+ * type exists rather than a string match on the message:
+ *
+ *   • a follow-up enqueue that FAILED — a transient database error. The work is still owed and the
+ *     obligation marker records that; QuickBooks deliberately does not fail the entry for it, and
+ *     that behaviour is unchanged here.
+ *   • a follow-up enqueue that was REFUSED — the planner or the ledger fence declined, deliberately,
+ *     and NOTHING WAS QUEUED. Nothing will re-drive it either: the QuickBooks repair sweep is still
+ *     unwired (o3d-s36z), so on this connector the marker alone is a note to nobody. The parent must
+ *     go back to being unsettled so this processor's own retry returns to it.
  */
+class FollowUpEnqueueRefused extends Error {}
+
 function requireFollowUpsEnqueued(entryId: string, outcome: FollowUpEnqueueOutcome): void {
   if (outcome.enqueued) return
-  throw new Error(
+  throw new FollowUpEnqueueRefused(
     `QuickBooks sync entry ${entryId} posted, but its follow-ups were REFUSED and nothing was queued: `
     + `${describeFollowUpEnqueueRefusals(outcome)}`,
   )
+}
+
+/**
+ * RETURN A POSTED PARENT TO ITS UNSETTLED STATE, KEEPING THE TWO FACTS THAT MAKE IT RECOVERABLE.
+ *
+ * The Xero twin is `markSyncLogForFollowUpRetry`, and this is deliberately the same three-column
+ * write rather than a re-use of the QuickBooks main-failure path a few lines below:
+ *
+ *   • `externalTransactionId` IS NOT TOUCHED. It is post evidence — the only local record that the
+ *     document is in QuickBooks — and it is also what makes the retry safe: the loop's idempotency
+ *     guard reads it and short-circuits straight to the follow-ups instead of posting a second
+ *     document. Dropping it would turn a retry into a duplicate.
+ *   • `backReferenceFollowUpsPendingAt` IS NOT TOUCHED either. The obligation is still owed; the
+ *     release runs only on the arm where the enqueue actually happened.
+ *   • NO MIRRORED EVENT is written. The main-failure path stamps the mirrored AccountingEvent FAILED
+ *     on a final failure, which is right when nothing posted and wrong here: this document POSTED,
+ *     the mirror already says so, and overwriting it would make the ledger's own copy of the record
+ *     contradict the ledger.
+ *
+ * Status goes back to PENDING, or FAILED once the retries are exhausted — the same bound every other
+ * failure on this loop observes, so a permanently refusable row cannot spin for ever.
+ */
+async function markSyncLogForFollowUpRetry(
+  entry: { id: string; retryCount: number },
+  error: unknown,
+): Promise<void> {
+  const retryCount = entry.retryCount + 1
+  await db.accountingSyncLog.update({
+    where: { id: entry.id },
+    data: {
+      status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
+      retryCount,
+      errorMessage: `QuickBooks follow-up work was refused after connector post: ${String(error)}`,
+      processingStartedAt: null,
+    },
+  })
 }
 
 /**
@@ -635,6 +689,29 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               + 'follow-ups need to be re-driven manually.',
             metadata: { syncLogId: entry.id, type: entry.type, referenceType: entry.referenceType, referenceId: entry.referenceId },
           })
+          // o3d-peh1, cross-ported from the Xero side (Codex, this branch) — A REFUSAL IS NOT A
+          // BEST-EFFORT FAILURE, AND THIS CATCH WAS ABSORBING BOTH.
+          //
+          // `requireFollowUpsEnqueued` was added above so that a refused enqueue could not be read as
+          // success. On this branch it could: the throw landed here, was logged, and execution fell
+          // through to `result.succeeded++` one line down — the parent stamped SYNCED and counted
+          // settled while the money-moving child was never queued. That is the exact defect
+          // o3d-peh1 exists to fix, surviving on the other connector because only the Xero caller was
+          // changed to act on the refusal.
+          //
+          // So the parent goes back to UNSETTLED, keeping its external id and its obligation marker
+          // (see markSyncLogForFollowUpRetry for why each of those is load-bearing), and the entry is
+          // counted FAILED. Nothing is re-posted: the retry finds the external id and takes the
+          // idempotency short-circuit straight to the follow-ups.
+          //
+          // A plain follow-up FAILURE still falls through to `succeeded` exactly as before. It is a
+          // transient error whose work the obligation marker records, and turning that into a retry
+          // here would be a second change wearing this one's clothes.
+          if (followUpError instanceof FollowUpEnqueueRefused) {
+            await markSyncLogForFollowUpRetry(entry, followUpError)
+            result.failed++
+            continue
+          }
         }
 
         result.succeeded++

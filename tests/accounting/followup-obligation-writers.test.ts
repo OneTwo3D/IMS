@@ -342,6 +342,30 @@ mock.module('@/lib/connectors/quickbooks/bills', {
   },
 })
 
+/**
+ * o3d-peh1 — THE LEDGER FENCE'S VERDICT, SWITCHABLE, SO A REFUSAL CAN BE DRIVEN THROUGH THE REAL LOOP.
+ *
+ * `enqueueFollowUpSyncLog` asks the ledger whether the attempt it is about to queue is already in it,
+ * on BOTH connectors and for every follow-up, and a "no" is returned to the caller as a REFUSAL —
+ * `{ enqueued: false }` — rather than thrown. That return value is the thing under test: a refusal
+ * and a success differ only in what the caller does with them, which is why nothing simulated can
+ * stand in for the caller here.
+ *
+ * CLEAR by default, so every other test in this file is untouched. `postMoneyUnderLedgerFence` and
+ * the two probe helpers are re-exported as pass-throughs because `mock.module` replaces the whole
+ * module and both processors import them at load time.
+ */
+let ledgerVerdict: { clear: true } | { clear: false; reason: string } = { clear: true }
+
+mock.module('@/lib/connectors/accounting-settlement-probe', {
+  namedExports: {
+    ledgerClearsFollowUpRevival: async () => ledgerVerdict,
+    postMoneyUnderLedgerFence: async (_params: unknown, run: () => Promise<unknown>) => run(),
+    probeLedgerSettlement: async () => ({ ok: true, records: [] }),
+    settlementProbeKey: () => 'probe-key',
+  },
+})
+
 let connectorUnderTest = 'xero'
 
 function blankRow(): SyncRow {
@@ -381,6 +405,7 @@ function reset(connector = 'xero') {
   state.failFollowUpsFor.clear()
   state.failReleaseFor.clear()
   state.unpersistableActivityActions.clear()
+  ledgerVerdict = { clear: true }
 }
 
 /** The single sync row under test (the follow-up rows the run creates are appended after it). */
@@ -1042,4 +1067,106 @@ test('[o3d-9kek r10 f1] a failed QuickBooks follow-up enqueue leaves the obligat
   assert.equal(state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 0, 'the follow-up half did not')
   assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date)
   assert.equal(subject().retryCount, 1)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-peh1, CROSS-PORTED — A REFUSED FOLLOW-UP ENQUEUE MUST NOT REPORT THE PARENT AS SETTLED.
+//
+// `requireFollowUpsEnqueued` exists on both connectors: the enqueue can decline (the planner cannot
+// tell which of several attempts committed, or the ledger fence says the settlement is already in
+// it) and it says so by RETURNING `{ enqueued: false }`. The guard turns that into a throw so the
+// obligation release below it cannot run.
+//
+// On QuickBooks the throw landed in a catch that treats every follow-up exception as best-effort:
+// it logged an ERROR and fell through to `result.succeeded++`. So the parent was SYNCED, counted
+// synced, and the money-moving child had never been queued — the o3d-peh1 defect exactly, surviving
+// on the connector whose caller was not changed. The QuickBooks repair sweep is still unwired
+// (o3d-s36z), so nothing else was going to come back for it either.
+//
+// These run the REAL processPendingQuickBooksSync down the fresh-post branch — the branch the
+// finding names — so what is asserted is the caller's behaviour, not a re-description of the guard.
+// A passing Xero test proves nothing here: the two callers are separate code.
+// ---------------------------------------------------------------------------
+
+test('[o3d-peh1] a REFUSED QuickBooks follow-up enqueue does not count the entry as succeeded', async () => {
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  ledgerVerdict = { clear: false, reason: 'a settlement matching this attempt is already in QuickBooks' }
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.succeeded, 0, 'nothing was queued, so nothing about this entry is finished')
+  assert.equal(result.failed, 1)
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length,
+    0,
+    'the refusal is real: no follow-up row exists',
+  )
+  assert.ok(
+    state.activities.some((entry) => entry.action === 'quickbooks_followup_enqueue_refused'),
+    'and it is on record as a refusal, not as a generic failure',
+  )
+})
+
+test('[o3d-peh1] the refused parent goes back to UNSETTLED, keeping its external id and its obligation', async () => {
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  ledgerVerdict = { clear: false, reason: 'a settlement matching this attempt is already in QuickBooks' }
+
+  await runQuickBooks()
+
+  assert.equal(subject().status, 'PENDING', 'the row is owed work again, so it must be claimable again')
+  assert.equal(subject().retryCount, 1, 'and bounded by the same retry budget as every other failure')
+  assert.equal(subject().processingStartedAt, null, 'the claim is given up — nothing is in flight')
+  // THE TWO FACTS THE REVERSAL MUST NOT DESTROY.
+  assert.equal(
+    subject().externalTransactionId,
+    'XBILL-1',
+    'the external id is POST EVIDENCE — it is the only local record the bill is in QuickBooks, and it is '
+    + 'what makes the retry take the idempotency short-circuit instead of posting a second document',
+  )
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date,
+    'the obligation is still owed; the release runs only on the arm where the enqueue actually happened',
+  )
+  assert.equal(state.bills[0].accountingInvoiceId, 'XBILL-1', 'the back-reference half succeeded and stands')
+})
+
+test('[o3d-peh1] a refused entry re-runs into the short-circuit and never posts a second document', async () => {
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  ledgerVerdict = { clear: false, reason: 'a settlement matching this attempt is already in QuickBooks' }
+
+  await runQuickBooks()
+  // The ambiguity clears — an operator reconciled the ledger — and the next cron pass picks the row
+  // up again. THIS is what "unsettled" has to mean: recoverable without a second post.
+  ledgerVerdict = { clear: true }
+  const second = await runQuickBooks()
+
+  assert.equal(second.succeeded, 1, 'the retry settles it')
+  assert.equal(subject().status, 'SYNCED')
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length,
+    1,
+    'the follow-up the refusal withheld is queued exactly once',
+  )
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'and only now is the obligation released')
+})
+
+test('[o3d-peh1] a plain follow-up FAILURE is still best-effort — the port did not widen', async () => {
+  // The catch has to tell a refusal from a transient error, and this is the case it must leave alone.
+  // A failed enqueue is retryable work the obligation marker records; QuickBooks deliberately does
+  // not fail the entry for it (the test above this block pins that), and changing it here would be a
+  // second change wearing this one's clothes.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.failFollowUpsFor.add('log-1')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.succeeded, 1)
+  assert.equal(result.failed, 0)
+  assert.equal(subject().status, 'SYNCED')
+  assert.equal(subject().retryCount, 0)
+  assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date)
 })
