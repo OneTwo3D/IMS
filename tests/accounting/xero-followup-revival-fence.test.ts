@@ -25,20 +25,60 @@ let store: SyncLogStore = createSyncLogStore([])
 let interleave: (() => void) | null = null
 const activity: Array<{ action: string; level?: string; description: string; metadata?: Record<string, unknown> }> = []
 const scheduled: Array<Record<string, unknown>> = []
+/**
+ * o3d-anu8 (Codex, this branch) — the DURABLE activity rows, written through the caller's transaction
+ * client by `logActivityInTransaction`. Kept apart from `activity` above on purpose: `activity` is the
+ * best-effort logger, and half the finding is that a record which belongs in one of these was in the
+ * other. `rowsAtThisPoint` is how ORDERING is asserted — "the record exists" is equally true of one
+ * written before the row it describes, and that is the version this fix removed.
+ */
+const durableActivity: Array<{ action: string; level?: string; description: string; metadata?: Record<string, unknown>; rowsAtThisPoint: number; viaTransaction: boolean }> = []
+/** When set, the durable write FAILS — the case that decides whether the enqueue may still commit. */
+let failDurableActivity = false
+/** o3d-anu8: switchable, so ONE test can drive a ledger refusal AFTER the plan has been made. */
+let ledgerVerdict: { clear: true } | { clear: false; reason: string } = { clear: true }
 
 const accountingSyncLog = new Proxy({}, {
   get: (_target, prop: string) => (args: never) => (store.delegate[prop] as (a: never) => Promise<unknown>)(args),
 })
 
+/**
+ * o3d-anu8: the transaction client and the module-level client keep SEPARATE delegates, so "written
+ * through the caller's transaction" is observable. If production passed `db` instead of `tx` the row
+ * would still be recorded — but as `viaTransaction: false`, and it would not roll back with the
+ * enqueue, which is the whole property.
+ */
+function activityLogDelegate(viaTransaction: boolean) {
+  return {
+    create: async ({ data }: { data: Record<string, unknown> }) => {
+      if (failDurableActivity) throw new Error('activity log unavailable')
+      durableActivity.push({ ...(data as unknown as Omit<(typeof durableActivity)[number], 'rowsAtThisPoint' | 'viaTransaction'>), rowsAtThisPoint: store.rows.length, viaTransaction })
+      return data
+    },
+  }
+}
+
 const dbStub = {
   accountingSyncLog,
+  // o3d-anu8: the enqueue now writes its carry-onward record through the transaction client, so the
+  // double has to offer the delegate that write uses — and has to be able to FAIL it.
+  activityLog: activityLogDelegate(false),
   // o3d-0m56's per-scope advisory lock, taken inside the revival transaction for money-moving types.
   $executeRaw: async () => 1,
   $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
     const hook = interleave
     interleave = null
     hook?.()
-    return fn(dbStub)
+    // ROLLBACK IS EMULATED (o3d-anu8). The record and the row now commit together or not at all, and
+    // a double that kept the row after the record threw would make that property untestable — the
+    // assertion would pass with the write moved back outside the transaction.
+    const snapshot = store.rows.map((row) => ({ ...row }))
+    try {
+      return await fn({ ...dbStub, activityLog: activityLogDelegate(true) })
+    } catch (error) {
+      store.rows.splice(0, store.rows.length, ...snapshot)
+      throw error
+    }
   },
 }
 
@@ -58,7 +98,7 @@ mock.module('@/lib/db', { namedExports: { db: dbStub } })
  */
 mock.module('@/lib/connectors/accounting-settlement-probe', {
   namedExports: {
-    ledgerClearsFollowUpRevival: async () => ({ clear: true }),
+    ledgerClearsFollowUpRevival: async () => ledgerVerdict,
     postMoneyUnderLedgerFence: async (_params: unknown, run: () => Promise<unknown>) => run(),
     probeLedgerSettlement: async () => ({ ok: true, records: [] }),
     settlementProbeKey: () => 'probe-key',
@@ -68,6 +108,12 @@ mock.module('@/lib/activity-log', {
   namedExports: {
     logActivity: async (entry: { action: string; level?: string; description: string; metadata?: Record<string, unknown> }) => {
       activity.push(entry)
+    },
+    // o3d-anu8: a FAITHFUL stand-in — production's version writes through the client it is given and
+    // does NOT catch, which is the two properties the tests below are about. A stub that swallowed
+    // here would make the abort test pass with the fix removed.
+    logActivityInTransaction: async (client: { activityLog: { create(args: { data: unknown }): Promise<unknown> } }, params: unknown) => {
+      await client.activityLog.create({ data: params })
     },
   },
 })
@@ -86,6 +132,9 @@ function reset(rows: Parameters<typeof createSyncLogStore>[0]) {
   interleave = null
   activity.length = 0
   scheduled.length = 0
+  durableActivity.length = 0
+  failDurableActivity = false
+  ledgerVerdict = { clear: true }
 }
 
 /** The remote token a previous attempt posted under; reviving must carry it forward unchanged. */
@@ -190,4 +239,127 @@ test('o3d-e2mz r3: an enqueue with no FAILED row to reuse still creates one, unf
   assert.equal(store.rows[0].status, 'PENDING')
   assert.equal(store.rows[0].attemptRevision, 0, 'a brand-new row has had no attempt, and must not claim one')
   assert.deepEqual(activity.filter((entry) => entry.action === 'xero_followup_enqueue_refused'), [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-anu8 (Codex, this branch) — THE CARRY-ONWARD RECORD MUST DESCRIBE SOMETHING THAT HAPPENED.
+//
+// When a scope holds a row an operator settled as NOT_POSTED, that assertion is what dropped the
+// distinct-token count and turned a refusal into an enqueue. Freeing the path is the settlement
+// action's stated purpose, so the plan does not re-block — it CARRIES the reliance onward, and the
+// connector records it. Without that line the resulting payment is indistinguishable from one the
+// connector's own history cleared, and if the assertion was wrong nothing leads back to it.
+//
+// The first revision wrote that record at PLAN time with a swallowed `logActivity`, so it was:
+//
+//   • UNTIED TO THE OUTCOME. The word in it is "Enqueued", and at that point nothing had been. The
+//     unfenced-reuse refusal, the ledger-clearance refusal and the write itself could all still stop
+//     it — each leaving a WARNING asserting a money post that never happened, which is worse than
+//     silence: it sends the next person reconciling a suspected duplicate to a payment that does not
+//     exist and makes the assertion look acted upon.
+//   • NOT DURABLE. This is the only thing that will ever say a ledger-affecting post rested on a
+//     human's word rather than on evidence — o3d-nf9i's own rule, and the reason
+//     `logActivityInTransaction` exists. Best-effort let the enqueue commit with the reliance
+//     silently unrecorded.
+//
+// It is now one transaction with the row it describes.
+// ---------------------------------------------------------------------------
+
+/** A row an operator settled as NEVER POSTED. It is what clears the token ambiguity for this scope. */
+function assertedNotPostedRow(overrides: Partial<Parameters<typeof syncLogRow>[0]> = {}) {
+  return syncLogRow({
+    id: 'log-asserted',
+    connector: 'xero',
+    type: 'INVOICE_PAYMENT',
+    status: 'CANCELLED',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    settlementBasis: 'OPERATOR_ASSERTION',
+    payload: { [FOLLOW_UP_IDEMPOTENCY_KEY]: 'xero:invoice_payment:salesorder:order-1:inv-9-old', accountingInvoiceId: 'inv-9', amount: 120 },
+    ...overrides,
+  })
+}
+
+const RELIANCE_ACTION = 'xero_followup_enqueue_rests_on_operator_assertion'
+
+test('[o3d-anu8] the reliance record is written INSIDE the enqueue, after the row it describes exists', async () => {
+  reset([assertedNotPostedRow()])
+
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+
+  assert.equal(store.rows.length, 2, 'the enqueue really happened')
+  const record = durableActivity.find((entry) => entry.action === RELIANCE_ACTION)
+  assert.ok(record, 'and the record went through the durable writer, not the best-effort logger')
+  assert.equal(record.viaTransaction, true, 'through the ENQUEUE\'s transaction client, so it rolls back with the row')
+  assert.equal(record.rowsAtThisPoint, 2, 'written after the created row, so "Enqueued" is a fact when it is stated')
+  assert.equal(record.level, 'WARNING')
+  assert.deepEqual((record.metadata as { assertedNotPostedRowIds?: string[] }).assertedNotPostedRowIds, ['log-asserted'],
+    'and it names the row to go back to')
+  assert.deepEqual(activity.filter((entry) => entry.action === RELIANCE_ACTION), [],
+    'the best-effort logger must no longer carry it — that is the half that could silently lose it')
+})
+
+test('[o3d-anu8] a LEDGER refusal after the plan leaves no record claiming a payment was enqueued', async () => {
+  reset([assertedNotPostedRow()])
+  ledgerVerdict = { clear: false, reason: 'Xero already holds a settlement of 120.00 dated 2026-08-01' }
+
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+
+  assert.equal(store.rows.length, 1, 'nothing was enqueued')
+  assert.deepEqual(durableActivity.filter((entry) => entry.action === RELIANCE_ACTION), [],
+    'so nothing may say one was — the refusal is the only thing that happened')
+  assert.deepEqual(activity.filter((entry) => entry.action === RELIANCE_ACTION), [])
+  assert.ok(activity.some((entry) => entry.action === 'xero_followup_enqueue_refused'))
+})
+
+test('[o3d-anu8] an UNFENCEABLE reuse target leaves no record either', async () => {
+  // The other refusal that used to run after the record was already written. The revision-0 row is
+  // the reuse candidate; the asserted row is what cleared the ambiguity that would otherwise refuse.
+  reset([assertedNotPostedRow(), failedPaymentRow({ attemptRevision: 0 })])
+
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+
+  assert.equal(store.get('log-pay')?.status, 'FAILED', 'the unfenceable row is left exactly as it was')
+  assert.deepEqual(scheduled, [], 'and nothing was queued')
+  assert.deepEqual(durableActivity.filter((entry) => entry.action === RELIANCE_ACTION), [],
+    'so the reliance record must not exist: it would describe an enqueue that was refused')
+  assert.deepEqual(activity.filter((entry) => entry.action === RELIANCE_ACTION), [],
+    'and it must not exist on the best-effort channel either — that is where it used to be written')
+  assert.ok(activity.some((entry) => entry.metadata?.reason === 'unfenced_reuse_target'))
+})
+
+test('[o3d-anu8] a REVIVAL cleared by an assertion is recorded too, and after the revival', async () => {
+  reset([assertedNotPostedRow(), failedPaymentRow()])
+
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+
+  assert.equal(store.get('log-pay')?.status, 'PENDING', 'the revival happened')
+  const record = durableActivity.find((entry) => entry.action === RELIANCE_ACTION)
+  assert.ok(record, 'a revived row is as much a post cleared by that assertion as a created one')
+  assert.equal((record.metadata as { planAction?: string }).planAction, 'reuse')
+})
+
+test('[o3d-anu8] an unwritable record ABORTS the enqueue rather than leaving an untraceable money post', async () => {
+  reset([assertedNotPostedRow()])
+  failDurableActivity = true
+
+  const enqueue = await loadEnqueue()
+  await assert.rejects(
+    () => enqueue('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD }),
+    /activity log unavailable/,
+    'the failure must propagate — swallowing it is what let the post commit unrecorded',
+  )
+
+  assert.equal(store.rows.length, 1,
+    'and the follow-up row must not survive: the record and the row commit together or neither does')
+  assert.deepEqual(scheduled, [])
+})
+
+test('[o3d-anu8] a scope with NO assertion in it writes nothing — this is not a per-enqueue warning', async () => {
+  reset([failedPaymentRow()])
+
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+
+  assert.equal(store.get('log-pay')?.status, 'PENDING')
+  assert.deepEqual(durableActivity, [], 'an ordinary revival rests on the connector s own history')
 })

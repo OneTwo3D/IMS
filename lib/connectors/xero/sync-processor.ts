@@ -15,7 +15,7 @@ import {
   reportUnrecordedRemoteWrite,
   UnrecordedRemoteWriteError,
 } from '@/lib/db/post-remote-persist'
-import { logActivity, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
+import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
 import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
@@ -66,6 +66,7 @@ import {
   planFollowUpEnqueue,
   readFollowUpIdempotencyKey,
   type FollowUpPayload,
+  type SettlementAssertionReliance,
 } from '@/lib/domain/accounting/followup-idempotency'
 import {
   isOperatorAssertedSettlement,
@@ -995,6 +996,64 @@ type FollowUpOriginEvidence =
   | { from: 'unobserved' }
 
 /**
+ * o3d-anu8 — THIS MONEY POST IS CLEARED BY A HUMAN'S WORD, and the record says so.
+ *
+ * The plan carries `restsOnAssertion` only on a money-moving create/reuse whose scope holds a row an
+ * operator settled as NOT_POSTED. That settlement is what dropped the distinct-token count and turned
+ * a refusal into this enqueue — deliberately, it is the documented purpose of the action — but
+ * without this line the resulting payment is indistinguishable from one the connector's own history
+ * cleared, and if the assertion was wrong there is nothing to lead anybody back to it.
+ *
+ * WRITTEN INSIDE THE ENQUEUE'S OWN TRANSACTION, AFTER THE ROW EXISTS (Codex, this branch). The first
+ * revision wrote it at PLAN time, with `logActivity(...).catch(() => {})`, and got both halves wrong:
+ *
+ *   • NOT TIED TO THE OUTCOME. The word in the record is "Enqueued", and at that point nothing had
+ *     been. Three things could still stop the enqueue afterwards — the unfenced-reuse refusal, the
+ *     ledger-clearance refusal, and the create/revive itself (a lost compare-and-swap, a unique-index
+ *     collision, any database failure). Each leaves a WARNING on the log asserting a money post that
+ *     never happened, which is worse than silence: the next person to reconcile a suspected duplicate
+ *     is led to a payment that does not exist, and the operator assertion it names looks acted upon.
+ *   • NOT DURABLE. `.catch(() => {})` is the correct default for the hundreds of informational writes
+ *     in this codebase and the wrong one here. This record is the ONLY thing that will ever say a
+ *     ledger-affecting post rested on a human's word rather than on evidence — o3d-nf9i's own rule,
+ *     and `logActivityInTransaction` exists for exactly it. Best-effort would let the enqueue commit
+ *     with the reliance silently unrecorded and nothing would ever surface the gap.
+ *
+ * One transaction, so the record and the row commit together or neither does: an unwritable record
+ * aborts the enqueue rather than leaving a money post nobody can trace back to the assertion that
+ * released it. Called on BOTH arms — a revived row is as much a post cleared by that assertion as a
+ * created one — and on neither of the arms that did not enqueue.
+ */
+async function recordEnqueueRestingOnAssertion(
+  tx: Pick<Prisma.TransactionClient, 'activityLog'>,
+  identity: { type: FollowUpSyncType; referenceType: string; referenceId: string },
+  plan: { action: 'create' | 'reuse'; restsOnAssertion?: SettlementAssertionReliance },
+): Promise<void> {
+  if (!plan.restsOnAssertion) return
+  await logActivityInTransaction(tx, {
+    // Explicit null: the session lookup logActivity falls back on is a React cache() read, which has
+    // no place inside a database transaction — and no operator is present here anyway. The people
+    // this names are on the settlement rows the metadata points at.
+    userId: null,
+    entityType: 'SYSTEM',
+    action: 'xero_followup_enqueue_rests_on_operator_assertion',
+    tag: 'sync',
+    level: 'WARNING',
+    description: `Enqueued Xero ${identity.type} for ${identity.referenceType} ${identity.referenceId} while `
+      + `${plan.restsOnAssertion.assertedNotPostedRowIds.length} earlier row(s) for it are CANCELLED because an `
+      + 'OPERATOR asserted they never posted. IMS verified nothing about that: if any of them did reach the ledger, '
+      + 'this post duplicates it. Reconcile in the accounting system if this money appears twice.',
+    metadata: {
+      type: identity.type,
+      referenceType: identity.referenceType,
+      referenceId: identity.referenceId,
+      assertedNotPostedRowIds: plan.restsOnAssertion.assertedNotPostedRowIds,
+      planAction: plan.action,
+    },
+  })
+}
+
+/**
  * Exported for unit tests (o3d-e2mz r3): the revival compare-and-swap in here is the one write on a
  * money-moving path that a whole processor run has to be driven to reach, and the fence on it is
  * cheaper to pin directly than through a full post-and-follow-up loop.
@@ -1110,33 +1169,6 @@ export async function enqueueFollowUpSyncLog(
     return
   }
 
-  // o3d-anu8 — THIS MONEY POST IS CLEARED BY A HUMAN'S WORD, and the record says so.
-  //
-  // The plan only carries this on a money-moving create/reuse whose scope holds a row an operator
-  // settled as NOT_POSTED. That settlement is what dropped the distinct-token count and turned a
-  // refusal into this enqueue — deliberately, it is the documented purpose of the action — but
-  // without a line here the resulting payment is indistinguishable from one the connector's own
-  // history cleared, and if the assertion was wrong there is nothing to lead anybody back to it.
-  if (plan.restsOnAssertion) {
-    await logActivity({
-      entityType: 'SYSTEM',
-      action: 'xero_followup_enqueue_rests_on_operator_assertion',
-      tag: 'sync',
-      level: 'WARNING',
-      description: `Enqueued Xero ${type} for ${referenceType} ${referenceId} while `
-        + `${plan.restsOnAssertion.assertedNotPostedRowIds.length} earlier row(s) for it are CANCELLED because an `
-        + 'OPERATOR asserted they never posted. IMS verified nothing about that: if any of them did reach the ledger, '
-        + 'this post duplicates it. Reconcile in the accounting system if this money appears twice.',
-      metadata: {
-        type,
-        referenceType,
-        referenceId,
-        assertedNotPostedRowIds: plan.restsOnAssertion.assertedNotPostedRowIds,
-        planAction: plan.action,
-      },
-    }).catch(() => { /* the record is important; failing the enqueue over it is not */ })
-  }
-
   // TWO REFUSALS GUARD THE AUTOMATIC REVIVAL, AND THEY ARE NOT THE SAME QUESTION (o3d-e2mz + o3d-0m56).
   //
   //   o3d-e2mz asks CAN THIS WRITE BE TIED TO AN ATTEMPT. A revival is a write to an attempt, and the
@@ -1235,6 +1267,8 @@ export async function enqueueFollowUpSyncLog(
           },
         })
         if (revived.count === 0) return 'cas-lost' as const
+        // The reliance record commits with the revival, or the revival does not commit.
+        await recordEnqueueRestingOnAssertion(tx, { type, referenceType, referenceId }, plan)
         await scheduleXeroAccountingOutbox(tx, {
           accountingSyncLogId: plan.syncLogId,
           // Explicit 0 rather than resetAttempts: a PROCESSING outbox row honours only an
@@ -1258,6 +1292,9 @@ export async function enqueueFollowUpSyncLog(
           ...stampingCustodyOnCreate(),
         },
       })
+      // Same rule on the create arm: one transaction, so a money post cleared by an assertion cannot
+      // exist without the line that says so.
+      await recordEnqueueRestingOnAssertion(tx, { type, referenceType, referenceId }, plan)
       await scheduleXeroAccountingOutbox(tx, {
         accountingSyncLogId: log.id,
       })

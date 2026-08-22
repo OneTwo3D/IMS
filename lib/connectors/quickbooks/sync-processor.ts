@@ -25,6 +25,11 @@ import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stam
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
+import {
+  guardInvoicePaymentCapacity,
+  retireOverSettlingInvoicePayment,
+} from '@/lib/domain/accounting/invoice-payment-capacity'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import {
@@ -152,12 +157,38 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
   })
 }
 
+/**
+ * o3d-anu8, CROSS-PORTED FROM THE XERO PATH (Codex, this branch) — A LIVE ROW SUPPRESSES THIS WORK,
+ * AND ONLY THE CONNECTOR IS ENTITLED TO.
+ *
+ * The live set is PENDING / PROCESSING / SYNCED, and this answer is what makes `planFollowUpEnqueue`
+ * skip — SILENTLY, which is correct when SYNCED means "the ledger was told". It does not always mean
+ * that any more: `buildSettlementData` writes SYNCED from a document id an OPERATOR TYPED, with
+ * `settlementBasis = OPERATOR_ASSERTION` and no remote call behind it.
+ *
+ * Counting rows made that indistinguishable. An asserted SYNCED INVOICE_PAYMENT therefore occupied
+ * the slot for ever: the real registration was never enqueued, the invoice was never settled in the
+ * ledger, and a skip logs nothing to say so. That is the laundering this branch removed on the Xero
+ * side, and it survived here because only the Xero lookup was taught to ask.
+ *
+ * So the basis is SELECTED and returned, and the planner is TOLD — it is the planner that decides
+ * (withhold rather than skip-or-enqueue, money-moving types only), so that both connectors reach one
+ * rule rather than each implementing their own reading of the same column.
+ *
+ * WORST-FIRST, as o3d-nf9i established for aggregation: one asserted occupant is enough for the
+ * suppression to rest on an assertion, because any of them may be the only reason this is skipped.
+ *
+ * DELIBERATELY NOT PORTED HERE: Xero's `liveRowOccupiesFollowUpSlot` anchor comparison (o3d-hbgo),
+ * which narrows the live set to rows targeting the SAME external document. That is a different
+ * finding about a different defect, and mixing it in would change which rows this returns as well as
+ * how they are described. The scope predicate is unchanged; only the basis is new.
+ */
 async function hasExistingSyncLog(
   type: AccountingSyncType,
   referenceType: string,
   referenceId: string,
-): Promise<boolean> {
-  const count = await db.accountingSyncLog.count({
+): Promise<{ exists: boolean; asserted: boolean }> {
+  const liveRows = await db.accountingSyncLog.findMany({
     where: {
       connector: QBO_CONNECTOR,
       type,
@@ -165,11 +196,23 @@ async function hasExistingSyncLog(
       referenceId,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
     },
+    // settlementBasis, because the occupying row is what makes the enqueue a silent skip and a SYNCED
+    // row is written by TWO things — the processor's writeback after QuickBooks answered, and an
+    // operator typing a document id into the settlement dialog.
+    select: { settlementBasis: true },
   })
-  return count > 0
+  return {
+    exists: liveRows.length > 0,
+    asserted: liveRows.some((row) => isOperatorAssertedSettlement(row.settlementBasis)),
+  }
 }
 
-async function enqueueFollowUpSyncLog(
+/**
+ * Exported for unit tests, exactly as the Xero twin is: the live-row lookup and the plan it feeds are
+ * the two halves of a decision that suppresses money-moving work, and reaching them through a whole
+ * post-and-follow-up loop would test the mocks rather than the decision.
+ */
+export async function enqueueFollowUpSyncLog(
   type: 'INVOICE_PAYMENT' | 'BILL_ATTACHMENT' | 'INVOICE_PDF' | 'INVOICE_EMAIL' | 'WC_INVOICE_NOTE',
   referenceType: string,
   referenceId: string,
@@ -177,7 +220,8 @@ async function enqueueFollowUpSyncLog(
   /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
   attempt = 0,
 ): Promise<void> {
-  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId)
+  const live = await hasExistingSyncLog(type, referenceType, referenceId)
+  const liveRowExists = live.exists
   // o3d-h2wx: a FAILED row is REUSED rather than replaced. The QuickBooks Request-Id is
   // derived from the entry id, so a replacement row posts the retry under a request id
   // Intuit has never seen — and if the failed attempt had actually committed, a SECOND
@@ -212,6 +256,9 @@ async function enqueueFollowUpSyncLog(
     referenceId,
     payload,
     liveRowExists,
+    // o3d-anu8: the flag the planner refuses on. Without it an operator's assertion reads as a
+    // completed follow-up and the enqueue is skipped for ever.
+    liveRowAsserted: live.asserted,
     failedRows,
   })
   if (plan.action === 'skip') return
@@ -798,6 +845,71 @@ async function processEntry(
       const accountRef = await resolveAccountRef(bankAccountId)
       if (!accountRef) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
+      }
+      // o3d-cjt8 / o3d-anu8, CROSS-PORTED FROM THE XERO PATH (Codex, this branch) — CAPACITY IS
+      // MEASURED HERE, WHERE NO ENQUEUE PATH CAN ROUTE AROUND IT.
+      //
+      // The Xero INVOICE_PAYMENT case has run `guardInvoicePaymentCapacity` since o3d-cjt8, and
+      // o3d-anu8 gave it the ASSERTED_REGISTRATION arm: a sibling registration that is SYNCED only
+      // because an OPERATOR asserted it posted carries an `amount` IMS INTENDED to send and never
+      // sent, so subtracting it from the invoice total produces a confident number measured from
+      // nothing. The QuickBooks branch went straight from validating its own payload to the money
+      // fence, so on this connector that sibling was not merely trusted indirectly — it was never
+      // looked at.
+      //
+      // THE SAME GUARD, NOT A QUICKBOOKS-SHAPED ONE. It is already connector-parameterised, and its
+      // own header says why a second definition would be wrong: two guards with two readings of "how
+      // much of this invoice is already settled" disagree about the question they both exist to
+      // answer. A narrower port refusing only on ASSERTED_REGISTRATION would BE that second
+      // definition, so the whole verdict is adopted — including WOULD_OVERPAY, LEDGER_AMOUNT_UNKNOWN
+      // and AMBIGUOUS_FAILED_REGISTRATION, which this connector had no equivalent of.
+      //
+      // Immediately before the money fence and AFTER the local validations, so a refusal is reached
+      // only by a payment that was otherwise ready to send. Fails CLOSED on anything it cannot
+      // measure, and on a genuine refusal retires the row as CANCELLED — provably accurate, because
+      // this runs BEFORE the remote call, so nothing was sent. Claim-fenced through `claimHeldFrom`,
+      // exactly as this connector's cancelled-order invoice retirement already is.
+      const capacity = await guardInvoicePaymentCapacity(db, {
+        connector: QBO_CONNECTOR,
+        entryId,
+        referenceType,
+        referenceId,
+        accountingInvoiceId,
+        amount,
+      })
+      if (!capacity.post) {
+        if (capacity.kind === 'unmeasurable') return { success: false, error: capacity.message }
+        const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, {
+          entryId,
+          claim: claimHeldFrom(claimedAt),
+          reason: capacity.message,
+        }))
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: referenceId,
+          // The refusals need an operator to do DIFFERENT things — reconcile an over-settlement,
+          // versus find out what the ledger actually holds — so they are not filed under one action
+          // name that would make the second read as the first. Same split as the Xero path.
+          action: capacity.refusal === 'AMBIGUOUS_FAILED_REGISTRATION' || capacity.refusal === 'ASSERTED_REGISTRATION'
+            ? 'invoice_payment_refused_unknown_ledger_state'
+            : 'invoice_payment_refused_over_settlement',
+          tag: 'accounting',
+          level: 'ERROR',
+          description: capacity.message,
+          metadata: {
+            syncLogId: entryId,
+            accountingInvoiceId,
+            amount,
+            refusal: capacity.refusal,
+            alreadyPosted: capacity.alreadyPosted,
+            ledgerTotal: capacity.ledgerTotal,
+            ambiguousSyncLogIds: capacity.ambiguousIds,
+            retired,
+          },
+        }).catch(() => { /* logging must never turn a safe refusal into a failure */ })
+        // Nothing was sent and nothing should be retried: report it as handled, not as a failure that
+        // burns retries and ends FAILED (which would then read as "may have posted").
+        return { success: true, skipped: true }
       }
       // o3d-0m56: the LAST check before money moves, AND the lock the post is made under. This
       // entry may have posted before — a committed call whose response was lost is FAILED, and
