@@ -108,9 +108,11 @@ export function reversalRecordVerdict(refund: {
   // The flag is set at creation on every refund that owes accounting, and o3d-2sm1 r6 made what
   // clears it STRICTLY STRONGER than it was: the staging transaction no longer clears it, so the one
   // writer that does is the caller's `clearRefundAccountingRetryState`, which runs only after
-  // `queueRefundAccountingActions` has returned with every sync it queued committed. Cleared
-  // therefore means staged, recorded AND queued — not merely staged and recorded. Nothing here had
-  // to change; the premise this line rests on only got harder to satisfy.
+  // `queueRefundAccountingActions` has returned having ACCOUNTED FOR every recorded obligation —
+  // each one queued, already standing, or decided by the pinned configuration to be a posting that
+  // will never exist (r7; before it, a clean return was compatible with nothing having been
+  // written). Cleared therefore means staged, recorded AND queued — not merely staged and recorded.
+  // Nothing here had to change; the premise this line rests on only got harder to satisfy.
   //
   // The converse is where the cost lands, and it is stated where it is created (see the staging
   // block in refund-service.ts): a crash between the last queue commit and that clear leaves the

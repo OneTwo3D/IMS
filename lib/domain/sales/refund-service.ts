@@ -4148,6 +4148,13 @@ export async function createSalesOrderRefund(
             // rows queued, the rest not, and the flag still set — and every queue write is
             // idempotent on its key, so the retry re-queues the remainder and adds no duplicate.
             //
+            // r7 CLOSED THE HOLE IN "EVERY SYNC IT QUEUED". A clean return used to be compatible with
+            // NOTHING having been written: `queueAccountingSync` returned `void` and returned early
+            // on a missing connector, a switched-off type, an order deleted under it or a superseded
+            // payload. It now reports what it did, and `queueRefundAccountingActions` throws unless
+            // every recorded obligation was queued, already standing, or decided by the pinned
+            // configuration to be one that will never post — so a clean return is proof again.
+            //
             // THE RESIDUAL, STATED EXACTLY, BECAUSE IT IS NOT ZERO. Between the last queue commit and
             // the caller's clearing UPDATE there is still one window, and it cannot be closed from
             // here: the clear is a different transaction from the last queue write by construction,
@@ -4155,8 +4162,15 @@ export async function createSalesOrderRefund(
             // SET on a refund that owes nothing. That is a stale flag, not a lost reversal, and the
             // asymmetry is the whole point — it is LOUD (the refund keeps its retry affordance and
             // the accounting inbox keeps naming it) and RECOVERABLE (re-running the retry re-queues
-            // nothing new, because every key is already taken, and then clears the flag). The
-            // window this replaces was silent and unrecoverable. See the note on
+            // nothing new while every prior row is still PENDING/PROCESSING/SYNCED, and then clears
+            // the flag). The window this replaces was silent and unrecoverable.
+            //
+            // WITH ONE CORRECTION r7 OWES THAT SENTENCE: the already-present check reads STATUS, so a
+            // prior row that has since reached FAILED is invisible to it and the retry enqueues a
+            // second reversal. A status is not a posting — a FAILED row can name a real document.
+            // That defect is in the enqueue's dedupe, predates this branch (which changes neither
+            // queue module nor the retry path), and is filed as o3d-d0pd; this window makes it easier
+            // to reach, which is why it is named here rather than left to be rediscovered. See the note on
             // `reversalRecordVerdict` for what such a row reads as: `accountingRetrySyncs` is
             // recorded, so the verdict is `nothing-lost` and it is never accused of having lost a
             // staged reversal.

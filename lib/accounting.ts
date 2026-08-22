@@ -166,27 +166,63 @@ export function isFxGainLossJournalSuppressed(
   return connector === 'xero' && FX_GAIN_LOSS_JOURNAL_TYPES.has(type)
 }
 
+/**
+ * WHAT AN ENQUEUE ACTUALLY DID (o3d-2sm1 r7, Codex HIGH).
+ *
+ * `queueAccountingSync` returned `void`, and it returns early — writing nothing — on at least five
+ * paths: no active connector, the connector's sync switched off, this type switched off, a type the
+ * connector posts natively, an order deleted under the enqueue, a payload the enqueue guard found
+ * stale. A caller could therefore await it, see it return cleanly, and conclude that a posting was
+ * queued when nothing at all had been written. Any caller that DISCHARGES AN OBLIGATION on that
+ * conclusion discharges it on a no-op.
+ *
+ * That is the same defect as a database NULL standing in for an empty list, one layer up: "nothing
+ * was written" and "nothing needed writing" were byte-identical, so the absence had nowhere to live.
+ * It is given somewhere to live here.
+ *
+ *   queued: true                    a sync row for this posting is durable — this call wrote it, or
+ *                                   it found one already standing (the idempotency-key hit). Either
+ *                                   way a GL counterpart exists.
+ *   queued: false, not-configured   A DECISION, and the only no-op that may read as settled: there is
+ *                                   no connector, or its sync (or this type) is switched off, or the
+ *                                   connector posts this type itself. No counterpart will ever exist,
+ *                                   so there is nothing outstanding either.
+ *   queued: false, refused          NOT a decision. The enqueue declined for a reason about this
+ *                                   particular call — the order was deleted under it, its payload was
+ *                                   superseded — and the posting is still owed. A caller must not
+ *                                   read this as success.
+ *
+ * `connector` names which connector the answer was given against, so a caller that pinned one for a
+ * multi-enqueue hand-off can tell that the setting flipped underneath it.
+ */
+export type ConnectorEnqueueOutcome = {
+  queued: boolean
+  reason?: 'not-configured' | 'refused'
+}
+
+export type AccountingEnqueueOutcome = ConnectorEnqueueOutcome & {
+  connector: AccountingConnectorInfo['id'] | null
+}
+
 export async function queueAccountingSync(params: {
   type: AccountingSyncType
   referenceType: string
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey?: string
-}): Promise<void> {
+}): Promise<AccountingEnqueueOutcome> {
   const connector = await getActiveAccountingConnectorId()
-  if (!connector) return
-  if (isFxGainLossJournalSuppressed(connector, params.type)) return
-
-  switch (connector) {
-    case 'xero': {
-      const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
-      return queueXeroSync(params)
-    }
-    case 'quickbooks': {
-      const { queueQuickBooksSync } = await import('@/lib/connectors/quickbooks/queue')
-      return queueQuickBooksSync(params)
-    }
+  if (!connector) return { queued: false, reason: 'not-configured', connector: null }
+  if (isFxGainLossJournalSuppressed(connector, params.type)) {
+    return { queued: false, reason: 'not-configured', connector }
   }
+
+  if (connector === 'quickbooks') {
+    const { queueQuickBooksSync } = await import('@/lib/connectors/quickbooks/queue')
+    return { ...await queueQuickBooksSync(params), connector }
+  }
+  const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
+  return { ...await queueXeroSync(params), connector }
 }
 
 async function getAccountingPostingContext(type: AccountingSyncType): Promise<{

@@ -15,6 +15,8 @@ import {
 } from '@/lib/domain/accounting/enqueue-order-guard'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
+// Type-only, so the facade's dynamic import of this module stays the only runtime edge between them.
+import type { ConnectorEnqueueOutcome } from '@/lib/accounting'
 
 /** Map sync type enum → setting key for per-type enable/disable */
 const SYNC_TYPE_SETTING: Record<string, keyof QuickBooksSettings> = {
@@ -40,13 +42,15 @@ export async function queueQuickBooksSync(params: {
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey?: string
-}): Promise<void> {
+  // o3d-2sm1 r7: and it SAYS what it did — the twin of the Xero queue's contract, for the same
+  // reason. See ConnectorEnqueueOutcome.
+}): Promise<ConnectorEnqueueOutcome> {
   const settings = await getQuickBooksSettings()
-  if (settings.quickbooks_sync_enabled !== 'true') return
+  if (settings.quickbooks_sync_enabled !== 'true') return { queued: false, reason: 'not-configured' }
 
   const settingKey = SYNC_TYPE_SETTING[params.type]
   const postingMode = settingKey ? settings[settingKey] : 'submitted'
-  if (!postingMode || postingMode === 'off') return
+  if (!postingMode || postingMode === 'off') return { queued: false, reason: 'not-configured' }
 
   const payload = {
     ...params.payload,
@@ -66,11 +70,13 @@ export async function queueQuickBooksSync(params: {
       },
       select: { id: true },
     })
-    if (existing) return
+    // ALREADY PRESENT IS QUEUED: a row for this posting is standing, so the GL counterpart exists.
+    if (existing) return { queued: true }
   }
 
   try {
     let mirrorErrorMessage: string | null = null
+    let deletedOrder = false
     let staleDiscount: { payloadDiscount: number; liveDiscount: number } | null = null
     await db.$transaction(async (tx) => {
       // o3d-hrak: join the sales-order delete protocol. The hard delete locks the order and
@@ -95,6 +101,7 @@ export async function queueQuickBooksSync(params: {
         console.warn(
           `[accounting-queue] skipping ${params.type} for deleted ${params.referenceType} ${params.referenceId}`,
         )
+        deletedOrder = true
         return
       }
 
@@ -151,8 +158,15 @@ export async function queueQuickBooksSync(params: {
         description: mirrorErrorMessage,
       })
     }
+    // NEITHER of these is a decision that nothing will post: the order went away under this enqueue,
+    // or the payload it was built from had been superseded. The posting is still owed.
+    if (deletedOrder || staleDiscount) return { queued: false, reason: 'refused' }
+    return { queued: true }
   } catch (error) {
-    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
+    // A concurrent insert already queued this posting, so the counterpart exists — already present.
+    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) {
+      return { queued: true }
+    }
     throw error
   }
 }
