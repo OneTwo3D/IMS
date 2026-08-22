@@ -54,6 +54,7 @@ import {
   getAccountingSettings,
   getActiveAccountingConnectorInfo,
   isAccountingSyncTypeEnabled,
+  isAccountingSyncTypeEnabledFor,
   type AccountingEnqueueOutcome,
   type AccountingSettings,
 } from '@/lib/accounting'
@@ -1961,7 +1962,9 @@ async function queueRefundAccountingActions(input: {
   }
   const ledger = await openRefundAccountingObligationLedger([creditNote, ...input.accountingSyncs], {
     activeConnector: async () => (await getActiveAccountingConnectorInfo())?.id ?? null,
-    isTypeEnabled: isAccountingSyncTypeEnabled,
+    // r9: the EXPLICIT-CONNECTOR verdict. `isAccountingSyncTypeEnabled` resolves the active connector
+    // for itself, so it cannot answer about the one this hand-off just pinned.
+    isTypeEnabledFor: isAccountingSyncTypeEnabledFor,
   })
 
   ledger.account(creditNote, await queueAccountingSync({

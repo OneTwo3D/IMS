@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 
+import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import {
   openRefundAccountingObligationLedger,
   RefundAccountingObligationsUnmet,
@@ -39,7 +40,7 @@ const COGS_REVERSAL: RefundAccountingObligation = {
 function postingEnabled(connector: string | null = 'xero') {
   return {
     activeConnector: async () => connector,
-    isTypeEnabled: async () => true,
+    isTypeEnabledFor: async () => true,
   }
 }
 
@@ -90,7 +91,7 @@ test('o3d-2sm1 r7: the ONE no-op that settles is the one the PINNED configuratio
   // recorded `[]` against a missing list.
   const noConnector = await openRefundAccountingObligationLedger([CREDIT_NOTE], {
     activeConnector: async () => null,
-    isTypeEnabled: async () => true,
+    isTypeEnabledFor: async () => true,
   })
   noConnector.account(CREDIT_NOTE, { queued: false, reason: 'not-configured', connector: null })
   noConnector.settle()
@@ -98,7 +99,7 @@ test('o3d-2sm1 r7: the ONE no-op that settles is the one the PINNED configuratio
   // Connector active, this TYPE switched off: same decision, taken per type.
   const typeOff = await openRefundAccountingObligationLedger([CREDIT_NOTE], {
     activeConnector: async () => 'xero',
-    isTypeEnabled: async () => false,
+    isTypeEnabledFor: async () => false,
   })
   typeOff.account(CREDIT_NOTE, { queued: false, reason: 'not-configured', connector: 'xero' })
   typeOff.settle()
@@ -106,7 +107,7 @@ test('o3d-2sm1 r7: the ONE no-op that settles is the one the PINNED configuratio
   // But a REFUSAL is never a decision, even when the type is switched off — it is about this call.
   const refusedWhileOff = await openRefundAccountingObligationLedger([CREDIT_NOTE], {
     activeConnector: async () => 'xero',
-    isTypeEnabled: async () => false,
+    isTypeEnabledFor: async () => false,
   })
   refusedWhileOff.account(CREDIT_NOTE, { queued: false, reason: 'refused', connector: 'xero' })
   assert.throws(() => refusedWhileOff.settle(), /the enqueue wrote nothing/)
@@ -135,7 +136,7 @@ test('o3d-2sm1 r7: the in-transaction arm reads a no-op against the pinned verdi
 
   const switchedOff = await openRefundAccountingObligationLedger([COGS_REVERSAL], {
     activeConnector: async () => 'xero',
-    isTypeEnabled: async () => false,
+    isTypeEnabledFor: async () => false,
   })
   switchedOff.accountInTransaction(COGS_REVERSAL, { queued: false, reason: 'not-configured', connector: 'xero' })
   switchedOff.settle()
@@ -337,4 +338,126 @@ test('o3d-2sm1 r8: the transactional enqueue names the connector it resolved, on
 
   // The boolean contract the other call sites read is untouched.
   assert.match(body, /\): Promise<boolean> \{/)
+})
+
+/* ------------------------------------------------------------------------------------------------
+ * ROUND 9 (Codex HIGH) — THE PINNED VERDICTS WERE NOT PINNED.
+ *
+ * r8 pinned the connector and checked every ANSWER against it, in both arms. What it did not do was
+ * resolve the pinned CONFIGURATION against the pin: each type's verdict was read through a helper
+ * that looked the active connector up for itself, after the pin had been taken. An ABA flip — away
+ * and back — therefore recorded verdicts belonging to another connector under the pinned one's name,
+ * and `willPost` is precisely what licenses the one no-op that may settle an obligation. A late
+ * `not-configured` could then discharge a posting the pinned connector was going to make.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The connector flips to QuickBooks the instant after the pin is taken, and back to Xero the instant
+ * after the verdict is read — so nothing downstream can see that it ever moved.
+ *
+ * `isTypeEnabledFor` answers about the connector it is HANDED. The reverted shape resolves `live`
+ * instead, which is the defect; the same fake serves both, which is what makes the mutation honest.
+ */
+function abaFlip(enabledOn: Record<string, boolean>) {
+  let live = 'xero'
+  const asked: string[] = []
+  return {
+    asked,
+    liveNow: () => live,
+    deps: {
+      activeConnector: async () => {
+        const pinned = live
+        live = 'quickbooks'
+        return pinned
+      },
+      isTypeEnabledFor: async (connector: string, _type: AccountingSyncType) => {
+        asked.push(connector)
+        live = 'xero'
+        return enabledOn[connector] ?? false
+      },
+    },
+  }
+}
+
+test('o3d-2sm1 r9: an ABA flip between the pin and a type verdict cannot poison the verdict', async () => {
+  // CREDIT_NOTE posts on Xero and is switched off on QuickBooks. The hand-off pins Xero.
+  const flip = abaFlip({ xero: true, quickbooks: false })
+  const ledger = await openRefundAccountingObligationLedger([CREDIT_NOTE], flip.deps)
+
+  assert.equal(ledger.pinnedConnector, 'xero')
+  assert.deepEqual(flip.asked, ['xero'], 'the verdict is asked FOR THE PINNED CONNECTOR, explicitly')
+  assert.equal(flip.liveNow(), 'xero', 'and the flip has been and gone, so nothing later can see it')
+
+  // THE CONSEQUENCE. A helper that resolved the active connector for itself would have read
+  // QuickBooks here, recorded "this posting will never exist", and let the enqueue's no-op settle an
+  // obligation the pinned connector was in fact going to post.
+  ledger.account(CREDIT_NOTE, { queued: false, reason: 'not-configured', connector: 'xero' })
+  assert.throws(
+    () => ledger.settle(),
+    (error: unknown) => {
+      assert.ok(error instanceof RefundAccountingObligationsUnmet)
+      assert.match(error.message, /CREDIT_NOTE for SalesOrderRefund refund-1/)
+      assert.match(error.message, /switched off, though it was enabled when the hand-off began/)
+      return true
+    },
+  )
+
+  // The in-transaction arm reads the same pinned verdict, so it reaches the same answer.
+  const flipTx = abaFlip({ xero: true, quickbooks: false })
+  const inTx = await openRefundAccountingObligationLedger([CREDIT_NOTE], flipTx.deps)
+  inTx.accountInTransaction(CREDIT_NOTE, { queued: false, reason: 'not-configured', connector: 'xero' })
+  assert.throws(() => inTx.settle(), /switched off, though it was enabled when the hand-off began/)
+})
+
+test('o3d-2sm1 r9: with nothing pinned, no verdict is asked of any connector at all', async () => {
+  // "No connector" is a decision the pin already made; asking a per-type helper would only give some
+  // other connector's answer a way in.
+  const flip = abaFlip({ xero: true, quickbooks: true })
+  const ledger = await openRefundAccountingObligationLedger([CREDIT_NOTE, COGS_REVERSAL], {
+    ...flip.deps,
+    activeConnector: async () => null,
+  })
+  assert.equal(ledger.pinnedConnector, null)
+  assert.deepEqual(flip.asked, [], 'nothing will post, so there is nothing to ask')
+  ledger.account(CREDIT_NOTE, { queued: false, reason: 'not-configured', connector: null })
+  ledger.accountInTransaction(COGS_REVERSAL, { queued: false, reason: 'not-configured', connector: null })
+  ledger.settle()
+})
+
+test('o3d-2sm1 r9: the ledger asks for the verdict explicitly, and the hand-off supplies the explicit helper', () => {
+  const ledgerSource = readFileSync(join(process.cwd(), 'lib/domain/sales/refund-accounting-obligations.ts'), 'utf8')
+  assert.match(
+    ledgerSource,
+    /willPost\.set\(type, pinnedConnector \? await deps\.isTypeEnabledFor\(pinnedConnector, type\) : false\)/,
+    'the verdict must be resolved FOR the pinned connector',
+  )
+  assert.ok(
+    !/deps\.isTypeEnabled\(/.test(ledgerSource),
+    'a verdict helper that resolves the active connector for itself is the r9 defect',
+  )
+
+  const source = readFileSync(join(process.cwd(), 'app/actions/sales.ts'), 'utf8')
+  const handoff = source.slice(
+    source.indexOf('async function queueRefundAccountingActions(input: {'),
+    source.indexOf('async function loadRefundAccountingQueueInput('),
+  )
+  assert.match(handoff, /isTypeEnabledFor: isAccountingSyncTypeEnabledFor/)
+  assert.ok(
+    !/isTypeEnabled: isAccountingSyncTypeEnabled\b/.test(handoff),
+    'the active-connector form must not be what the pinned hand-off asks',
+  )
+
+  // AND THE EXPLICIT FORM IS AN ADDITION, NOT A SUBSTITUTION: the active-connector helper still
+  // exists unchanged for its other call sites.
+  const accounting = readFileSync(join(process.cwd(), 'lib/accounting.ts'), 'utf8')
+  assert.match(accounting, /export async function isAccountingSyncTypeEnabled\(type: AccountingSyncType\): Promise<boolean> \{/)
+  assert.match(accounting, /export async function isAccountingSyncTypeEnabledFor\(/)
+  // The explicit variant must not resolve the active connector — that is the race, not the fix.
+  const at = accounting.indexOf('async function getAccountingPostingContextFor(')
+  assert.ok(at > -1, 'the explicit-connector context must be found')
+  const body = accounting.slice(at, accounting.indexOf('\n}\n', at))
+  assert.ok(
+    !/getActiveAccountingConnectorId/.test(body),
+    'the explicit-connector verdict must answer about the connector it was given',
+  )
 })

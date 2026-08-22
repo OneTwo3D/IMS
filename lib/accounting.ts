@@ -231,7 +231,25 @@ async function getAccountingPostingContext(type: AccountingSyncType): Promise<{
 } | null> {
   const connector = await getActiveAccountingConnectorId()
   if (!connector) return null
+  return getAccountingPostingContextFor(connector, type)
+}
 
+/**
+ * THE SAME VERDICT, FOR A CONNECTOR THE CALLER NAMES (o3d-2sm1 r9, Codex HIGH).
+ *
+ * Identical to {@link getAccountingPostingContext} except that it does not resolve the active
+ * connector: it answers for the one it is given. A caller that has PINNED a connector for a
+ * multi-step hand-off cannot use a helper that looks the connector up again — an ABA flip between the
+ * pin and the verdict poisons the verdict, and a verdict is what decides whether a later no-op may
+ * settle an obligation. This is the same move `queueAccountingSyncTx` made for the enqueue outcome:
+ * the answer must name the connector it was given, not the one that happens to be active now.
+ *
+ * A connector this build does not know is not "enabled by default": it returns null.
+ */
+async function getAccountingPostingContextFor(connector: string, type: AccountingSyncType): Promise<{
+  connector: AccountingConnectorInfo['id']
+  postingMode: string
+} | null> {
   if (connector === 'xero') {
     const { getXeroSettings } = await import('@/lib/connectors/xero/settings')
     const settings = await getXeroSettings()
@@ -242,6 +260,7 @@ async function getAccountingPostingContext(type: AccountingSyncType): Promise<{
     return { connector, postingMode }
   }
 
+  if (connector !== 'quickbooks') return null
   const { getQuickBooksSettings } = await import('@/lib/connectors/quickbooks/settings')
   const settings = await getQuickBooksSettings()
   if (settings.quickbooks_sync_enabled !== 'true') return null
@@ -274,6 +293,21 @@ export async function isDailyBatchPostingEnabled(): Promise<boolean> {
 
 export async function isAccountingSyncTypeEnabled(type: AccountingSyncType): Promise<boolean> {
   return (await getAccountingPostingContext(type)) !== null
+}
+
+/**
+ * Whether this type would post FOR THE NAMED CONNECTOR — o3d-2sm1 r9, Codex HIGH.
+ *
+ * The explicit-connector variant of {@link isAccountingSyncTypeEnabled}, added rather than
+ * substituted: every existing caller of the active-connector form is unaffected and keeps reading it.
+ * The one caller that needs this is a hand-off that pinned a connector before asking, and for which a
+ * verdict resolved against whatever is active NOW is not an answer about the pinned connector at all.
+ */
+export async function isAccountingSyncTypeEnabledFor(
+  connector: string,
+  type: AccountingSyncType,
+): Promise<boolean> {
+  return (await getAccountingPostingContextFor(connector, type)) !== null
 }
 
 export async function queueAccountingSyncTx(
