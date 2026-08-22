@@ -1130,8 +1130,39 @@ export async function fetchAllWcRefundsForOrder(
  * complete one at every call site. `complete: false` means refunds on this order are still
  * unread — the caller must NOT treat the sweep as having settled the order (acknowledge a webhook
  * delivery, advance an import cursor, or conclude a refund is absent from the store).
+ *
+ * AND `complete` DOES NOT ANSWER A THIRD QUESTION, WHICH IS THE ONE THAT MATTERS TO A CALLER
+ * DECIDING WHETHER THE ORDER IS SETTLED (o3d-xnwu r3, Codex HIGH). It is a fact about the READ, and
+ * only about the read. A walk can visit every page successfully and still FAIL TO APPLY some or all
+ * of what it fetched — `syncWcRefund` returns `{ success: false }` for an IMS order it cannot
+ * resolve, for a refund that WooCommerce has already attached to a different order, and for
+ * anything its own body throws — and every one of those left this type saying nothing at all.
+ *
+ * The webhook then read the silence two different ways, both wrong: `complete && synced === 0` as
+ * proof the STORE HOLDS NO REFUNDS for the order, and `complete && synced > 0` as proof EVERY
+ * REFUND IS NOW IN IMS. Neither follows from a read that succeeded. So the counts the type carries
+ * are the ones those sentences actually need:
+ *
+ *   fetched  how many refunds the walk READ. `fetched === 0` with `complete` is the only thing that
+ *            means "the store holds none".
+ *   failed   how many of those refunds did NOT apply. `failed === 0` with `complete` is the only
+ *            thing that means "every refund the store holds is now in IMS".
+ *
+ * TWO COUNTS, NOT A LIST OF FAILURES WITH A FLAG. The decisions above are arithmetic over the whole
+ * fetched set; a list invites a caller to look at one element and decide from it, which is how a
+ * partial answer becomes a settled one. `synced` is kept because it is what an operator-facing
+ * summary reports, but no caller may derive completeness from it: `fetched - failed` is the same
+ * number and says which half of it is meant.
  */
-export type RefundSweepResult = { synced: number; complete: boolean; error?: string }
+export type RefundSweepResult = {
+  synced: number
+  /** Refunds this walk actually read from the store. See the type header. */
+  fetched: number
+  /** Refunds that were read and then failed to apply. See the type header. */
+  failed: number
+  complete: boolean
+  error?: string
+}
 
 /**
  * Check for new refunds on synced orders and process them.
@@ -1140,6 +1171,7 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<Refu
   // Every page of refunds on the order, not just the first (o3d-okbd).
   const { refunds, error } = await fetchAllWcRefundsForOrder(externalOrderId)
   let synced = 0
+  let failed = 0
 
   for (const refund of refunds) {
     // o3d-7yf: BOTH the already-synced check and the parked-refund skip live in syncWcRefund now, scoped to
@@ -1147,11 +1179,16 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<Refu
     // repeat the cross-order leak — a refund/park owned by another order would wrongly skip this one.
     // syncWcRefund is idempotent for an already-synced or parked refund, so it is the single scoped authority.
     const result = await syncWcRefund(externalOrderId, refund)
+    // COUNTED, NOT INFERRED. `syncWcRefund` never throws — its body ends in a catch that returns
+    // `{ success: false }` — so every refund read lands in exactly one of these two, and
+    // `synced + failed === fetched` holds for every walk. A caller can therefore ask "did all of
+    // them apply?" without knowing anything about why one did not.
     if (result.success) synced++
+    else failed++
   }
 
   // The refunds that WERE read are still synced — that is the deliberate leniency above. What
-  // changes is that the caller is told the list was short, instead of inferring completeness from
-  // a number that cannot carry it.
-  return { synced, complete: error === undefined, error }
+  // changes is that the caller is told the list was short, and told how much of it failed to
+  // apply, instead of inferring either from a number that cannot carry them.
+  return { synced, fetched: refunds.length, failed, complete: error === undefined, error }
 }

@@ -280,7 +280,10 @@ IMS will refuse one, and they are handled differently because only one of them c
   would otherwise be judged against demand that still counted the refunded units and be refused
   seconds before the refund was applied. The completion is therefore re-checked once the refund sweep
   for that order has finished, and only the second answer is recorded. If the refunds could not be
-  read to the end, nothing is recorded at all and the delivery is retried.
+  read to the end, **or any refund that was read failed to apply**, nothing is recorded at all and the
+  delivery is retried — a refund sitting in the store but not in IMS leaves exactly the same hole in
+  the coverage check as one that was never read, and the failure is named in the delivery's own
+  failure list.
 
 Previously both took the same route and neither reached the caller at all: the store showed the order
 as completed, IMS never created the shipment, the webhook was acknowledged, and nothing retried.

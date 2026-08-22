@@ -42,6 +42,12 @@ let refundedQty = 0
 let storeRefundedQty = 0
 /** Whether the sweep managed to read the whole refund list. */
 let sweepComplete = true
+/**
+ * How many of the refunds the sweep READ then failed to APPLY (o3d-xnwu r3). Zero for every case
+ * round 2 could express — which is why round 2's classification could not tell a settled order from
+ * one whose refunds all bounced.
+ */
+let sweepFailed = 0
 /** Set to answer with a refusal that is NOT a coverage shortfall (the control). */
 let refusalOverride: { error: string; refusal: string; permanent: boolean } | null = null
 
@@ -116,9 +122,18 @@ mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
     syncRefundsForOrder: async () => {
       calls.push('refunds')
       // The refunds this delivery is carrying land HERE, which is after the completion has already
-      // been judged once.
-      refundedQty = storeRefundedQty
-      return { synced: storeRefundedQty > 0 ? 1 : 0, complete: sweepComplete, ...(sweepComplete ? {} : { error: 'the refund list did not end within 20 pages' }) }
+      // been judged once. `sweepFailed` of them bounce: they were READ but not APPLIED, so the
+      // units they would have taken out of demand are still counted against the dispatch.
+      const fetched = storeRefundedQty > 0 ? 1 : 0
+      const failed = Math.min(sweepFailed, fetched)
+      refundedQty = failed > 0 ? 0 : storeRefundedQty
+      return {
+        synced: fetched - failed,
+        fetched,
+        failed,
+        complete: sweepComplete,
+        ...(sweepComplete ? {} : { error: 'the refund list did not end within 20 pages' }),
+      }
     },
     syncWcRefund: async () => ({ success: true }),
   },
@@ -152,6 +167,7 @@ function reset() {
   refundedQty = 0
   storeRefundedQty = 0
   sweepComplete = true
+  sweepFailed = 0
   refusalOverride = null
 }
 
@@ -259,4 +275,56 @@ test('o3d-xnwu r2: a refusal refunds cannot answer is classified immediately, no
   assert.equal(response.status, 500, 'transient: the redelivery after a receipt lands is the fix')
   assert.ok(body.failures?.some((f) => /requires physical stock/.test(f)))
   assert.deepEqual(calls, ['status', 'refunds'], 'nothing was held, so nothing was re-asked')
+})
+
+test('o3d-xnwu r3: a refund that was READ but failed to APPLY may not bury the shortfall', async () => {
+  reset()
+  // THE FINDING. The walk visited every page and reached the empty one that ends it, so the sweep
+  // is `complete` and truthfully so — and then the two refunds that make this dispatch complete
+  // failed to reach IMS. Round 2 classified from `complete` alone: `synced === 0` was read as "the
+  // store holds no refunds for this order", so the shortfall was recorded PERMANENT, acknowledged,
+  // and the cursor advanced over an order whose refunds were still missing. A read that succeeded
+  // is not an application that succeeded.
+  storeRefundedQty = 2
+  sweepFailed = 1
+
+  const response = await pushCompletedOrder()
+  const body = await response.json() as { ok: boolean; failures?: string[]; permanentFailures?: string[] }
+
+  assert.equal(response.status, 500, 'transient: the redelivery re-sweeps the refunds and re-decides')
+  assert.equal(body.permanentFailures, undefined, 'nothing may be buried on an unapplied refund')
+  assert.ok(
+    body.failures?.some((f) => /without covering everything ordered/.test(f)),
+    'the held refusal is released as TRANSIENT, exactly as it is for an incomplete READ',
+  )
+  assert.ok(
+    body.failures?.some((f) => /could not be applied/.test(f)),
+    'and the unapplied refund is named — it produced no line of its own before this',
+  )
+  assert.deepEqual(calls, ['status', 'refunds'], 'an unsettled order buys no second look')
+  assert.equal(
+    settingUpserts.includes('last_wc_order_sync_at'),
+    false,
+    'and the cursor does not move past an order whose refunds are not in IMS',
+  )
+  assert.deepEqual(
+    activityLog.filter((entry) => entry.action === 'wc_order_webhook_rejected'),
+    [],
+    'a transient failure is not a business rejection',
+  )
+})
+
+test('o3d-xnwu r3: an APPLIED sweep still settles the order — the fix does not refuse everything', async () => {
+  reset()
+  // The control for the test above. Same order, same refunds, and this time they apply. If the
+  // classification had simply become "transient whenever anything is non-zero", this would fail.
+  storeRefundedQty = 2
+  sweepFailed = 0
+
+  const response = await pushCompletedOrder()
+  const body = await response.json() as { ok: boolean; permanentFailures?: string[] }
+
+  assert.equal(response.status, 200)
+  assert.equal(body.permanentFailures, undefined)
+  assert.deepEqual(calls, ['status', 'refunds', 'status'])
 })

@@ -486,15 +486,38 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
     }
 
     if (heldForRefunds) {
-      if (refundSweep?.complete && refundSweep.synced > 0) {
+      // o3d-xnwu round 3 (Codex HIGH): A SWEEP THAT READ EVERYTHING IS NOT A SWEEP THAT APPLIED
+      // EVERYTHING.
+      //
+      // Round 2 moved the classification onto the SECOND reading, which was the fix, and then
+      // decided WHICH second reading to take from `complete` and `synced` alone. Both of the
+      // sentences it built out of them are false of a sweep that read every page and then failed to
+      // apply what it fetched: `complete && synced === 0` was read as "the store holds no refunds
+      // for this order", and `complete && synced > 0` as "every refund the store holds is now in
+      // IMS". `syncWcRefund` refuses an order it cannot resolve, a refund WooCommerce has already
+      // attached to a different order, and anything its body throws — none of which touches the
+      // read — so a settled-looking sweep could be carrying nothing but refusals.
+      //
+      // THE ONLY STATE THAT SETTLES THE HELD REFUSAL is a read that finished AND a fetched set that
+      // applied in full. That is exactly the same defect shape this branch fixed one layer down —
+      // a result that cannot express failure gets read as success — so the answer is the same one:
+      // the counts travel, and the classification is made from them.
+      //
+      //   complete, nothing fetched      the store really does hold no refunds; nothing can change
+      //                                  the first answer, so it stands with its own classification.
+      //   complete, all of them applied  the demand IMS holds is now the demand the store holds; the
+      //                                  re-ask is the reading that gets classified.
+      //   anything else                  the demand this order carries is still unknown. TRANSIENT,
+      //                                  which is the direction round 2 already chose for a read
+      //                                  that did not finish — an unapplied refund leaves the same
+      //                                  hole in the coverage check as an unread one.
+      const settledTheOrder = refundSweep !== null && refundSweep.complete && refundSweep.failed === 0
+      if (settledTheOrder && refundSweep !== null && refundSweep.fetched > 0) {
         // ASK AGAIN, now that every refund the store holds for this order is in IMS. The re-ask is
         // the same call because it is idempotent by construction: allocation and shipment creation
         // are both skipped when they have already happened (the first attempt got as far as the
         // coverage check, so they had), and a completion that succeeded leaves the order in the
-        // target status, which `syncWcOrderStatus` short-circuits on. `synced > 0` is the cheap
-        // guard: the sweep counts refunds it handled, whether newly applied or already present, so
-        // it can over-count but never under-count — and a shortfall can only ever be settled by a
-        // refund, so an order the store holds none for cannot have a different answer.
+        // target status, which `syncWcOrderStatus` short-circuits on.
         //
         // A completion refused twice leaves two `wc_completion_fulfillment_refused` rows on the
         // order, and both are wanted: the first is what the dispatch looked like against the demand
@@ -506,14 +529,30 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
           if (settled.permanent) permanentFailures.push(detail)
           else failures.push(detail)
         }
-      } else if (refundSweep?.complete) {
-        // The store holds no refunds for this order, so the first answer was already computed from
-        // the settled state. It stands, with the classification it came with.
+      } else if (settledTheOrder) {
+        // The store holds no refunds for this order — `fetched === 0` on a read that finished, which
+        // is the only evidence of that there is — so the first answer was already computed from the
+        // settled state. It stands, with the classification it came with.
         permanentFailures.push(heldForRefunds)
       } else {
-        // The sweep did not finish, so the demand this order carries is still unknown. The delivery
-        // is failing anyway (the incomplete read above is in `failures`); classify the held refusal
-        // as transient so the redelivery re-decides it rather than burying it on a partial read.
+        // Either the sweep did not finish, or refunds it DID read failed to apply. Both leave the
+        // demand this order carries unknown, and neither is a verdict. Classify the held refusal as
+        // transient so the redelivery re-decides it rather than burying it.
+        //
+        // AND THE DELIVERY MUST NOT SUCCEED ON THIS PATH. An incomplete read already put its own
+        // line in `failures`; an application failure did not, and until this branch there was
+        // nothing at all to stop `ok: true` and the cursor advancing over it. Pushing the held
+        // refusal is what fails the delivery, so the refunds are re-swept and the shortfall
+        // re-decided. It is deliberately scoped to a HELD refusal rather than to every sweep that
+        // failed to apply something: a refund that can never apply (one WooCommerce has attached to
+        // a different order) would otherwise retry every delivery to a dead letter, which is the
+        // behaviour o3d-bx9 removed.
+        if (refundSweep && refundSweep.complete && refundSweep.failed > 0) {
+          failures.push(
+            `syncRefundsForOrder: ${refundSweep.failed} of ${refundSweep.fetched} refunds read for this `
+            + 'order could not be applied, so the demand it carries is still unknown',
+          )
+        }
         failures.push(heldForRefunds)
       }
     }
