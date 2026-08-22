@@ -1,5 +1,6 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
+import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * Joining accounting enqueue to the sales-order delete protocol (o3d-hrak).
@@ -106,4 +107,122 @@ export async function lockOrderForAccountingEnqueue(
   if (!order) return null
 
   return orderId
+}
+
+// ---------------------------------------------------------------------------
+// o3d-y14 — the payload snapshot, not just the queue row
+// ---------------------------------------------------------------------------
+
+/**
+ * Sync types whose payload carries the order-level discount and therefore has to agree with the
+ * live `SalesOrder.discountAmount`. Both are built by reading that column
+ * (`queueSalesInvoiceForOrder` in app/actions/sales.ts, and the WooCommerce importer).
+ */
+export const ORDER_DISCOUNT_FENCED_SYNC_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] as const
+
+export type StaleOrderDiscount = {
+  /** The order-level discount the caller's payload was built from. */
+  payloadDiscount: number
+  /** What the column says now, read under the order lock. */
+  liveDiscount: number
+}
+
+/** The convention both payload builders use for this field: the order's own currency, 2 dp. */
+function payloadRounded(value: unknown): number | null {
+  if (value === undefined || value === null) return 0
+  const numeric = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(numeric)) return null
+  return roundQuantity(toDecimal(numeric), 2).toNumber()
+}
+
+/**
+ * Is this payload's order-level discount STILL the order's? Called inside the locked enqueue
+ * transaction; returns the mismatch when the payload is stale, or `null` when it is fine or the
+ * check does not apply.
+ *
+ * WHY THIS EXISTS, when the enqueue already takes the order lock (o3d-y14).
+ *
+ * The lock serialises the INSERT of the queue row. It does not serialise the CONSTRUCTION of the
+ * payload, and the payload is what gets posted. `queueSalesInvoiceForOrder` reads
+ * `SalesOrder.discountAmount` and builds the entire payload BEFORE calling the queue helper, and
+ * only the helper takes the lock. So this interleaving is legal and the lock cannot see it:
+ *
+ *   1. a producer reads discountAmount = 10 and builds a payload containing 10;
+ *   2. the o3d-y14 backfill takes the lock, counts ZERO live invoice jobs — true, none exists yet —
+ *      corrects the column to 0 and permanently stamps the order as corrected;
+ *   3. the producer takes the now-free lock and inserts its payload containing 10;
+ *   4. a worker posts 10 to the ledger, from an order that says 0, marked as already fixed.
+ *
+ * Nothing downstream can detect that, which is the whole reason the backfill is fenced at all. The
+ * fix is that the payload has to be validated against the live row inside the SAME lock that
+ * decides the ordering — a snapshot older than the lock is refused rather than queued.
+ *
+ * SCOPE, stated honestly: this fences the ONE field the backfill mutates. It is not a general
+ * payload-freshness check, and it is not a substitute for building the payload under the lock —
+ * which remains the stronger fix, and the one to reach for if any other order column ever becomes
+ * correctable in flight. What it guarantees is the property the correction depends on: no queued
+ * SALES_INVOICE can carry an order-level discount the order does not currently have.
+ */
+export async function findStaleOrderLevelDiscount(
+  tx: Prisma.TransactionClient,
+  params: { type: string; referenceType: string; orderId: string; payload: Record<string, unknown> },
+): Promise<StaleOrderDiscount | null> {
+  if (!(ORDER_DISCOUNT_FENCED_SYNC_TYPES as readonly string[]).includes(params.type)) return null
+  // These types are always keyed on the order itself; a Shipment-keyed row of this type would mean
+  // the payload was built from something other than the order, so fencing it would be a guess.
+  if (params.referenceType !== 'SalesOrder') return null
+
+  const order = await tx.salesOrder.findUnique({
+    where: { id: params.orderId },
+    select: { discountAmount: true },
+  })
+  // A missing order is the caller's other guard's business (lockOrderForAccountingEnqueue already
+  // refused it); nothing to compare here.
+  if (!order) return null
+
+  const payloadDiscount = payloadRounded(params.payload.discountAmount)
+  const liveDiscount = roundQuantity(toDecimal(order.discountAmount ?? 0), 2).toNumber()
+  // A non-numeric discount is not "no discount": it is a payload this fence cannot read, so it
+  // fails CLOSED rather than waving it through.
+  if (payloadDiscount === null) return { payloadDiscount: Number.NaN, liveDiscount }
+  if (payloadDiscount === liveDiscount) return null
+
+  return { payloadDiscount, liveDiscount }
+}
+
+/** ActivityLog action written when an enqueue is refused for carrying a superseded discount. */
+export const STALE_ORDER_DISCOUNT_ENQUEUE_ACTION = 'accounting_enqueue_stale_order_discount'
+
+/**
+ * Report a refused enqueue. LOUD on purpose: the document was NOT queued, so an operator has to
+ * re-trigger it, and a silent skip would look identical to a disabled connector.
+ */
+export async function logStaleOrderDiscountEnqueue(
+  connector: string,
+  params: { type: string; referenceType: string; referenceId: string },
+  stale: StaleOrderDiscount,
+  deps?: { logActivity?: (input: Record<string, unknown>) => Promise<unknown> },
+): Promise<void> {
+  const log = deps?.logActivity ?? (await import('@/lib/activity-log')).logActivity
+  await log({
+    entityType: 'SALES_ORDER',
+    entityId: params.referenceId,
+    action: STALE_ORDER_DISCOUNT_ENQUEUE_ACTION,
+    tag: 'accounting',
+    level: 'ERROR',
+    description:
+      `Refused to queue a ${connector} ${params.type} for this order: the payload was built from an ` +
+      `order-level discount of ${stale.payloadDiscount}, but the order now says ${stale.liveDiscount}. ` +
+      'Something corrected the order between the payload being built and this enqueue (o3d-y14), so ' +
+      'posting it would put a figure in the ledger that the order contradicts. NOTHING WAS QUEUED — ' +
+      're-trigger the invoice for this order to send the current figures.',
+    metadata: {
+      connector,
+      type: params.type,
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+      payloadDiscount: Number.isFinite(stale.payloadDiscount) ? stale.payloadDiscount : null,
+      liveDiscount: stale.liveDiscount,
+    },
+  })
 }

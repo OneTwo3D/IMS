@@ -97,6 +97,7 @@ import {
   expectedSalesOrderLineTaxForeign,
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
+import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
 import { invoiceNumberIsExternallySupplied, resolveSalesInvoiceNumberForPost } from '@/lib/domain/accounting/sales-invoice-number'
 import { decideChargebackDiscountLine, readPostedSalesInvoiceDiscountForOrder } from '@/lib/domain/accounting/posted-document-discount'
 import {
@@ -2489,6 +2490,11 @@ export async function raiseChargebackForReversedOrder(
       totalBase: true,
       taxBase: true,
       discountAmount: true,
+      // o3d-y14 r3 finding 1: the credit note mirrors WHAT THE INVOICE POSTED, so the discount
+      // resolution needs the order's currency, its restatement record and its invoice link.
+      currency: true,
+      discountRestatement: true,
+      accountingInvoiceId: true,
       fxRateToBase: true,
       pricesIncludeVat: true,
       taxRatePercent: true,
@@ -2547,53 +2553,158 @@ export async function raiseChargebackForReversedOrder(
   // ambiguous. Safe-skip both edge cases to manual; otherwise pass the discount through
   // as its own mirrored line (in BASE currency = discountAmount / fxRateToBase).
   //
-  // o3d-356o: WHICH discount the invoice actually posted is a property of the DOCUMENT, not of
-  // today's settings. `decideChargebackDiscountLine` reads the mirrored POSTED sales-invoice
-  // event and only falls back to the live-setting proxy for orders that have no such event.
-  let discountInput: { totalBase: number } | undefined
-  if (decimalToNumber(order.discountAmount) > 0) {
-    const cbSettings = await getAccountingSettings().catch(() => null)
-    const postedDiscount = await readPostedSalesInvoiceDiscountForOrder(db.accountingEvent, orderId)
-    const decision = decideChargebackDiscountLine({
-      orderDiscountAmount: decimalToNumber(order.discountAmount),
-      configuredDiscountAccount: cbSettings?.discountAccount,
-      posted: postedDiscount,
+  // TWO INDEPENDENT FIXES OF THIS PARAGRAPH LANDED IN THE SAME MERGE, AND BOTH SURVIVE. They ask
+  // DIFFERENT questions about the same posted document and neither answers the other's:
+  //
+  //   • HOW MUCH did the document discount?  o3d-y14, `resolvePostedOrderDiscount` below. The
+  //     backfill rewrites `discountAmount` on legacy orders whose invoices already posted, so the
+  //     live column is not evidence of what the document charged.
+  //   • WHERE did that discount line go?     o3d-356o, `decideChargebackDiscountLine` further down.
+  //     The credit-note builder takes its account code from the LIVE setting, so a discount posted
+  //     to an account that has since been changed or cleared cannot be reversed where the debit
+  //     went, whatever the amount is.
+  //
+  // Reading the amount correctly does not make the account right, and vice versa; each module stays
+  // the single definition of its own question rather than one growing a hand-spelt copy of the other.
+  //
+  // o3d-y14 r3 finding 1: THE FIGURE MIRRORED MUST BE THE ONE THE INVOICE POSTED, not the one the
+  // order carries now — and where those two cannot be reconciled automatically, no credit note is
+  // raised at all.
+  //
+  // The o3d-y14 backfill rewrites `discountAmount` on legacy WooCommerce orders whose invoices are
+  // already in the ledger. On such an order the live column says what the order SHOULD have said,
+  // while the document this credit note reverses charged the old, larger figure — so building the
+  // reversal from the live column omits the invoice's discount leg and over-reverses AR and revenue
+  // by the cleared amount. That is the defect. `resolvePostedOrderDiscount` recovers what the
+  // document actually charged from the mirrored AccountingEvent — replaying the connector's own
+  // line-omission rule over the payload the mirror recorded, because the mirror records what IMS
+  // ENQUEUED and Xero omits the discount line when no discount account was configured (see that
+  // module for that derivation, and for why the sync log, the ActivityLog marker and the batch
+  // stamp are all unusable here).
+  //
+  // WHY A DISAGREEMENT IS A REFUSAL RATHER THAN "USE THE POSTED FIGURE". Because the backfill's own
+  // output puts every one of these orders on an operator's must-fix list: the posted document
+  // understates and needs a manual credit/adjustment in the accounting system. Whether that
+  // adjustment has been made is invisible from IMS — it happens in Xero/QuickBooks, and neither the
+  // order nor the mirror records it. Before it, the ledger holds the posted figure and mirroring
+  // that is right; after it, the ledger holds the corrected figure and mirroring the posted one
+  // under-reverses by the same amount. Both candidate credit notes are wrong in one of the two
+  // worlds, and nothing available here says which world this is. So the order joins the cases this
+  // path already refuses for exactly this reason — prior refunds, no discount account — and a human
+  // raises it with the invoice in front of them. The refusal names BOTH figures so they can.
+  //
+  // Orders whose posted document AGREES with the column (every order the backfill never touched,
+  // including all native and pre-column ones, which short-circuit before the lookup) are unaffected.
+  const postedDiscount = await resolvePostedOrderDiscount(db, {
+    id: orderId,
+    currency: order.currency,
+    discountAmount: decimalToNumber(order.discountAmount),
+    discountRestatement: order.discountRestatement,
+    accountingInvoiceId: order.accountingInvoiceId,
+  })
+  const discountDecision = decideChargebackOrderDiscount({
+    posted: postedDiscount,
+    orderDiscountAmount: decimalToNumber(order.discountAmount),
+  })
+  if (discountDecision.action === 'MANUAL') {
+    const orderRef = order.orderNumber ?? order.externalOrderNumber ?? orderId
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'chargeback_requires_manual_handling',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        discountDecision.reason === 'RESTATED_AFTER_POSTING'
+          ? `Payment reversed on order ${orderRef}, whose order-level discount was restated after its invoice posted: the ledger document charged ${discountDecision.postedAmount} ${order.currency} and the order now carries ${discountDecision.orderAmount} ${order.currency} (${discountDecision.detail}). Auto-chargeback skipped — reversing the order's figure over-credits the difference, and reversing the posted figure under-credits it if the manual ledger adjustment for this order has already been made. Raise the credit note manually against the document as it stands.`
+          : `Payment reversed on order ${orderRef}, but the order-level discount the invoice actually posted could not be established (${discountDecision.detail}) — auto-chargeback skipped; raise the credit note manually against the posted invoice.`,
+      metadata: {
+        reason: discountDecision.reason,
+        detail: discountDecision.detail,
+        currentOrderDiscount: discountDecision.orderAmount,
+        postedOrderDiscount: discountDecision.postedAmount,
+        documentType: discountDecision.documentType,
+        externalId: discountDecision.externalId,
+      },
+      resolveUser: false,
     })
-    if (decision.action === 'manual') {
+    return {
+      raised: false,
+      reason:
+        discountDecision.reason === 'RESTATED_AFTER_POSTING'
+          ? 'the order-level discount was restated after the invoice posted — manual chargeback required'
+          : 'the posted order-level discount could not be established — manual chargeback required',
+    }
+  }
+  // Past this point the posted document and the order agree (or nothing has posted), so the two
+  // readings are interchangeable and the figure below is both.
+  const mirroredDiscount = discountDecision.amount
+
+  let discountInput: { totalBase: number } | undefined
+  if (mirroredDiscount > 0) {
+    // o3d-356o's question, asked only once the amount above is settled. `orderDiscountAmount` is
+    // the POSTED figure, not the order's column: this decision is about the document being
+    // reversed, and passing the live column here would reintroduce exactly the substitution the
+    // block above exists to prevent.
+    const cbSettings = await getAccountingSettings().catch(() => null)
+    const postedDiscountLine = await readPostedSalesInvoiceDiscountForOrder(db.accountingEvent, orderId)
+    const accountDecision = decideChargebackDiscountLine({
+      orderDiscountAmount: mirroredDiscount,
+      configuredDiscountAccount: cbSettings?.discountAccount,
+      posted: postedDiscountLine,
+    })
+    if (accountDecision.action !== 'mirror-discount') {
+      // BOTH non-mirror verdicts are refusals HERE, and `no-discount-line` is a refusal rather than
+      // "credit the full goods" precisely because the amount question is already answered. Its two
+      // ordinary causes cannot reach this point: an order with no discount fails the guard above,
+      // and a Xero invoice that omitted the line resolves to 0 above and fails it too. What is left
+      // is a genuine DISAGREEMENT between the two reads about one document — the QuickBooks shape,
+      // where the adapter posts the discount line on amount alone while this reader requires an
+      // account code, so the document carries a discount whose account nobody here can name. That is
+      // the one case where crediting the full goods value would be a guess, so it goes to a human.
       await logActivity({
         entityType: 'SALES_ORDER',
         entityId: orderId,
         action: 'chargeback_requires_manual_handling',
         tag: 'accounting',
         level: 'WARNING',
-        description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount, but ${decision.reason} — auto-chargeback skipped; raise the credit note manually.`,
+        description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount, but ${accountDecision.reason} — auto-chargeback skipped; raise the credit note manually.`,
         resolveUser: false,
       })
-      return { raised: false, reason: `order-level discount: ${decision.reason} — manual chargeback required` }
+      return { raised: false, reason: `order-level discount: ${accountDecision.reason} — manual chargeback required` }
     }
-    if (decision.action === 'mirror-discount') {
-      // Convert to the NET (ex-VAT) basis the credit note posts on (lineAmountsIncludeTax
-      // is false). discountAmount is stored in the order's inclusive/exclusive convention,
-      // so strip VAT when the order is tax-inclusive, then to base currency.
-      const fxRate = decimalToNumber(order.fxRateToBase) || 1
-      const vatPct = decimalToNumber(order.taxRatePercent)
-      const discountForeignNet = order.pricesIncludeVat && vatPct > 0
-        ? decimalToNumber(order.discountAmount) / (1 + vatPct)
-        : decimalToNumber(order.discountAmount)
-      discountInput = { totalBase: discountForeignNet / fxRate }
-    } else {
-      // no-discount-line: the invoice charged the full goods value, so the credit note must
-      // reverse the full goods value. Mirroring a discount line here would under-credit by it.
-      await logActivity({
-        entityType: 'SALES_ORDER',
-        entityId: orderId,
-        action: 'chargeback_discount_line_omitted',
-        tag: 'accounting',
-        level: 'INFO',
-        description: `Chargeback for order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} omits the order-level discount line: ${decision.reason}.`,
-        resolveUser: false,
-      })
-    }
+    // Convert to the NET (ex-VAT) basis the credit note posts on (lineAmountsIncludeTax
+    // is false). discountAmount is stored in the order's inclusive/exclusive convention,
+    // so strip VAT when the order is tax-inclusive, then to base currency.
+    const fxRate = decimalToNumber(order.fxRateToBase) || 1
+    const vatPct = decimalToNumber(order.taxRatePercent)
+    // The posted figure uses the SAME convention as the column it replaces — the invoice payload is
+    // built from `SalesOrder.discountAmount` verbatim (queueSalesInvoiceForOrder), in the order's
+    // currency and its inclusive/exclusive convention — so only the number changes here, never the
+    // arithmetic applied to it.
+    const discountForeignNet = order.pricesIncludeVat && vatPct > 0
+      ? mirroredDiscount / (1 + vatPct)
+      : mirroredDiscount
+    discountInput = { totalBase: discountForeignNet / fxRate }
+  } else if (postedDiscount.source === 'POSTED_DOCUMENT') {
+    // o3d-356o's `no-discount-line` outcome, reached now by the recovered AMOUNT rather than by the
+    // live setting: the document charged the full goods value, so the credit note must reverse the
+    // full goods value. Mirroring a discount line here would under-credit by it.
+    //
+    // The condition is read off the DOCUMENT, never off `order.discountAmount`. It is the same rule
+    // the block above enforces and the r3 structural test pins: once the posted figure is resolved,
+    // the live column is not evidence of anything here — an order the backfill corrected carries a
+    // discount the invoice never charged, so branching on the column would log this the wrong way
+    // round on exactly the orders o3d-y14 exists for.
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'chargeback_discount_line_omitted',
+      tag: 'accounting',
+      level: 'INFO',
+      description: `Chargeback for order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} omits the order-level discount line: the posted ${postedDiscount.documentType} carried no order-level discount (${postedDiscount.detail}).`,
+      resolveUser: false,
+    })
   }
 
   const lines = buildChargebackRefundLines({

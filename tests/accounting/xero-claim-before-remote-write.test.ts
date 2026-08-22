@@ -64,6 +64,16 @@ function makeDbDouble(): Record<string, unknown> {
       }
     },
   })
+  // The sync-log delegate: `findUnique` answers from the pending rows this test seeded, so the
+  // post-claim re-read sees the payload the row actually carries. Every other method falls through
+  // to the permissive `model`.
+  const syncLogModel = new Proxy({}, {
+    get: (_target, method: string) => {
+      if (method !== 'findUnique') return (model as Record<string, unknown>)[method]
+      return async (args: { where?: { id?: string } }) =>
+        state.pending.find((row) => row.id === args?.where?.id) ?? null
+    },
+  })
   const db: Record<string, unknown> = new Proxy({}, {
     get: (_target, key: string) => {
       if (key === '$transaction') {
@@ -81,6 +91,16 @@ function makeDbDouble(): Record<string, unknown> {
       //  • `$executeRaw` — o3d-clxw r4's database-clock stamp on the SYNCED transition.
       if (key === '$queryRaw' || key === '$queryRawUnsafe') return async () => []
       if (key === '$executeRaw' || key === '$executeRawUnsafe') return async () => 1
+      // o3d-5ct (#618): the sweep no longer posts from the row object the batch `findMany` returned.
+      // Once the claim lands it RE-READS the payload by id, because the snapshot was taken before the
+      // claim and a corrective writer may have rewritten the row in between.
+      //
+      // The generic `model` proxy answers every `findUnique` with the SALES ORDER above, so the
+      // re-read returned `{ id: 'so-1', customerId, status }` as the payload, the invoice lost its
+      // number and lines, and nothing posted — which this file reported as "the ordinary path must be
+      // untouched by the guard", i.e. as a claim-fence regression, which it is not. The sync-log
+      // delegate therefore answers about SYNC LOGS; everything else still falls through to `model`.
+      if (key === 'accountingSyncLog') return syncLogModel
       return model
     },
   })

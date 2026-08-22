@@ -92,6 +92,9 @@ function matches(row: Row, where: Record<string, unknown>): boolean {
       const unsupported = Object.keys(operators).filter((op) => !['in', 'notIn', 'not', 'lt'].includes(op))
       if (unsupported.length > 0) throw new Error(`unsupported operator(s) ${unsupported.join(', ')} on "${key}"`)
       if ('in' in operators && !(operators.in as unknown[]).includes(value)) return false
+      // o3d-y14 added `status: { notIn: POSTABLE }` to the SAME predicate. The throw above is what
+      // surfaced it rather than letting the clause be silently ignored — which would have made every
+      // assertion in this file describe a predicate the code no longer has.
       if ('notIn' in operators && (operators.notIn as unknown[]).includes(value)) return false
       if ('not' in operators) {
         if (operators.not === null) { if (value === null) return false } else if (value === operators.not) return false
@@ -174,6 +177,21 @@ test('[o3d-9kek r2 f2] retention still deletes everything the sweep has SETTLED 
   assert.equal(matches(row({ type: 'COGS_JOURNAL' }), where), true)
   // Age is still the primary rule: nothing inside the retention window is deleted.
   assert.equal(matches(row({ createdAt: NOW }), where), false)
+})
+
+test('[o3d-y14] unfinished work is kept by the OTHER clause on the same predicate', async () => {
+  // The two rules meet here and neither subsumes the other. A PENDING invoice job has no external
+  // id, so this file's predicate is structurally incapable of seeing it — `externalTransactionId:
+  // { not: null }` excludes it from the evidence set, and it would be deleted by age. What keeps it
+  // is o3d-y14's `status: { notIn: POSTABLE }`: the row IS the work a worker will post from, and
+  // the coupon backfill counts these rows under the order lock to decide it is safe to correct.
+  const where = await captureDeletePredicate()
+
+  assert.equal(matches(row({ status: 'PENDING', externalTransactionId: null }), where), false)
+  assert.equal(matches(row({ status: 'PROCESSING', externalTransactionId: null }), where), false)
+  // And conversely, the evidence clause still covers what the status clause cannot: a SYNCED row is
+  // not postable work, so only `NOT: UNRESOLVED_…` keeps it.
+  assert.equal(matches(row({ status: 'SYNCED' }), where), false)
 })
 
 // ---------------------------------------------------------------------------
