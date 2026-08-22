@@ -144,11 +144,20 @@ function matches(row: Row, where: Record<string, unknown>): boolean {
       continue
     }
     // o3d-psvi: the compaction's age test is `createdAt < cutoff AND (syncedAt IS NULL OR
-    // syncedAt < cutoff)`, so this evaluator has to understand a disjunction or it would throw on
-    // the branch rather than checking it.
+    // syncedAt < cutoff)`, and o3d-nepa added a SECOND exemption to the delete (two NOTs, so an
+    // `AND` array) and a second population to the compaction (an `OR` array). Both are MODELLED
+    // rather than tolerated: an ignored `AND` would make the delete look unconditional and an
+    // ignored `OR` would make the compaction look universal, so every assertion below would
+    // describe a predicate the code does not have — the exact failure the `unsupported operator`
+    // throw exists to prevent one level down.
+    if (key === 'AND') {
+      const clauses = condition as Array<Record<string, unknown>>
+      if (!clauses.every((clause) => matches(row, clause))) return false
+      continue
+    }
     if (key === 'OR') {
-      const branches = condition as Array<Record<string, unknown>>
-      if (!branches.some((branch) => matches(row, branch))) return false
+      const clauses = condition as Array<Record<string, unknown>>
+      if (!clauses.some((clause) => matches(row, clause))) return false
       continue
     }
     const value = row[key] ?? null
@@ -190,6 +199,10 @@ function row(overrides: Row = {}): Row {
     externalTransactionId: 'XBILL-1',
     backReferenceCheckedAt: null,
     backReferenceEvidenceCompactedAt: null,
+    // o3d-nepa: null is the ordinary value — "not on record", which is what makes a CANCELLED row
+    // an UNRESOLVED abandonment. Spelled out rather than left absent so a reader of a fixture can
+    // see which of the two facts about a cancelled row it is describing.
+    abandonedBeforeRemoteCall: null,
     ...overrides,
   }
 }
@@ -258,8 +271,11 @@ test('[o3d-9kek r2 f2] retention still deletes everything the sweep has SETTLED 
   assert.equal(matches(row({ backReferenceCheckedAt: new Date('2021-01-01') }), where), true)
   // Never posted — it is not evidence of anything in the ledger.
   assert.equal(matches(row({ externalTransactionId: null }), where), true)
-  // Deliberately abandoned (audit-46ry), and types that carry no back-reference at all.
-  assert.equal(matches(row({ status: 'CANCELLED' }), where), true)
+  // o3d-nepa: a CANCELLED row expires ONLY when its abandonment is proof that nothing was sent —
+  // `abandonedBeforeRemoteCall`, which only the orphan sweep writes and only over a PENDING (pre-
+  // call) row — AND it names no document. This assertion used to be a bare `status: 'CANCELLED'`,
+  // which is exactly the deletion that turned a refusal into a duplicate journal.
+  assert.equal(matches(row({ status: 'CANCELLED', abandonedBeforeRemoteCall: true, externalTransactionId: null }), where), true)
   assert.equal(matches(row({ type: 'COGS_JOURNAL' }), where), true)
   // Age is still the primary rule: nothing inside the retention window is deleted.
   assert.equal(matches(row({ createdAt: NOW }), where), false)
@@ -466,7 +482,12 @@ test('[o3d-nepa] the exemption RELEASES the moment the row terminalises', async 
   // SYNCED and CANCELLED rows that are neither money evidence nor unresolved back-reference
   // evidence expire by age exactly as before.
   assert.equal(matches(row({ type: 'COGS_JOURNAL', status: 'SYNCED', externalTransactionId: null }), where), true)
-  assert.equal(matches(row({ type: 'COGS_JOURNAL', status: 'CANCELLED', externalTransactionId: null }), where), true)
+  // o3d-nepa: CANCELLED only terminalises the row for retention's purposes once its abandonment is
+  // ON RECORD as pre-call. SYNCED needs no such qualification — it IS the outcome.
+  assert.equal(
+    matches(row({ type: 'COGS_JOURNAL', status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }), where),
+    true,
+  )
   // ...and age is still the primary rule for a postable row: nothing inside the window was ever
   // eligible, so the exemption must not be read as the only thing protecting it.
   assert.equal(matches(row({ type: 'COGS_JOURNAL', status: 'PENDING', createdAt: NOW }), where), false)
@@ -607,4 +628,40 @@ test('[o3d-bqw7 r3] the per-row loop is BOUNDED — it is the only one in the pu
   // The remainder is not lost: a compacted row leaves the predicate for good, so the next run
   // continues rather than repeating. The predicate is what makes that true, so assert it is intact.
   assert.equal(compact.where.backReferenceEvidenceCompactedAt, null)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-nepa — THE DELETE PREDICATE MUST NOT REACH AN UNRESOLVED ABANDONED CLAIM.
+//
+// The assertions above pin what retention MAY delete. This pins the negative, which is the half a
+// removed exemption breaks silently: with the clause gone, every case below becomes deletable and
+// nothing else in this file objects, because each of its other tests names a row that SHOULD go.
+// ---------------------------------------------------------------------------
+
+test('[o3d-nepa] a CANCELLED row whose abandonment proves nothing is outside the delete predicate', async () => {
+  const { deleteWhere, compact } = await runRetention()
+
+  // Not on record — the ordinary shape. Every canceller except the orphan sweep leaves this.
+  assert.equal(matches(row({ type: 'COGS_JOURNAL', status: 'CANCELLED', externalTransactionId: null }), deleteWhere), false)
+  // Explicitly false is the same fact as absent: "not on record" either way.
+  assert.equal(
+    matches(row({ type: 'COGS_JOURNAL', status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: false }), deleteWhere),
+    false,
+  )
+  // Proved pre-call, but the row NAMES A DOCUMENT. An external id exists only because the remote
+  // call returned, so it is the ledger's own receipt and outranks the abandonment written over it.
+  assert.equal(
+    matches(row({ type: 'COGS_JOURNAL', status: 'CANCELLED', externalTransactionId: 'XJRNL-1', abandonedBeforeRemoteCall: true }), deleteWhere),
+    false,
+  )
+
+  // AND IT IS COMPACTED, which is what bounds the exemption. Retaining a CANCELLED SALES_INVOICE
+  // whole would keep customer names, addresses and line descriptions past the promised period —
+  // the objection that reverted the PROCESSING exemption — and nothing reads that payload: every
+  // reader the deletion misleads reads columns.
+  assert.equal(
+    matches(row({ type: 'SALES_INVOICE', status: 'CANCELLED', externalTransactionId: null }), compact.where),
+    true,
+  )
+  assert.deepEqual(compact.data.payload, {})
 })

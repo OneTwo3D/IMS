@@ -19,6 +19,11 @@ import {
   type CompactedFollowUpLossPhase,
 } from '@/lib/domain/accounting/compacted-followup-loss'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
+import {
+  describeFollowUpEnqueueRefusals,
+  followUpEnqueueRefusals,
+  type FollowUpEnqueueOutcome,
+} from '@/lib/domain/accounting/followup-enqueue-outcome'
 
 // ---------------------------------------------------------------------------
 // Connector-agnostic back-reference repair sweep (audit-H3, fixed by o3d-9kek)
@@ -529,6 +534,18 @@ export type BackReferenceSweepDeps = {
    * this to logActivityPersisted, whose return value is the confirmation.
    */
   logActivity: (entry: BackReferenceSweepActivity) => Promise<boolean>
+  /**
+   * MUST report whether the follow-ups were ACTUALLY ENQUEUED (o3d-peh1).
+   *
+   * The connector's enqueue has three deliberate refusals — an ambiguous idempotency-token history,
+   * a ledger that will not confirm the attempt is absent, a slot lost to a live row under another
+   * token — and each of them used to write a warning and return `void`. This sweep read that as
+   * success and SETTLED on it: parent row stamped, `backReferenceFollowUpsPendingAt` cleared,
+   * `*_backreference_followups_recovered` logged, while the money-moving child was still FAILED and
+   * had never been re-enqueued. Same defect family as the compacted-payload enqueue this file
+   * already refuses to trust — a no-op that reports success — and it is fixed the same way: the
+   * outcome is part of the contract, so a caller that settles on a refusal cannot compile.
+   */
   enqueueFollowUps: (
     entryId: string,
     type: AccountingSyncType,
@@ -551,7 +568,7 @@ export type BackReferenceSweepDeps = {
       connectionProvenance: string | null | undefined
       backReferenceEvidenceCompactedAt?: Date | null
     },
-  ) => Promise<void>
+  ) => Promise<FollowUpEnqueueOutcome>
   now?: () => Date
   /**
    * IS THE SALE THIS ROW BELONGS TO STILL LIVE — and if not, retire the row (o3d-e2mz r8).
@@ -1139,6 +1156,60 @@ export async function repairAccountingBackReferences(
   }
 
   /**
+   * o3d-peh1 — THE CONNECTOR REFUSED THE ENQUEUE, SO THIS ROW IS NOT RECOVERED.
+   *
+   * Returns whether the follow-ups were enqueued; `false` after reporting a refusal. Every caller
+   * uses it to withhold BOTH the settlement and the `*_followups_recovered` line, because those two
+   * together are what made this defect silent: a row marked SYNCED, its obligation marker cleared,
+   * and an INFO log saying the payment was recovered, while the payment row was still FAILED.
+   *
+   * NOT gated on the warning being persisted, unlike the discarded-tombstone warning. That one is
+   * terminal — the work is destroyed and the notice is the only trace — so it must not be settled
+   * past a failed write. This one destroys nothing: the row keeps its payload, keeps its obligation
+   * marker, stays unstamped, and stays a candidate, so the next sweep re-attempts and re-reports.
+   * The refusal has to CLEAR before this row can settle, and clearing it is an operator act.
+   *
+   * The message is the ENQUEUE's own, verbatim. The sweep is further from the evidence than the
+   * enqueue is, and a second hand-written description of the same refusal is a second thing to keep
+   * true (o3d-s36z: a remedy that cannot be performed is worse than no remedy).
+   */
+  const reportRefusedFollowUps = async (
+    row: BackReferenceSweepRow,
+    outcome: FollowUpEnqueueOutcome,
+  ): Promise<boolean> => {
+    if (outcome.enqueued) return true
+    // Deliberately NOT counted here. The two callers count differently and both are right: a
+    // follow-ups-only pass did nothing at all and is a failure, while a repair pass DID write the
+    // back-reference and reporting that as a failure would hide a real repair. Counting inside this
+    // helper would impose one of those answers on both.
+    const persisted = await deps.logActivity({
+      entityType: 'SYSTEM',
+      action: `${prefix}_backreference_followup_refused`,
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Did NOT enqueue the outstanding ${connectorLabel} follow-ups for ${row.type} on ${row.referenceType} `
+        + `${row.referenceId}: ${describeFollowUpEnqueueRefusals(outcome)} This row is left unsettled and still marked as `
+        + 'owing them, so nothing here reports it as recovered. It cannot clear itself — resolve the refusal named above '
+        + 'and the next sweep enqueues the follow-ups.',
+      metadata: {
+        syncLogId: row.id,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        refusals: followUpEnqueueRefusals(outcome).map((refusal) => ({
+          type: refusal.type,
+          reason: refusal.reason,
+          syncLogId: refusal.syncLogId ?? null,
+        })),
+      },
+    })
+    if (!persisted) {
+      console.error(`${prefix}: follow-up enqueue refusal was not persisted; row left unsettled anyway`, row.id)
+    }
+    return false
+  }
+
+  /**
    * DISCHARGE A FOLLOW-UP OBLIGATION ON A ROW WITH NO BACK-REFERENCE OF ITS OWN (o3d-p5j3).
    *
    * There is no id to repair here — the row's type writes no back-reference, or the call returned
@@ -1187,9 +1258,13 @@ export async function repairAccountingBackReferences(
     // REBUILT — an invoice PDF is assembled from `externalTransactionId` and `referenceId`, both of
     // which a tombstone keeps. The processor short-circuit already had this order for the reason
     // o3d-nepa r4 gives: the announcement gates the RELEASE, it must never gate the enqueue.
+    //
+    // o3d-peh1 (this branch): the enqueue now ANSWERS, so the outcome is bound rather than dropped —
+    // a refusal is not an enqueue and must not reach the recovered log below.
     const discarded = compactionDiscardedFollowUps(row)
+    let outcome: FollowUpEnqueueOutcome
     try {
-      await deps.enqueueFollowUps(
+      outcome = await deps.enqueueFollowUps(
         row.id,
         row.type,
         row.referenceType,
@@ -1211,6 +1286,14 @@ export async function repairAccountingBackReferences(
           + 'owing them, so the next sweep retries them.',
         metadata: { syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId },
       })
+      return false
+    }
+    // THE REFUSAL IS READ BEFORE ANYTHING IS CONSUMED (o3d-peh1). `reportRefusedFollowUps` answers
+    // false when the enqueue refused, and a refusal means the REBUILDABLE half did not go out — so
+    // the terminal discard below must not run either, or the marker would be consumed for work that
+    // was never queued.
+    if (!(await reportRefusedFollowUps(row, outcome))) {
+      result.failed++
       return false
     }
     // AND ONLY NOW THE TERMINAL DISCARD. The rebuildable half has gone out; what is left is work this
@@ -1576,10 +1659,18 @@ export async function repairAccountingBackReferences(
           let followUpsEnqueued = true
           {
             try {
-              await deps.enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, {
-                externalId: row.externalTransactionId,
-                invoiceNumber,
-              }, sweepRowOriginRecord(row))
+              // o3d-peh1: a REFUSAL is not an enqueue. It travels back exactly like the thrown
+              // failure below does — the row stays unsettled and still marked as owing the work —
+              // and it is the reason `followUpsEnqueued` is read rather than assumed. The origin
+              // record (o3d-bqw7 r2) is still handed over: a tombstone's follow-ups are rebuilt from
+              // it, and dropping it here would refuse them at post time as `no-origin-recorded`.
+              followUpsEnqueued = await reportRefusedFollowUps(row, await deps.enqueueFollowUps(
+                row.id, row.type, row.referenceType, row.referenceId, payload, {
+                  externalId: row.externalTransactionId,
+                  invoiceNumber,
+                },
+                sweepRowOriginRecord(row),
+              ))
             } catch (followUpError) {
               followUpsEnqueued = false
               console.error(`${prefix}: back-reference follow-up enqueue failed`, row.id, followUpError)

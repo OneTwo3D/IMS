@@ -35,8 +35,6 @@ const scheduled: Array<Record<string, unknown>> = []
 const durableActivity: Array<{ action: string; level?: string; description: string; metadata?: Record<string, unknown>; rowsAtThisPoint: number; viaTransaction: boolean }> = []
 /** When set, the durable write FAILS — the case that decides whether the enqueue may still commit. */
 let failDurableActivity = false
-/** o3d-anu8: switchable, so ONE test can drive a ledger refusal AFTER the plan has been made. */
-let ledgerVerdict: { clear: true } | { clear: false; reason: string } = { clear: true }
 
 const accountingSyncLog = new Proxy({}, {
   get: (_target, prop: string) => (args: never) => (store.delegate[prop] as (a: never) => Promise<unknown>)(args),
@@ -96,6 +94,13 @@ mock.module('@/lib/db', { namedExports: { db: dbStub } })
  * `postMoneyUnderLedgerFence` is re-exported unused: `mock.module` replaces the whole module, and the
  * sync processor imports it at load time.
  */
+/**
+ * SWITCHABLE, so one test can drive a ledger refusal AFTER the plan has been made (o3d-anu8) and
+ * another can read what the enqueue RETURNS when it does (o3d-peh1). Every other test in this file
+ * leaves it clear, per the note above. Declared once, next to the mock that reads it.
+ */
+let ledgerVerdict: { clear: true } | { clear: false; reason: string } = { clear: true }
+
 mock.module('@/lib/connectors/accounting-settlement-probe', {
   namedExports: {
     ledgerClearsFollowUpRevival: async () => ledgerVerdict,
@@ -218,24 +223,63 @@ test('o3d-e2mz r3: a revival planned against one attempt does not land on a LATE
   )
 })
 
-test('o3d-e2mz r3: a FAILED row carrying no attempt revision is REFUSED, not revived unfenced', async () => {
-  // Revision 0 means nothing that stamps an attempt has ever claimed this row — a pre-fence row, or a
-  // connector whose processor does not stamp one. There is no attempt to name, so there is no way to
-  // tell a revival that lands on the row we planned against from one that lands on a later attempt.
-  // It fails closed and says so, rather than risking a second payment on the invoice.
+test('o3d-peh1: a FAILED row at revision 0 is REVIVED and LEFT at 0, so the claim mints the first attempt', async () => {
+  // The migration put every pre-existing FAILED Xero payment and allocation at revision 0. Refusing
+  // them was a DEAD END, not a safe default: FAILED rows are not processor candidates, and the
+  // per-row Retry refuses at revision 0 for the same reason, so the refusal's own remedy could not
+  // be performed and the money row could only be revived by an operator who knew to use the bulk
+  // "Retry All". The revival now happens automatically and leaves the revision where it was — the
+  // PROCESSOR's claim is what mints attempt 1, so "0 is never forged into 1 by anything but a claim"
+  // still holds.
   reset([failedPaymentRow({ attemptRevision: 0 })])
+
+  const outcome = await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
+
+  assert.equal(outcome.enqueued, true, 'and the caller is told it is queued, because it is')
+  const row = store.get('log-pay')
+  assert.equal(row?.status, 'PENDING', 'the legacy row is back in the queue')
+  assert.equal(row?.attemptRevision, 0, 'the revival creates no attempt — it only offers one')
+  assert.deepEqual(scheduled, [{ accountingSyncLogId: 'log-pay', attempts: 0 }])
+  assert.deepEqual(
+    activity.filter((entry) => entry.action === 'xero_followup_enqueue_refused'),
+    [],
+    'nothing is refused, so nothing is logged as refused',
+  )
+  const revive = store.updateManyWheres.at(-1) as Record<string, unknown>
+  assert.equal(revive.attemptRevision, 0, 'and it is STILL a compare-and-swap: the revision is in the predicate')
+})
+
+test('o3d-peh1: a revision-0 revival is still a CAS — it does not land on the attempt a claim has since minted', async () => {
+  // Why reviving at revision 0 is a sound fence rather than the unfenced write it replaces.
+  // `attemptRevision` only ever moves UP — every writer goes through nextAttemptRevision and nothing
+  // anywhere resets it — so `(id, FAILED, revision 0)` is STRICTLY STRONGER than the `(id, FAILED)`
+  // ABA. Here the legacy row is claimed, attempted and back on FAILED as attempt 1 between the plan
+  // and the write: the status is identical, so ONLY the revision can tell the two apart.
+  reset([failedPaymentRow({ attemptRevision: 0 })])
+  interleave = () => {
+    Object.assign(store.get('log-pay')!, {
+      status: 'FAILED',
+      attemptRevision: 1,
+      errorMessage: 'attempt 1 failed after the plan was made',
+    })
+  }
 
   await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
+
+  const attempted = store.updateManyWheres.filter((where) => 'attemptRevision' in where)
+  assert.deepEqual(
+    attempted.map((where) => where.attemptRevision),
+    [0, 1],
+    'the stale swap must match nothing, and the re-plan must fence on the attempt that is actually current',
+  )
   const row = store.get('log-pay')
-  assert.equal(row?.status, 'FAILED', 'the unfenceable row must be left exactly as it was')
-  assert.equal(row?.attemptRevision, 0, 'and it must not be forged into a fenced one')
-  assert.deepEqual(scheduled, [], 'nothing may be queued for an attempt that could not be fenced')
-  const refusal = activity.find((entry) => entry.action === 'xero_followup_enqueue_refused')
-  assert.ok(refusal, 'the refusal must be visible, not silent')
-  assert.equal(refusal.metadata?.reason, 'unfenced_reuse_target')
-  assert.equal(refusal.metadata?.syncLogId, 'log-pay')
-  assert.match(refusal.description, /carries no attempt revision/)
+  assert.equal(row?.status, 'PENDING')
+  assert.equal(
+    row?.attemptRevision,
+    2,
+    'and once a real attempt EXISTS the revival advances it — leaving it alone is only right at 0',
+  )
 })
 
 test('o3d-e2mz r3: an enqueue with no FAILED row to reuse still creates one, unfenced by construction', async () => {
@@ -371,4 +415,27 @@ test('[o3d-anu8] a scope with NO assertion in it writes nothing — this is not 
 
   assert.equal(store.get('log-pay')?.status, 'PENDING')
   assert.deepEqual(durableActivity, [], 'an ordinary revival rests on the connector s own history')
+})
+
+test('o3d-peh1: a ledger refusal is RETURNED to the caller, not only written to the activity log', async () => {
+  // The defect in one assertion. The warning below was always written; what was missing is a value
+  // the caller could branch on, so `repairXeroBackReferences` settled the parent row and logged
+  // "follow-ups recovered" while this payment stayed FAILED. A test that asserted only the log line
+  // would have passed against the broken code, which is why the RETURN is what is asserted first.
+  reset([failedPaymentRow({ attemptRevision: 4 })])
+  ledgerVerdict = { clear: false, reason: 'Xero already holds a settlement of 120.00 dated 2026-08-01' }
+
+  const outcome = await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
+
+  assert.equal(outcome.enqueued, false, 'the caller must be able to see that nothing was queued')
+  const refusals = outcome.enqueued ? [] : outcome.refusals
+  assert.equal(refusals.length, 1)
+  assert.equal(refusals[0].reason, 'ledger_not_clear')
+  assert.equal(refusals[0].syncLogId, 'log-pay', 'and it names the row an operator has to go and look at')
+  assert.match(refusals[0].message, /already holds a settlement of 120\.00/)
+
+  const row = store.get('log-pay')
+  assert.equal(row?.status, 'FAILED', 'the row is left exactly as it was — refusing is not retiring')
+  assert.deepEqual(scheduled, [])
+  assert.ok(activity.some((entry) => entry.action === 'xero_followup_enqueue_refused'))
 })

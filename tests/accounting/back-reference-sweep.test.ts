@@ -15,6 +15,10 @@ import {
   type BackReferenceSweepActivity,
   type BackReferenceSweepClient,
 } from '@/lib/domain/accounting/back-reference-sweep'
+import {
+  FOLLOW_UPS_ENQUEUED,
+  refusedFollowUpEnqueue,
+} from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { adapterUniqueViolation } from '../helpers/prisma-unique-error'
 
 // ---------------------------------------------------------------------------
@@ -190,6 +194,14 @@ type Harness = {
     rawStatements: Array<{ sql: string; values: unknown[] }>
   }
   failFollowUpsFor: Set<string>
+  /**
+   * Sync rows whose follow-up enqueue REFUSES (o3d-peh1). A different fact from `failFollowUpsFor`:
+   * a throw is a transient failure the connector could not complete, a refusal is the connector
+   * DECLINING on purpose — an ambiguous token history, a ledger that will not clear the attempt.
+   * Both leave the follow-ups owed, and only the throw was ever modelled, which is why "the sweep
+   * settles a row whose money follow-up was refused" was invisible to every test in this file.
+   */
+  refuseFollowUpsFor: Set<string>
   failProbeFor: Set<string>
   /**
    * Activity-log persistence failures, by action. The PRODUCTION logActivity swallows its write
@@ -225,12 +237,13 @@ function makeHarness(store: Store): Harness {
   const followUps: Harness['followUps'] = []
   const calls = { candidateQueries: 0, syncRowsRead: 0, probes: 0, billUpdates: 0, transactions: 0, rawStatements: [] as Array<{ sql: string; values: unknown[] }> }
   const failFollowUpsFor = new Set<string>()
+  const refuseFollowUpsFor = new Set<string>()
   const failProbeFor = new Set<string>()
   const failActivityFor = new Set<string>()
   const failPendingMarkerFor = new Set<string>()
   const failInvoiceDateReadFor = new Set<string>()
   const harness = {
-    store, activities, followUps, calls, failFollowUpsFor, failProbeFor, failActivityFor, failPendingMarkerFor,
+    store, activities, followUps, calls, failFollowUpsFor, refuseFollowUpsFor, failProbeFor, failActivityFor, failPendingMarkerFor,
     failInvoiceDateReadFor, raceAfterBillRead: null,
   } as Harness
 
@@ -421,9 +434,13 @@ function sweepDeps(harness: Harness, now?: () => Date, overrides: { cursorStore?
       harness.activities.push(entry)
       return true
     },
+    // Models the PRODUCTION contract on BOTH axes (o3d-peh1): it may throw, and it may RETURN a
+    // refusal. A double that only ever threw or returned void could not tell a settled row from an
+    // abandoned one, which is the shape of the defect. And it records the ORIGIN it was handed
+    // (o3d-bqw7 r2) — the other half of what production passes, and what the tombstone tests read.
     enqueueFollowUps: async (
       entryId: string,
-      _type: string,
+      type: string,
       referenceType: string,
       referenceId: string,
       _payload: Record<string, unknown>,
@@ -431,7 +448,18 @@ function sweepDeps(harness: Harness, now?: () => Date, overrides: { cursorStore?
       origin: Harness['followUps'][number]['origin'],
     ) => {
       if (harness.failFollowUpsFor.has(entryId)) throw new Error('follow-up enqueue failed')
+      if (harness.refuseFollowUpsFor.has(entryId)) {
+        return refusedFollowUpEnqueue({
+          type,
+          referenceType,
+          referenceId,
+          reason: 'ledger_not_clear',
+          message: 'the ledger already holds a payment matching this attempt.',
+          syncLogId: `${entryId}-payment`,
+        })
+      }
       harness.followUps.push({ entryId, referenceType, referenceId, origin })
+      return FOLLOW_UPS_ENQUEUED
     },
   } as Parameters<typeof repairAccountingBackReferences>[0]
 }
@@ -2421,4 +2449,83 @@ test('[o3d-bqw7 r2] a TRUE discard warning that cannot be written still holds it
 
   assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null,
     'not settled: the loss is permanent and nobody has been told')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-peh1 — THE ENQUEUE REFUSED, AND THE SWEEP REPORTED THE ROW AS RECOVERED.
+//
+// `enqueueFollowUps` declines on purpose in three cases (an ambiguous idempotency-token history, a
+// ledger that will not confirm the attempt is absent, a slot lost to a live row under another
+// token). Every one of them logged a WARNING and then returned normally, and the dependency was
+// typed `Promise<void>`, so this sweep — which is a CALLER THAT ACTS ON THE RETURN — read the
+// refusal as success and settled on it: parent row stamped and flipped SYNCED, the follow-up
+// obligation marker cleared, and `xero_backreference_followups_recovered` written to the log, while
+// the money-moving child was still FAILED and had never been re-enqueued.
+//
+// These tests are written against what the CALLER DOES, not against the log line the enqueue wrote.
+// Asserting the warning alone would reproduce the exact defect: the warning was always there.
+// ---------------------------------------------------------------------------
+
+test('[o3d-peh1] a REFUSED follow-up enqueue never lets the repair path settle the row or claim a recovery', async () => {
+  const harness = makeHarness({
+    // The crash-after-post shape: SYNCED with an external id and no back-reference. The repair
+    // writes the link, and the follow-ups it owes include the INVOICE_PAYMENT.
+    syncRows: [salesInvoiceRow(1)],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  harness.refuseFollowUpsFor.add('log-0001')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 1, 'the back-reference half DID happen and must still be reported')
+  assert.equal(harness.store.orders[0].accountingInvoiceId, 'XINV-1')
+  assert.equal(harness.followUps.length, 0, 'nothing was enqueued — that is what a refusal means')
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'so the row must NOT be settled')
+  assert.ok(
+    harness.store.syncRows[0].backReferenceFollowUpsPendingAt,
+    'and the record that the follow-ups are owed must survive — deleting it is what made the loss permanent',
+  )
+  assert.equal(
+    harness.activities.some((entry) => entry.action === 'xero_backreference_followups_recovered'),
+    false,
+    'nothing may report a recovery that did not happen',
+  )
+  const refused = harness.activities.find((entry) => entry.action === 'xero_backreference_followup_refused')
+  assert.ok(refused, 'the refusal is reported by the caller too, naming what it did NOT do')
+  assert.equal(refused.level, 'WARNING')
+  assert.match(refused.description, /the ledger already holds a payment matching this attempt/,
+    "the enqueue's own message travels, rather than being re-worded by a reader further from the evidence")
+
+  // AND IT CLEARS. The row stayed a candidate, so once the refusal is resolved the next sweep
+  // completes the work — the refusal deferred it, it did not retire it.
+  harness.refuseFollowUpsFor.clear()
+  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-0001'])
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'NOW it settles')
+  assert.equal(harness.store.syncRows[0].backReferenceFollowUpsPendingAt, null)
+})
+
+test('[o3d-peh1] a REFUSED enqueue on the follow-ups-only path leaves the obligation standing', async () => {
+  // The other caller, and the one the issue names: a row with NO back-reference of its own, whose
+  // only outstanding work IS the enqueue. Here there is nothing else to have succeeded, so settling
+  // on a refusal discards the work outright.
+  const harness = makeHarness({
+    syncRows: [invoicePdfRow(1)],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: 'XINV-1' }],
+  })
+  harness.refuseFollowUpsFor.add('log-0001')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.failed, 1, 'a pass that enqueued nothing is a failure, not a settlement')
+  assert.equal(harness.followUps.length, 0)
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null)
+  assert.ok(harness.store.syncRows[0].backReferenceFollowUpsPendingAt)
+  assert.equal(
+    harness.activities.some((entry) => entry.action === 'xero_backreference_followups_recovered'),
+    false,
+  )
+  assert.ok(harness.activities.some((entry) => entry.action === 'xero_backreference_followup_refused'))
 })

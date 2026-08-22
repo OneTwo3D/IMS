@@ -31,6 +31,13 @@ import {
   retireOverSettlingInvoicePayment,
 } from '@/lib/domain/accounting/invoice-payment-capacity'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
+import {
+  FOLLOW_UPS_ENQUEUED,
+  combineFollowUpEnqueueOutcomes,
+  describeFollowUpEnqueueRefusals,
+  refusedFollowUpEnqueue,
+  type FollowUpEnqueueOutcome,
+} from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import {
   applyBackReference,
@@ -158,6 +165,21 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
 }
 
 /**
+ * o3d-peh1 — the follow-ups this entry owes were REFUSED, so the obligation is not released.
+ *
+ * The Xero twin of this carries the full argument; the shape here is the same. Thrown rather than
+ * branched because both post paths already handle a throw correctly: the obligation marker stays
+ * claimed and the entry is retried, which is the right state for work that has not run.
+ */
+function requireFollowUpsEnqueued(entryId: string, outcome: FollowUpEnqueueOutcome): void {
+  if (outcome.enqueued) return
+  throw new Error(
+    `QuickBooks sync entry ${entryId} posted, but its follow-ups were REFUSED and nothing was queued: `
+    + `${describeFollowUpEnqueueRefusals(outcome)}`,
+  )
+}
+
+/**
  * o3d-anu8, CROSS-PORTED FROM THE XERO PATH (Codex, this branch) — A LIVE ROW SUPPRESSES THIS WORK,
  * AND ONLY THE CONNECTOR IS ENTITLED TO.
  *
@@ -219,7 +241,7 @@ export async function enqueueFollowUpSyncLog(
   payload: SyncPayload,
   /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
   attempt = 0,
-): Promise<void> {
+): Promise<FollowUpEnqueueOutcome> {
   const live = await hasExistingSyncLog(type, referenceType, referenceId)
   const liveRowExists = live.exists
   // o3d-h2wx: a FAILED row is REUSED rather than replaced. The QuickBooks Request-Id is
@@ -261,17 +283,28 @@ export async function enqueueFollowUpSyncLog(
     liveRowAsserted: live.asserted,
     failedRows,
   })
-  if (plan.action === 'skip') return
+  // A live row already owns this scope, so the follow-up IS queued — by that row.
+  if (plan.action === 'skip') return FOLLOW_UPS_ENQUEUED
   if (plan.action === 'refuse') {
+    // o3d-peh1, cross-ported from the Xero side: the refusal is REPORTED TO THE CALLER, not only to
+    // the activity log. QuickBooks has no back-reference sweep to be misled (see the note at the end
+    // of this file), but its own post path releases the follow-up obligation on the strength of this
+    // call returning, and a refusal that returns normally discharges a marker for work never done.
+    const message = `Refused to re-enqueue QuickBooks ${type} for ${referenceType} ${referenceId}: ${plan.reason} `
+      + 'Nothing was queued and the FAILED rows are unchanged. '
+      + 'A RETRY CANNOT CLEAR THIS: the manual retry applies the same rule and refuses for the same reason. Open the '
+      + 'document in QuickBooks, establish which attempt actually landed, and record that on each row with Settle on the '
+      + 'accounting sync log (\'it posted, here is the id\' / \'it did not post\'). The follow-up is enqueued by the '
+      + 'next sweep once the scope is no longer ambiguous.'
     await logActivity({
       entityType: 'SYSTEM',
       action: 'quickbooks_followup_enqueue_refused',
       tag: 'sync',
       level: 'WARNING',
-      description: `Refused to re-enqueue QuickBooks ${type} for ${referenceType} ${referenceId}: ${plan.reason}`,
-      metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
+      description: message,
+      metadata: { type, referenceType, referenceId, reason: 'plan_refused', failedRowIds: failedRows.map((row) => row.id) },
     })
-    return
+    return refusedFollowUpEnqueue({ type, referenceType, referenceId, reason: 'plan_refused', message })
   }
 
   // o3d-0m56: the AUTOMATIC path carries the identical hazard the manual retry does. Reviving a
@@ -287,17 +320,27 @@ export async function enqueueFollowUpSyncLog(
     syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
   })
   if (!evidence.clear) {
+    const message = `Refused to re-enqueue QuickBooks ${type} for ${referenceType} ${referenceId}: `
+      + `${evidence.reason}. Re-posting it could duplicate a payment, so nothing was queued and the row is `
+      + 'unchanged. Open the document in QuickBooks: if that settlement IS this attempt, record it with Settle on the '
+      + 'accounting sync log so the row stops being retried; if it is not, the follow-up is enqueued by the next '
+      + 'sweep once the ledger no longer matches.'
     await logActivity({
       entityType: 'SYSTEM',
       action: 'quickbooks_followup_enqueue_refused',
       tag: 'sync',
       level: 'WARNING',
-      description: `Refused to re-enqueue QuickBooks ${type} for ${referenceType} ${referenceId}: `
-        + `${evidence.reason}. Re-posting it could duplicate a payment; check the ledger and resolve `
-        + 'the row by hand.',
-      metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
+      description: message,
+      metadata: { type, referenceType, referenceId, reason: 'ledger_not_clear', failedRowIds: failedRows.map((row) => row.id) },
     })
-    return
+    return refusedFollowUpEnqueue({
+      type,
+      referenceType,
+      referenceId,
+      reason: 'ledger_not_clear',
+      message,
+      syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
+    })
   }
 
   try {
@@ -322,7 +365,8 @@ export async function enqueueFollowUpSyncLog(
         })
       })
       if (revived.count === 0) {
-        await resolveLostFollowUpRevival({
+        // o3d-peh1: the resolver's verdict IS this call's verdict — see the Xero twin.
+        return await resolveLostFollowUpRevival({
           connector: QBO_CONNECTOR,
           type,
           referenceType,
@@ -335,10 +379,9 @@ export async function enqueueFollowUpSyncLog(
           // key as the row that vanished. That is what makes losing the row survivable.
           retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
         })
-        return
       }
       await logFollowUpRevival(QBO_CONNECTOR, type, referenceType, referenceId, plan)
-      return
+      return FOLLOW_UPS_ENQUEUED
     }
     await db.$transaction(async (tx) => {
       await lockFollowUpScope(tx, { connector: QBO_CONNECTOR, type, referenceType, referenceId })
@@ -365,7 +408,7 @@ export async function enqueueFollowUpSyncLog(
     // same resolver as a lost compare-and-set, which only accepts a live row carrying our
     // token.
     if (isUniqueConstraintViolation(error)) {
-      await resolveLostFollowUpRevival({
+      return await resolveLostFollowUpRevival({
         connector: QBO_CONNECTOR,
         type,
         referenceType,
@@ -375,10 +418,10 @@ export async function enqueueFollowUpSyncLog(
         attempt,
         retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
       })
-      return
     }
     throw error
   }
+  return FOLLOW_UPS_ENQUEUED
 }
 
 /**
@@ -515,7 +558,10 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           })
         })
         await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
-        await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+        // o3d-peh1: a REFUSED enqueue throws here for the same reason a failed one does — the
+        // release below must not discharge a marker for work that was never queued. The outer
+        // handler retries the row with the obligation still claimed.
+        requireFollowUpsEnqueued(entry.id, await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId }))
         // Only reached when the enqueue did NOT throw. This branch has no catch of its own — an
         // exception propagates to the outer handler, which retries the row — so the obligation
         // simply stays claimed, which is the correct state for work that has not run.
@@ -567,7 +613,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // safely recorded and won't be replayed.
         try {
           await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
+          requireFollowUpsEnqueued(entry.id, await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult))
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
         } catch (followUpError) {
           // ERROR, not WARNING: the external post is committed and this entry is about to be
@@ -1287,8 +1333,11 @@ async function enqueueSalesInvoiceFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string; invoiceNumber?: string },
-): Promise<void> {
-  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return
+): Promise<FollowUpEnqueueOutcome> {
+  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return FOLLOW_UPS_ENQUEUED
+  // o3d-peh1: the PAYMENT's outcome is kept and folded in with the PDF's at the end. Both are still
+  // attempted; a refused payment is no reason to withhold the PDF.
+  let paymentOutcome: FollowUpEnqueueOutcome = FOLLOW_UPS_ENQUEUED
 
   if (payload._registerPayment) {
     const paymentMap = await getPaymentAccountMap()
@@ -1337,7 +1386,7 @@ async function enqueueSalesInvoiceFollowUps(
             customerRef = (await customerContactIdIfCurrent(order?.customer)) ?? undefined
           }
 
-          await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
+          paymentOutcome = await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
             accountingInvoiceId: syncResult.externalId,
             bankAccountId: stored,
             amount,
@@ -1351,11 +1400,12 @@ async function enqueueSalesInvoiceFollowUps(
     }
   }
 
-  await enqueueFollowUpSyncLog('INVOICE_PDF', referenceType, referenceId, {
+  const pdfOutcome = await enqueueFollowUpSyncLog('INVOICE_PDF', referenceType, referenceId, {
     accountingInvoiceId: syncResult.externalId,
     referenceId,
     invoiceNumber: syncResult.invoiceNumber,
   })
+  return combineFollowUpEnqueueOutcomes(paymentOutcome, pdfOutcome)
 }
 
 async function enqueuePurchaseInvoiceFollowUps(
@@ -1364,10 +1414,12 @@ async function enqueuePurchaseInvoiceFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string },
-): Promise<void> {
+): Promise<FollowUpEnqueueOutcome> {
   // Entries can arrive with referenceType 'PurchaseInvoice' or 'PurchaseOrder'
-  if ((referenceType !== 'PurchaseInvoice' && referenceType !== 'PurchaseOrder') || !syncResult.externalId || !payload.supplierInvoicePath) return
-  await enqueueFollowUpSyncLog('BILL_ATTACHMENT', referenceType, referenceId, {
+  if ((referenceType !== 'PurchaseInvoice' && referenceType !== 'PurchaseOrder') || !syncResult.externalId || !payload.supplierInvoicePath) {
+    return FOLLOW_UPS_ENQUEUED
+  }
+  return await enqueueFollowUpSyncLog('BILL_ATTACHMENT', referenceType, referenceId, {
     accountingInvoiceId: syncResult.externalId,
     supplierInvoicePath: payload.supplierInvoicePath,
   })
@@ -1380,15 +1432,13 @@ async function enqueueFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string; invoiceNumber?: string },
-): Promise<void> {
+): Promise<FollowUpEnqueueOutcome> {
   if (type === 'SALES_INVOICE') {
-    await enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
-    return
+    return await enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
   }
 
   if (type === 'PURCHASE_INVOICE') {
-    await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
-    return
+    return await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
   }
 
   if (type === 'INVOICE_PDF' && referenceType === 'SalesOrder') {
@@ -1399,8 +1449,9 @@ async function enqueueFollowUps(
         shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
       },
     })
+    const outcomes: FollowUpEnqueueOutcome[] = []
     if (order?.customerEmail) {
-      await enqueueFollowUpSyncLog('INVOICE_EMAIL', referenceType, referenceId, { referenceId })
+      outcomes.push(await enqueueFollowUpSyncLog('INVOICE_EMAIL', referenceType, referenceId, { referenceId }))
     }
     // b8i6.6: the post-invoice note follow-up is WooCommerce-only BY DESIGN.
     // It is already connector-aware — only enqueued when the order has a
@@ -1410,9 +1461,12 @@ async function enqueueFollowUps(
     // implementation + live validation before a SHOPPING_INVOICE_NOTE could be
     // generalised here.
     if (order?.shoppingLinks.length) {
-      await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId })
+      outcomes.push(await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId }))
     }
+    return combineFollowUpEnqueueOutcomes(...outcomes)
   }
+
+  return FOLLOW_UPS_ENQUEUED
 }
 
 // ---------------------------------------------------------------------------

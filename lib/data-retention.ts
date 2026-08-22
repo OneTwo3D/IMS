@@ -10,6 +10,7 @@ import {
 import { followUpObligationsOwedBy } from '@/lib/domain/accounting/compacted-followup-loss'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
+import { UNRESOLVED_ABANDONED_CLAIM_WHERE } from '@/lib/domain/accounting/unresolved-abandoned-claim'
 import {
   compactableInboundEventWhere,
   inboundEventCompactionData,
@@ -108,7 +109,12 @@ export async function purgeExpiredData(): Promise<{
   wmsInboundEventsCompacted: number
   /** Finished WMS sync jobs deleted; their wms_sync_logs lines go with them by FK cascade (q66in.7.4). */
   wmsSyncJobsDeleted: number
-  /** Expired-but-unresolved accounting sync rows reduced to an attribution-only tombstone (o3d-9kek). */
+  /**
+   * Expired-but-unresolved accounting sync rows reduced to an attribution-only tombstone: unresolved
+   * back-reference evidence (o3d-9kek) and unresolved abandoned claims (o3d-nepa). One counter for
+   * both because it is one write producing one tombstone shape; the two differ only in which
+   * question keeps the row.
+   */
   backReferenceEvidenceCompacted: number
   stockMovementsDeleted: number
   webhookEventsCompacted: number
@@ -226,7 +232,19 @@ export async function purgeExpiredData(): Promise<{
       // FOLLOW-UP types whose row matters whatever their status. See remote-money-evidence.ts for
       // the three readers and for why this is not compaction (yet).
       //
-      // THREE CLAUSES, THREE DIFFERENT QUESTIONS, AND NONE SUBSUMES ANOTHER:
+      // o3d-nepa, THE OTHER HALF: AGE IS NOT EVIDENCE THAT A THING IS FINISHED. The status clause
+      // releases a row the moment it is no longer postable, which leaves TWO deletable statuses —
+      // and only one of them is an outcome. SYNCED is: the call was made and the ledger answered.
+      // CANCELLED is an ABANDONMENT, written by a sweep, by the post-time retirement of a CLAIMED
+      // row, or by an operator, none of whom can see whether the remote call had already landed.
+      // A claimed row that was abandoned and never resolved therefore ages out and disappears, and
+      // no reader FAILS when it does: the daily-batch recreate sweep reads "no row at all" as "the
+      // journal never posted" and re-raises a DUPLICATE into a live ledger, and the money-retry
+      // guard reads a scope one CANCELLED sibling short as UNAMBIGUOUS and posts a second payment.
+      // The one abandonment that IS proof — `abandonedBeforeRemoteCall`, written only over a
+      // provably PRE-CALL PENDING row — still expires by age. See unresolved-abandoned-claim.ts.
+      //
+      // FOUR CLAUSES, FOUR DIFFERENT QUESTIONS, AND NONE SUBSUMES ANOTHER:
       //
       //   status ∉ POSTABLE  — "can a document still be posted FROM this row?" PENDING carries no
       //                        externalTransactionId at all, so the back-reference predicate never
@@ -237,6 +255,12 @@ export async function purgeExpiredData(): Promise<{
       //                        rows, which the status clause deliberately releases.
       //   NOT UNRESOLVED_…   — "is this row the only evidence that a document was posted without
       //                        being linked?" SYNCED/FAILED carrying an external id.
+      //   NOT UNRESOLVED_ABANDONED_CLAIM
+      //                      — "was this row ever RESOLVED at all?" A CANCELLED SALES_INVOICE is in
+      //                        none of the other three: CANCELLED is outside POSTABLE by design,
+      //                        SALES_INVOICE is deliberately outside the money-evidence list, and a
+      //                        row abandoned before it posted carries no external id for the
+      //                        back-reference clause to see.
       //
       // Where the first and third overlap (FAILED with an external id) the row is retained by both
       // and then COMPACTED below, which blanks the payload. That is safe rather than contradictory:
@@ -249,7 +273,14 @@ export async function purgeExpiredData(): Promise<{
           createdAt: { lt: cutoff },
           status: { notIn: [...POSTABLE_ACCOUNTING_SYNC_STATUSES] },
           type: { notIn: [...REMOTE_MONEY_EVIDENCE_TYPES] },
-          NOT: UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
+          // TWO exemptions, both expressed as a NOT over a SHARED constant, and neither spelled out
+          // here. `AND` rather than two `NOT` keys because an object literal has only one of those —
+          // and writing them as one merged predicate would make the delete pass true when EITHER
+          // clause was satisfied, which is the opposite of what both of them mean.
+          AND: [
+            { NOT: UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE },
+            { NOT: UNRESOLVED_ABANDONED_CLAIM_WHERE },
+          ],
         },
       }),
     ])
@@ -275,6 +306,14 @@ export async function purgeExpiredData(): Promise<{
     // A POSTABLE row that DOES carry an external id (FAILED, already posted) is in both the delete's
     // exemption and this pass, and is compacted: its document exists, both processors short-circuit
     // to the follow-ups rather than re-posting, so the payload is not what makes it postable.
+    //
+    // o3d-nepa's UNRESOLVED ABANDONED CLAIM is the third set, and it IS in this pass — that is the
+    // whole reason it can be held back from the delete without repeating the mistake the reverted
+    // PROCESSING exemption made. A CANCELLED SALES_INVOICE payload is customer names, email and
+    // delivery addresses and line descriptions, and retaining that whole and for ever contradicts
+    // the period the settings UI promises. Nothing reads it: every reader that the deletion would
+    // mislead — the daily-batch recreate verdict, the money-retry ambiguity guard, the staged-debit
+    // resolver — reads COLUMNS. So the row survives as evidence and its content expires on schedule.
     //
     // `backReferenceEvidenceCompactedAt: null` PERMANENTLY excludes already-compacted rows from THIS
     // PASS, so each daily run rewrites only the newly-eligible slice instead of the whole tombstone
@@ -329,11 +368,24 @@ export async function purgeExpiredData(): Promise<{
     // DEFERRAL and not an exemption — it moves with the cutoff, so a released row that nothing ever
     // finishes becomes compactable one full retention period later and the bound this compaction
     // exists to impose still holds.
+    //
+    // o3d-nepa — TWO POPULATIONS, ONE TOMBSTONE, because they lose the same thing and keep the same
+    // thing. o3d-9kek's unresolved back-reference evidence, and the UNRESOLVED ABANDONED CLAIM: a
+    // CANCELLED row whose abandonment does not establish that nothing was sent. Both are kept for
+    // their COLUMNS (who, what, which document, what status) and neither has a reader that touches
+    // the payload, so the payload is what expires. The money-evidence types are in NEITHER pass, for
+    // the opposite reason: their payload IS the request.
+    //
+    // Both ORs are carried under an explicit `AND` rather than as two `OR` keys, which an object
+    // literal cannot hold: the age deferral and the population disjunction are separate conditions
+    // and collapsing them into one array would compact a row that satisfied EITHER.
     const compactableWhere = {
       createdAt: { lt: cutoff },
-      OR: [{ syncedAt: null }, { syncedAt: { lt: cutoff } }],
-      ...UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
       backReferenceEvidenceCompactedAt: null,
+      AND: [
+        { OR: [{ syncedAt: null }, { syncedAt: { lt: cutoff } }] },
+        { OR: [UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE, UNRESOLVED_ABANDONED_CLAIM_WHERE] },
+      ],
     }
     let compacted = 0
     let examined = 0

@@ -91,12 +91,16 @@ for (const connector of ['xero', 'quickbooks']) {
     assert.ok(planAt !== -1 && planAt < at, 'the plan comes first — there is nothing to check before it')
 
     const after = source.slice(at)
-    assert.match(after.slice(0, 900), /if \(!evidence\.clear\) \{[\s\S]*?level: 'WARNING'[\s\S]*?\n\s*return\n\s*\}/,
-      'a non-clear verdict must warn and RETURN, not fall through to the write')
+    // o3d-peh1 strengthens this: warning and returning was never enough, because a bare `return`
+    // is indistinguishable to the CALLER from a successful enqueue — which is how the back-reference
+    // sweep came to settle a row whose money follow-up had been refused. The refusal must now be
+    // RETURNED as a value.
+    assert.match(after.slice(0, 1600), /if \(!evidence\.clear\) \{[\s\S]*?level: 'WARNING'[\s\S]*?\n\s*return refusedFollowUpEnqueue\(\{/,
+      'a non-clear verdict must warn and RETURN A REFUSAL the caller can read, not fall through to the write')
 
     const writeAt = source.indexOf('accountingSyncLog.updateMany', at)
     assert.ok(writeAt > at, 'the revival write must come after the check')
-    assert.match(after.slice(0, 900), /tokenDisposition: plan\.action === 'reuse' \? plan\.tokenDisposition : 'rotated'/,
+    assert.match(after.slice(0, 1600), /tokenDisposition: plan\.action === 'reuse' \? plan\.tokenDisposition : 'rotated'/,
       'and it must pass the plan\'s own disposition, not a constant')
   })
 }

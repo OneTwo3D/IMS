@@ -58,6 +58,7 @@ import { buildTransitReconciliationSweepJournal, loadTransitGlReconciliation } f
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
+import { abandonmentProvesNoRemoteCall } from '@/lib/domain/accounting/unresolved-abandoned-claim'
 import {
   dailyBatchLiveRefs,
   foldDailyBatchRow,
@@ -628,6 +629,12 @@ const LIVE_DAILY_BATCH_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
  *                       row for the batch carries `abandonedBeforeRemoteCall`, the orphan sweep's
  *                       own record that it cancelled a PENDING row and nothing was ever sent.
  *
+ * o3d-nepa: and "no row at all" is only trustworthy because RETENTION NO LONGER PRODUCES IT for the
+ * rows this verdict blocks on. Deleting an unresolved abandoned row by age moved it out of the
+ * BLOCKED-unproved arm and into ALLOWED — silently, and with no reader failing anywhere — so the
+ * refusal below became a rebuild. Retention now keeps exactly the rows `abandonmentProvesNoRemoteCall`
+ * calls unproved, and compacts their payload instead; the columns this function selects all survive.
+ *
  * A row bearing an `externalTransactionId` blocks whatever its status says: that id exists only
  * because the remote call returned, so it is the ledger's own receipt and outranks any later
  * abandonment written over the top of it.
@@ -725,7 +732,11 @@ async function dailyBatchRecreateVerdict(
         'the row\'s own lines and correct the id.',
     }
   }
-  const unproved = rows.filter((row) => row.abandonedBeforeRemoteCall !== true || row.externalTransactionId)
+  // Read from the SHARED rule, not restated (o3d-nepa). Retention's delete predicate asks the same
+  // question of the same columns — "is this abandonment proof that nothing was sent?" — and it is
+  // this reader's `rows.length === 0` arm that a wrong answer there turns into a duplicate journal.
+  // Two spellings of one rule is how that hole reopens silently.
+  const unproved = rows.filter((row) => !abandonmentProvesNoRemoteCall(row))
   if (unproved.length === 0) return { blocked: false, refusal: null }
   const describe = unproved
     .map((row) => `${row.referenceId} (${row.id}, ${row.status}${row.externalTransactionId ? `, external id ${row.externalTransactionId}` : ''})`)

@@ -2,6 +2,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { readFollowUpIdempotencyKey, type FollowUpEnqueuePlan, type FollowUpPayload } from './followup-idempotency'
 import { isOperatorAssertedSettlement } from './sync-row-settlement'
+import { FOLLOW_UPS_ENQUEUED, type FollowUpEnqueueOutcome } from './followup-enqueue-outcome'
 
 /**
  * o3d-h2wx — the I/O half of the follow-up revival rule, shared by both accounting
@@ -96,10 +97,16 @@ export const MAX_FOLLOW_UP_REVIVAL_ATTEMPTS = 3
  * warning and returned, which silently dropped the follow-up: `logActivity` swallows its own
  * write failures, so the loss could be invisible (Codex r5 #2). Throwing hands it to the
  * connector's existing failure handling.
+ *
+ * o3d-peh1: the RE-PLAN's outcome is returned, not discarded. A re-plan can itself refuse — the
+ * ledger can decline it, the token history can be ambiguous — and swallowing that here would put
+ * back the exact "returned normally, enqueued nothing" silence one frame lower down, where it is
+ * harder to see. The only thing that returns "enqueued" without queueing anything is the case where
+ * a live row carrying OUR token already exists, which is the work, done by somebody else.
  */
 export async function resolveLostFollowUpRevival(
-  context: RevivalContext & { attempt: number; retry: () => Promise<void> },
-): Promise<void> {
+  context: RevivalContext & { attempt: number; retry: () => Promise<FollowUpEnqueueOutcome> },
+): Promise<FollowUpEnqueueOutcome> {
   const { connector, type, referenceType, referenceId, payload, syncLogId, attempt, retry } = context
   const pinnedToken = readFollowUpIdempotencyKey(payload)
 
@@ -142,7 +149,9 @@ export async function resolveLostFollowUpRevival(
         + 'accounting system and resolve that row before retrying.',
       )
     }
-    return
+    // o3d-peh1: the caller is TOLD this is accounted for. A bare `return` reads as "nothing to
+    // report", and the obligation release downstream cannot distinguish that from a refusal.
+    return FOLLOW_UPS_ENQUEUED
   }
   if (live.length > 0) {
     // A live row owns this scope but under a different token. Retrying cannot help — the
@@ -156,8 +165,7 @@ export async function resolveLostFollowUpRevival(
   }
 
   if (attempt + 1 < MAX_FOLLOW_UP_REVIVAL_ATTEMPTS) {
-    await retry()
-    return
+    return await retry()
   }
 
   throw new Error(

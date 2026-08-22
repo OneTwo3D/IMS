@@ -40,6 +40,8 @@ type SyncRow = {
   externalTransactionId?: string | null
   backReferenceCheckedAt?: Date | null
   backReferenceEvidenceCompactedAt?: Date | null
+  /** o3d-nepa: the orphan sweep's record that it cancelled a PENDING — pre-call — row. */
+  abandonedBeforeRemoteCall?: boolean | null
   payload?: Record<string, unknown>
 }
 
@@ -65,12 +67,15 @@ type Where = {
    */
   id?: string
   createdAt?: { lt: Date }
-  status?: { notIn?: string[]; in?: string[] }
+  status?: { notIn?: string[]; in?: string[] } | string
   type?: { in?: string[]; notIn?: string[] }
-  externalTransactionId?: { not: null }
+  externalTransactionId?: { not: null } | null
   backReferenceCheckedAt?: null
   backReferenceEvidenceCompactedAt?: null
+  abandonedBeforeRemoteCall?: boolean | null
   NOT?: Where
+  AND?: Where[]
+  OR?: Where[]
 }
 
 /**
@@ -85,8 +90,17 @@ type Where = {
 function matches(row: SyncRow, where: Where): boolean {
   if (where.id !== undefined && row.id !== where.id) return false
   if (where.createdAt && !(row.createdAt.getTime() < where.createdAt.lt.getTime())) return false
-  if (where.status?.notIn && where.status.notIn.includes(row.status)) return false
-  if (where.status?.in && !where.status.in.includes(row.status)) return false
+  // o3d-nepa's UNRESOLVED_ABANDONED_CLAIM_WHERE is an AND of a bare equality and an OR of three
+  // alternatives, and the delete now composes TWO negated constants under `AND`. All three shapes
+  // are modelled: a double that ignored `AND` would report the delete as unconditional and a double
+  // that ignored `OR` would report the compaction as universal, and every test here would pass
+  // whether the exemption was present or absent — which is the failure mode this file's header
+  // already describes for the clauses that came before it.
+  if (where.AND && !where.AND.every((clause) => matches(row, clause))) return false
+  if (where.OR && !where.OR.some((clause) => matches(row, clause))) return false
+  if (typeof where.status === 'string' && row.status !== where.status) return false
+  if (typeof where.status === 'object' && where.status.notIn && where.status.notIn.includes(row.status)) return false
+  if (typeof where.status === 'object' && where.status.in && !where.status.in.includes(row.status)) return false
   // o3d-nepa added `type: { notIn: REMOTE_MONEY_EVIDENCE_TYPES }` to the delete predicate, while
   // o3d-9kek's back-reference clause uses `type: { in: … }`. The double understood only `in`, so
   // the merged predicate made it read `undefined.includes` and every test here died — which is the
@@ -94,6 +108,10 @@ function matches(row: SyncRow, where: Where): boolean {
   // survivors whether the money-evidence clause was present or not.
   if (where.type?.in && !where.type.in.includes(row.type ?? '')) return false
   if (where.type?.notIn && where.type.notIn.includes(row.type ?? '')) return false
+  if ('abandonedBeforeRemoteCall' in where && (row.abandonedBeforeRemoteCall ?? null) !== where.abandonedBeforeRemoteCall) {
+    return false
+  }
+  if (where.externalTransactionId === null && (row.externalTransactionId ?? null) !== null) return false
   if (where.externalTransactionId && row.externalTransactionId == null) return false
   if ('backReferenceCheckedAt' in where && (row.backReferenceCheckedAt ?? null) !== null) return false
   if ('backReferenceEvidenceCompactedAt' in where && (row.backReferenceEvidenceCompactedAt ?? null) !== null) {
@@ -167,7 +185,10 @@ function seed() {
     { id: 'processing', createdAt: OLD, status: 'PROCESSING' },
     { id: 'failed', createdAt: OLD, status: 'FAILED' },
     { id: 'synced', createdAt: OLD, status: 'SYNCED', externalTransactionId: 'XERO-1' },
-    { id: 'cancelled', createdAt: OLD, status: 'CANCELLED' },
+    // o3d-nepa: cancelled AND proved pre-call by the orphan sweep, which is the only cancelled row
+    // retention may delete. A bare CANCELLED row is an UNRESOLVED abandoned claim; there is one of
+    // those in its own test below.
+    { id: 'cancelled', createdAt: OLD, status: 'CANCELLED', abandonedBeforeRemoteCall: true },
   ]
 }
 
@@ -311,4 +332,106 @@ test('the exemption uses the SAME constant the coupon backfill counts on (Codex 
     /'PROCESSING'/,
     'and does not spell the statuses out locally',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-nepa — AN UNRESOLVED ABANDONED CLAIM AGED OUT AND DISAPPEARED.
+//
+// The status exemption above covers work that CAN STILL BE POSTED. It deliberately releases a row
+// the moment it terminalises, and CANCELLED is one of the two statuses that releases it — but
+// CANCELLED is not an outcome. It records that somebody or something ABANDONED the row: the
+// cross-connector orphan sweep, the post-time retirement of a CLAIMED row whose worker died, or an
+// operator. The processors POST BEFORE they persist SYNCED and the external id, so none of those
+// writers knows whether pounds moved.
+//
+// And no reader FAILS when the row goes. `dailyBatchRecreateVerdict` takes its `rows.length === 0`
+// arm — "no log at all, so the journal never posted" — and re-raises a DUPLICATE journal into a live
+// ledger. `retryFailedXeroSync`'s sibling snapshot reads every row of a scope at any status because,
+// in its own words, "a SYNCED or CANCELLED sibling can also represent money already in the ledger";
+// one deleted sibling turns an ambiguous scope unambiguous and licenses a second payment.
+//
+// These rows are COMPACTED rather than retained whole, which is what separates this from the
+// PROCESSING exemption that was reverted: a CANCELLED SALES_INVOICE payload is customer names,
+// addresses and line descriptions, and NOTHING reads it. Every misled reader reads columns.
+// ---------------------------------------------------------------------------
+
+test('[o3d-nepa] an UNRESOLVED abandoned claim survives the purge and is COMPACTED instead', async () => {
+  const purgeExpiredData = await loadPurge()
+  seed()
+  store.accounting.push({
+    id: 'abandoned-claim',
+    createdAt: OLD,
+    status: 'CANCELLED',
+    type: 'SALES_INVOICE',
+    // The retirement nulls processingStartedAt as it writes CANCELLED, so nothing on the row says it
+    // was ever claimed. What it does NOT say is that no call was made — and that absence is the
+    // whole fact.
+    abandonedBeforeRemoteCall: null,
+    externalTransactionId: null,
+    payload: { customer: 'A Person', lines: [{ description: 'A thing' }] },
+  })
+
+  const result = await purgeExpiredData()
+
+  const kept = store.accounting.find((row) => row.id === 'abandoned-claim')
+  assert.ok(kept, 'age alone must not expire an abandonment nobody resolved')
+  assert.equal(result.backReferenceEvidenceCompacted, 1, 'it is compacted instead of retained whole')
+  assert.deepEqual(kept.payload, {}, 'the customer names and line descriptions expire on schedule')
+  assert.equal(kept.status, 'CANCELLED', 'while the columns every misled reader reads all survive')
+  assert.equal(kept.abandonedBeforeRemoteCall ?? null, null)
+})
+
+test('[o3d-nepa] a CANCELLED row PROVED pre-call still expires by age — the exemption is not a blanket one', async () => {
+  // The bound, and the reason this does not simply disable retention for cancelled rows.
+  // `cancelOrphanedRowsUnderLock` matches `status = PENDING` only — provably pre-call — and writes
+  // the proof in the same UPDATE as the status. That row IS resolved: no ledger holds its document.
+  const purgeExpiredData = await loadPurge()
+  seed()
+  store.accounting = [
+    { id: 'proved-pre-call', createdAt: OLD, status: 'CANCELLED', abandonedBeforeRemoteCall: true, externalTransactionId: null },
+    { id: 'unproved', createdAt: OLD, status: 'CANCELLED', abandonedBeforeRemoteCall: null, externalTransactionId: null },
+  ]
+
+  const result = await purgeExpiredData()
+
+  assert.equal(result.syncLogsDeleted, 1)
+  assert.deepEqual(store.accounting.map((row) => row.id), ['unproved'])
+})
+
+test('[o3d-nepa] a CANCELLED row that NAMES a document is kept even when it carries the pre-call proof', async () => {
+  // An external id exists only because the remote call returned, so it is the ledger's own receipt
+  // and outranks an abandonment written over the top of it. The recreate verdict already applies
+  // exactly this rule; retention must not delete what that verdict blocks on.
+  const purgeExpiredData = await loadPurge()
+  seed()
+  store.accounting = [{
+    id: 'abandoned-but-posted',
+    createdAt: OLD,
+    status: 'CANCELLED',
+    type: 'COGS_JOURNAL',
+    abandonedBeforeRemoteCall: true,
+    externalTransactionId: 'XJRNL-1',
+  }]
+
+  const result = await purgeExpiredData()
+
+  assert.equal(result.syncLogsDeleted, 0)
+  assert.ok(store.accounting.some((row) => row.id === 'abandoned-but-posted'))
+})
+
+test('[o3d-nepa] a young unresolved abandonment is untouched by both passes — the cutoff still applies', async () => {
+  const purgeExpiredData = await loadPurge()
+  seed()
+  store.accounting = [{
+    id: 'fresh-cancelled',
+    createdAt: new Date(),
+    status: 'CANCELLED',
+    type: 'SALES_INVOICE',
+    payload: { customer: 'A Person' },
+  }]
+
+  const result = await purgeExpiredData()
+
+  assert.equal(result.backReferenceEvidenceCompacted, 0, 'compaction is scheduled by age, like the delete')
+  assert.deepEqual(store.accounting[0].payload, { customer: 'A Person' })
 })
