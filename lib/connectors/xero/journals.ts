@@ -58,14 +58,65 @@ type XeroManualJournalResponse = {
 declare const PREPARED_MANUAL_JOURNAL_BRAND: unique symbol
 
 /**
- * A journal body that has cleared every local check and is ready for the wire.
+ * A CAPABILITY TO POST A JOURNAL THAT HAS CLEARED EVERY LOCAL CHECK — AND NOTHING ELSE.
  *
  * Opaque by construction: the only way to obtain one is {@link prepareManualJournal}, so a call site
  * cannot reach {@link postPreparedManualJournal} with an unvalidated body — it would not compile.
+ *
+ * AND IT CARRIES NO BODY (o3d-jit6 r4, Codex MEDIUM). r3's shape was
+ * `{ readonly journal: Record<string, unknown>; readonly [BRAND]: ... }`, and the brand
+ * authenticated THE WRAPPER ONLY. `readonly` is a compile-time property of the reference, not of
+ * the object: the record it pointed at was an ordinary mutable one, reachable through a legitimately
+ * prepared value, so
+ *
+ *     const p = prepareManualJournal(entry)
+ *     if (p.ok) (p.prepared.journal as Record<string, unknown>).JournalLines = whateverYouLike
+ *
+ * walked every gate the r2 split exists to enforce — the zero-line refusal, the balance check —
+ * WITHOUT constructing a forged wrapper. The gate was passed by an object that no longer resembled
+ * what was validated, which is the same defect as the forged wrapper arriving by a different door.
+ *
+ * So the type is now a PHANTOM: it has no accessible member at all, and the body lives in
+ * {@link PREPARED_MANUAL_JOURNAL_BODIES}, a module-private `WeakMap` no caller can name or import.
+ * `prepared.journal` is a compile error rather than a mutation point — see the `@ts-expect-error`
+ * assertion in tests/accounting/xero-manual-journal-dispatch-honesty.test.ts, which is where a
+ * type-level guarantee is tested from.
  */
 export type PreparedManualJournal = {
-  readonly journal: Record<string, unknown>
   readonly [PREPARED_MANUAL_JOURNAL_BRAND]: 'lib/connectors/xero/journals#prepareManualJournal'
+}
+
+/**
+ * WHERE THE VALIDATED BODY ACTUALLY LIVES — MODULE-PRIVATE, KEYED BY THE CAPABILITY.
+ *
+ * Not exported, so no other module can read it, write it, or take a reference to a body out of it.
+ * The only writer is {@link prepareManualJournal} and the only reader is
+ * {@link postPreparedManualJournal}; between those two statements the body is unreachable from
+ * anywhere else in the process except by a reference that never escaped this function.
+ *
+ * A `WeakMap` rather than a `Map` so a prepared value that is never posted is collected with its
+ * body instead of pinning a journal — and a hidden private field on the object would have been the
+ * same guarantee with a worse failure mode: a runtime `#private` is invisible to the structural type
+ * system, so the phantom type would still have needed writing down separately.
+ */
+const PREPARED_MANUAL_JOURNAL_BODIES = new WeakMap<PreparedManualJournal, Record<string, unknown>>()
+
+/**
+ * Freeze what was validated, so even the reference that never escaped cannot be edited later.
+ *
+ * BELT AND BRACES, and deliberately so. Hiding the body already stops today's caller; freezing stops
+ * a future edit inside this module from handing a live reference to something that mutates it, and
+ * makes any such attempt throw in strict mode rather than quietly change the wire body between the
+ * balance check and the socket. The lines are frozen individually because freezing the array only
+ * seals its LENGTH — `lines[0].LineAmount = 999` would still land.
+ */
+function freezeValidatedJournalBody(journal: Record<string, unknown>): Record<string, unknown> {
+  const lines = journal.JournalLines
+  if (Array.isArray(lines)) {
+    for (const line of lines) Object.freeze(line)
+    Object.freeze(lines)
+  }
+  return Object.freeze(journal)
 }
 
 export type ManualJournalPreparation =
@@ -114,18 +165,29 @@ export function prepareManualJournal(
     return { ok: false, error: `Journal unbalanced: debits=${totalDebits}, credits=${totalCredits}` }
   }
 
-  // The one mint. `as` rather than a literal because the brand is a phantom — it exists only in the
-  // type — and this is the single place in the codebase allowed to assert it. The body is annotated
-  // first so the assertion stays a NARROWING one: `PreparedManualJournal` is assignable to
-  // `{ journal: Record<string, unknown> }`, which is what makes `as` legal here and what would stop
-  // it if the wire shape and the type ever drifted apart. It is deliberately not `as unknown as`.
   const journal: Record<string, unknown> = {
     Narration: entry.narration,
     Date: entry.date,
     JournalLines: journalLines,
     Status: status,
   }
-  return { ok: true, prepared: { journal } as PreparedManualJournal }
+  // THE ONE MINT, and r4 makes it mint a TOKEN rather than a wrapper around the body.
+  //
+  // `as` rather than a literal because the brand is a phantom — it exists only in the type — and this
+  // is the single place in the codebase allowed to assert it. It is a NARROWING assertion still:
+  // every object type is assignable to `{}`, so the two types are comparable and this is legal
+  // without `as unknown as`, which stays banned here.
+  //
+  // The token is frozen as well as empty. There is nothing on it to reach, and now nothing can be
+  // stapled onto it either — a caller that could add `journal` back would not be reaching the body
+  // (the poster reads the map, not the argument), but it would make the capability look like it
+  // carried one, which is how the r3 shape read to everybody who used it.
+  const prepared = Object.freeze({}) as PreparedManualJournal
+  // The body goes where only this module can reach it, frozen, and the local reference dies with
+  // this call: `journal` is not returned, not captured by anything that outlives the function, and
+  // not reachable from `prepared`.
+  PREPARED_MANUAL_JOURNAL_BODIES.set(prepared, freezeValidatedJournalBody(journal))
+  return { ok: true, prepared }
 }
 
 /**
@@ -164,19 +226,39 @@ export type ManualJournalPostOutcome = {
 }
 
 /**
- * Send a body that has already cleared {@link prepareManualJournal}.
+ * Send the body that has already cleared {@link prepareManualJournal}.
  *
  * MAKES NO CHECKS. Anything added here would be a gate BELOW the caller's dispatch record again, which
  * is the defect this split exists to close — a new rule about journals belongs in `prepareManualJournal`.
  * Observing what the TRANSPORT did is not a check: it refuses nothing, changes no outcome here, and
  * only lets the caller tell a post that failed from one that never happened.
+ *
+ * NOTE WHAT IT SENDS (o3d-jit6 r4): the body from {@link PREPARED_MANUAL_JOURNAL_BODIES}, NOT one
+ * taken off the argument. That is the whole of the medium — the argument no longer has one — and it
+ * is what makes "the body that was validated" and "the body that goes on the wire" the same object
+ * by construction rather than by trusting the caller not to have touched it in between.
  */
 export async function postPreparedManualJournal(
   prepared: PreparedManualJournal,
   opts?: { idempotencyKey?: string },
 ): Promise<ManualJournalPostOutcome> {
+  const journal = PREPARED_MANUAL_JOURNAL_BODIES.get(prepared)
+  if (!journal) {
+    // UNREACHABLE FROM TYPED CODE, and not a gate: the only mint always registers a body, and the
+    // brand makes a token this module did not mint impossible to construct. It is here for the
+    // untyped bypass (`as never`, a plain-JS caller, a value that crossed a module-instance
+    // boundary), and it answers the only way that is safe for the caller's dispatch record — NOTHING
+    // WAS SENT, said through the same field the measured answer uses, so a create that reaches this
+    // line is handed back for replay instead of being failed or, worse, posted from an unvalidated
+    // body. It asks no question about the journal, so it is not a refusal moved below the fence.
+    return {
+      success: false,
+      error: 'the prepared journal carried no validated body — nothing was sent',
+      reachedTheWire: false,
+    }
+  }
   const attemptsBefore = xeroHttpAttemptCount()
-  const res = await xeroPost<XeroManualJournalResponse>('ManualJournals', prepared.journal, opts)
+  const res = await xeroPost<XeroManualJournalResponse>('ManualJournals', journal, opts)
   const reachedTheWire = xeroHttpAttemptCount() > attemptsBefore
   if (!res.ok || !res.data?.ManualJournals?.length) {
     return { success: false, error: res.error ?? 'Failed to create manual journal', reachedTheWire }

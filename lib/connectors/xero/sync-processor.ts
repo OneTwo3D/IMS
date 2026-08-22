@@ -2415,7 +2415,18 @@ async function reportUnrecordedXeroWrite(input: {
   }
 }
 
-async function deferOutboxForRateLimit(
+/**
+ * Hand an outbox job back at an instant THIS CALLER chooses, without spending one of its attempts.
+ *
+ * The difference from {@link markXeroOutboxRetry} is the whole reason both exist, and r4 gives it a
+ * second caller so the name no longer says "rate limit". `markXeroOutboxRetry` is the FAILURE path:
+ * it counts the attempt against `MAX_RETRIES` and computes its own backoff, whose floor for the first
+ * retry is `DEFAULT_RETRY_BASE_DELAY_MS` = five minutes. That is right for a job that really failed
+ * and wrong for one that never ran — a rate-limit backoff must sit exactly as long as Xero asked, and
+ * an attempt that provably sent nothing must not be charged an attempt at all, nor deferred past the
+ * window inside which it can still be replayed safely.
+ */
+async function deferOutboxWithoutSpendingAnAttempt(
   client: Pick<Prisma.TransactionClient, 'integrationOutbox'>,
   job: IntegrationOutboxRow,
   error: string,
@@ -2438,6 +2449,74 @@ async function deferOutboxForRateLimit(
     },
   })
   if (released.count === 0) throw new Error(`Xero outbox job ${job.id} is not claimed by ${XERO_ACCOUNTING_WORKER_ID}`)
+}
+
+/**
+ * HAND BACK A ROW THAT PROVABLY SENT NOTHING — AND HAND IT BACK IN TIME TO REPLAY IT
+ * (o3d-jit6 r4, Codex HIGH).
+ *
+ * WHAT ROUND 3 GOT RIGHT AND WHERE IT STOPPED. r3 classified a pre-egress transport refusal as
+ * `notPosted`, so the row was not failed and spent no retry — the right instinct. But the branch then
+ * logged the named activity row and moved on, leaving the row PROCESSING at the `processingStartedAt`
+ * the fence had just RENEWED. Neither runner's selector can take a PROCESSING row until it is older
+ * than `CLAIM_STALE_MS` (fifteen minutes), so the earliest possible next attempt was fifteen
+ * minutes after the refusal — and the dispatch marker minted moments earlier is only replayable for
+ * SIX. "No retry spent" had become "no retry possible in time": the marker stands, the window closes
+ * under it, and the next attempt meets a permanent refusal that needs an operator, for a create that
+ * was never sent.
+ *
+ * SO THE CLAIM IS RELEASED, THROUGH THE ONE FENCED RELEASE, AT AN INSTANT ALREADY PAST. `nextAttemptAt`
+ * is `now` rather than `now + backoff`: `releaseClaimForRetry` writes it as the PENDING row's
+ * earliest-next-claim gate, so the row is claimable from the refusal onwards — at EVERY instant of
+ * the window that is left, rather than at none of them.
+ *
+ * AND BE PRECISE ABOUT WHAT THAT DOES AND DOES NOT GUARANTEE. The usable part of the window is
+ * `XERO_IDEMPOTENCY_KEY_RETENTION_MS - CREATE_DISPATCH_REPLAY_MARGIN_MS` = five minutes from the
+ * dispatch, and `accounting-sync` ticks every five: whether a tick actually falls inside is a
+ * question about the cron's phase, which this layer does not choose and must not pretend to. What is
+ * ours is the INTERVAL. A zero delay leaves the whole remainder of the window open; a backoff carves
+ * ticks off the front of it, and the five-minute one `markXeroOutboxRetry` would apply leaves none at
+ * all. Nothing is spent to buy that — the release does not touch `retryCount` — so a refusal that
+ * persists costs one attempt per tick and never drives the row to FAILED, which is the correct
+ * treatment for a connection, a posting-intent refusal, an egress authorisation or an exhausted rate
+ * budget: none of them is a fact about this row.
+ *
+ * AND IT DOES NOT LICENSE A SECOND POST. THIS IS THE PART THAT HAD TO STAY TRUE.
+ *
+ * The marker is untouched — `createDispatchedAt` and `createDispatchIdempotencyKey` are write-once by
+ * database trigger, and this release writes neither. So the retry this makes possible arrives back at
+ * `planCreateDispatch`/`decideCreateDispatch` carrying the same deterministic key, and the marker
+ * answers exactly as it would have answered fifteen minutes later:
+ *
+ *   • INSIDE the window — `basis: 'replay-within-idempotency-window'`. Xero answers a repeat of a key
+ *     it still holds with the ORIGINAL document, so this is provably not a second create. And in the
+ *     case this path actually produces, there is no original: the transport refused, so the replay is
+ *     the first request Xero ever sees. One document either way, which is the point.
+ *   • PAST the window — REFUSED, unchanged, with the same message naming both producers of the state
+ *     and pointing at `xero_sync_transport_refused_before_post`. Releasing the claim buys a chance to
+ *     get back before the deadline; it does not move the deadline, and it cannot talk the marker into
+ *     letting a late attempt through.
+ *
+ * The order at the call sites is therefore LOG FIRST, RELEASE SECOND. The activity row is the evidence
+ * a later refusal tells an operator to look for, and it is the only durable trace that a create was
+ * recorded and then not sent; writing it before the row becomes claimable means no other worker can
+ * pick the row up in a state where that trace is missing.
+ *
+ * Fenced on the claim AND on the attempt, like every other non-terminal release: a displaced owner
+ * releases nothing, and an operator decision taken while this claim was held is not reopened.
+ */
+export async function releaseUnsentTransportRefusal(
+  client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  entryId: string,
+  held: HeldClaim,
+  attempt: AttemptRef,
+  message: string,
+  now: Date = new Date(),
+): Promise<boolean> {
+  return releaseClaimForRetry(client, entryId, held, {
+    errorMessage: message,
+    nextAttemptAt: now,
+  }, attempt)
 }
 
 async function markXeroOutboxRetry(job: IntegrationOutboxRow, error: string, client?: Pick<Prisma.TransactionClient, 'integrationOutbox'>): Promise<void> {
@@ -2955,29 +3034,61 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
       // BEFORE `skipped` and before `success` (r5 #1): this row stopped without sending anything, so
       // it must not be failed, must not spend a retry, and must not be persisted.
       if (syncResult.notPosted) {
+        const notPosted = syncResult.notPosted
         await logActivity({
           entityType: 'SYSTEM',
-          action: syncResult.notPosted.reason === 'lease-expired'
+          action: notPosted.reason === 'lease-expired'
             ? 'xero_sync_lease_expired_before_post'
-            : syncResult.notPosted.reason === 'dispatch-unrecorded'
+            : notPosted.reason === 'dispatch-unrecorded'
               ? 'xero_sync_dispatch_unrecorded_before_post'
               // o3d-jit6 r3: THE ONLY DURABLE TRACE that a create was recorded and then not sent.
               // The refusal a later attempt makes names this action and tells an operator to look
               // for it before they go hunting in the ledger.
-              : syncResult.notPosted.reason === 'transport-refused'
+              : notPosted.reason === 'transport-refused'
                 ? 'xero_sync_transport_refused_before_post'
                 : 'xero_sync_claim_lost_before_post',
           tag: 'sync',
           level: 'WARNING',
-          description: syncResult.notPosted.message,
+          description: notPosted.message,
           metadata: {
             syncLogId: entry.id,
             type: entry.type,
-            operation: syncResult.notPosted.operation,
-            reason: syncResult.notPosted.reason,
+            operation: notPosted.operation,
+            reason: notPosted.reason,
           },
           resolveUser: false,
         })
+        // o3d-jit6 r4 (Codex HIGH): AND THE ROW IS ACTUALLY GIVEN BACK. r3 left it PROCESSING at the
+        // instant the fence had just renewed, so nothing could re-take it for fifteen minutes — past
+        // the six-minute window in which the standing dispatch marker still permits a replay. See
+        // releaseUnsentTransportRefusal for why `nextAttemptAt` is now, and for why this cannot
+        // license a second post: the marker is untouched and still refuses a late attempt.
+        //
+        // ONLY `transport-refused`. The other three reasons are deliberately unchanged. `claim-lost`
+        // has no claim to give back — the release would match nothing, which is correct but pointless
+        // — and `lease-expired` and `dispatch-unrecorded` are the outcomes o3d-xl63 and r1 settled on
+        // their own terms, with no replay window running against them.
+        if (notPosted.reason === 'transport-refused') {
+          try {
+            // THE LEASE, NOT `held` (o3d-xl63 r6's rule, and it is load-bearing HERE of all places).
+            // `held` is `claimHeldFrom(claimedAt)` — the instant the sweep stamped — and
+            // `openRemoteWriteLease` has since RENEWED `processingStartedAt`, twice over on this
+            // path: once when the lease opened and once in the fence that minted the dispatch marker.
+            // A release fenced on the stale instant matches NOTHING, and because these fences fail
+            // closed the symptom is silence: the row would sit in PROCESSING exactly as it did in r3
+            // and this whole fix would be a no-op nobody could see. The lease satisfies `HeldClaim`
+            // structurally and answers the instant the row actually carries.
+            await releaseUnsentTransportRefusal(db, entry.id, lease, attempt, notPosted.message)
+          } catch (releaseError) {
+            // Degrades to r3's behaviour — PROCESSING until the stale cutoff — rather than throwing
+            // into the per-entry catch, which would spend a retry and mark FAILED a row that sent
+            // nothing. That is exactly the outcome `notPosted` exists to prevent.
+            console.error(
+              `[xero-sync] sync log ${entry.id} could not be handed back after a transport refusal: `
+                + String(releaseError),
+            )
+          }
+        }
         result.skipped++
         continue
       }
@@ -3486,41 +3597,68 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, origin, lease, attempt)
 
       if (syncResult.notPosted) {
-        // The lock may itself be what was lost, in which case handing the job back cannot work — say
-        // so rather than letting the fence's own throw escape into the generic failure handler and
-        // spend a retry on a row that was never posted.
-        try {
-          await markXeroOutboxRetry(job, syncResult.notPosted.message)
-        } catch (releaseError) {
-          console.error(
-            `[xero-sync] outbox job ${job.id} could not be handed back after a lost claim `
-              + `(${syncResult.notPosted.reason}): ${String(releaseError)}`,
-          )
-        }
+        const notPosted = syncResult.notPosted
+        // LOG FIRST (o3d-jit6 r4). This activity row is the evidence the later refusal tells an
+        // operator to look for, and the release below makes the row claimable again — so writing it
+        // afterwards would open a gap in which another worker can meet the marker with no trace of
+        // why it stands. r3 handed the JOB back before logging; the row could not move, so the order
+        // did not matter. It does now.
         await logActivity({
           entityType: 'SYSTEM',
-          action: syncResult.notPosted.reason === 'lease-expired'
+          action: notPosted.reason === 'lease-expired'
             ? 'xero_sync_lease_expired_before_post'
-            : syncResult.notPosted.reason === 'dispatch-unrecorded'
+            : notPosted.reason === 'dispatch-unrecorded'
               ? 'xero_sync_dispatch_unrecorded_before_post'
               // o3d-jit6 r3: THE ONLY DURABLE TRACE that a create was recorded and then not sent.
               // The refusal a later attempt makes names this action and tells an operator to look
               // for it before they go hunting in the ledger.
-              : syncResult.notPosted.reason === 'transport-refused'
+              : notPosted.reason === 'transport-refused'
                 ? 'xero_sync_transport_refused_before_post'
                 : 'xero_sync_claim_lost_before_post',
           tag: 'sync',
           level: 'WARNING',
-          description: syncResult.notPosted.message,
+          description: notPosted.message,
           metadata: {
             syncLogId: entry.id,
             type: entry.type,
             outboxJobId: job.id,
-            operation: syncResult.notPosted.operation,
-            reason: syncResult.notPosted.reason,
+            operation: notPosted.operation,
+            reason: notPosted.reason,
           },
           resolveUser: false,
         })
+        // The lock may itself be what was lost, in which case handing the job back cannot work — say
+        // so rather than letting the fence's own throw escape into the generic failure handler and
+        // spend a retry on a row that was never posted.
+        try {
+          if (notPosted.reason === 'transport-refused') {
+            // o3d-jit6 r4 (Codex HIGH): ONE TRANSACTION, because on this path the row and the job are
+            // two halves of one retry. A released row whose job stayed PROCESSING waits for the
+            // queue's own fifteen-minute stale-lock sweep — the same fifteen minutes the release
+            // exists to escape — and a requeued job whose row stayed PROCESSING is claimed by the
+            // next tick only to find the row unclaimable and skip it. Either half alone re-creates
+            // the defect, so neither may commit without the other.
+            //
+            // And the job is handed back through the deferral that spends NO attempt, at
+            // `nextAttemptAt` now, NOT through markXeroOutboxRetry: that one counts the attempt
+            // against MAX_RETRIES and its first backoff floor is five minutes, which would burn the
+            // replay window it is supposed to be racing.
+            await db.$transaction(async (tx) => {
+              // THE LEASE, NOT `held` — see the direct runner's note. The fence that minted the
+              // dispatch marker moved this row's claim instant, so the sweep's captured one matches
+              // nothing.
+              await releaseUnsentTransportRefusal(tx, entry.id, lease, attempt, notPosted.message)
+              await deferOutboxWithoutSpendingAnAttempt(tx, job, notPosted.message, 0)
+            })
+          } else {
+            await markXeroOutboxRetry(job, notPosted.message)
+          }
+        } catch (releaseError) {
+          console.error(
+            `[xero-sync] outbox job ${job.id} could not be handed back after a lost claim `
+              + `(${notPosted.reason}): ${String(releaseError)}`,
+          )
+        }
         result.skipped++
         continue
       }
@@ -3597,7 +3735,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
               errorMessage,
               nextAttemptAt: new Date(Date.now() + retryDelayMs),
             }, attempt)
-            await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
+            await deferOutboxWithoutSpendingAnAttempt(tx, job, errorMessage, retryDelayMs)
           })
         } else {
           await db.$transaction(async (tx) => {
@@ -3636,7 +3774,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             errorMessage,
             nextAttemptAt: new Date(Date.now() + retryDelayMs),
           }, attempt)
-          await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
+          await deferOutboxWithoutSpendingAnAttempt(tx, job, errorMessage, retryDelayMs)
         })
       } else {
         await db.$transaction(async (tx) => {

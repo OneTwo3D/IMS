@@ -60,6 +60,8 @@ let fetchAnswer: { status: number; body: unknown } = {
 }
 /** Every call that reached `connectorFetch`. The number that decides `reachedTheWire`. */
 const wireCalls: string[] = []
+/** The JSON body of each of those calls — what was ACTUALLY put on the wire (r4). */
+const postedBodies: unknown[] = []
 
 mock.module('@/lib/connectors/xero/auth', {
   namedExports: {
@@ -78,8 +80,9 @@ mock.module('@/lib/connectors/accounting-egress-authorization', {
 
 mock.module('@/lib/security/connector-fetch', {
   namedExports: {
-    connectorFetch: async (url: string) => {
+    connectorFetch: async (url: string, init?: { body?: string }) => {
       wireCalls.push(url)
+      postedBodies.push(typeof init?.body === 'string' ? JSON.parse(init.body) : null)
       return {
         ok: fetchAnswer.status >= 200 && fetchAnswer.status < 300,
         status: fetchAnswer.status,
@@ -113,6 +116,7 @@ async function postOne() {
 
 function reset() {
   wireCalls.length = 0
+  postedBodies.length = 0
   auth = { accessToken: 'tok', tenantId: `tenant-${Math.random()}` }
   intentRefusal = null
   egressRefusal = null
@@ -228,6 +232,113 @@ test('o3d-jit6 r3 (MEDIUM): an external caller CANNOT construct a PreparedManual
 })
 
 /* ------------------------------------------------------------------------------------------------
+ * r4 MEDIUM: THE BRAND AUTHENTICATED THE WRAPPER ONLY — THE BODY WAS STILL REACHABLE AND MUTABLE.
+ * ---------------------------------------------------------------------------------------------- */
+
+test('o3d-jit6 r4 (MEDIUM): a prepared journal does not expose the validated body at all', async () => {
+  const { prepareManualJournal } = await journals()
+  reset()
+
+  const preparation = prepareManualJournal({
+    date: '2026-08-22', reference: 'COGS 2026-08-22', narration: 'COGS', lines: LINES,
+  })
+  assert.ok(preparation.ok, 'the journal is valid, so this is a LEGITIMATELY obtained capability')
+
+  // THE ASSERTION IS THE DIRECTIVE, checked by `npx tsc --noEmit` rather than at run time — the same
+  // mechanism as the construction test above, pointed at the other half of the type.
+  //
+  // r3's shape was `{ readonly journal: Record<string, unknown>; readonly [BRAND]: ... }`. `readonly`
+  // is a property of the REFERENCE, not of the object, so this line compiled and the next one landed:
+  //
+  //     ;(preparation.prepared.journal as Record<string, unknown>).JournalLines = [{ LineAmount: 1e9 }]
+  //
+  // and the body that reached the socket was not the body `prepareManualJournal` checked. Put the
+  // `journal` property back on the type and this directive becomes UNUSED, which tsc reports as
+  // "Unused '@ts-expect-error' directive" — the test failing, in the only place it can be tested from.
+  // @ts-expect-error the validated body is not reachable from the capability
+  void preparation.prepared.journal
+
+  // And the storage really is module-private: not exported, and the only reader is the poster.
+  const source = readFileSync('lib/connectors/xero/journals.ts', 'utf8')
+  assert.ok(
+    !/export (const|type|function|class) PREPARED_MANUAL_JOURNAL_BODIES/.test(source),
+    'the body store must never be exported',
+  )
+  const code = source.split('\n').filter((line) => !line.trimStart().startsWith('*')).join('\n')
+  assert.equal(
+    code.split('PREPARED_MANUAL_JOURNAL_BODIES.get(').length - 1,
+    1,
+    'exactly one reader of the hidden body — the poster',
+  )
+  assert.equal(
+    code.split('PREPARED_MANUAL_JOURNAL_BODIES.set(').length - 1,
+    1,
+    'and exactly one writer — the mint',
+  )
+  // The capability itself carries nothing at run time either, so a plain-JS caller reading it back
+  // finds no body to edit. (The brand is a phantom: it exists only in the type.)
+  assert.deepEqual(Reflect.ownKeys(preparation.prepared as unknown as object), [])
+  assert.ok(Object.isFrozen(preparation.prepared), 'and nothing can be stapled onto it either')
+})
+
+test('o3d-jit6 r4 (MEDIUM): what is posted is the body that was validated, frozen', async () => {
+  const { prepareManualJournal, postPreparedManualJournal } = await journals()
+  reset()
+
+  const preparation = prepareManualJournal({
+    date: '2026-08-22', reference: 'COGS 2026-08-22', narration: 'COGS', lines: LINES,
+  })
+  assert.ok(preparation.ok)
+
+  const result = await postPreparedManualJournal(preparation.prepared, { idempotencyKey: 'k' })
+  assert.equal(result.success, true)
+  assert.equal(wireCalls.length, 1)
+
+  // The poster had no body on its argument, so this is proof it read the hidden one — and that what
+  // reached the socket is exactly what `prepareManualJournal` checked, line for line.
+  assert.deepEqual(postedBodies.at(-1), {
+    Narration: 'COGS',
+    Date: '2026-08-22',
+    JournalLines: [
+      { LineAmount: 40, AccountCode: '310', Description: 'COGS' },
+      { LineAmount: -40, AccountCode: '630', Description: 'Inventory' },
+    ],
+    Status: 'POSTED',
+  })
+
+  // FREEZING IS ASSERTED AT THE SOURCE, not off the wire: the wire carries JSON, and a parsed clone is
+  // a new mutable object, so `Object.isFrozen(postedBodies[0])` would be false however well the store
+  // is protected — a green assertion there would have meant nothing. What matters is that the stored
+  // body is frozen DOWN TO THE LINES: sealing the array alone fixes its length and leaves
+  // `lines[0].LineAmount = 999` working.
+  const code = readFileSync('lib/connectors/xero/journals.ts', 'utf8')
+    .split('\n').filter((line) => !line.trimStart().startsWith('*')).join('\n')
+  assert.match(
+    code,
+    /PREPARED_MANUAL_JOURNAL_BODIES\.set\(prepared, freezeValidatedJournalBody\(journal\)\)/,
+    'the mint must store the frozen body, never the live one',
+  )
+  assert.match(code, /for \(const line of lines\) Object\.freeze\(line\)/, 'each line is frozen')
+  assert.match(code, /Object\.freeze\(lines\)/, 'and so is the array holding them')
+  assert.match(code, /return Object\.freeze\(journal\)/, 'and the body itself')
+})
+
+test('o3d-jit6 r4 (MEDIUM): a token this module did not mint sends NOTHING and says so', async () => {
+  const { postPreparedManualJournal } = await journals()
+  reset()
+
+  // The untyped bypass — what a plain-JS caller or an `as never` gets. It cannot happen from typed
+  // code (the test above is the compile-time proof), and if it ever does, the answer must be the one
+  // the caller's dispatch record can act on: nothing was sent.
+  const forged = {} as unknown as Parameters<typeof postPreparedManualJournal>[0]
+  const result = await postPreparedManualJournal(forged)
+
+  assert.equal(result.success, false)
+  assert.deepEqual(wireCalls, [], 'an unvalidated body must never reach the socket')
+  assert.equal(result.reachedTheWire, false, 'and the caller is told nothing left, so the row replays')
+})
+
+/* ------------------------------------------------------------------------------------------------
  * THE REFUSAL THAT FOLLOWS: HONEST ABOUT WHAT IT DOES NOT KNOW.
  * ---------------------------------------------------------------------------------------------- */
 
@@ -308,9 +419,30 @@ test('o3d-jit6 r3: the journal branch classifies an unsent post as notPosted, an
     2,
     'both runner paths must name the action',
   )
-  assert.equal(
-    source.split("reason === 'transport-refused'").length - 1,
-    2,
-    'and both must select it from the reason rather than falling through to claim-lost',
+  // RE-POINTED BY r4, NOT RELAXED. This used to count `reason === 'transport-refused'` and require
+  // exactly two — one selector per runner. Each runner now tests the reason TWICE: once to choose the
+  // activity action, and once to decide whether to give the claim back (see
+  // releaseUnsentTransportRefusal). Counting occurrences would therefore have to be loosened to four,
+  // which says less than it did; so the property is asserted per BLOCK instead, which is strictly
+  // stronger — it pins that each runner both names the action and performs the release, rather than
+  // that the string appears the right number of times somewhere in a 5,000-line file.
+  const direct = source.slice(
+    source.indexOf('async function processPendingXeroSyncDirect('),
+    source.indexOf('async function processPendingXeroSyncViaOutbox('),
   )
+  const outbox = source.slice(
+    source.indexOf('async function processPendingXeroSyncViaOutbox('),
+    source.indexOf('async function guardCancelledSalesOrderInvoice('),
+  )
+  for (const [name, block] of [['direct', direct], ['outbox', outbox]] as const) {
+    assert.ok(block.length > 0, `the ${name} runner block must be found`)
+    assert.ok(
+      block.includes("'xero_sync_transport_refused_before_post'"),
+      `${name} runner: must select the named action from the reason rather than falling through to claim-lost`,
+    )
+    assert.ok(
+      block.includes("notPosted.reason === 'transport-refused'"),
+      `${name} runner: must branch on the reason`,
+    )
+  }
 })
