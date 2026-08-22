@@ -23,9 +23,14 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import {
   decideInvoicePaymentRegistration,
   selectReceiptsAwaitingRegistration,
+  unresolvedInvoicePaymentAttempts,
   type InvoicePaymentRegistrationDecision,
 } from '@/lib/domain/accounting/invoice-payment-registration'
 import { ledgerSalesInvoiceTotalForeign, type PaymentSyncRow } from '@/lib/domain/accounting/settlement-status'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import { attemptCouldHaveReachedTheLedger, effectiveTokenFor } from '@/lib/domain/accounting/followup-retry-guard'
+import { pinnedAttemptDate, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -39,6 +44,12 @@ export type InvoicePaymentSyncRow = PaymentSyncRow & {
   paymentId: string | null
   /** The ledger document this row settles — null on rows queued before the payload carried it. */
   accountingInvoiceId: string | null
+  /** The mark this attempt would have written into the ledger (o3d-0m56). */
+  settlementMarker: string | null
+  /** The date that attempt sent, so a settlement in the ledger can be matched to it (o3d-0m56). */
+  paymentDate: string | null
+  /** False when the stored body was too incomplete for the connector to have made the call. */
+  couldHaveReachedLedger: boolean
 }
 
 export async function loadInvoicePaymentSyncRows(
@@ -56,6 +67,9 @@ export async function loadInvoicePaymentSyncRows(
     where: { connector, type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: orderId },
     select: {
       status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true,
+      // o3d-0m56: the row id, because the token an attempt POSTED under is derived from it for rows
+      // whose payload pinned none. Without it `effectiveTokenFor` cannot name the mark to look for.
+      id: true,
       // o3d-nf9i r3: HOW the row reached its status. Without it an operator-asserted SYNCED row is
       // indistinguishable from one Xero confirmed, and settlementStatus would compare two local
       // numbers nothing verified and call the invoice SETTLED. `settlementBasis` is OPTIONAL on
@@ -79,6 +93,19 @@ export async function loadInvoicePaymentSyncRows(
       // o3d-hbgo: WHICH ledger invoice this settled. A row against a document the order no longer has
       // (deleted and re-posted) must not be read as bearing on the replacement's settlement.
       accountingInvoiceId: typeof payload.accountingInvoiceId === 'string' ? payload.accountingInvoiceId : null,
+      // o3d-0m56. The three facts the unresolved-attempt fence weighs, all derived through the SAME
+      // helpers the retry guard and the processors use rather than re-spelt here — copies of these
+      // rules are what let a probe go looking for a settlement on a day no post would ever create.
+      //
+      // ...the date it sent, because amount alone cannot tell one receipt from another:
+      paymentDate: pinnedAttemptDate('INVOICE_PAYMENT', r.payload),
+      // ...whether the stored body was ever complete enough to have been sent at all:
+      couldHaveReachedLedger: attemptCouldHaveReachedTheLedger('INVOICE_PAYMENT', r.payload),
+      // ...and the mark it would have written, which identifies the attempt even if its amount or
+      // date has since been corrected in the ledger.
+      settlementMarker: connector === 'xero' || connector === 'quickbooks'
+        ? settlementMarkerFor(effectiveTokenFor(connector, { id: r.id, payload: r.payload }))
+        : null,
     }
   })
 }
@@ -142,8 +169,37 @@ export async function registerInvoicePaymentWithLedger(params: {
     ])
     if (!so) return
 
+    const existing = paymentSyncEnabled && so.accountingInvoiceId
+      ? await loadInvoicePaymentSyncRows(params.orderId, connector?.id ?? null)
+      : []
+
+    // o3d-0m56: a FAILED or CANCELLED attempt does NOT prove the ledger is clear — the call may have
+    // committed before its response was lost. Recording another receipt beside one queues a fresh row
+    // under a NEW token, which posts a second payment without ever touching the retry guard. So when
+    // there is such an attempt, ask the ledger what it holds; the decision refuses unless the answer
+    // positively rules that attempt out.
+    //
+    // Conditional on purpose: this is a network read, and the ordinary receipt has no history to check.
+    const probeConnector = connector?.id === 'xero' || connector?.id === 'quickbooks' ? connector.id : null
+    const ledgerSettlements = so.accountingInvoiceId
+      && probeConnector
+      && unresolvedInvoicePaymentAttempts(existing, params.paymentId).length > 0
+      ? await (async () => {
+        const probe = await probeLedgerSettlement(probeConnector, {
+          type: 'INVOICE_PAYMENT',
+          payload: { accountingInvoiceId: so.accountingInvoiceId },
+        })
+        // A probe that could not answer stays null, which the decision reads as "refuse".
+        return probe.ok ? probe.records : null
+      })()
+      : null
+
     // Hoisted so the re-check under the order lock re-runs the IDENTICAL decision with only `existing`
     // refreshed — anything else diverging between the two would make the second a different guard.
+    //
+    // `ledgerSettlements` is deliberately NOT re-read there: it is a network call, and holding the
+    // order lock and the follow-up scope lock across one would let a slow remote block every payment
+    // enqueue in the system. What changes fast is the local row set, which is what IS re-read.
     const decisionInput = {
       syncEnabled: paymentSyncEnabled,
       accountingInvoiceId: so.accountingInvoiceId,
@@ -154,9 +210,8 @@ export async function registerInvoicePaymentWithLedger(params: {
       bankAccountId: paymentSyncEnabled && so.accountingInvoiceId
         ? lookupPaymentAccount(await getPaymentAccountMap(), params.method ?? '', params.currency)
         : null,
-      existing: paymentSyncEnabled && so.accountingInvoiceId
-        ? await loadInvoicePaymentSyncRows(params.orderId, connector?.id ?? null)
-        : [],
+      existing,
+      ledgerSettlements,
       ledgerTotal: ledgerSalesInvoiceTotalForeign({
         totalForeign: Number(so.totalForeign),
         taxForeign: Number(so.taxForeign),
@@ -200,6 +255,22 @@ export async function registerInvoicePaymentWithLedger(params: {
             `"${params.method ?? ''}" / currency "${params.currency}". Add a mapping in Settings → ` +
             `Accounting → Payment Account Mapping, then register the payment there.`,
             { amount: params.amount, currency: params.currency, method: params.method, refusal: refused.refusal })
+          return
+        // o3d-0m56: an earlier attempt on this order is FAILED or CANCELLED and the ledger could not be
+        // shown NOT to hold its payment. The capacity arithmetic cannot see this — a failed row
+        // consumes no capacity — so without this arm the receipt would look like it fits and a second
+        // payment would post. `detail` says which of the two it was: the ledger was unreachable, or it
+        // answered and the answer matched the earlier attempt.
+        case 'UNRESOLVED_PAYMENT_ATTEMPT':
+          await warn('invoice_payment_not_registered',
+            `Recorded ${amount} against ${params.orderReference}, but an earlier payment attempt on this ` +
+            `order did not resolve and could not be ruled out in the accounting connector ` +
+            `(${refused.detail ?? 'no detail'}). Sending this one could pay the invoice twice, so it was ` +
+            `not sent. Resolve the earlier attempt on the Accounting Sync page first. ${tail}`,
+            {
+              amount: params.amount, currency: params.currency, refusal: refused.refusal,
+              detail: refused.detail, ledgerTotal: refused.ledgerTotal,
+            })
           return
         // A registration is already on the invoice but IMS cannot read WHAT it was for, so the room
         // left on the invoice is unknown. Naming a figure here would be inventing one (o3d-cjt8).
@@ -248,6 +319,26 @@ export async function registerInvoicePaymentWithLedger(params: {
     // our row and retracts it.
     const outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, params.orderId)
+      // o3d-0m56: AND the follow-up scope lock, taken before the rows are re-read.
+      //
+      // The order lock serialises this against deletePayment, which is what it was added for. It does
+      // NOT serialise it against the other writers that can put an INVOICE_PAYMENT row into this same
+      // scope — the connector queues and the manual retry, neither of which touches the sales order.
+      // Between the re-read below and the insert, one of those can queue a row for this document under
+      // a fresh token; FAILED rows sit outside accounting_sync_logs_followup_live_unique, so nothing
+      // objects, and both can post. Only a lock BOTH sides take closes that, because PostgreSQL has no
+      // predicate locks and SELECT ... FOR UPDATE says nothing about a row about to be inserted.
+      //
+      // Order is fixed and uniform across every writer — sales-order row lock first, scope lock second
+      // — so this cannot deadlock against the enqueue path. See followup-scope-lock.ts.
+      if (probeConnector) {
+        await lockFollowUpScope(tx, {
+          connector: probeConnector,
+          type: 'INVOICE_PAYMENT',
+          referenceType: 'SalesOrder',
+          referenceId: params.orderId,
+        })
+      }
       const stillRecorded = await tx.payment.findUnique({ where: { id: params.paymentId }, select: { id: true } })
       if (!stillRecorded) return 'receipt-deleted' as const
       // RE-DECIDE UNDER THE LOCK (o3d-cjt8). While one live registration per ORDER was the rule, the

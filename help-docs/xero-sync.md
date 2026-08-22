@@ -1061,6 +1061,68 @@ Operators correct the underlying issue (in IMS or in the accounting system) and 
 sync from the Sync Dashboard. Once the row transitions out of `FAILED`, the alert disappears
 automatically.
 
+### When a Retry Is Refused
+
+A retry of a **payment** — a customer receipt, a supplier payment, or a credit-note allocation — is
+not the same kind of action as a retry of a PDF or an email. `FAILED` does **not** mean the ledger
+never saw it: a call that Xero committed and then failed to acknowledge lands here too. Re-sending
+it would settle the invoice twice, and only a human can reverse that in Xero.
+
+So before re-queueing a money row IMS **reads the target document in the accounting system** and
+looks for the settlement that attempt would have created — the same amount, on the same date. Four
+things can happen, and the last three leave the row `FAILED` with a message saying which:
+
+| Outcome | What IMS does |
+| --- | --- |
+| The ledger holds no such settlement | The row is re-queued normally |
+| The ledger already holds it | Refused. The payment is very likely already there — check the invoice in Xero, and if the row is genuinely owed, register it by hand |
+| The ledger could not be asked (connector down, document not found) | Refused. An unanswered question about money that may already be posted is not permission to send it again. Retry once the connector responds |
+| Several earlier attempts were sent under different idempotency keys | Refused. Any one of them may be the one that committed, and no single key can be re-sent safely. Reconcile the document in Xero |
+
+Two more refusals are about ordering rather than evidence:
+
+- **Another entry for this document is already queued or has posted.** Only one live entry per
+  document is allowed. Wait for it to finish, then retry this one if it is still needed.
+- **Only one entry can be queued at a time**, so a "Retry All" over several failed rows for the
+  *same* document re-queues the oldest usable one and leaves the rest failed. Retry them afterwards
+  if they are still needed — they are not lost, and nothing about them is wrong.
+
+Every refusal is written to the activity log as a warning naming the rows involved, and the count
+appears beside the retry result as *refused*. **A refusal is not a failure of the retry** — it is
+IMS declining to move money twice on your behalf.
+
+**The same check runs at the moment of sending, not only when you click.** A failed payment does not
+go straight to a permanent failure — it is re-attempted automatically several times first. Every one
+of those attempts, and every automatic re-queue, reads the ledger the same way: IMS records when a
+row first sent a payment, and from then on it will not send that row again until the ledger says the
+payment is not already there. The refusal appears as the row's error message.
+
+The practical consequence: a payment IMS cannot prove is absent ends up FAILED with an explanation,
+rather than being sent again in the background. That is the intended outcome — reversing a duplicate
+payment in Xero is manual work, and nobody is told it happened.
+
+Recording a **second receipt** against an order with an unresolved failed attempt is refused on the
+same grounds, with a warning on the order: the receipt stays recorded in IMS, and nothing is sent
+to Xero until the earlier attempt is resolved.
+
+### Closing a Payment That Is Already in the Ledger
+
+Those refusals leave one state with no way out on its own: a payment that **did** reach Xero but
+whose response was lost. It can never be retried (the ledger holds it), it will never post, and it
+goes on blocking the next receipt for that order as an unresolved attempt.
+
+Failed **payment** rows on the Sync Dashboard therefore carry an extra action — *Already paid in the
+accounting system? Check and close this entry*. It is not a "mark as done": IMS re-reads the
+document in Xero and closes the row **only if it can see the matching settlement itself**. Three
+outcomes:
+
+| What the ledger says | What happens |
+| --- | --- |
+| It holds the payment | The row is closed as synced, and the remote payment's id is recorded against it, so the row afterwards says *which* payment settled it |
+| It does **not** hold the payment | Refused — closing it would leave the invoice unpaid in Xero with nothing in IMS still asking anyone to look at it. Retry the row instead, or record the payment in Xero by hand first |
+| It could not be read | Refused. Try again when the connector responds |
+
+Only a `FAILED` payment row can be closed this way, and every use is written to the activity log.
 #### Retrying is not protected by idempotency — check Xero first
 
 IMS derives every `Idempotency-Key` deterministically from the sync entry id, so a re-post sends the
@@ -1683,6 +1745,16 @@ The sync log at **Integrations → Xero** shows queued transactions for the **cu
 
 Failed entries can be investigated via the error message and retried by resetting their status in the database.
 
+### Payments IMS refuses to send
+
+Before every payment, bill payment and credit-note allocation — automatic or retried by hand — IMS reads the target document in the accounting system and refuses to post if it cannot positively establish that the settlement is not already there. These refusals are recorded as ordinary failures on the row, and all of them start "Not sent". They are not bugs to retry around; each one means a person has to look at the document.
+
+- **"already holds a settlement of £X dated …"** — the payment is in the ledger. Either IMS sent it and lost the reply, or it was entered by hand. Reconcile the row against the settlement it names rather than sending another.
+- **"could not establish what the accounting connector already holds"** — the read failed (the connector was down, or it returned something IMS cannot measure). Nothing was sent. The row retries on the next run and usually clears itself.
+- **"does not record the amount its attempt would send, and the accounting connector already holds N settlement(s)"** — the queued row is incomplete, so IMS cannot tell its payment apart from what is already on the document. It only appears when the document is not empty; a document with nothing on it still posts normally.
+- **"QuickBooks reports £X already applied … but only £Y of it is accounted for"** (QuickBooks only) — money has come off the bill or invoice by something IMS does not read: a vendor credit, a credit memo, a deposit, a journal entry, or a transaction IMS has never seen. IMS will not pay a document it cannot fully account for. Apply the remainder in QuickBooks, or resolve the row by hand.
+- **"another entry for this document is posting … right now"** — two queued rows target the same document. Nothing is wrong; the second one retries once the first is readable.
+- **"the money-post lock for this document was lost while IMS was posting"** — rare. The database connection holding this document's exclusive claim died mid-call, so another entry could in principle have posted at the same instant. Check the document for a duplicate settlement before retrying. When this happens the server log also carries a line beginning `[money-post] EXCLUSION LOST` naming the connector, document and entry.
 ### Settling a row IMS cannot resolve for itself
 
 A **Failed** row does **not** prove that nothing reached Xero. The remote call is made *before* the

@@ -133,3 +133,14 @@ test('[o3d-4ajo] both daily batches check the lock before every write phase', ()
     assert.equal(checks, phases, `${path}: every write phase must assert the lock is still held`)
   }
 })
+
+test('[o3d-0m56 r4] the two-int advisory call passes the NAMESPACE first', async () => {
+  // Argument order is the whole of the two-int form and it is invisible at the call site:
+  // pg_try_advisory_lock takes (namespace, key). Swapped, it would take a REAL lock on a pair
+  // that means something else, with no error anywhere — and the acquire and the release would
+  // still agree with each other, so nothing downstream could notice the exclusion was wrong.
+  const { advisoryLockCall } = await import('../../lib/db/pinned-advisory-lock.ts')
+  assert.deepEqual(advisoryLockCall(7), { label: '7', args: [7], params: '$1' },
+    'the single-bigint form the daily batches use is unchanged')
+  assert.deepEqual(advisoryLockCall(7, 9), { label: '9/7', args: [9, 7], params: '$1, $2' })
+})

@@ -108,12 +108,19 @@ export type AccountingConnector = AccountingConnectorDef & {
   getSyncLogs(limit?: number): Promise<AccountingSyncLogRow[]>
   triggerSync(): Promise<{ success: boolean; result?: unknown; error?: string }>
   /**
+   * `refused` is part of the contract, not an optional extra: the guard can allow SOME rows
+   * and refuse others in one call, and a caller that drops it reports partial success as plain
+   * success (o3d-0m56).
+   *
    * o3d-e2mz: `expectedAttemptRevision` is the attempt the operator was looking at when they asked for
    * this ONE row to be retried. A connector whose processor stamps attempt revisions fences the retry on
    * it and refuses a request that names none; a connector that stamps none ignores it. Omitted for the
    * bulk ("Retry All") form, which is not a decision about any particular attempt.
    */
-  retryFailedSync(entryId?: string, expectedAttemptRevision?: number): Promise<{ success: boolean; reset: number; error?: string }>
+  retryFailedSync(
+    entryId?: string,
+    expectedAttemptRevision?: number,
+  ): Promise<{ success: boolean; reset: number; refused?: number; error?: string }>
   getSyncReadiness(): Promise<AccountingSyncReadiness>
 }
 

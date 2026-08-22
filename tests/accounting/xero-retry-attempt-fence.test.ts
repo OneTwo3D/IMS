@@ -18,7 +18,31 @@ const accountingSyncLog = new Proxy({}, {
   get: (_target, prop: string) => (args: never) => (store.delegate[prop] as (a: never) => Promise<unknown>)(args),
 })
 
-mock.module('@/lib/db', { namedExports: { db: { accountingSyncLog } } })
+/**
+ * o3d-0m56 wrapped this action's write in a PER-SCOPE TRANSACTION holding that scope's advisory lock
+ * across the sibling read, the plan and the reset. This double had only `accountingSyncLog`, so every
+ * case here died with "db.$transaction is not a function" — which reads as a broken fence and is not.
+ *
+ * The transaction runs the callback against the SAME store, which is what makes it a faithful double
+ * for these tests: they are about the ATTEMPT fence, and an isolation model of my own invention here
+ * would be a second, wrong answer to a question the real database already answers.
+ *
+ * `$executeRaw` is the scope lock itself (`pg_advisory_xact_lock`). It is a no-op because there is
+ * one caller in this file at a time; `manual-retry-action.test.ts` is where the lock's ORDERING is
+ * asserted, and it records the statement rather than swallowing it.
+ */
+mock.module('@/lib/db', {
+  namedExports: {
+    db: {
+      accountingSyncLog,
+      $executeRaw: async () => 1,
+      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({
+        accountingSyncLog,
+        $executeRaw: async () => 1,
+      }),
+    },
+  },
+})
 mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
 mock.module('@/lib/activity-log', {
   namedExports: {

@@ -420,6 +420,26 @@ const db = {
 }
 
 mock.module('@/lib/db', { namedExports: { db } })
+/**
+ * o3d-0m56: every money post now runs inside `postMoneyUnderLedgerFence`, which takes a per-DOCUMENT
+ * advisory lock on a PINNED connection — and that opens a real `pg` client from DATABASE_URL, which
+ * no unit test has. Unmocked, every case here failed with "DATABASE_URL is required for advisory
+ * locks", which this file reported as the connection guard refusing the post. It is not: the guard
+ * never ran.
+ *
+ * Granted unconditionally and never lost, because this file is about WHICH ORGANISATION a payload
+ * names, not about lock contention — one caller at a time, so the honest answer is "you hold it".
+ * money-post-lock.test.ts is where the contended and lost cases are pinned.
+ */
+mock.module('@/lib/db/pinned-advisory-lock', {
+  namedExports: {
+    acquirePinnedAdvisoryLockOrNull: async () => ({
+      assertHeld: () => undefined,
+      lost: false,
+      release: async () => undefined,
+    }),
+  },
+})
 mock.module('@/lib/activity-log', {
   namedExports: {
     logActivity: async (entry: { action: string }) => { state.activities.push(entry) },
@@ -448,8 +468,35 @@ mock.module('@/lib/connectors/xero/auth', {
 // observation: a stub that threw would prove the same thing by accident even if the guard never ran.
 mock.module('@/lib/security/connector-fetch', {
   namedExports: {
-    connectorFetch: async (url: string, init: { body?: string }) => {
-      state.posts.push({ path: url.replace(/^.*\/api\.xro\/2\.0\//, ''), body: JSON.parse(init?.body ?? 'null') })
+    connectorFetch: async (url: string, init: { body?: string; method?: string }) => {
+      const path = url.replace(/^.*\/api\.xro\/2\.0\//, '')
+      // WRITES ONLY. Every assertion in this file reads `state.posts` as "what was SENT to Xero" —
+      // `deepEqual(state.posts, [], 'NOTHING was posted')` four times over. o3d-0m56 made every money
+      // post READ the target document first, and recording that read here would have turned each of
+      // those into a one-element array and each "exactly one post" into two: a refusal that sent
+      // nothing would report as a post, which is the opposite of what this file exists to observe.
+      if ((init?.method ?? 'GET') !== 'GET') {
+        state.posts.push({ path, body: JSON.parse(init?.body ?? 'null') })
+      }
+      // o3d-0m56: every money post now READS the target document first — `postMoneyUnderLedgerFence`
+      // refuses unless it can establish what the ledger already holds against it, and fails CLOSED.
+      // Unanswered, the document GET returned the payment-POST shape above, which carries no
+      // `Invoices`, so the probe reported "Xero returned no document for that id" and every payment
+      // case here was refused BEFORE the connection guard ran. This file then read a fence it never
+      // reached as the guard working.
+      //
+      // Answered as a real, UNPAID invoice: the fence is satisfied on evidence rather than bypassed,
+      // so the guard is what decides these cases and "nothing was sent" still means what it says.
+      // Settled-document behaviour is pinned in settlement-probe.test.ts, not here.
+      if (/^Invoices\//.test(path) && (init?.method ?? 'GET') === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          json: async () => ({ Invoices: [{ InvoiceID: 'XBILL-ISSUED-BY-A', AmountPaid: 0, Payments: [] }] }),
+          text: async () => '',
+        }
+      }
       return {
         ok: true,
         status: 200,

@@ -32,6 +32,8 @@ const accountingSyncLog = new Proxy({}, {
 
 const dbStub = {
   accountingSyncLog,
+  // o3d-0m56's per-scope advisory lock, taken inside the revival transaction for money-moving types.
+  $executeRaw: async () => 1,
   $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
     const hook = interleave
     interleave = null
@@ -41,6 +43,27 @@ const dbStub = {
 }
 
 mock.module('@/lib/db', { namedExports: { db: dbStub } })
+/**
+ * o3d-0m56: the AUTOMATIC revival now asks the ledger whether the attempt is already in it before it
+ * revives a money row — reviving under a pinned token only protects while Xero still remembers that
+ * token, which is minutes, and a sweep runs long after.
+ *
+ * Answered CLEAR here, deliberately. This file is about the o3d-e2mz attempt compare-and-swap, and a
+ * ledger that refused would stop every case before the CAS was ever attempted — the tests would pass
+ * or fail on a fence they are not about. The ledger refusal's own behaviour is pinned in
+ * settlement-probe.test.ts and manual-retry-guard.test.ts.
+ *
+ * `postMoneyUnderLedgerFence` is re-exported unused: `mock.module` replaces the whole module, and the
+ * sync processor imports it at load time.
+ */
+mock.module('@/lib/connectors/accounting-settlement-probe', {
+  namedExports: {
+    ledgerClearsFollowUpRevival: async () => ({ clear: true }),
+    postMoneyUnderLedgerFence: async (_params: unknown, run: () => Promise<unknown>) => run(),
+    probeLedgerSettlement: async () => ({ ok: true, records: [] }),
+    settlementProbeKey: () => 'probe-key',
+  },
+})
 mock.module('@/lib/activity-log', {
   namedExports: {
     logActivity: async (entry: { action: string; level?: string; description: string; metadata?: Record<string, unknown> }) => {

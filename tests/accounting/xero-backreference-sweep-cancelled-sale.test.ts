@@ -141,6 +141,14 @@ const dbStub = {
     }
     return []
   },
+  // o3d-0m56: the follow-up enqueue takes the per-scope advisory lock (`pg_advisory_xact_lock`)
+  // before it writes, for money-moving types. Recorded like the row lock above so the ORDER of the
+  // two stays visible; without the delegate the enqueue throws and the sweep silently produces no
+  // follow-ups at all, which reads here as "the repair did not happen".
+  $executeRaw: async () => {
+    journal.push('scope-lock')
+    return 1
+  },
   $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(dbStub),
 }
 
@@ -298,10 +306,14 @@ test('o3d-e2mz r8: the sale is read UNDER ITS ROW LOCK, after the probe and befo
 
   assert.deepEqual(
     journal,
-    // The trailing probe is the shared sweep's own post-write verification (o3d-9kek), merged since
-    // this test was written. What this pins is the PREFIX: nothing is written before the lock and the
-    // status read behind it.
-    ['probe:order-1', 'lock:order-1', 'read-status:order-1', 'order-update:order-1', 'probe:order-1'],
+    // The trailing entries are other mechanisms' own steps, merged since this test was written, and
+    // they are listed rather than filtered out so that a NEW step appearing before the lock fails
+    // here rather than being absorbed:
+    //   • `scope-lock` — o3d-0m56's per-scope advisory lock, taken by the follow-up enqueue. AFTER
+    //     the back-reference write, which is the point: it guards the follow-up rows, not the sale.
+    //   • the trailing probe — the shared sweep's own post-write verification (o3d-9kek).
+    // What this pins is the PREFIX: nothing is written before the lock and the status read behind it.
+    ['probe:order-1', 'lock:order-1', 'read-status:order-1', 'order-update:order-1', 'scope-lock', 'probe:order-1'],
     'probe, then LOCK, then the status read, and only then the first write',
   )
 })

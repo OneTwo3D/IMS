@@ -45,6 +45,21 @@
  * What still refuses is genuine ambiguity: several FAILED rows for the same document, each
  * under a different token, where any one might be the one that committed.
  *
+ * AND A REVIVAL MUST NOT DESTROY THE EVIDENCE OF WHAT WAS ATTEMPTED (Codex round 8, HIGH).
+ * The revival is a WRITE OVER a FAILED row's payload, and that payload is where the row's own
+ * attempt is recorded: its anchors say which document it targeted, its amount and date say what
+ * it sent, and its `_followUpIdempotencyKey` is the token whose mark the ledger carries. Recycling
+ * a row that HAD posted therefore rotated a real attempt's token and threw away the only local
+ * record that it happened — see the note above the recycle below.
+ *
+ * AND "UNSTAMPED" ONLY MEANS THAT FOR A ROW NOTHING BUT A STAMPING BINARY HAS HANDLED (Codex
+ * rounds 9 and 10, HIGH). The migration's backfill covered the rows that existed when it ran, and a
+ * deploy keeps the OLD binary serving for minutes afterwards — so rows land unstamped on the far
+ * side of the backfill and were being read as "never attempted". Round 9 answered with a global
+ * epoch; round 10 replaced it with a fact the ROW carries, `attemptStampingCustodyAt`, because an
+ * instant recorded once could be defeated from outside the row by a clock skew, a cached read or a
+ * rollback. See money-attempt-provenance.ts.
+ *
  * WHY NOT REUSE THE EXISTING `_idempotencyKey` FIELD. It is already populated on rows this
  * module does not own: `addPayment` queues an INVOICE_PAYMENT through the generic
  * `queueAccountingSyncTx` with `invoice-payment:payment:<paymentId>`. Xero's payment
@@ -208,6 +223,48 @@ export type FailedFollowUpRow = {
    * original row is gone, which is why losing the row no longer has to refuse (Codex r4).
    */
   effectiveToken: string
+  /**
+   * When a REMOTE MONEY CALL was first made from this row, or null when none ever was.
+   *
+   * Read straight off the column `authoriseMoneyPost` claims — one conditional write, taken
+   * immediately before the call and never cleared, so it survives the retryCount reset that both
+   * revival paths perform. That makes it the only sound answer to "could this row's payload be the
+   * record of something that reached the ledger?", which is the question the recycle below asks:
+   *
+   *   not null -> a call left this row. Its payload is evidence and must not be overwritten.
+   *   null     -> no call ever left it, so its payload records nothing that happened.
+   *
+   * Only money-moving types are ever stamped (the fence returns early for the rest, and the
+   * backfill in 20260818090000 covered the pre-existing money rows). A PDF or e-mail follow-up
+   * therefore reads null forever — correctly, because a duplicate of one is not a settlement and
+   * its payload is not evidence of money.
+   *
+   * NULL ONLY PROVES ANYTHING FOR A ROW A STAMPING BINARY CREATED — see `createdAt` below.
+   */
+  remoteAttemptedAt: Date | null
+  /**
+   * When a binary that STAMPS `remoteAttemptedAt` before every money call last took custody of this
+   * row — created it, or claimed it — or null when something else has had it (Codex rounds 9
+   * and 10, HIGH).
+   *
+   * This is what says whether the NULL above is evidence of anything, and it is READ AS A
+   * PRESENCE, never as an instant. A row is trustworthy because of what handled it, not because of
+   * when it appeared:
+   *
+   *   not null -> everything that created or claimed this row stamps before it posts, so an unset
+   *               `remoteAttemptedAt` really does mean no call ever left it.
+   *   null     -> a binary that does not stamp created it (the column did not exist for it, so it
+   *               wrote nothing) or claimed it (the database's forfeit trigger took custody away).
+   *               Its unset stamp says nothing, and its payload may be the record of a payment.
+   *
+   * WHY NOT A DATE COMPARISON. Round 9 compared `createdAt` against a global epoch. Two clocks —
+   * the database's and the app process's — decided which side of that boundary a row fell on, and
+   * the wrong side is an attempted row read as never-attempted; and the epoch itself was
+   * established once, so a ROLLBACK produced unstamped rows after it that the rule trusted. A fact
+   * the row carries has neither failure: no clock is consulted, and a rolled-back binary declares
+   * itself simply by not writing the column.
+   */
+  attemptStampingCustodyAt: Date | null
 }
 
 export type FollowUpEnqueueInput = FollowUpIdentity & {
@@ -525,19 +582,81 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // Nothing surviving could have committed this document, so the recomputed request goes out
   // under a freshly derived token. Reuse a spent row when one exists rather than accumulating
   // replacements; its id no longer carries the token, so reuse is bookkeeping, not safety.
-  // Reuse a spent row ONLY when it recorded the same origin the new work was raised against.
   //
-  // Nothing is carried back on this branch — the token is freshly derived and the body is recomputed —
-  // so the row is a container rather than evidence about this attempt, and restamping it is honest FOR
-  // THE NEW WORK. What is not honest is doing that when the container still holds a different
-  // organisation's record: that record is the only surviving trace that an attempt was made against
-  // organisation A, and bookkeeping tidiness is not a reason to erase it. A brand-new row costs one
-  // insert, keeps A's row intact for reconciliation, and lets B's work proceed — whereas carrying A's
-  // stamp onto B's work would strand it behind a post-time refusal it can never satisfy.
-  const spentRow = input.failedRows[0]
-  const rowToReuse = spentRow && accountingOriginRecordsMatch(spentRow.payload, input.payload)
-    ? spentRow
-    : undefined
+  // BUT ONLY A ROW THAT IS NOT EVIDENCE (Codex round 8, HIGH). Reuse is a WRITE OVER the chosen
+  // row's payload, and reaching here means every surviving FAILED row targets a DIFFERENT external
+  // document — that is precisely why nothing could be pinned. So the row this branch used to grab
+  // (`failedRows[0]`, the newest) is by construction the record of an attempt against ANOTHER
+  // invoice, and overwriting it rotated that attempt's token and discarded its body:
+  //
+  //   INV-A's payment commits in Xero, the response is lost, the row ends FAILED. The invoice is
+  //   voided and re-raised as INV-B, the sweep re-enqueues, and this branch recycles the INV-A row
+  //   into an INV-B request. `_followUpIdempotencyKey` is now INV-B's token, the anchors say INV-B,
+  //   the amount and date are INV-B's — and the only local trace that anything was ever sent to
+  //   INV-A is gone, while `remoteAttemptedAt` stays set and now vouches for the wrong document.
+  //   The next enqueue against INV-A finds no attempt, rotates a token, and pays it twice.
+  //
+  // WHERE THE EVIDENCE LIVES ONCE THIS LEAVES IT ALONE: on the FAILED row itself — its `payload`
+  // (anchors, amount, date, `_followUpIdempotencyKey`) and its `remoteAttemptedAt`. THREE READERS
+  // depend on it, and all three go blind together when it is overwritten:
+  //
+  //   1. this planner, through `failedRows` — `couldHaveCommittedThis` pins the attempt's token
+  //      back, and the distinct-token count refuses when several could have committed;
+  //   2. `authoriseMoneyPost` (accounting-settlement-probe.ts) — its `attemptedSiblings` query
+  //      matches on `remoteAttemptedAt` plus the scope/document arms, then judges each rival by
+  //      `settlementMarkerFor(effectiveTokenFor(...))`, i.e. by the token in that payload;
+  //   3. `planManualRetry` (followup-retry-guard.ts) — the same siblings, the same marks, for the
+  //      operator-facing retry.
+  //
+  // A row that never made a remote call records nothing that happened, so recycling it destroys
+  // nothing and the bookkeeping is kept for exactly those. Anything else is left FAILED and a new
+  // row is created beside it; the cost is one extra row per distinct document in a scope.
+  //
+  // AND ONLY A ROW WHOSE UNSTAMPED-NESS IS ITSELF EVIDENCE (Codex rounds 9 and 10, HIGH).
+  // `remoteAttemptedAt === null` alone is not that. The stamp is written by `authoriseMoneyPost`,
+  // so a NULL means one of two very different things:
+  //
+  //   - a binary that stamps handled this row and never posted from it -> nothing happened;
+  //   - something that does not stamp handled it                       -> the NULL says nothing.
+  //
+  // The second is not hypothetical and it is not history. It is every deploy window (the migration
+  // backfills, then the build runs for minutes with the OLD binary still serving and still posting
+  // without stamping), every accidental overlap, and every ROLLBACK. Recycling one of those rows is
+  // precisely the evidence destruction this branch was written to stop, reintroduced at each of
+  // them: the recycled row's anchors, amount, date and `_followUpIdempotencyKey` are overwritten
+  // with another document's, and the payment it may have committed becomes invisible to all three
+  // readers listed above.
+  //
+  // `attemptStampingCustodyAt` separates them, and it does so from the ROW. Round 9 used a global
+  // instant instead and Codex round 10 defeated it three ways — a clock skew across the boundary, a
+  // cached epoch that ignored the documented reset, and a rollback that landed rows on the trusted
+  // side of an epoch established once. Custody has no boundary to fall the wrong side of: a binary
+  // that does not stamp cannot write the column when it creates a row, and the database's forfeit
+  // trigger takes custody away when it claims one. So the test is a presence check, and every way
+  // of losing custody leaves the row here, unrecycled, with its evidence intact.
+  const provablyNeverAttempted = (row: FailedFollowUpRow): boolean =>
+    row.remoteAttemptedAt === null && row.attemptStampingCustodyAt !== null
+
+  // AND ONLY A ROW THAT RECORDS THE SAME ORIGIN THE NEW WORK WAS RAISED AGAINST (o3d-s36z).
+  //
+  // The two conditions are joined rather than chosen between, because they refuse for different
+  // reasons and each admits rows the other would not:
+  //
+  //   provablyNeverAttempted   the row is not evidence of a REMOTE CALL, so overwriting its token,
+  //                            anchors, amount and date destroys nothing that happened.
+  //   same recorded origin     the row is not evidence of an ORGANISATION either. A stamp naming
+  //                            organisation A is the only surviving trace that this work was raised
+  //                            against A, and it survives an attempt that never left: restamping it
+  //                            for B erases that, and carrying A's stamp onto B's work would strand
+  //                            B behind a post-time refusal it can never satisfy.
+  //
+  // `accountingOriginRecordsMatch` also refuses when EITHER record is unreadable, which is the fence
+  // failing closed rather than a third state — the same shape as the four never-conflated stamp
+  // states it is built on. A brand-new row costs one insert per distinct document in a scope; the
+  // alternative costs a payment nobody can trace.
+  const rowToReuse = input.failedRows.find(
+    (row) => provablyNeverAttempted(row) && accountingOriginRecordsMatch(row.payload, input.payload),
+  )
   const freshPayload = withFollowUpIdempotencyKey(input)
   if (rowToReuse) {
     const stored = asPayload(rowToReuse.payload)

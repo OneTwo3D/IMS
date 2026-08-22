@@ -17,7 +17,9 @@ import test, { mock } from 'node:test'
 type QueuedRow = { type: string; payload: Record<string, unknown>; idempotencyKey?: string }
 
 const state = {
-  syncRows: [] as Array<{ status: string; externalTransactionId: null; errorMessage: null; retryCount: number; payload: Record<string, unknown> }>,
+  // `id` is not decoration: o3d-0m56 derives the token an attempt POSTED under from the row id when
+  // its payload pinned none, so a row without one makes the settlement marker a hash of `undefined`.
+  syncRows: [] as Array<{ id: string; status: string; externalTransactionId: null; errorMessage: null; retryCount: number; payload: Record<string, unknown> }>,
   queued: [] as QueuedRow[],
   activity: [] as Array<{ action: string; level: string; metadata: Record<string, unknown> }>,
   payments: [] as Array<{ id: string; amount: number; currency: string; method: string | null; reference: string | null; paidAt: Date }>,
@@ -54,6 +56,13 @@ function txClient() {
   return {
     accountingSyncLog: { findMany: async () => state.syncRows },
     payment: { findUnique: async ({ where }: { where: { id: string } }) => state.payments.find((p) => p.id === where.id) ?? null },
+    // o3d-0m56 took a SECOND lock inside this transaction: `lockFollowUpScope` is a
+    // `pg_advisory_xact_lock` issued through `$executeRaw`, on top of the sales-order row lock
+    // (`$queryRaw ... FOR UPDATE`). Both are no-ops here — this file drives one caller at a time and
+    // asserts ORDERING of registrations, not of locks — but they must EXIST, or the enqueue dies
+    // before it registers anything and every count below reads zero.
+    $executeRaw: async () => 1,
+    $queryRaw: async () => [],
   }
 }
 
@@ -83,6 +92,7 @@ mock.module('@/lib/accounting', {
       // A queued row is immediately live and visible to the next receipt's capacity read — which is the
       // whole behaviour under test.
       state.syncRows.unshift({
+        id: `log-${state.queued.length}`,
         status: 'PENDING',
         externalTransactionId: null,
         errorMessage: null,
@@ -153,7 +163,7 @@ test('an UNATTRIBUTED live registration suppresses the whole re-drive', async ()
   // The imported-order shape: the SALES_INVOICE follow-up registered a receipt with no local Payment
   // row, so it cannot be matched to one, and "which receipt is this?" unanswered has to read as
   // "possibly that one".
-  state.syncRows = [{ status: 'PENDING', externalTransactionId: null, errorMessage: null, retryCount: 0, payload: { amount: 100, accountingInvoiceId: 'INV-1' } }]
+  state.syncRows = [{ id: 'log-live', status: 'PENDING', externalTransactionId: null, errorMessage: null, retryCount: 0, payload: { amount: 100, accountingInvoiceId: 'INV-1' } }]
   state.payments = [{ id: 'pay-1', amount: 100, currency: 'GBP', method: 'card', reference: null, paidAt: new Date('2026-08-01') }]
 
   await redrive()
@@ -168,7 +178,7 @@ test('an UNATTRIBUTED live registration suppresses the whole re-drive', async ()
 test('a receipt that already has its OWN sync row is never re-driven', async () => {
   // A FAILED row may have committed remotely before failing; re-driving it here would post under a
   // token the ledger has never seen. That belongs to the retry path, which pins the token.
-  state.syncRows = [{ status: 'FAILED', externalTransactionId: null, errorMessage: null, retryCount: 3, payload: { amount: 100, accountingInvoiceId: 'INV-1', paymentId: 'pay-1' } }]
+  state.syncRows = [{ id: 'log-failed', status: 'FAILED', externalTransactionId: null, errorMessage: null, retryCount: 3, payload: { amount: 100, accountingInvoiceId: 'INV-1', paymentId: 'pay-1' } }]
   state.payments = [{ id: 'pay-1', amount: 100, currency: 'GBP', method: 'card', reference: null, paidAt: new Date('2026-08-01') }]
 
   await redrive()

@@ -1,5 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import type { AttemptRef } from '@/lib/domain/accounting/sync-log-attempt'
+import { stampingCustodyOnClaim } from '@/lib/domain/accounting/money-attempt-provenance'
 
 /**
  * A CLAIM THIS WORKER IS HOLDING RIGHT NOW — the thing every fence below is built from (o3d-550x).
@@ -138,7 +139,17 @@ export async function releaseClaimForRetry(
       errorMessage: release.errorMessage,
       // A future `processingStartedAt` on a PENDING row is the existing retry gate: it is read as
       // "earliest next claim time", not as a claim.
-      processingStartedAt: release.nextAttemptAt,
+      //
+      // o3d-0m56 r10: AND IT KEEPS ATTEMPT-STAMPING CUSTODY, here rather than at the six call sites.
+      // Re-gating a row is the same write as claiming it with a future instant, and the database's
+      // forfeit trigger nulls `attemptStampingCustodyAt` on any claim-shaped UPDATE that does not
+      // re-assert it in the same statement. Every deferral and every backoff is such a write, so
+      // without this each one silently forfeits custody — and a row outside custody can never again
+      // have its unset `remoteAttemptedAt` read as proof that no remote call left it, which is what
+      // lets the planner recycle it. `stampingCustodyOnClaim` returns BOTH fields from ONE instant
+      // so the pairing the trigger checks cannot be half-applied; spelling either out here would be
+      // a second copy of that rule, and this is the one release every non-terminal path goes through.
+      ...stampingCustodyOnClaim(release.nextAttemptAt),
     },
   })
   return released.count > 0

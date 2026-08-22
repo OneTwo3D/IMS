@@ -13,6 +13,11 @@
  * end: someone can act on a warning, but nobody goes looking for a payment they were never told about.
  */
 
+import {
+  classifyLedgerSettlement,
+  type LedgerSettlementRecord,
+} from './ledger-settlement-evidence'
+
 export type InvoicePaymentRegistrationRefusal =
   /** Nothing is expected to post: the connector is off. Not a fault, and not worth a warning. */
   | 'SYNC_DISABLED'
@@ -23,6 +28,11 @@ export type InvoicePaymentRegistrationRefusal =
   /** No bank account is mapped for this payment method/currency. */
   | 'NO_BANK_ACCOUNT'
   /**
+   * An earlier attempt for this order is FAILED or CANCELLED and cannot be shown to be absent from
+   * the ledger, so a second receipt could settle the same invoice twice (o3d-0m56).
+   */
+  | 'UNRESOLVED_PAYMENT_ATTEMPT'
+  /**
    * A live registration exists whose AMOUNT cannot be read, so the remaining capacity on the invoice
    * cannot be computed. Refusing is the only sound answer: unknown must not read as zero (o3d-cjt8).
    */
@@ -32,15 +42,35 @@ export type InvoicePaymentRegistrationRefusal =
 
 export type InvoicePaymentRegistrationDecision =
   | { register: true; bankAccountId: string }
-  | { register: false; refusal: InvoicePaymentRegistrationRefusal; alreadyRegistered?: number; ledgerTotal?: number }
+  | {
+      register: false
+      refusal: InvoicePaymentRegistrationRefusal
+      alreadyRegistered?: number
+      ledgerTotal?: number
+      /** Why an unresolved attempt could not be cleared, for the operator warning. */
+      detail?: string
+    }
 
 /** One INVOICE_PAYMENT sync row, reduced to what the decision depends on. */
 export type ExistingInvoicePaymentSync = {
   status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'CANCELLED'
   /** What was sent, in the document currency. Null when the payload did not record it. */
   amount?: number | null
+  /** The date that attempt sent, `YYYY-MM-DD`. Null when the payload did not pin one. */
+  paymentDate?: string | null
   /** The local Payment row it was queued for; null on rows queued before that was recorded. */
   paymentId?: string | null
+  /**
+   * The mark this attempt would have written into the ledger, derived from its own idempotency
+   * token (o3d-0m56 round 3). Null when the caller cannot derive one — the amount-and-date match
+   * is then the only evidence available, and it is weaker.
+   */
+  settlementMarker?: string | null
+  /**
+   * False when the stored body was missing a field the connector requires, which PROVES the attempt
+   * was rejected before any HTTP call. Undefined means unknown, which reads as "it could have".
+   */
+  couldHaveReachedLedger?: boolean
   /**
    * The LEDGER DOCUMENT this row settles (o3d-hbgo). A row that names a different invoice paid an
    * invoice this order no longer has — deleted and re-posted — so it says nothing about how much of
@@ -48,6 +78,29 @@ export type ExistingInvoicePaymentSync = {
    * has to read as "possibly this one": for money, unknown is not the same as irrelevant.
    */
   accountingInvoiceId?: string | null
+}
+
+/**
+ * Attempts whose outcome is not established: FAILED or CANCELLED, not this receipt's own row, and
+ * structurally complete enough that the connector would have made the call.
+ *
+ * Exported because the caller needs to know whether to ASK the ledger at all — the probe is a
+ * network read and must not run on every receipt, only on the ones with a history.
+ *
+ * DELIBERATELY NOT DOCUMENT-SCOPED, unlike the capacity filter below. o3d-hbgo drops a row naming a
+ * different invoice because it consumes none of THIS invoice's capacity — a statement about
+ * arithmetic. This question is not about capacity: an attempt whose response was lost may hold a
+ * payment in the ledger under whatever document it named, and a re-posted invoice does not make that
+ * payment go away. Narrowing this by document would discard exactly the evidence it exists to weigh.
+ */
+export function unresolvedInvoicePaymentAttempts(
+  existing: ExistingInvoicePaymentSync[],
+  paymentId: string,
+): ExistingInvoicePaymentSync[] {
+  return existing.filter((r) =>
+    (r.status === 'FAILED' || r.status === 'CANCELLED')
+    && (r.paymentId == null || r.paymentId !== paymentId)
+    && r.couldHaveReachedLedger !== false)
 }
 
 /**
@@ -71,6 +124,14 @@ export function decideInvoicePaymentRegistration(input: {
   bankAccountId: string | null
   /** Every INVOICE_PAYMENT sync row already on this order. */
   existing: ExistingInvoicePaymentSync[]
+  /**
+   * What the ledger holds against this invoice, or null when it could not be established (o3d-0m56).
+   *
+   * Only consulted when an unresolved earlier attempt exists, and null then means REFUSE: an
+   * unanswered question about money that may already be in the ledger is not permission to send
+   * more. Callers with no unresolved attempts may pass null freely.
+   */
+  ledgerSettlements: LedgerSettlementRecord[] | null
   /** What the ledger's copy of the invoice was built at (see ledgerSalesInvoiceTotalForeign). */
   ledgerTotal: number
 }): InvoicePaymentRegistrationDecision {
@@ -88,6 +149,50 @@ export function decideInvoicePaymentRegistration(input: {
   // stands in the way of an OVERPAYMENT either, because "the parts must not exceed the whole" is
   // arithmetic and no unique index can express it. That arithmetic is done here.
   //
+  // BOTH RULES SURVIVE THE o3d-cjt8 / o3d-0m56 MERGE, and they are different questions.
+  //
+  // o3d-cjt8 made the live-follow-up index RECEIPT-scoped, so "one live registration per order" is
+  // gone: a deposit and a balance may each register, and what stops an overpayment is arithmetic
+  // below. That retired this branch's LEDGER_HAS_LIVE_PAYMENT refusal, exactly as this file's own
+  // comment predicted it would ("Making the index receipt-scoped ... is o3d-cjt8").
+  //
+  // WHAT IT DID NOT RETIRE is o3d-0m56's question, and reading it as retired would be the whole
+  // defect. Capacity is measured from rows that are LIVE. A FAILED or CANCELLED attempt is not live
+  // and consumes no capacity — correctly, for arithmetic — but it is also not proof that the ledger
+  // is clear: a call that committed before its response was lost is FAILED (o3d-ju8t), and deleting
+  // a receipt CANCELS a row that may already have settled. Recording another receipt beside one
+  // queues a fresh row under a NEW idempotency token, which posts a second payment without ever
+  // touching the retry guard — and the capacity sum, having ignored the failed row, sees room for it.
+  //
+  // So the unresolved-attempt question is asked FIRST, before any arithmetic, because the arithmetic
+  // cannot see it.
+  const unresolved = unresolvedInvoicePaymentAttempts(input.existing, input.paymentId)
+  if (unresolved.length > 0) {
+    if (input.ledgerSettlements === null) {
+      return {
+        register: false,
+        refusal: 'UNRESOLVED_PAYMENT_ATTEMPT',
+        ledgerTotal: input.ledgerTotal,
+        detail: 'the accounting connector could not be asked what it already holds',
+      }
+    }
+    for (const attempt of unresolved) {
+      const verdict = classifyLedgerSettlement(
+        { amount: attempt.amount ?? null, date: attempt.paymentDate ?? null, marker: attempt.settlementMarker ?? null },
+        { ok: true, records: input.ledgerSettlements },
+      )
+      if (verdict.outcome === 'clear') continue
+      return {
+        register: false,
+        refusal: 'UNRESOLVED_PAYMENT_ATTEMPT',
+        ledgerTotal: input.ledgerTotal,
+        detail: verdict.outcome === 'present'
+          ? `the ledger already holds ${verdict.detail}, which matches an earlier ${attempt.status} attempt`
+          : verdict.reason,
+      }
+    }
+  }
+
   // FAILED and CANCELLED rows hold nothing — the ledger rejected them or never saw them — so they free
   // the capacity again, exactly as the index's live-status predicate does.
   const live = input.existing.filter(
@@ -124,6 +229,29 @@ export function decideInvoicePaymentRegistration(input: {
   }
   return { register: true, bankAccountId: input.bankAccountId }
 }
+
+/**
+ * `invoicePaymentRowSetBlocker` WAS HERE, AND IS GONE (o3d-0m56 rebased onto o3d-cjt8).
+ *
+ * It existed to split the two rules that depend on the order's other sync rows out of the decision,
+ * so the caller could re-run just those inside the transaction that writes — the amount checks were
+ * excluded because the caller "has the row set and nothing else", and re-running them there would
+ * have refused every receipt.
+ *
+ * Both halves of that premise are now false, and in the direction that makes the split unsafe rather
+ * than merely redundant:
+ *
+ *   • o3d-cjt8 made the double-registration protection ARITHMETIC. Once the live-follow-up index is
+ *     receipt-scoped, two racing receipts both insert cleanly and the invoice is over-settled, so the
+ *     capacity sum is precisely the thing that must be re-run under the lock. A re-check that
+ *     deliberately does not judge size would have re-opened the race it was written to close.
+ *   • The caller no longer has only the row set: `registerInvoicePaymentWithLedger` hoists its whole
+ *     `decisionInput` and re-runs `decideInvoicePaymentRegistration` under the lock with `existing`
+ *     refreshed and nothing else changed.
+ *
+ * So there is ONE decision function, evaluated twice, rather than a decision and a partial copy of
+ * it that could drift. See invoice-payment-enqueue.ts for the re-run.
+ */
 
 /**
  * WHICH LOCAL RECEIPTS ARE STILL WAITING TO BE REGISTERED (o3d-ekn8).

@@ -2394,6 +2394,33 @@ model AccountingSyncLog {
   // Not a candidate-query predicate: an unstamped row is a candidate already. It only widens the
   // "back-reference done, follow-ups outstanding" pass that used to be FAILED-only.
   backReferenceFollowUpsPendingAt DateTime?
+  // o3d-0m56: when this row first made a REMOTE money call. Set once, immediately BEFORE the
+  // call, and NEVER cleared — not by the manual retry, not by an automatic revival, both of
+  // which reset retryCount to 0 and so cannot be used to answer "has this been sent before?".
+  //
+  // It is the flag the posting site itself consults: with it set, no money-moving request is
+  // sent a second time until the connector's ledger has been read and does not already hold
+  // that attempt. FAILED never proved the call did not commit (o3d-ju8t), and the remote
+  // idempotency window that used to be the answer is measured in minutes.
+  remoteAttemptedAt DateTime?
+
+  // o3d-0m56 round 10 (Codex HIGH): when a binary that STAMPS `remoteAttemptedAt` before every
+  // remote money call last took custody of this row — i.e. created it, or claimed it for
+  // processing. NULL means something else had it, and a NULL `remoteAttemptedAt` on such a row is
+  // therefore no evidence at all.
+  //
+  // Written by `stampingCustodyOnCreate` / `stampingCustodyOnClaim`
+  // (lib/domain/accounting/money-attempt-provenance.ts) and TAKEN AWAY by the database: the
+  // trigger `accounting_sync_logs_forfeit_stamping_custody` nulls it on any UPDATE that starts a
+  // claim without re-asserting it in the same statement, which a binary that has never heard of
+  // the column cannot do. That is what makes a ROLLBACK self-declaring rather than something an
+  // operator has to remember, and it is why this replaced the round-9 `settings` epoch: an epoch
+  // is a single global instant, and every operational action — a clock skew, a cached read, a
+  // rollback — could invalidate it from outside the row.
+  //
+  // Only its PRESENCE is ever read. The value is a timestamp so the trigger has something that
+  // changes on every re-assertion, and so custody can be dated when a row is investigated.
+  attemptStampingCustodyAt DateTime?
   // o3d-k26m.5: the invoice number THIS row SET OUT TO POST under, written immediately before the
   // request left and only once a live lookup had said the ledger did not hold that number yet.
   //

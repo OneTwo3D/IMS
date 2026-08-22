@@ -14,6 +14,15 @@ import {
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import { freshAuthFailureResult, requireInternalUser, requirePermission, requireRole } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
+import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
+import {
+  classifyLedgerSettlement,
+  describeAttempt,
+  settlementMarkerFor,
+} from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { effectiveTokenFor, isMoneyMovingSyncType } from '@/lib/domain/accounting/followup-retry-guard'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import { decideSettledRowReconciliation } from '@/lib/domain/accounting/settled-row-reconciliation'
 import {
   summarizeCrossConnectorOrphans,
   type ConnectorOrphanSummary,
@@ -691,14 +700,97 @@ export async function triggerAccountingSync(): Promise<{ success: boolean; resul
  * (AccountingSyncLogRow.attemptRevision), so the connector can refuse it when the row has moved on to a
  * different attempt since. Connectors that stamp no revision report none and ignore it. Omit both for the
  * bulk "Retry All".
+ *
+ * o3d-0m56: `refused` rides back out with it — the connector guard can allow some rows and refuse
+ * others in one call, and dropping the count here reports partial success as plain success.
  */
 export async function retryFailedAccountingSync(
   entryId?: string,
   expectedAttemptRevision?: number,
-): Promise<{ success: boolean; reset: number; error?: string }> {
+): Promise<{ success: boolean; reset: number; refused?: number; error?: string }> {
   await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).retryFailedSync(entryId, expectedAttemptRevision)
+}
+
+/**
+ * Declare a FAILED payment entry SETTLED, on the strength of the settlement the ledger actually
+ * holds (o3d-0m56 round 3).
+ *
+ * This is the exit from the state every other guard in o3d-0m56 creates: a payment that reached the
+ * ledger but lost its response leaves a row that can never be retried and never posts, and goes on
+ * blocking the next receipt for that order. Without this the operator can see exactly what happened
+ * and has no button that changes anything.
+ *
+ * It is NOT a "mark as done": it refuses unless IMS can see the matching settlement itself, and it
+ * writes back the remote id it matched, so afterwards the row says WHICH payment settled it.
+ */
+export async function reconcileSettledAccountingSyncRow(
+  entryId: string,
+): Promise<{ success: boolean; error?: string; externalTransactionId?: string | null }> {
+  await requirePermission('settings')
+  try {
+    const row = await db.accountingSyncLog.findUnique({
+      where: { id: entryId },
+      select: { id: true, connector: true, type: true, status: true, referenceType: true, referenceId: true, payload: true },
+    })
+    if (!row || (row.connector !== 'xero' && row.connector !== 'quickbooks')) {
+      return { success: false, error: 'That sync entry no longer exists.' }
+    }
+    const connector = row.connector
+
+    // Read the ledger BEFORE opening the transaction: a network call inside the scope lock would
+    // let one slow remote block every payment enqueue in the system.
+    const probe = await probeLedgerSettlement(connector, { type: row.type, payload: row.payload })
+    const settlement = classifyLedgerSettlement(
+      describeAttempt(row.type, row.payload, settlementMarkerFor(effectiveTokenFor(connector, row))),
+      probe,
+    )
+    const decision = decideSettledRowReconciliation({ row, settlement, isMoneyMoving: isMoneyMovingSyncType })
+    if (!decision.resolve) return { success: false, error: decision.reason }
+
+    // Under the scope lock and fenced on FAILED, so this cannot race a retry or an automatic
+    // revival of the same row — and cannot resolve a row that has meanwhile gone live.
+    const applied = await db.$transaction(async (tx) => {
+      await lockFollowUpScope(tx, {
+        connector,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+      })
+      return tx.accountingSyncLog.updateMany({
+        where: { id: entryId, status: 'FAILED' },
+        data: {
+          status: 'SYNCED',
+          syncedAt: new Date(),
+          errorMessage: null,
+          ...(decision.externalTransactionId ? { externalTransactionId: decision.externalTransactionId } : {}),
+        },
+      })
+    })
+    if (applied.count === 0) {
+      return { success: false, error: 'That entry changed while it was being reconciled. Reload and look again.' }
+    }
+
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'accounting_sync_row_reconciled',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Reconciled ${row.type} for ${row.referenceType} ${row.referenceId} against a settlement `
+        + `already in the ledger: ${decision.detail}. Nothing was posted.`,
+      metadata: {
+        syncLogId: entryId,
+        connector,
+        type: row.type,
+        externalTransactionId: decision.externalTransactionId,
+      },
+    })
+    revalidatePath('/sync')
+    return { success: true, externalTransactionId: decision.externalTransactionId }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
 }
 
 export async function getAccountingSyncReadiness(): Promise<AccountingSyncReadiness> {

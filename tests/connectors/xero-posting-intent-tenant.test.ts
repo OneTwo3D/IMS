@@ -122,6 +122,24 @@ const db = {
 }
 
 mock.module('@/lib/db', { namedExports: { db } })
+/**
+ * o3d-0m56: every money post now runs inside `postMoneyUnderLedgerFence`, which takes a per-DOCUMENT
+ * lock on a PINNED connection opened from DATABASE_URL — which no unit test has. Unmocked, every case
+ * here failed with "DATABASE_URL is required for advisory locks", which this file would have reported
+ * as the tenant guard refusing the post. It is not: the guard never ran.
+ *
+ * Granted and never lost: this file is about WHICH TENANT a request is addressed to, with one caller
+ * at a time. Contention and lock loss are pinned in money-post-lock.test.ts.
+ */
+mock.module('@/lib/db/pinned-advisory-lock', {
+  namedExports: {
+    acquirePinnedAdvisoryLockOrNull: async () => ({
+      assertHeld: () => undefined,
+      lost: false,
+      release: async () => undefined,
+    }),
+  },
+})
 mock.module('@/lib/activity-log', {
   namedExports: {
     logActivity: async () => {},
@@ -143,8 +161,31 @@ mock.module('@/lib/connectors/xero/auth', {
 // The wire. Anything reaching here was SENT.
 mock.module('@/lib/security/connector-fetch', {
   namedExports: {
-    connectorFetch: async (url: string, init: { headers?: Record<string, string> }) => {
-      state.sent.push({ url, tenantId: init?.headers?.['Xero-Tenant-Id'] })
+    connectorFetch: async (url: string, init: { headers?: Record<string, string>; method?: string }) => {
+      // o3d-0m56 made each money post READ its target document before authorising the post. THAT ONE
+      // READ is excluded from `state.sent`, and nothing else is: every assertion here treats
+      // `state.sent` as "what was SENT" — including `deepEqual(state.sent, [], 'NOTHING reached
+      // connectorFetch')` — so recording the fence's own read would turn the refusal case into a
+      // one-element array and the control case into two.
+      //
+      // Narrowed to the fence's document GET rather than to GETs in general, because the last test in
+      // this file asserts that an ORDINARY GET (`xeroGet('Organisation')`, which carries no queued row
+      // and no intent) does reach the wire. Excluding every read would have hidden it.
+      const isFenceDocumentRead = (init?.method ?? 'GET') === 'GET' && /\/Invoices\//.test(url)
+      if (!isFenceDocumentRead) state.sent.push({ url, tenantId: init?.headers?.['Xero-Tenant-Id'] })
+      // Answered as a real, UNPAID invoice so the fence is satisfied on EVIDENCE rather than bypassed
+      // — the tenant guard is then what decides these cases, which is what this file is for. Left
+      // unanswered it returned the payment-POST shape below, which carries no `Invoices`, so the
+      // fence failed closed and refused every case before the guard ran.
+      if (isFenceDocumentRead) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          json: async () => ({ Invoices: [{ InvoiceID: 'INV-1', AmountPaid: 0, Payments: [] }] }),
+          text: async () => '',
+        }
+      }
       return {
         ok: true,
         status: 200,

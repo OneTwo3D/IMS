@@ -6,6 +6,7 @@ import test from 'node:test'
 import {
   FOLLOW_UP_IDEMPOTENCY_KEY,
   type FailedFollowUpRow,
+  type FollowUpPayload,
   buildFollowUpIdempotencySource,
   planFollowUpEnqueue,
   readFollowUpIdempotencyKey,
@@ -30,6 +31,29 @@ import {
  */
 
 const ORDER = { connector: 'quickbooks', type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: 'order-1' }
+
+/**
+ * o3d-0m56 round 10 — WHAT HAS HANDLED a row is what its unstamped `remoteAttemptedAt` proves, so
+ * every row double has to say so. It is a PRESENCE, not an instant: round 9 compared the row's
+ * `createdAt` against a global epoch, and Codex round 10 showed that boundary being crossed by a
+ * clock skew, by a cached read that ignored the documented reset, and by a rollback.
+ *
+ * `attemptStampingCustodyAt` is written by binaries that stamp before every money call — at create,
+ * and at every claim — and is taken away by the database's forfeit trigger from any row claimed by
+ * a binary that does not. Its VALUE is never compared with anything, which is why the doubles below
+ * use one deliberately absurd timestamp for it.
+ */
+const IN_CUSTODY = new Date('2026-08-01T09:00:00Z')
+/**
+ * The same fact, carried by a row whose custody was taken in a completely different year from
+ * anything else in these tests. Nothing may read it as an instant, so nothing may care.
+ */
+const IN_CUSTODY_LONG_AGO = new Date('1999-01-01T00:00:00Z')
+/**
+ * A row a binary outside stamping custody created (the column did not exist for it) or claimed (the
+ * trigger nulled it) — unstamped because nothing stamped it, not because nothing was sent from it.
+ */
+const OUTSIDE_CUSTODY = null
 
 test('the follow-up idempotency source does not depend on the sync-log row id (o3d-h2wx)', () => {
   const payload = { accountingInvoiceId: 'inv-9', amount: 120 }
@@ -125,7 +149,7 @@ test('a FAILED follow-up is REUSED, not replaced, so its row id survives (o3d-h2
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', amount: 120 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-old' }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-old')
@@ -141,7 +165,7 @@ test('reusing a LEGACY FAILED row pins its token EXPLICITLY, not implicitly (o3d
     type: 'INVOICE_PDF',
     payload: { accountingInvoiceId: 'inv-9', amount: 120 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-legacy' }],
+    failedRows: [{ id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-legacy', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(
@@ -162,6 +186,8 @@ test('reuse carries the FAILED row effective token forward, not a freshly derive
       id: 'log-old',
       payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'original-key' },
       effectiveToken: 'original-key',
+      remoteAttemptedAt: null,
+      attemptStampingCustodyAt: IN_CUSTODY,
     }],
   })
   assert.equal(plan.action, 'reuse')
@@ -176,7 +202,7 @@ test('a non-object payload on the FAILED row does not crash or lose its token (o
       ...ORDER,
       payload: { accountingInvoiceId: 'inv-9' },
       liveRowExists: false,
-      failedRows: [{ id: 'log-old', payload: stored, effectiveToken: 'log-old' }],
+      failedRows: [{ id: 'log-old', payload: stored, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
     })
     assert.equal(plan.action, 'reuse')
     // An unreadable payload still has a token -- the connector resolved it from the row --
@@ -194,7 +220,7 @@ test('a money-moving reuse pins the REQUEST BODY, not just the token (o3d-h2wx)'
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', amount: 150, bankAccountId: 'bank-2' },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-1' }, effectiveToken: 'log-old' }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-1' }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.payload.amount : undefined, 120)
@@ -214,7 +240,7 @@ test('a reuse targeting a DIFFERENT document gets a fresh key, not the old token
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-10', amount: 120 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'old-token' }, effectiveToken: 'log-old' }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'old-token' }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.payload.accountingInvoiceId : undefined, 'inv-10')
@@ -233,8 +259,8 @@ test('several FAILED money-moving rows REFUSE rather than guess which token comm
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-new' },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-old' },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-new', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'refuse')
@@ -248,8 +274,8 @@ test('several FAILED NON-money rows still retry — a duplicate PDF is not a fin
     payload: { accountingInvoiceId: 'inv-9' },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'log-new' },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'log-old' },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'log-new', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'reuse')
@@ -334,7 +360,7 @@ test('a same-target money reuse pins the stored body even when it looks wrong (o
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-new' },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-deleted' }, effectiveToken: 'log-old' }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-deleted' }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.payload.bankAccountId : undefined, 'bank-deleted')
@@ -350,8 +376,8 @@ test('several FAILED rows do NOT refuse when none of them targeted this document
     payload: { accountingInvoiceId: 'inv-new', amount: 120 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-old', amount: 120 }, effectiveToken: 'log-new' },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-old', amount: 120 }, effectiveToken: 'log-old' },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-old', amount: 120 }, effectiveToken: 'log-new', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-old', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'reuse')
@@ -365,8 +391,8 @@ test('only rows targeting THIS document count toward the ambiguity (o3d-h2wx)', 
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-other', payload: { accountingInvoiceId: 'inv-other', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-other' },
-      { id: 'log-ambiguous', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 110 }, effectiveToken: 'log-ambiguous' },
+      { id: 'log-other', payload: { accountingInvoiceId: 'inv-other', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-other', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-ambiguous', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 110 }, effectiveToken: 'log-ambiguous', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'reuse')
@@ -383,7 +409,7 @@ test('a FAILED row with no recorded target counts as possibly-this-one (o3d-h2wx
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', amount: 120 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-legacy', payload: { amount: 120 }, effectiveToken: 'log-legacy' }],
+    failedRows: [{ id: 'log-legacy', payload: { amount: 120 }, effectiveToken: 'log-legacy', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'pinned')
@@ -396,7 +422,7 @@ test('a same-target money reuse reports pinned/pinned, so the log cannot lie (o3
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 150 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-old' }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(pinned.action === 'reuse' ? pinned.tokenDisposition : undefined, 'pinned')
   assert.equal(pinned.action === 'reuse' ? pinned.bodyDisposition : undefined, 'pinned')
@@ -405,7 +431,7 @@ test('a same-target money reuse reports pinned/pinned, so the log cannot lie (o3
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-10', bankAccountId: 'bank-1', amount: 120 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-old' }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(rotated.action === 'reuse' ? rotated.tokenDisposition : undefined, 'rotated')
   assert.equal(rotated.action === 'reuse' ? rotated.bodyDisposition : undefined, 'fresh')
@@ -424,7 +450,7 @@ test('a rotated disposition is only reported when the token VALUE actually chang
     liveRowExists: false,
     // Different anchors on the stored payload, so it drops out of the could-have-committed
     // set — but the key it was stamped with is the one we would derive now.
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: sameKey }, effectiveToken: 'log-old' }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: sameKey }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(unchanged.action === 'reuse' ? unchanged.tokenDisposition : undefined, 'pinned')
 
@@ -432,7 +458,7 @@ test('a rotated disposition is only reported when the token VALUE actually chang
     ...ORDER,
     payload: fresh,
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'some-other-key' }, effectiveToken: 'log-old' }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'some-other-key' }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(changed.action === 'reuse' ? changed.tokenDisposition : undefined, 'rotated')
 })
@@ -440,9 +466,12 @@ test('a rotated disposition is only reported when the token VALUE actually chang
 test('the planner exposes no way to infer not-posted from free text (o3d-h2wx)', () => {
   // Codex r3 blocker A, pinned structurally: the input type must not carry an error message
   // or a flag derived from one, so the sound-looking shortcut cannot come back by accident.
-  // effectiveToken is a VALUE the connector resolved, not an inference about what happened.
-  const row: FailedFollowUpRow = { id: 'log-1', payload: {}, effectiveToken: 'log-1' }
-  assert.deepEqual(Object.keys(row).sort(), ['effectiveToken', 'id', 'payload'])
+  // effectiveToken, remoteAttemptedAt and attemptStampingCustodyAt are all VALUES the connector
+  // read off the row — a resolved token, a claimed timestamp, and the custody the row carries — not
+  // inferences about what the failure meant.
+  const row: FailedFollowUpRow = { id: 'log-1', payload: {}, effectiveToken: 'log-1', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }
+  assert.deepEqual(Object.keys(row).sort(),
+    ['attemptStampingCustodyAt', 'effectiveToken', 'id', 'payload', 'remoteAttemptedAt'])
 })
 
 test('a pinned token survives the row it came from disappearing (o3d-h2wx)', () => {
@@ -457,7 +486,7 @@ test('a pinned token survives the row it came from disappearing (o3d-h2wx)', () 
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', amount: 120 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-legacy' }],
+    failedRows: [{ id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-legacy', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(pinned.action, 'reuse')
   const carried = pinned.action === 'reuse' ? pinned.payload : {}
@@ -486,7 +515,7 @@ test('two racing workers that both lose the CAS converge on ONE token (o3d-h2wx)
   // Codex r4 #3: concurrent lost-CAS workers each wrote their own tombstone with a distinct
   // rotated token. Now both re-plan from the same pinned value, so whichever rows they
   // create carry the identical remote key and the ledger deduplicates them.
-  const row = { id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'log-legacy' }
+  const row = { id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'log-legacy', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }
   const workers = [row, row].map(() => planFollowUpEnqueue({
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9' },
@@ -505,7 +534,7 @@ test('a token already being carried is authoritative over a newly-appeared row (
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', amount: 120, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried-token' },
     liveRowExists: false,
-    failedRows: [{ id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'carried-token' }],
+    failedRows: [{ id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'carried-token', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'carried-token')
@@ -516,7 +545,7 @@ test('a carried token that CONFLICTS with a surviving row refuses rather than pi
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried-token' },
     liveRowExists: false,
-    failedRows: [{ id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'a-different-token' }],
+    failedRows: [{ id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'a-different-token', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'refuse')
 })
@@ -531,8 +560,8 @@ test('ambiguity is counted in DISTINCT TOKENS, not rows (o3d-h2wx)', () => {
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'invoice-payment:payment:p1' },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'invoice-payment:payment:p1' },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'invoice-payment:payment:p1', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'invoice-payment:payment:p1', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(sharedToken.action, 'reuse')
@@ -547,8 +576,8 @@ test('ambiguity is counted in DISTINCT TOKENS, not rows (o3d-h2wx)', () => {
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-new' },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-old' },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-new', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(distinct.action, 'refuse')
@@ -565,8 +594,8 @@ test('rows sharing one token pin the OLDEST body, not the newest (o3d-h2wx)', ()
     liveRowExists: false,
     // newest first, as both connectors order them
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 150 }, effectiveToken: 'shared' },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'shared' },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 150 }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'reuse')
@@ -582,8 +611,8 @@ test('a carried token selects the row that used it, not merely the newest (o3d-h
     payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried' },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'carried' },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'carried' },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'carried', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'carried', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'reuse')
@@ -599,8 +628,8 @@ test('an INCOMPLETE oldest body is skipped in favour of one that could have post
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 150 }, effectiveToken: 'shared' },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'shared' },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 150 }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'reuse')
@@ -618,8 +647,8 @@ test('when every shared-token body is incomplete the oldest is still pinned (o3d
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 150 }, effectiveToken: 'shared' },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'shared' },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 150 }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'reuse')
@@ -635,8 +664,8 @@ test('completeness only applies to money-moving types (o3d-h2wx)', () => {
     payload: { accountingInvoiceId: 'inv-9' },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'shared' },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'shared' },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-old')
@@ -652,8 +681,8 @@ test('completeness mirrors the connectors\' guards: falsy ids missing, zero amou
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 150 }, effectiveToken: 'shared' },
-      { id: 'log-old', payload: older, effectiveToken: 'shared' },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 150 }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: older, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
 
@@ -705,7 +734,7 @@ test('[o3d-qsbs] one unpostable legacy row pins its TOKEN but not its unusable b
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-legacy', payload: { amount: 200 }, effectiveToken: 'log-legacy' }],
+    failedRows: [{ id: 'log-legacy', payload: { amount: 200 }, effectiveToken: 'log-legacy', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-legacy')
@@ -722,8 +751,8 @@ test('[o3d-qsbs] two unpostable legacy rows do not refuse — neither token ever
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-newer', payload: { amount: 200 }, effectiveToken: 'log-newer' },
-      { id: 'log-older', payload: { amount: 200 }, effectiveToken: 'log-older' },
+      { id: 'log-newer', payload: { amount: 200 }, effectiveToken: 'log-newer', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-older', payload: { amount: 200 }, effectiveToken: 'log-older', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'reuse', 'two tokens that were never sent are not two candidates for having committed')
@@ -738,8 +767,8 @@ test('[o3d-qsbs] a POSTABLE row still refuses alongside an unpostable one', () =
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried-token' },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-complete', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 }, effectiveToken: 'log-complete' },
-      { id: 'log-legacy', payload: { amount: 200 }, effectiveToken: 'log-legacy' },
+      { id: 'log-complete', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 }, effectiveToken: 'log-complete', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-legacy', payload: { amount: 200 }, effectiveToken: 'log-legacy', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'refuse')
@@ -756,7 +785,7 @@ test('[o3d-qsbs] an EMPTY stored payload is never proof that nothing posted', ()
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried-token' },
     liveRowExists: false,
-    failedRows: [{ id: 'log-compacted', payload: {}, effectiveToken: 'log-compacted' }],
+    failedRows: [{ id: 'log-compacted', payload: {}, effectiveToken: 'log-compacted', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'refuse', 'an unreadable history must not be read as an innocent one')
 })
@@ -766,7 +795,7 @@ test('[o3d-qsbs] an UNREADABLE stored payload is never proof either', () => {
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried-token' },
     liveRowExists: false,
-    failedRows: [{ id: 'log-null', payload: null, effectiveToken: 'log-null' }],
+    failedRows: [{ id: 'log-null', payload: null, effectiveToken: 'log-null', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'refuse')
 })
@@ -779,7 +808,7 @@ test('[o3d-qsbs] a compacted body is still never PINNED as the request', () => {
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-compacted', payload: {}, effectiveToken: 'log-compacted' }],
+    failedRows: [{ id: 'log-compacted', payload: {}, effectiveToken: 'log-compacted', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'pinned')
@@ -802,11 +831,12 @@ test('[o3d-qsbs] an UNSENDABLE row never displaces the token of one that may hav
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-unsendable', payload: { amount: 200 }, effectiveToken: 'tok-never-left' },
+      { id: 'log-unsendable', payload: { amount: 200 }, effectiveToken: 'tok-never-left', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
       {
         id: 'log-sendable',
         payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
         effectiveToken: 'tok-sent',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
       },
     ],
   })
@@ -833,11 +863,12 @@ test('[o3d-qsbs] the may-have-committed token wins even when the unsendable row 
     payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-unsendable', payload: { accountingInvoiceId: 'inv-9', amount: 200 }, effectiveToken: 'tok-never-left' },
+      { id: 'log-unsendable', payload: { accountingInvoiceId: 'inv-9', amount: 200 }, effectiveToken: 'tok-never-left', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
       {
         id: 'log-sendable',
         payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 175 },
         effectiveToken: 'tok-sent',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
       },
     ],
   })
@@ -875,6 +906,7 @@ test('o3d-19gy: a NON-MONEY revival carries the ROW own origin, not the current 
       id: 'log-old',
       payload: { accountingInvoiceId: 'inv-9', [CONNECTION_KEY]: 'xero:tenant-A', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'original-key' },
       effectiveToken: 'original-key',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
     }],
   })
 
@@ -903,6 +935,7 @@ test('o3d-19gy: a MONEY revival keeps organisation A on the row, so the post-tim
       id: 'log-old',
       payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120, [CONNECTION_KEY]: 'xero:tenant-A' },
       effectiveToken: 'log-old',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
     }],
   })
 
@@ -921,7 +954,7 @@ test('o3d-19gy: a repair does not INVENT an origin for a legacy row that recorde
     type: 'INVOICE_PDF',
     payload: { accountingInvoiceId: 'inv-9', [CONNECTION_KEY]: 'xero:tenant-B' },
     liveRowExists: false,
-    failedRows: [{ id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'log-legacy' }],
+    failedRows: [{ id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'log-legacy', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
 
   assert.equal(plan.action, 'reuse')
@@ -945,6 +978,7 @@ test('o3d-19gy: a spent row from ANOTHER organisation is left intact and the new
       id: 'log-tenant-a',
       payload: { accountingInvoiceId: 'inv-9', amount: 120, [CONNECTION_KEY]: 'xero:tenant-A' },
       effectiveToken: 'log-tenant-a',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
     }],
   })
 
@@ -965,6 +999,7 @@ test('o3d-19gy: a spent row from the SAME organisation is still reused, so nothi
       id: 'log-same-org',
       payload: { accountingInvoiceId: 'inv-9', amount: 120, [CONNECTION_KEY]: 'xero:tenant-B' },
       effectiveToken: 'log-same-org',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
     }],
   })
 
@@ -984,6 +1019,7 @@ test('o3d-19gy: an UNREADABLE origin on the spent row is not treated as a match'
       id: 'log-garbled',
       payload: { accountingInvoiceId: 'inv-9', amount: 120, [CONNECTION_KEY]: 42 },
       effectiveToken: 'log-garbled',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
     }],
   })
 
@@ -1084,4 +1120,434 @@ test('o3d-m5qk: the two capacity guards import the ONE predicate rather than der
       `${file} must not re-derive the required-field table — that is the second definition`,
     )
   }
+})
+
+/* --------------------------------------------------------------------------------------- *
+ * o3d-0m56 round 8 (Codex, HIGH) — A REVIVAL MUST NOT DESTROY THE EVIDENCE OF WHAT WAS
+ * ATTEMPTED.
+ *
+ * The revival is a WRITE OVER the recycled row's payload, and that payload IS the row's
+ * attempt: its anchors say which document it targeted, its amount and date say what it sent,
+ * and `_followUpIdempotencyKey` (or, for a legacy row, its id) is the token whose mark the
+ * ledger carries. Reaching the rotate branch means every surviving FAILED row targets a
+ * DIFFERENT document — so the row it used to grab was, by construction, the record of an
+ * attempt against another invoice.
+ * --------------------------------------------------------------------------------------- */
+
+test('an ATTEMPTED FAILED row is never recycled — its payload is evidence (o3d-0m56)', () => {
+  // log-old posted to inv-9 and lost its response. The order is now re-invoiced as inv-10, so
+  // nothing surviving could have committed inv-10 and the token must rotate. Rotating it ON TOP
+  // of log-old would throw away the only local record that inv-9 was ever paid.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', bankAccountId: 'bank-1', amount: 120 },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'log-old',
+      payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120, paymentDate: '2026-08-01' },
+      effectiveToken: 'log-old',
+      remoteAttemptedAt: new Date('2026-08-01T10:00:00Z'),
+      attemptStampingCustodyAt: IN_CUSTODY,
+    }],
+  })
+
+  assert.equal(plan.action, 'create', 'a row a remote call left must be left exactly as it is')
+  assert.equal(plan.action === 'create' ? plan.payload.accountingInvoiceId : undefined, 'inv-10')
+  assert.equal(
+    plan.action === 'create' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined,
+    buildFollowUpIdempotencySource({ ...ORDER, payload: { accountingInvoiceId: 'inv-10' } }),
+  )
+})
+
+test('a never-attempted FAILED row is still recycled — it records nothing (o3d-0m56)', () => {
+  // remoteAttemptedAt is claimed by one conditional write immediately before the remote call, so
+  // NULL is proof no call ever left this row — PROVIDED nothing but a binary that claims the stamp
+  // has handled the row, which is what `attemptStampingCustodyAt` being present establishes. Its
+  // payload is then a plan, not a record, and reusing the row rather than accumulating replacements
+  // costs nothing.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', bankAccountId: 'bank-1', amount: 120 },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'log-old',
+      payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 },
+      effectiveToken: 'log-old',
+      remoteAttemptedAt: null,
+      attemptStampingCustodyAt: IN_CUSTODY,
+    }],
+  })
+
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-old')
+  assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'rotated')
+})
+
+test('the recycle steps over an attempted row and takes an unattempted one (o3d-0m56)', () => {
+  // Newest first. log-sent posted; log-unsent was rejected before any call was made. Only the
+  // second may be written over, and the choice must not be "whichever happens to be first".
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', bankAccountId: 'bank-1', amount: 120 },
+    liveRowExists: false,
+    failedRows: [
+      {
+        id: 'log-sent',
+        payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 },
+        effectiveToken: 'log-sent',
+        remoteAttemptedAt: new Date('2026-08-01T10:00:00Z'),
+        attemptStampingCustodyAt: IN_CUSTODY,
+      },
+      {
+        id: 'log-unsent',
+        payload: { accountingInvoiceId: 'inv-8', bankAccountId: 'bank-1', amount: 120 },
+        effectiveToken: 'log-unsent',
+        remoteAttemptedAt: null,
+        attemptStampingCustodyAt: IN_CUSTODY,
+      },
+    ],
+  })
+
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-unsent')
+})
+
+test('a re-invoiced order cannot rotate away the token its first payment posted under (o3d-0m56)', () => {
+  // THE DOUBLE POST THIS CLOSES, played out as the connector plays it.
+  //
+  //  1. A LEGACY row (no stamped key, so its token IS its row id) posts £100 to inv-9. Xero
+  //     commits it and the response is lost; the row ends FAILED with remoteAttemptedAt set and
+  //     a payment in the ledger marked settlementMarkerFor('log-a').
+  //  2. inv-9 is voided and re-raised as inv-10. The sweep re-enqueues, and nothing surviving
+  //     could have committed inv-10 — so the token legitimately rotates.
+  //  3. inv-10 turns out to be the wrong document (the void is reversed, the back-reference
+  //     resolves to inv-9 again) and a payment for inv-9 is enqueued once more.
+  //
+  // Step 3 must pin 'log-a'. `ledgerClearsFollowUpRevival` only probes a PINNED token, and the
+  // probe only recognises the committed payment by settlementMarkerFor('log-a') — the amount and
+  // date fallback loses it the moment either is recomputed. Recycling log-a at step 2 rotated its
+  // token and erased its anchors, so step 3 saw no attempt at all, skipped the probe, and paid
+  // inv-9 twice.
+  type Row = { id: string; payload: FollowUpPayload; remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null }
+  const rows: Row[] = [{
+    id: 'log-a',
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 100, paymentDate: '2026-08-01' },
+    remoteAttemptedAt: new Date('2026-08-01T10:00:00Z'),
+    attemptStampingCustodyAt: IN_CUSTODY,
+  }]
+  // Xero's followUpIdempotencySource, exactly: the stamped key when there is one, else the row id.
+  const asFailedRow = (row: Row): FailedFollowUpRow => ({
+    id: row.id,
+    payload: row.payload,
+    effectiveToken: readFollowUpIdempotencyKey(row.payload) ?? row.id,
+    remoteAttemptedAt: row.remoteAttemptedAt,
+    attemptStampingCustodyAt: row.attemptStampingCustodyAt,
+  })
+  // What both connectors do with a plan: a reuse OVERWRITES the row's payload, a create adds one.
+  const apply = (plan: ReturnType<typeof planFollowUpEnqueue>, newId: string) => {
+    if (plan.action === 'reuse') rows.find((row) => row.id === plan.syncLogId)!.payload = plan.payload
+    else if (plan.action === 'create') rows.unshift({ id: newId, payload: plan.payload, remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY })
+    else assert.fail(`unexpected plan ${plan.action}`)
+  }
+
+  apply(planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', bankAccountId: 'bank-1', amount: 100, paymentDate: '2026-09-01' },
+    liveRowExists: false,
+    failedRows: rows.map(asFailedRow),
+  }), 'log-b')
+
+  const stillThere = rows.find((row) => row.id === 'log-a')!
+  assert.equal(stillThere.payload.accountingInvoiceId, 'inv-9', 'the attempt against inv-9 must survive')
+  assert.equal(stillThere.payload.amount, 100)
+  assert.equal(readFollowUpIdempotencyKey(stillThere.payload), undefined, 'and must not be given a new token')
+
+  const back = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 105, paymentDate: '2026-09-02' },
+    liveRowExists: false,
+    failedRows: rows.map(asFailedRow),
+  })
+
+  assert.equal(back.action, 'reuse')
+  assert.equal(back.action === 'reuse' ? back.syncLogId : undefined, 'log-a')
+  assert.equal(back.action === 'reuse' ? back.tokenDisposition : undefined, 'pinned',
+    'a rotated disposition here would ALSO skip the ledger probe, which is the double post')
+  assert.equal(back.action === 'reuse' ? back.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'log-a',
+    'the token must be the one the committed payment carries the mark of')
+  assert.equal(back.action === 'reuse' ? back.payload.amount : undefined, 100,
+    'and the body stays pinned, so a recomputed amount cannot record a settlement never made')
+})
+
+/* --------------------------------------------------------------------------------------- *
+ * o3d-0m56 round 10 (Codex, HIGH x3) — AN UNSTAMPED ROW IS ONLY EVIDENCE OF NOTHING WHEN
+ * NOTHING BUT A STAMPING BINARY HAS HANDLED IT, AND THE ROW SAYS SO ITSELF.
+ *
+ * Round 9 said "created at or after a recorded epoch". Three ways that was not enough, all of
+ * them the same shape — the thing that made the premise true lived outside the row:
+ *
+ *   1. the epoch came from the app process's clock and `createdAt` from the database's, so a
+ *      skew put rows on the wrong side of the boundary;
+ *   2. the documented recovery (delete the settings key) was invisible to a process that had
+ *      already cached the epoch;
+ *   3. a ROLLBACK posts unstamped rows AFTER an epoch established once — and a rollback is a
+ *      sequential deploy, so the "no overlap" order round 9 leaned on was satisfied throughout.
+ *
+ * `attemptStampingCustodyAt` carries the fact instead: written by binaries that stamp, at create
+ * and at every claim, and taken away by the database from any row a binary that does not stamp
+ * claims. The tests below cover the deploy window, a ROLLBACK, and a CLOCK SKEW.
+ * --------------------------------------------------------------------------------------- */
+
+test('a FAILED money row created outside stamping custody is never recycled (o3d-0m56 r10)', () => {
+  // log-old was created after the migration's backfill and before the new process was live, so
+  // nothing stamped it and nothing gave it custody — but a payment for inv-9 may well be sitting
+  // in Xero under its token.
+  // Reaching the rotate branch means the row targets a DIFFERENT document from the one being
+  // enqueued, which is exactly when recycling would overwrite it.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', bankAccountId: 'bank-1', amount: 120 },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'log-old',
+      payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120, paymentDate: '2026-06-30' },
+      effectiveToken: 'log-old',
+      remoteAttemptedAt: null,
+      attemptStampingCustodyAt: OUTSIDE_CUSTODY,
+    }],
+  })
+
+  assert.equal(plan.action, 'create',
+    'a NULL stamp on a row nothing was going to stamp proves nothing, so its payload is not disposable')
+})
+
+test('a ROLLBACK that claimed this binary\'s row costs that row its custody (o3d-0m56 r10)', () => {
+  // FINDING 3, at the planner. log-mine was created by a stamping binary — under round 9's rule it
+  // was created after the epoch, so its NULL stamp was "proof". Then the binary was ROLLED BACK,
+  // the old version claimed the row and posted from it, and nothing stamped that call.
+  //
+  // Round 9 had no way to see this: the epoch is established once and the row's createdAt never
+  // moves, so the row still sat on the trusted side of the boundary and its payload was recycled
+  // away. Custody CAN see it — the claim came through the database's forfeit trigger, which nulls
+  // the column for any claim that does not re-assert it, and a rolled-back binary cannot re-assert
+  // a column it has never heard of.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', bankAccountId: 'bank-1', amount: 120 },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'log-mine',
+      payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120, paymentDate: '2026-08-02' },
+      effectiveToken: 'log-mine',
+      remoteAttemptedAt: null,
+      attemptStampingCustodyAt: OUTSIDE_CUSTODY,
+    }],
+  })
+
+  assert.equal(plan.action, 'create',
+    'a row whose custody a rollback forfeited is not disposable, whenever it was created')
+})
+
+test('NO CLOCK is consulted: the custody stamp is read as a presence, never as an instant (o3d-0m56 r10)', () => {
+  // FINDING 1. Round 9 compared two timestamps written by two different machines, and being a few
+  // seconds out on the wrong side of that comparison meant an attempted row read as never-attempted.
+  //
+  // Custody removes the comparison. These two rows carry custody stamps 27 years apart — one long
+  // before any epoch this test file mentions, one in a future no clock on either machine has
+  // reached — and both are recycled, because the only question asked of the column is whether it is
+  // there. There is no boundary for a skew to move a row across.
+  const withCustody = (custodyAt: Date) => planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', bankAccountId: 'bank-1', amount: 120 },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'log-skewed',
+      payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 },
+      effectiveToken: 'log-skewed',
+      remoteAttemptedAt: null,
+      attemptStampingCustodyAt: custodyAt,
+    }],
+  })
+
+  for (const custodyAt of [IN_CUSTODY_LONG_AGO, new Date('2099-12-31T23:59:59Z')]) {
+    const plan = withCustody(custodyAt)
+    assert.equal(plan.action, 'reuse', `custody at ${custodyAt.toISOString()} must still be custody`)
+    assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-skewed')
+  }
+})
+
+test('the recycle steps over a row outside custody and takes one inside it (o3d-0m56 r10)', () => {
+  // Newest first, and neither row carries a stamp — so under round 8's rule alone both looked
+  // disposable. Only the one whose custody is intact may be written over, and the choice must not
+  // be "whichever happens to be first".
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', bankAccountId: 'bank-1', amount: 120 },
+    liveRowExists: false,
+    failedRows: [
+      {
+        id: 'log-rolled-back',
+        payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 },
+        effectiveToken: 'log-rolled-back',
+        remoteAttemptedAt: null,
+        attemptStampingCustodyAt: OUTSIDE_CUSTODY,
+      },
+      {
+        id: 'log-mine',
+        payload: { accountingInvoiceId: 'inv-8', bankAccountId: 'bank-1', amount: 120 },
+        effectiveToken: 'log-mine',
+        remoteAttemptedAt: null,
+        attemptStampingCustodyAt: IN_CUSTODY,
+      },
+    ],
+  })
+
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-mine')
+})
+
+test('the deploy-window double post, played out end to end (o3d-0m56 r10)', () => {
+  // THE DEFECT, as the connector would live it:
+  //
+  //  1. `prisma migrate deploy` backfills every money row that exists. The build starts.
+  //  2. The OLD binary — still serving — queues log-a for inv-9 and posts £100. Xero commits it
+  //     and the response is lost. log-a ends FAILED, and UNSTAMPED, because the old binary has no
+  //     `authoriseMoneyPost` to claim the stamp.
+  //  3. The new process comes up. inv-9 is voided and re-raised as inv-10, and the sweep
+  //     re-enqueues. Nothing surviving could have committed inv-10, so the token rotates.
+  //  4. The void is reversed and a payment for inv-9 is enqueued again.
+  //
+  // Under round 8's rule step 3 recycled log-a (its NULL stamp read as "never sent"), erasing the
+  // £100/inv-9 attempt. Step 4 then found no attempt against inv-9, rotated a fresh token, and
+  // `ledgerClearsFollowUpRevival` never probed — inv-9 paid twice.
+  type Row = { id: string; payload: FollowUpPayload; remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null }
+  const rows: Row[] = [{
+    id: 'log-a',
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 100, paymentDate: '2026-06-30' },
+    remoteAttemptedAt: null,
+    attemptStampingCustodyAt: OUTSIDE_CUSTODY,
+  }]
+  const asFailedRow = (row: Row): FailedFollowUpRow => ({
+    id: row.id,
+    payload: row.payload,
+    effectiveToken: readFollowUpIdempotencyKey(row.payload) ?? row.id,
+    remoteAttemptedAt: row.remoteAttemptedAt,
+    attemptStampingCustodyAt: row.attemptStampingCustodyAt,
+  })
+  const apply = (plan: ReturnType<typeof planFollowUpEnqueue>, newId: string) => {
+    if (plan.action === 'reuse') rows.find((row) => row.id === plan.syncLogId)!.payload = plan.payload
+    else if (plan.action === 'create') {
+      rows.unshift({ id: newId, payload: plan.payload, remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY })
+    } else assert.fail(`unexpected plan ${plan.action}`)
+  }
+
+  apply(planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', bankAccountId: 'bank-1', amount: 100, paymentDate: '2026-09-01' },
+    liveRowExists: false,
+    failedRows: rows.map(asFailedRow),
+  }), 'log-b')
+
+  const stillThere = rows.find((row) => row.id === 'log-a')!
+  assert.equal(stillThere.payload.accountingInvoiceId, 'inv-9', 'the old binary\'s attempt must survive step 3')
+  assert.equal(stillThere.payload.amount, 100)
+  assert.equal(readFollowUpIdempotencyKey(stillThere.payload), undefined, 'and must not be given a new token')
+
+  const back = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 105, paymentDate: '2026-09-02' },
+    liveRowExists: false,
+    failedRows: rows.map(asFailedRow),
+  })
+
+  assert.equal(back.action, 'reuse')
+  assert.equal(back.action === 'reuse' ? back.syncLogId : undefined, 'log-a')
+  assert.equal(back.action === 'reuse' ? back.tokenDisposition : undefined, 'pinned',
+    'a rotated disposition would skip the ledger probe, which is the second payment')
+  assert.equal(back.action === 'reuse' ? back.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'log-a',
+    'the token must be the one the committed £100 payment carries the mark of')
+  assert.equal(back.action === 'reuse' ? back.payload.amount : undefined, 100,
+    'and the body stays pinned, so the recomputed 105 cannot record a settlement never made')
+})
+
+test('the ROLLBACK double post, played out end to end (o3d-0m56 r10)', () => {
+  // FINDING 3, as the connector would live it — and the one round 9's deploy order could not help
+  // with, because a rollback is a SEQUENTIAL deploy: the old process is fully stopped before the
+  // older binary starts, so the documented "no overlap" rule is satisfied at every moment.
+  //
+  //  1. This binary queues log-a for inv-9 IN CUSTODY. Under round 9 that was a row created after
+  //     the epoch, so its NULL stamp counted as proof no call ever left it.
+  //  2. The release is rolled back. The older binary claims log-a and posts £100. Xero commits it
+  //     and the response is lost; log-a ends FAILED and UNSTAMPED, because that binary has no
+  //     `authoriseMoneyPost` to claim the stamp. What it DOES leave behind is the claim itself: the
+  //     database's forfeit trigger sees a claim that did not re-assert custody and nulls the column.
+  //  3. The fix is rolled forward. inv-9 is voided and re-raised as inv-10 and the sweep
+  //     re-enqueues; nothing surviving could have committed inv-10, so the token rotates.
+  //  4. The void is reversed and a payment for inv-9 is enqueued once more.
+  //
+  // Under round 9's rule step 3 recycled log-a — its createdAt still sat after the epoch, and the
+  // epoch is established once, so nothing about the rollback was visible to it. Step 4 then found
+  // no attempt against inv-9, rotated a fresh token, skipped the probe, and paid inv-9 twice.
+  type Row = { id: string; payload: FollowUpPayload; remoteAttemptedAt: Date | null; attemptStampingCustodyAt: Date | null }
+  const rows: Row[] = [{
+    id: 'log-a',
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 100, paymentDate: '2026-08-02' },
+    remoteAttemptedAt: null,
+    // Step 1: created by a binary that stamps.
+    attemptStampingCustodyAt: IN_CUSTODY,
+  }]
+  // Step 2, as the DATABASE performs it. `accounting_sync_logs_forfeit_stamping_custody` fires on
+  // an UPDATE that starts a claim without re-asserting custody in the same statement — which is
+  // every claim made by a binary that has never heard of the column. The trigger's own text is
+  // pinned by tests/prisma/attempt-stamping-custody-migration.test.ts.
+  const rolledBackBinaryClaims = (id: string) => {
+    const row = rows.find((candidate) => candidate.id === id)!
+    row.attemptStampingCustodyAt = null
+  }
+  rolledBackBinaryClaims('log-a')
+
+  const asFailedRow = (row: Row): FailedFollowUpRow => ({
+    id: row.id,
+    payload: row.payload,
+    effectiveToken: readFollowUpIdempotencyKey(row.payload) ?? row.id,
+    remoteAttemptedAt: row.remoteAttemptedAt,
+    attemptStampingCustodyAt: row.attemptStampingCustodyAt,
+  })
+  const apply = (plan: ReturnType<typeof planFollowUpEnqueue>, newId: string) => {
+    if (plan.action === 'reuse') rows.find((row) => row.id === plan.syncLogId)!.payload = plan.payload
+    else if (plan.action === 'create') {
+      rows.unshift({ id: newId, payload: plan.payload, remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY })
+    } else assert.fail(`unexpected plan ${plan.action}`)
+  }
+
+  // Step 3.
+  apply(planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', bankAccountId: 'bank-1', amount: 100, paymentDate: '2026-09-01' },
+    liveRowExists: false,
+    failedRows: rows.map(asFailedRow),
+  }), 'log-b')
+
+  const stillThere = rows.find((row) => row.id === 'log-a')!
+  assert.equal(stillThere.payload.accountingInvoiceId, 'inv-9',
+    'the attempt the rolled-back binary made must survive step 3')
+  assert.equal(stillThere.payload.amount, 100)
+  assert.equal(readFollowUpIdempotencyKey(stillThere.payload), undefined, 'and must not be given a new token')
+
+  // Step 4.
+  const back = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 105, paymentDate: '2026-09-02' },
+    liveRowExists: false,
+    failedRows: rows.map(asFailedRow),
+  })
+
+  assert.equal(back.action, 'reuse')
+  assert.equal(back.action === 'reuse' ? back.syncLogId : undefined, 'log-a')
+  assert.equal(back.action === 'reuse' ? back.tokenDisposition : undefined, 'pinned',
+    'a rotated disposition would skip the ledger probe, which is the second payment')
+  assert.equal(back.action === 'reuse' ? back.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'log-a',
+    'the token must be the one the committed £100 payment carries the mark of')
+  assert.equal(back.action === 'reuse' ? back.payload.amount : undefined, 100,
+    'and the body stays pinned, so the recomputed 105 cannot record a settlement never made')
 })

@@ -31,6 +31,7 @@ import {
   resetMirroredAccountingEventsToPending,
 } from '@/lib/domain/accounting/accounting-event-mirror'
 import { scheduleXeroAccountingOutbox } from '@/lib/connectors/xero/outbox'
+import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
 import { stampAccountingPayloadConnection } from '@/lib/connectors/accounting-connection-provenance'
 import {
@@ -384,7 +385,14 @@ async function createPendingSyncLog(
       status: 'PENDING',
       referenceType: 'DailyBatch',
       referenceId: params.referenceId,
+      // The CONNECTION-STAMPED payload (o3d-s36z), not `params.payload`. Writing the raw one here
+      // would drop the stamp the const above exists to add, and the processor would refuse the row
+      // at post time as 'no-origin-recorded'.
       payload: payload as never,
+      // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
+      // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
+      // money-attempt-provenance.ts. A row created without it is never recycled again.
+      ...stampingCustodyOnCreate(),
     },
   })
   await scheduleXeroAccountingOutbox(tx, {

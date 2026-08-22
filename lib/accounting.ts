@@ -6,6 +6,8 @@ import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqueue-order-guard'
 import { hasLockedSalesOrder } from '@/lib/domain/sales/allocation-service'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 
 export type AccountingSettings = {
   syncEnabled: boolean
@@ -309,6 +311,17 @@ export async function queueAccountingSyncTx(
     ...(params.idempotencyKey ? { _idempotencyKey: params.idempotencyKey } : {}),
   }, await activeAccountingIdProvenance(context.connector))
 
+  // o3d-0m56: serialize this enqueue against the manual retry's read-then-reset for the same
+  // document. Without it, a receipt registered here can appear (and fail) between the retry's
+  // sibling snapshot and its reset, so the retry revives a row beside a SECOND token it never saw.
+  // Money-moving types only — ordinary queue traffic takes no lock.
+  await lockFollowUpScope(tx, {
+    connector: context.connector,
+    type: params.type,
+    referenceType: params.referenceType,
+    referenceId: params.referenceId,
+  })
+
   if (params.idempotencyKey) {
     const existing = await tx.accountingSyncLog.findFirst({
       where: {
@@ -338,6 +351,10 @@ export async function queueAccountingSyncTx(
         referenceType: params.referenceType,
         referenceId: params.referenceId,
         payload: payload as never,
+        // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
+        // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
+        // money-attempt-provenance.ts. A row created without it is never recycled again.
+        ...stampingCustodyOnCreate(),
       },
     })
     if (context.connector === 'xero') {

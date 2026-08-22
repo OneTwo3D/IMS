@@ -21,6 +21,10 @@ import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} fro
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
+import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
+import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import {
@@ -181,7 +185,14 @@ async function enqueueFollowUpSyncLog(
   const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: QBO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, payload: true },
+    // remoteAttemptedAt is what tells the planner whether a row's payload is the record of a call
+    // that reached QuickBooks. A revival OVERWRITES the payload it recycles, so recycling an
+    // attempted row rotates that attempt's token and discards its anchors, amount and date — see
+    // the recycle note in followup-idempotency.ts. attemptStampingCustodyAt comes with it because
+    // an unstamped row only proves anything when nothing but a STAMPING binary has handled it
+    // (round 10): it is read off the row rather than resolved from a global epoch, so this path
+    // needs no extra query and cannot be given a stale answer.
+    select: { id: true, payload: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true },
   })
   const failedRows = failedLogs.map((row) => ({
     id: row.id,
@@ -191,6 +202,8 @@ async function enqueueFollowUpSyncLog(
     // consults the generic `_idempotencyKey`, which QuickBooks has always honoured — unlike
     // Xero, whose payment branches never did.
     effectiveToken: getIdempotencySource(row.id, type, referenceId, (row.payload ?? {}) as SyncPayload),
+    remoteAttemptedAt: row.remoteAttemptedAt,
+    attemptStampingCustodyAt: row.attemptStampingCustodyAt,
   }))
   const plan = planFollowUpEnqueue({
     connector: QBO_CONNECTOR,
@@ -213,20 +226,53 @@ async function enqueueFollowUpSyncLog(
     })
     return
   }
+
+  // o3d-0m56: the AUTOMATIC path carries the identical hazard the manual retry does. Reviving a
+  // money row under a PINNED token assumes the remote still recognises that token; Intuit's
+  // `requestid` replay is better behaved than Xero's, but this guard exists because a lost
+  // response is indistinguishable from a failed call, and "their retention is probably long
+  // enough" is not evidence. So the ledger has to say the attempt is not already in it.
+  const evidence = await ledgerClearsFollowUpRevival({
+    connector: QBO_CONNECTOR,
+    type,
+    payload: plan.payload,
+    tokenDisposition: plan.action === 'reuse' ? plan.tokenDisposition : 'rotated',
+    syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
+  })
+  if (!evidence.clear) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_followup_enqueue_refused',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Refused to re-enqueue QuickBooks ${type} for ${referenceType} ${referenceId}: `
+        + `${evidence.reason}. Re-posting it could duplicate a payment; check the ledger and resolve `
+        + 'the row by hand.',
+      metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
+    })
+    return
+  }
+
   try {
     if (plan.action === 'reuse') {
       // Fenced on status: if another run revived the same row first — or retention deleted
       // it between the read and here (o3d-nepa) — this updates nothing rather than
       // resetting a claim it does not own.
-      const revived = await db.accountingSyncLog.updateMany({
-        where: { id: plan.syncLogId, status: 'FAILED' },
-        data: {
-          status: 'PENDING',
-          payload: plan.payload as never,
-          retryCount: 0,
-          errorMessage: null,
-          processingStartedAt: null,
-        },
+      //
+      // In a transaction ONLY to hold the scope lock across it, which serializes this revival
+      // against the manual retry's read-then-reset for the same document (o3d-0m56).
+      const revived = await db.$transaction(async (tx) => {
+        await lockFollowUpScope(tx, { connector: QBO_CONNECTOR, type, referenceType, referenceId })
+        return tx.accountingSyncLog.updateMany({
+          where: { id: plan.syncLogId, status: 'FAILED' },
+          data: {
+            status: 'PENDING',
+            payload: plan.payload as never,
+            retryCount: 0,
+            errorMessage: null,
+            processingStartedAt: null,
+          },
+        })
       })
       if (revived.count === 0) {
         await resolveLostFollowUpRevival({
@@ -247,15 +293,22 @@ async function enqueueFollowUpSyncLog(
       await logFollowUpRevival(QBO_CONNECTOR, type, referenceType, referenceId, plan)
       return
     }
-    await db.accountingSyncLog.create({
-      data: {
-        connector: QBO_CONNECTOR,
-        type,
-        status: 'PENDING',
-        referenceType,
-        referenceId,
-        payload: plan.payload as never,
-      },
+    await db.$transaction(async (tx) => {
+      await lockFollowUpScope(tx, { connector: QBO_CONNECTOR, type, referenceType, referenceId })
+      await tx.accountingSyncLog.create({
+        data: {
+          connector: QBO_CONNECTOR,
+          type,
+          status: 'PENDING',
+          referenceType,
+          referenceId,
+          payload: plan.payload as never,
+          // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
+          // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
+          // money-attempt-provenance.ts. A row created without it is never recycled again.
+          ...stampingCustodyOnCreate(),
+        },
+      })
     })
   } catch (error) {
     // A concurrent run took the live slot and the partial unique index
@@ -281,7 +334,37 @@ async function enqueueFollowUpSyncLog(
   }
 }
 
+/**
+ * o3d-0m56 round 10: make a custody forfeit VISIBLE.
+ *
+ * `repairMoneyAttemptsOutsideStampingCustody` stamps money rows that a binary outside stamping
+ * custody may have posted from — rows created during a deploy window, by an overlapping second
+ * instance, or by a version this one was rolled back to. Zero on every ordinary run: a non-zero
+ * count is the only signal that any of those happened, and it is worth an operator seeing, because
+ * each stamped row is a row whose next post now pays for a ledger read.
+ *
+ * The repair itself is what makes the fence correct; this only reports it.
+ */
+async function reportMoneyAttemptCustodyRepair(repaired: number, connector: string): Promise<void> {
+  if (repaired === 0) return
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: `${connector}_money_attempt_custody_repaired`,
+    tag: 'sync',
+    level: 'WARNING',
+    description: `Stamped ${repaired} accounting money row${repaired === 1 ? '' : 's'} that a version of IMS `
+      + 'outside attempt-stamping custody may have posted from (a deploy window, an overlapping instance, '
+      + 'or a rollback). They are now treated as attempted, so each will be checked against the ledger '
+      + 'before it is posted again.',
+    metadata: { repaired, connector },
+  })
+}
+
 export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
+  // Before any entry is CLAIMED or posted — see the note on processPendingXeroSync. The repair is
+  // per DATABASE, not per connector: it stamps every money row outside stamping custody whichever
+  // connector wrote it, so whichever processor runs first repairs for both.
+  await reportMoneyAttemptCustodyRepair(await repairMoneyAttemptsOutsideStampingCustody(), QBO_CONNECTOR)
   const result: ProcessResult = { processed: 0, succeeded: 0, failed: 0, skipped: 0 }
   const staleClaimCutoff = new Date(Date.now() - CLAIM_STALE_MS)
 
@@ -330,7 +413,11 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
       },
       data: {
         status: 'PROCESSING',
-        processingStartedAt: claimedAt,
+        // The claim and attempt-stamping CUSTODY move together, always (o3d-0m56 r10). A claim is
+        // what precedes a post, so the database reads a claim that does not re-assert custody as
+        // one made by a binary that does not stamp, and forfeits it — see
+        // money-attempt-provenance.ts.
+        ...stampingCustodyOnClaim(claimedAt),
       },
     })
     if (claim.count === 0) continue
@@ -463,7 +550,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             data: {
               status: 'PENDING',
               errorMessage,
-              processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
+              ...stampingCustodyOnClaim(new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage))),
             },
           })
         } else {
@@ -502,7 +589,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           data: {
             status: 'PENDING',
             errorMessage,
-            processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
+            ...stampingCustodyOnClaim(new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage))),
           },
         })
       } else {
@@ -678,10 +765,15 @@ async function processEntry(
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       const bankAccountId = payload.bankAccountId as string | undefined
       const amount = payload.amount as number | undefined
-      const paymentDate = (payload.paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT' }
       }
+      // o3d-0m56 round 6, finding 1: the date is not computed here. The probe that decides whether
+      // this document is already settled has to look for the settlement THIS call will create, and
+      // the only way that can never drift is for both to ask one function. See moneyPostDate.
+      const posting = moneyPostDateToSend(type, payload, new Date())
+      if (!posting.ok) return { success: false, error: `Cannot date this INVOICE_PAYMENT: ${posting.reason}` }
+      const paymentDate = posting.date
       // Resolve customer ref: prefer payload, fall back to order's customer.
       // RESIDUAL (o3d-gfh): payload.customerRef is a naked id stamped at ENQUEUE time and is NOT
       // provenance-checked here — the payment row carries no provenance to check it against. A payment
@@ -707,38 +799,62 @@ async function processEntry(
       if (!accountRef) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
       }
-      try {
-        // o3d-b3gw: idempotent, like every other document this connector posts. Without a
-        // stable Request-Id, a payment that QuickBooks COMMITS but whose response is lost — or
-        // whose local "mark SYNCED" write then fails — is retried and creates a SECOND payment
-        // against the same invoice. That over-settles it and needs a manual reversal.
-        const paymentRes = await qboPostIdempotent<{ Payment: { Id: string } }>('payment', {
-          CustomerRef: { value: customerRefId },
-          TotalAmt: amount,
-          TxnDate: paymentDate,
-          DepositToAccountRef: accountRef,
-          Line: [{
-            Amount: amount,
-            LinkedTxn: [{ TxnId: accountingInvoiceId, TxnType: 'Invoice' }],
-          }],
-        }, requestId)
-        if (!paymentRes.ok) {
-          return { success: false, error: paymentRes.error ?? 'Failed to post QuickBooks payment' }
+      // o3d-0m56: the LAST check before money moves, AND the lock the post is made under. This
+      // entry may have posted before — a committed call whose response was lost is FAILED, and
+      // the row returns to PENDING for several more attempts. Everything that happens earlier
+      // (the retry guard, the revival guard) is operator feedback; this is the reading the POST
+      // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
+      // competing row cannot slip its own post between them — the post is the callback for
+      // exactly that reason.
+      return postMoneyUnderLedgerFence({
+        connector: QBO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+        // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
+        // the fence must authorise against the very day the call below creates, and a second
+        // wall-clock read here is a second day whenever the two straddle a UTC midnight.
+        postingDate: paymentDate,
+      }, async () => {
+        try {
+          // o3d-b3gw: idempotent, like every other document this connector posts. Without a
+          // stable Request-Id, a payment that QuickBooks COMMITS but whose response is lost — or
+          // whose local "mark SYNCED" write then fails — is retried and creates a SECOND payment
+          // against the same invoice. That over-settles it and needs a manual reversal.
+          const paymentRes = await qboPostIdempotent<{ Payment: { Id: string } }>('payment', {
+            CustomerRef: { value: customerRefId },
+            TotalAmt: amount,
+            // o3d-0m56: IMS's own mark, so a later attempt can recognise THIS payment even if its
+            // amount or date has since been corrected. PrivateNote is not customer-visible, and it
+            // is derived from the same source the Request-Id is built from.
+            PrivateNote: settlementMarkerFor(getIdempotencySource(entryId, type, referenceId, payload)),
+            TxnDate: paymentDate,
+            DepositToAccountRef: accountRef,
+            Line: [{
+              Amount: amount,
+              LinkedTxn: [{ TxnId: accountingInvoiceId, TxnType: 'Invoice' }],
+            }],
+          }, requestId)
+          if (!paymentRes.ok) {
+            return { success: false, error: paymentRes.error ?? 'Failed to post QuickBooks payment' }
+          }
+          return { success: true, externalId: paymentRes.data?.Payment?.Id }
+        } catch (e) {
+          return { success: false, error: String(e) }
         }
-        return { success: true, externalId: paymentRes.data?.Payment?.Id }
-      } catch (e) {
-        return { success: false, error: String(e) }
-      }
+      })
     }
 
     case 'BILL_PAYMENT': {
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       const bankAccountId = payload.bankAccountId as string | undefined
       const amount = payload.amount as number | undefined
-      const paymentDate = (payload.paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for BILL_PAYMENT' }
       }
+      // o3d-0m56 round 6, finding 1: the date is not computed here. The probe that decides whether
+      // this document is already settled has to look for the settlement THIS call will create, and
+      // the only way that can never drift is for both to ask one function. See moneyPostDate.
+      const posting = moneyPostDateToSend(type, payload, new Date())
+      if (!posting.ok) return { success: false, error: `Cannot date this BILL_PAYMENT: ${posting.reason}` }
+      const paymentDate = posting.date
       // Resolve vendor ref: prefer payload, fall back to PO's supplier.
       // Same residual as INVOICE_PAYMENT above — payload.vendorRef is unchecked; see o3d-gfh.
       let vendorRefId = payload.vendorRef as string | undefined
@@ -757,27 +873,46 @@ async function processEntry(
       if (!accountRef) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
       }
-      try {
-        // o3d-b3gw: same reasoning as the customer payment above — a lost response must not
-        // become a second bill payment.
-        const paymentRes = await qboPostIdempotent<{ BillPayment: { Id: string } }>('billpayment', {
-          VendorRef: { value: vendorRefId },
-          TotalAmt: amount,
-          TxnDate: paymentDate,
-          PayType: 'Check',
-          CheckPayment: { BankAccountRef: accountRef },
-          Line: [{
-            Amount: amount,
-            LinkedTxn: [{ TxnId: accountingInvoiceId, TxnType: 'Bill' }],
-          }],
-        }, requestId)
-        if (!paymentRes.ok) {
-          return { success: false, error: paymentRes.error ?? 'Failed to post QuickBooks bill payment' }
+      // o3d-0m56: the LAST check before money moves, AND the lock the post is made under. This
+      // entry may have posted before — a committed call whose response was lost is FAILED, and
+      // the row returns to PENDING for several more attempts. Everything that happens earlier
+      // (the retry guard, the revival guard) is operator feedback; this is the reading the POST
+      // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
+      // competing row cannot slip its own post between them — the post is the callback for
+      // exactly that reason.
+      return postMoneyUnderLedgerFence({
+        connector: QBO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+        // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
+        // the fence must authorise against the very day the call below creates, and a second
+        // wall-clock read here is a second day whenever the two straddle a UTC midnight.
+        postingDate: paymentDate,
+      }, async () => {
+        try {
+          // o3d-b3gw: same reasoning as the customer payment above — a lost response must not
+          // become a second bill payment.
+          const paymentRes = await qboPostIdempotent<{ BillPayment: { Id: string } }>('billpayment', {
+            VendorRef: { value: vendorRefId },
+            TotalAmt: amount,
+            // See INVOICE_PAYMENT above — the same mark, from the same source as the Request-Id.
+            PrivateNote: settlementMarkerFor(getIdempotencySource(entryId, type, referenceId, payload)),
+            TxnDate: paymentDate,
+            // o3d-0m56 round 4: this PayType is why the probe must look for `BillPaymentCheck` —
+            // that, not `BillPayment`, is the TxnType QuickBooks records on the bill it settles.
+            PayType: 'Check',
+            CheckPayment: { BankAccountRef: accountRef },
+            Line: [{
+              Amount: amount,
+              LinkedTxn: [{ TxnId: accountingInvoiceId, TxnType: 'Bill' }],
+            }],
+          }, requestId)
+          if (!paymentRes.ok) {
+            return { success: false, error: paymentRes.error ?? 'Failed to post QuickBooks bill payment' }
+          }
+          return { success: true, externalId: paymentRes.data?.BillPayment?.Id }
+        } catch (e) {
+          return { success: false, error: String(e) }
         }
-        return { success: true, externalId: paymentRes.data?.BillPayment?.Id }
-      } catch (e) {
-        return { success: false, error: String(e) }
-      }
+      })
     }
 
     case 'BILL_ATTACHMENT': {

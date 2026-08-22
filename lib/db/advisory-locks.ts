@@ -190,10 +190,50 @@ export const BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE = 411_220_868
 export const XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE = 411_220_869
 
 
+/**
+ * Per-(connector, type, reference) serialization of money-moving accounting rows (o3d-0m56).
+ *
+ * Taken by every writer that can create or revive a money-moving AccountingSyncLog row — the two
+ * connector queues, the shared in-transaction queue, both processors' follow-up enqueue, and the
+ * manual retry action. Without it the retry's read-then-reset is not atomic against an enqueue
+ * for the same document, and the two can post under different tokens (see followup-scope-lock.ts
+ * for the full argument, including why row locks cannot substitute).
+ *
+ * Deliberately NOT shared with ACCOUNTING_WRITE_LOCK_KEY: that one is global and held for whole
+ * batch runs, and folding a per-document lock into it would serialize every payment enqueue in
+ * the system behind the daily batch.
+ */
+// 871, not 869: o3d-0m56 and o3d-k26m.5 each allocated the next free namespace from the same
+// starting point on separate branches, and both landed on 869 — a collision the uniqueness test
+// caught on the merge. THIS is the side that moved, because XERO_INVOICE_NUMBER_SLOT is already on
+// development and a shipped namespace must not change under running workers; this one has never
+// run outside a test. Nothing persists a namespace, so renumbering here costs nothing.
+export const ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE = 411_220_871
+
+/**
+ * Per-(connector, type, reference) serialization of the money POST itself (o3d-0m56 round 4).
+ *
+ * A SEPARATE domain from the scope lock above, and the separation is the point. That one is
+ * transaction-scoped and held by short database writes; this one is SESSION-scoped and held
+ * across two HTTP calls to Xero or QuickBooks — the ledger read that authorises the post and the
+ * post. Folding them together would put every enqueue transaction for a document behind a remote
+ * round trip, which is longer than Prisma's transaction timeout: the enqueue would not merely
+ * wait, it would abort.
+ *
+ * Kept distinct also means no transaction ever waits on this lock, so a caller that holds it and
+ * then needs a pooled connection of its own cannot deadlock against a queue of waiters. Taken
+ * with `pg_try_advisory_lock` — a caller that cannot have it refuses the post and lets the row
+ * retry, because a concurrent post to the same document is precisely the payment it might be
+ * about to duplicate, and waiting for it only to refuse afterwards buys nothing.
+ */
+export const ACCOUNTING_MONEY_POST_LOCK_NAMESPACE = 411_220_870
+
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
   REFUND_RELEASE_WARNING_LOCK_NAMESPACE,
   BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE,
+  ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE,
+  ACCOUNTING_MONEY_POST_LOCK_NAMESPACE,
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
 } as const

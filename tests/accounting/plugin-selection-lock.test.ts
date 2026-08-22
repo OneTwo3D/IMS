@@ -1176,6 +1176,10 @@ const MIGRATIONS_THAT_MUTATE_SETTINGS: Record<string, string> = {
   '20260410180000_generic_payment_account_map':
     'Renames ONE key by exact literal match (xero_payment_account_map → accounting_payment_account_map). '
     + 'Touches no plugin key and no other row.',
+  '20260819090000_accounting_sync_attempt_stamping_custody':
+    'Deletes ONE key by exact literal match (accounting.money-attempt-stamping-since), the round-9 '
+    + 'money-attempt epoch that `attemptStampingCustodyAt` replaces. Nothing reads it after this '
+    + 'migration, so the delete cannot race a reader; it touches no plugin key and no other row.',
   '20260819210000_xero_pin_write_consumes_release':
     'Deletes ONE key by exact literal match (xero_pin_release_witness), in two places: the backfill, '
     + 'and the body of the trigger it installs. Neither can reach a plugin key — the literal is the '

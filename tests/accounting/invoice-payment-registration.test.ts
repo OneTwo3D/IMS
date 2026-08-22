@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import test from 'node:test'
 
 import {
   decideInvoicePaymentRegistration,
   selectReceiptsAwaitingRegistration,
+  unresolvedInvoicePaymentAttempts,
   type ExistingInvoicePaymentSync,
 } from '@/lib/domain/accounting/invoice-payment-registration'
+import type { LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
 
 /**
  * o3d-lgo.15, decision recorded 2026-07-25: a manually-recorded sales receipt DOES register against the
@@ -26,6 +30,9 @@ const base = {
   paymentId: 'pay-new',
   bankAccountId: 'BANK-1',
   existing: [] as ExistingInvoicePaymentSync[],
+  // Most cases have no unresolved attempt, so the ledger is never consulted and this is unread.
+  // The cases that DO have one pass their own records — see the o3d-0m56 block at the end.
+  ledgerSettlements: null as LedgerSettlementRecord[] | null,
   ledgerTotal: 100,
 }
 
@@ -113,12 +120,22 @@ test('a payment still in the queue consumes capacity as firmly as a synced one',
   }
 })
 
-test('a rejected or cancelled payment frees the slot again', () => {
-  // The ledger rejected it or never saw it, and the unique index ignores those rows too — so a fresh
-  // receipt has room. Treating a FAILED row as holding the slot would block the retry that fixes it.
+test('a rejected or cancelled payment frees the DATABASE slot, but only the ledger frees the decision', () => {
+  // This test used to assert `register: true` outright, on the reading that a FAILED or CANCELLED row
+  // "holds nothing". The partial unique index does ignore those statuses — but the index is a statement
+  // about rows, not about money. A call that COMMITTED and then lost its response is FAILED, and
+  // deleting a receipt CANCELS a row that may already have settled (o3d-0m56, Codex review). So the
+  // slot is free and the decision is not, until the ledger says the earlier attempt is not in it.
   for (const status of ['FAILED', 'CANCELLED'] as const) {
-    const d = decideInvoicePaymentRegistration({ ...base, existing: [{ status, amount: 100, paymentId: 'pay-old' }] })
-    assert.equal(d.register, true, status)
+    const existing = [{ status, amount: 100, paymentDate: '2026-08-01', paymentId: 'pay-old' }]
+    assert.equal(
+      decideInvoicePaymentRegistration({ ...base, existing, ledgerSettlements: [] }).register,
+      true,
+      `${status}: a ledger with no matching settlement is what makes this safe`,
+    )
+    const blocked = decideInvoicePaymentRegistration({ ...base, existing, ledgerSettlements: null })
+    assert.equal(blocked.register === false && blocked.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT',
+      `${status}: an unanswered ledger is not permission`)
   }
 })
 
@@ -134,13 +151,18 @@ test('a live row with no recorded amount refuses on the UNREADABLE amount, and i
   assert.equal(d.register === false && d.alreadyRegistered, undefined)
 })
 
-test('an unreadable amount on a rejected row does not block a fresh receipt', () => {
-  // The slot-taken rule applies to rows the ledger HOLDS. A rejected row holds nothing, readable or not.
+test('an unreadable amount on a rejected row no longer waves the receipt through', () => {
+  // This asserted `register: true` on the reading that "a rejected row holds nothing". It can hold a
+  // payment — the response may simply have been lost — and with no amount recorded, no settlement in
+  // the ledger can ever be matched to it, so it can never be ruled out (o3d-0m56). It does NOT take the
+  // database's live slot, though, so the refusal names the unresolved attempt rather than a live one.
   const d = decideInvoicePaymentRegistration({
     ...base,
     existing: [{ status: 'FAILED', amount: null, paymentId: 'pay-old' }],
+    ledgerSettlements: [],
   })
-  assert.equal(d.register, true)
+  assert.equal(d.register, false)
+  assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
 })
 
 test('this receipt does not count against itself when the decision is re-run', () => {
@@ -172,6 +194,56 @@ test('sub-penny rounding does not refuse an exact settlement', () => {
   assert.equal(d.register, true)
 })
 
+// --- o3d-0m56: the OTHER way a second payment reaches the ledger (Codex finding 2) ---
+
+/**
+ * The manual-retry guard protects the RETRY of a failed payment row. Nothing was protecting the
+ * likelier operator action: record the receipt again. That queues a BRAND-NEW row under a NEW
+ * idempotency token, so it posts a second payment against the same invoice without the retry
+ * guard ever running — and a failed payment looks, from the order screen, like nothing happened.
+ */
+
+const unresolved = (over: Partial<ExistingInvoicePaymentSync> = {}): ExistingInvoicePaymentSync => ({
+  status: 'FAILED', amount: 100, paymentDate: '2026-08-01', paymentId: 'pay-old', ...over,
+})
+
+test('a receipt beside an unresolved attempt the ledger HOLDS is refused (o3d-0m56)', () => {
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    existing: [unresolved()],
+    ledgerSettlements: [{ amount: 100, date: '2026-08-01', id: 'PAY-1' }],
+  })
+  assert.equal(d.register, false)
+  assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+  assert.match(String(d.register === false ? d.detail : ''), /already holds 100\.00 dated 2026-08-01/)
+})
+
+test('a ledger that cannot be asked refuses too (o3d-0m56)', () => {
+  const d = decideInvoicePaymentRegistration({ ...base, existing: [unresolved()], ledgerSettlements: null })
+  assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+  assert.match(String(d.register === false ? d.detail : ''), /could not be asked/)
+})
+
+test('an unresolved attempt IMS cannot describe refuses (o3d-0m56)', () => {
+  // No amount or no date means no settlement in the ledger can be matched to it, so it can never
+  // be ruled out. Refusing is the only honest answer.
+  for (const attempt of [unresolved({ amount: null }), unresolved({ paymentDate: null })]) {
+    const d = decideInvoicePaymentRegistration({ ...base, existing: [attempt], ledgerSettlements: [] })
+    assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT', JSON.stringify(attempt))
+  }
+})
+
+test('an attempt that PROVABLY never posted does not block the receipt (o3d-0m56)', () => {
+  // The stranding direction has a cost, so it is kept as narrow as the retry guard's: a stored body
+  // missing a field the connector requires was rejected before any HTTP call, so it carries nothing.
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    existing: [unresolved({ couldHaveReachedLedger: false })],
+    ledgerSettlements: null,
+  })
+  assert.equal(d.register, true)
+})
+
 // ---------------------------------------------------------------------------
 // o3d-hbgo, read side: WHICH ledger document a registration settled
 // ---------------------------------------------------------------------------
@@ -186,6 +258,183 @@ test('o3d-hbgo: a payment registered against a RETIRED invoice leaves the replac
     existing: [{ status: 'SYNCED', amount: 100, paymentId: 'pay-old', accountingInvoiceId: 'INV-1' }],
   })
   assert.equal(d.register, true)
+})
+
+test('our OWN failed row does not block this receipt (o3d-0m56)', () => {
+  // Re-running the registration for the same Payment must not refuse for its own earlier failure —
+  // it re-posts under the same token, which is the case the whole idempotency scheme is built on.
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    existing: [unresolved({ paymentId: 'pay-new' })],
+    ledgerSettlements: null,
+  })
+  assert.equal(d.register, true)
+})
+
+test('a settlement for a different amount or date leaves the receipt free (o3d-0m56)', () => {
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    existing: [unresolved()],
+    ledgerSettlements: [{ amount: 100, date: '2026-07-01' }, { amount: 40, date: '2026-08-01' }],
+  })
+  assert.equal(d.register, true, 'only a settlement matching the ATTEMPT is evidence about it')
+})
+
+test('the caller can tell whether the ledger needs asking at all (o3d-0m56)', () => {
+  // The probe is a network read; putting one behind every receipt would be a new problem. This is
+  // the rule the caller uses to decide, so it is pinned here rather than left implicit in sales.ts.
+  assert.deepEqual(unresolvedInvoicePaymentAttempts([], 'pay-new'), [])
+  assert.deepEqual(unresolvedInvoicePaymentAttempts([{ status: 'SYNCED', amount: 100 }], 'pay-new'), [])
+  assert.deepEqual(unresolvedInvoicePaymentAttempts([unresolved({ paymentId: 'pay-new' })], 'pay-new'), [])
+  assert.deepEqual(unresolvedInvoicePaymentAttempts([unresolved({ couldHaveReachedLedger: false })], 'pay-new'), [])
+  assert.equal(unresolvedInvoicePaymentAttempts([unresolved(), unresolved({ status: 'CANCELLED' })], 'pay-new').length, 2)
+})
+
+test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', async () => {
+  // registerInvoicePaymentWithLedger is module-private, so this pins the WIRING the pure tests
+  // above cannot reach: the probe is gated on there being an unresolved attempt, its failure
+  // becomes null rather than an empty list, and the result is what the decision is given.
+  // SUPERSEDED LOCATION (o3d-ekn8 lifted this path out of the 'use server' file); same property.
+  const source = await readFile(
+    path.join(process.cwd(), 'lib/domain/accounting/invoice-payment-enqueue.ts'), 'utf8',
+  )
+  const at = source.indexOf('const ledgerSettlements =')
+  assert.notEqual(at, -1, 'the registration path must resolve what the ledger holds')
+  const body = source.slice(at, source.indexOf('const decision = decideInvoicePaymentRegistration', at))
+
+  assert.match(body, /unresolvedInvoicePaymentAttempts\(existing, params\.paymentId\)\.length > 0/,
+    'the probe must be gated on an unresolved attempt, not run on every receipt')
+  assert.match(body, /probe\.ok \? probe\.records : null/,
+    'a probe that could not answer must become null — the value the decision refuses on')
+  assert.match(source.slice(at), /ledgerSettlements,/, 'and it must reach the decision')
+
+  // The two fields the unresolved rule is decided from must actually be read off the stored row.
+  // Without paymentDate no attempt can ever be matched, so every receipt beside a failed row is
+  // refused; without the postability flag, a row that provably never posted strands one.
+  const loader = source.slice(source.indexOf('export async function loadInvoicePaymentSyncRows'))
+  const loaderBody = loader.slice(0, loader.indexOf('\n}\n'))
+  // Round 6, finding 1: carried from the SHARED date rule, not from a local copy of
+  // `payload.paymentDate?.slice(0, 10)`. A copy here is a copy that can drift from what the
+  // processor will actually send, which is how the probe came to look for settlements on days no
+  // post would ever create.
+  assert.match(loaderBody, /paymentDate: pinnedAttemptDate\('INVOICE_PAYMENT', r\.payload\)/,
+    'the attempt date must be carried from the shared money-post date rule')
+  assert.match(loaderBody, /couldHaveReachedLedger: attemptCouldHaveReachedTheLedger\('INVOICE_PAYMENT', r\.payload\)/,
+    'and postability judged by the SAME rule the retry guard uses')
+
+  // The refusal has to be surfaced, not swallowed: an operator who is not told will record the
+  // receipt again.
+  assert.match(source, /case 'UNRESOLVED_PAYMENT_ATTEMPT':/)
+  const warn = source.slice(source.indexOf("case 'UNRESOLVED_PAYMENT_ATTEMPT':"))
+  assert.match(warn.slice(0, 900), /invoice_payment_not_registered/)
+  assert.match(warn.slice(0, 900), /could pay the invoice twice/)
+})
+
+test('the BILL side is closed by a different mechanism, and it must stay closed (o3d-0m56)', async () => {
+  // Codex's finding 2 is about re-recording a receipt beside an unresolved attempt. The supplier side
+  // has the same shape and no unresolved-attempt check — because marking a bill paid is single-shot:
+  // it only writes paidAt while paidAt IS NULL, and the only thing that clears paidAt again is a
+  // payment poller finding the bill genuinely unpaid in the ledger. A committed-but-unacknowledged
+  // bill payment therefore leaves the ledger showing PAID, and the second attempt never reaches the
+  // queue. That argument rests entirely on the compare-and-set, so it is pinned rather than trusted.
+  //
+  // SUPERSEDED LOCATION, REWRITTEN. o3d-a3wx moved the transition out of app/actions/purchase-orders.ts
+  // into `markBillPaidSupersedingStaleRegistrations`, which additionally REFUSES when a claimed or
+  // posted BILL_PAYMENT row contradicts "IMS held this bill as unsettled" — i.e. it now carries an
+  // unresolved-attempt check of its own, which is what the o3d-0m56 comment said would be needed if
+  // the compare-and-set ever went. The compare-and-set did not go; it moved. Both are pinned here.
+  const source = await readFile(
+    path.join(process.cwd(), 'lib/domain/accounting/payment-reversal.ts'), 'utf8',
+  )
+  const at = source.indexOf('export async function markBillPaidSupersedingStaleRegistrations')
+  assert.notEqual(at, -1, 'the bill-paid transition must still be one guarded function')
+  const body = source.slice(at, source.indexOf('\nexport ', at + 1))
+  assert.match(body, /where: \{ id: params\.invoiceId, paidAt: null \}/,
+    'a bill may only be marked paid while it is unpaid')
+  assert.match(body, /if \(paid\.count === 0\) return \{ outcome: 'already-paid' \}/,
+    'and losing that compare-and-set must report already-paid, not fall through')
+  assert.match(body, /if \(!plan\.proceed\)/,
+    'and a live BILL_PAYMENT row that contradicts an unsettled bill must refuse before anything is written')
+
+  const action = await readFile(path.join(process.cwd(), 'app/actions/purchase-orders.ts'), 'utf8')
+  assert.match(action, /if \(invoice\.paidAt\) return \{ success: false/,
+    'and the early refusal in the action must stay too')
+})
+
+test('the WHOLE decision is re-runnable for the check inside the write (o3d-0m56, rebased onto o3d-cjt8)', () => {
+  // SUPERSEDED AND REWRITTEN. This test used to pin `invoicePaymentRowSetBlocker`, a split-out half of
+  // the decision covering only the rules that read the order's other sync rows, and it asserted in so
+  // many words that the re-check "must NOT judge size". Both halves of that are now wrong:
+  //
+  //   • o3d-cjt8 made the live-follow-up index RECEIPT-scoped, so the thing that stops two racing
+  //     receipts over-settling one invoice is the capacity SUM, not the index. A re-check that
+  //     deliberately skipped the arithmetic would re-open the very race it was added to close.
+  //   • its stated reason — "the caller inside the transaction has the row set and nothing else" —
+  //     stopped being true: registerInvoicePaymentWithLedger hoists a whole `decisionInput` and
+  //     re-runs `decideInvoicePaymentRegistration` under the lock with only `existing` refreshed.
+  //
+  // So the property being pinned is unchanged (the row-set rules must be re-evaluable against a fresh
+  // snapshot) and the mechanism is now the one decision function called twice, which is also what
+  // stops the two from drifting apart.
+  const clean = decideInvoicePaymentRegistration({ ...base, existing: [] })
+  assert.equal(clean.register, true)
+
+  // A sibling that appeared since the first decision consumes the invoice's remaining room.
+  const raced = decideInvoicePaymentRegistration({
+    ...base,
+    existing: [{ status: 'PENDING', amount: 100, paymentId: 'pay-other', accountingInvoiceId: 'INV-1' }],
+  })
+  assert.equal(raced.register === false && raced.refusal, 'WOULD_OVERPAY')
+  assert.equal(raced.register === false && raced.alreadyRegistered, 100)
+
+  // And an attempt that turned unresolved in the same window is still refused on its own grounds,
+  // which capacity arithmetic cannot see: a FAILED row consumes no capacity.
+  const unresolvedNow = decideInvoicePaymentRegistration({
+    ...base,
+    existing: [unresolved()],
+    ledgerSettlements: [{ amount: 100, date: '2026-08-01' }],
+  })
+  assert.equal(unresolvedNow.register === false && unresolvedNow.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+})
+
+test('the registration re-decides INSIDE the write transaction, under both locks (o3d-0m56 + o3d-cjt8)', async () => {
+  // SUPERSEDED LOCATION, SAME PROPERTY. This used to read app/actions/sales.ts; o3d-ekn8 lifted
+  // registerInvoicePaymentWithLedger into lib/domain/accounting/invoice-payment-enqueue.ts so a second
+  // caller (the connector's re-drive after a SALES_INVOICE posts) could reach it without every export
+  // of a 'use server' file becoming a server action. Pinned by source because the function is not
+  // exported for testing; the point is not that the rule exists but that it is evaluated AGAIN in the
+  // transaction that writes, against rows read through that transaction.
+  const source = await readFile(
+    path.join(process.cwd(), 'lib/domain/accounting/invoice-payment-enqueue.ts'), 'utf8',
+  )
+  const fnAt = source.indexOf('export async function registerInvoicePaymentWithLedger')
+  assert.notEqual(fnAt, -1, 'the registration path must still exist')
+  const at = source.indexOf('const outcome = await db.$transaction(async (tx) => {', fnAt)
+  assert.notEqual(at, -1)
+  const body = source.slice(at, source.indexOf('}, STOCK_TX_OPTIONS)', at))
+
+  const orderLockAt = body.indexOf('await lockSalesOrder(tx, params.orderId)')
+  const scopeLockAt = body.indexOf('await lockFollowUpScope(tx, {')
+  const readAt = body.indexOf('loadInvoicePaymentSyncRows(params.orderId, connector?.id ?? null, tx)')
+  const decideAt = body.indexOf('decideInvoicePaymentRegistration({')
+  const queueAt = body.indexOf('queueAccountingSyncTx(tx, {')
+
+  assert.ok(orderLockAt !== -1, 'the order lock serialises this against deletePayment')
+  assert.ok(scopeLockAt > orderLockAt,
+    'and the follow-up scope lock serialises it against the connector queues and the manual retry, '
+    + 'which do not touch the sales order at all — order first, scope second, the repo-wide lock order')
+  assert.ok(readAt > scopeLockAt, 'the rows must be re-read UNDER both locks, not before them')
+  // The re-read is an ARGUMENT of the re-decision, so it appears after `decideInvoicePaymentRegistration({`
+  // in source order while running before it. Both are therefore anchored to the locks and to the write,
+  // not to each other — an ordering assertion between the two would be about formatting, not sequence.
+  assert.ok(decideAt > scopeLockAt, 'the decision must be re-taken under the locks')
+  assert.ok(queueAt > readAt && queueAt > decideAt, 'and the write must come after both')
+  assert.match(body.slice(decideAt, decideAt + 400), /if \(!underLock\.register\) return \{ refused: underLock \}/,
+    'a refused re-decision must abandon the enqueue')
+
+  // The ledger is deliberately NOT re-read here — a network call inside the locks would let a slow
+  // remote block every payment enqueue in the system.
+  assert.ok(!/probeLedgerSettlement/.test(body), 'no network call inside the locked transaction')
 })
 
 test('o3d-hbgo: a registration that names NO document still consumes capacity', () => {

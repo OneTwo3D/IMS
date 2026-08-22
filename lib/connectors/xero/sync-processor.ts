@@ -67,6 +67,10 @@ import {
   readFollowUpIdempotencyKey,
   type FollowUpPayload,
 } from '@/lib/domain/accounting/followup-idempotency'
+import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
+import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
+import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import {
   buildCompactedFollowUpLossActivity,
   isCompactedFollowUpEvidence,
@@ -1026,9 +1030,21 @@ export async function enqueueFollowUpSyncLog(
   const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: XERO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
-    // o3d-e2mz r3: the attempt each candidate row is AT when it was read. Reviving one is a write to
-    // that attempt and must be fenced on it — see the compare-and-swap below.
-    select: { id: true, payload: true, attemptRevision: true },
+    // remoteAttemptedAt is what tells the planner whether a row's payload is the record of a call
+    // that reached Xero. A revival OVERWRITES the payload it recycles, so recycling an attempted
+    // row rotates that attempt's token and discards its anchors, amount and date — see the recycle
+    // note in followup-idempotency.ts. attemptStampingCustodyAt comes with it because an unstamped
+    // row only proves anything when nothing but a STAMPING binary has handled it (round 10): it is
+    // read off the row rather than resolved from a global epoch, so this path needs no extra query
+    // and cannot be given a stale answer.
+    //
+    // o3d-e2mz r3: and the attempt each candidate row is AT when it was read. Reviving one is a
+    // write to that attempt and must be fenced on it — see the compare-and-swap below.
+    select: {
+      id: true, payload: true,
+      remoteAttemptedAt: true, attemptStampingCustodyAt: true,
+      attemptRevision: true,
+    },
   })
   const failedAttemptRevisions = new Map(failedLogs.map((row) => [row.id, row.attemptRevision]))
   const failedRows = failedLogs.map((row) => ({
@@ -1037,6 +1053,8 @@ export async function enqueueFollowUpSyncLog(
     // Exactly what followUpIdempotencySource would have produced for this row, so pinning it
     // reproduces a byte-identical Idempotency-Key even after the row itself is gone.
     effectiveToken: followUpIdempotencySource(row.id, (row.payload ?? {}) as SyncPayload),
+    remoteAttemptedAt: row.remoteAttemptedAt,
+    attemptStampingCustodyAt: row.attemptStampingCustodyAt,
   }))
   const plan = planFollowUpEnqueue({
     connector: XERO_CONNECTOR,
@@ -1059,23 +1077,30 @@ export async function enqueueFollowUpSyncLog(
     })
     return
   }
-  // o3d-e2mz r3: A REVIVAL IS A WRITE TO AN ATTEMPT, AND WAS THE LAST UNFENCED ONE.
+
+  // TWO REFUSALS GUARD THE AUTOMATIC REVIVAL, AND THEY ARE NOT THE SAME QUESTION (o3d-e2mz + o3d-0m56).
   //
-  // The compare-and-swap below used to key on `(id, status: 'FAILED')`. That is exactly the ABA the
-  // manual retry path was fenced to close, and this automatic path was left with it: status is not
-  // an identity, and a row leaves FAILED and comes back to it every time it is retried. Between the
-  // read above and this write, the row can be revived by another run, claimed by a worker, posted or
-  // failed, and land back on FAILED as a DIFFERENT attempt — which the status CAS matches. It would
-  // then reset that attempt's outcome to PENDING and, worse, overwrite its `payload`, which is where
-  // the pinned idempotency token lives; the row would go out under a token chosen for the attempt we
-  // read, not the one that actually ran. Fencing on `attemptRevision` makes the write land on the
-  // attempt it was planned against or on nothing at all, and ADVANCES it so a worker still holding
-  // the old attempt finds out rather than writing over the revival.
+  //   o3d-e2mz asks CAN THIS WRITE BE TIED TO AN ATTEMPT. A revival is a write to an attempt, and the
+  //   compare-and-swap below used to key on `(id, status: 'FAILED')` — the ABA the manual retry was
+  //   already fenced against. Status is not an identity: a row leaves FAILED and comes back every
+  //   time it is retried, so between the read above and the write it can be revived, claimed, posted
+  //   or failed and land back on FAILED as a DIFFERENT attempt, which the status CAS matches. It
+  //   would reset that attempt's outcome and overwrite its `payload`, where the pinned idempotency
+  //   token lives, sending the row out under a token chosen for the attempt we read rather than the
+  //   one that ran. A candidate at revision 0 carries no attempt to name, so it is REFUSED rather
+  //   than revived unfenced — the same rule the operator path applies, and the same one that keeps
+  //   revision 0 from being forged into 1.
   //
-  // A candidate at revision 0 carries no attempt to name, so this REFUSES rather than reviving it
-  // unfenced — the same rule the operator path applies, and the same one that keeps revision 0 from
-  // being forged into 1. That is the pre-fence legacy shape (and any connector whose processor does
-  // not stamp an attempt); it fails closed, visibly, instead of risking a duplicate money movement.
+  //   o3d-0m56 asks MAY THIS BE RE-POSTED AT ALL. Reviving a money row under a PINNED token only
+  //   protects while Xero still remembers that token — minutes — and this runs whenever the
+  //   connector next sweeps, long after. So the ledger has to say the attempt is not already in it.
+  //
+  // Neither implies the other: a perfectly fenced attempt can still be one the ledger already holds,
+  // and a clear ledger says nothing about which attempt this write will land on. Both refusals leave
+  // the row FAILED and visible, which is the state it was already in; posting twice is not.
+  //
+  // ORDER IS DELIBERATE. The attempt fence is a local field comparison; the ledger check is a network
+  // read. Asking the cheap question first means a row that cannot be fenced never costs an API call.
   const reuseAttempt: AttemptRef | null = plan.action === 'reuse'
     ? { id: plan.syncLogId, attemptRevision: failedAttemptRevisions.get(plan.syncLogId) ?? UNCLAIMED_ATTEMPT_REVISION }
     : null
@@ -1101,8 +1126,38 @@ export async function enqueueFollowUpSyncLog(
     return
   }
 
+  const evidence = await ledgerClearsFollowUpRevival({
+    connector: XERO_CONNECTOR,
+    type,
+    payload: plan.payload,
+    tokenDisposition: plan.action === 'reuse' ? plan.tokenDisposition : 'rotated',
+    syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
+  })
+  if (!evidence.clear) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_followup_enqueue_refused',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: `
+        + `${evidence.reason}. Re-posting it could duplicate a payment; check the ledger and resolve `
+        + 'the row by hand.',
+      metadata: {
+        type,
+        referenceType,
+        referenceId,
+        reason: 'ledger_not_clear',
+        failedRowIds: failedRows.map((row) => row.id),
+      },
+    })
+    return
+  }
+
   try {
     const outcome = await db.$transaction(async (tx) => {
+      // Serializes this insert/revival against the manual retry's read-then-reset for the same
+      // document (o3d-0m56). Money-moving types only; everything else pays nothing.
+      await lockFollowUpScope(tx, { connector: XERO_CONNECTOR, type, referenceType, referenceId })
       if (plan.action === 'reuse') {
         if (!reuseAttempt) throw new Error(`Xero follow-up revival for ${plan.syncLogId} reached its write with no attempt to fence on`)
         // Fenced on the ATTEMPT, not on the status: if another run revived the same row first, a
@@ -1138,6 +1193,10 @@ export async function enqueueFollowUpSyncLog(
           referenceType,
           referenceId,
           payload: plan.payload as never,
+          // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
+          // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
+          // money-attempt-provenance.ts. A row created without it is never recycled again.
+          ...stampingCustodyOnCreate(),
         },
       })
       await scheduleXeroAccountingOutbox(tx, {
@@ -1440,7 +1499,15 @@ async function claimAccountingSyncLog(
   const claimData = {
     status: 'PROCESSING' as const,
     attemptRevision: attempt.attemptRevision,
-    processingStartedAt: claimedAt,
+    // o3d-0m56 r10: the claim and attempt-stamping CUSTODY move together, ALWAYS, and they do it
+    // here — in the one object both claim statements below share — rather than at each call site.
+    // A claim is what precedes a post, so the database's forfeit trigger reads a claim that does not
+    // re-assert custody as one made by a binary that does not stamp and takes custody away. Losing it
+    // is silent and permanent for that row: its unset `remoteAttemptedAt` can never again be read as
+    // proof no remote call left it, so the planner will never recycle it. `stampingCustodyOnClaim`
+    // emits `processingStartedAt` and `attemptStampingCustodyAt` from ONE instant, which is the
+    // pairing the trigger checks — spelling either out separately would break it.
+    ...stampingCustodyOnClaim(claimedAt),
   }
 
   if (entry.type !== 'INVOICE_PAYMENT' || entry.referenceType !== 'SalesOrder') {
@@ -1553,7 +1620,20 @@ export async function deferUnclaimedPaymentUntilEarlierLogsPost(
   const deferred = await client.accountingSyncLog.updateMany({
     where: { id: entry.id, status: 'PENDING' },
     data: {
-      processingStartedAt: new Date(Date.now() + ORDERING_DEFERRAL_MS),
+      // NO `status` KEY, and that is the whole point — see the header above. This row was never
+      // claimed, so writing the queued status here would stamp over a claim another runner took in
+      // the meantime, un-claiming a request that may already be on the wire. (Spelt that way
+      // deliberately: the structural test in xero-sync-processor.test.ts scans this call's argument
+      // text for a queued-status write, and a comment quoting one reads as the defect itself.)
+      //
+      // BUT THE CUSTODY STAMP IS STILL REQUIRED, and the two rules are not in tension. The forfeit
+      // trigger fires on ANY update that moves `processingStartedAt` to a new non-null value — it
+      // does not also require the status to change — so this write would silently drop
+      // `attemptStampingCustodyAt` and make the row permanently un-recyclable, however careful it is
+      // about ownership. `stampingCustodyOnClaim` re-asserts it and sets NO status, so it satisfies
+      // both fences at once. Custody is a claim about the BINARY that touched the row, not about who
+      // owns it, and a stamping binary is exactly what is touching it here.
+      ...stampingCustodyOnClaim(new Date(Date.now() + ORDERING_DEFERRAL_MS)),
       errorMessage: invoicePaymentDeferralMessage(detail),
     },
   })
@@ -2241,6 +2321,31 @@ async function markXeroOutboxSuccess(job: IntegrationOutboxRow): Promise<void> {
 }
 
 /**
+ * Report an attempt-stamping custody repair, when there was one (o3d-0m56 r10).
+ *
+ * A non-zero count means a binary that does not stamp `remoteAttemptedAt` has handled money rows on
+ * this database — a deploy window, an overlapping instance, or a rollback. Those rows are now
+ * treated as attempted, so each pays for one ledger read before it is posted again, and each is no
+ * longer recyclable. That is worth an operator's attention, hence WARNING rather than INFO.
+ *
+ * The repair itself is what makes the fence correct; this only reports it.
+ */
+async function reportMoneyAttemptCustodyRepair(repaired: number, connector: string): Promise<void> {
+  if (repaired === 0) return
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: `${connector}_money_attempt_custody_repaired`,
+    tag: 'sync',
+    level: 'WARNING',
+    description: `Stamped ${repaired} accounting money row${repaired === 1 ? '' : 's'} that a version of IMS `
+      + 'outside attempt-stamping custody may have posted from (a deploy window, an overlapping instance, '
+      + 'or a rollback). They are now treated as attempted, so each will be checked against the ledger '
+      + 'before it is posted again.',
+    metadata: { repaired, connector },
+  })
+}
+
+/**
  * WHAT A SUCCESSFUL POST OF EACH SYNC TYPE ACTUALLY DID, and what an operator can do about it
  * (o3d-e2mz r4, Codex finding 3).
  *
@@ -2488,6 +2593,21 @@ async function reportPostOnMovedAttempt(
 }
 
 export async function processPendingXeroSync(): Promise<ProcessResult> {
+  // BEFORE ANY ENTRY IS CLAIMED OR POSTED (round 10). Every money post in this run goes through
+  // `authoriseMoneyPost`, whose rival-attempt query is `remoteAttemptedAt: { not: null }` — kept
+  // deliberately narrow, and the partial index depends on it — so it is blind to a money row a
+  // binary outside stamping custody posted from. This makes those rows visible by stamping them,
+  // conservatively, and it is also what makes a forfeited custody PERMANENT before this run's
+  // claims can restore it.
+  //
+  // EVERY RUN, not once per database. Round 9 established its epoch once, which is precisely how a
+  // ROLLBACK got underneath it; a repair that re-runs cannot be got underneath, and in steady state
+  // it matches nothing through a partial index that is empty.
+  //
+  // THROWS rather than continuing if the repair fails. Nothing has posted yet, so failing the run
+  // costs a five-minute delay, whereas posting into a fence that cannot see its rivals costs a
+  // duplicate payment. The cron treats a throw here as it treats any other sync failure.
+  await reportMoneyAttemptCustodyRepair(await repairMoneyAttemptsOutsideStampingCustody(), XERO_CONNECTOR)
   if (!isXeroAccountingOutboxEnabled()) {
     return processPendingXeroSyncDirect()
   }
@@ -4345,10 +4465,15 @@ async function processClaimedEntry(
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       const bankAccountId = payload.bankAccountId as string | undefined
       const amount = payload.amount as number | undefined
-      const paymentDate = (payload.paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT' }
       }
+      // o3d-0m56 round 6, finding 1: the date is not computed here. The probe that decides whether
+      // this document is already settled has to look for the settlement THIS call will create, and
+      // the only way that can never drift is for both to ask one function. See moneyPostDate.
+      const posting = moneyPostDateToSend(type, payload, new Date())
+      if (!posting.ok) return { success: false, error: `Cannot date this INVOICE_PAYMENT: ${posting.reason}` }
+      const paymentDate = posting.date
       // OVER-SETTLEMENT IS REFUSED HERE, NOT AT THE ENQUEUE (o3d-cjt8 round 2).
       //
       // The under-lock capacity re-check in registerInvoicePaymentWithLedger only ever covered the
@@ -4411,24 +4536,52 @@ async function processClaimedEntry(
       if (!account) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced Xero chart of accounts` }
       }
-      try {
-        // A payment has no natural key Xero deduplicates on, so the local record is the ONLY thing between a second worker and a second payment. Prove the claim here.
-        const fence = await lease.fenceBeforeRemoteWrite('invoice-payment')
-        if (!fence.ok) return fence.result
-        const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
-          Invoice: { InvoiceID: accountingInvoiceId },
-          Account: { AccountID: account.externalAccountId },
-          Date: paymentDate,
-          Amount: amount,
-        }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'invoice-payment') })
-        if (!paymentRes.ok) {
-          return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
+      // o3d-0m56: the LAST check before money moves, AND the lock the post is made under. This
+      // entry may have posted before — a committed call whose response was lost is FAILED, and
+      // the row returns to PENDING for several more attempts. Everything that happens earlier
+      // (the retry guard, the revival guard) is operator feedback; this is the reading the POST
+      // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
+      // competing row cannot slip its own post between them — the post is the callback for
+      // exactly that reason.
+      return postMoneyUnderLedgerFence({
+        connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+        // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
+        // the fence must authorise against the very day the call below creates, and a second
+        // wall-clock read here is a second day whenever the two straddle a UTC midnight.
+        postingDate: paymentDate,
+      }, async () => {
+        try {
+          // BOTH FENCES, AND THE CLAIM FENCE IS LAST (o3d-0m56 + o3d-550x/o3d-xl63).
+          //
+          // The enclosing `postMoneyUnderLedgerFence` answers "has this settlement already reached the
+          // ledger?" — a network read, taken under the per-document lock the post is made inside.
+          // `lease.fenceBeforeRemoteWrite` answers "do I still hold the claim on this row?" — a local
+          // compare-and-set, and it must be the LAST statement before the wire call, because the
+          // structural test in xero-claim-before-remote-write asserts nothing awaitable sits between
+          // proving the claim and using it. So it goes HERE, inside the ledger fence's callback,
+          // rather than outside it: putting it before the ledger read would leave the read itself
+          // between the proof and the post, which is precisely what the fence is measured against.
+          const fence = await lease.fenceBeforeRemoteWrite('invoice-payment')
+          if (!fence.ok) return fence.result
+          const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
+            Invoice: { InvoiceID: accountingInvoiceId },
+            Account: { AccountID: account.externalAccountId },
+            Date: paymentDate,
+            Amount: amount,
+            // o3d-0m56: IMS's own mark, so a later attempt can recognise THIS payment even if its
+            // amount or date has since been corrected in Xero. Derived from the same token the
+            // Idempotency-Key is built from, so every attempt of this settlement carries one mark.
+            Reference: settlementMarkerFor(followUpIdempotencySource(entryId, payload)),
+          }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'invoice-payment') })
+          if (!paymentRes.ok) {
+            return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
+          }
+          const paymentId = paymentRes.data?.Payments?.[0]?.PaymentID
+          return { success: true, externalId: paymentId }
+        } catch (e) {
+          return { success: false, error: String(e) }
         }
-        const paymentId = paymentRes.data?.Payments?.[0]?.PaymentID
-        return { success: true, externalId: paymentId }
-      } catch (e) {
-        return { success: false, error: String(e) }
-      }
+      })
     }
 
     case 'BILL_ATTACHMENT': {
@@ -4514,10 +4667,15 @@ async function processClaimedEntry(
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       const bankAccountId = payload.bankAccountId as string | undefined
       const amount = payload.amount as number | undefined
-      const paymentDate = (payload.paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for BILL_PAYMENT' }
       }
+      // o3d-0m56 round 6, finding 1: the date is not computed here. The probe that decides whether
+      // this document is already settled has to look for the settlement THIS call will create, and
+      // the only way that can never drift is for both to ask one function. See moneyPostDate.
+      const posting = moneyPostDateToSend(type, payload, new Date())
+      if (!posting.ok) return { success: false, error: `Cannot date this BILL_PAYMENT: ${posting.reason}` }
+      const paymentDate = posting.date
       // Resolve bank account — accept either Xero AccountID (preferred) or a legacy account code.
       const account = await db.accountingAccount.findFirst({
         where: { connector: XERO_CONNECTOR, OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },
@@ -4526,24 +4684,52 @@ async function processClaimedEntry(
       if (!account) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced Xero chart of accounts` }
       }
-      try {
-        const fence = await lease.fenceBeforeRemoteWrite('bill-payment')
-        if (!fence.ok) return fence.result
-        const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
-          Invoice: { InvoiceID: accountingInvoiceId },
-          Account: { AccountID: account.externalAccountId },
-          Date: paymentDate,
-          Amount: amount,
-          Reference: (payload.reference as string | undefined) ?? undefined,
-        }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'bill-payment') })
-        if (!paymentRes.ok) {
-          return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
+      // o3d-0m56: the LAST check before money moves, AND the lock the post is made under. This
+      // entry may have posted before — a committed call whose response was lost is FAILED, and
+      // the row returns to PENDING for several more attempts. Everything that happens earlier
+      // (the retry guard, the revival guard) is operator feedback; this is the reading the POST
+      // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
+      // competing row cannot slip its own post between them — the post is the callback for
+      // exactly that reason.
+      return postMoneyUnderLedgerFence({
+        connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+        // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
+        // the fence must authorise against the very day the call below creates, and a second
+        // wall-clock read here is a second day whenever the two straddle a UTC midnight.
+        postingDate: paymentDate,
+      }, async () => {
+        try {
+          // BOTH FENCES, AND THE CLAIM FENCE IS LAST (o3d-0m56 + o3d-550x/o3d-xl63).
+          //
+          // The enclosing `postMoneyUnderLedgerFence` answers "has this settlement already reached the
+          // ledger?" — a network read, taken under the per-document lock the post is made inside.
+          // `lease.fenceBeforeRemoteWrite` answers "do I still hold the claim on this row?" — a local
+          // compare-and-set, and it must be the LAST statement before the wire call, because the
+          // structural test in xero-claim-before-remote-write asserts nothing awaitable sits between
+          // proving the claim and using it. So it goes HERE, inside the ledger fence's callback,
+          // rather than outside it: putting it before the ledger read would leave the read itself
+          // between the proof and the post, which is precisely what the fence is measured against.
+          const fence = await lease.fenceBeforeRemoteWrite('bill-payment')
+          if (!fence.ok) return fence.result
+          const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
+            Invoice: { InvoiceID: accountingInvoiceId },
+            Account: { AccountID: account.externalAccountId },
+            Date: paymentDate,
+            Amount: amount,
+            // The operator's reference is KEPT and the mark appended, never replaced: it is what they
+            // will look for on the bank reconciliation. See INVOICE_PAYMENT above for the mark.
+            Reference: [payload.reference as string | undefined, settlementMarkerFor(followUpIdempotencySource(entryId, payload))]
+              .filter(Boolean).join(' '),
+          }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'bill-payment') })
+          if (!paymentRes.ok) {
+            return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
+          }
+          const paymentId = paymentRes.data?.Payments?.[0]?.PaymentID
+          return { success: true, externalId: paymentId }
+        } catch (e) {
+          return { success: false, error: String(e) }
         }
-        const paymentId = paymentRes.data?.Payments?.[0]?.PaymentID
-        return { success: true, externalId: paymentId }
-      } catch (e) {
-        return { success: false, error: String(e) }
-      }
+      })
     }
 
     case 'CREDIT_NOTE': {
@@ -4614,20 +4800,43 @@ async function processClaimedEntry(
       const creditNoteId = payload.creditNoteId as string | undefined
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       const amount = payload.amount as number | undefined
-      const allocationDate = (payload.date as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
       if (!creditNoteId || !accountingInvoiceId || amount == null) {
         return { success: false, error: 'Missing creditNoteId, accountingInvoiceId, or amount for PURCHASE_CREDIT_NOTE_ALLOCATION' }
       }
-      // Two reads and a write inside this one call (the shape the review named); the fence is the last thing before it.
-      const fence = await lease.fenceBeforeRemoteWrite('purchase-credit-note-allocation')
-      if (!fence.ok) return fence.result
-      const result = await allocatePurchaseCreditNote(
-        { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
-        { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'purchase-credit-note-allocation') },
-      )
-      // No externalId to back-reference — the allocation is a sub-resource of the
-      // credit note, not a standalone document.
-      return { success: result.success, error: result.error }
+      // o3d-0m56 round 6, finding 1: an allocation dates itself from `date`, NOT `paymentDate` —
+      // the difference between this branch and the two payment branches above is exactly what a
+      // single shared "mirror" of both got wrong. moneyPostDateToSend knows which is which.
+      const posting = moneyPostDateToSend(type, payload, new Date())
+      if (!posting.ok) return { success: false, error: `Cannot date this allocation: ${posting.reason}` }
+      const allocationDate = posting.date
+      // o3d-0m56: the LAST check before money moves, AND the lock the post is made under. This
+      // entry may have posted before — a committed call whose response was lost is FAILED, and
+      // the row returns to PENDING for several more attempts. Everything that happens earlier
+      // (the retry guard, the revival guard) is operator feedback; this is the reading the POST
+      // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
+      // competing row cannot slip its own post between them — the post is the callback for
+      // exactly that reason.
+      return postMoneyUnderLedgerFence({
+        connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+        // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
+        // the fence must authorise against the very day the call below creates, and a second
+        // wall-clock read here is a second day whenever the two straddle a UTC midnight.
+        postingDate: allocationDate,
+      }, async () => {
+        // BOTH FENCES, CLAIM FENCE LAST — see the INVOICE_PAYMENT case for why it sits inside this
+        // callback rather than outside it. Two reads and a write happen inside
+        // `allocatePurchaseCreditNote` (the shape the review named), so the claim proof must be the
+        // statement immediately before the call.
+        const fence = await lease.fenceBeforeRemoteWrite('purchase-credit-note-allocation')
+        if (!fence.ok) return fence.result
+        const result = await allocatePurchaseCreditNote(
+          { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
+          { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'purchase-credit-note-allocation') },
+        )
+        // No externalId to back-reference — the allocation is a sub-resource of the
+        // credit note, not a standalone document.
+        return { success: result.success, error: result.error }
+      })
     }
 
     case 'COGS_JOURNAL':

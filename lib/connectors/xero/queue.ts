@@ -16,6 +16,8 @@ import {
   lockOrderForAccountingEnqueue,
   logStaleOrderDiscountEnqueue,
 } from '@/lib/domain/accounting/enqueue-order-guard'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 
 /** Map sync type enum → setting key for per-type enable/disable */
 const SYNC_TYPE_SETTING: Record<string, keyof XeroSettings> = {
@@ -88,6 +90,15 @@ export async function queueXeroSync(params: {
         referenceType: params.referenceType,
         referenceId: params.referenceId,
       })
+      // o3d-0m56: and the accounting scope lock, so this enqueue cannot land between the manual
+      // retry's sibling snapshot and its reset. Taken AFTER the order lock, the same order every
+      // other enqueue writer takes them in, so the pair cannot deadlock.
+      await lockFollowUpScope(tx, {
+        connector: 'xero',
+        type: params.type,
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+      })
       if (lockedOrderId === null) {
         console.warn(
           `[accounting-queue] skipping ${params.type} for deleted ${params.referenceType} ${params.referenceId}`,
@@ -119,6 +130,10 @@ export async function queueXeroSync(params: {
           referenceType: params.referenceType,
           referenceId: params.referenceId,
           payload: payload as never,
+          // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
+          // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
+          // money-attempt-provenance.ts. A row created without it is never recycled again.
+          ...stampingCustodyOnCreate(),
         },
       })
       await scheduleXeroAccountingOutbox(tx, {

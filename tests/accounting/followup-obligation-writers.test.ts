@@ -46,6 +46,13 @@ type SyncRow = {
   backReferenceCheckedAt: Date | null
   backReferenceFollowUpsPendingAt: Date | null
   /**
+   * o3d-0m56 r10: the two columns the money-attempt repair reads. `attemptStampingCustodyAt` is
+   * written by every production create path, so a row this codebase made carries it and the repair
+   * passes it over; a row left without it is one a binary outside stamping custody wrote.
+   */
+  remoteAttemptedAt?: Date | null
+  attemptStampingCustodyAt?: Date | null
+  /**
    * o3d-nepa r3: when data retention compacted this row to an attribution-only tombstone. NULL =
    * the payload is intact. The double carries it because it is the ONLY thing that distinguishes a
    * row whose follow-ups can still be rebuilt from one whose body was thrown away — `payload: {}`
@@ -231,6 +238,27 @@ const outboxClient = {
   },
 }
 
+const MONEY_TYPES = new Set(['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'])
+
+/**
+ * o3d-0m56 r10: a sync run REPAIRS money rows outside attempt-stamping custody before it claims
+ * anything, and that repair is raw SQL.
+ *
+ * The double applies the rule rather than returning a convenient 0. Returning 0 would be a double
+ * that cannot tell the difference between "no row needed repairing" and "the repair no longer
+ * matches anything", and the rows in this file are created through the production enqueue path, so
+ * they carry custody and the repair correctly leaves them alone.
+ */
+function repairOutsideCustody(): number {
+  const matched = state.syncRows.filter((row) => row.remoteAttemptedAt == null
+    && row.attemptStampingCustodyAt == null
+    && MONEY_TYPES.has(String(row.type)))
+  for (const row of matched) {
+    row.remoteAttemptedAt = row.syncedAt ?? row.processingStartedAt ?? row.createdAt
+  }
+  return matched.length
+}
+
 const db = {
   accountingSyncLog: syncLogClient,
   // o3d-19gy: the processor asks which accounting connection is live before it posts anything, and
@@ -249,11 +277,18 @@ const db = {
   async $transaction(fn: (tx: unknown) => Promise<unknown>) {
     return fn(db)
   },
-  // o3d-clxw r4: the SYNCED write stamps `syncedAt` from the DATABASE's clock rather than this
-  // host's, in the same transaction, so the payment poller's reversal fence compares two readings of
-  // one clock instead of two machines' wall clocks.
+  // TWO raw statements reach this double now, and it must tell them apart (o3d-clxw + o3d-0m56 r10).
+  // A single member that assumed either one would silently serve the other: both are
+  // `UPDATE accounting_sync_logs`, so the loose regex below is not enough on its own to discriminate.
+  //
+  //  • o3d-0m56 r10 — the attempt-stamping custody REPAIR, run once at the top of the processor
+  //    before anything is claimed. Recognised by the column it sets.
+  //  • o3d-clxw r4 — the SYNCED write stamping `syncedAt` from the DATABASE's clock rather than this
+  //    host's, in the same transaction, so the payment poller's reversal fence compares two readings
+  //    of one clock instead of two machines' wall clocks.
   async $executeRaw(strings: TemplateStringsArray, ...values: unknown[]) {
     const sql = strings.join('?')
+    if (/"remoteAttemptedAt" = COALESCE/.test(sql)) return repairOutsideCustody()
     if (!/UPDATE accounting_sync_logs/.test(sql)) throw new Error(`fake db: unexpected raw statement ${sql}`)
     const row = state.syncRows.find((candidate) => candidate.id === values[0])
     if (row) row.syncedAt = new Date()
