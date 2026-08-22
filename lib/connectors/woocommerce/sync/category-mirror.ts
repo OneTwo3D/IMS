@@ -32,22 +32,42 @@ export function clearWcCategoryMirrorCache(): void {
   cached = null
 }
 
+/**
+ * A hard ceiling on the category walk (o3d-jcx).
+ *
+ * This loop was `while (true)` with `x-wp-totalpages` as its ONLY ending, which is unbounded twice
+ * over: a header the API could not read arrived as NaN, `NaN <= page` is false, and the walk never
+ * ended — it asked a store with no more categories for empty page after empty page, for ever.
+ * Fifty pages is 5,000 categories at the size asked for, and still 500 against a store that caps
+ * `per_page` at the WooCommerce default of ten.
+ */
+const MAX_WC_CATEGORY_PAGES = 50
+
 export async function fetchWcCategoryTree(
   creds?: ConnectorCredentials | null,
 ): Promise<{ ok: true; categories: WcCategory[] } | { ok: false; error: string }> {
   const all: WcCategory[] = []
-  let page = 1
-  while (true) {
+  for (let page = 1; page <= MAX_WC_CATEGORY_PAGES; page += 1) {
     const res = await wcFetch('/products/categories', { per_page: '100', page: String(page) }, creds)
     if (res.error) return { ok: false, error: res.error }
     if (!Array.isArray(res.data)) return { ok: false, error: 'Unexpected response shape from WC categories endpoint' }
-    for (const raw of res.data as Array<{ id: number; name: string; slug: string; parent?: number }>) {
+    const batch = res.data as Array<{ id: number; name: string; slug: string; parent?: number }>
+    for (const raw of batch) {
       all.push({ id: raw.id, name: raw.name, slug: raw.slug, parent: raw.parent ?? 0 })
     }
-    if (res.totalPages <= page) break
-    page += 1
+    // ONLY AN EMPTY PAGE ENDS A WALK — the rule `fetchAllWcRefundsForOrder` established (o3d-okbd).
+    // `x-wp-totalpages` cannot: a store that never sends it is indistinguishable from one reporting
+    // a single page, so ending on it takes "the store said nothing" for "there is no more". Nor can
+    // a short page: `per_page` is a request, not a grant.
+    if (batch.length === 0) return { ok: true, categories: all }
   }
-  return { ok: true, categories: all }
+  // Reported as a failure rather than passed off as the whole tree: the caller fails OPEN (it
+  // leaves categoryId untouched), and a truncated tree would instead link products to the wrong
+  // ancestor — a wrong answer is worse than no answer here.
+  return {
+    ok: false,
+    error: `The WooCommerce category list did not end within ${MAX_WC_CATEGORY_PAGES} pages`,
+  }
 }
 
 /**

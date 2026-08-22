@@ -43,9 +43,11 @@ function rateDisplayName(r: WcTaxRate): string {
 export async function importWcTaxRates(): Promise<ImportWcTaxResult> {
   const errors: string[] = []
 
-  // Fetch all tax rates (paginated). Cap at 20 pages as a safety measure.
+  // Fetch all tax rates (paginated). Capped at 20 pages as a safety measure: a store that ignores
+  // `page` must not be asked for ever, now that the header cannot end the walk.
   const rates: WcTaxRate[] = []
   let page = 1
+  let ended = false
   while (page <= 20) {
     const r = await wcFetch('/taxes', { per_page: '100', page: String(page) })
     if (r.error || !Array.isArray(r.data)) {
@@ -54,8 +56,21 @@ export async function importWcTaxRates(): Promise<ImportWcTaxResult> {
     }
     const batch = r.data as WcTaxRate[]
     rates.push(...batch)
-    if (page >= r.totalPages || batch.length === 0) break
+    // ONLY AN EMPTY PAGE ENDS A WALK (o3d-okbd, o3d-jcx). `page >= r.totalPages` used to end it
+    // too, which is the "said nothing" / "said one page" conflation — and once `wcFetch` reports an
+    // unreadable header as a negative sentinel rather than NaN, that comparison would ALSO have
+    // become true on page one and truncated the list to its first hundred rates. A missing tax-rate
+    // mapping silently mis-taxes imported orders, so the walk pays the one extra request instead.
+    if (batch.length === 0) {
+      ended = true
+      break
+    }
     page++
+  }
+  // A bound has to be honest about what it did not do: a truncated rate list applied as if whole is
+  // how orders end up mapped to the wrong IMS tax rate.
+  if (!ended && errors.length === 0) {
+    errors.push(`The WooCommerce tax-rate list did not end within 20 pages; ${rates.length} rate(s) were read and later ones were not`)
   }
 
   let importedRates = 0

@@ -263,6 +263,21 @@ a live document onto the storefront's number.
 
 This uses the same shared external-fulfillment path that future WMS plugins will use. WooCommerce does not bypass the IMS shipment model or dispatch stock directly at order level.
 
+**A completion that cannot become a shipment is now reported, not swallowed.** There are two reasons
+IMS will refuse one, and they are handled differently because only one of them clears by itself:
+
+- **The order is on backorder** — there is no physical stock for IMS to consume, so nothing can be
+  marked shipped. The webhook delivery is **retried**, because the refusal describes IMS stock at
+  that instant and a receipt landing later is the fix. A warning is recorded against the order.
+- **The shipment lines do not cover what was ordered**, net of refunds. The goods have already left
+  the warehouse, so recording the smaller quantity would under-book stock movement and COGS
+  permanently. Re-delivering the same order reaches the same conclusion, so the delivery is
+  **acknowledged rather than retried**, and a warning naming the uncovered quantities is recorded
+  against the order for someone to act on.
+
+Previously both took the same route and neither reached the caller at all: the store showed the order
+as completed, IMS never created the shipment, the webhook was acknowledged, and nothing retried.
+
 ### Webhooks (Recommended)
 
 Webhooks deliver order changes to One Two Inventory in real-time, rather than waiting for the next poll. To set up:
@@ -324,9 +339,33 @@ The **Products** tab controls bidirectional product synchronisation.
 - Weight and dimensions (length, width, height)
 - GTIN/barcode from WooCommerce's `global_unique_id` field (only written if the IMS barcode field is empty)
 - HS code and country of origin from WC product attributes (only written if the IMS fields are empty)
-- **Categories** — the WC product-category tree is mirrored into IMS. Each WC category becomes an IMS reporting category with its WC parent chain preserved (so `Apparel > T-Shirts > V-Neck` arrives as a 3-level path). The product is linked to its **deepest** WC category. The mirror is cached for 5 minutes so per-product webhooks do not re-fetch the whole tree. If the WC categories endpoint is unreachable, the product's existing category link is left alone rather than wiped.
+- **Categories** — the WC product-category tree is mirrored into IMS. Each WC category becomes an IMS reporting category with its WC parent chain preserved (so `Apparel > T-Shirts > V-Neck` arrives as a 3-level path). The product is linked to its **deepest** WC category. The mirror is cached for 5 minutes so per-product webhooks do not re-fetch the whole tree. If the WC categories endpoint is unreachable — or the category list cannot be read to its end — the product's existing category link is left alone rather than wiped or linked to a partial tree.
 - Variable products: all variations are synced as child VARIANT products linked to the parent
 - Variation attributes are synced for the options panel
+
+**There is a supported size for a variable product: 1,000 variations.** A product's variations are
+read in full *before* anything is written, and then applied in a single transaction, so a failure
+anywhere leaves the catalogue exactly as it was. That transaction has a budget, and 1,000 variations
+is what fits inside it. A larger product is **refused before the first write**, naming the count —
+importing part of a product and reporting success would leave the catalogue silently incomplete. The
+remedy is to split the product in WooCommerce; raising the limit means raising the write
+transaction's budget with it.
+
+Two related refusals come from the same place, and both are retried rather than needing a person. If
+reading a product's variations takes longer than **five minutes**, the import gives up and comes back
+later, so a slow store cannot leave a webhook in flight long enough for a second worker to pick the
+same one up. And if the store serves **fewer variations than it says the product has**, the import is
+refused rather than applied — a truncated variation list applied as if whole is the silent
+incompleteness this connector exists to avoid.
+
+**How the connector decides it has read a whole list.** Every paged read here — variations,
+categories, tax rates, refunds — ends on an **empty page**, never on what the response headers say.
+A store that does not send a page count is indistinguishable from one reporting a single page, and
+`per_page` is a request rather than a grant, so a store that answers with its own smaller page size
+does so with no error at all. Ending on either would silently import the first page of a list and
+report it as the lot. Each walk also has a page ceiling so that a store ignoring the `page` parameter
+is not asked for ever; reaching that ceiling is reported as an incomplete read, not treated as the
+end of the collection.
 
 ### What the connector will NOT change
 
@@ -351,7 +390,7 @@ When a refusal applies, the row is left **structurally and commercially** untouc
 
 A variation is also only matched to an existing IMS row when that row is genuinely the one the WooCommerce variation owns: not mapped to a different WooCommerce object, not already a child of a *different* IMS parent, not itself a parent, of a type that can sit under a variable parent, and not carrying stock or open documents. A bare SKU match is not enough.
 
-When a refusal means WooCommerce data goes **unimported**, the import is reported as failed, the product is not marked synced, the reconcile cursor does not advance past it, and a row appears in the [Sync Exception Inbox](sync-exceptions.md). Resolve it in IMS or in WooCommerce; the next successful sync clears the row by itself. There are four ways to reach that state, and they are one rule — *the two systems disagree about whether the row is a variable parent*, asked of the row's **type and its actual child rows**, not of its type alone:
+When a refusal means WooCommerce data goes **unimported**, the import is reported as failed, the product is not marked synced, and a row appears in the [Sync Exception Inbox](sync-exceptions.md). Resolve it in IMS or in WooCommerce; the next successful sync clears the row by itself. There are four ways to reach that state, and they are one rule — *the two systems disagree about whether the row is a variable parent*, asked of the row's **type and its actual child rows**, not of its type alone:
 
 - a **variable** WooCommerce product paired with an IMS row that cannot be a parent (a kit, a row that is already somebody's variation, a row that already has child rows its type does not allow, or a row carrying stock or open documents) — none of its variations are imported;
 - a **simple** WooCommerce product paired with an IMS **VARIABLE** row — its type and its price are not applied, and the IMS variants stay where they are. The connector will not delete IMS children that WooCommerce never asked it to remove;
@@ -580,6 +619,22 @@ What it does:
 3. Runs the daily stock catch-up by draining queued retry jobs and force-pushing current stock
 
 Order reconcile also backfills orders that were intentionally skipped while `wc_initial_import_completed` was not yet `true`. The reconcile path uses its own `last_wc_order_reconcile_at` cursor, so the first reconcile after initial import completion can import those missed live orders.
+
+**A product that can never import does not stall the rest of the catalogue.** Each product sync
+carries a cursor — the point in WooCommerce's own modification history the next run reads from — and
+it only moves forward on a run with no failures a retry could fix. A failure that *no* retry can fix
+is treated as the opposite: a duplicate GTIN, a WooCommerce id already mapped to a different IMS
+product, or a product-structure conflict is **counted and named at ERROR level, and the cursor moves
+past it**. Holding the cursor for those was a stall, not caution — every later run re-read the whole
+catalogue from the same watermark, re-imported all of it, and re-failed on the same product, for
+ever.
+
+The log line names each blocked SKU, and the manual product sync shows them as **blocked (needs an
+operator)** separately from the error count, because re-running is the one thing that cannot help.
+One thing to know when you fix one: if the remedy is on the IMS side — clearing a product's external
+mapping, or resolving a structure conflict on [Sync Exceptions](sync-exceptions.md) — WooCommerce's
+own record of the product has not changed, so the cursor has nothing to find. **Re-save the product
+in WooCommerce** after fixing it and the next sync picks it up.
 
 The cron endpoints require a `CRON_SECRET` header for security. Cron setup is usually handled by your administrator during deployment.
 

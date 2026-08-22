@@ -16,7 +16,33 @@ import { logActivity } from '@/lib/activity-log'
  *  up, not something a withdrawal should block. */
 const POST_DISPATCH_FOR_WDRAW: ReadonlySet<string> = new Set(['SHIPPED', 'COMPLETED', 'DELIVERED'])
 
-export async function processWcCompletion(orderId: string, wcOrder: WcFullOrder): Promise<void> {
+/**
+ * What a WooCommerce completion actually did (o3d-xnwu).
+ *
+ * This function used to return `void`, and its last statement was a bare
+ * `await applyExternalFulfillmentUpdate(...)` whose result was thrown away. A call whose return
+ * value is discarded cannot fail: `syncWcOrderStatus` returned `{ success: true }` immediately
+ * afterwards, the webhook was acknowledged, the order-sync cursor advanced, and an order marked
+ * completed in the store that had NOT become an IMS shipment left no trace on the caller at all.
+ *
+ * Three outcomes, kept apart because their callers must treat them differently:
+ *
+ *   - `fulfilled` — shipments exist and are SHIPPED.
+ *   - `skipped_withdrawn` — deliberately not fulfilled, already logged, and NOT a failure: the
+ *     order is exactly where it should be. Acknowledged like a success (this is the behaviour that
+ *     was already correct, now stated instead of implied by falling off the end of the function).
+ *   - `refused` — the fulfilment did not happen. `permanent` carries the o3d-bx9 / o3d-i0y
+ *     distinction straight through from `applyExternalFulfillmentUpdate`.
+ */
+export type WcCompletionOutcome =
+  | { kind: 'fulfilled' }
+  | { kind: 'skipped_withdrawn' }
+  | { kind: 'refused'; error: string; permanent: boolean }
+
+export async function processWcCompletion(
+  orderId: string,
+  wcOrder: WcFullOrder,
+): Promise<WcCompletionOutcome> {
   // o3d-e1yb [wdraw]: this path bypasses applySalesOrderStatusTransition
   // entirely, so the locked terminal-approval guard there does NOT cover it.
   // A completion worker can read the order before an approval commits, pause,
@@ -50,12 +76,12 @@ export async function processWcCompletion(orderId: string, wcOrder: WcFullOrder)
       metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status, imsStatus: approved.status },
       resolveUser: false,
     })
-    return
+    return { kind: 'skipped_withdrawn' }
   }
 
   const wcTracking = extractWcTracking(wcOrder)
 
-  await applyExternalFulfillmentUpdate({
+  const applied = await applyExternalFulfillmentUpdate({
     source: 'woocommerce',
     lookup: { orderId },
     targetShipmentStatus: 'SHIPPED',
@@ -64,4 +90,30 @@ export async function processWcCompletion(orderId: string, wcOrder: WcFullOrder)
       shippingService: row.carrier,
     })),
   })
+  if (applied.success) return { kind: 'fulfilled' }
+
+  // The WooCommerce twin of the WMS dispatch sweep's failure counter. That path increments
+  // WmsOrderPushLink.dispatchFailureCount, dead-letters at DISPATCH_MAX_CONSECUTIVE_FAILURES and
+  // notifies admins; this path has no link row to count on, so the record is an activity row on the
+  // ORDER — where an operator investigating "the store says shipped, IMS does not" is looking —
+  // plus the outcome returned to the caller, which is what makes the webhook behave differently.
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'wc_completion_fulfillment_refused',
+    tag: 'sync',
+    level: 'WARNING',
+    description: `A WooCommerce order marked completed did not become an IMS shipment (${applied.refusal}): `
+      + `${applied.error}`,
+    metadata: {
+      externalOrderId: wcOrder.id,
+      wcStatus: wcOrder.status,
+      refusal: applied.refusal,
+      permanent: applied.permanent,
+      error: applied.error,
+    },
+    resolveUser: false,
+  })
+
+  return { kind: 'refused', error: applied.error, permanent: applied.permanent }
 }

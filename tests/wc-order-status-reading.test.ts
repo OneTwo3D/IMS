@@ -59,7 +59,12 @@ mock.module('@/lib/connectors/woocommerce/sync/withdrawal', {
 
 mock.module('@/lib/connectors/woocommerce/sync/completion-flow', {
   namedExports: {
-    processWcCompletion: async (orderId: string) => { state.completionsRun.push(orderId) },
+    // Returns the real discriminated outcome (o3d-xnwu): the caller now READS it, so a double that
+    // returned nothing would be answering a question production no longer asks.
+    processWcCompletion: async (orderId: string) => {
+      state.completionsRun.push(orderId)
+      return { kind: 'fulfilled' as const }
+    },
   },
 })
 

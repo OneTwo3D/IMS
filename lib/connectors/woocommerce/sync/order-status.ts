@@ -75,7 +75,15 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success
     // Special case: WC completed → run completion flow
     if (isWcStatus(wcOrder.status, 'completed')) {
       const { processWcCompletion } = await import('./completion-flow')
-      await processWcCompletion(so.id, wcOrder)
+      // CONSUME the outcome (o3d-xnwu). This used to be `await processWcCompletion(...)` followed
+      // by an unconditional `{ success: true }`, so a completion that was REFUSED — the order's
+      // shipment lines under-covering ordered-net-of-refunds demand, or no physical stock to
+      // consume — was reported to the webhook as a clean success. The delivery was acknowledged,
+      // the order-sync cursor advanced, and nothing retried or dead-lettered.
+      const completion = await processWcCompletion(so.id, wcOrder)
+      if (completion.kind === 'refused') {
+        return { success: false, error: completion.error, permanent: completion.permanent }
+      }
       return { success: true }
     }
 
