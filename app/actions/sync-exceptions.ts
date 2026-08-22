@@ -1,7 +1,6 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { mergeStuckDispatchRows } from '@/lib/domain/wms/exception-inbox'
 import {
@@ -39,6 +38,7 @@ import { syncRefundsForOrder } from '@/lib/connectors/woocommerce/sync/refund-sy
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import {
   RECOVERABLE_REFUND_PARK_STATUSES,
+  activeRefundParkWhere,
   buildRefundParkDismissData,
   buildRefundParkReassignData,
   describeRefundParkRecoverability,
@@ -394,27 +394,29 @@ const OUTBOX_FAILURE_STATUSES = [
   INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
 ]
 
-// Codex P2: order-import writes FROM_CONNECTOR/SalesOrder rows too (failed
-// imports have NO entityId; the missing-FX queue rows have NO entityId and a
-// payload.reason marker). Refund-sync rows always carry entityId = the IMS
-// order id, so require it — and exclude the FX-queue marker defensively so a
-// future entityId-carrying FX row can never be "retried" as a refund. The
-// exclusion must explicitly admit SQL-NULL payloads (refund-sync's FAILED rows
-// carry none): a JSON-path NOT predicate silently drops NULL rows.
-const REFUND_PARK_WHERE = {
-  connector: 'woocommerce',
-  direction: 'FROM_CONNECTOR' as const,
-  entityType: 'SalesOrder',
-  // QUARANTINED (o3d-w00 #2/#5 / o3d-iup): a monetary-only refund deliberately parked because the order
-  // isn't uniformly taxed. It has no SalesOrderRefund and the sweep skips it, so the exception inbox is
-  // the ONLY way an operator sees and recovers it — it must appear here alongside PENDING/FAILED.
-  status: { in: ['PENDING' as const, 'FAILED' as const, 'QUARANTINED' as const] },
-  entityId: { not: null },
-  OR: [
-    { payload: { equals: Prisma.DbNull } },
-    { NOT: { payload: { path: ['reason'], equals: 'missing_fx_rate' } } },
-  ],
-}
+/**
+ * WHAT COUNTS AS AN ACTIONABLE REFUND PARK — POSITIVELY (o3d-xnwu r7, Codex HIGH).
+ *
+ * This used to carry one more clause: every row whose payload's top-level `reason` equalled the
+ * pending-FX queue marker was EXCLUDED, to keep the missing-FX queue out of the inbox. A refund park
+ * persists the RAW WOOCOMMERCE REFUND, and `reason` on a WooCommerce refund is free text a human
+ * types when they issue it. So an operator who happened to type `missing_fx_rate` as their refund
+ * reason hid their own park from the one page that can recover it — and because a foreign park now
+ * HOLDS the refund delivery (see the cross-order guard in refund-sync.ts), that was not cosmetic: it
+ * was a permanent hold with no visible way to resolve it.
+ *
+ * The clause was also never the thing keeping FX rows out. Those rows carry no `entityId`, which
+ * `entityId: { not: null }` already excludes; the exclusion was a guess added on top, and the guess
+ * was the part that could be wrong. So the whole predicate now lives in one place, made of columns
+ * IMS writes — see `activeRefundParkWhere`, which the refund sync's cross-order guard and the park
+ * upsert use too, and which the pending-FX queue is disjoint from by construction rather than by
+ * inspection of payload contents.
+ *
+ * QUARANTINED (o3d-w00 #2/#5 / o3d-iup) is in the set deliberately: a monetary-only refund parked
+ * because the order isn't uniformly taxed has no SalesOrderRefund and the sweep skips it, so this
+ * inbox is the ONLY way an operator sees and recovers it.
+ */
+const REFUND_PARK_WHERE = activeRefundParkWhere()
 
 /**
  * Stuck dispatch reconciliations have no first-class entity (dispatch-sweep.ts

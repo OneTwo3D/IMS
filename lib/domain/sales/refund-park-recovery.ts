@@ -64,6 +64,51 @@ export function isRecoverableRefundParkStatus(status: string): status is Recover
 }
 
 /**
+ * THE ONE PREDICATE THAT SAYS "THIS ROW IS AN ACTIVE REFUND PARK" — AND IT SAYS SO POSITIVELY
+ * (o3d-xnwu r7, Codex HIGH).
+ *
+ * Every column here is written by IMS. `connector`, `direction` and `entityType` are literals the
+ * refund sync supplies; `entityId` is the IMS sales-order id a park is BY DEFINITION attached to;
+ * `status` is the actionable set. Nothing an operator can type into WooCommerce appears in it, and
+ * nothing is decided by ABSENCE. That is the whole point of the shape.
+ *
+ * WHAT IT REPLACED, and why the replacement is not a tidy-up. The exception inbox used to select
+ * parks by excluding rows whose payload's top-level `reason` was the pending-FX queue marker. A
+ * refund park PERSISTS THE RAW WOOCOMMERCE REFUND, and `reason` is a free-text field a human types
+ * when they issue a refund in WooCommerce. So an operator who typed that exact string hid their own
+ * park from the only page that can recover it — and since a foreign park now HOLDS the refund
+ * delivery, that was a permanent hold with no visible way out. An inbox that decides what to show by
+ * exclusion is one bad guess away from hiding the thing an operator needs.
+ *
+ * The pending-FX queue rows the exclusion was aimed at are told apart by a column instead, and by
+ * the one that cannot collide: they carry NO `entityId` (there is no IMS order yet — that is why
+ * they are queued), and `pendingFxQueueWhere` now says so explicitly. The two sets are disjoint by
+ * construction rather than by a guess about payload contents.
+ *
+ * ONE DEFINITION, three readers: the exception inbox, the refund sync's cross-order guard, and the
+ * park upsert. They must agree with each other and with the partial unique index
+ * `shopping_sync_logs_active_refund_park_uq`, and three hand-written copies could not.
+ */
+export function activeRefundParkWhere(): {
+  connector: string
+  direction: 'FROM_CONNECTOR'
+  entityType: string
+  entityId: { not: null }
+  status: { in: RecoverableRefundParkStatus[] }
+} {
+  return {
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    entityType: 'SalesOrder',
+    // A park is evidence ABOUT AN IMS ORDER, so it always names one. This is also what the partial
+    // unique index requires, and what separates a park from every other FROM_CONNECTOR/SalesOrder
+    // row this table holds (a failed import, a pending-FX queue row) — none of which has one.
+    entityId: { not: null },
+    status: { in: [...RECOVERABLE_REFUND_PARK_STATUSES] },
+  }
+}
+
+/**
  * The status a resolved park carries.
  *
  * SYNCED is not a claim that this refund posted — it is this table's established "an operator

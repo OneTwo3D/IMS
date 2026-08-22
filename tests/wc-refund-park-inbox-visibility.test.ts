@@ -1,0 +1,476 @@
+import assert from 'node:assert/strict'
+import test, { mock } from 'node:test'
+
+import type { WcRefund } from '@/lib/connectors/woocommerce/sync/types'
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu r7 (Codex HIGH) — A VALID REFUND REASON HID THE PARK FROM THE INBOX.
+//
+// The exception inbox used to select refund parks by EXCLUDING every row whose payload's top-level
+// `reason` was `missing_fx_rate`, to keep the pending-FX import queue out of the list. But a refund
+// park persists the RAW WOOCOMMERCE REFUND, and `reason` on a WooCommerce refund is free text a
+// human types when they issue it. So an operator who typed that string hid their own park — from the
+// inbox, from `retryRefundSyncPark`, and from `recoverRefundSyncPark`, all three of which read the
+// same predicate.
+//
+// And this branch made a FOREIGN park HOLD the refund delivery: the cross-order guard refuses and
+// waits for the "Wrong order" recovery. A park nobody can see is a recovery nobody can perform, so
+// the hold is permanent. A cosmetic collision became a stuck order.
+//
+// This is the end-to-end regression: ONE park store, three real production paths over it —
+//
+//   1. INBOX        getExceptionInboxData / getExceptionInboxSummary must LIST and COUNT it;
+//   2. REASSIGNMENT recoverRefundSyncPark must find it and move it to its true owner;
+//   3. REDELIVERY   syncWcRefund on that owner must no longer be held by it, and must apply.
+//
+// plus the control that the thing the exclusion was aimed at is still told apart — by a column IMS
+// writes, not by a string an operator types.
+// ---------------------------------------------------------------------------
+
+/** The refund reason that used to be fatal. It is an ordinary thing for a person to type. */
+const HOSTILE_REFUND_REASON = 'missing_fx_rate'
+
+type ParkRow = {
+  id: string
+  connector: string
+  direction: string
+  entityType: string
+  status: string
+  entityId: string | null
+  externalId: string | null
+  errorMessage: string | null
+  payload: unknown
+  syncedAt: Date | null
+  createdAt: Date
+}
+
+const state = {
+  permissions: new Set<string>(['sync']),
+  /** THE ONE STORE every layer below reads and writes. That sharing is what makes this end-to-end. */
+  parks: [] as ParkRow[],
+  refunds: [] as Array<{ id: string; externalRefundId: number; orderId: string }>,
+  links: [] as Array<{ orderId: string; connector: string; externalOrderId: string }>,
+  orders: new Set<string>(),
+  activity: [] as Array<Record<string, unknown>>,
+  /** WooCommerce's own answer, per WC order id — the authority the reassignment is verified against. */
+  wcRefundsByOrder: new Map<number, number[]>(),
+  createRefundCalls: 0,
+}
+
+// --- a where-interpreter that refuses to guess ---------------------------------------------------
+// It THROWS on an operator it does not implement. A double that quietly matched everything would
+// turn "the park is visible" into an assertion about the double rather than about the predicate.
+
+function jsonPath(value: unknown, path: string[]): unknown {
+  let cursor = value
+  for (const key of path) {
+    if (!cursor || typeof cursor !== 'object') return undefined
+    cursor = (cursor as Record<string, unknown>)[key]
+  }
+  return cursor
+}
+
+function matches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
+  for (const [key, condition] of Object.entries(where)) {
+    if (key === 'OR') {
+      if (!(condition as Array<Record<string, unknown>>).some((branch) => matches(row, branch))) return false
+      continue
+    }
+    if (key === 'NOT') {
+      if (matches(row, condition as Record<string, unknown>)) return false
+      continue
+    }
+    const value = row[key] ?? null
+    if (condition !== null && typeof condition === 'object' && !(condition instanceof Date)) {
+      const test = condition as Record<string, unknown>
+      for (const op of Object.keys(test)) {
+        if (op === 'in') {
+          if (!(test.in as unknown[]).includes(value)) return false
+        } else if (op === 'not') {
+          if (test.not === null ? value === null : value === test.not) return false
+        } else if (op === 'path') {
+          if (!('equals' in test)) throw new Error('test double: payload path without equals')
+        } else if (op === 'equals') {
+          if (test.path) {
+            if (jsonPath(value, test.path as string[]) !== test.equals) return false
+          } else if (value !== test.equals) {
+            return false
+          }
+        } else {
+          throw new Error(`test double does not implement where operator ${op}`)
+        }
+      }
+      continue
+    }
+    if (value !== condition) return false
+  }
+  return true
+}
+
+function project(row: Record<string, unknown>, select?: Record<string, unknown>) {
+  if (!select) return { ...row }
+  return Object.fromEntries(Object.keys(select).filter((key) => select[key]).map((key) => [key, row[key]]))
+}
+
+const shoppingSyncLog = {
+  async findFirst({ where, select }: { where?: Record<string, unknown>; select?: Record<string, unknown> } = {}) {
+    const row = state.parks.find((park) => matches(park as unknown as Record<string, unknown>, where ?? {}))
+    return row ? project(row as unknown as Record<string, unknown>, select) : null
+  },
+  async findMany({ where, select }: { where?: Record<string, unknown>; select?: Record<string, unknown> } = {}) {
+    return state.parks
+      .filter((park) => matches(park as unknown as Record<string, unknown>, where ?? {}))
+      .map((park) => project(park as unknown as Record<string, unknown>, select))
+  },
+  async count({ where }: { where?: Record<string, unknown> } = {}) {
+    return state.parks.filter((park) => matches(park as unknown as Record<string, unknown>, where ?? {})).length
+  },
+  async update({ where, data }: { where: { id: string }; data: Record<string, unknown> }) {
+    const row = state.parks.find((park) => park.id === where.id)
+    if (!row) throw new Error(`test double: no park ${where.id}`)
+    Object.assign(row, data)
+    return { ...row }
+  },
+  async updateMany({ where, data }: { where?: Record<string, unknown>; data: Record<string, unknown> }) {
+    const hits = state.parks.filter((park) => matches(park as unknown as Record<string, unknown>, where ?? {}))
+    for (const hit of hits) Object.assign(hit, data)
+    return { count: hits.length }
+  },
+  async create({ data }: { data: Record<string, unknown> }) {
+    const row = { id: `log-${state.parks.length + 1}`, syncedAt: null, createdAt: new Date(), payload: null, errorMessage: null, ...data } as unknown as ParkRow
+    state.parks.push(row)
+    return { ...row }
+  },
+  async deleteMany() { return { count: 0 } },
+}
+
+/**
+ * Everything else this page reads answers "nothing here". The subject is the refund-park predicate;
+ * an inbox with no other exceptions in it is the cleanest place to watch it.
+ */
+const emptyModel = {
+  async findMany() { return [] },
+  async findFirst() { return null },
+  async findUnique() { return null },
+  async count() { return 0 },
+  async updateMany() { return { count: 0 } },
+  async update() { return {} },
+  async aggregate() { return {} },
+  async groupBy() { return [] },
+}
+
+const salesOrder = {
+  ...emptyModel,
+  async findMany() {
+    return [...state.orders].map((id) => ({
+      id,
+      orderNumber: `SO-${id}`,
+      currency: 'GBP',
+      taxRateName: 'UK Standard Rate',
+      shippingForeign: 0,
+      shippingService: null,
+      shoppingLinks: [{ connector: 'woocommerce' }],
+      taxForeign: 2.5,
+      discountAmount: 0,
+      lines: [],
+    }))
+  },
+  async findFirst() {
+    return {
+      id: 'so-A',
+      externalOrderNumber: 'WC-1001',
+      fxRateToBase: 1,
+      currency: 'GBP',
+      taxRateName: 'UK Standard Rate',
+      totalBase: 15,
+      taxBase: 2.5,
+      taxRatePercent: 0.2,
+      shippingBase: 0,
+      lines: [{
+        id: 'line-1',
+        productId: 'product-1',
+        externalLineItemId: 501,
+        description: 'Widget',
+        qty: 1,
+        totalBase: 12.5,
+        taxBase: 2.5,
+        taxRate: { rate: 0.2, reverseCharge: false },
+      }],
+    }
+  },
+}
+
+const shoppingOrderLink = {
+  ...emptyModel,
+  async findFirst({ where, select }: { where?: Record<string, unknown>; select?: Record<string, unknown> } = {}) {
+    const row = state.links.find((link) => matches(link as unknown as Record<string, unknown>, where ?? {}))
+    return row ? project(row as unknown as Record<string, unknown>, select) : null
+  },
+  async findMany({ where, select }: { where?: Record<string, unknown>; select?: Record<string, unknown> } = {}) {
+    const orderIds = ((where?.orderId as { in?: string[] })?.in) ?? null
+    return state.links
+      .filter((link) => link.connector === 'woocommerce' && (!orderIds || orderIds.includes(link.orderId)))
+      .map((link) => project(link as unknown as Record<string, unknown>, select))
+  },
+}
+
+const salesOrderRefund = {
+  ...emptyModel,
+  async findFirst({ where, select }: { where?: Record<string, unknown>; select?: Record<string, unknown> } = {}) {
+    const row = state.refunds.find((refund) => matches(refund as unknown as Record<string, unknown>, where ?? {}))
+    return row ? project(row as unknown as Record<string, unknown>, select) : null
+  },
+}
+
+const client: Record<string, unknown> = {
+  shoppingSyncLog,
+  salesOrder,
+  salesOrderRefund,
+  shoppingOrderLink,
+  warehouse: { ...emptyModel, async findFirst() { return { id: 'return-wh' } } },
+  async $executeRaw() { return 1 },
+  async $queryRaw(strings: TemplateStringsArray, ...values: unknown[]) {
+    if (/FROM "sales_orders"/.test(strings.join(''))) {
+      const id = values[0] as string
+      return state.orders.has(id) ? [{ id }] : []
+    }
+    return []
+  },
+  async $transaction(fn: (tx: unknown) => Promise<unknown>) {
+    const snapshot = state.parks.map((park) => ({ ...park }))
+    try {
+      return await fn(db)
+    } catch (error) {
+      state.parks = snapshot
+      throw error
+    }
+  },
+}
+
+/**
+ * Any model this page reaches for that is not named above answers "nothing", rather than throwing.
+ * The alternative is a test that fails whenever an unrelated section is added to the inbox, which
+ * would make the regression this file exists for the FIRST thing anybody deleted.
+ */
+const db = new Proxy(client, {
+  get(target, property: string) {
+    if (property in target) return target[property]
+    return emptyModel
+  },
+})
+
+mock.module('@/lib/db', { namedExports: { db } })
+mock.module('@/lib/auth/server', {
+  namedExports: {
+    requirePermission: async (permission: string) => {
+      if (!state.permissions.has(permission)) throw new Error(`Forbidden: missing permission ${permission}`)
+      return { user: { id: 'op-1' } }
+    },
+    requireFreshPermission: async (permission: string) => {
+      if (!state.permissions.has(permission)) throw new Error(`Forbidden: missing permission ${permission}`)
+      return { user: { id: 'op-1' } }
+    },
+    freshAuthFailureResult: () => null,
+  },
+})
+mock.module('@/lib/activity-log', { namedExports: { logActivity: async (entry: Record<string, unknown>) => { state.activity.push(entry) } } })
+mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
+mock.module('@/lib/connectors/woocommerce/api', {
+  namedExports: {
+    wcFetch: async (path: string, params: Record<string, string> = {}) => {
+      const match = /^\/orders\/(\d+)\/refunds$/.exec(path)
+      if (!match) throw new Error(`test double does not implement WC path ${path}`)
+      const all = state.wcRefundsByOrder.get(Number(match[1])) ?? []
+      const perPage = Math.min(Number(params.per_page ?? '10'), 100)
+      const page = Number(params.page ?? '1')
+      return {
+        data: all.slice((page - 1) * perPage, page * perPage).map((id) => ({ id })),
+        totalPages: Math.max(1, Math.ceil(all.length / perPage)),
+        totalItems: all.length,
+      }
+    },
+  },
+})
+
+/** The WooCommerce refund as the store sent it — reason and all. This is what a park stores. */
+function wcRefund(overrides: Partial<WcRefund> = {}): WcRefund {
+  return {
+    id: 7001,
+    parent_id: 1001,
+    date_created: '2026-08-05T10:00:00',
+    date_created_gmt: '2026-08-05T10:00:00',
+    // GROSS, as WooCommerce reports it: the 12.50 net line plus its 2.50 of VAT. The sync reconciles
+    // the refund against the order's own money, so a figure that did not add up would fail this
+    // chain for a reason that has nothing to do with the park.
+    amount: '15.00',
+    // THE WHOLE FINDING, in one field. An operator typed it into WooCommerce's refund dialog.
+    reason: HOSTILE_REFUND_REASON,
+    refunded_by: 1,
+    refunded_payment: true,
+    meta_data: [],
+    line_items: [{
+      id: 601,
+      name: 'Widget',
+      product_id: 10,
+      variation_id: 0,
+      quantity: -1,
+      tax_class: '',
+      subtotal: '-12.50',
+      subtotal_tax: '-2.50',
+      total: '-12.50',
+      total_tax: '-2.50',
+      sku: 'WIDGET',
+      meta_data: [{ id: 1, key: '_refunded_item_id', value: '501' }],
+      refund_total: 12.5,
+    }],
+    ...overrides,
+  } as WcRefund
+}
+
+function parkRow(over: Partial<ParkRow> = {}): ParkRow {
+  return {
+    id: 'log-1',
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    entityType: 'SalesOrder',
+    status: 'FAILED',
+    // Parked against the WRONG order — the state the "Wrong order" recovery exists for.
+    entityId: 'so-B',
+    externalId: '7001',
+    errorMessage: 'WooCommerce refund 7001 amount mismatch',
+    payload: wcRefund(),
+    syncedAt: null,
+    createdAt: new Date('2026-08-05T10:00:00.000Z'),
+    ...over,
+  }
+}
+
+test.beforeEach(() => {
+  state.permissions = new Set(['sync'])
+  state.parks = [parkRow()]
+  state.refunds = []
+  state.links = [
+    { orderId: 'so-A', connector: 'woocommerce', externalOrderId: '1001' },
+    { orderId: 'so-B', connector: 'woocommerce', externalOrderId: '2002' },
+  ]
+  state.orders = new Set(['so-A', 'so-B'])
+  state.activity = []
+  // WooCommerce says refund 7001 is on order 1001 — the order the park is NOT on.
+  state.wcRefundsByOrder = new Map([[1001, [7001]], [2002, [9001]]])
+  state.createRefundCalls = 0
+})
+
+async function inbox() {
+  return await import('@/app/actions/sync-exceptions')
+}
+
+test('[o3d-xnwu r7] a park whose refund reason is the FX marker is still listed and counted by the inbox', async () => {
+  // Leg 1. Before the fix the park was filtered out of both the list and the count, so the page an
+  // operator is sent to by the hold showed nothing at all.
+  //
+  // (Revert evidence: restore the `OR: [{ payload DbNull }, { NOT: payload.reason == 'missing_fx_rate' }]`
+  // clause on REFUND_PARK_WHERE and this fails with 0 parks and a total of 0.)
+  const { getExceptionInboxData, getExceptionInboxSummary } = await inbox()
+
+  const summary = await getExceptionInboxSummary()
+  assert.equal(summary.refundSyncParks, 1, 'the park must be COUNTED — the badge is what sends an operator to the page')
+  assert.equal(summary.total, 1)
+
+  const data = await getExceptionInboxData()
+  assert.equal(data.refundSyncParks.length, 1, 'and LISTED, or there is nothing on the page to act on')
+  assert.equal(data.refundSyncParks[0].id, 'log-1')
+  assert.equal(data.refundSyncParks[0].externalRefundId, '7001')
+  assert.equal(data.refundSyncParks[0].orderId, 'so-B', 'shown against the order it is wrongly sitting on')
+  assert.equal(data.refundSyncParks[0].wcOrderId, '2002', 'with that order\'s WooCommerce id, which is how a human spots the mismatch')
+})
+
+test('[o3d-xnwu r7] the same park can be REASSIGNED to its true owner', async () => {
+  // Leg 2. The recovery reads the same predicate, so a hidden park was also an unrecoverable one:
+  // it answered "that refund park no longer exists or is already resolved" about a row sitting
+  // right there in the table.
+  //
+  // (Revert evidence: restore the payload-reason exclusion and this fails with code
+  // 'park_not_actionable'.)
+  const { recoverRefundSyncPark } = await inbox()
+
+  const result = await recoverRefundSyncPark('log-1', { observedOrderId: 'so-B', outcome: 'REASSIGN', wcOrderId: 1001 })
+
+  assert.deepEqual(result, { success: true, outcome: 'REASSIGN', targetOrderId: 'so-A' })
+  const park = state.parks[0]
+  assert.equal(park.entityId, 'so-A', 'the park now sits on the order WooCommerce named')
+  assert.equal(park.status, 'PENDING', 'as PENDING — the one actionable status the sweep dedup does not skip')
+})
+
+test('[o3d-xnwu r7] and the next delivery on the true owner is no longer held by it', async () => {
+  // Leg 3, the reason legs 1 and 2 matter. A FOREIGN park HOLDS the delivery: the cross-order guard
+  // refuses and waits for the recovery. Once the park has been moved, the same delivery falls
+  // through and the refund is applied — which is the whole chain the hidden park broke.
+  const { recoverRefundSyncPark } = await inbox()
+  const { syncWcRefund } = await import('@/lib/connectors/woocommerce/sync/refund-sync')
+
+  const dependencies = {
+    db: db as never,
+    createRefund: (async (_orderId: string, _lines: unknown, _reason: unknown, _wh: unknown, options?: { externalRefundId?: number }) => {
+      state.createRefundCalls += 1
+      state.refunds.push({ id: 'refund-1', externalRefundId: options?.externalRefundId ?? 0, orderId: 'so-A' })
+      return { success: true }
+    }) as never,
+    logActivity: (async (entry: Record<string, unknown>) => { state.activity.push(entry) }) as never,
+  }
+
+  // BEFORE the recovery: the delivery for the true owner is held, not settled and not applied.
+  const held = await syncWcRefund(1001, wcRefund(), dependencies)
+  assert.equal(held.outcome, 'cross-order-park-resolvable', 'a foreign park HOLDS the delivery — that is the branch this depends on')
+  assert.equal(state.createRefundCalls, 0)
+
+  // The operator does the one thing the product offers, on the page they can now see it.
+  const recovered = await recoverRefundSyncPark('log-1', { observedOrderId: 'so-B', outcome: 'REASSIGN', wcOrderId: 1001 })
+  assert.equal(recovered.success, true)
+
+  // AFTER: the redelivery applies.
+  const applied = await syncWcRefund(1001, wcRefund(), dependencies)
+  assert.notEqual(applied.outcome, 'cross-order-park-resolvable', 'the hold is gone')
+  assert.equal(state.createRefundCalls, 1, 'and the refund the hold was protecting is finally recorded')
+})
+
+test('[o3d-xnwu r7] the pending-FX queue is still told apart — by a column IMS writes, not a string an operator types', async () => {
+  // The control. The exclusion existed to keep the missing-FX import queue out of the inbox, and
+  // dropping it must not put it back. It does not: a queued order has no IMS order yet, which is why
+  // it is queued, and that is what both predicates now turn on.
+  //
+  // (Revert evidence: drop `entityId: null` from pendingFxQueueWhere and the last assertion fails —
+  // the FX retry sweep would select the refund park and stamp it FAILED over its own error text.)
+  const { getExceptionInboxData } = await inbox()
+  const { pendingFxQueueWhere } = await import('@/lib/connectors/woocommerce/sync/order-import')
+
+  // PENDING, because that is the state the collision is worst in — and it is not a contrived one: a
+  // retryable park is PENDING, and a park the operator has just REASSIGNED is PENDING by design
+  // (REASSIGNED_REFUND_PARK_STATUS). The FX retry sweep selects PENDING rows.
+  state.parks[0].status = 'PENDING'
+
+  const queueRow: ParkRow = {
+    id: 'fx-1',
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    entityType: 'SalesOrder',
+    status: 'PENDING',
+    entityId: null,
+    externalId: '1001',
+    errorMessage: 'waiting for a EUR rate',
+    payload: { reason: 'missing_fx_rate', connector: 'woocommerce', externalOrderId: '1001', externalOrderNumber: '1001', currency: 'EUR', asOf: null, order: { id: 1001 } },
+    syncedAt: null,
+    createdAt: new Date('2026-08-05T09:00:00.000Z'),
+  }
+  state.parks.push(queueRow)
+
+  const data = await getExceptionInboxData()
+  assert.deepEqual(data.refundSyncParks.map((row) => row.id), ['log-1'], 'the queue row is not a refund park')
+
+  const fxWhere = pendingFxQueueWhere() as unknown as Record<string, unknown>
+  assert.equal(matches(queueRow as unknown as Record<string, unknown>, fxWhere), true, 'and the queue row IS the FX queue')
+  assert.equal(
+    matches(state.parks[0] as unknown as Record<string, unknown>, fxWhere),
+    false,
+    'while the refund park is NOT — otherwise the FX retry sweep stamps it FAILED over its own error text',
+  )
+})

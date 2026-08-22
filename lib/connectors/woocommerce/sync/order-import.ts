@@ -191,12 +191,34 @@ function getPendingFxNotifyThreshold(env: Record<string, string | undefined> = p
   return parsePositiveIntegerEnv(env.WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD, DEFAULT_PENDING_FX_NOTIFY_THRESHOLD)
 }
 
+/**
+ * The pending-FX queue, and NOTHING ELSE THIS TABLE HOLDS (o3d-xnwu r7, Codex HIGH).
+ *
+ * `entityId: null` is the load-bearing clause, and it is load-bearing in both directions.
+ *
+ * A queued order has no IMS order yet — that is WHY it is queued, and `recordPendingFxOrder` has
+ * never written one. A REFUND PARK, by contrast, always names the IMS order it is evidence about.
+ * So this column separates the two sets by construction, and it is a column IMS writes.
+ *
+ * `payload.reason` DOES NOT, and relying on it here was a live defect. A refund park persists the
+ * RAW WOOCOMMERCE REFUND, whose top-level `reason` is free text a human types when issuing the
+ * refund. A PENDING park whose operator wrote `missing_fx_rate` matched this query, failed
+ * `isQueuedWcOrderPayload` (correctly — it is not an order snapshot), and was then STAMPED FAILED by
+ * `markPendingFxRetryLogFailed` with a message about a missing order snapshot — overwriting the
+ * park's own error text, which is what the Record-manually and recovery paths read. A user-controlled
+ * string cannot be allowed to select rows for a writer.
+ *
+ * The marker stays as a POSITIVE assertion about our own payload — it is what we wrote, and the
+ * replay verifies the whole shape with `isQueuedWcOrderPayload` before touching it — but it is no
+ * longer the only thing standing between an operator's refund reason and a destructive update.
+ */
 export function pendingFxQueueWhere(externalOrderId?: string): Prisma.ShoppingSyncLogWhereInput {
   return {
     connector: 'woocommerce',
     direction: 'FROM_CONNECTOR',
     status: 'PENDING',
     entityType: 'SalesOrder',
+    entityId: null,
     ...(externalOrderId ? { externalId: externalOrderId } : {}),
     payload: {
       path: ['reason'],

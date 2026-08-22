@@ -52,6 +52,12 @@ test('WooCommerce pending FX queue lookup uses structured payload reason, not GB
     direction: 'FROM_CONNECTOR',
     status: 'PENDING',
     entityType: 'SalesOrder',
+    // o3d-xnwu r7: a queued order has no IMS order yet — that is WHY it is queued — and a REFUND PARK
+    // always names one. This clause is what keeps the two sets disjoint, and it is the half that does
+    // not depend on payload contents: `reason` on a park's payload is the raw WooCommerce refund's
+    // reason, which is free text a human types. Without this, a PENDING park whose operator wrote
+    // `missing_fx_rate` was selected by the FX retry sweep and stamped FAILED over its own error text.
+    entityId: null,
     externalId: 'wc-123',
     payload: {
       path: ['reason'],

@@ -12,6 +12,7 @@ import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idem
 import { REFUND_TOTAL_EPSILON } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { FULL_REFUND_RATIO } from '@/lib/domain/sales/refund-thresholds'
+import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 // o3d-w00 (Codex r7 #3): shared with the exception inbox's hand-recording path — see refund-line-link.
 import { refundedOrderLineId } from './refund-line-link'
 export { refundedOrderLineId }
@@ -426,13 +427,12 @@ async function upsertRefundPark(
   // Match the partial unique index shopping_sync_logs_active_refund_park_uq EXACTLY (connector, direction,
   // entityType, actionable status, externalId, and entityId NOT NULL) so this can never pick up an
   // order-import failure log (same connector/type but no entityId) that happens to share an externalId.
+  // o3d-xnwu r7: the shape is stated ONCE, in activeRefundParkWhere, because the exception inbox and
+  // the cross-order guard below have to mean exactly this by "an actionable park" and three
+  // hand-written copies could not be relied on to.
   const parkWhere: Prisma.ShoppingSyncLogWhereInput = {
-    connector: 'woocommerce',
-    direction: 'FROM_CONNECTOR',
-    entityType: 'SalesOrder',
+    ...activeRefundParkWhere(),
     externalId: input.externalId,
-    entityId: { not: null },
-    status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
   }
   const data = {
     connector: 'woocommerce' as const,
@@ -714,13 +714,12 @@ export async function syncWcRefund(
     // order's QUARANTINED park is "handled" (awaiting operator resolution — not retryable); a PENDING/FAILED
     // park is this order's own retryable state, so fall through and let the sync re-attempt it.
     const parked = await client.shoppingSyncLog.findFirst({
+      // o3d-xnwu r7: the SAME predicate the exception inbox lists by. It has to be — this guard holds
+      // the delivery until an operator recovers the park it found, and a park this can see but the
+      // inbox cannot is a hold with no way out.
       where: {
-        connector: 'woocommerce',
-        direction: 'FROM_CONNECTOR',
-        entityType: 'SalesOrder',
+        ...activeRefundParkWhere(),
         externalId: String(wcRefund.id),
-        entityId: { not: null },
-        status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
       },
       select: { entityId: true, status: true },
     })
