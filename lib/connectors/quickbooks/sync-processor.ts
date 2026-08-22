@@ -172,12 +172,19 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
  * claimed and the entry is retried, which is the right state for work that has not run.
  *
  * A DISTINCT CLASS, not a bare Error (Codex, this branch). "Both post paths handle a throw
- * correctly" was true of the SHORT-CIRCUIT path, which has no catch and lets the throw reach the
- * outer retry handler — and false of the FRESH-POST path one branch down, whose local catch treats
- * every follow-up exception as best-effort, logs it and counts the entry SUCCEEDED. That is the
- * o3d-peh1 defect itself: the parent reported settled while the money-moving child was never
- * enqueued. The two cases the catch now has to tell apart are genuinely different, which is why the
- * type exists rather than a string match on the message:
+ * correctly" was false of the FRESH-POST path, whose local catch treats every follow-up exception as
+ * best-effort, logs it and counts the entry SUCCEEDED. That is the o3d-peh1 defect itself: the
+ * parent reported settled while the money-moving child was never enqueued. The two cases THAT catch
+ * has to tell apart are genuinely different, which is why the type exists rather than a string match
+ * on the message:
+ *
+ * The SHORT-CIRCUIT path needs no such distinction and does not make one (Codex round 2, HIGH). It
+ * used to have no catch at all, which sent every follow-up exception — refused or merely failed —
+ * into the main-post failure handler, where a final failure stamps the mirrored AccountingEvent
+ * FAILED on a document that is demonstrably in the ledger. It now catches both and routes both to
+ * `markSyncLogForFollowUpRetry`, which is the transition that keeps the mirror truthful. See the
+ * comment on that catch for why catching the plain failure there is not a widening.
+ *
  *
  *   • a follow-up enqueue that FAILED — a transient database error. The work is still owed and the
  *     obligation marker records that; QuickBooks deliberately does not fail the entry for it, and
@@ -201,7 +208,10 @@ function requireFollowUpsEnqueued(entryId: string, outcome: FollowUpEnqueueOutco
  * RETURN A POSTED PARENT TO ITS UNSETTLED STATE, KEEPING THE TWO FACTS THAT MAKE IT RECOVERABLE.
  *
  * The Xero twin is `markSyncLogForFollowUpRetry`, and this is deliberately the same three-column
- * write rather than a re-use of the QuickBooks main-failure path a few lines below:
+ * write rather than a re-use of the QuickBooks main-failure path a few lines below. BOTH posted
+ * arms use it (Codex round 2, HIGH): the fresh-post arm for a refusal, the short-circuit arm for
+ * every follow-up failure, because on that arm the row is only there at all by virtue of an external
+ * id — a document in the ledger — and the main-failure path's terminal write would deny it:
  *
  *   • `externalTransactionId` IS NOT TOUCHED. It is post evidence — the only local record that the
  *     document is in QuickBooks — and it is also what makes the retry safe: the loop's idempotency
@@ -227,7 +237,11 @@ async function markSyncLogForFollowUpRetry(
     data: {
       status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
       retryCount,
-      errorMessage: `QuickBooks follow-up work was refused after connector post: ${String(error)}`,
+      // Covers both callers: the fresh-post arm sends only REFUSALS here, the short-circuit arm
+      // sends every follow-up failure. The refusal's own text says "REFUSED and nothing was queued",
+      // so the prefix does not need to claim which happened — and claiming it would be wrong for
+      // half the rows that now reach this line.
+      errorMessage: `QuickBooks follow-up work did not complete after connector post: ${String(error)}`,
       processingStartedAt: null,
     },
   })
@@ -611,15 +625,65 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             externalId: entry.externalTransactionId,
           })
         })
-        await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
-        // o3d-peh1: a REFUSED enqueue throws here for the same reason a failed one does — the
-        // release below must not discharge a marker for work that was never queued. The outer
-        // handler retries the row with the obligation still claimed.
-        requireFollowUpsEnqueued(entry.id, await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId }))
-        // Only reached when the enqueue did NOT throw. This branch has no catch of its own — an
-        // exception propagates to the outer handler, which retries the row — so the obligation
-        // simply stays claimed, which is the correct state for work that has not run.
-        await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
+        // EVERY FOLLOW-UP FAILURE ON THIS ARM IS CAUGHT HERE, AND NONE OF THEM MAY REACH THE
+        // MAIN-POST FAILURE HANDLER (Codex round 2, HIGH).
+        //
+        // Round 1 gave the refusal its own transition on the FRESH-POST arm and left this one
+        // relying on the outer handler, reasoning that it "retries the row with the obligation still
+        // claimed". It does retry it — and on the LAST retry it also stamps the mirrored
+        // AccountingEvent FAILED, a few lines after this very branch wrote that same event POSTED.
+        // A row is only in this branch because `externalTransactionId` is set, i.e. because the
+        // document IS in QuickBooks, so the outer handler's terminal write records a live ledger
+        // document as a failed post — worse than the defect round 1 closed.
+        //
+        // Round 1 had already written down why: `markSyncLogForFollowUpRetry` writes NO mirrored
+        // event precisely because "this document POSTED, the mirror already says so, and overwriting
+        // it would make the ledger's own copy of the record contradict the ledger". That reasoning
+        // applies to this arm most of all, and it was the one arm not using the transition.
+        //
+        // So the follow-up work takes a catch of its own — the same shape as the Xero twin, which
+        // has had one since o3d-nepa — routed to the follow-up-only retry transition. Nothing else
+        // moves: the entry is still counted FAILED, still bounded by MAX_RETRIES, still keeps its
+        // external id and its obligation marker, and still re-enters this short-circuit on the next
+        // pass rather than posting a second document.
+        //
+        // CATCH-ALL, NOT `instanceof FollowUpEnqueueRefused`. The narrow catch belongs to the
+        // FRESH-POST arm, where a plain follow-up failure is deliberately best-effort and falls
+        // through to `succeeded` (o3d-peh1, and the test that pins it). Nothing on THIS arm was ever
+        // best-effort: every exception here already counted FAILED, through the outer handler. So
+        // for a plain failure the only thing that changes is WHICH transition records it, and it is
+        // the transition that does not contradict the ledger.
+        try {
+          await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+          // o3d-peh1: a REFUSED enqueue throws here for the same reason a failed one does — the
+          // release below must not discharge a marker for work that was never queued.
+          requireFollowUpsEnqueued(entry.id, await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId }))
+          // Only reached when the enqueue did NOT throw, so the obligation is discharged only for
+          // work that actually ran.
+          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
+        } catch (followUpError) {
+          await logActivity({
+            entityType: 'SYSTEM',
+            action: 'quickbooks_followup_error',
+            tag: 'sync',
+            level: 'ERROR',
+            description: `QuickBooks sync entry ${entry.id} is already posted (${entry.externalTransactionId}) but its `
+              + `follow-up work could not be completed: ${String(followUpError)}. The document is in QuickBooks and the `
+              + 'entry keeps its external id, so a retry resumes at the follow-ups rather than posting again.',
+            metadata: {
+              syncLogId: entry.id,
+              type: entry.type,
+              referenceType: entry.referenceType,
+              referenceId: entry.referenceId,
+              externalTransactionId: entry.externalTransactionId,
+            },
+            // A log write that fails must not throw out of the catch and land in the main-post
+            // failure handler — which is the entire hazard this block exists to remove.
+          }).catch(() => { /* the announcement is best-effort; the transition below is not */ })
+          await markSyncLogForFollowUpRetry(entry, followUpError)
+          result.failed++
+          continue
+        }
         result.succeeded++
         continue
       }
