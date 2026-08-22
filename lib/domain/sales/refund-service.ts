@@ -4107,10 +4107,65 @@ export async function createSalesOrderRefund(
           where: { id: txResult.createdRefund.id },
           data: {
             accountingRetrySyncs: refundAccountingSyncsJson(result.accountingSyncs),
-            // o3d-mrwu: staging succeeded and the syncs are now durable, so the row no longer
-            // owes anything. This is the ONLY place the flag is cleared — everything else
-            // leaves it set, which is what makes a crash recoverable.
-            accountingRetryRequired: false,
+            // -------------------------------------------------------------------------------------
+            // o3d-2sm1 r6 (Codex HIGH) — THE FLAG IS DELIBERATELY *NOT* CLEARED HERE.
+            //
+            // THE DEFECT, ONE SEAM ALONG. r5 closed the gap between staging and RECORDING the sync
+            // list by putting both writes in this transaction. But this transaction also wrote
+            // `accountingRetryRequired: false`, and the caller does not QUEUE those syncs until
+            // later, outside it (`queueRefundAccountingActions` in app/actions/sales.ts). So a crash
+            // after this commit and before the queueing landed left a refund that OWED ACCOUNTING,
+            // HAD NO QUEUED WORK, AND NO LONGER CARRIED THE FLAG THAT WOULD BRING ANYONE BACK:
+            //
+            //   • `retrySalesOrderRefundAccounting` refuses outright on `!accountingRetryRequired`
+            //     ("no failed refund accounting action is pending"), so the one recovery route is
+            //     shut;
+            //   • `reversalRecordVerdict` answers `nothing-lost` from the cleared flag alone, before
+            //     it ever looks at the witness;
+            //   • the accounting invariant's reversal query is bounded by
+            //     `where: { accountingRetryRequired: true }`, so the row is outside the report;
+            //   • and the credit note, the COGS reversal, the unearned reversal and the allocation
+            //     reversal are all still unqueued.
+            //
+            // That is the same shape this whole branch exists to end — an obligation discharged
+            // before the thing that discharges it has happened — fixed at one seam and left standing
+            // at the next.
+            //
+            // SO THE OBLIGATION STAYS DURABLE THROUGH THE CALLER'S QUEUEING PHASE. The flag is set at
+            // INSERT (`Boolean(so.revenueDeferredDate && input.accountingSettings)`) and is now
+            // cleared in exactly one place: `clearRefundAccountingRetryState`, which `createRefund`
+            // runs only after `queueRefundAccountingActions` has RETURNED WITHOUT THROWING and no
+            // accounting warning was raised. Every path that fails between here and there leaves it
+            // set, which is what makes the crash recoverable.
+            //
+            // WHAT "PERSISTED" MEANS AT THAT POINT, PRECISELY — because if the queueing were not
+            // durable when it returned, moving the clear would only relocate the window. It is
+            // durable: `queueAccountingSync` -> `queueXeroSync` commits its `AccountingSyncLog` row
+            // in its own `db.$transaction`, and the COGS_REVERSAL arm commits the sync row and its
+            // COGS subledger row together in one. Each returns only after its commit, and
+            // `queueRefundAccountingActions` awaits them in sequence, so when it returns every sync
+            // it queued is committed in Postgres. A crash PART WAY through it therefore leaves some
+            // rows queued, the rest not, and the flag still set — and every queue write is
+            // idempotent on its key, so the retry re-queues the remainder and adds no duplicate.
+            //
+            // THE RESIDUAL, STATED EXACTLY, BECAUSE IT IS NOT ZERO. Between the last queue commit and
+            // the caller's clearing UPDATE there is still one window, and it cannot be closed from
+            // here: the clear is a different transaction from the last queue write by construction,
+            // since the queueing is many transactions and not one. A crash inside it leaves the flag
+            // SET on a refund that owes nothing. That is a stale flag, not a lost reversal, and the
+            // asymmetry is the whole point — it is LOUD (the refund keeps its retry affordance and
+            // the accounting inbox keeps naming it) and RECOVERABLE (re-running the retry re-queues
+            // nothing new, because every key is already taken, and then clears the flag). The
+            // window this replaces was silent and unrecoverable. See the note on
+            // `reversalRecordVerdict` for what such a row reads as: `accountingRetrySyncs` is
+            // recorded, so the verdict is `nothing-lost` and it is never accused of having lost a
+            // staged reversal.
+            //
+            // AND THE GUARDS THAT READ THE FLAG GET MORE CONSERVATIVE, NOT LESS: the prior-refund
+            // block at `existingRefunds` and the chargeback replay guard at `existingChargeback`
+            // both refuse while it is set, so the widened window can only refuse a concurrent second
+            // refund that would previously have been admitted mid-queue. Both already fail closed.
+            // -------------------------------------------------------------------------------------
             // scjz.71: durably record whether any COGS/unearned reversal was staged
             // (the UNEARNED_REV_REVERSAL sync also carries allocation reversal) so the
             // invariant/reconciliation evidence checks can tell a credit-note-only

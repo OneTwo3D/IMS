@@ -17,6 +17,7 @@ import {
 import {
   REVERSAL_STAGING_NOT_STAGED,
   REVERSAL_STAGING_STAGED,
+  reversalRecordVerdict,
 } from '@/lib/domain/sales/refund-reversal-record'
 import type { AccountingSettings } from '@/lib/accounting'
 import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
@@ -3036,6 +3037,28 @@ test('createSalesOrderRefund reverses the FULL deferral on a full refund of a sh
 // amount, which a presence check cannot see.
 // ---------------------------------------------------------------------------
 
+/**
+ * WHAT THE CALLER DOES AFTER `createSalesOrderRefund` RETURNS (o3d-2sm1 r6).
+ *
+ * `createSalesOrderRefund` is one half of the create path. The other half lives in `createRefund`
+ * (app/actions/sales.ts): it queues the syncs the staging recorded and, ONLY once that has returned
+ * with every sync row committed, runs `clearRefundAccountingRetryState` — which is now the one and
+ * only writer that takes `accountingRetryRequired` down on this path. The staging transaction
+ * deliberately no longer clears it, because a crash between the two used to leave a refund that owed
+ * accounting, had nothing queued, and no longer carried the flag that would bring anyone back.
+ *
+ * Tests that exercise the service directly therefore have to play the caller's part, or they are
+ * asserting against a state production never leaves a refund in.
+ */
+function settleRefundAccountingQueueing(state: State, refundId?: string): void {
+  for (const refund of state.refunds) {
+    if (refundId && refund.id !== refundId) continue
+    refund.accountingRetryRequired = false
+    refund.accountingWarning = null
+    refund.accountingRetrySyncs = null
+  }
+}
+
 /** The Allocated Inventory credit on the refund's UNEARNED_REV_REVERSAL journal, or null. */
 function findAllocatedInventoryCredit(
   result: Awaited<ReturnType<typeof createSalesOrderRefund>>,
@@ -3623,6 +3646,12 @@ test('a partial refund then a full one credit the A2 debit exactly once, end to 
       payload: sync.payload,
     })
   }
+  // o3d-2sm1 r6: and the caller finishes the first refund off. The staging transaction no longer
+  // clears `accountingRetryRequired` — it is now held through the queueing phase above — so without
+  // this the prior-refund guard would (correctly) refuse the second refund as one whose accounting
+  // is still unresolved. Production always reaches this point before another refund can be created
+  // for the same order, because the queueing and the clear are the tail of the same call.
+  settleRefundAccountingQueueing(state)
 
   const full = await createSalesOrderRefund(client, {
     orderId: 'order-1',
@@ -5199,11 +5228,24 @@ test('a refund that owes accounting is created with accountingRetryRequired set 
     true,
     'the row must commit already marked as owing accounting — a crash before staging must be visible',
   )
+  // o3d-2sm1 r6: STAGING SUCCEEDING NO LONGER CLEARS IT. The obligation is carried through the
+  // caller's queueing phase, because staging is not the last thing that has to happen — the syncs it
+  // recorded still have to be queued, and a crash in between left a refund owing accounting with
+  // nothing queued and nothing marking it unfinished.
   assert.equal(
     state.refunds[0]?.accountingRetryRequired,
-    false,
-    'and staging succeeding is what clears it',
+    true,
+    'the row still owes its accounting when the service hands back — nothing has been queued yet',
   )
+  assert.deepEqual(
+    state.refunds[0]?.accountingRetrySyncs,
+    [],
+    'and it carries the record of what staging produced, so a retry can re-queue exactly that',
+  )
+
+  // The caller then queues those syncs and clears the flag, which is the only thing that does.
+  settleRefundAccountingQueueing(state)
+  assert.equal(state.refunds[0]?.accountingRetryRequired, false, 'discharged after queueing, not before')
 })
 
 test('a crash between commit and staging leaves the reversal recoverable, not silently complete (o3d-mrwu)', async () => {
@@ -5794,6 +5836,10 @@ test('a basis-less partial UNDER the cap is no longer priced from the layer eith
   })
   assert.equal(partial.success, true)
   assert.equal(findAllocatedInventoryCredit(partial), 20, 'r3 sent £36 here, uncapped, against a £20 posted basis')
+
+  // o3d-2sm1 r6: the caller queues the first refund's syncs and clears its obligation, as it does in
+  // production before any second refund on the order can be created.
+  settleRefundAccountingQueueing(state)
 
   // And the balance closes exactly: the full refund's residue takes the remaining £20, never £40.
   const full = await createSalesOrderRefund(client, {
@@ -6850,7 +6896,10 @@ test('o3d-ypkk: refunding a partially-shipped order finds a cost basis for the U
 
   assert.equal(result.success, true)
   assert.equal(result.accountingWarning, undefined, 'the reversal staged — nothing refused')
-  assert.equal(state.refunds[0]?.accountingRetryRequired, false, 'and the row owes nothing further')
+  // o3d-2sm1 r6: staged is not queued. The obligation stands until the caller has queued the syncs.
+  assert.equal(state.refunds[0]?.accountingRetryRequired, true, 'the row still owes its queueing')
+  settleRefundAccountingQueueing(state)
+  assert.equal(state.refunds[0]?.accountingRetryRequired, false, 'and owes nothing once that lands')
 
   // THE UNSHIPPED HALF. The 6 dispatched units were relieved off the front of the allocation
   // record by the shipment line that carries them, so the 4 units the refund values against the
@@ -7117,6 +7166,115 @@ test('o3d-2sm1: a refund whose staging genuinely staged NOTHING is still retried
   })
   assert.equal(neverStaged.success, true, 'nothing was staged, so nothing was lost')
   assert.deepEqual(neverStaged.success ? neverStaged.accountingSyncs : null, [])
+})
+
+/* --------------------------------------------------------------------------------------------
+ * o3d-2sm1 ROUND 6 (Codex HIGH) — THE SAME DEFECT, ONE SEAM ALONG.
+ *
+ * Round 5 put the un-stage and the record of what it staged in ONE transaction, so staging can no
+ * longer commit with nothing recorded behind it. But that transaction ALSO wrote
+ * `accountingRetryRequired: false`, and the caller does not queue those syncs until later, outside
+ * it. So the obligation was discharged one whole phase before the thing that discharges it had
+ * happened, and a crash in between left a refund that owed accounting, had no queued work, and no
+ * longer carried the flag that would bring anyone back to it.
+ *
+ * The flag is now held through the caller's queueing phase. These pin that.
+ * ------------------------------------------------------------------------------------------ */
+
+test('o3d-2sm1 r6: a crash after the staging transaction commits and before queueing lands leaves the obligation standing', async () => {
+  const state = sm1StagedState()
+
+  // Everything the SERVICE does succeeds: staging computes the reversals, un-stages the order, and
+  // records the sync list — all in one commit. Then the process dies. Nothing in this test calls
+  // `queueRefundAccountingActions` or `clearRefundAccountingRetryState`, because that is exactly the
+  // crash being modelled: the caller never got that far.
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Customer cancelled',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  // THE UN-STAGE COMMITTED, which is what makes this window dangerous rather than merely untidy:
+  // the stamps a retry would re-derive the reversals from are gone for good.
+  assert.equal(state.orders[0].revenueDeferredDate, null, 'the A1 deferral is gone')
+
+  const refund = state.refunds[0]!
+  // THE FIX, AS A FACT ABOUT THE ROW. Under round 5 this read `false`, and every route back in was
+  // shut by it: the retry refuses on `!accountingRetryRequired`, `reversalRecordVerdict` answers
+  // `nothing-lost` from the cleared flag alone, and the invariant query is bounded by it.
+  assert.equal(refund.accountingRetryRequired, true, 'the refund still owes its accounting')
+  assert.deepEqual(
+    (refund.accountingRetrySyncs as Array<{ type: string }>).map((sync) => sync.type).sort(),
+    ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL'],
+    'and it carries the record of exactly what a retry has to queue',
+  )
+  // AND IT IS NOT ACCUSED OF LOSING ONE. The recorded list decides the verdict before the witness is
+  // consulted, so a stale flag is never reported as a staged-and-lost reversal.
+  assert.equal(reversalRecordVerdict(refund as never), 'nothing-lost')
+
+  // RECOVERABLE, which is the whole point of holding the flag: the retry re-queues precisely the
+  // syncs the crash left unqueued.
+  const retry = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: refund.id,
+    accountingSettings,
+  })
+  assert.equal(retry.success, true)
+  assert.deepEqual(
+    retry.success ? retry.accountingSyncs.map((sync) => sync.type).sort() : [],
+    ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL'],
+    'the reversals the crash left unqueued are re-queued, not re-derived — the stamps are gone',
+  )
+
+  // THE COUNTERFACTUAL, ON THE SAME ROW. Clear the flag where the staging transaction used to clear
+  // it and the identical refund becomes unreachable: the one recovery route refuses outright, and
+  // the reversals are lost with no error anywhere.
+  refund.accountingRetryRequired = false
+  const cleared = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: refund.id,
+    accountingSettings,
+  })
+  assert.equal(cleared.success, false)
+  assert.match(
+    String(cleared.success ? '' : cleared.error),
+    /No failed refund accounting action is pending/,
+    'a flag cleared before queueing shuts the only door back in',
+  )
+})
+
+test('o3d-2sm1 r6: the staging transaction writes no discharge of its own', async () => {
+  // The obligation must not be taken down by any write the SERVICE makes — not in the staging
+  // transaction and not after it. `createRefund` is the only thing that may do it, and only once
+  // `queueRefundAccountingActions` has returned with every sync row committed.
+  const state = sm1StagedState()
+  const client = createClient(state)
+  const written: Array<Record<string, unknown>> = []
+  const realUpdate = client.salesOrderRefund.update.bind(client.salesOrderRefund)
+  client.salesOrderRefund.update = (async (args: { data: Record<string, unknown> }) => {
+    written.push(args.data)
+    return realUpdate(args as never)
+  }) as unknown as typeof client.salesOrderRefund.update
+
+  const result = await createSalesOrderRefund(client, {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Customer cancelled',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.ok(
+    written.some((data) => 'accountingRetrySyncs' in data),
+    'the staging transaction still records what it staged',
+  )
+  assert.ok(
+    !written.some((data) => data.accountingRetryRequired === false),
+    'but nothing the service writes discharges the obligation — that is the caller\'s, after queueing',
+  )
 })
 
 test('o3d-2sm1: staging that produced no syncs RECORDS the empty list rather than leaving NULL', async () => {

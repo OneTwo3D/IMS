@@ -105,8 +105,18 @@ export function reversalRecordVerdict(refund: {
   accountingRetrySyncs: unknown
   reversalStagingState?: unknown
 }): ReversalRecordVerdict {
-  // The flag is set at creation on every refund that owes accounting and cleared ONLY by a staging
-  // whose syncs were recorded (o3d-mrwu). Cleared means the pair of writes completed.
+  // The flag is set at creation on every refund that owes accounting, and o3d-2sm1 r6 made what
+  // clears it STRICTLY STRONGER than it was: the staging transaction no longer clears it, so the one
+  // writer that does is the caller's `clearRefundAccountingRetryState`, which runs only after
+  // `queueRefundAccountingActions` has returned with every sync it queued committed. Cleared
+  // therefore means staged, recorded AND queued — not merely staged and recorded. Nothing here had
+  // to change; the premise this line rests on only got harder to satisfy.
+  //
+  // The converse is where the cost lands, and it is stated where it is created (see the staging
+  // block in refund-service.ts): a crash between the last queue commit and that clear leaves the
+  // flag SET on a refund that owes nothing. Such a row reaches the next line with a recorded
+  // `accountingRetrySyncs`, so it answers `nothing-lost` — a stale flag is never dressed up as a
+  // lost reversal.
   if (!refund.accountingRetryRequired) return 'nothing-lost'
   // The record IS on the row. Asked BEFORE the witness, so a legacy row that has a recorded list is
   // decided on the evidence it actually carries instead of being swept into 'undecidable' — an

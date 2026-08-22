@@ -1859,6 +1859,20 @@ async function markRefundAccountingRetryRequired(
   })
 }
 
+/**
+ * THE ONE PLACE THE CREATE PATH DISCHARGES A REFUND'S ACCOUNTING OBLIGATION (o3d-2sm1 r6).
+ *
+ * `stageRefundAccountingReversals` used to clear `accountingRetryRequired` inside the staging
+ * transaction, while the syncs it produced were not queued until here — so a crash in between left a
+ * refund that owed accounting, had nothing queued, and no longer carried the flag that would bring
+ * anyone back to it. The staging transaction now leaves the flag standing; this call is the only
+ * thing on the create path that takes it down.
+ *
+ * IT MUST STAY AFTER `queueRefundAccountingActions` RETURNS, AND ONLY ON A CLEAN RETURN. Each queue
+ * write commits in its own transaction and is awaited, so a clean return means every sync row is
+ * durable in Postgres; a throw is caught by the caller, re-marks the flag and records the warning,
+ * and this is not reached. Moving it earlier by any amount re-opens the window this round closed.
+ */
 async function clearRefundAccountingRetryState(refundId: string): Promise<void> {
   await db.salesOrderRefund.update({
     where: { id: refundId },
@@ -2295,6 +2309,13 @@ export async function createRefund(
       })
     }
 
+    // o3d-2sm1 r6: AND HERE, NOT ONE STATEMENT EARLIER. The obligation set at refund INSERT has been
+    // carried, unbroken, through staging and through the queueing above; this is the first point at
+    // which every sync it covers is committed. The residual is the gap between the last queue commit
+    // and this UPDATE — a crash there leaves the flag set on a refund that owes nothing, which is a
+    // stale flag rather than a lost reversal: the row keeps its retry affordance, `retryRefundAccounting`
+    // re-queues nothing new (every key is taken) and clears it. See the staging block in
+    // refund-service.ts for why that gap cannot be closed from either side.
     if (!accountingWarning) {
       await clearRefundAccountingRetryState(refundResult.createdRefund.id)
     }

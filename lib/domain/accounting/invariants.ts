@@ -1170,8 +1170,17 @@ export async function collectAccountingInvariantRows(
     // o3d-2sm1 — THE REVERSALS THAT WERE STAGED AND NEVER SENT, ALSO OUTSIDE EVERY FILTER ABOVE.
     //
     // Bounded by `accountingRetryRequired`, which is the flag o3d-mrwu made durable: it is set on
-    // every refund at creation that owes accounting and cleared only by a staging whose syncs were
-    // recorded, so the outstanding set is small and the predicate is the bound. No refundStatus
+    // every refund at creation that owes accounting and cleared only once the syncs that staging
+    // recorded have ACTUALLY BEEN QUEUED (o3d-2sm1 r6 moved the clear out of the staging transaction
+    // and into the caller, after `queueRefundAccountingActions` returns), so the outstanding set is
+    // small and the predicate is the bound.
+    //
+    // That widening admits one benign row: a refund whose queueing landed and whose clearing UPDATE
+    // did not. It arrives here with `accountingRetrySyncs` recorded, so `reversalRecordVerdict`
+    // answers `nothing-lost` and this block skips it — a stale flag is never reported as a staged
+    // reversal that was lost. It is still named by `refund_accounting_retry_not_visible` in the
+    // per-order loop above, which is the intended outcome: loud and one retry away from resolved,
+    // where the state it replaced was silent and unrecoverable. No refundStatus
     // filter (the state is written by the FULL-refund un-stage, the one refundStatus the per-order
     // query excludes), no status filter and no retention window — an unraised COGS/unearned/
     // allocation reversal does not expire, and both daily-batch windows have already let the order

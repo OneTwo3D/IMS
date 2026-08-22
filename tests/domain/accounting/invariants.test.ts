@@ -539,6 +539,85 @@ test('refund accounting retry sync payload counts as visible refund sync evidenc
   assert.deepEqual(evaluateAccountingInvariantRows(rows), [])
 })
 
+/* --------------------------------------------------------------------------------------------
+ * o3d-2sm1 r6 — WHAT THE INVARIANT SEES NOW THAT THE FLAG IS HELD THROUGH QUEUEING.
+ *
+ * The staging transaction no longer clears `accountingRetryRequired`; the caller clears it after
+ * `queueRefundAccountingActions` returns. That flag is this report's bound AND the tri-state
+ * verdict's, so the widening has to be checked in both directions: a refund that finished cleanly
+ * must not be reported at all, and the one row the widening admits — flag set, queueing landed,
+ * clearing UPDATE lost to a crash — must be named as the stale flag it is and never as a reversal
+ * that was staged and lost.
+ * ------------------------------------------------------------------------------------------ */
+
+test('o3d-2sm1 r6: a refund that finished cleanly under the new ordering is not reported at all', () => {
+  const rows = cleanRows()
+  // The end state of the create path: staging recorded its syncs, `queueRefundAccountingActions`
+  // queued them, and `clearRefundAccountingRetryState` took the obligation down. The row is outside
+  // the reversal query's bound and carries live credit-note evidence.
+  rows.salesOrders[0].refunds = [{
+    id: 'refund-clean',
+    creditNoteNumber: 'CN-CLEAN',
+    accountingCreditNoteId: 'xero-credit-note-clean',
+    totalBase: 25,
+    accountingRetryRequired: false,
+    accountingWarning: null,
+    accountingRetrySyncs: null,
+  }]
+  rows.syncLogs.push(
+    {
+      id: 'cn-clean', connector: 'xero', type: 'CREDIT_NOTE', status: 'SYNCED',
+      referenceType: 'SalesOrderRefund', referenceId: 'refund-clean', externalTransactionId: 'xero-cn-1',
+      payload: { _idempotencyKey: 'sales-order-refund:refund-clean:credit-note' }, errorMessage: null, retryCount: 0, createdAt: B_DATE, syncedAt: B_DATE,
+    },
+    {
+      id: 'cogs-clean', connector: 'xero', type: 'COGS_REVERSAL', status: 'SYNCED',
+      referenceType: 'SalesOrderRefund', referenceId: 'refund-clean', externalTransactionId: 'xero-j-1',
+      payload: { _idempotencyKey: 'sales-order-refund:refund-clean:cogs-reversal' }, errorMessage: null, retryCount: 0, createdAt: B_DATE, syncedAt: B_DATE,
+    },
+  )
+  // And it is not in the reversal set either, because the query is bounded by the flag it cleared.
+  rows.reversalNeverRecordedRefunds = []
+
+  assert.deepEqual(evaluateAccountingInvariantRows(rows), [], 'no finding of any kind on a clean refund')
+})
+
+test('o3d-2sm1 r6: a flag left set by a crash after queueing is a stale flag, never a lost reversal', () => {
+  const rows = cleanRows()
+  // The residual window: every sync is queued and posted, and the process died before the clearing
+  // UPDATE. The row still carries the recorded sync list, which is what decides the verdict.
+  const stranded = {
+    id: 'refund-stale-flag',
+    creditNoteNumber: 'CN-STALE',
+    accountingCreditNoteId: null,
+    totalBase: 25,
+    accountingRetryRequired: true,
+    // No warning, because nothing failed — this is exactly the shape r6 makes reachable.
+    accountingWarning: null,
+    accountingRetrySyncs: [
+      { type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund', referenceId: 'refund-stale-flag', payload: {} },
+      { type: 'COGS_REVERSAL', referenceType: 'SalesOrderRefund', referenceId: 'refund-stale-flag', payload: {} },
+    ],
+  }
+  rows.salesOrders[0].refunds = [stranded]
+  rows.reversalNeverRecordedRefunds = [{
+    ...stranded,
+    orderId: 'order-1',
+    reversalStagingState: 'STAGED',
+    order: { orderNumber: 'SO-1', status: 'SHIPPED', refundStatus: 'FULL', revenueDeferredDate: null },
+  }]
+
+  const codes = evaluateAccountingInvariantRows(rows).map((finding) => finding.code)
+
+  // NOT accused of losing a staged reversal — the recorded list answers `nothing-lost` before the
+  // witness is ever consulted, so the critical that means "these reversals are gone" stays true.
+  assert.ok(!codes.includes('refund_reversal_staged_never_recorded'))
+  assert.ok(!codes.includes('refund_reversal_record_undecidable'))
+  // But it IS named, which is the intended trade: the state r6 replaces was silent and
+  // unrecoverable, and this one is loud and one retry away from resolved.
+  assert.ok(codes.includes('refund_accounting_retry_not_visible'))
+})
+
 test('refund accounting retry details must cover all missing refund accounting actions', () => {
   const rows = cleanRows()
   rows.salesOrders[0].refunds = [{
