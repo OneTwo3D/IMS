@@ -1026,7 +1026,27 @@ export async function runRestore(
     const child = spawnProcess('psql', args, {
       // PGAPPNAME becomes the backend's `application_name`, which is the only handle we have on the
       // server-side half of this restore once the client process is gone.
-      env: { ...process.env, PGPASSWORD: db.password, PGAPPNAME: applicationName },
+      env: {
+        ...process.env,
+        PGPASSWORD: db.password,
+        PGAPPNAME: applicationName,
+        // o3d-2sm1 (Codex r3): THIS SESSION IS A RESTORE, AND IT SAYS SO RATHER THAN BEING GUESSED
+        // AT. `sales_order_refund_witness_staging` mints a staging witness onto any statement that
+        // moves `accounting_allocated_relief_amount` — correct for a live staging, wrong for a
+        // replay, where the value is being reloaded from a file rather than computed by a
+        // transaction anybody watched. The alternative was to infer "this looks like a restore"
+        // from what the row contains, which is exactly the reasoning that let round 2 stamp a lost
+        // reversal as fine. Rows replayed here land unwitnessed and read as `undecidable`, which is
+        // the honest state for a history that came out of a dump.
+        //
+        // PGOPTIONS applies at connection time, so it covers the whole session including anything
+        // the dump runs before its first statement, and the dump cannot turn it off: the guard in
+        // `validateRestoreSqlFile` refuses every `SET`/`set_config` outside its narrow allowlist,
+        // and the one form it does allow — `RESET ALL` — returns a parameter to its CONNECTION-TIME
+        // value, which is this one. It is scoped to this child process; nothing else in the app,
+        // and no other session against the same database, sees it.
+        PGOPTIONS: [process.env.PGOPTIONS, '-c ims.unwitnessed_write=on'].filter(Boolean).join(' '),
+      },
       stdio: ['pipe', 'ignore', 'pipe'],
     })
 

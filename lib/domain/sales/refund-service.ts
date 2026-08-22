@@ -2642,9 +2642,12 @@ async function stageRefundAccountingReversals(
         // inside this transaction — so it commits with the un-stage or rolls back with it. It is
         // what lets a later reader tell "this refund's staging committed" from "the column did not
         // exist when this row was written", which no nullable amount on this row can say: NULL is
-        // the same on both. The migration stamps the same value from a BEFORE UPDATE trigger keyed
-        // on `allocatedReliefAmount` moving, so an OLD binary staging through this same statement
-        // mid-deploy is witnessed too. See lib/domain/sales/refund-reversal-record.ts.
+        // the same on both. The migration mints the same value from a BEFORE UPDATE trigger keyed on
+        // `allocatedReliefAmount` MOVING, which covers the one other writer that moves it — a
+        // #635-era build that has the relief column but not this one. It does NOT cover a build from
+        // before #635: that one writes nothing to this table while staging, so no trigger on it can
+        // witness anything, and its rows are left undecidable rather than guessed at (Codex r3).
+        // See lib/domain/sales/refund-reversal-record.ts.
         reversalStagingState: REVERSAL_STAGING_STAGED,
       },
     })
@@ -4601,11 +4604,17 @@ export async function retrySalesOrderRefundAccounting(
         //
         // Asymmetric and irreversible against recoverable and cheap: fail closed, the standing
         // choice on this path since o3d-mrwu (absent data must not be read as a positive fact on an
-        // irreversible path). The set is bounded and shrinking — every refund created from here on
-        // carries a witness, so no new row can ever be undecidable. That last clause is the
-        // migration's triggers speaking, not this file's writes (Codex r2): during a deploy the old
-        // binary is still creating refunds against the new schema, and only a rule in the database
-        // reaches it.
+        // irreversible path). The set is bounded and no longer grows in normal operation: every
+        // refund this build creates carries a witness from birth, and the migration's trigger mints
+        // one for a #635-era build that moves the relief amount without knowing this column.
+        //
+        // IT IS NOT EMPTY, AND THE HONEST VERSION OF THAT SENTENCE MATTERS (Codex r3). Across the
+        // window between the migration being applied and this build serving, a PRE-#635 binary writes
+        // nothing to `sales_order_refunds` while staging — only the un-stage of `sales_orders` — so
+        // no trigger on this table can witness it, and the rows it mints in that window are
+        // undecidable and land here. Round 2 claimed a trigger closed that; it did not, and the
+        // trigger it used stamped those rows as fine. Refusing them is the whole point: the window
+        // is minutes, the refusal costs a manual clear, and the alternative was the drop above.
         // -----------------------------------------------------------------------------------------
         if (recordVerdict === 'undecidable') {
           return {

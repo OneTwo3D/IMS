@@ -938,10 +938,17 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       //
       // So it gets its own code and its own severity: a standing warning naming a row an operator
       // has to decide by hand, against the ledger. It is bounded (the flag is the query's bound) and
-      // it cannot grow — every refund created from here on carries a witness, stamped by the
-      // migration's triggers so that the old binary still running through a deploy cannot add to the
-      // set either (Codex r2) — and it clears when
-      // the operator clears the flag, which is the same act that answers the question.
+      // it barely grows — every refund this build creates carries a witness from birth, and the
+      // migration's BEFORE UPDATE trigger mints one for a #635-era build that moves the relief
+      // amount without knowing this column — and it clears when the operator clears the flag, which
+      // is the same act that answers the question.
+      //
+      // WHAT STILL ADDS TO IT, SAID PLAINLY (Codex r3): the window between the migration being
+      // applied and the new build serving, when the predecessor is a PRE-#635 binary. That binary writes
+      // nothing to `sales_order_refunds` while staging, so nothing on this table can witness it, and
+      // a refund it leaves owing accounting arrives here as a warning rather than a decided row.
+      // That is the correct outcome and the reason this code exists: round 2 shipped an INSERT
+      // trigger that decided those rows instead, and it decided them `nothing-lost`.
       // -----------------------------------------------------------------------------------------
       findings.push({
         severity: 'warning',

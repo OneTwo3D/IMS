@@ -27,9 +27,6 @@
 --       NULL          nobody spoke for this row. UNDECIDABLE, and each reader says so: the retry
 --                     refuses rather than reporting success and letting its caller clear the flag,
 --                     and the invariant reports it as its own warning, never as a confirmed loss.
---                     Since the triggers at the foot of this file, this can ONLY be a row written
---                     before the column existed — see ROUND 2 below for why the application writes
---                     alone were not enough to make that sentence true.
 --
 -- NULLABLE WITH NO DEFAULT, deliberately. Postgres would fill every existing row with a default,
 -- and that value would be the database vouching for a staging it never witnessed — which is exactly
@@ -43,128 +40,147 @@
 --
 -- DEPLOY ORDER: this migration must be applied BEFORE the application code that writes either
 -- value. It adds a nullable column and touches no existing row, so it is safe to apply ahead of the
--- deploy and safe to leave in place if the deploy is rolled back. The gap that opens between the two
--- — the old binary still creating refunds against the new schema — is what the triggers below exist
--- to close, and it is why they ship in THIS file rather than a later one.
+-- deploy and safe to leave in place if the deploy is rolled back. WHAT THE GAP THAT OPENS BETWEEN
+-- THE TWO COSTS — and, since round 3, what it does NOT cost — is the whole of the next section.
 
 -- AlterTable
 ALTER TABLE "sales_order_refunds" ADD COLUMN "reversal_staging_state" TEXT;
 
 -- =================================================================================================
--- ROUND 2, Codex HIGH: THE COLUMN'S ABSENCE ONLY MEANS "WRITTEN BEFORE THE COLUMN EXISTED" IF THE
--- DATABASE — NOT THE APPLICATION — IS THE ONE THAT FILLS IT IN.
+-- ROUND 3, Codex CRITICAL: A TRIGGER CAN ONLY WITNESS AN EVENT THE WRITER IN FRONT OF IT ACTUALLY
+-- PERFORMS — AND THE BINARY THIS WINDOW IS ABOUT PERFORMS NEITHER OF THE TWO ROUND 2 CHOSE.
 -- =================================================================================================
 --
--- Everything above rests on one sentence: a NULL here is a row the column did not exist for. Round 1
--- argued that because every row minted from now on speaks for itself from birth. IT IS NOT TRUE
--- ACROSS A DEPLOY, and the deploy is the normal case, not the exotic one.
+-- ROUND 2 SHIPPED TWO TRIGGERS: a BEFORE INSERT that stamped 'NOT_STAGED' on any row arriving
+-- without one, and a BEFORE UPDATE that stamps 'STAGED' when `accounting_allocated_relief_amount`
+-- MOVES. Its argument was that these cover the old binary that keeps serving between
+-- `prisma migrate deploy` and the new build: "old binaries stage through that same statement, which
+-- is why this catches them."
 --
--- `prisma migrate deploy` runs BEFORE the new build is serving — it has to, or the two writes above
--- throw on an unknown column. So there is a window, minutes long on every release and longer on a
--- staged rollout, in which THIS MIGRATION IS APPLIED AND THE OLD BINARY IS STILL CREATING REFUNDS.
--- That binary does not know the column exists, so its INSERT omits it and the row lands NULL. NULL
--- therefore also means "written AFTER the migration by a build that did not know about it" — and
--- those rows are created by exactly the code that still has the two-commit bug, so the undecidable
--- set GROWS precisely where the round-1 reasoning said it could not, and grows fastest in the
--- population most likely to contain a real loss. A crash in that window produces a refund that
--- `reversalRecordVerdict` can only call `undecidable`: the retry refuses it and the invariant reports
--- a warning a human has to settle against the ledger, when the database could simply have known.
+-- THAT SENTENCE IS FALSE, and the way it is false decides the design.
 --
--- THE RULE THEREFORE RUNS AT WRITE TIME, IN THE DATABASE. That is the mechanism this repository has
--- already chosen twice for this exact shape of problem — evidence maintained by hand by every writer
--- is evidence the writers who do not know about it destroy silently (20260819210000, three writers
--- found maintaining a release receipt by hand; 20260821090000, which put the stamp-provenance rule on
--- a trigger BECAUSE it has to cover writers this repository does not contain: the previous release, a
--- repair script, a seed, `psql`). An old binary is precisely "a writer this repository does not
--- contain": it runs its own application code, but it does not bring its own database.
+--   `accounting_allocated_relief_amount` was added by o3d-o97 (#635), merged 2026-08-21 and NOT YET
+--   DEPLOYED. So the binary that will be serving while this migration is applied is one that
+--   PREDATES #635. Check for yourself: `git log origin/development -S accounting_allocated_relief_amount`
+--   names exactly one commit, and `git show 02169995^:lib/domain/sales/refund-service.ts` is the
+--   staging path as that binary runs it. It writes NOTHING AT ALL to `sales_order_refunds` inside
+--   the staging transaction — its only write is the un-stage of `sales_orders`. It does not know
+--   the relief column exists.
 --
--- DIRECTION — AND IT IS THE OPPOSITE OF BOTH PRECEDENTS, DELIBERATELY. Those two triggers only ever
--- CLEAR: 20260821090000 destroys a marker any write could have laundered, 20260819210000 destroys an
--- exemption. Both had to, because both vouch for an event the trigger did not itself execute — a
--- timestamp's provenance, a release — and a laundered claim is bit-identical to a minted one, so the
--- only safe move is to narrow. THIS TRIGGER MINTS, because it is not repeating a claim about the
--- past: it is the witness to the statement it is running inside.
+--   A trigger keyed on that column MOVING therefore CANNOT FIRE for it, ever. The one deploy the
+--   round-2 trigger was written to survive is the one deploy it is blind to.
 --
---   BEFORE INSERT   an INSERT *is* the row's birth. Nothing can have been staged for a refund that
---                   did not exist one statement ago, so 'NOT_STAGED' is true by construction at the
---                   instant it is written — the database is stating what it is doing, not vouching
---                   for something it was told.
---   BEFORE UPDATE   the statement that writes `accounting_allocated_relief_amount` *is* the staging.
---                   That column has exactly ONE writer on this table (the update inside
---                   `stageRefundAccountingReversals`, one statement before the un-stage and in the
---                   same transaction), so a statement moving it is the staging event happening, and
---                   'STAGED' commits or rolls back with the un-stage exactly as the application's own
---                   write does. Old binaries stage through that same statement, which is why this
---                   catches them.
+-- AND THE INSERT TRIGGER WAS NOT MERELY USELESS THERE, IT WAS THE DANGEROUS HALF. Note which
+-- writers it could ever fire for: its WHEN clause required `reversal_staging_state IS NULL`, and the
+-- new build ALWAYS supplies the value explicitly, so the trigger stood down for it. Its entire
+-- firing population was writers that do not set the column — the pre-#635 binary, a repair script,
+-- `psql`, a COPY. For every one of those the database then has no way to witness a staging. So it
+-- stamped 'NOT_STAGED' on exactly the rows whose staging it would never see, and `reversalRecordVerdict`
+-- reads 'NOT_STAGED' as `nothing-lost`. An old binary that staged mid-window and died before
+-- recording its syncs — THE FAILURE THIS ENTIRE ISSUE IS ABOUT — came out of that trigger stamped
+-- as fine. It did not fail to help; it converted a real loss into a clean bill of health, which is
+-- strictly worse than the bug the branch fixes.
 --
--- MINTING IS SAFE HERE BECAUSE IT CAN ONLY EVER MOVE A ROW TOWARDS BEING DECIDABLE, never back, and
--- never over the top of a value somebody else wrote:
---   * neither trigger overwrites a state supplied by its own statement (the WHEN clauses stand down
---     the moment the statement has an opinion), so the new build's explicit writes are untouched and
---     the trigger is a no-op for them;
---   * 'NOT_STAGED' is written only where there is no state at all, and only at INSERT;
---   * 'STAGED' is written only over NULL or 'NOT_STAGED' — it is never cleared, and 'NOT_STAGED' is
---     never written over 'STAGED'.
--- The worst it can do is report a refund as decidable when the alternative was a human deciding it by
--- hand, and it can do that only for a row whose deciding event the database itself executed.
+-- SO THE INSERT TRIGGER IS GONE. Not narrowed, not made conditional on some property of the row —
+-- removed, because there is no version of it that is safe: the set of writers it fires for is
+-- precisely the set of writers whose subsequent staging is invisible to this database. A row it
+-- would have stamped now lands NULL and reads as `undecidable`, and undecidable is a SAFE answer
+-- here: `retrySalesOrderRefundAccounting` refuses it (it does not proceed and let its caller clear
+-- the flag), and the invariant raises `refund_reversal_record_undecidable` for a human to settle
+-- against the ledger. Nothing is dropped and nothing is laundered; what is lost is an automatic
+-- answer the database was never entitled to give.
 --
--- WHY THE UPDATE TRIGGER TESTS THE MOVEMENT AND NOT THE STORED VALUE. `NEW ... IS DISTINCT FROM OLD`
--- is the whole point: firing on "the row currently has a relief amount" would stamp 'STAGED' from a
--- value the trigger did not see written, on any unrelated later UPDATE — inheriting a claim rather
--- than witnessing an event, which is the thing the two precedents forbid. A legacy row that was
--- staged before this migration therefore stays NULL and stays UNDECIDABLE, which is correct: nothing
--- witnessed it.
+-- THAT ALSO CLOSES THE ROUND 3 HIGH, structurally rather than by cleverness. Round 2 tried to keep
+-- restores out of the INSERT mint by requiring `accounting_allocated_relief_amount IS NULL` — a
+-- guess at "is this a reload?" read off the row's own contents, and a wrong one: this branch's own
+-- fixture `sm1PreWitnessLostRow` is a genuinely staged, genuinely LOST row with a NULL relief
+-- amount, because it predates that column too. It would have sailed through that test and been
+-- stamped 'NOT_STAGED' by a `pg_restore` or a repair INSERT — laundering the one row the critical
+-- exists to catch. With no INSERT mint at all there is nothing left to launder: a COPY of a
+-- pre-migration dump lands its rows exactly as they were, unwitnessed, and they stay undecidable.
+-- That is the same outcome, in the same direction, that 20260821090000 chose for `pg_restore`.
 --
--- WHY THE INSERT TRIGGER ALSO REQUIRES `accounting_allocated_relief_amount IS NULL`. A genuine birth
--- cannot carry a relief amount — only staging writes one, and staging cannot have run for a row that
--- does not exist. A row arriving at INSERT already holding one is not being born, it is being
--- RELOADED (`pg_restore`, a COPY of a pre-migration dump, a repair script), and stamping 'NOT_STAGED'
--- on it would be the database vouching for a staging it never saw — worse, it would launder the exact
--- row the critical finding exists to catch (relief written, syncs never recorded) into 'nothing-lost'
--- and delete the accusation. Such rows land NULL and stay undecidable, the same direction as the
--- deliberate absence of a backfill above. The residual is a reload of a pre-migration row that never
--- staged: it is stamped 'NOT_STAGED', which is what it would have been stamped had it been created
--- under this schema, and the reload is a deliberate one-off human act rather than the routine,
--- invisible thing a rolling deploy is.
+-- WHAT THE SURVIVING TRIGGER IS FOR, STATED HONESTLY. The BEFORE UPDATE mint covers ONE writer: a
+-- build that writes `accounting_allocated_relief_amount` but has never heard of this column. That is
+-- a #635-era build, and it is a real possibility rather than a hypothetical — #635 is merged to
+-- development and undeployed, so a release between now and this branch's merge makes it the
+-- immediate predecessor. For that binary the guarantee is STRUCTURAL: its staging UPDATE moves the
+-- relief amount in the same transaction as, and one statement before, the un-stage, so the mint
+-- commits with the un-stage or rolls back with it, exactly as the application's own write does.
 --
--- STILL NO BACKFILL. The trigger fixes the FORWARD window only: from the moment this migration
--- commits, no writer — this build, the previous build, a script, `psql` — can create a refund row
--- that cannot say what happened to it. Rows written before it remain legitimately unknown, and the
+-- IT DOES NOT COVER A PRE-#635 PREDECESSOR, AND NOTHING ON THIS TABLE CAN. That binary's staging
+-- transaction touches only `sales_orders`. The one event that separates "staged and lost" from
+-- "never staged" for it is the un-stage itself — and a trigger on `sales_orders` cannot attribute
+-- an ORDER-level event to a REFUND row: the refund's INSERT committed in an earlier transaction, so
+-- there is no handle in scope, and picking the refund by its contents (`accounting_retry_required`
+-- with a NULL `accounting_retry_syncs`) is the same inference-from-contents that produced the
+-- laundering above, one level along — it would falsely accuse any earlier refund on the order
+-- sitting in that state. A write outage across the migration window would make the guarantee true
+-- by decree, but it would buy nothing that matters: the only rows at risk are those left in the
+-- suspicious state, and those are already handled safely by refusing them. So this branch does not
+-- ask for one. For a pre-#635 predecessor the guarantee across the window is OPERATIONAL and
+-- WEAKER, and it is stated rather than assumed: rows minted in it are undecidable, refused by the
+-- retry and named by the invariant, never silently decided.
+--
+-- DIRECTION, WHICH IS WHAT MAKES THE SURVIVING MINT ADMISSIBLE. 20260821090000 and 20260819210000
+-- only ever CLEAR, because both vouch for an event the trigger did not execute and a laundered
+-- claim is bit-identical to a minted one. This one mints, and it may, because it can only ever move
+-- a row from `undecidable` TOWARDS AN ACCUSATION — NULL becomes 'STAGED', which reads as
+-- `staged-never-recorded` and costs a human an investigation. It can never produce `nothing-lost`:
+-- that verdict comes only from 'NOT_STAGED' (which nothing in this file writes any more), from a
+-- recorded sync list, or from a cleared flag. A wrong mint here therefore costs an investigation.
+-- A wrong mint in the direction round 2 chose cost a reversal.
+--
+-- AND IT STANDS DOWN RATHER THAN OVERWRITING: the WHEN clause requires that the statement have no
+-- opinion of its own (`NEW ... IS NOT DISTINCT FROM OLD`), so the new build's explicit write wins
+-- and the trigger is a no-op for it, and 'STAGED' is never re-minted over itself and never cleared.
+--
+-- WHY IT TESTS THE MOVEMENT AND NOT THE STORED VALUE. `NEW ... IS DISTINCT FROM OLD` is the whole
+-- point: firing on "the row currently has a relief amount" would stamp 'STAGED' from a value the
+-- trigger did not see written, on any unrelated later UPDATE — inheriting a claim rather than
+-- witnessing an event, which is the thing both precedents forbid. A legacy row staged before this
+-- migration therefore stays NULL and stays undecidable, which is correct: nothing witnessed it.
+--
+-- PROVENANCE FOR RESTORES AND IMPORTS (Codex r3, HIGH — the half that survives the deletion). A
+-- `pg_restore` cannot reach the surviving trigger, because it loads with COPY and this fires on
+-- UPDATE. A repair or import that RE-WRITES a relief amount can, and such a statement is a value
+-- being replaced, not a staging being performed — so those operations declare themselves:
+--
+--     SET LOCAL ims.unwitnessed_write = 'on';
+--
+-- inside their transaction (the application's restore endpoint sets it for the whole psql session
+-- via PGOPTIONS; see app/api/backup/restore/route.ts). While it is on, the trigger mints nothing and
+-- the rows land unwitnessed — undecidable, which is the honest state for a row whose history came
+-- out of a file. This is provenance DECLARED BY THE OPERATION, never inferred from what the row
+-- happens to contain; that inference is what round 2 got wrong, and repeating it one level down
+-- would fail the same way. An operation that does not declare itself is treated as an ordinary
+-- write, which is the safe default: it gets the accusatory mint, not the exonerating one.
+--
+-- STILL NO BACKFILL. Rows written before this migration remain legitimately unknown, and the
 -- invariant's `refund_reversal_record_undecidable` warning is how they are named.
 --
 -- IT IS IN THIS MIGRATION, BESIDE THE COLUMN, so there is no ordering in which a database holds the
 -- column without the rule.
 --
--- prisma-schema-scope-ok: db-native trigger | reason: Prisma cannot represent triggers, and the rule must bind writers outside this repository — an old binary mid-deploy above all
+-- prisma-schema-scope-ok: db-native trigger | reason: Prisma cannot represent triggers, and the rule must bind writers outside this repository — a build that writes the relief amount without knowing this column above all
 
-CREATE OR REPLACE FUNCTION sales_order_refund_witness_birth()
-RETURNS trigger
-LANGUAGE plpgsql
-AS $$
-BEGIN
-  NEW."reversal_staging_state" := 'NOT_STAGED';
-  RETURN NEW;
-END;
-$$;
-
+-- ROUND 2'S INSERT MINT, REMOVED. Dropped by name as well as never created, so a database that had
+-- an earlier revision of this file applied to it loses the trigger rather than keeping a stamp
+-- nothing in this repository still stands behind.
 DROP TRIGGER IF EXISTS sales_order_refund_witness_birth ON "sales_order_refunds";
-
--- BEFORE, because the value has to be on the row on its way in rather than corrected afterwards.
--- FOR EACH ROW with a WHEN clause, so a refund created by the new build pays two null tests.
-CREATE TRIGGER sales_order_refund_witness_birth
-BEFORE INSERT ON "sales_order_refunds"
-FOR EACH ROW
-WHEN (
-  NEW."reversal_staging_state" IS NULL
-  AND NEW."accounting_allocated_relief_amount" IS NULL
-)
-EXECUTE FUNCTION sales_order_refund_witness_birth();
+DROP FUNCTION IF EXISTS sales_order_refund_witness_birth();
 
 CREATE OR REPLACE FUNCTION sales_order_refund_witness_staging()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  -- The declared-provenance escape above. `true` as the second argument makes the setting's absence
+  -- a NULL rather than an error, so an ordinary write — which never sets it — falls straight
+  -- through to the mint.
+  IF current_setting('ims.unwitnessed_write', true) = 'on' THEN
+    RETURN NEW;
+  END IF;
   NEW."reversal_staging_state" := 'STAGED';
   RETURN NEW;
 END;
@@ -172,6 +188,7 @@ $$;
 
 DROP TRIGGER IF EXISTS sales_order_refund_witness_staging ON "sales_order_refunds";
 
+-- BEFORE, because the value has to be on the row on its way in rather than corrected afterwards.
 CREATE TRIGGER sales_order_refund_witness_staging
 BEFORE UPDATE ON "sales_order_refunds"
 FOR EACH ROW

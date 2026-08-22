@@ -34,9 +34,12 @@
  * written by the two transactions that actually see the events.
  *
  *   NOT_STAGED  written by the INSERT in `createSalesOrderRefund`, in the transaction that creates
- *               the refund row. It says: this row was born under code that keeps this column, and
- *               as of its birth no staging has committed for it. A staging that then rolls back
- *               leaves this standing, because the marker below rolls back with it.
+ *               the refund row, and by NOTHING ELSE — no trigger mints it, deliberately (see below).
+ *               It says: this row was born under code that keeps this column, and as of its birth no
+ *               staging has committed for it. That is only credible from a writer that also keeps
+ *               the column at staging time, which is why the claim is the application's to make and
+ *               not the database's. A staging that then rolls back leaves this standing, because the
+ *               marker below rolls back with it.
  *   STAGED      written by `stageRefundAccountingReversals`, in the SAME statement as
  *               `allocatedReliefAmount` and the statement immediately before the un-stage, inside
  *               the staging transaction. Commits with the un-stage or not at all, which is what
@@ -44,17 +47,33 @@
  *   NULL        no writer ever spoke for this row: the column did not exist when it was written.
  *               UNDECIDABLE. Not "nothing was staged".
  *
- * AND THE TWO APPLICATION WRITES ABOVE ARE NOT WHAT MAKES THAT LAST LINE TRUE (Codex r2, HIGH).
- * Migrations are applied before the build that knows about them is serving, so for the length of
- * every deploy the OLD binary is inserting refunds into the new schema, omitting the column it has
- * never heard of. Rows written by that binary — the one that still has the two-commit bug — would
- * land NULL as well, so NULL would mean "predates the column" OR "was written minutes ago by a build
- * that did not know about it", and the undecidable set would grow exactly where this module claims it
- * cannot. The rule therefore lives at write time, in the database: the migration that adds this
- * column also adds two BEFORE triggers that stamp 'NOT_STAGED' at INSERT and 'STAGED' on the
- * statement that writes `allocatedReliefAmount`. They bind every writer, including the ones this
- * repository does not contain, so NULL means what it says here and nothing else. See
- * prisma/migrations/20260822090000_refund_reversal_staging_state/migration.sql.
+ * WHICH WRITERS THE DATABASE CAN SPEAK FOR, AND WHICH IT CANNOT (Codex r2 HIGH, corrected by r3
+ * CRITICAL). Migrations are applied before the build that knows about them is serving, so for the
+ * length of every deploy an OLD binary is writing refunds into the new schema, omitting the column
+ * it has never heard of. Rows it mints land NULL, and they are minted by exactly the code that still
+ * has the two-commit bug. Round 2 tried to close that with two database triggers. Only one of them
+ * could work, and the other was actively harmful:
+ *
+ *   THE STAGING MINT SURVIVES, for one writer. The migration's BEFORE UPDATE trigger stamps 'STAGED'
+ *   when `accountingAllocatedReliefAmount` MOVES, so a build that writes the relief amount without
+ *   knowing about this column — a #635-era build, which is a real possible predecessor since #635 is
+ *   merged and undeployed — is witnessed structurally: its staging UPDATE moves that column in the
+ *   same transaction as, and one statement before, the un-stage.
+ *
+ *   THE BIRTH MINT IS GONE. It stamped 'NOT_STAGED' on any row arriving without a state — which is
+ *   never the new build (it supplies the value) and always a writer whose later staging this database
+ *   cannot see. A PRE-#635 binary writes NOTHING to this table while staging; its only write is the
+ *   un-stage of `sales_orders`. So the birth mint could not witness that binary's staging, but it
+ *   HAD already stamped its rows 'NOT_STAGED' — and 'NOT_STAGED' reads as `nothing-lost` below. A
+ *   reversal staged and lost mid-window came out of it certified fine. Removing it leaves such a row
+ *   NULL, which is `undecidable`, which every reader here refuses rather than waves through.
+ *
+ * SO NULL MEANS ONE OF TWO THINGS, AND THE MODULE CLAIMS NO MORE: the row predates the column, or it
+ * was written by a binary this database could not witness. Both are undecidable and both are treated
+ * identically — refused by the retry, named by the invariant. What NULL never means is "nothing was
+ * staged". See prisma/migrations/20260822090000_refund_reversal_staging_state/migration.sql for the
+ * full argument, including why a trigger on `sales_orders` cannot rescue the pre-#635 case and why
+ * this branch does not ask for a write outage instead.
  *
  * DELIBERATELY NOT BACKFILLED, and the migration adds the column with no DEFAULT for exactly this
  * reason. Setting `NOT_STAGED` (or `STAGED`) on the rows that are already there from what they look
