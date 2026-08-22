@@ -189,16 +189,26 @@ export type UnsettledQboOperation = {
  * moved out of the claim — ONE wording, used by the durable record and by the console escalation.
  *
  * It does NOT offer the "it will be re-attempted under the same Request-Id" reassurance the document
- * wording does, because that reassurance does not exist here. What it says instead is the honest
- * bound: the ONLY way this effect can happen a second time is a fresh claim, and a fresh claim is a
- * write to the very row whose write just failed three times.
+ * wording does, because that reassurance does not exist here. What it says instead is the bound that
+ * IS true, and r7 is what made it true: the row's claim carries a non-replayable-attempt marker, and
+ * the sweep's candidate scan and its claim both refuse a row that carries one. Nothing re-drives it.
+ *
+ * AND IT SAYS WHAT THE ROW THEN IS, rather than promising a remedy that does not exist. This
+ * connector mints no attempt revision, so while QuickBooks is the ACTIVE connector the per-attempt
+ * settlement control refuses the row (UNFENCED_ATTEMPT) and it simply stays PROCESSING. That is a
+ * bookkeeping remnant of an operation that already happened, not work in progress — and telling an
+ * operator to "settle it by hand" when they cannot is worse than telling them there is nothing to do.
  */
 export function describeUnsettledQboOperation(incident: UnsettledQboOperation, cause: unknown): string {
   const { entry } = incident
   return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} COMPLETED — the attachment, PDF, `
     + `email or order note was actually sent — but sync row ${entry.id} could not be settled: ${String(cause)}. `
     + 'This operation returns no external id and carries no Intuit Request-Id, so a re-attempt would REPEAT the '
-    + 'effect rather than being deduplicated. The row still holds this run\'s claim; it can only be re-run by a '
-    + 'fresh claim, which is a write to the same row that just refused three settling writes. REMEDY: fix the '
-    + 'write failure above, then settle the row by hand so the sweep does not send it a second time.'
+    + 'effect rather than being deduplicated. The row is therefore FENCED: it still shows as PROCESSING, and its '
+    + 'claim carries a non-replayable-attempt marker that the sweep refuses to claim past, so NOTHING WILL RUN IT '
+    + 'AGAIN — not the stale-claim recovery, not a later sweep, not a restart. It will stay PROCESSING: this '
+    + 'connector mints no attempt revision, so the per-attempt settlement control cannot take a decision about it '
+    + 'while QuickBooks is the active connector. REMEDY: fix the write failure above so the next one settles '
+    + 'normally, and confirm this operation landed (the file, the PDF, the email, the order note) — the row '
+    + 'itself needs nothing, and must be left alone rather than re-queued.'
 }
