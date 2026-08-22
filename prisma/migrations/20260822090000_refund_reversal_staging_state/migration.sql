@@ -1,0 +1,107 @@
+-- o3d-2sm1 (Codex r1, CRITICAL) — A WITNESS FOR WHETHER A REFUND'S REVERSAL STAGING COMMITTED.
+--
+-- WITHOUT THIS FILE THE BRANCH IS WORSE THAN THE BUG. `prisma migrate deploy` applies migrations,
+-- not schema.prisma, so on production this column would not exist: the INSERT in
+-- createSalesOrderRefund and the staging UPDATE both throw on an unknown column — the first kills
+-- every refund, the second rolls back inside the staging transaction and takes the un-stage with
+-- it. Nothing degrades quietly here; it stops.
+--
+-- WHAT IT IS FOR (the full argument lives in lib/domain/sales/refund-reversal-record.ts).
+--
+--   sales_order_refunds.reversal_staging_state
+--     The state this whole issue is about — reversals STAGED and never recorded — was decided until
+--     now by `accounting_allocated_relief_amount IS NOT NULL AND accounting_retry_syncs IS NULL`.
+--     Both of those columns are nullable, were never backfilled, and were both added AFTER the
+--     two-commit window they were being asked about. On a row written before them the answer is
+--     NULL/NULL, which that predicate read as "staging never committed" — so a genuinely lost
+--     legacy reversal, the exact row it exists to catch, was reported as fine, and a legacy row
+--     that never staged at all was reported the same way. It could not distinguish the two in
+--     either direction.
+--
+--     Three states, each written by a transaction that actually sees the event:
+--       'NOT_STAGED'  by the INSERT that creates the refund, in the transaction that creates it.
+--       'STAGED'      by stageRefundAccountingReversals, in the same UPDATE as
+--                     accounting_allocated_relief_amount and the statement immediately before the
+--                     un-stage of sales_orders.revenue_deferred_date — so it commits with the
+--                     un-stage or rolls back with it.
+--       NULL          nobody spoke for this row. UNDECIDABLE, and each reader says so: the retry
+--                     refuses rather than reporting success and letting its caller clear the flag,
+--                     and the invariant reports it as its own warning, never as a confirmed loss.
+--
+-- NULLABLE WITH NO DEFAULT, deliberately. Postgres would fill every existing row with a default,
+-- and that value would be the database vouching for a staging it never witnessed — which is exactly
+-- how `reversal_staged BOOLEAN NOT NULL DEFAULT false` came to be useless for this question. The
+-- same refusal o3d-s36z made, and the same one this branch made when it started writing '[]' for an
+-- empty stage without promoting the historical NULLs.
+--
+-- NO BACKFILL STATEMENT IN THIS FILE, and none should be added later. The pre-fix set is bounded
+-- (rows still carrying accounting_retry_required with a NULL accounting_retry_syncs) and cannot be
+-- reconstructed; it can only be named, which the accounting invariant now does.
+
+-- AlterTable
+ALTER TABLE "sales_order_refunds" ADD COLUMN "reversal_staging_state" TEXT;
+
+-- =================================================================================================
+-- NO TRIGGERS. THE COLUMN IS WRITTEN BY THE APPLICATION AND BY NOTHING ELSE — DELIBERATELY, AFTER
+-- THREE ATTEMPTS TO MAKE THE DATABASE WRITE IT.
+-- =================================================================================================
+--
+-- WHAT THOSE ATTEMPTS WERE FOR. A migration lands before the build that knows about it is serving,
+-- so for the length of every release an OLD binary writes refunds into the new schema, omitting a
+-- column it has never heard of. Those rows land NULL. Rounds 2 to 4 of this file each tried to buy
+-- that window back with database mechanism, and each attempt was right about the hole and wrong
+-- about where the rule could live:
+--
+--   ROUND 2 — a BEFORE INSERT trigger stamping 'NOT_STAGED' on any row arriving without a state,
+--   and a BEFORE UPDATE trigger stamping 'STAGED' when `accounting_allocated_relief_amount` moves.
+--   The INSERT mint was actively harmful: the new build always supplies the value, so the mint's
+--   entire firing population was writers that do NOT set the column — and for exactly those writers
+--   the database can never witness a later staging. It stamped 'NOT_STAGED', which reads as
+--   `nothing-lost`, on precisely the rows whose loss it would never see.
+--
+--   ROUND 3 — the INSERT mint removed; the UPDATE mint kept. But `accounting_allocated_relief_amount`
+--   arrived with o3d-o97 (#635), merged and not deployed, so the binary actually serving across this
+--   migration's window PREDATES it and writes NOTHING AT ALL to `sales_order_refunds` while staging
+--   — its only write is the un-stage of `sales_orders`. A trigger keyed on that column moving cannot
+--   fire for it. A trigger can only witness what the writer in front of it actually does.
+--
+--   ROUND 4 — a BEFORE UPDATE trigger REFUSING the predecessor's clearing statement, because the
+--   predecessor's retry reports success having queued nothing and its caller then clears
+--   `accounting_retry_required`, which is the accounting invariant's only bound. True, and the most
+--   nearly right of the three. But a refusal needs an escape for a legitimate manual settle; that
+--   escape was a GUC, and a GUC is reachable from restore SQL. And the migration survives a
+--   rollback, so the set of rows the guard would falsely accuse — a #635-era predecessor that
+--   legitimately staged an EMPTY list, whose serialiser wrote NULL for empty — is not bounded by
+--   the deploy window either.
+--
+-- THE PATTERN IS THE ANSWER. Every round was the same problem in new clothes: a witness trying to
+-- make a guarantee that spans a DEPLOY WINDOW. That guarantee cannot be bought with more database
+-- mechanism, because the thing that must change is which process is serving while this file runs.
+-- The old binary is buggy until it is replaced — true of every fix ever shipped — and closing it
+-- properly is a DEPLOYMENT change, not a schema one. It is filed as o3d-2sm1.1 (P1): stop and drain
+-- the predecessor BEFORE migrating, start the new build after, and keep the old binary fenced off on
+-- any post-stop failure. This branch deliberately does not attempt it.
+--
+-- SO THIS FILE IS A PLAIN NULLABLE `ADD COLUMN` and the two writers are the two application
+-- statements that see the events: the INSERT in createSalesOrderRefund and the staging UPDATE in
+-- stageRefundAccountingReversals. Nothing here mints, clears, refuses or escapes. There is no GUC
+-- to set, and no way for a restore or a repair script to make a claim about a staging on this
+-- column — such a write simply lands whatever it carries, which for a reload of a pre-migration
+-- dump is NULL.
+--
+-- THE RESIDUAL, STATED EXACTLY RATHER THAN PAPERED OVER, because an honest weaker guarantee beats a
+-- false stronger one and this branch has now made that call twice:
+--
+--   A row written by any binary that does not set this column lands NULL and reads as
+--   `undecidable`. `retrySalesOrderRefundAccounting` REFUSES such a row rather than reporting
+--   success, and the accounting invariant reports it under its own warning code
+--   `refund_reversal_record_undecidable`. Both of those live in the NEW binary.
+--
+--   A PREDECESSOR'S OWN RETRY CAN STILL CLEAR `accounting_retry_required` ON SUCH A ROW, and after
+--   that the row is outside the invariant's only bound and is UNRECOVERABLE — not by this file, not
+--   by the invariant, not by any later sweep. That is a real limitation of deploying a fix at all,
+--   and it is not one this branch can make good on. o3d-2sm1.1 is where it gets closed.
+--
+-- THIS MIGRATION HAS NEVER BEEN APPLIED TO ANY DATABASE, so there is nothing left behind by the
+-- earlier revisions of this file to drop: they existed only on this unmerged branch, and Prisma's
+-- own checksum would refuse to reconcile an intermediate revision with this one anyway.

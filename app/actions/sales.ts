@@ -50,12 +50,18 @@ import {
 } from '@/lib/domain/accounting/payment-ledger-hold'
 import {
   queueAccountingSync,
-  queueAccountingSyncTx,
+  queueAccountingSyncTxWithOutcome,
   getAccountingSettings,
   getActiveAccountingConnectorInfo,
   isAccountingSyncTypeEnabled,
+  isAccountingSyncTypeEnabledFor,
+  type AccountingEnqueueOutcome,
   type AccountingSettings,
 } from '@/lib/accounting'
+import {
+  openRefundAccountingObligationLedger,
+  type RefundAccountingObligation,
+} from '@/lib/domain/sales/refund-accounting-obligations'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { creditNoteLineTaxTypeResolver } from '@/lib/domain/sales/refund-posted-tax-identity'
@@ -1859,6 +1865,27 @@ async function markRefundAccountingRetryRequired(
   })
 }
 
+/**
+ * THE ONE PLACE THE CREATE PATH DISCHARGES A REFUND'S ACCOUNTING OBLIGATION (o3d-2sm1 r6).
+ *
+ * `stageRefundAccountingReversals` used to clear `accountingRetryRequired` inside the staging
+ * transaction, while the syncs it produced were not queued until here — so a crash in between left a
+ * refund that owed accounting, had nothing queued, and no longer carried the flag that would bring
+ * anyone back to it. The staging transaction now leaves the flag standing; this call is the only
+ * thing on the create path that takes it down.
+ *
+ * IT MUST STAY AFTER `queueRefundAccountingActions` RETURNS, AND ONLY ON A CLEAN RETURN. Each queue
+ * write commits in its own transaction and is awaited, so a clean return means every sync row is
+ * durable in Postgres; a throw is caught by the caller, re-marks the flag and records the warning,
+ * and this is not reached. Moving it earlier by any amount re-opens the window this round closed.
+ *
+ * r7 MADE "A CLEAN RETURN" MEAN THAT. It did not before: `queueAccountingSync` returned `void` and
+ * returned early — writing nothing — on a missing connector, a switched-off type, an order deleted
+ * under the enqueue or a superseded payload, so the flag came down on a no-op. Every enqueue now
+ * reports what it did and `queueRefundAccountingActions` refuses to return unless every recorded
+ * obligation was queued, already standing, or decided by the PINNED configuration to be a posting
+ * that will never exist. See lib/domain/sales/refund-accounting-obligations.ts.
+ */
 async function clearRefundAccountingRetryState(refundId: string): Promise<void> {
   await db.salesOrderRefund.update({
     where: { id: refundId },
@@ -1925,10 +1952,23 @@ async function queueRefundAccountingActions(input: {
     orderDefaultTaxType: cnTaxRate?.accountingTaxType ?? null,
   })
 
-  await queueAccountingSync({
+  // THE RECORDED OBLIGATIONS OF THIS HAND-OFF: the credit note, plus every sync staging recorded.
+  // Opened before the first enqueue so the configuration it checks against is the one that held when
+  // the hand-off began — see openRefundAccountingObligationLedger.
+  const creditNote: RefundAccountingObligation = {
     type: 'CREDIT_NOTE',
     referenceType: 'SalesOrderRefund',
     referenceId: input.refundId,
+  }
+  const ledger = await openRefundAccountingObligationLedger([creditNote, ...input.accountingSyncs], {
+    activeConnector: async () => (await getActiveAccountingConnectorInfo())?.id ?? null,
+    // r9: the EXPLICIT-CONNECTOR verdict. `isAccountingSyncTypeEnabled` resolves the active connector
+    // for itself, so it cannot answer about the one this hand-off just pinned.
+    isTypeEnabledFor: isAccountingSyncTypeEnabledFor,
+  })
+
+  ledger.account(creditNote, await queueAccountingSync({
+    ...creditNote,
     idempotencyKey: `sales-order-refund:${input.refundId}:credit-note`,
     payload: {
       creditNoteNumber: input.creditNoteNumber ?? undefined,
@@ -1959,10 +1999,14 @@ async function queueRefundAccountingActions(input: {
       lineAmountsIncludeTax: false,
       currencyRateToBase: Number(input.refundFxRate) || undefined,
     },
-  })
+  }))
 
   for (const sync of input.accountingSyncs) {
     if (sync.type === 'COGS_REVERSAL') {
+      // r8: the WHOLE answer, not a bare boolean — see queueAccountingSyncTxWithOutcome. The default
+      // is a refusal because an obligation whose enqueue never answered is owed, not settled; it is
+      // unreachable while the transaction either assigns or throws.
+      let outcomeInTx: AccountingEnqueueOutcome = { queued: false, reason: 'refused', connector: null }
       // bcz9.4: queue the COGS_REVERSAL journal and record its COGS subledger row in
       // ONE transaction. Recording at queue time (not at refund staging) guarantees the
       // negative ledger row exists only once the GL reversal is durably queued, so the
@@ -1978,13 +2022,23 @@ async function queueRefundAccountingActions(input: {
         await lockSalesOrder(tx, input.orderId)
         // Record based on the queue's OWN decision (not a separate settings recheck) so
         // a connector/setting flip between the two can't desync queue vs ledger (Codex).
-        const queued = await queueAccountingSyncTx(tx, sync)
-        await recordRefundCogsReversalFromSync(tx, sync, queued)
+        // r8: the adapter, which carries out the connector the enqueue itself resolved — the one the
+        // row is written under — so the ledger can apply the same pinned-connector check it applies
+        // to every facade answer. `queued` is the identical boolean the other call sites read, so the
+        // COGS subledger row is still recorded on the queue's OWN decision.
+        const outcome = await queueAccountingSyncTxWithOutcome(tx, sync)
+        outcomeInTx = outcome
+        await recordRefundCogsReversalFromSync(tx, sync, outcome.queued)
       })
+      ledger.accountInTransaction(sync, outcomeInTx)
     } else {
-      await queueAccountingSync(sync)
+      ledger.account(sync, await queueAccountingSync(sync))
     }
   }
+
+  // NOTHING BELOW THIS LINE MAY DISCHARGE THE OBLIGATION UNLESS THIS RETURNS. It throws when any
+  // recorded posting was not queued, including when one of them was never handed to an enqueue.
+  ledger.settle()
 }
 
 async function loadRefundAccountingQueueInput(
@@ -2295,6 +2349,24 @@ export async function createRefund(
       })
     }
 
+    // o3d-2sm1 r6: AND HERE, NOT ONE STATEMENT EARLIER. The obligation set at refund INSERT has been
+    // carried, unbroken, through staging and through the queueing above; this is the first point at
+    // which every sync it covers is committed — and r7 made that true rather than assumed, because a
+    // clean return from `queueRefundAccountingActions` used to be compatible with nothing having
+    // been written at all (see openRefundAccountingObligationLedger).
+    //
+    // The residual is the gap between the last queue commit and this UPDATE — a crash there leaves
+    // the flag set on a refund that owes nothing, which is a stale flag rather than a lost reversal.
+    // See the staging block in refund-service.ts for why that gap cannot be closed from either side.
+    //
+    // r7 CORRECTS WHAT r6 SAID ABOUT RECOVERING FROM IT. r6 claimed an operator retry on such a row
+    // "re-queues nothing new (every key is taken)". That is only true while every prior row is still
+    // PENDING/PROCESSING/SYNCED: the already-present check reads status, so a prior attempt that has
+    // since reached FAILED is invisible to it and the retry enqueues a SECOND reversal. A status is
+    // not a posting — a FAILED row can name a real document. That is a PRE-EXISTING defect of the
+    // enqueue's dedupe (unchanged by this branch, which touches neither queue module nor the retry
+    // path), which this window merely makes easier to reach; it is filed as o3d-d0pd and is not
+    // fixed here.
     if (!accountingWarning) {
       await clearRefundAccountingRetryState(refundResult.createdRefund.id)
     }
@@ -2809,6 +2881,18 @@ export async function retryRefundAccounting(
       accountingSettings,
     })
 
+    // o3d-2sm1: THE STATEMENT THAT CLEARS THE ACCOUNTING INVARIANT'S ONLY BOUND.
+    //
+    // In the binary that precedes this one, this write ran on rows whose reversals had been staged
+    // and lost: the retry read the nulled deferral as "nothing was owed", reported success having
+    // queued nothing, and this statement then erased the last mark that anything was outstanding —
+    // taking the row outside `where: { accountingRetryRequired: true }` for good.
+    //
+    // It is safe HERE because `retrySalesOrderRefundAccounting` refuses both `staged-never-recorded`
+    // and `undecidable` before it can return success, so every path that reaches this line has a
+    // recorded sync list behind it. It is NOT safe in the predecessor, and nothing in this branch
+    // makes it so — a rule in the database would have to span the release window, which is where
+    // three attempts at one came apart. That is a deployment change and it is filed as o3d-2sm1.1.
     await db.salesOrderRefund.update({
       where: { id: result.refundId },
       data: {

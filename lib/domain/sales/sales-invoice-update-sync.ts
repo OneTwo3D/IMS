@@ -17,7 +17,10 @@ type QueueXeroSync = (params: {
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey: string
-}) => Promise<void>
+  // o3d-2sm1 r7: the real `queueXeroSync` now reports what it did, and `unknown` is what this
+  // injection point needs — it does not read the answer, and widening it to the outcome type here
+  // would make this module import the accounting facade's contract for no purpose.
+}) => Promise<unknown>
 
 type LogActivity = (params: {
   entityType: 'SALES_ORDER'

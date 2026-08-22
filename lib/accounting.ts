@@ -166,27 +166,63 @@ export function isFxGainLossJournalSuppressed(
   return connector === 'xero' && FX_GAIN_LOSS_JOURNAL_TYPES.has(type)
 }
 
+/**
+ * WHAT AN ENQUEUE ACTUALLY DID (o3d-2sm1 r7, Codex HIGH).
+ *
+ * `queueAccountingSync` returned `void`, and it returns early — writing nothing — on at least five
+ * paths: no active connector, the connector's sync switched off, this type switched off, a type the
+ * connector posts natively, an order deleted under the enqueue, a payload the enqueue guard found
+ * stale. A caller could therefore await it, see it return cleanly, and conclude that a posting was
+ * queued when nothing at all had been written. Any caller that DISCHARGES AN OBLIGATION on that
+ * conclusion discharges it on a no-op.
+ *
+ * That is the same defect as a database NULL standing in for an empty list, one layer up: "nothing
+ * was written" and "nothing needed writing" were byte-identical, so the absence had nowhere to live.
+ * It is given somewhere to live here.
+ *
+ *   queued: true                    a sync row for this posting is durable — this call wrote it, or
+ *                                   it found one already standing (the idempotency-key hit). Either
+ *                                   way a GL counterpart exists.
+ *   queued: false, not-configured   A DECISION, and the only no-op that may read as settled: there is
+ *                                   no connector, or its sync (or this type) is switched off, or the
+ *                                   connector posts this type itself. No counterpart will ever exist,
+ *                                   so there is nothing outstanding either.
+ *   queued: false, refused          NOT a decision. The enqueue declined for a reason about this
+ *                                   particular call — the order was deleted under it, its payload was
+ *                                   superseded — and the posting is still owed. A caller must not
+ *                                   read this as success.
+ *
+ * `connector` names which connector the answer was given against, so a caller that pinned one for a
+ * multi-enqueue hand-off can tell that the setting flipped underneath it.
+ */
+export type ConnectorEnqueueOutcome = {
+  queued: boolean
+  reason?: 'not-configured' | 'refused'
+}
+
+export type AccountingEnqueueOutcome = ConnectorEnqueueOutcome & {
+  connector: AccountingConnectorInfo['id'] | null
+}
+
 export async function queueAccountingSync(params: {
   type: AccountingSyncType
   referenceType: string
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey?: string
-}): Promise<void> {
+}): Promise<AccountingEnqueueOutcome> {
   const connector = await getActiveAccountingConnectorId()
-  if (!connector) return
-  if (isFxGainLossJournalSuppressed(connector, params.type)) return
-
-  switch (connector) {
-    case 'xero': {
-      const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
-      return queueXeroSync(params)
-    }
-    case 'quickbooks': {
-      const { queueQuickBooksSync } = await import('@/lib/connectors/quickbooks/queue')
-      return queueQuickBooksSync(params)
-    }
+  if (!connector) return { queued: false, reason: 'not-configured', connector: null }
+  if (isFxGainLossJournalSuppressed(connector, params.type)) {
+    return { queued: false, reason: 'not-configured', connector }
   }
+
+  if (connector === 'quickbooks') {
+    const { queueQuickBooksSync } = await import('@/lib/connectors/quickbooks/queue')
+    return { ...await queueQuickBooksSync(params), connector }
+  }
+  const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
+  return { ...await queueXeroSync(params), connector }
 }
 
 async function getAccountingPostingContext(type: AccountingSyncType): Promise<{
@@ -195,7 +231,25 @@ async function getAccountingPostingContext(type: AccountingSyncType): Promise<{
 } | null> {
   const connector = await getActiveAccountingConnectorId()
   if (!connector) return null
+  return getAccountingPostingContextFor(connector, type)
+}
 
+/**
+ * THE SAME VERDICT, FOR A CONNECTOR THE CALLER NAMES (o3d-2sm1 r9, Codex HIGH).
+ *
+ * Identical to {@link getAccountingPostingContext} except that it does not resolve the active
+ * connector: it answers for the one it is given. A caller that has PINNED a connector for a
+ * multi-step hand-off cannot use a helper that looks the connector up again — an ABA flip between the
+ * pin and the verdict poisons the verdict, and a verdict is what decides whether a later no-op may
+ * settle an obligation. This is the same move `queueAccountingSyncTx` made for the enqueue outcome:
+ * the answer must name the connector it was given, not the one that happens to be active now.
+ *
+ * A connector this build does not know is not "enabled by default": it returns null.
+ */
+async function getAccountingPostingContextFor(connector: string, type: AccountingSyncType): Promise<{
+  connector: AccountingConnectorInfo['id']
+  postingMode: string
+} | null> {
   if (connector === 'xero') {
     const { getXeroSettings } = await import('@/lib/connectors/xero/settings')
     const settings = await getXeroSettings()
@@ -206,6 +260,7 @@ async function getAccountingPostingContext(type: AccountingSyncType): Promise<{
     return { connector, postingMode }
   }
 
+  if (connector !== 'quickbooks') return null
   const { getQuickBooksSettings } = await import('@/lib/connectors/quickbooks/settings')
   const settings = await getQuickBooksSettings()
   if (settings.quickbooks_sync_enabled !== 'true') return null
@@ -240,6 +295,21 @@ export async function isAccountingSyncTypeEnabled(type: AccountingSyncType): Pro
   return (await getAccountingPostingContext(type)) !== null
 }
 
+/**
+ * Whether this type would post FOR THE NAMED CONNECTOR — o3d-2sm1 r9, Codex HIGH.
+ *
+ * The explicit-connector variant of {@link isAccountingSyncTypeEnabled}, added rather than
+ * substituted: every existing caller of the active-connector form is unaffected and keeps reading it.
+ * The one caller that needs this is a hand-off that pinned a connector before asking, and for which a
+ * verdict resolved against whatever is active NOW is not an answer about the pinned connector at all.
+ */
+export async function isAccountingSyncTypeEnabledFor(
+  connector: string,
+  type: AccountingSyncType,
+): Promise<boolean> {
+  return (await getAccountingPostingContextFor(connector, type)) !== null
+}
+
 export async function queueAccountingSyncTx(
   tx: Prisma.TransactionClient,
   params: {
@@ -257,8 +327,44 @@ export async function queueAccountingSyncTx(
      * rather than silently reopening the race. Grep this name to find every acknowledged gap.
      */
     unlockedOrderScopeReason?: string
+    /**
+     * REPORT WHAT THIS ENQUEUE ACTUALLY DID, AND WHICH CONNECTOR DID IT (o3d-2sm1 r8, Codex HIGH).
+     *
+     * The return type stays `boolean` — fourteen call sites read it and none of them change. What a
+     * caller that has PINNED a connector for a multi-enqueue hand-off cannot get from that boolean is
+     * the one fact it needs: `true` says a row was written and says nothing about which connector it
+     * was written for, while this function resolves the active connector for itself, AFTER the pin was
+     * taken. So a flip part-way through a hand-off satisfies the caller with work queued against a
+     * connector the obligations were never reckoned against.
+     *
+     * The answer therefore comes out through here rather than through the return value, and it names
+     * `context.connector` — THE CONNECTOR THE ROW IS ACTUALLY WRITTEN UNDER, not a second independent
+     * resolution — on every path that has resolved one. Optional, so no existing caller pays for it or
+     * has to know about it; {@link queueAccountingSyncTxWithOutcome} is the adapter that uses it.
+     */
+    reportOutcome?: (outcome: AccountingEnqueueOutcome) => void
   },
 ): Promise<boolean> {
+  /**
+   * Answer through the out-channel and return the SAME boolean this function has always returned.
+   *
+   * `connector` is passed explicitly wherever the enqueue has resolved one, so the reported connector
+   * is the one the write used. It is resolved here only on the two paths that refuse BEFORE resolving
+   * one at all, where nothing was written and so nothing can be misattributed — and only when a
+   * reporter is listening, so the unchanged call sites do no extra work.
+   */
+  const answer = async (
+    outcome: ConnectorEnqueueOutcome,
+    connector?: AccountingConnectorInfo['id'] | null,
+  ): Promise<boolean> => {
+    if (params.reportOutcome) {
+      params.reportOutcome({
+        ...outcome,
+        connector: connector === undefined ? await getActiveAccountingConnectorId() : connector,
+      })
+    }
+    return outcome.queued
+  }
   // o3d-3zgy: this is the enqueue path that writes inside a CALLER's transaction, so — unlike
   // queueXeroSync / queueQuickBooksSync, which open their own — it cannot take the sales-order row
   // lock itself. Taking it here would take it LATE, inside a transaction that may already hold
@@ -283,7 +389,9 @@ export async function queueAccountingSyncTx(
   } else if (orderScope.scope === 'deleted') {
     // The order went away before this enqueue: writing the sync row would orphan it against a
     // reference nothing can resolve, which is the o3d-hrak race the lock exists to close.
-    return false
+    // REFUSED, not decided: this posting is still owed, and a caller holding an obligation for it
+    // must not read this as settled.
+    return answer({ queued: false, reason: 'refused' })
   }
 
   // Returns whether a GL counterpart for this posting exists or will post: false when
@@ -292,11 +400,15 @@ export async function queueAccountingSyncTx(
   // COGS subledger ledger writes, bcz9.2/bcz9.4) should record based on THIS result, not
   // a separate settings recheck — avoiding a TOCTOU if the connector/setting flips.
   const context = await getAccountingPostingContext(params.type)
-  if (!context) return false
+  // A DECISION: there is no connector, or its sync (or this type) is switched off. No counterpart
+  // will ever exist for this posting, so nothing is left outstanding.
+  if (!context) return answer({ queued: false, reason: 'not-configured' })
   // Xero posts FX gain/loss natively; an IMS journal to the AR/AP control
   // account is rejected + double-counts (see isFxGainLossJournalSuppressed).
   // Return false: no IMS GL counterpart posts, so callers stay consistent.
-  if (isFxGainLossJournalSuppressed(context.connector, params.type)) return false
+  if (isFxGainLossJournalSuppressed(context.connector, params.type)) {
+    return answer({ queued: false, reason: 'not-configured' }, context.connector)
+  }
 
   // o3d-19gy: the CONNECTION this payload was composed for. Stamped for whichever connector is active,
   // because the defect is not Xero's — every connector resolves ids at enqueue and again at post — but
@@ -334,7 +446,7 @@ export async function queueAccountingSyncTx(
       },
       select: { id: true },
     })
-    if (existing) return true
+    if (existing) return answer({ queued: true }, context.connector)
   }
 
   try {
@@ -381,13 +493,57 @@ export async function queueAccountingSyncTx(
         description: `Accounting sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
       },
     }).then(() => undefined))
-    return true
+    return answer({ queued: true }, context.connector)
   } catch (error) {
     // A unique-key collision means a concurrent insert already queued this posting,
     // so the GL counterpart exists — treat as queued.
-    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return true
+    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) {
+      return answer({ queued: true }, context.connector)
+    }
     throw error
   }
+}
+
+/**
+ * THE TRANSACTIONAL ENQUEUE, ANSWERING IN FULL (o3d-2sm1 r8, Codex HIGH).
+ *
+ * WHAT ROUND 7 GOT RIGHT AND WHERE IT STOPPED. r7 pinned the connector and each type's verdict for
+ * the whole refund hand-off and checked every FACADE answer against them — the right idea, and it is
+ * kept whole. But the in-transaction arm took a bare `true`, which cannot say which connector
+ * produced it, while `queueAccountingSyncTx` resolves the active connector for itself AFTER the pin
+ * was taken. A flip mid-hand-off therefore satisfied the ledger with work queued against a DIFFERENT
+ * connector than the obligations were reckoned against — the same defect the facade arm was hardened
+ * against, still open through the one arm that could not see it.
+ *
+ * AN ADAPTER, NOT A NEW CONTRACT. `queueAccountingSyncTx` returns `boolean` to fourteen call sites,
+ * and none of them is asking this question; changing that signature would edit thirteen files to no
+ * purpose and give every one of them a shape it does not use. So the boolean stays exactly as it was
+ * and this wraps it, taking the full answer through the enqueue's own optional out-channel.
+ *
+ * THE CONNECTOR IT REPORTS IS THE ONE THE ROW WAS WRITTEN UNDER, taken from inside the enqueue rather
+ * than resolved again out here — resolving it a second time is the very race being closed, and a
+ * second read could agree with the pin while the write did not.
+ *
+ * AND THE TWO ANSWERS MUST AGREE. If the structured outcome and the boolean the other call sites see
+ * ever disagree — or if no outcome was reported at all — this refuses rather than guessing: an
+ * obligation whose enqueue will not say what it did is exactly the silence this branch exists to end.
+ */
+export async function queueAccountingSyncTxWithOutcome(
+  tx: Prisma.TransactionClient,
+  params: Omit<Parameters<typeof queueAccountingSyncTx>[1], 'reportOutcome'>,
+): Promise<AccountingEnqueueOutcome> {
+  // A holder rather than a bare `let`: the assignment happens in a callback, and this keeps what was
+  // reported readable as what it is rather than as the initialiser.
+  const answered: { outcome?: AccountingEnqueueOutcome } = {}
+  const queued = await queueAccountingSyncTx(tx, {
+    ...params,
+    reportOutcome: (outcome) => { answered.outcome = outcome },
+  })
+  const outcome = answered.outcome
+  if (!outcome || outcome.queued !== queued) {
+    return { queued: false, reason: 'refused', connector: null }
+  }
+  return outcome
 }
 
 export async function getAccountingSettings(): Promise<AccountingSettings> {

@@ -1949,6 +1949,27 @@ model SalesOrderRefund {
   // chargeback that staged an UNEARNED_REV_REVERSAL and must still have that evidence.
   // accountingRetrySyncs is cleared once syncs queue, so it can't carry this.
   reversalStaged  Boolean    @default(false)
+  // o3d-2sm1: WHO WITNESSED THIS ROW'S REVERSAL STAGING, as a tri-state. 'NOT_STAGED' is written
+  // by the INSERT that creates the refund (so the row itself attests it was born under code that
+  // keeps this column); 'STAGED' is written by stageRefundAccountingReversals in the same statement
+  // as allocatedReliefAmount, one statement before the un-stage and inside its transaction, so it
+  // commits or rolls back with the event it describes. NULL is neither: the column did not exist
+  // when the row was written, and the row is UNDECIDABLE — never "nothing was staged".
+  //
+  // THOSE TWO STATEMENTS ARE THE ONLY WRITERS. The migration adds the column and ships nothing else
+  // — no trigger, no default, no backfill. A migration lands before the build that knows about it is
+  // serving, so across every release the old binary inserts refunds omitting this column and those
+  // rows land NULL; three rounds of this work tried to have the database stamp them and each needed
+  // a guarantee spanning the deploy window. NULL is therefore left meaning "no writer spoke for this
+  // row", which every reader treats as undecidable rather than as an absence of staging. Closing the
+  // window is a deployment change, filed as o3d-2sm1.1.
+  //
+  // Nullable with NO DEFAULT, and never backfilled. A default would be a value, and it would be the
+  // database vouching for stagings it did not witness — which is the whole reason the boolean this
+  // replaces was unsound: reversalStaged above defaults to false, and allocatedReliefAmount /
+  // accountingRetrySyncs are NULL on every pre-existing row, so none of the three can tell a genuine
+  // lost reversal from a row that predates them. See lib/domain/sales/refund-reversal-record.ts.
+  reversalStagingState String? @map("reversal_staging_state")
   refundedAt      DateTime   @default(now())
   createdAt       DateTime   @default(now())
 
