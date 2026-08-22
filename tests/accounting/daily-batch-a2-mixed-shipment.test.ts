@@ -839,3 +839,79 @@ test('Xero live Group A2 REFUSES to write when the record it planned from change
     'the refusal names the allocation, the order and both quantities',
   )
 })
+
+// ---------------------------------------------------------------------------
+// o3d-ypkk — THE UNSHIPPED PART OF A PARTIALLY-SHIPPED ORDER MUST KEEP A COST BASIS.
+//
+// Before the per-row A2 plan landed, Group A2 valued an order from its SHIPMENT snapshots the
+// moment it carried any SHIPPED shipment and put NO entry in `allocationSnapshots` — so the write
+// loop's `allocationSnapshots.get(alloc.id) ?? []` stamped every allocation row on that order with
+// an EMPTY snapshot. The dispatched units were valued and posted, and the units still on the shelf
+// were left with no recorded cost basis anywhere. The emptiness was silent: nothing read it until
+// someone refunded the unshipped part, at which point refund-service's
+// `consumeAllocationCostForLine` refused — "requested N unit(s) of allocation cost basis but only 0
+// available across recorded allocations" — with no remedy an operator could act on, because the
+// basis had never been written and could not be reconstructed.
+//
+// This asserts WHAT THE ROW ENDS UP HOLDING, on the live writer, rather than that a write happened:
+// a write happened before the fix too, and its payload was the defect. The refund end of the same
+// order is pinned in tests/domain/sales/refund-service.test.ts ("o3d-ypkk").
+// ---------------------------------------------------------------------------
+
+test('o3d-ypkk: Group A2 leaves a partially-shipped order UNSHIPPED units with a cost basis, not an empty snapshot', async () => {
+  resetRun()
+  // 10 allocated, never reclassified. 6 dispatched at £3 before A2 ever ran; 4 are still on the
+  // shelf, and the shelf's next layer prices them at £5.
+  a2Order = {
+    ...mixedOrder(),
+    allocations: [{ ...mixedOrder().allocations[0], costLayerSnapshot: null }],
+  }
+  shelfLayers = [{ id: 'layer-shelf-2', remainingQty: 4, unitCostBase: 5 }]
+
+  const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
+  const result = await runDailyBatchSync()
+
+  assert.deepEqual(result.errors, [], 'the run must complete, not be asserted on after failing')
+  assert.equal(result.groupA2, 1)
+
+  assert.equal(allocationUpdates.length, 1, 'the one allocation row is written once')
+  assert.deepEqual(
+    allocationUpdates[0]?.costLayerSnapshot,
+    [
+      // The 6 dispatched units, recorded against the layers the DISPATCH consumed and marked as
+      // reaching the row through the shipment. They come FIRST, and that ordering is load-bearing:
+      // every qty-based relief — Group B's, and the refund reversal's — consumes from the front of
+      // this array, so these are the units a shipment relieves and the pin below survives it.
+      {
+        costLayerId: 'layer-dispatched',
+        qty: '6.000000',
+        unitCostBase: '3.000000',
+        shipmentLineId: 'ship-line-1',
+        source: 'shipment',
+        orderAllocationId: 'alloc-1',
+        postedUnitCostBase: '3.000000',
+      },
+      // And the 4 UNSHIPPED units, pinned to a real shelf layer at what this pass posted for them.
+      // This entry is the whole issue: pre-fix the array was `[]` and these 4 units had no basis.
+      {
+        costLayerId: 'layer-shelf-2',
+        qty: 4,
+        unitCostBase: 5,
+        postedUnitCostBase: 5,
+      },
+    ],
+    'the row records all 10 accounted units — 6 through the shipment, 4 pinned on the shelf',
+  )
+
+  const journal = a2Journal()
+  assert.ok(journal, 'A2 posted a reclassification journal')
+  assert.deepEqual(
+    journal.payload.lines,
+    [
+      { accountCode: '631', description: 'Daily inventory allocation — 1 order(s)', debit: 38 },
+      { accountCode: '630', description: 'Daily inventory allocation — 1 order(s)', credit: 38 },
+    ],
+    'and posts BOTH bases — £18 of dispatched units and £20 of fresh pin — not the shipment basis alone',
+  )
+  assert.equal(orderUpdates[0]?.data.allocationBatchAmount, 38)
+})

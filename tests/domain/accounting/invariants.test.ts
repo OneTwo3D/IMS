@@ -129,6 +129,8 @@ function cleanRows(): AccountingInvariantRows {
     // o3d-o97 r4: the refusals arrive as their OWN row set, loaded by a query with none of the
     // filters the sales-order query carries — that is the whole point of the field existing.
     unresolvedAllocationBasisRefunds: [],
+    // o3d-2sm1: same reasoning — the "staged and never recorded" refunds are their own row set.
+    reversalNeverRecordedRefunds: [],
   }
 }
 
@@ -678,6 +680,8 @@ function fullyShippedNoRefundRows(): AccountingInvariantRows {
       },
     ],
     unresolvedAllocationBasisRefunds: [],
+    // o3d-2sm1: same reasoning — the "staged and never recorded" refunds are their own row set.
+    reversalNeverRecordedRefunds: [],
   }
 }
 
@@ -924,18 +928,109 @@ test('o3d-o97 r4: a refusal on a FULLY-REFUNDED order is still reported — the 
   assert.equal((finding.details as { orderStatus: string }).orderStatus, 'CANCELLED')
 })
 
-test('o3d-o97 r4: the refusal query carries no refundStatus, status or retention filter', async () => {
-  // The row set is only as visible as its query. Every filter on the sales-order query is right
-  // there and fatal here, so this pins the predicate to exactly the one condition that bounds it:
-  // the column being set. A window or a status filter added later would silence the report again.
-  const calls: Record<string, unknown> = {}
+test('o3d-2sm1: a reversal that was staged and never recorded is reported, on a FULLY-REFUNDED order', () => {
+  // The state the whole issue is about: staging committed — `allocatedReliefAmount` is written in
+  // the same transaction as the un-stage, so the order's A1/A2 stamps are already gone — and the
+  // syncs it produced were never recorded. Nothing else in this report can see it: the order is
+  // `refundStatus: 'FULL'`, which the per-order query excludes, and the reconciliation's own refund
+  // scan is windowed by `refundedAt` and needs a posted shipment. Here the order is absent from
+  // `salesOrders` entirely, exactly as production returns it.
+  const rows = cleanRows()
+  rows.reversalNeverRecordedRefunds = [{
+    id: 'refund-lost',
+    orderId: 'order-gone',
+    creditNoteNumber: 'CN-LOST',
+    totalBase: 100,
+    accountingRetryRequired: true,
+    accountingRetrySyncs: null,
+    accountingWarning: null,
+    allocatedReliefAmount: 20,
+    order: {
+      orderNumber: 'SO-GONE',
+      externalOrderNumber: null,
+      status: 'SHIPPED',
+      refundStatus: 'FULL',
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: 100,
+    },
+  }]
+  assert.equal(rows.salesOrders.some((order) => order.id === 'order-gone'), false)
+
+  const finding = evaluateAccountingInvariantRows(rows)
+    .find((row) => row.code === 'refund_reversal_staged_never_recorded')
+  assert.ok(finding, 'the lost reversal is reported')
+  assert.equal(finding.severity, 'critical')
+  assert.equal(finding.refundId, 'refund-lost')
+  assert.equal(finding.orderId, 'order-gone')
+  assert.equal((finding.details as { allocatedReliefAmount: number }).allocatedReliefAmount, 20)
+})
+
+test('o3d-2sm1: a refund that recorded an EMPTY stage, or never staged at all, is NOT reported', () => {
+  // The two rows that share the same missing deferral date and owe nothing. Reporting either would
+  // make the finding noise — and the finding has to be trusted, because it is the only thing that
+  // says a reversal was lost.
+  const rows = cleanRows()
+  rows.reversalNeverRecordedRefunds = [
+    {
+      // Staging ran and staged nothing (a fully-shipped chargeback), then the credit-note enqueue
+      // failed and re-flagged the row. `[]` is the written record of that.
+      id: 'refund-empty-stage',
+      orderId: 'order-a',
+      creditNoteNumber: 'CN-A',
+      totalBase: 100,
+      accountingRetryRequired: true,
+      accountingRetrySyncs: [],
+      accountingWarning: 'Refund was created, but accounting queueing failed',
+      allocatedReliefAmount: 0,
+      order: { orderNumber: 'SO-A', externalOrderNumber: null, status: 'SHIPPED', refundStatus: 'FULL', revenueDeferredDate: null },
+    },
+    {
+      // Staging never ran: the order was never revenue-deferred, so there is no relief figure and
+      // the null date means what it looks like.
+      id: 'refund-never-staged',
+      orderId: 'order-b',
+      creditNoteNumber: 'CN-B',
+      totalBase: 100,
+      accountingRetryRequired: true,
+      accountingRetrySyncs: null,
+      accountingWarning: 'Refund was created, but accounting queueing failed',
+      allocatedReliefAmount: undefined,
+      order: { orderNumber: 'SO-B', externalOrderNumber: null, status: 'SHIPPED', refundStatus: 'PARTIAL', revenueDeferredDate: null },
+    },
+    {
+      // Staging committed and its syncs were lost — but the order is still A1-deferred, so nothing
+      // was un-staged and a retry re-derives the reversal from stamps that are still there. Lost
+      // and RECOVERABLE are different findings, and this one is not this finding.
+      id: 'refund-recoverable',
+      orderId: 'order-c',
+      creditNoteNumber: 'CN-C',
+      totalBase: 100,
+      accountingRetryRequired: true,
+      accountingRetrySyncs: null,
+      accountingWarning: null,
+      allocatedReliefAmount: 20,
+      order: { orderNumber: 'SO-C', externalOrderNumber: null, status: 'SHIPPED', refundStatus: 'PARTIAL', revenueDeferredDate: A1_DATE },
+    },
+  ]
+
+  assert.deepEqual(
+    evaluateAccountingInvariantRows(rows).filter((row) => row.code === 'refund_reversal_staged_never_recorded'),
+    [],
+  )
+})
+
+test('o3d-o97 r4 + o3d-2sm1: the refund queries carry no refundStatus, status or retention filter', async () => {
+  // The row sets are only as visible as their queries. Every filter on the sales-order query is
+  // right there and fatal here, so this pins each predicate to exactly the one condition that
+  // bounds it. A window or a status filter added to either would silence its report again.
+  const refundQueries: Array<{ where: unknown }> = []
   const client = {
     salesOrder: { async findMany() { return [] } },
     shipment: { async findMany() { return [] } },
     accountingSyncLog: { async findMany() { return [] } },
     salesOrderRefund: {
       async findMany(args: unknown) {
-        calls.salesOrderRefund = args
+        refundQueries.push(args as { where: unknown })
         return []
       },
     },
@@ -947,7 +1042,13 @@ test('o3d-o97 r4: the refusal query carries no refundStatus, status or retention
   })
 
   assert.deepEqual(
-    (calls.salesOrderRefund as { where: unknown }).where,
-    { allocationBasisUnresolved: { not: null } },
+    refundQueries.map((query) => query.where),
+    [
+      { allocationBasisUnresolved: { not: null } },
+      // o3d-2sm1: the flag o3d-mrwu made durable is the bound. Nothing else — a FULL refund is
+      // exactly the row this set exists for, so the per-order query's `refundStatus` exclusion
+      // would remove every one of them.
+      { accountingRetryRequired: true },
+    ],
   )
 })

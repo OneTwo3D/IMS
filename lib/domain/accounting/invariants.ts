@@ -5,6 +5,7 @@ import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-re
 import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 import { loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
+import { reversalStagedButNeverRecorded } from '@/lib/domain/sales/refund-reversal-record'
 
 export type AccountingInvariantSeverity = 'info' | 'warning' | 'critical'
 
@@ -117,6 +118,34 @@ type UnresolvedAllocationBasisRefundRow = {
   } | null
 }
 
+/**
+ * o3d-2sm1 — REFUNDS WHOSE REVERSAL STAGING COMMITTED AND WAS NEVER RECORDED.
+ *
+ * Loaded on the same terms and for the same reason as the refusal row set above: the state is
+ * written almost exclusively on a FULL refund (only a full refund un-stages the order), so the
+ * per-order query's `refundStatus: { not: 'FULL' }` filters out precisely the rows that carry it,
+ * and its `postedShipments` requirement would additionally miss an unshipped order whose only owed
+ * reversal is the unearned one. Neither filter applies here.
+ */
+type ReversalNeverRecordedRefundRow = {
+  id: string
+  orderId: string
+  creditNoteNumber: string | null
+  totalBase: DecimalLike
+  accountingRetryRequired: boolean
+  accountingRetrySyncs: unknown
+  accountingWarning: string | null
+  allocatedReliefAmount?: DecimalLike
+  order?: {
+    orderNumber?: string | null
+    externalOrderNumber?: string | null
+    status?: string
+    refundStatus?: string | null
+    revenueDeferredDate?: Date | string | null
+    unearnedRevenueAmount?: DecimalLike
+  } | null
+}
+
 type ShipmentAccountingRow = {
   id: string
   orderId: string
@@ -160,6 +189,12 @@ export type AccountingInvariantRows = {
    * would drop the findings silently, which is the exact failure this field exists to end.
    */
   unresolvedAllocationBasisRefunds: UnresolvedAllocationBasisRefundRow[]
+  /**
+   * o3d-2sm1: every refund still owing accounting whose reversal staging committed without its
+   * syncs ever being recorded. REQUIRED for the same reason as the field above — a collector that
+   * forgot it would make the drop invisible again, which is the whole defect.
+   */
+  reversalNeverRecordedRefunds: ReversalNeverRecordedRefundRow[]
 }
 
 type AccountingInvariantClient = {
@@ -176,6 +211,9 @@ type AccountingInvariantClient = {
   // default. A double that omits it would make every refusal invisible, which is the failure this
   // whole row set exists to end, and it would do so without any signal at all.
   salesOrderRefund: {
+    // One delegate, two selects (o3d-2sm1). The signature names the older of the two row shapes and
+    // the second call casts its own result — the alternative, a row type that is the union of both
+    // selects, would make every field of both optional and lose the compiler's hold on either.
     findMany(args: unknown): Promise<UnresolvedAllocationBasisRefundRow[]>
   }
   setting?: {
@@ -845,6 +883,50 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     })
   }
 
+  // o3d-2sm1 — A REVERSAL THAT WAS STAGED AND NEVER SENT, NAMED WHERE SOMEONE SEES IT.
+  //
+  // `stageRefundAccountingReversals` committed for this refund — `allocatedReliefAmount` is written
+  // in the same transaction, in the statement before the un-stage — and the syncs it produced were
+  // never recorded. The COGS reversal, the unearned reversal and the allocation reversal exist
+  // nowhere: not as sync logs, not on the refund, and not derivable any more, because the same
+  // transaction cleared the order's A1 deferral and A2 attribution. `retrySalesOrderRefundAccounting`
+  // now refuses such a row rather than reporting success and letting the caller clear the flag; this
+  // is what tells an operator the row is there before they go looking.
+  //
+  // Critical and standing: `accountingRetryRequired` is never cleared on this path, so the finding
+  // lives until the reversal is raised by hand and the flag cleared with it. What it CANNOT see is a
+  // row a pre-fix retry already cleared the flag on — those are gone from the query's bound and are
+  // only reachable through the reconciliation's `terminal_refunded_order_missing_reversal_evidence`,
+  // which is windowed by `refundedAt` and needs a posted shipment. Nothing here can invent them
+  // back; what it can do is stop the set growing.
+  //
+  // The un-stage having HAPPENED is part of the test, exactly as it is in the retry: a refund whose
+  // staging committed while the order is still A1-deferred lost its syncs too, but a retry re-derives
+  // them from the stamps that are still there, so it is recoverable rather than lost.
+  for (const refund of rows.reversalNeverRecordedRefunds) {
+    if (!reversalStagedButNeverRecorded(refund)) continue
+    if (refund.order?.revenueDeferredDate) continue
+    const order = refund.order ?? null
+    const label = order?.orderNumber ?? order?.externalOrderNumber ?? refund.orderId
+    findings.push({
+      severity: 'critical',
+      code: 'refund_reversal_staged_never_recorded',
+      orderId: refund.orderId,
+      refundId: refund.id,
+      message: `Refund ${refund.creditNoteNumber ?? refund.id} on order ${label} staged its accounting reversals but no record of them was ever written — they were never queued and cannot be derived again`,
+      details: {
+        orderNumber: label,
+        orderStatus: order?.status ?? null,
+        refundStatus: order?.refundStatus ?? null,
+        revenueDeferredDate: order?.revenueDeferredDate ?? null,
+        unearnedRevenueAmount: decimalToNumber(order?.unearnedRevenueAmount ?? 0),
+        allocatedReliefAmount: decimalToNumber(refund.allocatedReliefAmount ?? 0),
+        totalBase: decimalToNumber(refund.totalBase),
+        accountingWarning: refund.accountingWarning,
+      },
+    })
+  }
+
   return findings
 }
 
@@ -897,7 +979,7 @@ export async function collectAccountingInvariantRows(
           { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
         ],
       }
-  const [salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds] = await Promise.all([
+  const [salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds] = await Promise.all([
     client.salesOrder.findMany({
       where: {
         status: { not: 'CANCELLED' },
@@ -1035,9 +1117,42 @@ export async function collectAccountingInvariantRows(
         },
       },
     }),
+    // o3d-2sm1 — THE REVERSALS THAT WERE STAGED AND NEVER SENT, ALSO OUTSIDE EVERY FILTER ABOVE.
+    //
+    // Bounded by `accountingRetryRequired`, which is the flag o3d-mrwu made durable: it is set on
+    // every refund at creation that owes accounting and cleared only by a staging whose syncs were
+    // recorded, so the outstanding set is small and the predicate is the bound. No refundStatus
+    // filter (the state is written by the FULL-refund un-stage, the one refundStatus the per-order
+    // query excludes), no status filter and no retention window — an unraised COGS/unearned/
+    // allocation reversal does not expire, and both daily-batch windows have already let the order
+    // go. `evaluateAccountingInvariantRows` narrows this set to the rows whose staging actually
+    // committed; see `reversalStagedButNeverRecorded`.
+    client.salesOrderRefund.findMany({
+      where: { accountingRetryRequired: true },
+      select: {
+        id: true,
+        orderId: true,
+        creditNoteNumber: true,
+        totalBase: true,
+        accountingRetryRequired: true,
+        accountingRetrySyncs: true,
+        accountingWarning: true,
+        allocatedReliefAmount: true,
+        order: {
+          select: {
+            orderNumber: true,
+            externalOrderNumber: true,
+            status: true,
+            refundStatus: true,
+            revenueDeferredDate: true,
+            unearnedRevenueAmount: true,
+          },
+        },
+      },
+    }) as unknown as Promise<ReversalNeverRecordedRefundRow[]>,
   ])
 
-  return { salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds }
+  return { salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds }
 }
 
 export async function runAccountingInvariantReport(options: {

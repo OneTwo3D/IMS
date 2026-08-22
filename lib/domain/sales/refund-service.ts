@@ -17,6 +17,7 @@ import { addMoney, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type 
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
+import { reversalStagedButNeverRecorded } from '@/lib/domain/sales/refund-reversal-record'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { findOverAllocatedRefundTarget, overAllocatedRefundTargetMessage } from '@/lib/domain/sales/refund-target-balances'
@@ -2840,10 +2841,27 @@ function parseRefundAccountingRetrySyncs(
   })
 }
 
+/**
+ * o3d-2sm1: AN EMPTY STAGE IS A WRITTEN VALUE, NOT AN ABSENCE.
+ *
+ * This used to return `DbNull` for an empty list, which made the column say the same thing about two
+ * opposite events: "staging committed and staged no reversal" (a fully-shipped chargeback — scjz.70
+ * suppresses the COGS reversal, and there is no unearned or allocated residue left to reverse) and
+ * "the write that records what staging produced never happened at all". No reader can tell those
+ * apart from a NULL, and one of them means a reversal is still owed by a row that says it owes
+ * nothing — the o3d-clxw shape: an empty field is not a zero.
+ *
+ * An empty array is therefore stored as an empty array. `parseRefundAccountingRetrySyncs` and every
+ * `retrySyncTypes` reader already treat `[]` and `null` identically, so nothing downstream changes;
+ * what changes is that `accountingRetrySyncs IS NULL` now means the persist did not run.
+ *
+ * NOT BACKFILLED — a row written before this change is NULL whichever event produced it, and
+ * promoting those to `[]` would be the database vouching for a write it never saw. Such rows stay
+ * undecidable, and the retry treats them exactly as it did before.
+ */
 function refundAccountingSyncsJson(
   syncs: RefundAccountingSyncRequest[],
-): Prisma.InputJsonValue | typeof Prisma.DbNull {
-  if (syncs.length === 0) return Prisma.DbNull
+): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(syncs)) as Prisma.InputJsonValue
 }
 
@@ -4027,36 +4045,63 @@ export async function createSalesOrderRefund(
   let snapshotReturnRows: RefundReturnRow[] | null = null
   if (txResult.so.revenueDeferredDate && input.accountingSettings) {
     try {
-      const staged = await stageRefundAccountingReversals(client, {
-        orderId: input.orderId,
-        orderRef: refundOrderRef,
-        refundId: txResult.createdRefund.id,
-        refundLines: txResult.createdRefundLines,
-        returnWarehouseId: effectiveReturnWarehouseId,
-        accountingSettings: input.accountingSettings,
-        so: txResult.so,
-        newStatus: txResult.newStatus,
-        chargeback: input.chargeback,
-        activeConnector: input.activeAccountingConnector,
+      // ---------------------------------------------------------------------------------------
+      // o3d-2sm1 — THE UN-STAGE AND THE RECORD OF WHAT IT STAGED ARE ONE COMMIT.
+      //
+      // `stageRefundAccountingReversals` runs a transaction that, on a FULL refund, NULLS
+      // `revenueDeferredDate`, `revenueDeferredBatchRef` and the whole A2 attribution. That is the
+      // event which destroys the evidence a reversal is still owed: after it, nothing on the order
+      // says this refund ever had one to raise. The syncs it produced were then persisted by a
+      // SECOND, separate statement.
+      //
+      // A crash, timeout or lost connection between the two left the refund `accountingRetryRequired`
+      // with nothing recorded for a retry to re-queue — and `retrySalesOrderRefundAccounting` read the now-null
+      // deferral as "this order never owed a reversal" and reported SUCCESS having queued nothing.
+      // The COGS reversal, the unearned reversal and the allocation reversal were dropped in silence,
+      // and the flag was cleared behind them, so no later sweep would look again.
+      //
+      // Both writes are therefore ONE transaction. `runInTransaction` hands the same client straight
+      // through when it is already a transaction client, so the staging transaction below is this
+      // one — exactly the shape `retrySalesOrderRefundAccounting` already uses, where the un-stage
+      // and the persist have always shared a commit. Either the deferral is still standing and the
+      // reversal is re-derivable, or the syncs are on the row; there is no third state.
+      //
+      // The catch stays OUTSIDE, on `client`, because it has to record a warning on a row whose
+      // transaction has just rolled back.
+      // ---------------------------------------------------------------------------------------
+      const staged = await runInTransaction(client, async (tx) => {
+        const result = await stageRefundAccountingReversals(tx, {
+          orderId: input.orderId,
+          orderRef: refundOrderRef,
+          refundId: txResult.createdRefund.id,
+          refundLines: txResult.createdRefundLines,
+          returnWarehouseId: effectiveReturnWarehouseId,
+          accountingSettings: input.accountingSettings!,
+          so: txResult.so,
+          newStatus: txResult.newStatus,
+          chargeback: input.chargeback,
+          activeConnector: input.activeAccountingConnector,
+        })
+        await tx.salesOrderRefund.update({
+          where: { id: txResult.createdRefund.id },
+          data: {
+            accountingRetrySyncs: refundAccountingSyncsJson(result.accountingSyncs),
+            // o3d-mrwu: staging succeeded and the syncs are now durable, so the row no longer
+            // owes anything. This is the ONLY place the flag is cleared — everything else
+            // leaves it set, which is what makes a crash recoverable.
+            accountingRetryRequired: false,
+            // scjz.71: durably record whether any COGS/unearned reversal was staged
+            // (the UNEARNED_REV_REVERSAL sync also carries allocation reversal) so the
+            // invariant/reconciliation evidence checks can tell a credit-note-only
+            // chargeback from one that owes reversal evidence — independent of
+            // accountingRetrySyncs, which is cleared once the syncs queue.
+            reversalStaged: stagedAReversal(result.accountingSyncs),
+          },
+        })
+        return result
       })
       accountingSyncs = staged.accountingSyncs
       snapshotReturnRows = staged.snapshotReturnRows
-      await client.salesOrderRefund.update({
-        where: { id: txResult.createdRefund.id },
-        data: {
-          accountingRetrySyncs: refundAccountingSyncsJson(accountingSyncs),
-          // o3d-mrwu: staging succeeded and the syncs are now durable, so the row no longer
-          // owes anything. This is the ONLY place the flag is cleared — everything else
-          // leaves it set, which is what makes a crash recoverable.
-          accountingRetryRequired: false,
-          // scjz.71: durably record whether any COGS/unearned reversal was staged
-          // (the UNEARNED_REV_REVERSAL sync also carries allocation reversal) so the
-          // invariant/reconciliation evidence checks can tell a credit-note-only
-          // chargeback from one that owes reversal evidence — independent of
-          // accountingRetrySyncs, which is cleared once the syncs queue.
-          reversalStaged: stagedAReversal(accountingSyncs),
-        },
-      })
       // bcz9.4: the COGS subledger row is recorded later, atomically with queuing the
       // COGS_REVERSAL sync (queueRefundAccountingActions), not here at staging.
     } catch (error) {
@@ -4382,6 +4427,10 @@ export async function retrySalesOrderRefundAccounting(
           chargeback: true,
           accountingRetryRequired: true,
           accountingRetrySyncs: true,
+          // o3d-2sm1: the footprint `stageRefundAccountingReversals` leaves in the same transaction
+          // as the un-stage. Read here so the short-circuit below can tell a refund whose staging
+          // committed from one on an order that was never revenue-deferred at all.
+          allocatedReliefAmount: true,
           order: {
             select: {
               id: true,
@@ -4487,7 +4536,26 @@ export async function retrySalesOrderRefundAccounting(
           returnedRows: [],
         }
       }
+      // o3d-2sm1: THE ORDER'S DEFERRAL BEING GONE IS NOT PROOF THAT NOTHING WAS OWED — it is
+      // equally what a full refund's OWN un-stage leaves behind. Which of the two this row is, is
+      // decided by `reversalStagedButNeverRecorded`, never by the missing date on its own.
       if (!refund.order.revenueDeferredDate) {
+        // Re-staging is not the alternative, and the omission is worth stating: every reversal
+        // amount is derived from the stamps the un-stage removed. `openAllocatedContra` is computed
+        // only under `stagedA2?.inventoryAllocatedDate`, so a re-stage here would credit the lines'
+        // allocated basis UNCAPPED, take no residue and record no refusal — a fabricated figure in
+        // place of a missing one. It fails instead: `accountingRetryRequired` stays set (nothing on
+        // this path clears it), the refund keeps its retry affordance and its standing
+        // reversal-evidence findings, and a human raises the reversal from records that still exist.
+        if (reversalStagedButNeverRecorded(refund)) {
+          return {
+            success: false,
+            error: 'This refund\'s accounting reversals were staged but the record of them was never '
+              + 'written, and the same staging cleared the order\'s revenue deferral — so no retry can '
+              + 'derive them again. Raise the COGS/unearned/allocated-inventory reversals manually against '
+              + 'the refund\'s own cost snapshots and reconcile the order before clearing this flag.',
+          }
+        }
         return {
           success: true,
           orderId: refund.orderId,
