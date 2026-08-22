@@ -40,9 +40,13 @@ import {
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import {
+  QBO_UNMIRRORED_OPERATION_ACTION,
   QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+  QBO_UNSETTLED_OPERATION_ACTION,
   describeUnpersistedQboPost,
+  describeUnsettledQboOperation,
   type UnpersistedQboPost,
+  type UnsettledQboOperation,
 } from '@/lib/domain/accounting/unrecorded-posted-document'
 import { redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import {
@@ -376,6 +380,160 @@ function unpersistedQboPostRecord(incident: UnpersistedQboPost, description: str
   }
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * THE SPLIT (o3d-peh1 r6, Codex HIGH) — NOT EVERY SUCCESS IS A DOCUMENT POST.
+ *
+ * Round 5 gave EVERY successful result the re-drive-and-escalate treatment below. That treatment is
+ * built on one sentence, and the sentence is written down in `describeUnpersistedQboPost`: the row is
+ * left CLAIMED, so `CLAIM_STALE_MS` later it is re-claimed and re-posted UNDER THE SAME DERIVED
+ * INTUIT REQUEST-ID, which is what makes the replay a deduplicated one rather than a second document.
+ *
+ * THAT SENTENCE IS FALSE OF FOUR OF THE TYPES THIS LOOP PROCESSES. BILL_ATTACHMENT, INVOICE_PDF,
+ * INVOICE_EMAIL and WC_INVOICE_NOTE are not document posts at all. Look at their branches in
+ * `processEntry`: `qboUploadAttachment` takes no request id, the PDF path downloads and saves a file,
+ * INVOICE_EMAIL calls `sendAccountingInvoiceEmailInternal`, WC_INVOICE_NOTE calls `pushInvoiceNoteToWc`.
+ * None of them goes anywhere near `qboPostIdempotent`, and every one of them returns
+ * `{ success: true }` WITH NO EXTERNAL ID. So for these, "leave the row claimed and let the stale
+ * claim replay it" is not a deduplicated replay — IT IS THE SIDE EFFECT AGAIN. An email sent again on
+ * the next sweep, and the one after, and the one after that, for as long as the settling write keeps
+ * failing. There is no bound on it anywhere: no retry is consumed, the row never leaves PROCESSING,
+ * and nothing else in this loop is counting.
+ *
+ * SO THE SPLIT IS DRAWN ON WHAT CAME BACK, in this order, and each arm is the right one for its case:
+ *
+ *   • AN EXTERNAL ID CAME BACK  → the id is the thing that must become durable, and every branch that
+ *     returns one posted under the derived Request-Id. Re-drive, then escalate. UNCHANGED.
+ *   • NO ID, AND THE TYPE IS ONE OF THE FOUR ABOVE → there is no id to lose and no document to
+ *     orphan, and the effect has already happened outside any deduplication. SETTLE IT, so it is
+ *     never replayed. See `settleUnidentifiedQboOperationOrEscalate`.
+ *   • NO ID, AND THE TYPE IS A DOCUMENT POST → a document post that came back without an id. We
+ *     cannot rule out a document existing, so this keeps the escalating arm exactly as it was. That
+ *     is also what makes the set below safe to be a NARROWING one: a type nobody adds to it keeps
+ *     round 5's behaviour rather than silently acquiring the settling arm.
+ * ------------------------------------------------------------------------------------------- */
+
+/**
+ * The QuickBooks sync types whose `processEntry` branch legitimately returns success with NO external
+ * id, because it posts no document and carries no Intuit Request-Id.
+ *
+ * A NARROWING list, read in exactly one place. Its members are the operations whose replay repeats a
+ * real-world effect: an upload, a saved PDF, an EMAIL, a note written onto a WooCommerce order.
+ */
+const QBO_OPERATIONS_WITHOUT_EXTERNAL_ID: ReadonlySet<AccountingSyncType> = new Set<AccountingSyncType>([
+  'BILL_ATTACHMENT',
+  'INVOICE_PDF',
+  'INVOICE_EMAIL',
+  'WC_INVOICE_NOTE',
+])
+
+/** The one shape of the stuck-claim record, so the console line and the durable row cannot drift. */
+function unsettledQboOperationRecord(incident: UnsettledQboOperation, description: string) {
+  const { entry } = incident
+  return {
+    userId: null,
+    entityType: 'SYSTEM' as const,
+    entityId: entry.id,
+    action: QBO_UNSETTLED_OPERATION_ACTION,
+    tag: 'sync',
+    level: 'ERROR' as const,
+    description: redactActivityLogText(description),
+    metadata: JSON.parse(JSON.stringify(sanitizeActivityLogMetadata({
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+    }))),
+  }
+}
+
+/**
+ * THE SETTLING PATH FOR AN OPERATION THAT HAS NO ID — AND THE CONTROL CODEX ASKED FOR: A SUCCESSFUL
+ * ATTACHMENT OR EMAIL FOLLOWED BY A SETTLING FAILURE MUST NOT EXECUTE THE EXTERNAL SIDE EFFECT
+ * INDEFINITELY.
+ *
+ * Reached only when the full durable transaction has already been re-driven to exhaustion. That
+ * transaction writes TWO rows — the sync row's SYNCED transition and the mirrored AccountingEvent —
+ * and either can be what refuses. THIS WRITE IS THE FIRST ONE ALONE: one row, one statement, no
+ * dependent write, no mirror. A mirrored event that will not accept a write is then no longer able to
+ * hold the operation in its claim, which is the case that actually produces the endless replay.
+ *
+ * WHY SYNCED AND NOT A COUNTED RETRY. The operation SUCCEEDED. The attachment is on the bill, the
+ * email is in somebody's inbox. Sending it four more times before giving up would be a smaller
+ * version of the same defect, so the row is settled on the first pass rather than bounded.
+ *
+ * WHAT IT COSTS, said out loud rather than hidden: the mirrored accounting event is missing, and the
+ * ERROR activity row below is what says so. It is deliberately NOT retention-exempt — nothing is
+ * stuck and nothing repeats, the row itself is settled, and the mirror for a no-id operation names no
+ * document. The retention-exempt record is the other one, for the row that could not be settled.
+ *
+ * AND IF EVEN THIS WRITE WILL NOT LAND. Then the incident is escalated, and the replay is still
+ * bounded — by the database rather than by this function. The ONLY route back to the side effect is a
+ * fresh claim, and the claim is an `updateMany` against THIS ROW: the same row that has just refused
+ * three single-column settling writes. A store that will not take this write will not take that one
+ * either, and a claim that throws aborts the sweep before any post is made.
+ */
+async function settleUnidentifiedQboOperationOrEscalate(
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  cause: unknown,
+): Promise<boolean> {
+  let lastError = cause
+  for (let attempt = 0; attempt < POST_EVIDENCE_TRANSACTION_ATTEMPTS; attempt += 1) {
+    try {
+      await db.accountingSyncLog.update({
+        where: { id: entry.id },
+        data: {
+          status: 'SYNCED',
+          syncedAt: new Date(),
+          processingStartedAt: null,
+          // The row carries its own caveat, so the state is legible without going and finding the
+          // activity row. It is settled AND it is annotated; those are not in conflict.
+          errorMessage: 'Settled without a mirrored accounting event: this operation returns no external id, '
+            + 'and re-running it would repeat the attachment, PDF, email or order note it already performed.',
+          // Claimed exactly as the full transition claims it, so the follow-ups the caller is about
+          // to enqueue are owed on this row in the same way they would be on any other.
+          ...followUpObligationClaim(),
+        },
+      })
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: QBO_UNMIRRORED_OPERATION_ACTION,
+        tag: 'sync',
+        level: 'ERROR',
+        description: `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} completed, but the `
+          + `transaction that records it could not be written (${String(lastError)}). Sync row ${entry.id} was `
+          + 'settled by a narrowed write instead, so the operation is NOT repeated; its mirrored accounting event '
+          + 'is missing and will not be written by anything.',
+        metadata: {
+          syncLogId: entry.id,
+          type: entry.type,
+          referenceType: entry.referenceType,
+          referenceId: entry.referenceId,
+        },
+        // Best-effort, and it must stay that way: a failed announcement must not throw out of here
+        // into the handler that would then record a settled operation as a failed post.
+      }).catch(() => { /* the row is already settled; the announcement is the only part that is best-effort */ })
+      return true
+    } catch (error) {
+      lastError = error
+    }
+  }
+
+  const incident: UnsettledQboOperation = { entry }
+  const description = describeUnsettledQboOperation(incident, lastError)
+  // The console line FIRST, for the same reason the document escalation writes one: it cannot fail
+  // and it cannot be swept, and at this instant it is the only account of what happened.
+  console.error(`[quickbooks-sync] ${description}`)
+  try {
+    await db.activityLog.create({ data: unsettledQboOperationRecord(incident, description) })
+  } catch (recordError) {
+    console.error(
+      `[quickbooks-sync] the unsettled-operation record for sync log ${entry.id} could not be written `
+      + `either: ${String(recordError)}`,
+    )
+  }
+  return false
+}
+
 /**
  * PERSIST THE ID THIS WORKER IS HOLDING, OR ESCALATE THE DOCUMENT IT CANNOT WRITE DOWN — AND NEVER
  * FALL THROUGH TO A HANDLER THAT WOULD CALL IT A FAILED POST (Codex r5, HIGH).
@@ -429,6 +587,14 @@ async function persistFreshQboPostOrEscalate(
     } catch (error) {
       lastError = error
     }
+  }
+
+  // THE SPLIT (Codex r6, HIGH). Everything below this line is the DOCUMENT arm, and it is the arm
+  // whose justification is "the row keeps its claim and the stale-claim replay is deduplicated by the
+  // derived Request-Id". An operation that returned no id and posted under no request id has no such
+  // protection, so it must never be left to that replay — see the block above this function.
+  if (externalId === null && QBO_OPERATIONS_WITHOUT_EXTERNAL_ID.has(entry.type)) {
+    return await settleUnidentifiedQboOperationOrEscalate(entry, lastError)
   }
 
   const incident: UnpersistedQboPost = { entry, postedExternalId: externalId }
@@ -911,6 +1077,12 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // evidence fence there cannot stop it because the database has no evidence yet. See
         // persistFreshQboPostOrEscalate: the write is re-driven, and an id that still cannot be
         // recorded is escalated rather than denied.
+        //
+        // AND WHICH OF THE TWO SETTLING PATHS THIS TAKES DEPENDS ON WHAT CAME BACK (Codex r6, HIGH).
+        // Not every `success` here is a document post: BILL_ATTACHMENT, INVOICE_PDF, INVOICE_EMAIL
+        // and WC_INVOICE_NOTE return no id and go out under no Request-Id, so the escalation's
+        // "the stale-claim replay is deduplicated" reasoning does not hold for them — they get a
+        // settling path of their own instead. The split is drawn inside that function.
         if (!await persistFreshQboPostOrEscalate(entry, payload, syncResult.externalId ?? null)) {
           result.failed++
           continue

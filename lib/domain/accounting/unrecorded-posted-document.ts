@@ -147,3 +147,58 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
     + 'rather than duplicated. REMEDY: open the id above in QuickBooks, confirm exactly one document '
     + 'exists for this reference, and void any duplicate.'
 }
+
+/* ---------------------------------------------------------------------------------------------
+ * AND THE CASE THAT IS NOT A DOCUMENT AT ALL (o3d-peh1 r6, Codex HIGH).
+ *
+ * Everything above is about an IDENTIFIER: a document QuickBooks holds, whose id the sync row can
+ * never carry. The re-drive-and-escalate treatment above is correct for those and ONLY for those,
+ * and the reason is spelled out in `describeUnpersistedQboPost`: the row is left CLAIMED so the
+ * stale-claim reclaim re-attempts it, and that re-attempt goes out under the SAME derived Intuit
+ * Request-Id, which makes it a deduplicated replay rather than a second document.
+ *
+ * FOUR QuickBooks OPERATIONS LEGITIMATELY RETURN NO ID — BILL_ATTACHMENT, INVOICE_PDF,
+ * INVOICE_EMAIL and WC_INVOICE_NOTE. They are not document posts. They upload a file, save a PDF,
+ * SEND AN EMAIL, write a note onto a WooCommerce order — and NONE of them carries a Request-Id,
+ * because none of them goes through the idempotent post helper. So the sentence the escalation above
+ * rests on is simply false about them: their replay is not deduplicated by anything, and leaving the
+ * row claimed means the email is sent again on the next sweep, and the one after that, for as long
+ * as the settling write keeps failing.
+ *
+ * So they get a SETTLING path instead of an escalating one, and this is the record of the case where
+ * even that could not be written. It is retention-exempt for the kind-(2) reason the two above are:
+ * the effect happened OUTSIDE this database, the row does not record it, and nothing re-derives it.
+ * ------------------------------------------------------------------------------------------- */
+
+/** The one action name for a no-id QuickBooks operation that could not be settled. Retention exempts exactly this string. */
+export const QBO_UNSETTLED_OPERATION_ACTION = 'quickbooks_operation_unsettled'
+
+/**
+ * The action name for the LESSER incident: the operation WAS settled, by the narrowed write, but the
+ * mirrored accounting event it should have carried is missing. Deliberately NOT retention-exempt —
+ * nothing is stuck, nothing repeats, and the row itself records the outcome.
+ */
+export const QBO_UNMIRRORED_OPERATION_ACTION = 'quickbooks_operation_unmirrored'
+
+export type UnsettledQboOperation = {
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
+}
+
+/**
+ * The operator-facing account of a no-id operation whose effect happened and whose row could not be
+ * moved out of the claim — ONE wording, used by the durable record and by the console escalation.
+ *
+ * It does NOT offer the "it will be re-attempted under the same Request-Id" reassurance the document
+ * wording does, because that reassurance does not exist here. What it says instead is the honest
+ * bound: the ONLY way this effect can happen a second time is a fresh claim, and a fresh claim is a
+ * write to the very row whose write just failed three times.
+ */
+export function describeUnsettledQboOperation(incident: UnsettledQboOperation, cause: unknown): string {
+  const { entry } = incident
+  return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} COMPLETED — the attachment, PDF, `
+    + `email or order note was actually sent — but sync row ${entry.id} could not be settled: ${String(cause)}. `
+    + 'This operation returns no external id and carries no Intuit Request-Id, so a re-attempt would REPEAT the '
+    + 'effect rather than being deduplicated. The row still holds this run\'s claim; it can only be re-run by a '
+    + 'fresh claim, which is a write to the same row that just refused three settling writes. REMEDY: fix the '
+    + 'write failure above, then settle the row by hand so the sweep does not send it a second time.'
+}

@@ -1,6 +1,10 @@
 import { db } from '@/lib/db'
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
-import { QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
+import {
+  QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+  QBO_UNSETTLED_OPERATION_ACTION,
+  UNRECORDED_POSTED_DOCUMENT_ACTION,
+} from '@/lib/domain/accounting/unrecorded-posted-document'
 
 const DEFAULTS: Record<string, number> = {
   INFO: 30,
@@ -59,6 +63,12 @@ const RETAINED_ACTIONS = [
   // transaction that would have made that id durable failed. The row names no document, so nothing
   // re-derives the identifier and no later sync attempt can: it exists only in this record.
   QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+  // o3d-peh1 r6 — the same kind-(2) exemption for the operations that have NO id to lose. An
+  // attachment, a PDF, an invoice email or a WooCommerce note has already happened outside this
+  // database when this row is written, the sync row does not say so, and nothing re-derives it. It
+  // is also the ONE record that a row is stuck holding a claim it cannot be settled out of, which
+  // is the state a person has to clear by hand.
+  QBO_UNSETTLED_OPERATION_ACTION,
 ]
 
 const DELETE_BATCH_SIZE = 10_000
