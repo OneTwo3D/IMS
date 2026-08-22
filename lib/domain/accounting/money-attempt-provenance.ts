@@ -98,6 +98,41 @@
  */
 export const STAMPED_MONEY_TYPES = ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'] as const
 
+/** The two columns that, together, can prove a money row is PRE-CALL. Neither proves it alone. */
+export type MoneyAttemptProvenance = {
+  remoteAttemptedAt: Date | null
+  attemptStampingCustodyAt: Date | null
+}
+
+/**
+ * THE CANONICAL "THIS ROW NEVER MADE A REMOTE CALL" TEST — one definition, every reader.
+ *
+ * `planFollowUpEnqueue` has asked this question since round 10 and spelled the predicate out inline.
+ * `guardInvoicePaymentCapacity` needs the same question answered, and two spellings of "nothing was
+ * sent" is exactly the failure mode `invoice-payment-capacity.ts` already refuses for
+ * `storedBodyMayHaveReachedTheLedger` — two guards with two definitions disagree about whether an
+ * invoice has capacity, which is the whole question. So it lives here, beside the mechanism that
+ * makes it true, and both readers call it.
+ *
+ * BOTH HALVES ARE POSITIVE STATEMENTS ABOUT WHAT THE ROW SAYS, and the direction matters:
+ *
+ *   attemptStampingCustodyAt present  every binary that created or claimed this row stamps
+ *                                     `remoteAttemptedAt` before it posts (see the header above),
+ *                                     so the absence of that stamp is evidence rather than silence.
+ *   remoteAttemptedAt null            and it is absent, so nothing ever left this row.
+ *
+ * ABSENCE OF A STAMP IS NOT PROOF OF NO ATTEMPT. Custody null means something outside custody had
+ * this row and a NULL `remoteAttemptedAt` proves nothing at all — so does a column the caller did
+ * not select, which arrives `undefined`. Both return false: only a positive record that the row is
+ * pre-call excludes it, everything else stays undetermined and the caller must fail closed.
+ *
+ * It is deliberately NOT a statement about the row's STATUS. A caller decides which statuses it
+ * wants to ask about; this only answers whether a call left.
+ */
+export function attemptProvenNeverMade(row: MoneyAttemptProvenance): boolean {
+  return row.remoteAttemptedAt === null && row.attemptStampingCustodyAt != null
+}
+
 /**
  * Custody for a row this binary is CREATING.
  *

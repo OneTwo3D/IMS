@@ -274,3 +274,145 @@ test('[o3d-cjt8] a clean invoice with no siblings still posts — the guard is a
   assert.equal(qboPosts.length, 1)
   assert.equal(qboPosts[0].path, 'payment')
 })
+
+// ---------------------------------------------------------------------------
+// CODEX ROUND 2, HIGH — A PROVEN PRE-CALL FAILURE MUST NOT TERMINALLY REFUSE THE NEXT PAYMENT.
+//
+// The ported guard reads every FAILED sibling with a syntactically complete payload as
+// possibly-posted, and refuses AMBIGUOUS_FAILED_REGISTRATION for ever. That rule was written against
+// Xero, which validates the payload and then goes almost straight to the fence.
+//
+// QuickBooks fails EARLIER. Its INVOICE_PAYMENT case resolves a customer reference and a bank
+// account from the database AFTER the payload validation and BEFORE the capacity guard, so
+// `Missing customer reference for INVOICE_PAYMENT` is a FAILED row whose payload is complete and
+// whose attempt provably never left the process. Every later receipt on that invoice was then
+// refused terminally — a perfectly good payment, permanently.
+//
+// THIS IS NOT A QUICKBOOKS BUG. It is a gap in the SHARED guard that only became visible on a
+// connector that fails earlier, so the fix is in the guard: it now selects the attempt-provenance
+// pair and excludes FAILED rows that are canonically proven never attempted
+// (`attemptProvenNeverMade`). Xero gains the same exclusion for its own post-guard, pre-send
+// failures.
+//
+// These drive the REAL processPendingQuickBooksSync, and the FAILED sibling in the first test is
+// produced BY that connector rather than hand-written, so the row shape under test is the one
+// QuickBooks actually creates.
+// ---------------------------------------------------------------------------
+
+/** An order whose customer has no QuickBooks contact id — the pre-call failure QuickBooks detects. */
+const ORDER_100_NO_CUSTOMER = { ...ORDER_100, customer: null }
+/** The same order, with a contact the connector will accept. */
+const ORDER_100_WITH_CUSTOMER = {
+  ...ORDER_100,
+  customer: { accountingContactId: 'QBCUST-1', accountingContactProvenance: null },
+}
+
+/** A queued receipt with NO customerRef in its payload, so the connector must resolve one. */
+function receiptNeedingCustomerLookup(id: string, amount: number) {
+  const { customerRef: _dropped, ...withoutCustomerRef } = PAYMENT_PAYLOAD
+  return syncLogRow({
+    id,
+    connector: 'quickbooks',
+    type: 'INVOICE_PAYMENT',
+    status: 'PENDING',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    payload: { ...withoutCustomerRef, amount },
+    createdAt: new Date('2026-08-20T08:00:00.000Z'),
+  })
+}
+
+test('[o3d-anu8 r2] a receipt QuickBooks refused PRE-CALL does not block the next one on that invoice', async () => {
+  // PHASE 1 — let the connector itself produce the FAILED row. Five passes exhaust the retry budget,
+  // and the row lands FAILED with a COMPLETE payload (accountingInvoiceId, bankAccountId, amount all
+  // present, so the body test cannot clear it) and NO remoteAttemptedAt — while every claim stamped
+  // attempt-stamping custody onto it, which is what makes that silence evidence.
+  reset([receiptNeedingCustomerLookup('receipt-a', 40)])
+  salesOrder = ORDER_100_NO_CUSTOMER
+
+  for (let pass = 0; pass < 5; pass += 1) await runQuickBooks()
+
+  const failed = store.get('receipt-a')
+  assert.equal(failed?.status, 'FAILED', 'the connector really does terminalise it')
+  assert.match(String(failed?.errorMessage), /Missing customer reference/)
+  // `length`, not `deepEqual(qboPosts, [])`: node:assert's deep-equality against a literal `[]`
+  // narrows the array to `never[]` for the rest of the test, and phase 2 below reads qboPosts[0].
+  assert.equal(qboPosts.length, 0, 'and it never sent anything — that is the whole point')
+  assert.equal(failed?.remoteAttemptedAt, null, 'no attempt was ever stamped')
+  assert.ok(
+    failed?.attemptStampingCustodyAt instanceof Date,
+    'and custody was asserted by the production claim, so the missing stamp is a PROOF, not a silence',
+  )
+
+  // PHASE 2 — the operator fixes the contact and records the receipt again. Before this fix the
+  // guard read receipt-a as "might have posted" and refused this row terminally.
+  store.rows.push(queuedPaymentEntry())
+  salesOrder = ORDER_100_WITH_CUSTOMER
+
+  await runQuickBooks()
+
+  assert.equal(qboPosts.length, 1, 'the replacement receipt posts')
+  assert.equal(qboPosts[0].path, 'payment')
+  assert.notEqual(
+    store.get('entry-pay')?.status,
+    'CANCELLED',
+    'it must not be retired as an unresolvable ambiguity',
+  )
+})
+
+test('[o3d-anu8 r2] a FAILED sibling that DID reach the remote call still refuses — the exclusion is narrow', async () => {
+  // The control that makes the test above about PROVENANCE rather than about pre-call failures being
+  // waved through. Identical row, one column different: `remoteAttemptedAt` is set, which
+  // `authoriseMoneyPost` does as its FIRST act before any send. A stamped row may hold a payment
+  // whose response was lost, so the invoice's balance is genuinely unknowable.
+  reset([
+    queuedPaymentEntry(),
+    syncLogRow({
+      id: 'receipt-a',
+      connector: 'quickbooks',
+      type: 'INVOICE_PAYMENT',
+      status: 'FAILED',
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      payload: { ...PAYMENT_PAYLOAD },
+      remoteAttemptedAt: new Date('2026-08-20T08:30:00.000Z'),
+      attemptStampingCustodyAt: new Date('2026-08-20T08:00:00.000Z'),
+    }),
+  ])
+  salesOrder = ORDER_100_WITH_CUSTOMER
+
+  await runQuickBooks()
+
+  assert.deepEqual(qboPosts, [], 'a row that made a call may have settled the invoice; nothing may be sent')
+  assert.equal(store.get('entry-pay')?.status, 'CANCELLED')
+  const refusal = activity.find((entry) => entry.action === 'invoice_payment_refused_unknown_ledger_state')
+  assert.ok(refusal)
+  assert.equal((refusal.metadata as { refusal?: string }).refusal, 'AMBIGUOUS_FAILED_REGISTRATION')
+})
+
+test('[o3d-anu8 r2] a FAILED sibling OUTSIDE stamping custody still refuses — absence is not proof', async () => {
+  // The direction the fix must not get backwards. Custody NULL means a binary that does not stamp
+  // has handled this row (a deploy window, an overlap, a rollback), so its empty `remoteAttemptedAt`
+  // says nothing at all. Only a POSITIVE record that the row is pre-call may exclude it; everything
+  // undetermined keeps failing closed.
+  reset([
+    queuedPaymentEntry(),
+    syncLogRow({
+      id: 'receipt-a',
+      connector: 'quickbooks',
+      type: 'INVOICE_PAYMENT',
+      status: 'FAILED',
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      payload: { ...PAYMENT_PAYLOAD },
+      remoteAttemptedAt: null,
+      attemptStampingCustodyAt: null,
+    }),
+  ])
+  salesOrder = ORDER_100_WITH_CUSTOMER
+
+  await runQuickBooks()
+
+  assert.deepEqual(qboPosts, [])
+  assert.equal(store.get('entry-pay')?.status, 'CANCELLED')
+})

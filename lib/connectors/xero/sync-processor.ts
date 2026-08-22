@@ -1132,7 +1132,13 @@ export async function enqueueFollowUpSyncLog(
   })
   // Split back out. Only FAILED rows are the ambiguity set the planner counts tokens over; the
   // asserted-cancelled ones are carried purely so a plan can say what cleared it (o3d-anu8).
-  const assertedNotPostedRows = failedLogs.filter((row) => row.status === 'CANCELLED').map((row) => ({ id: row.id }))
+  // The PAYLOAD travels with the id (Codex round 2, MEDIUM). These rows are scoped to the ORDER, not
+  // to the document this follow-up targets, so the planner filters them by anchor before it records
+  // a reliance on them — and it can only do that from the payload. Handing over ids alone is what
+  // let the audit record name assertions about an invoice this payment never touched.
+  const assertedNotPostedRows = failedLogs
+    .filter((row) => row.status === 'CANCELLED')
+    .map((row) => ({ id: row.id, payload: row.payload }))
   const failedAttemptRevisions = new Map(
     failedLogs.filter((row) => row.status === 'FAILED').map((row) => [row.id, row.attemptRevision]),
   )

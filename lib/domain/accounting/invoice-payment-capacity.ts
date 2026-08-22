@@ -70,11 +70,22 @@
  *    rejection apart from a lost response.
  *
  * So a FAILED row makes remaining capacity UNKNOWABLE, and unknowable must not read as either "free"
- * or "spent" — it must refuse, and say what a human has to do. The ONE exception is not a guess but a
- * proof: a stored body missing a field the connector rejects before building a request CANNOT have
- * reached the ledger. That test already exists, reviewed, in followup-idempotency.ts, and is imported
- * rather than re-derived — two guards with two definitions of "nothing was sent" would disagree about
- * whether an invoice has capacity, which is the whole question.
+ * or "spent" — it must refuse, and say what a human has to do. The exceptions are not guesses but
+ * PROOFS, and there are two of them. Both are imported rather than re-derived — two guards with two
+ * definitions of "nothing was sent" would disagree about whether an invoice has capacity, which is
+ * the whole question:
+ *
+ *   the BODY   a stored request missing a field the connector rejects before building a request
+ *              CANNOT have reached the ledger (`storedBodyMayHaveReachedTheLedger`,
+ *              followup-idempotency.ts).
+ *   the ROW    a money row held in attempt-stamping custody for its whole life, carrying no
+ *              `remoteAttemptedAt`, never made a call at all (`attemptProvenNeverMade`,
+ *              money-attempt-provenance.ts). Added in Codex round 2 because the body test can only
+ *              clear failures a connector detects by READING the payload, and the connectors also
+ *              fail after that and before the send — QuickBooks on a customer reference or a bank
+ *              account it resolves from the database, Xero on a lost write lease or a refused money
+ *              fence. Those rows have perfect payloads and provably sent nothing, and reading them
+ *              as ambiguous terminally refused the next good receipt on the invoice.
  *
  * THE COST, STATED. An unresolved FAILED registration now blocks later receipts on the same invoice
  * instead of silently letting them through. That is the direction this file already chose for
@@ -102,6 +113,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
+import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { CAPACITY_EPSILON } from '@/lib/domain/accounting/invoice-payment-registration'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
@@ -138,6 +150,19 @@ export type PostedInvoicePaymentRegistration = {
    * not knowing what was sent is not evidence that nothing was (o3d-m5qk).
    */
   bodyCouldHavePosted: boolean
+  /**
+   * THE SECOND — AND STRONGER — PROOF THAT NOTHING WAS SENT (Codex round 2, HIGH).
+   *
+   * `attemptProvenNeverMade`: this row is stamped as having been in attempt-stamping custody for its
+   * whole life and carries NO `remoteAttemptedAt`, so no call ever left it. Unlike
+   * `bodyCouldHavePosted` this reads the ROW's own record of what happened rather than inferring it
+   * from the shape of the stored request, which is why it can clear a row whose payload is perfectly
+   * complete.
+   *
+   * `false` covers both "it was attempted" and "cannot tell" — custody forfeited, columns not
+   * selected — and the caller must treat both as possibly-posted. Only `true` is a proof.
+   */
+  provenNeverAttempted: boolean
 }
 
 export type InvoicePaymentPostRefusal =
@@ -194,10 +219,37 @@ export function decideInvoicePaymentPost(input: {
   // ledger's balance on this invoice undetermined, so there is no sum to compute — not a sum that
   // happens to come out favourable. Checked first because it is the stronger fact: a row whose
   // outcome is unknown makes an unreadable amount on some OTHER row beside the point.
+  // TWO INDEPENDENT PROOFS CLEAR A FAILED ROW, AND EITHER IS ENOUGH (Codex round 2, HIGH).
+  //
+  // THE GAP THIS CLOSES was only VISIBLE on QuickBooks, but it was never a QuickBooks bug. The
+  // ambiguity rule above rests on "a FAILED money row might have posted", and its one exception was
+  // the SHAPE of the stored request: a body missing a field the connector rejects before it builds a
+  // request cannot have been sent. That test is about the payload, so it can only clear the failures
+  // a connector detects by reading the payload.
+  //
+  // QuickBooks fails LATER than that and EARLIER than Xero does. Its INVOICE_PAYMENT case resolves a
+  // customer reference and a bank account against the database after the payload validation and
+  // before this guard, and either can be missing — `Missing customer reference for INVOICE_PAYMENT`
+  // is a row with a complete, readable payload whose attempt provably never left the process. The
+  // guard read every one of those as "might have posted" and TERMINALLY REFUSED the next perfectly
+  // good receipt on the invoice. Xero has the same shape in its own post-guard, pre-send window (a
+  // lost write lease, a refused money fence), so the fix belongs to the shared guard, not to a port.
+  //
+  // `attemptProvenNeverMade` is the proof, and it is the one the ROW carries: custody held for the
+  // row's whole life plus no `remoteAttemptedAt` means no call left it, whatever its payload looks
+  // like. It cannot wrongly clear an attempted row, because `authoriseMoneyPost` stamps
+  // `remoteAttemptedAt` as its FIRST act — before it decides anything, and before the send — so any
+  // row that reached the fence is stamped, and any row outside custody has been stamped by
+  // `repairMoneyAttemptsOutsideStampingCustody` before either processor claims anything.
+  //
+  // Everything undetermined still fails closed: `bodyCouldHavePosted` stays `true` for unknown and
+  // compacted bodies, `provenNeverAttempted` stays `false` for a forfeited custody or an unselected
+  // column, and a row that satisfies neither proof is still ambiguous.
   const ambiguous = againstThisInvoice.filter(
     (row) =>
       (AMBIGUOUS_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status)
-      && row.bodyCouldHavePosted,
+      && row.bodyCouldHavePosted
+      && !row.provenNeverAttempted,
   )
   if (ambiguous.length > 0) {
     return {
@@ -326,7 +378,14 @@ export async function guardInvoicePaymentCapacity(
     pricesIncludeVat: boolean
     shoppingLinks: { connector: string }[]
   } | null
-  let registrations: { id: string; status: string; payload: unknown; settlementBasis: string | null }[]
+  let registrations: {
+    id: string
+    status: string
+    payload: unknown
+    settlementBasis: string | null
+    remoteAttemptedAt: Date | null
+    attemptStampingCustodyAt: Date | null
+  }[]
   try {
     ;[order, registrations] = await Promise.all([
       client.salesOrder.findUnique({
@@ -348,7 +407,19 @@ export async function guardInvoicePaymentCapacity(
         // o3d-anu8: settlementBasis is asked for EXPLICITLY. It is what separates a SYNCED row the
         // connector wrote back from one an operator asserted, and without it the second reads as
         // the first.
-        select: { id: true, status: true, payload: true, settlementBasis: true },
+        //
+        // And the attempt-provenance pair with it (Codex round 2, HIGH), for the same kind of
+        // reason: without them a FAILED row that provably never made a call is indistinguishable
+        // from one that may have, and every later receipt on the invoice is refused for ever. They
+        // are read as a PAIR because neither proves anything alone — see `attemptProvenNeverMade`.
+        select: {
+          id: true,
+          status: true,
+          payload: true,
+          settlementBasis: true,
+          remoteAttemptedAt: true,
+          attemptStampingCustodyAt: true,
+        },
       }),
     ])
   } catch (error) {
@@ -398,6 +469,7 @@ export async function guardInvoicePaymentCapacity(
       amount: payloadNumber(row.payload, 'amount'),
       accountingInvoiceId: payloadString(row.payload, 'accountingInvoiceId'),
       bodyCouldHavePosted: storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', row.payload),
+      provenNeverAttempted: attemptProvenNeverMade(row),
     })),
   })
   if (verdict.post) return { post: true }

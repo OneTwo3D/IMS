@@ -74,6 +74,7 @@ import {
   accountingOriginRecordsMatch,
   carryAccountingOriginRecord,
 } from '@/lib/connectors/accounting-connection-provenance'
+import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
 
 export type FollowUpPayload = Record<string, unknown>
 
@@ -299,8 +300,13 @@ export type FollowUpEnqueueInput = FollowUpIdentity & {
    * part-payment history that otherwise refuses for ever. What they are here for is the other half
    * of that — so a plan that only exists because of an assertion can SAY so, instead of being
    * indistinguishable from one where the connector itself established that nothing was sent.
+   *
+   * THE PAYLOAD IS REQUIRED, not decorative (Codex round 2, MEDIUM). The rows arrive scoped to
+   * (connector, type, referenceType, referenceId) — an ORDER — and an order can hold assertions
+   * about a document it no longer has. The planner filters them by document anchor, and it can only
+   * do that if each row brings the payload the anchors are read from.
    */
-  assertedNotPostedRows?: readonly { id: string }[]
+  assertedNotPostedRows?: readonly { id: string; payload: unknown }[]
 }
 
 /**
@@ -498,7 +504,25 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // money-moving type while a settled-as-NOT_POSTED row sits in this scope means the ambiguity that
   // would otherwise have refused was cleared by a HUMAN'S WORD, and the caller records that. It does
   // not change the decision: freeing this path is the settlement action's stated purpose.
-  const assertedNotPostedRowIds = (input.assertedNotPostedRows ?? []).map((row) => row.id)
+  //
+  // ...AND ONLY ASSERTIONS ABOUT THE DOCUMENT THIS PLAN IS ENQUEUEING (Codex round 2, MEDIUM). The
+  // rows are read per (connector, type, referenceType, referenceId), which is an ORDER, and an order
+  // accumulates assertions about invoices it no longer has: delete and re-post an invoice and the
+  // predecessor's cancelled registrations stay in the scope for ever. Unfiltered, the record written
+  // from this list names rows that had nothing to do with the payment being enqueued — a warning
+  // that tells an operator to reconcile a document this plan never touched, which is the opposite of
+  // what an audit record is for. Worse, on a scope where NO assertion is relevant it manufactures a
+  // reliance out of nothing: `restsOnAssertion` is precisely the claim "this plan only got here
+  // because a human vouched for something", and that would be untrue.
+  //
+  // `couldHaveCommittedThis` is the SAME comparison the live-row lookup (`liveRowOccupiesFollowUpSlot`)
+  // and the failed-row history (`couldHaveCommitted`, below) already use — anchors compared
+  // element-wise, an unanchored stored payload counting as MATCHING because unknown must read as
+  // "possibly this one". A second comparison here could disagree with the two that decide, and then
+  // the record would describe a different question from the one that was answered.
+  const assertedNotPostedRowIds = (input.assertedNotPostedRows ?? [])
+    .filter((row) => couldHaveCommittedThis(asPayload(row.payload), freshAnchors))
+    .map((row) => row.id)
   const restsOnAssertion: SettlementAssertionReliance | undefined =
     moneyMoving && assertedNotPostedRowIds.length > 0 ? { assertedNotPostedRowIds } : undefined
 
@@ -702,8 +726,12 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // that does not stamp cannot write the column when it creates a row, and the database's forfeit
   // trigger takes custody away when it claims one. So the test is a presence check, and every way
   // of losing custody leaves the row here, unrecycled, with its evidence intact.
-  const provablyNeverAttempted = (row: FailedFollowUpRow): boolean =>
-    row.remoteAttemptedAt === null && row.attemptStampingCustodyAt !== null
+  //
+  // The predicate itself moved to `attemptProvenNeverMade` (money-attempt-provenance.ts) when the
+  // post-time capacity guard needed to ask the same question. It is the SAME question, so it is the
+  // same function: two spellings of "nothing was sent" would eventually disagree, and the readers
+  // that depend on it are the three listed above plus a money fence.
+  const provablyNeverAttempted = (row: FailedFollowUpRow): boolean => attemptProvenNeverMade(row)
 
   // AND ONLY A ROW THAT RECORDS THE SAME ORIGIN THE NEW WORK WAS RAISED AGAINST (o3d-s36z).
   //
