@@ -4,7 +4,9 @@ import path from 'node:path'
 import test from 'node:test'
 
 import {
+  CUSTODY_MAY_BE_RESTORED,
   STAMPED_MONEY_TYPES,
+  attemptProvenNeverMade,
   stampingCustodyOnClaim,
   stampingCustodyOnCreate,
 } from '@/lib/domain/accounting/money-attempt-provenance'
@@ -39,6 +41,30 @@ async function source(file: string): Promise<string> {
   return readFile(path.join(process.cwd(), file), 'utf8')
 }
 
+/**
+ * The source with every `stampingCustodyOnClaim(...)` argument removed, brace/paren-balanced. What
+ * remains is the code that writes to `accountingSyncLog` WITHOUT going through the helper.
+ */
+function withoutHelperCalls(text: string): string {
+  const CALL = 'stampingCustodyOnClaim('
+  let out = ''
+  let cursor = 0
+  for (let at = text.indexOf(CALL); at !== -1; at = text.indexOf(CALL, cursor)) {
+    out += text.slice(cursor, at)
+    let depth = 0
+    let i = at + CALL.length - 1
+    for (; i < text.length; i += 1) {
+      if (text[i] === '(') depth += 1
+      else if (text[i] === ')') {
+        depth -= 1
+        if (depth === 0) break
+      }
+    }
+    cursor = i + 1
+  }
+  return out + text.slice(cursor)
+}
+
 test('custody on CREATE is a presence, and that is all it has to be (o3d-0m56 r10)', () => {
   const custody = stampingCustodyOnCreate(new Date('2026-08-19T10:00:00Z'))
 
@@ -54,12 +80,99 @@ test('custody on CLAIM is written in the same statement as the claim, from the s
   // loses custody. Returning both fields from one function is what stops the pairing being
   // half-applied at one of the thirteen sites that write a non-null `processingStartedAt`.
   const claimedAt = new Date('2026-08-19T11:22:33.444Z')
-  const claim = stampingCustodyOnClaim(claimedAt)
+  const claim = stampingCustodyOnClaim({
+    where: { id: 'log-1' },
+    processingStartedAt: claimedAt,
+    data: { status: 'PROCESSING' },
+  })
 
-  assert.deepEqual(Object.keys(claim).sort(), ['attemptStampingCustodyAt', 'processingStartedAt'])
-  assert.equal(claim.processingStartedAt, claimedAt)
-  assert.equal(claim.attemptStampingCustodyAt.getTime(), claimedAt.getTime(),
+  assert.deepEqual(Object.keys(claim).sort(), ['data', 'where'],
+    'the helper returns the WHOLE updateMany argument, so the custody stamp cannot be taken without '
+    + 'the predicate that makes taking it safe')
+  assert.equal(claim.data.processingStartedAt, claimedAt)
+  assert.equal((claim.data.attemptStampingCustodyAt as Date).getTime(), claimedAt.getTime(),
     'a claim re-asserts custody at the claim instant; two different values would be two facts')
+  assert.equal(claim.data.status, 'PROCESSING', 'the caller\'s own data survives')
+})
+
+/**
+ * A minimal evaluator for the fragment of Prisma's where-grammar this predicate uses — `AND`, `NOT`,
+ * `{ in: [...] }` and equality, including equality with `null`. Enough to ask the question the
+ * database will be asked, over rows built here, without a database.
+ */
+function whereMatches(where: Record<string, unknown>, row: Record<string, unknown>): boolean {
+  return Object.entries(where).every(([key, condition]) => {
+    if (key === 'AND') return (condition as Record<string, unknown>[]).every((arm) => whereMatches(arm, row))
+    if (key === 'NOT') return !whereMatches(condition as Record<string, unknown>, row)
+    if (condition !== null && typeof condition === 'object' && 'in' in (condition as object)) {
+      return (condition as { in: unknown[] }).in.includes(row[key])
+    }
+    return row[key] === condition
+  })
+}
+
+test('a claim arriving after an UNSTAMPED WIRE ATTEMPT does not launder the row back into custody (o3d-anu8 r3)', () => {
+  // THE SEQUENCE THIS MODELS, and it is the deployment overlap the whole mechanism exists to
+  // support. An OLD binary claimed this INVOICE_PAYMENT row, its request REACHED THE WIRE, and it
+  // recorded nothing: the forfeit trigger took custody (NULL) and the old binary never stamps
+  // (`remoteAttemptedAt` NULL). That pair means UNDETERMINED — the payment may be in the ledger.
+  //
+  // The pass-level repair has already run, so nothing will stamp this row before the next pass. A
+  // claim by THIS binary then arrives. Restoring custody unconditionally would leave
+  // `custody present, no stamp`, which `attemptProvenNeverMade` reads as canonical proof that
+  // nothing was ever sent — the capacity guard frees a slot and the planner recycles the payload,
+  // and a payment that may have posted is treated as certainly not posted.
+  const claimedAt = new Date('2026-08-20T09:00:00.000Z')
+  const claim = stampingCustodyOnClaim({
+    where: { id: 'log-old-binary' },
+    processingStartedAt: claimedAt,
+    data: { status: 'PROCESSING' },
+  })
+
+  const wentToTheWireUnstamped = {
+    id: 'log-old-binary',
+    type: 'INVOICE_PAYMENT',
+    remoteAttemptedAt: null,
+    attemptStampingCustodyAt: null,
+  }
+  assert.equal(whereMatches(claim.where as Record<string, unknown>, wentToTheWireUnstamped), false,
+    'the claim must not land on a money row that carries neither custody nor a stamp')
+
+  // And the conservative reading therefore SURVIVES the claim: the row is untouched, so it still
+  // reads undetermined rather than proven.
+  assert.equal(attemptProvenNeverMade(wentToTheWireUnstamped), false,
+    'a row the claim refused still proves nothing, which is the whole point of refusing it')
+
+  // WHAT MUST STILL CLAIM. Refusing more than this population would strand rows for ever.
+  const stillClaimable = [
+    // Inside custody: the ordinary case, every row this binary created.
+    { case: 'in custody, unstamped', row: { type: 'INVOICE_PAYMENT', remoteAttemptedAt: null, attemptStampingCustodyAt: claimedAt } },
+    // Outside custody but STAMPED — the repair has been here, or a real attempt was recorded. There
+    // is no silence left to convert into proof.
+    { case: 'outside custody, stamped', row: { type: 'INVOICE_PAYMENT', remoteAttemptedAt: claimedAt, attemptStampingCustodyAt: null } },
+    // A PDF/e-mail follow-up: nothing ever stamps it, so refusing it would make it permanently
+    // unclaimable, and its unstamped state is never read as evidence of anything.
+    { case: 'non-money type outside custody', row: { type: 'SALES_INVOICE', remoteAttemptedAt: null, attemptStampingCustodyAt: null } },
+  ]
+  for (const { case: name, row } of stillClaimable) {
+    assert.equal(whereMatches(claim.where as Record<string, unknown>, { id: 'log-old-binary', ...row }), true,
+      `a row that is ${name} must still be claimable`)
+  }
+
+  // And the caller's own predicate is still AND-ed in, not replaced by the refusal.
+  assert.equal(
+    whereMatches(claim.where as Record<string, unknown>, { id: 'someone-else', type: 'SALES_INVOICE', remoteAttemptedAt: null, attemptStampingCustodyAt: null }),
+    false,
+    'the refusal is AND-ed onto the caller\'s predicate, never merged into it',
+  )
+})
+
+test('every money type the repair reaches is also a type custody may not be laundered onto (o3d-anu8 r3)', () => {
+  // The refusal and the repair must cover the SAME population: a money type the refusal skips is a
+  // type whose out-of-custody rows can be claimed into a false proof, and a money type the repair
+  // skips is one the refusal would strand for ever.
+  const types = (CUSTODY_MAY_BE_RESTORED.NOT as { type: { in: string[] } }).type.in
+  assert.deepEqual([...types].sort(), [...STAMPED_MONEY_TYPES].sort())
 })
 
 test('the repaired types are exactly the ones the fence stamps (o3d-0m56 r9)', () => {
@@ -135,11 +248,18 @@ test('every claim re-asserts custody in the same write (o3d-0m56 r10)', async ()
   for (const file of files) {
     const text = await source(file)
     if (!text.includes('accountingSyncLog')) continue
-    const handWritten = [...text.matchAll(/^\s*processingStartedAt: (?!null,)(.+)$/gm)]
+    // The helper's OWN module is where the pairing is defined — its declaration of the parameter and
+    // its one write of the column are the rule, not a site that could skip it. Pinned instead by the
+    // unit tests above, which read the returned statement rather than the source text.
+    if (file === PROVENANCE) continue
+    // Everything a call site hands to `stampingCustodyOnClaim` is removed before scanning, because
+    // naming the instant THERE is exactly how a site is supposed to write it now (o3d-anu8 r3): the
+    // helper owns the write. What is left is a `processingStartedAt` written by hand, which is the
+    // thing that must not exist.
+    const handWritten = [...withoutHelperCalls(text).matchAll(/^\s*processingStartedAt: (?!null,)(.+)$/gm)]
       .map((match) => match[1]!.trim())
-      // A `where` clause is a READ of the column, not a write: it cannot start a claim. The helper's
-      // own signature (`processingStartedAt: Date,`) is the declaration of the pairing, not a write.
-      .filter((value) => !value.startsWith('{') && !value.startsWith('Date,'))
+      // A `where` clause is a READ of the column, not a write: it cannot start a claim.
+      .filter((value) => !value.startsWith('{'))
     assert.deepEqual(handWritten, [], `${file} must write a non-null processingStartedAt only via stampingCustodyOnClaim`)
     if (text.includes('stampingCustodyOnClaim(')) claimers++
   }

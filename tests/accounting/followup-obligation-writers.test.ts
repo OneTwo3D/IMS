@@ -71,6 +71,10 @@ const SYNC_COLUMNS = new Set([
   // than tolerated, because this matcher's whole contract is to throw on a predicate it cannot
   // honour — silently ignoring the fence would turn these assertions into assertions about nothing.
   'attemptRevision',
+  // o3d-0m56 r10 / o3d-anu8 r3: the two columns that together decide whether a NULL attempt stamp
+  // is evidence. The claim statement reads BOTH, so a double that could not see them would let a
+  // laundering claim through and report a pass.
+  'remoteAttemptedAt', 'attemptStampingCustodyAt',
 ])
 
 /**
@@ -86,6 +90,14 @@ function matches(row: Record<string, unknown>, where: Record<string, unknown>): 
     }
     if (key === 'AND') {
       if (!(condition as Array<Record<string, unknown>>).every((clause) => matches(row, clause))) return false
+      continue
+    }
+    // o3d-anu8 r3: `NOT` is a real Prisma operator and the claim/custody statement now uses one —
+    // `stampingCustodyOnClaim` refuses to restore custody to a money row that carries neither
+    // custody nor an attempt stamp. Interpreting it (rather than ignoring it, or throwing) is what
+    // makes these doubles evaluate the predicate production evaluates.
+    if (key === 'NOT') {
+      if (matches(row, condition as Record<string, unknown>)) return false
       continue
     }
     if (!SYNC_COLUMNS.has(key)) throw new Error(`fake db: unknown column "${key}" in where clause`)

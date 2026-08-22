@@ -30,6 +30,8 @@
  * database or a Xero tenant.
  */
 
+import { isOperatorAssertedSettlement } from './sync-row-settlement'
+
 /** The sync type that registers a locally-recorded sales receipt against the ledger invoice. */
 export const PAYMENT_REGISTRATION_TYPE = 'INVOICE_PAYMENT'
 
@@ -95,6 +97,16 @@ export type PaymentRegistrationRow = {
   connector: string
   status: string
   externalTransactionId: string | null
+  /**
+   * o3d-anu8 — HOW this row reached its status. NULL is the connector's own writeback (or a
+   * verified reversal this module performed); `OPERATOR_ASSERTION` is a human's claim IMS checked
+   * nothing about. See `registrationLedgerStanding`, where it is the ONLY thing separating shape (c)
+   * of an operator settlement from `buildVerifiedReversalData`'s output.
+   *
+   * Optional: absent reads as the connector's own writeback, which is right for every row written
+   * before the column existed and for callers that legitimately have only a status and an id.
+   */
+  settlementBasis?: string | null
 }
 
 export type PaymentRegistrationSplit = {
@@ -142,16 +154,37 @@ export type RegistrationLedgerStanding =
   /** Nothing was sent, or what was sent has been established — by evidence — to be gone. */
   | 'NOTHING'
 
-export function registrationLedgerStanding(row: { status: string; externalTransactionId?: string | null }): RegistrationLedgerStanding {
+export function registrationLedgerStanding(
+  row: { status: string; externalTransactionId?: string | null; settlementBasis?: string | null },
+): RegistrationLedgerStanding {
   // CANCELLED IS ASKED FIRST, AHEAD OF POST EVIDENCE, and this is the one place that precedence is
   // inverted. Everywhere else a document id outranks a status, because a status is what IMS wrote
   // down and a document id is what the ledger gave back. CANCELLED is the exception because it is
-  // never written from an outcome: it is written where "nothing stands there" has ALREADY been
-  // established — a PENDING row retired before any call, or a registration retired after Xero was
-  // asked and answered DELETED. A cancelled row that still names a payment is the complete account
-  // of a payment that existed and was undone (see buildVerifiedReversalData), and reading that id as
-  // a live hold would alarm for ever over the reversal that fixed it.
-  if (row.status === 'CANCELLED') return 'NOTHING'
+  // written where "nothing stands there" has ALREADY been established — a PENDING row retired
+  // before any call, or a registration retired after Xero was asked and answered DELETED. A
+  // cancelled row that still names a payment is the complete account of a payment that existed and
+  // was undone (see buildVerifiedReversalData), and reading that id as a live hold would alarm for
+  // ever over the reversal that fixed it.
+  //
+  // ONE WRITER BREAKS THAT, AND IT PRODUCES A BYTE-IDENTICAL ROW (o3d-anu8).
+  // `buildVerifiedReversalData` writes { CANCELLED, externalTransactionId, errorMessage } after
+  // asking Xero and being told DELETED. `buildCancelledSaleSettlementData` writes { CANCELLED,
+  // externalTransactionId, errorMessage } because an operator typed a document id in and the sale
+  // this row belongs to is cancelled. The first is a verified absence; the second is an UNVERIFIED
+  // CLAIM THAT THE DOCUMENT EXISTS — the opposite fact — and the two rows differ in exactly one
+  // column, this one. Reading the asserted row as NOTHING lets deletePayment destroy the last local
+  // record of a payment that may be standing in a real ledger.
+  //
+  // So the short-circuit applies only where the CANCELLED actually establishes an absence. An
+  // asserted row that NAMES a document falls through to the post-evidence rule below and reads
+  // HELD, which is what its own note says it is.
+  //
+  // An asserted CANCELLED row with NO document id (the NOT_POSTED settlement) still reads NOTHING,
+  // deliberately: that assertion IS "nothing posted", it is audited with a person's name on it, and
+  // giving a stranded receipt a way out is what the settlement action exists for.
+  if (row.status === 'CANCELLED' && !(isOperatorAssertedSettlement(row.settlementBasis) && hasPostEvidence(row))) {
+    return 'NOTHING'
+  }
   // POST EVIDENCE OUTRANKS STATUS. The processor calls the ledger BEFORE it writes the result down,
   // so a FAILED row naming a document is a failure recorded in front of a payment that exists.
   if (hasPostEvidence(row)) return 'HELD'

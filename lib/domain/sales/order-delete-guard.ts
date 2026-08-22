@@ -1,5 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep'
+import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 
 /**
  * o3d-5r8 — hard-delete safety for sales orders.
@@ -332,6 +333,17 @@ export async function findSalesOrderDeleteBlocker(
   // selected, and if the back-reference also failed there is no accountingInvoiceId either. The
   // match is therefore "live status OR carries an external id", whatever the status (o3d-v7sy).
   //
+  // DELIBERATELY NOT COVERED (o3d-anu8): a row an OPERATOR settled as NOT_POSTED. It lands CANCELLED
+  // with externalTransactionId left NULL, so it matches neither arm above and the blocker for it
+  // disappears — and that is the intended consequence, not an oversight. `buildSettlementData` says
+  // so in as many words where it explains why the NOT_POSTED patch must never WRITE and never CLEAR
+  // an external id: "leaving the column untouched leaves it NULL, which is what makes the order
+  // deletable again". The alternative is the state o3d-nf9i exists to end, where a FAILED row that
+  // nothing can resolve blocks the delete for ever. What makes it acceptable is that the assertion is
+  // an audited act with a person's name on it (app/actions/accounting-settlement.ts), not that the
+  // system has established anything — so this is the one place in this guard where a human's word,
+  // and not evidence, is what lets a delete through.
+  //
   // NOT COVERED (o3d-sref): a STALE PROCESSING claim that the orphan sweep retires to CANCELLED
   // before its worker wrote a result. There is no external id yet, so nothing here can see it,
   // and a late remote success then strands the document. Closing that needs the orphan sweep to
@@ -347,17 +359,26 @@ export async function findSalesOrderDeleteBlocker(
         ],
       }],
     },
-    select: { id: true, connector: true, type: true, status: true, externalTransactionId: true },
+    // o3d-anu8: settlementBasis, because SYNCED-plus-an-external-id is written by TWO things — the
+    // connector's own writeback after the ledger answered, and an operator typing a document id into
+    // the settlement dialog. This guard reports the first as fact; without this column it reports the
+    // second as fact too.
+    select: { id: true, connector: true, type: true, status: true, externalTransactionId: true, settlementBasis: true },
   })
 
   // Order matters: with several rows, findFirst could return a merely QUEUED one ahead of a
   // POSTED one and advise cancelling a document that is already in the ledger. Posted evidence
   // wins, then FAILED (unknown), then in-flight, then queued — most severe remedy first.
-  const rank = (row: { status: string; externalTransactionId: string | null }): number => {
-    if (row.externalTransactionId || row.status === 'SYNCED') return 0
-    if (row.status === 'FAILED') return 1
-    if (row.status === 'PROCESSING') return 2
-    return 3
+  //
+  // o3d-anu8 splits the top rank in two. An operator-ASSERTED post still blocks the delete and still
+  // needs a reversal, so it stays above FAILED; but where a connector-confirmed row exists as well,
+  // that is the one to show, because its instruction rests on something the ledger said.
+  const rank = (row: { status: string; externalTransactionId: string | null; settlementBasis: string | null }): number => {
+    const posted = Boolean(row.externalTransactionId) || row.status === 'SYNCED'
+    if (posted) return isOperatorAssertedSettlement(row.settlementBasis) ? 1 : 0
+    if (row.status === 'FAILED') return 2
+    if (row.status === 'PROCESSING') return 3
+    return 4
   }
   const liveDocument = [...candidateDocuments].sort((a, b) => rank(a) - rank(b))[0] ?? null
   if (liveDocument) {
@@ -369,10 +390,22 @@ export async function findSalesOrderDeleteBlocker(
       // cancel-after-post needs an explicit reversal. Telling an operator to cancel a posted
       // document leaves a live receivable against a CANCELLED order.
       message: (liveDocument.status === 'SYNCED' || liveDocument.externalTransactionId)
-        ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
-          + `is already POSTED${liveDocument.externalTransactionId ? ` as ${liveDocument.externalTransactionId}` : ''}. `
-          + 'It needs an explicit reversal or credit note in the accounting system — '
-          + 'cancelling the order does NOT reverse a posted document.'
+        // o3d-anu8: SAY WHOSE CLAIM IT IS. "is already POSTED as X" is a statement about the ledger,
+        // and on a settled row nobody has read the ledger: a human typed X in, IMS made no call and
+        // compared no figure. The blocker is the same (the order must not be deleted while a document
+        // may stand against it) but the instruction is not — "reverse it" assumes the document exists,
+        // which is the very thing that has not been established.
+        ? isOperatorAssertedSettlement(liveDocument.settlementBasis)
+          ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) an OPERATOR `
+            + `recorded as POSTED${liveDocument.externalTransactionId ? ` (${liveDocument.externalTransactionId})` : ''}. `
+            + 'That is an assertion, not a confirmation: IMS never made the call and never read the document, so this id '
+            + 'is what somebody typed in. Open it in the accounting system first. If the document is there it needs an '
+            + 'explicit reversal or credit note — cancelling the order does NOT reverse a posted document; if it is not '
+            + 'there, the settlement was recorded in error and that is what has to be corrected before anything is deleted.'
+          : `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
+            + `is already POSTED${liveDocument.externalTransactionId ? ` as ${liveDocument.externalTransactionId}` : ''}. `
+            + 'It needs an explicit reversal or credit note in the accounting system — '
+            + 'cancelling the order does NOT reverse a posted document.'
         : liveDocument.status === 'FAILED'
           ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) is FAILED. `
             + 'A failed sync does not prove nothing was posted — the remote call happens before the result is written back, '

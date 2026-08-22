@@ -272,6 +272,23 @@ export async function registerInvoicePaymentWithLedger(params: {
               detail: refused.detail, ledgerTotal: refused.ledgerTotal,
             })
           return
+        // o3d-anu8: a registration on this invoice was SETTLED BY AN OPERATOR, so the figure IMS holds
+        // for it is what IMS meant to send and not what the ledger recorded. There IS a document id
+        // to go and read, which is what separates this from LEDGER_AMOUNT_UNKNOWN, so the message
+        // names it and says what reading it decides.
+        case 'LEDGER_AMOUNT_ASSERTED':
+          await warn('invoice_payment_not_registered',
+            `Recorded ${amount} against ${params.orderReference}, but a payment already registered against this ` +
+            `invoice (${refused.detail ?? 'unnamed'}) was recorded on an OPERATOR'S ASSERTION rather than confirmed by ` +
+            `the accounting connector — IMS never made that call and never read the document, so the amount it holds ` +
+            `for it is what it MEANT to send, not what the ledger recorded. How much of the invoice is still ` +
+            `outstanding therefore cannot be computed, and this receipt was not sent. Open that payment in the ` +
+            `accounting system, confirm what it actually settled, and register the balance there. ${tail}`,
+            {
+              amount: params.amount, currency: params.currency, refusal: refused.refusal,
+              detail: refused.detail, ledgerTotal: refused.ledgerTotal,
+            })
+          return
         // A registration is already on the invoice but IMS cannot read WHAT it was for, so the room
         // left on the invoice is unknown. Naming a figure here would be inventing one (o3d-cjt8).
         case 'LEDGER_AMOUNT_UNKNOWN':

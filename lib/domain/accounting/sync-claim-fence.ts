@@ -127,30 +127,29 @@ export async function releaseClaimForRetry(
    */
   attempt?: AttemptRef,
 ): Promise<boolean> {
-  const released = await client.accountingSyncLog.updateMany({
+  // THE WHOLE STATEMENT COMES FROM `stampingCustodyOnClaim`, here rather than at the six call sites
+  // (o3d-0m56 r10, o3d-anu8 r3). Re-gating a row is the same write as claiming it with a future
+  // instant: the database's forfeit trigger nulls `attemptStampingCustodyAt` on any claim-shaped
+  // UPDATE that does not re-assert it in the same statement, so without this every deferral and
+  // every backoff would silently forfeit custody — and a row outside custody can never again have
+  // its unset `remoteAttemptedAt` read as proof that no remote call left it. The helper also welds
+  // in the refusal that stops custody being restored to a row that carries neither custody nor a
+  // stamp; a release always holds its own claim, so that arm never fires here, and if it ever did
+  // the release simply reports that it did not land, which is the closed direction.
+  const released = await client.accountingSyncLog.updateMany(stampingCustodyOnClaim({
     // The instant is read HERE, as the statement is built — so a claim that has been renewed since
     // the entry was picked up releases the row it actually holds (Codex r2, medium 2).
     where: {
       ...heldClaimWhere(entryId, claim),
       ...(attempt ? { attemptRevision: attempt.attemptRevision } : {}),
     },
+    // A future `processingStartedAt` on a PENDING row is the existing retry gate: it is read as
+    // "earliest next claim time", not as a claim.
+    processingStartedAt: release.nextAttemptAt,
     data: {
       status: 'PENDING',
       errorMessage: release.errorMessage,
-      // A future `processingStartedAt` on a PENDING row is the existing retry gate: it is read as
-      // "earliest next claim time", not as a claim.
-      //
-      // o3d-0m56 r10: AND IT KEEPS ATTEMPT-STAMPING CUSTODY, here rather than at the six call sites.
-      // Re-gating a row is the same write as claiming it with a future instant, and the database's
-      // forfeit trigger nulls `attemptStampingCustodyAt` on any claim-shaped UPDATE that does not
-      // re-assert it in the same statement. Every deferral and every backoff is such a write, so
-      // without this each one silently forfeits custody — and a row outside custody can never again
-      // have its unset `remoteAttemptedAt` read as proof that no remote call left it, which is what
-      // lets the planner recycle it. `stampingCustodyOnClaim` returns BOTH fields from ONE instant
-      // so the pairing the trigger checks cannot be half-applied; spelling either out here would be
-      // a second copy of that rule, and this is the one release every non-terminal path goes through.
-      ...stampingCustodyOnClaim(release.nextAttemptAt),
     },
-  })
+  }))
   return released.count > 0
 }

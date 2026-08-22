@@ -955,6 +955,8 @@ type ReleaseSourceRow = {
   errorMessage: string | null
   backReferenceAmbiguousLoggedAt: Date | null
   backReferenceEvidenceCompactedAt: Date | null
+  /** o3d-anu8: NULL = the connector's own writeback. 'OPERATOR_ASSERTION' = a human's claim. */
+  settlementBasis: string | null
 }
 
 const CLAIM_ROW_COLUMNS = new Set(['id', 'accountingInvoiceId'])
@@ -1003,6 +1005,7 @@ function makeClaimDeps(options: {
     errorMessage: 'QuickBooks PURCHASE_INVOICE for PurchaseInvoice bill-target POSTED SUCCESSFULLY as external id 145, but …',
     backReferenceAmbiguousLoggedAt: null,
     backReferenceEvidenceCompactedAt: null,
+    settlementBasis: null,
     ...options.source,
   }
   const claimCalls = {
@@ -1837,6 +1840,65 @@ test('[o3d-9kek r8 f2] a CANCELLED sync row is refused', async () => {
 
   assert.deepEqual(result, { outcome: 'source-refused', reason: 'NOT_REPAIRABLE_STATUS' })
   assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '145')
+})
+
+test('[o3d-anu8] an OPERATOR-SETTLED source is refused, and the posted bill KEEPS its id and its provenance', async () => {
+  // THE WORST OF THE EIGHT LAUNDERING READERS.
+  //
+  // The operator settlement action writes exactly this row: status SYNCED, the document id the
+  // operator TYPED, and — into errorMessage — its own note. errorMessage is the first of the four
+  // conflict markers `releaseSourceRefusal` accepts, so before o3d-anu8 this row sailed through the
+  // NO_CONFLICT_EVIDENCE gate on the strength of a note the settlement itself had just written.
+  //
+  // What the command then did is the point, and it is why this test asserts state rather than a log
+  // line: it NULLED bill-retired's accountingInvoiceId AND its accountingInvoiceIdSource — one
+  // statement, deliberately, so the pair cannot come apart — and wrote the typed id onto bill-target
+  // with linkSource MANUAL. bill-retired is a genuinely posted bill. Afterwards nothing in IMS names
+  // the ledger document at all, and the transaction has committed, so there is nothing to undo.
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', accountingInvoiceIdSource: 'BILL_KEYED_SYNC', createdAt: 1 },
+    ],
+    source: {
+      status: 'SYNCED',
+      // The note buildSettlementData writes. It is NOT conflict evidence, and the gate used to read
+      // it as such.
+      errorMessage: 'Settled by operator: verified POSTED as 145.',
+      settlementBasis: 'OPERATOR_ASSERTION',
+    },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' }, recordRelease)
+
+  assert.deepEqual(result, { outcome: 'source-refused', reason: 'OPERATOR_ASSERTED_ID' })
+  // THE EVIDENCE SURVIVES. Asserting the refusal alone would pass against a version that refused
+  // AFTER releasing, and asserting only that something was logged would reproduce the defect exactly.
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '145',
+    'the genuinely posted bill must still hold its document id')
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceIdSource, 'BILL_KEYED_SYNC',
+    'and how it acquired that id — the provenance is cleared in the same statement as the id')
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, null,
+    'and the operator-typed id must not have been written onto the other document')
+})
+
+test('[o3d-anu8] a connector-written SYNCED row with the same shape is still repairable', async () => {
+  // The other side of the fence: without this, "refuse everything SYNCED with an errorMessage" would
+  // pass the test above while destroying the QuickBooks quarantine route this command exists for.
+  // Same row, same note-shaped errorMessage, settlementBasis NULL — it must still release.
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', accountingInvoiceIdSource: 'BILL_KEYED_SYNC', createdAt: 1 },
+    ],
+    source: { status: 'SYNCED', settlementBasis: null },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' }, recordRelease)
+
+  assert.equal(result.outcome, 'relinked')
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, null)
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, '145')
 })
 
 test('[o3d-9kek r8 f2] a FAILED sync row is repairable — it is what a XERO conflict looks like', async () => {

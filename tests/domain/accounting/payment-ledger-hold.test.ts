@@ -409,3 +409,43 @@ test('hasPostEvidence ignores whitespace-only ids', () => {
   assert.equal(hasPostEvidence(reg({ externalTransactionId: '   ' })), false)
   assert.equal(hasPostEvidence(reg({ externalTransactionId: 'PAY-9' })), true)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-anu8 — TWO WRITERS, ONE ROW SHAPE, OPPOSITE FACTS.
+//
+// `buildVerifiedReversalData` writes { CANCELLED, externalTransactionId, errorMessage } after asking
+// Xero and being told the payment is DELETED. `buildCancelledSaleSettlementData` writes
+// { CANCELLED, externalTransactionId, errorMessage } because an operator typed a document id in and
+// the sale is cancelled. The first is a VERIFIED ABSENCE; the second is an UNVERIFIED CLAIM THAT THE
+// DOCUMENT EXISTS. They differ in exactly one column.
+// ---------------------------------------------------------------------------
+
+test('[o3d-anu8] a CANCELLED registration an OPERATOR asserted still HOLDS — only a verified reversal is NOTHING', () => {
+  // The verified reversal, unchanged: Xero was asked and answered.
+  assert.equal(
+    registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: null }),
+    'NOTHING',
+  )
+  // The assertion. Reading this as NOTHING lets deletePayment destroy the last local record of a
+  // payment that may be standing in a real ledger.
+  assert.equal(
+    registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: 'OPERATOR_ASSERTION' }),
+    'HELD',
+  )
+  // ...and the NOT_POSTED settlement, which names no document, still frees the receipt. That
+  // assertion IS "nothing posted", it is audited with a person's name on it, and giving a stranded
+  // receipt a way out is what the settlement action exists for.
+  assert.equal(
+    registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }),
+    'NOTHING',
+  )
+})
+
+test('[o3d-anu8] the delete split routes the asserted cancellation into ledgerHold, not into no bucket at all', () => {
+  const split = splitPaymentRegistrations([
+    { id: 'r1', connector: 'xero', status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: 'OPERATOR_ASSERTION' },
+  ])
+  assert.deepEqual(split.ledgerHold.map((row) => row.id), ['r1'])
+  assert.deepEqual(split.retirable, [])
+  assert.deepEqual(split.undecided, [])
+})

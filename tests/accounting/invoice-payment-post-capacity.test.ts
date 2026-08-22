@@ -33,11 +33,20 @@ const ENTRY = 'entry-under-test'
  * complete — or unreadable — reports, i.e. the ordinary case, and the only case that is safe to
  * assume when nothing is known. A test that wants the provably-never-sent row has to say so.
  */
+type RegDefaults = 'bodyCouldHavePosted' | 'settlementBasis' | 'provenNeverAttempted'
+
 function reg(
-  row: Omit<PostedInvoicePaymentRegistration, 'bodyCouldHavePosted'>
-    & Partial<Pick<PostedInvoicePaymentRegistration, 'bodyCouldHavePosted'>>,
+  row: Omit<PostedInvoicePaymentRegistration, RegDefaults>
+    & Partial<Pick<PostedInvoicePaymentRegistration, RegDefaults>>,
 ): PostedInvoicePaymentRegistration {
-  return { bodyCouldHavePosted: true, ...row }
+  // o3d-anu8: `settlementBasis: null` is the connector's own writeback, i.e. the ordinary case, for
+  // the same reason `bodyCouldHavePosted: true` is the default. A test that wants an
+  // OPERATOR-ASSERTED row has to say so.
+  //
+  // Codex round 2: `provenNeverAttempted: false` for the same reason again. "Cannot prove nothing
+  // was sent" is the ordinary reading of a FAILED money row, and a default of `true` would silently
+  // clear every ambiguity test in this file.
+  return { bodyCouldHavePosted: true, settlementBasis: null, provenNeverAttempted: false, ...row }
 }
 
 function decide(overrides: Partial<Parameters<typeof decideInvoicePaymentPost>[0]> = {}) {
@@ -145,6 +154,63 @@ test('a FAILED registration whose stored body was INCOMPLETE frees the capacity 
   assert.equal(verdict.post, true)
 })
 
+// ---------------------------------------------------------------------------
+// CODEX ROUND 2, HIGH — THE ROW'S OWN RECORD IS THE SECOND PROOF THAT NOTHING WAS SENT.
+//
+// The body test can only clear failures a connector detects by READING the payload. Both connectors
+// also fail after that and before the send — QuickBooks on a customer reference or a bank account it
+// resolves from the database, Xero on a lost write lease or a refused money fence — and those rows
+// have complete payloads. Read as ambiguous, they terminally refuse every later receipt on the
+// invoice.
+// ---------------------------------------------------------------------------
+
+test('a FAILED registration PROVEN never attempted frees the capacity even with a complete body', () => {
+  const verdict = decide({
+    amount: 100,
+    registrations: [
+      reg({
+        id: 'other',
+        status: 'FAILED',
+        amount: 100,
+        accountingInvoiceId: 'INV-1',
+        // The body is perfect — this is the case the body test cannot reach.
+        bodyCouldHavePosted: true,
+        provenNeverAttempted: true,
+      }),
+    ],
+  })
+  assert.equal(verdict.post, true)
+})
+
+test('the attempt proof does NOT free capacity on a POSTED row — it is only about the ambiguous set', () => {
+  // A SYNCED row is the connector's writeback after the ledger answered; nothing about attempt
+  // provenance can unsay that. Wiring the new fact into the arithmetic would be a different, and
+  // wrong, change.
+  const verdict = decide({
+    amount: 60,
+    registrations: [
+      reg({ id: 'other', status: 'SYNCED', amount: 60, accountingInvoiceId: 'INV-1', provenNeverAttempted: true }),
+    ],
+  })
+  assert.equal(verdict.post, false)
+  assert.equal(verdict.post === false && verdict.refusal, 'WOULD_OVERPAY')
+})
+
+test('a FAILED registration that is merely UNSTAMPED is still ambiguous — absence is not proof', () => {
+  // `provenNeverAttempted` is false for a row outside stamping custody as well as for one that was
+  // attempted, and both must keep failing closed. This is the assertion that stops the fix being
+  // written as "no remoteAttemptedAt means it never posted", which is the reading round 10 of
+  // o3d-0m56 spent three findings dismantling.
+  const verdict = decide({
+    amount: 100,
+    registrations: [
+      reg({ id: 'other', status: 'FAILED', amount: 100, accountingInvoiceId: 'INV-1', provenNeverAttempted: false }),
+    ],
+  })
+  assert.equal(verdict.post, false)
+  assert.equal(verdict.post === false && verdict.refusal, 'AMBIGUOUS_FAILED_REGISTRATION')
+})
+
 test('a FAILED registration against a DIFFERENT document does not make this invoice ambiguous', () => {
   // o3d-hbgo, applied to the ambiguity: an attempt on the invoice this order no longer has cannot
   // have settled the one it does have. Scoping the ambiguity the same way the arithmetic is scoped
@@ -209,7 +275,18 @@ test('an unreadable amount on a posted registration fails CLOSED with LEDGER_AMO
 // DB WIRING — the reads the guard does, against a recording client.
 // ---------------------------------------------------------------------------
 
-type LogRow = { id: string; status: string; payload: unknown }
+type LogRow = {
+  id: string
+  status: string
+  payload: unknown
+  /**
+   * Codex round 2: the attempt-provenance pair the guard now selects. Defaulted by `logRow` below so
+   * every existing case keeps the conservative reading — custody NULL, i.e. "this row cannot prove
+   * anything", which is what a row written before custody shipped looks like.
+   */
+  remoteAttemptedAt?: Date | null
+  attemptStampingCustodyAt?: Date | null
+}
 
 function mockClient(options: {
   order?: { totalForeign: number; taxForeign: number; pricesIncludeVat: boolean; imported: boolean } | null
@@ -233,7 +310,11 @@ function mockClient(options: {
     accountingSyncLog: {
       findMany: async (args: Record<string, unknown>) => {
         calls.syncFindMany.push(args)
-        return options.logs ?? []
+        return (options.logs ?? []).map((row) => ({
+          remoteAttemptedAt: null,
+          attemptStampingCustodyAt: null,
+          ...row,
+        }))
       },
     },
   }
@@ -301,6 +382,33 @@ test('a FAILED sibling row read from the database refuses, and the message tells
   assert.match(message, /NOT proof that nothing reached the ledger/)
   assert.match(message, /Nothing was sent\./)
   assert.match(message, /Open this invoice in the ledger/)
+})
+
+test('the guard SELECTS the attempt-provenance pair, and a pre-call row read from the database frees the invoice', async () => {
+  // The pure rule above is only real if the columns are asked for: an unselected column arrives
+  // `undefined`, `attemptProvenNeverMade` reads that as "cannot tell", and every such row stays
+  // ambiguous for ever. So this asserts the query AND the outcome together.
+  const { client, calls } = mockClient({
+    order: { totalForeign: 100, taxForeign: 0, pricesIncludeVat: false, imported: false },
+    logs: [
+      { id: ENTRY, status: 'PROCESSING', payload: { amount: 100, accountingInvoiceId: 'INV-1', bankAccountId: 'bank-1' } },
+      {
+        // The QuickBooks shape: complete body, refused on a customer reference before any call left.
+        id: 'receipt-a',
+        status: 'FAILED',
+        payload: { amount: 100, accountingInvoiceId: 'INV-1', bankAccountId: 'bank-1' },
+        remoteAttemptedAt: null,
+        attemptStampingCustodyAt: new Date('2026-08-20T08:00:00.000Z'),
+      },
+    ],
+  })
+
+  const result = await guardInvoicePaymentCapacity(client as never, GUARD_PARAMS)
+
+  const select = (calls.syncFindMany[0] as { select?: Record<string, unknown> }).select ?? {}
+  assert.equal(select.remoteAttemptedAt, true, 'an unselected column can never prove anything')
+  assert.equal(select.attemptStampingCustodyAt, true, 'and neither column proves anything without the other')
+  assert.equal(result.post, true)
 })
 
 test('a FAILED sibling whose stored body the connector would have rejected pre-call does not block the post', async () => {
@@ -491,4 +599,39 @@ test('the Xero INVOICE_PAYMENT case runs the capacity guard BEFORE it posts to X
     guardAt < postAt,
     'the capacity guard must run BEFORE the remote call — after it, the money has already moved',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-anu8 — the POST-TIME half of the same rule. SYNCED is the one status this guard reads as
+// "money moved", and the operator settlement action writes SYNCED from a document id a human typed.
+// ---------------------------------------------------------------------------
+
+test('[o3d-anu8] an OPERATOR-ASSERTED SYNCED registration makes the capacity unmeasurable, not favourable', () => {
+  const verdict = decide({
+    amount: 40,
+    ledgerTotal: 100,
+    registrations: [reg({
+      id: 'asserted',
+      status: 'SYNCED',
+      // 60 + 40 = 100 exactly. Without the basis this returns post:true on a figure nothing sent.
+      amount: 60,
+      accountingInvoiceId: 'INV-1',
+      settlementBasis: 'OPERATOR_ASSERTION',
+    })],
+  })
+  assert.equal(verdict.post, false)
+  assert.equal(verdict.post === false && verdict.refusal, 'ASSERTED_REGISTRATION')
+  assert.equal(verdict.post === false && verdict.alreadyPosted, null,
+    'no figure is stated, because none is known')
+  assert.deepEqual(verdict.post === false && verdict.ambiguousIds, ['asserted'],
+    'and the row to go and read is named')
+})
+
+test('[o3d-anu8] the same registration written back by the connector still posts', () => {
+  const verdict = decide({
+    amount: 40,
+    ledgerTotal: 100,
+    registrations: [reg({ id: 'real', status: 'SYNCED', amount: 60, accountingInvoiceId: 'INV-1', settlementBasis: null })],
+  })
+  assert.equal(verdict.post, true)
 })

@@ -1,5 +1,6 @@
 import type { AccountingLinkSource, AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import { isUniqueConstraintViolation, uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 
 // ---------------------------------------------------------------------------
@@ -999,6 +1000,10 @@ type ExternalDocumentIdReleaseSourceDelegate = {
       errorMessage: true
       backReferenceAmbiguousLoggedAt: true
       backReferenceEvidenceCompactedAt: true
+      // o3d-anu8 — stated in the DELEGATE, so the select and the returned shape cannot come apart:
+      // a caller that stops asking for the column no longer type-checks, rather than silently
+      // handing `releaseSourceRefusal` an `undefined` that reads as a connector confirmation.
+      settlementBasis: true
     }
   }): Promise<{
     id: string
@@ -1011,6 +1016,7 @@ type ExternalDocumentIdReleaseSourceDelegate = {
     errorMessage: string | null
     backReferenceAmbiguousLoggedAt: Date | null
     backReferenceEvidenceCompactedAt: Date | null
+    settlementBasis: string | null
   } | null>
   update(args: { where: { id: string }; data: { errorMessage: null } }): Promise<unknown>
 }
@@ -1152,11 +1158,15 @@ export type ExternalDocumentIdReleaseOutcome =
    *                          CANCELLED means the row was deliberately abandoned.
    *   NO_CONFLICT_EVIDENCE — nothing on the row records that its back-reference was ever refused, so
    *                          there is no durable evidence this is the conflict being resolved.
+   *   OPERATOR_ASSERTED_ID — the row's status and its external id were written by an OPERATOR
+   *                          asserting an outcome, not by the connector. See below: on such a row
+   *                          the only "conflict evidence" this command can see is the note the
+   *                          settlement itself wrote, and acting on it DESTROYS a real link.
    *   EXTERNAL_ID_CHANGED  — it now carries a different external id: it re-posted, and the id the
    *                          operator confirmed a holder for is no longer the one this row is about.
    *   TARGET_CHANGED       — connector/type/reference moved, so it no longer names this document.
    */
-  | { outcome: 'source-refused'; reason: 'MISSING' | 'NOT_REPAIRABLE_STATUS' | 'NO_CONFLICT_EVIDENCE' | 'EXTERNAL_ID_CHANGED' | 'TARGET_CHANGED' }
+  | { outcome: 'source-refused'; reason: 'MISSING' | 'NOT_REPAIRABLE_STATUS' | 'NO_CONFLICT_EVIDENCE' | 'OPERATOR_ASSERTED_ID' | 'EXTERNAL_ID_CHANGED' | 'TARGET_CHANGED' }
   /**
    * THE DESTINATION no longer needs this link (o3d-9kek r8 finding 2). Nothing was written.
    *
@@ -1226,6 +1236,34 @@ function releaseSourceRefusal(
   // A FAILED row's errorMessage can also be an ordinary failure unrelated to any conflict, so this
   // is a FLOOR, not a proof: what actually stops a wrong write is the operator's confirmation of the
   // holder, the holder still holding exactly this id, and the destination fence below.
+  // THE SETTLEMENT NOTE IS NOT CONFLICT EVIDENCE, AND ON THIS PATH IT IS WORSE THAN NOTHING
+  // (o3d-anu8, the worst of the eight).
+  //
+  // Read the four markers above and note what the first one actually is: ANY errorMessage on a
+  // SYNCED or FAILED row. `buildSettlementData` writes SYNCED, the operator's typed document id,
+  // and — into errorMessage — the sentence "Settled by operator: verified POSTED as <id>." So the
+  // marker this command treats as durable proof that a back-reference was REFUSED is a note the
+  // settlement wrote about something else entirely, and every operator-settled POSTED row passes
+  // the gate.
+  //
+  // What happens next is not a wrong answer, it is the destruction of evidence. The command NULLs
+  // the confirmed holder's `accountingInvoiceId` AND its `accountingInvoiceLinkSource` — deliberately
+  // in one statement, so the provenance cannot come apart from the id — and writes the operator's
+  // typed id onto the source document with `linkSource: 'MANUAL'`. The holder was a genuinely
+  // POSTED document: after this, its id is gone, how it got that id is gone, and NOTHING in IMS
+  // names the ledger document any more. The transaction commits, so there is nothing to roll back.
+  //
+  // FAIL CLOSED, and refuse BEFORE the marker test so the reason names the truth rather than
+  // reporting the settlement note as a conflict. There is no weaker honest action available here:
+  // the operator's confirmation of the holder is the only thing separating a stale id from a
+  // correct link, and an asserted row supplies no independent fact for it to be confirmed against.
+  // If the id really is misattributed, the route is to establish that from the LEDGER — the row's
+  // own status is a claim, not a reading.
+  //
+  // Read from the COLUMN. The note is free text an operator can edit, and o3d-h2wx established
+  // that errorMessage carries no provenance at all: both connectors overwrite it with the remote
+  // system's own words. A parse of it could not say "I could not tell" either.
+  if (isOperatorAssertedSettlement(source.settlementBasis)) return 'OPERATOR_ASSERTED_ID'
   if (!source.errorMessage && !source.backReferenceAmbiguousLoggedAt && !source.backReferenceEvidenceCompactedAt) {
     return 'NO_CONFLICT_EVIDENCE'
   }
@@ -1323,6 +1361,10 @@ export async function releaseAndRelinkExternalDocumentId(
           id: true, connector: true, type: true, referenceType: true, referenceId: true,
           externalTransactionId: true, status: true, errorMessage: true,
           backReferenceAmbiguousLoggedAt: true, backReferenceEvidenceCompactedAt: true,
+          // o3d-anu8. WITHOUT THIS LINE the refusal below cannot fire: `settlementBasis` is
+          // optional on the row shape, so an unselected column arrives `undefined` and reads as a
+          // connector confirmation. The consumer half is the half that was never swept.
+          settlementBasis: true,
         },
       })
       const sourceRefusal = releaseSourceRefusal(source, params)

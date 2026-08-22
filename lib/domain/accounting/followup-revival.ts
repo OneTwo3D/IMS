@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { readFollowUpIdempotencyKey, type FollowUpEnqueuePlan, type FollowUpPayload } from './followup-idempotency'
+import { isOperatorAssertedSettlement } from './sync-row-settlement'
 
 /**
  * o3d-h2wx — the I/O half of the follow-up revival rule, shared by both accounting
@@ -113,9 +114,36 @@ export async function resolveLostFollowUpRevival(
       referenceId,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
     },
-    select: { id: true, payload: true },
+    // o3d-anu8: settlementBasis, because SYNCED is in the live set above and an operator can put a
+    // row there by asserting it posted.
+    select: { id: true, payload: true, settlementBasis: true },
   })
-  if (live.some((row) => readFollowUpIdempotencyKey(row.payload) === pinnedToken)) return
+  const ours = live.filter((row) => readFollowUpIdempotencyKey(row.payload) === pinnedToken)
+  if (ours.length > 0) {
+    // A ROW SOMEBODY ASSERTED IS NOT "ANOTHER RUN GOT THERE FIRST" (o3d-anu8).
+    //
+    // Returning here means the follow-up is accounted for: a live row exists carrying our token, so
+    // whatever posts it will post under the key we would have used. That reasoning is about a row a
+    // PROCESSOR owns. An operator-settled row is SYNCED with a document id typed by hand, no worker
+    // will ever pick it up, and returning quietly leaves the work permanently undone while looking
+    // like the ordinary race outcome — the same silent suppression as the skip in planFollowUpEnqueue,
+    // reached through the recovery path instead.
+    //
+    // Throwing hands it to the connector's failure handling, which is what makes it visible. It is
+    // NOT re-enqueued here: if the assertion is right the ledger already holds this, and this
+    // function has no way to find out which.
+    const asserted = ours.filter((row) => isOperatorAssertedSettlement(row.settlementBasis))
+    if (asserted.length > 0) {
+      throw new Error(
+        `Cannot enqueue ${connector} ${type} for ${referenceType} ${referenceId}: the live row carrying this `
+        + `follow-up's idempotency token (${asserted.map((row) => row.id).join(', ')}) is SYNCED because an OPERATOR `
+        + 'asserted it posted, not because the connector confirmed it — no worker will ever post from it, so treating '
+        + 'it as work already in hand would leave this permanently undone. Check the asserted document in the '
+        + 'accounting system and resolve that row before retrying.',
+      )
+    }
+    return
+  }
   if (live.length > 0) {
     // A live row owns this scope but under a different token. Retrying cannot help — the
     // unique index gives it the slot — and silently accepting it would be the duplicate we

@@ -45,7 +45,7 @@ import {
 import { updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
-import { describeSyncRowSettleability } from '@/lib/domain/accounting/sync-row-settlement'
+import { describeSyncRowSettleability, isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import { SettleSyncRowControl } from './settle-sync-row-control'
 
 type AccountingAccount = { id: string; externalAccountId: string; code: string | null; name: string; type: string }
@@ -1091,15 +1091,44 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                       // reason). Rendering "not settleable" against every SYNCED row would be noise
                       // that buries the rows an operator actually has to act on.
                       const settlementApplies = log.status === 'FAILED' || log.status === 'PROCESSING'
+                      // o3d-anu8 — SAY WHOSE CLAIM THIS ROW IS.
+                      //
+                      // A settled row renders identically to one Xero confirmed: the same SYNCED (or
+                      // CANCELLED) badge, and an external id in the same column. The operator reading
+                      // this page is the last reader in the chain, and they were the only one with no
+                      // way at all to tell that the id in front of them is one somebody typed in.
+                      // Read from the COLUMN — the note the settlement writes into errorMessage shows
+                      // two cells over, but it is free text and both connectors overwrite that field.
+                      const assertedBasis = isOperatorAssertedSettlement(log.settlementBasis)
                       return (
                         <TableRow key={log.id}>
                           <TableCell className="font-mono text-xs">{log.type.replace(/_/g, ' ')}</TableCell>
                           <TableCell>
                             <Badge variant={badge.variant} className="text-xs">{badge.label}</Badge>
                             {log.retryCount > 0 && <span className="ml-1 text-[10px] text-muted-foreground">({log.retryCount})</span>}
+                            {assertedBasis && (
+                              <Badge
+                                variant="outline"
+                                className="ml-1 text-[10px] border-amber-500 text-amber-600 dark:text-amber-400"
+                                title={
+                                  'Recorded by an OPERATOR, not confirmed by Xero. IMS made no call, read no document and '
+                                  + 'compared no amount — the external id beside this row is one somebody typed in. Verify it '
+                                  + 'in the accounting system.'
+                                }
+                              >
+                                asserted
+                              </Badge>
+                            )}
                           </TableCell>
                           <TableCell className="text-xs text-muted-foreground">{log.referenceType}:{log.referenceId.slice(0, 8)}</TableCell>
-                          <TableCell className="font-mono text-xs text-muted-foreground">{log.externalTransactionId?.slice(0, 12) ?? '—'}</TableCell>
+                          <TableCell
+                            className={`font-mono text-xs ${assertedBasis ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'}`}
+                            title={assertedBasis && log.externalTransactionId
+                              ? `${log.externalTransactionId} — asserted by an operator, not confirmed by Xero.`
+                              : log.externalTransactionId ?? undefined}
+                          >
+                            {log.externalTransactionId?.slice(0, 12) ?? '—'}
+                          </TableCell>
                           <TableCell className="text-xs text-muted-foreground">{formatDateTime(log.createdAt)}</TableCell>
                           <TableCell className="text-xs text-destructive max-w-48 truncate" title={log.errorMessage ?? undefined}>
                             {log.errorMessage ?? '—'}

@@ -497,3 +497,56 @@ test('o3d-ekn8: an unattributed row that is CANCELLED holds nothing back', () =>
   })
   assert.deepEqual(awaiting.map((r) => r.id), ['pay-1', 'pay-2'])
 })
+
+// ---------------------------------------------------------------------------
+// o3d-anu8 — AN ASSERTED AMOUNT IS NOT A MEASUREMENT.
+//
+// A row an operator settled as POSTED is SYNCED with a document id, so it is LIVE and the capacity
+// sum counts it. But its `amount` came out of the payload IMS BUILT — nothing sent it, nothing read
+// the ledger back — and Xero will accept a payment smaller than an invoice as a PART payment while
+// handing back a perfectly valid payment id. `ledgerTotal - alreadyRegistered` therefore overstates
+// the room left by however much the assertion was wrong, in the direction that lets a second
+// payment out.
+// ---------------------------------------------------------------------------
+
+test('[o3d-anu8] a live OPERATOR-ASSERTED registration refuses the arithmetic instead of trusting its amount', () => {
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    paymentAmount: 40,
+    ledgerTotal: 100,
+    existing: [{
+      status: 'SYNCED',
+      // 60 + 40 = 100 exactly, so WOULD_OVERPAY does not fire and the receipt sails through on a
+      // number nothing verified. That is the whole point: the sum is self-consistent and meaningless.
+      amount: 60,
+      paymentId: 'pay-old',
+      accountingInvoiceId: 'INV-1',
+      externalTransactionId: 'PAY-TYPED',
+      settlementBasis: 'OPERATOR_ASSERTION',
+    }],
+  })
+  assert.equal(d.register, false)
+  assert.equal(d.register === false && d.refusal, 'LEDGER_AMOUNT_ASSERTED')
+  // The refusal NAMES the payment, because unlike LEDGER_AMOUNT_UNKNOWN there is a document to go
+  // and read, and reading it is what resolves this.
+  assert.equal(d.register === false && d.detail, 'PAY-TYPED')
+})
+
+test('[o3d-anu8] the identical row written back by the CONNECTOR still registers', () => {
+  // The fence in the other direction: refusing every live SYNCED row would pass the test above while
+  // refusing every ordinary deposit-plus-balance. Same numbers, settlementBasis NULL.
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    paymentAmount: 40,
+    ledgerTotal: 100,
+    existing: [{
+      status: 'SYNCED',
+      amount: 60,
+      paymentId: 'pay-old',
+      accountingInvoiceId: 'INV-1',
+      externalTransactionId: 'PAY-REAL',
+      settlementBasis: null,
+    }],
+  })
+  assert.equal(d.register, true)
+})

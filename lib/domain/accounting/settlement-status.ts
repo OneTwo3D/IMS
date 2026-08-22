@@ -338,13 +338,37 @@ export function settlementStatus(input: {
         basis: 'NONE',
       }
     case 'CANCELLED':
+      // A CANCELLED ROW THAT NAMES A DOCUMENT IS NOT "NEVER SENT" (o3d-anu8).
+      //
+      // `buildCancelledSaleSettlementData` writes CANCELLED **with** the operator's typed document
+      // id: the assertion is that the payment DID post, and the row is retired only so no sweep
+      // carries a cancelled sale's remaining work any further. Telling the operator "the ledger was
+      // never told" over one of those is the exact inverse of what was asserted, and it is the
+      // sentence that talks somebody into registering the payment a second time.
+      if (assertedPost && p.externalTransactionId) {
+        return {
+          status: 'ASSERTED_UNVERIFIED',
+          discrepancy: true,
+          basis: 'OPERATOR_ASSERTION',
+          detail:
+            `An operator recorded this as posted in the ledger (payment ${p.externalTransactionId}) and the row was ` +
+            'then retired, so nothing here will chase it. IMS never made the call, never read the document and never ' +
+            'compared the amount. Open that payment in the accounting system and confirm it before registering ' +
+            'anything else against this document.',
+        }
+      }
       return {
         status: 'NOT_SENT',
         discrepancy: true,
         detail:
           'The payment sync was cancelled, so the ledger was never told about this settlement and still ' +
-          'shows the amount outstanding.',
-        basis: 'NONE',
+          'shows the amount outstanding.' +
+          // The NOT_POSTED settlement: the same conclusion, reached from a human's word rather than
+          // from IMS's own record. Named, because a reader acting on it deserves to know which.
+          (assertedPost
+            ? ' That cancellation was an OPERATOR\'S ASSERTION that nothing posted, not something IMS established.'
+            : ''),
+        basis: assertedPost ? 'OPERATOR_ASSERTION' : 'NONE',
       }
   }
 }

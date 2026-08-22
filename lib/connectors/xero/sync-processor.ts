@@ -15,7 +15,7 @@ import {
   reportUnrecordedRemoteWrite,
   UnrecordedRemoteWriteError,
 } from '@/lib/db/post-remote-persist'
-import { logActivity, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
+import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
 import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
@@ -66,7 +66,12 @@ import {
   planFollowUpEnqueue,
   readFollowUpIdempotencyKey,
   type FollowUpPayload,
+  type SettlementAssertionReliance,
 } from '@/lib/domain/accounting/followup-idempotency'
+import {
+  isOperatorAssertedSettlement,
+  OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+} from '@/lib/domain/accounting/sync-row-settlement'
 import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
@@ -940,7 +945,7 @@ async function hasExistingSyncLog(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
-): Promise<boolean> {
+): Promise<{ exists: boolean; asserted: boolean }> {
   const liveRows = await db.accountingSyncLog.findMany({
     where: {
       connector: XERO_CONNECTOR,
@@ -949,9 +954,18 @@ async function hasExistingSyncLog(
       referenceId,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
     },
-    select: { payload: true },
+    // o3d-anu8: settlementBasis, because the occupying row is what makes the enqueue a silent skip
+    // and a SYNCED row is written by TWO things — the processor's writeback after Xero answered, and
+    // an operator typing a document id into the settlement dialog.
+    select: { payload: true, settlementBasis: true },
   })
-  return liveRows.some((row) => liveRowOccupiesFollowUpSlot(row.payload, payload as FollowUpPayload))
+  const occupying = liveRows.filter((row) => liveRowOccupiesFollowUpSlot(row.payload, payload as FollowUpPayload))
+  return {
+    exists: occupying.length > 0,
+    // WORST-FIRST, as o3d-nf9i established for aggregation: one asserted occupant is enough for the
+    // suppression to rest on an assertion, because any of them may be the only reason this is skipped.
+    asserted: occupying.some((row) => isOperatorAssertedSettlement(row.settlementBasis)),
+  }
 }
 
 /**
@@ -980,6 +994,64 @@ type FollowUpOriginEvidence =
   | { from: 'postedRow'; payload: unknown }
   /** Nothing in hand observed the origin. The row is created carrying no record, and cannot post. */
   | { from: 'unobserved' }
+
+/**
+ * o3d-anu8 — THIS MONEY POST IS CLEARED BY A HUMAN'S WORD, and the record says so.
+ *
+ * The plan carries `restsOnAssertion` only on a money-moving create/reuse whose scope holds a row an
+ * operator settled as NOT_POSTED. That settlement is what dropped the distinct-token count and turned
+ * a refusal into this enqueue — deliberately, it is the documented purpose of the action — but
+ * without this line the resulting payment is indistinguishable from one the connector's own history
+ * cleared, and if the assertion was wrong there is nothing to lead anybody back to it.
+ *
+ * WRITTEN INSIDE THE ENQUEUE'S OWN TRANSACTION, AFTER THE ROW EXISTS (Codex, this branch). The first
+ * revision wrote it at PLAN time, with `logActivity(...).catch(() => {})`, and got both halves wrong:
+ *
+ *   • NOT TIED TO THE OUTCOME. The word in the record is "Enqueued", and at that point nothing had
+ *     been. Three things could still stop the enqueue afterwards — the unfenced-reuse refusal, the
+ *     ledger-clearance refusal, and the create/revive itself (a lost compare-and-swap, a unique-index
+ *     collision, any database failure). Each leaves a WARNING on the log asserting a money post that
+ *     never happened, which is worse than silence: the next person to reconcile a suspected duplicate
+ *     is led to a payment that does not exist, and the operator assertion it names looks acted upon.
+ *   • NOT DURABLE. `.catch(() => {})` is the correct default for the hundreds of informational writes
+ *     in this codebase and the wrong one here. This record is the ONLY thing that will ever say a
+ *     ledger-affecting post rested on a human's word rather than on evidence — o3d-nf9i's own rule,
+ *     and `logActivityInTransaction` exists for exactly it. Best-effort would let the enqueue commit
+ *     with the reliance silently unrecorded and nothing would ever surface the gap.
+ *
+ * One transaction, so the record and the row commit together or neither does: an unwritable record
+ * aborts the enqueue rather than leaving a money post nobody can trace back to the assertion that
+ * released it. Called on BOTH arms — a revived row is as much a post cleared by that assertion as a
+ * created one — and on neither of the arms that did not enqueue.
+ */
+async function recordEnqueueRestingOnAssertion(
+  tx: Pick<Prisma.TransactionClient, 'activityLog'>,
+  identity: { type: FollowUpSyncType; referenceType: string; referenceId: string },
+  plan: { action: 'create' | 'reuse'; restsOnAssertion?: SettlementAssertionReliance },
+): Promise<void> {
+  if (!plan.restsOnAssertion) return
+  await logActivityInTransaction(tx, {
+    // Explicit null: the session lookup logActivity falls back on is a React cache() read, which has
+    // no place inside a database transaction — and no operator is present here anyway. The people
+    // this names are on the settlement rows the metadata points at.
+    userId: null,
+    entityType: 'SYSTEM',
+    action: 'xero_followup_enqueue_rests_on_operator_assertion',
+    tag: 'sync',
+    level: 'WARNING',
+    description: `Enqueued Xero ${identity.type} for ${identity.referenceType} ${identity.referenceId} while `
+      + `${plan.restsOnAssertion.assertedNotPostedRowIds.length} earlier row(s) for it are CANCELLED because an `
+      + 'OPERATOR asserted they never posted. IMS verified nothing about that: if any of them did reach the ledger, '
+      + 'this post duplicates it. Reconcile in the accounting system if this money appears twice.',
+    metadata: {
+      type: identity.type,
+      referenceType: identity.referenceType,
+      referenceId: identity.referenceId,
+      assertedNotPostedRowIds: plan.restsOnAssertion.assertedNotPostedRowIds,
+      planAction: plan.action,
+    },
+  })
+}
 
 /**
  * Exported for unit tests (o3d-e2mz r3): the revival compare-and-swap in here is the one write on a
@@ -1015,7 +1087,8 @@ export async function enqueueFollowUpSyncLog(
   ) as SyncPayload
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
-  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId, payload)
+  const live = await hasExistingSyncLog(type, referenceType, referenceId, payload)
+  const liveRowExists = live.exists
   // o3d-h2wx: a FAILED row is REUSED rather than replaced. Xero's Idempotency-Key is
   // derived from the entry id, so creating a replacement row would post the retry under a
   // key Xero has never seen — and if the failed attempt had actually committed, a SECOND
@@ -1028,7 +1101,18 @@ export async function enqueueFollowUpSyncLog(
   // pinned request body — see lib/domain/accounting/idempotency-retention.ts for what is and
   // is not protected once the window has closed.
   const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
-    where: { connector: XERO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
+    where: {
+      connector: XERO_CONNECTOR, type, referenceType, referenceId,
+      // o3d-anu8: the SAME query widened rather than a second one, because the two row sets answer
+      // one question between them. FAILED rows are the ambiguity set. A CANCELLED row carrying
+      // OPERATOR_ASSERTION is a row that LEFT that set on a human's word — `buildSettlementData`
+      // documents that as the intended unblock — and the planner is told about it so a money post
+      // cleared that way can be recorded as such instead of looking connector-cleared.
+      OR: [
+        { status: 'FAILED' },
+        { status: 'CANCELLED', settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS },
+      ],
+    },
     orderBy: { createdAt: 'desc' },
     // remoteAttemptedAt is what tells the planner whether a row's payload is the record of a call
     // that reached Xero. A revival OVERWRITES the payload it recycles, so recycling an attempted
@@ -1041,13 +1125,24 @@ export async function enqueueFollowUpSyncLog(
     // o3d-e2mz r3: and the attempt each candidate row is AT when it was read. Reviving one is a
     // write to that attempt and must be fenced on it — see the compare-and-swap below.
     select: {
-      id: true, payload: true,
+      id: true, payload: true, status: true,
       remoteAttemptedAt: true, attemptStampingCustodyAt: true,
       attemptRevision: true,
     },
   })
-  const failedAttemptRevisions = new Map(failedLogs.map((row) => [row.id, row.attemptRevision]))
-  const failedRows = failedLogs.map((row) => ({
+  // Split back out. Only FAILED rows are the ambiguity set the planner counts tokens over; the
+  // asserted-cancelled ones are carried purely so a plan can say what cleared it (o3d-anu8).
+  // The PAYLOAD travels with the id (Codex round 2, MEDIUM). These rows are scoped to the ORDER, not
+  // to the document this follow-up targets, so the planner filters them by anchor before it records
+  // a reliance on them — and it can only do that from the payload. Handing over ids alone is what
+  // let the audit record name assertions about an invoice this payment never touched.
+  const assertedNotPostedRows = failedLogs
+    .filter((row) => row.status === 'CANCELLED')
+    .map((row) => ({ id: row.id, payload: row.payload }))
+  const failedAttemptRevisions = new Map(
+    failedLogs.filter((row) => row.status === 'FAILED').map((row) => [row.id, row.attemptRevision]),
+  )
+  const failedRows = failedLogs.filter((row) => row.status === 'FAILED').map((row) => ({
     id: row.id,
     payload: row.payload,
     // Exactly what followUpIdempotencySource would have produced for this row, so pinning it
@@ -1063,7 +1158,9 @@ export async function enqueueFollowUpSyncLog(
     referenceId,
     payload,
     liveRowExists,
+    liveRowAsserted: live.asserted,
     failedRows,
+    assertedNotPostedRows,
   })
   if (plan.action === 'skip') return
   if (plan.action === 'refuse') {
@@ -1176,6 +1273,8 @@ export async function enqueueFollowUpSyncLog(
           },
         })
         if (revived.count === 0) return 'cas-lost' as const
+        // The reliance record commits with the revival, or the revival does not commit.
+        await recordEnqueueRestingOnAssertion(tx, { type, referenceType, referenceId }, plan)
         await scheduleXeroAccountingOutbox(tx, {
           accountingSyncLogId: plan.syncLogId,
           // Explicit 0 rather than resetAttempts: a PROCESSING outbox row honours only an
@@ -1199,6 +1298,9 @@ export async function enqueueFollowUpSyncLog(
           ...stampingCustodyOnCreate(),
         },
       })
+      // Same rule on the create arm: one transaction, so a money post cleared by an assertion cannot
+      // exist without the line that says so.
+      await recordEnqueueRestingOnAssertion(tx, { type, referenceType, referenceId }, plan)
       await scheduleXeroAccountingOutbox(tx, {
         accountingSyncLogId: log.id,
       })
@@ -1496,25 +1598,31 @@ async function claimAccountingSyncLog(
    */
   attempt: AttemptRef,
 ): Promise<SyncLogClaimResult> {
-  const claimData = {
-    status: 'PROCESSING' as const,
-    attemptRevision: attempt.attemptRevision,
-    // o3d-0m56 r10: the claim and attempt-stamping CUSTODY move together, ALWAYS, and they do it
-    // here — in the one object both claim statements below share — rather than at each call site.
-    // A claim is what precedes a post, so the database's forfeit trigger reads a claim that does not
-    // re-assert custody as one made by a binary that does not stamp and takes custody away. Losing it
-    // is silent and permanent for that row: its unset `remoteAttemptedAt` can never again be read as
-    // proof no remote call left it, so the planner will never recycle it. `stampingCustodyOnClaim`
-    // emits `processingStartedAt` and `attemptStampingCustodyAt` from ONE instant, which is the
-    // pairing the trigger checks — spelling either out separately would break it.
-    ...stampingCustodyOnClaim(claimedAt),
-  }
+  // o3d-0m56 r10 / o3d-anu8 r3: the claim, attempt-stamping CUSTODY and the refusal that makes
+  // restoring custody safe are ONE `updateMany` argument, built here — in the one object both claim
+  // statements below share — rather than assembled at each call site.
+  //
+  // A claim is what precedes a post, so the database's forfeit trigger reads a claim that does not
+  // re-assert custody as one made by a binary that does not stamp, and takes custody away. Losing it
+  // is silent and permanent for that row: its unset `remoteAttemptedAt` can never again be read as
+  // proof no remote call left it, so the planner will never recycle it.
+  //
+  // And restoring it is not unconditional. A money row an OLD binary claimed, posted from and left
+  // unstamped carries neither custody nor a stamp, and that pair means "undetermined". Restoring
+  // custody alone would rewrite it into `attemptProvenNeverMade`'s positive proof — a payment that
+  // may have posted, read as certainly not posted. The helper's predicate refuses that row instead;
+  // the repair on the first line of this sweep stamps it, and it claims normally afterwards.
+  const claimStatement = stampingCustodyOnClaim({
+    where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision),
+    processingStartedAt: claimedAt,
+    data: {
+      status: 'PROCESSING' as const,
+      attemptRevision: attempt.attemptRevision,
+    },
+  })
 
   if (entry.type !== 'INVOICE_PAYMENT' || entry.referenceType !== 'SalesOrder') {
-    const claim = await db.accountingSyncLog.updateMany({
-      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision),
-      data: claimData,
-    })
+    const claim = await db.accountingSyncLog.updateMany({ ...claimStatement })
     return claim.count === 0 ? { outcome: 'not-claimable' } : { outcome: 'claimed' }
   }
 
@@ -1534,10 +1642,7 @@ async function claimAccountingSyncLog(
     if (!decision.claim) {
       return { outcome: 'deferred', reason: decision.reason, blockedBy: decision.blockedBy }
     }
-    const claim = await tx.accountingSyncLog.updateMany({
-      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision),
-      data: claimData,
-    })
+    const claim = await tx.accountingSyncLog.updateMany({ ...claimStatement })
     return claim.count === 0 ? { outcome: 'not-claimable' } : { outcome: 'claimed' }
   })
 }
@@ -1617,26 +1722,33 @@ export async function deferUnclaimedPaymentUntilEarlierLogsPost(
 ): Promise<boolean> {
   // A future `processingStartedAt` on a PENDING row is the existing retry gate: it is read as
   // "earliest next claim time", not as a claim.
-  const deferred = await client.accountingSyncLog.updateMany({
+  //
+  // The `data` below carries NO `status` KEY, and that is the whole point — see the header above.
+  // This row was never claimed, so writing the queued status here would stamp over a claim another
+  // runner took in the meantime, un-claiming a request that may already be on the wire. (Spelt that
+  // way deliberately: the structural test in xero-sync-processor.test.ts scans this call's argument
+  // text for a queued-status write, and a comment quoting one reads as the defect itself.) The
+  // where-clause pins the row instead.
+  //
+  // BUT THE CUSTODY STAMP IS STILL REQUIRED, and the two rules are not in tension. The forfeit
+  // trigger fires on ANY update that moves `processingStartedAt` to a new non-null value — it does
+  // not also require the status to change — so this write would silently drop
+  // `attemptStampingCustodyAt` and make the row permanently un-recyclable, however careful it is
+  // about ownership. `stampingCustodyOnClaim` re-asserts it and sets no status of its own, so it
+  // satisfies both fences at once. Custody is a claim about the BINARY that touched the row, not
+  // about who owns it, and a stamping binary is exactly what is touching it here.
+  //
+  // AND THIS IS THE ONE CUSTODY WRITE THAT REACHES A ROW THIS WORKER DOES NOT OWN (o3d-anu8 r3), so
+  // it is the one most able to launder an old binary's unstamped attempt back into custody. The
+  // helper's refusal covers it: an INVOICE_PAYMENT row carrying neither custody nor a stamp is not
+  // re-gated at all, and this reports that the deferral did not land — the closed direction.
+  const deferred = await client.accountingSyncLog.updateMany(stampingCustodyOnClaim({
     where: { id: entry.id, status: 'PENDING' },
+    processingStartedAt: new Date(Date.now() + ORDERING_DEFERRAL_MS),
     data: {
-      // NO `status` KEY, and that is the whole point — see the header above. This row was never
-      // claimed, so writing the queued status here would stamp over a claim another runner took in
-      // the meantime, un-claiming a request that may already be on the wire. (Spelt that way
-      // deliberately: the structural test in xero-sync-processor.test.ts scans this call's argument
-      // text for a queued-status write, and a comment quoting one reads as the defect itself.)
-      //
-      // BUT THE CUSTODY STAMP IS STILL REQUIRED, and the two rules are not in tension. The forfeit
-      // trigger fires on ANY update that moves `processingStartedAt` to a new non-null value — it
-      // does not also require the status to change — so this write would silently drop
-      // `attemptStampingCustodyAt` and make the row permanently un-recyclable, however careful it is
-      // about ownership. `stampingCustodyOnClaim` re-asserts it and sets NO status, so it satisfies
-      // both fences at once. Custody is a claim about the BINARY that touched the row, not about who
-      // owns it, and a stamping binary is exactly what is touching it here.
-      ...stampingCustodyOnClaim(new Date(Date.now() + ORDERING_DEFERRAL_MS)),
       errorMessage: invoicePaymentDeferralMessage(detail),
     },
-  })
+  }))
   return deferred.count > 0
 }
 
@@ -4508,7 +4620,11 @@ async function processClaimedEntry(
           // The two refusals need an operator to do DIFFERENT things — reconcile an over-settlement,
           // versus find out whether a failed attempt actually posted — so they are not filed under one
           // action name that would make the second read as the first.
-          action: capacity.refusal === 'AMBIGUOUS_FAILED_REGISTRATION'
+          // o3d-anu8 adds a third: a SYNCED registration an OPERATOR asserted. It is filed with the
+          // unknown-ledger-state action rather than the over-settlement one, because what the
+          // operator must do is the same — go and find out what the ledger actually holds — and
+          // filing it as an over-settlement would tell them a figure IMS is in no position to state.
+          action: capacity.refusal === 'AMBIGUOUS_FAILED_REGISTRATION' || capacity.refusal === 'ASSERTED_REGISTRATION'
             ? 'invoice_payment_refused_unknown_ledger_state'
             : 'invoice_payment_refused_over_settlement',
           tag: 'accounting',

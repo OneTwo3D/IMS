@@ -13,6 +13,7 @@ import {
   storedBodyMayHaveReachedTheLedger,
   withFollowUpIdempotencyKey,
 } from '@/lib/domain/accounting/followup-idempotency'
+import { attemptCouldBeTheSameDocument } from '@/lib/domain/accounting/followup-retry-guard'
 
 /**
  * o3d-h2wx: a follow-up's REMOTE idempotency key must survive regeneration of its
@@ -1550,4 +1551,249 @@ test('the ROLLBACK double post, played out end to end (o3d-0m56 r10)', () => {
     'the token must be the one the committed £100 payment carries the mark of')
   assert.equal(back.action === 'reuse' ? back.payload.amount : undefined, 100,
     'and the body stays pinned, so the recomputed 105 cannot record a settlement never made')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-anu8 — WHO SUPPRESSED THIS WORK, AND WHAT CLEARED IT.
+// ---------------------------------------------------------------------------
+
+test('[o3d-anu8] a live row that an OPERATOR asserted refuses instead of skipping silently', () => {
+  // The live set is PENDING/PROCESSING/SYNCED, and a SYNCED row means "the ledger was told" — which
+  // is why the skip is silent. `buildSettlementData` also writes SYNCED, from a document id a human
+  // typed, and for an INVOICE_PAYMENT that row permanently suppresses the real registration: the
+  // invoice is never settled and the skip logs nothing to say so.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: true,
+    liveRowAsserted: true,
+    failedRows: [],
+  })
+  assert.equal(plan.action, 'refuse')
+  assert.match(plan.action === 'refuse' ? plan.reason : '', /OPERATOR asserted it posted/)
+})
+
+test('[o3d-anu8] a live row the connector wrote back still skips silently', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: true,
+    liveRowAsserted: false,
+    failedRows: [],
+  })
+  assert.equal(plan.action, 'skip')
+})
+
+test('[o3d-anu8] a NON-money live asserted row still skips — a missed PDF is not money', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    type: 'INVOICE_PDF',
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: true,
+    liveRowAsserted: true,
+    failedRows: [],
+  })
+  assert.equal(plan.action, 'skip')
+})
+
+test('[o3d-anu8] a money enqueue cleared by an operator-cancelled row SAYS so on the plan', () => {
+  // Moving a FAILED row to CANCELLED drops the distinct-token count and turns a refusal into this
+  // enqueue — deliberately, it is the documented purpose of the settlement action. What must not
+  // happen is that the resulting money post looks identical to one the connector's own history
+  // cleared, with nothing to lead anybody back to the assertion if it was wrong.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [],
+    assertedNotPostedRows: [{ id: 'log-settled', payload: { accountingInvoiceId: 'inv-9' } }],
+  })
+  assert.equal(plan.action, 'create')
+  assert.deepEqual(
+    plan.action === 'create' ? plan.restsOnAssertion : undefined,
+    { assertedNotPostedRowIds: ['log-settled'] },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// CODEX ROUND 2, MEDIUM — THE RECORD MUST NAME THE ASSERTIONS THAT CLEARED *THIS* PAYMENT.
+//
+// `assertedNotPostedRows` is read per (connector, type, referenceType, referenceId) — an ORDER — and
+// an order accumulates cancelled registrations for invoices it no longer has (delete and re-post an
+// invoice and the predecessor's rows stay in the scope for ever). Unfiltered, the reliance record
+// named rows that had nothing to do with the payment being enqueued, and on a scope where none of
+// them was relevant it manufactured a reliance out of nothing: `restsOnAssertion` claims "this plan
+// only got here because a human vouched for something", which would then be untrue.
+//
+// The filter is the SAME anchor comparison the live-row lookup and the failed-row history use.
+// ---------------------------------------------------------------------------
+
+test('[o3d-anu8 r2] an assertion about a DIFFERENT document is not part of what cleared this payment', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [],
+    // The order's PREVIOUS invoice. Its cancelled registration says nothing about inv-9.
+    assertedNotPostedRows: [{ id: 'log-old-invoice', payload: { accountingInvoiceId: 'inv-1' } }],
+  })
+  assert.equal(plan.action, 'create')
+  assert.equal(
+    plan.action === 'create' ? plan.restsOnAssertion : 'unset',
+    undefined,
+    'nothing about inv-9 rested on a human\'s word, so the plan must not claim it did',
+  )
+})
+
+test('[o3d-anu8 r2] the relevant assertions survive the filter and the irrelevant ones do not', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [],
+    assertedNotPostedRows: [
+      { id: 'log-old-invoice', payload: { accountingInvoiceId: 'inv-1' } },
+      { id: 'log-this-invoice', payload: { accountingInvoiceId: 'inv-9' } },
+    ],
+  })
+  assert.deepEqual(
+    plan.action === 'create' ? plan.restsOnAssertion : undefined,
+    { assertedNotPostedRowIds: ['log-this-invoice'] },
+    'the record must lead an operator to the row that actually cleared this post, and to no other',
+  )
+})
+
+test('[o3d-anu8 r2] an UNANCHORED assertion still counts — unknown reads as possibly this one', () => {
+  // The same direction `couldHaveCommittedThis` takes everywhere else, and the reason the comparison
+  // is shared rather than re-derived: a stored payload that names no document cannot be ruled out,
+  // and over-naming a row in a warning is recoverable where under-naming it is not.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [],
+    assertedNotPostedRows: [{ id: 'log-legacy', payload: {} }],
+  })
+  assert.deepEqual(
+    plan.action === 'create' ? plan.restsOnAssertion : undefined,
+    { assertedNotPostedRowIds: ['log-legacy'] },
+  )
+})
+
+test('[o3d-anu8 r3] an assertion about THIS document in a different CASE is still part of what cleared it', () => {
+  // Codex round 3, MEDIUM. XERO MATCHES INVOICE NUMBERS CASE-INSENSITIVELY and its document ids are
+  // GUIDs — `4D8A…` and `4d8a…` address ONE invoice — which is why the repository has a canonical,
+  // case-folded money-document comparison and why the money fence uses it. The round-2 filter
+  // reached for this module's own byte-exact `couldHaveCommittedThis` instead, so an assertion about
+  // the very document being enqueued was dropped from the record: `restsOnAssertion` then said
+  // nothing rested on a human's word when something did, and the audit trail back to the operator
+  // who vouched for it was gone.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: '4D8A1F2B-0000-4000-8000-00000000ABCD' },
+    liveRowExists: false,
+    failedRows: [],
+    assertedNotPostedRows: [{ id: 'log-same-doc', payload: { accountingInvoiceId: '4d8a1f2b-0000-4000-8000-00000000abcd' } }],
+  })
+  assert.deepEqual(
+    plan.action === 'create' ? plan.restsOnAssertion : undefined,
+    { assertedNotPostedRowIds: ['log-same-doc'] },
+    'case is not part of a document\'s identity, so this assertion cleared THIS payment',
+  )
+})
+
+test('[o3d-anu8 r3] a PAYMENT is identified by its invoice — an irrelevant creditNoteId does not split it', () => {
+  // The other half of "canonical". `creditNoteId` identifies a credit-note ALLOCATION and nothing
+  // else: no payment body either connector sends carries it, and neither probe dereferences it on a
+  // payment branch. Comparing the UNION of both anchors — which is what this module's local
+  // comparison does — made a row that happens to hold one come out UNEQUAL to a row that does not,
+  // and the assertion about the same invoice vanished from the record.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [],
+    assertedNotPostedRows: [{ id: 'log-with-cn', payload: { accountingInvoiceId: 'inv-9', creditNoteId: 'cn-3' } }],
+  })
+  assert.deepEqual(
+    plan.action === 'create' ? plan.restsOnAssertion : undefined,
+    { assertedNotPostedRowIds: ['log-with-cn'] },
+    'a payment is identified by the invoice it settles; a stray anchor is not a different document',
+  )
+})
+
+test('[o3d-anu8 r3] the assertion filter and the money fence answer with ONE comparison', () => {
+  // The rule the two tests above are instances of, stated directly: the planner must not have a
+  // comparison of its own. `attemptCouldBeTheSameDocument` is what the POST fence judges rival
+  // attempts with, and a record built from a different answer describes a different question from
+  // the one that was decided.
+  for (const [left, right] of [
+    [{ accountingInvoiceId: '4D8A' }, { accountingInvoiceId: '4d8a' }],
+    [{ accountingInvoiceId: 'inv-9', creditNoteId: 'cn-3' }, { accountingInvoiceId: 'inv-9' }],
+    [{ accountingInvoiceId: 'inv-1' }, { accountingInvoiceId: 'inv-9' }],
+    [{}, { accountingInvoiceId: 'inv-9' }],
+  ] as const) {
+    const plan = planFollowUpEnqueue({
+      ...ORDER,
+      payload: right as Record<string, unknown>,
+      liveRowExists: false,
+      failedRows: [],
+      assertedNotPostedRows: [{ id: 'log-x', payload: left }],
+    })
+    const named = plan.action === 'create' && plan.restsOnAssertion !== undefined
+    assert.equal(
+      named,
+      attemptCouldBeTheSameDocument('INVOICE_PAYMENT', left, right),
+      `the filter disagreed with the fence about ${JSON.stringify(left)} vs ${JSON.stringify(right)}`,
+    )
+  }
+})
+
+test('[o3d-anu8] with no operator-cancelled row the plan carries no such claim', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [],
+  })
+  assert.equal(plan.action, 'create')
+  assert.equal(plan.action === 'create' ? plan.restsOnAssertion : 'unset', undefined)
+})
+
+test('[o3d-anu8] the Xero connector ASKS for the basis and hands both halves to the planner', async () => {
+  // The planner is pure, so the two rules above are only real if the connector supplies the inputs.
+  // This is the consumer half — the position nothing had swept — asserted on the source because
+  // driving a whole processor run to reach one enqueue would test the harness, not the wiring.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(
+    path.join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8',
+  )
+
+  const liveAt = source.indexOf('async function hasExistingSyncLog')
+  assert.notEqual(liveAt, -1)
+  const liveBody = source.slice(liveAt, source.indexOf('\n}', liveAt))
+  assert.match(liveBody, /select: \{ payload: true, settlementBasis: true \}/,
+    'an unselected column arrives undefined and reads as a connector confirmation')
+  assert.match(liveBody, /asserted: occupying\.some\(\(row\) => isOperatorAssertedSettlement\(row\.settlementBasis\)\)/)
+
+  const enqueueAt = source.indexOf('export async function enqueueFollowUpSyncLog')
+  assert.notEqual(enqueueAt, -1)
+  const enqueueBody = source.slice(enqueueAt, source.indexOf('const plan = planFollowUpEnqueue', enqueueAt))
+  // The ambiguity query is WIDENED rather than duplicated: the two row sets answer one question
+  // between them and a second query could see a different instant.
+  assert.match(enqueueBody, /\{ status: 'CANCELLED', settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS \}/)
+  assert.match(enqueueBody, /assertedNotPostedRows = failedLogs\s*\n?\s*\.filter\(\(row\) => row\.status === 'CANCELLED'\)/)
+  // Codex round 2, MEDIUM: the PAYLOAD travels with the id, or the planner cannot filter the
+  // assertions down to the document this payment targets and the record describes the wrong rows.
+  assert.match(enqueueBody, /\.map\(\(row\) => \(\{ id: row\.id, payload: row\.payload \}\)\)/)
+  assert.match(enqueueBody, /failedRows = failedLogs\.filter\(\(row\) => row\.status === 'FAILED'\)/,
+    'the asserted-cancelled rows must NOT enter the token-ambiguity set')
+
+  const planCall = source.slice(source.indexOf('const plan = planFollowUpEnqueue', enqueueAt), source.indexOf('if (plan.action === \'skip\')', enqueueAt))
+  assert.match(planCall, /liveRowAsserted: live\.asserted/)
+  assert.match(planCall, /assertedNotPostedRows/)
+
+  assert.match(source, /xero_followup_enqueue_rests_on_operator_assertion/,
+    'a money post cleared by an assertion must leave a record naming the rows that cleared it')
 })

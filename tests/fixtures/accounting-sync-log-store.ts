@@ -36,6 +36,17 @@ export type SyncLogRow = {
   backReferenceEvidenceCompactedAt: Date | null
   backReferenceFollowUpsPendingAt: Date | null
   settlementBasis: string | null
+  /**
+   * o3d-0m56 r10 — the attempt-provenance PAIR. Carried here because more than one reader now selects
+   * both and judges a money row on them together (`attemptProvenNeverMade`): the follow-up planner's
+   * recycle rule, and since Codex round 2 the post-time invoice-capacity guard.
+   *
+   * Both default to NULL, which is the CONSERVATIVE reading — "nothing was attempted that we can
+   * see, and nothing vouches for that silence" — so a test that wants a row provably PRE-CALL has to
+   * say so by setting custody, exactly as production does when it claims the row.
+   */
+  remoteAttemptedAt: Date | null
+  attemptStampingCustodyAt: Date | null
 }
 
 export function syncLogRow(overrides: Partial<SyncLogRow> & { id: string }): SyncLogRow {
@@ -58,6 +69,8 @@ export function syncLogRow(overrides: Partial<SyncLogRow> & { id: string }): Syn
     backReferenceEvidenceCompactedAt: null,
     backReferenceFollowUpsPendingAt: null,
     settlementBasis: null,
+    remoteAttemptedAt: null,
+    attemptStampingCustodyAt: null,
     ...overrides,
   }
 }

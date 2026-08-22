@@ -36,7 +36,8 @@
  *
  *   - at CREATE, by every `accountingSyncLog.create` in this codebase (`stampingCustodyOnCreate`);
  *   - at CLAIM and at every other write that moves `processingStartedAt` forward
- *     (`stampingCustodyOnClaim`), because a claim is what precedes a post.
+ *     (`stampingCustodyOnClaim`), because a claim is what precedes a post — but ONLY where doing so
+ *     cannot turn a row's silence into proof; see that helper.
  *
  * and it is TAKEN AWAY, by the database itself, from any row a binary that does not know about it
  * claims. The trigger `accounting_sync_logs_forfeit_stamping_custody` (migration 20260819090000)
@@ -84,11 +85,20 @@
  *
  * WHY THE ROW-LEVEL FACT ALSO NEEDS THAT REPAIR TO BE STICKY. Custody is re-asserted by our own
  * claim, so a row the old binary claimed (custody NULL) would look trustworthy again the moment
- * this binary re-claimed it. It never does: the repair converts "outside custody" into a permanent
- * `remoteAttemptedAt`, and it runs BEFORE the claim, in the same function. That ordering is a
- * property of this code — `processPendingXeroSync` and `processPendingQuickBooksSync` call it on
- * their first line — not of how anything is deployed, and it is pinned by a test.
+ * this binary re-claimed it. It never does, for two reasons that have to hold TOGETHER:
+ *
+ *   - the repair converts "outside custody" into a permanent `remoteAttemptedAt`, and it runs
+ *     BEFORE the claim, in the same function. That ordering is a property of this code —
+ *     `processPendingXeroSync` and `processPendingQuickBooksSync` call it on their first line — not
+ *     of how anything is deployed, and it is pinned by a test.
+ *   - and the CLAIM ITSELF REFUSES to restore custody to a money row that carries neither custody
+ *     nor a stamp (o3d-anu8 round 3). The repair is a PASS-level statement; a deployment overlap is
+ *     not, and an old binary's row can appear after the pass has already repaired. Without the
+ *     refusal, the next claim would hand that row custody and its unstamped state would read as
+ *     canonical proof that nothing was ever sent — see `stampingCustodyOnClaim` below.
  */
+
+import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 
 /**
  * The types `authoriseMoneyPost` stamps — `MONEY_MOVING_SYNC_TYPES` in followup-retry-guard.ts,
@@ -97,6 +107,41 @@
  * money type missing from here is a type whose out-of-custody rows are never repaired.
  */
 export const STAMPED_MONEY_TYPES = ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'] as const
+
+/** The two columns that, together, can prove a money row is PRE-CALL. Neither proves it alone. */
+export type MoneyAttemptProvenance = {
+  remoteAttemptedAt: Date | null
+  attemptStampingCustodyAt: Date | null
+}
+
+/**
+ * THE CANONICAL "THIS ROW NEVER MADE A REMOTE CALL" TEST — one definition, every reader.
+ *
+ * `planFollowUpEnqueue` has asked this question since round 10 and spelled the predicate out inline.
+ * `guardInvoicePaymentCapacity` needs the same question answered, and two spellings of "nothing was
+ * sent" is exactly the failure mode `invoice-payment-capacity.ts` already refuses for
+ * `storedBodyMayHaveReachedTheLedger` — two guards with two definitions disagree about whether an
+ * invoice has capacity, which is the whole question. So it lives here, beside the mechanism that
+ * makes it true, and both readers call it.
+ *
+ * BOTH HALVES ARE POSITIVE STATEMENTS ABOUT WHAT THE ROW SAYS, and the direction matters:
+ *
+ *   attemptStampingCustodyAt present  every binary that created or claimed this row stamps
+ *                                     `remoteAttemptedAt` before it posts (see the header above),
+ *                                     so the absence of that stamp is evidence rather than silence.
+ *   remoteAttemptedAt null            and it is absent, so nothing ever left this row.
+ *
+ * ABSENCE OF A STAMP IS NOT PROOF OF NO ATTEMPT. Custody null means something outside custody had
+ * this row and a NULL `remoteAttemptedAt` proves nothing at all — so does a column the caller did
+ * not select, which arrives `undefined`. Both return false: only a positive record that the row is
+ * pre-call excludes it, everything else stays undetermined and the caller must fail closed.
+ *
+ * It is deliberately NOT a statement about the row's STATUS. A caller decides which statuses it
+ * wants to ask about; this only answers whether a call left.
+ */
+export function attemptProvenNeverMade(row: MoneyAttemptProvenance): boolean {
+  return row.remoteAttemptedAt === null && row.attemptStampingCustodyAt != null
+}
 
 /**
  * Custody for a row this binary is CREATING.
@@ -114,19 +159,99 @@ export function stampingCustodyOnCreate(now: Date = new Date()): { attemptStampi
 }
 
 /**
- * Custody for a row this binary is CLAIMING — or re-gating, which is the same write with a future
- * timestamp (the retry backoff parks a row by moving `processingStartedAt` ahead).
+ * ABSENCE OF A STAMP IS NOT PROOF OF NO ATTEMPT — AND A CLAIM MUST NOT TURN IT INTO ONE
+ * (o3d-anu8 round 3, Codex HIGH).
  *
- * Returns BOTH fields so the pairing cannot be half-applied: the database's trigger reads a claim
- * whose custody does not EQUAL its own claim instant as one made by a binary that does not stamp,
- * and forfeits custody. That failure is deliberately the safe direction — a missed pairing
- * costs one ledger GET and one un-recycled row, never a lost attempt — but it is still a defect,
- * so the two values are produced together, from the same instant, by this function.
+ * Round 2 made the canonical test POSITIVE IN BOTH HALVES: a row is proven pre-call only when it
+ * carries custody AND carries no attempt stamp. That is sound about the row as it stands. What it
+ * did not survive is the WRITE THAT CREATES THE FIRST HALF. This helper restored custody
+ * unconditionally, and the repair that converts the other population — outside custody, unstamped —
+ * into a permanent `remoteAttemptedAt` runs ONLY at the top of a processor pass. So during exactly
+ * the deployment overlap this whole mechanism exists to survive:
+ *
+ *   1. an OLD binary claims a money row, posts it, and dies before recording anything. Custody is
+ *      NULL (the forfeit trigger took it) and `remoteAttemptedAt` is NULL (the old binary does not
+ *      stamp). The pair reads "undetermined", which is correct: the payment may be in the ledger.
+ *   2. THIS binary claims the same row after the pass-level repair has already run. Custody is
+ *      restored from nothing but the fact that we claimed it.
+ *   3. The row now reads `custody present, no stamp` — CANONICALLY PROVEN NEVER ATTEMPTED. The
+ *      capacity guard frees a slot for it and the planner recycles its payload, and a payment that
+ *      may have posted is treated as though it certainly did not. That is the unrecoverable
+ *      direction, reached without anybody doing anything wrong.
+ *
+ * THE FIX IS TO MAKE CUSTODY RESTORATION ATOMIC WITH THE PRESERVATION OF PRIOR UNCERTAINTY, and the
+ * only place that can be atomic is the statement itself. So this helper no longer returns a `data`
+ * fragment a call site pairs with a `where` of its own choosing: it returns THE WHOLE `updateMany`
+ * ARGUMENT, with a refusal welded into the predicate —
+ *
+ *   NOT (money type AND attemptStampingCustodyAt IS NULL AND remoteAttemptedAt IS NULL)
+ *
+ * — so a money row whose previous custody and previous attempt stamp are BOTH null is not claimed
+ * at all rather than claimed into a false proof. The conservative reading survives the claim because
+ * the claim does not land. There is no window between reading the row and restoring custody, because
+ * nothing is read: the condition is evaluated by the database inside the same UPDATE that would have
+ * written custody.
+ *
+ * WHY REFUSE RATHER THAN STAMP IN THE SAME STATEMENT. `updateMany` cannot express the per-row
+ * `COALESCE("syncedAt", "processingStartedAt", "createdAt")` the repair uses, and a second statement
+ * to compute it would put back the window this removes. Refusing needs no value at all, and it is
+ * not a dead end: `repairMoneyAttemptsOutsideStampingCustody` runs on the first line of both
+ * processors, so such a row is stamped at the next pass and then claims normally — permanently
+ * un-recyclable, which is the documented conservative cost (one extra ledger GET), never a lost
+ * attempt.
+ *
+ * THE REFUSAL IS SCOPED TO THE MONEY TYPES THE REPAIR REACHES, and for the same reason: those are
+ * the only rows whose unstamped state is ever read as evidence. A PDF or e-mail follow-up left
+ * outside custody by an old binary would otherwise become permanently unclaimable, since nothing
+ * ever stamps it — its `remoteAttemptedAt` is NULL for ever and correctly so.
+ *
+ * IT IS THE WHOLE ARGUMENT, NOT TWO HALVES A CALLER ASSEMBLES. Returning `{ where, data }` as one
+ * object passed straight to `updateMany` is what makes the pairing unskippable: there is no way to
+ * take the custody stamp without taking the refusal that makes it safe, and no way to take the
+ * refusal and forget the stamp the forfeit trigger demands. Every site that writes a non-null
+ * `processingStartedAt` — a claim, a rate-limit backoff, an ordering deferral, the one non-terminal
+ * release — goes through here, and `tests/accounting/money-attempt-provenance.test.ts` scans every
+ * module that touches `accountingSyncLog` to say so.
  */
-export function stampingCustodyOnClaim(
-  processingStartedAt: Date,
-): { processingStartedAt: Date; attemptStampingCustodyAt: Date } {
-  return { processingStartedAt, attemptStampingCustodyAt: processingStartedAt }
+export function stampingCustodyOnClaim(args: {
+  /** The predicate the caller would have used. The refusal is AND-ed onto it, never merged into it. */
+  where: Prisma.AccountingSyncLogWhereInput
+  /**
+   * The claim instant — or, for a re-gate, the future instant that acts as the earliest-next-claim
+   * gate. Written to BOTH columns, because the forfeit trigger's test for "this statement re-asserted
+   * custody" is equality with the claim instant.
+   */
+  processingStartedAt: Date
+  /** Everything else the write sets: status, errorMessage, attemptRevision. */
+  data?: Prisma.AccountingSyncLogUpdateManyMutationInput
+}): { where: Prisma.AccountingSyncLogWhereInput; data: Prisma.AccountingSyncLogUpdateManyMutationInput } {
+  return {
+    // AND-ed at the top level rather than spread into the caller's object: several of these
+    // predicates already carry `OR` (both claim fences do) and one carries `NOT`, and a spread
+    // would silently REPLACE the caller's key with this one — a fence that reads as present and
+    // excludes nothing.
+    where: { AND: [args.where, CUSTODY_MAY_BE_RESTORED] },
+    data: {
+      ...args.data,
+      processingStartedAt: args.processingStartedAt,
+      attemptStampingCustodyAt: args.processingStartedAt,
+    },
+  }
+}
+
+/**
+ * The rows custody may NOT be restored to: a money row that carries neither custody nor an attempt
+ * stamp. Its NULL stamp is silence, not evidence — and restoring custody would convert that silence
+ * into `attemptProvenNeverMade`'s positive proof.
+ *
+ * Exported for the tests that evaluate it against rows; it is not meant to be composed by hand.
+ */
+export const CUSTODY_MAY_BE_RESTORED: Prisma.AccountingSyncLogWhereInput = {
+  NOT: {
+    type: { in: [...STAMPED_MONEY_TYPES] as AccountingSyncType[] },
+    attemptStampingCustodyAt: null,
+    remoteAttemptedAt: null,
+  },
 }
 
 /**
