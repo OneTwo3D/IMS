@@ -408,10 +408,21 @@ function unpersistedQboPostRecord(incident: UnpersistedQboPost, description: str
  *
  * THE ROW IS LEFT ALONE on the escalation path, deliberately. Writing PENDING/FAILED over it would
  * record a post that failed, which is the falsehood being avoided; and the row still holds this
- * worker's claim, so `CLAIM_STALE_MS` later it is re-claimed and re-posted — under the SAME derived
- * Intuit Request-Id, which is what makes that retry a deduplicated replay rather than a second
- * document. (Not a guarantee, which is why o3d-tr2q exists; the record above is what makes the
- * residual risk visible to a person rather than silent.)
+ * worker's claim, so `CLAIM_STALE_MS` later it is re-claimed and re-attempted. FOR A DOCUMENT POST
+ * that re-attempt goes out under the SAME derived Intuit Request-Id, which is what makes it a
+ * deduplicated replay rather than a second document. (Not a guarantee, which is why o3d-tr2q exists;
+ * the record above is what makes the residual risk visible to a person rather than silent.)
+ *
+ * FOR THE FOUR NO-IDENTIFIER OPERATIONS IT IS NOT A DEDUPLICATED REPLAY, AND THE RECORD NOW SAYS SO.
+ * `BILL_ATTACHMENT`, `INVOICE_PDF`, `INVOICE_EMAIL` and `WC_INVOICE_NOTE` reach this function on
+ * exactly the same path — they succeed, they carry no external id, and nothing sent them under a
+ * Request-Id — so the stale-claim reclaim REPEATS THE EFFECT: another upload, another PDF write,
+ * another email to the customer, another WooCommerce note, once per sweep, unbounded. That is a real
+ * open defect, filed as o3d-qn21, and it is NOT fenced here: rounds 6 and 7 built the fence out of a
+ * claim-time marker and it was unsound twice over (a claim is not proof of dispatch, and a failure is
+ * not proof of no effect), so the machinery was reverted and the hole was filed instead. What
+ * `describeUnpersistedQboPost` does is refuse to describe a protection these four do not have — it
+ * tells the operator the effect will repeat, what the effect is, and to settle the row so it stops.
  *
  * Returns whether the id is now durable. `false` means the caller must NOT continue into the
  * follow-ups and must NOT let the outer handler see this iteration.

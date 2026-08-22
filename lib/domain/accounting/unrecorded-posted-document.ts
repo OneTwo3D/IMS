@@ -128,16 +128,78 @@ export type UnpersistedQboPost = {
 }
 
 /**
+ * THE FOUR OPERATIONS NO REQUEST-ID PROTECTS, AND WHAT REPLAYING ONE ACTUALLY DOES (o3d-qn21).
+ *
+ * Every successful QuickBooks operation is routed through the same escalation, and until now that
+ * escalation told an operator ONE story: the row keeps its claim, the stale-claim reclaim re-posts
+ * under the SAME derived Intuit Request-Id, so the replay is deduplicated rather than duplicated.
+ * FOR THESE FOUR THAT SENTENCE IS FALSE. They are not document posts — they upload a file, save a
+ * PDF, send an email to a customer, write a note onto a WooCommerce order — none of them reaches the
+ * idempotent poster, none carries a Request-Id, and none returns an id that could ever name it
+ * again. Nothing on the far side collapses a second attempt into the first, so the reclaim does not
+ * replay an identifier, it REPEATS THE EFFECT.
+ *
+ * THIS TABLE SELECTS WORDING AND NOTHING ELSE. It is not a fence, and it is deliberately not one:
+ * rounds 6 and 7 tried to build the fence out of a claim-time marker and it was unsound both times
+ * (a claim is not proof of dispatch; a failure is not proof of no effect). The durable fix is a
+ * pre-post dispatch record and it is filed as o3d-qn21. Until that lands, the honest thing this
+ * module can do is stop promising a protection that does not exist — because an incident record that
+ * describes a protection that is not there sends an operator looking for a duplicate to reconcile
+ * when what they need to do is stop a send from repeating.
+ *
+ * The `check` is what the operator does about the effect; the `effect` is what the replay costs.
+ */
+const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<AccountingSyncType, { effect: string; check: string }>> = {
+  BILL_ATTACHMENT: {
+    effect: 'the supplier invoice PDF is uploaded to the QuickBooks bill AGAIN, once per sweep',
+    check: 'open the bill in QuickBooks and delete any duplicate attachment',
+  },
+  INVOICE_PDF: {
+    effect: 'the invoice PDF is re-downloaded and written over the stored copy AGAIN, once per sweep',
+    check: 'confirm the invoice PDF stored against the order is the document you expect',
+  },
+  INVOICE_EMAIL: {
+    effect: 'ANOTHER COPY OF THE INVOICE EMAIL IS SENT TO THE CUSTOMER, once per sweep',
+    check: 'check what was sent for this order and, if the customer was mailed more than once, tell them',
+  },
+  WC_INVOICE_NOTE: {
+    effect: 'a second invoice note is written onto the WooCommerce order, once per sweep',
+    check: 'open the order in WooCommerce and remove any duplicate note',
+  },
+}
+
+/**
  * The operator-facing account of it — ONE wording, used by the durable record and by the
  * last-resort console escalation, so a single incident cannot be described two different ways.
  *
- * It names the identifier, says plainly what state the row was left in, and ends in something a
- * person can do. It does NOT claim the document is unreachable: the QuickBooks Request-Id is derived
- * from the sync row's own id, so the retry that follows re-posts under an id Intuit has already
- * seen — which is why the remedy is "check, then reconcile" rather than "assume a duplicate".
+ * IT IS OPERATION-AWARE, and that is the point of it (o3d-qn21). There are two genuinely different
+ * incidents behind this one escalation and they need opposite actions from the reader:
+ *
+ *   • A DOCUMENT POST whose id could not be recorded. It goes out under a Request-Id derived from
+ *     the sync row's own id, so the re-attempt re-posts under an id Intuit has already seen — which
+ *     is why the remedy is "check, then reconcile" rather than "assume a duplicate".
+ *   • ONE OF THE FOUR NO-IDENTIFIER OPERATIONS above. No id came back and no Request-Id was ever
+ *     sent, so nothing deduplicates the re-attempt: stale-claim recovery REPLAYS THE EFFECT
+ *     OUTRIGHT, and goes on replaying it every sweep for as long as the row stays claimed. That
+ *     reader has to be told to go and look at the effect, and to settle the row so it stops.
  */
 export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: unknown): string {
   const { entry, postedExternalId } = incident
+  const noRequestId = QBO_OPERATIONS_WITHOUT_REQUEST_ID[entry.type]
+  if (noRequestId) {
+    return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} SUCCEEDED — the `
+      + 'external effect has happened — but IMS could not record that it did: '
+      + `${String(cause)}. THIS OPERATION RETURNS NO IDENTIFIER AND NO REQUEST ID PROTECTS IT: unlike a `
+      + 'document post it is not sent under a derived Intuit Request-Id, so there is nothing for '
+      + `QuickBooks or WooCommerce or a mail server to deduplicate it against. Sync row ${entry.id} still `
+      + 'holds this worker\'s claim and no mirrored accounting event was written, so once that claim goes '
+      + `stale THE SWEEP WILL RECLAIM THE ROW AND RUN THE OPERATION AGAIN OUTRIGHT — ${noRequestId.effect}, `
+      + 'unbounded, because no retry is consumed while the row never leaves PROCESSING. '
+      + `REMEDY: ${noRequestId.check}; then settle sync row ${entry.id} by hand (mark it SYNCED, or FAILED `
+      + 'if the operation must not run again) so the sweep stops re-running it. This is the known hole '
+      + 'o3d-qn21 — the durable fix is a pre-post dispatch record, not this message, and until it lands '
+      + 'this record is the only thing that says the effect repeated.'
+  }
   return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as `
     + `${postedExternalId ?? '(no id returned)'}, but IMS could not record that id: ${String(cause)}. `
     + `Sync row ${entry.id} still names no document, so nothing in IMS points at this one and no `

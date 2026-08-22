@@ -424,6 +424,29 @@ mock.module('@/lib/connectors/quickbooks/bills', {
 })
 
 /**
+ * THE EXTERNAL SIDE EFFECT OF A NO-IDENTIFIER OPERATION, COUNTED (o3d-qn21).
+ *
+ * INVOICE_EMAIL is the plainest of the four: it sends a real email to a real customer and returns
+ * nothing that could ever name it again. It has to be stubbed at all because the production path
+ * would otherwise mail somebody from a unit test — and it is stubbed with a COUNTER because the
+ * property the escalation's new wording claims is not a property of the database. "The row settled"
+ * is observable in `state`; "the customer was mailed three times" is only observable here.
+ *
+ * Counted on ENTRY, not on success: a send that throws may still have reached the customer, and the
+ * subject is how many times the operation was DISPATCHED.
+ */
+let emailsSent = 0
+
+mock.module('@/lib/accounting-email', {
+  namedExports: {
+    sendAccountingInvoiceEmailInternal: async () => {
+      emailsSent += 1
+      return { success: true }
+    },
+  },
+})
+
+/**
  * o3d-peh1 — THE LEDGER FENCE'S VERDICT, SWITCHABLE, SO A REFUSAL CAN BE DRIVEN THROUGH THE REAL LOOP.
  *
  * `enqueueFollowUpSyncLog` asks the ledger whether the attempt it is about to queue is already in it,
@@ -493,6 +516,7 @@ function reset(connector = 'xero') {
   state.activityRows.length = 0
   ledgerVerdict = { clear: true }
   qboPostVerdict = { success: true, invoiceId: 'XBILL-1' }
+  emailsSent = 0
 }
 
 /** The single sync row under test (the follow-up rows the run creates are appended after it). */
@@ -1565,5 +1589,153 @@ test('[o3d-peh1 r5] the durable write is re-driven, and an id that lands on a la
     state.activityRows.filter((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION),
     [],
     'and nothing is escalated: a recovered write is not an unrecorded document',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-qn21 (Codex MEDIUM) — THE ESCALATION PROMISED A DEDUPLICATION FOUR OPERATIONS DO NOT HAVE.
+//
+// Round 5's escalation is given EVERY successful QuickBooks result, and its wording told one story:
+// the row keeps its claim, the stale-claim reclaim re-posts UNDER THE SAME DERIVED INTUIT
+// REQUEST-ID, so the replay is deduplicated rather than duplicated.
+//
+// FOUR TYPES BREAK THAT SENTENCE. BILL_ATTACHMENT, INVOICE_PDF, INVOICE_EMAIL and WC_INVOICE_NOTE
+// are not document posts: they upload a file, save a PDF, SEND AN EMAIL, write a note onto a
+// WooCommerce order. None reaches the idempotent poster, none carries a Request-Id, and every one
+// returns success with no external id. For them the reclaim is not a deduplicated replay — it is the
+// side effect again, on every sweep.
+//
+// ROUNDS 6 AND 7 STAY REVERTED. This is a MESSAGE fix, not the fence: both attempts at the fence
+// were unsound (a claim is not proof of dispatch; a failure is not proof of no effect) and the hole
+// is filed as o3d-qn21. What these tests pin is that the record an operator reads no longer
+// describes a protection that is not there — and, in the second test, that the replay it now warns
+// about is real, so the wording is true rather than merely different.
+// ---------------------------------------------------------------------------
+
+/** A no-identifier operation row: the email follow-up, which is the one with a customer on the end. */
+function emailRow(): SyncRow {
+  return {
+    ...blankRow(),
+    type: 'INVOICE_EMAIL',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    externalTransactionId: null,
+    payload: { referenceId: 'order-1' },
+  }
+}
+
+/** The stale-claim reclaim, driven by hand: age this row's claim past CLAIM_STALE_MS (15 minutes). */
+function ageTheClaim() {
+  const row = subject()
+  if (row.processingStartedAt) row.processingStartedAt = new Date(Date.now() - 20 * 60 * 1000)
+}
+
+function qboEscalation() {
+  return state.activityRows.find((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION)
+}
+
+test('[o3d-qn21] a no-identifier operation is escalated as a REPLAY, never as a deduplicated re-post', async () => {
+  // The email goes out; every attempt at the transaction that would record it fails. That is exactly
+  // the round-5 escalation path — the assertion is about WHAT IT SAYS to the operator who finds it.
+  reset('quickbooks')
+  state.syncRows = [emailRow()]
+  state.failSyncedWriteFor.add('log-1')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.failed, 1, 'the failure is real and counted')
+  assert.equal(emailsSent, 1, 'and the effect really did happen — otherwise there is nothing to warn about')
+
+  const escalation = qboEscalation()
+  assert.ok(escalation, 'the unrecorded operation must still leave a durable record')
+  const description = String(escalation.description)
+
+  // THE FALSEHOOD THAT WAS THERE, both halves of the sentence that used to be printed here. Either
+  // one alone sends the operator to reconcile a duplicate document rather than stop a send from
+  // repeating. (The negations are matched, not the WORD "Request-Id" — the new wording has to be
+  // free to say that no Request-Id was ever sent, which is the correction itself.)
+  assert.doesNotMatch(
+    description,
+    /re-posts under the SAME Intuit Request-Id/,
+    'no Request-Id may be claimed for an operation that was never sent under one',
+  )
+  assert.doesNotMatch(
+    description,
+    /should be deduplicated rather than duplicated/,
+    'and nothing deduplicates it, so the record must not promise a deduplicated replay',
+  )
+  assert.match(
+    description,
+    /nothing for QuickBooks or WooCommerce or a mail server to deduplicate it against/,
+    'the only mention of deduplication left is its ABSENCE, said out loud',
+  )
+
+  // WHAT IT MUST SAY INSTEAD: no protection, the effect will be replayed, and what to check.
+  assert.match(description, /NO REQUEST ID PROTECTS IT/, 'it states plainly that nothing protects the effect')
+  assert.match(
+    description,
+    /RUN THE OPERATION AGAIN OUTRIGHT/,
+    'and that stale-claim recovery replays it, rather than replaying an identifier',
+  )
+  assert.match(
+    description,
+    /ANOTHER COPY OF THE INVOICE EMAIL IS SENT TO THE CUSTOMER/,
+    'named as the effect this particular operation has, not as a generic "side effect"',
+  )
+  assert.match(description, /REMEDY: check what was sent for this order/, 'the operator is told what to check')
+  assert.match(description, /settle sync row log-1 by hand/, 'and how to make the replay stop')
+  assert.match(description, /o3d-qn21/, 'and the durable fix is named, so the reader can see it is tracked')
+
+  // The console line and the durable record are the SAME wording — one incident, one story.
+  assert.equal(escalation.level, 'ERROR')
+  assert.equal(
+    (escalation.metadata as { postedExternalId?: string | null }).postedExternalId,
+    null,
+    'there is no identifier, which is the whole reason this arm exists',
+  )
+})
+
+test('[o3d-qn21] the replay that message warns about is real — three sweeps, three emails', async () => {
+  // THE CONTROL THAT MAKES THE WORDING TRUE RATHER THAN MERELY DIFFERENT. If the row were somehow
+  // settled or fenced, "the sweep WILL run the operation again outright" would be a new falsehood
+  // replacing the old one. It is not fenced — rounds 6 and 7 are reverted — so the customer is
+  // mailed once per sweep, and this is the defect o3d-qn21 records as still open.
+  reset('quickbooks')
+  state.syncRows = [emailRow()]
+  state.failSyncedWriteFor.add('log-1')
+
+  await runQuickBooks()
+  ageTheClaim()
+  await runQuickBooks()
+  ageTheClaim()
+  await runQuickBooks()
+
+  assert.equal(emailsSent, 3, 'one email per sweep — the replay the record now warns about, unbounded')
+  assert.equal(subject().status, 'PROCESSING', 'the row never leaves PROCESSING, which is why it recurs')
+  assert.equal(subject().retryCount, 0, 'and no retry is consumed, so nothing bounds it')
+})
+
+test('[o3d-qn21] a DOCUMENT post keeps its Request-Id wording — the split is per operation, not a rewrite', async () => {
+  // THE OTHER SIDE OF THE SPLIT. A bill IS sent under a derived Request-Id, so for it the
+  // re-attempt really is a deduplicated replay and the remedy really is "check, then reconcile".
+  // Without this the change would be indistinguishable from deleting the deduplication claim
+  // everywhere — which would send THIS operator looking for a replayed effect that cannot happen.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.failSyncedWriteFor.add('log-1')
+
+  await runQuickBooks()
+
+  const description = String(qboEscalation()?.description)
+  assert.match(description, /POSTED as XBILL-1/, 'the identifier is in the record')
+  assert.match(
+    description,
+    /re-posts under the SAME Intuit Request-Id, so it should be deduplicated/,
+    'and the deduplication claim survives exactly where it is TRUE',
+  )
+  assert.doesNotMatch(
+    description,
+    /NO REQUEST ID PROTECTS IT/,
+    'the no-protection warning must not leak onto an operation that has the protection',
   )
 })
