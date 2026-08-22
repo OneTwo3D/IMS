@@ -2529,6 +2529,31 @@ export function unsentHandBackOperationId(entryId: string, lease: HeldClaim, att
 }
 
 /**
+ * THE RECORD THAT THE FENCED RELEASE ACTUALLY RAN, AND WHAT IT MATCHED (o3d-jit6 r9, Codex MEDIUM).
+ *
+ * r8's probe looked for the EVIDENCE row and read it as proof that the whole hand-back landed. It is
+ * not. The evidence row is written FIRST — before the release — and the transaction deliberately
+ * commits even when the fenced release matches ZERO rows, because a refusal that really happened must
+ * not be rolled back on the grounds that somebody else now owns the row. That asymmetry stays. What
+ * it means is that "the named evidence row exists" and "the release ran" are different facts, and the
+ * probe was certifying the second from the first.
+ *
+ * So the release's own result is persisted, in the same transaction, on a row that carries the
+ * hand-back's deterministic name — written AFTER the release, so it cannot exist unless the release
+ * returned. The probe requires THAT row, and requires it to state a boolean: a hand-back is
+ * acknowledged as landed only by a record that says what the release matched.
+ *
+ * `false` is a perfectly good answer here and still means the hand-back committed. What is no longer
+ * possible is a hand-back certified by a record that never saw the release at all.
+ */
+export const UNSENT_HANDBACK_COMMIT_ACTION = 'xero_sync_transport_refusal_handback_committed'
+
+/** True only for a commit record that actually states what the fenced release matched. */
+export function unsentHandBackCommitProvesRelease(metadata: unknown): boolean {
+  return typeof (metadata as { released?: unknown } | null | undefined)?.released === 'boolean'
+}
+
+/**
  * THE WHOLE HAND-BACK, AS ONE TRANSACTION BODY — SHARED BY BOTH RUNNERS (o3d-jit6 r5, Codex HIGH).
  *
  * WHAT ROUND 4 GOT RIGHT AND WHERE IT STOPPED, AGAIN. r4 established the ORDER: write the evidence
@@ -2586,15 +2611,13 @@ export async function recordAndReleaseUnsentTransportRefusal(
     job?: IntegrationOutboxRow | null
   },
 ): Promise<{ released: boolean }> {
+  const handBackId = unsentHandBackOperationId(args.entry.id, args.lease, args.attempt)
   // EVIDENCE FIRST — inside the transaction, so the order is now belt as well as braces.
   await logActivityInTransaction(tx, {
     // o3d-jit6 r8: AND IT CARRIES THE HAND-BACK'S OWN NAME. The evidence row is the only member of
     // this commit a later reader can identify unambiguously, so it is what makes the whole commit
     // detectable to a retry whose acknowledgement went missing.
-    ...unsentPostEvidence(
-      args.entry, args.notPosted, args.job?.id,
-      unsentHandBackOperationId(args.entry.id, args.lease, args.attempt),
-    ),
+    ...unsentPostEvidence(args.entry, args.notPosted, args.job?.id, handBackId),
     // No session exists on either runner; both are cron-driven. `resolveUser: false` is the
     // best-effort helper's way of saying this, and this one takes the answer directly.
     userId: null,
@@ -2605,6 +2628,31 @@ export async function recordAndReleaseUnsentTransportRefusal(
   // AND NOT `markXeroOutboxRetry`: that one counts the attempt against MAX_RETRIES and its first
   // backoff floor is five minutes, which would burn the replay window this is racing.
   if (args.job) await deferOutboxWithoutSpendingAnAttempt(tx, args.job, args.notPosted.message, 0)
+  // AND LAST, WHAT THE FENCED RELEASE MATCHED — see UNSENT_HANDBACK_COMMIT_ACTION. Written after the
+  // release, so this row cannot exist unless the release returned; committed with everything else, so
+  // it cannot exist unless the whole hand-back landed. This, not the evidence row, is what the
+  // ambiguous-commit probe is allowed to read as proof.
+  await logActivityInTransaction(tx, {
+    entityType: 'SYSTEM',
+    entityId: args.entry.id,
+    action: UNSENT_HANDBACK_COMMIT_ACTION,
+    tag: 'sync',
+    level: 'INFO',
+    description: `[xero-sync] sync log ${args.entry.id}: the unsent-refusal hand-back committed — `
+      + `evidence written, fenced release matched ${released ? 'the row' : 'NOTHING (displaced owner '
+        + 'or a moved attempt; the refusal is still recorded)'}`
+      + `${args.job ? ', job requeued' : ''}.`,
+    metadata: {
+      syncLogId: args.entry.id,
+      type: args.entry.type,
+      ...(args.job?.id ? { outboxJobId: args.job.id } : {}),
+      operation: args.notPosted.operation,
+      reason: args.notPosted.reason,
+      handBackId,
+      released,
+    },
+    userId: null,
+  })
   return { released }
 }
 
@@ -2799,6 +2847,26 @@ export function unsentHandBackAttemptBudgetMs(remainingMs: number): number {
   return Math.min(Math.max(remainingMs, UNSENT_HANDBACK_MIN_ATTEMPT_MS), UNSENT_HANDBACK_RETRY_BUDGET_MS)
 }
 
+/**
+ * ONE REMAINDER, SPLIT — NEVER TWO BUDGETS THAT ADD UP (o3d-jit6 r9, Codex HIGH).
+ *
+ * r8 handed the attempt's whole budget down as the transaction's `timeout` and then let `maxWait`
+ * allow ANOTHER two seconds, independently, for getting a connection out of the pool. Those are
+ * consecutive, not concurrent: an attempt could wait its full acquisition and then execute for its
+ * full budget, and the sequence would leave the deadline the previous round installed behind it by up
+ * to `UNSENT_HANDBACK_MAX_WAIT_MS` per attempt — under pool exhaustion, which is exactly the
+ * condition that produces the long wait in the first place.
+ *
+ * So the acquisition is RESERVED OUT OF the attempt's budget rather than added to it: `maxWait +
+ * timeout` is the budget, exactly, whatever the budget is. The reservation is capped at
+ * `UNSENT_HANDBACK_MAX_WAIT_MS` so a large budget still gives execution nearly all of it, and at half
+ * the budget so a small one cannot leave the transaction with nothing to run in.
+ */
+export function unsentHandBackAttemptBounds(attemptBudgetMs: number): { maxWait: number; timeout: number } {
+  const maxWait = Math.max(1, Math.min(UNSENT_HANDBACK_MAX_WAIT_MS, Math.floor(attemptBudgetMs / 2)))
+  return { maxWait, timeout: Math.max(1, attemptBudgetMs - maxWait) }
+}
+
 export async function retryUnsentHandBack(
   /** Runs the COMPLETE hand-back transaction, bounded by the time it is given. */
   run: (attemptBudgetMs: number) => Promise<{ released: boolean }>,
@@ -2856,13 +2924,14 @@ export async function retryUnsentHandBack(
 /**
  * DID THE HAND-BACK ALREADY COMMIT? (o3d-jit6 r8, Codex MEDIUM.)
  *
- * The evidence row is the only member of the hand-back transaction that carries the sequence's own
- * deterministic name, so it is the one thing a later reader can identify unambiguously — the released
- * row and the requeued job look the same whoever released them. Because all three commit together,
- * finding the named evidence row proves the whole hand-back landed.
+ * The hand-back's own deterministic name is the one thing a later reader can identify unambiguously —
+ * the released row and the requeued job look the same whoever released them.
  *
- * The action is asked of the shared evidence builder rather than spelt out again: one name for that
- * row, written in one place, read in one place.
+ * BUT THE NAMED EVIDENCE ROW IS NOT THE PROOF (r9, Codex MEDIUM). It is written BEFORE the release,
+ * and the transaction commits even when the fenced release matches zero rows, so its existence says
+ * a refusal was recorded and says nothing about whether the release ran. The proof is the COMMIT
+ * RECORD — written after the release, stating what it matched — and this asks for that row and for
+ * the boolean on it. See {@link UNSENT_HANDBACK_COMMIT_ACTION}.
  *
  * BEST-EFFORT ON PURPOSE. A probe that throws answers "not recorded", which is precisely the r7
  * outcome — an over-stated abort report — rather than a new failure mode. It must never be the thing
@@ -2874,17 +2943,19 @@ async function findRecordedUnsentHandBack(args: {
   handBackId: string
 }): Promise<boolean> {
   try {
-    const { entityType, entityId, action } = unsentPostEvidence(args.entry, args.notPosted)
     const found = await db.activityLog.findFirst({
       where: {
-        entityType,
-        entityId,
-        action,
+        entityType: 'SYSTEM',
+        entityId: args.entry.id,
+        action: UNSENT_HANDBACK_COMMIT_ACTION,
         metadata: { path: ['handBackId'], equals: args.handBackId },
       },
-      select: { id: true },
+      select: { metadata: true },
     })
-    return found !== null
+    // A row is not enough: it must SAY what the fenced release matched. Anything else — a row from a
+    // writer this build does not contain, a truncated metadata — is "not recorded", which is the r7
+    // behaviour and never a false certification.
+    return unsentHandBackCommitProvesRelease(found?.metadata)
   } catch {
     return false
   }
@@ -2956,9 +3027,11 @@ async function handBackUnsentTransportRefusal(args: {
   // Derived from the row, the claim instant the release fences on and the attempt: the same on every
   // pass of the sequence, and different for any other sequence.
   const handBackId = unsentHandBackOperationId(entry.id, lease, attempt)
+  // r9: ACQUISITION AND EXECUTION SHARE THE ONE REMAINDER — see unsentHandBackAttemptBounds. Passing
+  // the budget as `timeout` while `maxWait` independently allowed more was two budgets, not one.
   const outcome = await retryUnsentHandBack((attemptBudgetMs) => db.$transaction(async (tx) => {
     return recordAndReleaseUnsentTransportRefusal(tx, { entry, notPosted, lease, attempt, job })
-  }, { timeout: attemptBudgetMs, maxWait: Math.min(attemptBudgetMs, UNSENT_HANDBACK_MAX_WAIT_MS) }), {
+  }, unsentHandBackAttemptBounds(attemptBudgetMs)), {
     deadline,
     recordedHandBack: () => findRecordedUnsentHandBack({ entry, notPosted, handBackId }),
   })

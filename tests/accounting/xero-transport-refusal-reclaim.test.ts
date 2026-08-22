@@ -10,14 +10,20 @@ import {
   UNSENT_HANDBACK_MAX_ATTEMPTS,
   UNSENT_HANDBACK_MIN_ATTEMPT_MS,
   UNSENT_HANDBACK_RETRY_BASE_DELAY_MS,
+  UNSENT_HANDBACK_COMMIT_ACTION,
+  UNSENT_HANDBACK_MAX_WAIT_MS,
   UNSENT_HANDBACK_RETRY_BUDGET_MS,
+  unsentHandBackAttemptBounds,
   unsentHandBackAttemptBudgetMs,
+  unsentHandBackCommitProvesRelease,
   unsentHandBackDeadline,
   unsentHandBackOperationId,
 } from '@/lib/connectors/xero/sync-processor'
 import {
   CREATE_DISPATCH_REPLAY_MARGIN_MS,
   decideCreateDispatch,
+  readCreateDispatchAge,
+  type CreateDispatchClient,
 } from '@/lib/domain/accounting/create-dispatch-record'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
@@ -563,10 +569,11 @@ test('o3d-jit6 r5: the queued hand-back commits evidence, release and requeue as
 
   assert.equal(out.released, true)
   const after = w.world()
-  assert.equal(after.activity.length, 1, 'the evidence row is written')
+  assert.equal(after.activity.length, 2, 'the evidence row is written, and the r9 commit record after it')
   assert.equal(after.activity[0].action, 'xero_sync_transport_refused_before_post',
     'and it is the action the marker refusal tells an operator to look for')
   assert.equal(after.activity[0].level, 'WARNING')
+  assert.equal(after.activity[1].action, UNSENT_HANDBACK_COMMIT_ACTION)
   assert.equal(after.sync.status, 'PENDING', 'the row is claimable again')
   assert.equal(after.job.status, 'RETRYABLE_FAILED', 'and its job is back in the queue')
   assert.equal(after.job.attempts, 2, 'without spending an attempt')
@@ -628,7 +635,7 @@ test('o3d-jit6 r5: the DIRECT hand-back rolls back as one too — it is the same
   }))
   assert.equal(out.released, true)
   assert.equal(ok.world().sync.status, 'PENDING')
-  assert.equal(ok.world().activity.length, 1)
+  assert.equal(ok.world().activity.length, 2, 'evidence row plus commit record')
   assert.equal(ok.world().job.status, 'PROCESSING', 'the direct path must not touch an outbox job')
 })
 
@@ -650,7 +657,7 @@ test('o3d-jit6 r5: a ZERO-ROW fenced release does NOT abort — the evidence and
   assert.equal(out.released, false, 'the caller is told the release matched nothing')
   const after = displaced.world()
   assert.equal(after.sync.status, 'PROCESSING', "the replacement's claim is untouched")
-  assert.equal(after.activity.length, 1, 'but the refusal that really happened is still recorded')
+  assert.equal(after.activity.length, 2, 'but the refusal that really happened is still recorded')
   assert.equal(after.job.status, 'RETRYABLE_FAILED', 'and this worker still hands back its own job')
 
   // Same when an operator moved the attempt while this claim was held.
@@ -664,7 +671,7 @@ test('o3d-jit6 r5: a ZERO-ROW fenced release does NOT abort — the evidence and
   }))
   assert.equal(outDecided.released, false)
   assert.equal(decided.world().sync.status, 'PROCESSING', "an operator's decision is not reopened")
-  assert.equal(decided.world().activity.length, 1)
+  assert.equal(decided.world().activity.length, 2)
 })
 
 test('o3d-jit6 r5: a job this worker no longer holds aborts the whole hand-back, evidence included', async () => {
@@ -730,7 +737,7 @@ test('o3d-jit6 r7: a transient abort is retried and the row IS handed back', asy
 
   const after = w.world()
   assert.equal(after.sync.status, 'PENDING', 'THE ROW IS CLAIMABLE AGAIN — this is the whole finding')
-  assert.equal(after.activity.length, 1, 'with exactly one evidence row, from the attempt that committed')
+  assert.equal(after.activity.length, 2, 'with exactly ONE hand-back\'s rows, from the attempt that committed')
   assert.equal(after.activity[0].action, 'xero_sync_transport_refused_before_post')
   assert.equal(after.job.status, 'RETRYABLE_FAILED', 'and the job went back with it, in the same commit')
   assert.equal(after.job.attempts, 2, 'still without spending an attempt')
@@ -824,7 +831,6 @@ test('o3d-jit6 r8: the deadline is anchored on the marker, so time the window ha
   const nearlySpent = unsentHandBackDeadline(1_000, {
     known: true,
     elapsedMs: UNSENT_HANDBACK_RETRY_BUDGET_MS - 100,
-    dispatchedAt: T_DISPATCH,
   })
   assert.equal(nearlySpent.anchor, 'dispatch-marker')
   assert.equal(nearlySpent.atMs, 1_100, 'what is left is the budget MINUS what the window has already run')
@@ -980,10 +986,13 @@ test('o3d-jit6 r8: a hand-back whose acknowledgement was lost is reported as HAN
     {
       sleep: async (ms) => { slept.push(ms) },
       monotonicMs: () => 0,
-      // The probe production uses: the evidence row carries the hand-back's deterministic name, and
-      // all three writes committed together, so finding it proves the whole hand-back landed.
+      // THE PROBE PRODUCTION USES, r9: not the evidence row — the COMMIT RECORD, which is written
+      // after the release and states what it matched. `findRecordedUnsentHandBack` applies exactly
+      // this predicate against `db`.
       recordedHandBack: async () => w.world().activity.some(
-        (row) => (row.metadata as { handBackId?: string } | undefined)?.handBackId === HAND_BACK_ID,
+        (row) => row.action === UNSENT_HANDBACK_COMMIT_ACTION
+          && (row.metadata as { handBackId?: string } | undefined)?.handBackId === HAND_BACK_ID
+          && unsentHandBackCommitProvesRelease(row.metadata),
       ),
     },
   )
@@ -995,9 +1004,11 @@ test('o3d-jit6 r8: a hand-back whose acknowledgement was lost is reported as HAN
   assert.deepEqual(slept, [], 'and no pause is spent on work that has already happened')
 
   const after = w.world()
-  assert.equal(after.activity.length, 1, 'exactly one evidence row — r7 wrote a second one on the retry')
+  assert.equal(after.activity.length, 2, "exactly ONE hand-back's rows — r7 wrote a second set on the retry")
   assert.equal(after.activity[0].entityId, 'log-1', 'named on the row, so the probe is an index lookup')
   assert.equal((after.activity[0].metadata as { handBackId?: string }).handBackId, HAND_BACK_ID)
+  assert.equal(after.activity[1].action, UNSENT_HANDBACK_COMMIT_ACTION)
+  assert.equal((after.activity[1].metadata as { released?: boolean }).released, true)
   assert.equal(after.sync.status, 'PENDING', 'the row really was handed back')
   assert.equal(after.job.status, 'RETRYABLE_FAILED', 'and the job with it, in that same commit')
   assert.equal(after.job.attempts, 2, 'still without spending an attempt')
@@ -1048,7 +1059,7 @@ test('o3d-jit6 r8: without the probe, that same lost acknowledgement is exactly 
   // report sends an operator to resolve a row that needs nothing.
   const after = w.world()
   assert.equal(after.sync.status, 'PENDING', 'THE WORK WAS DONE ALL ALONG')
-  assert.equal(after.activity.length, 1, 'and the later attempts rolled back, so not even a duplicate remains')
+  assert.equal(after.activity.length, 2, 'and the later attempts rolled back, so not even a duplicate remains')
   assert.equal(after.job.status, 'RETRYABLE_FAILED')
 })
 
@@ -1070,8 +1081,12 @@ test('o3d-jit6 r8: the shared hand-back anchors on the marker, bounds the attemp
   )
   assert.match(
     handBack,
-    /timeout: attemptBudgetMs/,
-    'and the attempt must be bounded by what is left, not by the default transaction timeout',
+    /unsentHandBackAttemptBounds\(attemptBudgetMs\)/,
+    'and acquisition AND execution must come out of what is left, as ONE remainder (r9)',
+  )
+  assert.ok(
+    !/maxWait: Math\.min\(attemptBudgetMs/.test(handBack),
+    'an independently granted maxWait is a second budget added to the first — the r9 defect',
   )
   assert.match(
     handBack,
@@ -1087,4 +1102,207 @@ test('o3d-jit6 r8: the shared hand-back anchors on the marker, bounds the attemp
     !/throw /.test(handBack),
     'it must still not throw into the per-entry catch: that spends a retry and FAILS a row that sent nothing',
   )
+})
+
+/* ------------------------------------------------------------------------------------------------
+ * ROUND 9 — THE DEADLINE WAS SAMPLED IN TWO CALLS, THE ATTEMPT HAD TWO BUDGETS, AND THE PROBE
+ * CERTIFIED A RELEASE IT HAD NOT SEEN.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A database whose clock only moves when it is asked to do work — so "how long the read took" is a
+ * number the test controls rather than a race it hopes for.
+ */
+function makeSampledDatabase(options: { dispatchedAt: Date; startElapsedMs: number; statementMs: number; secondQueryMs: number }) {
+  let dbNowMs = options.dispatchedAt.getTime() + options.startElapsedMs
+  const calls = { queryRaw: 0, findUnique: 0 }
+  const client: CreateDispatchClient = {
+    $queryRaw: (async (strings: TemplateStringsArray) => {
+      calls.queryRaw++
+      // The statement itself costs time, and `clock_timestamp()` is evaluated INSIDE it.
+      dbNowMs += options.statementMs
+      const sql = Array.from(strings).join('?')
+      if (sql.includes('create_dispatched_at')) {
+        return [{ elapsedMs: dbNowMs - options.dispatchedAt.getTime() }]
+      }
+      // r8's shape: a clock read on its own, with the marker still to be fetched.
+      return [{ now: new Date(dbNowMs) }]
+    }) as CreateDispatchClient['$queryRaw'],
+    accountingSyncLog: {
+      findUnique: async () => {
+        calls.findUnique++
+        // THE SLOW SECOND QUERY. Under load this is where the time goes, and under r8 every
+        // millisecond of it fell outside the elapsed figure.
+        dbNowMs += options.secondQueryMs
+        return { createDispatchedAt: options.dispatchedAt, createDispatchIdempotencyKey: KEY }
+      },
+    },
+  }
+  return { client, calls, elapsedNow: () => dbNowMs - options.dispatchedAt.getTime() }
+}
+
+test('o3d-jit6 r9: the marker age is sampled in ONE statement, so a slow read cannot extend the deadline', async () => {
+  const STATEMENT_MS = 40
+  const SECOND_QUERY_MS = 3_000
+  const START_ELAPSED_MS = 1_000
+  const db = makeSampledDatabase({
+    dispatchedAt: T_DISPATCH,
+    startElapsedMs: START_ELAPSED_MS,
+    statementMs: STATEMENT_MS,
+    secondQueryMs: SECOND_QUERY_MS,
+  })
+
+  const age = await readCreateDispatchAge(db.client, 'log-1')
+
+  // ONE ROUND TRIP. The marker and the clock are read together; there is no second query for time to
+  // hide in.
+  assert.equal(db.calls.queryRaw, 1, 'the marker and the clock come back from the same statement')
+  assert.equal(db.calls.findUnique, 0, 'and there is no separate fetch of the marker at all')
+
+  assert.equal(age.known, true)
+  assert.equal(
+    age.known === true && age.elapsedMs,
+    db.elapsedNow(),
+    'the duration handed to the host is the one the database measured when it read the row',
+  )
+  assert.equal(age.known === true && age.elapsedMs, START_ELAPSED_MS + STATEMENT_MS)
+
+  // AND THE DEADLINE IS THAT MUCH EARLIER. r8 sampled the clock first and then paid SECOND_QUERY_MS
+  // for the marker, so its elapsed figure was short by exactly that and the deadline it built sat
+  // that much LATER than the truth — under the delay that makes the window tight.
+  const honest = unsentHandBackDeadline(0, age)
+  assert.equal(honest.anchor, 'dispatch-marker')
+  assert.equal(honest.atMs, UNSENT_HANDBACK_RETRY_BUDGET_MS - (START_ELAPSED_MS + STATEMENT_MS))
+  const twoCallSampling = unsentHandBackDeadline(0, { known: true, elapsedMs: START_ELAPSED_MS + STATEMENT_MS - SECOND_QUERY_MS })
+  assert.ok(
+    honest.atMs < twoCallSampling.atMs,
+    'a deadline built from a two-call sample is later than the truth by the cost of the second call',
+  )
+})
+
+test('o3d-jit6 r9: a row that is gone and a row with no marker are still told apart, from the one statement', async () => {
+  const missing: CreateDispatchClient = {
+    $queryRaw: (async () => []) as CreateDispatchClient['$queryRaw'],
+    accountingSyncLog: { findUnique: async () => { throw new Error('must not be called') } },
+  }
+  assert.deepEqual(await readCreateDispatchAge(missing, 'log-1'), { known: false, reason: 'unreadable' })
+
+  const unmarked: CreateDispatchClient = {
+    $queryRaw: (async () => [{ elapsedMs: null }]) as CreateDispatchClient['$queryRaw'],
+    accountingSyncLog: { findUnique: async () => { throw new Error('must not be called') } },
+  }
+  assert.deepEqual(await readCreateDispatchAge(unmarked, 'log-1'), { known: false, reason: 'no-marker' })
+
+  // An age this instance cannot order against the database's own clock is evidence of nothing.
+  const backwards: CreateDispatchClient = {
+    $queryRaw: (async () => [{ elapsedMs: -1 }]) as CreateDispatchClient['$queryRaw'],
+    accountingSyncLog: { findUnique: async () => { throw new Error('must not be called') } },
+  }
+  assert.deepEqual(await readCreateDispatchAge(backwards, 'log-1'), { known: false, reason: 'unorderable' })
+
+  const broken: CreateDispatchClient = {
+    $queryRaw: (async () => { throw new Error('connection terminated') }) as CreateDispatchClient['$queryRaw'],
+    accountingSyncLog: { findUnique: async () => { throw new Error('must not be called') } },
+  }
+  assert.deepEqual(await readCreateDispatchAge(broken, 'log-1'), { known: false, reason: 'unreadable' })
+})
+
+test('o3d-jit6 r9: acquisition and execution come out of ONE remainder, never two budgets that add up', () => {
+  for (const budget of [
+    UNSENT_HANDBACK_MIN_ATTEMPT_MS,
+    UNSENT_HANDBACK_MIN_ATTEMPT_MS + 1,
+    5_000,
+    UNSENT_HANDBACK_RETRY_BUDGET_MS,
+  ]) {
+    const bounds = unsentHandBackAttemptBounds(budget)
+    assert.equal(
+      bounds.maxWait + bounds.timeout,
+      budget,
+      `${budget}: waiting for a connection and running the transaction must share the remainder`,
+    )
+    assert.ok(bounds.maxWait >= 1 && bounds.timeout >= 1, `${budget}: both halves must be usable`)
+    assert.ok(bounds.maxWait <= UNSENT_HANDBACK_MAX_WAIT_MS, `${budget}: the reservation is capped`)
+  }
+
+  // THE r8 SHAPE, FOR CONTRAST: the budget as `timeout` with `maxWait` granted independently on top.
+  // An attempt could spend both, consecutively, and outlive the deadline by the whole wait.
+  const budget = unsentHandBackAttemptBudgetMs(UNSENT_HANDBACK_RETRY_BUDGET_MS)
+  const r8 = { timeout: budget, maxWait: Math.min(budget, UNSENT_HANDBACK_MAX_WAIT_MS) }
+  assert.ok(r8.maxWait + r8.timeout > budget, 'which is the finding')
+  assert.equal(unsentHandBackAttemptBounds(budget).maxWait + unsentHandBackAttemptBounds(budget).timeout, budget)
+})
+
+test('o3d-jit6 r9: the commit records WHAT THE FENCED RELEASE MATCHED, and only that proves a hand-back', async () => {
+  const w = makeWorld()
+  const out = await w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+    entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+    notPosted: NOT_POSTED,
+    lease: claimHeldFrom(T_DISPATCH),
+    attempt: ATTEMPT,
+    job: JOB as never,
+  }))
+  assert.equal(out.released, true)
+
+  const [evidence, commit] = w.world().activity
+  // THE FINDING. The evidence row is written BEFORE the release and commits even when the release
+  // matches nothing, so it cannot prove the release ran — and r8's probe read exactly this row.
+  assert.equal(evidence.action, 'xero_sync_transport_refused_before_post')
+  assert.equal((evidence.metadata as { handBackId?: string }).handBackId, HAND_BACK_ID)
+  assert.equal(
+    unsentHandBackCommitProvesRelease(evidence.metadata),
+    false,
+    'the named evidence row says a refusal was recorded, and nothing about the release',
+  )
+
+  assert.equal(commit.action, UNSENT_HANDBACK_COMMIT_ACTION)
+  assert.equal((commit.metadata as { handBackId?: string }).handBackId, HAND_BACK_ID,
+    'the release result is persisted alongside the deterministic identifier, in the same transaction')
+  assert.equal((commit.metadata as { released?: boolean }).released, true)
+  assert.equal(unsentHandBackCommitProvesRelease(commit.metadata), true)
+
+  // AND A ZERO-ROW RELEASE STILL COMMITS — deliberately — and is recorded truthfully rather than
+  // hidden. The probe may certify it, because the record proves the release ran and says what it did.
+  const displaced = makeWorld({ sync: { processingStartedAt: new Date(T_DISPATCH.getTime() + 60_000) } })
+  const zero = await displaced.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+    entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+    notPosted: NOT_POSTED,
+    lease: claimHeldFrom(T_DISPATCH),
+    attempt: ATTEMPT,
+    job: JOB as never,
+  }))
+  assert.equal(zero.released, false)
+  const zeroCommit = displaced.world().activity[1]
+  assert.equal(zeroCommit.action, UNSENT_HANDBACK_COMMIT_ACTION)
+  assert.equal((zeroCommit.metadata as { released?: boolean }).released, false)
+  assert.equal(unsentHandBackCommitProvesRelease(zeroCommit.metadata), true)
+})
+
+test('o3d-jit6 r9: the probe looks for the commit record, not for the evidence row', () => {
+  const source = readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
+  const probe = source.slice(
+    source.indexOf('async function findRecordedUnsentHandBack(args: {'),
+    source.indexOf('/**\n * SAY THAT AN ACKNOWLEDGEMENT WAS LOST'),
+  )
+  assert.ok(probe.length > 0, 'the probe must be found')
+  assert.match(probe, /action: UNSENT_HANDBACK_COMMIT_ACTION/, 'it asks for the record the release wrote')
+  assert.ok(
+    !/unsentPostEvidence\(/.test(probe),
+    'the evidence row cannot prove the release ran — it is written before it and commits without it',
+  )
+  assert.match(
+    probe,
+    /return unsentHandBackCommitProvesRelease\(found\?\.metadata\)/,
+    'and success requires a record that STATES what the fenced release matched',
+  )
+
+  // The commit record is written AFTER the release, in the same transaction, so it cannot exist
+  // unless the release returned.
+  const body = source.slice(
+    source.indexOf('export async function recordAndReleaseUnsentTransportRefusal('),
+    source.indexOf('/**\n * SAY THAT THE HAND-BACK ABORTED'),
+  )
+  const releaseAt = body.indexOf('await releaseUnsentTransportRefusal(')
+  const commitAt = body.indexOf('action: UNSENT_HANDBACK_COMMIT_ACTION')
+  assert.ok(releaseAt > -1 && commitAt > releaseAt, 'the release result is recorded after the release')
+  assert.match(body, /handBackId,\n      released,\n/, 'the identifier and the result on the same record')
 })

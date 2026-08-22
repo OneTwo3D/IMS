@@ -506,13 +506,28 @@ export async function planCreateDispatch(
  * `new Date()` is the o3d-clxw defect, and this deliberately does not do it — see the header of
  * {@link decideCreateDispatch} for why that comparison fails in the permissive direction.
  *
+ * AND THE SAMPLE IS ONE STATEMENT, NOT TWO (o3d-jit6 r9, Codex HIGH). r8 read `clock_timestamp()`
+ * and then fetched the marker in a SEPARATE query. Everything the second round trip cost — which is
+ * exactly what a database under load costs most of — fell outside the difference, so the elapsed
+ * figure was short by that much and the deadline built from it sat that much LATER than the truth,
+ * under precisely the delay that makes the window tight. One statement reads the marker and the clock
+ * together and returns nothing but their difference, so the duration that crosses to the host is the
+ * one the database measured at the moment it read the row.
+ *
+ * BOUNDED BY CONSTRUCTION: one row, by primary key, with no join and no scan — the read cannot cost
+ * more than the thing it is measuring.
+ *
  * FAILS TO "UNKNOWN", NOT TO ZERO. A caller that cannot learn the age must fall back to its own
  * entry-anchored bound rather than treat the budget as spent: refusing to hand the row back at all is
  * strictly worse than handing it back a little late, because a row left PROCESSING is unclaimable for
  * the whole stale cutoff — which is the very stranding the hand-back exists to prevent.
  */
 export type CreateDispatchAge =
-  | { known: true; elapsedMs: number; dispatchedAt: Date }
+  /**
+   * `elapsedMs` and nothing else: r9's rule is that ONLY A DURATION may cross to the host. An instant
+   * carried out of here invites a host-side `Date.now()` comparison, which is the o3d-clxw defect.
+   */
+  | { known: true; elapsedMs: number }
   | { known: false; reason: 'no-marker' | 'unreadable' | 'unorderable' }
 
 export async function readCreateDispatchAge(
@@ -520,25 +535,29 @@ export async function readCreateDispatchAge(
   entryId: string,
 ): Promise<CreateDispatchAge> {
   try {
-    const clock = await client.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS "now"`
-    const now = clock?.[0]?.now
-    if (!(now instanceof Date) || Number.isNaN(now.getTime())) return { known: false, reason: 'unreadable' }
-
-    const row = await client.accountingSyncLog.findUnique({
-      where: { id: entryId },
-      select: { createDispatchedAt: true, createDispatchIdempotencyKey: true },
-    })
+    // ONE STATEMENT, ONE ROW, ONE CLOCK READ. `clock_timestamp()` is evaluated inside the same
+    // statement that reads the marker, so the subtraction happens where both operands live and the
+    // time this query itself spends is INSIDE the figure rather than after it. NULL comes back for a
+    // row that carries no marker; no row at all comes back for a row that is gone.
+    const rows = await client.$queryRaw<Array<{ elapsedMs: number | null }>>`
+      SELECT (EXTRACT(EPOCH FROM (clock_timestamp() - "create_dispatched_at")) * 1000)::double precision
+             AS "elapsedMs"
+      FROM "accounting_sync_logs"
+      WHERE "id" = ${entryId}
+      LIMIT 1
+    `
+    const row = rows?.[0]
     if (!row) return { known: false, reason: 'unreadable' }
     // No marker means no replay window is standing over this row at all, so there is nothing for a
     // deadline to be anchored to. That is a different answer from "could not read", and the caller
     // says which one it got.
-    if (row.createDispatchedAt === null) return { known: false, reason: 'no-marker' }
+    if (row.elapsedMs === null || row.elapsedMs === undefined) return { known: false, reason: 'no-marker' }
 
-    const elapsedMs = now.getTime() - row.createDispatchedAt.getTime()
+    const elapsedMs = Number(row.elapsedMs)
     // THE SAME NON-NEGATIVE TEST `decideCreateDispatch` MAKES, for the same reason: an instant this
     // instance cannot order against its own reading of the same clock is not evidence of anything.
     if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return { known: false, reason: 'unorderable' }
-    return { known: true, elapsedMs, dispatchedAt: row.createDispatchedAt }
+    return { known: true, elapsedMs }
   } catch {
     return { known: false, reason: 'unreadable' }
   }
