@@ -16,6 +16,8 @@ type SyncLogRow = {
   referenceId: string
   /** Post evidence. Present once the document exists in the ledger, regardless of status. */
   externalTransactionId?: string | null
+  /** o3d-anu8: NULL = the connector's own writeback; 'OPERATOR_ASSERTION' = a human's claim. */
+  settlementBasis?: string | null
 }
 
 type WhereNode = Record<string, unknown>
@@ -140,6 +142,7 @@ function syncLog(overrides: Partial<SyncLogRow>): SyncLogRow {
     referenceType: 'SalesOrder',
     referenceId: 'order-1',
     externalTransactionId: null,
+    settlementBasis: null,
     ...overrides,
   }
 }
@@ -947,4 +950,51 @@ test('o3d-2y1c: a committed shipment outranks WMS evidence but not a posted acco
   // A posted invoice needs a finance reversal first; saying "cancel the order" would leave a live
   // receivable behind, so the accounting blocker must still be the one shown.
   assert.equal(underPostedInvoice?.code, 'accounting_document_exists')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-anu8 — SAY WHOSE CLAIM IT IS.
+//
+// "is already POSTED as X" is a statement about the ledger. On an operator-settled row nobody has
+// read the ledger: a human typed X in. The order must still not be deleted, but the instruction
+// "reverse it in the accounting system" assumes the document exists, which is precisely what has
+// not been established.
+// ---------------------------------------------------------------------------
+
+test('[o3d-anu8] an OPERATOR-ASSERTED posted document blocks, and the message does not state it as fact', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [syncLog({
+        status: 'SYNCED',
+        externalTransactionId: 'INV-TYPED-IN',
+        settlementBasis: 'OPERATOR_ASSERTION',
+      })],
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'accounting_sync_live')
+  assert.match(blocker!.message, /an OPERATOR\s+recorded as POSTED/)
+  assert.match(blocker!.message, /assertion, not a confirmation/)
+  assert.doesNotMatch(blocker!.message, /is already POSTED as/,
+    'the connector-confirmed wording claims the ledger holds it, and nothing here has asked')
+})
+
+test('[o3d-anu8] a connector-confirmed posted document outranks an asserted one', async () => {
+  // Both block; the question is which remedy the operator is shown. The one resting on something the
+  // ledger actually said wins.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [
+        syncLog({ id: 'asserted', status: 'SYNCED', externalTransactionId: 'INV-TYPED-IN', settlementBasis: 'OPERATOR_ASSERTION' }),
+        syncLog({ id: 'real', status: 'SYNCED', externalTransactionId: 'INV-REAL', settlementBasis: null }),
+      ],
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'accounting_sync_live')
+  assert.match(blocker!.message, /is already POSTED as INV-REAL/)
 })

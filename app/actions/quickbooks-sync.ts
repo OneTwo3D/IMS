@@ -293,6 +293,14 @@ export type QuickBooksSyncLogRow = {
   externalTransactionId: string | null
   errorMessage: string | null
   retryCount: number
+  /**
+   * o3d-anu8. Carried here for ONE reason: the shared `AccountingSyncLogRow` requires it, and the
+   * sync page renders through that. The per-row settlement action is connector-agnostic — it writes
+   * this column on whichever row an operator settles — so the display must be able to mark a
+   * QuickBooks row as asserted too, or the marker would silently mean "Xero only". No
+   * QuickBooks-specific behaviour is changed by it.
+   */
+  settlementBasis: string | null
   syncedAt: string | null
   createdAt: string
 }
@@ -312,6 +320,7 @@ export async function getQuickBooksSyncLogs(limit = 50): Promise<QuickBooksSyncL
     externalTransactionId: r.externalTransactionId,
     errorMessage: r.errorMessage,
     retryCount: r.retryCount,
+    settlementBasis: r.settlementBasis,
     syncedAt: r.syncedAt?.toISOString() ?? null,
     createdAt: r.createdAt.toISOString(),
   }))

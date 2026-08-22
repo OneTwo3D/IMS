@@ -52,6 +52,9 @@ function cleanRows(): AccountingReconciliationRows {
         referenceType: 'DailyBatch',
         referenceId: 'A1-2026-04-24',
         externalTransactionId: 'journal-a1',
+        // o3d-anu8: NULL is the connector's own writeback. Stated rather than defaulted so a fixture
+        // that means to model an OPERATOR-ASSERTED row has to say so.
+        settlementBasis: null,
         payload: { date: '2026-04-24' },
       },
       {
@@ -62,6 +65,9 @@ function cleanRows(): AccountingReconciliationRows {
         referenceType: 'DailyBatch',
         referenceId: 'A2-2026-04-24',
         externalTransactionId: 'journal-a2',
+        // o3d-anu8: NULL is the connector's own writeback. Stated rather than defaulted so a fixture
+        // that means to model an OPERATOR-ASSERTED row has to say so.
+        settlementBasis: null,
         payload: { date: '2026-04-24' },
       },
       {
@@ -72,6 +78,9 @@ function cleanRows(): AccountingReconciliationRows {
         referenceType: 'DailyBatch',
         referenceId: 'B-2026-04-25',
         externalTransactionId: 'journal-b',
+        // o3d-anu8: NULL is the connector's own writeback. Stated rather than defaulted so a fixture
+        // that means to model an OPERATOR-ASSERTED row has to say so.
+        settlementBasis: null,
         payload: { date: '2026-04-25' },
       },
       {
@@ -82,6 +91,9 @@ function cleanRows(): AccountingReconciliationRows {
         referenceType: 'SalesOrderRefund',
         referenceId: 'refund-1',
         externalTransactionId: 'journal-refund-cogs',
+        // o3d-anu8: NULL is the connector's own writeback. Stated rather than defaulted so a fixture
+        // that means to model an OPERATOR-ASSERTED row has to say so.
+        settlementBasis: null,
         payload: { _idempotencyKey: 'sales-order-refund:refund-1:cogs-reversal' },
       },
     ],
@@ -473,6 +485,9 @@ test('shipment COGS revaluation sync logs count as source state for mirrored eve
     referenceType: 'Shipment',
     referenceId: 'shipment-1',
     externalTransactionId: 'journal-shipment-cogs-revaluation',
+    // o3d-anu8: NULL is the connector's own writeback. Stated rather than defaulted so a fixture
+    // that means to model an OPERATOR-ASSERTED row has to say so.
+    settlementBasis: null,
     payload: { _idempotencyKey: 'shipment-cogs-revalue:shipment-1:layer-1:20:27.5' },
   })
   rows.accountingEvents.push({
@@ -635,6 +650,9 @@ test('live sync status membership gates terminal credit-note evidence', () => {
       referenceType: 'SalesOrderRefund',
       referenceId: 'refund-1',
       externalTransactionId: status === 'SYNCED' ? 'credit-note-1' : null,
+      // o3d-anu8: NULL is the connector's own writeback. Stated rather than defaulted so a fixture
+      // that means to model an OPERATOR-ASSERTED row has to say so.
+      settlementBasis: null,
       payload: { _idempotencyKey: `sales-order-refund:refund-1:credit-note:${status}` },
     })
 
@@ -657,6 +675,9 @@ test('live sync status membership gates terminal credit-note evidence', () => {
       referenceType: 'SalesOrderRefund',
       referenceId: 'refund-1',
       externalTransactionId: null,
+      // o3d-anu8: NULL is the connector's own writeback. Stated rather than defaulted so a fixture
+      // that means to model an OPERATOR-ASSERTED row has to say so.
+      settlementBasis: null,
       payload: { _idempotencyKey: `sales-order-refund:refund-1:credit-note:${status}` },
     })
 
@@ -688,6 +709,9 @@ test('cancelled terminal order with reversal evidence stays clean', () => {
     referenceType: 'SalesOrderRefund',
     referenceId: 'refund-1',
     externalTransactionId: 'cancelled-reversal-1',
+    // o3d-anu8: NULL is the connector's own writeback. Stated rather than defaulted so a fixture
+    // that means to model an OPERATOR-ASSERTED row has to say so.
+    settlementBasis: null,
     payload: { _idempotencyKey: 'sales-order-refund:refund-1:cogs-reversal' },
   })
 
@@ -732,6 +756,9 @@ test('refunded terminal order with credit-note and reversal evidence stays clean
     referenceType: 'SalesOrderRefund',
     referenceId: 'refund-1',
     externalTransactionId: 'credit-note-1',
+    // o3d-anu8: NULL is the connector's own writeback. Stated rather than defaulted so a fixture
+    // that means to model an OPERATOR-ASSERTED row has to say so.
+    settlementBasis: null,
     payload: { _idempotencyKey: 'sales-order-refund:refund-1:credit-note' },
   })
 
@@ -962,6 +989,9 @@ function invoiceSyncLog(id: string, type: string, referenceId: string, externalT
     referenceType: 'SalesOrder',
     referenceId,
     externalTransactionId,
+    // o3d-anu8: NULL is the connector's own writeback. Stated rather than defaulted so a fixture
+    // that means to model an OPERATOR-ASSERTED row has to say so.
+    settlementBasis: null,
     payload: { date: '2026-04-25' },
   }
 }
@@ -1031,6 +1061,9 @@ function familySyncLog(id: string, type: string, referenceType: string, referenc
     referenceType,
     referenceId,
     externalTransactionId,
+    // o3d-anu8: NULL is the connector's own writeback. Stated rather than defaulted so a fixture
+    // that means to model an OPERATOR-ASSERTED row has to say so.
+    settlementBasis: null,
     payload: { date: '2026-04-25' },
   }
 }
@@ -1366,4 +1399,66 @@ test('o3d-ecow r2: a split day with PERSISTED refs is matched exactly and never 
   const orphan = findings.find((finding) => finding.code === 'event_without_source')
   assert.ok(orphan, 'the second journal has no source state of its own and is reported')
   assert.equal((orphan!.details as { sourceEntityId: string }).sourceEntityId, A1_SPLIT_REF)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-anu8 — A LIVE SYNC ROW IS EVIDENCE ONLY WHEN THE CONNECTOR PUT IT THERE.
+//
+// `syncLogHasLiveEvidence` is the reason a missing-evidence finding is NOT raised. That reading
+// holds for a row the processor wrote — SYNCED means the ledger answered. It does not hold for a
+// row an operator settled, where the id was typed and no call was made, and where silencing the
+// finding removes the only thing that would have told anybody to go and look.
+// ---------------------------------------------------------------------------
+
+test('[o3d-anu8] an OPERATOR-ASSERTED credit-note sync row does NOT silence the missing-evidence finding', () => {
+  const rows = cleanRows()
+  rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED', refundStatus: 'FULL' }]
+  rows.refunds = [{ ...rows.refunds[0], accountingCreditNoteId: null }]
+  rows.syncLogs = rows.syncLogs.filter((log) => log.referenceType !== 'SalesOrderRefund')
+  rows.accountingEvents = rows.accountingEvents.filter(
+    (event) => event.sourceEntityType !== 'SalesOrderRefund' || event.type !== 'CREDIT_NOTE',
+  )
+  rows.syncLogs.push({
+    id: 'sync-refund-credit-note-asserted',
+    connector: 'xero',
+    type: 'CREDIT_NOTE',
+    status: 'SYNCED',
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    externalTransactionId: 'credit-note-typed-in',
+    settlementBasis: 'OPERATOR_ASSERTION',
+    payload: { _idempotencyKey: 'sales-order-refund:refund-1:credit-note:asserted' },
+  })
+
+  const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+
+  assert.equal(codes.includes('terminal_refunded_order_missing_credit_note_evidence'), true,
+    'an assertion is not evidence, and over-reporting is the safe direction for this report')
+})
+
+test('[o3d-anu8] the identical row written back by the connector still silences it', () => {
+  // The fence in the other direction — otherwise the test above would pass against a version that
+  // simply stopped believing SYNCED rows at all.
+  const rows = cleanRows()
+  rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED', refundStatus: 'FULL' }]
+  rows.refunds = [{ ...rows.refunds[0], accountingCreditNoteId: null }]
+  rows.syncLogs = rows.syncLogs.filter((log) => log.referenceType !== 'SalesOrderRefund')
+  rows.accountingEvents = rows.accountingEvents.filter(
+    (event) => event.sourceEntityType !== 'SalesOrderRefund' || event.type !== 'CREDIT_NOTE',
+  )
+  rows.syncLogs.push({
+    id: 'sync-refund-credit-note-real',
+    connector: 'xero',
+    type: 'CREDIT_NOTE',
+    status: 'SYNCED',
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    externalTransactionId: 'credit-note-1',
+    settlementBasis: null,
+    payload: { _idempotencyKey: 'sales-order-refund:refund-1:credit-note:real' },
+  })
+
+  const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+
+  assert.equal(codes.includes('terminal_refunded_order_missing_credit_note_evidence'), false)
 })

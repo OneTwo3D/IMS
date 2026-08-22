@@ -68,6 +68,18 @@ export type AccountingSyncLogRow = {
    * and applyFencedAttemptDecision refuses both — the caller never has to tell them apart.
    */
   attemptRevision?: number
+  /**
+   * o3d-anu8 — HOW this row reached its status: NULL for the connector's own writeback, and
+   * `OPERATOR_ASSERTION` when a human typed the outcome and the document id in and IMS verified
+   * nothing. The sync page renders an external id beside a status badge, and this is the only thing
+   * that lets it say which of the two the reader is looking at.
+   *
+   * REQUIRED, unlike `attemptRevision` above, and the difference matters: an absent attempt revision
+   * means "this connector cannot be fenced", which the decision path already refuses. An absent
+   * basis would mean "connector-confirmed", which is a claim — and defaulting to the stronger claim
+   * is the whole defect this column exists to stop.
+   */
+  settlementBasis: string | null
   syncedAt: string | null
   createdAt: string
 }

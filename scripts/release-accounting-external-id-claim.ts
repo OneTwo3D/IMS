@@ -65,6 +65,7 @@ import {
   releaseAndRelinkExternalDocumentId,
   type ExternalDocumentIdReleaseRecorder,
 } from '../lib/domain/accounting/back-reference'
+import { isOperatorAssertedSettlement } from '../lib/domain/accounting/sync-row-settlement'
 
 // .env MUST load before lib/db is imported: that module builds its pg Pool from
 // process.env.DATABASE_URL at IMPORT time, so a static import would construct a pool with no
@@ -106,6 +107,11 @@ async function main() {
       id: true, connector: true, type: true, referenceType: true, referenceId: true,
       externalTransactionId: true, status: true, errorMessage: true,
       backReferenceAmbiguousLoggedAt: true, backReferenceEvidenceCompactedAt: true,
+      // o3d-anu8: read so the DRY RUN can refuse an operator-asserted row. The transaction re-reads
+      // it and refuses too — that is the check that counts — but a dry run that printed
+      // "conflict marker: errorMessage on the sync row" and then invited --apply is how an operator
+      // is walked into destroying a real link.
+      settlementBasis: true,
       // o3d-r5pj: read for ONE thing — the business date the document was posted with, so this
       // relink reproduces it instead of re-dating the sale to whenever an operator ran the command.
       payload: true,
@@ -176,6 +182,21 @@ async function main() {
   // and the fourth is the retention tombstone: compaction NULLS errorMessage, and for a QuickBooks
   // conflict (no repair sweep, so no deferred-refusal stamp either) that would otherwise erase the
   // last marker and close this route for good at the retention horizon.
+  // AN OPERATOR-SETTLED ROW HAS NO CONFLICT TO RESOLVE (o3d-anu8). Refused before the marker is
+  // even computed, because on such a row the marker IS the settlement note: `buildSettlementData`
+  // writes "Settled by operator: verified POSTED as <id>." into errorMessage, which the first branch
+  // below reports as durable evidence that a back-reference was refused. It is nothing of the kind,
+  // and the operation it authorises NULLs a genuinely posted document's id and its provenance.
+  if (isOperatorAssertedSettlement(row.settlementBasis)) {
+    throw new Error(
+      `Sync row ${syncLogId} was SETTLED BY AN OPERATOR, not written back by ${row.connector}. Its status and its external `
+      + `id (${row.externalTransactionId}) are a human's assertion that IMS verified nothing about — no call was made and no `
+      + 'document was read — and the only "conflict evidence" on it is the note the settlement itself wrote into errorMessage. '
+      + 'Releasing another record\'s claim on the strength of that would clear a genuinely posted document\'s link and its '
+      + 'provenance, after which nothing in IMS names that ledger document at all. Establish from the ACCOUNTING SYSTEM which '
+      + 'document holds this id before releasing anything.',
+    )
+  }
   const marker = row.errorMessage ? 'errorMessage on the sync row'
     : row.backReferenceAmbiguousLoggedAt ? 'deferred-refusal stamp from the repair sweep'
     : row.backReferenceEvidenceCompactedAt ? 'retention tombstone (payload and error text compacted away; attribution kept)'
@@ -270,6 +291,12 @@ async function main() {
     case 'source-refused':
       // The row you named is not the row you read. Nothing was written.
       console.error(`REFUSED: sync row ${row.id} is no longer the quarantined conflict you named (${result.reason}).`)
+      if (result.reason === 'OPERATOR_ASSERTED_ID') {
+        // o3d-anu8. Reachable even past the pre-flight above: the row can be settled between the
+        // dry run and the apply, which is exactly why the transaction re-reads it.
+        console.error('That row was settled BY AN OPERATOR — its status and its external id are an assertion IMS verified nothing '
+          + 'about, and the note on it was written by the settlement, not by a refused back-reference. Nothing was written.')
+      }
       console.error('Nothing was written. Re-read the row and the activity entry — if it re-posted, its external id has changed and this '
         + 'release is about an id that row no longer owns.')
       process.exitCode = 1

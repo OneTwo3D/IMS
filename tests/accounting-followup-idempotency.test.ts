@@ -1551,3 +1551,111 @@ test('the ROLLBACK double post, played out end to end (o3d-0m56 r10)', () => {
   assert.equal(back.action === 'reuse' ? back.payload.amount : undefined, 100,
     'and the body stays pinned, so the recomputed 105 cannot record a settlement never made')
 })
+
+// ---------------------------------------------------------------------------
+// o3d-anu8 — WHO SUPPRESSED THIS WORK, AND WHAT CLEARED IT.
+// ---------------------------------------------------------------------------
+
+test('[o3d-anu8] a live row that an OPERATOR asserted refuses instead of skipping silently', () => {
+  // The live set is PENDING/PROCESSING/SYNCED, and a SYNCED row means "the ledger was told" — which
+  // is why the skip is silent. `buildSettlementData` also writes SYNCED, from a document id a human
+  // typed, and for an INVOICE_PAYMENT that row permanently suppresses the real registration: the
+  // invoice is never settled and the skip logs nothing to say so.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: true,
+    liveRowAsserted: true,
+    failedRows: [],
+  })
+  assert.equal(plan.action, 'refuse')
+  assert.match(plan.action === 'refuse' ? plan.reason : '', /OPERATOR asserted it posted/)
+})
+
+test('[o3d-anu8] a live row the connector wrote back still skips silently', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: true,
+    liveRowAsserted: false,
+    failedRows: [],
+  })
+  assert.equal(plan.action, 'skip')
+})
+
+test('[o3d-anu8] a NON-money live asserted row still skips — a missed PDF is not money', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    type: 'INVOICE_PDF',
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: true,
+    liveRowAsserted: true,
+    failedRows: [],
+  })
+  assert.equal(plan.action, 'skip')
+})
+
+test('[o3d-anu8] a money enqueue cleared by an operator-cancelled row SAYS so on the plan', () => {
+  // Moving a FAILED row to CANCELLED drops the distinct-token count and turns a refusal into this
+  // enqueue — deliberately, it is the documented purpose of the settlement action. What must not
+  // happen is that the resulting money post looks identical to one the connector's own history
+  // cleared, with nothing to lead anybody back to the assertion if it was wrong.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [],
+    assertedNotPostedRows: [{ id: 'log-settled' }],
+  })
+  assert.equal(plan.action, 'create')
+  assert.deepEqual(
+    plan.action === 'create' ? plan.restsOnAssertion : undefined,
+    { assertedNotPostedRowIds: ['log-settled'] },
+  )
+})
+
+test('[o3d-anu8] with no operator-cancelled row the plan carries no such claim', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [],
+  })
+  assert.equal(plan.action, 'create')
+  assert.equal(plan.action === 'create' ? plan.restsOnAssertion : 'unset', undefined)
+})
+
+test('[o3d-anu8] the Xero connector ASKS for the basis and hands both halves to the planner', async () => {
+  // The planner is pure, so the two rules above are only real if the connector supplies the inputs.
+  // This is the consumer half — the position nothing had swept — asserted on the source because
+  // driving a whole processor run to reach one enqueue would test the harness, not the wiring.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(
+    path.join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8',
+  )
+
+  const liveAt = source.indexOf('async function hasExistingSyncLog')
+  assert.notEqual(liveAt, -1)
+  const liveBody = source.slice(liveAt, source.indexOf('\n}', liveAt))
+  assert.match(liveBody, /select: \{ payload: true, settlementBasis: true \}/,
+    'an unselected column arrives undefined and reads as a connector confirmation')
+  assert.match(liveBody, /asserted: occupying\.some\(\(row\) => isOperatorAssertedSettlement\(row\.settlementBasis\)\)/)
+
+  const enqueueAt = source.indexOf('export async function enqueueFollowUpSyncLog')
+  assert.notEqual(enqueueAt, -1)
+  const enqueueBody = source.slice(enqueueAt, source.indexOf('const plan = planFollowUpEnqueue', enqueueAt))
+  // The ambiguity query is WIDENED rather than duplicated: the two row sets answer one question
+  // between them and a second query could see a different instant.
+  assert.match(enqueueBody, /\{ status: 'CANCELLED', settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS \}/)
+  assert.match(enqueueBody, /assertedNotPostedRows = failedLogs\.filter\(\(row\) => row\.status === 'CANCELLED'\)/)
+  assert.match(enqueueBody, /failedRows = failedLogs\.filter\(\(row\) => row\.status === 'FAILED'\)/,
+    'the asserted-cancelled rows must NOT enter the token-ambiguity set')
+
+  const planCall = source.slice(source.indexOf('const plan = planFollowUpEnqueue', enqueueAt), source.indexOf('if (plan.action === \'skip\')', enqueueAt))
+  assert.match(planCall, /liveRowAsserted: live\.asserted/)
+  assert.match(planCall, /assertedNotPostedRows/)
+
+  assert.match(source, /xero_followup_enqueue_rests_on_operator_assertion/,
+    'a money post cleared by an assertion must leave a record naming the rows that cleared it')
+})

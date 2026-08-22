@@ -38,9 +38,18 @@
  *                      serialises INVOICE_PAYMENT entries per reference: only the earliest live entry
  *                      for an order is ever un-deferred, so no sibling can be posting alongside us. The
  *                      later one re-runs this guard against our SYNCED row when its turn comes.
- *   CANCELLED          provably pre-call. Every writer of this status in the tree asserts it only where
- *                      "nothing was sent" is TRUE (o3d-sref; retireOverSettlingInvoicePayment runs
- *                      BEFORE the remote call). It frees the capacity again.
+ *   CANCELLED          frees the capacity again. That USED to rest on "every writer of this status in
+ *                      the tree asserts it only where nothing was sent is TRUE" (o3d-sref;
+ *                      retireOverSettlingInvoicePayment runs BEFORE the remote call). SINCE o3d-nf9i
+ *                      THAT SENTENCE IS FALSE and must not be relied on again: the per-row settlement
+ *                      action writes CANCELLED on an OPERATOR'S ASSERTION that nothing posted, with
+ *                      settlementBasis='OPERATOR_ASSERTION' and no remote call behind it at all.
+ *                      Capacity is still freed, deliberately (o3d-anu8): the FAILED row it replaces
+ *                      refuses every later receipt for ever via AMBIGUOUS_FAILED_REGISTRATION, and
+ *                      giving that a way out — audited, named, with the operator's identity on it —
+ *                      is the whole point of the settlement action. What changes is only that the
+ *                      justification is now "a human took responsibility", not "the code can prove
+ *                      it", and the next reader must not re-derive a proof from the status.
  *   FAILED             NEITHER. See below — this is the round 3 correction.
  *
  * A FAILED MONEY ROW IS NOT EVIDENCE THAT NOTHING POSTED (Codex round 3 #3).
@@ -95,6 +104,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { CAPACITY_EPSILON } from '@/lib/domain/accounting/invoice-payment-registration'
+import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import { ledgerSalesInvoiceTotalForeign } from '@/lib/domain/accounting/settlement-status'
 
 /** The only status that asserts the remote call happened. */
@@ -110,6 +120,12 @@ export const AMBIGUOUS_INVOICE_PAYMENT_STATUSES = ['FAILED'] as const
 export type PostedInvoicePaymentRegistration = {
   id: string
   status: string
+  /**
+   * HOW this row reached its status (o3d-anu8). NULL = the connector's own writeback. On an
+   * `OPERATOR_ASSERTION` row nothing was sent, so `amount` below is what IMS INTENDED to send and is
+   * not a reading of the ledger — see the SYNCED arm of `decideInvoicePaymentPost`.
+   */
+  settlementBasis: string | null
   /** What was sent, in the document currency. Null when the payload did not record it. */
   amount: number | null
   /** The ledger document it settled. Null on rows queued before the payload recorded it. */
@@ -127,6 +143,12 @@ export type PostedInvoicePaymentRegistration = {
 export type InvoicePaymentPostRefusal =
   /** A posted registration exists whose amount cannot be read, so remaining capacity is unknowable. */
   | 'LEDGER_AMOUNT_UNKNOWN'
+  /**
+   * A registration against this invoice is SYNCED because an operator ASSERTED it posted, so the
+   * amount IMS holds for it was never sent anywhere and the capacity sum is not a measurement
+   * (o3d-anu8).
+   */
+  | 'ASSERTED_REGISTRATION'
   /**
    * A FAILED registration against this same document may or may not have posted, so how much of the
    * invoice the ledger already holds cannot be determined at all (Codex round 3 #3).
@@ -190,6 +212,28 @@ export function decideInvoicePaymentPost(input: {
   const posted = againstThisInvoice.filter(
     (row) => (POSTED_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status),
   )
+
+  // A SYNCED ROW AN OPERATOR ASSERTED IS NOT A POSTED AMOUNT (o3d-anu8). SYNCED is the one status
+  // this guard reads as "money moved", and that reading is sound only for the connector's own
+  // writeback, which happens after the ledger answered. The settlement action writes the same
+  // status from a document id a human typed, and `amount` still comes out of the payload IMS built
+  // — so the sum below would subtract a figure nothing ever sent from the invoice total and call
+  // the remainder capacity. Xero accepts a payment smaller than the invoice as a PART payment, so
+  // the error runs in the direction that lets a second payment out.
+  //
+  // Checked after the ambiguous-FAILED gate (that one is the stronger fact) and before the
+  // unreadable-amount gate, because a readable-but-unverified amount is the more misleading of the
+  // two: it produces a confident number.
+  const assertedPosted = posted.filter((row) => isOperatorAssertedSettlement(row.settlementBasis))
+  if (assertedPosted.length > 0) {
+    return {
+      post: false,
+      refusal: 'ASSERTED_REGISTRATION',
+      alreadyPosted: null,
+      ledgerTotal: input.ledgerTotal,
+      ambiguousIds: assertedPosted.map((row) => row.id),
+    }
+  }
 
   if (posted.some((row) => typeof row.amount !== 'number')) {
     return {
@@ -282,7 +326,7 @@ export async function guardInvoicePaymentCapacity(
     pricesIncludeVat: boolean
     shoppingLinks: { connector: string }[]
   } | null
-  let registrations: { id: string; status: string; payload: unknown }[]
+  let registrations: { id: string; status: string; payload: unknown; settlementBasis: string | null }[]
   try {
     ;[order, registrations] = await Promise.all([
       client.salesOrder.findUnique({
@@ -301,7 +345,10 @@ export async function guardInvoicePaymentCapacity(
           referenceType: 'SalesOrder',
           referenceId: params.referenceId,
         },
-        select: { id: true, status: true, payload: true },
+        // o3d-anu8: settlementBasis is asked for EXPLICITLY. It is what separates a SYNCED row the
+        // connector wrote back from one an operator asserted, and without it the second reads as
+        // the first.
+        select: { id: true, status: true, payload: true, settlementBasis: true },
       }),
     ])
   } catch (error) {
@@ -347,6 +394,7 @@ export async function guardInvoicePaymentCapacity(
     registrations: registrations.map((row) => ({
       id: row.id,
       status: row.status,
+      settlementBasis: row.settlementBasis,
       amount: payloadNumber(row.payload, 'amount'),
       accountingInvoiceId: payloadString(row.payload, 'accountingInvoiceId'),
       bodyCouldHavePosted: storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', row.payload),
@@ -366,6 +414,14 @@ export async function guardInvoicePaymentCapacity(
           + `a payment already posted for this invoice does not record its amount, so IMS cannot tell `
           + `how much of the invoice is still outstanding. Nothing was sent — reconcile the invoice in `
           + `the ledger and register the payment there by hand.`
+      case 'ASSERTED_REGISTRATION':
+        return head
+          + `a payment already registered against this invoice (sync ${verdict.ambiguousIds.join(', ')}) was `
+          + `recorded on an OPERATOR'S ASSERTION, not confirmed by the accounting connector: IMS never made `
+          + `that call, never read the document and never compared the amount, so the figure it holds for it `
+          + `is what it MEANT to send. How much of this invoice is already settled therefore cannot be `
+          + `measured, and IMS will not guess with money. Nothing was sent. Open that payment in the ledger, `
+          + `confirm what it actually settled, and register any balance genuinely owed there by hand.`
       case 'AMBIGUOUS_FAILED_REGISTRATION':
         return head
           + `an earlier registration against this same invoice FAILED `

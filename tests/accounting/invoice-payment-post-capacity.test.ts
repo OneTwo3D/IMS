@@ -34,10 +34,13 @@ const ENTRY = 'entry-under-test'
  * assume when nothing is known. A test that wants the provably-never-sent row has to say so.
  */
 function reg(
-  row: Omit<PostedInvoicePaymentRegistration, 'bodyCouldHavePosted'>
-    & Partial<Pick<PostedInvoicePaymentRegistration, 'bodyCouldHavePosted'>>,
+  row: Omit<PostedInvoicePaymentRegistration, 'bodyCouldHavePosted' | 'settlementBasis'>
+    & Partial<Pick<PostedInvoicePaymentRegistration, 'bodyCouldHavePosted' | 'settlementBasis'>>,
 ): PostedInvoicePaymentRegistration {
-  return { bodyCouldHavePosted: true, ...row }
+  // o3d-anu8: `settlementBasis: null` is the connector's own writeback, i.e. the ordinary case, for
+  // the same reason `bodyCouldHavePosted: true` is the default. A test that wants an
+  // OPERATOR-ASSERTED row has to say so.
+  return { bodyCouldHavePosted: true, settlementBasis: null, ...row }
 }
 
 function decide(overrides: Partial<Parameters<typeof decideInvoicePaymentPost>[0]> = {}) {
@@ -491,4 +494,39 @@ test('the Xero INVOICE_PAYMENT case runs the capacity guard BEFORE it posts to X
     guardAt < postAt,
     'the capacity guard must run BEFORE the remote call — after it, the money has already moved',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-anu8 — the POST-TIME half of the same rule. SYNCED is the one status this guard reads as
+// "money moved", and the operator settlement action writes SYNCED from a document id a human typed.
+// ---------------------------------------------------------------------------
+
+test('[o3d-anu8] an OPERATOR-ASSERTED SYNCED registration makes the capacity unmeasurable, not favourable', () => {
+  const verdict = decide({
+    amount: 40,
+    ledgerTotal: 100,
+    registrations: [reg({
+      id: 'asserted',
+      status: 'SYNCED',
+      // 60 + 40 = 100 exactly. Without the basis this returns post:true on a figure nothing sent.
+      amount: 60,
+      accountingInvoiceId: 'INV-1',
+      settlementBasis: 'OPERATOR_ASSERTION',
+    })],
+  })
+  assert.equal(verdict.post, false)
+  assert.equal(verdict.post === false && verdict.refusal, 'ASSERTED_REGISTRATION')
+  assert.equal(verdict.post === false && verdict.alreadyPosted, null,
+    'no figure is stated, because none is known')
+  assert.deepEqual(verdict.post === false && verdict.ambiguousIds, ['asserted'],
+    'and the row to go and read is named')
+})
+
+test('[o3d-anu8] the same registration written back by the connector still posts', () => {
+  const verdict = decide({
+    amount: 40,
+    ledgerTotal: 100,
+    registrations: [reg({ id: 'real', status: 'SYNCED', amount: 60, accountingInvoiceId: 'INV-1', settlementBasis: null })],
+  })
+  assert.equal(verdict.post, true)
 })

@@ -18,6 +18,7 @@ import {
 } from './accounting-event-mirror'
 import type { AccountingEventDraft } from './accounting-event-types'
 import { isExternalAccountingReferenceUniqueError, isIdempotencyKeyUniqueError } from './prisma-errors'
+import { isOperatorAssertedSettlement } from './sync-row-settlement'
 import {
   DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
   reconciliationLookbackDate,
@@ -319,6 +320,9 @@ async function collectAccountingBackfillCandidateSyncLogs(
         referenceId: true,
         externalTransactionId: true,
         payload: true,
+        // o3d-anu8: HOW the row reached its status, so the loop below can refuse to mirror an
+        // operator's assertion as a POSTED accounting event.
+        settlementBasis: true,
         // Stamped onto the repaired event so its age is the work's age, not the repair's.
         createdAt: true,
       },
@@ -854,6 +858,29 @@ export async function runAccountingEventBackfill(
         ...syncLogResultBase(log),
         action: 'skipped',
         reason: 'payload_not_mirrorable',
+      })
+      continue
+    }
+
+    // AN OPERATOR'S ASSERTION IS NOT A THING TO MIRROR (o3d-anu8).
+    //
+    // `buildDraftForSyncLog` copies the row's status and externalTransactionId straight into the
+    // draft, so a settled row mints a mirrored event with status POSTED carrying an id a human
+    // TYPED. That event is then read as system evidence by everything downstream — the mirror is
+    // precisely what `hasAccountingEvent` in reconciliation.ts consults — so the backfill would
+    // turn a claim into a record, in a second table, with no marker on it at all.
+    //
+    // WITHHOLD rather than fail: the backfill's whole premise is reconstructing a mirror the
+    // CONNECTOR's post should have left behind, and there was no post here to reconstruct. Settling
+    // a row already writes its own mirror under `settlementMirrorGuard`; if that write did not land,
+    // the answer is to look at the ledger, not to have a repair sweep vouch for the assertion. The
+    // row is REPORTED as skipped with its reason rather than dropped, so it stays visible.
+    if (isOperatorAssertedSettlement(log.settlementBasis)) {
+      results.push({
+        ...syncLogResultBase(log),
+        action: 'skipped',
+        reason: 'operator_asserted_settlement',
+        idempotencyKey: draft.idempotencyKey,
       })
       continue
     }

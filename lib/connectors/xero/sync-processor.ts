@@ -67,6 +67,10 @@ import {
   readFollowUpIdempotencyKey,
   type FollowUpPayload,
 } from '@/lib/domain/accounting/followup-idempotency'
+import {
+  isOperatorAssertedSettlement,
+  OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+} from '@/lib/domain/accounting/sync-row-settlement'
 import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
@@ -940,7 +944,7 @@ async function hasExistingSyncLog(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
-): Promise<boolean> {
+): Promise<{ exists: boolean; asserted: boolean }> {
   const liveRows = await db.accountingSyncLog.findMany({
     where: {
       connector: XERO_CONNECTOR,
@@ -949,9 +953,18 @@ async function hasExistingSyncLog(
       referenceId,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
     },
-    select: { payload: true },
+    // o3d-anu8: settlementBasis, because the occupying row is what makes the enqueue a silent skip
+    // and a SYNCED row is written by TWO things — the processor's writeback after Xero answered, and
+    // an operator typing a document id into the settlement dialog.
+    select: { payload: true, settlementBasis: true },
   })
-  return liveRows.some((row) => liveRowOccupiesFollowUpSlot(row.payload, payload as FollowUpPayload))
+  const occupying = liveRows.filter((row) => liveRowOccupiesFollowUpSlot(row.payload, payload as FollowUpPayload))
+  return {
+    exists: occupying.length > 0,
+    // WORST-FIRST, as o3d-nf9i established for aggregation: one asserted occupant is enough for the
+    // suppression to rest on an assertion, because any of them may be the only reason this is skipped.
+    asserted: occupying.some((row) => isOperatorAssertedSettlement(row.settlementBasis)),
+  }
 }
 
 /**
@@ -1015,7 +1028,8 @@ export async function enqueueFollowUpSyncLog(
   ) as SyncPayload
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
-  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId, payload)
+  const live = await hasExistingSyncLog(type, referenceType, referenceId, payload)
+  const liveRowExists = live.exists
   // o3d-h2wx: a FAILED row is REUSED rather than replaced. Xero's Idempotency-Key is
   // derived from the entry id, so creating a replacement row would post the retry under a
   // key Xero has never seen — and if the failed attempt had actually committed, a SECOND
@@ -1028,7 +1042,18 @@ export async function enqueueFollowUpSyncLog(
   // pinned request body — see lib/domain/accounting/idempotency-retention.ts for what is and
   // is not protected once the window has closed.
   const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
-    where: { connector: XERO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
+    where: {
+      connector: XERO_CONNECTOR, type, referenceType, referenceId,
+      // o3d-anu8: the SAME query widened rather than a second one, because the two row sets answer
+      // one question between them. FAILED rows are the ambiguity set. A CANCELLED row carrying
+      // OPERATOR_ASSERTION is a row that LEFT that set on a human's word — `buildSettlementData`
+      // documents that as the intended unblock — and the planner is told about it so a money post
+      // cleared that way can be recorded as such instead of looking connector-cleared.
+      OR: [
+        { status: 'FAILED' },
+        { status: 'CANCELLED', settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS },
+      ],
+    },
     orderBy: { createdAt: 'desc' },
     // remoteAttemptedAt is what tells the planner whether a row's payload is the record of a call
     // that reached Xero. A revival OVERWRITES the payload it recycles, so recycling an attempted
@@ -1041,13 +1066,18 @@ export async function enqueueFollowUpSyncLog(
     // o3d-e2mz r3: and the attempt each candidate row is AT when it was read. Reviving one is a
     // write to that attempt and must be fenced on it — see the compare-and-swap below.
     select: {
-      id: true, payload: true,
+      id: true, payload: true, status: true,
       remoteAttemptedAt: true, attemptStampingCustodyAt: true,
       attemptRevision: true,
     },
   })
-  const failedAttemptRevisions = new Map(failedLogs.map((row) => [row.id, row.attemptRevision]))
-  const failedRows = failedLogs.map((row) => ({
+  // Split back out. Only FAILED rows are the ambiguity set the planner counts tokens over; the
+  // asserted-cancelled ones are carried purely so a plan can say what cleared it (o3d-anu8).
+  const assertedNotPostedRows = failedLogs.filter((row) => row.status === 'CANCELLED').map((row) => ({ id: row.id }))
+  const failedAttemptRevisions = new Map(
+    failedLogs.filter((row) => row.status === 'FAILED').map((row) => [row.id, row.attemptRevision]),
+  )
+  const failedRows = failedLogs.filter((row) => row.status === 'FAILED').map((row) => ({
     id: row.id,
     payload: row.payload,
     // Exactly what followUpIdempotencySource would have produced for this row, so pinning it
@@ -1063,7 +1093,9 @@ export async function enqueueFollowUpSyncLog(
     referenceId,
     payload,
     liveRowExists,
+    liveRowAsserted: live.asserted,
     failedRows,
+    assertedNotPostedRows,
   })
   if (plan.action === 'skip') return
   if (plan.action === 'refuse') {
@@ -1076,6 +1108,33 @@ export async function enqueueFollowUpSyncLog(
       metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
     })
     return
+  }
+
+  // o3d-anu8 — THIS MONEY POST IS CLEARED BY A HUMAN'S WORD, and the record says so.
+  //
+  // The plan only carries this on a money-moving create/reuse whose scope holds a row an operator
+  // settled as NOT_POSTED. That settlement is what dropped the distinct-token count and turned a
+  // refusal into this enqueue — deliberately, it is the documented purpose of the action — but
+  // without a line here the resulting payment is indistinguishable from one the connector's own
+  // history cleared, and if the assertion was wrong there is nothing to lead anybody back to it.
+  if (plan.restsOnAssertion) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_followup_enqueue_rests_on_operator_assertion',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Enqueued Xero ${type} for ${referenceType} ${referenceId} while `
+        + `${plan.restsOnAssertion.assertedNotPostedRowIds.length} earlier row(s) for it are CANCELLED because an `
+        + 'OPERATOR asserted they never posted. IMS verified nothing about that: if any of them did reach the ledger, '
+        + 'this post duplicates it. Reconcile in the accounting system if this money appears twice.',
+      metadata: {
+        type,
+        referenceType,
+        referenceId,
+        assertedNotPostedRowIds: plan.restsOnAssertion.assertedNotPostedRowIds,
+        planAction: plan.action,
+      },
+    }).catch(() => { /* the record is important; failing the enqueue over it is not */ })
   }
 
   // TWO REFUSALS GUARD THE AUTOMATIC REVIVAL, AND THEY ARE NOT THE SAME QUESTION (o3d-e2mz + o3d-0m56).
@@ -4508,7 +4567,11 @@ async function processClaimedEntry(
           // The two refusals need an operator to do DIFFERENT things — reconcile an over-settlement,
           // versus find out whether a failed attempt actually posted — so they are not filed under one
           // action name that would make the second read as the first.
-          action: capacity.refusal === 'AMBIGUOUS_FAILED_REGISTRATION'
+          // o3d-anu8 adds a third: a SYNCED registration an OPERATOR asserted. It is filed with the
+          // unknown-ledger-state action rather than the over-settlement one, because what the
+          // operator must do is the same — go and find out what the ledger actually holds — and
+          // filing it as an over-settlement would tell them a figure IMS is in no position to state.
+          action: capacity.refusal === 'AMBIGUOUS_FAILED_REGISTRATION' || capacity.refusal === 'ASSERTED_REGISTRATION'
             ? 'invoice_payment_refused_unknown_ledger_state'
             : 'invoice_payment_refused_over_settlement',
           tag: 'accounting',

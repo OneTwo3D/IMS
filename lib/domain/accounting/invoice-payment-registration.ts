@@ -17,6 +17,7 @@ import {
   classifyLedgerSettlement,
   type LedgerSettlementRecord,
 } from './ledger-settlement-evidence'
+import { isOperatorAssertedSettlement } from './sync-row-settlement'
 
 export type InvoicePaymentRegistrationRefusal =
   /** Nothing is expected to post: the connector is off. Not a fault, and not worth a warning. */
@@ -37,6 +38,13 @@ export type InvoicePaymentRegistrationRefusal =
    * cannot be computed. Refusing is the only sound answer: unknown must not read as zero (o3d-cjt8).
    */
   | 'LEDGER_AMOUNT_UNKNOWN'
+  /**
+   * A live registration exists that an OPERATOR asserted, so its amount is what IMS INTENDED to send
+   * rather than anything the ledger reported — and the remaining capacity computed from it is not a
+   * measurement (o3d-anu8). Kept apart from LEDGER_AMOUNT_UNKNOWN because the remedy differs: there
+   * is a document id to go and read, and reading it is what resolves this.
+   */
+  | 'LEDGER_AMOUNT_ASSERTED'
   /** This receipt does not fit in what is left of the invoice after what the ledger already holds. */
   | 'WOULD_OVERPAY'
 
@@ -78,6 +86,21 @@ export type ExistingInvoicePaymentSync = {
    * has to read as "possibly this one": for money, unknown is not the same as irrelevant.
    */
   accountingInvoiceId?: string | null
+  /**
+   * HOW this row reached its status (o3d-anu8). NULL / absent = the connector's own writeback, so a
+   * real call was made and the ledger answered. `OPERATOR_ASSERTION` = a human typed the outcome and
+   * the document id in, and IMS verified nothing — see lib/domain/accounting/sync-row-settlement.ts.
+   *
+   * Read from the COLUMN. `loadInvoicePaymentSyncRows` already selects it; it is declared here so
+   * the capacity arithmetic below can see it rather than receiving a row that merely happens to
+   * carry it.
+   */
+  settlementBasis?: string | null
+  /**
+   * The ledger document this row's settlement is recorded under. Carried only so a refusal can NAME
+   * the payment an operator has to go and read (o3d-anu8).
+   */
+  externalTransactionId?: string | null
 }
 
 /**
@@ -206,6 +229,34 @@ export function decideInvoicePaymentRegistration(input: {
     // names NO document stays counted: unknown has to read as "possibly this one".
     && (r.accountingInvoiceId == null || r.accountingInvoiceId === input.accountingInvoiceId),
   )
+
+  // AN ASSERTED AMOUNT IS NOT A MEASUREMENT (o3d-anu8; the same rule settlement-status.ts applies on
+  // the verdict side, o3d-nf9i r3).
+  //
+  // A row an operator settled as POSTED is SYNCED with a document id — live, and therefore counted
+  // against the invoice by the sum below. But `r.amount` on that row is read out of the payload IMS
+  // BUILT: it is what IMS meant to send, and nothing sent it. The ledger's copy can be any figure at
+  // all, and Xero specifically will accept a payment SMALLER than the invoice as a part payment and
+  // hand back a perfectly valid payment id — so an asserted row can name a real payment of £10
+  // against an invoice IMS thinks it settled for £1,000. `ledgerTotal - alreadyRegistered` then
+  // OVERSTATES what is left by however much the assertion was wrong by, in the one direction that
+  // ends in a second payment on the ledger.
+  //
+  // FAIL CLOSED, before the sum and before the unknown-amount test: the amount here is not merely
+  // unreadable, it is readable and unverified, which is worse because it looks like an answer. The
+  // remedy is nameable and an operator can perform it — open the asserted payment in the accounting
+  // system, confirm what it really settled, and register the balance there.
+  const asserted = live.filter((r) => isOperatorAssertedSettlement(r.settlementBasis))
+  if (asserted.length > 0) {
+    return {
+      register: false,
+      refusal: 'LEDGER_AMOUNT_ASSERTED',
+      ledgerTotal: input.ledgerTotal,
+      detail: asserted
+        .map((r) => r.externalTransactionId ?? 'an unnamed payment')
+        .join(', '),
+    }
+  }
 
   // An unreadable amount cannot be arithmetic. Treating it as zero would let this receipt through on the
   // assumption that the ledger holds nothing, which is precisely what is not known.

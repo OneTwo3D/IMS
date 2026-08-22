@@ -109,7 +109,11 @@ for (const connector of ['xero', 'quickbooks']) {
     // connector tells it which rows were attempted — so the column has to be selected AND passed.
     // The enqueue helper is module-private, which is why this is asserted on the source.
     const source = await readFile(path.join(process.cwd(), `lib/connectors/${connector}/sync-processor.ts`), 'utf8')
-    const at = source.indexOf("status: 'FAILED' },\n    orderBy: { createdAt: 'desc' },")
+    // Anchored on the ASSIGNMENT rather than on the `where` text (o3d-anu8): Xero's arm of that
+    // query is now an OR that also picks up rows an operator settled as NOT_POSTED, so a literal
+    // `status: 'FAILED' }` no longer appears there. The two connectors' predicates differ; the row
+    // set they hand the planner is what these assertions are about.
+    const at = source.indexOf('const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({')
     assert.notEqual(at, -1, 'the enqueue must read the scope\'s FAILED rows')
 
     const window = source.slice(at, source.indexOf('const plan = planFollowUpEnqueue({', at))
@@ -127,7 +131,11 @@ for (const connector of ['xero', 'quickbooks']) {
     // the column has to be selected AND passed — and the epoch lookup has to be GONE, or the same
     // clock-skew, cache and rollback failures come back with it.
     const source = await readFile(path.join(process.cwd(), `lib/connectors/${connector}/sync-processor.ts`), 'utf8')
-    const at = source.indexOf("status: 'FAILED' },\n    orderBy: { createdAt: 'desc' },")
+    // Anchored on the ASSIGNMENT rather than on the `where` text (o3d-anu8): Xero's arm of that
+    // query is now an OR that also picks up rows an operator settled as NOT_POSTED, so a literal
+    // `status: 'FAILED' }` no longer appears there. The two connectors' predicates differ; the row
+    // set they hand the planner is what these assertions are about.
+    const at = source.indexOf('const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({')
     assert.notEqual(at, -1, 'the enqueue must read the scope\'s FAILED rows')
 
     const window = source.slice(at, source.indexOf('const plan = planFollowUpEnqueue({', at))

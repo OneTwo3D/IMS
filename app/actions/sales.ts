@@ -3541,11 +3541,17 @@ async function readPaymentRegistrations(
         { externalTransactionId: { not: null } },
       ],
     },
-    select: { id: true, connector: true, status: true, externalTransactionId: true, payload: true },
+    // o3d-anu8: settlementBasis, because a CANCELLED row carrying a document id is written by TWO
+    // things — a VERIFIED reversal (buildVerifiedReversalData, Xero said DELETED) and an operator
+    // asserting the document exists on a cancelled sale. This column is the only difference between
+    // them, and `registrationLedgerStanding` draws opposite conclusions from the two.
+    select: { id: true, connector: true, status: true, externalTransactionId: true, settlementBasis: true, payload: true },
   })
   return rows
     .filter((row) => payloadPaymentId(row.payload) === paymentId)
-    .map(({ id, connector, status, externalTransactionId }) => ({ id, connector, status, externalTransactionId }))
+    .map(({ id, connector, status, externalTransactionId, settlementBasis }) => (
+      { id, connector, status, externalTransactionId, settlementBasis }
+    ))
 }
 
 /**

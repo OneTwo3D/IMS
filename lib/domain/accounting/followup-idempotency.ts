@@ -196,6 +196,15 @@ export function withFollowUpIdempotencyKey(identity: FollowUpIdentity): FollowUp
  */
 export type TokenDisposition = 'pinned' | 'rotated'
 
+/**
+ * o3d-anu8 — the sync rows an OPERATOR'S ASSERTION cleared out of the way for this plan.
+ *
+ * Present only on a money-moving `create`/`reuse` that a settled-as-NOT_POSTED row is standing
+ * behind. The caller records it, because the alternative is that a money post whose only clearance
+ * is a human's belief looks exactly like one the connector's own history cleared.
+ */
+export type SettlementAssertionReliance = { assertedNotPostedRowIds: string[] }
+
 export type FollowUpEnqueuePlan =
   | { action: 'skip' }
   /** An ambiguous history that must not be auto-reposted; the caller warns and stops. */
@@ -208,8 +217,9 @@ export type FollowUpEnqueuePlan =
       /** `pinned` = the stored request body was kept; `fresh` = the recomputed one is used. */
       bodyDisposition: 'pinned' | 'fresh'
       divergedFields: string[]
+      restsOnAssertion?: SettlementAssertionReliance
     }
-  | { action: 'create'; payload: FollowUpPayload }
+  | { action: 'create'; payload: FollowUpPayload; restsOnAssertion?: SettlementAssertionReliance }
 
 export type FailedFollowUpRow = {
   id: string
@@ -270,8 +280,27 @@ export type FailedFollowUpRow = {
 export type FollowUpEnqueueInput = FollowUpIdentity & {
   /** A PENDING / PROCESSING / SYNCED row already owns this follow-up. */
   liveRowExists: boolean
+  /**
+   * o3d-anu8 — that live row reached SYNCED because an OPERATOR ASSERTED it posted
+   * (settlementBasis = OPERATOR_ASSERTION), not because the connector wrote back after a call.
+   *
+   * Optional, and absent reads as "the connector wrote it" — which is the correct default for every
+   * row that predates the settlement action and for every caller that has not been taught to ask.
+   */
+  liveRowAsserted?: boolean
   /** Every surviving FAILED row for this scope, newest first. */
   failedRows: FailedFollowUpRow[]
+  /**
+   * o3d-anu8 — rows in this scope an OPERATOR asserted NEVER posted: status CANCELLED,
+   * settlementBasis = OPERATOR_ASSERTION.
+   *
+   * They are deliberately NOT in `failedRows` and must not be: `buildSettlementData` documents that
+   * moving a FAILED row to CANCELLED to drop the distinct-token count is the INTENDED unblock for a
+   * part-payment history that otherwise refuses for ever. What they are here for is the other half
+   * of that — so a plan that only exists because of an assertion can SAY so, instead of being
+   * indistinguishable from one where the connector itself established that nothing was sent.
+   */
+  assertedNotPostedRows?: readonly { id: string }[]
 }
 
 /**
@@ -431,10 +460,47 @@ function couldHaveCommittedThis(stored: FollowUpPayload | null, freshAnchors: st
  * The caller does the I/O implied by the returned plan.
  */
 export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueuePlan {
-  if (input.liveRowExists) return { action: 'skip' }
+  const moneyMoving = isMoneyMovingFollowUp(input.type)
+
+  if (input.liveRowExists) {
+    // A LIVE ROW SUPPRESSES THIS WORK, AND ONLY THE CONNECTOR IS ENTITLED TO (o3d-anu8).
+    //
+    // The live set is PENDING / PROCESSING / SYNCED, and a SYNCED row means "the ledger was told" —
+    // which is why a skip is silent and correct. But `buildSettlementData` also writes SYNCED, from
+    // a document id an operator TYPED, and nothing about the resulting row distinguishes it. So for
+    // an INVOICE_PAYMENT that row PERMANENTLY suppresses the real registration: the invoice is never
+    // settled in the ledger, and the skip logs nothing to say so.
+    //
+    // WITHHOLD RATHER THAN DECIDE (the third state, o3d-54p). Skipping asserts the ledger holds a
+    // payment nobody has checked; enqueuing asserts it does not, and would post a second one if the
+    // operator was right. Neither is knowable from here, so the plan refuses — visibly, with a
+    // reason an operator can act on — instead of choosing one silently.
+    //
+    // MONEY-MOVING TYPES ONLY. For a PDF, an e-mail or a note, a suppressed re-drive costs a
+    // document nobody received; it does not move money, and turning every asserted row into a
+    // repeating warning would bury the ones that do.
+    if (moneyMoving && input.liveRowAsserted) {
+      return {
+        action: 'refuse',
+        reason: `the live ${input.type} row for this reference is SYNCED because an OPERATOR asserted it posted, not `
+          + 'because the accounting connector confirmed it — IMS made no call and read no document. Skipping would '
+          + 'treat that assertion as proof the ledger already holds this money; enqueuing could pay it twice if the '
+          + 'assertion is right. Open the asserted document in the accounting system: if it is genuinely there, '
+          + 'nothing more is owed; if it is not, correct that row so this can be re-enqueued.',
+      }
+    }
+    return { action: 'skip' }
+  }
 
   const freshAnchors = anchorsOf(input.payload)
-  const moneyMoving = isMoneyMovingFollowUp(input.type)
+
+  // o3d-anu8 — carried onto every non-refusing plan below. Reaching a `create` or a `reuse` on a
+  // money-moving type while a settled-as-NOT_POSTED row sits in this scope means the ambiguity that
+  // would otherwise have refused was cleared by a HUMAN'S WORD, and the caller records that. It does
+  // not change the decision: freeing this path is the settlement action's stated purpose.
+  const assertedNotPostedRowIds = (input.assertedNotPostedRows ?? []).map((row) => row.id)
+  const restsOnAssertion: SettlementAssertionReliance | undefined =
+    moneyMoving && assertedNotPostedRowIds.length > 0 ? { assertedNotPostedRowIds } : undefined
 
   // Narrow the history to attempts that could have committed THIS document. An attempt
   // against a DIFFERENT external document cannot have posted the one we are about to
@@ -559,6 +625,7 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
         tokenDisposition: 'pinned',
         bodyDisposition: 'pinned',
         divergedFields,
+        ...(restsOnAssertion ? { restsOnAssertion } : {}),
       }
     }
 
@@ -576,6 +643,7 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
       tokenDisposition: 'pinned',
       bodyDisposition: 'fresh',
       divergedFields,
+      ...(restsOnAssertion ? { restsOnAssertion } : {}),
     }
   }
 
@@ -674,9 +742,10 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
       tokenDisposition: unchanged ? 'pinned' : 'rotated',
       bodyDisposition: 'fresh',
       divergedFields: stored ? divergedRequestFields(stored, input.payload) : [],
+      ...(restsOnAssertion ? { restsOnAssertion } : {}),
     }
   }
-  return { action: 'create', payload: freshPayload }
+  return { action: 'create', payload: freshPayload, ...(restsOnAssertion ? { restsOnAssertion } : {}) }
 }
 
 /**

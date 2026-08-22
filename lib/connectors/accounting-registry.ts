@@ -39,6 +39,19 @@ export type AccountingSyncLogRow = {
   externalTransactionId: string | null
   errorMessage: string | null
   retryCount: number
+  /**
+   * o3d-anu8 — HOW this row reached its status. NULL is the connector's own writeback, i.e. a real
+   * call was made and the ledger answered; `OPERATOR_ASSERTION` means a human typed the outcome and
+   * the document id into the settlement dialog and IMS verified nothing.
+   *
+   * REQUIRED, not optional, and carried by the CONNECTOR-AGNOSTIC row rather than by each
+   * connector's own: the sync page renders an external id beside a SYNCED badge, and without this
+   * field no view built on this interface CAN distinguish the two — the display would keep
+   * presenting an assertion as a confirmation however carefully each reader below it was fixed.
+   * `errorMessage` is not a substitute: it carries the settlement note, but it is free text an
+   * operator can edit and both connectors overwrite it with the remote system's own words.
+   */
+  settlementBasis: string | null
   syncedAt: string | null
   createdAt: string
 }
@@ -329,6 +342,7 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
         errorMessage: row.errorMessage,
         retryCount: row.retryCount,
         attemptRevision: row.attemptRevision,
+        settlementBasis: row.settlementBasis,
         syncedAt: row.syncedAt,
         createdAt: row.createdAt,
       }))

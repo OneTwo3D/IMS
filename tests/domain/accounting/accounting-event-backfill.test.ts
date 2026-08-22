@@ -24,6 +24,8 @@ type SyncLog = {
    * purpose, to prove the repair no longer answers from it.
    */
   createdAt: Date
+  /** o3d-anu8: NULL = the connector's own writeback; 'OPERATOR_ASSERTION' = a human's claim. */
+  settlementBasis: string | null
 }
 
 type EventRow = {
@@ -312,6 +314,7 @@ function syncedJournalLog(overrides: Partial<SyncLog> = {}): SyncLog {
     referenceId: 'A1-2026-04-26',
     externalTransactionId: 'journal-a1',
     createdAt: new Date('2026-04-26T09:00:00.000Z'),
+    settlementBasis: null,
     payload: {
       date: '2026-04-26',
       _idempotencyKey: 'daily-batch:a1:2026-04-26',
@@ -334,6 +337,7 @@ function syncedDocumentLog(overrides: Partial<SyncLog> = {}): SyncLog {
     referenceId: 'refund-1',
     externalTransactionId: 'credit-note-1',
     createdAt: new Date('2026-04-26T09:00:00.000Z'),
+    settlementBasis: null,
     payload: {
       date: '2026-04-26',
       currency: 'GBP',
@@ -739,6 +743,7 @@ function syncedInvoiceUpdateLog(overrides: Partial<SyncLog> = {}): SyncLog {
     referenceId: 'so-1',
     externalTransactionId: 'INV-9',
     createdAt: REVISION_QUEUED_AT,
+    settlementBasis: null,
     payload: {
       date: '2026-04-25',
       currency: 'GBP',
@@ -1299,4 +1304,43 @@ test('o3d-cvj9 r6: the backfill repairs unclaimed rather than take an id on an A
   assert.equal(createdEventData(createdEvents).externalId ?? null, null, 'the repair took no claim')
   assert.equal(logsByAction(createdLogs, 'superseded_by_revision').length, 0, 'and released nothing')
   assert.equal(logsByAction(createdLogs, 'revision_claim_order_unverified').length, 1)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-anu8 — AN OPERATOR'S ASSERTION IS NOT A THING TO MIRROR.
+//
+// `buildDraftForSyncLog` copies the row's status and externalTransactionId straight into the draft,
+// so a settled row would mint a mirrored accounting event with status POSTED carrying an id a human
+// typed — and the mirror is exactly what `hasAccountingEvent` in reconciliation.ts reads as system
+// evidence. The claim would become a record, in a second table, with no marker on it at all.
+// ---------------------------------------------------------------------------
+
+test('[o3d-anu8] an OPERATOR-SETTLED sync log is skipped, not mirrored as a POSTED event', async () => {
+  const { client, createdEvents, createdLogs } = makeClient({
+    syncLogs: [syncedDocumentLog({
+      id: 'sync-asserted',
+      externalTransactionId: 'CN-TYPED-IN',
+      settlementBasis: 'OPERATOR_ASSERTION',
+    })],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  assert.equal(createdEvents.length, 0, 'nothing may vouch for the assertion in the mirror')
+  assert.equal(createdLogs.length, 0)
+  const result = resultBySyncLog(report, 'sync-asserted')
+  assert.equal(result.action, 'skipped')
+  assert.equal(result.reason, 'operator_asserted_settlement',
+    'and it is REPORTED rather than dropped, so the row stays visible')
+})
+
+test('[o3d-anu8] the identical row written back by the connector is still mirrored', async () => {
+  const { client, createdEvents } = makeClient({
+    syncLogs: [syncedDocumentLog({ id: 'sync-real', settlementBasis: null })],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  assert.equal(createdEvents.length, 1)
+  assert.equal(resultBySyncLog(report, 'sync-real').action, 'created')
 })

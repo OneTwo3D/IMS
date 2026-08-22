@@ -8,6 +8,7 @@ import {
   isDocumentRevisionAccountingSyncType,
   isMirrorableAccountingSyncType,
 } from './accounting-event-mirror'
+import { isOperatorAssertedSettlement } from './sync-row-settlement'
 
 export type AccountingReconciliationSeverity = 'warning' | 'critical'
 export type AccountingReconciliationRunStatus = 'COMPLETED' | 'FAILED' | 'PARTIAL'
@@ -86,6 +87,14 @@ type AccountingSyncLogRow = {
   referenceId: string
   externalTransactionId: string | null
   payload: unknown
+  /**
+   * o3d-anu8 — HOW this row reached its status. NULL is the connector's own writeback;
+   * `OPERATOR_ASSERTION` means a human typed the outcome in and IMS verified nothing (see
+   * lib/domain/accounting/sync-row-settlement.ts). Read from the COLUMN, never from the note the
+   * settlement also writes into `errorMessage`: a note is free text an operator can edit, and a
+   * parse of it has no way to say "I could not tell".
+   */
+  settlementBasis: string | null
 }
 
 type AccountingEventRow = {
@@ -314,6 +323,25 @@ function retrySyncTypes(value: unknown): Set<string> {
   )))
 }
 
+/**
+ * A LIVE SYNC ROW IS EVIDENCE ONLY WHEN THE CONNECTOR PUT IT THERE (o3d-anu8).
+ *
+ * This function is the reason a "no accounting evidence for this refund/order" finding is NOT
+ * raised: a live row for the right (type, reference) is taken as proof that the document either
+ * reached the ledger or is on its way there. That reading holds for a row the processor wrote,
+ * because the processor only writes SYNCED after the ledger answered.
+ *
+ * It does not hold for a row an OPERATOR settled. `buildSettlementData` writes SYNCED plus a
+ * document id the operator TYPED — no call was made, no document was read — so an asserted row
+ * silences exactly the finding that would have told somebody to go and look. Reconciliation exists
+ * to surface disagreements between IMS and the ledger, and an unverified claim of agreement is not
+ * an agreement.
+ *
+ * So an asserted row does not count as evidence here. That can OVER-report — the operator may well
+ * have been right — and over-reporting is the safe direction for this report in exactly the way
+ * `aggregatePaymentSyncRows` already argues: a spurious "check this" costs a look, a spurious
+ * silence costs a reconciliation nobody knows to do.
+ */
 function syncLogHasLiveEvidence(
   syncLogs: AccountingSyncLogRow[],
   params: { type: string; referenceType: string; referenceId: string },
@@ -322,7 +350,8 @@ function syncLogHasLiveEvidence(
     log.type === params.type &&
     log.referenceType === params.referenceType &&
     log.referenceId === params.referenceId &&
-    LIVE_SYNC_STATUSES.has(log.status)
+    LIVE_SYNC_STATUSES.has(log.status) &&
+    !isOperatorAssertedSettlement(log.settlementBasis)
   ))
 }
 
@@ -1068,6 +1097,10 @@ export async function collectAccountingReconciliationRows(
         referenceId: true,
         externalTransactionId: true,
         payload: true,
+        // o3d-anu8: asked for EXPLICITLY, because a select is not a `*`. Dropping this line does
+        // not fail a type-check anywhere the field is optional — it just makes every asserted row
+        // arrive looking connector-confirmed, which is the defect this reads it to avoid.
+        settlementBasis: true,
       },
     }),
     client.accountingEvent.findMany({

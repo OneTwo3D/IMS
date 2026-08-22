@@ -546,3 +546,49 @@ test('an asserted SYNCED row with no document id is still the unverifiable case,
   assert.equal(v.basis, 'OPERATOR_ASSERTION')
   assert.equal(v.discrepancy, true)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-anu8 — THE CANCELLED ARM, which the o3d-nf9i pass did not reach.
+//
+// `buildCancelledSaleSettlementData` writes CANCELLED **with** the operator's typed document id: the
+// assertion is that the payment DID post, and the row is retired only so no sweep carries a
+// cancelled sale's remaining work further. Telling the operator "the ledger was never told" over one
+// of those is the exact inverse of what was asserted, and it is the sentence that talks somebody
+// into registering the payment a second time.
+// ---------------------------------------------------------------------------
+
+test('[o3d-anu8] a CANCELLED row an operator asserted POSTED is not reported as never sent', () => {
+  const v = settlementStatus({
+    ...base,
+    payment: row({ status: 'CANCELLED', externalTransactionId: 'PAY-TYPED', settlementBasis: 'OPERATOR_ASSERTION' }),
+    totalForeign: 100,
+  })
+  assert.equal(v.status, 'ASSERTED_UNVERIFIED')
+  assert.equal(v.basis, 'OPERATOR_ASSERTION')
+  assert.equal(v.discrepancy, true)
+  assert.doesNotMatch(v.detail, /never told/)
+  assert.match(v.detail, /PAY-TYPED/)
+})
+
+test('[o3d-anu8] a CANCELLED row an operator asserted NEVER posted keeps the verdict but names the basis', () => {
+  const v = settlementStatus({
+    ...base,
+    payment: row({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }),
+    totalForeign: 100,
+  })
+  assert.equal(v.status, 'NOT_SENT')
+  assert.equal(v.basis, 'OPERATOR_ASSERTION', 'the same conclusion, reached from a human\'s word')
+  assert.match(v.detail, /OPERATOR'S ASSERTION/)
+})
+
+test('[o3d-anu8] an ordinary connector cancellation is unchanged', () => {
+  const v = settlementStatus({
+    ...base,
+    payment: row({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: null }),
+    totalForeign: 100,
+  })
+  assert.equal(v.status, 'NOT_SENT')
+  assert.equal(v.basis, 'NONE')
+  assert.match(v.detail, /never told/)
+  assert.doesNotMatch(v.detail, /ASSERTION/)
+})

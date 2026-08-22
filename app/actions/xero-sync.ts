@@ -488,6 +488,11 @@ export type XeroSyncLogRow = {
    * to a different attempt since it was read. 0 means no fence-aware processor has ever claimed it.
    */
   attemptRevision: number
+  /**
+   * o3d-anu8: `OPERATOR_ASSERTION` when this row's status and external id were asserted by a human
+   * rather than written back by Xero. NULL is the ordinary connector confirmation.
+   */
+  settlementBasis: string | null
   syncedAt: string | null
   createdAt: string
 }
@@ -510,6 +515,7 @@ export async function getXeroSyncLogs(limit = 50): Promise<XeroSyncLogRow[]> {
     errorMessage: r.errorMessage,
     retryCount: r.retryCount,
     attemptRevision: r.attemptRevision,
+    settlementBasis: r.settlementBasis,
     syncedAt: r.syncedAt?.toISOString() ?? null,
     createdAt: r.createdAt.toISOString(),
   }))
