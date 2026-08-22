@@ -1956,6 +1956,11 @@ model SalesOrderRefund {
   // commits or rolls back with the event it describes. NULL is neither: the column did not exist
   // when the row was written, and the row is UNDECIDABLE — never "nothing was staged".
   //
+  // Both values are ALSO written by BEFORE triggers shipped in the same migration as the column, and
+  // that is what makes the NULL reading sound: a migration lands before the build that knows about
+  // it, so for the length of every deploy the old binary inserts refunds omitting this column. The
+  // triggers stamp those rows too, so NULL can only ever mean "written before the column existed".
+  //
   // Nullable with NO DEFAULT, and never backfilled. A default would be a value, and it would be the
   // database vouching for stagings it did not witness — which is the whole reason the boolean this
   // replaces was unsound: reversalStaged above defaults to false, and allocatedReliefAmount /

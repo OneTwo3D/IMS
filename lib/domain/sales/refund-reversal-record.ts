@@ -44,6 +44,18 @@
  *   NULL        no writer ever spoke for this row: the column did not exist when it was written.
  *               UNDECIDABLE. Not "nothing was staged".
  *
+ * AND THE TWO APPLICATION WRITES ABOVE ARE NOT WHAT MAKES THAT LAST LINE TRUE (Codex r2, HIGH).
+ * Migrations are applied before the build that knows about them is serving, so for the length of
+ * every deploy the OLD binary is inserting refunds into the new schema, omitting the column it has
+ * never heard of. Rows written by that binary — the one that still has the two-commit bug — would
+ * land NULL as well, so NULL would mean "predates the column" OR "was written minutes ago by a build
+ * that did not know about it", and the undecidable set would grow exactly where this module claims it
+ * cannot. The rule therefore lives at write time, in the database: the migration that adds this
+ * column also adds two BEFORE triggers that stamp 'NOT_STAGED' at INSERT and 'STAGED' on the
+ * statement that writes `allocatedReliefAmount`. They bind every writer, including the ones this
+ * repository does not contain, so NULL means what it says here and nothing else. See
+ * prisma/migrations/20260822090000_refund_reversal_staging_state/migration.sql.
+ *
  * DELIBERATELY NOT BACKFILLED, and the migration adds the column with no DEFAULT for exactly this
  * reason. Setting `NOT_STAGED` (or `STAGED`) on the rows that are already there from what they look
  * like today would be the database vouching for events it never witnessed — the same refusal

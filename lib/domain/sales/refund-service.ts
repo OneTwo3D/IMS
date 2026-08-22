@@ -2642,7 +2642,9 @@ async function stageRefundAccountingReversals(
         // inside this transaction — so it commits with the un-stage or rolls back with it. It is
         // what lets a later reader tell "this refund's staging committed" from "the column did not
         // exist when this row was written", which no nullable amount on this row can say: NULL is
-        // the same on both. See lib/domain/sales/refund-reversal-record.ts.
+        // the same on both. The migration stamps the same value from a BEFORE UPDATE trigger keyed
+        // on `allocatedReliefAmount` moving, so an OLD binary staging through this same statement
+        // mid-deploy is witnessed too. See lib/domain/sales/refund-reversal-record.ts.
         reversalStagingState: REVERSAL_STAGING_STAGED,
       },
     })
@@ -3831,6 +3833,10 @@ export async function createSalesOrderRefund(
         // more importantly, that this row was born under code that keeps the column at all. That
         // is what makes a NULL here mean "written before the column existed" rather than "nothing
         // was staged", and it is only true because it is written at INSERT and never backfilled.
+        // The migration writes the same value from a BEFORE INSERT trigger, which is what extends
+        // the guarantee to the writer this statement cannot speak for: the OLD binary, still
+        // creating refunds for the length of every deploy against a schema that already has the
+        // column (Codex r2).
         reversalStagingState: REVERSAL_STAGING_NOT_STAGED,
       },
       select: { id: true },
@@ -4596,7 +4602,10 @@ export async function retrySalesOrderRefundAccounting(
         // Asymmetric and irreversible against recoverable and cheap: fail closed, the standing
         // choice on this path since o3d-mrwu (absent data must not be read as a positive fact on an
         // irreversible path). The set is bounded and shrinking — every refund created from here on
-        // carries a witness, so no new row can ever be undecidable.
+        // carries a witness, so no new row can ever be undecidable. That last clause is the
+        // migration's triggers speaking, not this file's writes (Codex r2): during a deploy the old
+        // binary is still creating refunds against the new schema, and only a rule in the database
+        // reaches it.
         // -----------------------------------------------------------------------------------------
         if (recordVerdict === 'undecidable') {
           return {
