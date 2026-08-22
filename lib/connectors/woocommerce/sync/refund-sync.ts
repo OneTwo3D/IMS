@@ -482,11 +482,76 @@ async function upsertRefundPark(
   })
 }
 
+/**
+ * WHAT ONE REFUND'S SYNC ACTUALLY DID — o3d-xnwu round 4 (Codex HIGH), and the THIRD time this
+ * branch has fixed the same defect one layer further in.
+ *
+ *   first   a DISCARDED RETURN VALUE made `syncWcRefund` a call that could not fail;
+ *   then    a RESULT TYPE THAT COULD NOT SAY IT FAILED — the read was short, or the fetched refunds
+ *           never applied, and neither fact had anywhere to travel;
+ *   now     a BOOLEAN THAT CONFLATES "applied" WITH "handled".
+ *
+ * `success: true` was returned by five different endings, and only three of them put the refund in
+ * IMS. The other two say "there is nothing more for this delivery to do", which is not the same
+ * sentence at all:
+ *
+ *   - a QUARANTINED park on THIS order. The refund is deliberately not applied and will not be
+ *     retried by a sweep; it is waiting for an operator. Nothing is in IMS.
+ *   - a refund suppressed because the payment poller charged the whole order back first. A second
+ *     credit note would double-reverse it, so none is raised. Nothing is in IMS.
+ *
+ * The sweep counted both as applied, so `synced + failed === fetched` reconciled ARITHMETICALLY
+ * while misclassifying: the webhook's held-refusal branch concluded "every refund the store holds is
+ * now in IMS" for an order whose refunds were sitting in an operator's inbox. The coverage shortfall
+ * it then re-asked was answered from demand IMS does not hold — and answered PERMANENTLY, which
+ * acknowledges the delivery and advances the cursor over it.
+ *
+ * So the boolean is gone and the endings name themselves. The distinction the callers need is not
+ * success/failure at all, it is APPLICATION: `refundIsInIms` is the only question the coverage
+ * arithmetic may ask, and it is true for exactly two of these.
+ */
+export type WcRefundOutcome =
+  /** A SalesOrderRefund was created by THIS call. */
+  | 'applied'
+  /** A SalesOrderRefund for this refund already exists on THIS order — an earlier delivery applied it. */
+  | 'already-applied'
+  /**
+   * Handled, and deliberately NOT applied: a quarantined park awaiting an operator, or a refund
+   * suppressed by a prior chargeback. Nothing is owed by this delivery and nothing is in IMS, so it
+   * must never be retried as a failure NOR counted as applied.
+   */
+  | 'handled-unapplied'
+  /** Did not apply, and a later delivery may succeed — a missing IMS order, a park to retry, a throw. */
+  | 'retryable-failure'
+  /**
+   * Did not apply and never will without a human: WooCommerce has the refund on a different order,
+   * or the refusal was recorded as a quarantine by this call.
+   */
+  | 'permanent-failure'
+
+export type WcRefundSyncResult = { outcome: WcRefundOutcome; error?: string }
+
+/**
+ * IS THIS REFUND IN IMS? The ONE predicate the coverage arithmetic is allowed to ask.
+ *
+ * Deliberately not "did the call succeed": three outcomes are not failures and only two of them mean
+ * the demand this refund carries is recorded. Every count that a caller turns into a statement about
+ * the STORE versus IMS is aggregated through here.
+ */
+export function refundIsInIms(outcome: WcRefundOutcome): boolean {
+  return outcome === 'applied' || outcome === 'already-applied'
+}
+
+/** Whether this ending is a failure the caller should report. Neither failure kind is in IMS. */
+export function refundOutcomeFailed(outcome: WcRefundOutcome): boolean {
+  return outcome === 'retryable-failure' || outcome === 'permanent-failure'
+}
+
 export async function syncWcRefund(
   externalOrderId: number,
   wcRefund: WcRefund,
   dependencies: WcRefundSyncDependencies = {},
-): Promise<{ success: boolean; error?: string }> {
+): Promise<WcRefundSyncResult> {
   const client = dependencies.db ?? db
   const writeActivity = dependencies.logActivity ?? logActivity
   try {
@@ -533,7 +598,8 @@ export async function syncWcRefund(
         },
       },
     })
-    if (!so) return { success: false, error: `IMS order not found for WC order ${externalOrderId}` }
+    // RETRYABLE: the order may simply not have been imported yet, and the next delivery re-resolves it.
+    if (!so) return { outcome: 'retryable-failure', error: `IMS order not found for WC order ${externalOrderId}` }
 
     // Check if already processed. externalRefundId is GLOBALLY unique, so a matching refund may belong to
     // ANOTHER order — o3d-7yf: verify ownership. Same order => idempotent success; different order => fail
@@ -545,9 +611,10 @@ export async function syncWcRefund(
         // and written a FAILED park — every later delivery lands here, so resolve that lingering park now
         // rather than leaving it actionable forever (inbox / deletion+rebind guard / retention exemption).
         await resolveActionableParks(client, so.id, String(wcRefund.id))
-        return { success: true }
+        return { outcome: 'already-applied' }
       }
-      return { success: false, error: `WooCommerce refund ${wcRefund.id} already exists on a different order (${existing.orderId}); refusing to apply it here.` }
+      // PERMANENT: a WC refund id maps to one order, so this can never become applicable here.
+      return { outcome: 'permanent-failure', error: `WooCommerce refund ${wcRefund.id} already exists on a different order (${existing.orderId}); refusing to apply it here.` }
     }
 
     // o3d-iup: a refund we deliberately PARKED (a monetary-only refund the order can't tax uniformly)
@@ -568,10 +635,18 @@ export async function syncWcRefund(
       select: { entityId: true, status: true },
     })
     if (parked && parked.entityId !== so.id) {
-      return { success: false, error: `WooCommerce refund ${wcRefund.id} is already parked for a different order (${parked.entityId}); refusing to process it for this order.` }
+      return { outcome: 'permanent-failure', error: `WooCommerce refund ${wcRefund.id} is already parked for a different order (${parked.entityId}); refusing to process it for this order.` }
     }
+    // HANDLED, AND NOTHING IS IN IMS (o3d-xnwu r4). This used to be `success: true`, which the sweep
+    // counted as applied — so an order whose refunds were all sitting in the exception inbox looked,
+    // to the coverage arithmetic, exactly like an order whose refunds were all recorded. It is not
+    // retryable either: a sweep will refuse it identically every run until an operator resolves the
+    // park, and reporting it as a failure would retry the refund webhook against a condition only a
+    // human can clear. (The ORDER webhook does still hold its delivery over this row — but only
+    // while a completion refusal is being held on it, where the alternative is burying a dispatch
+    // IMS genuinely cannot cover. That scoping is the caller's, and deliberate.)
     if (parked && parked.status === 'QUARANTINED') {
-      return { success: true } // this order's quarantined park — handled, not retryable
+      return { outcome: 'handled-unapplied', error: `WooCommerce refund ${wcRefund.id} is quarantined for this order and awaits manual resolution` }
     }
 
     const fxRate = toDecimal(so.fxRateToBase).gt(0) ? toDecimal(so.fxRateToBase) : toDecimal(1)
@@ -709,7 +784,9 @@ export async function syncWcRefund(
           errorMessage: error,
           payload: wcRefund,
         })
-        return { success: false, error }
+        // PERMANENT: this call recorded the quarantine, and only an operator resolving it can change
+        // the answer. Reported as a failure once, by the delivery that decided it.
+        return { outcome: 'permanent-failure', error }
       }
       const netForeign = toDecimal(refundAmountForeign).div(toDecimal(1).add(basis.vatRate))
       refundLines.push({
@@ -733,10 +810,9 @@ export async function syncWcRefund(
         errorMessage: error,
         payload: wcRefund,
       })
-      return {
-        success: false,
-        error,
-      }
+      // RETRYABLE: the park is PENDING, which the sweep deliberately re-attempts — a corrected or
+      // completed WooCommerce refund can still reconcile.
+      return { outcome: 'retryable-failure', error }
     }
 
     // Find return warehouse (default return warehouse)
@@ -768,7 +844,7 @@ export async function syncWcRefund(
       // otherwise the loser is falsely marked synced while its refund lives on a different order.
       const winner = await client.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id }, select: { orderId: true } })
       if (winner && winner.orderId !== so.id) {
-        return { success: false, error: `WooCommerce refund ${wcRefund.id} was concurrently created on a different order (${winner.orderId}); refusing to mark it synced here.` }
+        return { outcome: 'permanent-failure', error: `WooCommerce refund ${wcRefund.id} was concurrently created on a different order (${winner.orderId}); refusing to mark it synced here.` }
       }
       await client.shoppingSyncLog.create({
         data: {
@@ -793,7 +869,8 @@ export async function syncWcRefund(
         metadata: { externalRefundId: wcRefund.id, parentOrderId: externalOrderId },
         resolveUser: false,
       })
-      return { success: true }
+      // The refund IS in IMS — the winner of the race is this same order's row, verified above.
+      return { outcome: 'already-applied' }
     }
 
     // o3d-6oyu.18: the refund transaction refused this credit note because a payment-poller
@@ -864,7 +941,11 @@ export async function syncWcRefund(
           resolveUser: false,
         })
       }
-      return { success: true }
+      // HANDLED, AND NOTHING IS IN IMS (o3d-xnwu r4). No credit note is raised and no restock is
+      // made, so counting this as applied told the coverage arithmetic that demand it does not hold
+      // had been recorded. It is not a failure either: the condition can never clear by retrying —
+      // the activity record above is what asks a human to reconcile it.
+      return { outcome: 'handled-unapplied', error: WC_REFUND_SUPPRESSED_BY_CHARGEBACK }
     }
 
     if (!result.success) {
@@ -895,7 +976,12 @@ export async function syncWcRefund(
         // cannot run. This is the non-uniform-tax refusal — the commonest quarantine there is.
         payload: wcRefund,
       })
-      return { success: false, error: `${result.error ?? 'refund sync failed'}${unitsNote}` }
+      // A quarantine is a refusal only an operator can clear; a FAILED park is this order's own
+      // retryable state and a later delivery may well apply it.
+      return {
+        outcome: quarantined ? 'permanent-failure' : 'retryable-failure',
+        error: `${result.error ?? 'refund sync failed'}${unitsNote}`,
+      }
     }
 
     await client.shoppingSyncLog.create({
@@ -922,9 +1008,11 @@ export async function syncWcRefund(
       resolveUser: false,
     })
 
-    return { success: true }
+    return { outcome: 'applied' }
   } catch (e) {
-    return { success: false, error: String(e) }
+    // A throw says nothing about whether it can recur, so it stays RETRYABLE — the transient
+    // reading, which is the direction every unrecognised condition on this branch takes.
+    return { outcome: 'retryable-failure', error: String(e) }
   }
 }
 
@@ -1134,32 +1222,45 @@ export async function fetchAllWcRefundsForOrder(
  * AND `complete` DOES NOT ANSWER A THIRD QUESTION, WHICH IS THE ONE THAT MATTERS TO A CALLER
  * DECIDING WHETHER THE ORDER IS SETTLED (o3d-xnwu r3, Codex HIGH). It is a fact about the READ, and
  * only about the read. A walk can visit every page successfully and still FAIL TO APPLY some or all
- * of what it fetched — `syncWcRefund` returns `{ success: false }` for an IMS order it cannot
- * resolve, for a refund that WooCommerce has already attached to a different order, and for
- * anything its own body throws — and every one of those left this type saying nothing at all.
+ * of what it fetched — `syncWcRefund` refuses an IMS order it cannot resolve, a refund WooCommerce
+ * has already attached to a different order, and anything its own body throws — and every one of
+ * those left this type saying nothing at all.
  *
  * The webhook then read the silence two different ways, both wrong: `complete && synced === 0` as
  * proof the STORE HOLDS NO REFUNDS for the order, and `complete && synced > 0` as proof EVERY
  * REFUND IS NOW IN IMS. Neither follows from a read that succeeded. So the counts the type carries
  * are the ones those sentences actually need:
  *
- *   fetched  how many refunds the walk READ. `fetched === 0` with `complete` is the only thing that
- *            means "the store holds none".
- *   failed   how many of those refunds did NOT apply. `failed === 0` with `complete` is the only
- *            thing that means "every refund the store holds is now in IMS".
+ *   fetched    how many refunds the walk READ. `fetched === 0` with `complete` is the only thing
+ *              that means "the store holds none".
+ *   unapplied  how many of those refunds are NOT in IMS afterwards. `unapplied === 0` with
+ *              `complete` is the only thing that means "every refund the store holds is now in IMS".
  *
- * TWO COUNTS, NOT A LIST OF FAILURES WITH A FLAG. The decisions above are arithmetic over the whole
+ * AND THEY ARE AGGREGATED ON APPLICATION, NOT ON SUCCESS (o3d-xnwu r4, Codex HIGH). Round 3 counted
+ * a per-refund `success` boolean, and that boolean ALSO meant "handled without applying": a
+ * same-order quarantined park and a chargeback-suppressed refund both returned it. The counts
+ * therefore reconciled arithmetically and still misclassified — `synced + failed === fetched` held
+ * while `synced` included refunds sitting in an operator's inbox, so the branch concluded every
+ * fetched refund was in IMS when some were merely HANDLED. `refundIsInIms` is now the only test
+ * either counter applies, and it is true for exactly the two outcomes that put a SalesOrderRefund on
+ * this order.
+ *
+ * TWO SCALARS, NOT A LIST OF FAILURES WITH A FLAG. The decisions above are arithmetic over the whole
  * fetched set; a list invites a caller to look at one element and decide from it, which is how a
  * partial answer becomes a settled one. `synced` is kept because it is what an operator-facing
- * summary reports, but no caller may derive completeness from it: `fetched - failed` is the same
+ * summary reports, but no caller may derive completeness from it: `fetched - unapplied` is the same
  * number and says which half of it is meant.
  */
 export type RefundSweepResult = {
+  /** Refunds that ARE in IMS after this walk — applied now or applied by an earlier delivery. */
   synced: number
   /** Refunds this walk actually read from the store. See the type header. */
   fetched: number
-  /** Refunds that were read and then failed to apply. See the type header. */
-  failed: number
+  /**
+   * Refunds that were read and are NOT in IMS afterwards — failures of either kind AND refunds that
+   * were handled without being applied. See the type header.
+   */
+  unapplied: number
   complete: boolean
   error?: string
 }
@@ -1171,7 +1272,7 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<Refu
   // Every page of refunds on the order, not just the first (o3d-okbd).
   const { refunds, error } = await fetchAllWcRefundsForOrder(externalOrderId)
   let synced = 0
-  let failed = 0
+  let unapplied = 0
 
   for (const refund of refunds) {
     // o3d-7yf: BOTH the already-synced check and the parked-refund skip live in syncWcRefund now, scoped to
@@ -1179,16 +1280,18 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<Refu
     // repeat the cross-order leak — a refund/park owned by another order would wrongly skip this one.
     // syncWcRefund is idempotent for an already-synced or parked refund, so it is the single scoped authority.
     const result = await syncWcRefund(externalOrderId, refund)
-    // COUNTED, NOT INFERRED. `syncWcRefund` never throws — its body ends in a catch that returns
-    // `{ success: false }` — so every refund read lands in exactly one of these two, and
-    // `synced + failed === fetched` holds for every walk. A caller can therefore ask "did all of
-    // them apply?" without knowing anything about why one did not.
-    if (result.success) synced++
-    else failed++
+    // COUNTED ON APPLICATION, NOT INFERRED FROM SUCCESS (o3d-xnwu r4). `syncWcRefund` never throws —
+    // its body ends in a catch that returns a retryable failure — so every refund read lands in
+    // exactly one of these two and `synced + unapplied === fetched` holds for every walk. What
+    // decides which is `refundIsInIms`, NOT whether the call reported a failure: a quarantined park
+    // and a chargeback suppression are both handled endings that apply nothing, and counting them as
+    // applied is what let a caller conclude the store's refunds were all in IMS when they were not.
+    if (refundIsInIms(result.outcome)) synced++
+    else unapplied++
   }
 
-  // The refunds that WERE read are still synced — that is the deliberate leniency above. What
-  // changes is that the caller is told the list was short, and told how much of it failed to
-  // apply, instead of inferring either from a number that cannot carry them.
-  return { synced, fetched: refunds.length, failed, complete: error === undefined, error }
+  // The refunds that WERE read are still applied — that is the deliberate leniency above. What
+  // changes is that the caller is told the list was short, and told how much of it is not in IMS,
+  // instead of inferring either from a number that cannot carry them.
+  return { synced, fetched: refunds.length, unapplied, complete: error === undefined, error }
 }

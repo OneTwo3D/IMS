@@ -14,7 +14,7 @@ import type { WcRefund } from '../lib/connectors/woocommerce/sync/types.ts'
  * `complete && synced === 0` as proof the STORE HOLDS NO REFUNDS, and `complete && synced > 0` as
  * proof EVERY REFUND IS NOW IN IMS.
  *
- * This file is the sweep's half of the fix: the result carries `fetched` and `failed`, counted from
+ * This file is the sweep's half of the fix: the result carries `fetched` and `unapplied`, counted from
  * what actually happened, so the caller has something to decide on. The webhook's half — which
  * verdict it draws from them — is tests/wc-completion-refund-ordering.test.ts.
  *
@@ -135,14 +135,14 @@ test('o3d-xnwu r3: a sweep that reads every page and applies NOTHING is not an e
 
   assert.equal(result.complete, true, 'the READ finished — that is what complete means')
   assert.equal(result.fetched, 2, 'and it read two refunds, which is what an empty store cannot do')
-  assert.equal(result.failed, 2)
+  assert.equal(result.unapplied, 2)
   assert.equal(result.synced, 0)
   // The shape the caller used to misread. `complete && synced === 0` is IDENTICAL here to a store
   // that genuinely holds no refunds, and only `fetched` tells them apart.
   assert.equal(result.error, undefined)
 })
 
-test('o3d-xnwu r3: a partly-applied sweep says so — synced and failed both non-zero', async () => {
+test('o3d-xnwu r3: a partly-applied sweep says so — synced and unapplied both non-zero', async () => {
   reset()
   // One refund is already on this order (idempotent success); the other belongs to a different IMS
   // order, which `syncWcRefund` refuses rather than mis-applying. Read complete, application not.
@@ -156,10 +156,10 @@ test('o3d-xnwu r3: a partly-applied sweep says so — synced and failed both non
   assert.equal(result.complete, true)
   assert.equal(result.fetched, 2)
   assert.equal(result.synced, 1)
-  assert.equal(result.failed, 1)
+  assert.equal(result.unapplied, 1)
   // The other shape the caller used to misread: `complete && synced > 0` was taken for "every
   // refund the store holds is now in IMS".
-  assert.equal(result.synced + result.failed, result.fetched, 'every refund read is accounted for')
+  assert.equal(result.synced + result.unapplied, result.fetched, 'every refund read is accounted for')
 })
 
 test('o3d-xnwu r3: a fully-applied sweep reports no failures, and an empty store reports nothing fetched', async () => {
@@ -170,15 +170,15 @@ test('o3d-xnwu r3: a fully-applied sweep reports no failures, and an empty store
 
   const applied = await sweep(WC_ORDER_ID)
   assert.deepEqual(
-    { complete: applied.complete, fetched: applied.fetched, synced: applied.synced, failed: applied.failed },
-    { complete: true, fetched: 3, synced: 3, failed: 0 },
+    { complete: applied.complete, fetched: applied.fetched, synced: applied.synced, unapplied: applied.unapplied },
+    { complete: true, fetched: 3, synced: 3, unapplied: 0 },
   )
 
   reset()
   const empty = await sweep(WC_ORDER_ID)
   assert.deepEqual(
-    { complete: empty.complete, fetched: empty.fetched, synced: empty.synced, failed: empty.failed },
-    { complete: true, fetched: 0, synced: 0, failed: 0 },
+    { complete: empty.complete, fetched: empty.fetched, synced: empty.synced, unapplied: empty.unapplied },
+    { complete: true, fetched: 0, synced: 0, unapplied: 0 },
     'nothing fetched on a read that finished is the ONLY evidence that the store holds no refunds',
   )
 })

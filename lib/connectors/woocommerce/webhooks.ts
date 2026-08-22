@@ -8,6 +8,7 @@ import { importWcOrder } from '@/lib/connectors/woocommerce/sync/order-import'
 import { syncWcOrderStatus } from '@/lib/connectors/woocommerce/sync/order-status'
 import { externalFulfillmentRefusalAwaitsRefunds } from '@/lib/fulfillment/external-fulfillment'
 import {
+  refundOutcomeFailed,
   syncRefundsForOrder,
   syncWcRefund,
   type RefundSweepResult,
@@ -289,7 +290,10 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
     if (typeof wcRefund.parent_id === 'number') {
       try {
         const refundResult = await syncWcRefund(wcRefund.parent_id, wcRefund)
-        if (!refundResult.success) failures.push(`syncWcRefund: ${refundResult.error ?? 'unknown error'}`)
+        // o3d-xnwu r4: a FAILURE is reported; an ending that applied nothing but is not a failure
+        // (a quarantined park, a chargeback suppression) is not, exactly as before — this delivery
+        // owes nothing more, and retrying it would hammer a condition only an operator can clear.
+        if (refundOutcomeFailed(refundResult.outcome)) failures.push(`syncWcRefund: ${refundResult.error ?? 'unknown error'}`)
       } catch (e) {
         failures.push(`syncWcRefund: ${e instanceof Error ? e.message : String(e)}`)
       }
@@ -498,20 +502,32 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       // attached to a different order, and anything its body throws — none of which touches the
       // read — so a settled-looking sweep could be carrying nothing but refusals.
       //
+      // o3d-xnwu round 4 (Codex HIGH): AND A SWEEP THAT HANDLED EVERYTHING IS NOT A SWEEP THAT
+      // APPLIED EVERYTHING EITHER. Round 3's counts came from a per-refund `success` boolean that
+      // ALSO meant "handled without applying" — a same-order QUARANTINED park and a refund
+      // suppressed by a prior chargeback both returned it. The arithmetic reconciled and the
+      // classification was still wrong: this branch concluded every fetched refund was in IMS while
+      // some of them were sitting in the exception inbox, and then answered the coverage shortfall
+      // PERMANENTLY from demand IMS does not hold — acknowledging the delivery and advancing the
+      // cursor over a dispatch that is genuinely short. The counts are now aggregated on
+      // APPLICATION (`refundIsInIms`), so `unapplied` covers refusals and handled-but-unapplied
+      // endings alike.
+      //
       // THE ONLY STATE THAT SETTLES THE HELD REFUSAL is a read that finished AND a fetched set that
-      // applied in full. That is exactly the same defect shape this branch fixed one layer down —
+      // is in IMS in full. That is exactly the same defect shape this branch fixed one layer down —
       // a result that cannot express failure gets read as success — so the answer is the same one:
       // the counts travel, and the classification is made from them.
       //
       //   complete, nothing fetched      the store really does hold no refunds; nothing can change
       //                                  the first answer, so it stands with its own classification.
-      //   complete, all of them applied  the demand IMS holds is now the demand the store holds; the
+      //   complete, all of them in IMS   the demand IMS holds is now the demand the store holds; the
       //                                  re-ask is the reading that gets classified.
       //   anything else                  the demand this order carries is still unknown. TRANSIENT,
       //                                  which is the direction round 2 already chose for a read
-      //                                  that did not finish — an unapplied refund leaves the same
-      //                                  hole in the coverage check as an unread one.
-      const settledTheOrder = refundSweep !== null && refundSweep.complete && refundSweep.failed === 0
+      //                                  that did not finish — a refund that was quarantined,
+      //                                  suppressed or refused leaves the same hole in the coverage
+      //                                  check as an unread one.
+      const settledTheOrder = refundSweep !== null && refundSweep.complete && refundSweep.unapplied === 0
       if (settledTheOrder && refundSweep !== null && refundSweep.fetched > 0) {
         // ASK AGAIN, now that every refund the store holds for this order is in IMS. The re-ask is
         // the same call because it is idempotent by construction: allocation and shipment creation
@@ -535,22 +551,28 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
         // settled state. It stands, with the classification it came with.
         permanentFailures.push(heldForRefunds)
       } else {
-        // Either the sweep did not finish, or refunds it DID read failed to apply. Both leave the
-        // demand this order carries unknown, and neither is a verdict. Classify the held refusal as
-        // transient so the redelivery re-decides it rather than burying it.
+        // Either the sweep did not finish, or refunds it DID read are not in IMS — refused,
+        // quarantined or suppressed. Both leave the demand this order carries unknown, and neither
+        // is a verdict. Classify the held refusal as transient so the redelivery re-decides it
+        // rather than burying it.
         //
         // AND THE DELIVERY MUST NOT SUCCEED ON THIS PATH. An incomplete read already put its own
-        // line in `failures`; an application failure did not, and until this branch there was
-        // nothing at all to stop `ok: true` and the cursor advancing over it. Pushing the held
-        // refusal is what fails the delivery, so the refunds are re-swept and the shortfall
-        // re-decided. It is deliberately scoped to a HELD refusal rather than to every sweep that
-        // failed to apply something: a refund that can never apply (one WooCommerce has attached to
-        // a different order) would otherwise retry every delivery to a dead letter, which is the
+        // line in `failures`; an unapplied refund did not, and until this branch there was nothing
+        // at all to stop `ok: true` and the cursor advancing over it. Pushing the held refusal is
+        // what fails the delivery, so the refunds are re-swept and the shortfall re-decided. The
+        // cursor therefore STAYS HELD until the refunds are actually in IMS — for a quarantined
+        // park that means until an operator resolves it, which is the point: a held refusal is a
+        // dispatch IMS cannot complete, and acknowledging it would bury a real shortfall behind a
+        // sweep that only looked settled.
+        //
+        // It is deliberately scoped to a HELD refusal rather than to every sweep that failed to
+        // apply something: a refund that can never apply (one WooCommerce has attached to a
+        // different order) would otherwise retry every delivery to a dead letter, which is the
         // behaviour o3d-bx9 removed.
-        if (refundSweep && refundSweep.complete && refundSweep.failed > 0) {
+        if (refundSweep && refundSweep.complete && refundSweep.unapplied > 0) {
           failures.push(
-            `syncRefundsForOrder: ${refundSweep.failed} of ${refundSweep.fetched} refunds read for this `
-            + 'order could not be applied, so the demand it carries is still unknown',
+            `syncRefundsForOrder: ${refundSweep.unapplied} of ${refundSweep.fetched} refunds read for this `
+            + 'order are not in IMS, so the demand it carries is still unknown',
           )
         }
         failures.push(heldForRefunds)

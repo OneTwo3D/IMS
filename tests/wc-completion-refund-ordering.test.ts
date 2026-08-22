@@ -43,11 +43,13 @@ let storeRefundedQty = 0
 /** Whether the sweep managed to read the whole refund list. */
 let sweepComplete = true
 /**
- * How many of the refunds the sweep READ then failed to APPLY (o3d-xnwu r3). Zero for every case
- * round 2 could express — which is why round 2's classification could not tell a settled order from
- * one whose refunds all bounced.
+ * How many of the refunds the sweep READ that are NOT in IMS afterwards (o3d-xnwu r3, r4). Zero for
+ * every case round 2 could express — which is why round 2's classification could not tell a settled
+ * order from one whose refunds all bounced. Since r4 it also covers refunds that were HANDLED and
+ * not applied (a quarantined park, a chargeback suppression), which round 3 still counted as
+ * applied; the end-to-end proof of that is tests/wc-refund-quarantine-holds-completion.test.ts.
  */
-let sweepFailed = 0
+let sweepUnapplied = 0
 /** Set to answer with a refusal that is NOT a coverage shortfall (the control). */
 let refusalOverride: { error: string; refusal: string; permanent: boolean } | null = null
 
@@ -122,20 +124,24 @@ mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
     syncRefundsForOrder: async () => {
       calls.push('refunds')
       // The refunds this delivery is carrying land HERE, which is after the completion has already
-      // been judged once. `sweepFailed` of them bounce: they were READ but not APPLIED, so the
+      // been judged once. `sweepUnapplied` of them bounce: they were READ but not APPLIED, so the
       // units they would have taken out of demand are still counted against the dispatch.
       const fetched = storeRefundedQty > 0 ? 1 : 0
-      const failed = Math.min(sweepFailed, fetched)
-      refundedQty = failed > 0 ? 0 : storeRefundedQty
+      const unapplied = Math.min(sweepUnapplied, fetched)
+      refundedQty = unapplied > 0 ? 0 : storeRefundedQty
       return {
-        synced: fetched - failed,
+        synced: fetched - unapplied,
         fetched,
-        failed,
+        unapplied,
         complete: sweepComplete,
         ...(sweepComplete ? {} : { error: 'the refund list did not end within 20 pages' }),
       }
     },
-    syncWcRefund: async () => ({ success: true }),
+    syncWcRefund: async () => ({ outcome: 'applied' }),
+    // o3d-xnwu r4: the webhook imports these two from the same module, so a double that replaces the
+    // module must supply them or the handler calls `undefined`.
+    refundIsInIms: (outcome: string) => outcome === 'applied' || outcome === 'already-applied',
+    refundOutcomeFailed: (outcome: string) => outcome === 'retryable-failure' || outcome === 'permanent-failure',
   },
 })
 
@@ -167,7 +173,7 @@ function reset() {
   refundedQty = 0
   storeRefundedQty = 0
   sweepComplete = true
-  sweepFailed = 0
+  sweepUnapplied = 0
   refusalOverride = null
 }
 
@@ -286,7 +292,7 @@ test('o3d-xnwu r3: a refund that was READ but failed to APPLY may not bury the s
   // and the cursor advanced over an order whose refunds were still missing. A read that succeeded
   // is not an application that succeeded.
   storeRefundedQty = 2
-  sweepFailed = 1
+  sweepUnapplied = 1
 
   const response = await pushCompletedOrder()
   const body = await response.json() as { ok: boolean; failures?: string[]; permanentFailures?: string[] }
@@ -298,7 +304,7 @@ test('o3d-xnwu r3: a refund that was READ but failed to APPLY may not bury the s
     'the held refusal is released as TRANSIENT, exactly as it is for an incomplete READ',
   )
   assert.ok(
-    body.failures?.some((f) => /could not be applied/.test(f)),
+    body.failures?.some((f) => /are not in IMS/.test(f)),
     'and the unapplied refund is named — it produced no line of its own before this',
   )
   assert.deepEqual(calls, ['status', 'refunds'], 'an unsettled order buys no second look')
@@ -319,7 +325,7 @@ test('o3d-xnwu r3: an APPLIED sweep still settles the order — the fix does not
   // The control for the test above. Same order, same refunds, and this time they apply. If the
   // classification had simply become "transient whenever anything is non-zero", this would fail.
   storeRefundedQty = 2
-  sweepFailed = 0
+  sweepUnapplied = 0
 
   const response = await pushCompletedOrder()
   const body = await response.json() as { ok: boolean; permanentFailures?: string[] }
