@@ -3,7 +3,10 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { releaseUnsentTransportRefusal } from '@/lib/connectors/xero/sync-processor'
+import {
+  recordAndReleaseUnsentTransportRefusal,
+  releaseUnsentTransportRefusal,
+} from '@/lib/connectors/xero/sync-processor'
 import {
   CREATE_DISPATCH_REPLAY_MARGIN_MS,
   decideCreateDispatch,
@@ -292,7 +295,7 @@ test('o3d-jit6 r4: the release keeps attempt-stamping custody, like every other 
  * THE WIRING, WHICH NO UNIT ABOVE CAN SEE.
  * ---------------------------------------------------------------------------------------------- */
 
-test('o3d-jit6 r4: BOTH runners hand the row back, and the outbox one does it atomically with the job', () => {
+test('o3d-jit6 r5: BOTH runners hand back through the ONE transaction body, evidence included', () => {
   const source = readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
   const direct = source.slice(
     source.indexOf('async function processPendingXeroSyncDirect('),
@@ -308,54 +311,77 @@ test('o3d-jit6 r4: BOTH runners hand the row back, and the outbox one does it at
     const branch = block.slice(block.indexOf('if (syncResult.notPosted) {'))
     assert.ok(branch.length > 0, `${name}: the notPosted branch must be found`)
 
-    // THE EVIDENCE FIRST. This activity row is what the later refusal tells an operator to look for,
-    // and the release below makes the row claimable — so writing it afterwards opens a gap in which
-    // another worker meets the marker with no trace of why it stands.
-    const logAt = branch.indexOf('await logActivity({')
-    const releaseAt = branch.indexOf('releaseUnsentTransportRefusal(')
-    assert.ok(logAt > -1, `${name}: the refusal must still be logged`)
-    assert.ok(releaseAt > -1, `${name}: the claim must be handed back`)
-    assert.ok(releaseAt > logAt, `${name}: the evidence row is written BEFORE the row becomes claimable`)
-
     // Only on the reason that has a replay window running against it.
-    assert.ok(
-      branch.slice(0, releaseAt).includes("if (notPosted.reason === 'transport-refused') {"),
-      `${name}: the release is guarded on the transport refusal`,
-    )
+    const guardAt = branch.indexOf("if (notPosted.reason === 'transport-refused') {")
+    assert.ok(guardAt > -1, `${name}: the hand-back is guarded on the transport refusal`)
 
+    // ONE TRANSACTION, AND THE EVIDENCE IS INSIDE IT (r5). r4 wrote the evidence with the
+    // best-effort `logActivity` from outside the release, so the release could commit while the
+    // only durable trace of the refusal was silently lost. The transaction body is now shared, so
+    // there is no call site at which that separation can be reintroduced by one runner alone.
+    const txAt = branch.indexOf('await db.$transaction(async (tx) => {', guardAt)
+    assert.ok(txAt > -1, `${name}: the hand-back must be one transaction`)
+    const txBody = branch.slice(txAt, branch.indexOf('})', txAt))
+    assert.match(
+      txBody,
+      /await recordAndReleaseUnsentTransportRefusal\(tx, \{ entry, notPosted, lease, attempt/,
+      `${name}: the hand-back goes through the shared body, fenced on the LEASE`,
+    )
     // FENCED ON THE LEASE, NOT ON THE SWEEP'S CAPTURED INSTANT, and this is the difference between
     // the fix working and the fix being invisible. `openRemoteWriteLease` renews
     // `processingStartedAt` when it opens and again in the fence that mints the dispatch marker, so
     // `held` — `claimHeldFrom(claimedAt)` from the top of the loop — names an instant the row no
-    // longer carries. `releaseClaimForRetry` fences on the instant, and it fails CLOSED: a release
-    // fenced on the stale one matches no row, reports nothing, and leaves the row in PROCESSING
-    // exactly as round 3 did.
-    assert.match(
-      branch,
-      /releaseUnsentTransportRefusal\((db|tx), entry\.id, lease, attempt, notPosted\.message\)/,
-      `${name}: the release must fence on the LEASE — the claim this worker holds at that moment`,
-    )
+    // longer carries. The fence fails CLOSED, so a release fenced on the stale one matches no row,
+    // reports nothing, and leaves the row in PROCESSING exactly as round 3 did.
     assert.ok(
-      !/releaseUnsentTransportRefusal\((db|tx), entry\.id, held,/.test(branch),
+      !/recordAndReleaseUnsentTransportRefusal\(tx, \{ entry, notPosted, held,/.test(branch),
       `${name}: fencing on the sweep's captured instant would match nothing and fail silently`,
+    )
+
+    // AND NO BEST-EFFORT EVIDENCE WRITE ON THIS PATH. `logActivity` swallows its own failures; using
+    // it for the row the marker's refusal points at is exactly the defect r5 closes.
+    const refusalArm = branch.slice(guardAt, branch.indexOf('} else {', guardAt))
+    assert.ok(
+      !/await logActivity\(\{/.test(refusalArm),
+      `${name}: the refusal evidence must not be written best-effort alongside the release`,
     )
   }
 
-  // ONE TRANSACTION on the outbox path: a released row whose job stayed PROCESSING waits for the
-  // queue's own fifteen-minute stale-lock sweep, and a requeued job whose row stayed PROCESSING is
-  // claimed only to find the row unclaimable. Either half alone re-creates the defect.
-  const tx = outbox.slice(outbox.indexOf('if (syncResult.notPosted) {'))
-  const txAt = tx.indexOf('await db.$transaction(async (tx) => {')
-  assert.ok(txAt > -1, 'the outbox hand-back must be one transaction')
-  const body = tx.slice(txAt, tx.indexOf('})', tx.indexOf('deferOutboxWithoutSpendingAnAttempt(')))
-  assert.match(body, /releaseUnsentTransportRefusal\(tx, entry\.id, lease, attempt, notPosted\.message\)/)
+  // The direct runner owns no outbox job and passes none; the queued runner passes its job, so the
+  // requeue joins the same commit. Either half alone re-creates r4's defect: a released row whose
+  // job stayed PROCESSING waits for the queue's own fifteen-minute stale-lock sweep, and a requeued
+  // job whose row stayed PROCESSING is claimed only to find the row unclaimable.
+  const directTx = direct.slice(direct.indexOf('recordAndReleaseUnsentTransportRefusal(tx, {'))
+  assert.match(directTx.slice(0, directTx.indexOf('\n')), /\{ entry, notPosted, lease, attempt \}\)/)
+  const outboxTx = outbox.slice(outbox.indexOf('recordAndReleaseUnsentTransportRefusal(tx, {'))
+  assert.match(outboxTx.slice(0, outboxTx.indexOf('\n')), /\{ entry, notPosted, lease, attempt, job \}\)/)
+})
+
+test('o3d-jit6 r5: the shared body writes the evidence transactionally, and never best-effort', () => {
+  const source = readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
+  const body = source.slice(
+    source.indexOf('export async function recordAndReleaseUnsentTransportRefusal('),
+    source.indexOf('/**\n * SAY THAT THE HAND-BACK ABORTED'),
+  )
+  assert.ok(body.length > 0, 'the shared hand-back body must be found')
+
+  const logAt = body.indexOf('await logActivityInTransaction(tx, {')
+  const releaseAt = body.indexOf('await releaseUnsentTransportRefusal(')
+  const deferAt = body.indexOf('deferOutboxWithoutSpendingAnAttempt(tx, args.job,')
+  assert.ok(logAt > -1, 'the evidence must be written through the transaction')
+  assert.ok(releaseAt > logAt, 'the evidence row is written BEFORE the row becomes claimable')
+  assert.ok(deferAt > releaseAt, 'and the job requeue is the third write of the same commit')
+
+  // `logActivity` and `logActivityPersisted` both swallow; neither may appear here.
+  assert.ok(!/await logActivity\(/.test(body), 'no best-effort activity write inside the hand-back')
+  assert.ok(!/logActivityPersisted\(/.test(body), 'nor the reporting-but-still-committing variant')
   // AND NOT `markXeroOutboxRetry`, whose first backoff floor is five minutes and which counts the
   // attempt against MAX_RETRIES — it would burn the window it is supposed to be racing.
-  assert.match(body, /deferOutboxWithoutSpendingAnAttempt\(tx, job, notPosted\.message, 0\)/)
   assert.ok(
     !body.includes('markXeroOutboxRetry('),
     'the unsent hand-back must not spend an outbox attempt or take the five-minute backoff floor',
   )
+  assert.match(body, /deferOutboxWithoutSpendingAnAttempt\(tx, args\.job, args\.notPosted\.message, 0\)/)
 })
 
 test('o3d-jit6 r4: the release goes through the ONE fenced release, not a hand-spelt statement', () => {
@@ -373,4 +399,256 @@ test('o3d-jit6 r4: the release goes through the ONE fenced release, not a hand-s
     'the helper must not write the row itself',
   )
   assert.match(helper, /nextAttemptAt: now,/, 'and it must not introduce a backoff')
+})
+
+/* ------------------------------------------------------------------------------------------------
+ * ROUND 5 — THE EVIDENCE IS NOT BEST-EFFORT ANY MORE, AND THESE PROVE IT BEHAVIOURALLY.
+ *
+ * The structural tests above pin the shape. What they cannot see is what happens when the activity
+ * write FAILS, which is the entire defect: `logActivity` swallows its own errors, so round 4's
+ * evidence write could fail silently while the release and the requeue committed anyway — leaving a
+ * standing dispatch marker, a claimable row, and no trace at all of why the marker stands.
+ *
+ * So the fake below is a TRANSACTION, not a client. It stages every write against a copy and commits
+ * that copy only if the body returns; a throw discards it. Without that, "one transaction" is a claim
+ * no unit test can distinguish from three statements in a row.
+ * ---------------------------------------------------------------------------------------------- */
+
+const WORKER = 'xero-accounting-sync'
+const T_LOCK = new Date('2026-08-22T08:59:00.000Z')
+const NOT_POSTED = {
+  reason: 'transport-refused' as const,
+  operation: 'manual-journal',
+  message: MESSAGE,
+}
+
+type JobRow = {
+  id: string
+  status: string
+  lockedAt: Date | null
+  lockedBy: string | null
+  nextAttemptAt: Date | null
+  lastError: string | null
+  attempts: number
+}
+type World = { sync: Row; job: JobRow; activity: Array<Record<string, unknown>> }
+
+function whereMatches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
+  for (const [key, expected] of Object.entries(where)) {
+    const actual = row[key]
+    if (expected instanceof Date) {
+      if ((actual as Date | null)?.valueOf() !== expected.valueOf()) return false
+    } else if (actual !== expected) return false
+  }
+  return true
+}
+
+function updateManyOn(get: () => Record<string, unknown>) {
+  return async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+    const row = get()
+    if (!whereMatches(row, where)) return { count: 0 }
+    Object.assign(row, data)
+    return { count: 1 }
+  }
+}
+
+/** A transaction that actually rolls back: writes land on a staged copy, promoted only on return. */
+function makeWorld(options: { sync?: Partial<Row>; activityLogFails?: boolean } = {}) {
+  let committed: World = {
+    sync: {
+      id: 'log-1',
+      status: 'PROCESSING',
+      processingStartedAt: T_DISPATCH,
+      attemptStampingCustodyAt: null,
+      attemptRevision: 4,
+      retryCount: 3,
+      errorMessage: null,
+      createDispatchedAt: T_DISPATCH,
+      createDispatchIdempotencyKey: KEY,
+      ...options.sync,
+    },
+    job: {
+      id: 'job-1',
+      status: 'PROCESSING',
+      lockedAt: T_LOCK,
+      lockedBy: WORKER,
+      nextAttemptAt: null,
+      lastError: null,
+      attempts: 2,
+    },
+    activity: [],
+  }
+
+  async function transaction<T>(body: (tx: never) => Promise<T>): Promise<T> {
+    const staged: World = structuredClone(committed)
+    const tx = {
+      activityLog: {
+        create: async ({ data }: { data: Record<string, unknown> }) => {
+          // The failure `logActivity` would have swallowed. Here it must propagate.
+          if (options.activityLogFails) throw new Error('activity_log is not writable')
+          staged.activity.push(data)
+          return data
+        },
+      },
+      accountingSyncLog: { updateMany: updateManyOn(() => staged.sync as unknown as Record<string, unknown>) },
+      integrationOutbox: { updateMany: updateManyOn(() => staged.job as unknown as Record<string, unknown>) },
+    }
+    const out = await body(tx as never)
+    committed = staged
+    return out
+  }
+
+  return { transaction, world: () => committed }
+}
+
+const JOB = {
+  id: 'job-1',
+  connector: 'xero',
+  operation: 'sync',
+  idempotencyKey: 'k',
+  payloadJson: {},
+  status: 'PROCESSING',
+  attempts: 2,
+  nextAttemptAt: null,
+  lastError: null,
+  lockedAt: T_LOCK,
+  lockedBy: WORKER,
+  createdAt: T_LOCK,
+  updatedAt: T_LOCK,
+}
+
+test('o3d-jit6 r5: the queued hand-back commits evidence, release and requeue as ONE fact', async () => {
+  const w = makeWorld()
+  const out = await w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+    entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+    notPosted: NOT_POSTED,
+    lease: claimHeldFrom(T_DISPATCH),
+    attempt: ATTEMPT,
+    job: JOB as never,
+  }))
+
+  assert.equal(out.released, true)
+  const after = w.world()
+  assert.equal(after.activity.length, 1, 'the evidence row is written')
+  assert.equal(after.activity[0].action, 'xero_sync_transport_refused_before_post',
+    'and it is the action the marker refusal tells an operator to look for')
+  assert.equal(after.activity[0].level, 'WARNING')
+  assert.equal(after.sync.status, 'PENDING', 'the row is claimable again')
+  assert.equal(after.job.status, 'RETRYABLE_FAILED', 'and its job is back in the queue')
+  assert.equal(after.job.attempts, 2, 'without spending an attempt')
+  // The marker is untouched, so the retry meets the same deterministic key and the same verdict.
+  assert.equal(after.sync.createDispatchedAt?.valueOf(), T_DISPATCH.valueOf())
+  assert.equal(after.sync.createDispatchIdempotencyKey, KEY)
+})
+
+test('o3d-jit6 r5: an unwritable activity row ABORTS the hand-back — nothing released, nothing requeued', async () => {
+  // THE DEFECT, AS A FACT ABOUT THE DATABASE. Under round 4 this is exactly the run that broke the
+  // invariant: `logActivity` swallowed the failure, the release and the requeue committed, and the
+  // row went back to PENDING with the dispatch marker standing and no trace of why.
+  const w = makeWorld({ activityLogFails: true })
+
+  await assert.rejects(
+    () => w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+      entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+      notPosted: NOT_POSTED,
+      lease: claimHeldFrom(T_DISPATCH),
+      attempt: ATTEMPT,
+      job: JOB as never,
+    })),
+    /activity_log is not writable/,
+    'an unwritable record must abort, not be swallowed',
+  )
+
+  const after = w.world()
+  assert.equal(after.activity.length, 0, 'nothing was recorded')
+  assert.equal(after.sync.status, 'PROCESSING',
+    'AND THEREFORE NOTHING WAS RELEASED — no worker can meet the marker with the trace missing')
+  assert.equal(after.sync.processingStartedAt?.valueOf(), T_DISPATCH.valueOf(), 'the claim is exactly as it was')
+  assert.equal(after.job.status, 'PROCESSING', 'and the job was not requeued either')
+  assert.equal(after.job.lockedBy, WORKER)
+})
+
+test('o3d-jit6 r5: the DIRECT hand-back rolls back as one too — it is the same body, with no job', async () => {
+  const w = makeWorld({ activityLogFails: true })
+
+  await assert.rejects(
+    () => w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+      entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+      notPosted: NOT_POSTED,
+      lease: claimHeldFrom(T_DISPATCH),
+      attempt: ATTEMPT,
+    })),
+    /activity_log is not writable/,
+  )
+  assert.equal(w.world().sync.status, 'PROCESSING', 'the direct runner releases nothing either')
+  assert.equal(w.world().activity.length, 0)
+
+  // And with a writable log the direct body releases the row and touches no job — the runner holds
+  // none, so there is nothing on that side to keep atomic with.
+  const ok = makeWorld()
+  const out = await ok.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+    entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+    notPosted: NOT_POSTED,
+    lease: claimHeldFrom(T_DISPATCH),
+    attempt: ATTEMPT,
+  }))
+  assert.equal(out.released, true)
+  assert.equal(ok.world().sync.status, 'PENDING')
+  assert.equal(ok.world().activity.length, 1)
+  assert.equal(ok.world().job.status, 'PROCESSING', 'the direct path must not touch an outbox job')
+})
+
+test('o3d-jit6 r5: a ZERO-ROW fenced release does NOT abort — the evidence and the requeue still commit', async () => {
+  // The asymmetry with the log failure is deliberate. `false` here means a displaced owner, or an
+  // attempt an operator has since moved: the fence doing its job. The refusal it records STILL
+  // HAPPENED and is still the row the marker's refusal points at, so rolling the evidence back would
+  // delete the record of a real refusal on the grounds that somebody else now owns the row. And the
+  // outbox job is this worker's regardless of what happened to the sync row, so it is handed back.
+  const displaced = makeWorld({ sync: { processingStartedAt: new Date(T_DISPATCH.getTime() + 60_000) } })
+  const out = await displaced.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+    entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+    notPosted: NOT_POSTED,
+    lease: claimHeldFrom(T_DISPATCH),
+    attempt: ATTEMPT,
+    job: JOB as never,
+  }))
+
+  assert.equal(out.released, false, 'the caller is told the release matched nothing')
+  const after = displaced.world()
+  assert.equal(after.sync.status, 'PROCESSING', "the replacement's claim is untouched")
+  assert.equal(after.activity.length, 1, 'but the refusal that really happened is still recorded')
+  assert.equal(after.job.status, 'RETRYABLE_FAILED', 'and this worker still hands back its own job')
+
+  // Same when an operator moved the attempt while this claim was held.
+  const decided = makeWorld({ sync: { attemptRevision: 5 } })
+  const outDecided = await decided.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+    entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+    notPosted: NOT_POSTED,
+    lease: claimHeldFrom(T_DISPATCH),
+    attempt: ATTEMPT,
+    job: JOB as never,
+  }))
+  assert.equal(outDecided.released, false)
+  assert.equal(decided.world().sync.status, 'PROCESSING', "an operator's decision is not reopened")
+  assert.equal(decided.world().activity.length, 1)
+})
+
+test('o3d-jit6 r5: a job this worker no longer holds aborts the whole hand-back, evidence included', async () => {
+  // `deferOutboxWithoutSpendingAnAttempt` throws when its fence matches nothing. Under round 4 the
+  // evidence had already been committed by then; now it rolls back with the rest, which is the
+  // correct reading of "abort": the row was not released, so nothing will meet the marker.
+  const w = makeWorld()
+  await assert.rejects(
+    () => w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+      entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+      notPosted: NOT_POSTED,
+      lease: claimHeldFrom(T_DISPATCH),
+      attempt: ATTEMPT,
+      job: { ...JOB, lockedAt: new Date(T_LOCK.getTime() + 1_000) } as never,
+    })),
+    /is not claimed by xero-accounting-sync/,
+  )
+  const after = w.world()
+  assert.equal(after.sync.status, 'PROCESSING', 'the row stays claimed by this worker')
+  assert.equal(after.activity.length, 0, 'and the evidence rolled back with it')
 })

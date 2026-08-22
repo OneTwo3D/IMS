@@ -412,20 +412,27 @@ test('o3d-jit6 r3: the journal branch classifies an unsent post as notPosted, an
   assert.ok(!/status === 0|res\.status|\.error\?\.includes|match\(/.test(branch),
     'the branch must not infer "nothing was sent" from a status code or from prose')
 
-  // And the runner turns that reason into its own named activity row, on BOTH paths — the sweep and
-  // the outbox — because the refusal tells operators to look for exactly that action.
+  // And the refusal turns into its own named activity row, because the refusal message tells
+  // operators to look for exactly that action.
+  //
+  // RE-POINTED AGAIN BY r5. r4 required the string TWICE — once per runner — which was the right
+  // property while each runner spelt its own evidence out. r5 moved the wording and the metadata
+  // into ONE builder (`unsentPostEvidence`) precisely so a transactional write and a best-effort one
+  // could not describe the same refusal differently, so the string is now written ONCE and that is
+  // the stronger fact: there is no second copy to drift.
   assert.equal(
     source.split("'xero_sync_transport_refused_before_post'").length - 1,
-    2,
-    'both runner paths must name the action',
+    1,
+    'the action is named in exactly one place, so both runners cannot disagree about it',
   )
-  // RE-POINTED BY r4, NOT RELAXED. This used to count `reason === 'transport-refused'` and require
-  // exactly two — one selector per runner. Each runner now tests the reason TWICE: once to choose the
-  // activity action, and once to decide whether to give the claim back (see
-  // releaseUnsentTransportRefusal). Counting occurrences would therefore have to be loosened to four,
-  // which says less than it did; so the property is asserted per BLOCK instead, which is strictly
-  // stronger — it pins that each runner both names the action and performs the release, rather than
-  // that the string appears the right number of times somewhere in a 5,000-line file.
+  const evidence = source.slice(
+    source.indexOf('function unsentPostEvidence('),
+    source.indexOf('type UnsentRefusalTransactionClient'),
+  )
+  assert.ok(evidence.length > 0, 'the shared evidence builder must be found')
+  assert.match(evidence, /'xero_sync_transport_refused_before_post'/, 'and it is the builder that names it')
+  // The per-BLOCK property is what r4 introduced and it stays: each runner must reach that builder
+  // and must branch on the reason, rather than the string appearing somewhere in a 5,000-line file.
   const direct = source.slice(
     source.indexOf('async function processPendingXeroSyncDirect('),
     source.indexOf('async function processPendingXeroSyncViaOutbox('),
@@ -437,8 +444,12 @@ test('o3d-jit6 r3: the journal branch classifies an unsent post as notPosted, an
   for (const [name, block] of [['direct', direct], ['outbox', outbox]] as const) {
     assert.ok(block.length > 0, `the ${name} runner block must be found`)
     assert.ok(
-      block.includes("'xero_sync_transport_refused_before_post'"),
-      `${name} runner: must select the named action from the reason rather than falling through to claim-lost`,
+      block.includes('unsentPostEvidence(entry, notPosted'),
+      `${name} runner: must build its refusal evidence from the one shared builder`,
+    )
+    assert.ok(
+      block.includes('recordAndReleaseUnsentTransportRefusal(tx, { entry, notPosted, lease, attempt'),
+      `${name} runner: must commit that evidence with the fenced release, not beside it`,
     )
     assert.ok(
       block.includes("notPosted.reason === 'transport-refused'"),

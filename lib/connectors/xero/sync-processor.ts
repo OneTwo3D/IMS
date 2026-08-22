@@ -2452,6 +2452,174 @@ async function deferOutboxWithoutSpendingAnAttempt(
 }
 
 /**
+ * THE REFUSAL EVIDENCE, BUILT ONCE FOR BOTH RUNNERS AND BOTH WAYS OF WRITING IT (o3d-jit6 r5).
+ *
+ * This is the activity row a later refusal tells an operator to look for: on the `transport-refused`
+ * reason it is THE ONLY DURABLE TRACE that a create was recorded by the marker and then not sent, and
+ * `CREATE_DISPATCH_UNSETTLED_MEANING` names its `action` verbatim. So the wording and the metadata are
+ * produced here rather than spelt out at each call site — a transactional write and a best-effort one
+ * that described the same refusal differently would send that operator looking for the wrong row.
+ */
+function unsentPostEvidence(
+  entry: { id: string; type: string },
+  notPosted: NonNullable<EntryResult['notPosted']>,
+  outboxJobId?: string,
+) {
+  return {
+    entityType: 'SYSTEM' as const,
+    action: notPosted.reason === 'lease-expired'
+      ? 'xero_sync_lease_expired_before_post'
+      : notPosted.reason === 'dispatch-unrecorded'
+        ? 'xero_sync_dispatch_unrecorded_before_post'
+        // o3d-jit6 r3: THE ONLY DURABLE TRACE that a create was recorded and then not sent. The
+        // refusal a later attempt makes names this action and tells an operator to look for it
+        // before they go hunting in the ledger.
+        : notPosted.reason === 'transport-refused'
+          ? 'xero_sync_transport_refused_before_post'
+          : 'xero_sync_claim_lost_before_post',
+    tag: 'sync',
+    level: 'WARNING' as const,
+    description: notPosted.message,
+    metadata: {
+      syncLogId: entry.id,
+      type: entry.type,
+      ...(outboxJobId ? { outboxJobId } : {}),
+      operation: notPosted.operation,
+      reason: notPosted.reason,
+    },
+  }
+}
+
+/** The three tables one unsent-refusal hand-back touches, and nothing else. */
+type UnsentRefusalTransactionClient = Pick<Prisma.TransactionClient, 'activityLog' | 'accountingSyncLog' | 'integrationOutbox'>
+
+/**
+ * THE WHOLE HAND-BACK, AS ONE TRANSACTION BODY — SHARED BY BOTH RUNNERS (o3d-jit6 r5, Codex HIGH).
+ *
+ * WHAT ROUND 4 GOT RIGHT AND WHERE IT STOPPED, AGAIN. r4 established the ORDER: write the evidence
+ * first, release second, so no worker can meet the standing dispatch marker with the trace of why it
+ * stands already missing. That ordering is correct and it could not enforce itself, because the write
+ * it ordered was `logActivity` — which SWALLOWS ITS OWN FAILURES so that logging can never break its
+ * caller — and it sat OUTSIDE the transaction that released the row and requeued the job. So the
+ * release could commit while the ONLY DURABLE EVIDENCE OF THE REFUSAL was silently lost, and the
+ * invariant the ordering existed to buy did not hold at all:
+ *
+ *   • the row goes back to PENDING and another worker takes it;
+ *   • it meets `createDispatchedAt`/`createDispatchIdempotencyKey` still standing;
+ *   • past the window, `decideCreateDispatch` refuses and its message tells an operator to look for
+ *     `xero_sync_transport_refused_before_post` before they go hunting in the ledger;
+ *   • and that activity row is not there, because the write that would have made it failed into a
+ *     `console.error` nobody durably keeps.
+ *
+ * SO ALL THREE WRITES COMMIT TOGETHER. `logActivityInTransaction` applies the identical redaction and
+ * sanitisation as `logActivity` but writes through the caller's transaction and does NOT catch, so an
+ * unwritable record ABORTS the hand-back rather than letting it proceed silently. That is the same
+ * consequence o3d-batch-settle settled on for an operator's settlement assertion, and for the same
+ * reason: an audit record written best-effort BEFORE the thing it describes can vanish while the
+ * thing proceeds.
+ *
+ * ONE BODY, TWO CALLERS. The direct runner holds no outbox job, so it passes none and the requeue is
+ * simply absent; the queued runner passes the job and the requeue joins the same commit. Both halves
+ * of the queued pair were already required to be atomic (r4): a released row whose job stayed
+ * PROCESSING waits for the queue's own fifteen-minute stale-lock sweep — the very fifteen minutes the
+ * release exists to escape — and a requeued job whose row stayed PROCESSING is claimed by the next
+ * tick only to find the row unclaimable and skip it. The evidence is now the third member of that
+ * set, on the same reasoning.
+ *
+ * A ZERO-ROW RELEASE DOES NOT ABORT, and the asymmetry with the log failure is deliberate. `false`
+ * from the fenced release means a displaced owner, or an attempt an operator has since moved — the
+ * fence doing its job. The refusal it records still happened, it is still the row the marker's
+ * refusal points at, and rolling it back would delete the record of a real refusal on the grounds
+ * that somebody else now owns the row. The caller gets the flag so it can say so.
+ */
+export async function recordAndReleaseUnsentTransportRefusal(
+  tx: UnsentRefusalTransactionClient,
+  args: {
+    entry: { id: string; type: string }
+    notPosted: NonNullable<EntryResult['notPosted']>
+    /**
+     * THE LEASE, NOT the sweep's captured claim instant (o3d-xl63 r6's rule, load-bearing here of all
+     * places). `openRemoteWriteLease` renews `processingStartedAt` when it opens and again in the
+     * fence that mints the dispatch marker, so `claimHeldFrom(claimedAt)` from the top of the runner
+     * loop names an instant the row no longer carries. `releaseClaimForRetry` fences on the instant
+     * and fails CLOSED, so a release fenced on the stale one matches nothing, reports nothing, and
+     * leaves the row in PROCESSING exactly as round 3 did — an invisible no-op that looks like a fix.
+     */
+    lease: HeldClaim
+    attempt: AttemptRef
+    /** The queued runner's job. Absent on the direct runner, which owns no outbox row. */
+    job?: IntegrationOutboxRow | null
+  },
+): Promise<{ released: boolean }> {
+  // EVIDENCE FIRST — inside the transaction, so the order is now belt as well as braces.
+  await logActivityInTransaction(tx, {
+    ...unsentPostEvidence(args.entry, args.notPosted, args.job?.id),
+    // No session exists on either runner; both are cron-driven. `resolveUser: false` is the
+    // best-effort helper's way of saying this, and this one takes the answer directly.
+    userId: null,
+  })
+  const released = await releaseUnsentTransportRefusal(
+    tx, args.entry.id, args.lease, args.attempt, args.notPosted.message,
+  )
+  // AND NOT `markXeroOutboxRetry`: that one counts the attempt against MAX_RETRIES and its first
+  // backoff floor is five minutes, which would burn the replay window this is racing.
+  if (args.job) await deferOutboxWithoutSpendingAnAttempt(tx, args.job, args.notPosted.message, 0)
+  return { released }
+}
+
+/**
+ * SAY THAT THE HAND-BACK ABORTED — because the alternative is the silence this round exists to end
+ * (o3d-jit6 r5, Codex HIGH).
+ *
+ * The refusal evidence and the hand-back now commit together, which means a database that cannot take
+ * the evidence takes neither: nothing is released, nothing is requeued, and the row waits for the
+ * stale-claim cutoff exactly as round 3 left it. That is the CORRECT outcome — an unwritable record
+ * must abort rather than let the release proceed without it — but an abort nobody hears is how the
+ * best-effort write failed in the first place.
+ *
+ * So it is reported twice, and the pair is deliberate. `console.error` survives the case where the
+ * database itself is refusing writes, which is precisely when the transaction is most likely to have
+ * rolled back. The best-effort activity row covers every other cause — a serialisation failure, a
+ * fence that matched no outbox job, a constraint — and is where an operator actually looks; it carries
+ * the original refusal wording, so in those cases the trace is not lost after all, only relabelled.
+ * Best-effort is right HERE and wrong inside the transaction: this write guards no state change, and a
+ * throw would spend a retry and FAIL a row that sent nothing.
+ */
+async function reportUnsentHandBackAborted(
+  entry: { id: string; type: string },
+  notPosted: NonNullable<EntryResult['notPosted']>,
+  error: unknown,
+  outboxJobId?: string,
+): Promise<void> {
+  // Only the transport-refusal path binds the evidence to the hand-back, so only it can have lost
+  // the evidence with it. Saying otherwise on the other three reasons would send an operator looking
+  // for a row that IS there.
+  const detail = notPosted.reason === 'transport-refused'
+    ? `[xero-sync] sync log ${entry.id} could not be handed back after a transport refusal, and the `
+      + `refusal evidence was NOT recorded either — they roll back together: ${String(error)}`
+    : `[xero-sync] sync log ${entry.id} could not be handed back after ${notPosted.reason}: ${String(error)}`
+  console.error(detail)
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'xero_sync_transport_refusal_handback_aborted',
+    tag: 'sync',
+    // ERROR, not WARNING: the row is stranded in PROCESSING until the stale cutoff, by which time
+    // the dispatch marker's replay window has closed and only a human can resolve it.
+    level: 'ERROR',
+    description: `${detail} The refusal was: ${notPosted.message}`,
+    metadata: {
+      syncLogId: entry.id,
+      type: entry.type,
+      ...(outboxJobId ? { outboxJobId } : {}),
+      operation: notPosted.operation,
+      reason: notPosted.reason,
+      abortedBy: String(error),
+    },
+    resolveUser: false,
+  })
+}
+
+/**
  * HAND BACK A ROW THAT PROVABLY SENT NOTHING — AND HAND IT BACK IN TIME TO REPLAY IT
  * (o3d-jit6 r4, Codex HIGH).
  *
@@ -3035,29 +3203,10 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
       // it must not be failed, must not spend a retry, and must not be persisted.
       if (syncResult.notPosted) {
         const notPosted = syncResult.notPosted
-        await logActivity({
-          entityType: 'SYSTEM',
-          action: notPosted.reason === 'lease-expired'
-            ? 'xero_sync_lease_expired_before_post'
-            : notPosted.reason === 'dispatch-unrecorded'
-              ? 'xero_sync_dispatch_unrecorded_before_post'
-              // o3d-jit6 r3: THE ONLY DURABLE TRACE that a create was recorded and then not sent.
-              // The refusal a later attempt makes names this action and tells an operator to look
-              // for it before they go hunting in the ledger.
-              : notPosted.reason === 'transport-refused'
-                ? 'xero_sync_transport_refused_before_post'
-                : 'xero_sync_claim_lost_before_post',
-          tag: 'sync',
-          level: 'WARNING',
-          description: notPosted.message,
-          metadata: {
-            syncLogId: entry.id,
-            type: entry.type,
-            operation: notPosted.operation,
-            reason: notPosted.reason,
-          },
-          resolveUser: false,
-        })
+        // The evidence is worded and shaped in ONE place (unsentPostEvidence) and written through
+        // one of TWO mechanisms. Which one it takes is the whole of round 5, and it turns on whether
+        // this reason also changes the row's state here.
+        //
         // o3d-jit6 r4 (Codex HIGH): AND THE ROW IS ACTUALLY GIVEN BACK. r3 left it PROCESSING at the
         // instant the fence had just renewed, so nothing could re-take it for fifteen minutes — past
         // the six-minute window in which the standing dispatch marker still permits a replay. See
@@ -3070,24 +3219,42 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         // their own terms, with no replay window running against them.
         if (notPosted.reason === 'transport-refused') {
           try {
-            // THE LEASE, NOT `held` (o3d-xl63 r6's rule, and it is load-bearing HERE of all places).
-            // `held` is `claimHeldFrom(claimedAt)` — the instant the sweep stamped — and
-            // `openRemoteWriteLease` has since RENEWED `processingStartedAt`, twice over on this
-            // path: once when the lease opened and once in the fence that minted the dispatch marker.
-            // A release fenced on the stale instant matches NOTHING, and because these fences fail
-            // closed the symptom is silence: the row would sit in PROCESSING exactly as it did in r3
-            // and this whole fix would be a no-op nobody could see. The lease satisfies `HeldClaim`
-            // structurally and answers the instant the row actually carries.
-            await releaseUnsentTransportRefusal(db, entry.id, lease, attempt, notPosted.message)
+            // o3d-jit6 r5 (Codex HIGH): THE EVIDENCE AND THE RELEASE ARE ONE COMMIT.
+            //
+            // r4 established the right ORDER — log first, release second, so no worker can meet the
+            // marker with the trace missing — and then defeated it with the mechanism. `logActivity`
+            // SWALLOWS ITS OWN FAILURES by design, and it sat OUTSIDE the release. So the ordering
+            // guaranteed nothing at all: the write could fail silently, the release below would
+            // commit regardless, and the row would become claimable with the only durable trace of
+            // the refusal gone. The marker would then stand over a create nobody made, its refusal
+            // would send an operator hunting for an activity row that was never written, and nothing
+            // anywhere would say so — which is the very invariant the ordering was meant to buy.
+            //
+            // `logActivityInTransaction` applies the identical redaction and sanitisation but writes
+            // THROUGH this transaction and does NOT catch, so evidence and release commit or roll
+            // back together. An unwritable record therefore ABORTS the hand-back instead of letting
+            // it proceed silently — the same consequence o3d-batch-settle settled on for an
+            // operator's settlement assertion, for the same reason.
+            //
+            // THE SAME hand-back body as the queued runner, not a copy of it. It fences on the LEASE
+            // (never on `held`, which the minting fence has since moved), and a zero-row release
+            // does not abort it — see recordAndReleaseUnsentTransportRefusal.
+            await db.$transaction(async (tx) => {
+              await recordAndReleaseUnsentTransportRefusal(tx, { entry, notPosted, lease, attempt })
+            })
           } catch (releaseError) {
-            // Degrades to r3's behaviour — PROCESSING until the stale cutoff — rather than throwing
-            // into the per-entry catch, which would spend a retry and mark FAILED a row that sent
-            // nothing. That is exactly the outcome `notPosted` exists to prevent.
-            console.error(
-              `[xero-sync] sync log ${entry.id} could not be handed back after a transport refusal: `
-                + String(releaseError),
-            )
+            // ABORTED, AND SAID SO — see reportUnsentHandBackAborted. Nothing was released and
+            // nothing was recorded, so the row degrades to r3's behaviour (PROCESSING until the
+            // stale cutoff) rather than throwing into the per-entry catch, which would spend a retry
+            // and mark FAILED a row that sent nothing. That is exactly the outcome `notPosted`
+            // exists to prevent.
+            await reportUnsentHandBackAborted(entry, notPosted, releaseError)
           }
+        } else {
+          // The other three reasons change nothing about this row here, so no invariant binds the
+          // evidence to a state change and the best-effort write is the right default: a failed log
+          // must not turn a settled outcome into an unsettled one.
+          await logActivity({ ...unsentPostEvidence(entry, notPosted), resolveUser: false })
         }
         result.skipped++
         continue
@@ -3598,35 +3765,13 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
 
       if (syncResult.notPosted) {
         const notPosted = syncResult.notPosted
-        // LOG FIRST (o3d-jit6 r4). This activity row is the evidence the later refusal tells an
-        // operator to look for, and the release below makes the row claimable again — so writing it
-        // afterwards would open a gap in which another worker can meet the marker with no trace of
-        // why it stands. r3 handed the JOB back before logging; the row could not move, so the order
-        // did not matter. It does now.
-        await logActivity({
-          entityType: 'SYSTEM',
-          action: notPosted.reason === 'lease-expired'
-            ? 'xero_sync_lease_expired_before_post'
-            : notPosted.reason === 'dispatch-unrecorded'
-              ? 'xero_sync_dispatch_unrecorded_before_post'
-              // o3d-jit6 r3: THE ONLY DURABLE TRACE that a create was recorded and then not sent.
-              // The refusal a later attempt makes names this action and tells an operator to look
-              // for it before they go hunting in the ledger.
-              : notPosted.reason === 'transport-refused'
-                ? 'xero_sync_transport_refused_before_post'
-                : 'xero_sync_claim_lost_before_post',
-          tag: 'sync',
-          level: 'WARNING',
-          description: notPosted.message,
-          metadata: {
-            syncLogId: entry.id,
-            type: entry.type,
-            outboxJobId: job.id,
-            operation: notPosted.operation,
-            reason: notPosted.reason,
-          },
-          resolveUser: false,
-        })
+        // LOG FIRST (o3d-jit6 r4) is now LOG IN THE SAME TRANSACTION (r5): this activity row is what
+        // the later refusal tells an operator to look for, and the release below makes the row
+        // claimable again, so the gap in which another worker can meet the marker with no trace of
+        // why it stands must not merely be narrow — it must not exist. r3 handed the JOB back before
+        // logging; the row could not move, so the order did not matter. It does now, and ordering
+        // alone was never enough to secure it.
+        //
         // The lock may itself be what was lost, in which case handing the job back cannot work — say
         // so rather than letting the fence's own throw escape into the generic failure handler and
         // spend a retry on a row that was never posted.
@@ -3643,21 +3788,30 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             // `nextAttemptAt` now, NOT through markXeroOutboxRetry: that one counts the attempt
             // against MAX_RETRIES and its first backoff floor is five minutes, which would burn the
             // replay window it is supposed to be racing.
+            // o3d-jit6 r5 (Codex HIGH): AND THE EVIDENCE IS THE THIRD MEMBER OF THAT TRANSACTION.
+            //
+            // r4 wrote it with `logActivity` — which SWALLOWS ITS OWN FAILURES — from outside this
+            // block, so the release and the requeue could commit while the only durable trace of the
+            // refusal was silently lost. The ordering r4 chose was the right one and could not
+            // enforce itself. THE SAME hand-back body as the direct runner now writes all three,
+            // and it does not catch: an unwritable record aborts the lot rather than letting two of
+            // them proceed without it.
             await db.$transaction(async (tx) => {
-              // THE LEASE, NOT `held` — see the direct runner's note. The fence that minted the
-              // dispatch marker moved this row's claim instant, so the sweep's captured one matches
-              // nothing.
-              await releaseUnsentTransportRefusal(tx, entry.id, lease, attempt, notPosted.message)
-              await deferOutboxWithoutSpendingAnAttempt(tx, job, notPosted.message, 0)
+              await recordAndReleaseUnsentTransportRefusal(tx, { entry, notPosted, lease, attempt, job })
             })
           } else {
+            // The other three reasons take the ordinary failure hand-back, which is not the
+            // marker-and-replay-window state the invariant is about, so the evidence stays
+            // best-effort: a failed log must not stop a job being handed back.
+            await logActivity({ ...unsentPostEvidence(entry, notPosted, job.id), resolveUser: false })
             await markXeroOutboxRetry(job, notPosted.message)
           }
         } catch (releaseError) {
-          console.error(
-            `[xero-sync] outbox job ${job.id} could not be handed back after a lost claim `
-              + `(${notPosted.reason}): ${String(releaseError)}`,
-          )
+          // ABORTED, AND SAID SO — see reportUnsentHandBackAborted. On the transport-refusal path all
+          // three writes rolled back together, so the row AND the job wait for their own stale-lock
+          // sweeps and no worker meets the marker without the trace, because no worker meets the
+          // marker at all until then.
+          await reportUnsentHandBackAborted(entry, notPosted, releaseError, job.id)
         }
         result.skipped++
         continue
