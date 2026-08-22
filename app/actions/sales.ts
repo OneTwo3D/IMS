@@ -2809,17 +2809,18 @@ export async function retryRefundAccounting(
       accountingSettings,
     })
 
-    // o3d-2sm1 (Codex r4): THE STATEMENT THE DATABASE GUARDS.
+    // o3d-2sm1: THE STATEMENT THAT CLEARS THE ACCOUNTING INVARIANT'S ONLY BOUND.
     //
-    // This clears the accounting invariant's only bound, and in the binary that precedes this one it
-    // ran on rows whose reversals had been staged and lost — the retry reported success having
-    // queued nothing, and this write then erased the last mark that anything was owed. It is
-    // unreachable that way from here (`retrySalesOrderRefundAccounting` refuses both
-    // `staged-never-recorded` and `undecidable` before returning success, and every success path
-    // leaves a recorded sync list on the row for the guard to see), but a BEFORE UPDATE trigger in
-    // 20260822090000 refuses it anyway when the witness says STAGED and neither the row nor this
-    // statement carries a record — because the rule has to bind the binary that has never heard of
-    // it. A deliberate manual clear declares itself with `SET LOCAL ims.reversal_settled_manually`.
+    // In the binary that precedes this one, this write ran on rows whose reversals had been staged
+    // and lost: the retry read the nulled deferral as "nothing was owed", reported success having
+    // queued nothing, and this statement then erased the last mark that anything was outstanding —
+    // taking the row outside `where: { accountingRetryRequired: true }` for good.
+    //
+    // It is safe HERE because `retrySalesOrderRefundAccounting` refuses both `staged-never-recorded`
+    // and `undecidable` before it can return success, so every path that reaches this line has a
+    // recorded sync list behind it. It is NOT safe in the predecessor, and nothing in this branch
+    // makes it so — a rule in the database would have to span the release window, which is where
+    // three attempts at one came apart. That is a deployment change and it is filed as o3d-2sm1.1.
     await db.salesOrderRefund.update({
       where: { id: result.refundId },
       data: {

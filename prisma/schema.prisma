@@ -1956,10 +1956,13 @@ model SalesOrderRefund {
   // commits or rolls back with the event it describes. NULL is neither: the column did not exist
   // when the row was written, and the row is UNDECIDABLE — never "nothing was staged".
   //
-  // Both values are ALSO written by BEFORE triggers shipped in the same migration as the column, and
-  // that is what makes the NULL reading sound: a migration lands before the build that knows about
-  // it, so for the length of every deploy the old binary inserts refunds omitting this column. The
-  // triggers stamp those rows too, so NULL can only ever mean "written before the column existed".
+  // THOSE TWO STATEMENTS ARE THE ONLY WRITERS. The migration adds the column and ships nothing else
+  // — no trigger, no default, no backfill. A migration lands before the build that knows about it is
+  // serving, so across every release the old binary inserts refunds omitting this column and those
+  // rows land NULL; three rounds of this work tried to have the database stamp them and each needed
+  // a guarantee spanning the deploy window. NULL is therefore left meaning "no writer spoke for this
+  // row", which every reader treats as undecidable rather than as an absence of staging. Closing the
+  // window is a deployment change, filed as o3d-2sm1.1.
   //
   // Nullable with NO DEFAULT, and never backfilled. A default would be a value, and it would be the
   // database vouching for stagings it did not witness — which is the whole reason the boolean this

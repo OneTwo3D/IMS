@@ -34,7 +34,8 @@
  * written by the two transactions that actually see the events.
  *
  *   NOT_STAGED  written by the INSERT in `createSalesOrderRefund`, in the transaction that creates
- *               the refund row, and by NOTHING ELSE — no trigger mints it, deliberately (see below).
+ *               the refund row, and by NOTHING ELSE — the migration ships no trigger that could mint
+ *               it, deliberately (see below).
  *               It says: this row was born under code that keeps this column, and as of its birth no
  *               staging has committed for it. That is only credible from a writer that also keeps
  *               the column at staging time, which is why the claim is the application's to make and
@@ -47,51 +48,35 @@
  *   NULL        no writer ever spoke for this row: the column did not exist when it was written.
  *               UNDECIDABLE. Not "nothing was staged".
  *
- * WHICH WRITERS THE DATABASE CAN SPEAK FOR, AND WHICH IT CANNOT (Codex r2 HIGH, corrected by r3
- * CRITICAL). Migrations are applied before the build that knows about them is serving, so for the
- * length of every deploy an OLD binary is writing refunds into the new schema, omitting the column
- * it has never heard of. Rows it mints land NULL, and they are minted by exactly the code that still
- * has the two-commit bug. Round 2 tried to close that with two database triggers. Only one of them
- * could work, and the other was actively harmful:
+ * WHICH WRITERS THIS COLUMN CAN SPEAK FOR, AND WHICH IT CANNOT. Migrations are applied before the
+ * build that knows about them is serving, so for the length of every release an OLD binary is
+ * writing refunds into the new schema, omitting the column it has never heard of. Rows it mints land
+ * NULL — and they are minted by exactly the code that still has the two-commit bug.
  *
- *   THE STAGING MINT SURVIVES, for one writer. The migration's BEFORE UPDATE trigger stamps 'STAGED'
- *   when `accountingAllocatedReliefAmount` MOVES, so a build that writes the relief amount without
- *   knowing about this column — a #635-era build, which is a real possible predecessor since #635 is
- *   merged and undeployed — is witnessed structurally: its staging UPDATE moves that column in the
- *   same transaction as, and one statement before, the un-stage.
- *
- *   THE BIRTH MINT IS GONE. It stamped 'NOT_STAGED' on any row arriving without a state — which is
- *   never the new build (it supplies the value) and always a writer whose later staging this database
- *   cannot see. A PRE-#635 binary writes NOTHING to this table while staging; its only write is the
- *   un-stage of `sales_orders`. So the birth mint could not witness that binary's staging, but it
- *   HAD already stamped its rows 'NOT_STAGED' — and 'NOT_STAGED' reads as `nothing-lost` below. A
- *   reversal staged and lost mid-window came out of it certified fine. Removing it leaves such a row
- *   NULL, which is `undecidable`, which every reader here refuses rather than waves through.
+ * THE COLUMN IS WRITTEN BY THIS APPLICATION AND BY NOTHING ELSE. Three successive rounds of this
+ * work tried to close that window with database triggers — an INSERT mint, an UPDATE mint, then a
+ * BEFORE UPDATE trigger refusing the predecessor's clearing statement — and each was right about the
+ * hole and wrong about where the rule could live. A trigger can only witness what the writer in
+ * front of it actually does, and the predecessor across this window writes nothing to this table
+ * while staging; a refusal needs an escape for a legitimate manual settle, and that escape was
+ * reachable from restore SQL; and the migration outlives a rollback, so the rows such a guard would
+ * falsely accuse are not bounded by the window either. Every attempt was the same problem in new
+ * clothes: a witness trying to make a guarantee that spans a DEPLOY WINDOW. That is a deployment
+ * change, not a schema one, and it is filed as o3d-2sm1.1 rather than approximated here.
  *
  * SO NULL MEANS ONE OF TWO THINGS, AND THE MODULE CLAIMS NO MORE: the row predates the column, or it
- * was written by a binary this database could not witness. Both are undecidable and both are treated
+ * was written by a binary that does not set it. Both are undecidable and both are treated
  * identically — refused by the retry, named by the invariant. What NULL never means is "nothing was
- * staged". See prisma/migrations/20260822090000_refund_reversal_staging_state/migration.sql for the
- * full argument, including why a trigger on `sales_orders` cannot rescue the pre-#635 case and why
- * this branch does not ask for a write outage instead.
+ * staged".
  *
- * AND THE PROTECTIONS THAT SENTENCE NAMES ARE IN THIS BINARY ONLY (Codex r4, CRITICAL). Across the
- * window the PREDECESSOR is serving, and its retry does not refuse anything: it reads the nulled
- * deferral as "nothing was owed", reports success, and its caller writes
- * `accountingRetryRequired: false` with a NULL sync list. That flag is the accounting invariant's
- * only bound, so the predecessor can EXONERATE a row before the refusing code below ever ships, and
- * a cleared row cannot be found again by anything. Losing reversals until it is replaced is what any
- * unfixed binary does; destroying the witness this branch introduced is specific, and it is closed
- * where the predecessor cannot reach past it — a BEFORE UPDATE trigger in the same migration refuses
- * the clear on exactly the rows this module calls `staged-never-recorded`, term for term, unless the
- * transaction declares `SET LOCAL ims.reversal_settled_manually = 'on'`. It is unreachable from this
- * build, whose own retry refuses those rows first.
- *
- * WHAT THAT DOES NOT CLOSE: a row with NO witness. The guard has nothing to stand on there and does
- * not fire, deliberately — refusing every clear of a flagged row with no recorded syncs would be
- * inference from contents, on legacy rows an operator legitimately settles. So a pre-#635
- * predecessor's window rows can still be cleared by it, and once cleared they are outside the
- * invariant's bound and unrecoverable. That residual is stated in the migration, not papered over.
+ * THE RESIDUAL, EXACTLY. The retry that refuses and the invariant that names both live in THIS
+ * binary. Across the release window the PREDECESSOR is serving, and its retry does not refuse
+ * anything: it reads the nulled deferral as "nothing was owed", reports success, and its caller
+ * writes `accountingRetryRequired: false` with a NULL sync list. That flag is the accounting
+ * invariant's only bound. So a predecessor's own retry can still clear the flag on an undecidable
+ * row, and once it has, the row is outside the bound and UNRECOVERABLE — not by this module, not by
+ * the invariant, not by any later sweep. That is a real limitation of deploying a fix, not a claim
+ * this branch can make good on; see the migration and o3d-2sm1.1.
  *
  * DELIBERATELY NOT BACKFILLED, and the migration adds the column with no DEFAULT for exactly this
  * reason. Setting `NOT_STAGED` (or `STAGED`) on the rows that are already there from what they look

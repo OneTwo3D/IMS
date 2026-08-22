@@ -2642,11 +2642,9 @@ async function stageRefundAccountingReversals(
         // inside this transaction — so it commits with the un-stage or rolls back with it. It is
         // what lets a later reader tell "this refund's staging committed" from "the column did not
         // exist when this row was written", which no nullable amount on this row can say: NULL is
-        // the same on both. The migration mints the same value from a BEFORE UPDATE trigger keyed on
-        // `allocatedReliefAmount` MOVING, which covers the one other writer that moves it — a
-        // #635-era build that has the relief column but not this one. It does NOT cover a build from
-        // before #635: that one writes nothing to this table while staging, so no trigger on it can
-        // witness anything, and its rows are left undecidable rather than guessed at (Codex r3).
+        // the same on both. This statement and the INSERT in `createSalesOrderRefund` are the ONLY
+        // writers of the column — the migration adds it and nothing else; a build that does not
+        // know it leaves NULL, which reads as undecidable rather than being guessed at.
         // See lib/domain/sales/refund-reversal-record.ts.
         reversalStagingState: REVERSAL_STAGING_STAGED,
       },
@@ -3834,12 +3832,10 @@ export async function createSalesOrderRefund(
         // o3d-2sm1 (Codex r1): the OTHER half of the witness. This transaction sees the row come
         // into existence, so it can attest that as of now nothing has been staged for it — and,
         // more importantly, that this row was born under code that keeps the column at all. That
-        // is what makes a NULL here mean "written before the column existed" rather than "nothing
+        // is what makes a NULL here mean "no writer ever spoke for this row" rather than "nothing
         // was staged", and it is only true because it is written at INSERT and never backfilled.
-        // The migration writes the same value from a BEFORE INSERT trigger, which is what extends
-        // the guarantee to the writer this statement cannot speak for: the OLD binary, still
-        // creating refunds for the length of every deploy against a schema that already has the
-        // column (Codex r2).
+        // A binary that does not write it leaves NULL, and NULL is undecidable — never exonerated
+        // by a default and never minted for it by the database.
         reversalStagingState: REVERSAL_STAGING_NOT_STAGED,
       },
       select: { id: true },
@@ -4581,16 +4577,15 @@ export async function retrySalesOrderRefundAccounting(
             error: 'This refund\'s accounting reversals were staged but the record of them was never '
               + 'written, and the same staging cleared the order\'s revenue deferral — so no retry can '
               + 'derive them again. Raise the COGS/unearned/allocated-inventory reversals manually against '
-              + 'the refund\'s own cost snapshots and reconcile the order before clearing this flag. The '
-              + 'database refuses a bare clear on this row (o3d-2sm1 r4), so clear it from a transaction '
-              + 'that declares SET LOCAL ims.reversal_settled_manually = \'on\'.',
+              + 'the refund\'s own cost snapshots and reconcile the order, then clear this flag by hand.',
           }
         }
         // -----------------------------------------------------------------------------------------
         // o3d-2sm1 (Codex r1): UNDECIDABLE REFUSES TOO, AND THE RISK THAT BUYS IS THE CHEAP ONE.
         //
-        // This row predates `reversalStagingState`, so the database cannot say whether its staging
-        // committed. The two errors available are not comparable:
+        // Nothing spoke for this row's staging — it predates `reversalStagingState`, or it was
+        // written by a binary that does not set it — so the database cannot say whether that
+        // staging committed. The two errors available are not comparable:
         //
         //   Proceeding wrongly is IRREVERSIBLE. "Proceed" here does not re-derive anything — it
         //   returns success with an empty sync list, and `retryRefundAccounting` then writes
@@ -4606,29 +4601,16 @@ export async function retrySalesOrderRefundAccounting(
         //
         // Asymmetric and irreversible against recoverable and cheap: fail closed, the standing
         // choice on this path since o3d-mrwu (absent data must not be read as a positive fact on an
-        // irreversible path). The set is bounded and no longer grows in normal operation: every
-        // refund this build creates carries a witness from birth, and the migration's trigger mints
-        // one for a #635-era build that moves the relief amount without knowing this column.
+        // irreversible path).
         //
-        // IT IS NOT EMPTY, AND THE HONEST VERSION OF THAT SENTENCE MATTERS (Codex r3). Across the
-        // window between the migration being applied and this build serving, a PRE-#635 binary writes
-        // nothing to `sales_order_refunds` while staging — only the un-stage of `sales_orders` — so
-        // no trigger on this table can witness it, and the rows it mints in that window are
-        // undecidable and land here. Round 2 claimed a trigger closed that; it did not, and the
-        // trigger it used stamped those rows as fine. Refusing them is the whole point: the window
-        // is minutes, the refusal costs a manual clear, and the alternative was the drop above.
-        //
-        // AND THIS REFUSAL IS THIS BINARY'S, WHICH IS NOT THE ONE SERVING IN THAT WINDOW (Codex r4).
-        // The predecessor's retry does not reach this branch at all — it has none of it. It reports
-        // success on the same row and its caller clears `accountingRetryRequired`, the accounting
-        // invariant's only bound, so the row it just lost becomes unfindable. For a row the database
-        // WITNESSED as staged, the migration's second trigger refuses that clear outright, which is
-        // the same rule as the `staged-never-recorded` branch above put where a binary that has never
-        // heard of it still obeys it. For a row with NO witness — the pre-#635 case this paragraph is
-        // about — there is nothing to stand a refusal on, and the honest statement is that such a row
-        // can still be exonerated by the predecessor and is then gone for good. The migration says so
-        // in those words rather than claiming the window is closed.
-        // -----------------------------------------------------------------------------------------
+        // THE SET IS NOT EMPTY, AND SAYING SO HONESTLY IS THE POINT. Every refund THIS build creates
+        // carries a witness from birth, so it does not grow in normal operation. It does grow across
+        // a release: the predecessor writes refunds into the migrated schema without the column, and
+        // those rows arrive here. Worse, the predecessor's own retry never reaches this branch at
+        // all — it reports success on the same row and its caller clears the flag, so a row it just
+        // lost becomes unfindable. No rule on this table can stop that: three attempts at one are
+        // recorded in the migration, and each needed a guarantee that spans a deploy window. Closing
+        // it means stopping the predecessor before migrating, which is o3d-2sm1.1, not this file.
         if (recordVerdict === 'undecidable') {
           return {
             success: false,

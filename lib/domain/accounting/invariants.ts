@@ -907,13 +907,11 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
   // which is windowed by `refundedAt` and needs a posted shipment. Nothing here can invent them
   // back; what it can do is stop the set growing.
   //
-  // WHICH IS WHY THE FLAG IS DEFENDED IN THE DATABASE AND NOT ONLY HERE (Codex r4). A pre-fix retry
-  // is not only history: it is what serves between this branch's migration being applied and this
-  // build starting, and it clears the bound on rows it has just lost. 20260822090000 refuses that
-  // clear for a row whose witness says its staging committed and whose syncs were never recorded —
-  // the `staged-never-recorded` shape below — so those rows are still here to be reported. A row
-  // with no witness has nothing to refuse on, so the `undecidable` set below can still be silently
-  // cleared by that predecessor, and once it is, this report is not the thing that finds it.
+  // AND A PRE-FIX RETRY IS NOT ONLY HISTORY: it is what serves between this branch's migration being
+  // applied and this build starting, and it clears the bound on rows it has just lost. Nothing on
+  // this table stops it — the migration ships no trigger, for reasons it sets out at length — so a
+  // row cleared in that window is not reported here or anywhere else. That window is closed by
+  // deploying differently (o3d-2sm1.1), not by this query.
   //
   // The un-stage having HAPPENED is part of the test, exactly as it is in the retry: a refund whose
   // staging committed while the order is still A1-deferred lost its syncs too, but a retry re-derives
@@ -938,7 +936,8 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       // -----------------------------------------------------------------------------------------
       // o3d-2sm1 (Codex r1): SAID, NOT CLAIMED — AND NOT DROPPED.
       //
-      // This row predates `reversalStagingState`, so nothing in the database distinguishes "staging
+      // Nothing spoke for this row's staging — it predates `reversalStagingState`, or it was written
+      // by a binary that does not set it — so nothing in the database distinguishes "staging
       // committed and its record was lost" from "staging never ran". Reporting it as the critical
       // above would be a fabricated accusation on every historical row that still owes accounting,
       // and the critical has to stay trustworthy because it is the only thing that says a reversal
@@ -946,17 +945,17 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       //
       // So it gets its own code and its own severity: a standing warning naming a row an operator
       // has to decide by hand, against the ledger. It is bounded (the flag is the query's bound) and
-      // it barely grows — every refund this build creates carries a witness from birth, and the
-      // migration's BEFORE UPDATE trigger mints one for a #635-era build that moves the relief
-      // amount without knowing this column — and it clears when the operator clears the flag, which
-      // is the same act that answers the question.
+      // it clears when the operator clears the flag, which is the same act that answers the question.
       //
-      // WHAT STILL ADDS TO IT, SAID PLAINLY (Codex r3): the window between the migration being
-      // applied and the new build serving, when the predecessor is a PRE-#635 binary. That binary writes
-      // nothing to `sales_order_refunds` while staging, so nothing on this table can witness it, and
-      // a refund it leaves owing accounting arrives here as a warning rather than a decided row.
-      // That is the correct outcome and the reason this code exists: round 2 shipped an INSERT
-      // trigger that decided those rows instead, and it decided them `nothing-lost`.
+      // WHAT STILL ADDS TO IT, SAID PLAINLY: the window between the migration being applied and the
+      // new build serving. The predecessor creates refunds without the column, so its rows arrive
+      // here as warnings rather than decided rows — which is the correct outcome, and the reason
+      // this branch ships no trigger that would decide them instead. An earlier round shipped one
+      // that did, and it decided them `nothing-lost`.
+      //
+      // AND THE HONEST HALF OF THAT SENTENCE: the predecessor's own retry can clear the flag on such
+      // a row, which takes it outside this query's bound entirely. This report is then not the thing
+      // that finds it, and nothing else is either. See o3d-2sm1.1.
       // -----------------------------------------------------------------------------------------
       findings.push({
         severity: 'warning',
