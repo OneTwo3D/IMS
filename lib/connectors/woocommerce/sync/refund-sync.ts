@@ -12,7 +12,7 @@ import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idem
 import { REFUND_TOTAL_EPSILON } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { FULL_REFUND_RATIO } from '@/lib/domain/sales/refund-thresholds'
-import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
+import { activeRefundParkWhere, WC_REFUND_PARK_RECORD_KIND } from '@/lib/domain/sales/refund-park-recovery'
 // o3d-w00 (Codex r7 #3): shared with the exception inbox's hand-recording path — see refund-line-link.
 import { refundedOrderLineId } from './refund-line-link'
 export { refundedOrderLineId }
@@ -441,6 +441,10 @@ async function upsertRefundPark(
     entityType: 'SalesOrder',
     entityId: input.soId,
     externalId: input.externalId,
+    // o3d-xnwu r8: the row SAYS what it is. Everything that means "an actionable refund park" asks
+    // for this value by name, so it is written on the create AND on the update — a park that lost
+    // its stamp would be a park the recovery inbox cannot see.
+    recordKind: WC_REFUND_PARK_RECORD_KIND,
     errorMessage: input.errorMessage,
     syncedAt: new Date(),
     ...(input.payload !== undefined ? { payload: input.payload as never } : {}),

@@ -24,6 +24,8 @@ type ParkRow = {
   direction: string
   entityType: string
   status: string
+  /** o3d-xnwu r8: the column that says WHICH family this row is — a park, or an invoice hold. */
+  recordKind: string | null
   entityId: string | null
   externalId: string | null
   errorMessage: string | null
@@ -312,6 +314,7 @@ function parkRow(over: Partial<ParkRow> = {}): ParkRow {
     direction: 'FROM_CONNECTOR',
     entityType: 'SalesOrder',
     status: 'FAILED',
+    recordKind: 'WC_REFUND_PARK',
     entityId: 'order-B',
     externalId: '7001',
     errorMessage: 'WooCommerce refund 7001 amount mismatch',

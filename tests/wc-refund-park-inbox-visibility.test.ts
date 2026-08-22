@@ -36,6 +36,8 @@ type ParkRow = {
   direction: string
   entityType: string
   status: string
+  /** o3d-xnwu r8: the column that says WHICH family this row is — a park, or an invoice hold. */
+  recordKind: string | null
   entityId: string | null
   externalId: string | null
   errorMessage: string | null
@@ -334,6 +336,7 @@ function parkRow(over: Partial<ParkRow> = {}): ParkRow {
     direction: 'FROM_CONNECTOR',
     entityType: 'SalesOrder',
     status: 'FAILED',
+    recordKind: 'WC_REFUND_PARK',
     // Parked against the WRONG order — the state the "Wrong order" recovery exists for.
     entityId: 'so-B',
     externalId: '7001',
@@ -454,6 +457,7 @@ test('[o3d-xnwu r7] the pending-FX queue is still told apart — by a column IMS
     direction: 'FROM_CONNECTOR',
     entityType: 'SalesOrder',
     status: 'PENDING',
+    recordKind: null,
     entityId: null,
     externalId: '1001',
     errorMessage: 'waiting for a EUR rate',
@@ -473,4 +477,142 @@ test('[o3d-xnwu r7] the pending-FX queue is still told apart — by a column IMS
     false,
     'while the refund park is NOT — otherwise the FX retry sweep stamps it FAILED over its own error text',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu r8 (Codex HIGH) — THE POSITIVE DEFINITION WAS NOT A REFUND DEFINITION.
+//
+// r7 above replaced an exclusion with a positive predicate, which was the right move. But every
+// clause in it — connector, direction, entityType 'SalesOrder', an actionable status, entityId NOT
+// NULL — is also written by `holdWcSalesInvoiceForMissingNumber`, the hold that keeps a sales
+// invoice back until WooCommerce assigns it a number. So an invoice hold was admitted as an
+// ACTIONABLE REFUND PARK: listed in the recovery inbox, counted in its badge, and offered "Wrong
+// order" and "Dismiss".
+//
+// Neither of those is survivable. A REASSIGN moves the row onto another IMS order as a PENDING
+// park — an invoice payload attached to a stranger's order, and the true order's hold gone. A
+// DISMISS flips it SYNCED, which is precisely how a hold is retired once its invoice was released;
+// the release sweep then finds nothing, and the order is never invoiced.
+//
+// AND THE COLLISION RUNS BOTH WAYS, with the write on the other side. `heldSalesInvoiceQueueWhere`
+// told holds apart by `payload.reason`, and a park's payload is the RAW WOOCOMMERCE REFUND whose
+// `reason` is free text a human types — the same fact r7 was about. A park whose reason read
+// `missing_wc_invoice_number` was selected by the hold's own findFirst-and-update.
+//
+// The fix is a column IMS writes and the store cannot reach: `recordKind`.
+// ---------------------------------------------------------------------------
+
+/** The reason string that makes the collision run in the OTHER direction. Also ordinary to type. */
+const HOSTILE_INVOICE_HOLD_REASON = 'missing_wc_invoice_number'
+
+/**
+ * A held sales invoice, exactly as `holdWcSalesInvoiceForMissingNumber` writes it — same connector,
+ * same direction, same entity type, PENDING, and the IMS order id in `entityId`. Only `recordKind`
+ * differs from a park, which is the whole point.
+ */
+function heldInvoiceRow(over: Partial<ParkRow> = {}): ParkRow {
+  return {
+    id: 'hold-1',
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    entityType: 'SalesOrder',
+    status: 'PENDING',
+    recordKind: 'WC_HELD_SALES_INVOICE',
+    entityId: 'so-A',
+    // The WooCommerce ORDER id — a hold is keyed to the order, a park to the refund.
+    externalId: '1001',
+    errorMessage: 'Waiting for _wcpdf_invoice_number on WooCommerce order 1001 before the sales invoice can be posted.',
+    payload: {
+      reason: HOSTILE_INVOICE_HOLD_REASON,
+      connector: 'woocommerce',
+      externalOrderId: '1001',
+      externalOrderNumber: '1001',
+      salesOrderId: 'so-A',
+      orderNumber: 'SO-1001',
+      metaKey: '_wcpdf_invoice_number',
+      accountingPayload: { total: '15.00' },
+    },
+    syncedAt: null,
+    createdAt: new Date('2026-08-05T11:00:00.000Z'),
+    ...over,
+  }
+}
+
+test('[o3d-xnwu r8] a held sales invoice is NOT listed or counted as an actionable refund park', async () => {
+  // (Revert evidence: drop `recordKind` from activeRefundParkWhere and this fails with 2 parks and
+  // a total of 2 — the invoice hold appears in the recovery inbox as a refund.)
+  state.parks.push(heldInvoiceRow())
+
+  const { getExceptionInboxData, getExceptionInboxSummary } = await inbox()
+
+  const summary = await getExceptionInboxSummary()
+  assert.equal(summary.refundSyncParks, 1, 'the genuine park, and only it')
+  assert.equal(summary.total, 1)
+
+  const data = await getExceptionInboxData()
+  assert.deepEqual(data.refundSyncParks.map((row) => row.id), ['log-1'], 'the invoice hold is not a refund park')
+})
+
+test('[o3d-xnwu r8] and the recovery refuses to act on one, so no invoice is reassigned or dismissed', async () => {
+  // The list is only half of it: `recoverRefundSyncPark` reads the SAME predicate, so a hold the
+  // inbox showed was a hold the recovery would have moved or closed.
+  //
+  // (Revert evidence: drop `recordKind` from activeRefundParkWhere and this fails — the DISMISS
+  // succeeds and the hold is stamped SYNCED, which is exactly how a released hold is retired, so
+  // the release sweep never comes back for it and the order is never invoiced.)
+  state.parks.push(heldInvoiceRow())
+  const { recoverRefundSyncPark } = await inbox()
+
+  const dismissed = await recoverRefundSyncPark('hold-1', { observedOrderId: 'so-A', outcome: 'DISMISS' })
+  assert.equal(dismissed.success, false)
+  assert.equal((dismissed as { code?: string }).code, 'park_not_actionable')
+
+  const reassigned = await recoverRefundSyncPark('hold-1', { observedOrderId: 'so-A', outcome: 'REASSIGN', wcOrderId: 2002 })
+  assert.equal(reassigned.success, false)
+  assert.equal((reassigned as { code?: string }).code, 'park_not_actionable')
+
+  const hold = state.parks.find((row) => row.id === 'hold-1')
+  assert.equal(hold?.status, 'PENDING', 'the hold is untouched — still waiting for its number')
+  assert.equal(hold?.entityId, 'so-A', 'and still on its own order')
+  assert.equal(hold?.errorMessage, heldInvoiceRow().errorMessage, 'with its own text, not a recovery note')
+})
+
+test('[o3d-xnwu r8] and the hold queue does not select a refund park, whatever the store typed as the reason', async () => {
+  // THE OTHER DIRECTION, AND IT IS THE ONE THAT WRITES. holdWcSalesInvoiceForMissingNumber does a
+  // findFirst on this predicate and UPDATES what it finds; the release sweep rewrites the
+  // errorMessage of what it finds. Selecting on the store's `reason` meant a park could be either.
+  //
+  // (Revert evidence: drop `recordKind` from heldSalesInvoiceQueueWhere and the first assertion
+  // fails — the park matches the hold queue on its own order, and the next import of that order
+  // overwrites the refund evidence with an invoice payload.)
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+
+  // A park whose operator typed the hold's marker into WooCommerce's refund dialog, sitting on the
+  // very order an import would look for a hold on.
+  const hostilePark = parkRow({
+    id: 'log-2',
+    status: 'PENDING',
+    entityId: 'so-A',
+    payload: wcRefund({ reason: HOSTILE_INVOICE_HOLD_REASON }),
+  })
+  state.parks.push(hostilePark)
+  state.parks.push(heldInvoiceRow())
+
+  const holdWhere = heldSalesInvoiceQueueWhere({ salesOrderId: 'so-A' }) as unknown as Record<string, unknown>
+
+  assert.equal(
+    matches(hostilePark as unknown as Record<string, unknown>, holdWhere),
+    false,
+    'a refund park is never the invoice-hold queue, however its reason reads',
+  )
+  assert.equal(
+    matches(heldInvoiceRow() as unknown as Record<string, unknown>, holdWhere),
+    true,
+    'and the genuine hold still is — the control, or the predicate could just be broken',
+  )
+
+  // …and the park is still a park, on the same store, at the same time.
+  const { getExceptionInboxData } = await inbox()
+  const data = await getExceptionInboxData()
+  assert.deepEqual(data.refundSyncParks.map((row) => row.id).sort(), ['log-1', 'log-2'])
 })

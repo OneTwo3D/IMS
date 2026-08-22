@@ -1612,3 +1612,44 @@ test('a monetary-only quarantine claims no units (o3d-w00 Codex r7 #3)', async (
   assert.equal(park?.status, 'QUARANTINED')
   assert.doesNotMatch(String(park?.errorMessage), /unit\(s\)/)
 })
+
+test('the park the sweep writes carries the stamp the recovery inbox selects on (o3d-xnwu r8)', async () => {
+  // THE WRITER AND THE READER, IN ONE TEST. r8 made `activeRefundParkWhere` ask for
+  // `recordKind = 'WC_REFUND_PARK'`, because a held sales invoice matched every other clause. That
+  // predicate is only as good as the write: a park the sweep did not stamp is a park the recovery
+  // inbox cannot see, and an unseen park HOLDS the refund delivery for ever (the cross-order guard
+  // refuses and waits for a recovery nobody can perform). So the two are pinned together here
+  // rather than separately.
+  //
+  // (Revert evidence: drop `recordKind` from upsertRefundPark's `data` and the last assertion fails
+  // — the row the sweep just wrote is not one `activeRefundParkWhere` would return.)
+  const { activeRefundParkWhere } = await import('@/lib/domain/sales/refund-park-recovery')
+
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: { ...makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2 }), taxRatePercent: null },
+  })
+  const refund = makeRefund({ id: 7301, amount: '120.00', line_items: [], shipping_lines: [] })
+
+  await syncWcRefund(1001, refund, state.dependencies)
+
+  const park = state.syncLogs.at(-1) as { data?: Record<string, unknown> }
+  assert.ok(park?.data, 'a park was written')
+  assert.equal(park.data.recordKind, 'WC_REFUND_PARK', 'the row says which family it belongs to')
+
+  // And it satisfies the predicate the inbox, the cross-order guard and the park upsert all read —
+  // asserted against the predicate itself, so a change to either side that breaks the pairing fails
+  // here rather than in production.
+  const where = activeRefundParkWhere() as unknown as Record<string, unknown>
+  const row = park.data
+  assert.equal(row.connector, where.connector)
+  assert.equal(row.direction, where.direction)
+  assert.equal(row.entityType, where.entityType)
+  assert.equal(row.recordKind, where.recordKind)
+  assert.notEqual(row.entityId, null)
+  assert.equal(
+    (where.status as { in: string[] }).in.includes(row.status as string),
+    true,
+    'and in an actionable status, or the inbox never shows it',
+  )
+})

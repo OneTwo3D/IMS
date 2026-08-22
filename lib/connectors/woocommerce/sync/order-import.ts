@@ -15,6 +15,7 @@ import { decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } fro
 import {
   buildHeldSalesInvoicePayload,
   buildReleasedSalesInvoicePayload,
+  HELD_SALES_INVOICE_RECORD_KIND,
   heldSalesInvoiceQueueWhere,
   isHeldSalesInvoicePayload,
   releasedSalesInvoiceQueueWhere,
@@ -990,6 +991,9 @@ async function holdWcSalesInvoiceForMissingNumber(params: {
     entityType: 'SalesOrder',
     entityId: params.salesOrderId,
     externalId: String(params.wcOrder.id),
+    // o3d-xnwu r8: the hold names its own family, so it is neither admitted by the refund-park
+    // predicate (which would offer refund recoveries on an invoice) nor able to select a park.
+    recordKind: HELD_SALES_INVOICE_RECORD_KIND,
     payload: jsonPayload,
     errorMessage: `Waiting for ${params.metaKey} on WooCommerce order ${params.wcOrder.number} before the sales invoice can be posted.`,
     syncedAt: null,

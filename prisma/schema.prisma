@@ -2715,6 +2715,29 @@ model ShoppingSyncLog {
   syncedAt     DateTime?
   createdAt    DateTime              @default(now())
 
+  // o3d-xnwu r8 (Codex HIGH) — WHICH FAMILY OF ROW THIS IS, said in a column IMS owns.
+  //
+  // `entityType` says what the row is ABOUT; this says what the row IS. They are different
+  // questions, and until r8 the second one had no column to live in. This table keeps several
+  // distinct row families that share connector/direction/entityType/status, and each one grew its
+  // own way of being told apart: the pending-FX queue and the admission-refusal queue by having NO
+  // entityId, the refund park by HAVING one. That last discriminator stopped working the moment a
+  // second family with an entityId appeared — the held sales invoice — and the refund-park
+  // predicate, which is the one the recovery inbox offers refund actions from, admitted it.
+  //
+  // WHY NOT payload. A refund park PERSISTS THE RAW WOOCOMMERCE REFUND, whose fields are the
+  // store's and whose `reason` is free text a human types. Selecting or excluding rows on it is
+  // the exact defect r7 fixed (an operator's refund reason hid their own park), and it is
+  // bidirectional: a park whose reason happened to read `missing_wc_invoice_number` was selected
+  // by the held-invoice queue, which UPDATES the rows it finds. A discriminator has to be a
+  // column, and it has to be one only IMS ever writes.
+  //
+  // Nullable, and a value here is a POSITIVE assertion by the writer. It is never decided by
+  // absence: NULL means "an ordinary sync log, or a row written before this column existed", not
+  // "a park". Every predicate that reads it asks for its own value by name, so a new family that
+  // forgets to stamp is invisible to the others rather than silently inheriting one of them.
+  recordKind   String?
+
   // Polymorphic reference: use entityType + entityId for application-level lookups.
   // No FK constraints — entityId may point to Product or SalesOrder based on entityType.
 

@@ -64,13 +64,51 @@ export function isRecoverableRefundParkStatus(status: string): status is Recover
 }
 
 /**
+ * WHAT THIS ROW IS — the value a refund park stamps into `recordKind` (o3d-xnwu r8, Codex HIGH).
+ *
+ * `entityType` says what the row is ABOUT (a sales order). This says what the row IS. They are
+ * different questions and r7's predicate could only ask the first one, which is why it admitted a
+ * held sales invoice — see {@link activeRefundParkWhere}.
+ *
+ * Written by `upsertRefundPark` and by nothing else, and read by every predicate that means "an
+ * actionable refund park". It is an assertion the writer makes about its own row, never an
+ * inference from what a row lacks.
+ */
+export const WC_REFUND_PARK_RECORD_KIND = 'WC_REFUND_PARK'
+
+/**
  * THE ONE PREDICATE THAT SAYS "THIS ROW IS AN ACTIVE REFUND PARK" — AND IT SAYS SO POSITIVELY
  * (o3d-xnwu r7, Codex HIGH).
  *
  * Every column here is written by IMS. `connector`, `direction` and `entityType` are literals the
  * refund sync supplies; `entityId` is the IMS sales-order id a park is BY DEFINITION attached to;
- * `status` is the actionable set. Nothing an operator can type into WooCommerce appears in it, and
- * nothing is decided by ABSENCE. That is the whole point of the shape.
+ * `status` is the actionable set; `recordKind` is the row's own statement of which family it
+ * belongs to. Nothing an operator can type into WooCommerce appears in it, and nothing is decided
+ * by ABSENCE. That is the whole point of the shape.
+ *
+ * AND IT IS REFUND-SPECIFIC, WHICH r7 WAS NOT (o3d-xnwu r8, Codex HIGH). r7 was right that the
+ * definition had to be positive, and right that `entityId` was the column separating a park from
+ * the pending-FX queue and the admission-refusal queue — both of which have none. It was wrong that
+ * this made the predicate a REFUND predicate. A held sales invoice (o3d-k26m.6,
+ * `holdWcSalesInvoiceForMissingNumber`) writes the same connector, the same direction, the same
+ * `SalesOrder` entity type, PENDING, and the IMS order id in `entityId`, so it satisfied all five
+ * clauses. The recovery inbox listed an invoice hold as a refund park and offered "Wrong order" and
+ * "Dismiss" on it — a REASSIGN would have moved an invoice payload onto another order as a PENDING
+ * park, and a DISMISS would have closed a hold on an invoice nothing then posts.
+ *
+ * WHY A NEW COLUMN AND NOT AN EXISTING ONE. There was no existing one. `shopping_sync_logs` carries
+ * connector, direction, status, entityType, entityId, externalId, payload, errorMessage, syncedAt
+ * and createdAt — no action, no reason code, no kind — and the hold matches this park on every one
+ * of the five that are not free text. `syncedAt` happens to differ (a park is written with one, a
+ * hold with NULL), and was rejected: it means "when this synced", so an unsettled PENDING park
+ * carrying one is an accident of the writer rather than a distinction, and a recovery inbox built
+ * on it would empty itself the day somebody tidied it up.
+ *
+ * AND NOT THE PAYLOAD, WHICH IS THE DEFECT r7 FIXED. The park's payload is the STORE'S. The hold's
+ * marker lives at `payload.reason`, and `reason` on a WooCommerce refund is free text a human types
+ * — so excluding holds by it would let an operator who wrote `missing_wc_invoice_number` hide their
+ * own park, exactly as `missing_fx_rate` did. The collision runs both ways and the other way
+ * WRITES, which is why `heldSalesInvoiceQueueWhere` now carries its own `recordKind` too.
  *
  * WHAT IT REPLACED, and why the replacement is not a tidy-up. The exception inbox used to select
  * parks by excluding rows whose payload's top-level `reason` was the pending-FX queue marker. A
@@ -94,6 +132,7 @@ export function activeRefundParkWhere(): {
   direction: 'FROM_CONNECTOR'
   entityType: string
   entityId: { not: null }
+  recordKind: typeof WC_REFUND_PARK_RECORD_KIND
   status: { in: RecoverableRefundParkStatus[] }
 } {
   return {
@@ -101,9 +140,12 @@ export function activeRefundParkWhere(): {
     direction: 'FROM_CONNECTOR',
     entityType: 'SalesOrder',
     // A park is evidence ABOUT AN IMS ORDER, so it always names one. This is also what the partial
-    // unique index requires, and what separates a park from every other FROM_CONNECTOR/SalesOrder
-    // row this table holds (a failed import, a pending-FX queue row) — none of which has one.
+    // unique index requires, and what separates a park from the row families that have NO entityId
+    // (a failed import, a pending-FX queue row, an admission refusal).
     entityId: { not: null },
+    // …and this is what separates it from the one family that DOES have one: the held sales
+    // invoice. The row says which family it belongs to; nothing here infers it (r8).
+    recordKind: WC_REFUND_PARK_RECORD_KIND,
     status: { in: [...RECOVERABLE_REFUND_PARK_STATUSES] },
   }
 }
