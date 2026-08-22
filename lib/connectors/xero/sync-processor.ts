@@ -34,7 +34,7 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
-import { CREATE_DISPATCH_REPLAY_MARGIN_MS, describeCreateDispatchNotSent, planCreateDispatch, type CreateDispatchMint } from '@/lib/domain/accounting/create-dispatch-record'
+import { CREATE_DISPATCH_REPLAY_MARGIN_MS, describeCreateDispatchNotSent, planCreateDispatch, readCreateDispatchAge, type CreateDispatchAge, type CreateDispatchMint } from '@/lib/domain/accounting/create-dispatch-record'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
@@ -2465,9 +2465,20 @@ function unsentPostEvidence(
   entry: { id: string; type: string },
   notPosted: NonNullable<EntryResult['notPosted']>,
   outboxJobId?: string,
+  /**
+   * o3d-jit6 r8: THE DETERMINISTIC IDENTITY OF THE HAND-BACK THAT WROTE THIS ROW, on the one path
+   * that has one. It is what lets a retry whose COMMIT landed but whose acknowledgement was lost
+   * recognise its own committed work instead of reporting the row permanently stranded — see
+   * {@link unsentHandBackOperationId} and {@link findRecordedUnsentHandBack}.
+   */
+  handBackId?: string,
 ) {
   return {
     entityType: 'SYSTEM' as const,
+    // o3d-jit6 r8: NAMED ON THE ROW, not only inside the metadata. This is the row an operator is
+    // sent to find, and it is the row the ambiguous-commit probe must look up cheaply — `entityType`
+    // + `entityId` is an index, a JSON scan of every activity row is not.
+    entityId: entry.id,
     action: notPosted.reason === 'lease-expired'
       ? 'xero_sync_lease_expired_before_post'
       : notPosted.reason === 'dispatch-unrecorded'
@@ -2487,12 +2498,35 @@ function unsentPostEvidence(
       ...(outboxJobId ? { outboxJobId } : {}),
       operation: notPosted.operation,
       reason: notPosted.reason,
+      ...(handBackId ? { handBackId } : {}),
     },
   }
 }
 
 /** The three tables one unsent-refusal hand-back touches, and nothing else. */
 type UnsentRefusalTransactionClient = Pick<Prisma.TransactionClient, 'activityLog' | 'accountingSyncLog' | 'integrationOutbox'>
+
+/**
+ * THE DETERMINISTIC NAME OF ONE HAND-BACK (o3d-jit6 r8, Codex MEDIUM).
+ *
+ * A retried transaction can COMMIT and still fail: the connection drops between the commit and its
+ * acknowledgement, and the caller sees only a rejection. Round 7 named that residual honestly and
+ * then paid its full price — the next attempt met an already-released row, aborted on the outbox
+ * fence, and the sequence reported the work PERMANENTLY STRANDED at an operator when it had in fact
+ * been handed back. A false alarm pointed at a human is not a cheaper failure than the one it
+ * replaces.
+ *
+ * So the hand-back carries an identifier it can recognise afterwards, and the identifier is derived
+ * rather than generated: the ROW, the exact CLAIM INSTANT the release is fenced on, and the ATTEMPT
+ * the operator-fence is taken against. Those three are precisely what make this hand-back the one it
+ * is, they are fixed for the whole retry sequence — no fence runs during it, so `heldFrom()` cannot
+ * move — and any OTHER sequence, on this row or another, necessarily differs in one of them. A
+ * random id would have to be threaded through and could not be re-derived by a later reader; a
+ * derived one is the same on every attempt by construction.
+ */
+export function unsentHandBackOperationId(entryId: string, lease: HeldClaim, attempt: AttemptRef): string {
+  return `${entryId}:${lease.heldFrom().toISOString()}:${attempt.attemptRevision}`
+}
 
 /**
  * THE WHOLE HAND-BACK, AS ONE TRANSACTION BODY — SHARED BY BOTH RUNNERS (o3d-jit6 r5, Codex HIGH).
@@ -2554,7 +2588,13 @@ export async function recordAndReleaseUnsentTransportRefusal(
 ): Promise<{ released: boolean }> {
   // EVIDENCE FIRST — inside the transaction, so the order is now belt as well as braces.
   await logActivityInTransaction(tx, {
-    ...unsentPostEvidence(args.entry, args.notPosted, args.job?.id),
+    // o3d-jit6 r8: AND IT CARRIES THE HAND-BACK'S OWN NAME. The evidence row is the only member of
+    // this commit a later reader can identify unambiguously, so it is what makes the whole commit
+    // detectable to a retry whose acknowledgement went missing.
+    ...unsentPostEvidence(
+      args.entry, args.notPosted, args.job?.id,
+      unsentHandBackOperationId(args.entry.id, args.lease, args.attempt),
+    ),
     // No session exists on either runner; both are cron-driven. `resolveUser: false` is the
     // best-effort helper's way of saying this, and this one takes the answer directly.
     userId: null,
@@ -2591,7 +2631,12 @@ async function reportUnsentHandBackAborted(
   notPosted: NonNullable<EntryResult['notPosted']>,
   error: unknown,
   outboxJobId?: string,
-  exhaustion?: { attempts: number; abandoned: UnsentHandBackAbandonment },
+  exhaustion?: {
+    attempts: number
+    abandoned: UnsentHandBackAbandonment
+    /** r8: whether the wall-time bound was the marker's real one, or the fallback from entry. */
+    deadlineAnchor?: UnsentHandBackDeadline['anchor']
+  },
 ): Promise<void> {
   // o3d-jit6 r7: HOW HARD IT TRIED, AND WHAT THE ROW IS NOW. An operator meeting the marker's
   // permanent refusal later needs both: that this was not one unlucky statement, and that the row
@@ -2629,7 +2674,13 @@ async function reportUnsentHandBackAborted(
       operation: notPosted.operation,
       reason: notPosted.reason,
       abortedBy: String(error),
-      ...(exhaustion ? { handBackAttempts: exhaustion.attempts, abandoned: exhaustion.abandoned } : {}),
+      ...(exhaustion
+        ? {
+          handBackAttempts: exhaustion.attempts,
+          abandoned: exhaustion.abandoned,
+          ...(exhaustion.deadlineAnchor ? { deadlineAnchor: exhaustion.deadlineAnchor } : {}),
+        }
+        : {}),
     },
     resolveUser: false,
   })
@@ -2656,23 +2707,44 @@ async function reportUnsentHandBackAborted(
  * writes the evidence, releases under the same lease fence and defers the same job, or rolls all
  * three back again.
  *
- * AND THE RETRIES ARE BOUNDED TWICE OVER, because the thing being raced is a deadline.
- * `UNSENT_HANDBACK_MAX_ATTEMPTS` caps the attempts; `UNSENT_HANDBACK_RETRY_BUDGET_MS` caps the WALL
- * TIME, at a tenth of the usable replay window, and the next pause is checked against it BEFORE it is
- * taken — so the retry sequence can never consume the window it exists to get back inside. Whichever
- * bound is reached first, the sequence stops and the caller reports the exhaustion.
+ * AND THE SEQUENCE IS BOUNDED BY A DEADLINE, NOT BY A BUDGET IT GRANTS ITSELF AT ENTRY (r8, Codex
+ * HIGH). `UNSENT_HANDBACK_MAX_ATTEMPTS` still caps the attempts. The wall-time bound is now an
+ * ABSOLUTE INSTANT derived from `createDispatchedAt` — the marker's own DATABASE-clock stamp, which is
+ * when the replay window actually opened — so the time already spent between the mint and this
+ * hand-back is time the sequence does not get to spend a second time. r7 computed its budget at entry
+ * and then checked only the REQUESTED delay before sleeping, which bounded nothing it did not itself
+ * choose: a slow attempt, or a sleep that took longer than it asked for, carried the sequence past the
+ * very window it exists to protect while every check it made still passed. So the ELAPSED time is
+ * measured before EVERY attempt — which is also after every sleep — and what remains is passed DOWN
+ * into the attempt as its own transaction timeout, so an attempt cannot outlive the deadline either.
  *
- * THE RESIDUAL, SAID PLAINLY: if an attempt's COMMIT succeeded but its acknowledgement was lost, the
- * next attempt re-writes the evidence row (a duplicate, not a loss), releases nothing — the lease
- * fence matches the row it already released — and, on the queued runner, throws on the outbox fence
- * that no longer matches. The sequence then reports an abort for a hand-back that in fact happened.
- * A duplicated WARNING and an over-stated ERROR are strictly better than a stranded row, which is why
- * the bound is retried at all.
+ * THE FIRST ATTEMPT IS NEVER SKIPPED, however late the marker already is. Declining to try leaves the
+ * row PROCESSING for the full stale cutoff with no evidence written at all, which is strictly worse
+ * than a hand-back that lands late: the late one still records why the marker stands and still returns
+ * the row to PENDING, where the next tick can at least meet an honest refusal.
+ *
+ * AND AN AMBIGUOUS COMMIT IS NO LONGER REPORTED AS PERMANENT STRANDING (r8, Codex MEDIUM). r7 named
+ * this residual and then paid its full price: an attempt whose COMMIT succeeded and whose
+ * ACKNOWLEDGEMENT was lost had already written the evidence, released the row and requeued the job —
+ * and the sequence then re-ran, met the already-released row, threw on the outbox fence that no longer
+ * matched, and told an operator the work was permanently stranded. It was not stranded; it was done.
+ * A false alarm pointed at a human is not a cheaper failure than the one it replaces. So the hand-back
+ * carries a deterministic name ({@link unsentHandBackOperationId}) written into the evidence row, and
+ * a failed attempt ASKS THE DATABASE whether that name is already recorded. If it is, the hand-back
+ * happened: the sequence returns success, no second attempt duplicates the evidence, and nobody is
+ * sent looking for a row that is already back in the queue.
  */
 export type UnsentHandBackAbandonment = 'attempts-exhausted' | 'budget-exhausted'
 
 export type UnsentHandBackOutcome =
-  | { handedBack: true; released: boolean; attempts: number }
+  /** The hand-back committed on this run, and `released` is what its fenced release matched. */
+  | { handedBack: true; released: boolean; attempts: number; alreadyRecorded: false }
+  /**
+   * The hand-back was found ALREADY RECORDED after an attempt failed ambiguously: an earlier attempt
+   * committed and its acknowledgement was lost. `released` is null because this run did not perform
+   * the release and must not claim to know what it matched — the commit that did is the authority.
+   */
+  | { handedBack: true; released: null; attempts: number; alreadyRecorded: true }
   | { handedBack: false; attempts: number; error: unknown; abandoned: UnsentHandBackAbandonment }
 
 /** Attempts of the COMPLETE hand-back transaction, including the first. */
@@ -2684,36 +2756,178 @@ export const UNSENT_HANDBACK_RETRY_BASE_DELAY_MS = 250
  * `XERO_IDEMPOTENCY_KEY_RETENTION_MS - CREATE_DISPATCH_REPLAY_MARGIN_MS`, derived rather than retyped
  * so that shortening the window shortens this with it. The refusal happens within seconds of the
  * mint, so spending at most a tenth of what remains cannot be what closes it.
+ *
+ * r8: this is a LENGTH, and the deadline it produces is measured FROM THE MARKER (see
+ * {@link unsentHandBackDeadline}), not from whenever the hand-back happened to start.
  */
 export const UNSENT_HANDBACK_RETRY_BUDGET_MS =
   Math.floor((XERO_IDEMPOTENCY_KEY_RETENTION_MS - CREATE_DISPATCH_REPLAY_MARGIN_MS) / 10)
+/**
+ * The floor under a single attempt's own bound. A transaction handed a timeout of a millisecond
+ * cannot write three rows, so an already-overrun deadline would turn the last permitted attempt into
+ * a guaranteed abort — a bound that manufactures the failure it is measuring.
+ */
+export const UNSENT_HANDBACK_MIN_ATTEMPT_MS = 1_000
+/** How long an attempt may wait for a connection before it counts as failed; never past its own bound. */
+export const UNSENT_HANDBACK_MAX_WAIT_MS = 2_000
+
+/**
+ * The instant past which no FURTHER attempt may begin, and what it is anchored to.
+ *
+ * `anchor` is reported rather than inferred: an operator reading an exhausted sequence needs to know
+ * whether the deadline was the real one (the marker's) or the fallback the code had to invent because
+ * the marker could not be read.
+ */
+export type UnsentHandBackDeadline = { atMs: number; anchor: 'dispatch-marker' | 'hand-back-entry' }
+
+/**
+ * ANCHOR THE DEADLINE ON THE MARKER'S OWN TIMESTAMP (r8, Codex HIGH).
+ *
+ * `age` is a DURATION measured entirely on the database's clock (see `readCreateDispatchAge`), so
+ * subtracting it from the budget converts "a tenth of the usable window" from a promise the sequence
+ * makes to itself into the deadline the row is actually under. `atMs` may already be in the past when
+ * the marker is old; the loop still makes its first attempt, because not handing the row back at all
+ * is the worse end.
+ */
+export function unsentHandBackDeadline(nowMs: number, age: CreateDispatchAge): UnsentHandBackDeadline {
+  if (!age.known) return { atMs: nowMs + UNSENT_HANDBACK_RETRY_BUDGET_MS, anchor: 'hand-back-entry' }
+  return { atMs: nowMs + (UNSENT_HANDBACK_RETRY_BUDGET_MS - age.elapsedMs), anchor: 'dispatch-marker' }
+}
+
+/** What one attempt may spend: the measured remainder, floored so it can work and capped by the budget. */
+export function unsentHandBackAttemptBudgetMs(remainingMs: number): number {
+  return Math.min(Math.max(remainingMs, UNSENT_HANDBACK_MIN_ATTEMPT_MS), UNSENT_HANDBACK_RETRY_BUDGET_MS)
+}
 
 export async function retryUnsentHandBack(
-  run: () => Promise<{ released: boolean }>,
-  deps: { sleep?: (ms: number) => Promise<void>; monotonicMs?: () => number } = {},
+  /** Runs the COMPLETE hand-back transaction, bounded by the time it is given. */
+  run: (attemptBudgetMs: number) => Promise<{ released: boolean }>,
+  deps: {
+    sleep?: (ms: number) => Promise<void>
+    monotonicMs?: () => number
+    /** Defaults to a budget from entry — the r7 behaviour — only when no marker could be read. */
+    deadline?: UnsentHandBackDeadline
+    /** "Did an earlier attempt's hand-back already commit?" Defaults to "no idea", i.e. no. */
+    recordedHandBack?: () => Promise<boolean>
+  } = {},
 ): Promise<UnsentHandBackOutcome> {
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   const monotonicMs = deps.monotonicMs ?? (() => Date.now())
-  const startedAt = monotonicMs()
+  const deadlineAtMs = deps.deadline?.atMs ?? monotonicMs() + UNSENT_HANDBACK_RETRY_BUDGET_MS
+  const recordedHandBack = deps.recordedHandBack ?? (async () => false)
   let attempts = 0
+  let lastError: unknown = undefined
   for (;;) {
+    // MEASURED, NOT REQUESTED, AND CHECKED HERE — which is before every attempt AND after every
+    // sleep. r7 checked only the delay it was about to ask for, so an attempt that overran its share
+    // of the budget, or a pause that slept longer than it requested, was never noticed at all.
+    const remainingMs = deadlineAtMs - monotonicMs()
+    if (attempts > 0 && remainingMs <= 0) {
+      return { handedBack: false, attempts, error: lastError, abandoned: 'budget-exhausted' }
+    }
     attempts++
     try {
-      const { released } = await run()
-      return { handedBack: true, released, attempts }
+      // AND THE ATTEMPT CANNOT OUTLIVE THE DEADLINE EITHER: what is left is handed down as the
+      // transaction's own bound, so a hung statement ends the attempt instead of the window.
+      const { released } = await run(unsentHandBackAttemptBudgetMs(remainingMs))
+      return { handedBack: true, released, attempts, alreadyRecorded: false }
     } catch (error) {
+      lastError = error
+      // AN AMBIGUOUS COMMIT IS NOT AN EXHAUSTED ONE. Asked BEFORE the bounds are consulted and before
+      // a retry is made, so a hand-back that committed is neither duplicated nor reported stranded.
+      // A probe that cannot answer says "no", which is exactly the r7 behaviour it replaces.
+      if (await recordedHandBack()) {
+        return { handedBack: true, released: null, attempts, alreadyRecorded: true }
+      }
       if (attempts >= UNSENT_HANDBACK_MAX_ATTEMPTS) {
         return { handedBack: false, attempts, error, abandoned: 'attempts-exhausted' }
       }
-      // CHECKED BEFORE THE PAUSE IS TAKEN, not after: a budget that is only noticed once it has been
-      // overspent is not a bound on the window.
+      // CHECKED BEFORE THE PAUSE IS TAKEN as well as after it: a pause that would land past the
+      // deadline is not worth taking, and the check above catches one that overran anyway.
       const delayMs = UNSENT_HANDBACK_RETRY_BASE_DELAY_MS * 2 ** (attempts - 1)
-      if (monotonicMs() - startedAt + delayMs >= UNSENT_HANDBACK_RETRY_BUDGET_MS) {
+      if (monotonicMs() + delayMs >= deadlineAtMs) {
         return { handedBack: false, attempts, error, abandoned: 'budget-exhausted' }
       }
       await sleep(delayMs)
     }
   }
+}
+
+/**
+ * DID THE HAND-BACK ALREADY COMMIT? (o3d-jit6 r8, Codex MEDIUM.)
+ *
+ * The evidence row is the only member of the hand-back transaction that carries the sequence's own
+ * deterministic name, so it is the one thing a later reader can identify unambiguously — the released
+ * row and the requeued job look the same whoever released them. Because all three commit together,
+ * finding the named evidence row proves the whole hand-back landed.
+ *
+ * The action is asked of the shared evidence builder rather than spelt out again: one name for that
+ * row, written in one place, read in one place.
+ *
+ * BEST-EFFORT ON PURPOSE. A probe that throws answers "not recorded", which is precisely the r7
+ * outcome — an over-stated abort report — rather than a new failure mode. It must never be the thing
+ * that turns a hand-back into an exception.
+ */
+async function findRecordedUnsentHandBack(args: {
+  entry: { id: string; type: string }
+  notPosted: NonNullable<EntryResult['notPosted']>
+  handBackId: string
+}): Promise<boolean> {
+  try {
+    const { entityType, entityId, action } = unsentPostEvidence(args.entry, args.notPosted)
+    const found = await db.activityLog.findFirst({
+      where: {
+        entityType,
+        entityId,
+        action,
+        metadata: { path: ['handBackId'], equals: args.handBackId },
+      },
+      select: { id: true },
+    })
+    return found !== null
+  } catch {
+    return false
+  }
+}
+
+/**
+ * SAY THAT AN ACKNOWLEDGEMENT WAS LOST — and that the work was NOT (o3d-jit6 r8, Codex MEDIUM).
+ *
+ * Silence here would be defensible: the row is back in the queue and nothing needs doing. But the
+ * sequence took a rejection from the database and then decided it did not mean what it said, and that
+ * is worth a line an operator can find later — not least because the same conditions that lose an
+ * acknowledgement lose other things too. WARNING, not ERROR: nothing is stranded.
+ */
+async function reportUnsentHandBackAcknowledgementLost(
+  entry: { id: string; type: string },
+  notPosted: NonNullable<EntryResult['notPosted']>,
+  attempts: number,
+  handBackId: string,
+  outboxJobId?: string,
+): Promise<void> {
+  await logActivity({
+    entityType: 'SYSTEM',
+    entityId: entry.id,
+    action: 'xero_sync_transport_refusal_handback_ack_lost',
+    tag: 'sync',
+    level: 'WARNING',
+    description: `[xero-sync] sync log ${entry.id}: attempt ${attempts} of the unsent-refusal hand-back `
+      + 'reported a failure, but the hand-back it describes is already recorded in the database — the '
+      + 'commit landed and only its acknowledgement was lost. The row was handed back: the refusal '
+      + 'evidence is written, the claim is released and (on the queued runner) the job is requeued. '
+      + 'NOTHING IS STRANDED and no operator action is needed; this is recorded because a rejection '
+      + 'that did not mean what it said is worth knowing about.',
+    metadata: {
+      syncLogId: entry.id,
+      type: entry.type,
+      ...(outboxJobId ? { outboxJobId } : {}),
+      operation: notPosted.operation,
+      reason: notPosted.reason,
+      handBackAttempts: attempts,
+      handBackId,
+    },
+    resolveUser: false,
+  })
 }
 
 /**
@@ -2735,15 +2949,32 @@ async function handBackUnsentTransportRefusal(args: {
   job?: IntegrationOutboxRow | null
 }): Promise<UnsentHandBackOutcome> {
   const { entry, notPosted, lease, attempt, job } = args
-  const outcome = await retryUnsentHandBack(() => db.$transaction(async (tx) => {
+  // THE DEADLINE IS ANCHORED WHERE THE WINDOW ACTUALLY OPENED (r8): the marker's own database-clock
+  // stamp, read as an ELAPSED DURATION so no instant crosses between clocks. Unreadable — or no marker
+  // at all — falls back to a budget from here, which is the r7 bound and never a longer one.
+  const deadline = unsentHandBackDeadline(Date.now(), await readCreateDispatchAge(db, entry.id))
+  // Derived from the row, the claim instant the release fences on and the attempt: the same on every
+  // pass of the sequence, and different for any other sequence.
+  const handBackId = unsentHandBackOperationId(entry.id, lease, attempt)
+  const outcome = await retryUnsentHandBack((attemptBudgetMs) => db.$transaction(async (tx) => {
     return recordAndReleaseUnsentTransportRefusal(tx, { entry, notPosted, lease, attempt, job })
-  }))
-  if (!outcome.handedBack) {
+  }, { timeout: attemptBudgetMs, maxWait: Math.min(attemptBudgetMs, UNSENT_HANDBACK_MAX_WAIT_MS) }), {
+    deadline,
+    recordedHandBack: () => findRecordedUnsentHandBack({ entry, notPosted, handBackId }),
+  })
+  if (outcome.handedBack) {
+    // A LOST ACKNOWLEDGEMENT IS NOT AN EXHAUSTION (r8): the work is done, and the line that says so
+    // is a WARNING about the database, not an ERROR about this row.
+    if (outcome.alreadyRecorded) {
+      await reportUnsentHandBackAcknowledgementLost(entry, notPosted, outcome.attempts, handBackId, job?.id)
+    }
+  } else {
     // ABORTED, AND SAID SO — see reportUnsentHandBackAborted, which now also names how many complete
-    // attempts were made and what state the row is left in.
+    // attempts were made, what the deadline was anchored to, and what state the row is left in.
     await reportUnsentHandBackAborted(entry, notPosted, outcome.error, job?.id, {
       attempts: outcome.attempts,
       abandoned: outcome.abandoned,
+      deadlineAnchor: deadline.anchor,
     })
   }
   return outcome

@@ -487,3 +487,59 @@ export async function planCreateDispatch(
     }
   }
 }
+
+/**
+ * HOW LONG THE REPLAY WINDOW HAS ALREADY BEEN RUNNING — MEASURED ENTIRELY ON THE DATABASE'S CLOCK
+ * (o3d-jit6 r8, Codex HIGH).
+ *
+ * The window a hand-back races did not start when the hand-back started. It started at
+ * `createDispatchedAt` — the instant the claim fence stamped as the create went out — and by the time
+ * a transport refusal has been classified, worded and carried back up to the runner, some of it is
+ * already gone. A budget computed from the hand-back's own entry therefore describes a window that no
+ * longer exists, and the further the refusal is from the mint the more of the real deadline it
+ * over-states. The marker's instant is the only honest anchor, because it IS the instant the window
+ * opened.
+ *
+ * WHAT CROSSES BETWEEN CLOCKS IS A DURATION, NEVER AN INSTANT. `clock_timestamp()` and
+ * `createDispatchedAt` are read from the SAME database in the same call, so their difference is a real
+ * elapsed time and is safe to hand to a host-side bound. Comparing the column against this host's own
+ * `new Date()` is the o3d-clxw defect, and this deliberately does not do it — see the header of
+ * {@link decideCreateDispatch} for why that comparison fails in the permissive direction.
+ *
+ * FAILS TO "UNKNOWN", NOT TO ZERO. A caller that cannot learn the age must fall back to its own
+ * entry-anchored bound rather than treat the budget as spent: refusing to hand the row back at all is
+ * strictly worse than handing it back a little late, because a row left PROCESSING is unclaimable for
+ * the whole stale cutoff — which is the very stranding the hand-back exists to prevent.
+ */
+export type CreateDispatchAge =
+  | { known: true; elapsedMs: number; dispatchedAt: Date }
+  | { known: false; reason: 'no-marker' | 'unreadable' | 'unorderable' }
+
+export async function readCreateDispatchAge(
+  client: CreateDispatchClient,
+  entryId: string,
+): Promise<CreateDispatchAge> {
+  try {
+    const clock = await client.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS "now"`
+    const now = clock?.[0]?.now
+    if (!(now instanceof Date) || Number.isNaN(now.getTime())) return { known: false, reason: 'unreadable' }
+
+    const row = await client.accountingSyncLog.findUnique({
+      where: { id: entryId },
+      select: { createDispatchedAt: true, createDispatchIdempotencyKey: true },
+    })
+    if (!row) return { known: false, reason: 'unreadable' }
+    // No marker means no replay window is standing over this row at all, so there is nothing for a
+    // deadline to be anchored to. That is a different answer from "could not read", and the caller
+    // says which one it got.
+    if (row.createDispatchedAt === null) return { known: false, reason: 'no-marker' }
+
+    const elapsedMs = now.getTime() - row.createDispatchedAt.getTime()
+    // THE SAME NON-NEGATIVE TEST `decideCreateDispatch` MAKES, for the same reason: an instant this
+    // instance cannot order against its own reading of the same clock is not evidence of anything.
+    if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return { known: false, reason: 'unorderable' }
+    return { known: true, elapsedMs, dispatchedAt: row.createDispatchedAt }
+  } catch {
+    return { known: false, reason: 'unreadable' }
+  }
+}

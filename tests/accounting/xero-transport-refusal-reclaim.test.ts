@@ -8,8 +8,12 @@ import {
   releaseUnsentTransportRefusal,
   retryUnsentHandBack,
   UNSENT_HANDBACK_MAX_ATTEMPTS,
+  UNSENT_HANDBACK_MIN_ATTEMPT_MS,
   UNSENT_HANDBACK_RETRY_BASE_DELAY_MS,
   UNSENT_HANDBACK_RETRY_BUDGET_MS,
+  unsentHandBackAttemptBudgetMs,
+  unsentHandBackDeadline,
+  unsentHandBackOperationId,
 } from '@/lib/connectors/xero/sync-processor'
 import {
   CREATE_DISPATCH_REPLAY_MARGIN_MS,
@@ -373,7 +377,7 @@ test('o3d-jit6 r5/r7: BOTH runners hand back through the ONE shared hand-back, e
   assert.ok(handBack.length > 0, 'the shared hand-back must be found')
   assert.match(
     handBack,
-    /retryUnsentHandBack\(\(\) => db\.\$transaction\(async \(tx\) => \{\s*\n\s*return recordAndReleaseUnsentTransportRefusal\(tx, \{ entry, notPosted, lease, attempt, job \}\)/,
+    /retryUnsentHandBack\(\(attemptBudgetMs\) => db\.\$transaction\(async \(tx\) => \{\s*\n\s*return recordAndReleaseUnsentTransportRefusal\(tx, \{ entry, notPosted, lease, attempt, job \}\)/,
     'the COMPLETE atomic hand-back is what is retried',
   )
   assert.match(
@@ -790,4 +794,297 @@ test('o3d-jit6 r7: the wall-time budget is checked BEFORE the pause, so the retr
   assert.equal(slept.length, 0, 'AND BEFORE THE PAUSE — a budget noticed after it is overspent is not a bound')
   assert.equal(outcome.handedBack, false)
   assert.equal(outcome.handedBack === false && outcome.abandoned, 'budget-exhausted')
+})
+
+/* ------------------------------------------------------------------------------------------------
+ * ROUND 8 — THE BOUND WAS NOT A BOUND, AND A FALSE ALARM WAS POINTED AT AN OPERATOR.
+ *
+ * r7 retried the complete hand-back and called it "bounded twice over". It was not. The wall-time
+ * bound accounted only for the delay it was ABOUT TO REQUEST: nothing measured how long an attempt
+ * actually took, nothing re-checked after a sleep, and the attempt itself carried no bound at all —
+ * so a slow transaction or an over-long pause carried the sequence past the replay window it exists
+ * to get back inside, with every check it made still passing. And the budget was granted at ENTRY, as
+ * if the window opened when the hand-back started rather than when the marker was stamped.
+ *
+ * r7 also named — and accepted — a residual that ended with an operator being told a row was
+ * permanently stranded when it had in fact been handed back: an attempt whose COMMIT landed and whose
+ * ACKNOWLEDGEMENT was lost.
+ *
+ * These pin both: a deadline anchored on the marker's own database-clock stamp and checked against
+ * MEASURED elapsed time before every attempt and after every sleep, an attempt that cannot outlive
+ * what is left, and a committed hand-back that is recognised as success rather than exhaustion.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The name this hand-back gives itself: the row, the claim instant it fences on, the attempt. */
+const HAND_BACK_ID = unsentHandBackOperationId('log-1', claimHeldFrom(T_DISPATCH), ATTEMPT)
+
+test('o3d-jit6 r8: the deadline is anchored on the marker, so time the window has already run is not re-granted', () => {
+  // The marker was stamped almost a whole budget ago by the time the refusal is being handed back —
+  // the transport hung, the refusal was classified, and all of that came out of the SAME window.
+  const nearlySpent = unsentHandBackDeadline(1_000, {
+    known: true,
+    elapsedMs: UNSENT_HANDBACK_RETRY_BUDGET_MS - 100,
+    dispatchedAt: T_DISPATCH,
+  })
+  assert.equal(nearlySpent.anchor, 'dispatch-marker')
+  assert.equal(nearlySpent.atMs, 1_100, 'what is left is the budget MINUS what the window has already run')
+  // r7's bound, for contrast: a full budget handed out at entry, however old the marker was.
+  assert.notEqual(
+    nearlySpent.atMs,
+    1_000 + UNSENT_HANDBACK_RETRY_BUDGET_MS,
+    'a budget computed at entry describes a window that no longer exists',
+  )
+
+  // A marker that cannot be read — or is not there — falls back to the entry-anchored bound, and
+  // never to a LONGER one: the fallback may only be as permissive as r7 already was.
+  for (const reason of ['no-marker', 'unreadable', 'unorderable'] as const) {
+    const fallback = unsentHandBackDeadline(1_000, { known: false, reason })
+    assert.equal(fallback.anchor, 'hand-back-entry', `${reason}: the report must say which bound was used`)
+    assert.equal(fallback.atMs, 1_000 + UNSENT_HANDBACK_RETRY_BUDGET_MS)
+  }
+})
+
+test('o3d-jit6 r8: a marker-anchored deadline stops a retry that the entry-anchored budget would have allowed', async () => {
+  async function sequenceUnder(deadline?: { atMs: number; anchor: 'dispatch-marker' | 'hand-back-entry' }) {
+    let calls = 0
+    const slept: number[] = []
+    const outcome = await retryUnsentHandBack(
+      () => {
+        calls++
+        return Promise.reject(new Error('deadlock detected'))
+      },
+      { sleep: async (ms) => { slept.push(ms) }, monotonicMs: () => 0, deadline },
+    )
+    return { calls, slept, outcome }
+  }
+
+  // The marker is 100ms from the end of the sequence's share of the window: there is no room for even
+  // the first pause, so the sequence stops rather than spending the window it is racing.
+  const anchored = await sequenceUnder({ atMs: 100, anchor: 'dispatch-marker' })
+  assert.equal(anchored.calls, 1, 'one attempt, and then the real deadline stopped it')
+  assert.deepEqual(anchored.slept, [], 'AND NOTHING WAS SLEPT — the pause was never affordable')
+  assert.equal(anchored.outcome.handedBack, false)
+  assert.equal(anchored.outcome.handedBack === false && anchored.outcome.abandoned, 'budget-exhausted')
+
+  // The same failures, the same clock, the entry-anchored fallback: three attempts and two pauses.
+  // That is the difference the anchor makes, stated as behaviour rather than as arithmetic.
+  const fromEntry = await sequenceUnder()
+  assert.equal(fromEntry.calls, UNSENT_HANDBACK_MAX_ATTEMPTS)
+  assert.equal(fromEntry.slept.length, UNSENT_HANDBACK_MAX_ATTEMPTS - 1)
+  assert.equal(fromEntry.outcome.handedBack === false && fromEntry.outcome.abandoned, 'attempts-exhausted')
+})
+
+test('o3d-jit6 r8: an attempt that overruns its share of the budget ends the sequence, and is given what is left', async () => {
+  const budgets: number[] = []
+  const slept: number[] = []
+  let nowMs = 0
+  let calls = 0
+
+  const outcome = await retryUnsentHandBack(
+    (attemptBudgetMs) => {
+      calls++
+      budgets.push(attemptBudgetMs)
+      // THE ATTEMPT ITSELF OVERRUNS. It requested no delay, so r7's check — which looked only at the
+      // pause it was about to ask for — could not see this at all.
+      nowMs += 8_000
+      return Promise.reject(new Error('could not serialize access due to concurrent update'))
+    },
+    {
+      sleep: async (ms) => { slept.push(ms) },
+      monotonicMs: () => nowMs,
+      deadline: { atMs: 10_000, anchor: 'dispatch-marker' },
+    },
+  )
+
+  assert.equal(calls, 2, 'the third attempt is not started: by then the deadline is 6s in the past')
+  assert.deepEqual(slept, [UNSENT_HANDBACK_RETRY_BASE_DELAY_MS], 'only the pause that was still affordable')
+  assert.equal(outcome.handedBack, false)
+  assert.equal(outcome.handedBack === false && outcome.abandoned, 'budget-exhausted')
+
+  // EACH ATTEMPT IS BOUNDED BY WHAT IS LEFT, so it cannot outlive the deadline on its own.
+  assert.equal(budgets[0], 10_000, 'the first attempt may spend the whole remainder')
+  assert.equal(budgets[1], 2_000, 'the second gets only what the first left behind')
+
+  // AND THE DEFECT, IN ITS OWN TERMS: r7 compared (elapsed + requested delay) against a budget granted
+  // at entry, and that comparison still passes here — which is why it never stopped anything.
+  assert.ok(
+    nowMs - 0 + UNSENT_HANDBACK_RETRY_BASE_DELAY_MS * 2 < UNSENT_HANDBACK_RETRY_BUDGET_MS,
+    "r7's own check would have permitted a third attempt long after the deadline had passed",
+  )
+})
+
+test('o3d-jit6 r8: a pause that sleeps longer than it asked for is caught AFTER the sleep, before the next attempt', async () => {
+  let nowMs = 0
+  let calls = 0
+  const slept: number[] = []
+
+  const outcome = await retryUnsentHandBack(
+    () => {
+      calls++
+      return Promise.reject(new Error('deadlock detected'))
+    },
+    {
+      // The pause was affordable when it was requested and was not when it ended — a stalled host, a
+      // saturated event loop, a suspended container. r7 never looked again.
+      sleep: async (ms) => { slept.push(ms); nowMs += 30_000 },
+      monotonicMs: () => nowMs,
+      deadline: { atMs: 10_000, anchor: 'dispatch-marker' },
+    },
+  )
+
+  assert.equal(calls, 1, 'NO ATTEMPT BEGINS AFTER THE DEADLINE — this is the check r7 did not make')
+  assert.deepEqual(slept, [UNSENT_HANDBACK_RETRY_BASE_DELAY_MS], 'the pause itself was legitimately taken')
+  assert.equal(outcome.handedBack, false)
+  assert.equal(outcome.handedBack === false && outcome.attempts, 1)
+  assert.equal(outcome.handedBack === false && outcome.abandoned, 'budget-exhausted')
+})
+
+test('o3d-jit6 r8: an attempt is given the measured remainder, floored so it can still do its work', () => {
+  assert.equal(unsentHandBackAttemptBudgetMs(5_000), 5_000, 'what is left is what it gets')
+  assert.equal(unsentHandBackAttemptBudgetMs(1), UNSENT_HANDBACK_MIN_ATTEMPT_MS, 'never less than it takes to write three rows')
+  assert.equal(
+    unsentHandBackAttemptBudgetMs(-9_000),
+    UNSENT_HANDBACK_MIN_ATTEMPT_MS,
+    'an already-overrun deadline must not manufacture the abort it is measuring',
+  )
+  assert.equal(
+    unsentHandBackAttemptBudgetMs(UNSENT_HANDBACK_RETRY_BUDGET_MS * 2),
+    UNSENT_HANDBACK_RETRY_BUDGET_MS,
+    'and never more than the sequence itself is allowed',
+  )
+})
+
+/* ------------------------------------------------------------------------------------------------
+ * ROUND 8 — THE MEDIUM: A LOST ACKNOWLEDGEMENT IS NOT A STRANDED ROW.
+ * ---------------------------------------------------------------------------------------------- */
+
+test('o3d-jit6 r8: a hand-back whose acknowledgement was lost is reported as HANDED BACK, not as stranded', async () => {
+  const w = makeWorld()
+  let calls = 0
+  const slept: number[] = []
+
+  const outcome = await retryUnsentHandBack(
+    async () => {
+      calls++
+      await w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+        entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+        notPosted: NOT_POSTED,
+        lease: claimHeldFrom(T_DISPATCH),
+        attempt: ATTEMPT,
+        job: JOB as never,
+      }))
+      // THE COMMIT LANDED AND THE ACKNOWLEDGEMENT DID NOT. Everything the hand-back had to do is
+      // done; the caller sees only a rejection, exactly as a dropped connection presents it.
+      throw new Error('connection terminated unexpectedly')
+    },
+    {
+      sleep: async (ms) => { slept.push(ms) },
+      monotonicMs: () => 0,
+      // The probe production uses: the evidence row carries the hand-back's deterministic name, and
+      // all three writes committed together, so finding it proves the whole hand-back landed.
+      recordedHandBack: async () => w.world().activity.some(
+        (row) => (row.metadata as { handBackId?: string } | undefined)?.handBackId === HAND_BACK_ID,
+      ),
+    },
+  )
+
+  assert.equal(outcome.handedBack, true, 'THE WORK WAS DONE — reporting it stranded is the false alarm')
+  assert.equal(outcome.handedBack === true && outcome.alreadyRecorded, true, 'and it is distinguished from a fresh commit')
+  assert.equal(outcome.handedBack === true && outcome.released, null, 'this run did not release, so it claims nothing about it')
+  assert.equal(calls, 1, 'detected before a second attempt duplicates the evidence or throws on the outbox fence')
+  assert.deepEqual(slept, [], 'and no pause is spent on work that has already happened')
+
+  const after = w.world()
+  assert.equal(after.activity.length, 1, 'exactly one evidence row — r7 wrote a second one on the retry')
+  assert.equal(after.activity[0].entityId, 'log-1', 'named on the row, so the probe is an index lookup')
+  assert.equal((after.activity[0].metadata as { handBackId?: string }).handBackId, HAND_BACK_ID)
+  assert.equal(after.sync.status, 'PENDING', 'the row really was handed back')
+  assert.equal(after.job.status, 'RETRYABLE_FAILED', 'and the job with it, in that same commit')
+  assert.equal(after.job.attempts, 2, 'still without spending an attempt')
+})
+
+test('o3d-jit6 r8: the identifier is deterministic across attempts and unique to this hand-back', () => {
+  assert.equal(
+    unsentHandBackOperationId('log-1', claimHeldFrom(T_DISPATCH), ATTEMPT),
+    HAND_BACK_ID,
+    'every attempt of one sequence derives the same name — nothing is generated and threaded through',
+  )
+  // A different row, a different claim instant, or a different attempt is a different hand-back, and
+  // none of them may be mistaken for this one.
+  assert.notEqual(unsentHandBackOperationId('log-2', claimHeldFrom(T_DISPATCH), ATTEMPT), HAND_BACK_ID)
+  assert.notEqual(unsentHandBackOperationId('log-1', claimHeldFrom(T_REFUSAL), ATTEMPT), HAND_BACK_ID)
+  assert.notEqual(
+    unsentHandBackOperationId('log-1', claimHeldFrom(T_DISPATCH), { ...ATTEMPT, attemptRevision: 5 }),
+    HAND_BACK_ID,
+  )
+})
+
+test('o3d-jit6 r8: without the probe, that same lost acknowledgement is exactly the false alarm r7 accepted', async () => {
+  // THE DEFECT, kept as a fact about the code rather than a story about it. Nothing here is mocked
+  // into failing: the retry meets its OWN committed work and cannot tell that is what it is.
+  const w = makeWorld()
+  let calls = 0
+
+  const outcome = await retryUnsentHandBack(
+    async () => {
+      calls++
+      const out = await w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+        entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+        notPosted: NOT_POSTED,
+        lease: claimHeldFrom(T_DISPATCH),
+        attempt: ATTEMPT,
+        job: JOB as never,
+      }))
+      if (calls === 1) throw new Error('connection terminated unexpectedly')
+      return out
+    },
+    { sleep: async () => {}, monotonicMs: () => 0 },
+  )
+
+  assert.equal(outcome.handedBack, false, 'the sequence reports exhaustion...')
+  assert.equal(outcome.handedBack === false && outcome.abandoned, 'attempts-exhausted')
+  assert.equal(calls, UNSENT_HANDBACK_MAX_ATTEMPTS)
+  // ...about a row that is sitting in PENDING with its evidence written and its job requeued. That
+  // report sends an operator to resolve a row that needs nothing.
+  const after = w.world()
+  assert.equal(after.sync.status, 'PENDING', 'THE WORK WAS DONE ALL ALONG')
+  assert.equal(after.activity.length, 1, 'and the later attempts rolled back, so not even a duplicate remains')
+  assert.equal(after.job.status, 'RETRYABLE_FAILED')
+})
+
+test('o3d-jit6 r8: the shared hand-back anchors on the marker, bounds the attempt, and probes for its own work', () => {
+  const source = readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
+  const handBack = source.slice(
+    source.indexOf('async function handBackUnsentTransportRefusal(args: {'),
+    source.indexOf('/**\n * HAND BACK A ROW THAT PROVABLY SENT NOTHING'),
+  )
+  assert.ok(handBack.length > 0, 'the shared hand-back must be found')
+
+  // The deadline comes from the marker's own database-clock stamp, read as an elapsed DURATION so no
+  // instant crosses between clocks (o3d-clxw). A `new Date()` compared against the column would be
+  // that defect returning.
+  assert.match(
+    handBack,
+    /unsentHandBackDeadline\(Date\.now\(\), await readCreateDispatchAge\(db, entry\.id\)\)/,
+    'the wall-time bound must be anchored on the marker, not on when the hand-back happened to start',
+  )
+  assert.match(
+    handBack,
+    /timeout: attemptBudgetMs/,
+    'and the attempt must be bounded by what is left, not by the default transaction timeout',
+  )
+  assert.match(
+    handBack,
+    /const handBackId = unsentHandBackOperationId\(entry\.id, lease, attempt\)/,
+    'the hand-back names itself from the row, the claim instant and the attempt',
+  )
+  assert.match(
+    handBack,
+    /recordedHandBack: \(\) => findRecordedUnsentHandBack\(\{ entry, notPosted, handBackId \}\)/,
+    'and an ambiguous failure asks the database whether that name is already recorded',
+  )
+  assert.ok(
+    !/throw /.test(handBack),
+    'it must still not throw into the per-entry catch: that spends a retry and FAILS a row that sent nothing',
+  )
 })
