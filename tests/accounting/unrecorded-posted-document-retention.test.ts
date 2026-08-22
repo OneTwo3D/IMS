@@ -1,11 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import {
-  QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
-  QBO_UNSETTLED_OPERATION_ACTION,
-  UNRECORDED_POSTED_DOCUMENT_ACTION,
-} from '@/lib/domain/accounting/unrecorded-posted-document'
+import { QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 
 // ---------------------------------------------------------------------------
@@ -84,25 +80,6 @@ test('o3d-peh1 r5: the QuickBooks unrecorded-document record is exempt too, for 
   // A DISTINCT string, not a reuse: the operator reading it has to know which ledger to look in, and
   // an exemption only protects the spelling it was given.
   assert.notEqual(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, UNRECORDED_POSTED_DOCUMENT_ACTION)
-})
-
-test('o3d-peh1 r6: the record of a no-id operation that could not be settled is exempt too', async () => {
-  // A DIFFERENT kind-(2) incident on the same connector: an attachment, PDF, email or WooCommerce note
-  // that ALREADY HAPPENED, on a row that could not be moved out of its claim. There is no external id
-  // to escalate here — the record IS the whole account of it, and it is also the only notice that a
-  // row is stuck. Ageing it out leaves a claimed row nobody knows to clear.
-  await purge()
-
-  const errorDelete = captured.find((query) => query.values[0] === 'ERROR')
-  const exempt = errorDelete!.values.find((value): value is string[] => Array.isArray(value))
-  assert.ok(
-    exempt!.includes(QBO_UNSETTLED_OPERATION_ACTION),
-    'the only record of a completed operation whose row is stuck must not be deleted by age',
-  )
-  // Distinct from BOTH document actions: this one is not about a document at all, and an operator
-  // searching for it is asking a different question.
-  assert.notEqual(QBO_UNSETTLED_OPERATION_ACTION, QBO_UNRECORDED_POSTED_DOCUMENT_ACTION)
-  assert.notEqual(QBO_UNSETTLED_OPERATION_ACTION, UNRECORDED_POSTED_DOCUMENT_ACTION)
 })
 
 test('Codex r2 medium 1: the exemption is inside the DELETE, not applied afterwards', async () => {

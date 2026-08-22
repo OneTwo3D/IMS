@@ -40,13 +40,9 @@ import {
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import {
-  QBO_UNMIRRORED_OPERATION_ACTION,
   QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
-  QBO_UNSETTLED_OPERATION_ACTION,
   describeUnpersistedQboPost,
-  describeUnsettledQboOperation,
   type UnpersistedQboPost,
-  type UnsettledQboOperation,
 } from '@/lib/domain/accounting/unrecorded-posted-document'
 import { redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import {
@@ -244,9 +240,6 @@ function postedRowRetryColumns(entry: { retryCount: number }, errorMessage: stri
     retryCount,
     errorMessage,
     processingStartedAt: null,
-    // A counted failure IS a recorded outcome, so the at-most-once fence is discharged with it
-    // (r7) — otherwise the ordinary bounded retry these columns exist to drive could never run.
-    ...ATTEMPT_OUTCOME_RECORDED,
   }
 }
 
@@ -348,8 +341,6 @@ async function persistFreshQboPost(
         // write (r10 finding 1) — the comment above is exactly why they have to: everything
         // after this transaction can die without the row ever being re-posted.
         ...followUpObligationClaim(),
-        // The attempt's outcome is now on record, so the at-most-once fence is discharged (r7).
-        ...ATTEMPT_OUTCOME_RECORDED,
       },
     })
     await updateMirroredEventForSyncLog(tx, {
@@ -383,225 +374,6 @@ function unpersistedQboPostRecord(incident: UnpersistedQboPost, description: str
       postedExternalId: incident.postedExternalId,
     }))),
   }
-}
-
-/* ---------------------------------------------------------------------------------------------
- * THE SPLIT (o3d-peh1 r6, Codex HIGH) — NOT EVERY SUCCESS IS A DOCUMENT POST.
- *
- * Round 5 gave EVERY successful result the re-drive-and-escalate treatment below. That treatment is
- * built on one sentence, and the sentence is written down in `describeUnpersistedQboPost`: the row is
- * left CLAIMED, so `CLAIM_STALE_MS` later it is re-claimed and re-posted UNDER THE SAME DERIVED
- * INTUIT REQUEST-ID, which is what makes the replay a deduplicated one rather than a second document.
- *
- * THAT SENTENCE IS FALSE OF FOUR OF THE TYPES THIS LOOP PROCESSES. BILL_ATTACHMENT, INVOICE_PDF,
- * INVOICE_EMAIL and WC_INVOICE_NOTE are not document posts at all. Look at their branches in
- * `processEntry`: `qboUploadAttachment` takes no request id, the PDF path downloads and saves a file,
- * INVOICE_EMAIL calls `sendAccountingInvoiceEmailInternal`, WC_INVOICE_NOTE calls `pushInvoiceNoteToWc`.
- * None of them goes anywhere near `qboPostIdempotent`, and every one of them returns
- * `{ success: true }` WITH NO EXTERNAL ID. So for these, "leave the row claimed and let the stale
- * claim replay it" is not a deduplicated replay — IT IS THE SIDE EFFECT AGAIN. An email sent again on
- * the next sweep, and the one after, and the one after that, for as long as the settling write keeps
- * failing. There is no bound on it anywhere: no retry is consumed, the row never leaves PROCESSING,
- * and nothing else in this loop is counting.
- *
- * SO THE SPLIT IS DRAWN ON WHAT CAME BACK, in this order, and each arm is the right one for its case:
- *
- *   • AN EXTERNAL ID CAME BACK  → the id is the thing that must become durable, and every branch that
- *     returns one posted under the derived Request-Id. Re-drive, then escalate. UNCHANGED.
- *   • NO ID, AND THE TYPE IS ONE OF THE FOUR ABOVE → there is no id to lose and no document to
- *     orphan, and the effect has already happened outside any deduplication. SETTLE IT, so it is
- *     never replayed. See `settleUnidentifiedQboOperationOrEscalate`.
- *   • NO ID, AND THE TYPE IS A DOCUMENT POST → a document post that came back without an id. We
- *     cannot rule out a document existing, so this keeps the escalating arm exactly as it was. That
- *     is also what makes the set below safe to be a NARROWING one: a type nobody adds to it keeps
- *     round 5's behaviour rather than silently acquiring the settling arm.
- * ------------------------------------------------------------------------------------------- */
-
-/**
- * The QuickBooks sync types whose `processEntry` branch legitimately returns success with NO external
- * id, because it posts no document and carries no Intuit Request-Id.
- *
- * A NARROWING list, read in exactly one place. Its members are the operations whose replay repeats a
- * real-world effect: an upload, a saved PDF, an EMAIL, a note written onto a WooCommerce order.
- */
-const QBO_OPERATIONS_WITHOUT_EXTERNAL_ID: ReadonlySet<AccountingSyncType> = new Set<AccountingSyncType>([
-  'BILL_ATTACHMENT',
-  'INVOICE_PDF',
-  'INVOICE_EMAIL',
-  'WC_INVOICE_NOTE',
-])
-
-/* ---------------------------------------------------------------------------------------------
- * ROUND 7 (Codex HIGH) — THE ESCALATION WAS A LOG LINE, NOT A FENCE.
- *
- * Round 6 settled a no-id operation instead of re-driving it, and that is right FOR AS LONG AS THE
- * NARROWED WRITE LANDS. When every narrowed write refuses, `settleUnidentifiedQboOperationOrEscalate`
- * files its record, returns false — and LEAVES THE ROW PROCESSING. Nothing else in the loop touches
- * it, so `CLAIM_STALE_MS` later the ordinary sweep reclaims it as a stale claim and runs the
- * operation again. The email goes out a second time, and a third, for as long as the store keeps
- * refusing: exactly the defect round 6 set out to remove, one layer further down.
- *
- * SO THE AT-MOST-ONCE PROPERTY IS MOVED OFF THE FAILING WRITER AND ONTO THE CLAIM. The claim is the
- * last write known to have landed — a row cannot be in `processEntry` at all unless it committed —
- * so it is the only place a fence for "no write will land" can be written. For these four types the
- * claim stamps `nonReplayableAttemptAt`, BEFORE anything is dispatched, and both the candidate scan
- * and the claim's own compare-and-swap require that column to be NULL.
- *
- * WHY AN ORDINARY SWEEP CANNOT UNDO IT. The sweep's only route back to the side effect is a fresh
- * claim, and the marker is a predicate ON THAT CLAIM. There is no reclamation path that clears it:
- * the four writes that do are the ones that RECORD AN OUTCOME, and every one of them is a write this
- * process makes about an attempt it watched.
- *
- * AND IT IS NOT "MARK IT FAILED", WHICH THIS BRANCH HAS REFUSED THREE TIMES. Writing PENDING or
- * FAILED over a row whose operation SUCCEEDED records a post that failed — untrue, and the reason
- * rounds 2, 4 and 5 exist. The marker asserts the thing that is true of both outcomes: THIS WAS
- * DISPATCHED AND MUST NOT BE DISPATCHED AGAIN. Status is left exactly where the round-6 arms put it.
- *
- * THE DOCUMENT ARM IS UNTOUCHED. A document post carries a derived Intuit Request-Id, its replay IS
- * deduplicated, and that replay is what makes leaving the row claimed the correct escalation. No
- * document type is ever stamped, so nothing about that arm changes.
- * ------------------------------------------------------------------------------------------- */
-
-/**
- * The claim's stamp — `{}` for everything else, so only the four narrowed types acquire the fence
- * and a type nobody adds to the set keeps the ordinary stale-claim recovery.
- */
-function nonReplayableAttemptClaim(type: AccountingSyncType, claimedAt: Date): { nonReplayableAttemptAt?: Date } {
-  return QBO_OPERATIONS_WITHOUT_EXTERNAL_ID.has(type) ? { nonReplayableAttemptAt: claimedAt } : {}
-}
-
-/**
- * What every write that RECORDS AN OUTCOME carries, so an ordinary failure still retries exactly as
- * it did before this fence existed. Spelled once and spread, because a write that settled a row
- * without clearing the marker would leave a resolved row permanently unclaimable — and the fence
- * would then be indistinguishable from a bug.
- */
-const ATTEMPT_OUTCOME_RECORDED = { nonReplayableAttemptAt: null } as const
-
-/**
- * The one predicate that keeps a dispatched-but-unresolved operation out of the ordinary sweep.
- * Applied to the candidate scan AND to the claim, so a row that acquires the marker between the two
- * cannot be claimed by the read that preceded it.
- */
-const ORDINARY_RECLAMATION_FENCE = { nonReplayableAttemptAt: null } as const
-
-/** The one shape of the stuck-claim record, so the console line and the durable row cannot drift. */
-function unsettledQboOperationRecord(incident: UnsettledQboOperation, description: string) {
-  const { entry } = incident
-  return {
-    userId: null,
-    entityType: 'SYSTEM' as const,
-    entityId: entry.id,
-    action: QBO_UNSETTLED_OPERATION_ACTION,
-    tag: 'sync',
-    level: 'ERROR' as const,
-    description: redactActivityLogText(description),
-    metadata: JSON.parse(JSON.stringify(sanitizeActivityLogMetadata({
-      syncLogId: entry.id,
-      type: entry.type,
-      referenceType: entry.referenceType,
-      referenceId: entry.referenceId,
-    }))),
-  }
-}
-
-/**
- * THE SETTLING PATH FOR AN OPERATION THAT HAS NO ID — AND THE CONTROL CODEX ASKED FOR: A SUCCESSFUL
- * ATTACHMENT OR EMAIL FOLLOWED BY A SETTLING FAILURE MUST NOT EXECUTE THE EXTERNAL SIDE EFFECT
- * INDEFINITELY.
- *
- * Reached only when the full durable transaction has already been re-driven to exhaustion. That
- * transaction writes TWO rows — the sync row's SYNCED transition and the mirrored AccountingEvent —
- * and either can be what refuses. THIS WRITE IS THE FIRST ONE ALONE: one row, one statement, no
- * dependent write, no mirror. A mirrored event that will not accept a write is then no longer able to
- * hold the operation in its claim, which is the case that actually produces the endless replay.
- *
- * WHY SYNCED AND NOT A COUNTED RETRY. The operation SUCCEEDED. The attachment is on the bill, the
- * email is in somebody's inbox. Sending it four more times before giving up would be a smaller
- * version of the same defect, so the row is settled on the first pass rather than bounded.
- *
- * WHAT IT COSTS, said out loud rather than hidden: the mirrored accounting event is missing, and the
- * ERROR activity row below is what says so. It is deliberately NOT retention-exempt — nothing is
- * stuck and nothing repeats, the row itself is settled, and the mirror for a no-id operation names no
- * document. The retention-exempt record is the other one, for the row that could not be settled.
- *
- * AND IF EVEN THIS WRITE WILL NOT LAND. Then the incident is escalated — and until r7 that was ALL
- * that happened, which is why r7 exists. The old argument here was that a store refusing three
- * settling writes would refuse the next claim too. It does, FOR AS LONG AS IT IS REFUSING: a store
- * recovers, the row is still PROCESSING with its claim held, `CLAIM_STALE_MS` passes, the ordinary
- * sweep reclaims it as a stale claim, AND THE EMAIL GOES OUT AGAIN. The escalation was a log line,
- * not a fence.
- *
- * THE FENCE IS THE CLAIM'S OWN MARKER (see `nonReplayableAttemptClaim`). It was written before the
- * dispatch, by the last write known to have landed, and both the candidate scan and the claim refuse
- * a row that carries it. So when this function returns false the row is not merely un-settled — it
- * is UNCLAIMABLE, and no amount of the store recovering brings the side effect back. The record
- * below is what makes that legible to a person; the marker is what makes it true.
- */
-async function settleUnidentifiedQboOperationOrEscalate(
-  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
-  cause: unknown,
-): Promise<boolean> {
-  let lastError = cause
-  for (let attempt = 0; attempt < POST_EVIDENCE_TRANSACTION_ATTEMPTS; attempt += 1) {
-    try {
-      await db.accountingSyncLog.update({
-        where: { id: entry.id },
-        data: {
-          status: 'SYNCED',
-          syncedAt: new Date(),
-          processingStartedAt: null,
-          // The row carries its own caveat, so the state is legible without going and finding the
-          // activity row. It is settled AND it is annotated; those are not in conflict.
-          errorMessage: 'Settled without a mirrored accounting event: this operation returns no external id, '
-            + 'and re-running it would repeat the attachment, PDF, email or order note it already performed.',
-          // Claimed exactly as the full transition claims it, so the follow-ups the caller is about
-          // to enqueue are owed on this row in the same way they would be on any other.
-          ...followUpObligationClaim(),
-          // The outcome IS recorded by this very statement, so the fence comes off with it (r7). If
-          // this write never lands the marker stays, and that is the whole point: the row keeps its
-          // claim AND its refusal to be reclaimed.
-          ...ATTEMPT_OUTCOME_RECORDED,
-        },
-      })
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: QBO_UNMIRRORED_OPERATION_ACTION,
-        tag: 'sync',
-        level: 'ERROR',
-        description: `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} completed, but the `
-          + `transaction that records it could not be written (${String(lastError)}). Sync row ${entry.id} was `
-          + 'settled by a narrowed write instead, so the operation is NOT repeated; its mirrored accounting event '
-          + 'is missing and will not be written by anything.',
-        metadata: {
-          syncLogId: entry.id,
-          type: entry.type,
-          referenceType: entry.referenceType,
-          referenceId: entry.referenceId,
-        },
-        // Best-effort, and it must stay that way: a failed announcement must not throw out of here
-        // into the handler that would then record a settled operation as a failed post.
-      }).catch(() => { /* the row is already settled; the announcement is the only part that is best-effort */ })
-      return true
-    } catch (error) {
-      lastError = error
-    }
-  }
-
-  const incident: UnsettledQboOperation = { entry }
-  const description = describeUnsettledQboOperation(incident, lastError)
-  // The console line FIRST, for the same reason the document escalation writes one: it cannot fail
-  // and it cannot be swept, and at this instant it is the only account of what happened.
-  console.error(`[quickbooks-sync] ${description}`)
-  try {
-    await db.activityLog.create({ data: unsettledQboOperationRecord(incident, description) })
-  } catch (recordError) {
-    console.error(
-      `[quickbooks-sync] the unsettled-operation record for sync log ${entry.id} could not be written `
-      + `either: ${String(recordError)}`,
-    )
-  }
-  return false
 }
 
 /**
@@ -657,14 +429,6 @@ async function persistFreshQboPostOrEscalate(
     } catch (error) {
       lastError = error
     }
-  }
-
-  // THE SPLIT (Codex r6, HIGH). Everything below this line is the DOCUMENT arm, and it is the arm
-  // whose justification is "the row keeps its claim and the stale-claim replay is deduplicated by the
-  // derived Request-Id". An operation that returned no id and posted under no request id has no such
-  // protection, so it must never be left to that replay — see the block above this function.
-  if (externalId === null && QBO_OPERATIONS_WITHOUT_EXTERNAL_ID.has(entry.type)) {
-    return await settleUnidentifiedQboOperationOrEscalate(entry, lastError)
   }
 
   const incident: UnpersistedQboPost = { entry, postedExternalId: externalId }
@@ -969,10 +733,6 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
   const pending = await db.accountingSyncLog.findMany({
     where: {
       connector: QBO_CONNECTOR,
-      // TOP-LEVEL, over both arms (o3d-peh1 r7). A row that dispatched a non-deduplicable effect
-      // and could not record the outcome is not a stale claim to be recovered — recovering it IS
-      // the second email. See the block above `nonReplayableAttemptClaim`.
-      ...ORDINARY_RECLAMATION_FENCE,
       OR: [
         {
           status: 'PENDING',
@@ -1006,10 +766,6 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         id: entry.id,
         connector: QBO_CONNECTOR,
         retryCount: { lt: MAX_RETRIES },
-        // The same fence as the scan, restated HERE because this is the statement that decides. The
-        // scan is a read: a row can acquire the marker between it and this compare-and-swap, and
-        // the claim is the only place that can be true of the row at the instant of the write.
-        ...ORDINARY_RECLAMATION_FENCE,
         OR: [
           {
             status: 'PENDING',
@@ -1028,11 +784,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
       data: {
         status: 'PROCESSING',
         // Attempt-stamping custody moves with the claim through `stampingCustodyOnClaim` above
-        // (o3d-0m56 r10 / o3d-anu8 r3), which now wraps the whole argument. And for the four
-        // operations whose effect nothing deduplicates, so does the fence that makes this dispatch
-        // at-most-once (o3d-peh1 r7). It is written HERE, in the last write known to have landed,
-        // precisely because the state it guards is the one where no later write lands at all.
-        ...nonReplayableAttemptClaim(entry.type, claimedAt),
+        // (o3d-0m56 r10 / o3d-anu8 r3), which wraps this whole argument.
       },
     }))
     if (claim.count === 0) continue
@@ -1067,7 +819,6 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               // block above enqueueFollowUps at the end of this file for why the marker is set here
               // even though the QuickBooks sweep is still unwired.
               ...followUpObligationClaim(),
-              ...ATTEMPT_OUTCOME_RECORDED,
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -1162,12 +913,6 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // evidence fence there cannot stop it because the database has no evidence yet. See
         // persistFreshQboPostOrEscalate: the write is re-driven, and an id that still cannot be
         // recorded is escalated rather than denied.
-        //
-        // AND WHICH OF THE TWO SETTLING PATHS THIS TAKES DEPENDS ON WHAT CAME BACK (Codex r6, HIGH).
-        // Not every `success` here is a document post: BILL_ATTACHMENT, INVOICE_PDF, INVOICE_EMAIL
-        // and WC_INVOICE_NOTE return no id and go out under no Request-Id, so the escalation's
-        // "the stale-claim replay is deduplicated" reasoning does not hold for them — they get a
-        // settling path of their own instead. The split is drawn inside that function.
         if (!await persistFreshQboPostOrEscalate(entry, payload, syncResult.externalId ?? null)) {
           result.failed++
           continue
@@ -1235,10 +980,6 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             data: {
               status: 'PENDING',
               errorMessage,
-              // A backoff is a recorded outcome too — the connector said "not now", the row is going
-              // back to PENDING to be re-driven, and the fence must not outlive the attempt it
-              // fenced or the deferred retry would never be claimed (r7).
-              ...ATTEMPT_OUTCOME_RECORDED,
             },
           }))
         } else {
@@ -1252,9 +993,6 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
                 retryCount,
                 errorMessage,
                 processingStartedAt: null,
-                // The connector returned a verdict and this statement records it, so the
-                // at-most-once fence is discharged and the counted retry can be claimed (r7).
-                ...ATTEMPT_OUTCOME_RECORDED,
               },
             })
             if (finalFailure) {
@@ -1284,8 +1022,6 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           data: {
             status: 'PENDING',
             errorMessage,
-            // Recorded outcome, fence discharged — same reasoning as the sibling backoff above (r7).
-            ...ATTEMPT_OUTCOME_RECORDED,
           },
         }))
       } else {
@@ -1318,9 +1054,6 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               retryCount,
               errorMessage,
               processingStartedAt: null,
-              // Discharged only where the write LANDS — the fence rides the same fenced statement
-              // as the status, so a row this predicate does not match keeps both (r7).
-              ...ATTEMPT_OUTCOME_RECORDED,
             },
           })
           // AND THE MIRROR FOLLOWS THE WRITE THAT LANDED, not the intention. `count === 0` here means

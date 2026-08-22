@@ -1,11 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import {
-  QBO_UNMIRRORED_OPERATION_ACTION,
-  QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
-  QBO_UNSETTLED_OPERATION_ACTION,
-} from '@/lib/domain/accounting/unrecorded-posted-document'
+import { QBO_UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
 
 // ---------------------------------------------------------------------------
 // o3d-9kek Codex r10 finding 1 — the NORMAL Xero writer must claim the follow-up obligation.
@@ -65,14 +61,6 @@ type SyncRow = {
    * looks identical either way, which is exactly why the loss was silent.
    */
   backReferenceEvidenceCompactedAt: Date | null
-  /**
-   * o3d-peh1 r7: the at-most-once fence. Stamped BY THE CLAIM for the four operations whose replay
-   * repeats a real-world effect, and required NULL by both the candidate scan and the claim itself —
-   * so a row that carries it cannot be re-claimed however many times the sweep runs. The double
-   * carries it because without it the fence's predicate would be a `where` key the matcher rejects,
-   * and every QuickBooks assertion in this file would be about a run that claimed nothing.
-   */
-  nonReplayableAttemptAt: Date | null
 }
 
 type BillRow = { id: string; accountingInvoiceId: string | null }
@@ -89,8 +77,6 @@ const SYNC_COLUMNS = new Set([
   // is evidence. The claim statement reads BOTH, so a double that could not see them would let a
   // laundering claim through and report a pass.
   'remoteAttemptedAt', 'attemptStampingCustodyAt',
-  // o3d-peh1 r7: the non-replayable-attempt fence, read by the candidate scan AND by the claim.
-  'nonReplayableAttemptAt',
 ])
 
 /**
@@ -198,15 +184,6 @@ const state = {
   unpersistableActivityActions: new Set<string>(),
   /** Every write to the mirrored AccountingEvent, in order. See the mirror mock below. */
   mirror: [] as Array<{ syncLogId: string; status: string; externalId: string | null }>,
-  /**
-   * Sync-log ids whose MIRRORED-EVENT write must throw (Codex r6).
-   *
-   * A different injection from `failSyncedWriteFor`, and the difference is the whole of the r6 test:
-   * the durable persistence is ONE transaction over TWO rows, and when it is the MIRROR that refuses,
-   * a narrowed write of the sync row alone can still land. `failSyncedWriteFor` fails the first of
-   * the two and so fails everything downstream of it, which cannot distinguish the two arms.
-   */
-  failMirrorWriteFor: new Set<string>(),
   /**
    * Rows written STRAIGHT to ActivityLog, bypassing the `logActivity` helper (Codex r5). The
    * unrecorded-posted-document record is written this way on both connectors — it carries its own
@@ -362,23 +339,8 @@ const db = {
   salesOrderRefund: { async findUnique() { return null }, async update() { return {} } },
   supplierCreditNote: { async findUnique() { return null }, async update() { return {} } },
   integrationOutbox: outboxClient,
-  /**
-   * ROLLS BACK ON A THROW (Codex r6). The double used to hand the caller `db` and let a failed
-   * transaction's earlier writes stand — so a mirror write that refused left the sync row SYNCED
-   * anyway, and "the operation is never replayed" would have been an assertion about a double that
-   * had already settled the row for a reason production would have undone. The journal is NOT rolled
-   * back: it records writes ATTEMPTED, which is what the re-drive assertions count.
-   */
   async $transaction(fn: (tx: unknown) => Promise<unknown>) {
-    const rowsBefore = state.syncRows.map((row) => ({ ...row }))
-    const mirrorBefore = state.mirror.length
-    try {
-      return await fn(db)
-    } catch (error) {
-      state.syncRows = rowsBefore
-      state.mirror.length = mirrorBefore
-      throw error
-    }
+    return fn(db)
   },
   // TWO raw statements reach this double now, and it must tell them apart (o3d-clxw + o3d-0m56 r10).
   // A single member that assumed either one would silently serve the other: both are
@@ -426,10 +388,6 @@ mock.module('@/lib/activity-log', {
 mock.module('@/lib/domain/accounting/accounting-event-mirror', {
   namedExports: {
     updateMirroredAccountingEventStatus: async (_client: unknown, params: { syncLogId: string; status: string; externalId?: string | null }) => {
-      if (state.failMirrorWriteFor.has(params.syncLogId)) {
-        record('mirror.attempted-and-failed')
-        throw new Error('transient: the mirrored accounting event could not be written')
-      }
       state.mirror.push({ syncLogId: params.syncLogId, status: params.status, externalId: params.externalId ?? null })
     },
   },
@@ -462,34 +420,6 @@ let qboPostVerdict: { success: true; invoiceId: string } | { success: false; err
 mock.module('@/lib/connectors/quickbooks/bills', {
   namedExports: {
     pushPurchaseBill: async () => qboPostVerdict,
-  },
-})
-
-/**
- * THE EXTERNAL SIDE EFFECT, COUNTED (Codex r6).
- *
- * INVOICE_EMAIL is the plainest of the four no-id operations: it sends a real email to a real
- * customer and returns nothing that could ever identify it again. The counter is the whole of the
- * control — "the row settled" is a property of the database, and the property under test is about
- * what happened OUTSIDE it.
- */
-let emailsSent = 0
-/**
- * SWITCHABLE (o3d-peh1 r7). The fence added in r7 is written by the CLAIM, before the dispatch, so
- * it is on the row for every outcome — including the one where the send itself fails. That makes
- * "an ordinary failure is still retried" a property the fence could plausibly break, and a mock that
- * always succeeded could not drive it. Succeeds by default, so every earlier test is untouched.
- */
-let emailVerdict: { success: true } | { success: false; error: string } = { success: true }
-
-mock.module('@/lib/accounting-email', {
-  namedExports: {
-    sendAccountingInvoiceEmailInternal: async () => {
-      // Counted on ENTRY, not on success: a send that fails may still have reached the customer, and
-      // the whole subject of these tests is how many times the operation was DISPATCHED.
-      emailsSent += 1
-      return emailVerdict
-    },
   },
 })
 
@@ -543,8 +473,6 @@ function blankRow(): SyncRow {
     backReferenceCheckedAt: null,
     backReferenceFollowUpsPendingAt: null,
     backReferenceEvidenceCompactedAt: null,
-    // o3d-peh1 r7: a fresh row has dispatched nothing, so it carries no fence and is claimable.
-    nonReplayableAttemptAt: null,
   }
 }
 
@@ -559,15 +487,12 @@ function reset(connector = 'xero') {
   state.failReleaseFor.clear()
   state.failSyncedWriteFor.clear()
   state.syncedWriteFailuresLeft.clear()
-  state.failMirrorWriteFor.clear()
   state.throwingActivityActions.clear()
   state.unpersistableActivityActions.clear()
   state.mirror.length = 0
   state.activityRows.length = 0
   ledgerVerdict = { clear: true }
   qboPostVerdict = { success: true, invoiceId: 'XBILL-1' }
-  emailsSent = 0
-  emailVerdict = { success: true }
 }
 
 /** The single sync row under test (the follow-up rows the run creates are appended after it). */
@@ -1641,338 +1566,4 @@ test('[o3d-peh1 r5] the durable write is re-driven, and an id that lands on a la
     [],
     'and nothing is escalated: a recovered write is not an unrecorded document',
   )
-})
-
-// ---------------------------------------------------------------------------
-// ROUND 6 (Codex HIGH) — NO-ID SUCCESSES WERE RETRIED FOR EVER WITH AN IDEMPOTENCY THEY NEVER HAD.
-//
-// Round 5's re-drive-and-escalate path was given EVERY successful result. Its justification for
-// leaving the row CLAIMED rather than settling it is written down in `describeUnpersistedQboPost`:
-// the stale-claim reclaim re-posts UNDER THE SAME DERIVED INTUIT REQUEST-ID, so the replay is a
-// deduplicated one rather than a second document.
-//
-// FOUR TYPES BREAK THAT SENTENCE. BILL_ATTACHMENT, INVOICE_PDF, INVOICE_EMAIL and WC_INVOICE_NOTE
-// are not document posts: they upload a file, save a PDF, SEND AN EMAIL, write a note onto a
-// WooCommerce order. None reaches `qboPostIdempotent`, none carries a Request-Id, and every one
-// returns `{ success: true }` with no external id. For them "leave it claimed and let the replay
-// handle it" is not deduplication — it is the side effect again, on every sweep, unbounded: no retry
-// is consumed and the row never leaves PROCESSING.
-//
-// So the split is drawn on what came back. An id → the document arm, unchanged. No id AND one of the
-// four → a SETTLING arm, which ends the operation rather than re-driving it. No id and a document
-// type → still the document arm, because a document post that returned nothing might still have
-// created something.
-//
-// THE INJECTION IS THE MIRROR, NOT THE ROW. The durable persistence is one transaction over two
-// rows; when the MIRROR is what refuses, a narrowed write of the sync row alone can still land, and
-// that is exactly the case that used to produce the endless replay. `failSyncedWriteFor` fails the
-// first of the two and therefore everything after it, which cannot tell the arms apart.
-// ---------------------------------------------------------------------------
-
-/** A no-id operation row: the email follow-up, which is the one with a customer on the other end. */
-function emailRow(): SyncRow {
-  return {
-    ...blankRow(),
-    type: 'INVOICE_EMAIL',
-    referenceType: 'SalesOrder',
-    referenceId: 'order-1',
-    externalTransactionId: null,
-    payload: { referenceId: 'order-1' },
-  }
-}
-
-/** The stale-claim reclaim, driven by hand: age this row's claim past CLAIM_STALE_MS (15 minutes). */
-function ageTheClaim() {
-  const row = subject()
-  if (row.processingStartedAt) row.processingStartedAt = new Date(Date.now() - 20 * 60 * 1000)
-}
-
-test('[o3d-peh1 r6] a sent email whose settling transaction fails is SETTLED, not replayed for ever', async () => {
-  // THE CONTROL CODEX ASKED FOR. The email goes out; the mirrored accounting event then refuses every
-  // write, for ever. Before r6 the row was left PROCESSING with no retry consumed, so every stale-claim
-  // reclaim re-entered `processEntry` and SENT THE EMAIL AGAIN — three sweeps here, three emails, and
-  // nothing anywhere counting them.
-  reset('quickbooks')
-  state.syncRows = [emailRow()]
-  state.failMirrorWriteFor.add('log-1')
-
-  await runQuickBooks()
-  // Two more sweeps, each preceded by the claim going stale. This is the replay route itself, so if
-  // the row were still claimed rather than settled these passes are what would re-send.
-  ageTheClaim()
-  await runQuickBooks()
-  ageTheClaim()
-  const third = await runQuickBooks()
-
-  assert.equal(emailsSent, 1, 'THE POINT: the customer is emailed ONCE, however many times the settle fails')
-  assert.equal(subject().status, 'SYNCED', 'the operation is settled — it succeeded, and re-running it repeats it')
-  assert.equal(subject().processingStartedAt, null, 'and the claim is released rather than held for a replay')
-  assert.equal(third.processed, 0, 'a settled row is not even picked up again')
-  assert.equal(
-    state.journal.filter((entry) => entry.op === 'mirror.attempted-and-failed').length,
-    3,
-    'the mirror really did refuse, three times in the one pass that got that far — otherwise this asserts nothing',
-  )
-  assert.deepEqual(state.mirror, [], 'and no mirrored write landed: the transaction that carried it rolled back')
-
-  // SAID OUT LOUD, at ERROR, because a settled row with no mirrored event is not a normal outcome.
-  const announced = state.activities.filter((entry) => entry.action === QBO_UNMIRRORED_OPERATION_ACTION)
-  assert.equal(announced.length, 1)
-  assert.equal(announced[0].level, 'ERROR')
-  assert.deepEqual(
-    state.activityRows.filter((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION),
-    [],
-    'and nothing is escalated as an unrecorded POSTED DOCUMENT, because an email is not a document',
-  )
-})
-
-test('[o3d-peh1 r6] the narrowed settle is re-driven too, and an unwritable row is escalated — still once', async () => {
-  // The other exhaustion: not the mirror but the ROW refuses, so even the narrowed single-statement
-  // settle cannot land. There is nothing further to try, and the escalation says so in the wording
-  // that belongs to a no-id operation rather than the document one — no "it will be re-attempted
-  // under the same Request-Id", because it would not be.
-  reset('quickbooks')
-  state.syncRows = [emailRow()]
-  state.failSyncedWriteFor.add('log-1')
-
-  const result = await runQuickBooks()
-
-  assert.equal(result.failed, 1)
-  assert.equal(emailsSent, 1, 'the email went out exactly once, and nothing here sent it again')
-  assert.equal(
-    state.journal.filter((entry) => entry.op === 'synced.attempted-and-failed').length,
-    6,
-    'three attempts at the durable transaction, then three at the narrowed settle — both are re-driven',
-  )
-
-  const escalation = state.activityRows.find((row) => row.action === QBO_UNSETTLED_OPERATION_ACTION)
-  assert.ok(escalation, 'a row stuck in its own claim must leave a durable, retention-exempt record')
-  assert.equal(escalation.level, 'ERROR')
-  assert.match(String(escalation.description), /INVOICE_EMAIL for SalesOrder order-1 COMPLETED/)
-  assert.doesNotMatch(
-    String(escalation.description),
-    /Request-Id, so it should be deduplicated/,
-    'and it must NOT repeat the document wording\'s promise, which is exactly what does not hold here',
-  )
-  assert.deepEqual(
-    state.activityRows.filter((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION),
-    [],
-    'nor be filed as an unrecorded posted document: there is no document and no id',
-  )
-  assert.deepEqual(mirrorFailures(), [], 'and no FAILED mirror, on either arm — that principle is untouched')
-})
-
-test('[o3d-peh1 r6] a DOCUMENT whose id cannot be recorded still takes the escalating arm', async () => {
-  // THE OTHER HALF OF THE SPLIT, and the reason it is drawn on the returned id rather than on the
-  // type alone. A bill that POSTED and came back with XBILL-1 must never be settled by the narrowed
-  // write — that would mark the row SYNCED naming no document and orphan a real bill silently. It
-  // keeps r5's behaviour exactly: claim held, no retry consumed, identifier escalated.
-  //
-  // (Targeted mutation that fails this: add 'PURCHASE_INVOICE' to QBO_OPERATIONS_WITHOUT_EXTERNAL_ID
-  // and drop the `externalId === null` conjunct from the guard.)
-  reset('quickbooks')
-  state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
-  state.failMirrorWriteFor.add('log-1')
-
-  const result = await runQuickBooks()
-
-  assert.equal(result.failed, 1)
-  assert.equal(subject().status, 'PROCESSING', 'the claim is still held, so the deduplicated replay can happen')
-  assert.equal(subject().externalTransactionId, null, 'the id could not be written — that is the incident')
-  const escalation = state.activityRows.find((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION)
-  assert.ok(escalation, 'and the identifier is escalated, exactly as r5 requires')
-  assert.match(String(escalation.description), /POSTED as XBILL-1/)
-  assert.deepEqual(
-    state.activityRows.filter((row) => row.action === QBO_UNSETTLED_OPERATION_ACTION),
-    [],
-    'the settling arm never sees a document post',
-  )
-  assert.deepEqual(
-    state.activities.filter((entry) => entry.action === QBO_UNMIRRORED_OPERATION_ACTION),
-    [],
-    'and nothing settled it',
-  )
-  assert.deepEqual(mirrorFailures(), [], 'no FAILED mirror for a document that exists — unchanged')
-})
-
-test('[o3d-peh1 r6] an ordinary no-id operation is untouched by any of this', async () => {
-  // The control that stops the fix being "always take the narrowed write". With nothing injected the
-  // email settles through the ordinary durable transaction, WITH its mirrored event, and says nothing.
-  //
-  // (Targeted mutation that fails this: make `settleUnidentifiedQboOperationOrEscalate` the first
-  // thing `persistFreshQboPostOrEscalate` does for a no-id type, ahead of the re-drive loop.)
-  reset('quickbooks')
-  state.syncRows = [emailRow()]
-
-  const result = await runQuickBooks()
-
-  assert.equal(result.succeeded, 1)
-  assert.equal(emailsSent, 1)
-  assert.equal(subject().status, 'SYNCED')
-  assert.deepEqual(
-    state.mirror.map((entry) => entry.status),
-    ['POSTED'],
-    'the mirrored event is written by the ordinary path — the narrowed write is a fallback, not the route',
-  )
-  assert.equal(subject().errorMessage, null, 'and the row carries no caveat, because there is nothing to caveat')
-  assert.equal(
-    state.activities.filter((entry) => entry.action === QBO_UNMIRRORED_OPERATION_ACTION).length,
-    0,
-  )
-})
-
-// ---------------------------------------------------------------------------
-// ROUND 7 (Codex HIGH) — THE ESCALATION WAS A LOG LINE, NOT A FENCE.
-//
-// Round 6 settled a no-id operation instead of re-driving it, and its test stopped one instruction
-// too early. It drove the case where EVERY settling write refuses, watched the escalation get filed,
-// and asserted "the email went out exactly once" — of that single pass. The row was left PROCESSING
-// holding its claim, and nothing in the test ever let the claim go stale. In production it does:
-// fifteen minutes later the ordinary sweep reclaims the row and RUNS THE OPERATION AGAIN, and again,
-// for as long as the store keeps refusing — and the moment the store recovers it runs it once more,
-// because the old argument ("a store that will not take this write will not take the claim either")
-// is only true while the store is broken.
-//
-// So the at-most-once property moved onto the CLAIM: `nonReplayableAttemptAt`, stamped before any
-// dispatch, required NULL by the candidate scan and by the claim's own compare-and-swap. These tests
-// are the ones that go past where round 6's stopped — through stale-claim recovery, through repeated
-// sweeps, and through the store coming back.
-// ---------------------------------------------------------------------------
-
-/** The claim the run took for the subject row, or undefined — the write the fence rides on. */
-function claimWrite() {
-  return state.journal.find((entry) => entry.op === 'syncLog.updateMany' && entry.data?.status === 'PROCESSING')
-}
-
-test('[o3d-peh1 r7] an escalated no-id operation is not replayed by the stale-claim sweep, ever', async () => {
-  // THE EXTENSION ROUND 6'S TEST DID NOT MAKE. Same injection — the row itself refuses every settling
-  // write — but the claim is aged between sweeps, which is the exact route the replay takes.
-  //
-  // (Revert evidence: drop `...nonReplayableAttemptClaim(entry.type, claimedAt)` from the claim in
-  // processPendingQuickBooksSync and this fails on the second sweep with emailsSent 2, processed 1.)
-  reset('quickbooks')
-  state.syncRows = [emailRow()]
-  state.failSyncedWriteFor.add('log-1')
-
-  const first = await runQuickBooks()
-
-  assert.equal(first.failed, 1)
-  assert.equal(emailsSent, 1, 'the email went out on the first pass — that is the effect being fenced')
-  assert.equal(subject().status, 'PROCESSING', 'nothing could settle it, so the row is where round 6 left it')
-  // …but it is no longer merely un-settled. The claim carried the fence, and the claim is the last
-  // write known to have landed, which is why it is the only place this could have been written.
-  assert.ok(
-    subject().nonReplayableAttemptAt instanceof Date,
-    'the row must carry the non-replayable-attempt marker its claim stamped',
-  )
-  assert.ok(
-    claimWrite()?.data?.nonReplayableAttemptAt instanceof Date,
-    'and it must have been stamped BY THE CLAIM, before the dispatch — not by any later write',
-  )
-  assert.equal(
-    (claimWrite()?.where as Record<string, unknown> | undefined)?.nonReplayableAttemptAt,
-    null,
-    'the claim also REQUIRES it null, so a marked row cannot be claimed by the statement that decides',
-  )
-
-  // Now the replay route itself, twice. An ordinary sweep's only way back to the side effect is a
-  // fresh claim, and the fence is a predicate on that claim: there is nothing here to undo it.
-  ageTheClaim()
-  const second = await runQuickBooks()
-  ageTheClaim()
-  const third = await runQuickBooks()
-
-  assert.equal(second.processed, 0, 'a fenced row is not a stale claim to recover — the sweep does not pick it up')
-  assert.equal(third.processed, 0, 'and it stays that way, however many sweeps run')
-  assert.equal(emailsSent, 1, 'THE POINT: the customer is emailed ONCE, whatever the sweep does afterwards')
-  assert.equal(
-    state.activityRows.filter((row) => row.action === QBO_UNSETTLED_OPERATION_ACTION).length,
-    1,
-    'and one incident is filed, not one per sweep',
-  )
-})
-
-test('[o3d-peh1 r7] the fence holds after the store recovers — which is when the replay used to happen', async () => {
-  // The case the round-6 reasoning got wrong in the one direction that matters. Its argument was
-  // that a store refusing three settling writes would refuse the next claim too; true while it is
-  // broken, and false the moment it is not. Here the store recovers between sweeps, so every write
-  // is available again — and the row must STILL not be dispatched a second time.
-  //
-  // (Revert evidence: drop the claim's fence stamp and this fails with emailsSent 2.)
-  reset('quickbooks')
-  state.syncRows = [emailRow()]
-  state.failSyncedWriteFor.add('log-1')
-
-  await runQuickBooks()
-  assert.equal(emailsSent, 1)
-
-  state.failSyncedWriteFor.clear()
-  ageTheClaim()
-  const afterRecovery = await runQuickBooks()
-
-  assert.equal(afterRecovery.processed, 0, 'a working store does not license the effect a second time')
-  assert.equal(emailsSent, 1)
-  assert.equal(subject().status, 'PROCESSING', 'the row is a bookkeeping remnant now; nothing re-drives it')
-  assert.ok(subject().nonReplayableAttemptAt instanceof Date, 'and the marker is what says so')
-})
-
-test('[o3d-peh1 r7] an ordinary email FAILURE is still retried — the fence is discharged with the outcome', async () => {
-  // The control that stops the fence being "these types are never retried". The fence is written by
-  // the claim, so it is on the row for EVERY outcome, including a plain failure — and a plain failure
-  // is a recorded outcome, so the transition that records it clears the fence in the same statement.
-  // Without that, the first transient SMTP error would strand the row for good.
-  //
-  // (Targeted mutation that fails this: remove `...ATTEMPT_OUTCOME_RECORDED` from the counted-failure
-  // transition in processPendingQuickBooksSync — the second sweep then reports processed 0.)
-  reset('quickbooks')
-  state.syncRows = [emailRow()]
-  emailVerdict = { success: false, error: 'transient: the mail host refused the message' }
-
-  const first = await runQuickBooks()
-
-  assert.equal(first.failed, 1)
-  assert.equal(emailsSent, 1)
-  assert.equal(subject().status, 'PENDING', 'an ordinary failure goes back to PENDING, exactly as before')
-  assert.equal(subject().retryCount, 1, 'with the attempt counted, so the retries are still bounded')
-  assert.equal(
-    subject().nonReplayableAttemptAt,
-    null,
-    'and the fence comes off with the outcome, or the bounded retry could never be claimed',
-  )
-
-  emailVerdict = { success: true }
-  const second = await runQuickBooks()
-
-  assert.equal(second.succeeded, 1, 'so the retry runs')
-  assert.equal(emailsSent, 2, 'and the operation is dispatched again — deliberately, because the first one failed')
-  assert.equal(subject().status, 'SYNCED')
-  assert.equal(subject().nonReplayableAttemptAt, null, 'settled rows carry no fence either')
-})
-
-test('[o3d-peh1 r7] the DOCUMENT arm keeps its deduplicated stale-claim replay', async () => {
-  // The fence must NOT widen to document posts. Their replay goes out under the same derived Intuit
-  // Request-Id, which is what makes leaving the row claimed the correct escalation — take that away
-  // and a bill whose id could not be recorded is stranded rather than recovered.
-  //
-  // (Targeted mutation that fails this: make `nonReplayableAttemptClaim` stamp unconditionally
-  // instead of consulting QBO_OPERATIONS_WITHOUT_EXTERNAL_ID — the second sweep then reports
-  // processed 0.)
-  reset('quickbooks')
-  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
-  state.failMirrorWriteFor.add('log-1')
-
-  const first = await runQuickBooks()
-
-  assert.equal(first.failed, 1)
-  assert.equal(subject().status, 'PROCESSING', 'the claim is held so the deduplicated replay can happen')
-  assert.equal(subject().nonReplayableAttemptAt, null, 'and NO fence is stamped for a document type')
-  assert.ok(
-    state.activityRows.some((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION),
-    'the document escalation is the one that fires here',
-  )
-
-  ageTheClaim()
-  const second = await runQuickBooks()
-
-  assert.equal(second.processed, 1, 'THE POINT: a stale document claim is still reclaimed and re-driven')
 })

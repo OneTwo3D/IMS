@@ -2565,41 +2565,6 @@ model AccountingSyncLog {
   /// warning is noise, an under-broad one loses a payment in silence.
   followUpObligations Json? @map("follow_up_obligations")
 
-  // o3d-peh1 r7 (Codex HIGH) — THIS ROW'S CLAIM DISPATCHED AN EFFECT THAT CANNOT BE DEDUPLICATED,
-  // AND THE ATTEMPT'S OUTCOME IS NOT RECORDED. Stamped by the CLAIM itself, before anything is
-  // dispatched, and only for the operations whose replay repeats a real-world act: an attachment
-  // upload, a saved PDF, an EMAIL to a customer, a note written onto a WooCommerce order. Those
-  // carry no remote request id, so nothing on the far side collapses a second attempt into the
-  // first.
-  //
-  // WHY THE CLAIM AND NOT THE FAILURE. The state this exists to fence is the one where NO write
-  // lands: the operation succeeded, every settling write refused, and the row was left PROCESSING
-  // with its claim held — so `CLAIM_STALE_MS` later the ordinary sweep reclaimed it and SENT THE
-  // EMAIL AGAIN, unbounded, because no retry was ever consumed. A fence written at the point of
-  // failure is a fence written by the writer that is failing. This one is written by the claim,
-  // which is the last write known to have landed.
-  //
-  // IT IS NOT "FAILED", DELIBERATELY. This branch has refused three times to write PENDING or
-  // FAILED over a row whose post succeeded, because that records a post that failed. The marker
-  // says something different and true of both outcomes: THIS WAS DISPATCHED, AND MUST NOT BE
-  // DISPATCHED AGAIN. Status is untouched by it.
-  //
-  // READ BY THE ORDINARY SWEEP, WHICH WILL NOT CLAIM A ROW THAT CARRIES IT — that is the whole of
-  // the fence, and it is why a stale-claim reclaim cannot undo it: reclaiming is the thing the
-  // predicate forbids. Cleared by every processor write that RECORDS THE ATTEMPT'S OUTCOME (the
-  // SYNCED transition, the narrowed settle, the counted-failure transition, the rate-limit
-  // backoff), so an ordinary failure still retries exactly as it did. A row whose outcome could
-  // never be recorded keeps it, and is settled by hand from the accounting sync log — it is
-  // PROCESSING, which is a settleable status.
-  //
-  // The COST, said out loud: a worker that dies mid-attempt on one of these types now leaves a row
-  // nothing re-drives, where before it would have re-sent. That is the trade at-most-once is: a
-  // missing email an operator can re-queue, rather than a duplicate one they cannot recall.
-  //
-  // Nullable, no default, not backfilled — a value here is an assertion about a dispatch, and no
-  // historical row can be asserted about.
-  nonReplayableAttemptAt DateTime? @map("non_replayable_attempt_at")
-
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
 
