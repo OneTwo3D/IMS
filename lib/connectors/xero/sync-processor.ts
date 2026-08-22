@@ -34,7 +34,8 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
-import { describeCreateDispatchNotSent, planCreateDispatch, type CreateDispatchMint } from '@/lib/domain/accounting/create-dispatch-record'
+import { CREATE_DISPATCH_REPLAY_MARGIN_MS, describeCreateDispatchNotSent, planCreateDispatch, type CreateDispatchMint } from '@/lib/domain/accounting/create-dispatch-record'
+import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
@@ -2590,13 +2591,27 @@ async function reportUnsentHandBackAborted(
   notPosted: NonNullable<EntryResult['notPosted']>,
   error: unknown,
   outboxJobId?: string,
+  exhaustion?: { attempts: number; abandoned: UnsentHandBackAbandonment },
 ): Promise<void> {
+  // o3d-jit6 r7: HOW HARD IT TRIED, AND WHAT THE ROW IS NOW. An operator meeting the marker's
+  // permanent refusal later needs both: that this was not one unlucky statement, and that the row
+  // itself is sitting in PROCESSING rather than waiting its turn in PENDING.
+  const tried = exhaustion
+    ? ` The complete hand-back was attempted ${exhaustion.attempts} time${exhaustion.attempts === 1 ? '' : 's'} `
+      + `and abandoned (${exhaustion.abandoned}).`
+    : ''
+  const stranded = ` THE ROW IS LEFT PROCESSING: no selector re-takes it for ${Math.round(CLAIM_STALE_MS / 60_000)} `
+    + 'minutes, which is past the replay window the standing dispatch marker allows, so the next attempt '
+    + 'will meet a permanent refusal for a create that was never sent and only an operator can resolve it. '
+    + 'That is the least-bad end: throwing here would spend a retry and mark FAILED a row that provably '
+    + 'sent nothing, and releasing without the evidence would let a worker meet the marker with no trace '
+    + 'of why it stands.'
   // Only the transport-refusal path binds the evidence to the hand-back, so only it can have lost
   // the evidence with it. Saying otherwise on the other three reasons would send an operator looking
   // for a row that IS there.
   const detail = notPosted.reason === 'transport-refused'
     ? `[xero-sync] sync log ${entry.id} could not be handed back after a transport refusal, and the `
-      + `refusal evidence was NOT recorded either — they roll back together: ${String(error)}`
+      + `refusal evidence was NOT recorded either — they roll back together: ${String(error)}.${tried}${stranded}`
     : `[xero-sync] sync log ${entry.id} could not be handed back after ${notPosted.reason}: ${String(error)}`
   console.error(detail)
   await logActivity({
@@ -2614,9 +2629,124 @@ async function reportUnsentHandBackAborted(
       operation: notPosted.operation,
       reason: notPosted.reason,
       abortedBy: String(error),
+      ...(exhaustion ? { handBackAttempts: exhaustion.attempts, abandoned: exhaustion.abandoned } : {}),
     },
     resolveUser: false,
   })
+}
+
+/**
+ * BOUNDEDLY RETRY THE COMPLETE ATOMIC HAND-BACK, WHILE THE REPLAY WINDOW IS STILL OPEN
+ * (o3d-jit6 r7, Codex HIGH).
+ *
+ * WHAT ROUND 6 GOT RIGHT AND WHERE IT STOPPED. r6 made the evidence, the release and the requeue ONE
+ * transaction, and it chose deliberately NOT to throw the abort into the per-entry catch: that would
+ * spend a retry and mark FAILED a row that provably sent nothing, which is the very outcome
+ * `notPosted` exists to prevent. Both of those still hold and neither is traded away here.
+ *
+ * WHAT IT DID INSTEAD WAS GIVE UP AFTER ONE ATTEMPT. The catch reported best-effort and continued, so
+ * a transaction that aborted for a transient reason — a serialisation failure, a deadlock, a dropped
+ * connection — left the row PROCESSING at a freshly renewed `processingStartedAt`, unclaimable until
+ * the FIFTEEN-MINUTE stale cutoff, which is past the SIX-minute window in which a replay is provably
+ * not a second create. That is precisely the defect round 5 fixed, reached again through the abort
+ * path, and a transient abort is exactly the case that succeeds on a second attempt.
+ *
+ * SO THE WHOLE TRANSACTION IS RE-RUN, NOT PART OF IT. Retrying anything smaller would reintroduce the
+ * separation r5 closed. The body is atomic, so a failed attempt left nothing behind: re-running it
+ * writes the evidence, releases under the same lease fence and defers the same job, or rolls all
+ * three back again.
+ *
+ * AND THE RETRIES ARE BOUNDED TWICE OVER, because the thing being raced is a deadline.
+ * `UNSENT_HANDBACK_MAX_ATTEMPTS` caps the attempts; `UNSENT_HANDBACK_RETRY_BUDGET_MS` caps the WALL
+ * TIME, at a tenth of the usable replay window, and the next pause is checked against it BEFORE it is
+ * taken — so the retry sequence can never consume the window it exists to get back inside. Whichever
+ * bound is reached first, the sequence stops and the caller reports the exhaustion.
+ *
+ * THE RESIDUAL, SAID PLAINLY: if an attempt's COMMIT succeeded but its acknowledgement was lost, the
+ * next attempt re-writes the evidence row (a duplicate, not a loss), releases nothing — the lease
+ * fence matches the row it already released — and, on the queued runner, throws on the outbox fence
+ * that no longer matches. The sequence then reports an abort for a hand-back that in fact happened.
+ * A duplicated WARNING and an over-stated ERROR are strictly better than a stranded row, which is why
+ * the bound is retried at all.
+ */
+export type UnsentHandBackAbandonment = 'attempts-exhausted' | 'budget-exhausted'
+
+export type UnsentHandBackOutcome =
+  | { handedBack: true; released: boolean; attempts: number }
+  | { handedBack: false; attempts: number; error: unknown; abandoned: UnsentHandBackAbandonment }
+
+/** Attempts of the COMPLETE hand-back transaction, including the first. */
+export const UNSENT_HANDBACK_MAX_ATTEMPTS = 3
+/** The first pause between attempts; each subsequent one doubles. */
+export const UNSENT_HANDBACK_RETRY_BASE_DELAY_MS = 250
+/**
+ * The whole sequence's share of the window it is racing — a tenth of
+ * `XERO_IDEMPOTENCY_KEY_RETENTION_MS - CREATE_DISPATCH_REPLAY_MARGIN_MS`, derived rather than retyped
+ * so that shortening the window shortens this with it. The refusal happens within seconds of the
+ * mint, so spending at most a tenth of what remains cannot be what closes it.
+ */
+export const UNSENT_HANDBACK_RETRY_BUDGET_MS =
+  Math.floor((XERO_IDEMPOTENCY_KEY_RETENTION_MS - CREATE_DISPATCH_REPLAY_MARGIN_MS) / 10)
+
+export async function retryUnsentHandBack(
+  run: () => Promise<{ released: boolean }>,
+  deps: { sleep?: (ms: number) => Promise<void>; monotonicMs?: () => number } = {},
+): Promise<UnsentHandBackOutcome> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const monotonicMs = deps.monotonicMs ?? (() => Date.now())
+  const startedAt = monotonicMs()
+  let attempts = 0
+  for (;;) {
+    attempts++
+    try {
+      const { released } = await run()
+      return { handedBack: true, released, attempts }
+    } catch (error) {
+      if (attempts >= UNSENT_HANDBACK_MAX_ATTEMPTS) {
+        return { handedBack: false, attempts, error, abandoned: 'attempts-exhausted' }
+      }
+      // CHECKED BEFORE THE PAUSE IS TAKEN, not after: a budget that is only noticed once it has been
+      // overspent is not a bound on the window.
+      const delayMs = UNSENT_HANDBACK_RETRY_BASE_DELAY_MS * 2 ** (attempts - 1)
+      if (monotonicMs() - startedAt + delayMs >= UNSENT_HANDBACK_RETRY_BUDGET_MS) {
+        return { handedBack: false, attempts, error, abandoned: 'budget-exhausted' }
+      }
+      await sleep(delayMs)
+    }
+  }
+}
+
+/**
+ * THE ONE PLACE EITHER RUNNER HANDS BACK AN UNSENT TRANSPORT REFUSAL (o3d-jit6 r7).
+ *
+ * r5 shared the transaction BODY between the runners; r6 left the transaction, its catch and its
+ * report spelt out at each call site, which is where a bounded retry would have had to be written
+ * twice and could drift once. All of it lives here now, so the direct and queued runners differ in
+ * exactly one thing — whether an outbox job joins the commit — and in nothing else.
+ *
+ * It does not throw. The caller counts the row as `skipped` either way: it sent nothing, so it must
+ * not be failed and must not spend a retry, whether or not the hand-back landed.
+ */
+async function handBackUnsentTransportRefusal(args: {
+  entry: { id: string; type: string }
+  notPosted: NonNullable<EntryResult['notPosted']>
+  lease: HeldClaim
+  attempt: AttemptRef
+  job?: IntegrationOutboxRow | null
+}): Promise<UnsentHandBackOutcome> {
+  const { entry, notPosted, lease, attempt, job } = args
+  const outcome = await retryUnsentHandBack(() => db.$transaction(async (tx) => {
+    return recordAndReleaseUnsentTransportRefusal(tx, { entry, notPosted, lease, attempt, job })
+  }))
+  if (!outcome.handedBack) {
+    // ABORTED, AND SAID SO — see reportUnsentHandBackAborted, which now also names how many complete
+    // attempts were made and what state the row is left in.
+    await reportUnsentHandBackAborted(entry, notPosted, outcome.error, job?.id, {
+      attempts: outcome.attempts,
+      abandoned: outcome.abandoned,
+    })
+  }
+  return outcome
 }
 
 /**
@@ -3218,38 +3348,28 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         // — and `lease-expired` and `dispatch-unrecorded` are the outcomes o3d-xl63 and r1 settled on
         // their own terms, with no replay window running against them.
         if (notPosted.reason === 'transport-refused') {
-          try {
-            // o3d-jit6 r5 (Codex HIGH): THE EVIDENCE AND THE RELEASE ARE ONE COMMIT.
-            //
-            // r4 established the right ORDER — log first, release second, so no worker can meet the
-            // marker with the trace missing — and then defeated it with the mechanism. `logActivity`
-            // SWALLOWS ITS OWN FAILURES by design, and it sat OUTSIDE the release. So the ordering
-            // guaranteed nothing at all: the write could fail silently, the release below would
-            // commit regardless, and the row would become claimable with the only durable trace of
-            // the refusal gone. The marker would then stand over a create nobody made, its refusal
-            // would send an operator hunting for an activity row that was never written, and nothing
-            // anywhere would say so — which is the very invariant the ordering was meant to buy.
-            //
-            // `logActivityInTransaction` applies the identical redaction and sanitisation but writes
-            // THROUGH this transaction and does NOT catch, so evidence and release commit or roll
-            // back together. An unwritable record therefore ABORTS the hand-back instead of letting
-            // it proceed silently — the same consequence o3d-batch-settle settled on for an
-            // operator's settlement assertion, for the same reason.
-            //
-            // THE SAME hand-back body as the queued runner, not a copy of it. It fences on the LEASE
-            // (never on `held`, which the minting fence has since moved), and a zero-row release
-            // does not abort it — see recordAndReleaseUnsentTransportRefusal.
-            await db.$transaction(async (tx) => {
-              await recordAndReleaseUnsentTransportRefusal(tx, { entry, notPosted, lease, attempt })
-            })
-          } catch (releaseError) {
-            // ABORTED, AND SAID SO — see reportUnsentHandBackAborted. Nothing was released and
-            // nothing was recorded, so the row degrades to r3's behaviour (PROCESSING until the
-            // stale cutoff) rather than throwing into the per-entry catch, which would spend a retry
-            // and mark FAILED a row that sent nothing. That is exactly the outcome `notPosted`
-            // exists to prevent.
-            await reportUnsentHandBackAborted(entry, notPosted, releaseError)
-          }
+          // o3d-jit6 r5 (Codex HIGH): THE EVIDENCE AND THE RELEASE ARE ONE COMMIT.
+          //
+          // r4 established the right ORDER — log first, release second, so no worker can meet the
+          // marker with the trace missing — and then defeated it with the mechanism. `logActivity`
+          // SWALLOWS ITS OWN FAILURES by design, and it sat OUTSIDE the release. So the ordering
+          // guaranteed nothing at all: the write could fail silently, the release would commit
+          // regardless, and the row would become claimable with the only durable trace of the
+          // refusal gone. `logActivityInTransaction` writes THROUGH the transaction and does NOT
+          // catch, so evidence and release commit or roll back together.
+          //
+          // o3d-jit6 r7 (Codex HIGH): AND AN ABORT IS NOW RETRIED, BOUNDEDLY, RATHER THAN CONCEDED.
+          // r6 caught the abort, reported best-effort and continued — so a transient serialisation
+          // failure or deadlock left the row PROCESSING until the fifteen-minute stale cutoff, past
+          // the replay window, which is the defect r5 fixed reached through the abort path. It still
+          // does not throw into the per-entry catch (that would spend a retry and FAIL a row that
+          // provably sent nothing); it re-runs the COMPLETE atomic hand-back inside a wall-time
+          // budget, and says what state the row is left in if the bounds are reached.
+          //
+          // THE SAME hand-back as the queued runner, not a copy of it. It fences on the LEASE
+          // (never on `held`, which the minting fence has since moved), and a zero-row release does
+          // not abort it — see recordAndReleaseUnsentTransportRefusal.
+          await handBackUnsentTransportRefusal({ entry, notPosted, lease, attempt })
         } else {
           // The other three reasons change nothing about this row here, so no invariant binds the
           // evidence to a state change and the best-effort write is the right default: a failed log
@@ -3793,12 +3913,17 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             // r4 wrote it with `logActivity` — which SWALLOWS ITS OWN FAILURES — from outside this
             // block, so the release and the requeue could commit while the only durable trace of the
             // refusal was silently lost. The ordering r4 chose was the right one and could not
-            // enforce itself. THE SAME hand-back body as the direct runner now writes all three,
-            // and it does not catch: an unwritable record aborts the lot rather than letting two of
-            // them proceed without it.
-            await db.$transaction(async (tx) => {
-              await recordAndReleaseUnsentTransportRefusal(tx, { entry, notPosted, lease, attempt, job })
-            })
+            // enforce itself. THE SAME hand-back as the direct runner now writes all three, and it
+            // does not catch: an unwritable record aborts the lot rather than letting two of them
+            // proceed without it.
+            //
+            // o3d-jit6 r7 (Codex HIGH): AND THAT ABORT IS BOUNDEDLY RETRIED. Conceding after one
+            // attempt left BOTH halves stranded until their own fifteen-minute stale sweeps — past
+            // the replay window — for what is typically a transient serialisation failure. The
+            // complete transaction is re-run within a wall-time budget that cannot itself close the
+            // window; only when the bounds are reached is the abort reported, naming the state the
+            // row is left in. It still never throws into the per-entry catch.
+            await handBackUnsentTransportRefusal({ entry, notPosted, lease, attempt, job })
           } else {
             // The other three reasons take the ordinary failure hand-back, which is not the
             // marker-and-replay-window state the invariant is about, so the evidence stays
@@ -3807,10 +3932,11 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             await markXeroOutboxRetry(job, notPosted.message)
           }
         } catch (releaseError) {
-          // ABORTED, AND SAID SO — see reportUnsentHandBackAborted. On the transport-refusal path all
-          // three writes rolled back together, so the row AND the job wait for their own stale-lock
-          // sweeps and no worker meets the marker without the trace, because no worker meets the
-          // marker at all until then.
+          // REACHABLE FROM THE `else` ARM ONLY (r7): the refusal arm handles, retries and reports its
+          // own abort and does not throw. What can still land here is the ordinary hand-back for the
+          // other three reasons — `markXeroOutboxRetry`'s own fence, say — and it is reported the
+          // same way rather than escaping into the generic failure handler and spending a retry on a
+          // row that was never posted.
           await reportUnsentHandBackAborted(entry, notPosted, releaseError, job.id)
         }
         result.skipped++

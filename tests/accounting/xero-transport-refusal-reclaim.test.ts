@@ -6,6 +6,10 @@ import test from 'node:test'
 import {
   recordAndReleaseUnsentTransportRefusal,
   releaseUnsentTransportRefusal,
+  retryUnsentHandBack,
+  UNSENT_HANDBACK_MAX_ATTEMPTS,
+  UNSENT_HANDBACK_RETRY_BASE_DELAY_MS,
+  UNSENT_HANDBACK_RETRY_BUDGET_MS,
 } from '@/lib/connectors/xero/sync-processor'
 import {
   CREATE_DISPATCH_REPLAY_MARGIN_MS,
@@ -295,7 +299,7 @@ test('o3d-jit6 r4: the release keeps attempt-stamping custody, like every other 
  * THE WIRING, WHICH NO UNIT ABOVE CAN SEE.
  * ---------------------------------------------------------------------------------------------- */
 
-test('o3d-jit6 r5: BOTH runners hand back through the ONE transaction body, evidence included', () => {
+test('o3d-jit6 r5/r7: BOTH runners hand back through the ONE shared hand-back, evidence included', () => {
   const source = readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
   const direct = source.slice(
     source.indexOf('async function processPendingXeroSyncDirect('),
@@ -315,17 +319,20 @@ test('o3d-jit6 r5: BOTH runners hand back through the ONE transaction body, evid
     const guardAt = branch.indexOf("if (notPosted.reason === 'transport-refused') {")
     assert.ok(guardAt > -1, `${name}: the hand-back is guarded on the transport refusal`)
 
-    // ONE TRANSACTION, AND THE EVIDENCE IS INSIDE IT (r5). r4 wrote the evidence with the
-    // best-effort `logActivity` from outside the release, so the release could commit while the
-    // only durable trace of the refusal was silently lost. The transaction body is now shared, so
-    // there is no call site at which that separation can be reintroduced by one runner alone.
-    const txAt = branch.indexOf('await db.$transaction(async (tx) => {', guardAt)
-    assert.ok(txAt > -1, `${name}: the hand-back must be one transaction`)
-    const txBody = branch.slice(txAt, branch.indexOf('})', txAt))
+    // r7: NO RUNNER OWNS THE TRANSACTION ANY MORE. r5 shared the transaction BODY and left the
+    // transaction, its catch and its report spelt out per runner — which is where r7's bounded
+    // retry would have had to be written twice and could drift once. A runner that opened its own
+    // transaction here would be doing exactly that, so the shape is forbidden rather than merely
+    // unused.
+    const refusalArm = branch.slice(guardAt, branch.indexOf('} else {', guardAt))
+    assert.ok(
+      !/db\.\$transaction\(/.test(refusalArm),
+      `${name}: the transaction belongs to the shared hand-back, not to the runner`,
+    )
     assert.match(
-      txBody,
-      /await recordAndReleaseUnsentTransportRefusal\(tx, \{ entry, notPosted, lease, attempt/,
-      `${name}: the hand-back goes through the shared body, fenced on the LEASE`,
+      refusalArm,
+      /await handBackUnsentTransportRefusal\(\{ entry, notPosted, lease, attempt/,
+      `${name}: the hand-back goes through the shared function, fenced on the LEASE`,
     )
     // FENCED ON THE LEASE, NOT ON THE SWEEP'S CAPTURED INSTANT, and this is the difference between
     // the fix working and the fix being invisible. `openRemoteWriteLease` renews
@@ -334,13 +341,12 @@ test('o3d-jit6 r5: BOTH runners hand back through the ONE transaction body, evid
     // longer carries. The fence fails CLOSED, so a release fenced on the stale one matches no row,
     // reports nothing, and leaves the row in PROCESSING exactly as round 3 did.
     assert.ok(
-      !/recordAndReleaseUnsentTransportRefusal\(tx, \{ entry, notPosted, held,/.test(branch),
+      !/handBackUnsentTransportRefusal\(\{ entry, notPosted, held,/.test(branch),
       `${name}: fencing on the sweep's captured instant would match nothing and fail silently`,
     )
 
     // AND NO BEST-EFFORT EVIDENCE WRITE ON THIS PATH. `logActivity` swallows its own failures; using
     // it for the row the marker's refusal points at is exactly the defect r5 closes.
-    const refusalArm = branch.slice(guardAt, branch.indexOf('} else {', guardAt))
     assert.ok(
       !/await logActivity\(\{/.test(refusalArm),
       `${name}: the refusal evidence must not be written best-effort alongside the release`,
@@ -351,10 +357,34 @@ test('o3d-jit6 r5: BOTH runners hand back through the ONE transaction body, evid
   // requeue joins the same commit. Either half alone re-creates r4's defect: a released row whose
   // job stayed PROCESSING waits for the queue's own fifteen-minute stale-lock sweep, and a requeued
   // job whose row stayed PROCESSING is claimed only to find the row unclaimable.
-  const directTx = direct.slice(direct.indexOf('recordAndReleaseUnsentTransportRefusal(tx, {'))
-  assert.match(directTx.slice(0, directTx.indexOf('\n')), /\{ entry, notPosted, lease, attempt \}\)/)
-  const outboxTx = outbox.slice(outbox.indexOf('recordAndReleaseUnsentTransportRefusal(tx, {'))
-  assert.match(outboxTx.slice(0, outboxTx.indexOf('\n')), /\{ entry, notPosted, lease, attempt, job \}\)/)
+  const directCall = direct.slice(direct.indexOf('handBackUnsentTransportRefusal({'))
+  assert.match(directCall.slice(0, directCall.indexOf('\n')), /\{ entry, notPosted, lease, attempt \}\)/)
+  const outboxCall = outbox.slice(outbox.indexOf('handBackUnsentTransportRefusal({'))
+  assert.match(outboxCall.slice(0, outboxCall.indexOf('\n')), /\{ entry, notPosted, lease, attempt, job \}\)/)
+
+  // AND THE SHARED HAND-BACK IS WHERE THE ONE TRANSACTION LIVES, INSIDE THE BOUNDED RETRY. r6 ran
+  // the transaction once and conceded on abort; retrying anything SMALLER than the whole
+  // transaction would reintroduce the separation r5 closed, so the retry must wrap the
+  // `$transaction`, not a statement inside it.
+  const handBack = source.slice(
+    source.indexOf('async function handBackUnsentTransportRefusal(args: {'),
+    source.indexOf('/**\n * HAND BACK A ROW THAT PROVABLY SENT NOTHING'),
+  )
+  assert.ok(handBack.length > 0, 'the shared hand-back must be found')
+  assert.match(
+    handBack,
+    /retryUnsentHandBack\(\(\) => db\.\$transaction\(async \(tx\) => \{\s*\n\s*return recordAndReleaseUnsentTransportRefusal\(tx, \{ entry, notPosted, lease, attempt, job \}\)/,
+    'the COMPLETE atomic hand-back is what is retried',
+  )
+  assert.match(
+    handBack,
+    /await reportUnsentHandBackAborted\(entry, notPosted, outcome\.error, job\?\.id, \{/,
+    'and an exhausted retry is reported, with how many attempts were made',
+  )
+  assert.ok(
+    !/throw /.test(handBack),
+    'it must not throw into the per-entry catch: that spends a retry and FAILS a row that sent nothing',
+  )
 })
 
 test('o3d-jit6 r5: the shared body writes the evidence transactionally, and never best-effort', () => {
@@ -651,4 +681,113 @@ test('o3d-jit6 r5: a job this worker no longer holds aborts the whole hand-back,
   const after = w.world()
   assert.equal(after.sync.status, 'PROCESSING', 'the row stays claimed by this worker')
   assert.equal(after.activity.length, 0, 'and the evidence rolled back with it')
+})
+
+/* ------------------------------------------------------------------------------------------------
+ * ROUND 7 — A TRANSIENT ABORT MUST NOT STRAND THE ROW.
+ *
+ * r6 made the evidence, the release and the requeue one transaction and — correctly — chose not to
+ * throw the abort into the per-entry catch, because that would spend a retry and mark FAILED a row
+ * that provably sent nothing. But it then skipped and continued unconditionally, so a serialisation
+ * failure, a deadlock or a dropped connection left the row PROCESSING at a freshly renewed claim,
+ * unclaimable for FIFTEEN minutes — past the window in which a replay is provably not a second
+ * create. That is the r5 defect, reached through the abort path.
+ *
+ * These pin the bounded retry: the whole transaction is re-run, transient aborts end with the row
+ * released, and the bounds are real — attempts AND wall time, the latter checked before the pause is
+ * taken so the sequence cannot consume the window it is racing.
+ * ---------------------------------------------------------------------------------------------- */
+
+test('o3d-jit6 r7: a transient abort is retried and the row IS handed back', async () => {
+  const w = makeWorld()
+  let calls = 0
+  const slept: number[] = []
+
+  const outcome = await retryUnsentHandBack(
+    () => {
+      calls++
+      // The first attempt aborts the way a serialisation failure does: the transaction rolls back
+      // whole, so nothing of it survives into the retry.
+      if (calls === 1) return Promise.reject(new Error('could not serialize access due to concurrent update'))
+      return w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+        entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+        notPosted: NOT_POSTED,
+        lease: claimHeldFrom(T_DISPATCH),
+        attempt: ATTEMPT,
+        job: JOB as never,
+      }))
+    },
+    { sleep: async (ms) => { slept.push(ms) }, monotonicMs: () => 0 },
+  )
+
+  assert.equal(outcome.handedBack, true, 'the second attempt succeeded, so the row was handed back')
+  assert.equal(outcome.attempts, 2)
+  assert.deepEqual(slept, [UNSENT_HANDBACK_RETRY_BASE_DELAY_MS], 'one pause, and it is the base delay')
+
+  const after = w.world()
+  assert.equal(after.sync.status, 'PENDING', 'THE ROW IS CLAIMABLE AGAIN — this is the whole finding')
+  assert.equal(after.activity.length, 1, 'with exactly one evidence row, from the attempt that committed')
+  assert.equal(after.activity[0].action, 'xero_sync_transport_refused_before_post')
+  assert.equal(after.job.status, 'RETRYABLE_FAILED', 'and the job went back with it, in the same commit')
+  assert.equal(after.job.attempts, 2, 'still without spending an attempt')
+  // The marker is untouched by the retry, so a replay is still decided by the window, not by us.
+  assert.equal(after.sync.createDispatchedAt?.valueOf(), T_DISPATCH.valueOf())
+})
+
+test('o3d-jit6 r7: the retry is bounded by attempts, and the row is left exactly as the abort left it', async () => {
+  const w = makeWorld({ activityLogFails: true })
+  let calls = 0
+  const slept: number[] = []
+
+  const outcome = await retryUnsentHandBack(
+    () => {
+      calls++
+      return w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+        entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+        notPosted: NOT_POSTED,
+        lease: claimHeldFrom(T_DISPATCH),
+        attempt: ATTEMPT,
+        job: JOB as never,
+      }))
+    },
+    { sleep: async (ms) => { slept.push(ms) }, monotonicMs: () => 0 },
+  )
+
+  assert.equal(outcome.handedBack, false)
+  assert.equal(calls, UNSENT_HANDBACK_MAX_ATTEMPTS, 'it stops at the cap rather than retrying forever')
+  assert.equal(outcome.handedBack === false && outcome.attempts, UNSENT_HANDBACK_MAX_ATTEMPTS)
+  assert.equal(outcome.handedBack === false && outcome.abandoned, 'attempts-exhausted')
+  assert.equal(slept.length, UNSENT_HANDBACK_MAX_ATTEMPTS - 1, 'one pause between attempts, none after the last')
+  assert.deepEqual(slept, [UNSENT_HANDBACK_RETRY_BASE_DELAY_MS, UNSENT_HANDBACK_RETRY_BASE_DELAY_MS * 2])
+
+  const after = w.world()
+  assert.equal(after.activity.length, 0, 'nothing was recorded')
+  assert.equal(after.sync.status, 'PROCESSING', 'and therefore nothing was released')
+  assert.equal(after.job.status, 'PROCESSING', 'nor requeued — the halves stay together to the end')
+})
+
+test('o3d-jit6 r7: the wall-time budget is checked BEFORE the pause, so the retry cannot eat the window', async () => {
+  // The budget is a fraction of the usable replay window, derived from the window's own constants.
+  assert.ok(
+    UNSENT_HANDBACK_RETRY_BUDGET_MS < USABLE_WINDOW_MS,
+    'the retry sequence must not be allowed to spend the window it is trying to get back inside',
+  )
+
+  let calls = 0
+  const slept: number[] = []
+  // A clock that has already spent almost the whole budget by the time the first attempt fails.
+  let nowMs = 0
+  const outcome = await retryUnsentHandBack(
+    () => {
+      calls++
+      nowMs = UNSENT_HANDBACK_RETRY_BUDGET_MS - 1
+      return Promise.reject(new Error('deadlock detected'))
+    },
+    { sleep: async (ms) => { slept.push(ms) }, monotonicMs: () => nowMs },
+  )
+
+  assert.equal(calls, 1, 'the budget stopped it before a second attempt')
+  assert.equal(slept.length, 0, 'AND BEFORE THE PAUSE — a budget noticed after it is overspent is not a bound')
+  assert.equal(outcome.handedBack, false)
+  assert.equal(outcome.handedBack === false && outcome.abandoned, 'budget-exhausted')
 })

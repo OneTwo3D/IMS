@@ -447,8 +447,11 @@ test('o3d-jit6 r3: the journal branch classifies an unsent post as notPosted, an
       block.includes('unsentPostEvidence(entry, notPosted'),
       `${name} runner: must build its refusal evidence from the one shared builder`,
     )
+    // r7: through the ONE hand-back, which owns the transaction, the bounded retry and the abort
+    // report. The runner no longer spells the transaction out, so what is pinned here is that it
+    // reaches the shared hand-back and passes the LEASE to it.
     assert.ok(
-      block.includes('recordAndReleaseUnsentTransportRefusal(tx, { entry, notPosted, lease, attempt'),
+      block.includes('handBackUnsentTransportRefusal({ entry, notPosted, lease, attempt'),
       `${name} runner: must commit that evidence with the fenced release, not beside it`,
     )
     assert.ok(
