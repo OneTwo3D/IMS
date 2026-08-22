@@ -75,6 +75,24 @@
  * full argument, including why a trigger on `sales_orders` cannot rescue the pre-#635 case and why
  * this branch does not ask for a write outage instead.
  *
+ * AND THE PROTECTIONS THAT SENTENCE NAMES ARE IN THIS BINARY ONLY (Codex r4, CRITICAL). Across the
+ * window the PREDECESSOR is serving, and its retry does not refuse anything: it reads the nulled
+ * deferral as "nothing was owed", reports success, and its caller writes
+ * `accountingRetryRequired: false` with a NULL sync list. That flag is the accounting invariant's
+ * only bound, so the predecessor can EXONERATE a row before the refusing code below ever ships, and
+ * a cleared row cannot be found again by anything. Losing reversals until it is replaced is what any
+ * unfixed binary does; destroying the witness this branch introduced is specific, and it is closed
+ * where the predecessor cannot reach past it — a BEFORE UPDATE trigger in the same migration refuses
+ * the clear on exactly the rows this module calls `staged-never-recorded`, term for term, unless the
+ * transaction declares `SET LOCAL ims.reversal_settled_manually = 'on'`. It is unreachable from this
+ * build, whose own retry refuses those rows first.
+ *
+ * WHAT THAT DOES NOT CLOSE: a row with NO witness. The guard has nothing to stand on there and does
+ * not fire, deliberately — refusing every clear of a flagged row with no recorded syncs would be
+ * inference from contents, on legacy rows an operator legitimately settles. So a pre-#635
+ * predecessor's window rows can still be cleared by it, and once cleared they are outside the
+ * invariant's bound and unrecoverable. That residual is stated in the migration, not papered over.
+ *
  * DELIBERATELY NOT BACKFILLED, and the migration adds the column with no DEFAULT for exactly this
  * reason. Setting `NOT_STAGED` (or `STAGED`) on the rows that are already there from what they look
  * like today would be the database vouching for events it never witnessed — the same refusal

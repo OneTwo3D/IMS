@@ -228,3 +228,252 @@ test('the forward window only — the migration still backfills nothing (o3d-2sm
   const sql = statements(MIGRATION)
   assert.ok(!/^\s*UPDATE\s/m.test(sql), 'no backfill statement may be added to this migration')
 })
+
+/**
+ * o3d-2sm1 round 4 (Codex CRITICAL) — THE ACTOR IN THE WINDOW IS THE PREDECESSOR, AND IT CLEARS THE
+ * FLAG EVERYTHING ELSE IS BOUNDED BY.
+ *
+ * Round 3 signed off with "rows minted in the window are undecidable, refused by the retry and named
+ * by the invariant". Both of those live in the NEW binary. The one that is serving while the window
+ * is open is the predecessor, whose retry reads the nulled deferral as "nothing was owed", reports
+ * success having queued nothing, and whose caller then writes exactly `PREDECESSOR_CLEAR` below.
+ * `accounting_retry_required` is the accounting invariant's only bound, so that statement does not
+ * merely fail to fix the row — it makes a row this branch's own witness had ACCUSED unfindable.
+ *
+ * These tests run the predecessor's statement against the migration's own rules: the guard's WHEN
+ * clause is read out of the file and EVALUATED against (OLD, NEW) row pairs, so a clause that is
+ * removed, narrowed to the wrong column, or keyed on NEW where it must read OLD fails them rather
+ * than passing on a hardcoded string.
+ */
+
+const REFUND_SERVICE = 'lib/domain/sales/refund-service.ts'
+
+type DbRow = Record<string, unknown>
+
+/** The guard trigger's WHEN clause, exactly as the migration declares it — or null if it is gone. */
+function guardWhenClause(sql: string): string | null {
+  const create = /CREATE TRIGGER sales_order_refund_guard_witnessed_clear\s+BEFORE UPDATE ON "sales_order_refunds"[\s\S]*?WHEN\s*\(([\s\S]+?)\)\s*EXECUTE FUNCTION sales_order_refund_guard_witnessed_clear\(\)/
+    .exec(sql)
+  if (!create) return null
+  const dropIndex = sql.lastIndexOf('DROP TRIGGER IF EXISTS sales_order_refund_guard_witnessed_clear ON')
+  if (dropIndex > sql.indexOf('CREATE TRIGGER sales_order_refund_guard_witnessed_clear')) return null
+  return create[1].replace(/\s+/g, ' ').trim()
+}
+
+/** The guard trigger function's body, up to its terminator. */
+function guardFunctionBody(sql: string): string | null {
+  const marker = 'CREATE OR REPLACE FUNCTION sales_order_refund_guard_witnessed_clear()'
+  if (!sql.includes(marker)) return null
+  const body = sql.slice(sql.indexOf(marker))
+  return body.slice(0, body.indexOf('$$;'))
+}
+
+/**
+ * Does the guard fire on this statement? Evaluates the migration's own WHEN clause — every term of
+ * it — against the row before and after. A term shape this cannot evaluate fails loudly rather than
+ * being skipped, so the clause cannot quietly grow a condition the test does not police.
+ */
+function guardFires(clause: string, before: DbRow, after: DbRow): boolean {
+  return clause.split(' AND ').every((term) => {
+    const parsed = /^(OLD|NEW)\."([a-z_]+)" (?:IS (NOT NULL|NULL|TRUE|FALSE)|= '([A-Z_]+)')$/.exec(term.trim())
+    assert.ok(parsed, `the guard's WHEN clause carries a term this test cannot evaluate: ${term}`)
+    const row = parsed![1] === 'OLD' ? before : after
+    const value = row[parsed![2]]
+    switch (parsed![3]) {
+      case 'NULL': return value == null
+      case 'NOT NULL': return value != null
+      case 'TRUE': return value === true
+      case 'FALSE': return value === false
+      default: return value === parsed![4]
+    }
+  })
+}
+
+/** One refund in the two vocabularies these tests need: the database's, and the module's. */
+function refundRow(input: { retryRequired: boolean; syncs: unknown; witness: string | null }) {
+  return {
+    db: {
+      accounting_retry_required: input.retryRequired,
+      accounting_retry_syncs: input.syncs,
+      reversal_staging_state: input.witness,
+    } as DbRow,
+    domain: {
+      accountingRetryRequired: input.retryRequired,
+      accountingRetrySyncs: input.syncs,
+      reversalStagingState: input.witness,
+    },
+  }
+}
+
+/**
+ * The clearing UPDATE in `retryRefundAccounting` (app/actions/sales.ts), which is the same statement
+ * in the predecessor as in this build: the flag off, the warning gone, the retry list nulled — and
+ * nothing recorded in their place.
+ */
+const PREDECESSOR_CLEAR: DbRow = {
+  accounting_retry_required: false,
+  accounting_warning: null,
+  accounting_retry_syncs: null,
+}
+
+const applyStatement = (before: DbRow, patch: DbRow): DbRow => ({ ...before, ...patch })
+
+test('o3d-2sm1 Codex r4: the predecessor\'s retry cannot exonerate a row the witness has accused', () => {
+  const sql = statements(MIGRATION)
+
+  // The row the CRITICAL is about, built the way the database builds it: born unwitnessed under a
+  // #635-era binary, then staged through a statement that MOVES the relief amount — which is what
+  // the surviving mint fires on — then dead before the syncs were recorded.
+  const lost = refundRow({
+    retryRequired: true,
+    syncs: null,
+    witness: stateAfterReliefMove(sql, stateAfterForeignInsert(sql)),
+  })
+  assert.equal(lost.domain.reversalStagingState, REVERSAL_STAGING_STAGED)
+  assert.equal(reversalRecordVerdict(lost.domain), 'staged-never-recorded', 'the witness accuses it')
+
+  // Now the predecessor's retry runs against this schema. It has none of this build's refusals: it
+  // reports success having queued nothing, and issues the clear.
+  const clause = guardWhenClause(sql)
+  assert.ok(clause, 'the migration must carry a rule the predecessor cannot bypass')
+  assert.ok(
+    guardFires(clause!, lost.db, applyStatement(lost.db, PREDECESSOR_CLEAR)),
+    'the exonerating clear must be caught by the database, because the code that would catch it is not deployed yet',
+  )
+
+  // And caught means REFUSED, not observed. A function that fell through to RETURN NEW would let the
+  // write land and the row would leave the invariant's bound for good.
+  const body = guardFunctionBody(sql)
+  assert.ok(body, 'the guard trigger needs a function')
+  assert.match(body!, /RAISE EXCEPTION/)
+  assert.equal(
+    (body!.match(/RETURN NEW/g) ?? []).length,
+    1,
+    'exactly one RETURN NEW — the declared manual settle. Any other is a hole',
+  )
+  assert.ok(
+    body!.indexOf('RETURN NEW') < body!.indexOf('RAISE EXCEPTION'),
+    'and it is the declared escape, which must precede the refusal it bypasses',
+  )
+
+  // So the flag survives the window, which is the whole point: the row is still inside
+  // `where: { accountingRetryRequired: true }` when the new build's invariant finally runs.
+  assert.equal(reversalRecordVerdict(lost.domain), 'staged-never-recorded')
+})
+
+test('o3d-2sm1 Codex r4: the guard refuses exactly `staged-never-recorded`, and no ordinary clear', () => {
+  // A guard that blocked a legitimate clear would strand rows an operator then has to clear by hand,
+  // so every statement in THIS build that clears the flag is run through it here.
+  const sql = statements(MIGRATION)
+  const clause = guardWhenClause(sql)!
+
+  const cases: Array<{ name: string; before: ReturnType<typeof refundRow>; patch: DbRow; fires: boolean }> = [
+    {
+      name: 'the predecessor exonerating a witnessed loss — the CRITICAL',
+      before: refundRow({ retryRequired: true, syncs: null, witness: REVERSAL_STAGING_STAGED }),
+      patch: PREDECESSOR_CLEAR,
+      fires: true,
+    },
+    {
+      name: 'the `nothing-lost` short-circuit: witnessed birth, staging demonstrably never committed',
+      before: refundRow({ retryRequired: true, syncs: null, witness: REVERSAL_STAGING_NOT_STAGED }),
+      patch: PREDECESSOR_CLEAR,
+      fires: false,
+    },
+    {
+      name: 'a legacy row with no witness — nothing to accuse on, so nothing to refuse',
+      before: refundRow({ retryRequired: true, syncs: null, witness: null }),
+      patch: PREDECESSOR_CLEAR,
+      fires: false,
+    },
+    {
+      name: 'an ordinary successful retry that RE-STAGED: its own transaction recorded the list first',
+      before: refundRow({ retryRequired: true, syncs: [], witness: REVERSAL_STAGING_STAGED }),
+      patch: PREDECESSOR_CLEAR,
+      fires: false,
+    },
+    {
+      name: 'an ordinary successful retry that re-queued syncs already on the row',
+      before: refundRow({ retryRequired: true, syncs: [{ type: 'COGS_REVERSAL' }], witness: REVERSAL_STAGING_STAGED }),
+      patch: PREDECESSOR_CLEAR,
+      fires: false,
+    },
+    {
+      name: 'createSalesOrderRefund clearing the flag in the SAME statement that records the list',
+      before: refundRow({ retryRequired: true, syncs: null, witness: REVERSAL_STAGING_STAGED }),
+      patch: { accounting_retry_required: false, accounting_retry_syncs: [] },
+      fires: false,
+    },
+    {
+      name: 'any later write to a row whose flag is already clear — the guard tests movement',
+      before: refundRow({ retryRequired: false, syncs: null, witness: REVERSAL_STAGING_STAGED }),
+      patch: PREDECESSOR_CLEAR,
+      fires: false,
+    },
+  ]
+
+  for (const scenario of cases) {
+    assert.equal(
+      guardFires(clause, scenario.before.db, applyStatement(scenario.before.db, scenario.patch)),
+      scenario.fires,
+      scenario.name,
+    )
+  }
+
+  // THE SAME RULE, NOT A SECOND ONE. For the statement that records nothing in place of what it
+  // clears, the database's answer and `reversalRecordVerdict`'s must agree term for term — otherwise
+  // the guard is a database-flavoured rule of its own, free to drift from the application's.
+  for (const scenario of cases) {
+    if (scenario.patch !== PREDECESSOR_CLEAR) continue
+    if (scenario.before.domain.accountingRetryRequired !== true) continue
+    assert.equal(
+      guardFires(clause, scenario.before.db, applyStatement(scenario.before.db, scenario.patch)),
+      reversalRecordVerdict(scenario.before.domain) === 'staged-never-recorded',
+      `the database and reversalRecordVerdict must not disagree about: ${scenario.name}`,
+    )
+  }
+})
+
+test('o3d-2sm1 Codex r4: the guard reads OLD for every accusation, and tests the flag MOVING', () => {
+  const clause = guardWhenClause(statements(MIGRATION))!
+  // Movement, not the stored value — the same reason the mint tests a move: a rule keyed on "this
+  // row has the flag clear" would fire on every later write to a settled refund.
+  assert.match(clause, /OLD\."accounting_retry_required" IS TRUE/)
+  assert.match(clause, /NEW\."accounting_retry_required" IS FALSE/)
+  // The accusation is read from the row as it stood BEFORE the statement. Reading the witness from
+  // NEW would let the mint, firing on the very same statement, manufacture the accusation the guard
+  // then refuses.
+  assert.match(clause, /OLD\."reversal_staging_state" = 'STAGED'/)
+  assert.match(clause, /OLD\."accounting_retry_syncs" IS NULL/)
+  assert.ok(
+    !/NEW\."reversal_staging_state"/.test(clause),
+    'the guard must not read the witness the mint may have just written',
+  )
+  // And it stands down for a statement that records something in place of what it clears.
+  assert.match(clause, /NEW\."accounting_retry_syncs" IS NULL/)
+})
+
+test('o3d-2sm1 Codex r4: a deliberate manual clear declares itself, under a setting a restore cannot use', () => {
+  const sql = statements(MIGRATION)
+  const body = guardFunctionBody(sql)!
+  const escape = /current_setting\('([a-z_.]+)',\s*true\)\s*=\s*'on'/.exec(body)
+  assert.ok(escape, 'both refusal messages tell an operator to clear the flag by hand, so a declared clear must be possible')
+
+  // NOT the mint's setting. `ims.unwitnessed_write` says "this write is not an event anyone
+  // witnessed" and the restore endpoint sets it for a whole psql session; this one says "a human has
+  // settled these reversals against the ledger". A restore must never be able to make that claim.
+  const mintBody = sql.slice(sql.indexOf(`CREATE OR REPLACE FUNCTION ${triggerFunctionFor(sql, 'UPDATE')}()`))
+  const mintEscape = /current_setting\('([a-z_.]+)',\s*true\)\s*=\s*'on'/.exec(mintBody)!
+  assert.notEqual(
+    escape![1],
+    mintEscape[1],
+    'a restore declaring itself unwitnessed must not thereby be able to exonerate a witnessed loss',
+  )
+
+  // And the refusal the application raises for the same row names the same setting, so an operator
+  // reading the error is told the one thing that unblocks them.
+  assert.ok(
+    readFileSync(REFUND_SERVICE, 'utf8').includes(escape![1]),
+    `retrySalesOrderRefundAccounting's refusal must name ${escape![1]}`,
+  )
+})

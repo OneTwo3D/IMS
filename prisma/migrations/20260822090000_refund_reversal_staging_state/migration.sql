@@ -115,12 +115,16 @@ ALTER TABLE "sales_order_refunds" ADD COLUMN "reversal_staging_state" TEXT;
 -- there is no handle in scope, and picking the refund by its contents (`accounting_retry_required`
 -- with a NULL `accounting_retry_syncs`) is the same inference-from-contents that produced the
 -- laundering above, one level along — it would falsely accuse any earlier refund on the order
--- sitting in that state. A write outage across the migration window would make the guarantee true
--- by decree, but it would buy nothing that matters: the only rows at risk are those left in the
--- suspicious state, and those are already handled safely by refusing them. So this branch does not
--- ask for one. For a pre-#635 predecessor the guarantee across the window is OPERATIONAL and
--- WEAKER, and it is stated rather than assumed: rows minted in it are undecidable, refused by the
--- retry and named by the invariant, never silently decided.
+-- sitting in that state. For a pre-#635 predecessor the guarantee across the window is therefore
+-- OPERATIONAL and WEAKER, and it is stated rather than assumed: rows minted in it are undecidable
+-- rather than decided.
+--
+-- ROUND 3 WENT ON TO SAY THOSE ROWS ARE "refused by the retry and named by the invariant, never
+-- silently decided", AND ARGUED FROM THAT THAT NO WRITE OUTAGE WAS WORTH ASKING FOR. THAT WAS WRONG,
+-- and round 4 at the foot of this file is the correction: the retry that refuses and the invariant
+-- that names both live in the NEW binary, while across the window it is the PREDECESSOR's retry that
+-- runs -- and it clears the very flag the invariant is bounded by. Read the round 4 section for what
+-- the database now refuses, what is merely documented, and which half of this window is still open.
 --
 -- DIRECTION, WHICH IS WHAT MAKES THE SURVIVING MINT ADMISSIBLE. 20260821090000 and 20260819210000
 -- only ever CLEAR, because both vouch for an event the trigger did not execute and a laundered
@@ -199,3 +203,137 @@ WHEN (
   AND NEW."reversal_staging_state" IS DISTINCT FROM 'STAGED'
 )
 EXECUTE FUNCTION sales_order_refund_witness_staging();
+
+-- =================================================================================================
+-- ROUND 4, Codex CRITICAL: THE PREDECESSOR CAN EXONERATE A WITNESSED ROW BEFORE THE REFUSING CODE
+-- EVER SHIPS — SO THE REFUSAL HAS TO EXIST SOMEWHERE THE PREDECESSOR CANNOT BYPASS.
+-- =================================================================================================
+--
+-- ROUND 3 ENDED ON THIS SENTENCE: rows minted in the window "are undecidable, refused by the retry
+-- and named by the invariant, never silently decided". BOTH OF THOSE PROTECTIONS LIVE ONLY IN THE
+-- NEW BINARY. Across the window it is the PREDECESSOR that is serving, and its retry is the buggy
+-- one: it reads the nulled deferral as "this order never owed a reversal", returns success having
+-- queued nothing, and its caller then writes
+--
+--     accounting_retry_required = false, accounting_warning = NULL, accounting_retry_syncs = NULL
+--
+-- (`retryRefundAccounting`, app/actions/sales.ts). `accounting_retry_required` is the ONLY bound the
+-- accounting invariant's query has. So this is not the ordinary "the old binary keeps losing
+-- reversals until it is replaced" — that is true of every fix and no migration can repair the past.
+-- It is the predecessor ACTIVELY DESTROYING THE EVIDENCE the new code would have used, on a row this
+-- branch's own witness had already accused. Once the flag is gone the row falls outside the bound
+-- and cannot be found again. The round 3 guarantee was false for exactly the interval it described.
+--
+-- SEQUENCING VERSUS A RULE IN THE DATABASE. Stopping the predecessor, applying this, then starting
+-- the new build does close the window — but it is OPERATIONAL: nothing in this repository enforces
+-- it, nobody is obliged to read it, and the single occasion it is skipped costs a reversal that can
+-- never be found again. A trigger is refused by the database itself and the predecessor does not
+-- know the rule exists, which is precisely the property that made a trigger the right answer for the
+-- witness. So the rule goes here, for the third time on this file.
+--
+-- WHAT IT REFUSES — and note that the first three terms are `reversalRecordVerdict(OLD) ===
+-- 'staged-never-recorded'` TERM FOR TERM:
+--
+--     OLD.accounting_retry_required IS TRUE    the row still owes accounting
+--     OLD.reversal_staging_state = 'STAGED'    a witness says its staging COMMITTED
+--     OLD.accounting_retry_syncs IS NULL       and no record of what it produced exists
+--     NEW.accounting_retry_required IS FALSE   and this statement is clearing the flag
+--     NEW.accounting_retry_syncs IS NULL       while recording nothing in its place
+--
+-- That identity is deliberate. This is not a second, database-flavoured rule that could drift from
+-- the application's; it is THE SAME RULE, put where a binary that has never heard of it still obeys
+-- it. It tests MOVEMENT and not the stored value, exactly as the mint above does: it fires on the
+-- flag going true -> false, never on a row that merely has it clear. And every accusing term reads
+-- OLD, so the mint firing on the same statement cannot manufacture the accusation the guard refuses.
+--
+-- WHAT HAPPENS TO A LEGITIMATE CLEAR, checked against every statement in the NEW build that clears
+-- the flag — because a guard that strands ordinary work is worse than the hole it plugs:
+--
+--   createSalesOrderRefund's staging clear writes accounting_retry_syncs IN THE SAME STATEMENT, and
+--   the serialiser writes '[]' rather than NULL for an empty stage. NEW is therefore never NULL there
+--   and the guard stands down.
+--
+--   retryRefundAccounting's clear does write NULL — but it is reached only when the retry SUCCEEDED,
+--   and success means either the syncs were already on the row (OLD not NULL) or the retry re-staged
+--   and wrote them inside its own transaction (OLD not NULL, '[]' at worst). The one success path
+--   that arrives with OLD NULL is the `nothing-lost` short-circuit, and that one requires
+--   'NOT_STAGED', which this guard does not fire on.
+--
+--   SO IN THE NEW BUILD THIS TRIGGER IS UNREACHABLE. The only statements it can fire on are ones the
+--   new build's own retry refuses long before reaching them. It cannot turn an ordinary successful
+--   retry into a refusal; it can only refuse an actor that never made the check.
+--
+-- IT REFUSES RATHER THAN NEUTRALISING. Silently pinning the flag back would leave an operator
+-- watching a row that will not clear with nothing anywhere to read, and clicking retry again. The
+-- exception is caught by the predecessor's own error path, which re-asserts the flag and writes the
+-- message into `accounting_warning`, where that operator is already looking. The credit note the
+-- predecessor queues just before the clear carries a fixed idempotency key, so a retry after the
+-- refusal does not duplicate it.
+--
+-- A DELIBERATE MANUAL CLEAR IS STILL POSSIBLE, and has to be: both refusal messages in
+-- `retrySalesOrderRefundAccounting` end by telling an operator to settle the reversal against the
+-- ledger and clear the flag by hand. DECLARED BY THE OPERATION, NEVER INFERRED, like the mint's:
+--
+--     SET LOCAL ims.reversal_settled_manually = 'on';
+--
+-- A SEPARATE SETTING FROM `ims.unwitnessed_write`, deliberately. That one says "this write is not an
+-- event anybody witnessed" and the restore endpoint sets it for a whole psql session; this one says
+-- "a human has settled these reversals against the ledger". A restore must never be able to make the
+-- second claim, so it does not get to.
+--
+-- THE RESIDUAL, STATED EXACTLY, BECAUSE HALF OF THIS WINDOW IS STILL OPEN:
+--
+--   A PRE-#635 PREDECESSOR'S WINDOW ROWS REMAIN EXONERABLE, AND UNRECOVERABLY SO. That binary writes
+--   nothing to this table while staging, so no witness is ever minted; the row is NULL, `undecidable`,
+--   and this guard has no accusation to stand on. Its retry clears the flag, the row leaves the
+--   invariant's bound, and NOTHING CAN FIND IT AGAIN — not this guard, not the invariant, not a later
+--   sweep. The guard does not fire on NULL ON PURPOSE: a rule keyed on "the flag is set and there are
+--   no syncs" is the same inference-from-contents that round 2's INSERT mint got wrong, one level
+--   along, and it would refuse the clear on every legacy row an operator legitimately settles, on no
+--   evidence at all. The database refuses to exonerate where it holds a witness and admits it cannot
+--   speak where it does not. For this half the only closure is operational — drain and stop the
+--   predecessor, apply this, start the new build — and that is offered here as an option, NOT claimed
+--   as a guarantee, because nothing in this repository can enforce it.
+--
+--   A #635-ERA PREDECESSOR THAT STAGED NOTHING IS FALSELY ACCUSED. It moves the relief amount (so the
+--   witness says 'STAGED'), stages an empty list, and its serialiser writes NULL for empty — the
+--   o3d-clxw defect this branch fixed one level down. Its legitimate clear is refused. The database
+--   genuinely cannot tell that row from a lost one: under that serialiser both are STAGED with a NULL
+--   syncs column. The cost is one investigation and one declared manual clear, on a window-length
+--   set, and the direction is the one this branch has taken every time: accuse where it cannot tell,
+--   because the other error drops a reversal.
+
+CREATE OR REPLACE FUNCTION sales_order_refund_guard_witnessed_clear()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  -- The declared manual settle. `true` as the second argument makes an unset value a NULL rather
+  -- than an error, so an ordinary write — which never sets it — falls straight through to the
+  -- refusal below.
+  IF current_setting('ims.reversal_settled_manually', true) = 'on' THEN
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION
+    'Refusing to clear accounting_retry_required on sales order refund %: its staging is witnessed as committed and no record of what that staging produced was ever written, and this statement records none either. Raise the COGS/unearned/allocated-inventory reversals by hand from the refund''s own cost snapshots, reconcile the order, then clear the flag in a transaction that declares itself with SET LOCAL ims.reversal_settled_manually = ''on''.',
+    OLD.id
+    USING ERRCODE = '23514';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS sales_order_refund_guard_witnessed_clear ON "sales_order_refunds";
+
+-- BEFORE, so the write is stopped rather than reported after the fact. Named to sort ahead of the
+-- mint (Postgres fires row triggers in name order) purely for readability — every accusing term
+-- reads OLD, so the two cannot interact whichever order they run in.
+CREATE TRIGGER sales_order_refund_guard_witnessed_clear
+BEFORE UPDATE ON "sales_order_refunds"
+FOR EACH ROW
+WHEN (
+  OLD."accounting_retry_required" IS TRUE
+  AND NEW."accounting_retry_required" IS FALSE
+  AND OLD."reversal_staging_state" = 'STAGED'
+  AND OLD."accounting_retry_syncs" IS NULL
+  AND NEW."accounting_retry_syncs" IS NULL
+)
+EXECUTE FUNCTION sales_order_refund_guard_witnessed_clear();

@@ -4581,7 +4581,9 @@ export async function retrySalesOrderRefundAccounting(
             error: 'This refund\'s accounting reversals were staged but the record of them was never '
               + 'written, and the same staging cleared the order\'s revenue deferral — so no retry can '
               + 'derive them again. Raise the COGS/unearned/allocated-inventory reversals manually against '
-              + 'the refund\'s own cost snapshots and reconcile the order before clearing this flag.',
+              + 'the refund\'s own cost snapshots and reconcile the order before clearing this flag. The '
+              + 'database refuses a bare clear on this row (o3d-2sm1 r4), so clear it from a transaction '
+              + 'that declares SET LOCAL ims.reversal_settled_manually = \'on\'.',
           }
         }
         // -----------------------------------------------------------------------------------------
@@ -4615,6 +4617,17 @@ export async function retrySalesOrderRefundAccounting(
         // undecidable and land here. Round 2 claimed a trigger closed that; it did not, and the
         // trigger it used stamped those rows as fine. Refusing them is the whole point: the window
         // is minutes, the refusal costs a manual clear, and the alternative was the drop above.
+        //
+        // AND THIS REFUSAL IS THIS BINARY'S, WHICH IS NOT THE ONE SERVING IN THAT WINDOW (Codex r4).
+        // The predecessor's retry does not reach this branch at all — it has none of it. It reports
+        // success on the same row and its caller clears `accountingRetryRequired`, the accounting
+        // invariant's only bound, so the row it just lost becomes unfindable. For a row the database
+        // WITNESSED as staged, the migration's second trigger refuses that clear outright, which is
+        // the same rule as the `staged-never-recorded` branch above put where a binary that has never
+        // heard of it still obeys it. For a row with NO witness — the pre-#635 case this paragraph is
+        // about — there is nothing to stand a refusal on, and the honest statement is that such a row
+        // can still be exonerated by the predecessor and is then gone for good. The migration says so
+        // in those words rather than claiming the window is closed.
         // -----------------------------------------------------------------------------------------
         if (recordVerdict === 'undecidable') {
           return {

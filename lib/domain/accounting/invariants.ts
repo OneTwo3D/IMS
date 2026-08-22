@@ -907,6 +907,14 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
   // which is windowed by `refundedAt` and needs a posted shipment. Nothing here can invent them
   // back; what it can do is stop the set growing.
   //
+  // WHICH IS WHY THE FLAG IS DEFENDED IN THE DATABASE AND NOT ONLY HERE (Codex r4). A pre-fix retry
+  // is not only history: it is what serves between this branch's migration being applied and this
+  // build starting, and it clears the bound on rows it has just lost. 20260822090000 refuses that
+  // clear for a row whose witness says its staging committed and whose syncs were never recorded —
+  // the `staged-never-recorded` shape below — so those rows are still here to be reported. A row
+  // with no witness has nothing to refuse on, so the `undecidable` set below can still be silently
+  // cleared by that predecessor, and once it is, this report is not the thing that finds it.
+  //
   // The un-stage having HAPPENED is part of the test, exactly as it is in the retry: a refund whose
   // staging committed while the order is still A1-deferred lost its syncs too, but a retry re-derives
   // them from the stamps that are still there, so it is recoverable rather than lost.

@@ -2809,6 +2809,17 @@ export async function retryRefundAccounting(
       accountingSettings,
     })
 
+    // o3d-2sm1 (Codex r4): THE STATEMENT THE DATABASE GUARDS.
+    //
+    // This clears the accounting invariant's only bound, and in the binary that precedes this one it
+    // ran on rows whose reversals had been staged and lost — the retry reported success having
+    // queued nothing, and this write then erased the last mark that anything was owed. It is
+    // unreachable that way from here (`retrySalesOrderRefundAccounting` refuses both
+    // `staged-never-recorded` and `undecidable` before returning success, and every success path
+    // leaves a recorded sync list on the row for the guard to see), but a BEFORE UPDATE trigger in
+    // 20260822090000 refuses it anyway when the witness says STAGED and neither the row nor this
+    // statement carries a record — because the rule has to bind the binary that has never heard of
+    // it. A deliberate manual clear declares itself with `SET LOCAL ims.reversal_settled_manually`.
     await db.salesOrderRefund.update({
       where: { id: result.refundId },
       data: {
