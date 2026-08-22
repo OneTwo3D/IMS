@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
-import { refundIsInIms, refundOutcomeFailed, resolveMonetaryRefundVatRate, syncWcRefund, type WcRefundSyncDependencies } from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { refundIsInIms, refundMayStillReachIms, refundOutcomeFailed, resolveMonetaryRefundVatRate, syncWcRefund, type WcRefundSyncDependencies } from '@/lib/connectors/woocommerce/sync/refund-sync'
 import type { WcRefund } from '@/lib/connectors/woocommerce/sync/types'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
@@ -1227,8 +1227,12 @@ test('a refused monetary-only refund is QUARANTINED and not re-attempted on the 
   // o3d-xnwu r4: HANDLED, AND NOT APPLIED — and those are now two different things. This ending used
   // to return the same `success: true` the applied endings did, so the sweep counted a refund sitting
   // in the exception inbox as one that is in IMS.
-  assert.equal(second.outcome, 'handled-unapplied', 'the parked refund is treated as handled, not retried')
+  // o3d-xnwu r5: and RESOLVABLE — the half of "handled" that says an operator can still make this a
+  // SalesOrderRefund, which is what makes holding a delivery for it worth something. The other half
+  // (a chargeback-suppressed refund) can never be applied and must not hold anything.
+  assert.equal(second.outcome, 'handled-unapplied-resolvable', 'the parked refund is treated as handled, not retried')
   assert.equal(refundIsInIms(second.outcome), false, 'and nothing about it is in IMS')
+  assert.equal(refundMayStillReachIms(second.outcome), true, 'but an operator resolving the park still lands it')
   assert.equal(state.createRefundCalls, callsAfterFirst, 'createRefund was NOT called again for a parked refund')
 })
 

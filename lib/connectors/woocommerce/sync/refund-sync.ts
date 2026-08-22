@@ -516,16 +516,29 @@ export type WcRefundOutcome =
   /** A SalesOrderRefund for this refund already exists on THIS order — an earlier delivery applied it. */
   | 'already-applied'
   /**
-   * Handled, and deliberately NOT applied: a quarantined park awaiting an operator, or a refund
-   * suppressed by a prior chargeback. Nothing is owed by this delivery and nothing is in IMS, so it
-   * must never be retried as a failure NOR counted as applied.
+   * Handled, deliberately NOT applied, and STILL CAPABLE OF BEING APPLIED: a QUARANTINED park on this
+   * order, waiting for an operator. Nothing is owed by this delivery and nothing is in IMS — but the
+   * day the operator records it, this refund becomes demand IMS holds. Holding a delivery for it
+   * therefore buys something.
    */
-  | 'handled-unapplied'
-  /** Did not apply, and a later delivery may succeed — a missing IMS order, a park to retry, a throw. */
+  | 'handled-unapplied-resolvable'
+  /**
+   * Handled, deliberately NOT applied, and IT NEVER WILL BE: the payment poller charged the whole
+   * order back first, so no credit note is raised and none ever will be for this refund. There is no
+   * resolution that turns this into demand IMS holds — not an operator's, not a redelivery's.
+   */
+  | 'handled-unapplied-terminal'
+  /** Did not apply, and a later delivery may succeed — a missing IMS order, a FAILED park to retry, a throw. */
   | 'retryable-failure'
   /**
-   * Did not apply and never will without a human: WooCommerce has the refund on a different order,
-   * or the refusal was recorded as a quarantine by this call.
+   * Did not apply, was PARKED QUARANTINED by this call, and needs a human. A failure the caller must
+   * report — and, like the resolvable park it becomes on the next sweep, one an operator can still
+   * turn into an applied refund.
+   */
+  | 'quarantined-refusal'
+  /**
+   * Did not apply and never will: WooCommerce has this refund attached to a DIFFERENT order, so no
+   * redelivery and no operator action inside IMS makes it demand this order holds.
    */
   | 'permanent-failure'
 
@@ -534,17 +547,67 @@ export type WcRefundSyncResult = { outcome: WcRefundOutcome; error?: string }
 /**
  * IS THIS REFUND IN IMS? The ONE predicate the coverage arithmetic is allowed to ask.
  *
- * Deliberately not "did the call succeed": three outcomes are not failures and only two of them mean
- * the demand this refund carries is recorded. Every count that a caller turns into a statement about
- * the STORE versus IMS is aggregated through here.
+ * Deliberately not "did the call succeed", and deliberately NOT widened by the split below: the
+ * coverage check nets ordered demand against refunds IMS HOLDS, and it holds exactly the two
+ * outcomes that put a SalesOrderRefund on the order. A terminally-suppressed refund is not one of
+ * them and must never be counted as one — see `refundMayStillReachIms` for the separate question a
+ * caller deciding whether to WAIT has to ask instead.
  */
 export function refundIsInIms(outcome: WcRefundOutcome): boolean {
   return outcome === 'applied' || outcome === 'already-applied'
 }
 
-/** Whether this ending is a failure the caller should report. Neither failure kind is in IMS. */
+/** Whether this ending is a failure the caller should report. No failure kind is in IMS. */
 export function refundOutcomeFailed(outcome: WcRefundOutcome): boolean {
-  return outcome === 'retryable-failure' || outcome === 'permanent-failure'
+  return outcome === 'retryable-failure'
+    || outcome === 'quarantined-refusal'
+    || outcome === 'permanent-failure'
+}
+
+/**
+ * COULD THIS REFUND STILL REACH IMS? — the settlement question, and it is NOT the coverage question.
+ *
+ * o3d-xnwu round 5 (Codex HIGH): `handled-unapplied` COVERED TWO ENDINGS THAT NEED OPPOSITE
+ * TREATMENT. Round 4 was right that neither is applied and right that the coverage arithmetic must
+ * not count either — and then the caller used "not applied" as its reason to HOLD the delivery,
+ * which is only correct for one of them:
+ *
+ *   a QUARANTINED park is operator-resolvable. It may yet become a SalesOrderRefund, so a delivery
+ *   held for it is a delivery waiting for something that can actually arrive.
+ *
+ *   a CHARGEBACK-SUPPRESSED refund never applies. Nothing an operator does in IMS raises the credit
+ *   note — the whole order was already reversed — so holding the delivery means HTTP 500 for ever
+ *   and a cursor that never advances, which is the endless-retry behaviour o3d-bx9 removed and this
+ *   branch exists to keep removed.
+ *
+ * The same cut runs through the FAILURES, which is why this predicate is defined over the whole
+ * union rather than over the two handled endings: a refund WooCommerce has attached to a different
+ * order is exactly as unreachable as a suppressed one, and holding for it dead-letters every
+ * delivery of the order.
+ *
+ * A refund that is already in IMS answers FALSE: there is nothing left to wait for. Callers ask this
+ * only about refunds `refundIsInIms` already rejected, and the false keeps the two questions from
+ * being confusable.
+ *
+ * UNRECOGNISED STAYS TRANSIENT. An outcome this switch does not know is treated as still reachable —
+ * the same direction every unrecognised condition on this branch takes — because concluding "settled"
+ * from ignorance is what buries a real shortfall, and concluding "wait" merely costs a redelivery.
+ */
+export function refundMayStillReachIms(outcome: WcRefundOutcome): boolean {
+  switch (outcome) {
+    case 'applied':
+    case 'already-applied':
+      return false
+    case 'handled-unapplied-terminal':
+    case 'permanent-failure':
+      return false
+    case 'handled-unapplied-resolvable':
+    case 'quarantined-refusal':
+    case 'retryable-failure':
+      return true
+    default:
+      return true
+  }
 }
 
 export async function syncWcRefund(
@@ -637,7 +700,8 @@ export async function syncWcRefund(
     if (parked && parked.entityId !== so.id) {
       return { outcome: 'permanent-failure', error: `WooCommerce refund ${wcRefund.id} is already parked for a different order (${parked.entityId}); refusing to process it for this order.` }
     }
-    // HANDLED, AND NOTHING IS IN IMS (o3d-xnwu r4). This used to be `success: true`, which the sweep
+    // HANDLED, NOTHING IS IN IMS, AND AN OPERATOR CAN STILL CHANGE THAT (o3d-xnwu r4/r5). This used
+    // to be `success: true`, which the sweep
     // counted as applied — so an order whose refunds were all sitting in the exception inbox looked,
     // to the coverage arithmetic, exactly like an order whose refunds were all recorded. It is not
     // retryable either: a sweep will refuse it identically every run until an operator resolves the
@@ -646,7 +710,12 @@ export async function syncWcRefund(
     // while a completion refusal is being held on it, where the alternative is burying a dispatch
     // IMS genuinely cannot cover. That scoping is the caller's, and deliberate.)
     if (parked && parked.status === 'QUARANTINED') {
-      return { outcome: 'handled-unapplied', error: `WooCommerce refund ${wcRefund.id} is quarantined for this order and awaits manual resolution` }
+      // RESOLVABLE, and that half of the name is load-bearing (r5). The park is what an operator
+      // clears; the moment they do, this refund becomes demand IMS holds. A caller deciding whether
+      // to wait for this order's refunds must wait for THIS one — which is the opposite of what it
+      // must do for the chargeback suppression further down, and the reason one outcome could not
+      // carry both.
+      return { outcome: 'handled-unapplied-resolvable', error: `WooCommerce refund ${wcRefund.id} is quarantined for this order and awaits manual resolution` }
     }
 
     const fxRate = toDecimal(so.fxRateToBase).gt(0) ? toDecimal(so.fxRateToBase) : toDecimal(1)
@@ -784,9 +853,12 @@ export async function syncWcRefund(
           errorMessage: error,
           payload: wcRefund,
         })
-        // PERMANENT: this call recorded the quarantine, and only an operator resolving it can change
-        // the answer. Reported as a failure once, by the delivery that decided it.
-        return { outcome: 'permanent-failure', error }
+        // QUARANTINED: this call recorded the park, and only an operator resolving it can change the
+        // answer. Reported as a failure once, by the delivery that decided it — and, r5, named as the
+        // OPERATOR-RESOLVABLE kind, because "only an operator can change it" is precisely the state a
+        // caller is right to hold a delivery for. `permanent-failure` is now reserved for the refunds
+        // no resolution reaches at all.
+        return { outcome: 'quarantined-refusal', error }
       }
       const netForeign = toDecimal(refundAmountForeign).div(toDecimal(1).add(basis.vatRate))
       refundLines.push({
@@ -941,11 +1013,18 @@ export async function syncWcRefund(
           resolveUser: false,
         })
       }
-      // HANDLED, AND NOTHING IS IN IMS (o3d-xnwu r4). No credit note is raised and no restock is
-      // made, so counting this as applied told the coverage arithmetic that demand it does not hold
-      // had been recorded. It is not a failure either: the condition can never clear by retrying —
-      // the activity record above is what asks a human to reconcile it.
-      return { outcome: 'handled-unapplied', error: WC_REFUND_SUPPRESSED_BY_CHARGEBACK }
+      // HANDLED, NOTHING IS IN IMS, AND NOTHING EVER PUTS IT THERE (o3d-xnwu r4/r5). No credit note
+      // is raised and no restock is made, so counting this as applied told the coverage arithmetic
+      // that demand it does not hold had been recorded. It is not a failure either: the condition
+      // can never clear by retrying — the activity record above is what asks a human to reconcile
+      // it, IN WOOCOMMERCE AND THE LEDGER, not in IMS.
+      //
+      // TERMINAL, and r5 is what that word is for. r4 gave this the same outcome as a quarantined
+      // park, so the caller that (correctly) holds a delivery for a park held it for this too —
+      // for ever, because no resolution exists: the whole order was already reversed by the payment
+      // poller, and a second credit note is precisely what must not be raised. HTTP 500 on every
+      // redelivery with a cursor that never advances is the endless retry o3d-bx9 removed.
+      return { outcome: 'handled-unapplied-terminal', error: WC_REFUND_SUPPRESSED_BY_CHARGEBACK }
     }
 
     if (!result.success) {
@@ -978,8 +1057,15 @@ export async function syncWcRefund(
       })
       // A quarantine is a refusal only an operator can clear; a FAILED park is this order's own
       // retryable state and a later delivery may well apply it.
+      //
+      // r5: the quarantine this call has just recorded is the SAME STATE the early return above
+      // reports on every later sweep, so it must answer the settlement question the same way —
+      // operator-resolvable, hold. It stays a reported FAILURE (`refundOutcomeFailed`), which is
+      // what the refund webhook has always done with it; what it stops being is a `permanent-failure`
+      // lumped in with a refund WooCommerce holds on another order, whose only thing in common was
+      // the word permanent.
       return {
-        outcome: quarantined ? 'permanent-failure' : 'retryable-failure',
+        outcome: quarantined ? 'quarantined-refusal' : 'retryable-failure',
         error: `${result.error ?? 'refund sync failed'}${unitsNote}`,
       }
     }
@@ -1245,7 +1331,23 @@ export async function fetchAllWcRefundsForOrder(
  * either counter applies, and it is true for exactly the two outcomes that put a SalesOrderRefund on
  * this order.
  *
- * TWO SCALARS, NOT A LIST OF FAILURES WITH A FLAG. The decisions above are arithmetic over the whole
+ * AND "NOT IN IMS" IS NOT THE SAME QUESTION AS "STILL WORTH WAITING FOR" (o3d-xnwu r5, Codex HIGH).
+ * Round 4's caller read `unapplied > 0` as "the demand this order carries is still unknown" and held
+ * the delivery on it. That is right for a refund an operator can still record and WRONG for one that
+ * can never be recorded at all — a chargeback-suppressed refund, or one WooCommerce has attached to
+ * a different order. Held on those, the delivery returns 500 for ever and the cursor never advances:
+ * the endless retry o3d-bx9 removed, reintroduced by the fix for the opposite hole. So the walk also
+ * counts how many of the unapplied refunds CAN still arrive:
+ *
+ *   outstanding  refunds read, not in IMS, and still reachable (`refundMayStillReachIms`) — a
+ *                quarantined park, a retryable failure. `outstanding === 0` with `complete` is the
+ *                only thing that means "no further waiting can change what this order carries".
+ *
+ * `unapplied - outstanding` is therefore the terminally-unappliable count, and a caller that settles
+ * over one owes an operator a record of it — it is real refunded money that IMS deliberately does
+ * not hold.
+ *
+ * SCALARS, NOT A LIST OF FAILURES WITH A FLAG. The decisions above are arithmetic over the whole
  * fetched set; a list invites a caller to look at one element and decide from it, which is how a
  * partial answer becomes a settled one. `synced` is kept because it is what an operator-facing
  * summary reports, but no caller may derive completeness from it: `fetched - unapplied` is the same
@@ -1257,10 +1359,16 @@ export type RefundSweepResult = {
   /** Refunds this walk actually read from the store. See the type header. */
   fetched: number
   /**
-   * Refunds that were read and are NOT in IMS afterwards — failures of either kind AND refunds that
-   * were handled without being applied. See the type header.
+   * Refunds that were read and are NOT in IMS afterwards — failures of every kind AND refunds that
+   * were handled without being applied. The COVERAGE question. See the type header.
    */
   unapplied: number
+  /**
+   * The subset of `unapplied` that could still reach IMS — a quarantined park an operator may record,
+   * a retryable failure a later delivery may apply. The SETTLEMENT question, and the only one a
+   * caller may use to decide whether holding the delivery achieves anything. Always `<= unapplied`.
+   */
+  outstanding: number
   complete: boolean
   error?: string
 }
@@ -1273,6 +1381,7 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<Refu
   const { refunds, error } = await fetchAllWcRefundsForOrder(externalOrderId)
   let synced = 0
   let unapplied = 0
+  let outstanding = 0
 
   for (const refund of refunds) {
     // o3d-7yf: BOTH the already-synced check and the parked-refund skip live in syncWcRefund now, scoped to
@@ -1286,12 +1395,20 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<Refu
     // decides which is `refundIsInIms`, NOT whether the call reported a failure: a quarantined park
     // and a chargeback suppression are both handled endings that apply nothing, and counting them as
     // applied is what let a caller conclude the store's refunds were all in IMS when they were not.
-    if (refundIsInIms(result.outcome)) synced++
-    else unapplied++
+    if (refundIsInIms(result.outcome)) {
+      synced++
+      continue
+    }
+    unapplied++
+    // AND SEPARATELY: can it still get there? (o3d-xnwu r5.) Two questions, two counters, one
+    // predicate each — `refundIsInIms` decides the coverage half and is not widened, and
+    // `refundMayStillReachIms` decides the settlement half. Deriving the second from the first is
+    // exactly the conflation r4 removed one layer down, arriving one layer up.
+    if (refundMayStillReachIms(result.outcome)) outstanding++
   }
 
   // The refunds that WERE read are still applied — that is the deliberate leniency above. What
   // changes is that the caller is told the list was short, and told how much of it is not in IMS,
   // instead of inferring either from a number that cannot carry them.
-  return { synced, fetched: refunds.length, unapplied, complete: error === undefined, error }
+  return { synced, fetched: refunds.length, unapplied, outstanding, complete: error === undefined, error }
 }

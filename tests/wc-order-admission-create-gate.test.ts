@@ -157,12 +157,12 @@ mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
     // webhook fails the delivery when it did not. A double answering `undefined` makes
     // `refundSweep.complete` throw, and the delivery 500s for a reason that has nothing to do
     // with the admission gate under test.
-    syncRefundsForOrder: async () => ({ synced: 0, fetched: 0, unapplied: 0, complete: true }),
+    syncRefundsForOrder: async () => ({ synced: 0, fetched: 0, unapplied: 0, outstanding: 0, complete: true }),
     syncWcRefund: async () => ({ outcome: 'applied' }),
     // o3d-xnwu r4: the webhook imports these two from the same module, so a double that replaces the
     // module must supply them or the handler calls `undefined`.
     refundIsInIms: (outcome: string) => outcome === 'applied' || outcome === 'already-applied',
-    refundOutcomeFailed: (outcome: string) => outcome === 'retryable-failure' || outcome === 'permanent-failure',
+    refundOutcomeFailed: (outcome: string) => outcome === 'retryable-failure' || outcome === 'quarantined-refusal' || outcome === 'permanent-failure',
   },
 })
 mock.module('@/lib/connectors/woocommerce/sync/order-webhook-echo', {

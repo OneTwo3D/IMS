@@ -133,6 +133,10 @@ mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
         synced: fetched - unapplied,
         fetched,
         unapplied,
+        // r5: these bounced refunds are the OPERATOR-RESOLVABLE kind — a park that may yet be
+        // recorded — so every one of them is still outstanding and the delivery is right to wait.
+        // The terminally-unappliable case has its own file.
+        outstanding: unapplied,
         complete: sweepComplete,
         ...(sweepComplete ? {} : { error: 'the refund list did not end within 20 pages' }),
       }
@@ -141,7 +145,7 @@ mock.module('@/lib/connectors/woocommerce/sync/refund-sync', {
     // o3d-xnwu r4: the webhook imports these two from the same module, so a double that replaces the
     // module must supply them or the handler calls `undefined`.
     refundIsInIms: (outcome: string) => outcome === 'applied' || outcome === 'already-applied',
-    refundOutcomeFailed: (outcome: string) => outcome === 'retryable-failure' || outcome === 'permanent-failure',
+    refundOutcomeFailed: (outcome: string) => outcome === 'retryable-failure' || outcome === 'quarantined-refusal' || outcome === 'permanent-failure',
   },
 })
 
