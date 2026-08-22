@@ -6,7 +6,12 @@ import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { scheduleInboxDrain } from '@/lib/jobs/shopping/drain-inbox'
 import { importWcOrder } from '@/lib/connectors/woocommerce/sync/order-import'
 import { syncWcOrderStatus } from '@/lib/connectors/woocommerce/sync/order-status'
-import { syncRefundsForOrder, syncWcRefund } from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { externalFulfillmentRefusalAwaitsRefunds } from '@/lib/fulfillment/external-fulfillment'
+import {
+  syncRefundsForOrder,
+  syncWcRefund,
+  type RefundSweepResult,
+} from '@/lib/connectors/woocommerce/sync/refund-sync'
 import { shouldSuppressWcOrderWebhookEcho } from '@/lib/connectors/woocommerce/sync/order-webhook-echo'
 import { syncWcProductToIms } from '@/lib/connectors/woocommerce/sync/product-sync'
 import {
@@ -438,26 +443,79 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
     // classifies as rejected-held and invites an operator to release a live
     // withdrawal. Refunds still process — they are keyed on the WC refund id
     // and are unaffected by the hold.
+    // o3d-xnwu round 2 (Codex HIGH): A REFUSAL THE REFUNDS BELOW WOULD HAVE ANSWERED IS NOT A
+    // VERDICT YET.
+    //
+    // The status sync runs FIRST, and on a `completed` order it runs the whole external-fulfilment
+    // flow, whose coverage check nets ordered demand against the refunds IMS HAS. The refunds this
+    // very delivery is carrying are swept a few lines further down. So an order shipped 8 of 10
+    // with 2 refunded — a complete dispatch — is refused as a coverage shortfall and, because that
+    // refusal is (correctly) permanent, ACKNOWLEDGED and buried, seconds before the refund that
+    // makes it correct is applied. The state it was answered from was committed and stale, and
+    // "computed from committed IMS state" was the whole argument for calling it permanent.
+    //
+    // The ordering is not swapped: applying refunds before the order is dispatched would change
+    // what the refunds themselves do (restock and COGS reversal both key off the shipment). What
+    // changes is that a refusal of this ONE kind is HELD rather than recorded, and re-asked after
+    // the sweep — the second reading is the one that gets classified. Everything else is classified
+    // exactly as before, and `coverage_shortfall` stays permanent once the refunds are in: making
+    // it transient would restore the endless retries o3d-bx9 removed.
+    let heldForRefunds: string | null = null
     if (!suppressed.suppress && !suppressionHandled) {
       const statusResult = await syncWcOrderStatus(wcOrder)
       if (!statusResult.success) {
         const detail = `syncWcOrderStatus: ${statusResult.error ?? 'unknown error'}`
-        if (statusResult.permanent) permanentFailures.push(detail)
+        if (externalFulfillmentRefusalAwaitsRefunds(statusResult.refusal)) heldForRefunds = detail
+        else if (statusResult.permanent) permanentFailures.push(detail)
         else failures.push(detail)
       }
     }
+    let refundSweep: RefundSweepResult | null = null
     try {
       // An INCOMPLETE refund read is a failure of this delivery, not a detail of it. The refunds
       // that were read are already applied, but acknowledging the delivery would retire the only
       // prompt to come back for the rest — and the missing ones are demand the external-fulfilment
       // coverage check never nets, so a complete 3PL dispatch is refused until they land. A
       // retried delivery re-reads the order from page one, so this is self-clearing (o3d-ecbj r5).
-      const refundSweep = await syncRefundsForOrder(wcOrder.id)
+      refundSweep = await syncRefundsForOrder(wcOrder.id)
       if (!refundSweep.complete) {
         failures.push(`syncRefundsForOrder: incomplete refund read — ${refundSweep.error ?? 'unknown error'}`)
       }
     } catch (e) {
       failures.push(`syncRefundsForOrder: ${e instanceof Error ? e.message : String(e)}`)
+    }
+
+    if (heldForRefunds) {
+      if (refundSweep?.complete && refundSweep.synced > 0) {
+        // ASK AGAIN, now that every refund the store holds for this order is in IMS. The re-ask is
+        // the same call because it is idempotent by construction: allocation and shipment creation
+        // are both skipped when they have already happened (the first attempt got as far as the
+        // coverage check, so they had), and a completion that succeeded leaves the order in the
+        // target status, which `syncWcOrderStatus` short-circuits on. `synced > 0` is the cheap
+        // guard: the sweep counts refunds it handled, whether newly applied or already present, so
+        // it can over-count but never under-count — and a shortfall can only ever be settled by a
+        // refund, so an order the store holds none for cannot have a different answer.
+        //
+        // A completion refused twice leaves two `wc_completion_fulfillment_refused` rows on the
+        // order, and both are wanted: the first is what the dispatch looked like against the demand
+        // IMS held, the second is what it still looks like with every refund the store has applied.
+        // Only the second is classified.
+        const settled = await syncWcOrderStatus(wcOrder)
+        if (!settled.success) {
+          const detail = `syncWcOrderStatus (re-asked after refund sweep): ${settled.error ?? 'unknown error'}`
+          if (settled.permanent) permanentFailures.push(detail)
+          else failures.push(detail)
+        }
+      } else if (refundSweep?.complete) {
+        // The store holds no refunds for this order, so the first answer was already computed from
+        // the settled state. It stands, with the classification it came with.
+        permanentFailures.push(heldForRefunds)
+      } else {
+        // The sweep did not finish, so the demand this order carries is still unknown. The delivery
+        // is failing anyway (the incomplete read above is in `failures`); classify the held refusal
+        // as transient so the redelivery re-decides it rather than burying it on a partial read.
+        failures.push(heldForRefunds)
+      }
     }
   }
 

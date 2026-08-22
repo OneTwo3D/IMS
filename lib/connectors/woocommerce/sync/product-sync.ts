@@ -4,7 +4,7 @@
 
 import { after } from 'next/server'
 import { db } from '@/lib/db'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { getSettingValue } from '@/lib/settings-store'
 import { wcFetch, wcPut, WC_PAGINATION_UNKNOWN } from '../api'
 import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
@@ -2298,28 +2298,36 @@ export async function syncAllWcProducts(
     page++
   }
 
-  // ONE LOUD LINE, and it is emitted BEFORE the cursor moves past these products (o3d-xbt).
+  // ONE LOUD LINE, and it is emitted BEFORE the cursor moves past these products (o3d-xbt) — in
+  // the SAME TRANSACTION as the advance (o3d-xbt r2, Codex MEDIUM).
   //
   // Advancing the cursor is the right call — see WcProductBulkSyncResult — but it means the next
   // run will not even look at these SKUs, so this is the only place the operator is told. ERROR,
   // not WARNING: nothing will import these products until someone resolves the duplicate GTIN /
   // WooCommerce id / structure conflict, and the run itself has stopped complaining about them.
-  if (result.permanentErrors.length > 0) {
-    await logActivity({
-      entityType: 'SYNC',
-      action: 'wc_product_sync_permanent_conflicts',
-      tag: 'sync',
-      level: 'ERROR',
-      description: `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'} could not import `
-        + `${result.permanentErrors.length} product(s) and never will without an operator: `
-        + `${permanentConflictSkus.join(', ')}. The sync cursor was advanced past them so the rest of `
-        + 'the catalogue keeps syncing. Resolve the duplicate SKU / barcode / WooCommerce id, or the '
-        + 'product-structure conflict on /sync/exceptions — then re-save the product in WooCommerce so '
-        + 'it restamps date_modified and the next poll picks it up, because a fix made only in IMS '
-        + 'leaves nothing for the cursor to find.',
-      metadata: { mode, skus: permanentConflictSkus, permanentErrors: result.permanentErrors },
-      resolveUser: false,
-    })
+  //
+  // "Before" was being carried by `await logActivity(...)` standing above the upsert, and that is
+  // not a guarantee: `logActivity` catches its own persistence failure, logs to stderr and returns
+  // void, so a failed INSERT reaches the next statement looking exactly like a successful one. The
+  // cursor would then advance past products whose only record names nobody — the rule this line
+  // exists to satisfy ("the loud line is emitted before the cursor moves, BECAUSE advancing means
+  // nothing looks at them again") inverted into its own failure mode, silently. A rule that has to
+  // hold needs a logger whose failure is visible, which is `logActivityInTransaction`: it does not
+  // catch, so the record and the advance commit together or neither does. Same shape as the
+  // operator assertion in app/actions/accounting-settlement.ts.
+  const permanentConflictLine = {
+    entityType: 'SYNC' as const,
+    action: 'wc_product_sync_permanent_conflicts',
+    tag: 'sync' as const,
+    level: 'ERROR' as const,
+    description: `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'} could not import `
+      + `${result.permanentErrors.length} product(s) and never will without an operator: `
+      + `${permanentConflictSkus.join(', ')}. The sync cursor was advanced past them so the rest of `
+      + 'the catalogue keeps syncing. Resolve the duplicate SKU / barcode / WooCommerce id, or the '
+      + 'product-structure conflict on /sync/exceptions — then re-save the product in WooCommerce so '
+      + 'it restamps date_modified and the next poll picks it up, because a fix made only in IMS '
+      + 'leaves nothing for the cursor to find.',
+    metadata: { mode, skus: permanentConflictSkus, permanentErrors: result.permanentErrors },
   }
 
   // Advance the cursor when nothing TRANSIENT failed. Advancing after a fetch or import error that
@@ -2336,11 +2344,25 @@ export async function syncAllWcProducts(
   // not a reason to keep the cursor pinned, because a pinned cursor re-reads the WHOLE catalogue
   // every cycle for ever and still never imports the conflicted product.
   if (result.errors.length === 0) {
-    await db.setting.upsert({
-      where: { key: cursorKey },
-      create: { key: cursorKey, value: new Date().toISOString() },
-      update: { value: new Date().toISOString() },
+    const cursorAt = new Date().toISOString()
+    await db.$transaction(async (tx) => {
+      // Inside, and FIRST, so a failure to record the burial aborts the burial. `userId` is passed
+      // explicitly because the session lookup logActivity falls back on is a cache() read with no
+      // place in a transaction; this is a background run and there is no user to name.
+      if (result.permanentErrors.length > 0) {
+        await logActivityInTransaction(tx, { ...permanentConflictLine, userId: null })
+      }
+      await tx.setting.upsert({
+        where: { key: cursorKey },
+        create: { key: cursorKey, value: cursorAt },
+        update: { value: cursorAt },
+      })
     })
+  } else if (result.permanentErrors.length > 0) {
+    // The cursor is HELD by a transient failure, so these SKUs are re-read and re-reported by the
+    // next run: nothing is being buried, and best-effort is the right cost for a line that will be
+    // emitted again. It is still emitted now, because a run can be transiently failing for weeks.
+    await logActivity({ ...permanentConflictLine, resolveUser: false })
   }
 
   if (result.synced > 0) {

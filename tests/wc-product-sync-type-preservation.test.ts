@@ -31,6 +31,8 @@ const state = {
   settingUpserts: [] as string[],
   /** Every logActivity call, so the bulk sync's operator-facing lines can be asserted (o3d-xbt). */
   activity: [] as Row[],
+  /** When set, every activity-log INSERT fails — see the bulk-cursor tests (o3d-xbt r2). */
+  failActivityLogWrite: false,
   /**
    * SKU -> the value `product.findFirst` throws when the sync looks it up (o3d-xbt).
    *
@@ -139,6 +141,11 @@ function snapshot() {
     components: state.components.map((row) => ({ ...row })),
     options: state.options.map((row) => ({ ...row })),
     syncLogs: state.syncLogs.map((row) => ({ ...row })),
+    // A ROLLBACK TAKES THESE BACK TOO (o3d-xbt r2). The cursor advance and the permanent-conflict
+    // line are now written in one transaction, and a double whose rollback left either behind would
+    // report exactly the outcome the change exists to prevent.
+    activity: state.activity.map((row) => ({ ...row })),
+    settingUpserts: [...state.settingUpserts],
   }
 }
 
@@ -147,6 +154,8 @@ function restore(snap: ReturnType<typeof snapshot>) {
   state.components.splice(0, state.components.length, ...snap.components)
   state.options.splice(0, state.options.length, ...snap.options)
   state.syncLogs.splice(0, state.syncLogs.length, ...snap.syncLogs)
+  state.activity.splice(0, state.activity.length, ...snap.activity)
+  state.settingUpserts.splice(0, state.settingUpserts.length, ...snap.settingUpserts)
 }
 
 let nextId = 1
@@ -190,6 +199,16 @@ mock.module('@/lib/connectors/woocommerce/api', {
 mock.module('@/lib/activity-log', {
   namedExports: {
     logActivity: async (entry: Row) => { state.activity.push(entry) },
+    /**
+     * MODELS THE REAL ONE, and the two differences from `logActivity` are the whole point (o3d-xbt
+     * r2): it writes through the CALLER'S transaction client, and it does not catch. A double that
+     * pushed straight onto `state.activity` and swallowed would make the bulk cursor's new
+     * guarantee — the loud line and the advance commit together — untestable.
+     */
+    logActivityInTransaction: async (
+      tx: { activityLog: { create: (args: { data: Row }) => Promise<unknown> } },
+      entry: Row,
+    ) => { await tx.activityLog.create({ data: entry }) },
   },
 })
 mock.module('@/lib/trade/hs-classification-trigger', {
@@ -731,6 +750,18 @@ const txClient = {
       return { count: removed }
     },
   },
+  /**
+   * The activity-log table, reachable from inside a transaction (o3d-xbt r2). `failActivityLogWrite`
+   * is how a test makes the record of a burial fail — the case the old best-effort logger turned
+   * into a silent success.
+   */
+  activityLog: {
+    create: async ({ data }: { data: Row }) => {
+      if (state.failActivityLogWrite) throw new Error('activity_log insert failed')
+      state.activity.push(data)
+      return data
+    },
+  },
   setting: {
     upsert: async ({ where }: { where: { key: string } }) => {
       state.settingUpserts.push(where.key)
@@ -840,6 +871,7 @@ function resetState() {
   state.componentDeletes = 0
   state.settingUpserts.length = 0
   state.activity.length = 0
+  state.failActivityLogWrite = false
   state.throwForSku.clear()
   state.stockLevels.length = 0
   state.salesOrderLines.length = 0
@@ -2465,6 +2497,58 @@ test('a permanent conflict alongside a transient one still holds the cursor (o3d
     state.activity.filter((entry) => entry.action === 'wc_product_sync_permanent_conflicts').length,
     1,
     'the permanent conflict is still named even though the run was not clean',
+  )
+})
+
+test('the loud line and the cursor advance are ONE COMMIT (o3d-xbt r2)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // Codex r2 (MEDIUM). The rule was "the line is emitted BEFORE the cursor moves, because advancing
+  // means nothing looks at these SKUs again" — and it was carried by an `await logActivity(...)`
+  // standing above the upsert. `logActivity` catches its own persistence failure and returns void,
+  // so a failed INSERT reached the advance looking exactly like a successful one: the products were
+  // buried and NOTHING named them. A rule that has to hold needs a logger whose failure is visible.
+  state.throwForSku.set('PARENT-SKU', duplicateBarcodeConflict())
+  state.failActivityLogWrite = true
+  productPages = { '1': [variableProduct() as unknown as Row] }
+
+  await assert.rejects(
+    () => capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' })),
+    /activity_log insert failed/,
+    'the failure is the caller\'s problem now, not stderr\'s',
+  )
+
+  assert.deepEqual(
+    state.settingUpserts.filter((key) => key.includes('reconcile')),
+    [],
+    'the cursor MUST NOT move past products whose only record failed to be written',
+  )
+  assert.deepEqual(
+    state.activity.filter((entry) => entry.action === 'wc_product_sync_permanent_conflicts'),
+    [],
+    'and the line really did not land — this is not a test of a double that recorded it anyway',
+  )
+})
+
+test('a cursor HELD by a transient failure still gets the line, best-effort (o3d-xbt r2)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // The other half of the split. Nothing is being buried here — the cursor is held, so the next run
+  // re-reads and re-reports these SKUs — so the line is worth writing but not worth failing the run
+  // for. It goes through the swallowing logger, and the run still returns its result.
+  state.throwForSku.set('PARENT-SKU', duplicateBarcodeConflict())
+  state.throwForSku.set('KIT-SKU', new Error('lock timeout'))
+  state.failActivityLogWrite = true
+  productPages = { '1': [variableProduct() as unknown as Row, simpleProduct() as unknown as Row] }
+
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(result.permanentErrors.length, 1)
+  assert.equal(result.errors.length, 1)
+  assert.deepEqual(
+    state.settingUpserts.filter((key) => key.includes('reconcile')),
+    [],
+    'held by the transient failure, exactly as before',
   )
 })
 

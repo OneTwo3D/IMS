@@ -275,6 +275,13 @@ IMS will refuse one, and they are handled differently because only one of them c
   **acknowledged rather than retried**, and a warning naming the uncovered quantities is recorded
   against the order for someone to act on.
 
+  This one is only decided **after the order's refunds have been read**. A delivery that carries both
+  the completion and a refund — eight of ten shipped, two refunded, which is a complete dispatch —
+  would otherwise be judged against demand that still counted the refunded units and be refused
+  seconds before the refund was applied. The completion is therefore re-checked once the refund sweep
+  for that order has finished, and only the second answer is recorded. If the refunds could not be
+  read to the end, nothing is recorded at all and the delivery is retried.
+
 Previously both took the same route and neither reached the caller at all: the store showed the order
 as completed, IMS never created the shipment, the webhook was acknowledged, and nothing retried.
 
@@ -631,6 +638,8 @@ ever.
 
 The log line names each blocked SKU, and the manual product sync shows them as **blocked (needs an
 operator)** separately from the error count, because re-running is the one thing that cannot help.
+That line and the cursor move are written together: if the line cannot be recorded, the cursor does
+not move either, so products are never skipped past with nothing naming them.
 One thing to know when you fix one: if the remedy is on the IMS side — clearing a product's external
 mapping, or resolving a structure conflict on [Sync Exceptions](sync-exceptions.md) — WooCommerce's
 own record of the product has not changed, so the cursor has nothing to find. **Re-save the product

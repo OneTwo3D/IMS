@@ -8,7 +8,10 @@
 
 import type { WcFullOrder } from './types'
 import { extractWcTracking } from './field-mapping'
-import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
+import {
+  applyExternalFulfillmentUpdate,
+  type ExternalFulfillmentRefusal,
+} from '@/lib/fulfillment/external-fulfillment'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 
@@ -32,12 +35,15 @@ const POST_DISPATCH_FOR_WDRAW: ReadonlySet<string> = new Set(['SHIPPED', 'COMPLE
  *     order is exactly where it should be. Acknowledged like a success (this is the behaviour that
  *     was already correct, now stated instead of implied by falling off the end of the function).
  *   - `refused` — the fulfilment did not happen. `permanent` carries the o3d-bx9 / o3d-i0y
- *     distinction straight through from `applyExternalFulfillmentUpdate`.
+ *     distinction straight through from `applyExternalFulfillmentUpdate`, and `refusal` carries
+ *     WHICH rule said no — which the WooCommerce webhook needs, because it sweeps the order's
+ *     refunds after this runs and a coverage shortfall computed before that sweep is an answer
+ *     about a state that is committed but stale (o3d-xnwu r2).
  */
 export type WcCompletionOutcome =
   | { kind: 'fulfilled' }
   | { kind: 'skipped_withdrawn' }
-  | { kind: 'refused'; error: string; permanent: boolean }
+  | { kind: 'refused'; error: string; permanent: boolean; refusal: ExternalFulfillmentRefusal }
 
 export async function processWcCompletion(
   orderId: string,
@@ -115,5 +121,5 @@ export async function processWcCompletion(
     resolveUser: false,
   })
 
-  return { kind: 'refused', error: applied.error, permanent: applied.permanent }
+  return { kind: 'refused', error: applied.error, permanent: applied.permanent, refusal: applied.refusal }
 }
