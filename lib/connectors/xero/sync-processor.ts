@@ -24,6 +24,7 @@ import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
 import {
   carryAccountingOriginRecord,
+  mintAccountingConnectionProvenanceColumn,
   readAccountingPayloadConnectionStamp,
   type AccountingConnectionStamp,
 } from '@/lib/connectors/accounting-connection-provenance'
@@ -32,7 +33,8 @@ import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
-import { readClaimedSyncLogPayload } from '@/lib/domain/accounting/claimed-sync-payload'
+import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
+import { takeCreateDispatchSlot } from '@/lib/domain/accounting/create-dispatch-record'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
@@ -1292,6 +1294,12 @@ export async function enqueueFollowUpSyncLog(
           referenceType,
           referenceId,
           payload: plan.payload as never,
+          // o3d-dzip: the DURABLE half of the same origin record, minted from the stamp in the
+          // payload this statement is writing — which for a follow-up is the origin INHERITED from the
+          // row whose post issued these ids (carryAccountingOriginRecord above), never the connection
+          // that happens to be live now. A repair that witnessed nothing mints nothing, and that
+          // absence refuses.
+          connectionProvenance: mintAccountingConnectionProvenanceColumn(plan.payload),
           // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
           // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
           // money-attempt-provenance.ts. A row created without it is never recycled again.
@@ -2796,9 +2804,18 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
     // The pre-claim snapshot survives only as the seed value: if the re-read itself throws, the
     // catch below records a FAILURE with it. Nothing is posted on that path.
     let payload = (entry.payload ?? {}) as SyncPayload
+    // o3d-dzip: and the durable half of the row's origin record. Seeded from the row the sweep read
+    // — `entry` already carries it — so that if the authoritative re-read below throws, the failure
+    // path describes the row with the record it was selected with rather than with a null that would
+    // read as "this row records nothing".
+    let connectionProvenance = entry.connectionProvenance ?? null
 
     try {
-      payload = await readClaimedSyncLogPayload(db, entry.id) as SyncPayload
+      // ONE read for both halves (o3d-dzip): the payload and the column are one record, and
+      // assembling them from two reads is how a disagreement gets manufactured.
+      const claimed = await readClaimedSyncLogOriginRecord(db, entry.id)
+      payload = claimed.payload as SyncPayload
+      connectionProvenance = claimed.connectionProvenance
       // Kept as a cheap pre-filter over the run's snapshot. It is no longer what makes the ordering
       // safe — the locked claim above is — but it still spares a lock round-trip in the ordinary case
       // and its verdict, when it fires, is the same one.
@@ -2881,7 +2898,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, lease, attempt)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, connectionProvenance, lease, attempt)
 
       // BEFORE `skipped` and before `success` (r5 #1): this row stopped without sending anything, so
       // it must not be failed, must not spend a retry, and must not be persisted.
@@ -3281,9 +3298,18 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     // The pre-claim snapshot survives only as the seed value: if the re-read itself throws, the
     // catch below records a FAILURE with it. Nothing is posted on that path.
     let payload = (entry.payload ?? {}) as SyncPayload
+    // o3d-dzip: and the durable half of the row's origin record. Seeded from the row the sweep read
+    // — `entry` already carries it — so that if the authoritative re-read below throws, the failure
+    // path describes the row with the record it was selected with rather than with a null that would
+    // read as "this row records nothing".
+    let connectionProvenance = entry.connectionProvenance ?? null
 
     try {
-      payload = await readClaimedSyncLogPayload(db, entry.id) as SyncPayload
+      // ONE read for both halves (o3d-dzip): the payload and the column are one record, and
+      // assembling them from two reads is how a disagreement gets manufactured.
+      const claimed = await readClaimedSyncLogOriginRecord(db, entry.id)
+      payload = claimed.payload as SyncPayload
+      connectionProvenance = claimed.connectionProvenance
       // Cheap pre-filter over the run's snapshot; the locked claim above is what makes the ordering
       // safe. The claim IS held here, so the deferral gives it back under its own fence.
       if (blockedPaymentEntryIds.has(entry.id)) {
@@ -3390,7 +3416,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, lease, attempt)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, connectionProvenance, lease, attempt)
 
       if (syncResult.notPosted) {
         // The lock may itself be what was lost, in which case handing the job back cannot work — say
@@ -4382,6 +4408,12 @@ async function processEntry(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
+  /**
+   * o3d-dzip: the row's durable origin column, read in the same statement as `payload`. It travels to
+   * the intent, and from there to the verdict taken at the socket, so a retention-compacted row is
+   * still checked against the organisation it was raised for instead of refusing as unrecorded.
+   */
+  connectionProvenance: string | null,
   // The LEASE, not a claim timestamp (o3d-xl63 r5 #1). Every remote mutation below fences on it, and
   // the caller reads `lease.heldFrom()` afterwards to anchor the persist to the claim actually held.
   lease: RemoteWriteLease,
@@ -4389,7 +4421,7 @@ async function processEntry(
   attempt: AttemptRef,
 ): Promise<EntryResult> {
   return withAccountingPostingIntent(
-    { connector: XERO_CONNECTOR, payload, type, referenceType, referenceId },
+    { connector: XERO_CONNECTOR, payload, connectionProvenance, type, referenceType, referenceId },
     () => processClaimedEntry(entryId, type, referenceType, referenceId, payload, lease, attempt),
   )
 }
@@ -4980,6 +5012,27 @@ async function processClaimedEntry(
         : type.startsWith('DAILY_BATCH_')
         ? `${type}:${referenceId}`
         : entryId
+      const journalIdempotencyKey = buildXeroIdempotencyKey(idempotencySource, 'manual-journal')
+      // o3d-jit6: THE DURABLE RECORD THAT A CREATE IS ABOUT TO LEAVE, committed before it does.
+      //
+      // A manual journal is the one create with nothing else standing behind it: `POST /ManualJournals`
+      // deduplicates on no key we own, so if the transaction that settles this row with the returned
+      // id fails at COMMIT, the document is real, its id is gone, and the ordinary retry posts a
+      // SECOND journal into the accounts. This records the dispatch first — so the retry can tell —
+      // and REFUSES rather than guessing once Xero's six-minute idempotency window has closed.
+      //
+      // The key is passed exactly as it will be sent, so the replay arm is comparing what was sent
+      // against what is about to be sent rather than two derivations of it.
+      const dispatch = await takeCreateDispatchSlot(db, {
+        entryId,
+        type,
+        idempotencyKey: journalIdempotencyKey,
+        label: `${type} for ${referenceType} ${referenceId}`,
+      })
+      if (!dispatch.dispatch) return { success: false, error: dispatch.error }
+      // AFTER that write, never before (the o3d-xl63 r5 #1 ordering): the dispatch record is awaited,
+      // and the whole point of the claim fence is that nothing awaitable happens between proving the
+      // claim and using it. Both rules survive in this order.
       const fence = await lease.fenceBeforeRemoteWrite('manual-journal')
       if (!fence.ok) return fence.result
       return pushManualJournal({
@@ -4987,7 +5040,7 @@ async function processClaimedEntry(
         reference: payload.reference as string,
         narration: payload.narration as string,
         lines: payload.lines as Array<{ accountCode: string; description: string; debit?: number; credit?: number; taxType?: string }>,
-      }, resolveJournalStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(idempotencySource, 'manual-journal') }).then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
+      }, resolveJournalStatus(postingMode), { idempotencyKey: journalIdempotencyKey }).then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
     }
 
     case 'TAX_RATE_SYNC': {

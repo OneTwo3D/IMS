@@ -22,9 +22,21 @@ export type ClaimedSyncPayloadClient = {
   accountingSyncLog: {
     findUnique(args: {
       where: { id: string }
-      select: { payload: true }
-    }): Promise<{ payload: unknown } | null>
+      select: { payload: true; connectionProvenance: true }
+    }): Promise<{ payload: unknown; connectionProvenance?: string | null } | null>
   }
+}
+
+/**
+ * The row's origin record, both halves (o3d-dzip).
+ *
+ * `connectionProvenance` is read HERE rather than from the pre-claim snapshot for the same reason the
+ * payload is: the two are one record, and reading them from two different moments would be a way to
+ * manufacture the disagreement `readAccountingOriginRecord` refuses on.
+ */
+export type ClaimedSyncOriginRecord = {
+  payload: Record<string, unknown>
+  connectionProvenance: string | null
 }
 
 /**
@@ -39,9 +51,26 @@ export async function readClaimedSyncLogPayload(
   client: ClaimedSyncPayloadClient,
   entryId: string,
 ): Promise<Record<string, unknown>> {
+  return (await readClaimedSyncLogOriginRecord(client, entryId)).payload
+}
+
+/**
+ * The same read, returning the DURABLE origin record beside the payload (o3d-dzip).
+ *
+ * Not a second query and not a second moment: one `findUnique` selects both, so a caller can never
+ * hold a payload from one read and a column from another. {@link readClaimedSyncLogPayload} is the
+ * narrow face of this for callers that do not make the connection check (QuickBooks today).
+ *
+ * A client whose `findUnique` predates this column answers `undefined`, which reads as "no durable
+ * record" — the same as a pre-migration row, and refuses nothing that is not already refused.
+ */
+export async function readClaimedSyncLogOriginRecord(
+  client: ClaimedSyncPayloadClient,
+  entryId: string,
+): Promise<ClaimedSyncOriginRecord> {
   const row = await client.accountingSyncLog.findUnique({
     where: { id: entryId },
-    select: { payload: true },
+    select: { payload: true, connectionProvenance: true },
   })
   if (!row) {
     throw new Error(
@@ -49,7 +78,10 @@ export async function readClaimedSyncLogPayload(
     )
   }
   const payload = row.payload
-  return payload && typeof payload === 'object' && !Array.isArray(payload)
-    ? (payload as Record<string, unknown>)
-    : {}
+  return {
+    payload: payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>)
+      : {},
+    connectionProvenance: row.connectionProvenance ?? null,
+  }
 }

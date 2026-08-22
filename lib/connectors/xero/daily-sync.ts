@@ -33,7 +33,10 @@ import {
 import { scheduleXeroAccountingOutbox } from '@/lib/connectors/xero/outbox'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
-import { stampAccountingPayloadConnection } from '@/lib/connectors/accounting-connection-provenance'
+import {
+  mintAccountingConnectionProvenanceColumn,
+  stampAccountingPayloadConnection,
+} from '@/lib/connectors/accounting-connection-provenance'
 import {
   accountedAllocationQty,
   parseCostLayerSnapshot,
@@ -389,6 +392,12 @@ async function createPendingSyncLog(
       // would drop the stamp the const above exists to add, and the processor would refuse the row
       // at post time as 'no-origin-recorded'.
       payload: payload as never,
+      // o3d-dzip: the DURABLE half of the same origin record, minted from the stamp in the payload
+      // this statement is writing. Retention compacts the payload to `{}` and keeps the external id,
+      // so a stamp that lives only in the payload is missing from exactly the rows whose realm is
+      // least knowable. Minted here and nowhere else — see mintAccountingConnectionProvenanceColumn
+      // for why this is not a back-fill.
+      connectionProvenance: mintAccountingConnectionProvenanceColumn(payload),
       // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
       // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
       // money-attempt-provenance.ts. A row created without it is never recycled again.

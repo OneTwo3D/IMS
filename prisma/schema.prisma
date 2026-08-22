@@ -2494,6 +2494,48 @@ model AccountingSyncLog {
   // any path that posts, so it can only ever be set by a writer that knows the negative.
   abandonedBeforeRemoteCall Boolean? @map("abandoned_before_remote_call")
 
+  /// o3d-dzip — WHICH ACCOUNTING ORGANISATION THIS ROW WAS RAISED AGAINST, in a place retention
+  /// cannot reach. o3d-s36z records the same fact in the payload (`_connectionProvenance`), and
+  /// `backReferenceEvidenceTombstone` compacts an expired-but-unresolved row to `payload: {}` while
+  /// KEEPING `externalTransactionId` — so the rows whose realm is least knowable are precisely the
+  /// ones that lose the stamp. This column is MINTED FROM that stamp, in the same INSERT statement,
+  /// so the two cannot disagree at birth.
+  ///
+  /// Readers must go through `readAccountingOriginRecord`, never this column alone and never the
+  /// payload alone: column-only ignores every row queued before this shipped, payload-only ignores
+  /// every tombstone, and a DISAGREEMENT between the two is undecidable and must refuse.
+  ///
+  /// NULL is not a missing value, it is "this row records no origin" — which already refuses at the
+  /// socket. Never backfilled from the payload: that would be the database vouching for every
+  /// historical stamp at once, which is the shortcut o3d-s36z refused.
+  ///
+  /// A trigger in the same migration CLEARS this column on any UPDATE that changes it, so it can be
+  /// minted by the enqueue that observed the connection and by nothing else — not the previous
+  /// release, not a repair script, not `psql`. Triggers are invisible to this schema; the migration
+  /// is where the rule lives.
+  connectionProvenance String? @map("connection_provenance")
+
+  /// o3d-jit6 — WHEN A CREATE FOR THIS ROW WAS FIRST PUT ON THE WIRE, and under which
+  /// `Idempotency-Key`. Written and COMMITTED before the request leaves, from the DATABASE's clock;
+  /// a failure to write it REFUSES the post, because a create whose local record cannot be written
+  /// is a create whose outcome cannot be recorded either (the o3d-k26m.5 rule).
+  ///
+  /// It exists because the transaction that settles the row with the id Xero returned can fail AT
+  /// COMMIT, taking a real, freshly created document down with it. Nothing written inside that
+  /// transaction is evidence of anything afterwards; only a record that committed FIRST survives.
+  ///
+  /// The key is stored, not a bare flag, so a retry can PROVE its re-post is a replay of the same
+  /// request rather than a new one — which is the whole of what Xero's six-minute idempotency
+  /// window is worth. Past that window a ManualJournal create has no natural key and no remedy, and
+  /// the poster refuses instead of guessing (lib/domain/accounting/create-dispatch-record.ts).
+  ///
+  /// Write-once, and the database enforces it: a trigger in the same migration RESTORES the pair on
+  /// any UPDATE that clears, moves or splits it, and refuses one supplied by an INSERT. Note the
+  /// direction is the opposite of `syncedAtDatabaseClock`'s trigger, deliberately — that marker is a
+  /// permission, so tampering clears it; this one is a prohibition, so tampering must not.
+  createDispatchedAt           DateTime? @map("create_dispatched_at")
+  createDispatchIdempotencyKey String?   @map("create_dispatch_idempotency_key")
+
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
 

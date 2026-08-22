@@ -182,6 +182,105 @@ export function readAccountingPayloadConnection(payload: unknown): string | null
 }
 
 /**
+ * THE DURABLE HALF OF THE SAME RECORD (o3d-dzip).
+ *
+ * `AccountingSyncLog.connectionProvenance` holds what the payload stamp holds, in a column retention
+ * cannot reach. It is MINTED FROM the stamp by {@link mintAccountingConnectionProvenanceColumn}, in the
+ * INSERT that writes the payload, so the two are one fact written twice rather than two facts kept in
+ * step by hand — and a database trigger then clears the column on any UPDATE that changes it, so after
+ * the INSERT only the payload can move.
+ *
+ * NOTHING MAY READ EITHER HALF ALONE. Reading the column alone would refuse every row queued before it
+ * existed — a rollout cliff, and a queue's worth of legitimate work cancelled by hand. Reading the
+ * payload alone is the defect: `backReferenceEvidenceTombstone` compacts an expired unresolved row to
+ * `payload: {}` and KEEPS its external id, so the rows whose realm is least knowable are exactly the
+ * ones with nothing left to read. {@link readAccountingOriginRecord} is the only reader.
+ */
+export type AccountingOriginRecord = {
+  /** The stored payload, exactly as it came out of the database. */
+  payload: unknown
+  /** `AccountingSyncLog.connectionProvenance`. `null`/`undefined` = this row has no durable record. */
+  connectionProvenance: string | null | undefined
+}
+
+/**
+ * The value to write into `connectionProvenance` for a row being INSERTED with `payload`.
+ *
+ * MINTING, NOT BACKFILLING, and the distinction is the whole of why this is allowed to exist. This runs
+ * in the same statement as the INSERT, over the payload that statement is writing, which the enqueue
+ * that OBSERVED the connection composed moments earlier. Running the same derivation over rows already
+ * in the table would be the database vouching for stamps it did not witness — the shortcut o3d-s36z
+ * refused — so there is no back-fill and this function must never be used to write one.
+ *
+ * An unreadable or unstamped payload mints NOTHING. A row that records no origin in its payload must
+ * not acquire one in its column: absence is the honest answer and it already refuses.
+ */
+export function mintAccountingConnectionProvenanceColumn(payload: unknown): string | null {
+  const stamp = readAccountingPayloadConnectionStamp(payload)
+  if (stamp.state === 'stamped') return stamp.provenance
+  if (stamp.state === 'raised-disconnected') return ACCOUNTING_CONNECTION_RAISED_DISCONNECTED
+  return null
+}
+
+/** Read the durable column with the same four states, so it can be compared with the payload's. */
+function readAccountingConnectionColumn(value: string | null | undefined): AccountingConnectionStamp {
+  if (value === null || value === undefined) return { state: 'absent' }
+  if (typeof value !== 'string') {
+    return { state: 'unreadable', detail: `the durable connection column is a ${typeof value}, not a string` }
+  }
+  const trimmed = value.trim()
+  if (trimmed === '') return { state: 'unreadable', detail: 'the durable connection column is blank' }
+  if (trimmed === ACCOUNTING_CONNECTION_RAISED_DISCONNECTED) return { state: 'raised-disconnected' }
+  return { state: 'stamped', provenance: trimmed }
+}
+
+/**
+ * WHAT THIS ROW RECORDS ABOUT THE ORGANISATION IT WAS RAISED AGAINST — column and payload together.
+ *
+ * The combining rule, and what each line is for:
+ *
+ *   payload UNREADABLE            unreadable, whatever the column says. A payload something we do not
+ *                                 recognise has written is not one this row's column can vouch for; the
+ *                                 column describes an INSERT, and that payload is no longer the one the
+ *                                 INSERT wrote.
+ *   column UNREADABLE             unreadable. Same reason, other half.
+ *   both ABSENT                   absent — `no-origin-recorded`, which refuses.
+ *   column present, payload absent  THE COLUMN. This is the case the column exists for: a
+ *                                 retention-compacted tombstone still names its organisation.
+ *   payload present, column absent  THE PAYLOAD. Every row queued before the column shipped, answering
+ *                                 exactly as it does today.
+ *   both present, AGREEING        the record.
+ *   both present, DISAGREEING     UNREADABLE. One of the two was rewritten by a writer that did not
+ *                                 know about the other, and nothing here can say which is the truth.
+ *                                 "I cannot tell" is never "the same" — the rule
+ *                                 {@link accountingOriginRecordsMatch} already states for two rows.
+ */
+export function readAccountingOriginRecord(record: AccountingOriginRecord): AccountingConnectionStamp {
+  const fromPayload = readAccountingPayloadConnectionStamp(record.payload)
+  if (fromPayload.state === 'unreadable') return fromPayload
+  const fromColumn = readAccountingConnectionColumn(record.connectionProvenance)
+  if (fromColumn.state === 'unreadable') return fromColumn
+  if (fromColumn.state === 'absent') return fromPayload
+  if (fromPayload.state === 'absent') return fromColumn
+  if (fromColumn.state === 'stamped' && fromPayload.state === 'stamped') {
+    if (fromColumn.provenance === fromPayload.provenance) return fromColumn
+    return {
+      state: 'unreadable',
+      detail: `this row records TWO different origins — the durable column says ${fromColumn.provenance} `
+        + `and the payload says ${fromPayload.provenance}`,
+    }
+  }
+  if (fromColumn.state === fromPayload.state) return fromColumn
+  return {
+    state: 'unreadable',
+    detail: 'this row records TWO different origins — the durable column says '
+      + `${fromColumn.state === 'stamped' ? fromColumn.provenance : ACCOUNTING_CONNECTION_RAISED_DISCONNECTED} `
+      + `and the payload says `
+      + `${fromPayload.state === 'stamped' ? fromPayload.provenance : ACCOUNTING_CONNECTION_RAISED_DISCONNECTED}`,
+  }
+}
+
+/**
  * Do two payloads RECORD THE SAME ORIGIN? (o3d-19gy, the repair paths — Codex r1 finding 2)
  *
  * NOT a permission and deliberately not `accountingPayloadConnectionVerdict`: this compares two records
@@ -297,12 +396,19 @@ export type AccountingConnectionVerdict = {
  */
 export function accountingPayloadConnectionVerdict(params: {
   payload: unknown
+  /**
+   * o3d-dzip: `AccountingSyncLog.connectionProvenance`, the half of this record that survives
+   * retention. Optional ONLY so callers with no row in hand (the module's own unit tests, a future
+   * caller holding a payload alone) stay expressible; every production caller passes it, and omitting
+   * it silently narrows the verdict to the payload — which is the defect, not a default.
+   */
+  connectionProvenance?: string | null
   activeProvenance: string | null
   type: string
   referenceType: string
   referenceId: string
 }): AccountingConnectionVerdict {
-  const stamp = readAccountingPayloadConnectionStamp(params.payload)
+  const stamp = readAccountingOriginRecord({ payload: params.payload, connectionProvenance: params.connectionProvenance })
   const stamped = stamp.state === 'stamped' ? stamp.provenance : null
   const active = params.activeProvenance
   const what = `${params.type} for ${params.referenceType} ${params.referenceId}`
@@ -387,6 +493,7 @@ export function accountingPayloadConnectionVerdict(params: {
  */
 export function accountingPayloadConnectionRefusal(params: {
   payload: unknown
+  connectionProvenance?: string | null
   activeProvenance: string | null
   type: string
   referenceType: string
