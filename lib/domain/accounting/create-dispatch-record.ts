@@ -84,6 +84,15 @@
  * batch recreators and the order delete guard, so it blocks the duplicate recreate and keeps the
  * orders protected. NOT_POSTED stays refused, and the batch refusal says so instead of offering it.
  *
+ * AND THAT BLOCK IS NOW NAMED FOR WHAT IT IS (r2, Codex finding 2). "POSTED reads as posted to both
+ * consumers" was the whole argument for admitting the assertion — and it only holds if "posted" is
+ * TRUE, which nothing here checks: the operator types a document id and IMS makes no call, reads no
+ * document and compares no figure. So the assertion is recorded as one (`settlementBasis`), and both
+ * consumers read it: the recreate verdict still blocks but REPORTS the batch on every run instead of
+ * skipping it silently, and the delete guard still refuses but stops telling the operator that a
+ * document exists and needs reversing. The block is unchanged; the claim behind it is no longer
+ * laundered into a confirmation.
+ *
  * AND BE HONEST ABOUT HOW OFTEN THE REPLAY ARM ACTUALLY FIRES: rarely. The retry that follows a failed
  * persist is scheduled through the outbox, whose first backoff FLOOR is five minutes and which is only
  * claimable on the next five-minute cron tick, so by the time it runs the window has usually closed —
@@ -303,9 +312,11 @@ export function describeCreateDispatchRemedy(type: AccountingSyncType): string {
   if (isDailyBatchSyncType(type)) {
     return 'REMEDY: look in the accounting system for that journal. If it is there, record its id '
       + 'against this row with the per-row settlement action on /sync, choosing "It DID post" — a '
-      + 'DAILY BATCH row accepts that assertion and only that one. It leaves the row SYNCED, which is '
-      + 'what the batch recreate probe and the order delete guard already read as "this batch posted", '
-      + 'so no second journal is derived and the orders staged into the batch stay protected. If the '
+      + 'DAILY BATCH row accepts that assertion and only that one. It leaves the row SYNCED, which '
+      + 'blocks both the batch recreate probe and the order delete guard, so no second journal is '
+      + 'derived and the orders staged into the batch stay protected. It is recorded as YOUR '
+      + 'ASSERTION, not as a confirmed post: both of those readers name it as one, and the daily run '
+      + 'will report the batch until somebody confirms the journal is really there. If the '
       + 'journal is NOT there, post it in the accounting system from this row\'s own lines and record '
       + 'that id here the same way: a batch covers every order staged into it, so there is deliberately '
       + 'no per-row cancel-and-re-queue for one — cancelling it would let an order be hard-deleted while '

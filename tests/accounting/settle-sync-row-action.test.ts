@@ -451,6 +451,11 @@ test('o3d-jit6 r1#3: a DAILY_BATCH row ACCEPTS the POSTED assertion, and the row
   // SYNCED is the safe terminal state here, and that is the whole argument: it is a LIVE status to
   // `dailyBatchRecreateVerdict` (so no second journal is derived) and to the order delete guard (so
   // the orders staged into the batch stay undeletable). Only CANCELLED tells those two the opposite.
+  //
+  // r2 finding 2: the row is ALSO stamped `settlementBasis = OPERATOR_ASSERTION`, and both of those
+  // readers now act on it — the recreate reports the batch on every run instead of blocking silently,
+  // and the delete guard refuses under its own code rather than claiming the journal exists. The
+  // argument above only licenses admitting POSTED if "posted" is true, and nothing here checks it.
   const settle = await loadAction()
   state.rows = [syncRow({ type: 'DAILY_BATCH_GROUP_B', attemptRevision: 4 })]
   const result = await settle('log-1', posted({ observedAttemptRevision: 4, externalTransactionId: 'MJ-4242' }))

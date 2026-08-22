@@ -19,7 +19,7 @@ import { logActivity, logActivityInTransaction, logActivityPersisted, redactActi
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
 import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
-import { pushManualJournal } from './journals'
+import { prepareManualJournal, postPreparedManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
 import {
@@ -5079,6 +5079,42 @@ async function processClaimedEntry(
         ? `${type}:${referenceId}`
         : entryId
       const journalIdempotencyKey = buildXeroIdempotencyKey(idempotencySource, 'manual-journal')
+      // EVERY GATE THAT CAN REFUSE THIS JOURNAL, ABOVE EVERYTHING THAT RECORDS ANYTHING (o3d-jit6 r2,
+      // Codex finding 1).
+      //
+      // `pushManualJournal` used to build and CHECK the request body itself — a journal with no
+      // non-zero lines, or one whose debits and credits do not agree, returns from it without calling
+      // Xero. Those returns happened BELOW the fence, so the marker was minted and nothing left the
+      // process: the exact shape r1 finding 2 closed for the fence's own refusals, arriving through
+      // the payload instead of through the claim. The next legitimate attempt then met a dispatch that
+      // never happened.
+      //
+      // `prepareManualJournal` is that check, extracted whole. It is PURE and SYNCHRONOUS — no clock,
+      // no database, no network — so hoisting it costs the adjacency rule nothing: it adds no await
+      // anywhere, least of all between proving the claim and using it. What is left below the fence
+      // (`postPreparedManualJournal`) has no refusal of its own; it hands an already-checked body to
+      // the transport.
+      //
+      // WHAT IS STILL BELOW THE MINT, SAID PLAINLY: the TRANSPORT's own pre-egress stops — an
+      // unresolvable connection, `accountingPostingIntentRefusal`, the egress authorisations, the
+      // rate-limit budget. They are not hoistable and must not be pre-evaluated here. Each is
+      // evaluated once, immediately before the socket, against the very `auth` the request is built
+      // from (see accounting-egress-authorization.ts): an authorisation may read AND WRITE the
+      // database and one of them takes an exclusive slot, so asking twice is not free, and o3d-batch-
+      // realm deleted precisely such a pre-check on the ground that a refusal produced from a stale
+      // read is as wrong as a permission produced from one. A refusal there therefore still leaves the
+      // marker standing, and the remedy is the one the refusal already prescribes — the per-row
+      // settlement, which since r2 records itself as an OPERATOR ASSERTION rather than as a
+      // confirmation. Releasing a marker on positive "this never left the process" evidence would need
+      // a durable column of its own; the trigger deliberately forbids clearing the pair, so that is a
+      // separate change and not a comment.
+      const prepared = prepareManualJournal({
+        date: payload.date as string,
+        reference: payload.reference as string,
+        narration: payload.narration as string,
+        lines: payload.lines as Array<{ accountCode: string; description: string; debit?: number; credit?: number; taxType?: string }>,
+      }, resolveJournalStatus(postingMode))
+      if (!prepared.ok) return { success: false, error: prepared.error }
       // o3d-jit6: THE DURABLE RECORD THAT A CREATE IS ABOUT TO LEAVE, committed before it does.
       //
       // A manual journal is the one create with nothing else standing behind it: `POST /ManualJournals`
@@ -5087,7 +5123,8 @@ async function processClaimedEntry(
       // SECOND journal into the accounts. So the dispatch is recorded first — so the retry can tell —
       // and REFUSED rather than guessed at once Xero's six-minute idempotency window has closed.
       //
-      // TWO STEPS, AND THE ORDER IS THE WHOLE OF Codex r1 FINDING 2. `planCreateDispatch` only READS:
+      // THREE STEPS, AND THE ORDER IS THE WHOLE OF Codex r1 FINDING 2 AND r2 FINDING 1. The journal is
+      // VALIDATED above, before anything is read or written. `planCreateDispatch` only READS:
       // it answers "may this create go out at all", refuses here if not, and writes nothing whichever
       // way it answers. It is awaited BEFORE the fence for the same reason
       // `isFirstPurchaseCreditNoteAttempt` is (o3d-xl63 r5 #1) — nothing awaitable may sit between
@@ -5108,12 +5145,8 @@ async function processClaimedEntry(
       if (!dispatch.dispatch) return { success: false, error: dispatch.error }
       const fence = await lease.fenceBeforeRemoteWrite('manual-journal', dispatch.mint ?? undefined)
       if (!fence.ok) return fence.result
-      return pushManualJournal({
-        date: payload.date as string,
-        reference: payload.reference as string,
-        narration: payload.narration as string,
-        lines: payload.lines as Array<{ accountCode: string; description: string; debit?: number; credit?: number; taxType?: string }>,
-      }, resolveJournalStatus(postingMode), { idempotencyKey: journalIdempotencyKey }).then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
+      return postPreparedManualJournal(prepared.prepared, { idempotencyKey: journalIdempotencyKey })
+        .then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
     }
 
     case 'TAX_RATE_SYNC': {

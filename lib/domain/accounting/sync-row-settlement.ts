@@ -193,6 +193,12 @@ export function settleableSettlementOutcomes(type: string): readonly SettlementO
  * MONETARY-ONLY COMPARISON MUST FAIL CLOSED on an asserted row: see lib/domain/accounting/
  * settlement-status.ts, which refuses to return SETTLED for one whatever the amounts say.
  *
+ * WHO READS IT (r2, Codex finding 2 added the last two). `settlementStatus` refuses to return a clean
+ * SETTLED from a monetary-only comparison; the back-reference sweep refuses to stamp an asserted id
+ * onto a sale; `dailyBatchRecreateVerdict` still blocks the recreate but REPORTS the batch instead of
+ * skipping it silently; and the order delete guard still refuses the delete but under its own blocker
+ * code, with a message that does not claim the document exists.
+ *
  * Written on BOTH outcomes, not only POSTED. A CANCELLED row is read as "nothing posted" by the
  * delete guard and by the follow-up ambiguity set, and "nothing posted because a human looked" is a
  * weaker fact than "nothing posted because the connector never got a document id" in exactly the
@@ -258,9 +264,11 @@ function describeDailyBatchRefusal(type: string): string {
     + 'the batch, not by one order, and CANCELLED reads as "never posted" BOTH to the batch recreators '
     + 'and to the order delete guard. Settling it that way would let an order be hard-deleted while a '
     + 'recreate is already building a journal that still contains that order\'s value. What you CAN do '
-    + 'is settle it POSTED with the journal id: that leaves the row SYNCED, which both of those readers '
-    + 'already treat as "this batch posted", so the recreate stays blocked and the orders stay '
-    + 'protected. If the journal is genuinely not in the accounting system, post it there from this '
+    + 'is settle it POSTED with the journal id: that leaves the row SYNCED, which blocks both of those '
+    + 'readers, so the recreate stays blocked and the orders stay protected. It is recorded as an '
+    + 'ASSERTION rather than as a confirmed post — both readers say so, and the daily run keeps '
+    + 'reporting the batch until the journal is confirmed. If the journal is genuinely not in the '
+    + 'accounting system, post it there from this '
     + 'row\'s own lines and record that id here — a batch is a finance-level correction, and there is '
     + 'no per-row cancel for one.'
 }

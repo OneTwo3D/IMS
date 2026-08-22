@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
+import { prepareManualJournal } from '@/lib/connectors/xero/journals'
 import {
   CREATE_DISPATCH_REPLAY_MARGIN_MS,
   CREATE_REPLAY_POLICY,
@@ -100,16 +101,34 @@ function harness() {
   }
 
   /**
-   * One attempt, in the production ORDER: PLAN (a read), then the claim fence (which mints), then
-   * post, then settle. Returns the refusal when the plan or the fence stops it, so a caller can
-   * assert nothing was sent.
+   * One attempt, in the production ORDER: VALIDATE the journal (pure, refuses before anything is
+   * recorded), then PLAN (a read), then the claim fence (which mints), then post, then settle.
+   * Returns the refusal when any of those stops it, so a caller can assert nothing was sent.
+   *
+   * The validation step is the REAL `prepareManualJournal`, not a stand-in: Codex r2 finding 1 is
+   * that its two refusals — no non-zero lines, debits and credits disagreeing — used to happen
+   * BELOW the mint, inside `pushManualJournal`. A model of the order that faked them could not tell
+   * the fixed shape from the broken one.
    */
   async function attempt(opts: {
     commitFails: boolean
     type?: keyof typeof CREATE_REPLAY_POLICY
     key?: string
     claimHeld?: boolean
+    /** Defaults to a balanced pair. Pass an unbalanced or empty set to stop before the socket. */
+    lines?: Array<{ accountCode: string; description: string; debit?: number; credit?: number }>
   }): Promise<string | null> {
+    const prepared = prepareManualJournal({
+      date: '2026-08-22',
+      reference: 'COGS 2026-08-22',
+      narration: 'COGS',
+      lines: opts.lines ?? [
+        { accountCode: '310', description: 'COGS', debit: 40 },
+        { accountCode: '630', description: 'Inventory', credit: 40 },
+      ],
+    })
+    if (!prepared.ok) return prepared.error
+
     const plan = await planCreateDispatch(client, {
       entryId: ENTRY_ID,
       type: opts.type ?? 'COGS_JOURNAL',
@@ -177,6 +196,37 @@ test('o3d-jit6 r1#2: a fence that refuses writes NO dispatch record — the proh
   assert.equal(second, null, 'the legitimate attempt is not refused by a dispatch that never happened')
   assert.equal(h.xeroCreates.length, 1, 'and it actually posts')
   assert.equal(h.row.externalTransactionId, 'MJ-1')
+})
+
+test('o3d-jit6 r2#1: a journal that stops BEFORE the socket writes no dispatch record either', async () => {
+  // CODEX ROUND 2, FINDING 1. The mint moved inside the fence in r1, which closed the paths where the
+  // FENCE refuses. It said nothing about the paths where the JOURNAL refuses: `pushManualJournal`
+  // returns `{ success: false }` for a journal with no non-zero lines and for one whose debits and
+  // credits disagree, and both of those returns are past the fence — so the marker was written and
+  // nothing left the process, and the next legitimate attempt refused a create nobody had made.
+  for (const lines of [
+    [],
+    [{ accountCode: '310', description: 'COGS', debit: 40 }],
+    [{ accountCode: '310', description: 'nothing', debit: 0, credit: 0 }],
+  ]) {
+    const h = harness()
+
+    const refusal = await h.attempt({ commitFails: false, lines })
+
+    assert.ok(refusal, `the journal is refused (${JSON.stringify(lines)})`)
+    assert.equal(h.xeroCreates.length, 0, 'nothing was sent — the precondition of the finding')
+    assert.equal(h.row.createDispatchedAt, null, 'THE POINT: and nothing was recorded either')
+    assert.equal(h.row.createDispatchIdempotencyKey, null)
+
+    // And the row is not wedged: once the payload is right, the create is a FIRST dispatch. Under the
+    // defect it met its own marker from an attempt that never reached Xero and refused for ever —
+    // and for a DAILY_BATCH row that refusal has no cancel, only a settlement asserting a document
+    // that does not exist.
+    h.advance(XERO_IDEMPOTENCY_KEY_RETENTION_MS + 60_000)
+    assert.equal(await h.attempt({ commitFails: false }), null)
+    assert.equal(h.xeroCreates.length, 1)
+    assert.equal(h.row.externalTransactionId, 'MJ-1')
+  }
 })
 
 test('o3d-jit6 r1#2: planning writes NOTHING, whatever it answers', async () => {
@@ -335,12 +385,28 @@ test('o3d-jit6 r1#2: the journal branch PLANS before the fence and RECORDS in it
   )
   assert.ok(branch.length > 0, 'the manual-journal branch must be locatable')
 
+  const validate = branch.indexOf('prepareManualJournal({')
   const plan = branch.indexOf('planCreateDispatch(db, {')
   const fence = branch.indexOf("lease.fenceBeforeRemoteWrite('manual-journal'")
-  const post = branch.indexOf('pushManualJournal({')
+  const post = branch.indexOf('postPreparedManualJournal(prepared.prepared,')
   assert.ok(plan > -1, 'the branch must plan the dispatch')
+  // CODEX ROUND 2, FINDING 1. `pushManualJournal` refuses a journal with no non-zero lines and an
+  // unbalanced one WITHOUT CALLING XERO. Below the fence, those returns left the marker written and
+  // nothing sent — r1 finding 2's defect reached through the payload instead of through the claim.
+  assert.ok(validate > -1, 'the branch must VALIDATE the journal itself')
+  assert.ok(validate < plan, 'and it must do so before anything is read, planned or minted')
+  assert.match(
+    branch.slice(validate, plan),
+    /if \(!prepared\.ok\) return \{ success: false, error: prepared\.error \}/,
+    'a journal that cannot be built must stop the attempt before the dispatch record exists',
+  )
   assert.ok(plan < fence, 'the READ comes first — nothing awaitable may sit between the fence and the socket')
   assert.ok(fence < post, 'and the fence is still the last thing before the socket')
+  // Nothing below the fence may refuse for a reason of its own: `postPreparedManualJournal` takes a
+  // body that has already cleared every check, and `prepareManualJournal` is pure and synchronous, so
+  // hoisting it added no await between proving the claim and using it.
+  assert.ok(!branch.slice(fence).includes('pushManualJournal('),
+    'the post below the fence must be the prepared one — pushManualJournal validates, and validating below the mint is the finding')
   assert.match(
     branch.slice(plan, fence),
     /if \(!dispatch\.dispatch\) return \{ success: false, error: dispatch\.error \}/,
