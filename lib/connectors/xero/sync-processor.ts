@@ -34,7 +34,7 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
-import { takeCreateDispatchSlot } from '@/lib/domain/accounting/create-dispatch-record'
+import { planCreateDispatch, type CreateDispatchMint } from '@/lib/domain/accounting/create-dispatch-record'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
@@ -1964,14 +1964,34 @@ function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date, observe
  */
 // Exported for tests/accounting/xero-claim-before-remote-write.test.ts: "we did not post" is the
 // outcome under test, and it is only observable at this seam.
-export async function renewClaimForRemoteWrite(entryId: string, held: HeldClaim): Promise<Date | null> {
+export async function renewClaimForRemoteWrite(
+  entryId: string,
+  held: HeldClaim,
+  /**
+   * o3d-jit6 (Codex r1 finding 2): the durable "a create for this row is on the wire" record, minted
+   * IN THIS STATEMENT rather than in one of its own.
+   *
+   * The record has to be committed before the request leaves, and the claim has to be the last thing
+   * proven before it — and those two requirements only fit together if they are the same write. A
+   * separate statement before the fence writes the marker on paths that then send nothing (the defect);
+   * a separate statement after it puts an await between proving the claim and using it (o3d-xl63
+   * r5 #1). One statement is both: the marker lands if and only if this worker still holds the row.
+   *
+   * Absent for every other remote mutation, which mint nothing.
+   */
+  mint?: CreateDispatchMint,
+): Promise<Date | null> {
   const renewedAt = new Date()
   const renewed = await db.accountingSyncLog.updateMany({
     // The shared claim-identity fence (see heldClaimWhere), narrowed to this connector. `held` is
     // asked for its instant HERE, as the statement is built — so a renewal that has happened since
     // the caller obtained the claim is the instant this re-take fences on (o3d-xl63 r6).
     where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR },
-    data: { processingStartedAt: renewedAt },
+    // `processingStartedAt` is this host's clock and `createDispatchedAt` is the DATABASE's, read by
+    // `planCreateDispatch` one statement ago. They are deliberately not the same instant: the claim is
+    // only ever compared against itself, while the dispatch instant is aged against `clock_timestamp()`
+    // by the next attempt, and mixing the two clocks there is the o3d-clxw defect.
+    data: mint ? { processingStartedAt: renewedAt, ...mint } : { processingStartedAt: renewedAt },
   })
   return renewed.count === 1 ? renewedAt : null
 }
@@ -2030,8 +2050,14 @@ export type RemoteWriteLease = HeldClaim & {
   heldFrom: () => Date
   /** Wall-clock instant past which no further remote mutation may BEGIN. Never moves. */
   deadlineAt: number
-  /** Re-take the claim immediately before a remote mutation, or refuse to make it. */
-  fenceBeforeRemoteWrite: (operation: string) => Promise<RemoteWriteFence>
+  /**
+   * Re-take the claim immediately before a remote mutation, or refuse to make it.
+   *
+   * `mintCreateDispatch` (o3d-jit6) makes the SAME statement record that a create is going out. It is
+   * written only on the path that actually reaches the socket, and it is written before it — see
+   * {@link renewClaimForRemoteWrite}.
+   */
+  fenceBeforeRemoteWrite: (operation: string, mintCreateDispatch?: CreateDispatchMint) => Promise<RemoteWriteFence>
 }
 
 /**
@@ -2089,7 +2115,7 @@ export async function openRemoteWriteLease(
     entryId,
     heldFrom: () => heldFrom,
     deadlineAt,
-    async fenceBeforeRemoteWrite(operation: string): Promise<RemoteWriteFence> {
+    async fenceBeforeRemoteWrite(operation: string, mintCreateDispatch?: CreateDispatchMint): Promise<RemoteWriteFence> {
       // The deadline is checked BEFORE the renewal, so an entry that has run out of lease does not
       // extend its own claim on the way to refusing. Nothing is sent either way.
       if (now() >= deadlineAt) {
@@ -2109,7 +2135,25 @@ export async function openRemoteWriteLease(
         return { ok: false, result: { success: false, error: message, notPosted: { reason: 'claim-lost', operation, message } } }
       }
 
-      const again = await renewClaimForRemoteWrite(entryId, claim)
+      // THE CLAIM PROOF AND THE DISPATCH RECORD, ONE STATEMENT (o3d-jit6, Codex r1 finding 2). Every
+      // gate that can refuse — the deadline, the outbox lock — has already refused above, without
+      // writing anything. From here the only outcomes are "this worker still owns the row, the record
+      // is committed, send" and "it does not, nothing was written, nothing is sent".
+      let again: Date | null
+      try {
+        again = await renewClaimForRemoteWrite(entryId, claim, mintCreateDispatch)
+      } catch (error) {
+        // A create whose local record cannot be written is a create whose OUTCOME cannot be recorded
+        // either (o3d-k26m.5), so it is refused rather than sent unrecorded. Only the minting fence
+        // catches: without a record to write, a failed renewal is an ordinary error and belongs to the
+        // per-entry catch exactly as it did before.
+        if (!mintCreateDispatch) throw error
+        const message = `Xero sync log ${entryId} was not posted: IMS could not record that a create `
+          + `(${operation}) was about to be dispatched — ${String(error)}. NOTHING WAS SENT, because a `
+          + 'create whose dispatch cannot be written down is one whose outcome cannot be written down '
+          + 'either, which is the state that produces a duplicate document.'
+        return { ok: false, result: { success: false, error: message, notPosted: { reason: 'dispatch-unrecorded', operation, message } } }
+      }
       if (!again) {
         const message = lostClaimMessage(entryId, operation)
         return { ok: false, result: { success: false, error: message, notPosted: { reason: 'claim-lost', operation, message } } }
@@ -2804,18 +2848,26 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
     // The pre-claim snapshot survives only as the seed value: if the re-read itself throws, the
     // catch below records a FAILURE with it. Nothing is posted on that path.
     let payload = (entry.payload ?? {}) as SyncPayload
-    // o3d-dzip: and the durable half of the row's origin record. Seeded from the row the sweep read
-    // — `entry` already carries it — so that if the authoritative re-read below throws, the failure
-    // path describes the row with the record it was selected with rather than with a null that would
-    // read as "this row records nothing".
-    let connectionProvenance = entry.connectionProvenance ?? null
+    // o3d-dzip: and the durable half of the row's origin record — the column, PLUS retention's own
+    // record of having emptied the payload, which is what tells a compacted row from a rewritten one
+    // (Codex r1 finding 1). Seeded from the row the sweep read — `entry` already carries both — so
+    // that if the authoritative re-read below throws, the failure path describes the row with the
+    // record it was selected with rather than with a null that would read as "this row records
+    // nothing".
+    let origin = {
+      connectionProvenance: entry.connectionProvenance ?? null,
+      backReferenceEvidenceCompactedAt: entry.backReferenceEvidenceCompactedAt ?? null,
+    }
 
     try {
-      // ONE read for both halves (o3d-dzip): the payload and the column are one record, and
-      // assembling them from two reads is how a disagreement gets manufactured.
+      // ONE read for all of it (o3d-dzip): the payload, the column and the compaction instant are one
+      // record, and assembling them from two reads is how a disagreement gets manufactured.
       const claimed = await readClaimedSyncLogOriginRecord(db, entry.id)
       payload = claimed.payload as SyncPayload
-      connectionProvenance = claimed.connectionProvenance
+      origin = {
+        connectionProvenance: claimed.connectionProvenance,
+        backReferenceEvidenceCompactedAt: claimed.backReferenceEvidenceCompactedAt,
+      }
       // Kept as a cheap pre-filter over the run's snapshot. It is no longer what makes the ordering
       // safe — the locked claim above is — but it still spares a lock round-trip in the ordinary case
       // and its verdict, when it fires, is the same one.
@@ -2898,7 +2950,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, connectionProvenance, lease, attempt)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, origin, lease, attempt)
 
       // BEFORE `skipped` and before `success` (r5 #1): this row stopped without sending anything, so
       // it must not be failed, must not spend a retry, and must not be persisted.
@@ -2907,7 +2959,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           entityType: 'SYSTEM',
           action: syncResult.notPosted.reason === 'lease-expired'
             ? 'xero_sync_lease_expired_before_post'
-            : 'xero_sync_claim_lost_before_post',
+            : syncResult.notPosted.reason === 'dispatch-unrecorded'
+              ? 'xero_sync_dispatch_unrecorded_before_post'
+              : 'xero_sync_claim_lost_before_post',
           tag: 'sync',
           level: 'WARNING',
           description: syncResult.notPosted.message,
@@ -3298,18 +3352,26 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     // The pre-claim snapshot survives only as the seed value: if the re-read itself throws, the
     // catch below records a FAILURE with it. Nothing is posted on that path.
     let payload = (entry.payload ?? {}) as SyncPayload
-    // o3d-dzip: and the durable half of the row's origin record. Seeded from the row the sweep read
-    // — `entry` already carries it — so that if the authoritative re-read below throws, the failure
-    // path describes the row with the record it was selected with rather than with a null that would
-    // read as "this row records nothing".
-    let connectionProvenance = entry.connectionProvenance ?? null
+    // o3d-dzip: and the durable half of the row's origin record — the column, PLUS retention's own
+    // record of having emptied the payload, which is what tells a compacted row from a rewritten one
+    // (Codex r1 finding 1). Seeded from the row the sweep read — `entry` already carries both — so
+    // that if the authoritative re-read below throws, the failure path describes the row with the
+    // record it was selected with rather than with a null that would read as "this row records
+    // nothing".
+    let origin = {
+      connectionProvenance: entry.connectionProvenance ?? null,
+      backReferenceEvidenceCompactedAt: entry.backReferenceEvidenceCompactedAt ?? null,
+    }
 
     try {
-      // ONE read for both halves (o3d-dzip): the payload and the column are one record, and
-      // assembling them from two reads is how a disagreement gets manufactured.
+      // ONE read for all of it (o3d-dzip): the payload, the column and the compaction instant are one
+      // record, and assembling them from two reads is how a disagreement gets manufactured.
       const claimed = await readClaimedSyncLogOriginRecord(db, entry.id)
       payload = claimed.payload as SyncPayload
-      connectionProvenance = claimed.connectionProvenance
+      origin = {
+        connectionProvenance: claimed.connectionProvenance,
+        backReferenceEvidenceCompactedAt: claimed.backReferenceEvidenceCompactedAt,
+      }
       // Cheap pre-filter over the run's snapshot; the locked claim above is what makes the ordering
       // safe. The claim IS held here, so the deferral gives it back under its own fence.
       if (blockedPaymentEntryIds.has(entry.id)) {
@@ -3416,7 +3478,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, connectionProvenance, lease, attempt)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, origin, lease, attempt)
 
       if (syncResult.notPosted) {
         // The lock may itself be what was lost, in which case handing the job back cannot work — say
@@ -3434,7 +3496,9 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           entityType: 'SYSTEM',
           action: syncResult.notPosted.reason === 'lease-expired'
             ? 'xero_sync_lease_expired_before_post'
-            : 'xero_sync_claim_lost_before_post',
+            : syncResult.notPosted.reason === 'dispatch-unrecorded'
+              ? 'xero_sync_dispatch_unrecorded_before_post'
+              : 'xero_sync_claim_lost_before_post',
           tag: 'sync',
           level: 'WARNING',
           description: syncResult.notPosted.message,
@@ -3620,7 +3684,7 @@ type EntryResult = {
    * a failure may have reached Xero, this provably did not, so the row is handed back rather than
    * having its retry count spent. Callers must test this before `skipped` and before `success`.
    */
-  notPosted?: { reason: 'claim-lost' | 'lease-expired'; operation: string; message: string }
+  notPosted?: { reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded'; operation: string; message: string }
 }
 
 /**
@@ -4409,11 +4473,13 @@ async function processEntry(
   referenceId: string,
   payload: SyncPayload,
   /**
-   * o3d-dzip: the row's durable origin column, read in the same statement as `payload`. It travels to
-   * the intent, and from there to the verdict taken at the socket, so a retention-compacted row is
-   * still checked against the organisation it was raised for instead of refusing as unrecorded.
+   * o3d-dzip: the row's DURABLE origin record — the `connectionProvenance` column and retention's
+   * `backReferenceEvidenceCompactedAt` — read in the same statement as `payload`. It travels to the
+   * intent, and from there to the verdict taken at the socket, so a retention-compacted row is still
+   * checked against the organisation it was raised for instead of refusing as unrecorded, while a row
+   * whose payload was merely REWRITTEN is not silently authorised by the column (Codex r1 finding 1).
    */
-  connectionProvenance: string | null,
+  origin: { connectionProvenance: string | null; backReferenceEvidenceCompactedAt: Date | null },
   // The LEASE, not a claim timestamp (o3d-xl63 r5 #1). Every remote mutation below fences on it, and
   // the caller reads `lease.heldFrom()` afterwards to anchor the persist to the claim actually held.
   lease: RemoteWriteLease,
@@ -4421,7 +4487,7 @@ async function processEntry(
   attempt: AttemptRef,
 ): Promise<EntryResult> {
   return withAccountingPostingIntent(
-    { connector: XERO_CONNECTOR, payload, connectionProvenance, type, referenceType, referenceId },
+    { connector: XERO_CONNECTOR, payload, ...origin, type, referenceType, referenceId },
     () => processClaimedEntry(entryId, type, referenceType, referenceId, payload, lease, attempt),
   )
 }
@@ -5018,22 +5084,29 @@ async function processClaimedEntry(
       // A manual journal is the one create with nothing else standing behind it: `POST /ManualJournals`
       // deduplicates on no key we own, so if the transaction that settles this row with the returned
       // id fails at COMMIT, the document is real, its id is gone, and the ordinary retry posts a
-      // SECOND journal into the accounts. This records the dispatch first — so the retry can tell —
-      // and REFUSES rather than guessing once Xero's six-minute idempotency window has closed.
+      // SECOND journal into the accounts. So the dispatch is recorded first — so the retry can tell —
+      // and REFUSED rather than guessed at once Xero's six-minute idempotency window has closed.
       //
-      // The key is passed exactly as it will be sent, so the replay arm is comparing what was sent
-      // against what is about to be sent rather than two derivations of it.
-      const dispatch = await takeCreateDispatchSlot(db, {
+      // TWO STEPS, AND THE ORDER IS THE WHOLE OF Codex r1 FINDING 2. `planCreateDispatch` only READS:
+      // it answers "may this create go out at all", refuses here if not, and writes nothing whichever
+      // way it answers. It is awaited BEFORE the fence for the same reason
+      // `isFirstPurchaseCreditNoteAttempt` is (o3d-xl63 r5 #1) — nothing awaitable may sit between
+      // proving the claim and using it.
+      //
+      // The RECORD is then minted by the fence itself, inside the very statement that re-proves the
+      // claim. That is what stops the marker being written on a path that sends nothing: an expired
+      // lease or a lost claim returns from `fenceBeforeRemoteWrite` having written neither the claim
+      // renewal nor the dispatch, so a later legitimate attempt does not meet a dispatch that never
+      // happened. The key is passed exactly as it will be sent, so the replay arm compares what was
+      // sent against what is about to be sent rather than two derivations of it.
+      const dispatch = await planCreateDispatch(db, {
         entryId,
         type,
         idempotencyKey: journalIdempotencyKey,
         label: `${type} for ${referenceType} ${referenceId}`,
       })
       if (!dispatch.dispatch) return { success: false, error: dispatch.error }
-      // AFTER that write, never before (the o3d-xl63 r5 #1 ordering): the dispatch record is awaited,
-      // and the whole point of the claim fence is that nothing awaitable happens between proving the
-      // claim and using it. Both rules survive in this order.
-      const fence = await lease.fenceBeforeRemoteWrite('manual-journal')
+      const fence = await lease.fenceBeforeRemoteWrite('manual-journal', dispatch.mint ?? undefined)
       if (!fence.ok) return fence.result
       return pushManualJournal({
         date: payload.date as string,

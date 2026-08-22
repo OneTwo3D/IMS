@@ -434,13 +434,30 @@ test('an already-terminal row cannot have its recorded outcome rewritten', async
   }
 })
 
-test('a DAILY_BATCH row is refused whatever its status or attempt', async () => {
+test('a DAILY_BATCH row is refused the NOT_POSTED assertion whatever its status or attempt', async () => {
   const settle = await loadAction()
   state.rows = [syncRow({ type: 'DAILY_BATCH_GROUP_B', attemptRevision: 4 })]
   const result = await settle('log-1', notPosted({ observedAttemptRevision: 4 }))
   assert.equal(result.success, false)
   assert.equal('code' in result ? result.code : null, 'daily_batch_not_settleable')
   assert.equal(stored().status, 'FAILED')
+})
+
+test('o3d-jit6 r1#3: a DAILY_BATCH row ACCEPTS the POSTED assertion, and the row lands SYNCED with the id', async () => {
+  // The remedy o3d-jit6's dispatch refusal now prescribes for the six DAILY_BATCH journal types. It
+  // has to actually run, or the refusal is a dead end: a FAILED batch row is revived to PENDING every
+  // daily run, so it would refuse, fail and revive for ever while blocking its own batch's recreate.
+  //
+  // SYNCED is the safe terminal state here, and that is the whole argument: it is a LIVE status to
+  // `dailyBatchRecreateVerdict` (so no second journal is derived) and to the order delete guard (so
+  // the orders staged into the batch stay undeletable). Only CANCELLED tells those two the opposite.
+  const settle = await loadAction()
+  state.rows = [syncRow({ type: 'DAILY_BATCH_GROUP_B', attemptRevision: 4 })]
+  const result = await settle('log-1', posted({ observedAttemptRevision: 4, externalTransactionId: 'MJ-4242' }))
+  assert.equal(result.success, true)
+  assert.equal(result.success === true ? result.settledStatus : null, 'SYNCED')
+  assert.equal(stored().status, 'SYNCED')
+  assert.equal(stored().externalTransactionId, 'MJ-4242')
 })
 
 test('"it did NOT post" is refused against a row that already names a document', async () => {

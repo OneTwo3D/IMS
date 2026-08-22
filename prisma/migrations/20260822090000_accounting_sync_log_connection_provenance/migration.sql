@@ -17,8 +17,15 @@
 -- connection. The two cannot disagree at birth, and after birth only one of them can move (see the
 -- trigger). A reader combines them:
 --
---   column present, payload silent    the column is the record. THIS IS THE POINT — a compacted
---                                     tombstone still names its organisation.
+--   column present, payload silent    the column is the record — BUT ONLY where the row also carries
+--                                     `back_reference_evidence_compacted_at` and an empty payload,
+--                                     i.e. where RETENTION is provably what took the stamp away. THIS
+--                                     IS THE POINT: a compacted tombstone still names its
+--                                     organisation. A payload that merely lacks the key — rewritten
+--                                     by a repair, a seed, a psql session, an older release still
+--                                     rolling — is NOT that row, and letting the column speak for it
+--                                     would have the column vouch for content it never saw. That case
+--                                     is undecidable and refuses.
 --   column silent, payload stamped    the payload is the record. Rows queued before this migration
 --                                     keep working exactly as they do today; there is no rollout
 --                                     cliff and no in-flight queue to drain.
@@ -81,11 +88,14 @@ ALTER TABLE "accounting_sync_logs" ADD COLUMN "connection_provenance" TEXT;
 --
 -- WHY IT DOES NOT FIRE ON A PAYLOAD REWRITE. Two statements rewrite a stored payload and both are
 -- right to leave this column alone. Retention's compaction (`payload: {}`) is the case the column
--- exists for. The follow-up REVIVAL (`plan.action === 'reuse'`) rewrites a FAILED row's payload with
--- one built by `withStoredOriginRecord`, which copies the stored origin VERBATIM — a revival
--- inherits, it does not re-observe — so the payload it writes agrees with the column by
--- construction. A writer that rewrites the payload with a DIFFERENT origin and leaves the column
--- alone is caught by the reader instead, as a disagreement, and refuses.
+-- exists for, and it stamps `back_reference_evidence_compacted_at` in the same statement, which is
+-- what the reader requires before it will decide from the column alone. The follow-up REVIVAL
+-- (`plan.action === 'reuse'`) rewrites a FAILED row's payload with one built by
+-- `withStoredOriginRecord`, which copies the stored origin VERBATIM — a revival inherits, it does not
+-- re-observe — so the payload it writes agrees with the column by construction. A writer that
+-- rewrites the payload with a DIFFERENT origin and leaves the column alone is caught by the reader as
+-- a disagreement; a writer that rewrites it with NO origin and leaves the column alone is caught as
+-- an unexplained silence, because it wrote no compaction record either. Both refuse.
 --
 -- prisma-schema-scope-ok: db-native trigger | reason: Prisma cannot represent triggers, and the rule has to bind writers outside this repository
 CREATE OR REPLACE FUNCTION accounting_sync_log_clear_connection_provenance()

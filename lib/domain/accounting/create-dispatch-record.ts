@@ -21,6 +21,38 @@
  * cannot be written is a create whose OUTCOME cannot be recorded either, which is precisely the
  * lost-response state — so a failure to write it REFUSES the post rather than proceeding.
  *
+ * BUT "BEFORE THE REQUEST" IS NOT "AS EARLY AS POSSIBLE" (Codex r1 finding 2, HIGH). The first cut
+ * minted the record in its own statement and THEN asked the claim fence whether this worker still
+ * owned the row. A fence that reports an expired lease or a lost claim returns with nothing sent —
+ * and, in that version, with the record permanently written. A later, legitimate attempt then read a
+ * dispatch that never happened and refused a create that had never been made: the prohibition fired
+ * on a post nobody made, which is the same class of error as the duplicate it exists to prevent, in
+ * the opposite direction.
+ *
+ * SO THE WORK IS SPLIT IN TWO, AND THE SPLIT IS ALONG "READ" / "WRITE":
+ *
+ *   {@link planCreateDispatch}   a READ. What does this row already record, and may this create go
+ *                                out at all? Refuses here, before any gate has been passed, and
+ *                                writes nothing whatever the answer is.
+ *   the MINT                     the `data` fragment the plan hands back, written by the CLAIM FENCE
+ *                                ITSELF — merged into the very `updateMany` that re-proves this
+ *                                worker's claim, immediately before the socket.
+ *
+ * WHY THE MINT RIDES INSIDE THE FENCE'S OWN STATEMENT rather than being a second statement after it.
+ * o3d-xl63 r5 #1 established, and a structural test asserts, that NOTHING AWAITABLE MAY SIT BETWEEN
+ * PROVING THE CLAIM AND USING IT — a claim proven before an await has had that await to lapse in. A
+ * dispatch record written after the fence would be exactly such an await. Making it part of the
+ * fence's statement satisfies both rules at once: the record is committed before the wire, and the
+ * claim proof is still the last thing that happens before it. It also makes the two facts atomic —
+ * there is no interleaving in which this worker holds the claim but the record failed to land, or
+ * the record landed for a worker that had already lost the row.
+ *
+ * AND THE EXCLUSIVITY IS THE CLAIM'S, NOT A CONDITIONAL WRITE'S. The earlier revision used
+ * `where: { createDispatchedAt: null }` so that two workers could not both be told they were first.
+ * They still cannot: the mint is written under `heldClaimWhere`, which exactly one worker satisfies,
+ * and the database trigger makes the pair immutable once set even if a writer this repository does
+ * not contain tries. Two workers can both PLAN "first-dispatch"; only one of them can fence.
+ *
  * WHAT IS DURABLE, AND AT WHICH MOMENT:
  *
  *   before the socket   `createDispatchedAt` + `createDispatchIdempotencyKey`, committed by their own
@@ -38,6 +70,20 @@
  * guard therefore refuses instead of guessing, and the refusal names an action a human can take. A
  * refusal an operator can act on beats a coin-flip that duplicates the accounts half the time.
  *
+ * AND "AN ACTION A HUMAN CAN TAKE" HAS TO BE TRUE OF THE ROW IN FRONT OF THEM (Codex r1 finding 3).
+ * The first cut printed ONE remedy for all eighteen no-remedy types: record the id with the per-row
+ * settlement action, or cancel the row and re-queue. Six of those eighteen are DAILY_BATCH types, and
+ * the settlement action refused the whole family — so for a sixth of the population the refusal
+ * prescribed something that could not be done, which is the o3d-s36z defect (a re-queue that rebuilt
+ * the identical payload and was then skipped by the sweep) in a new place.
+ *
+ * The remedy is now chosen by type, and the daily-batch half of it was MADE TO EXIST rather than
+ * merely renamed: `settleableSettlementOutcomes` admits the POSTED assertion for DAILY_BATCH rows,
+ * because every reason the family was refused is a reason about CANCELLED — see the argument beside
+ * that function. Recording the journal's id leaves the row SYNCED, which is a live status to both the
+ * batch recreators and the order delete guard, so it blocks the duplicate recreate and keeps the
+ * orders protected. NOT_POSTED stays refused, and the batch refusal says so instead of offering it.
+ *
  * AND BE HONEST ABOUT HOW OFTEN THE REPLAY ARM ACTUALLY FIRES: rarely. The retry that follows a failed
  * persist is scheduled through the outbox, whose first backoff FLOOR is five minutes and which is only
  * claimable on the next five-minute cron tick, so by the time it runs the window has usually closed —
@@ -54,6 +100,7 @@ import {
   XERO_IDEMPOTENCY_KEY_RETENTION_MS,
   isWithinXeroIdempotencyWindow,
 } from './idempotency-retention'
+import { isDailyBatchSyncType } from './sync-row-settlement'
 
 /**
  * What stands between a SECOND attempt at this type's remote create and a duplicate document.
@@ -147,17 +194,38 @@ export type RecordedCreateDispatch = {
   idempotencyKey: string | null
 }
 
+export type CreateDispatchBasis =
+  /** Nothing is dispatched for this row yet; the fence must mint the record as it sends. */
+  | 'first-dispatch'
+  /** The same key, inside the window: Xero answers with the original document. */
+  | 'replay-within-idempotency-window'
+  /** The create is update-or-create on a number IMS re-mints identically. */
+  | 'natural-key-upsert'
+
 export type CreateDispatchDecision =
-  | {
-      dispatch: true
-      basis:
-        /** Nothing had been dispatched for this row; this call minted the record. */
-        | 'first-dispatch'
-        /** The same key, inside the window: Xero answers with the original document. */
-        | 'replay-within-idempotency-window'
-        /** The create is update-or-create on a number IMS re-mints identically. */
-        | 'natural-key-upsert'
-    }
+  | { dispatch: true; basis: CreateDispatchBasis }
+  | { dispatch: false; error: string }
+
+/**
+ * The columns the CLAIM FENCE must merge into its renewal statement as it sends.
+ *
+ * Shaped as the `data` fragment rather than as loose values so the fence cannot write one half of the
+ * pair: the instant and the key it describes are one fact, and the database trigger restores them
+ * TOGETHER for exactly the same reason.
+ */
+export type CreateDispatchMint = {
+  createDispatchedAt: Date
+  createDispatchIdempotencyKey: string
+}
+
+/**
+ * May this create go out — and, when it is the FIRST one, what the fence must record as it sends.
+ *
+ * `mint` is present only for `first-dispatch`. A replay does not re-mint: the row already carries the
+ * record, and moving the instant forward would renew Xero's six-minute window against itself for ever.
+ */
+export type CreateDispatchPlan =
+  | { dispatch: true; basis: CreateDispatchBasis; mint: CreateDispatchMint | null }
   | { dispatch: false; error: string }
 
 /**
@@ -218,22 +286,47 @@ export function decideCreateDispatch(params: {
         : 'This attempt would go out under a DIFFERENT idempotency key than the dispatch on record, so '
           + 'it would be processed as a new request'}`
       + `, and a ${params.type} create has no number or reference Xero deduplicates on. Posting would `
-      + 'therefore create a SECOND document if the first one landed, and nothing IMS can read says '
-      + 'whether it did. REMEDY: look in Xero for that document. If it is there, record its id against '
-      + 'this row with the per-row settlement action on /sync (it is written as an operator assertion, '
-      + 'not a connector confirmation). If it is not there, cancel this row and re-queue the work from '
-      + 'the source document, which raises a new row with no dispatch on record.',
+      + `therefore create a SECOND document if the first one landed, and nothing IMS can read says `
+      + `whether it did. ${describeCreateDispatchRemedy(params.type)}`,
   }
 }
 
-/** The narrow delegate surface this needs, so a caller can pass `db`, a transaction, or a stub. */
+/**
+ * The remedy, CHOSEN BY TYPE (Codex r1 finding 3).
+ *
+ * A refusal whose remedy cannot be performed is not a remedy, and the generic one could not be
+ * performed on a DAILY_BATCH row: that family had no per-row settlement at all, no cancel, and a
+ * FAILED batch row is revived to PENDING by `resetFailedDailyBatchLogs` on every daily run — so it
+ * would refuse, fail and revive for ever while blocking its own batch's recreate.
+ */
+export function describeCreateDispatchRemedy(type: AccountingSyncType): string {
+  if (isDailyBatchSyncType(type)) {
+    return 'REMEDY: look in the accounting system for that journal. If it is there, record its id '
+      + 'against this row with the per-row settlement action on /sync, choosing "It DID post" — a '
+      + 'DAILY BATCH row accepts that assertion and only that one. It leaves the row SYNCED, which is '
+      + 'what the batch recreate probe and the order delete guard already read as "this batch posted", '
+      + 'so no second journal is derived and the orders staged into the batch stay protected. If the '
+      + 'journal is NOT there, post it in the accounting system from this row\'s own lines and record '
+      + 'that id here the same way: a batch covers every order staged into it, so there is deliberately '
+      + 'no per-row cancel-and-re-queue for one — cancelling it would let an order be hard-deleted while '
+      + 'a recreate was already building a journal containing its value.'
+  }
+  return 'REMEDY: look in Xero for that document. If it is there, record its id against this row with '
+    + 'the per-row settlement action on /sync (it is written as an operator assertion, not a connector '
+    + 'confirmation). If it is not there, cancel this row and re-queue the work from the source '
+    + 'document, which raises a new row with no dispatch on record.'
+}
+
+/**
+ * The narrow delegate surface this needs, so a caller can pass `db`, a transaction, or a stub.
+ *
+ * READ-ONLY, and that is the finding-2 fix expressed in a type: this module can no longer write a
+ * dispatch record at all, so no future call site can reintroduce one on a path that sends nothing.
+ * The only writer is the claim fence, using {@link CreateDispatchMint}.
+ */
 export type CreateDispatchClient = {
   $queryRaw<T = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<T>
   accountingSyncLog: {
-    updateMany(args: {
-      where: { id: string; createDispatchedAt: null }
-      data: { createDispatchedAt: Date; createDispatchIdempotencyKey: string }
-    }): Promise<{ count: number }>
     findUnique(args: {
       where: { id: string }
       select: { createDispatchedAt: true; createDispatchIdempotencyKey: true }
@@ -242,34 +335,37 @@ export type CreateDispatchClient = {
 }
 
 /**
- * Record that a create is about to go out for this row — and decide whether it may.
+ * Decide whether this create may go out, and hand back what the CLAIM FENCE must record as it sends.
  *
- * MUST BE AWAITED IMMEDIATELY BEFORE THE REQUEST, and after it nothing awaitable may happen except
- * the claim fence. The record is what makes the NEXT attempt able to tell a first create from a
- * repeat, and it is worth nothing if it is written after the wire.
+ * WRITES NOTHING. That is finding 2: everything below can refuse, and a refusal here must leave the
+ * row exactly as it found it, because a marker written on a path that sends nothing is a prohibition
+ * standing over a post nobody made. The record is minted by the fence, from {@link CreateDispatchPlan}
+ * `mint`, in the same statement that re-proves the claim — see the header.
  *
- * THE CLAIM IS ONE CONDITIONAL WRITE, WITH NO READ FIRST, and the absence of the read is the point —
- * the same shape as `authoriseMoneyPost`. Two workers cannot both be told they are the first, because
- * `createDispatchedAt: null` is a predicate exactly one `updateMany` can satisfy. A read-then-write
- * would let both read null.
+ * WHERE IT IS CALLED. Immediately before the fence, which is immediately before the socket. It is
+ * awaited, so it deliberately runs BEFORE the claim is proven rather than after it: an await between
+ * the proof and the send is the o3d-xl63 r5 #1 defect, and the same ordering argument the
+ * PURCHASE_CREDIT_NOTE branch already makes for `isFirstPurchaseCreditNoteAttempt`.
  *
- * `count === 0` means the record was already there (or the row is gone), and only THEN is the row
- * read, to describe what is already recorded. That read cannot be raced into a wrong answer: the
- * trigger makes the pair immutable once set, so whatever it returns is what the dispatch minted.
- *
- * FAILS CLOSED, IN BOTH DIRECTIONS THAT MATTER. A `$queryRaw`, `updateMany` or `findUnique` that
- * throws refuses the post — nothing was sent — because a create we cannot record is a create whose
- * outcome we cannot record. A row that has vanished refuses for the same reason: there is nowhere left
- * to write the id this post would return.
+ * FAILS CLOSED. A `$queryRaw` or `findUnique` that throws refuses the post — nothing was sent —
+ * because a create we cannot describe is a create whose outcome we cannot record. A row that has
+ * vanished refuses for the same reason: there is nowhere left to write the id this post would return.
  */
-export async function takeCreateDispatchSlot(
+export async function planCreateDispatch(
   client: CreateDispatchClient,
   params: { entryId: string; type: AccountingSyncType; idempotencyKey: string; label: string },
-): Promise<CreateDispatchDecision> {
+): Promise<CreateDispatchPlan> {
   try {
     // ONE reading of the DATABASE's clock, used both to stamp and to age. `clock_timestamp()` rather
     // than `now()`: `now()` is the transaction's start time, and these statements are not in one
     // transaction, so it would be a different kind of instant on each call.
+    //
+    // IT IS ALSO WHAT THE FENCE WILL STAMP, one statement later. Taking it here rather than in the
+    // fence keeps every `createDispatchedAt` on the SAME clock as the `now` every later attempt ages
+    // it against (o3d-clxw) — the application host's `new Date()` the fence uses for the claim is a
+    // different clock and must never end up in this column. The gap between this read and the write
+    // is one statement, and it errs in the safe direction anyway: a record stamped very slightly
+    // EARLY reads as slightly OLDER, so the replay window closes sooner, never later.
     const clock = await client.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS "now"`
     const now = clock?.[0]?.now
     if (!(now instanceof Date) || Number.isNaN(now.getTime())) {
@@ -280,17 +376,11 @@ export async function takeCreateDispatchSlot(
       }
     }
 
-    const claimed = await client.accountingSyncLog.updateMany({
-      where: { id: params.entryId, createDispatchedAt: null },
-      data: { createDispatchedAt: now, createDispatchIdempotencyKey: params.idempotencyKey },
-    })
-    if (claimed.count === 1) return { dispatch: true, basis: 'first-dispatch' }
-
     const row = await client.accountingSyncLog.findUnique({
       where: { id: params.entryId },
       select: { createDispatchedAt: true, createDispatchIdempotencyKey: true },
     })
-    if (!row || row.createDispatchedAt === null) {
+    if (!row) {
       return {
         dispatch: false,
         error: `NOTHING WAS SENT. The sync row for ${params.label} could not be read back to record that `
@@ -299,7 +389,15 @@ export async function takeCreateDispatchSlot(
       }
     }
 
-    return decideCreateDispatch({
+    if (row.createDispatchedAt === null) {
+      return {
+        dispatch: true,
+        basis: 'first-dispatch',
+        mint: { createDispatchedAt: now, createDispatchIdempotencyKey: params.idempotencyKey },
+      }
+    }
+
+    const decision = decideCreateDispatch({
       type: params.type,
       idempotencyKey: params.idempotencyKey,
       recorded: {
@@ -309,6 +407,10 @@ export async function takeCreateDispatchSlot(
       now,
       label: params.label,
     })
+    // A row that already carries a record is never re-minted: the pair is what the earlier dispatch
+    // wrote, the trigger holds it there, and moving the instant forward would renew Xero's six-minute
+    // window against itself for ever.
+    return decision.dispatch ? { dispatch: true, basis: decision.basis, mint: null } : decision
   } catch (error) {
     return {
       dispatch: false,

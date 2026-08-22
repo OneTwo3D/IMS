@@ -259,9 +259,10 @@ test('both sweep paths open the lease before posting and anchor the persist to t
     // o3d-e2mz: the call now carries the ATTEMPT as well as the lease — two fences answering two
     // different questions (do I still own this row / is this still the attempt I claimed). The lease
     // must still be there, and must still be the LEASE rather than a snapshot of it.
-    // o3d-dzip added the durable origin column to the arguments; the LEASE and the ATTEMPT must still
-    // be the last two, and must still be the lease itself rather than a snapshot of it.
-    assert.match(lines[index], /payload, connectionProvenance, lease, attempt\)/,
+    // o3d-dzip added the durable origin record to the arguments (the column plus retention's
+    // compaction instant, Codex r1 finding 1); the LEASE and the ATTEMPT must still be the last two,
+    // and must still be the lease itself rather than a snapshot of it.
+    assert.match(lines[index], /payload, origin, lease, attempt\)/,
       `and everything downstream must fence on the lease, not on the claim taken before the deferral checks`)
   }
 

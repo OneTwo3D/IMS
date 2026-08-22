@@ -708,3 +708,143 @@ test('r6: the give-up path records the external id against the RENEWED claim, no
   assert.equal(state.row?.status, 'PENDING',
     'handed back so the next run short-circuits on the external id instead of posting a second document')
 })
+
+/**
+ * o3d-jit6, Codex r1 finding 2 — THE DISPATCH RECORD IS MINTED BY THE FENCE, SO IT CANNOT OUTLIVE A
+ * POST THAT NEVER LEFT.
+ *
+ * The record has to be committed before a manual-journal create goes out, or a commit failure after
+ * the post leaves nothing behind to stop the retry duplicating the journal. The first cut wrote it in
+ * a statement of its own, ahead of the fence — so an expired lease, a lost outbox lock or a stolen
+ * claim returned with the marker written and nothing sent, and the next legitimate attempt refused a
+ * create nobody had made.
+ *
+ * These drive the REAL lease against the row-honouring double, which is the only way to observe both
+ * halves of the property: that the record lands in the same statement as the claim renewal, and that
+ * every refusing path leaves the row untouched.
+ */
+const MINT = {
+  createDispatchedAt: new Date('2026-08-20T10:05:00.000Z'),
+  createDispatchIdempotencyKey: 'ims-manual-journal-log-1',
+}
+
+/** Rows carry the two columns from the migration; the double starts them null, as a fresh row is. */
+function claimedRowWithNoDispatch(claimedAt: Date): void {
+  state.row!.status = 'PROCESSING'
+  state.row!.processingStartedAt = claimedAt
+  state.row!.createDispatchedAt = null
+  state.row!.createDispatchIdempotencyKey = null
+}
+
+test('o3d-jit6 r1#2: the fence records the dispatch in the SAME statement that re-proves the claim', async () => {
+  reset()
+  const { openRemoteWriteLease } = await processor()
+  const claimedAt = new Date('2026-08-20T10:00:00.000Z')
+  claimedRowWithNoDispatch(claimedAt)
+
+  const lease = await openRemoteWriteLease('log-1', claimedAt)
+  assert.ok(lease)
+  // The claim as it stands after the lease's own re-take — the instant the fence must fence on.
+  const heldBeforeFence = lease.heldFrom()
+  state.syncLogWrites = []
+
+  const fence = await lease.fenceBeforeRemoteWrite('manual-journal', MINT)
+  assert.equal(fence.ok, true)
+
+  assert.equal(state.syncLogWrites.length, 1,
+    'ONE statement — two would be either a record with no claim or an await between the claim and the socket')
+  const [write] = state.syncLogWrites
+  assert.equal(write.count, 1)
+  assert.ok(write.data.processingStartedAt instanceof Date, 'it is the claim renewal')
+  assert.deepEqual(write.data.createDispatchedAt, MINT.createDispatchedAt, 'and it carries the dispatch record')
+  assert.equal(write.data.createDispatchIdempotencyKey, MINT.createDispatchIdempotencyKey)
+  assert.equal(write.where.status, 'PROCESSING')
+  assert.deepEqual(write.where.processingStartedAt, heldBeforeFence,
+    'scoped to the claim this worker holds, so only the owner of the row can record a dispatch for it')
+  assert.deepEqual(state.row?.createDispatchedAt, MINT.createDispatchedAt, 'the record is on the row before the socket')
+})
+
+test('o3d-jit6 r1#2: a STOLEN claim records no dispatch — nothing was sent, so nothing may be on record', async () => {
+  reset()
+  const { openRemoteWriteLease } = await processor()
+  const claimedAt = new Date('2026-08-20T10:00:00.000Z')
+  claimedRowWithNoDispatch(claimedAt)
+
+  const lease = await openRemoteWriteLease('log-1', claimedAt)
+  assert.ok(lease)
+
+  // Another worker re-claims the row between the lease opening and the write.
+  state.row!.processingStartedAt = new Date('2026-08-20T10:10:00.000Z')
+  state.syncLogWrites = []
+
+  const fence = await lease.fenceBeforeRemoteWrite('manual-journal', MINT)
+  assert.equal(fence.ok, false)
+  assert.equal(fence.ok === false && fence.result.notPosted?.reason, 'claim-lost')
+  assert.equal(state.syncLogWrites[0]?.count, 0, 'the conditional write matched nothing')
+  assert.equal(state.row?.createDispatchedAt, null,
+    'THE FINDING: a marker written here would refuse a later, legitimate create for a post nobody made')
+  assert.equal(state.row?.createDispatchIdempotencyKey, null)
+})
+
+test('o3d-jit6 r1#2: an EXPIRED LEASE and a LOST OUTBOX LOCK record no dispatch either', async () => {
+  reset()
+  const { openRemoteWriteLease, XERO_ENTRY_LEASE_MS } = await processor()
+  const claimedAt = new Date('2026-08-20T10:00:00.000Z')
+  claimedRowWithNoDispatch(claimedAt)
+
+  let clock = 0
+  const lease = await openRemoteWriteLease('log-1', claimedAt, undefined, () => clock)
+  assert.ok(lease)
+  state.syncLogWrites = []
+
+  clock = XERO_ENTRY_LEASE_MS
+  const expired = await lease.fenceBeforeRemoteWrite('manual-journal', MINT)
+  assert.equal(expired.ok, false)
+  assert.equal(expired.ok === false && expired.result.notPosted?.reason, 'lease-expired')
+  assert.equal(state.syncLogWrites.length, 0, 'the deadline refuses before anything is written at all')
+  assert.equal(state.row?.createDispatchedAt, null)
+
+  // And the queue-side lock, which is checked before the row claim for the same reason.
+  reset()
+  claimedRowWithNoDispatch(claimedAt)
+  const lockedAt = new Date('2026-08-20T10:00:00.000Z')
+  const job = { id: 'job-1', lockedAt, attempts: 0 } as unknown as Parameters<typeof openRemoteWriteLease>[2]
+  const outboxLease = await openRemoteWriteLease('log-1', claimedAt, job)
+  assert.ok(outboxLease)
+  state.outbox.lockHeld = false
+  state.syncLogWrites = []
+
+  const lost = await outboxLease.fenceBeforeRemoteWrite('manual-journal', MINT)
+  assert.equal(lost.ok, false)
+  assert.equal(state.syncLogWrites.length, 0, 'the row is left exactly as it was, record included')
+  assert.equal(state.row?.createDispatchedAt, null)
+})
+
+test('o3d-jit6 r1#2: a fence that CANNOT write the record refuses the post rather than sending it unrecorded', async () => {
+  // o3d-k26m.5: a create whose local record cannot be written is a create whose OUTCOME cannot be
+  // recorded either. Only the MINTING fence turns the failure into a refusal; an ordinary fence keeps
+  // letting the error reach the per-entry catch exactly as it did before.
+  reset()
+  const { openRemoteWriteLease } = await processor()
+  const claimedAt = new Date('2026-08-20T10:00:00.000Z')
+  claimedRowWithNoDispatch(claimedAt)
+
+  const lease = await openRemoteWriteLease('log-1', claimedAt)
+  assert.ok(lease)
+
+  const { db } = await import('@/lib/db') as unknown as { db: { accountingSyncLog: { updateMany: unknown } } }
+  const good = db.accountingSyncLog.updateMany
+  db.accountingSyncLog.updateMany = async () => { throw new Error('deadlock detected') }
+  try {
+    const refused = await lease.fenceBeforeRemoteWrite('manual-journal', MINT)
+    assert.equal(refused.ok, false)
+    assert.equal(refused.ok === false && refused.result.notPosted?.reason, 'dispatch-unrecorded')
+    assert.match(refused.ok === false ? refused.result.error ?? '' : '', /NOTHING WAS SENT/)
+    assert.match(refused.ok === false ? refused.result.error ?? '' : '', /deadlock detected/)
+
+    // Without a record to write it is an ordinary error and belongs to the per-entry catch.
+    await assert.rejects(lease.fenceBeforeRemoteWrite('sales-invoice'), /deadlock detected/)
+  } finally {
+    db.accountingSyncLog.updateMany = good
+  }
+})

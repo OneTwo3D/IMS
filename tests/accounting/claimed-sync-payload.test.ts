@@ -18,18 +18,32 @@ import { readClaimedSyncLogPayload } from '@/lib/domain/accounting/claimed-sync-
  */
 
 /** A double that resolves by id — a fixed return value could not tell a re-read from a snapshot. */
-function makeClient(rows: Record<string, { payload: unknown; connectionProvenance?: string | null } | undefined>) {
+function makeClient(rows: Record<string, {
+  payload: unknown
+  connectionProvenance?: string | null
+  backReferenceEvidenceCompactedAt?: Date | null
+} | undefined>) {
   const reads: string[] = []
   const client = {
     accountingSyncLog: {
       findUnique: async (
-        { where, select }: { where: { id: string }; select: { payload: true; connectionProvenance: true } },
+        { where, select }: {
+          where: { id: string }
+          select: { payload: true; connectionProvenance: true; backReferenceEvidenceCompactedAt: true }
+        },
       ) => {
         reads.push(where.id)
-        // o3d-dzip: both halves of the origin record come out of THIS read. Selecting them separately
+        // o3d-dzip: EVERY half of the origin record comes out of THIS read. Selecting them separately
         // would let a caller hold a payload from one moment and a column from another, which is how a
-        // disagreement — the state that must refuse — gets manufactured out of two honest reads.
-        assert.deepEqual(select, { payload: true, connectionProvenance: true }, 'the payload and its durable origin, together')
+        // disagreement — the state that must refuse — gets manufactured out of two honest reads. The
+        // compaction instant joined them in Codex r1 finding 1: it is what tells a payload retention
+        // emptied from one something rewrote, and reading it at a different moment from the payload it
+        // vouches for would be that same manufactured disagreement.
+        assert.deepEqual(
+          select,
+          { payload: true, connectionProvenance: true, backReferenceEvidenceCompactedAt: true },
+          'the payload and its durable origin, together',
+        )
         return rows[where.id] ?? null
       },
     },

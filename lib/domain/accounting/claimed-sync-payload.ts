@@ -22,8 +22,10 @@ export type ClaimedSyncPayloadClient = {
   accountingSyncLog: {
     findUnique(args: {
       where: { id: string }
-      select: { payload: true; connectionProvenance: true }
-    }): Promise<{ payload: unknown; connectionProvenance?: string | null } | null>
+      select: { payload: true; connectionProvenance: true; backReferenceEvidenceCompactedAt: true }
+    }): Promise<
+      { payload: unknown; connectionProvenance?: string | null; backReferenceEvidenceCompactedAt?: Date | null } | null
+    >
   }
 }
 
@@ -37,6 +39,13 @@ export type ClaimedSyncPayloadClient = {
 export type ClaimedSyncOriginRecord = {
   payload: Record<string, unknown>
   connectionProvenance: string | null
+  /**
+   * o3d-dzip (Codex r1 finding 1): retention's own record that it emptied this payload. Read from the
+   * SAME statement as the other two, because the question it answers — "is this payload silent because
+   * retention took it, or because something rewrote it?" — is only answerable if all three describe
+   * one moment.
+   */
+  backReferenceEvidenceCompactedAt: Date | null
 }
 
 /**
@@ -70,7 +79,7 @@ export async function readClaimedSyncLogOriginRecord(
 ): Promise<ClaimedSyncOriginRecord> {
   const row = await client.accountingSyncLog.findUnique({
     where: { id: entryId },
-    select: { payload: true, connectionProvenance: true },
+    select: { payload: true, connectionProvenance: true, backReferenceEvidenceCompactedAt: true },
   })
   if (!row) {
     throw new Error(
@@ -83,5 +92,6 @@ export async function readClaimedSyncLogOriginRecord(
       ? (payload as Record<string, unknown>)
       : {},
     connectionProvenance: row.connectionProvenance ?? null,
+    backReferenceEvidenceCompactedAt: row.backReferenceEvidenceCompactedAt ?? null,
   }
 }

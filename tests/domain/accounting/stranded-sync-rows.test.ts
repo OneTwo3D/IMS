@@ -165,7 +165,7 @@ test('the described row now carries its settlement affordance — o3d-osl8 item 
   assert.deepEqual(Object.keys(row).sort(), [
     'ageDays', 'attemptRevision', 'connector', 'createdAt', 'errorMessage', 'externalTransactionId',
     'id', 'notSettleableReason', 'referenceId', 'referenceType', 'requiresAttemptAdoption', 'settleable',
-    'settlementCaveat', 'status', 'type',
+    'settleableOutcomes', 'settlementCaveat', 'status', 'type',
   ])
 })
 
@@ -192,14 +192,16 @@ test('a row that cannot be settled says WHY, and each reason names its own cause
   assert.equal(pending.settleable, false)
   assert.match(pending.notSettleableReason ?? '', /nothing has been sent/)
 
-  const batch = stranded({ status: 'FAILED', type: 'DAILY_BATCH_GROUP_B', attemptRevision: 4 })
-  assert.equal(batch.settleable, false)
-  assert.match(batch.notSettleableReason ?? '', /DAILY BATCH row/)
+  assert.equal(pending.settlementCaveat, null, 'a caveat is for a decision that can be made')
+  assert.equal(pending.requiresAttemptAdoption, false)
 
-  for (const row of [pending, batch]) {
-    assert.equal(row.settlementCaveat, null, 'a caveat is for a decision that can be made')
-    assert.equal(row.requiresAttemptAdoption, false)
-  }
+  // o3d-jit6 r1#3: a DAILY_BATCH row is no longer one of them. It IS settleable — POSTED only — and
+  // the half it does not admit is stated as a caveat rather than as a missing control.
+  const batch = stranded({ status: 'FAILED', type: 'DAILY_BATCH_GROUP_B', attemptRevision: 4 })
+  assert.equal(batch.settleable, true)
+  assert.equal(batch.notSettleableReason, null)
+  assert.deepEqual(batch.settleableOutcomes, ['POSTED'])
+  assert.match(batch.settlementCaveat ?? '', /cannot be settled as NOT POSTED/)
 })
 
 test('a STRANDED row at revision 0 reaches the remedy by adoption — this list is the whole point of it', () => {
