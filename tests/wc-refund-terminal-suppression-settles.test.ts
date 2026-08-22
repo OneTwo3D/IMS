@@ -52,6 +52,16 @@ let refundVerdict: 'chargeback' | 'applies' = 'chargeback'
 let ownedByAnotherOrder = false
 /** A QUARANTINED park on THIS order for THIS refund — the operator-resolvable control. */
 let parkIsQuarantined = false
+/**
+ * o3d-xnwu r6: a park for THIS refund sitting on ANOTHER order, or null.
+ *
+ * This is the state o3d-54p's "Wrong order" recovery exists to clear, and reassigning it is modelled
+ * exactly as that action leaves it: the park moves onto this order as PENDING
+ * (REASSIGNED_REFUND_PARK_STATUS), which is the one actionable status `syncWcRefund` does not treat
+ * as handled. Setting it to null instead would model a DELETION, which the recovery never performs
+ * and which would make the test pass for the wrong reason.
+ */
+let foreignPark: { entityId: string; status: string } | null = null
 /** Set by the real path when a SalesOrderRefund is actually created. */
 let refundLandedInIms = false
 let createRefundCalls = 0
@@ -141,6 +151,7 @@ mock.module('@/lib/db', {
           // (status in PENDING/FAILED/QUARANTINED) and the "have we already recorded this
           // suppression?" lookup, which is keyed on the errorMessage.
           if ('errorMessage' in where) return null
+          if (foreignPark) return foreignPark
           return parkIsQuarantined ? { entityId: IMS_ORDER_ID, status: 'QUARANTINED' } : null
         },
         updateMany: async () => ({ count: 0 }),
@@ -229,6 +240,7 @@ function reset() {
   refundVerdict = 'chargeback'
   ownedByAnotherOrder = false
   parkIsQuarantined = false
+  foreignPark = null
   refundLandedInIms = false
 }
 
@@ -326,4 +338,102 @@ test('o3d-xnwu r5: the control — a QUARANTINED park on the same order still HO
     'and the cursor stays held until an operator resolves it',
   )
   assert.deepEqual(calls, ['deliver', 'status'], 'an unsettled order buys no second look')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu ROUND 6 (Codex HIGH) — A RECOVERABLE CROSS-ORDER PARK WAS STILL CLASSIFIED TERMINAL.
+//
+// Round 5 split `handled-unapplied` into resolvable and terminal, and was right to. But
+// `permanent-failure` carried the same conflation one step along: it was produced by TWO refusals,
+//
+//   • a SalesOrderRefund that ALREADY EXISTS on another order — a created record, unrecoverable,
+//     and the case the test above this one covers; and
+//   • an actionable PARK sitting on another order — which o3d-54p (merged, PR #640) built a
+//     recovery for. The exception inbox's "Wrong order" action asks WooCommerce whether the refund
+//     is on the named order right now and, if it is, MOVES the park there as PENDING, the one
+//     actionable status this sync does not treat as handled. The refund is then retryable.
+//
+// Classifying the second terminal settles the delivery and advances the cursor over a refund the
+// product has a documented operator path for — the same burial round 5 removed for a quarantined
+// park, arriving by the failure route instead of the handled one.
+//
+// THIS TEST IS THE ONE CODEX ASKED FOR: reassignment recovery works, AND neither the cursor nor the
+// acknowledgement moves before the refund lands.
+// ---------------------------------------------------------------------------
+
+test('o3d-xnwu r6: a refund parked on ANOTHER order HOLDS the delivery — an operator can still move it', async () => {
+  reset()
+  // The park is on some other IMS order. Failing closed is unchanged and correct; what is under test
+  // is whether the caller concludes nothing can ever change it.
+  foreignPark = { entityId: 'so-somebody-else', status: 'FAILED' }
+  refundVerdict = 'applies'
+
+  const response = await deliverCompletedOrder()
+  const body = await response.json() as { ok: boolean; failures?: string[]; permanentFailures?: string[] }
+
+  assert.equal(createRefundCalls, 0, 'the cross-order park guard still refuses before anything is created')
+  assert.equal(response.status, 500, 'THE DELIVERY IS NOT ACKNOWLEDGED: this refund can still land here')
+  assert.equal(
+    settingUpserts.includes('last_wc_order_sync_at'),
+    false,
+    'AND THE CURSOR DOES NOT ADVANCE — settling over it buries a shortfall an operator can clear',
+  )
+  assert.equal(body.permanentFailures, undefined, 'nothing is written off on the strength of a movable park')
+  assert.ok(
+    body.failures?.some((f) => /1 of 1 refunds read for this order are not in IMS/.test(f)),
+    'it is counted OUTSTANDING, not terminally unappliable',
+  )
+  assert.deepEqual(calls, ['deliver', 'status'], 'an unsettled order buys no second look, exactly as a quarantine does not')
+})
+
+test('o3d-xnwu r6: after the "Wrong order" reassignment the very next delivery lands the refund', async () => {
+  // THE RECOVERY ITSELF, end to end. The park moves onto this order as PENDING — which is precisely
+  // what `REASSIGNED_REFUND_PARK_STATUS` is and precisely why it is PENDING rather than the status it
+  // had — and the next sweep falls straight through the guard to the refund. Nothing else changes.
+  reset()
+  foreignPark = { entityId: 'so-somebody-else', status: 'FAILED' }
+  refundVerdict = 'applies'
+
+  const held = await deliverCompletedOrder()
+  assert.equal(held.status, 500, 'blocked first, so the recovery below is what changes the answer')
+  assert.equal(settingUpserts.includes('last_wc_order_sync_at'), false)
+
+  // The operator asserts "this refund belongs to WooCommerce order 6201, not there". o3d-54p verifies
+  // that against a fresh WooCommerce read and moves the park.
+  foreignPark = { entityId: IMS_ORDER_ID, status: 'PENDING' }
+
+  const settled = await deliverCompletedOrder()
+  const body = await settled.json() as { ok: boolean; failures?: string[]; permanentFailures?: string[] }
+
+  assert.equal(createRefundCalls, 1, 'THE REFUND IS ATTEMPTED once the park is its own order\'s')
+  assert.equal(refundLandedInIms, true, 'and it LANDS — a reassigned park is retryable, not resolved-away')
+  assert.equal(settled.status, 200, 'only now is the delivery acknowledged')
+  assert.equal(body.failures, undefined)
+  assert.equal(body.permanentFailures, undefined, 'the shortfall is covered by the refund, so nothing is refused')
+  assert.ok(
+    settingUpserts.includes('last_wc_order_sync_at'),
+    'AND ONLY NOW DOES THE CURSOR ADVANCE — after the refund is in IMS, never before it',
+  )
+})
+
+test('o3d-xnwu r6: an ALREADY-CREATED refund on another order is still terminal', async () => {
+  // THE FENCE. Reserving terminal for the unrecoverable case is half the finding; without this the
+  // change is indistinguishable from "nothing is ever terminal", which reinstates the endless retry
+  // o3d-bx9 removed. A created SalesOrderRefund is not a park: there is nothing for the "Wrong order"
+  // recovery to move, and a WC refund id maps to one order.
+  //
+  // (Targeted mutation that fails this: make the `existing.orderId !== so.id` branch return
+  // 'cross-order-park-resolvable'.)
+  reset()
+  ownedByAnotherOrder = true
+
+  const response = await deliverCompletedOrder()
+  const body = await response.json() as { ok: boolean; permanentFailures?: string[] }
+
+  assert.equal(response.status, 200, 'acknowledged rather than dead-lettered')
+  assert.ok(settingUpserts.includes('last_wc_order_sync_at'), 'and the cursor advances')
+  assert.ok(
+    body.permanentFailures?.some((f) => /can NEVER be applied in IMS/.test(f)),
+    'recorded, not swallowed',
+  )
 })

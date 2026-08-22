@@ -537,8 +537,20 @@ export type WcRefundOutcome =
    */
   | 'quarantined-refusal'
   /**
-   * Did not apply and never will: WooCommerce has this refund attached to a DIFFERENT order, so no
-   * redelivery and no operator action inside IMS makes it demand this order holds.
+   * Did not apply, and it is a PARK BELONGING TO ANOTHER ORDER that is in the way — but an operator
+   * CAN clear it (o3d-xnwu r6). o3d-54p built the recovery: the exception inbox's "Wrong order"
+   * action asks WooCommerce whether this refund is on the named order RIGHT NOW and, if it is, moves
+   * the park onto that order as PENDING, which is the one actionable status this sync does not skip.
+   * So the moment they do, this refund is retryable HERE. It is a failure the caller reports, and it
+   * is NOT terminal: `refundMayStillReachIms` says so.
+   */
+  | 'cross-order-park-resolvable'
+  /**
+   * Did not apply and never will: a SalesOrderRefund for this WooCommerce refund ALREADY EXISTS on a
+   * different order. That is a created record, not a park — nothing moves it, and a WC refund id maps
+   * to one order — so no redelivery and no operator action inside IMS makes it demand this order
+   * holds. Reserved for exactly that case (o3d-xnwu r6); the foreign PARK, which used to share this
+   * outcome, has a resolvable one of its own above.
    */
   | 'permanent-failure'
 
@@ -561,6 +573,10 @@ export function refundIsInIms(outcome: WcRefundOutcome): boolean {
 export function refundOutcomeFailed(outcome: WcRefundOutcome): boolean {
   return outcome === 'retryable-failure'
     || outcome === 'quarantined-refusal'
+    // A foreign park applies nothing and the caller must hear about it, exactly as before. What
+    // changed in r6 is only whether it can EVER clear — a different question, asked by
+    // `refundMayStillReachIms`.
+    || outcome === 'cross-order-park-resolvable'
     || outcome === 'permanent-failure'
 }
 
@@ -581,9 +597,19 @@ export function refundOutcomeFailed(outcome: WcRefundOutcome): boolean {
  *   branch exists to keep removed.
  *
  * The same cut runs through the FAILURES, which is why this predicate is defined over the whole
- * union rather than over the two handled endings: a refund WooCommerce has attached to a different
- * order is exactly as unreachable as a suppressed one, and holding for it dead-letters every
- * delivery of the order.
+ * union rather than over the two handled endings: a refund that ALREADY EXISTS as a SalesOrderRefund
+ * on a different order is exactly as unreachable as a suppressed one, and holding for it
+ * dead-letters every delivery of the order.
+ *
+ * o3d-xnwu ROUND 6 (Codex HIGH): AND THE CUT RAN ONE STEP TOO FAR. `permanent-failure` was produced
+ * by TWO refusals, and only one of them is unrecoverable. The other is a refund PARKED for a
+ * different order — and o3d-54p (merged, PR #640) built the recovery for exactly that: the "Wrong
+ * order" action asks WooCommerce whether the refund is on the named order right now and, if so,
+ * moves the park there as PENDING, after which the refund is retryable on its true owner. Calling
+ * that terminal buries a refund the product has a documented operator path for, in the same way
+ * round 5's `handled-unapplied` buried a quarantined park. It has its own resolvable outcome now,
+ * and TERMINAL means what it says: a chargeback suppression, or a SalesOrderRefund that already
+ * exists elsewhere.
  *
  * A refund that is already in IMS answers FALSE: there is nothing left to wait for. Callers ask this
  * only about refunds `refundIsInIms` already rejected, and the false keeps the two questions from
@@ -603,6 +629,7 @@ export function refundMayStillReachIms(outcome: WcRefundOutcome): boolean {
       return false
     case 'handled-unapplied-resolvable':
     case 'quarantined-refusal':
+    case 'cross-order-park-resolvable':
     case 'retryable-failure':
       return true
     default:
@@ -698,7 +725,30 @@ export async function syncWcRefund(
       select: { entityId: true, status: true },
     })
     if (parked && parked.entityId !== so.id) {
-      return { outcome: 'permanent-failure', error: `WooCommerce refund ${wcRefund.id} is already parked for a different order (${parked.entityId}); refusing to process it for this order.` }
+      // RESOLVABLE, NOT TERMINAL (o3d-xnwu r6, Codex HIGH). Failing closed here is the right
+      // AUTOMATIC behaviour and is unchanged — silently moving or resolving another order's park
+      // would destroy that order's durable refund evidence. What was wrong was the CLASSIFICATION:
+      // this shared `permanent-failure` with the case below it, so a caller deciding whether to wait
+      // concluded nothing could ever change it and settled the delivery over a refund the product has
+      // a documented operator path for.
+      //
+      // That path is o3d-54p (merged, PR #640): the exception inbox's "Wrong order" recovery asks
+      // WooCommerce which refunds the named order actually has, right now, and — only if this refund
+      // is one of them — MOVES the park onto it as PENDING (REASSIGNED_REFUND_PARK_STATUS), the one
+      // actionable status the guard above does not treat as handled. The next sweep of THIS order
+      // then falls straight through to the refund. A quarantined park on this same order is already
+      // classified resolvable for precisely this reason; a foreign park is no less clearable, it
+      // simply needs a different operator act.
+      //
+      // The genuinely unrecoverable cross-order case is the one above: a SalesOrderRefund that
+      // already EXISTS on another order. There is no park to move there, and that is what
+      // `permanent-failure` is now reserved for.
+      return {
+        outcome: 'cross-order-park-resolvable',
+        error: `WooCommerce refund ${wcRefund.id} is already parked for a different order (${parked.entityId}); `
+          + 'refusing to process it for this order. If that park is stale, an operator can clear it with the '
+          + '"Wrong order" recovery on the sync exceptions page, after which this refund becomes retryable here.',
+      }
     }
     // HANDLED, NOTHING IS IN IMS, AND AN OPERATOR CAN STILL CHANGE THAT (o3d-xnwu r4/r5). This used
     // to be `success: true`, which the sweep
@@ -1334,14 +1384,16 @@ export async function fetchAllWcRefundsForOrder(
  * AND "NOT IN IMS" IS NOT THE SAME QUESTION AS "STILL WORTH WAITING FOR" (o3d-xnwu r5, Codex HIGH).
  * Round 4's caller read `unapplied > 0` as "the demand this order carries is still unknown" and held
  * the delivery on it. That is right for a refund an operator can still record and WRONG for one that
- * can never be recorded at all — a chargeback-suppressed refund, or one WooCommerce has attached to
- * a different order. Held on those, the delivery returns 500 for ever and the cursor never advances:
+ * can never be recorded at all — a chargeback-suppressed refund, or one that already exists as a
+ * SalesOrderRefund on another order. Held on those, the delivery returns 500 for ever and the cursor
+ * never advances:
  * the endless retry o3d-bx9 removed, reintroduced by the fix for the opposite hole. So the walk also
  * counts how many of the unapplied refunds CAN still arrive:
  *
  *   outstanding  refunds read, not in IMS, and still reachable (`refundMayStillReachIms`) — a
- *                quarantined park, a retryable failure. `outstanding === 0` with `complete` is the
- *                only thing that means "no further waiting can change what this order carries".
+ *                quarantined park, a park sitting on the WRONG order that o3d-54p's "Wrong order"
+ *                recovery can move (r6), a retryable failure. `outstanding === 0` with `complete` is
+ *                the only thing that means "no further waiting can change what this order carries".
  *
  * `unapplied - outstanding` is therefore the terminally-unappliable count, and a caller that settles
  * over one owes an operator a record of it — it is real refunded money that IMS deliberately does
@@ -1365,8 +1417,9 @@ export type RefundSweepResult = {
   unapplied: number
   /**
    * The subset of `unapplied` that could still reach IMS — a quarantined park an operator may record,
-   * a retryable failure a later delivery may apply. The SETTLEMENT question, and the only one a
-   * caller may use to decide whether holding the delivery achieves anything. Always `<= unapplied`.
+   * a park on the wrong order an operator may move back (r6), a retryable failure a later delivery
+   * may apply. The SETTLEMENT question, and the only one a caller may use to decide whether holding
+   * the delivery achieves anything. Always `<= unapplied`.
    */
   outstanding: number
   complete: boolean

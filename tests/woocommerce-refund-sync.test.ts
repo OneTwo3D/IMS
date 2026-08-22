@@ -1294,6 +1294,76 @@ test('a PENDING park for a DIFFERENT order blocks applying the same refund here 
   assert.equal(state.createRefundCalls, 0, 'no refund created on this order while another order holds the park')
 })
 
+// ---------------------------------------------------------------------------
+// o3d-xnwu ROUND 6 (Codex HIGH) — THE TWO CROSS-ORDER REFUSALS ARE NOT THE SAME KIND.
+//
+// Both used to return `permanent-failure`, and a caller deciding whether to WAIT read that as "no
+// operator act inside IMS can ever change this". True of one of them, false of the other:
+//
+//   a PARK on another order is exactly what o3d-54p's "Wrong order" recovery moves (merged, PR
+//   #640). It asks WooCommerce whether the refund is on the named order right now and, if it is,
+//   reassigns the park as PENDING — the one actionable status this sync does not treat as handled —
+//   after which the refund is retryable there.
+//
+//   a SalesOrderRefund that ALREADY EXISTS on another order is a created record. There is no park
+//   to move, a WooCommerce refund id maps to one order, and nothing in IMS makes it this order's.
+//
+// The refusals themselves are unchanged — failing closed automatically is right in both cases, and
+// `refundOutcomeFailed` is still true of both. What changed is only which of them
+// `refundMayStillReachIms` answers TRUE for.
+// ---------------------------------------------------------------------------
+
+test('o3d-xnwu r6: a park owned by another order is RESOLVABLE, not terminal', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.syncLogs.push({ id: 'log-r6', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-other', externalId: '7061', status: 'FAILED' } })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7061 }), state.dependencies)
+
+  assert.equal(result.outcome, 'cross-order-park-resolvable')
+  assert.equal(refundOutcomeFailed(result.outcome), true, 'still a failure the caller reports — that half is unchanged')
+  assert.equal(refundIsInIms(result.outcome), false, 'and nothing is in IMS: the coverage predicate is NOT widened')
+  assert.equal(
+    refundMayStillReachIms(result.outcome),
+    true,
+    'THE POINT: the "Wrong order" recovery moves this park, so waiting for it buys something',
+  )
+  assert.match(result.error ?? '', /Wrong order/, 'and the refusal names the recovery an operator can use')
+  assert.equal(state.createRefundCalls, 0, 'the refusal itself is unchanged — nothing is created here')
+})
+
+test('o3d-xnwu r6: a QUARANTINED park owned by another order is resolvable too', async () => {
+  // Every actionable status is recoverable — RECOVERABLE_REFUND_PARK_STATUSES is exactly the set this
+  // guard queries — so the classification must not depend on which one the foreign park happens to be.
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.syncLogs.push({ id: 'log-r6q', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-other', externalId: '7062', status: 'QUARANTINED' } })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7062 }), state.dependencies)
+
+  assert.equal(result.outcome, 'cross-order-park-resolvable')
+  assert.equal(refundMayStillReachIms(result.outcome), true)
+})
+
+test('o3d-xnwu r6: an existing refund on another order stays TERMINAL', async () => {
+  // THE FENCE. Without it the change reads as "nothing is ever terminal", which reinstates the
+  // endless retry o3d-bx9 removed.
+  //
+  // (Targeted mutation that fails this: make the `existing.orderId !== so.id` branch return
+  // 'cross-order-park-resolvable'.)
+  const state = makeDependencies()
+  state.refunds.push({ id: 'refund-r6', externalRefundId: 7063, orderId: 'so-other' })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7063 }), state.dependencies)
+
+  assert.equal(result.outcome, 'permanent-failure')
+  assert.equal(refundOutcomeFailed(result.outcome), true)
+  assert.equal(refundIsInIms(result.outcome), false)
+  assert.equal(
+    refundMayStillReachIms(result.outcome),
+    false,
+    'there is no park to move and no act inside IMS that makes this refund this order\'s',
+  )
+})
+
 test('a successful retry RESOLVES this order\'s lingering actionable park (o3d-7yf)', async () => {
   const state = makeDependencies({ alwaysMissExistingRefund: true })
   // This order (so-1) has a FAILED park for refund 7016 from an earlier transient failure.

@@ -498,9 +498,9 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       // sentences it built out of them are false of a sweep that read every page and then failed to
       // apply what it fetched: `complete && synced === 0` was read as "the store holds no refunds
       // for this order", and `complete && synced > 0` as "every refund the store holds is now in
-      // IMS". `syncWcRefund` refuses an order it cannot resolve, a refund WooCommerce has already
-      // attached to a different order, and anything its body throws — none of which touches the
-      // read — so a settled-looking sweep could be carrying nothing but refusals.
+      // IMS". `syncWcRefund` refuses an order it cannot resolve, a refund already recorded against a
+      // different order, a refund parked for one, and anything its body throws — none of which
+      // touches the read — so a settled-looking sweep could be carrying nothing but refusals.
       //
       // o3d-xnwu round 4 (Codex HIGH): AND A SWEEP THAT HANDLED EVERYTHING IS NOT A SWEEP THAT
       // APPLIED EVERYTHING EITHER. Round 3's counts came from a per-refund `success` boolean that
@@ -562,7 +562,7 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
         // ERROR when units were returned).
         permanentFailures.push(
           `syncRefundsForOrder: ${terminallyUnappliable} of ${refundSweep.fetched} refunds read for this `
-          + 'order can NEVER be applied in IMS (suppressed by a chargeback, or held by WooCommerce on a '
+          + 'order can NEVER be applied in IMS (suppressed by a chargeback, or already recorded against a '
           + 'different order), so the delivery is settled without them and this order will keep reading '
           + 'as short by that amount. Reconcile them by hand.',
         )
@@ -609,10 +609,16 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
         //
         // It is deliberately scoped to a HELD refusal rather than to every sweep that failed to
         // apply something. r5: that scoping was NOT on its own enough. A refund that can never apply
-        // — one WooCommerce has attached to a different order, one a chargeback suppressed — reached
+        // — one already recorded against a different order, one a chargeback suppressed — reached
         // this branch whenever a refusal WAS held, and dead-lettered every delivery of the order.
         // What keeps that from happening is the settlement predicate above, not this scoping; both
         // are needed, and o3d-bx9's behaviour is what both are protecting.
+        //
+        // r6: and the predicate's TERMINAL set narrowed again, so this branch reaches one more case
+        // than it did. A refund PARKED on the wrong order used to be classified terminal and settled
+        // here; o3d-54p's "Wrong order" recovery moves that park, so it is outstanding, and the
+        // delivery is held for it exactly as it is held for a quarantined park — which is what makes
+        // the operator's act reach the refund instead of arriving after the shortfall was buried.
         if (refundSweep && refundSweep.complete && refundSweep.outstanding > 0) {
           failures.push(
             `syncRefundsForOrder: ${refundSweep.outstanding} of ${refundSweep.fetched} refunds read for this `
