@@ -40,6 +40,12 @@ import {
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import {
+  QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+  describeUnpersistedQboPost,
+  type UnpersistedQboPost,
+} from '@/lib/domain/accounting/unrecorded-posted-document'
+import { redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
+import {
   applyBackReference,
   backReferenceHolder,
   findExternalDocumentIdClaim,
@@ -296,6 +302,153 @@ async function markPostedSyncLogRetryPreservingEvidence(
     data: postedRowRetryColumns(entry, errorMessage),
   })
   return updated.count > 0
+}
+
+/**
+ * HOW MANY TIMES THE FRESH POST'S EVIDENCE TRANSACTION IS RE-DRIVEN BEFORE THE ID IS DECLARED
+ * UNRECORDABLE.
+ *
+ * The same number and the same reasoning as the Xero side's EVIDENCE_TRANSACTION_ATTEMPTS: each
+ * attempt is a WHOLE fresh transaction writing the same two rows from the same in-memory result, so
+ * re-driving weakens nothing, and the common failure here is a serialization conflict or a deadlock
+ * victim that would commit perfectly well a moment later. No sleep between attempts, deliberately —
+ * a cron worker holding a claim is the wrong place to add latency.
+ */
+const POST_EVIDENCE_TRANSACTION_ATTEMPTS = 3
+
+/**
+ * THE ONE WRITE THAT TURNS A RETURNED ID INTO A FACT THE DATABASE KNOWS.
+ *
+ * Extracted so it can be RE-DRIVEN (below) rather than attempted once. Its contents are unchanged:
+ * SYNCED + the external id + the follow-up obligation claim, and the mirrored event stamped POSTED,
+ * in ONE transaction — everything after it can die without the row ever being re-posted.
+ */
+async function persistFreshQboPost(
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  payload: SyncPayload,
+  externalId: string | null,
+): Promise<void> {
+  await db.$transaction(async (tx) => {
+    await tx.accountingSyncLog.update({
+      where: { id: entry.id },
+      data: {
+        status: 'SYNCED',
+        externalTransactionId: externalId,
+        syncedAt: new Date(),
+        errorMessage: null,
+        processingStartedAt: null,
+        // The external id and the record that follow-ups are owed become durable in ONE
+        // write (r10 finding 1) — the comment above is exactly why they have to: everything
+        // after this transaction can die without the row ever being re-posted.
+        ...followUpObligationClaim(),
+      },
+    })
+    await updateMirroredEventForSyncLog(tx, {
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      payload,
+      status: 'POSTED',
+      externalId,
+    })
+  })
+}
+
+/** The one shape of the durable record, so the two places that write it cannot drift apart. */
+function unpersistedQboPostRecord(incident: UnpersistedQboPost, description: string) {
+  const { entry } = incident
+  return {
+    userId: null,
+    entityType: 'SYSTEM' as const,
+    entityId: entry.id,
+    action: QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+    tag: 'sync',
+    level: 'ERROR' as const,
+    description: redactActivityLogText(description),
+    metadata: JSON.parse(JSON.stringify(sanitizeActivityLogMetadata({
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      postedExternalId: incident.postedExternalId,
+    }))),
+  }
+}
+
+/**
+ * PERSIST THE ID THIS WORKER IS HOLDING, OR ESCALATE THE DOCUMENT IT CANNOT WRITE DOWN — AND NEVER
+ * FALL THROUGH TO A HANDLER THAT WOULD CALL IT A FAILED POST (Codex r5, HIGH).
+ *
+ * THE DEFECT. Rounds 2 and 4 fixed the cases where the row ALREADY CARRIED an external id: the
+ * database could be asked, so the failure handler could establish there was a document not to
+ * contradict. This is the case where it does not carry one yet. The connector returned success —
+ * QUICKBOOKS ALREADY HOLDS THE DOCUMENT — and the id is recorded only by the transaction above. If
+ * that transaction fails, the database never learns the id, `markPostedSyncLogRetryPreservingEvidence`
+ * correctly answers "this row names no document", and the ordinary failure path writes a FAILED
+ * MIRROR FOR A DOCUMENT THAT EXISTS. The evidence fence cannot help: there is no evidence, and that
+ * is precisely the problem.
+ *
+ * WHAT THIS IS, NAMED. It is o3d-jit6 on this connector — "a commit failure after a successful post
+ * discards the new document id, and the retry posts again". The full answer is a PRE-POST DISPATCH
+ * RECORD, so the id has somewhere to live before the call is made; the Xero mechanism for it is in
+ * flight on o3d-batch-prov and is not merged, and building a second copy of it here would be a much
+ * larger change made in a hurry. The QuickBooks equivalent is filed as o3d-tr2q.
+ *
+ * SO THIS DOES THE SMALLER, CORRECT THING. At this point the process HOLDS the returned id and KNOWS
+ * the post succeeded, so:
+ *
+ *   • the durable persistence is RE-DRIVEN, because the common failure is a blip, not a verdict;
+ *   • if it still cannot be written, the identifier is RECORDED AND ESCALATED — an ERROR ActivityLog
+ *     row under the retention exemption (evidence that expires is the same defect one layer out),
+ *     plus a console line that cannot fail and cannot be swept;
+ *   • and NO MIRRORED EVENT IS WRITTEN AT ALL, on any exit. A FAILED mirror contradicts a document
+ *     that exists — the principle this branch has now established twice — and it is untrue here for
+ *     exactly the same reason it was there: the fact is about the LEDGER, not about the exception.
+ *
+ * THE ROW IS LEFT ALONE on the escalation path, deliberately. Writing PENDING/FAILED over it would
+ * record a post that failed, which is the falsehood being avoided; and the row still holds this
+ * worker's claim, so `CLAIM_STALE_MS` later it is re-claimed and re-posted — under the SAME derived
+ * Intuit Request-Id, which is what makes that retry a deduplicated replay rather than a second
+ * document. (Not a guarantee, which is why o3d-tr2q exists; the record above is what makes the
+ * residual risk visible to a person rather than silent.)
+ *
+ * Returns whether the id is now durable. `false` means the caller must NOT continue into the
+ * follow-ups and must NOT let the outer handler see this iteration.
+ */
+async function persistFreshQboPostOrEscalate(
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  payload: SyncPayload,
+  externalId: string | null,
+): Promise<boolean> {
+  let lastError: unknown
+  for (let attempt = 0; attempt < POST_EVIDENCE_TRANSACTION_ATTEMPTS; attempt += 1) {
+    try {
+      await persistFreshQboPost(entry, payload, externalId)
+      return true
+    } catch (error) {
+      lastError = error
+    }
+  }
+
+  const incident: UnpersistedQboPost = { entry, postedExternalId: externalId }
+  const description = describeUnpersistedQboPost(incident, lastError)
+  // The console line FIRST, because it cannot fail and cannot be swept: at this instant it is the
+  // only place the identifier is written down, and a crash inside the durable write below must still
+  // leave the incident said out loud.
+  console.error(`[quickbooks-sync] ${description}`)
+  try {
+    await db.activityLog.create({ data: unpersistedQboPostRecord(incident, description) })
+  } catch (cause) {
+    // Swallowed on purpose: there is nothing further to try, and throwing from here would replace an
+    // escalation with a stack trace — landing in the very handler that would then write the FAILED
+    // mirror this whole function exists to prevent.
+    console.error(
+      `[quickbooks-sync] the unrecorded-document record for sync log ${entry.id} could not be `
+      + `written either: ${String(cause)}`,
+    )
+  }
+  return false
 }
 
 /**
@@ -751,31 +904,17 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // Persist external ID and SYNCED status BEFORE any follow-up work.
         // If follow-ups fail, the next retry will see externalTransactionId
         // and skip the QBO write (idempotency guard above).
-        await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'SYNCED',
-              externalTransactionId: syncResult.externalId ?? null,
-              syncedAt: new Date(),
-              errorMessage: null,
-              processingStartedAt: null,
-              // The external id and the record that follow-ups are owed become durable in ONE
-              // write (r10 finding 1) — the comment above is exactly why they have to: everything
-              // after this transaction can die without the row ever being re-posted.
-              ...followUpObligationClaim(),
-            },
-          })
-          await updateMirroredEventForSyncLog(tx, {
-            syncLogId: entry.id,
-            type: entry.type,
-            referenceType: entry.referenceType,
-            referenceId: entry.referenceId,
-            payload,
-            status: 'POSTED',
-            externalId: syncResult.externalId ?? null,
-          })
-        })
+        //
+        // AND IF THAT PERSISTENCE ITSELF FAILS, THIS ITERATION ENDS HERE (Codex r5, HIGH). The
+        // document is in QuickBooks and the id is in this process's memory; letting the throw reach
+        // the outer handler would produce a FAILED mirror for a document that exists, and the
+        // evidence fence there cannot stop it because the database has no evidence yet. See
+        // persistFreshQboPostOrEscalate: the write is re-driven, and an id that still cannot be
+        // recorded is escalated rather than denied.
+        if (!await persistFreshQboPostOrEscalate(entry, payload, syncResult.externalId ?? null)) {
+          result.failed++
+          continue
+        }
 
         // Follow-up work (back-references, enqueue PDF/email/payment).
         // These are best-effort: if they fail, the external post is already

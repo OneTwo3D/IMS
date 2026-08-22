@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import { QBO_UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
+
 // ---------------------------------------------------------------------------
 // o3d-9kek Codex r10 finding 1 — the NORMAL Xero writer must claim the follow-up obligation.
 //
@@ -158,6 +160,12 @@ const state = {
    */
   failSyncedWriteFor: new Set<string>(),
   /**
+   * The SAME injection, but COUNTED (Codex r5). The fresh post's evidence transaction is now
+   * RE-DRIVEN, and a set-membership switch cannot tell "it failed and was retried into success" from
+   * "it never failed at all" — which is the difference between a re-drive and a no-op.
+   */
+  syncedWriteFailuresLeft: new Map<string, number>(),
+  /**
    * Activity actions whose write must THROW (Codex r4), as distinct from
    * `unpersistableActivityActions`, which only makes the persisted variant return false.
    *
@@ -176,6 +184,13 @@ const state = {
   unpersistableActivityActions: new Set<string>(),
   /** Every write to the mirrored AccountingEvent, in order. See the mirror mock below. */
   mirror: [] as Array<{ syncLogId: string; status: string; externalId: string | null }>,
+  /**
+   * Rows written STRAIGHT to ActivityLog, bypassing the `logActivity` helper (Codex r5). The
+   * unrecorded-posted-document record is written this way on both connectors — it carries its own
+   * retention-exempt action and its own redaction — so a double that only watched `logActivity`
+   * could not see it at all, and "the identifier was escalated" would be an assertion about nothing.
+   */
+  activityRows: [] as Array<Record<string, unknown>>,
 }
 
 function marker(): Date | null {
@@ -225,9 +240,13 @@ const syncLogClient = {
       record('release.attempted-and-failed')
       throw new Error('transient: could not clear the obligation')
     }
-    if (args.data.status === 'SYNCED' && state.failSyncedWriteFor.has(row.id)) {
-      record('synced.attempted-and-failed')
-      throw new Error('transient: the SYNCED transaction could not be written')
+    if (args.data.status === 'SYNCED') {
+      const countedLeft = state.syncedWriteFailuresLeft.get(row.id) ?? 0
+      if (state.failSyncedWriteFor.has(row.id) || countedLeft > 0) {
+        if (countedLeft > 0) state.syncedWriteFailuresLeft.set(row.id, countedLeft - 1)
+        record('synced.attempted-and-failed')
+        throw new Error('transient: the SYNCED transaction could not be written')
+      }
     }
     Object.assign(row, args.data)
     record('syncLog.update', args.data)
@@ -308,7 +327,13 @@ const db = {
   // The outbox runner reads the filed unrecorded-posted-document incidents once per batch, before it
   // decides anything about a settled row (Codex r3, HIGH). Nothing in this file files one, so the
   // honest answer is "none" — not a missing model.
-  activityLog: { async findMany() { return [] }, async create(args: { data: unknown }) { return args.data } },
+  activityLog: {
+    async findMany() { return [] },
+    async create(args: { data: Record<string, unknown> }) {
+      state.activityRows.push(args.data)
+      return args.data
+    },
+  },
   purchaseInvoice: billClient,
   salesOrder: { async findUnique() { return null }, async update() { return {} } },
   salesOrderRefund: { async findUnique() { return null }, async update() { return {} } },
@@ -349,6 +374,11 @@ mock.module('@/lib/activity-log', {
       state.activities.push(entry)
       return !state.unpersistableActivityActions.has(entry.action)
     },
+    // The unrecorded-posted-document record does NOT go through the helper, so it applies these
+    // itself. `mock.module` replaces the whole module, so they have to be here or the escalation
+    // calls `undefined` (Codex r5).
+    redactActivityLogText: (value: string) => value,
+    sanitizeActivityLogMetadata: (value: unknown) => value,
   },
 })
 // RECORDED, not swallowed (Codex round 2, HIGH). The mirrored AccountingEvent is the ledger's own
@@ -374,9 +404,22 @@ mock.module('@/lib/connectors/xero/bills', {
     updatePurchaseBill: async () => ({ success: true, invoiceId: 'XBILL-1' }),
   },
 })
+/**
+ * THE QUICKBOOKS POST'S OWN VERDICT, SWITCHABLE (Codex r5).
+ *
+ * It has to be, because "the connector refused" and "the connector accepted and the database then
+ * refused" are now DIFFERENT OUTCOMES and the control test distinguishes them. Before r5 the mock
+ * always succeeded, so the test that called itself "a main-post failure on a row with no document"
+ * was in fact driving a post that HAD succeeded — pinning the defect r5 removes as if it were the
+ * desired behaviour.
+ *
+ * Succeeds by default, so every other test in this file is untouched.
+ */
+let qboPostVerdict: { success: true; invoiceId: string } | { success: false; error: string } = { success: true, invoiceId: 'XBILL-1' }
+
 mock.module('@/lib/connectors/quickbooks/bills', {
   namedExports: {
-    pushPurchaseBill: async () => ({ success: true, invoiceId: 'XBILL-1' }),
+    pushPurchaseBill: async () => qboPostVerdict,
   },
 })
 
@@ -443,10 +486,13 @@ function reset(connector = 'xero') {
   state.failFollowUpsFor.clear()
   state.failReleaseFor.clear()
   state.failSyncedWriteFor.clear()
+  state.syncedWriteFailuresLeft.clear()
   state.throwingActivityActions.clear()
   state.unpersistableActivityActions.clear()
   state.mirror.length = 0
+  state.activityRows.length = 0
   ledgerVerdict = { clear: true }
+  qboPostVerdict = { success: true, invoiceId: 'XBILL-1' }
 }
 
 /** The single sync row under test (the follow-up rows the run creates are appended after it). */
@@ -1397,9 +1443,15 @@ test('[o3d-peh1 r4] a main-post failure on a row with NO document is recorded ex
   // posted has no evidence to protect: the terminal write must still stamp the mirrored event FAILED,
   // because that is the truth about it. Without this the change would be indistinguishable from
   // deleting the FAILED mirror altogether.
+  //
+  // THE POST IS WHAT FAILS HERE, and until r5 it was not (Codex r5). This test used to make the
+  // SYNCED WRITE fail while `pushPurchaseBill` succeeded — which is a document that IS in
+  // QuickBooks with an id this process is holding, i.e. the r5 defect itself, pinned as if it were
+  // the intended behaviour. A control has to be the case it claims to be, so the connector now
+  // refuses and nothing is ever posted.
   reset('quickbooks')
   state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
-  state.failSyncedWriteFor.add('log-1')
+  qboPostVerdict = { success: false, error: 'QuickBooks rejected the bill: invalid account reference' }
 
   const result = await runQuickBooks()
 
@@ -1410,5 +1462,108 @@ test('[o3d-peh1 r4] a main-post failure on a row with NO document is recorded ex
     mirrorFailures().map((entry) => entry.syncLogId),
     ['log-1'],
     'so the mirrored event IS stamped FAILED — the evidence check is a fence, not a blanket refusal',
+  )
+  assert.deepEqual(
+    state.activityRows.filter((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION),
+    [],
+    'and nothing is escalated as an unrecorded document, because there is no document',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 5 (Codex HIGH) — A POST-SUCCESS PERSISTENCE FAILURE STILL WROTE A FAILED MIRROR.
+//
+// Rounds 2 and 4 fixed the cases where the row ALREADY CARRIED an external id. The database could
+// be asked, so the outer handler could establish there was a document not to contradict, and
+// `markPostedSyncLogRetryPreservingEvidence` is that question asked in the statement that writes.
+//
+// THIS IS THE CASE WHERE THE ROW DOES NOT CARRY ONE YET. `processEntry` returns success —
+// QUICKBOOKS ALREADY HOLDS THE DOCUMENT — and the id becomes durable only in the transaction that
+// follows. When that transaction fails, the database never learns the id; the evidence fence
+// correctly answers "this row names no document" (it does not); and the ordinary failure path
+// stamps the mirrored AccountingEvent FAILED FOR A DOCUMENT THAT EXISTS. No fence built on the
+// database can close it, because at that instant the database is the thing that is wrong.
+//
+// It is o3d-jit6 on this connector. The full answer — a pre-post dispatch record — is in flight for
+// Xero on o3d-batch-prov and is filed here as o3d-tr2q. What this branch does instead is the
+// smaller thing that is unambiguously correct: the process HOLDS the returned id and KNOWS the post
+// succeeded, so it re-drives the durable write, and if that is exhausted it RECORDS AND ESCALATES
+// the unrecorded posted document rather than recording a falsehood.
+//
+// The mirror-failure assertions below are the same shape as r2's and r4's for a reason: this is the
+// third route to one untrue write, and the property is stated identically each time.
+// ---------------------------------------------------------------------------
+
+test('[o3d-peh1 r5] a persistence failure AFTER a successful post never records a failed post', async () => {
+  // The connector accepts the bill and returns XBILL-1; every attempt at the SYNCED/POSTED
+  // transaction then fails. The retries are already at their last one, so the pre-r5 handler took
+  // its terminal arm — the arm that writes the FAILED mirror.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
+  state.failSyncedWriteFor.add('log-1')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.failed, 1, 'the failure is real and counted')
+  assert.equal(
+    state.journal.filter((entry) => entry.op === 'synced.attempted-and-failed').length,
+    3,
+    'and the durable write was RE-DRIVEN before anything was given up on — a blip is not a verdict',
+  )
+  assert.deepEqual(
+    mirrorFailures(),
+    [],
+    'THE POINT: QuickBooks holds this document, so nothing may write the mirrored event FAILED for it',
+  )
+  assert.deepEqual(
+    state.mirror,
+    [],
+    'and no mirrored write landed at all — the POSTED one was inside the transaction that failed',
+  )
+
+  // RECORDED AND ESCALATED, which is what makes this different from swallowing the incident.
+  const escalation = state.activityRows.find((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION)
+  assert.ok(escalation, 'the posted document IMS cannot name must leave a durable record')
+  assert.equal(escalation.level, 'ERROR')
+  assert.match(String(escalation.description), /POSTED as XBILL-1/, 'the identifier is IN the record')
+  assert.equal(
+    (escalation.metadata as { postedExternalId?: string }).postedExternalId,
+    'XBILL-1',
+    'and in its metadata, so it is searchable rather than only readable',
+  )
+
+  // THE ROW IS LEFT ALONE, deliberately: a PENDING/FAILED write here would record a post that failed.
+  assert.equal(subject().externalTransactionId, null, 'the id could not be written — that is the incident')
+  assert.equal(subject().status, 'PROCESSING', 'the claim is still held, so the stale-claim reclaim retries it')
+  assert.equal(subject().retryCount, QBO_MAX_RETRIES - 1, 'and no retry was consumed for a post that succeeded')
+})
+
+test('[o3d-peh1 r5] the durable write is re-driven, and an id that lands on a later attempt settles normally', async () => {
+  // THE OTHER HALF OF "re-driven": the common failure here is a serialization conflict or a deadlock
+  // victim, and a transaction that lost commits perfectly well a moment later. Without this the fix
+  // could be a single attempt plus an escalation, which would escalate every blip.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.syncedWriteFailuresLeft.set('log-1', 2)
+
+  const result = await runQuickBooks()
+
+  assert.equal(
+    state.journal.filter((entry) => entry.op === 'synced.attempted-and-failed').length,
+    2,
+    'it really did fail twice — otherwise this asserts nothing about re-driving',
+  )
+  assert.equal(result.succeeded, 1, 'and the third attempt settled it, exactly as an unbroken run would')
+  assert.equal(subject().status, 'SYNCED')
+  assert.equal(subject().externalTransactionId, 'XBILL-1', 'the id is durable')
+  assert.deepEqual(
+    [...new Set(state.mirror.map((entry) => entry.status))],
+    ['POSTED'],
+    'the mirror says POSTED, once the write that carries it lands',
+  )
+  assert.deepEqual(
+    state.activityRows.filter((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION),
+    [],
+    'and nothing is escalated: a recovered write is not an unrecorded document',
   )
 })

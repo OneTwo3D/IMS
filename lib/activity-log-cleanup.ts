@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
-import { UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
+import { QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
 
 const DEFAULTS: Record<string, number> = {
   INFO: 30,
@@ -33,6 +33,10 @@ const DEFAULTS: Record<string, number> = {
  * for one reference was the accident. Ageing it out does not expire a log line, it converts a recorded
  * duplicate into an invisible one — the exact outcome the branch that writes it exists to prevent.
  *
+ * The QuickBooks twin `quickbooks_posted_document_unrecorded` (o3d-peh1 r5) is the same kind for the
+ * same reason, differing only in HOW the row came to name no document: there the id was returned and
+ * could not be written down at all, rather than displaced by a competing worker.
+ *
  * A kind-(2) exemption does NOT need a clearing mechanism, and demanding one would be asking for the
  * wrong thing: the resolution happens in Xero, by a person voiding or crediting the duplicate, and IMS
  * cannot observe that. What it needs instead is to be bounded, and it is — one row per incident, and an
@@ -47,7 +51,15 @@ const DEFAULTS: Record<string, number> = {
  * what makes it a landmine: it would work until the day someone added a second action. THIS IS THAT
  * DAY — the array below now has two entries, and `<> ALL` is what makes both of them hold.
  */
-const RETAINED_ACTIONS = [DIRECT_CREATE_PENDING_ACTION, UNRECORDED_POSTED_DOCUMENT_ACTION]
+const RETAINED_ACTIONS = [
+  DIRECT_CREATE_PENDING_ACTION,
+  UNRECORDED_POSTED_DOCUMENT_ACTION,
+  // o3d-peh1 r5 — the same kind-(2) exemption on the other connector, for the other way a real
+  // document ends up unreferenced: QuickBooks accepted the post and returned an id, and the
+  // transaction that would have made that id durable failed. The row names no document, so nothing
+  // re-derives the identifier and no later sync attempt can: it exists only in this record.
+  QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+]
 
 const DELETE_BATCH_SIZE = 10_000
 const DEFAULT_CRON_RUN_RETENTION_DAYS = 90

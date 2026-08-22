@@ -101,3 +101,49 @@ export class PostedDocumentEvidenceUnwritten extends Error {
     this.operatorMessage = this.message
   }
 }
+
+/* ---------------------------------------------------------------------------------------------
+ * THE SAME INCIDENT, ARRIVING BY A DIFFERENT DOOR, ON THE OTHER CONNECTOR (o3d-peh1 r5).
+ *
+ * Everything above is about a document whose id the row REFUSES — it names another one, or it is
+ * gone. This is about a document whose id the row never gets the chance to hold: the connector
+ * accepted the post, the id came back, and the transaction that would have made it durable failed.
+ * The end state is identical — a real document in the ledger that nothing in IMS points at — so it
+ * gets the same treatment: an ERROR ActivityLog row that RETENTION MAY NOT DELETE, because a record
+ * that expires converts a recorded orphan into an invisible one.
+ *
+ * A SEPARATE ACTION NAME, not a reuse of the Xero one. The retention sweep exempts literal strings,
+ * the operator reading it needs to know which ledger to go and look in, and the two connectors'
+ * incidents are found by different searches. The constant lives here for exactly the reason the Xero
+ * one does: three modules must agree about it and none may drag the others in.
+ * ------------------------------------------------------------------------------------------- */
+
+/** The one action name for the QuickBooks incident. Retention exempts exactly this string. */
+export const QBO_UNRECORDED_POSTED_DOCUMENT_ACTION = 'quickbooks_posted_document_unrecorded'
+
+export type UnpersistedQboPost = {
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
+  /** What QuickBooks accepted, and what this process could not write down. */
+  postedExternalId: string | null
+}
+
+/**
+ * The operator-facing account of it — ONE wording, used by the durable record and by the
+ * last-resort console escalation, so a single incident cannot be described two different ways.
+ *
+ * It names the identifier, says plainly what state the row was left in, and ends in something a
+ * person can do. It does NOT claim the document is unreachable: the QuickBooks Request-Id is derived
+ * from the sync row's own id, so the retry that follows re-posts under an id Intuit has already
+ * seen — which is why the remedy is "check, then reconcile" rather than "assume a duplicate".
+ */
+export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: unknown): string {
+  const { entry, postedExternalId } = incident
+  return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as `
+    + `${postedExternalId ?? '(no id returned)'}, but IMS could not record that id: ${String(cause)}. `
+    + `Sync row ${entry.id} still names no document, so nothing in IMS points at this one and no `
+    + 'mirrored accounting event was written for it — deliberately, because a FAILED one would deny a '
+    + 'document that exists. The row keeps its claim and will be re-attempted once the claim goes '
+    + 'stale; that attempt re-posts under the SAME Intuit Request-Id, so it should be deduplicated '
+    + 'rather than duplicated. REMEDY: open the id above in QuickBooks, confirm exactly one document '
+    + 'exists for this reference, and void any duplicate.'
+}
