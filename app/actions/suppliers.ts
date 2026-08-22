@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
@@ -186,7 +186,7 @@ async function getAvgDeliveryDaysBySupplier(
 }
 
 export async function getSuppliers(includeInactive = false): Promise<SupplierRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.supplier.findMany({
     where: includeInactive ? undefined : { active: true },
     select: SUPPLIER_SELECT,
@@ -197,7 +197,7 @@ export async function getSuppliers(includeInactive = false): Promise<SupplierRow
 }
 
 export async function getSupplier(id: string): Promise<SupplierRow | null> {
-  await requireAuth()
+  await requireInternalUser()
   const s = await db.supplier.findUnique({ where: { id }, select: SUPPLIER_SELECT })
   if (!s) return null
   const avgMap = await getAvgDeliveryDaysBySupplier([id])

@@ -434,6 +434,97 @@ test('rows the cancel could not retire are reported, not silently left in the co
 })
 
 // ---------------------------------------------------------------------------
+// The RETRY control, actually used (o3d-aouf).
+//
+// The harness faked `retryFailedAccountingSync` as `async () => ({ success: true })` —
+// uninstrumented and never invoked, so it existed only to make the banner module link. Nothing
+// asserted that the control called it, what it sent, or what the banner did with either answer:
+// deleting the onClick, scoping the "retry all" to one row, or dropping the refresh all stayed
+// green. Same treatment as the cancel controls above.
+// ---------------------------------------------------------------------------
+
+async function mountFailedSyncBannerFromPage(summary: Record<string, unknown> = {}) {
+  state.plugins = { woocommerce: true }
+  state.reads.getFailedAccountingSyncSummary = () => ({ connector: 'xero', failedCount: 3, ...summary })
+
+  const { tree } = await renderSyncPage()
+  const element = elementOf(tree, 'FailedSyncBanner')
+  assert.ok(element, 'the page must construct the failed-sync banner')
+  const props = element.props as Record<string, unknown>
+  const banner = mountClientComponent(element.type as (props: Record<string, unknown>) => unknown, props)
+  return Object.assign(banner, { props })
+}
+
+test('the Retry control re-queues EVERY failed row — it sends no entry id (o3d-aouf)', async () => {
+  // retryFailedAccountingSync(entryId) scopes the reset to ONE row; called with nothing it resets
+  // every FAILED row on the active connector. This banner is the "all" control, so the ABSENCE of
+  // the argument is the thing under test — a control that quietly sent one would re-queue a single
+  // row while reporting the whole backlog re-queued.
+  const banner = await mountFailedSyncBannerFromPage()
+  const { controls } = banner.render()
+
+  assert.deepEqual(controls.map((c) => c.label), ['Retry all failed'], 'one control, and it has a handler')
+
+  await banner.click(controls[0])
+
+  assert.deepEqual(state.retry.calls, [[]], 'called once, with no entry id at all')
+})
+
+test('a successful retry says how many rows moved and re-reads the page (o3d-aouf)', async () => {
+  // The banner hides itself on `failedCount === 0`, which only works if the server summary is
+  // re-read. Without router.refresh() the alert sits there after a successful retry, describing a
+  // backlog that no longer exists.
+  state.retry.result = { success: true, reset: 3 }
+  const banner = await mountFailedSyncBannerFromPage()
+
+  await banner.click(banner.render().controls.find((c) => c.label === 'Retry all failed'))
+
+  assert.equal(state.refreshes, 1, 'the summary is re-read from the server')
+  assert.match(banner.render().html, /Re-queued 3 failed row\(s\)/, 'and the count comes from the ACTION, not the props')
+})
+
+test('a failed retry explains itself and does NOT refresh (o3d-aouf)', async () => {
+  // Swallowing the error leaves a button that visibly does nothing, and refreshing on a failure
+  // re-reads a summary that cannot have changed.
+  state.retry.result = { success: false, reset: 0, error: 'You do not have permission to retry sync rows.' }
+  const banner = await mountFailedSyncBannerFromPage()
+
+  await banner.click(banner.render().controls.find((c) => c.label === 'Retry all failed'))
+
+  assert.equal(state.refreshes, 0, 'nothing changed, so there is nothing new to read')
+  assert.match(banner.render().html, /You do not have permission to retry sync rows\./)
+  assert.ok(!banner.render().html.includes('Re-queued'), 'and it does not also claim success')
+})
+
+test('a failure with no reason still says something the operator can act on (o3d-aouf)', async () => {
+  state.retry.result = { success: false, reset: 0 }
+  const banner = await mountFailedSyncBannerFromPage()
+
+  await banner.click(banner.render().controls.find((c) => c.label === 'Retry all failed'))
+
+  assert.match(banner.render().html, /Failed to re-queue the failed rows\./)
+  assert.equal(state.refreshes, 0)
+})
+
+test('the retry control states what a retry COSTS on Xero, and claims nothing elsewhere (o3d-wahn)', async () => {
+  // Xero keeps an Idempotency-Key for six minutes; a row is only FAILED after its automatic
+  // retries are exhausted, so this control is always past the window and a re-post is a NEW
+  // request. That is not enforceable — refusing every aged row would remove the only remedy — so
+  // it has to be SAID, at the control.
+  const xero = await mountFailedSyncBannerFromPage({ connector: 'xero' })
+  const xeroHtml = xero.render().html
+  assert.match(xeroHtml, /only 6 minutes/, 'the window, quoted')
+  assert.match(xeroHtml, /SECOND document/, 'the consequence in the ledger')
+  assert.match(xeroHtml, /Check Xero/, 'and the check to make first')
+
+  // QuickBooks' RequestId window is unestablished, so no caution is shown rather than a guessed one.
+  const quickbooks = await mountFailedSyncBannerFromPage({ connector: 'quickbooks' })
+  const quickbooksHtml = quickbooks.render().html
+  assert.ok(!quickbooksHtml.includes('6 minutes'), 'a window nobody verified is not quoted at another connector')
+  assert.match(quickbooksHtml, /Retry all failed/, 'the control itself is unchanged')
+})
+
+// ---------------------------------------------------------------------------
 // Round 5, finding 3 — the controls are offered only to a reader who can USE them.
 //
 // `sync` gets a reader onto this page; cancelOrphanedAccountingSyncRows requires `settings`, which
@@ -716,7 +807,7 @@ test('every read is made with the arguments it claims, and every result reaches 
     // Shaped: the page maps this to {id,name} for `taxRates` and passes it whole as `imsTaxRates`.
     taxRatesRaw: [{ id: 'tax-id', name: 'tax-name', sentinel: 'taxRatesRaw' }],
     accountingSettings: { sentinel: 'accountingSettings' },
-    accountingStatus: { connected: true, tenantName: 'tenant-sentinel' },
+    accountingStatus: { connected: true, tenantName: 'tenant-sentinel', hasStoredToken: true },
     accountingConnectionTest: { sentinel: 'accountingConnectionTest' },
     accountingAccounts: [{ sentinel: 'accountingAccounts' }],
     accountingLogs: [{ sentinel: 'accountingLogs' }],
@@ -800,8 +891,9 @@ test('every read is made with the arguments it claims, and every result reaches 
   const props = propsOf(tree, 'SyncDashboard')
   assert.ok(props)
   assert.deepEqual(Object.keys(props).sort(), [
-    'accountingAccounts', 'accountingBatchHistory', 'accountingBatchPreview', 'accountingConnected',
-    'accountingConnectionTest', 'accountingLogs', 'accountingReadiness', 'accountingSettings',
+    'accountingAccounts', 'accountingBatchHistory', 'accountingBatchPreview', 'accountingBlockedReason',
+    'accountingConnected', 'accountingConnectionTest', 'accountingHasStoredToken', 'accountingLogs',
+    'accountingReadiness', 'accountingSettings',
     'accountingTaxRates', 'accountingTenantName', 'currencies', 'imsTaxRates', 'paymentAccountMap',
     'paymentMethodCombos', 'pluginState', 'shopifyCredentials', 'shopifyLogs', 'shopifySettings',
     'shoppingCredentials', 'shoppingLogs', 'shoppingPaymentMethods', 'shoppingSettings',
@@ -822,6 +914,8 @@ test('every read is made with the arguments it claims, and every result reaches 
   assert.equal(props.accountingSettings, s.accountingSettings)
   assert.equal(props.accountingConnected, true)
   assert.equal(props.accountingTenantName, 'tenant-sentinel')
+  assert.equal(props.accountingHasStoredToken, true)
+  assert.equal(props.accountingBlockedReason, undefined, 'a healthy connection carries no refusal')
   assert.equal(props.accountingConnectionTest, s.accountingConnectionTest)
   assert.equal(props.accountingAccounts, s.accountingAccounts)
   assert.equal(props.accountingLogs, s.accountingLogs)
@@ -834,6 +928,26 @@ test('every read is made with the arguments it claims, and every result reaches 
   assert.equal(props.accountingBatchHistory, s.accountingBatchHistory)
   assert.equal(props.wmsData, s.wmsData)
   assert.equal(props.accountingTaxRates, s.accountingTaxRates)
+})
+
+test('an allow-list-blocked connection reaches the dashboard as a refusal, not as connected', async () => {
+  // o3d-9tbz. isConnected() used to answer `connected: true` for the presence of a token row alone, so
+  // /sync showed a green badge while every sync failed. The reason now travels to the screen the
+  // operator actually looks at, and the blocked instance makes no Xero call to render it.
+  state.plugins = { woocommerce: true, xero: true }
+  state.reads.getAccountingConnectionStatus = () => ({
+    connected: false,
+    tenantName: 'OneTwo3D Ltd',
+    hasStoredToken: true,
+    blockedReason: 'Xero sync is halted: the stored connection is to OneTwo3D Ltd [tenantId e7fb4378-live-org]…',
+  })
+
+  const { tree } = await renderSyncPage()
+  const props = propsOf(tree, 'SyncDashboard')
+  assert.equal(props?.accountingConnected, false)
+  assert.match(String(props?.accountingBlockedReason), /Xero sync is halted/)
+  assert.equal(props?.accountingHasStoredToken, true, 'so /sync keeps offering the Disconnect the refusal names')
+  assert.deepEqual(callArgs('fetchAccountingTaxRates'), [], 'a blocked connection makes no Xero round trip')
 })
 
 test('the accounting tax-rate round trip is skipped unless a connector is enabled AND connected', async () => {

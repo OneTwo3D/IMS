@@ -5,31 +5,87 @@
 
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
-import { db } from '@/lib/db'
-import { logActivity, logActivityPersisted } from '@/lib/activity-log'
-import { pushSalesInvoice, updateSalesInvoice } from './invoices'
+import { db, POST_REMOTE_PERSIST_TX_OPTIONS } from '@/lib/db'
+import { XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import {
+  LostClaimDuringPersistError,
+  LOST_CLAIM_DURING_PERSIST_REASON,
+  persistAfterRemoteWrite,
+  postRemotePersistDeadlineMs,
+  reportUnrecordedRemoteWrite,
+  UnrecordedRemoteWriteError,
+} from '@/lib/db/post-remote-persist'
+import { logActivity, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
+import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
 import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
+import {
+  carryAccountingOriginRecord,
+  readAccountingPayloadConnectionStamp,
+  type AccountingConnectionStamp,
+} from '@/lib/connectors/accounting-connection-provenance'
+import { withAccountingPostingIntent } from '@/lib/connectors/accounting-posting-intent'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
-import { applyBackReference, followUpObligationClaim, releaseFollowUpObligation } from '@/lib/domain/accounting/back-reference'
+import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
+import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
+import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
+import {
+  BACK_REFERENCE_REPAIRABLE_STATUSES,
+  applyBackReference,
+  backReferenceIsMissing,
+  followUpObligationClaim,
+  releaseFollowUpObligation,
+  syncTypeWritesBackReference,
+} from '@/lib/domain/accounting/back-reference'
+import { stampSyncedAtFromDatabaseClock } from './synced-at-clock'
+import { claimHeldFrom, heldClaimWhere, releaseClaimForRetry, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
+import {
+  describeUnrecordablePostedDocument,
+  PostedDocumentEvidenceUnwritten,
+  UNRECORDED_POSTED_DOCUMENT_ACTION,
+  type UnrecordablePostedDocument,
+  type UnrecordablePostedDocumentReason,
+} from '@/lib/domain/accounting/unrecorded-posted-document'
 import {
   DEFAULT_BACK_REFERENCE_SWEEP_LIMIT,
   createBackReferenceSweepCursorStore,
   repairAccountingBackReferences,
   type BackReferenceRepairResult,
+  type BackReferenceSweepRelease,
 } from '@/lib/domain/accounting/back-reference-sweep'
-import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import {
+  liveRowOccupiesFollowUpSlot,
+  planFollowUpEnqueue,
+  readFollowUpIdempotencyKey,
+  type FollowUpPayload,
+} from '@/lib/domain/accounting/followup-idempotency'
 import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import {
+  buildCompactedFollowUpLossActivity,
+  isCompactedFollowUpEvidence,
+} from '@/lib/domain/accounting/compacted-followup-loss'
+import {
+  guardInvoicePaymentCapacity,
+  retireOverSettlingInvoicePayment,
+} from '@/lib/domain/accounting/invoice-payment-capacity'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
+import {
+  UNCLAIMED_ATTEMPT_REVISION,
+  claimAttemptWhere,
+  nextAttemptRevision,
+  updateAtAttemptRevision,
+  type AttemptRef,
+} from '@/lib/domain/accounting/sync-log-attempt'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
@@ -56,6 +112,70 @@ const XERO_CONNECTOR = 'xero'
 const XERO_ACCOUNTING_WORKER_ID = 'xero-accounting-sync'
 
 class XeroOutboxCompletionError extends Error {}
+
+/**
+ * The outbox job carrying an unrecorded posted document could not be buried (Codex r3, HIGH). Thrown
+ * out of the run rather than swallowed, and carrying the incident wording rather than only the database
+ * error, because at that moment the wording is not written down anywhere the run can point at.
+ */
+class XeroOutboxBurialError extends Error {}
+
+/**
+ * The warning about a retention tombstone's unrebuildable follow-ups could not be written down.
+ *
+ * Thrown, not swallowed, so both short-circuit sites route it into their EXISTING follow-up-failure
+ * handling: the row goes back to PENDING (or FAILED at MAX_RETRIES) still carrying
+ * `backReferenceFollowUpsPendingAt`, so the obligation stays owed and the next pass — this
+ * processor's own retry, or the repair sweep — gets another chance to announce it.
+ */
+class CompactedFollowUpLossUnrecorded extends Error {}
+
+/**
+ * o3d-nepa r3 — SAY SO WHEN A RETRY SETTLES A ROW WHOSE FOLLOW-UPS CANNOT BE REBUILT.
+ *
+ * The short-circuit below is reached when a sync row already carries an external id: the document
+ * posted, so the retry must NOT re-post it, and the row goes straight to SYNCED. That branch then
+ * calls `enqueueFollowUps` with the row's payload and releases the follow-up obligation.
+ *
+ * On a RETENTION TOMBSTONE the payload is `{}`. The enqueue does not fail on it — it takes no
+ * branch, enqueues nothing and returns normally — so the release ran on the strength of work that
+ * never happened, and `backReferenceFollowUpsPendingAt`, the last record that a payment or
+ * attachment was still owed, was cleared. A bulk "Retry all" over old failures therefore lost them
+ * silently. The repair sweep had announced exactly this loss since o3d-9kek r4; the processors had
+ * not, and the processors are the path an operator actually triggers.
+ *
+ * So the loss is announced, from the SAME shared message the sweep uses, and the obligation is
+ * released only once the announcement is on record. A no-op for every row that is not a tombstone.
+ *
+ * r4 finding 1: it runs AFTER `enqueueFollowUps`, not before. Throwing from here is how the release
+ * is withheld, and putting it first made that throw withhold the ENQUEUE as well — including the
+ * follow-ups that survive compaction and would have gone out fine. The gate is on the release only.
+ */
+async function announceCompactedFollowUpLoss(entry: {
+  id: string
+  type: AccountingSyncType
+  referenceType: string
+  referenceId: string
+  externalTransactionId: string | null
+  backReferenceEvidenceCompactedAt: Date | null
+}): Promise<void> {
+  if (!isCompactedFollowUpEvidence(entry)) return
+  // logActivityPersisted, NOT logActivity: the release below is conditional on having warned, and
+  // logActivity swallows its own write failures and resolves regardless — which is the same
+  // "reported success, did nothing" shape as the empty enqueue this exists to catch.
+  const persisted = await logActivityPersisted(buildCompactedFollowUpLossActivity({
+    connectorLabel: 'Xero',
+    activityActionPrefix: XERO_CONNECTOR,
+    row: entry,
+    phase: 'processor-short-circuit',
+  }))
+  if (persisted) return
+  throw new CompactedFollowUpLossUnrecorded(
+    `Xero sync entry ${entry.id} outlived the retention period and was compacted, so its follow-ups cannot be rebuilt — `
+    + 'and the warning about that could not be written. The row keeps its follow-up obligation so the loss is announced '
+    + 'by a later pass instead of disappearing with it.',
+  )
+}
 
 type ProcessResult = {
   processed: number
@@ -138,6 +258,13 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
   payload: SyncPayload
   status: 'POSTED' | 'FAILED'
   externalId?: string | null
+  /**
+   * o3d-cvj9 r3: the revision stamp Xero put on the document as it applied THIS write, out of the
+   * response to that write. Supplied only where a write actually landed in this attempt — the
+   * short-circuit for a sync log that already carries an external id makes no connector call, so it
+   * supplies nothing and can never take a document id off the row that holds it.
+   */
+  externalRevisionAt?: Date | null
   message?: string
 }): Promise<void> {
   await updateMirroredAccountingEventStatus(client, {
@@ -149,12 +276,523 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
     payload: params.payload,
     status: params.status,
     externalId: params.externalId,
+    ...(params.externalRevisionAt !== undefined ? { externalRevisionAt: params.externalRevisionAt } : {}),
     message: params.message,
   })
 }
 
+/**
+ * THE CLAIM FENCE IS NOT DEFINED HERE (o3d-550x; Codex r1, medium 1).
+ *
+ * `heldClaimWhere` and the single non-terminal release that carries it live in
+ * `@/lib/domain/accounting/sync-claim-fence`, because the cancelled-order invoice retirement releases
+ * these same claims and a second hand-spelt copy of the predicate would be a second DEFINITION of
+ * ownership, free to drift from this one. Re-exported so existing importers of the connector keep
+ * working and so the fence still reads as part of this processor's contract.
+ *
+ * THE CLAIM INSTANT CONVENTION THIS FILE FOLLOWS (Codex r2, medium 2). This runner never renews a
+ * claim: it stamps one instant when it takes the row and holds it for the entry. But it does NOT pass
+ * that instant around as a `Date` — it passes the CLAIM, a `HeldClaim` built by `claimHeldFrom`, and
+ * every fence asks it for the instant at the moment of the write. The sibling that DOES renew
+ * (o3d-batch-small2's remote-write lease) satisfies the same interface with the same method name, so
+ * when the two land together the holder is swapped for the lease and all six releases keep fencing on
+ * the claim this worker actually holds. A carried-down `Date` would compile there and match nothing —
+ * and these fences fail closed, so the symptom is silent refusal, not an error.
+ *
+ * WHAT A MISSING FENCE COSTS ON THIS BRANCH SPECIFICALLY (o3d-a3wx r6). A displaced owner that writes
+ * the row back erases the replacement's PROCESSING claim and drops the row to PENDING/FAILED WHILE THE
+ * REPLACEMENT'S REQUEST IS STILL ON THE WIRE — and that reopens the post slot with nothing to show a
+ * post is in flight. For an order-scoped INVOICE_PAYMENT that is the double post: the exclusion test
+ * ({@link decideInvoicePaymentClaim}) admits a sibling the moment no row for the reference is
+ * PROCESSING, the sibling posts, and the same invoice is settled twice. Nothing downstream catches it,
+ * because the capacity guard counts SYNCED rows and neither request has landed yet. A re-claim does not
+ * advance retryCount, so the `{ id, retryCount }` guard those writers used to carry does not stop any
+ * of it.
+ */
+export { claimHeldFrom, heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
+
+/**
+ * The outcome of trying to record a posted document on its sync row (o3d-550x).
+ *
+ * `ANOTHER_DOCUMENT_NAMED` is the case the claim fence must NOT be used for: the row already carries a
+ * DIFFERENT externalTransactionId, so a newer claim posted its own document while this worker was on
+ * the wire. Both documents are real and in the ledger. Overwriting would destroy the only local record
+ * of one of them, so the row keeps what it already names and the displaced id is recorded as evidence
+ * instead — in the same transaction, which is what `evidence` on the refusal variants is proof of.
+ */
+export type PostedSyncRecord =
+  | { recorded: true }
+  | { recorded: false; reason: 'ANOTHER_DOCUMENT_NAMED'; namedExternalId: string | null; evidence: string }
+  | { recorded: false; reason: 'ROW_MISSING'; evidence: string }
+
+/**
+ * Record a posted document on its sync row — NOT fenced on claim ownership, on purpose (o3d-550x).
+ *
+ * o3d-550x asked for every result write to be fenced on the claim, `count === 0` meaning "discard my
+ * result". That is right for the FAILURE and DEFERRAL writes ({@link heldClaimWhere}) and WRONG here,
+ * and the difference is the whole point: a failure write asserts a state the row can be talked out of,
+ * while this one records A FACT ABOUT THE EXTERNAL LEDGER that has already happened. Making it
+ * conditional on still holding the claim would mean the displaced worker — the one that DID post —
+ * writes nothing, and the document exists in Xero with nothing in IMS naming it.
+ *
+ * So the only precondition is the fact it protects: the row must not already name a DIFFERENT
+ * document. `externalTransactionId: null` (nothing recorded yet) or the same id again (an idempotent
+ * re-record) both land; a different id refuses, AND FILES THE EVIDENCE NAMING BOTH IDS BEFORE THIS
+ * TRANSACTION COMMITS ({@link recordUnrecordablePostedDocument}) — the caller is handed the wording,
+ * not the job of writing it. Whichever worker gets there first is recorded unconditionally — no race
+ * decides it.
+ */
+export async function recordPostedSyncResult(
+  // `activityLog` because the conflict evidence is filed inside this transaction (o3d-550x r2);
+  // `$executeRaw` because the database-clock stamp below is raw SQL (o3d-batch-billpay / o3d-clxw r4).
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog' | 'activityLog' | '$executeRaw'>,
+  params: {
+    entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
+    externalId: string | null
+    payload: SyncPayload
+    /**
+     * o3d-cvj9: the revision stamp Xero put on the document as it applied THIS write. Supplied ONLY
+     * by the call sites where a connector write actually landed in this attempt. The short-circuit
+     * sites — the row already carried an external id, so nothing was called — omit it entirely, and
+     * that ABSENCE (not `null`) is what `resolveDocumentRevisionOrder` decides those paths on: an
+     * attempt that called nothing changed nothing about the document and takes no claim on it.
+     */
+    externalRevisionAt?: Date | null
+    /**
+     * CALLED THE INSTANT A CONFLICT IS OBSERVED — before anything is written, and outside the
+     * transaction's fate (Codex r3, HIGH).
+     *
+     * The return value of this function only reaches the caller if the transaction COMMITS. Round 3
+     * covered a failure of the RECORD, which throws from inside and is therefore preserved; it did not
+     * cover a failure of the TRANSACTION at any other point — a deadlock victim, a serialization
+     * failure, a connection dropped at COMMIT. Those roll the record back and surface as an ORDINARY
+     * error, and an ordinary error is handed to the ordinary retry, which round 3 traced to the end:
+     * the row by then names the other document, so the runner completes the job as a success before it
+     * even claims. The displaced identifier is in this process's memory and nowhere else, so it has to
+     * leave the callback by a route a rollback cannot take with it.
+     */
+    onConflictObserved?: (incident: UnrecordablePostedDocument) => void
+  },
+): Promise<PostedSyncRecord> {
+  const { entry, externalId, payload } = params
+  const written = await tx.accountingSyncLog.updateMany({
+    where: {
+      id: entry.id,
+      OR: [
+        { externalTransactionId: null },
+        ...(externalId ? [{ externalTransactionId: externalId }] : []),
+      ],
+    },
+    data: {
+      status: 'SYNCED',
+      externalTransactionId: externalId,
+      syncedAt: new Date(),
+      errorMessage: null,
+      processingStartedAt: null,
+      // Claimed IN this transaction, so the row can never be SYNCED-with-an-id and silent about the
+      // follow-ups it still owes (r10 finding 1).
+      ...followUpObligationClaim(),
+    },
+  })
+  if (written.count === 0) {
+    const current = await tx.accountingSyncLog.findUnique({
+      where: { id: entry.id },
+      select: { externalTransactionId: true },
+    })
+    // THE EVIDENCE IS WRITTEN HERE, IN THE TRANSACTION THAT OBSERVED THE CONFLICT (Codex r1, high).
+    // Not afterwards by the caller: see recordUnrecordablePostedDocument for why "afterwards" was a
+    // way to lose it permanently.
+    const refusal = current === null
+      ? { reason: 'ROW_MISSING' as const, namedExternalId: null }
+      : { reason: 'ANOTHER_DOCUMENT_NAMED' as const, namedExternalId: current.externalTransactionId }
+    const evidence = await recordUnrecordablePostedDocument(tx, entry, externalId, refusal, params.onConflictObserved)
+    return refusal.reason === 'ROW_MISSING'
+      ? { recorded: false, reason: 'ROW_MISSING', evidence }
+      : { recorded: false, reason: 'ANOTHER_DOCUMENT_NAMED', namedExternalId: refusal.namedExternalId, evidence }
+  }
+  // The registration's completion time is stamped by the DATABASE, in this transaction and strictly
+  // after the POST returned (o3d-clxw round 4, merged as o3d-batch-billpay). The payment poller fences
+  // its reversal verdict on this value against a `clock_timestamp()` it reads from the same database,
+  // so no application host's clock can order — or misorder — a supplier payment.
+  //
+  // AFTER the Prisma write above, never before: the SYNCED write changes `status` without assigning
+  // the provenance marker, so it trips the trigger that clears the marker; this statement then mints
+  // the new pair. Swapped, the transaction would erase its own stamp.
+  await stampSyncedAtFromDatabaseClock(tx, entry.id)
+  await updateMirroredEventForSyncLog(tx, {
+    syncLogId: entry.id,
+    type: entry.type,
+    referenceType: entry.referenceType,
+    referenceId: entry.referenceId,
+    payload,
+    status: 'POSTED',
+    externalId,
+    // Spread, not `externalRevisionAt: params.externalRevisionAt`: the mirror distinguishes an
+    // absent field from an explicit `null`, and a replay that called nothing must leave the stamp
+    // an earlier write established alone rather than wiping it.
+    ...(params.externalRevisionAt !== undefined ? { externalRevisionAt: params.externalRevisionAt } : {}),
+  })
+  return { recorded: true }
+}
+
+/**
+ * A POSTED DOCUMENT COULD NOT BE RECORDED ON ITS ROW — and this write is the only thing that will ever
+ * say so (o3d-550x; Codex r1 HIGH, Codex r2 medium 1).
+ *
+ * WHAT WENT WRONG THE FIRST TIME. The branch's whole rule is "fence the releases, never the evidence",
+ * and {@link recordPostedSyncResult} honours it: the id write refuses no race. But when that write
+ * REFUSES — the one case where the evidence is irreplaceable, because the row will never name this
+ * document — the escalation was handed to `logActivityPersisted` AFTER the transaction closed. That
+ * logger catches its own database errors and returns `false`; the return was ignored, and a crash
+ * between the transaction and the call lost it just as completely. On the outbox path the job was then
+ * marked PERMANENTLY failed on the strength of an escalation that may never have been written, and on
+ * replay the already-SYNCED row is skipped — so a real Xero document ended up with NO durable IMS
+ * evidence anywhere. The fence covered the happy evidence path and left the conflict evidence to the
+ * weakest writer in the system.
+ *
+ * WHAT IT DOES NOW. The record is created inside the SAME transaction that observed the conflict, from
+ * the SAME `findUnique` that established which document the row keeps — so it cannot describe a row
+ * state that never existed, there is no window between observing and recording, and a failure to write
+ * it ABORTS the transaction and throws {@link PostedDocumentEvidenceUnwritten} instead of returning a
+ * description nobody wrote down. Callers therefore cannot complete or permanently fail an outbox job on
+ * unwritten evidence: they never reach that code.
+ *
+ * THE STORE, RE-DECIDED WITH THE THIRD CONSTRAINT IN VIEW (Codex r2, medium 1). Four candidates, three
+ * of which destroy the record they are asked to keep:
+ *
+ *   • The mirrored `AccountingEvent` — REJECTED. Its `(externalSystem, externalId)` unique is exactly
+ *     what a second document for one reference collides on (o3d-cvj9), so the evidence of the collision
+ *     would be the thing the collision destroys.
+ *   • `AccountingSyncLog.errorMessage` — REJECTED. A later legitimate re-record of the id the row
+ *     already names sets `errorMessage: null`, which erases it. It also does not exist at all in the
+ *     ROW_MISSING case, which is the case that needs the record MOST.
+ *   • `ActivityLog` under ordinary retention — REJECTED, and this is what round 2 got wrong. It is
+ *     append-only and takes no foreign key, so it survives both of the above; but ERROR rows are
+ *     deleted at 90 days by `purgeExpiredActivityLogs`, and this branch exists to stop a real Xero
+ *     document becoming permanently untracked. Evidence that expires is the same defect one layer out.
+ *   • `ActivityLog` NAMED IN THE RETENTION SWEEP'S EXEMPTION LIST — CHOSEN. The sweep's own
+ *     `RETAINED_ACTIONS` is the mechanism the codebase already uses for rows that are STATE rather than
+ *     history, it is enforced in the delete predicate itself (`action <> ALL(...)`), and it keeps every
+ *     property that made ActivityLog right in the first place. See lib/activity-log-cleanup.ts for the
+ *     boundedness argument that entry has to carry.
+ *
+ * The action name is imported, not spelt here, so the sweep and this write cannot drift apart.
+ *
+ * Redaction is applied here rather than inherited from the activity-log helper, because this write does
+ * not go through it. `userId: null` deliberately: this runs on cron with no session, and resolving one
+ * inside a transaction would put an auth round-trip on the conflict path.
+ *
+ * Returns the operator-facing description so the caller can reuse it as the outbox job's failure
+ * message WITHOUT rebuilding it — one wording for one incident.
+ */
+async function recordUnrecordablePostedDocument(
+  tx: Pick<Prisma.TransactionClient, 'activityLog'>,
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  externalId: string | null,
+  refusal: { reason: UnrecordablePostedDocumentReason; namedExternalId: string | null },
+  onConflictObserved?: (incident: UnrecordablePostedDocument) => void,
+): Promise<string> {
+  const incident: UnrecordablePostedDocument = {
+    entry,
+    postedExternalId: externalId,
+    reason: refusal.reason,
+    namedExternalId: refusal.namedExternalId,
+  }
+  // BEFORE the write, not after it. What this hands upward is the OBSERVATION, and the observation is
+  // already complete: the row was read in this transaction and it names another document. Announcing it
+  // after a successful insert would make it worth exactly as much as the insert — nothing, if the
+  // transaction then fails to commit (Codex r3, HIGH).
+  onConflictObserved?.(incident)
+  const description = describeUnrecordablePostedDocument(incident)
+  try {
+    await tx.activityLog.create({ data: unrecordedPostedDocumentRecord(incident, description) })
+  } catch (cause) {
+    // Aborts the transaction, AND carries the displaced identifier upward — the runners match on this
+    // type and escalate it out of band, because the ordinary retry cannot (Codex r2, HIGH).
+    throw new PostedDocumentEvidenceUnwritten(incident, cause)
+  }
+  return description
+}
+
+/**
+ * The one shape of the durable record, built in one place because it is written from TWO — inside the
+ * conflict transaction, and again standalone by {@link escalateUnwrittenPostedEvidence} when that
+ * transaction could not commit. Two spellings of the same record would be two `action` values the day
+ * anybody edited one of them, and the retention exemption only protects the spelling it was given.
+ */
+function unrecordedPostedDocumentRecord(incident: UnrecordablePostedDocument, description: string) {
+  const { entry } = incident
+  return {
+    userId: null,
+    entityType: 'SYSTEM' as const,
+    entityId: entry.id,
+    action: UNRECORDED_POSTED_DOCUMENT_ACTION,
+    tag: 'sync',
+    level: 'ERROR' as const,
+    description: redactActivityLogText(description),
+    metadata: JSON.parse(JSON.stringify(sanitizeActivityLogMetadata({
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      postedExternalId: incident.postedExternalId,
+      rowNamesExternalId: incident.reason === 'ANOTHER_DOCUMENT_NAMED' ? incident.namedExternalId : null,
+      reason: incident.reason,
+    }))),
+  }
+}
+
+/**
+ * HOW MANY TIMES THE CONFLICT TRANSACTION IS RE-DRIVEN BEFORE THE IDENTIFIER IS DECLARED UNSAVEABLE.
+ *
+ * Each attempt is a WHOLE fresh transaction — it re-takes the row, re-observes which document the row
+ * names, and writes the record from that same observation — so re-driving does not weaken the property
+ * round 2 established. What it buys is the common failure: a serialization conflict or a deadlock
+ * victim, where the transaction that lost is perfectly able to commit a moment later. There is no sleep
+ * between attempts on purpose: the conflicting transaction has already committed by the time ours is
+ * rolled back, and a cron worker holding a claim is the wrong place to add latency.
+ */
+const EVIDENCE_TRANSACTION_ATTEMPTS = 3
+
+/**
+ * RECORD A POSTED DOCUMENT, AND DO NOT COME BACK WITHOUT EITHER THE RECORD OR THE IDENTIFIER
+ * (Codex r2, HIGH).
+ *
+ * THE DEFECT THIS CLOSES. Round 2 made an unwritable conflict record abort its transaction and throw,
+ * on the reasoning that the job would then be "retried rather than buried". But look at what the retry
+ * is. It re-enters the sweep as an ORDINARY sync attempt against a row that now names the OTHER
+ * document — so it takes the `entry.externalTransactionId` short-circuit, records that id (which
+ * matches, so it lands), settles the row SYNCED and completes the outbox job as a SUCCESS. On the
+ * outbox path it does not even get that far: the top of the loop sees a SYNCED row with an external id
+ * and completes the job before claiming anything. The displaced identifier was never in the database
+ * and is not in the retry's memory, so the retry that was supposed to preserve it is precisely what
+ * throws it away, quietly, with a success verdict.
+ *
+ * So the identifier never enters the ordinary retry path. Every one of the four call sites goes through
+ * this function, which owns the transaction, and:
+ *
+ *   • re-drives the whole conflict transaction while the failure is the RECORD (bounded — see
+ *     {@link EVIDENCE_TRANSACTION_ATTEMPTS}); a later attempt that finds the row recordable after all
+ *     records the document normally, which is the right answer and not a special case;
+ *   • lets any OTHER error out untouched, so ordinary sync failures keep their ordinary handling;
+ *   • rethrows {@link PostedDocumentEvidenceUnwritten}, carrying both identifiers, for the runners to
+ *     escalate through {@link escalateUnwrittenPostedEvidence} instead of through a retry.
+ */
+export async function recordPostedDocumentDurably(
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  externalId: string | null,
+  payload: SyncPayload,
+  /**
+   * o3d-cvj9, threaded through the re-drive: the revision stamp of the write THIS attempt made, or
+   * omitted entirely by the two short-circuit sites that called nothing. Omitted and `null` are
+   * different answers to the mirror, so this stays optional rather than defaulting to `null`.
+   */
+  externalRevisionAt?: Date | null,
+  /**
+   * o3d-xl63 r3 #2: the transaction options for a POST-REMOTE persist. Prisma's default `maxWait` is
+   * 2 seconds, which is right for work that has not started and wrong for the record of a document
+   * the external ledger already holds — it gives up long before the pool's own acquisition bound and
+   * turns a busy moment into a lost identifier. Callers persisting after a remote write pass
+   * `POST_REMOTE_PERSIST_TX_OPTIONS`; everyone else keeps Prisma's defaults.
+   */
+  txOptions?: { maxWait?: number; timeout?: number },
+): Promise<PostedSyncRecord> {
+  const revision = externalRevisionAt !== undefined ? { externalRevisionAt } : {}
+  let unwritten: PostedDocumentEvidenceUnwritten | undefined
+  /**
+   * THE OBSERVATION IS STICKY FOR THE WHOLE CALL, AND ROUND 4 MADE IT PER ATTEMPT (Codex r4, HIGH).
+   *
+   * Round 4 reset the observation every attempt, on the reasoning that "an observation from a
+   * rolled-back attempt must not DESCRIBE the next one". That half is still true and is still honoured
+   * below — `observed` wins whenever this attempt made one of its own. What round 4 also did, by
+   * accident, was let a later attempt that observed NOTHING throw the earlier observation away: attempt
+   * 1 sees the conflict and cannot write the record, attempt 2 dies in the row `updateMany` before it
+   * ever reaches the conflict branch, `observed` is undefined, and `throw error` leaves this function
+   * as a BARE DATABASE ERROR. The runners do not recognise that type, so it takes the ordinary failure
+   * branch, and round 3 already traced where that ends: next run the row is the winner's, settled with
+   * ITS id, and the job is completed as a success. The re-drive that exists to PRESERVE the displaced
+   * identifier discarded it on the attempt that followed.
+   *
+   * So an observation is kept for the life of the call. It is a fact about the LEDGER — this worker
+   * posted `externalId` and the row named something else — not a fact about the attempt that saw it,
+   * and no rollback can make it untrue. The part a later attempt could legitimately update
+   * (`namedExternalId`) is exactly the part a later observation overrides.
+   */
+  let carried: UnrecordablePostedDocument | undefined
+  for (let attempt = 1; attempt <= EVIDENCE_TRANSACTION_ATTEMPTS; attempt++) {
+    // Per ATTEMPT for DESCRIBING this attempt: each attempt is a whole fresh transaction that
+    // re-observes the row, so a stale observation never gets to speak for a fresh one. It is `carried`
+    // that survives the attempt, and only as the fallback.
+    let observed: UnrecordablePostedDocument | undefined
+    try {
+      return await db.$transaction(async (tx) => recordPostedSyncResult(tx, {
+        entry,
+        externalId,
+        payload,
+        ...revision,
+        onConflictObserved: (incident) => { observed = incident },
+      }), txOptions)
+    } catch (error) {
+      if (error instanceof PostedDocumentEvidenceUnwritten) {
+        // Both halves: the ready-made failure to throw if we run out of attempts, AND the incident
+        // itself, so an attempt that observes nothing still has something true to carry (Codex r4, HIGH).
+        unwritten = error
+        carried = error.incident
+        continue
+      }
+      // THE TRANSACTION FAILED SOMEWHERE ELSE, AND THE CONFLICT WAS ALREADY OBSERVED (Codex r3, HIGH).
+      //
+      // Round 3 preserved a failure OF THE RECORD, because that one throws from inside and the throw is
+      // the preservation. A deadlock victim, a serialization failure or a connection lost at COMMIT does
+      // not: the record rolls back, and what leaves this function is an ordinary database error. Follow
+      // it, the way round 3 followed the retry. The runners' catch tests for
+      // PostedDocumentEvidenceUnwritten and this is not one, so it lands in the ORDINARY failure branch
+      // — applyMainSyncFailureRetry plus markXeroOutboxRetry — and the next run reads a row that the
+      // winning worker has already settled SYNCED with ITS id. The outbox runner completes such a job at
+      // the top of the loop, before it claims anything; the direct runner never selects the row again at
+      // all. Green verdict, and the identifier this process is holding is the only copy there was.
+      //
+      // So an observed conflict converts the failure rather than being lost to it: same incident, both
+      // ids, same operator wording, and a type the runners escalate out of band. Re-driven like any
+      // other attempt first — a deadlock victim is exactly the case that commits a moment later.
+      //
+      // AND `carried`, NOT ONLY `observed` (Codex r4, HIGH). A conflict this call has ALREADY seen is
+      // not unseen by a later attempt failing earlier than the branch that would have seen it again;
+      // rethrowing bare here is the same discard, one attempt further on.
+      const incident = observed ?? carried
+      if (!incident) throw error
+      carried = incident
+      unwritten = new PostedDocumentEvidenceUnwritten(incident, error)
+    }
+  }
+  // `unwritten` is set by construction (the loop runs at least once), but throwing `undefined` if
+  // somebody ever set the attempt budget to zero would lose the incident in a different way.
+  throw unwritten ?? new Error(
+    `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} was never recorded and never `
+    + `attempted: the posted-document attempt budget is ${EVIDENCE_TRANSACTION_ATTEMPTS}.`,
+  )
+}
+
+/**
+ * THE LAST RESORT, and it is deliberately not a retry (Codex r2, HIGH).
+ *
+ * Reached only when {@link recordPostedDocumentDurably} could not save the record at all. The identifier
+ * exists in exactly one place — the error in this function's hand — and every ordinary route out of here
+ * discards it:
+ *
+ *   • handing the row back through `applyMainSyncFailureRetry` schedules an ordinary attempt, and an
+ *     ordinary attempt settles the row and reports success;
+ *   • `markXeroOutboxRetry` does the same thing one level up: the next run sees SYNCED + an external id
+ *     and completes the job;
+ *   • `markXeroOutboxSuccess` is obviously worse.
+ *
+ * The row itself is left ALONE. In the usual shape of this incident the winning worker has already
+ * recorded its document and released the row, so this worker no longer holds the claim and must not
+ * touch it — failing closed means refusing to release, never retracting a settlement somebody else's
+ * successful read justified. No document is at risk from leaving it: the row already names a document,
+ * so any later attempt short-circuits and settles rather than posting a second one.
+ *
+ * What is left is to put the identifier somewhere that is NOT the store that just refused it. The
+ * process log always gets it (it cannot fail and it cannot be swept), and the outbox runner also burns
+ * the job PERMANENTLY with the same wording — which is not the round-1 defect of burying on evidence
+ * nobody wrote, but the opposite: burying is what stops the retry that would erase the incident, and the
+ * job's own failure column is a durable record in a different table from the one that failed.
+ *
+ * ONE MORE ATTEMPT AT THE DURABLE RECORD, STANDALONE (Codex r3, HIGH). The transaction is gone; the
+ * record it wanted to write need not be. Since the conflict is now also carried out of transactions that
+ * failed at COMMIT — where the insert itself was never the problem — a plain, unwrapped write of the
+ * same row very often lands, and it is the only writable form of the incident that a later run can READ.
+ * It is what stops a job whose burial failed from being completed as a success on the next pass (see
+ * `findUnrecordedPostedDocumentEvidenceFor`). It is attempted AFTER the console line, never before: the
+ * console line cannot fail, and the order means a crash inside this call still leaves the incident said
+ * out loud. Its own failure is swallowed for the same reason — there is nothing further to try, and
+ * throwing here would replace an escalation with a stack trace.
+ *
+ * Returns whether the record landed, so a caller can say which kind of incident it is looking at.
+ */
+export async function escalateUnwrittenPostedEvidence(error: PostedDocumentEvidenceUnwritten): Promise<boolean> {
+  console.error(`[xero-sync] ${error.operatorMessage}`)
+  try {
+    await db.activityLog.create({
+      data: unrecordedPostedDocumentRecord(
+        error.incident,
+        // The incident's own wording, not `operatorMessage`: the same sentence the transactional write
+        // would have stored, so one incident reads identically wherever it landed. `operatorMessage`
+        // ends by saying the identifier exists only in that message, which this write makes untrue.
+        `${describeUnrecordablePostedDocument(error.incident)} (Recorded outside its own transaction, `
+        + `which could not be committed: ${String(error.cause)}.)`,
+      ),
+    })
+    return true
+  } catch (cause) {
+    console.error(
+      `[xero-sync] the unrecorded-document record for sync log ${error.syncLogId} could not be written `
+      + `outside its transaction either: ${String(cause)}`,
+    )
+    return false
+  }
+}
+
+/** How many times the outbox job's burial is re-driven before the run itself is failed. */
+const EVIDENCE_BURIAL_ATTEMPTS = 3
+
+/**
+ * BURY THE JOB, AND DO NOT LET A FAILED BURIAL BECOME A SUCCESS (Codex r3, HIGH).
+ *
+ * Round 3 chose burial for one reason: burying is what STOPS the retry that erases the incident. Follow
+ * what a failed `markXeroOutboxPermanent` actually did before this function existed. It threw from
+ * inside the catch handler, so it escaped the handler, the loop and the run — leaving the job exactly as
+ * it was, PROCESSING and locked by this worker. `CLAIM_STALE_MS` later, `claimIntegrationOutboxWork`
+ * re-claims it as a stale lock, and the next run reads the sync row: SYNCED, with the WINNER's id on it.
+ * That is the branch at the top of the loop, whose own comment said the incident could no longer reach
+ * it — `markXeroOutboxSuccess`, `result.skipped++`. The incident round 3 refused to let a retry erase
+ * was erased by a reclaim instead, with a green verdict, which is the same failure one layer further
+ * out.
+ *
+ * Three things now stand between that failure and a success:
+ *
+ *   • the burial is RE-DRIVEN, because the common failure here is a blip, not a verdict;
+ *   • if it still cannot be written, the run FAILS carrying the operator wording, instead of a bare
+ *     database error with the incident detached from it;
+ *   • and the reclaim path reads the standalone evidence record before it completes anything, so the
+ *     job is buried on the next pass rather than completed. That is the durable half: it survives this
+ *     process ending, which nothing held in memory here does.
+ */
+export async function buryOutboxJobForUnwrittenPostedEvidence(
+  job: IntegrationOutboxRow,
+  error: PostedDocumentEvidenceUnwritten,
+  /** Whether {@link escalateUnwrittenPostedEvidence} got the record written down after all. */
+  recordFiled: boolean,
+): Promise<void> {
+  let lastFailure: unknown
+  for (let attempt = 1; attempt <= EVIDENCE_BURIAL_ATTEMPTS; attempt++) {
+    try {
+      await markXeroOutboxPermanent(job, error.operatorMessage)
+      return
+    } catch (cause) {
+      lastFailure = cause
+    }
+  }
+  throw new XeroOutboxBurialError(
+    `${error.operatorMessage} THE OUTBOX JOB ${job.id} COULD NOT BE BURIED EITHER: ${String(lastFailure)}. `
+    + (recordFiled
+      ? 'The incident IS on record in the activity log, and the next run reads it before completing this '
+        + 'job, so the reclaim will bury the job rather than complete it.'
+      : 'NOTHING WAS WRITTEN DOWN: not the record, not the job. This message is the only copy of the '
+        + 'identifier, and a reclaim of this job will find a settled row and complete it as a success.'),
+    { cause: lastFailure },
+  )
+}
+
+/**
+ * NOT fenced on the claim, deliberately (o3d-a3wx r6). This runs only AFTER the post succeeded and the
+ * row was written SYNCED with `processingStartedAt: null`, so there is no claim left to match — the
+ * row is already out of the live set either way. A displaced owner reaching here has posted, and its
+ * SYNCED row is what the post-time capacity guard counts, so the slot it frees is not a silent one.
+ */
 export async function markSyncLogForFollowUpRetry(
-  entry: { id: string; retryCount: number },
+  attempt: AttemptRef,
+  entry: { retryCount: number },
   error: unknown,
   client?: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
 ): Promise<{ errorMessage: string; finalFailure: boolean }> {
@@ -167,8 +805,12 @@ export async function markSyncLogForFollowUpRetry(
   // at one AccountingSyncLog) must not both increment from a stale value and
   // double-write the failure transition. The compound where makes the update a
   // no-op for the loser of the race.
+  //
+  // o3d-e2mz: fenced on the claimed attempt too. retryCount alone cannot identify
+  // an attempt — retryFailedXeroSync resets it to 0 — so without the revision this
+  // write could land on a LATER attempt, or revive a row an operator has settled.
   const updated = await conn.accountingSyncLog.updateMany({
-    where: { id: entry.id, retryCount: entry.retryCount },
+    where: { id: attempt.id, attemptRevision: attempt.attemptRevision, retryCount: entry.retryCount },
     data: {
       status: finalFailure ? 'FAILED' : 'PENDING',
       retryCount,
@@ -184,7 +826,7 @@ export async function markSyncLogForFollowUpRetry(
   // reality, not our stale view — otherwise we could mark the outbox job for
   // retry while the row is already terminally FAILED (or vice-versa).
   const current = await conn.accountingSyncLog.findUnique({
-    where: { id: entry.id },
+    where: { id: attempt.id },
     select: { retryCount: true, status: true },
   })
   return {
@@ -204,17 +846,40 @@ export async function markSyncLogForFollowUpRetry(
  * compound where makes the update a no-op for the loser; on a lost race we
  * re-read so the caller's outbox permanent/retry decision reflects reality and
  * we skip the mirrored-event write the winner already did.
+ *
+ * o3d-550x: RETRYCOUNT WAS NEVER THE LOSER-DETECTOR IT WAS WRITTEN AS, for the stale-claim reclaim
+ * this header names first. Re-claiming a row does not advance retryCount, so both workers observe the
+ * same value and BOTH updates match. The displaced owner therefore wins here, un-claims the
+ * replacement mid-flight and drops the row back to PENDING/FAILED, which frees the row for a third
+ * claim while a request is still on the wire. This write now also carries {@link heldClaimWhere}: a
+ * failure is recorded only by the worker that still holds the claim it took, and a displaced one falls
+ * through to the lost-race branch and reports the row as it actually stands.
  */
 export async function applyMainSyncFailureRetry(
   tx: Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog'>,
-  entry: { id: string; retryCount: number; type: AccountingSyncType; referenceType: string; referenceId: string },
+  attempt: AttemptRef,
+  entry: { retryCount: number; type: AccountingSyncType; referenceType: string; referenceId: string },
   errorMessage: string,
   payload: SyncPayload,
+  /** The claim THIS worker holds. Required: an unfenced release is the o3d-550x defect. */
+  held: HeldClaim,
 ): Promise<{ finalFailure: boolean }> {
   const retryCount = entry.retryCount + 1
   const computedFinal = retryCount >= MAX_RETRIES
+  // o3d-e2mz: fenced on the claimed attempt as well as the observed retryCount. A
+  // failure belongs to ONE attempt; without the revision this write reopens a row an
+  // operator settled while this attempt was in flight, sending it round again as
+  // PENDING/FAILED with no trace that a decision was discarded.
   const updated = await tx.accountingSyncLog.updateMany({
-    where: { id: entry.id, retryCount: entry.retryCount },
+    // BOTH fences, and they answer different questions (o3d-550x + o3d-e2mz). The held claim says
+    // "I still own this row" — it stops a DISPLACED owner writing over its replacement. The attempt
+    // revision says "this failure belongs to the attempt I claimed" — it stops the write landing on
+    // a row an OPERATOR has decided about, which moves the revision without touching the claim.
+    where: {
+      ...heldClaimWhere(attempt.id, held),
+      attemptRevision: attempt.attemptRevision,
+      retryCount: entry.retryCount,
+    },
     data: {
       status: computedFinal ? 'FAILED' : 'PENDING',
       retryCount,
@@ -225,7 +890,7 @@ export async function applyMainSyncFailureRetry(
   if (updated.count > 0) {
     if (computedFinal) {
       await updateMirroredEventForSyncLog(tx, {
-        syncLogId: entry.id,
+        syncLogId: attempt.id,
         type: entry.type,
         referenceType: entry.referenceType,
         referenceId: entry.referenceId,
@@ -239,7 +904,7 @@ export async function applyMainSyncFailureRetry(
   // Lost the race: another worker already advanced this row (and wrote the
   // mirrored event if it became terminal). Report the persisted state.
   const current = await tx.accountingSyncLog.findUnique({
-    where: { id: entry.id },
+    where: { id: attempt.id },
     select: { retryCount: true, status: true },
   })
   return {
@@ -259,12 +924,23 @@ async function logFollowUpRetry(entryId: string, error: unknown): Promise<void> 
   })
 }
 
+/**
+ * o3d-hbgo: a live row only owns this follow-up when it targets the SAME external document. Counting
+ * rows by (connector, type, reference) alone made a re-invoiced order's payment look already-handled,
+ * so the replacement invoice was never settled — and a skip logs nothing. The anchor comparison lives
+ * in the follow-up idempotency module so the ROW dedup and the remote TOKEN are scoped by the same
+ * fields; a dedup that names less than the token can only discard work the token could distinguish.
+ *
+ * Payloads rather than a count: the anchors live inside the JSON, and the live rows for one scope are
+ * bounded by the partial unique index that backs this check.
+ */
 async function hasExistingSyncLog(
   type: AccountingSyncType,
   referenceType: string,
   referenceId: string,
+  payload: SyncPayload,
 ): Promise<boolean> {
-  const count = await db.accountingSyncLog.count({
+  const liveRows = await db.accountingSyncLog.findMany({
     where: {
       connector: XERO_CONNECTOR,
       type,
@@ -272,8 +948,9 @@ async function hasExistingSyncLog(
       referenceId,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
     },
+    select: { payload: true },
   })
-  return count > 0
+  return liveRows.some((row) => liveRowOccupiesFollowUpSlot(row.payload, payload as FollowUpPayload))
 }
 
 /**
@@ -286,21 +963,69 @@ export function isUniqueConstraintViolation(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'P2002'
 }
 
-async function enqueueFollowUpSyncLog(
+/**
+ * Where a follow-up's ORIGIN RECORD comes from. Never from "what is connected now" (Codex r3 finding 1).
+ *
+ * A follow-up is always work about a document some earlier post created, so the only honest statement
+ * about which organisation its ids belong to is the one the row that made that post already carries.
+ * Naming the two cases in the type is the point: a caller cannot reach the enqueue without saying which
+ * of them it is in, and there is no third option that means "look it up".
+ */
+type FollowUpOriginEvidence =
+  /**
+   * The stored payload of the row whose post issued the ids in this follow-up. Its record is carried
+   * VERBATIM — including its absence, which then refuses.
+   */
+  | { from: 'postedRow'; payload: unknown }
+  /** Nothing in hand observed the origin. The row is created carrying no record, and cannot post. */
+  | { from: 'unobserved' }
+
+/**
+ * Exported for unit tests (o3d-e2mz r3): the revival compare-and-swap in here is the one write on a
+ * money-moving path that a whole processor run has to be driven to reach, and the fence on it is
+ * cheaper to pin directly than through a full post-and-follow-up loop.
+ */
+export async function enqueueFollowUpSyncLog(
   type: FollowUpSyncType,
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
+  origin: FollowUpOriginEvidence,
   /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
   attempt = 0,
 ): Promise<void> {
+  // o3d-19gy: the origin record is settled HERE, before anything reads or plans against it, so a
+  // follow-up payload carries the connection whose post issued the external id it is built from.
+  //
+  // IT IS INHERITED, NEVER MINTED (Codex r2 finding 1, then r3 finding 1). Round 1 claimed "re-stamping
+  // on a revival is deliberate", and that was the defect: a revived row is pinned to the idempotency
+  // token its EARLIER attempt was spent under, and rewriting its origin to the current tenant made a
+  // payment first attempted against organisation A look, to the post-time guard, like ordinary
+  // organisation-B work. Round 2 fixed the REVIVAL path in `planFollowUpEnqueue`, and left the CREATE
+  // path still reading `activeAccountingIdProvenance()` — the same forgery one step out, because a
+  // creating repair had not witnessed the post either, and the guard would later compare B against B.
+  //
+  // So there is no read of the live connection on this path at all. A caller that took the post hands
+  // over that row's payload and its record travels; a caller that did not hands over nothing and the row
+  // is born with no record, which `accountingPayloadConnectionVerdict` refuses rather than assumes.
+  payload = carryAccountingOriginRecord(
+    payload,
+    origin.from === 'postedRow' ? origin.payload : undefined,
+  ) as SyncPayload
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
-  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId)
+  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId, payload)
   // o3d-h2wx: a FAILED row is REUSED rather than replaced. Xero's Idempotency-Key is
   // derived from the entry id, so creating a replacement row would post the retry under a
   // key Xero has never seen — and if the failed attempt had actually committed, a SECOND
   // payment lands on the invoice.
+  //
+  // KEEPING THE KEY IS NECESSARY, NOT SUFFICIENT (o3d-wahn r2 #1). Xero forgets an
+  // Idempotency-Key after SIX MINUTES, and a follow-up is re-enqueued long after that, so a
+  // pinned token is by then a string Xero no longer recognises either. What actually stops
+  // the second payment is the plan's REFUSAL on an ambiguous token history below, plus the
+  // pinned request body — see lib/domain/accounting/idempotency-retention.ts for what is and
+  // is not protected once the window has closed.
   const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: XERO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
@@ -311,8 +1036,16 @@ async function enqueueFollowUpSyncLog(
     // row only proves anything when nothing but a STAMPING binary has handled it (round 10): it is
     // read off the row rather than resolved from a global epoch, so this path needs no extra query
     // and cannot be given a stale answer.
-    select: { id: true, payload: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true },
+    //
+    // o3d-e2mz r3: and the attempt each candidate row is AT when it was read. Reviving one is a
+    // write to that attempt and must be fenced on it — see the compare-and-swap below.
+    select: {
+      id: true, payload: true,
+      remoteAttemptedAt: true, attemptStampingCustodyAt: true,
+      attemptRevision: true,
+    },
   })
+  const failedAttemptRevisions = new Map(failedLogs.map((row) => [row.id, row.attemptRevision]))
   const failedRows = failedLogs.map((row) => ({
     id: row.id,
     payload: row.payload,
@@ -344,11 +1077,54 @@ async function enqueueFollowUpSyncLog(
     return
   }
 
-  // o3d-0m56: the AUTOMATIC path carries the identical hazard the manual retry does. Reviving a
-  // money row under a PINNED token only protects while Xero still remembers that token — minutes —
-  // and this runs whenever the connector next sweeps, long after. So the ledger has to say the
-  // attempt is not already in it. Refusing here leaves the row FAILED and visible, which is the
-  // same end state as before this check existed; posting twice is not.
+  // TWO REFUSALS GUARD THE AUTOMATIC REVIVAL, AND THEY ARE NOT THE SAME QUESTION (o3d-e2mz + o3d-0m56).
+  //
+  //   o3d-e2mz asks CAN THIS WRITE BE TIED TO AN ATTEMPT. A revival is a write to an attempt, and the
+  //   compare-and-swap below used to key on `(id, status: 'FAILED')` — the ABA the manual retry was
+  //   already fenced against. Status is not an identity: a row leaves FAILED and comes back every
+  //   time it is retried, so between the read above and the write it can be revived, claimed, posted
+  //   or failed and land back on FAILED as a DIFFERENT attempt, which the status CAS matches. It
+  //   would reset that attempt's outcome and overwrite its `payload`, where the pinned idempotency
+  //   token lives, sending the row out under a token chosen for the attempt we read rather than the
+  //   one that ran. A candidate at revision 0 carries no attempt to name, so it is REFUSED rather
+  //   than revived unfenced — the same rule the operator path applies, and the same one that keeps
+  //   revision 0 from being forged into 1.
+  //
+  //   o3d-0m56 asks MAY THIS BE RE-POSTED AT ALL. Reviving a money row under a PINNED token only
+  //   protects while Xero still remembers that token — minutes — and this runs whenever the
+  //   connector next sweeps, long after. So the ledger has to say the attempt is not already in it.
+  //
+  // Neither implies the other: a perfectly fenced attempt can still be one the ledger already holds,
+  // and a clear ledger says nothing about which attempt this write will land on. Both refusals leave
+  // the row FAILED and visible, which is the state it was already in; posting twice is not.
+  //
+  // ORDER IS DELIBERATE. The attempt fence is a local field comparison; the ledger check is a network
+  // read. Asking the cheap question first means a row that cannot be fenced never costs an API call.
+  const reuseAttempt: AttemptRef | null = plan.action === 'reuse'
+    ? { id: plan.syncLogId, attemptRevision: failedAttemptRevisions.get(plan.syncLogId) ?? UNCLAIMED_ATTEMPT_REVISION }
+    : null
+  if (reuseAttempt && reuseAttempt.attemptRevision === UNCLAIMED_ATTEMPT_REVISION) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_followup_enqueue_refused',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: the FAILED row it would `
+        + `revive (${reuseAttempt.id}) carries no attempt revision, so the revival cannot be tied to the attempt it `
+        + 'was planned against and could land on a later one. Retry the row from the sync log once it has been '
+        + 'claimed under the attempt fence.',
+      metadata: {
+        type,
+        referenceType,
+        referenceId,
+        syncLogId: reuseAttempt.id,
+        reason: 'unfenced_reuse_target',
+        failedRowIds: failedRows.map((row) => row.id),
+      },
+    })
+    return
+  }
+
   const evidence = await ledgerClearsFollowUpRevival({
     connector: XERO_CONNECTOR,
     type,
@@ -365,7 +1141,13 @@ async function enqueueFollowUpSyncLog(
       description: `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: `
         + `${evidence.reason}. Re-posting it could duplicate a payment; check the ledger and resolve `
         + 'the row by hand.',
-      metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
+      metadata: {
+        type,
+        referenceType,
+        referenceId,
+        reason: 'ledger_not_clear',
+        failedRowIds: failedRows.map((row) => row.id),
+      },
     })
     return
   }
@@ -376,17 +1158,20 @@ async function enqueueFollowUpSyncLog(
       // document (o3d-0m56). Money-moving types only; everything else pays nothing.
       await lockFollowUpScope(tx, { connector: XERO_CONNECTOR, type, referenceType, referenceId })
       if (plan.action === 'reuse') {
-        // Fenced on status: if another run revived the same row first — or retention
-        // deleted it between the read and here (o3d-nepa) — this updates nothing rather
-        // than resetting a claim it does not own.
+        if (!reuseAttempt) throw new Error(`Xero follow-up revival for ${plan.syncLogId} reached its write with no attempt to fence on`)
+        // Fenced on the ATTEMPT, not on the status: if another run revived the same row first, a
+        // worker claimed it, or retention deleted it between the read and here (o3d-nepa), this
+        // updates nothing rather than resetting an attempt it does not own. The bump is what stops
+        // the previous attempt's holder writing back over the revival.
         const revived = await tx.accountingSyncLog.updateMany({
-          where: { id: plan.syncLogId, status: 'FAILED' },
+          where: { id: reuseAttempt.id, status: 'FAILED', attemptRevision: reuseAttempt.attemptRevision },
           data: {
             status: 'PENDING',
             payload: plan.payload as never,
             retryCount: 0,
             errorMessage: null,
             processingStartedAt: null,
+            attemptRevision: nextAttemptRevision(reuseAttempt.attemptRevision),
           },
         })
         if (revived.count === 0) return 'cas-lost' as const
@@ -430,7 +1215,13 @@ async function enqueueFollowUpSyncLog(
         // plan.payload carries the PINNED token, and withFollowUpIdempotencyKey never
           // overwrites one — so a row created by the re-plan posts under the same remote
           // key as the row that vanished. That is what makes losing the row survivable.
-          retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
+          // The plan's payload already holds the origin this enqueue resolved (carried from the row
+          // it reuses, or inherited on a create), so the re-plan inherits from itself rather than
+          // asking again — asking again is what "look it up" would reintroduce.
+          retry: () => enqueueFollowUpSyncLog(
+            type, referenceType, referenceId, plan.payload,
+            { from: 'postedRow', payload: plan.payload }, attempt + 1,
+          ),
       })
       return
     }
@@ -451,7 +1242,10 @@ async function enqueueFollowUpSyncLog(
         payload: plan.payload,
         syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
         attempt,
-        retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
+        retry: () => enqueueFollowUpSyncLog(
+          type, referenceType, referenceId, plan.payload,
+          { from: 'postedRow', payload: plan.payload }, attempt + 1,
+        ),
       })
       return
     }
@@ -468,6 +1262,36 @@ function syncLogNextAttemptAt(log: { status: string; processingStartedAt: Date |
 
 function invoicePaymentReferenceKey(entry: Pick<InvoicePaymentOrderingEntry, 'referenceType' | 'referenceId'>): string {
   return `${entry.referenceType}\u0000${entry.referenceId}`
+}
+
+/**
+ * A TOTAL order over the live INVOICE_PAYMENT rows of one reference (Codex round 3 #2).
+ *
+ * `createdAt` ALONE IS NOT AN ORDER. `default(now())` is transaction-clock, so two rows inserted in
+ * the same transaction — or in two transactions that committed inside the same clock tick — carry the
+ * IDENTICAL timestamp. Under a strict `<` comparison neither of them is "after" the other, so NEITHER
+ * is deferred, and both run.
+ *
+ * That is not a cosmetic tie. The whole reason the post-time capacity guard may treat PENDING and
+ * PROCESSING siblings as consuming no capacity is that this function lets exactly ONE live entry per
+ * order be undeferred at a time — the later ones re-run the arithmetic against the earlier one's
+ * SYNCED row when their turn comes. Two same-timestamp receipts defeat that serialisation, both read
+ * a table in which neither has posted yet, and both post: the order is settled twice.
+ *
+ * So the order is made total by falling back to the row id, which is unique by construction. The
+ * TIE-BREAK VALUE DOES NOT MATTER — only that every runner computing this set independently picks the
+ * SAME winner. `id` is stable and identical in every process, where `createdAt` is not discriminating.
+ * (`[{ createdAt: 'asc' }, { id: 'asc' }]` is the same tie-break the tree already uses for stable
+ * pagination, e.g. pending-shipment-reconciliation.ts and outbox-admin.ts.)
+ */
+export function invoicePaymentLogPrecedes(
+  a: { id: string; createdAt: Date },
+  b: { id: string; createdAt: Date },
+): boolean {
+  const at = a.createdAt.getTime()
+  const bt = b.createdAt.getTime()
+  if (at !== bt) return at < bt
+  return a.id < b.id
 }
 
 export async function findInvoicePaymentsBlockedByEarlierLiveLogs(
@@ -490,39 +1314,329 @@ export async function findInvoicePaymentsBlockedByEarlierLiveLogs(
       status: { in: ['PENDING', 'PROCESSING'] },
       OR: referenceFilters,
     },
-    select: { id: true, referenceType: true, referenceId: true, createdAt: true },
-    orderBy: { createdAt: 'asc' },
+    // `status` is selected because this pre-filter now asks decideInvoicePaymentClaim the question
+    // rather than re-deriving a second, narrower rule of its own (round 5 #1).
+    select: { id: true, referenceType: true, referenceId: true, status: true, createdAt: true },
+    // Tie-broken by id so the database's own ordering agrees with invoicePaymentLogPrecedes below.
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
   })
 
-  const earliestLiveByReference = new Map<string, { id: string; createdAt: Date }>()
+  // ONE RULE, ASKED TWICE (round 5 #1). Both runners consult this set AFTER taking the locked claim
+  // and defer the entry if it is a member — so a verdict here that the locked claim does not share is
+  // not a cheap pre-filter, it is a second, contradictory decider that hands the claim straight back.
+  //
+  // Round 4's local rule was "is any live row for this reference earlier than me?", which says YES for
+  // the stale PROCESSING holder that the claim had just admitted: claimed, then immediately deferred,
+  // every minute, for ever. That is the same deadlock as decideInvoicePaymentClaim's, reached through
+  // the pre-filter instead. Delegating removes the possibility of the two disagreeing at all.
+  const liveByReference = new Map<string, LiveInvoicePaymentEntry[]>()
   for (const log of liveLogs) {
     const key = invoicePaymentReferenceKey(log)
-    if (!earliestLiveByReference.has(key)) {
-      earliestLiveByReference.set(key, log)
-    }
+    const bucket = liveByReference.get(key)
+    if (bucket) bucket.push(log)
+    else liveByReference.set(key, [log])
   }
 
   const blocked = new Set<string>()
   for (const entry of paymentEntries) {
-    const earliest = earliestLiveByReference.get(invoicePaymentReferenceKey(entry))
-    if (earliest && earliest.id !== entry.id && earliest.createdAt < entry.createdAt) {
+    const live = liveByReference.get(invoicePaymentReferenceKey(entry)) ?? []
+    if (!decideInvoicePaymentClaim({ entryId: entry.id, live }).claim) {
       blocked.add(entry.id)
     }
   }
   return blocked
 }
 
-async function deferPaymentUntilEarlierLogsPost(entry: { id: string }): Promise<void> {
-  await db.accountingSyncLog.update({
-    where: { id: entry.id },
+/**
+ * THE ELECTION IS NOT A SERIALISATION (Codex round 4 #3).
+ *
+ * `findInvoicePaymentsBlockedByEarlierLiveLogs` makes every runner that sees THE SAME ROWS elect the
+ * same winner. Round 3 proved that property and then used it as though it were mutual exclusion. It
+ * is not, and the gap is not the tie-break:
+ *
+ *   Both runners compute the blocked set ONCE, before their claim loop, from their OWN snapshot of
+ *   the table. `processPendingXeroSyncDirect` reads at t1; the outbox worker reads at t2. A row that
+ *   commits between them is in one snapshot and not the other:
+ *
+ *     t1  direct runner reads live rows for order O and sees only X. X is the minimum, so X runs.
+ *     t1' a second receipt Y commits for order O, with an EARLIER createdAt (a deferred re-drive
+ *         restoring an older row's timestamp, or simply two receipts recorded seconds apart under
+ *         clock skew between the app instances).
+ *     t2  outbox worker reads and sees {X, Y}. The minimum is Y — not X — so Y runs.
+ *
+ *   Two runners, one total order, no tie anywhere, and both entries post. The post-time capacity
+ *   guard cannot catch it either: it counts SYNCED rows, and at the moment both read the table
+ *   neither sibling has posted yet. That guard's own header states the assumption plainly — "only the
+ *   EARLIEST live INVOICE_PAYMENT for an order is ever un-deferred, so a sibling cannot be posting
+ *   alongside us" — and that is precisely what an unsynchronised election does not deliver.
+ *
+ * WHAT ACTUALLY EXCLUDES. A rule of the form "am I the smallest?" can always be invalidated by a row
+ * arriving later with a smaller key, so no amount of agreement about ORDER produces exclusion. What
+ * does is a rule that only ever looks BACKWARD: another entry for this reference is already claimed,
+ * therefore I may not be. That is monotone — a newly-committed row cannot un-claim an existing claim.
+ *
+ * So the ordering keeps its job (which PENDING entry goes next, and it is still total so both runners
+ * pick the same one) and a second, decisive test is added: nothing else for this reference may be
+ * PROCESSING. Both are evaluated INSIDE the transaction that takes the claim, under the sales order's
+ * row lock — the same lock o3d-3zgy already makes order-scoped accounting writes take — so two
+ * runners cannot interleave their read and their write at all.
+ *
+ * STALENESS IS NOT AN EXEMPTION. A PROCESSING sibling whose claim went stale fifteen minutes ago is
+ * still a request nothing local can recall; that is the settled reading everywhere else in this tree
+ * (IN_FLIGHT_BILL_PAYMENT_STATUSES, the round-2 supersession rule). Blocking on it costs a 60-second
+ * deferral, because a stale row is itself re-claimable and will be driven to SYNCED or FAILED by
+ * whichever runner takes it — at which point this entry proceeds and the capacity guard judges it on
+ * what that row ended up saying.
+ *
+ * AND THAT LAST SENTENCE WAS NOT TRUE AS ROUND 4 WROTE IT (Codex round 5 #1). The stale row is only
+ * re-claimable if the rules let it claim, and they did not:
+ *
+ *     S  PROCESSING, claimed fifteen minutes ago, createdAt 09:00:05
+ *     P  PENDING, createdAt 09:00:00
+ *
+ *   P asks to claim: S is PROCESSING, so ANOTHER_ENTRY_IS_POSTING — defer 60s.
+ *   S asks to re-claim: P is PENDING and precedes it, so AN_EARLIER_ENTRY_IS_WAITING — defer 60s.
+ *
+ * Each defers to the other, for ever, and the order's payment never posts. The exclusion rule and the
+ * ordering rule formed a cycle: exclusion points forward in status, ordering points backward in time,
+ * and with the two rows disagreeing on those two axes there is no member of the live set that either
+ * rule admits.
+ *
+ * THE CUT IS AT THE ORDERING RULE, NEVER AT THE EXCLUSION. Ordering exists to pick which UNCLAIMED
+ * entry goes next; a row that is ITSELF PROCESSING is not queueing for the slot, it already holds it.
+ * Applying a queue-position rule to the holder is what closed the cycle. So the holder skips the
+ * ordering test — and only that test: it still has to pass the exclusion, so it can never run
+ * alongside a different in-flight post. Nothing forward-looking is reintroduced.
+ *
+ * WHY THIS TERMINATES, as a property of the live set L for one reference rather than a hope:
+ *   • If some row of L is PROCESSING, it is the ONLY one (exclusion + the order row lock admit no
+ *     second claim), every other row is deferred by exclusion, and the holder is admitted by the
+ *     exemption above. Whoever takes it drives it to SYNCED/FAILED/CANCELLED and it leaves L.
+ *   • If no row of L is PROCESSING, the minimum under the total order has no PROCESSING sibling and
+ *     no earlier sibling, so it is admitted.
+ * L is therefore never fully blocked, and every admission ends with a row leaving L. |L| strictly
+ * decreases, which is the termination argument round 4 asserted and did not have.
+ *
+ * The exemption costs nothing in safety: `accountingSyncLogClaimWhere` is still the fence that decides
+ * whether a PROCESSING row may actually be re-taken, and it requires the claim to be older than the
+ * stale cutoff. A live worker's own row is admitted by this function and then refused by that where
+ * clause. This function decides QUEUE POSITION; the where clause decides WHO OWNS THE ROW.
+ */
+export type LiveInvoicePaymentEntry = { id: string; status: string; createdAt: Date }
+
+export type InvoicePaymentClaimDecision =
+  | { claim: true }
+  /** Another entry for this reference holds the post slot. Nothing may be sent alongside it. */
+  | { claim: false; reason: 'ANOTHER_ENTRY_IS_POSTING'; blockedBy: string }
+  /** An earlier live entry for this reference has not gone yet. Ordering, not exclusion. */
+  | { claim: false; reason: 'AN_EARLIER_ENTRY_IS_WAITING'; blockedBy: string }
+
+/**
+ * Pure. `live` is every PENDING/PROCESSING INVOICE_PAYMENT row for this entry's reference, INCLUDING
+ * the entry itself when it is still live (a stale re-claim reads its own row back as PROCESSING —
+ * self is never a blocker, or nothing could ever be retried).
+ */
+export function decideInvoicePaymentClaim(input: {
+  entryId: string
+  live: LiveInvoicePaymentEntry[]
+}): InvoicePaymentClaimDecision {
+  const others = input.live.filter((row) => row.id !== input.entryId)
+  const self = input.live.find((row) => row.id === input.entryId)
+
+  // BACKWARD-LOOKING, and therefore the only test here that excludes. Ordered by the same total order
+  // so the id reported is stable rather than whichever row the database happened to return first.
+  const posting = others
+    .filter((row) => row.status === 'PROCESSING')
+    .sort((a, b) => (invoicePaymentLogPrecedes(a, b) ? -1 : 1))[0]
+  if (posting) return { claim: false, reason: 'ANOTHER_ENTRY_IS_POSTING', blockedBy: posting.id }
+
+  // THE HOLDER OF THE SLOT IS NOT QUEUEING FOR IT (round 5 #1). Reached only when nothing ELSE is
+  // posting, so this row is the single live claim for the reference. Deferring it behind an earlier
+  // PENDING row — which is itself deferred by the exclusion above, because THIS row is the thing
+  // posting — is the deadlock: the two rules point in opposite directions and neither admits anybody.
+  // Ordering decides which unclaimed entry goes next; it has no opinion about the entry that already
+  // went. Whether this row may actually be RE-taken is `accountingSyncLogClaimWhere`'s question, and
+  // it still answers "only if the claim is stale".
+  if (self?.status === 'PROCESSING') return { claim: true }
+
+  if (!self) return { claim: true }
+  const earlier = others
+    .filter((row) => invoicePaymentLogPrecedes(row, self))
+    .sort((a, b) => (invoicePaymentLogPrecedes(a, b) ? -1 : 1))[0]
+  if (earlier) return { claim: false, reason: 'AN_EARLIER_ENTRY_IS_WAITING', blockedBy: earlier.id }
+  return { claim: true }
+}
+
+export type SyncLogClaimResult =
+  | { outcome: 'claimed' }
+  /** The row was not claimable (already taken, retired, posted, or out of retries). */
+  | { outcome: 'not-claimable' }
+  /** Another INVOICE_PAYMENT for the same reference owns the slot, or precedes this one. */
+  | { outcome: 'deferred'; reason: 'ANOTHER_ENTRY_IS_POSTING' | 'AN_EARLIER_ENTRY_IS_WAITING'; blockedBy: string }
+
+/**
+ * Take the claim. For an order-scoped INVOICE_PAYMENT this happens under the order row lock together
+ * with the exclusion test, so the read that authorises the claim and the claim itself cannot be
+ * interleaved by another runner. Everything else claims exactly as before — the lock buys nothing for
+ * a type that is not competing for a single per-reference post slot, and taking it would put an
+ * unnecessary order lock in front of every journal and invoice push.
+ */
+async function claimAccountingSyncLog(
+  entry: { id: string; type: string; referenceType: string; referenceId: string; attemptRevision: number },
+  claimedAt: Date,
+  staleClaimCutoff: Date,
+  /**
+   * o3d-e2mz: the attempt this claim MINTS, taken from the revision the caller read.
+   *
+   * It is stamped by the claim statement itself and the claim swaps on the observed revision, so the
+   * claim is the compare-and-swap that creates the identity: two workers reading the same row can
+   * never both believe they hold it, and the winner holds a value nothing else can name. Passed in
+   * rather than derived here so the caller and every write below fence on ONE object.
+   */
+  attempt: AttemptRef,
+): Promise<SyncLogClaimResult> {
+  const claimData = {
+    status: 'PROCESSING' as const,
+    attemptRevision: attempt.attemptRevision,
+    // o3d-0m56 r10: the claim and attempt-stamping CUSTODY move together, ALWAYS, and they do it
+    // here — in the one object both claim statements below share — rather than at each call site.
+    // A claim is what precedes a post, so the database's forfeit trigger reads a claim that does not
+    // re-assert custody as one made by a binary that does not stamp and takes custody away. Losing it
+    // is silent and permanent for that row: its unset `remoteAttemptedAt` can never again be read as
+    // proof no remote call left it, so the planner will never recycle it. `stampingCustodyOnClaim`
+    // emits `processingStartedAt` and `attemptStampingCustodyAt` from ONE instant, which is the
+    // pairing the trigger checks — spelling either out separately would break it.
+    ...stampingCustodyOnClaim(claimedAt),
+  }
+
+  if (entry.type !== 'INVOICE_PAYMENT' || entry.referenceType !== 'SalesOrder') {
+    const claim = await db.accountingSyncLog.updateMany({
+      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision),
+      data: claimData,
+    })
+    return claim.count === 0 ? { outcome: 'not-claimable' } : { outcome: 'claimed' }
+  }
+
+  return db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, entry.referenceId)
+    const live = await tx.accountingSyncLog.findMany({
+      where: {
+        connector: XERO_CONNECTOR,
+        type: 'INVOICE_PAYMENT',
+        referenceType: entry.referenceType,
+        referenceId: entry.referenceId,
+        status: { in: ['PENDING', 'PROCESSING'] },
+      },
+      select: { id: true, status: true, createdAt: true },
+    })
+    const decision = decideInvoicePaymentClaim({ entryId: entry.id, live })
+    if (!decision.claim) {
+      return { outcome: 'deferred', reason: decision.reason, blockedBy: decision.blockedBy }
+    }
+    const claim = await tx.accountingSyncLog.updateMany({
+      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision),
+      data: claimData,
+    })
+    return claim.count === 0 ? { outcome: 'not-claimable' } : { outcome: 'claimed' }
+  })
+}
+
+/**
+ * How long an ordering deferral holds the row before it may be claimed again.
+ *
+ * One constant, and one message per deferral reason, consumed by BOTH runners — the outbox runner
+ * also puts the reason on its job, and two spellings of the same deferral would read as two different
+ * conditions on the exceptions page (o3d-550x, Codex r1).
+ */
+const ORDERING_DEFERRAL_MS = 60_000
+const PAYMENT_ORDERING_DEFERRAL_MESSAGE = 'Deferred until older invoice payment sync logs post'
+const UPDATE_ORDERING_DEFERRAL_MESSAGE = 'Deferred until the invoice CREATE for this document posts'
+
+/** Which of the two exclusion tests declined, and the entry that stands in the way. */
+export type InvoicePaymentDeferralDetail = {
+  reason: 'ANOTHER_ENTRY_IS_POSTING' | 'AN_EARLIER_ENTRY_IS_WAITING'
+  blockedBy: string
+}
+
+/**
+ * What the row's errorMessage says while it waits, in terms an operator reading the queue can act on.
+ *
+ * Still ONE spelling per condition and still shared by both runners (o3d-550x): the no-detail answer
+ * is `PAYMENT_ORDERING_DEFERRAL_MESSAGE` itself, so the pre-filter deferral reads exactly as it did.
+ * The two detailed forms are not a second spelling of that condition — they are the two conditions
+ * the locked claim can distinguish and the snapshot pre-filter cannot, and each names the entry to
+ * go and look at.
+ */
+export function invoicePaymentDeferralMessage(detail?: InvoicePaymentDeferralDetail): string {
+  if (detail?.reason === 'ANOTHER_ENTRY_IS_POSTING') {
+    return `Deferred: invoice payment sync log ${detail.blockedBy} for the same order is being sent now`
+  }
+  if (detail?.reason === 'AN_EARLIER_ENTRY_IS_WAITING') {
+    return `Deferred until earlier invoice payment sync log ${detail.blockedBy} posts`
+  }
+  return PAYMENT_ORDERING_DEFERRAL_MESSAGE
+}
+
+/**
+ * o3d-550x: the caller holds the claim, so this gives it back through the one fenced release.
+ * o3d-e2mz: and through the attempt it claimed — a deferral is still a write ABOUT one attempt, and
+ * unfenced on the revision it can hand back a row an operator has decided about.
+ */
+export async function deferPaymentUntilEarlierLogsPost(
+  client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  entry: { id: string },
+  held: HeldClaim,
+  detail?: InvoicePaymentDeferralDetail,
+  attempt?: AttemptRef,
+): Promise<boolean> {
+  return releaseClaimForRetry(client, entry.id, held, {
+    errorMessage: invoicePaymentDeferralMessage(detail),
+    nextAttemptAt: new Date(Date.now() + ORDERING_DEFERRAL_MS),
+  }, attempt)
+}
+
+/**
+ * THE OTHER WAY TO GET HERE, AND IT IS NOT A RELEASE (o3d-a3wx round 4 #3, merged with o3d-550x).
+ *
+ * The locked claim can DECLINE, and then this entry was never claimed at all. There is no claim to
+ * give back, so this deliberately does not go through `releaseClaimForRetry` and is not a second copy
+ * of it: that function's whole job is to return a row this worker owns to PENDING under
+ * `heldClaimWhere`, and here we own nothing.
+ *
+ * WHAT IT MUST NOT DO IS WRITE THE STATUS. An unconditional `status: 'PENDING'` would stamp over a
+ * claim another runner took in the meantime — un-claiming a request that may already be on the wire,
+ * which is the exact failure `heldClaimWhere` exists to prevent, reached from the opposite direction.
+ * So the where-clause pins the row to PENDING (if it is not PENDING, somebody else owns it and this
+ * must be a no-op) and only the next-attempt gate and the message move.
+ */
+export async function deferUnclaimedPaymentUntilEarlierLogsPost(
+  client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  entry: { id: string },
+  detail?: InvoicePaymentDeferralDetail,
+): Promise<boolean> {
+  // A future `processingStartedAt` on a PENDING row is the existing retry gate: it is read as
+  // "earliest next claim time", not as a claim.
+  const deferred = await client.accountingSyncLog.updateMany({
+    where: { id: entry.id, status: 'PENDING' },
     data: {
-      status: 'PENDING',
-      // Future processingStartedAt is the existing retry gate for PENDING sync
-      // rows. Treat future values on PENDING rows as "earliest next claim time".
-      ...stampingCustodyOnClaim(new Date(Date.now() + 60_000)),
-      errorMessage: 'Deferred until older invoice payment sync logs post',
+      // NO `status` KEY, and that is the whole point — see the header above. This row was never
+      // claimed, so writing the queued status here would stamp over a claim another runner took in
+      // the meantime, un-claiming a request that may already be on the wire. (Spelt that way
+      // deliberately: the structural test in xero-sync-processor.test.ts scans this call's argument
+      // text for a queued-status write, and a comment quoting one reads as the defect itself.)
+      //
+      // BUT THE CUSTODY STAMP IS STILL REQUIRED, and the two rules are not in tension. The forfeit
+      // trigger fires on ANY update that moves `processingStartedAt` to a new non-null value — it
+      // does not also require the status to change — so this write would silently drop
+      // `attemptStampingCustodyAt` and make the row permanently un-recyclable, however careful it is
+      // about ownership. `stampingCustodyOnClaim` re-asserts it and sets NO status, so it satisfies
+      // both fences at once. Custody is a claim about the BINARY that touched the row, not about who
+      // owns it, and a stamping binary is exactly what is touching it here.
+      ...stampingCustodyOnClaim(new Date(Date.now() + ORDERING_DEFERRAL_MS)),
+      errorMessage: invoicePaymentDeferralMessage(detail),
     },
   })
+  return deferred.count > 0
 }
 
 // audit-H5: an *_INVOICE_UPDATE must not post before the invoice's CREATE. The
@@ -590,15 +1704,20 @@ export async function findInvoiceUpdatesBlockedByPendingCreate(
   return blocked
 }
 
-async function deferUpdateUntilCreatePosts(entry: { id: string }): Promise<void> {
-  await db.accountingSyncLog.update({
-    where: { id: entry.id },
-    data: {
-      status: 'PENDING',
-      ...stampingCustodyOnClaim(new Date(Date.now() + 60_000)),
-      errorMessage: 'Deferred until the invoice CREATE for this document posts',
-    },
-  })
+/**
+ * o3d-550x: fenced on the claim this worker holds, through the one release, like every other.
+ * o3d-e2mz: and on the attempt that claim minted, for the reason on the payment deferral above.
+ */
+export async function deferUpdateUntilCreatePosts(
+  client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  entry: { id: string },
+  held: HeldClaim,
+  attempt?: AttemptRef,
+): Promise<boolean> {
+  return releaseClaimForRetry(client, entry.id, held, {
+    errorMessage: UPDATE_ORDERING_DEFERRAL_MESSAGE,
+    nextAttemptAt: new Date(Date.now() + ORDERING_DEFERRAL_MS),
+  }, attempt)
 }
 
 async function ensureXeroOutboxForPendingSyncLogs(limit: number, staleClaimCutoff: Date): Promise<void> {
@@ -635,8 +1754,15 @@ async function ensureXeroOutboxForPendingSyncLogs(limit: number, staleClaimCutof
   }
 }
 
-function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date) {
-  return {
+/**
+ * o3d-e2mz: the claim is itself a compare-and-swap on `attemptRevision`. Reading a row and then
+ * claiming it on status alone lets two workers that read the same row both believe they hold it —
+ * and lets a claim land on a row an operator has decided about since the read. Pairing this where
+ * with `attemptRevision: nextAttemptRevision(observed)` in the data makes exactly one of them win
+ * and gives the winner a value nothing else can hold.
+ */
+function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date, observedAttemptRevision: number) {
+  return claimAttemptWhere({
     id,
     connector: XERO_CONNECTOR,
     retryCount: { lt: MAX_RETRIES },
@@ -653,6 +1779,474 @@ function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date) {
         processingStartedAt: { lt: staleClaimCutoff },
       },
     ],
+  }, observedAttemptRevision)
+}
+
+
+/**
+ * RECORD A DOCUMENT XERO HAS ALREADY ACCEPTED (o3d-xl63 r2 #2, r3 #1-#3).
+ *
+ * Both processors reach the same point: `POST /Invoices` (or /Payments, /ManualJournals ...) has
+ * returned an id, and the ONLY thing standing between that id and a duplicate on the next run is this
+ * local write. Three properties, none of which the round-2 shape had:
+ *
+ *  1. IT IS RE-DRIVEN ACROSS A FAILURE TO START, using the transaction options that put the wait back
+ *     under the pool's bound rather than Prisma's 2-second default (`POST_REMOTE_PERSIST_TX_OPTIONS`).
+ *
+ *  2. ITS DEADLINE IS THE CLAIM'S, NOT A CHOSEN NUMBER. `claim` is this row's actual claim —
+ *     `processingStartedAt` and the cutoff another worker measures staleness against — so
+ *     `persistAfterRemoteWrite` derives a deadline that always ends before this worker could be
+ *     overtaken. That matters because the Xero post in front of it can itself burn minutes on
+ *     rate-limit waits: a fixed two minutes measured from HERE could have run straight through the
+ *     moment the claim lapsed, which is the double-post this is all for.
+ *
+ *  3. WHEN IT GIVES UP, THE EVIDENCE IS NOT WRITTEN THROUGH THE POOL THAT JUST REFUSED IT. Returning
+ *     false used to drop the caller into the generic failure handler, whose first act is another
+ *     `db.$transaction` — a connection from the pool that has spent the whole deadline handing none
+ *     out. The record of what went unrecorded therefore could not be written in exactly the case it
+ *     existed for. Now the id goes to fd 2 first (`reportUnrecordedRemoteWrite`), with no precondition
+ *     beyond this process still holding it, and only then is a database record ATTEMPTED — as a single
+ *     statement rather than an interactive transaction, because that path waits the full pool bound
+ *     instead of being cut off after 2s, and because one statement needs a connection for an instant
+ *     rather than for a transaction.
+ *
+ * Returns true when the row was recorded normally. On false the caller must NOT touch the database for
+ * this row: the pool is exhausted, and everything worth saying has already been said by the reporter.
+ */
+/**
+ * RE-TAKE THE CLAIM AT THE INSTANT THE REMOTE WRITE BEGINS (o3d-xl63 round 4, finding 1).
+ *
+ * Round 3 anchored the persist's deadline to the row's claim, which stops the persist outliving this
+ * worker's exclusivity. It says nothing about the OTHER end: the claim can be gone before the post
+ * even starts.
+ *
+ * The claim is taken, and then `processEntry` runs — and `processEntry` is not a POST. It reads the
+ * granted scopes, resolves (or creates) the Xero contact, looks items up, and every one of those calls
+ * goes through the same rate-limited client: `api.ts` records the worst case between the first HTTP
+ * call and the last as three 90-second Retry-After sleeps plus three 60-second minute-limit waits.
+ * Several such calls in front of the document post, and fifteen minutes of claim is spent BEFORE
+ * anything is posted. Meanwhile the next sweep tick measures staleness, finds this row past the
+ * cutoff, re-claims it and posts the document. Then this worker's post lands too: two documents in the
+ * ledger, and the persist that follows — deadline 0 — cannot even record which one we made.
+ *
+ * A check would only tell us we had lost. Re-taking tells us AND fixes the runway: the update is
+ * fenced on the exact `processingStartedAt` this worker wrote, so
+ *
+ *  • one row matched  -> the claim was still ours, and it now runs from HERE, giving the post and the
+ *                        persist that follows it the full claim rather than whatever was left;
+ *  • no row matched   -> someone else owns it. NOTHING IS POSTED. That is the whole point: the cheapest
+ *                        possible outcome for a lost claim is to have sent nothing.
+ *
+ * The renewed timestamp becomes the claim anchor for everything downstream — the cancelled-order
+ * guards inside `processEntry`, the persist deadline, and the claim-fenced terminal write on the
+ * give-up path — so all of them fence on the claim this worker actually holds.
+ */
+// Exported for tests/accounting/xero-claim-before-remote-write.test.ts: "we did not post" is the
+// outcome under test, and it is only observable at this seam.
+export async function renewClaimForRemoteWrite(entryId: string, held: HeldClaim): Promise<Date | null> {
+  const renewedAt = new Date()
+  const renewed = await db.accountingSyncLog.updateMany({
+    // The shared claim-identity fence (see heldClaimWhere), narrowed to this connector. `held` is
+    // asked for its instant HERE, as the statement is built — so a renewal that has happened since
+    // the caller obtained the claim is the instant this re-take fences on (o3d-xl63 r6).
+    where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR },
+    data: { processingStartedAt: renewedAt },
+  })
+  return renewed.count === 1 ? renewedAt : null
+}
+
+/**
+ * What to say when a claim was lost before anything was sent. Nothing is wrong with the row — it is
+ * being worked on by somebody else — so this is a re-drive, not a failure.
+ */
+function lostClaimMessage(entryId: string, operation?: string): string {
+  return `Xero sync log ${entryId} was not posted: this worker's claim on it had been taken by another `
+    + `worker before the remote write${operation ? ` (${operation})` : ''} began, so posting would have `
+    + `created a second document. The row belongs to whoever holds it now.`
+}
+
+/**
+ * ONE ABSOLUTE LEASE OVER THE WHOLE ENTRY, AND A FENCE AT EVERY REMOTE MUTATION (o3d-xl63 r5 #1).
+ *
+ * Round 4 re-took the claim at the instant the remote write began and flagged, in its own commit
+ * message, what that did NOT close: `processEntry` is not one call. Preparing an invoice loops over
+ * every distinct item; a credit-note allocation does two reads and then a write; several types read
+ * the chart of accounts first. Every one of those goes through the same rate-limited client, whose
+ * in-request budget is six minutes PER CALL. The re-take happened once, in front of all of it — so
+ * with enough sequential preparation calls the claim it took could be gone again by the time the
+ * document itself was sent, which is the very state the re-take existed to prevent.
+ *
+ * Two bounds, and they answer different questions:
+ *
+ *  • THE FENCE answers "is this row still mine, right now?" It re-takes the claim immediately before
+ *    each remote mutation — not once per entry — so the exclusivity is proven at the instant it is
+ *    relied on rather than minutes earlier. Renewing rather than merely checking also means a long
+ *    but legitimate entry stops LOOKING stale to the next sweep tick, which is what invited the
+ *    second worker in.
+ *
+ *  • THE ABSOLUTE DEADLINE answers "has this entry had long enough?" It is fixed when the lease opens
+ *    and NEVER moves, however many times the claim is renewed. Without it the renewals are a
+ *    perpetual motion machine: a row wedged behind a rate limit could hold its claim for ever and
+ *    never post. Preparation calls are inside it, which is the whole point — round 4's window began
+ *    at the post; this one begins where the work does.
+ *
+ * A refusal from either is the SAME outcome, and it is the good one: nothing has been sent, so there
+ * is nothing to be duplicated, no id to lose, and no persist to fence. The row is handed back.
+ */
+export const XERO_ENTRY_LEASE_MS = CLAIM_STALE_MS
+
+export type RemoteWriteFence = { ok: true } | { ok: false; result: EntryResult }
+
+export type RemoteWriteLease = HeldClaim & {
+  entryId: string
+  /**
+   * The claim this worker holds RIGHT NOW. Moves forward on every successful fence.
+   *
+   * This accessor is the whole of the {@link HeldClaim} contract, so a lease IS a claim: it is passed
+   * to `heldClaimWhere` and to every consumer that fences, and each of them reads the instant the row
+   * currently carries rather than one snapshotted before the fences ran (o3d-xl63 r6).
+   */
+  heldFrom: () => Date
+  /** Wall-clock instant past which no further remote mutation may BEGIN. Never moves. */
+  deadlineAt: number
+  /** Re-take the claim immediately before a remote mutation, or refuse to make it. */
+  fenceBeforeRemoteWrite: (operation: string) => Promise<RemoteWriteFence>
+}
+
+/**
+ * Renew this worker's lock on the outbox job, fenced on the exact `lockedAt` it holds.
+ *
+ * The sync-row claim is not the only thing that can lapse under a long entry: the outbox job carries
+ * its own `staleLockMs` (the same fifteen minutes), and a job whose lock has gone stale is handed to
+ * another worker by `claimIntegrationOutboxWork` exactly as the row is. Fencing one and not the other
+ * would leave the second worker free to re-post from the queue side.
+ *
+ * On success `job.lockedAt` is advanced IN PLACE, because every `markXeroOutbox*` helper fences on
+ * it — a renewal that did not update the caller's copy would make the job impossible to complete.
+ */
+async function renewOutboxLockForRemoteWrite(job: IntegrationOutboxRow): Promise<boolean> {
+  if (!job.lockedAt) return false
+  const renewedAt = new Date()
+  const renewed = await db.integrationOutbox.updateMany({
+    where: {
+      id: job.id,
+      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+      lockedBy: XERO_ACCOUNTING_WORKER_ID,
+      lockedAt: job.lockedAt,
+    },
+    data: { lockedAt: renewedAt },
+  })
+  if (renewed.count !== 1) return false
+  job.lockedAt = renewedAt
+  return true
+}
+
+/**
+ * Open a lease for one entry: re-take the claim now, and fix the absolute deadline from this moment.
+ *
+ * Returns null when the claim is already gone, which is round 4's outcome unchanged — nothing is
+ * sent and the row belongs to whoever holds it.
+ */
+export async function openRemoteWriteLease(
+  entryId: string,
+  claimedAt: Date,
+  outboxJob?: IntegrationOutboxRow,
+  now: () => number = () => Date.now(),
+): Promise<RemoteWriteLease | null> {
+  // `claimedAt` really is a fixed instant at this one point — it is the claim the sweep loop stamped,
+  // and this is the statement that replaces it — so it is wrapped rather than carried further.
+  const renewed = await renewClaimForRemoteWrite(entryId, claimHeldFrom(claimedAt))
+  if (!renewed) return null
+
+  let heldFrom = renewed
+  // From here on the claim is an OBJECT, never a value: the fences below move `heldFrom`, and
+  // everything downstream must see those moves (o3d-xl63 r6).
+  const claim: HeldClaim = { heldFrom: () => heldFrom }
+  const deadlineAt = now() + XERO_ENTRY_LEASE_MS
+
+  return {
+    entryId,
+    heldFrom: () => heldFrom,
+    deadlineAt,
+    async fenceBeforeRemoteWrite(operation: string): Promise<RemoteWriteFence> {
+      // The deadline is checked BEFORE the renewal, so an entry that has run out of lease does not
+      // extend its own claim on the way to refusing. Nothing is sent either way.
+      if (now() >= deadlineAt) {
+        const message = `Xero sync log ${entryId} was not posted: this entry has held its lease for the `
+          + `full ${Math.round(XERO_ENTRY_LEASE_MS / 60_000)} minutes it is allowed — preparation calls `
+          + `included — and the remote write (${operation}) was not started. Nothing was sent, so the row `
+          + `is handed back intact and the next run gets a fresh lease.`
+        return { ok: false, result: { success: false, error: message, notPosted: { reason: 'lease-expired', operation, message } } }
+      }
+
+      // Outbox lock first: if it is gone the sync-row claim is left exactly as it was, so the two
+      // never disagree about who holds this work.
+      if (outboxJob && !(await renewOutboxLockForRemoteWrite(outboxJob))) {
+        const message = `Xero sync log ${entryId} was not posted: this worker's lock on outbox job `
+          + `${outboxJob.id} had been taken before the remote write (${operation}) began, so the queue `
+          + `may already be posting it. Nothing was sent.`
+        return { ok: false, result: { success: false, error: message, notPosted: { reason: 'claim-lost', operation, message } } }
+      }
+
+      const again = await renewClaimForRemoteWrite(entryId, claim)
+      if (!again) {
+        const message = lostClaimMessage(entryId, operation)
+        return { ok: false, result: { success: false, error: message, notPosted: { reason: 'claim-lost', operation, message } } }
+      }
+      heldFrom = again
+      return { ok: true }
+    },
+  }
+}
+
+// Exported for tests/accounting/xero-unrecorded-remote-write.test.ts: the give-up path is the one
+// that runs when the database is unreachable, so it has to be drivable without one.
+export type PostedDocumentPersistOutcome =
+  | { persisted: true }
+  /**
+   * THE POOL refused this attempt for the whole deadline (o3d-xl63 r3). The identifier has already
+   * been reported on a channel that does not need a connection, and the caller must NOT touch the
+   * database again for this row — the next thing it would do is ask the same exhausted pool.
+   */
+  | { persisted: false; reason: 'pool-exhausted' }
+  /**
+   * THE ROW ALREADY NAMES A DIFFERENT DOCUMENT (o3d-550x, merged as #639). Nothing is wrong with the
+   * pool and the conflict evidence IS durable — both identifiers are filed. This is a settled,
+   * permanent outcome, and it is deliberately distinct from the one above: retrying it would only
+   * post a second document, whereas the pool case is transient.
+   */
+  | { persisted: false; reason: 'not-recorded'; evidence: string }
+
+export async function persistPostedXeroDocument(input: {
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
+  payload: SyncPayload
+  externalId: string | null | undefined
+  /**
+   * THE CLAIM, NOT A SNAPSHOT OF IT (o3d-xl63 r6). The caller hands over the LEASE. Every statement
+   * below asks it for its instant as that statement is built, so a claim that has been renewed since
+   * this function was entered is fenced on the instant the row actually carries. A `Date` here would
+   * compile and then fail closed in silence: the fence would match nothing, the persist would report
+   * a lost claim, and a document Xero already holds would go unrecorded for a claim we never lost.
+   */
+  claim: HeldClaim
+  /**
+   * o3d-cvj9 (merged into development as o3d-batch-cvj9): the revision stamp Xero put on the document
+   * as it applied THIS write. Supplied by the call sites where a connector write actually landed; a
+   * site that called nothing omits it, and the ABSENCE — not `null` — is what the mirror's ordering
+   * rule decides such a path on.
+   */
+  externalRevisionAt?: Date | null
+}): Promise<PostedDocumentPersistOutcome> {
+  const { entry, payload, claim } = input
+  const externalId = input.externalId ?? null
+  const what = `xero sync log ${entry.id} (${entry.type})`
+
+  try {
+    // WHAT IS WRITTEN IS o3d-550x'S; WHETHER WE GET A CONNECTION TO WRITE IT IS THIS BRANCH'S.
+    //
+    // Until #639 merged, this function spelt the SYNCED transition out inline. It must not any more,
+    // and re-introducing that inline write is the silent regression this rebase had to avoid: the
+    // merged `recordPostedDocumentDurably` is not the same statement in a different place. It refuses
+    // to overwrite a row that already names a DIFFERENT document, files the conflict evidence inside
+    // the transaction that observed it, re-drives that evidence transaction on its own budget, and
+    // reports the displaced identifier rather than losing it. An inline `update({ where: { id } })`
+    // has none of those and would look identical in a green test run.
+    //
+    // So the delegation is total: this function contributes only the things o3d-550x has no opinion
+    // about — the post-remote transaction options (r3 #2), the pool re-drive, the deadline derived
+    // from this worker's own claim, and the off-pool give-up report.
+    const record = await persistAfterRemoteWrite(
+      what,
+      () => recordPostedDocumentDurably(
+        entry,
+        externalId,
+        payload,
+        input.externalRevisionAt,
+        POST_REMOTE_PERSIST_TX_OPTIONS,
+      ),
+      // o3d-xl63 r6/r7: the deadline is derived from the claim THIS worker holds, read here as the
+      // call is built rather than carried down from the top of the sweep. A renewal that moved the
+      // claim forward lengthens the window it is safe to re-drive in; a snapshot would have shortened
+      // it silently.
+      { claim: { heldFrom: claim.heldFrom(), staleAfterMs: CLAIM_STALE_MS } },
+    )
+    // Not a pool problem and not this branch's to report: a newer claim posted its own document while
+    // this attempt was on the wire, and o3d-550x has already made both identifiers durable.
+    if (!record.recorded) return { persisted: false, reason: 'not-recorded', evidence: record.evidence }
+    return { persisted: true }
+  } catch (error) {
+    // Only the pool's own give-up is handled here. Everything else — including the unwritten-evidence
+    // throw o3d-550x raises when it cannot file a conflict — is left to the runner, untouched.
+    //
+    // o3d-xl63 r5/r6 also caught `LostClaimDuringPersistError` here. Nothing raises it any more: it
+    // was thrown by the claim fence this branch put on the SETTLING write, and #639 rejected that
+    // fence for this write in as many words. See the note on it in persistPostedXeroDocument.
+    if (!(error instanceof UnrecordedRemoteWriteError)) throw error
+    await reportUnrecordedXeroWrite({ entry, externalId, claim, error })
+    return { persisted: false, reason: 'pool-exhausted' }
+  }
+}
+
+/**
+ * The claim was lost between deriving the persist's deadline and making its write (o3d-xl63 r5 #2).
+ *
+ * There is no recovery write to attempt, and that is not a gap — it is the finding. Every write this
+ * module makes to a sync row is fenced on this worker's claim, and the claim is gone; a fenced write
+ * would match nothing, and an UNFENCED one is exactly the trample the fence was added to prevent.
+ * What is left is evidence, and the id is the whole of it.
+ *
+ * fd 2 FIRST and unconditionally, before anything touches the database — the round-3 ordering, kept
+ * for the same reason: it is the only channel with no precondition beyond this process still holding
+ * the id. The activity row follows, because a log line nobody greps is not an alert; here, unlike the
+ * pool-exhaustion case, the database is not the thing that failed, so it is very likely reachable.
+ */
+async function reportLostClaimAfterXeroWrite(input: {
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
+  externalId: string | null
+  claim: HeldClaim
+  error: LostClaimDuringPersistError
+}): Promise<void> {
+  const { entry, externalId, claim, error } = input
+  // The instant the fence that just failed was built from — read from the claim, so the evidence
+  // names the claim this worker actually held rather than one it captured earlier (r6).
+  const claimedAt = claim.heldFrom()
+
+  reportUnrecordedRemoteWrite({
+    what: error.what,
+    externalId,
+    detail: {
+      connector: XERO_CONNECTOR,
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      claimedAt: claimedAt.toISOString(),
+    },
+    attempts: 1,
+    elapsedMs: 0,
+    recorded: false,
+    reason: LOST_CLAIM_DURING_PERSIST_REASON,
+  })
+
+  const description = externalId
+    ? `Xero accepted this document (${externalId}) but the record of it could NOT be written: this `
+      + `worker's claim on sync log ${entry.id} was taken by another worker before the write landed. `
+      + `The row now belongs to that worker, which may post the document a SECOND time. CHECK XERO for `
+      + `${externalId} and for a duplicate of it before doing anything to this row.`
+    : `Xero accepted a document for sync log ${entry.id} but returned no id, AND this worker's claim `
+      + `was taken before the attempt could be recorded. There is nothing that would stop a re-post. `
+      + `CHECK XERO before re-queueing this row.`
+
+  try {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_sync_claim_lost_during_persist',
+      tag: 'sync',
+      level: 'ERROR',
+      description,
+      metadata: {
+        syncLogId: entry.id,
+        type: entry.type,
+        externalId,
+        claimedAt: claimedAt.toISOString(),
+        reason: LOST_CLAIM_DURING_PERSIST_REASON,
+      },
+      resolveUser: false,
+    })
+  } catch (activityError) {
+    reportUnrecordedRemoteWrite({
+      what: error.what,
+      externalId,
+      attempts: 1,
+      elapsedMs: 0,
+      recorded: false,
+      reason: `the activity row for the lost claim could not be written either, so THIS LINE IS THE `
+        + `ONLY RECORD of ${externalId ?? 'an unidentified document'} in Xero: ${String(activityError)}`,
+    })
+  }
+}
+
+/**
+ * The give-up path: say what went unrecorded somewhere the exhausted pool cannot reach, then try the
+ * database anyway.
+ *
+ * The fallback write is deliberately the SMALLEST one that removes the duplicate hazard: record the
+ * external id and hand the row back as PENDING. The next run claims it, takes the
+ * `if (entry.externalTransactionId)` short-circuit at the top of the loop, posts NOTHING, and finishes
+ * the mirrored event and follow-ups properly. Its WHERE clause is this worker's own claim, so if the
+ * claim has since been taken the write does nothing rather than trampling another worker's row.
+ *
+ * With no external id there is nothing that would stop a re-post, so the row keeps its claim and only
+ * gains an errorMessage: re-queueing it would be the duplicate, and saying so is all we honestly can.
+ */
+async function reportUnrecordedXeroWrite(input: {
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
+  externalId: string | null
+  claim: HeldClaim
+  error: UnrecordedRemoteWriteError
+}): Promise<void> {
+  const { entry, externalId, claim, error } = input
+  const claimedAt = claim.heldFrom()
+  const base = {
+    what: `xero sync log ${entry.id} (${entry.type})`,
+    externalId,
+    detail: {
+      connector: XERO_CONNECTOR,
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      claimedAt: claimedAt.toISOString(),
+    },
+    attempts: error.attempts,
+    elapsedMs: error.elapsedMs,
+  }
+
+  // FIRST, and unconditionally: the id, on a channel with no database in it.
+  reportUnrecordedRemoteWrite({ ...base, recorded: false, reason: error.message })
+
+  const errorMessage = externalId
+    ? `Xero accepted this document (${externalId}) but the record of it could not be written for `
+      + `${error.elapsedMs}ms (${error.attempts} attempts): no database transaction could be started. `
+      + `The external id was recovered by a single-statement write; this row will finish on the next run `
+      + `WITHOUT posting again. Do not re-queue it.`
+    : `Xero accepted this document but returned no id, and the record of the attempt could not be `
+      + `written for ${error.elapsedMs}ms (${error.attempts} attempts). CHECK XERO before re-queueing: `
+      + `a re-post would create a second document.`
+
+  try {
+    const recovery = await db.accountingSyncLog.updateMany({
+      where: {
+        // Read at the point of use (r6), NOT from the value the deadline was derived from minutes
+        // ago: the re-drive above can span the whole claim, and on this branch a claim moves. A
+        // fence on the stale instant matches nothing, and `count === 0` here is indistinguishable
+        // from a genuinely lost claim — so the external id of a document Xero holds would be
+        // reported as unrecoverable while the row was still ours.
+        ...heldClaimWhere(entry.id, claim),
+        connector: XERO_CONNECTOR,
+        ...(externalId ? { externalTransactionId: null } : {}),
+      },
+      data: externalId
+        ? { externalTransactionId: externalId, status: 'PENDING', processingStartedAt: null, errorMessage }
+        : { errorMessage },
+    })
+    reportUnrecordedRemoteWrite({
+      ...base,
+      recorded: recovery.count === 1 && externalId !== null,
+      reason: recovery.count === 0
+        ? 'the fallback write matched no row: this claim was already lost, so another worker owns it'
+        : externalId
+          ? 'the external id was recorded by the single-statement fallback; the next run will not re-post'
+          : 'there is no external id to record — the row carries the warning and nothing else',
+    })
+  } catch (fallbackError) {
+    reportUnrecordedRemoteWrite({
+      ...base,
+      recorded: false,
+      reason: `the single-statement fallback write failed as well, so THIS LINE IS THE ONLY RECORD of `
+        + `${externalId ?? 'an unidentified document'} in Xero: `
+        + `${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+    })
   }
 }
 
@@ -726,13 +2320,12 @@ async function markXeroOutboxSuccess(job: IntegrationOutboxRow): Promise<void> {
 }
 
 /**
- * o3d-0m56 round 10: make a custody forfeit VISIBLE.
+ * Report an attempt-stamping custody repair, when there was one (o3d-0m56 r10).
  *
- * `repairMoneyAttemptsOutsideStampingCustody` stamps money rows that a binary outside stamping
- * custody may have posted from — rows created during a deploy window, by an overlapping second
- * instance, or by a version this one was rolled back to. Zero on every ordinary run: a non-zero
- * count is the only signal that any of those happened, and it is worth an operator seeing, because
- * each stamped row is a row whose next post now pays for a ledger read.
+ * A non-zero count means a binary that does not stamp `remoteAttemptedAt` has handled money rows on
+ * this database — a deploy window, an overlapping instance, or a rollback. Those rows are now
+ * treated as attempted, so each pays for one ledger read before it is posted again, and each is no
+ * longer recyclable. That is worth an operator's attention, hence WARNING rather than INFO.
  *
  * The repair itself is what makes the fence correct; this only reports it.
  */
@@ -748,6 +2341,253 @@ async function reportMoneyAttemptCustodyRepair(repaired: number, connector: stri
       + 'or a rollback). They are now treated as attempted, so each will be checked against the ledger '
       + 'before it is posted again.',
     metadata: { repaired, connector },
+  })
+}
+
+/**
+ * WHAT A SUCCESSFUL POST OF EACH SYNC TYPE ACTUALLY DID, and what an operator can do about it
+ * (o3d-e2mz r4, Codex finding 3).
+ *
+ * The fence-loss escalation used to end with one sentence for every type: "The document is in the
+ * ledger: reverse or credit-note it there if it should not exist." That is true of an invoice and
+ * false of most of the queue. Several types return no external id because they CREATE NO DOCUMENT:
+ * INVOICE_PDF saves a file locally, INVOICE_EMAIL sends an email, WC_INVOICE_NOTE writes a note on
+ * the WooCommerce order, BILL_ATTACHMENT attaches a file (and is a no-op when uploads are disabled),
+ * PURCHASE_CREDIT_NOTE_ALLOCATION applies an existing credit note to a bill. Sending an operator to
+ * credit-note a document that does not exist is not merely useless — the nearest matching document
+ * is a real receivable or payable, and the instruction points straight at it.
+ *
+ * Exhaustive over `AccountingSyncType` ON PURPOSE: a `Record<AccountingSyncType, …>` means a new
+ * member fails the type-check here rather than silently inheriting the invoice wording, which is
+ * exactly how the generic sentence came to cover types nobody had thought about.
+ *
+ * `effect` completes "…{effect} on attempt N"; `remedy` is a whole sentence.
+ */
+const POST_EFFECT_LEDGER_DOCUMENT = {
+  effect: 'POSTED a document to the Xero ledger',
+  remedy: 'The document is in the ledger: void or credit-note it there if it should not exist.',
+} as const
+const POST_EFFECT_JOURNAL = {
+  effect: 'POSTED a manual journal to the Xero ledger',
+  remedy: 'The journal is in the ledger: post a reversing journal there if it should not exist.',
+} as const
+/**
+ * o3d-e2mz r5 (Codex finding 2): A DRAFT JOURNAL'S REMEDY IS NOT A REVERSAL — IT IS A DELETION.
+ *
+ * `_postingMode` is a per-sync-type operator setting, and on `draft` the journal is created in Xero
+ * with status DRAFT (see resolveJournalStatus). A draft manual journal has not reached the ledger:
+ * no account balance has moved. Telling an operator to "post a reversing journal" for one is the most
+ * dangerous line in this table — the reversal WOULD post, so following the advice takes a document
+ * that moved nothing and turns it into a real, one-sided movement of exactly the amount they were
+ * trying to undo. The draft is then still sitting there as well.
+ */
+const POST_EFFECT_DRAFT_JOURNAL = {
+  effect: 'created a DRAFT manual journal in Xero (nothing posted to the ledger)',
+  remedy: 'The journal is a DRAFT — it has not reached the ledger and no balances have moved. DELETE the draft '
+    + 'in Xero if it should not exist. Do NOT post a reversing journal: a reversal posts for real, so it would '
+    + 'move the accounts by exactly the amount this draft never moved.',
+} as const
+const POST_EFFECT_PAYMENT = {
+  effect: 'APPLIED a payment in Xero',
+  remedy: 'A payment is applied against the document named above: remove or reverse THAT PAYMENT in Xero if it '
+    + 'should not exist. Do not credit-note the invoice — the invoice itself was not created here.',
+} as const
+const POST_EFFECT_DOCUMENT_UPDATE = {
+  effect: 'MODIFIED an existing Xero document',
+  remedy: 'No new document was created — an existing one was changed. Compare it against IMS and correct it in '
+    + 'Xero if the change should not stand; there is nothing to void or credit-note.',
+} as const
+
+const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }> = {
+  SALES_INVOICE: POST_EFFECT_LEDGER_DOCUMENT,
+  PURCHASE_INVOICE: POST_EFFECT_LEDGER_DOCUMENT,
+  CREDIT_NOTE: POST_EFFECT_LEDGER_DOCUMENT,
+  PURCHASE_CREDIT_NOTE: POST_EFFECT_LEDGER_DOCUMENT,
+  SALES_INVOICE_UPDATE: POST_EFFECT_DOCUMENT_UPDATE,
+  PURCHASE_INVOICE_UPDATE: POST_EFFECT_DOCUMENT_UPDATE,
+  INVOICE_PAYMENT: POST_EFFECT_PAYMENT,
+  BILL_PAYMENT: POST_EFFECT_PAYMENT,
+  COGS_JOURNAL: POST_EFFECT_JOURNAL,
+  COGS_REVERSAL: POST_EFFECT_JOURNAL,
+  INVENTORY_ADJUSTMENT: POST_EFFECT_JOURNAL,
+  STOCK_IN_TRANSIT: POST_EFFECT_JOURNAL,
+  STOCK_RECEIPT: POST_EFFECT_JOURNAL,
+  STOCK_ALLOCATION: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_REVENUE_DEFERRAL: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_INVENTORY_ALLOC: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_GROUP_B: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_INVENTORY_RECONCILIATION: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_COGS_RECONCILIATION: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_TRANSIT_RECONCILIATION: POST_EFFECT_JOURNAL,
+  UNEARNED_REV_REVERSAL: POST_EFFECT_JOURNAL,
+  // Added by the compiler, not by hand: this Record is exhaustive over AccountingSyncType on
+  // purpose (o3d-e2mz r4), so a type merged since — o3d-0i5y's allocation reversal — fails the
+  // type-check here rather than silently inheriting the invoice wording. It goes through
+  // `pushManualJournal` beside the other reversals, so it is a journal.
+  ALLOCATION_REVERSAL: POST_EFFECT_JOURNAL,
+  REALISED_FX_JOURNAL: POST_EFFECT_JOURNAL,
+  UNREALISED_FX_JOURNAL: POST_EFFECT_JOURNAL,
+  MANUFACTURING_JOURNAL: POST_EFFECT_JOURNAL,
+  MANUFACTURING_RECLASS: POST_EFFECT_JOURNAL,
+  PURCHASE_CREDIT_NOTE_ALLOCATION: {
+    effect: 'ALLOCATED an existing supplier credit note against a bill in Xero',
+    remedy: 'NO document was created — the allocation is a sub-resource of a credit note that already existed. '
+      + 'Undo the allocation on that credit note in Xero if it should not stand; there is nothing to reverse or '
+      + 'credit-note.',
+  },
+  BILL_ATTACHMENT: {
+    effect: 'ATTACHED the supplier PDF to an existing Xero bill (a no-op when attachment upload is disabled)',
+    remedy: 'NO ledger document was created and no money moved. Remove the attachment from the bill in Xero if it '
+      + 'should not be there; nothing needs reversing or credit-noting.',
+  },
+  INVOICE_PDF: {
+    effect: 'DOWNLOADED and stored the invoice PDF in IMS',
+    remedy: 'NO ledger document was created and nothing in Xero changed — the effect is a file held by IMS. '
+      + 'Nothing needs reversing or credit-noting.',
+  },
+  INVOICE_EMAIL: {
+    effect: 'SENT the invoice email to the customer',
+    remedy: 'NO ledger document was created, and the email CANNOT be recalled. If the invoice should not have been '
+      + 'sent, contact the customer; there is nothing in Xero to reverse or credit-note for this row.',
+  },
+  WC_INVOICE_NOTE: {
+    effect: 'ADDED an invoice note to the WooCommerce order',
+    remedy: 'NO ledger document was created and nothing in Xero changed. Remove the note on the WooCommerce order '
+      + 'if it should not be there.',
+  },
+  TAX_RATE_SYNC: {
+    effect: 'CREATED or UPDATED a tax rate in Xero',
+    remedy: 'NO ledger document was created and no money moved, but the tax rate is now live and documents posted '
+      + 'after it will use it. Correct or archive the tax rate in Xero if it should not exist.',
+  },
+}
+
+/**
+ * The table above answers "what does posting this TYPE do"; the posting mode answers "did it actually
+ * reach the ledger". Only the journal types have a mode that changes the answer, and the branch is
+ * keyed on the shared constant rather than on a type list, so a journal type added to the table gets
+ * the draft wording for free. `resolveJournalStatus` is reused rather than re-tested so the remedy
+ * cannot drift from the status the request was actually sent with.
+ */
+function postEffectFor(type: AccountingSyncType, payload: SyncPayload): { effect: string; remedy: string } {
+  const effect = POST_EFFECT[type]
+  if (effect === POST_EFFECT_JOURNAL && resolveJournalStatus(payload._postingMode) === 'DRAFT') {
+    return POST_EFFECT_DRAFT_JOURNAL
+  }
+  return effect
+}
+
+/**
+ * THE ONE `referenceType` WHOSE ROW BELONGS TO A SALE THAT CAN BE CANCELLED (o3d-e2mz r8).
+ *
+ * `referenceId` IS the sales order id for these rows, so the cancellation state is one locked read
+ * away. Every other reference the sweep and the recovery carry resolves to something a sales-order
+ * cancellation does not speak for, and must NOT be gated on one:
+ *
+ *  • `PurchaseInvoice` / `PurchaseOrder` — a supplier bill. No sale is involved at all.
+ *  • `SalesOrderRefund` (the CREDIT_NOTE rows) — a refund credit note is very often the DIRECT
+ *    CONSEQUENCE of the cancellation. Refusing to finish its back-reference because the order is
+ *    cancelled would strand exactly the document the cancellation created, which is the opposite of
+ *    the harm this gate exists to stop: crediting a cancelled sale is right, invoicing it is wrong.
+ *
+ * One constant, consumed by the locked read below and by the sweep's gate, for the same reason
+ * `BACK_REFERENCE_SWEEP_STATUSES` is one constant: two copies of "which rows belong to a sale" could
+ * disagree, and the disagreement would be invisible.
+ */
+const SALE_SCOPED_REFERENCE_TYPE = 'SalesOrder'
+
+/**
+ * IS THERE STILL A SALE FOR THIS WORK TO BELONG TO? (o3d-e2mz r5, Codex finding 1)
+ * o3d-e2mz: DID AN OPERATOR DECIDE ABOUT THIS ATTEMPT WHILE IT WAS POSTING?
+ *
+ * ESCALATION ONLY. It writes NOTHING to the sync row, and that is the whole of this branch's rebase
+ * onto o3d-550x. An earlier round fenced the SYNCED write itself on the attempt revision and then
+ * recovered from losing that fence by writing the external id anyway — which is a SECOND
+ * implementation of the posted-document record. There is exactly one: `recordPostedSyncResult`,
+ * reached here through `recordPostedDocumentDurably` / `persistPostedXeroDocument`. It records the
+ * post unconditionally, its only precondition being that the row does not already name a DIFFERENT
+ * document, precisely because evidence of a post must never be conditional on winning a race — which
+ * is the same end state the earlier round's recovery path arrived at by a longer route.
+ *
+ * WHAT THE REVISION STILL BUYS, AND NOTHING ELSE DOES: an operator who settled attempt N as "did not
+ * post" has to be TOLD that attempt N posted. `heldClaimWhere` cannot see that — `applyFencedAttemptDecision`
+ * moves the revision, and a decision can leave the claim instant untouched — so this asks the row.
+ *
+ * One indexed read per posted document, on the post path only. A row that is GONE escalates too:
+ * retention deleted the only record of an attempt whose document is in the ledger.
+ */
+async function readSaleCancellationStateUnderLock(
+  tx: Prisma.TransactionClient,
+  entry: { referenceType: string; referenceId: string },
+): Promise<'LIVE' | 'CANCELLED'> {
+  if (entry.referenceType !== SALE_SCOPED_REFERENCE_TYPE) return 'LIVE'
+  await lockSalesOrder(tx, entry.referenceId)
+  const so = await tx.salesOrder.findUnique({
+    where: { id: entry.referenceId },
+    select: { status: true },
+  })
+  // A deleted order cannot have its work continued either, and nothing downstream would find it.
+  if (!so) return 'CANCELLED'
+  return so.status === 'CANCELLED' ? 'CANCELLED' : 'LIVE'
+}
+
+/**
+ * o3d-e2mz: DID AN OPERATOR DECIDE ABOUT THIS ATTEMPT WHILE IT WAS POSTING?
+ *
+ * ESCALATION ONLY. It writes NOTHING to the sync row, and that is this branch's rebase onto o3d-550x.
+ * An earlier round fenced the SYNCED write itself on the attempt revision and then recovered from
+ * losing that fence by writing the external id anyway — a SECOND implementation of the posted-document
+ * record. There is exactly one: `recordPostedSyncResult`, reached here through
+ * `recordPostedDocumentDurably` / `persistPostedXeroDocument`. It records the post unconditionally,
+ * its only precondition being that the row does not already name a DIFFERENT document, precisely
+ * because evidence of a post must never be conditional on winning a race.
+ *
+ * WHAT THE REVISION STILL BUYS, AND NOTHING ELSE DOES: an operator who settled attempt N as "did not
+ * post" has to be TOLD that attempt N posted. `heldClaimWhere` cannot see that — a decision moves the
+ * revision and can leave the claim instant untouched — so this asks the row.
+ *
+ * One indexed read per posted document, on the post path only. A row that is GONE escalates too:
+ * retention deleted the only record of an attempt whose document is in the ledger.
+ */
+async function reportPostOnMovedAttempt(
+  attempt: AttemptRef,
+  entry: { type: AccountingSyncType; referenceType: string; referenceId: string },
+  externalId: string | null,
+  /** Read ONLY for `_postingMode` — see postEffectFor, and why a DRAFT journal's remedy differs. */
+  payload: SyncPayload,
+): Promise<void> {
+  const current = await db.accountingSyncLog.findUnique({
+    where: { id: attempt.id },
+    select: { status: true, attemptRevision: true },
+  })
+  if (current && current.attemptRevision === attempt.attemptRevision) return
+  const effect = postEffectFor(entry.type, payload)
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'xero_sync_post_fenced_out',
+    tag: 'sync',
+    level: 'ERROR',
+    // o3d-e2mz r4 (Codex finding 3): the effect and its remedy are looked up from the SYNC TYPE, not
+    // asserted. Several types succeed without creating any ledger document at all, and telling an
+    // operator to credit-note one points them at whatever real receivable is nearest.
+    description: `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} ${effect.effect}`
+      + `${externalId === null ? '' : ` (${externalId})`} on attempt ${attempt.attemptRevision}, but sync `
+      + `row ${attempt.id} had already moved to attempt ${current?.attemptRevision ?? 'a deleted row'} `
+      + `(${current?.status ?? 'gone'}). Anything decided about attempt ${attempt.attemptRevision} was decided `
+      + 'without this outcome. The document id IS recorded on the sync row — this runs only after the '
+      + `record landed — so anything keyed on that row can see it. ${effect.remedy}`,
+    metadata: {
+      syncLogId: attempt.id,
+      claimedAttemptRevision: attempt.attemptRevision,
+      currentAttemptRevision: current?.attemptRevision ?? null,
+      currentStatus: current?.status ?? null,
+      externalId,
+      /** o3d-e2mz r4: what the successful post actually did, so a dashboard can filter on it. */
+      postEffect: effect.effect,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+    },
   })
 }
 
@@ -803,67 +2643,94 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
 
   for (const entry of pending) {
     const claimedAt = new Date()
-    const claim = await db.accountingSyncLog.updateMany({
-      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
-      data: {
-        status: 'PROCESSING',
-        // The claim and attempt-stamping CUSTODY move together, always (o3d-0m56 r10). A claim is
-        // what precedes a post, so the database reads a claim that does not re-assert custody as
-        // one made by a binary that does not stamp, and forfeits it — see
-        // money-attempt-provenance.ts.
-        ...stampingCustodyOnClaim(claimedAt),
-      },
-    })
-    if (claim.count === 0) continue
+    // The claim, not the bare instant (Codex r2, medium 2). Nothing in this runner renews it, so the
+    // holder answers the same instant every time — but every fence below asks the holder rather than
+    // closing over a Date, which is what a renewing lease needs and what a merge would otherwise have
+    // to find by hand at six call sites.
+    const held = claimHeldFrom(claimedAt)
+    // o3d-e2mz: the claim is ALSO the compare-and-swap that mints this attempt's identity. `attempt`
+    // fences every write below on the revision, so nothing this worker does can land on a different
+    // attempt — including one an operator has decided about while this claim was held.
+    const attempt: AttemptRef = { id: entry.id, attemptRevision: nextAttemptRevision(entry.attemptRevision) }
+    // The claim itself is the exclusion for INVOICE_PAYMENT: taken under the order row lock together
+    // with the "is anything else for this order already posting?" test, so two runners working from
+    // different snapshots cannot both elect themselves (o3d-a3wx round 4 #3). The attempt is minted
+    // INSIDE that one statement rather than beside it — see claimAccountingSyncLog.
+    const claim = await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff, attempt)
+    if (claim.outcome === 'deferred') {
+      // NOT `deferPaymentUntilEarlierLogsPost`: the locked claim declined, so `held` was never
+      // granted and there is nothing to release. See deferUnclaimedPaymentUntilEarlierLogsPost.
+      //
+      // And no attempt fence either, for the same reason and it is the same fact: `attempt` was
+      // MINTED here but never written, so the row is still at the revision we read. Fencing this
+      // write on a value nothing ever stamped would match nothing, and because these fences fail
+      // closed the symptom would be a deferral that silently never landed.
+      await deferUnclaimedPaymentUntilEarlierLogsPost(db, entry, claim)
+      result.skipped++
+      continue
+    }
+    if (claim.outcome === 'not-claimable') continue
 
     result.processed++
     const payload = (entry.payload ?? {}) as SyncPayload
 
     try {
+      // Kept as a cheap pre-filter over the run's snapshot. It is no longer what makes the ordering
+      // safe — the locked claim above is — but it still spares a lock round-trip in the ordinary case
+      // and its verdict, when it fires, is the same one.
       if (blockedPaymentEntryIds.has(entry.id)) {
-        await deferPaymentUntilEarlierLogsPost(entry)
+        // No `detail`: this is the snapshot PRE-FILTER, which knows only that something earlier was
+        // live when the run began — the two conditions a detail names are the ones only the locked
+        // claim can tell apart. `undefined` is what makes this read exactly as it always did.
+        await deferPaymentUntilEarlierLogsPost(db, entry, held, undefined, attempt)
         result.skipped++
         continue
       }
       if (blockedUpdateEntryIds.has(entry.id)) {
-        await deferUpdateUntilCreatePosts(entry)
+        await deferUpdateUntilCreatePosts(db, entry, held, attempt)
         result.skipped++
         continue
       }
 
       if (entry.externalTransactionId) {
-        await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'SYNCED',
-              syncedAt: new Date(),
-              errorMessage: null,
-              processingStartedAt: null,
-              // Claimed IN this transaction, so the row can never be SYNCED-with-an-id and silent
-              // about the follow-ups it still owes (r10 finding 1).
-              ...followUpObligationClaim(),
-            },
-          })
-          await updateMirroredEventForSyncLog(tx, {
-            syncLogId: entry.id,
-            type: entry.type,
-            referenceType: entry.referenceType,
-            referenceId: entry.referenceId,
-            payload,
-            status: 'POSTED',
-            externalId: entry.externalTransactionId,
-          })
-        })
+        // o3d-550x: the evidence write, NOT fenced on the claim — see recordPostedSyncResult. The
+        // transaction is owned by recordPostedDocumentDurably, which is also the only thing standing
+        // between an unwritable record and the ordinary retry that would erase it (Codex r2, high).
+        const record = await recordPostedDocumentDurably(entry, entry.externalTransactionId, payload)
+        if (!record.recorded) {
+          // No escalation call here: the evidence committed with the transaction that observed the
+          // conflict (Codex r1, high). Reaching this line IS the proof it was written.
+          result.failed++
+          continue
+        }
+        // o3d-e2mz: the record above is deliberately unfenced, so it lands even when the attempt has
+        // moved. Whether it moved is still news for whoever moved it — see reportPostOnMovedAttempt.
+        await reportPostOnMovedAttempt(attempt, entry, entry.externalTransactionId, payload)
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+          // AFTER the enqueue, and that ORDER IS THE FIX (o3d-nepa r4, Codex finding 1).
+          //
+          // r3 put the announcement first and then threw when it could not be written, so a failed
+          // ACTIVITY-LOG WRITE stopped the enqueue from being called at all — and r3's own reason for
+          // still calling it on a tombstone is that SOME follow-ups are rebuilt from columns that
+          // survive compaction (an INVOICE_PDF is enqueued from `externalTransactionId` and
+          // `referenceId` alone). Those are real, recoverable work, and refusing to settle the row is
+          // no reason to withhold them: the retry will just meet the same unwritable log next pass.
+          //
+          // What the announcement gates is the RELEASE, which is the property r3 was actually
+          // defending — the obligation marker must never be discharged on the strength of an enqueue
+          // that silently did nothing. That still holds exactly: a throw here skips the release, the
+          // catch below returns the row to PENDING still carrying `backReferenceFollowUpsPendingAt`,
+          // and the next pass announces. Re-running the enqueue on that pass is a no-op — it is
+          // idempotent through `hasExistingSyncLog` and the partial unique index (audit-42co).
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+          await announceCompactedFollowUpLoss(entry)
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
           // NOT released: the follow-ups did not run. The row goes back to PENDING (or FAILED at
           // MAX_RETRIES) still carrying the obligation, so whichever gets there first — this
           // processor's own retry or the repair sweep — knows the work is outstanding.
-          await markSyncLogForFollowUpRetry(entry, followUpError)
+          await markSyncLogForFollowUpRetry(attempt, entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
           result.failed++
           continue
@@ -872,7 +2739,48 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, claimedAt)
+      // o3d-xl63 r4 #1 / r5 #1: open the lease. Opening it re-takes the claim at the instant the work
+      // begins and posts NOTHING if it is gone; from here on every remote mutation inside processEntry
+      // fences on it again, and the absolute deadline it fixes covers the preparation calls too.
+      const lease = await openRemoteWriteLease(entry.id, claimedAt)
+      if (!lease) {
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'xero_sync_claim_lost_before_post',
+          tag: 'sync',
+          level: 'WARNING',
+          description: lostClaimMessage(entry.id),
+          metadata: { syncLogId: entry.id, type: entry.type, claimedAt: claimedAt.toISOString() },
+          resolveUser: false,
+        })
+        result.skipped++
+        continue
+      }
+
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, lease, attempt)
+
+      // BEFORE `skipped` and before `success` (r5 #1): this row stopped without sending anything, so
+      // it must not be failed, must not spend a retry, and must not be persisted.
+      if (syncResult.notPosted) {
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: syncResult.notPosted.reason === 'lease-expired'
+            ? 'xero_sync_lease_expired_before_post'
+            : 'xero_sync_claim_lost_before_post',
+          tag: 'sync',
+          level: 'WARNING',
+          description: syncResult.notPosted.message,
+          metadata: {
+            syncLogId: entry.id,
+            type: entry.type,
+            operation: syncResult.notPosted.operation,
+            reason: syncResult.notPosted.reason,
+          },
+          resolveUser: false,
+        })
+        result.skipped++
+        continue
+      }
 
       if (syncResult.skipped) {
         // processEntry already terminalised this row (e.g. its order was cancelled — o3d-5rs). Nothing
@@ -881,37 +2789,41 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
       if (syncResult.success) {
-        await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'SYNCED',
-              externalTransactionId: syncResult.externalId ?? null,
-              syncedAt: new Date(),
-              errorMessage: null,
-              processingStartedAt: null,
-              // Same transaction as the external id itself (r10 finding 1): the two facts that make
-              // the crash-after-post state recoverable become durable together or not at all.
-              ...followUpObligationClaim(),
-            },
-          })
-          await updateMirroredEventForSyncLog(tx, {
-            syncLogId: entry.id,
-            type: entry.type,
-            referenceType: entry.referenceType,
-            referenceId: entry.referenceId,
-            payload,
-            status: 'POSTED',
-            externalId: syncResult.externalId ?? null,
-          })
+        // POST-REMOTE PERSIST, NOT A PRE-FLIGHT ONE (o3d-xl63 r2 #2, r3 #1-#3). The document is
+        // already in Xero; this write is the only thing that will ever say so — and WHAT it writes is
+        // o3d-550x's durable record, not a re-spelt SYNCED update. See persistPostedXeroDocument.
+        const persisted = await persistPostedXeroDocument({
+          entry,
+          payload,
+          externalId: syncResult.externalId,
+          // THE LEASE ITSELF, not `lease.heldFrom()` (r6). The persist's deadline, its own fence, and
+          // the claim-fenced terminal write on the give-up path must each use the claim this worker
+          // holds AT THE MOMENT THEY RUN. A snapshot taken here would be read minutes before the
+          // give-up path's write, and because these fences fail closed the symptom of it being wrong
+          // is silence: a document Xero already holds recorded nowhere.
+          claim: lease,
+          // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it
+          // made is recorded and orders the document against other writers.
+          externalRevisionAt: syncResult.externalRevisionAt ?? null,
         })
+        if (!persisted.persisted) {
+          // Both reasons end the same way on THIS path, and for the same reason they end differently
+          // on the outbox path below: there is no job here to bury or to leave locked. Either the
+          // conflict evidence is durable (o3d-550x) or the identifier was reported off-pool
+          // (o3d-xl63) — in both cases it has been recorded somewhere an operator can reach, and
+          // anything further here would be another transaction against a pool that may have none.
+          result.failed++
+          continue
+        }
+        // o3d-e2mz: see reportPostOnMovedAttempt — the persist is unfenced by design, the news is not.
+        await reportPostOnMovedAttempt(attempt, entry, syncResult.externalId ?? null, payload)
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
-          await markSyncLogForFollowUpRetry(entry, followUpError)
+          await markSyncLogForFollowUpRetry(attempt, entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
           result.failed++
           continue
@@ -921,35 +2833,42 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
       } else {
         const errorMessage = syncResult.error ?? 'Unknown error'
         if (isRateLimitError(errorMessage)) {
-          await db.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'PENDING',
-              errorMessage,
-              ...stampingCustodyOnClaim(new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage))),
-            },
-          })
+          // o3d-550x: the one fenced release — a displaced owner backing off here would hand the
+          // row back to PENDING mid-post. o3d-e2mz: and fenced on the attempt, so a backoff cannot
+          // reopen a row an operator has decided about.
+          await releaseClaimForRetry(db, entry.id, held, {
+            errorMessage,
+            nextAttemptAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
+          }, attempt)
         } else {
           await db.$transaction(async (tx) => {
-            await applyMainSyncFailureRetry(tx, entry, errorMessage, payload)
+            await applyMainSyncFailureRetry(tx, attempt, entry, errorMessage, payload, held)
           })
         }
         result.failed++
       }
     } catch (e) {
+      if (e instanceof PostedDocumentEvidenceUnwritten) {
+        // NEVER into the ordinary retry (Codex r2, HIGH): a retry of this entry finds the row already
+        // naming the other document, settles it and reports success, and the identifier this error is
+        // carrying is the only copy left. The row is left exactly as its winner left it.
+        //
+        // AWAITED (Codex r3, HIGH): the escalation now tries to write the record standalone, and a
+        // floating promise would let this iteration finish — and the process exit — before it lands.
+        await escalateUnwrittenPostedEvidence(e)
+        result.failed++
+        continue
+      }
       const errorMessage = String(e)
       if (isRateLimitError(errorMessage)) {
-        await db.accountingSyncLog.update({
-          where: { id: entry.id },
-          data: {
-            status: 'PENDING',
-            errorMessage,
-            ...stampingCustodyOnClaim(new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage))),
-          },
-        })
+        // o3d-550x: the one fenced release. o3d-e2mz: on the attempt as well as the claim.
+        await releaseClaimForRetry(db, entry.id, held, {
+          errorMessage,
+          nextAttemptAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
+        }, attempt)
       } else {
         await db.$transaction(async (tx) => {
-          await applyMainSyncFailureRetry(tx, entry, errorMessage, payload)
+          await applyMainSyncFailureRetry(tx, attempt, entry, errorMessage, payload, held)
         })
       }
       result.failed++
@@ -974,6 +2893,129 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
   }
 
   return result
+}
+
+/**
+ * IS AN UNRECORDED POSTED DOCUMENT ON FILE AGAINST THIS SYNC ROW — ASKED NOW, FOR ONE ROW
+ * (Codex r3 HIGH; re-shaped by Codex r4, HIGH).
+ *
+ * The durable half of the burial guarantee. A job whose sync row carries one of these records must not
+ * be completed as a success by ANY later run, and "later" includes runs in a process that never saw the
+ * incident — the burial's own failure is precisely the case where the deciding run is a different one.
+ * The record is the only thing both runs can see.
+ *
+ * WHY IT IS NO LONGER A BATCH SNAPSHOT (Codex r4, HIGH). Round 3 read every job's evidence once, before
+ * the loop, and both doors consulted that Map. A Map read at the top of a run answers with the world as
+ * it was BEFORE the run's Xero calls — and the incident this fence exists for is filed by ANOTHER
+ * WORKER, mid-run, while it is on the wire. A snapshot cannot contain a row that did not exist when it
+ * was taken, so the door it guards reopened under exactly the concurrency it was built for. Round 3
+ * patched half of that from inside (`unrecordedPostedDocuments.set(...)` after an in-line burial), which
+ * only ever covered incidents THIS run filed — the ones a second process files were never visible.
+ *
+ * So the question is asked at the moment the verdict is decided, for the one row being decided, and the
+ * batch read is gone rather than kept as a fast path: a fast path whose miss is unsafe is not a fast
+ * path. It costs one indexed point read on the (entityType, entityId) index, and only on the settled
+ * replay branches — the rare ones, not the per-job path.
+ *
+ * A stale answer here is the safe direction. If an operator has already dealt with the duplicate in
+ * Xero, the record still stands (nothing in IMS can observe a void, which is why it has no clearing
+ * mechanism), and a later job for that row is permanently failed instead of completed — a visible,
+ * harmless verdict on a row that is already SYNCED and that nothing will retry. The opposite mistake is
+ * a document nobody knows about.
+ */
+export async function findUnrecordedPostedDocumentEvidenceFor(syncLogId: string): Promise<string | undefined> {
+  const row = await db.activityLog.findFirst({
+    where: {
+      entityType: 'SYSTEM',
+      entityId: syncLogId,
+      action: UNRECORDED_POSTED_DOCUMENT_ACTION,
+    },
+    select: { description: true },
+    orderBy: { createdAt: 'desc' },
+  })
+  return row?.description ?? undefined
+}
+
+/**
+ * The verdict on a job whose sync row is already settled — the only three answers the doors below have.
+ * RETRACTED is BURIED that had to travel through a completion to get there; both are failures, and the
+ * caller counts them the same.
+ */
+type SettledOutboxVerdict =
+  | { verdict: 'BURIED'; evidence: string }
+  | { verdict: 'RETRACTED'; evidence: string }
+  | { verdict: 'COMPLETED' }
+
+/**
+ * COMPLETE A SETTLED JOB — BUT ONLY IF NO INCIDENT IS FILED AGAINST ITS ROW, AND ASK TWICE
+ * (Codex r4, HIGH).
+ *
+ * BOTH doors that turn a settled row into a green outbox job come through here, because they are one
+ * decision made in two places and round 3 fixed them as two: the settled-replay short circuit at the top
+ * of the loop, and the claim-failure branch reached when the row settles BETWEEN the batch read and the
+ * claim. One function means one ordering, and a third door added later has somewhere obvious to go.
+ *
+ * The interleaving this closes, written out, because "read it fresh" alone does not close it:
+ *
+ *   • BEFORE. `findUnrecordedPostedDocumentEvidenceFor` is the statement immediately preceding the
+ *     completion, so any incident committed before that read buries the job instead. That is the whole
+ *     of round 4's finding: the snapshot could not see it, this read can.
+ *   • AFTER. An incident committed between that read and the completion would still have been laundered,
+ *     and the window is small but it is not zero — the displaced worker's insert lands whenever it
+ *     lands. So the same question is asked again once the completion is written, and an incident that
+ *     appeared in the gap RETRACTS it: the job is put back to PERMANENT_FAILED carrying the incident
+ *     wording, which is where it would have gone had the read been a moment later.
+ *
+ * What is left after both is an incident committed strictly AFTER the confirming read, and that one is
+ * not silent by construction: the worker filing it is still running, still holding the displaced
+ * identifier, and the record it just committed is durable and exempt from retention. It buries its own
+ * job with the same wording, or — if this run stole that job's claim — fails loudly rather than
+ * completing anything. Nothing in that path ends in a green verdict with the identifier nowhere.
+ *
+ * The retraction is fenced on SUCCEEDED, not on the claim: the completion released the claim, and the
+ * only row it may touch is the one it just completed. If the retraction cannot be written the run says
+ * so on the process log — it does not throw, because the record whose wording it is quoting has already
+ * been read out of the durable store, so the incident is on file whatever happens to the job.
+ */
+export async function completeSettledOutboxJobUnlessIncidentFiled(
+  job: IntegrationOutboxRow,
+  syncLogId: string,
+): Promise<SettledOutboxVerdict> {
+  const filed = await findUnrecordedPostedDocumentEvidenceFor(syncLogId)
+  if (filed) {
+    await markXeroOutboxPermanent(job, filed)
+    return { verdict: 'BURIED', evidence: filed }
+  }
+
+  await markXeroOutboxSuccess(job)
+
+  const filedSince = await findUnrecordedPostedDocumentEvidenceFor(syncLogId)
+  if (!filedSince) return { verdict: 'COMPLETED' }
+
+  const retracted = await db.integrationOutbox.updateMany({
+    where: { id: job.id, status: INTEGRATION_OUTBOX_STATUS.SUCCEEDED },
+    data: {
+      status: INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
+      lastError: filedSince.slice(0, 1000),
+      nextAttemptAt: null,
+      lockedAt: null,
+      lockedBy: null,
+    },
+  }).catch((cause: unknown) => {
+    console.error(
+      `[xero-sync] outbox job ${job.id} was completed a moment before an unrecorded posted document was `
+      + `filed against sync log ${syncLogId}, and the completion could not be retracted: ${String(cause)}. `
+      + filedSince,
+    )
+    return { count: 0 }
+  })
+  if (retracted.count === 0) {
+    console.error(
+      `[xero-sync] outbox job ${job.id} is still recorded as succeeded although an unrecorded posted `
+      + `document is on file against sync log ${syncLogId}. ${filedSince}`,
+    )
+  }
+  return { verdict: 'RETRACTED', evidence: filedSince }
 }
 
 async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
@@ -1012,6 +3054,10 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       })
     : []
   const entriesById = new Map(entries.map((entry) => [entry.id, entry]))
+  // NO BATCH READ OF THE FILED INCIDENTS (Codex r4, HIGH). One taken here answers with the world as it
+  // was before this run made a single Xero call, and the incident the doors below guard against is filed
+  // by ANOTHER worker while this one is on the wire. Each door asks at the moment it decides — see
+  // completeSettledOutboxJobUnlessIncidentFiled.
   const blockedPaymentEntryIds = await findInvoicePaymentsBlockedByEarlierLiveLogs(db, entries)
   const blockedUpdateEntryIds = await findInvoiceUpdatesBlockedByPendingCreate(db, entries)
 
@@ -1023,24 +3069,51 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       continue
     }
     if (entry.status === 'SYNCED' && entry.externalTransactionId) {
-      await markXeroOutboxSuccess(job)
-      result.skipped++
+      // Ordinarily a replay of settled work. It is ALSO the exact line that used to swallow a lost
+      // document (Codex r2, HIGH): when a conflict's record could not be written, the job was left
+      // retryable, and the retry arrived here — SYNCED, an id on the row — and completed as a success
+      // with the displaced identifier nowhere.
+      //
+      // Round 3 answered that by burying the job at the point of failure, and said this line no longer
+      // sees such a job. It does, by one route round 3 did not follow: WHEN THE BURIAL ITSELF FAILS
+      // (Codex r3, HIGH). The throw escaped the run and left the job PROCESSING and locked, so
+      // CLAIM_STALE_MS later it is re-claimed as a stale lock and arrives here — SYNCED, an id on the
+      // row — to be completed as a success, exactly as before. A guarantee that lives only "where the
+      // identifier is still in hand" cannot survive the process that is holding it.
+      //
+      // So this line now asks the durable record instead of assuming it was acted on. If an incident is
+      // filed against this sync row, the job is BURIED with that record's wording — never completed —
+      // and the answer comes from the one store that outlives the run, READ AT THIS INSTANT rather than
+      // from a snapshot taken before the run's first Xero call (Codex r4, HIGH).
+      const settled = await completeSettledOutboxJobUnlessIncidentFiled(job, entry.id)
+      if (settled.verdict === 'COMPLETED') result.skipped++
+      else result.failed++
       continue
     }
 
     const claimedAt = new Date()
-    const claim = await db.accountingSyncLog.updateMany({
-      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
-      data: {
-        status: 'PROCESSING',
-        // The claim and attempt-stamping CUSTODY move together, always (o3d-0m56 r10). A claim is
-        // what precedes a post, so the database reads a claim that does not re-assert custody as
-        // one made by a binary that does not stamp, and forfeits it — see
-        // money-attempt-provenance.ts.
-        ...stampingCustodyOnClaim(claimedAt),
-      },
-    })
-    if (claim.count === 0) {
+    // The claim, not the bare instant (Codex r2, medium 2). Nothing in this runner renews it, so the
+    // holder answers the same instant every time — but every fence below asks the holder rather than
+    // closing over a Date, which is what a renewing lease needs and what a merge would otherwise have
+    // to find by hand at six call sites.
+    const held = claimHeldFrom(claimedAt)
+    // o3d-e2mz: same claim-as-CAS as the direct path — `attempt` fences every write below to the
+    // attempt this worker actually holds.
+    const attempt: AttemptRef = { id: entry.id, attemptRevision: nextAttemptRevision(entry.attemptRevision) }
+    const claim = await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff, attempt)
+    if (claim.outcome === 'deferred') {
+      // Same shape as the blocked-payment branch below: the sync row's next attempt moves out and the
+      // outbox job is retried, in ONE transaction so the queue and the row cannot disagree about
+      // whether this entry is waiting. Unclaimed, so `held` is not used and no attempt fence applies
+      // — the claim was declined, so nothing stamped the revision this worker minted.
+      await db.$transaction(async (tx) => {
+        await deferUnclaimedPaymentUntilEarlierLogsPost(tx, entry, claim)
+        await markXeroOutboxRetry(job, invoicePaymentDeferralMessage(claim), tx)
+      })
+      result.skipped++
+      continue
+    }
+    if (claim.outcome === 'not-claimable') {
       // The claim failed because the row is no longer PENDING/claimable. `entry` is a snapshot, so
       // re-read the live status: it may have been retired (CANCELLED — e.g. its order was cancelled,
       // o3d-5rs) or posted (SYNCED) since. CANCELLED is an INTENTIONAL no-op, not a failure — completing
@@ -1051,8 +3124,19 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         select: { status: true },
       })
       const liveStatus = fresh?.status ?? entry.status
+      // THE SECOND DOOR TO THE SAME CONVERSION (Codex r3, HIGH). This branch is reached when the row was
+      // settled between the batch read and the claim — which is exactly the window a displaced worker's
+      // conflict is recorded in. Completing the job then turns a filed incident into a success just as
+      // the settled-replay short-circuit above did, so it goes through the SAME function rather than
+      // asking the same question a second way (Codex r4, HIGH).
+      //
+      // CANCELLED asks too, and round 3 did not. A row can be retired while a worker is on the wire, and
+      // that worker's post then meets a row it may not write to; the incident is filed against a row
+      // whose live status is CANCELLED, and completing green here would launder it exactly as the SYNCED
+      // case did. Asking costs one point read on a branch that is already rare.
       if (liveStatus === 'SYNCED' || liveStatus === 'CANCELLED') {
-        await markXeroOutboxSuccess(job)
+        const settled = await completeSettledOutboxJobUnlessIncidentFiled(job, entry.id)
+        if (settled.verdict !== 'COMPLETED') result.failed++
       } else if (liveStatus === 'FAILED' || entry.retryCount >= MAX_RETRIES) {
         await markXeroOutboxPermanent(job, entry.errorMessage ?? `Accounting sync log ${entry.id} is not claimable`)
       } else {
@@ -1065,19 +3149,15 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     const payload = (entry.payload ?? {}) as SyncPayload
 
     try {
+      // Cheap pre-filter over the run's snapshot; the locked claim above is what makes the ordering
+      // safe. The claim IS held here, so the deferral gives it back under its own fence.
       if (blockedPaymentEntryIds.has(entry.id)) {
         await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'PENDING',
-              // Future processingStartedAt is the existing retry gate for
-              // PENDING sync rows; here it means "earliest next claim time".
-              ...stampingCustodyOnClaim(new Date(Date.now() + 60_000)),
-              errorMessage: 'Deferred until older invoice payment sync logs post',
-            },
-          })
-          await markXeroOutboxRetry(job, 'Deferred until older invoice payment sync logs post', tx)
+          // o3d-550x: THE SAME release as the direct runner, not a copy of it. o3d-e2mz: fenced on
+          // the claimed attempt too; the outbox job is released either way, since this worker holds
+          // that job regardless of what happened to the sync row.
+          await deferPaymentUntilEarlierLogsPost(tx, entry, held, undefined, attempt)
+          await markXeroOutboxRetry(job, PAYMENT_ORDERING_DEFERRAL_MESSAGE, tx)
         })
         result.skipped++
         continue
@@ -1085,51 +3165,58 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
 
       if (blockedUpdateEntryIds.has(entry.id)) {
         await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'PENDING',
-              ...stampingCustodyOnClaim(new Date(Date.now() + 60_000)),
-              errorMessage: 'Deferred until the invoice CREATE for this document posts',
-            },
-          })
-          await markXeroOutboxRetry(job, 'Deferred until the invoice CREATE for this document posts', tx)
+          // o3d-550x: THE SAME release as the direct runner, not a copy of it. o3d-e2mz: attempt-fenced.
+          await deferUpdateUntilCreatePosts(tx, entry, held, attempt)
+          await markXeroOutboxRetry(job, UPDATE_ORDERING_DEFERRAL_MESSAGE, tx)
         })
         result.skipped++
         continue
       }
 
       if (entry.externalTransactionId) {
-        await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'SYNCED',
-              syncedAt: new Date(),
-              errorMessage: null,
-              processingStartedAt: null,
-              // r10 finding 1. The outbox path is the one MOST rows take, and it is also the one
-              // that skips a SYNCED row outright next run — so a crash here left nothing to notice.
-              ...followUpObligationClaim(),
-            },
-          })
-          await updateMirroredEventForSyncLog(tx, {
-            syncLogId: entry.id,
-            type: entry.type,
-            referenceType: entry.referenceType,
-            referenceId: entry.referenceId,
-            payload,
-            status: 'POSTED',
-            externalId: entry.externalTransactionId,
-          })
-        })
+        // o3d-550x: the evidence write, NOT fenced on the claim — see recordPostedSyncResult.
+        const record = await recordPostedDocumentDurably(entry, entry.externalTransactionId, payload)
+        if (!record.recorded) {
+          // PERMANENT, not retryable: the document is in Xero and cannot be recorded here, so
+          // another attempt would only post a second one. SAFE TO BE PERMANENT ONLY BECAUSE THE
+          // EVIDENCE IS ALREADY COMMITTED — `record.evidence` exists exactly when the activity row
+          // it describes was written in the conflict transaction (Codex r1, high). If that write had
+          // failed, the transaction above would have thrown and the job would be retried, not buried.
+          //
+          // Nothing is cached for later jobs in this batch any more (Codex r4, HIGH): the record is
+          // committed, and every door reads the store at the point it decides, so a second job for this
+          // row finds it — as it also finds the ones a CONCURRENT process filed, which the cache never
+          // could.
+          await markXeroOutboxPermanent(job, record.evidence)
+          result.failed++
+          continue
+        }
+        // o3d-e2mz: see reportPostOnMovedAttempt — the record above is unfenced by design, the news
+        // that an operator's decision about this attempt is now known to be wrong is not.
+        await reportPostOnMovedAttempt(attempt, entry, entry.externalTransactionId, payload)
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+          // AFTER the enqueue, and that ORDER IS THE FIX (o3d-nepa r4, Codex finding 1).
+          //
+          // r3 put the announcement first and then threw when it could not be written, so a failed
+          // ACTIVITY-LOG WRITE stopped the enqueue from being called at all — and r3's own reason for
+          // still calling it on a tombstone is that SOME follow-ups are rebuilt from columns that
+          // survive compaction (an INVOICE_PDF is enqueued from `externalTransactionId` and
+          // `referenceId` alone). Those are real, recoverable work, and refusing to settle the row is
+          // no reason to withhold them: the retry will just meet the same unwritable log next pass.
+          //
+          // What the announcement gates is the RELEASE, which is the property r3 was actually
+          // defending — the obligation marker must never be discharged on the strength of an enqueue
+          // that silently did nothing. That still holds exactly: a throw here skips the release, the
+          // catch below returns the row to PENDING still carrying `backReferenceFollowUpsPendingAt`,
+          // and the next pass announces. Re-running the enqueue on that pass is a no-op — it is
+          // idempotent through `hasExistingSyncLog` and the partial unique index (audit-42co).
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+          await announceCompactedFollowUpLoss(entry)
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
-            const nextRetry = await markSyncLogForFollowUpRetry(entry, followUpError, tx)
+            const nextRetry = await markSyncLogForFollowUpRetry(attempt, entry, followUpError, tx)
             if (nextRetry.finalFailure) {
               await markXeroOutboxPermanent(job, nextRetry.errorMessage, tx)
             } else {
@@ -1147,7 +3234,61 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, claimedAt)
+      // o3d-xl63 r4 #1 / r5 #1: as in the direct path — open the lease, which re-takes the claim at the
+      // instant the work begins. The job is passed in, so every fence renews the OUTBOX lock as well:
+      // the queue side has its own fifteen-minute staleness and would otherwise hand this job to a
+      // second worker while the first is still legitimately working. Handed back for retry rather than
+      // failed, because nothing was sent.
+      const lease = await openRemoteWriteLease(entry.id, claimedAt, job)
+      if (!lease) {
+        await markXeroOutboxRetry(job, lostClaimMessage(entry.id))
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'xero_sync_claim_lost_before_post',
+          tag: 'sync',
+          level: 'WARNING',
+          description: lostClaimMessage(entry.id),
+          metadata: { syncLogId: entry.id, type: entry.type, outboxJobId: job.id, claimedAt: claimedAt.toISOString() },
+          resolveUser: false,
+        })
+        result.skipped++
+        continue
+      }
+
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, lease, attempt)
+
+      if (syncResult.notPosted) {
+        // The lock may itself be what was lost, in which case handing the job back cannot work — say
+        // so rather than letting the fence's own throw escape into the generic failure handler and
+        // spend a retry on a row that was never posted.
+        try {
+          await markXeroOutboxRetry(job, syncResult.notPosted.message)
+        } catch (releaseError) {
+          console.error(
+            `[xero-sync] outbox job ${job.id} could not be handed back after a lost claim `
+              + `(${syncResult.notPosted.reason}): ${String(releaseError)}`,
+          )
+        }
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: syncResult.notPosted.reason === 'lease-expired'
+            ? 'xero_sync_lease_expired_before_post'
+            : 'xero_sync_claim_lost_before_post',
+          tag: 'sync',
+          level: 'WARNING',
+          description: syncResult.notPosted.message,
+          metadata: {
+            syncLogId: entry.id,
+            type: entry.type,
+            outboxJobId: job.id,
+            operation: syncResult.notPosted.operation,
+            reason: syncResult.notPosted.reason,
+          },
+          resolveUser: false,
+        })
+        result.skipped++
+        continue
+      }
 
       if (syncResult.skipped) {
         // processEntry already terminalised this row (e.g. its order was cancelled — o3d-5rs). Complete
@@ -1157,29 +3298,37 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
       if (syncResult.success) {
-        await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'SYNCED',
-              externalTransactionId: syncResult.externalId ?? null,
-              syncedAt: new Date(),
-              errorMessage: null,
-              processingStartedAt: null,
-              // THE LINE r10 finding 1 NAMED. This is where most successfully posted rows go.
-              ...followUpObligationClaim(),
-            },
-          })
-          await updateMirroredEventForSyncLog(tx, {
-            syncLogId: entry.id,
-            type: entry.type,
-            referenceType: entry.referenceType,
-            referenceId: entry.referenceId,
-            payload,
-            status: 'POSTED',
-            externalId: syncResult.externalId ?? null,
-          })
+        // Same post-remote persist as the direct path (o3d-xl63 r2 #2, r3 #1-#3), and this is the one
+        // MOST rows take: losing it loses the external id of a document Xero already holds.
+        const persisted = await persistPostedXeroDocument({
+          entry,
+          payload,
+          externalId: syncResult.externalId,
+          // The lease itself (r6) — see the direct path.
+          claim: lease,
+          // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it
+          // made is recorded and orders the document against other writers.
+          externalRevisionAt: syncResult.externalRevisionAt ?? null,
         })
+        if (!persisted.persisted) {
+          // THE TWO FAILURES ARE NOT THE SAME JOB OUTCOME, and collapsing them would be wrong in
+          // whichever direction it collapsed.
+          //
+          //  • not-recorded (o3d-550x): the row already names a DIFFERENT document and the evidence
+          //    is durable. Bury the job PERMANENTLY — a retry could only post a second document —
+          //    and the burial is safe to attempt because nothing here says the pool is unavailable.
+          //  • pool-exhausted (o3d-xl63 r3): completing OR failing the job needs the very pool that
+          //    just refused this persist for the whole deadline. So the job is left locked and lapses
+          //    into a stale lock, which is the correct outcome: when it is re-claimed, the row's
+          //    recovered external id makes the retry a no-op short-circuit.
+          if (persisted.reason === 'not-recorded') {
+            await markXeroOutboxPermanent(job, persisted.evidence)
+          }
+          result.failed++
+          continue
+        }
+        // o3d-e2mz: see reportPostOnMovedAttempt.
+        await reportPostOnMovedAttempt(attempt, entry, syncResult.externalId ?? null, payload)
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
@@ -1187,7 +3336,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
-            const nextRetry = await markSyncLogForFollowUpRetry(entry, followUpError, tx)
+            const nextRetry = await markSyncLogForFollowUpRetry(attempt, entry, followUpError, tx)
             if (nextRetry.finalFailure) {
               await markXeroOutboxPermanent(job, nextRetry.errorMessage, tx)
             } else {
@@ -1208,19 +3357,16 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         if (isRateLimitError(errorMessage)) {
           const retryDelayMs = getRateLimitBackoffMs(entry.retryCount, errorMessage)
           await db.$transaction(async (tx) => {
-            await tx.accountingSyncLog.update({
-              where: { id: entry.id },
-              data: {
-                status: 'PENDING',
-                errorMessage,
-                ...stampingCustodyOnClaim(new Date(Date.now() + retryDelayMs)),
-              },
-            })
+            // o3d-550x: the one fenced release. o3d-e2mz: on the attempt as well as the claim.
+            await releaseClaimForRetry(tx, entry.id, held, {
+              errorMessage,
+              nextAttemptAt: new Date(Date.now() + retryDelayMs),
+            }, attempt)
             await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
           })
         } else {
           await db.$transaction(async (tx) => {
-            const { finalFailure } = await applyMainSyncFailureRetry(tx, entry, errorMessage, payload)
+            const { finalFailure } = await applyMainSyncFailureRetry(tx, attempt, entry, errorMessage, payload, held)
             if (finalFailure) {
               await markXeroOutboxPermanent(job, errorMessage, tx)
             } else {
@@ -1232,23 +3378,34 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       }
     } catch (e) {
       if (e instanceof XeroOutboxCompletionError) throw e
+      if (e instanceof PostedDocumentEvidenceUnwritten) {
+        // The job is buried, and burying is the SAFE direction here (Codex r2, HIGH). Round 1's defect
+        // was burying while claiming an escalation had been filed; this buries BECAUSE nothing could be
+        // filed, and it carries the wording that names both documents into the job's own failure column
+        // — a different table from the one that just refused the write. Marking it retryable instead
+        // would hand the incident to a run that sees a SYNCED row with an external id and completes the
+        // job as a success, which is how the identifier disappears.
+        const recordFiled = await escalateUnwrittenPostedEvidence(e)
+        // And the burial is not assumed to succeed (Codex r3, HIGH) — see
+        // buryOutboxJobForUnwrittenPostedEvidence for where a failed one used to end up.
+        await buryOutboxJobForUnwrittenPostedEvidence(job, e, recordFiled)
+        result.failed++
+        continue
+      }
       const errorMessage = String(e)
       if (isRateLimitError(errorMessage)) {
         const retryDelayMs = getRateLimitBackoffMs(entry.retryCount, errorMessage)
         await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'PENDING',
-              errorMessage,
-              ...stampingCustodyOnClaim(new Date(Date.now() + retryDelayMs)),
-            },
-          })
+          // o3d-550x: the one fenced release. o3d-e2mz: on the attempt as well as the claim.
+          await releaseClaimForRetry(tx, entry.id, held, {
+            errorMessage,
+            nextAttemptAt: new Date(Date.now() + retryDelayMs),
+          }, attempt)
           await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
         })
       } else {
         await db.$transaction(async (tx) => {
-          const { finalFailure } = await applyMainSyncFailureRetry(tx, entry, errorMessage, payload)
+          const { finalFailure } = await applyMainSyncFailureRetry(tx, attempt, entry, errorMessage, payload, held)
           if (finalFailure) {
             await markXeroOutboxPermanent(job, errorMessage, tx)
           } else {
@@ -1289,7 +3446,21 @@ function resolveJournalStatus(mode: unknown): string {
   return mode === 'draft' ? 'DRAFT' : 'POSTED'
 }
 
-type EntryResult = { success: boolean; externalId?: string; invoiceNumber?: string; error?: string; skipped?: boolean }
+type EntryResult = {
+  success: boolean
+  externalId?: string
+  invoiceNumber?: string
+  /** o3d-cvj9 r3: the external system's revision stamp for the document this write just changed. */
+  externalRevisionAt?: Date | null
+  error?: string
+  skipped?: boolean
+  /**
+   * Set when the entry stopped BEFORE sending anything (o3d-xl63 r5 #1). Distinct from a failure:
+   * a failure may have reached Xero, this provably did not, so the row is handed back rather than
+   * having its retry count spent. Callers must test this before `skipped` and before `success`.
+   */
+  notPosted?: { reason: 'claim-lost' | 'lease-expired'; operation: string; message: string }
+}
 
 /**
  * Post-time backstop for the cancel-time sweep (o3d-5rs), shared by SALES_INVOICE and its UPDATE. A row
@@ -1299,44 +3470,826 @@ type EntryResult = { success: boolean; externalId?: string; invoiceNumber?: stri
  *  - unreadable / missing → FAIL CLOSED (return a retryable failure, do NOT post): a transient read
  *    outage must not become permission to post.
  *  - live → return the customerId and let the caller post.
- * A residual remains: cancellation can still commit AFTER this read but before the external Xero call
- * (a lock-less TOCTOU shared with the daily-batch's own select-then-post window); closing it fully needs
- * a posting-intent/lock protocol between cancellation and posting (tracked separately).
+ * o3d-7o0 — THE READ IS NOW TAKEN UNDER THE ORDER'S ROW LOCK, IN THE TRANSACTION THAT RETIRES.
+ *
+ * It used to be a bare `findUnique` followed by a separate transaction, so a cancellation could commit
+ * between the answer and the external POST and the invoice landed anyway — a lock-less TOCTOU this
+ * function's own header could only declare. `cancelSalesOrderFulfillmentState` opens with
+ * `lockSalesOrder` on the same row, so taking it here makes the two SERIALISE: either the cancellation
+ * commits first and this read sees CANCELLED, or this transaction holds the lock and the cancellation
+ * waits — and then finds this worker's PROCESSING claim (committed by the runner BEFORE processEntry)
+ * and REFUSES, via assertNoSalesInvoicePostingInFlight. The claim is the posting intent; this lock is
+ * what makes reading it binding. Together they close the window rather than narrowing it.
+ *
+ * LOCK ORDERING: `lockSalesOrder` is the FIRST statement and the ONLY lock this transaction takes,
+ * before any accounting_sync_logs write. The cancellation takes the same order lock first, then stock
+ * levels, then the sync rows. Nothing can cycle.
+ *
+ * Fails CLOSED on an unreadable order, exactly as before: the whole transaction is wrapped, so a lock
+ * timeout or a read error returns a retryable failure rather than permission to post.
  */
-async function guardCancelledSalesOrderInvoice(
-  entryId: string,
+export async function guardCancelledSalesOrderInvoice(
+  attempt: AttemptRef,
   referenceType: string,
   referenceId: string,
-  claimedAt: Date,
+  held: HeldClaim,
 ): Promise<{ post: true; customerId?: string } | { post: false; result: EntryResult }> {
   if (referenceType !== 'SalesOrder') return { post: true }
-  let so: { customerId: string | null; status: string } | null
+  let outcome:
+    | { kind: 'missing' }
+    | { kind: 'cancelled' }
+    | { kind: 'live'; customerId?: string }
   try {
-    so = await db.salesOrder.findUnique({ where: { id: referenceId }, select: { customerId: true, status: true } })
+    outcome = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, referenceId)
+      const so = await tx.salesOrder.findUnique({
+        where: { id: referenceId },
+        select: { customerId: true, status: true },
+      })
+      if (!so) return { kind: 'missing' as const }
+      if (so.status === 'CANCELLED') {
+        // Claim-fenced AND attempt-fenced (o3d-550x + o3d-e2mz): only retire if this exact claim
+        // still owns the row and THIS attempt is still the current one, and advance the attempt as
+        // it retires so nothing else can write back onto it (retire returns false otherwise).
+        // Either way nothing was posted, so skip — a lost fence means another attempt owns/posted it.
+        await retireSalesInvoiceForCancelledOrder(tx, attempt, referenceId, held)
+        return { kind: 'cancelled' as const }
+      }
+      return { kind: 'live' as const, customerId: so.customerId ?? undefined }
+    })
   } catch (error) {
     return { post: false, result: { success: false, error: `Could not read sales order ${referenceId} status before posting: ${String(error)}` } }
   }
-  if (!so) {
+  if (outcome.kind === 'missing') {
     return { post: false, result: { success: false, error: `Sales order ${referenceId} not found before posting an invoice` } }
   }
-  if (so.status === 'CANCELLED') {
-    // Claim-fenced: only retire if this exact claim still owns the row (retire returns false otherwise).
-    // Either way nothing was posted, so skip — a lost fence means another worker owns/posted it.
-    await db.$transaction((tx) => retireSalesInvoiceForCancelledOrder(tx, entryId, referenceId, claimedAt))
+  if (outcome.kind === 'cancelled') {
     return { post: false, result: { success: true, skipped: true } }
   }
-  return { post: true, customerId: so.customerId ?? undefined }
+  return { post: true, customerId: outcome.customerId }
 }
 
+// o3d-k26m.5 round 4 added a SECOND `heldClaimWhere` here, with a note saying it was deliberately
+// identical to the sibling branch's and that "if both land, keep one definition". Both have landed,
+// so this is that collapse: the definition is the one in `@/lib/domain/accounting/sync-claim-fence`,
+// imported at the top of this file and re-exported below, and the copy that stood here is gone.
+//
+// It is not merely a duplicate. It took a bare `Date`, and this branch's contract is that a claim is
+// a HOLDER asked for its instant at the point of use — which is why every consumer of the copy below
+// had to be threaded with the claim rather than a snapshot of it, and why the compiler, not a
+// reviewer, found them.
+
+/**
+ * THE OTHER WRITER IS US: ONE IMS WORKER AT A TIME MAY POST UNDER A GIVEN NUMBER (o3d-k26m.5 r4,
+ * rebuilt on a LOCK in round 5).
+ *
+ * The ledger lookup answers "who holds this number NOW", and between that answer and the POST there
+ * is a window. Once xeroom is removed the only thing that can take a number inside that window is
+ * another IMS worker holding a DIFFERENT sync row that carries the SAME number — two rows for one
+ * order, or two orders WooCommerce numbered alike. Both workers would read "unclaimed", both would
+ * post, and because the create is update-or-create on the number the second silently REPLACES the
+ * first. One invoice, one survivor, nothing anywhere recording that there had been two.
+ *
+ * It is the only race that survives the cutover, and unlike a foreign writer it is entirely ours to
+ * close.
+ *
+ * ------------------------------------------------------------------------------------------------
+ * WHAT ROUND 4 GOT WRONG, AND WHY BOTH HALVES WERE THE SAME MISTAKE (Codex round 4 → round 5)
+ * ------------------------------------------------------------------------------------------------
+ * Round 4 closed it WITHOUT a lock: each worker wrote its stamp before it read for rivals, and
+ * yielded to any rival whose stamp was not strictly later than its own. Two independent defects,
+ * and both come from letting something other than the resource itself decide.
+ *
+ * 1. THE IDENTITY WAS NARROWER THAN THE LEDGER'S. The rival scan matched `attemptedInvoiceNumber`
+ *    as an exact string. Xero matches invoice numbers case-insensitively — this module's own lookup
+ *    says so and re-compares its response that way — so `INV-1` and `inv-1` are ONE document and one
+ *    upsert target, while round 4 gave them two independent slots. Each worker found itself
+ *    unopposed; the second post replaced the first. The mutex and the ledger now share ONE
+ *    definition of "the same number", `xeroInvoiceNumberIdentity`, so a pair of rows Xero would
+ *    collide cannot hold different slots.
+ *
+ * 2. A CLOCK DECIDED WHO WON, AND CLOCKS DO NOT AGREE. Round 4 already found one clock trap here
+ *    (two stamps recording as equal when one genuinely preceded the other, fixed by making a tie
+ *    yield both ways). The deeper one it left: the stamps come from DIFFERENT HOSTS. If worker A's
+ *    clock runs far enough ahead of worker B's, A reads B's live stamp as older than the lease and
+ *    filters it out entirely — while B, seeing A's stamp dated in its own future, reads A as
+ *    "strictly later" and posts anyway. BOTH POST. No tie-break can repair that, because the inputs
+ *    are not comparable quantities.
+ *
+ * ------------------------------------------------------------------------------------------------
+ * SO THE ORDERING IS A LOCK ORDERING, NOT A CLOCK READING — AND NO HOST PARTICIPATES
+ * ------------------------------------------------------------------------------------------------
+ * The sibling branch o3d-batch-wcfix reached the same conclusion about its own evidence ordering and
+ * replaced a wall clock with a monotonic generation minted under a lock. A generation is the right
+ * answer THERE because what that code needs is an ORDER over successive writes to one row. Here
+ * there is no order to establish: what is needed is that only one worker at a time may look and then
+ * stamp. So the lock is not a way of minting an ordering, it IS the answer — the shared resource is
+ * the invoice number, and PostgreSQL will serialize on it directly:
+ *
+ *   `pg_advisory_xact_lock(XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE, hashtext(<identity>))`
+ *
+ * taken as the FIRST statement of the transaction that reads the in-flight rows and writes this
+ * row's stamp. Under it, look-then-stamp is atomic with respect to every other worker asking about
+ * the same number, so:
+ *
+ *   - there is no tie to break and no stamp comparison anywhere in the decision;
+ *   - who gets the slot is decided by the lock manager, which is one arbiter with one view, not by
+ *     two hosts comparing readings of two clocks;
+ *   - the round-4 write-before-read proof is retired along with the thing it was proving. It was an
+ *     argument that two workers could not both miss each other; the lock makes "both look" impossible
+ *     rather than merely unprofitable.
+ *
+ * THE LOCK IS NOT HELD ACROSS THE POST, and could not be: the post is an HTTP request that may take
+ * minutes, and an advisory lock spanning it would wedge every other worker behind a crashed one. What
+ * fences the number DURING the post is the stamp, and the stamp has a lease.
+ *
+ * IT IS ALSO EXACTLY ONE LOCK, TAKEN FIRST AND RELEASED BY THE TRANSACTION. Nothing here acquires a
+ * second, so there is no acquisition order to get wrong and no deadlock to construct — the hazard the
+ * per-SKU product locks have to sort their ids for. A worker blocked behind a rival long enough to
+ * exhaust the interactive-transaction timeout ends in the catch below, which REFUSES; waiting too
+ * long for the lock costs a retry, never a post.
+ *
+ * THE ONE REMAINING CLOCK READING IS THAT LEASE, AND IT IS THE DATABASE'S. A stamp fences the number
+ * only while it is younger than {@link CLAIM_STALE_MS} — and, since round 7, for the WHOLE of that
+ * window whatever becomes of the row. A worker that died mid-post writes no outcome at all, and a
+ * worker whose post timed out writes one that is not evidence either way; the lease is what stops
+ * either of them fencing a number off for good. That is a duration, not an ordering — nothing about who wins depends on it — and both ends of it are now read from the SAME
+ * clock: `now()` inside the transaction supplies the cutoff AND the value written into
+ * `attemptedInvoiceNumberAt`. So a stamp lapses exactly one lease after it was written, whatever the
+ * workers' own hosts believe the time to be, and two clocks are never compared.
+ *
+ * ------------------------------------------------------------------------------------------------
+ * WHY THE NUMBER IS COMPARED IN JAVASCRIPT AND NOT IN THE QUERY
+ * ------------------------------------------------------------------------------------------------
+ * The obvious spelling of a case-insensitive match — Prisma's `mode: 'insensitive'` — compiles to
+ * `ILIKE`, which treats the value as a PATTERN. `_wcpdf_invoice_number` is free text an admin can
+ * edit (prefix, number and suffix are all settings), so it can contain `%`, `_` or a backslash. The
+ * first two only widen the match, which is harmless here; a BACKSLASH does not — `a\_b` as a pattern
+ * matches `a_b` and NOT the stored `a\_b`, so the rival would be MISSED. A missed rival is the
+ * overwrite. So the query narrows only on things with no pattern semantics (connector, status, the
+ * lease window, a non-null stamp) and the identity comparison happens in code, where it is string
+ * equality and nothing else.
+ *
+ * The candidate set that reaches code is every row that has attempted a post under this connector
+ * within the last lease — one row per create attempt, so a handful in any ordinary quarter-hour, and
+ * bounded in the limit by Xero's own 1,000-call rolling day budget (each create costs several calls,
+ * so the cap below cannot be approached except by a burst that is about to exhaust the day). It is
+ * served by `accounting_sync_logs_invoice_number_fence_idx`, a partial index on exactly the stamped
+ * rows. It is still CAPPED, and a scan that hits the cap REFUSES rather than reporting the fraction
+ * it saw: the same rule the ledger lookup applies to a page it cannot prove is complete.
+ *
+ * ------------------------------------------------------------------------------------------------
+ * WHAT COUNTS AS A LIVE RIVAL — AND WHY IT IS NO LONGER "STILL PROCESSING" (Codex round 7, #1)
+ * ------------------------------------------------------------------------------------------------
+ * Stamped within the lease. THAT IS THE WHOLE TEST; the row's status is not part of it, and used to
+ * be. Rounds 4-6 also required `status = 'PROCESSING'`, on the reasoning that a loser's row drops
+ * back to PENDING as it fails, which frees the number immediately. It does — and that is the defect,
+ * because A FAILED ROW IS NOT PROOF THAT NOTHING WAS POSTED.
+ *
+ * A POST THAT TIMES OUT HAS NO OUTCOME, ONLY AN UNKNOWN ONE. The socket write happened; the reply
+ * did not arrive. Xero may have created the document, may not, and this process cannot tell which —
+ * that is the same lost-response state the whole fence is built around, and the `Idempotency-Key`
+ * that would once have replayed the original answer is retained for six minutes, well inside the
+ * fifteen this lease runs for. Past that, a replay is a fresh create, and the create is
+ * update-or-create on the number.
+ *
+ * Under the old predicate that row settled — FAILED, or back to PENDING for the retry ladder — and
+ * STOPPED FENCING ITS NUMBER within seconds of the timeout. A second worker whose ledger answer had
+ * been taken before the first post left would then find no rival, take the slot, and post under a
+ * number a live document may already be carrying. The exclusion evaporated at exactly the moment its
+ * subject became uncertain.
+ *
+ * SO A STAMP IS RETIRED BY ITS LEASE AND BY NOTHING ELSE. It says "this row may already have written
+ * this number", and only time can make that stop mattering. Nothing releases it early, because
+ * nothing available locally is proof of a remote non-write: not a FAILED status, not a refusal
+ * recorded after an earlier attempt in the same call already reached the wire, not a 429 the client
+ * gave up on.
+ *
+ * THAT IS WHAT MAKES THE TWO BOUNDS FIT TOGETHER. A rival's answer may be at most one lease old when
+ * it is spent ({@link LEDGER_ANSWER_MAX_AGE_MS}), and a stamp fences for exactly one lease from the
+ * instant it was written — which is the instant of the send, since the stamp is re-taken on every
+ * attempt. So no answer obtained BEFORE our post left can still be spendable after our fence lapses.
+ * With the status filter in place that argument was simply false; the fence could vanish in seconds
+ * while the answer it was protecting against stayed valid for fifteen minutes.
+ *
+ * WHAT THE LEASE DOES NOT COVER, STATED. A rival that asks the ledger AFTER our post left, and posts
+ * a full lease later, can outlive our stamp. Its backstop is the ledger question itself: by then a
+ * post that landed is a document Xero will report, and the answer is a refusal
+ * (NUMBER_HELD_BY_FOREIGN_DOCUMENT) rather than a permission. The local fence covers the window in
+ * which the ledger cannot yet know; it does not pretend to cover the one in which it can.
+ *
+ * THE COST OF THE WIDER SET IS REFUSALS, WHICH IS THE RECOVERABLE DIRECTION. A row that genuinely
+ * sent nothing — refused by a later authorisation in the same scope, say — still fences its number
+ * for up to a lease, so a different row carrying the SAME number waits and retries. Two rows racing
+ * on one number is the situation this fence exists for; making one of them wait fifteen minutes is
+ * not a cost worth trading an unrecoverable write for.
+ *
+ * NOT filtered by sync type. The question is "is another worker about to write this number", and the
+ * only writer of this column is this fence, so a type filter could only ever hide a rival.
+ *
+ * IT LICENSES NOTHING. Finding no rival is not permission to post — the ledger's answer is, and it is
+ * asked separately. This can only ever refuse.
+ *
+ * EXPORTED so the exclusion can be exercised directly, against a database double and with no Xero
+ * client anywhere near it — the property being pinned is about two workers and one column, and
+ * driving it through `processEntry` would need the whole connector to say nothing more.
+ *
+ * AND A LOST CLAIM REFUSES. If the stamp updates no row, this worker no longer owns the entry: it was
+ * re-claimed after aging out, another worker is on it, and continuing would post from a row whose
+ * outcome this worker may no longer write.
+ */
+export const INVOICE_NUMBER_RIVAL_SCAN_LIMIT = 200
+
+export async function takeInvoiceNumberPostSlot(params: {
+  entryId: string
+  /** The claim this worker HOLDS, read as each fenced statement is built — never a snapshot. */
+  held: HeldClaim
+  invoiceNumber: string
+  orderLabel: string
+}): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const identity = xeroInvoiceNumberIdentity(params.invoiceNumber)
+  if (!identity) {
+    // Unreachable from the fence (an empty number is refused before the ledger is even asked), and
+    // kept as a refusal because an empty lock key would serialize every unrelated invoice onto one
+    // slot — a mutex that says "yes" to nobody.
+    return {
+      ok: false,
+      reason:
+        `Refusing to post ${params.orderLabel}: the invoice number is blank once trimmed, so there is no `
+        + 'number to exclude another worker on. NOTHING WAS SENT.',
+    }
+  }
+
+  try {
+    return await db.$transaction(async (tx) => {
+      // FIRST, before any read or write. Everything below is a look-then-stamp, and a look-then-stamp
+      // is only atomic for as long as this is the statement that precedes it.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE}::int4, hashtext(${identity})::int4)`
+
+      // The lease's clock, read once and used at BOTH ends — see the header. Taking it from the
+      // database rather than this host is what stops two workers' clocks being compared.
+      const clock = await tx.$queryRaw<Array<{ now: Date }>>`SELECT now() AS now`
+      const now = clock?.[0]?.now
+      if (!(now instanceof Date)) {
+        return {
+          ok: false,
+          reason:
+            `Could not read the database clock before posting ${params.orderLabel} as invoice number `
+            + `${params.invoiceNumber}, so how old another worker's in-flight stamp is cannot be established. `
+            + 'NOTHING WAS SENT.',
+        }
+      }
+
+      const inFlight = await tx.accountingSyncLog.findMany({
+        where: {
+          id: { not: params.entryId },
+          connector: XERO_CONNECTOR,
+          // NO STATUS FILTER, and its absence is the round-7 fix — see WHAT COUNTS AS A LIVE RIVAL
+          // in the header. A row that has left PROCESSING is not a row whose post did not land.
+          attemptedInvoiceNumber: { not: null },
+          attemptedInvoiceNumberAt: { gte: new Date(now.getTime() - CLAIM_STALE_MS) },
+        },
+        // Makes the REFUSAL deterministic when several rows qualify. It decides nothing: any live
+        // rival refuses, so which one is named is a diagnostic question, not an ordering one.
+        orderBy: { id: 'asc' },
+        select: { id: true, referenceId: true, attemptedInvoiceNumber: true },
+        take: INVOICE_NUMBER_RIVAL_SCAN_LIMIT,
+      })
+
+      if (inFlight.length >= INVOICE_NUMBER_RIVAL_SCAN_LIMIT) {
+        return {
+          ok: false,
+          reason:
+            `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: the in-flight scan `
+            + `filled its ${INVOICE_NUMBER_RIVAL_SCAN_LIMIT}-row limit, so it cannot show that it saw every sync `
+            + 'row that might be posting under that number. NOTHING WAS SENT.',
+        }
+      }
+
+      const rival = inFlight.find(
+        (r) => r.attemptedInvoiceNumber !== null && xeroInvoiceNumberIdentity(r.attemptedInvoiceNumber) === identity,
+      )
+      if (rival) {
+        return {
+          ok: false,
+          reason:
+            `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: sync row ${rival.id} `
+            + `(reference ${rival.referenceId}) is already in flight under that same number `
+            + `(${JSON.stringify(rival.attemptedInvoiceNumber)}). The create is update-or-create on the number, so `
+            + 'both posts would land on ONE document and the later one would silently replace the earlier. NOTHING '
+            + 'WAS SENT — this retries once that row settles, and if both rows genuinely describe the same invoice, '
+            + 'cancel the duplicate.',
+        }
+      }
+
+      // The number is recorded VERBATIM, not as its identity: the column is the record of what this
+      // row set out to post, and what it set out to post is the customer's own number. The identity
+      // is how the fence compares two of them, never what it stores.
+      //
+      // BEFORE the post, never after — and a failure to write it REFUSES the post. Not because the
+      // record licenses anything (it does not: see invoice-number-ownership.ts), but because a create
+      // whose local record cannot be written is a create whose OUTCOME cannot be written either. A
+      // database that will not take this row will not take the InvoiceID the response carries, and
+      // that is exactly the lost-response state the fence can no longer heal.
+      const stamped = await tx.accountingSyncLog.updateMany({
+        where: heldClaimWhere(params.entryId, params.held),
+        data: { attemptedInvoiceNumber: params.invoiceNumber, attemptedInvoiceNumberAt: now },
+      })
+      if (stamped.count === 0) {
+        return {
+          ok: false,
+          reason:
+            `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: this worker no longer `
+            + `holds the claim on sync row ${params.entryId} — it aged out and another worker re-claimed it. NOTHING `
+            + 'WAS SENT; the worker that holds the row now will post it.',
+        }
+      }
+
+      return { ok: true }
+    })
+  } catch (error) {
+    // Fails closed like every other read and write on this path: not knowing whether a sibling is
+    // mid-post, or failing to record that we are about to be, is not permission to post.
+    return {
+      ok: false,
+      reason:
+        `Could not take the exclusive post slot for invoice number ${params.invoiceNumber} on sync row `
+        + `${params.entryId} (${params.orderLabel}): ${String(error)}. NOTHING WAS SENT.`,
+    }
+  }
+}
+
+/**
+ * HOW OLD THE LEDGER'S ANSWER MAY BE WHEN THE REQUEST FINALLY LEAVES (o3d-k26m.5 round 5, #2).
+ *
+ * Deliberately the claim's own lease and not a number of its own. Past this point the claim under
+ * which the answer was obtained is itself re-takeable by another worker, so the row may no longer be
+ * ours to post from — an answer that has outlived the claim it was taken under cannot be authorising
+ * anything.
+ */
+const LEDGER_ANSWER_MAX_AGE_MS = CLAIM_STALE_MS
+
+/**
+ * A monotonic, in-process millisecond reader.
+ *
+ * `Date.now()` would be a wall clock, and a wall clock can step backwards under NTP — which on this
+ * particular measurement would report a stale answer as fresh. This measures ONE elapsed interval
+ * inside ONE process, which is exactly what `performance.now()` is for; nothing here is compared
+ * against a value from another host.
+ */
+const monotonicNowMs = (): number => performance.now()
+
+/**
+ * THE CHECK THAT RUNS IMMEDIATELY BEFORE THE REQUEST LEAVES (o3d-k26m.5 round 5 #2, round 6).
+ *
+ * THE PROBLEM IT FIXES. Round 4 asked the ledger, then took the post slot, then called
+ * `pushSalesInvoice` — and `pushSalesInvoice` does not post first. It PREPARES: `findOrCreateContact`
+ * is a Xero round trip, and `findOrCreateItem` is another one per distinct item code, each through
+ * the same rate-limited client whose in-request budget is six minutes PER CALL. So an ordinary
+ * multi-line invoice could sit in preparation for longer than the fifteen-minute lease that made the
+ * slot mean anything, and the sequence was:
+ *
+ *     ask the ledger → take the slot → [unbounded preparation] → POST
+ *
+ * By the time the POST left, the slot could have lapsed (so a rival's scan no longer saw it, and a
+ * second worker was free to post under the same number), the claim on the row could have aged out and
+ * been re-taken (so the row was not even ours), and the ledger's answer was as old as all of it. The
+ * answer that authorised the post was stale in every way at once.
+ *
+ * THE FIX IS PLACEMENT, NOT ANOTHER CHECK. The slot is no longer taken before preparation; it is
+ * taken by this closure, which is now scoped around the create and run from inside `performRequest`
+ * as the last statement before the socket. So the sequence is now:
+ *
+ *     ask the ledger → [unbounded preparation] → take the slot → POST
+ *
+ * and the slot cannot expire during preparation because it does not yet exist during preparation.
+ *
+ * ROUND 6 MOVED THE EVALUATION ONE LAYER FURTHER DOWN, because "immediately before `xeroPost`" was
+ * not immediately before the write: `xeroPost` resolves auth (a token refresh is a network call),
+ * then blocks in `waitForBudget` until the tenant's minute window clears, then retries a 429 with
+ * sleeps of up to 90 seconds, up to four attempts. The slot is a fifteen-minute lease and A RETRY CAN
+ * OUTLIVE IT — so this closure now runs ON EVERY ATTEMPT, immediately before the bytes move, which is
+ * also what keeps the lease refreshed for as long as we are still trying. See
+ * lib/connectors/accounting-egress-authorization.ts. The gap it has to cover shrinks from "the whole
+ * entry" to "the width of one socket write".
+ *
+ * ROUND 7 ADDED THE ONE THING THE PLACEMENT ALONE DID NOT FIX: WHICH LEDGER THE ANSWER IS ABOUT.
+ * `lookupXeroInvoiceNumberClaim` resolves the Xero connection for itself and the create resolves it
+ * again; between the two, a reconnect, a tenant re-pin, or a refresh landing on another tenant makes
+ * the answer a fact about organisation A and the post a write to organisation B — where nothing was
+ * asked, and where the number may well be held by a live document. Age was bounded and identity was
+ * not, so a perfectly fresh answer could authorise a post into a ledger it had never seen.
+ *
+ * The answer therefore travels with the tenant that gave it (`answeredByTenantId`, carried out of the
+ * lookup and onto the decision), and this closure re-states it against `request.tenantId` — the
+ * `auth` the outgoing request was built from, handed in by the egress seam as the last statement
+ * before the socket. This is the ONE place the comparison is sound: anywhere earlier and the post
+ * resolves auth again afterwards, which is the stale read being removed rather than a check.
+ *
+ * It reuses the sibling `o3d-batch-realm`'s seam rather than adding a third: that branch reaches its
+ * own tenant verdict at this same point against this same `auth.tenantId`, and DELETED its earlier
+ * pre-check on the ground that a refusal from a stale read is as wrong as a permission from one.
+ * There is no pre-check here either — the guard binds nothing, it only records which organisation
+ * answered. The two questions are different (realm: may this row reach this ledger at all; here: is
+ * this the ledger my answer came from), so they are two entries in the accumulating authorisation
+ * list, evaluated in scope order, never two evaluation sites.
+ *
+ * WHAT HAPPENS TO EACH OF THE FOUR THINGS THAT COULD GO STALE:
+ *
+ *   - THE ORGANISATION THE ANSWER IS ABOUT: re-stated against the outgoing request's own tenant, on
+ *     every attempt, and refused on any difference — see above.
+ *   - THE SLOT: no longer stale by construction — see above.
+ *   - THE CLAIM ON THE ROW: RE-CHECKED, in the database, at the same instant. The stamp is fenced on
+ *     `heldClaimWhere`, so a worker whose claim aged out during preparation writes nothing and posts
+ *     nothing. That check is not advisory: it is the same statement that takes the slot.
+ *   - THE LEDGER'S ANSWER: BOUNDED, and refused past the bound — re-measured on every attempt, so a
+ *     retry ladder that sleeps past the bound refuses instead of sending on a lapsed answer. It is
+ *     deliberately NOT re-asked. The
+ *     fence is costed at ONE lookup per create against a 1,000-call daily budget, and a second call
+ *     would buy almost nothing: the only writers that could have taken the number since are another
+ *     IMS worker — which the slot excludes, and now excludes at the instant of the post rather than
+ *     minutes before it — or a human typing an invoice into Xero by hand, which is unobservable from
+ *     inside IMS at any age of answer and is documented as such rather than implied to be covered.
+ *     What a bound does buy is that the fence can never post on an answer of unbounded age, which is
+ *     the state Codex found.
+ *
+ * RELATIONSHIP TO THE SIBLING BRANCH o3d-batch-small2, WHICH FOUND THE SAME WINDOW. That branch
+ * closes the GENERIC half — a lease over the whole entry, an absolute deadline, and a claim re-take
+ * before each of the fourteen remote mutations — and flagged, in its own commit message, exactly the
+ * residual it could not reach: "the fence cannot reach INSIDE a connector call, so one call that does
+ * two reads then a write is bounded only by the per-call budget — closing that needs a hook threaded
+ * through the connector modules". THIS IS THAT HOOK, threaded for the one call where the residual is
+ * an irreversible overwrite rather than a duplicate. The two answers do not disagree and are not
+ * alternatives: small2 proves the ROW is still ours, this proves the NUMBER is still ours, and after a
+ * merge both belong in the same place — `lease.fenceBeforeRemoteWrite('sales-invoice')` should move
+ * from the call site into this closure, so the claim re-take and the slot are taken at one instant
+ * immediately before the socket rather than one before preparation and one after.
+ *
+ * RE-ENTRANCY. Because this now runs once per HTTP attempt rather than once per call, everything it
+ * does must be safe to repeat: it is. The rival scan is a read; the stamp is an idempotent write of
+ * the SAME number with a refreshed database timestamp, fenced on the claim, so a repeat either
+ * renews our own lease or discovers the row is no longer ours and refuses.
+ *
+ * A REFUSAL HERE IS AN ORDINARY FAILURE, like every other refusal this fence produces: nothing was
+ * sent, the row runs the normal retry ladder, and the next run re-asks the ledger from scratch. (On
+ * small2 the same outcome is additionally marked `notPosted` so it does not spend a retry; that is
+ * that branch's field to add and this one must not invent a second spelling of it.)
+ */
+export function buildInvoiceNumberPostSlotCheck(params: {
+  entryId: string
+  /** The claim this worker HOLDS — see `takeInvoiceNumberPostSlot`. */
+  held: HeldClaim
+  invoiceNumber: string
+  orderLabel: string
+  referenceType: string
+  referenceId: string
+  /**
+   * The organisation the ledger's answer came from — see the ORGANISATION section above. The post is
+   * refused unless the request on the point of leaving is addressed to this same one.
+   */
+  answeredByTenantId: string
+  /** Injected only by tests. Monotonic milliseconds — never a wall clock. */
+  monotonicNowMs?: () => number
+}): BeforeRemoteWrite {
+  const readNow = params.monotonicNowMs ?? monotonicNowMs
+  // Taken at CONSTRUCTION, which the fence does immediately after the ledger answers. The age this
+  // measures is therefore the age of the answer, not the age of this closure.
+  const answeredAt = readNow()
+
+  const warn = async (description: string, action: string) => {
+    await logActivity({
+      entityType: params.referenceType === 'SalesOrder' ? 'SALES_ORDER' : 'SYSTEM',
+      entityId: params.referenceType === 'SalesOrder' ? params.referenceId : undefined,
+      action,
+      tag: 'accounting',
+      level: 'WARNING',
+      description,
+      metadata: { connector: XERO_CONNECTOR, syncLogId: params.entryId, invoiceNumber: params.invoiceNumber },
+      resolveUser: false,
+    }).catch(() => {})
+  }
+
+  return async (request) => {
+    // FIRST, because it is the cheapest refusal and the most fundamental one: everything below is
+    // about a number, and a number only means anything inside one organisation. Asked here, against
+    // the tenant the outgoing request itself carries, because this is the only point at which the
+    // ledger that ANSWERED and the ledger that will be WRITTEN TO can be compared with no second
+    // token resolution able to slip between them. Nothing is stamped and no slot is taken for a post
+    // that is going somewhere the fence never asked about.
+    if (request.tenantId !== params.answeredByTenantId) {
+      const error =
+        `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: the ledger that was asked `
+        + `who holds that number was organisation ${params.answeredByTenantId}, but this request is addressed to `
+        + `organisation ${request.tenantId} — the accounting connection changed between the question and the write. `
+        + 'The answer says nothing about the organisation about to receive the post, and the create is '
+        + 'update-or-create on the number, so it could silently replace a document there. NOTHING WAS SENT; the '
+        + 'next run asks the organisation that is actually connected.'
+      await warn(error, 'sales_invoice_number_answer_wrong_tenant')
+      return { ok: false, error }
+    }
+
+    const ageMs = readNow() - answeredAt
+    if (ageMs >= LEDGER_ANSWER_MAX_AGE_MS) {
+      const error =
+        `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: the ledger was asked who `
+        + `holds that number ${Math.round(ageMs / 1000)}s ago — longer than the ${Math.round(LEDGER_ANSWER_MAX_AGE_MS / 60_000)} `
+        + 'minutes this worker\'s claim on the row is guaranteed for — because building the invoice took that long '
+        + '(the contact and every item are separate calls to the accounting system). The answer that would authorise '
+        + 'this post is no longer current, and the create is update-or-create on the number. NOTHING WAS SENT; the '
+        + 'next run asks again.'
+      await warn(error, 'sales_invoice_number_answer_stale')
+      return { ok: false, error }
+    }
+
+    const slot = await takeInvoiceNumberPostSlot({
+      entryId: params.entryId,
+      held: params.held,
+      invoiceNumber: params.invoiceNumber,
+      orderLabel: params.orderLabel,
+    })
+    if (!slot.ok) {
+      await warn(slot.reason, 'sales_invoice_number_in_flight_elsewhere')
+      return { ok: false, error: slot.reason }
+    }
+
+    return { ok: true }
+  }
+}
+
+/**
+ * THE OWNERSHIP FENCE ON THE SALES-INVOICE CREATE (o3d-k26m.5).
+ *
+ * `POST /Invoices` is update-or-create on InvoiceNumber. Since o3d-k26m.1 the number is
+ * WooCommerce's own `_wcpdf_invoice_number` — which the outgoing xeroom plugin is posting to this
+ * same live organisation today — so a create for an order xeroom has already invoiced does not
+ * duplicate: it silently REPLACES that invoice. This asks the ledger who holds the number and
+ * lets the post through only when the answer is "nobody" or "a document we own". The rule itself
+ * is `decideInvoiceNumberPost`; this is its wiring, and it is the last thing between the payload
+ * and an irreversible write.
+ *
+ * APPLIED TO EVERY CREATE, not only to storefront-supplied numbers. The hazard is the VERB, not
+ * the number's provenance: an IMS-minted number that collides with anything already in the ledger
+ * overwrites it just as quietly. It costs one GET per invoice create, which is real against a
+ * 1,000-call rolling daily budget and is bought deliberately — the alternative currency is
+ * destroyed documents.
+ *
+ * NOT applied to SALES_INVOICE_UPDATE: that posts to `Invoices/{InvoiceID}`, an id IMS recorded
+ * from the create's own response, so it is already addressing a document we own by identity.
+ *
+ * FAILS CLOSED on an unreadable order and on an unreachable ledger, the same way
+ * guardCancelledSalesOrderInvoice does — a transient read outage must not become permission to
+ * post.
+ *
+ * AND THE ANSWER IS NEVER SEPARATED FROM THE LEDGER THAT GAVE IT (round 7). `lookupXeroInvoiceNumberClaim`
+ * reports the tenant that answered, `decideInvoiceNumberPost` carries it onto the permission, and the
+ * closure below re-states it against the tenant on the outgoing request. Nothing in THIS function
+ * compares tenants: a pre-check here would be a comparison between two separate resolutions of "the
+ * current connection", minutes before the write, which is a refusal or a permission produced from a
+ * stale read — the sibling branch o3d-batch-realm deleted exactly such a pre-check for exactly that
+ * reason. All this function does is refuse to hand on a permission that cannot say where it came from.
+ *
+ * AND ON THE WORKER NEXT TO IT — BUT NOT FROM HERE (round 5). The ledger's answer is about a moment;
+ * {@link takeInvoiceNumberPostSlot} covers the window between that moment and the request, which after
+ * the cutover only another IMS worker can occupy. Round 4 took that slot HERE, which put it in front
+ * of `pushSalesInvoice`'s preparation — a contact round trip plus one per distinct item code — so the
+ * slot, and the claim it was fenced on, could both have lapsed before the request left. This function
+ * therefore does not take the slot; it returns {@link buildInvoiceNumberPostSlotCheck}'s closure, which
+ * `pushSalesInvoice` runs after the payload is built and immediately before `xeroPost`. The order is
+ * unchanged — ledger first, so the common refusals cost no writes — but the slot is now taken as late
+ * as it is possible to take it.
+ *
+ * A REFUSAL IS RETURNED AS AN ORDINARY FAILURE, so the row runs the normal retry ladder and settles
+ * as FAILED with the reason on it. That is not wasted budget: the fence re-asks the ledger each
+ * time, so the operator's remedy — linking the right document to the order, or voiding the wrong
+ * one — is picked up automatically by the next retry instead of needing a re-queue. The ladder is
+ * bounded (MAX_RETRIES), so a refusal nobody acts on costs a handful of reads and then stops.
+ */
+async function guardSalesInvoiceNumberOwnership(
+  entryId: string,
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+  /**
+   * The claim this worker HOLDS — the fence's own writes are conditioned on it. A holder, not the
+   * instant: on this branch the claim is RENEWED before every remote mutation, and the slot stamp
+   * below is written some way after this guard is entered, so a snapshot taken here would fence on
+   * a claim that has since moved and would match nothing at all.
+   */
+  held: HeldClaim,
+): Promise<{ post: true; beforePost: BeforeRemoteWrite } | { post: false; result: EntryResult }> {
+  const invoiceNumber = typeof payload.invoiceNumber === 'string' ? payload.invoiceNumber : null
+
+  let ownedInvoiceId: string | null = null
+  let orderLabel = `${referenceType} ${referenceId}`
+  if (referenceType === 'SalesOrder') {
+    try {
+      const so = await db.salesOrder.findUnique({
+        where: { id: referenceId },
+        select: { accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true },
+      })
+      // A missing order is NOT "unowned". It means the thing we are invoicing cannot be read, and
+      // the fence's whole job is to refuse to guess.
+      if (!so) {
+        return {
+          post: false,
+          result: { success: false, error: `Sales order ${referenceId} not found before posting an invoice` },
+        }
+      }
+      ownedInvoiceId = so.accountingInvoiceId
+      orderLabel = `order ${so.orderNumber ?? so.externalOrderNumber ?? referenceId}`
+    } catch (error) {
+      return {
+        post: false,
+        result: { success: false, error: `Could not read sales order ${referenceId} before the invoice-number ownership check: ${String(error)}` },
+      }
+    }
+  }
+
+  // Message material for a refusal, never a licence to post (o3d-k26m.5, Codex round 3). A read
+  // failure here still refuses: it is the same unhealthy-database signal that would stop the
+  // POST's own outcome from being recorded.
+  let attemptedInvoiceNumber: string | null = null
+  try {
+    const entry = await db.accountingSyncLog.findUnique({
+      where: { id: entryId },
+      select: { attemptedInvoiceNumber: true },
+    })
+    attemptedInvoiceNumber = entry?.attemptedInvoiceNumber ?? null
+  } catch (error) {
+    return {
+      post: false,
+      result: { success: false, error: `Could not read the invoice-number attempt on sync row ${entryId}: ${String(error)}` },
+    }
+  }
+
+  const lookup = await lookupXeroInvoiceNumberClaim(invoiceNumber ?? '')
+  const decision = decideInvoiceNumberPost({ invoiceNumber, lookup, ownedInvoiceId, attemptedInvoiceNumber, orderLabel })
+
+  if (!decision.post) {
+    await logActivity({
+      entityType: referenceType === 'SalesOrder' ? 'SALES_ORDER' : 'SYSTEM',
+      entityId: referenceType === 'SalesOrder' ? referenceId : undefined,
+      action: 'sales_invoice_number_not_ours',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: decision.reason,
+      metadata: {
+        connector: XERO_CONNECTOR,
+        syncLogId: entryId,
+        invoiceNumber,
+        refusalCode: decision.code,
+        retryable: decision.retryable,
+      },
+      resolveUser: false,
+    }).catch(() => {})
+    return { post: false, result: { success: false, error: decision.reason } }
+  }
+
+  // EVERY post that lands on the number takes the slot — the `unclaimed` create and the
+  // `own-document` update alike. Both write to the ledger addressing it BY NUMBER, so both are
+  // capable of being the second of two writes that collapse into one document. The stamp is also
+  // the durability gate it always was; only its condition has changed (from "the ledger said
+  // nobody holds it" to "we are about to post"), which is the honest one for both jobs.
+  if (!invoiceNumber) {
+    // Unreachable: a missing number is refused by the rule above. Kept as a refusal rather than a
+    // non-null assertion, because the one thing that must never happen here is posting unfenced.
+    return {
+      post: false,
+      result: { success: false, error: `No invoice number to fence before posting ${orderLabel}` },
+    }
+  }
+
+  // Built HERE, so the age it measures starts at the ledger's answer — and RUN by pushSalesInvoice,
+  // after preparation, immediately before the request leaves (round 5, finding #2).
+  return {
+    post: true,
+    beforePost: buildInvoiceNumberPostSlotCheck({
+      entryId,
+      held,
+      invoiceNumber,
+      orderLabel,
+      referenceType,
+      referenceId,
+      // Not re-read from the connection here, and that is the point (round 7, finding 2). This is the
+      // organisation that ANSWERED the question above, carried out of the decision that granted the
+      // permission, so the comparison at the socket is between the ledger asked and the ledger
+      // written to — never between two separate resolutions of "the current tenant".
+      answeredByTenantId: decision.answeredByTenantId,
+    }),
+  }
+}
+
+/**
+ * HAS IMS EVER DISPATCHED A CREATE FOR THIS SUPPLIER CREDIT NOTE? (o3d-tfri r3)
+ *
+ * The question is about the CREDIT NOTE, not this row. `retryCount` alone answers it for the ordinary
+ * case — a row that has failed once may have failed AFTER the request left — but a row whose retries
+ * exhausted settles as FAILED, and `queueXeroSync` dedupes new enqueues on PENDING/PROCESSING/SYNCED
+ * only, so the same credit note can legitimately be re-queued as a BRAND NEW row with `retryCount` 0.
+ * Reading this row alone would then call a replay a first attempt, which is the one wrong answer that
+ * ends in a second ACCPAYCREDIT.
+ *
+ * Conservative in the safe direction, and deliberately: a sibling row that never actually sent
+ * (cancelled, or refused before the request was built) makes this say "not the first attempt", and
+ * the poster then refuses a create the ledger cannot vouch for. That costs an operator a look at
+ * Xero. The opposite error costs the ledger a duplicate credit note.
+ *
+ * FAILS CLOSED. A count that cannot be read is not permission to treat this as a first attempt.
+ */
+async function isFirstPurchaseCreditNoteAttempt(
+  entryId: string,
+  referenceType: string,
+  referenceId: string,
+): Promise<{ ok: true; firstAttempt: boolean } | { ok: false; error: string }> {
+  try {
+    const row = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { retryCount: true } })
+    if (!row) {
+      return { ok: false, error: `NOTHING WAS SENT. Sync row ${entryId} could not be read back to establish whether a supplier credit-note create has already been dispatched.` }
+    }
+    if (row.retryCount > 0) return { ok: true, firstAttempt: false }
+    const siblings = await db.accountingSyncLog.count({
+      where: {
+        connector: XERO_CONNECTOR,
+        type: 'PURCHASE_CREDIT_NOTE',
+        referenceType,
+        referenceId,
+        id: { not: entryId },
+      },
+    })
+    return { ok: true, firstAttempt: siblings === 0 }
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        `NOTHING WAS SENT. IMS could not establish whether a create has already been dispatched for this supplier `
+        + `credit note: ${String(error)}. Creating without that answer risks a second ACCPAYCREDIT.`,
+    }
+  }
+}
+
+/**
+ * o3d-19gy / o3d-s36z / o3d-gfh: every remote call this entry makes is attributed to this entry's row.
+ *
+ * WHERE THE PERMISSION IS ACTUALLY GRANTED. Not here. This establishes the INTENT — which row is being
+ * posted — and the verdict is reached inside `performRequest`, against the tenant id that will be
+ * written into the outgoing `Xero-Tenant-Id` header, immediately before the request leaves. The earlier
+ * revision decided it here, from its own read of the `AccountingToken` row, and the request then made a
+ * second, independent selection of the tenant when it built its headers; a permission taken at T1 and
+ * spent at T2 is not a permission, and that gap is what Codex r1 finding 3 names.
+ *
+ * The wrap covers the whole entry rather than just its write, because a handler's contact and item
+ * lookups CACHE ids from the responses they get: reading organisation C's chart of accounts on behalf of
+ * a row raised against B is the same error one step earlier.
+ */
 async function processEntry(
   entryId: string,
   type: AccountingSyncType,
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
-  claimedAt: Date,
+  // The LEASE, not a claim timestamp (o3d-xl63 r5 #1). Every remote mutation below fences on it, and
+  // the caller reads `lease.heldFrom()` afterwards to anchor the persist to the claim actually held.
+  lease: RemoteWriteLease,
+  /** o3d-e2mz: the attempt this claim minted — the cancelled-order retirement below fences on it. */
+  attempt: AttemptRef,
+): Promise<EntryResult> {
+  return withAccountingPostingIntent(
+    { connector: XERO_CONNECTOR, payload, type, referenceType, referenceId },
+    () => processClaimedEntry(entryId, type, referenceType, referenceId, payload, lease, attempt),
+  )
+}
+
+async function processClaimedEntry(
+  entryId: string,
+  type: AccountingSyncType,
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+  // THE LEASE (o3d-xl63 r5 #1). Development split this function out of `processEntry` for the
+  // posting-intent wrapper (o3d-19gy / o3d-s36z) and gave it a `HeldClaim`; this branch needs more
+  // than the holder here, because every remote mutation below calls `lease.fenceBeforeRemoteWrite`
+  // to re-take the claim immediately before it sends. `RemoteWriteLease` satisfies `HeldClaim`
+  // structurally, so everything downstream that only wants the holder still takes it unchanged.
+  lease: RemoteWriteLease,
+  attempt: AttemptRef,
 ): Promise<EntryResult> {
   const postingMode = payload._postingMode
+
+  // THE CONNECTION CHECK USED TO BE HERE, and removing it is the fix rather than a regression.
+  //
+  // It compared the row's origin stamp against a tenant read from the `AccountingToken` row; the
+  // request then resolved the tenant AGAIN, from `getAccessToken()`, when it built its headers. Two
+  // independent selections of one thing, and the gap between them is measured in whatever the handler
+  // does plus, on a rate-limited entry, tens of seconds asleep on a Retry-After. Keeping it as a
+  // "harmless early no" was tempting and is the same mistake one notch quieter: it would still be a
+  // second reading of a value that can disagree with the one the request uses, and a refusal produced
+  // from a stale read is as wrong as a permission produced from one. `small2`: A PERMISSION IS
+  // EVALUATED IN EXACTLY ONE PLACE, IMMEDIATELY BEFORE THE ACT IT AUTHORISES.
+  //
+  // It is now evaluated in `performRequest`, against the `auth.tenantId` that is going into this
+  // request's own `Xero-Tenant-Id` header, and it reaches the row the same way it always did — as the
+  // response's `error`, which each arm returns as an ordinary entry failure, so a queue holding one
+  // previous-tenant row still does not stop the rows behind it.
 
   // A MISSING SCOPE IS A CONFIGURATION FAULT, NOT AN API ERROR (o3d-g2i). Adding a scope to the
   // authorization URL only affects future consents, so a connection made before it keeps 401ing
@@ -1352,10 +4305,25 @@ async function processEntry(
 
   switch (type) {
     case 'SALES_INVOICE': {
-      const guard = await guardCancelledSalesOrderInvoice(entryId, referenceType, referenceId, claimedAt)
+      // o3d-cyn r3: FIRST, and before any read, let alone any write. A document the importer already
+      // computed will not total to its order is refused here rather than posted with a warning
+      // attached — see lib/domain/accounting/document-tax-reconciliation.ts.
+      const reconciled = refuseUnreconciledDocument(payload)
+      if (!reconciled.post) return { success: false, error: reconciled.reason }
+      const guard = await guardCancelledSalesOrderInvoice(attempt, referenceType, referenceId, lease)
       if (!guard.post) return guard.result
       const customerId = guard.customerId
+      // o3d-k26m.5: the number must be ours to post under. Refusing is recoverable; overwriting a
+      // live invoice is not. Runs AFTER the cancelled-order backstop (no point asking the ledger
+      // about an order that must not be invoiced at all) and BEFORE anything is sent.
+      // THE LEASE, not a snapshot: it satisfies `HeldClaim` structurally, so the slot stamp is fenced
+      // on the claim as renewed by the fence immediately before the post (o3d-xl63 r5/r6).
+      const numberFence = await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload, lease)
+      if (!numberFence.post) return numberFence.result
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice', payload)
+      // r5 #1: the claim is re-taken HERE, after the scope read and the cancelled-order guard, not once at the top of the entry.
+      const fence = await lease.fenceBeforeRemoteWrite('sales-invoice')
+      if (!fence.ok) return fence.result
       const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,
         contactName: payload.contactName as string,
@@ -1374,21 +4342,30 @@ async function processEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId })
-      return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, error: invoiceResult.error }
+        // o3d-k26m.5 round 5/6: the number fence's LAST word. Handed in here, scoped around the
+        // create by pushSalesInvoice, and evaluated inside the HTTP client on every attempt as the
+        // last statement before the socket. Nothing is sent if it refuses.
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: numberFence.beforePost })
+      return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
 
     case 'SALES_INVOICE_UPDATE': {
+      // An UPDATE carrying the stamp would overwrite a good document with the bad one, which is the
+      // same damage as the create and one step harder to spot.
+      const reconciledUpdate = refuseUnreconciledDocument(payload)
+      if (!reconciledUpdate.post) return { success: false, error: reconciledUpdate.reason }
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for SALES_INVOICE_UPDATE' }
       }
       // Same cancelled-order backstop as the create: don't modify an external receivable for an order
       // that has since been cancelled (retire the update instead), and fail closed on an unreadable order.
-      const guard = await guardCancelledSalesOrderInvoice(entryId, referenceType, referenceId, claimedAt)
+      const guard = await guardCancelledSalesOrderInvoice(attempt, referenceType, referenceId, lease)
       if (!guard.post) return guard.result
       const customerId = guard.customerId
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice-update', payload)
+      const fence = await lease.fenceBeforeRemoteWrite('sales-invoice-update')
+      if (!fence.ok) return fence.result
       const invoiceResult = await updateSalesInvoice(accountingInvoiceId, {
         invoiceNumber: payload.invoiceNumber as string,
         contactName: payload.contactName as string,
@@ -1408,7 +4385,7 @@ async function processEntry(
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId })
-      return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, error: invoiceResult.error }
+      return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
 
     case 'PURCHASE_INVOICE': {
@@ -1419,6 +4396,8 @@ async function processEntry(
           }).catch(() => null)
         : null
       const billIdempotencyKey = buildXeroIdempotencyKey(entryId, 'bill', payload)
+      const fence = await lease.fenceBeforeRemoteWrite('purchase-bill')
+      if (!fence.ok) return fence.result
       const billResult = await pushPurchaseBill({
         invoiceNumber: payload.invoiceNumber as string | undefined,
         contactName: payload.contactName as string,
@@ -1429,7 +4408,7 @@ async function processEntry(
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey, supplierId: supplier?.supplierId, supplierEmail: supplier?.supplier.email ?? undefined })
-      return { success: billResult.success, externalId: billResult.invoiceId, error: billResult.error }
+      return { success: billResult.success, externalId: billResult.invoiceId, externalRevisionAt: billResult.externalRevisionAt, error: billResult.error }
     }
 
     case 'PURCHASE_INVOICE_UPDATE': {
@@ -1444,6 +4423,8 @@ async function processEntry(
           }).catch(() => null)
         : null
       const billIdempotencyKey = buildXeroIdempotencyKey(entryId, 'bill-update', payload)
+      const fence = await lease.fenceBeforeRemoteWrite('purchase-bill-update')
+      if (!fence.ok) return fence.result
       const billResult = await updatePurchaseBill(accountingInvoiceId, {
         invoiceNumber: payload.invoiceNumber as string | undefined,
         contactName: payload.contactName as string,
@@ -1454,7 +4435,7 @@ async function processEntry(
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey, supplierId: supplier?.supplierId, supplierEmail: supplier?.supplier.email ?? undefined })
-      return { success: billResult.success, externalId: billResult.invoiceId, error: billResult.error }
+      return { success: billResult.success, externalId: billResult.invoiceId, externalRevisionAt: billResult.externalRevisionAt, error: billResult.error }
     }
 
     case 'INVOICE_PAYMENT': {
@@ -1470,6 +4451,61 @@ async function processEntry(
       const posting = moneyPostDateToSend(type, payload, new Date())
       if (!posting.ok) return { success: false, error: `Cannot date this INVOICE_PAYMENT: ${posting.reason}` }
       const paymentDate = posting.date
+      // OVER-SETTLEMENT IS REFUSED HERE, NOT AT THE ENQUEUE (o3d-cjt8 round 2).
+      //
+      // The under-lock capacity re-check in registerInvoicePaymentWithLedger only ever covered the
+      // enqueue paths someone remembered to list, and that list was already wrong: the imported-order
+      // follow-up (`_registerPayment`, enqueueSalesInvoiceFollowUps below) enqueues a payment with no
+      // order lock and no arithmetic at all. Rather than add the check to a third call site — the same
+      // assumption that has now failed once — it goes where nothing can route around it. Every
+      // INVOICE_PAYMENT, whatever enqueued it, must come through this case to reach Xero.
+      //
+      // Fails CLOSED on anything it cannot measure, and on a genuine refusal retires the row as
+      // CANCELLED — accurate, because this runs BEFORE the remote call, so nothing was sent.
+      const capacity = await guardInvoicePaymentCapacity(db, {
+        connector: XERO_CONNECTOR,
+        entryId,
+        referenceType,
+        referenceId,
+        accountingInvoiceId,
+        amount,
+      })
+      if (!capacity.post) {
+        if (capacity.kind === 'unmeasurable') return { success: false, error: capacity.message }
+        // The LEASE, which is the claim: `heldClaimWhere` reads the instant it holds as the statement
+        // is built, so a renewal between the guard and this write cannot make the retirement a no-op.
+        const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, {
+          entryId,
+          claim: lease,
+          reason: capacity.message,
+        }))
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: referenceId,
+          // The two refusals need an operator to do DIFFERENT things — reconcile an over-settlement,
+          // versus find out whether a failed attempt actually posted — so they are not filed under one
+          // action name that would make the second read as the first.
+          action: capacity.refusal === 'AMBIGUOUS_FAILED_REGISTRATION'
+            ? 'invoice_payment_refused_unknown_ledger_state'
+            : 'invoice_payment_refused_over_settlement',
+          tag: 'accounting',
+          level: 'ERROR',
+          description: capacity.message,
+          metadata: {
+            syncLogId: entryId,
+            accountingInvoiceId,
+            amount,
+            refusal: capacity.refusal,
+            alreadyPosted: capacity.alreadyPosted,
+            ledgerTotal: capacity.ledgerTotal,
+            ambiguousSyncLogIds: capacity.ambiguousIds,
+            retired,
+          },
+        }).catch(() => { /* logging must never turn a safe refusal into a failure */ })
+        // Nothing was sent and nothing should be retried: report it as handled, not as a failure that
+        // burns retries and ends FAILED (which would then read as "may have posted").
+        return { success: true, skipped: true }
+      }
       const account = await db.accountingAccount.findFirst({
         where: { connector: XERO_CONNECTOR, OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },
         select: { externalAccountId: true },
@@ -1492,6 +4528,18 @@ async function processEntry(
         postingDate: paymentDate,
       }, async () => {
         try {
+          // BOTH FENCES, AND THE CLAIM FENCE IS LAST (o3d-0m56 + o3d-550x/o3d-xl63).
+          //
+          // The enclosing `postMoneyUnderLedgerFence` answers "has this settlement already reached the
+          // ledger?" — a network read, taken under the per-document lock the post is made inside.
+          // `lease.fenceBeforeRemoteWrite` answers "do I still hold the claim on this row?" — a local
+          // compare-and-set, and it must be the LAST statement before the wire call, because the
+          // structural test in xero-claim-before-remote-write asserts nothing awaitable sits between
+          // proving the claim and using it. So it goes HERE, inside the ledger fence's callback,
+          // rather than outside it: putting it before the ledger read would leave the read itself
+          // between the proof and the post, which is precisely what the fence is measured against.
+          const fence = await lease.fenceBeforeRemoteWrite('invoice-payment')
+          if (!fence.ok) return fence.result
           const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
             Invoice: { InvoiceID: accountingInvoiceId },
             Account: { AccountID: account.externalAccountId },
@@ -1531,6 +4579,9 @@ async function processEntry(
         }
         const pdfBuffer = await readFile(pdfPath)
         const filename = relPath.split('/').pop() ?? 'supplier-invoice.pdf'
+        // The PDF read above can be slow on a cold disk; fence after it, immediately before the upload.
+        const fence = await lease.fenceBeforeRemoteWrite('bill-attachment')
+        if (!fence.ok) return fence.result
         const uploadRes = await xeroUploadAttachment('Invoices', accountingInvoiceId, filename, pdfBuffer, 'application/pdf')
         if (!uploadRes.ok) {
           return { success: false, error: uploadRes.error ?? 'Failed to attach supplier invoice PDF' }
@@ -1547,6 +4598,10 @@ async function processEntry(
       if (!accountingInvoiceId || !orderId) {
         return { success: false, error: 'Missing accountingInvoiceId or referenceId for INVOICE_PDF' }
       }
+      // NO FENCE, deliberately (o3d-xl63 r5 #1). This branch makes no remote mutation: it GETs the
+      // PDF Xero already holds and writes the file path locally. Two workers doing it concurrently
+      // produce the same path from the same document — there is no second document to create, so a
+      // fence here would renew a claim to protect nothing.
       try {
         const { downloadXeroInvoicePdf, saveInvoicePdf } = await import('./invoice-pdf')
         const pdfBuffer = await downloadXeroInvoicePdf(accountingInvoiceId)
@@ -1566,6 +4621,9 @@ async function processEntry(
       const orderId = payload.referenceId as string | undefined
       if (!orderId) return { success: false, error: 'Missing referenceId for INVOICE_EMAIL' }
       const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
+      // Not a Xero call, but an external side effect all the same: a second worker here means the customer receives the invoice twice.
+      const fence = await lease.fenceBeforeRemoteWrite('invoice-email')
+      if (!fence.ok) return fence.result
       const emailResult = await sendAccountingInvoiceEmailInternal(orderId)
       return emailResult.success ? { success: true } : { success: false, error: emailResult.error ?? 'Failed to email invoice' }
     }
@@ -1574,6 +4632,8 @@ async function processEntry(
       const orderId = payload.referenceId as string | undefined
       if (!orderId) return { success: false, error: 'Missing referenceId for WC_INVOICE_NOTE' }
       const { pushInvoiceNoteToWc } = await import('@/lib/connectors/woocommerce/sync/invoice-note')
+      const fence = await lease.fenceBeforeRemoteWrite('wc-invoice-note')
+      if (!fence.ok) return fence.result
       const wcResult = await pushInvoiceNoteToWc(orderId)
       return wcResult.success ? { success: true } : { success: false, error: wcResult.error ?? 'Failed to notify WooCommerce about invoice' }
     }
@@ -1616,6 +4676,18 @@ async function processEntry(
         postingDate: paymentDate,
       }, async () => {
         try {
+          // BOTH FENCES, AND THE CLAIM FENCE IS LAST (o3d-0m56 + o3d-550x/o3d-xl63).
+          //
+          // The enclosing `postMoneyUnderLedgerFence` answers "has this settlement already reached the
+          // ledger?" — a network read, taken under the per-document lock the post is made inside.
+          // `lease.fenceBeforeRemoteWrite` answers "do I still hold the claim on this row?" — a local
+          // compare-and-set, and it must be the LAST statement before the wire call, because the
+          // structural test in xero-claim-before-remote-write asserts nothing awaitable sits between
+          // proving the claim and using it. So it goes HERE, inside the ledger fence's callback,
+          // rather than outside it: putting it before the ledger read would leave the read itself
+          // between the proof and the post, which is precisely what the fence is measured against.
+          const fence = await lease.fenceBeforeRemoteWrite('bill-payment')
+          if (!fence.ok) return fence.result
           const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
             Invoice: { InvoiceID: accountingInvoiceId },
             Account: { AccountID: account.externalAccountId },
@@ -1644,6 +4716,8 @@ async function processEntry(
             select: { order: { select: { customerId: true } } },
           }).catch(() => null))?.order.customerId ?? undefined
         : undefined
+      const fence = await lease.fenceBeforeRemoteWrite('credit-note')
+      if (!fence.ok) return fence.result
       return pushCreditNote({
         creditNoteNumber: payload.creditNoteNumber as string,
         contactName: payload.contactName as string,
@@ -1661,6 +4735,19 @@ async function processEntry(
       // audit-g5u2: supplier credit note (ACCPAYCREDIT) — e.g. crediting a
       // duplicate freight bill. The payload carries the supplier contact + the
       // expense-account lines (built by recordSupplierFreightCreditNote, g5u2.3).
+      //
+      // o3d-tfri r3: and the poster must be told whether IMS has EVER dispatched a create for this
+      // credit note, because that is the only thing that turns "the ledger shows nothing" into
+      // permission to create one. Fails closed — a count we cannot read is not a first attempt.
+      const attempt = await isFirstPurchaseCreditNoteAttempt(entryId, referenceType, referenceId)
+      if (!attempt.ok) return { success: false, error: attempt.error }
+      // o3d-xl63 r5 #1: the fence goes AFTER that read, not before it. The read is awaited, and the whole
+      // point of the fence is that NOTHING AWAITABLE happens between proving the claim and using it — a
+      // claim proven before an await has had that await to lapse in. Both rules survive in this order:
+      // the first-attempt question is still answered before we decide to create, and the claim is still
+      // the last thing established before the socket.
+      const fence = await lease.fenceBeforeRemoteWrite('purchase-credit-note')
+      if (!fence.ok) return fence.result
       return pushPurchaseCreditNote({
         creditNoteNumber: payload.creditNoteNumber as string,
         contactName: payload.contactName as string,
@@ -1671,7 +4758,15 @@ async function processEntry(
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'purchase-credit-note'), supplierId: payload.supplierId as string | undefined }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+      }, resolveInvoiceStatus(postingMode), {
+        firstAttempt: attempt.firstAttempt,
+        // o3d-tfri r4: the row's own identity, so the poster can PROVE the number is one IMS minted
+        // rather than one that merely starts with the prefix. Without it the replay fence would be
+        // asking the ledger about a number that need not be ours.
+        creditNote: { referenceType, referenceId },
+        idempotencyKey: buildXeroIdempotencyKey(entryId, 'purchase-credit-note'),
+        supplierId: payload.supplierId as string | undefined,
+      }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
     }
 
     case 'PURCHASE_CREDIT_NOTE_ALLOCATION': {
@@ -1705,6 +4800,12 @@ async function processEntry(
         // wall-clock read here is a second day whenever the two straddle a UTC midnight.
         postingDate: allocationDate,
       }, async () => {
+        // BOTH FENCES, CLAIM FENCE LAST — see the INVOICE_PAYMENT case for why it sits inside this
+        // callback rather than outside it. Two reads and a write happen inside
+        // `allocatePurchaseCreditNote` (the shape the review named), so the claim proof must be the
+        // statement immediately before the call.
+        const fence = await lease.fenceBeforeRemoteWrite('purchase-credit-note-allocation')
+        if (!fence.ok) return fence.result
         const result = await allocatePurchaseCreditNote(
           { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
           { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'purchase-credit-note-allocation') },
@@ -1728,6 +4829,9 @@ async function processEntry(
     case 'DAILY_BATCH_COGS_RECONCILIATION':
     case 'DAILY_BATCH_TRANSIT_RECONCILIATION':
     case 'UNEARNED_REV_REVERSAL':
+    // o3d-0i5y r9: the orphaned-allocation reversal. A plain manual journal like every other type
+    // in this group — the amount is decided (and evidenced) at staging time, not here.
+    case 'ALLOCATION_REVERSAL':
     case 'REALISED_FX_JOURNAL':
     case 'UNREALISED_FX_JOURNAL':
     case 'MANUFACTURING_JOURNAL':
@@ -1737,6 +4841,8 @@ async function processEntry(
         : type.startsWith('DAILY_BATCH_')
         ? `${type}:${referenceId}`
         : entryId
+      const fence = await lease.fenceBeforeRemoteWrite('manual-journal')
+      if (!fence.ok) return fence.result
       return pushManualJournal({
         date: payload.date as string,
         reference: payload.reference as string,
@@ -1753,6 +4859,8 @@ async function processEntry(
         return { success: false, error: 'TAX_RATE_SYNC payload missing name or components' }
       }
       const idempotencyKey = buildXeroIdempotencyKey(entryId, 'tax-rate', payload)
+      const fence = await lease.fenceBeforeRemoteWrite('tax-rate')
+      if (!fence.ok) return fence.result
       const result = await putXeroTaxRate({
         name,
         reportTaxType: payload.reportTaxType as string | null | undefined,
@@ -1805,6 +4913,63 @@ async function updateBackReference(
 export type { BackReferenceRepairResult }
 
 /**
+ * THE LOCKED HALF OF THE SWEEP'S CANCELLED-SALE GATE (o3d-e2mz r8).
+ *
+ * The GATE — when it is asked, what the three answers mean, what is counted and logged — is in the
+ * shared sweep, once. This is only what that gate cannot do from a connector-agnostic module: read the
+ * sale UNDER ITS ROW LOCK and, if it is cancelled, retire the row in the SAME transaction.
+ *
+ * The lock is the one `cancelSalesOrderFulfillmentState` opens with, so a cancellation either commits
+ * first and is seen here, or waits behind the decision it would have invalidated.
+ *
+ * The retirement's precondition IS THE FACT IT PROTECTS — the row names a document and is in the
+ * sweep's candidate status set — so it is self-guarding against a row that moved between the candidate
+ * read and here: a row no longer in the shape needs no retiring. And a writer that retires a row must
+ * advance the fence, or a concurrent run could still win a compare-and-swap on the revision it read;
+ * revision 0 stays 0, because bumping it would forge an attempt a later decision could believe in.
+ *
+ * ONLY `SalesOrder` rows are gated. `referenceId` IS the sales order id for those, so the state is one
+ * locked read away. Every other reference resolves to something a sales-order cancellation does not
+ * speak for — a supplier bill is not a sale at all, and a refund CREDIT NOTE is very often the direct
+ * CONSEQUENCE of the cancellation, so refusing to finish it would strand the document the cancellation
+ * created. Crediting a cancelled sale is right; invoicing it is wrong.
+ */
+async function decideSaleRelease(row: {
+  id: string
+  referenceType: string
+  referenceId: string
+  attemptRevision?: number
+}): Promise<BackReferenceSweepRelease> {
+  if (row.referenceType !== SALE_SCOPED_REFERENCE_TYPE) return { release: 'RELEASE' }
+  try {
+    return await db.$transaction(async (tx): Promise<BackReferenceSweepRelease> => {
+      if (await readSaleCancellationStateUnderLock(tx, row) !== 'CANCELLED') return { release: 'RELEASE' }
+      await tx.accountingSyncLog.updateMany({
+        where: {
+          id: row.id,
+          externalTransactionId: { not: null },
+          status: { in: [...BACK_REFERENCE_REPAIRABLE_STATUSES] },
+        },
+        data: {
+          status: 'CANCELLED',
+          syncedAt: null,
+          ...(row.attemptRevision === undefined || row.attemptRevision === UNCLAIMED_ATTEMPT_REVISION
+            ? {}
+            : { attemptRevision: { increment: 1 } }),
+          errorMessage: 'Retired by the Xero back-reference sweep: the row named a document and was in the sweep\'s '
+            + 'candidate shape while THE SALE IT BELONGS TO IS CANCELLED. The document id is kept — the order delete '
+            + 'guard reads it whatever the status — but the back-reference was NOT written onto the cancelled order '
+            + 'and none of its follow-ups (PDF, email, storefront note, PAYMENT) were enqueued.',
+        },
+      })
+      return { release: 'RETIRED' }
+    })
+  } catch (error) {
+    return { release: 'SALE_UNREADABLE', error: String(error) }
+  }
+}
+
+/**
  * audit-H3 repair sweep, Xero binding. The implementation is connector-agnostic
  * (lib/domain/accounting/back-reference-sweep) — o3d-9kek fixed its starvation and its
  * page-local PO ambiguity check there, once, so a second connector cannot inherit the
@@ -1822,6 +4987,11 @@ export async function repairXeroBackReferences(limit = DEFAULT_BACK_REFERENCE_SW
     // the strength of having warned about it, and logActivity cannot tell it whether the warning
     // was written (o3d-9kek r2 finding 3).
     logActivity: logActivityPersisted,
+    // o3d-e2mz r8: the sweep is the CONSUMER — the only place a cancelled sale's work is actually
+    // released — so the gate lives IN the sweep (see `decideSaleRelease` on BackReferenceSweepDeps).
+    // What the connector supplies is only the part the connector-agnostic module cannot hold: the
+    // locked read and the retirement, in one transaction on the Xero database handle.
+    decideSaleRelease,
     enqueueFollowUps: (entryId, type, referenceType, referenceId, payload, syncResult) =>
       enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult),
   }, { limit })
@@ -1870,6 +5040,137 @@ export function selectCreditNotesNeedingAllocation(
   return out
 }
 
+/** A `PURCHASE_CREDIT_NOTE` sync row, narrowed to the two columns provenance is resolved from. */
+export type CreditNotePostRow = {
+  /**
+   * The document this row's post RETURNED. This — not the row's status, and not its recency — is what
+   * makes a row the issuing post of a particular credit note.
+   */
+  externalTransactionId: string | null
+  /** The stored payload, verbatim. What gets inherited, stamp or no stamp. */
+  payload: unknown
+}
+
+/** What the rows in hand can say about which organisation issued one specific credit note. */
+export type IssuingPostOrigin =
+  /** One row named this exact document. Its payload travels verbatim — including carrying no stamp. */
+  | { outcome: 'inherited'; payload: unknown }
+  /** No row in hand names this document id. Nothing observed the post; record nothing. */
+  | { outcome: 'no-issuing-row' }
+  /** Two rows claim to have posted this document id against DIFFERENT organisations. Record nothing. */
+  | { outcome: 'conflicting-origins'; recorded: string[] }
+
+/**
+ * WHICH POST ISSUED THIS CREDIT NOTE? (Codex r4 finding 1, HIGH.)
+ *
+ * Round 3 stopped the sweep minting an origin from "whatever is connected when the cron fires" and made
+ * it INHERIT from the post that issued the id it is carrying. The lookup it shipped, though, matched only
+ * (connector, type, referenceType, `referenceId`), filtered to SYNCED, and took the NEWEST row — it never
+ * looked at `externalTransactionId` at all. A supplier credit note that was posted, voided and posted
+ * again has TWO rows under one `referenceId` naming two different documents, and
+ * `SupplierCreditNote.accountingCreditNoteId` holds whichever of them the last back-reference write left
+ * there. Taking the newest row therefore inherits from a post that issued a DIFFERENT document — an origin
+ * the row being created did not come from, which is the same class of defect as inventing one, and would
+ * be believed by the post-time guard exactly as readily.
+ *
+ * So the pair is the identity: a row is the issuing post only if it names the SAME reference AND carries
+ * the SAME `externalTransactionId` as the credit id being allocated.
+ *
+ * AND STATUS IS NOT A PROXY FOR "HAS POSTED". `status: 'SYNCED'` was too narrow in the other direction.
+ * This branch already establishes both halves of that: a row that posted successfully and then failed its
+ * FOLLOW-UPS is sent back to PENDING or, at MAX_RETRIES, to FAILED, *keeping* the external id
+ * (`markSyncLogForFollowUpRetry`); and a row retired to CANCELLED by the orphan sweep keeps it too — which
+ * is precisely why `order-delete-guard` matches on "carries an external id, whatever the status". A row
+ * that names a document posted that document. The id is the evidence; the status is where the row ended up
+ * afterwards. So no status filter is applied here at all.
+ *
+ * WHEN SEVERAL ROWS NAME THE SAME DOCUMENT. They are all describing the same post of the same document, so
+ * the one that RECORDED an organisation is preferred over one that recorded nothing (a retention-compacted
+ * `payload: {}`, or a pre-stamping row). That is not choosing the convenient answer: the rows do not
+ * disagree, one of them simply says less. If two of them do genuinely disagree — two readable stamps naming
+ * DIFFERENT organisations for one document id — nothing here can say which is right, so this reports
+ * `conflicting-origins` and the caller records nothing, exactly as it does for no row at all. "I cannot
+ * tell" must not resolve to "take the newest", which is the habit this whole finding is about.
+ */
+export function selectIssuingPostOriginRecord(rows: CreditNotePostRow[], creditNoteId: string): IssuingPostOrigin {
+  const wanted = creditNoteId.trim()
+  if (wanted === '') return { outcome: 'no-issuing-row' }
+  const issuing = rows.filter((row) => (row.externalTransactionId ?? '').trim() === wanted)
+  if (issuing.length === 0) return { outcome: 'no-issuing-row' }
+
+  // Distinct organisations actually NAMED by rows that issued this document. More than one is a
+  // contradiction no rule here is entitled to settle.
+  const named = new Set<string>()
+  // Prefer the row that recorded the most about the post: a comparable stamp, then the observed
+  // "raised while disconnected", then silence, then an unreadable payload. Every rank below 0 still
+  // refuses at post time — the preference only decides which true statement the operator is shown.
+  const rank = (payload: unknown): number => {
+    const stamp = readAccountingPayloadConnectionStamp(payload)
+    if (stamp.state === 'stamped') {
+      named.add(stamp.provenance)
+      return 0
+    }
+    return stamp.state === 'raised-disconnected' ? 1 : stamp.state === 'absent' ? 2 : 3
+  }
+  const ranked = issuing
+    .map((row) => ({ payload: row.payload, rank: rank(row.payload) }))
+    .sort((a, b) => a.rank - b.rank)
+  if (named.size > 1) return { outcome: 'conflicting-origins', recorded: [...named].sort() }
+  return { outcome: 'inherited', payload: ranked[0].payload }
+}
+
+/** Which of the ways an origin can be unavailable this row hit — one clause, so the log names the case. */
+function describeMissingCreditNoteOrigin(
+  origin: IssuingPostOrigin,
+  inherited: AccountingConnectionStamp | null,
+  creditNoteId: string,
+): string {
+  if (origin.outcome === 'no-issuing-row') {
+    return `no surviving sync row records a post of credit note ${creditNoteId} (retention removed it, or the `
+      + 'credit was posted before this instance recorded which organisation it was posting to)'
+  }
+  if (origin.outcome === 'conflicting-origins') {
+    return `two sync rows both claim to have posted credit note ${creditNoteId}, against DIFFERENT accounting `
+      + `organisations (${origin.recorded.join(' and ')}), and nothing here can say which of them issued it`
+  }
+  if (inherited?.state === 'raised-disconnected') {
+    return `the sync row that posted credit note ${creditNoteId} records that it was raised while this instance `
+      + 'had no accounting connection at all, so nothing vouches for the id even there'
+  }
+  if (inherited?.state === 'unreadable') {
+    return `the sync row that posted credit note ${creditNoteId} has an origin record that cannot be read `
+      + `(${inherited.detail})`
+  }
+  return `the sync row that posted credit note ${creditNoteId} survives but records no organisation itself — it `
+    + 'was queued before origins were recorded, or retention compacted its payload away'
+}
+
+/**
+ * WHAT AN OPERATOR ACTUALLY DOES WITH A ROW WHOSE ORIGIN CANNOT BE ESTABLISHED (Codex r4 finding 2).
+ *
+ * The previous text ended "re-queue the allocation from the credit note itself if it is still owed", which
+ * is not a remedy an operator can perform: re-queueing rebuilds the identical payload out of the identical
+ * two local columns, so it refuses identically — and this sweep skips any credit note that already has an
+ * allocation row of any status, so it would not even be re-created. A refusal that names a step which
+ * cannot work is worse than one that names none, because the operator spends the attempt before finding
+ * out. So the remedy named here is the one that exists: do the allocation where the documents are, in the
+ * ledger, by the one party who can see which organisation they live in.
+ */
+function creditNoteAllocationOriginRemedy(item: { creditNoteId: string; accountingInvoiceId: string }): string {
+  return 'WHAT TO DO: allocate it in the accounting system by hand — open credit note '
+    + `${item.creditNoteId} in the organisation that issued it and apply it to bill ${item.accountingInvoiceId}. `
+    + 'That is exactly the effect this row would have had, decided by someone who can see which organisation '
+    + 'the two documents live in, which nothing in this instance can. Do NOT retry or re-queue the row: it '
+    + 'rebuilds the same payload from the same two local columns (SupplierCreditNote.accountingCreditNoteId '
+    + 'and PurchaseInvoice.accountingInvoiceId), which is exactly the evidence that is missing — and the '
+    + 'origin must not be back-filled, because writing a marker for a post nobody witnessed is the defect '
+    + 'this guard exists to stop. (The refusal on the sync row itself says "cancel and re-queue from the '
+    + 'source document". For an allocation that is not a remedy, for the reason just given.) The row is '
+    + 'inert meanwhile: it sends nothing, and once its retries are spent it sits FAILED in the sync log '
+    + 'carrying the refusal, as a record rather than as outstanding work. Nothing else depends on it, and no '
+    + 'second one will be created.'
+}
+
 /**
  * audit-w77e: backstop for the audit-v08m gap. postSupplierCreditNote only
  * enqueues the PURCHASE_CREDIT_NOTE_ALLOCATION follow-up when the offset bill
@@ -1886,6 +5187,39 @@ export function selectCreditNotesNeedingAllocation(
  * draft posting mode the Xero credit is DRAFT and can't be allocated yet — the
  * allocation no-ops/retries until it's authorised. This matches the live v08m
  * enqueue path; freight credits are posted authorised in practice.
+ *
+ * WHERE THIS SWEEP'S ORIGIN RECORD COMES FROM (Codex r3 finding 1, CRITICAL). This is the purest form of
+ * the defect that finding names: a cron that witnessed nothing, building a payload out of external ids
+ * that were written to local columns at some unknown earlier time, and — until this round — stamping
+ * whichever organisation happens to be connected when the cron fires onto it. That is not weak evidence,
+ * it is manufactured evidence: the post-time guard would then compare the current tenant against the
+ * current tenant and could not fail, on exactly the rows nobody watched being made.
+ *
+ * So the sweep inherits instead. `creditNoteId` is `SupplierCreditNote.accountingCreditNoteId`, which was
+ * written by one specific PURCHASE_CREDIT_NOTE sync row's successful post; THAT row is found by the pair
+ * (`referenceId`, `externalTransactionId` = the credit id being carried) and its own origin record is
+ * carried onto the allocation verbatim. The pair is the point (Codex r4 finding 1): round 3 matched the
+ * reference alone and took the newest SYNCED row, which for a credit posted twice inherits from the post
+ * of a DIFFERENT document — an origin the row never came from, which is inventing one by another route.
+ * Status is not part of the identity either, because a posted row can be sent back to PENDING/FAILED by a
+ * follow-up failure, or retired to CANCELLED, while keeping the id it posted. See
+ * `selectIssuingPostOriginRecord`.
+ *
+ * If no row names that exact document — retention removed it, or the credit predates origin records — or
+ * if two rows name it against DIFFERENT organisations, the allocation is created carrying NO record and
+ * refuses at post time. That is bounded, one-per-credit-note, since the sweep skips any credit note that
+ * already has an allocation row of any status; it is reported as a WARNING rather than left for an
+ * operator to discover from a refusal; and the warning carries a remedy that can actually be performed —
+ * allocate the credit in the ledger by hand, because re-queueing rebuilds the same evidence-free payload
+ * (`creditNoteAllocationOriginRemedy`, Codex r4 finding 2).
+ *
+ * AND WHAT THAT RECORD DOES NOT COVER, stated rather than implied. It vouches for `creditNoteId`. The
+ * bill id (`accountingInvoiceId`) came from a DIFFERENT post — the whole reason this gap exists is that
+ * the bill synced after the credit — and no column records that post's tenant, so nothing here can
+ * compare the two. If they ever disagreed, the allocation would be addressed to the credit's
+ * organisation carrying a foreign bill id, and Xero would reject it: a visible failure, not a silent
+ * one. Closing that residual needs a provenance column beside `PurchaseInvoice.accountingInvoiceId`,
+ * the same shape `Product.accountingItemProvenance` already has; it is not closed here.
  */
 export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promise<CreditNoteAllocationReenqueueResult> {
   const result: CreditNoteAllocationReenqueueResult = { checked: 0, enqueued: 0, failed: 0 }
@@ -1920,24 +5254,81 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
   })
   const hasAllocation = new Set(existing.map((e) => e.referenceId))
   const toEnqueue = selectCreditNotesNeedingAllocation(candidates, hasAllocation)
+  if (toEnqueue.length === 0) return result
+
+  // The rows whose posts ISSUED these credit ids, so the organisation one of them recorded can be carried
+  // onto the allocation rather than a fresh read of the token row being invented for it.
+  //
+  // BOTH HALVES OF THE PAIR ARE FETCHED, AND THE PAIRING IS DONE IN MEMORY (Codex r4 finding 1). The two
+  // `in` clauses narrow the scan but do NOT pair anything: a row for credit note A carrying credit note
+  // B's document id satisfies both of them, and that cross-match is the whole defect — the id has to be
+  // compared against the id THIS allocation is carrying, per candidate. `selectIssuingPostOriginRecord`
+  // does that. No status filter: a row that names a document posted that document, whatever status it
+  // ended up in (see the header there).
+  const creditNotePosts = await db.accountingSyncLog.findMany({
+    where: {
+      connector: XERO_CONNECTOR,
+      type: 'PURCHASE_CREDIT_NOTE',
+      referenceType: 'SupplierCreditNote',
+      referenceId: { in: toEnqueue.map((item) => item.supplierCreditNoteId) },
+      externalTransactionId: { in: toEnqueue.map((item) => item.creditNoteId) },
+    },
+    // Only for a stable read; the choice among several issuing rows is made by rank, not by order.
+    orderBy: [{ syncedAt: 'desc' }, { createdAt: 'desc' }],
+    select: { referenceId: true, externalTransactionId: true, payload: true },
+  })
+  const postsByCreditNote = new Map<string, CreditNotePostRow[]>()
+  for (const row of creditNotePosts) {
+    const bucket = postsByCreditNote.get(row.referenceId)
+    if (bucket) bucket.push(row)
+    else postsByCreditNote.set(row.referenceId, [row])
+  }
 
   for (const item of toEnqueue) {
     result.checked++
     try {
+      const origin = selectIssuingPostOriginRecord(
+        postsByCreditNote.get(item.supplierCreditNoteId) ?? [],
+        item.creditNoteId,
+      )
+      // What the inherited record will MEAN at post time, read from the value actually being carried
+      // rather than assumed from the fact that something was found. An issuing row that survives but
+      // records nothing itself hands on nothing, and that row refuses too — so it gets the same warning
+      // and the same remedy as finding no row at all, with a description that says which it was.
+      const inherited = origin.outcome === 'inherited' ? readAccountingPayloadConnectionStamp(origin.payload) : null
+      const inheritedProvenance = inherited?.state === 'stamped' ? inherited.provenance : null
       await enqueueFollowUpSyncLog('PURCHASE_CREDIT_NOTE_ALLOCATION', 'SupplierCreditNote', item.supplierCreditNoteId, {
         creditNoteId: item.creditNoteId,
         accountingInvoiceId: item.accountingInvoiceId,
         amount: item.amount,
         sourceEntryId: 'reenqueue-sweep',
-      })
+      }, origin.outcome === 'inherited'
+        ? { from: 'postedRow', payload: origin.payload }
+        : { from: 'unobserved' })
       result.enqueued++
       await logActivity({
         entityType: 'SYSTEM',
         action: 'xero_credit_note_allocation_reenqueued',
         tag: 'sync',
-        level: 'INFO',
-        description: `Enqueued a missing supplier-credit-note allocation for ${item.supplierCreditNoteId} (bill synced after the credit posted).`,
-        metadata: { supplierCreditNoteId: item.supplierCreditNoteId, creditNoteId: item.creditNoteId, accountingInvoiceId: item.accountingInvoiceId },
+        level: inheritedProvenance ? 'INFO' : 'WARNING',
+        description: inheritedProvenance
+          ? `Enqueued a missing supplier-credit-note allocation for ${item.supplierCreditNoteId} (bill synced after the `
+            + `credit posted), carrying the accounting organisation recorded by the sync row that posted credit note `
+            + `${item.creditNoteId} — ${inheritedProvenance}.`
+          : `Enqueued a missing supplier-credit-note allocation for ${item.supplierCreditNoteId}, but `
+            + `${describeMissingCreditNoteOrigin(origin, inherited, item.creditNoteId)}, so the allocation carries no `
+            + 'usable record of which accounting organisation issued the credit and WILL be refused at post time '
+            + 'rather than sent to whichever organisation happens to be connected. '
+            + creditNoteAllocationOriginRemedy(item),
+        metadata: {
+          supplierCreditNoteId: item.supplierCreditNoteId,
+          creditNoteId: item.creditNoteId,
+          accountingInvoiceId: item.accountingInvoiceId,
+          originRecordInherited: inheritedProvenance !== null,
+          originOutcome: origin.outcome,
+          originRecordState: inherited?.state ?? null,
+          ...(origin.outcome === 'conflicting-origins' ? { conflictingOrigins: origin.recorded } : {}),
+        },
       })
     } catch (error) {
       result.failed++
@@ -1999,7 +5390,7 @@ async function enqueueSalesInvoiceFollowUps(
             currency,
             method,
             sourceEntryId: entryId,
-          })
+          }, { from: 'postedRow', payload })
         }
       }
     }
@@ -2010,7 +5401,19 @@ async function enqueueSalesInvoiceFollowUps(
     referenceId,
     invoiceNumber: syncResult.invoiceNumber,
     sourceEntryId: entryId,
-  })
+  }, { from: 'postedRow', payload })
+
+  // o3d-ekn8: receipts recorded BEFORE this invoice existed were refused with DOCUMENT_NOT_POSTED and
+  // nothing ever came back for them. This is the moment that refusal stops applying — the CREATE has
+  // posted and updateBackReference (which runs before enqueueFollowUps) has written accountingInvoiceId
+  // — so re-drive the same guarded decision here. Imported orders are unaffected: their receipt is
+  // registered by the `_registerPayment` branch above and has no local Payment row to re-drive.
+  //
+  // Imported dynamically so the connector does not take a static dependency on the sales domain, and
+  // awaited but never allowed to throw: the invoice HAS posted, and a receipt that could not be
+  // re-registered must not turn that into a failed sync entry.
+  const { registerDeferredOrderReceipts } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
+  await registerDeferredOrderReceipts(referenceId)
 }
 
 async function enqueuePurchaseInvoiceFollowUps(
@@ -2025,7 +5428,7 @@ async function enqueuePurchaseInvoiceFollowUps(
     accountingInvoiceId: syncResult.externalId,
     supplierInvoicePath: payload.supplierInvoicePath,
     sourceEntryId: entryId,
-  })
+  }, { from: 'postedRow', payload })
 }
 
 async function enqueuePurchaseCreditNoteFollowUps(
@@ -2053,9 +5456,24 @@ async function enqueuePurchaseCreditNoteFollowUps(
     // retry of a pinned request was no longer the same request (Codex review, r2 #3).
     date: (payload.date as string | undefined)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
     sourceEntryId: entryId,
-  })
+  }, { from: 'postedRow', payload })
 }
 
+/**
+ * Fan a posted row out into the follow-up work it owes.
+ *
+ * `payload` IS THE ORIGIN EVIDENCE, not just the source of fields (Codex r3 finding 1). It is the stored
+ * payload of the row that posted — whether this call comes from the processor moments after the post, or
+ * from the back-reference sweep days later for a row whose process died before its follow-ups ran — and
+ * the record it carries is the only thing that knows which organisation the external ids being handed on
+ * belong to. Every `enqueueFollowUpSyncLog` below therefore passes `{ from: 'postedRow', payload }`, and
+ * none of them reads the live connection.
+ *
+ * A row whose payload recorded nothing hands nothing on, and the follow-up refuses at post time instead
+ * of being addressed to whoever is connected. That is the same answer the parent row itself would now
+ * get, which is the property that makes the chain sound: a follow-up can never be MORE permitted than
+ * the post it descends from.
+ */
 async function enqueueFollowUps(
   entryId: string,
   type: AccountingSyncType,
@@ -2088,10 +5506,16 @@ async function enqueueFollowUps(
       },
     })
     if (order?.customerEmail) {
-      await enqueueFollowUpSyncLog('INVOICE_EMAIL', referenceType, referenceId, { referenceId, sourceEntryId: entryId })
+      await enqueueFollowUpSyncLog(
+        'INVOICE_EMAIL', referenceType, referenceId, { referenceId, sourceEntryId: entryId },
+        { from: 'postedRow', payload },
+      )
     }
     if (order?.shoppingLinks.length) {
-      await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId, sourceEntryId: entryId })
+      await enqueueFollowUpSyncLog(
+        'WC_INVOICE_NOTE', referenceType, referenceId, { referenceId, sourceEntryId: entryId },
+        { from: 'postedRow', payload },
+      )
     }
   }
 }

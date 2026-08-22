@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 
 /**
  * Read + recovery surface for the outbound WMS order push (Phase 8). Reads the
@@ -22,7 +22,7 @@ export type WmsOrderPushStateView = {
 }
 
 export async function getWmsOrderPushStateForSalesOrder(salesOrderId: string): Promise<WmsOrderPushStateView | null> {
-  await requireAuth()
+  await requireInternalUser()
   const link = await db.wmsOrderPushLink.findUnique({
     where: { orderId: salesOrderId },
     select: { state: true, externalOrderNumber: true, attempts: true, lastError: true, pushedAt: true },

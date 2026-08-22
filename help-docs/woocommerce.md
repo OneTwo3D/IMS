@@ -31,6 +31,8 @@ Official guide: <https://woocommerce.com/document/woocommerce-rest-api/>
 
 > **Note:** The consumer secret is masked after saving. To change it, enter the full new value — the system detects and ignores the masked placeholder.
 >
+> **Settings own the credentials.** `WC_STORE_URL`, `WC_CONSUMER_KEY` and `WC_CONSUMER_SECRET` in `.env` are used **once**, at install time, to seed these fields. After that the connection form is the only place that changes them, and editing the `.env` values has no effect. Rotate the key here, not in the file.
+>
 > **Base currency check:** the WooCommerce store currency must match the IMS base currency before credentials or sync settings can be enabled. Order currencies may still vary per transaction; the IMS converts them into its own base currency for reporting and valuation.
 
 ### Connection Test Gate
@@ -47,6 +49,22 @@ The connection test gate prevents sync from running with stale or wrong credenti
 5. If you later change the URL, key, or secret, the fingerprint comparison detects the change and reverts the status to `stale`. You must re-test.
 
 This means a credential rotation can't silently leave sync running with old (or broken) credentials.
+
+### What happens to in-flight work when you rebind
+
+Changing the URL, key or secret is a **rebind**. It clears every cached WooCommerce product id (the next sync re-matches products by SKU). Work that belongs to the old binding is then refused rather than applied:
+
+- A product import or stock push that started before the rebind abandons its writes instead of writing the old store's ids over the freshly cleared cache.
+- A **product webhook sent by the previous store** is refused, and is acknowledged rather than retried — its payload describes that store, and no number of retries can make it describe the new one. Nothing is imported and no stock is corrected from it. These appear in the activity log at ERROR level, naming the store that sent the delivery and the store you are bound to. The reconcile sync re-imports the affected products from the current store, so nothing needs replaying by hand.
+
+Every delivery is judged on **which store sent it**, taken from the store's own statement of its address in the delivery and compared against the store URL in your Connection settings. The statement is read from the **signed body first** (the product's own REST link or permalink) and only from the `X-WC-Webhook-Source` header when the body carries neither — the header travels outside the signature, so it never overrides what the signed body says about itself. The comparison includes the **subdirectory**, so two stores sharing one host (`example.com/store-a` and `example.com/store-b`, as in path-based multisite) are told apart. That is deliberately not the same as "did anything change since the delivery arrived":
+
+- Rotating the key or secret **for the same store**, or pressing *Reset cached product IDs*, is not a rebind of the store. Deliveries keep flowing normally through both.
+- A delivery that was already on its way when you changed the store URL is still recognised as coming from the old store, even though it lands afterwards.
+- A delivery that does not say which store sent it is refused as well, rather than assumed to be current. If that happens for every delivery, something between WooCommerce and IMS is stripping headers.
+- A handful of refusals immediately after an IMS upgrade is expected: deliveries accepted by the previous version during the changeover carry no store statement, so they cannot be shown to describe the current store. The reconcile sync covers them.
+
+A burst of refusals after a store change is normal for a few minutes (the old store's queued deliveries draining). A burst that keeps going means the old store is still sending webhooks — remove the webhook in that store's WooCommerce admin.
 
 ## Order Sync
 
@@ -68,7 +86,7 @@ With the initial import complete, new and updated WooCommerce orders are importe
 **Configuration options:**
 
 - **Enable/disable** order sync with the toggle
-- **Status filter** — choose which WooCommerce statuses trigger an import (e.g. `processing`, `on-hold`, `completed`)
+- **Status filter** — choose which WooCommerce statuses trigger an import (e.g. `processing`, `on-hold`, `completed`). At least one status must be ticked: an empty selection is rejected when you save, because it is not a filter WooCommerce can be asked for. To stop importing orders altogether, turn **Enable order sync** off instead.
 - **Sync interval** — how often the system polls WooCommerce for changes (default: 5 minutes). This field is disabled when webhooks are active.
 
 **What happens when an order is imported:**
@@ -78,8 +96,103 @@ With the initial import complete, new and updated WooCommerce orders are importe
 - The customer is matched by WooCommerce customer ID or email, or created if new
 - Multi-currency orders are converted to the IMS base currency using the FX rate from `frankfurter.dev` (ECB) at import time. The same rate is stamped on the order's `fxRateToBase` field and forwarded to Xero as `CurrencyRate` on the resulting invoice — so the WooCommerce store, IMS, and Xero all see the same base-currency total for the order. See `docs/xero-sync.md` § Multi-Currency FX Rates.
 - Tax rates are resolved using the tax rate mappings you configure (see Tax Rates below)
+- **Shipping is taxed at its own rate, not the goods' rate.** A store that charges zero-rated postage
+  beside standard-rated goods (or the reverse) would otherwise post an accounting invoice that does
+  not total to the WooCommerce order — and the payment IMS registers for the order total would only
+  part-settle it, leaving a balance in the ledger while IMS showed the order settled. The shipping
+  line now takes the tax rate that reproduces the tax WooCommerce actually charged on shipping
+- **A document that will not total to the order is NOT posted at all.** Before queueing the invoice,
+  IMS checks the tax the accounting document will produce against the tax WooCommerce charged, per
+  line and for shipping. When they disagree, the invoice is queued but the accounting connector
+  refuses to send it: the sync row fails with the reason on it, no payment is registered, and an
+  ERROR is logged against the order naming each component and both figures. This happens whether or
+  not the order is paid.
+
+  Posting it anyway is the worse option, and is what IMS used to do. Xero accepts a payment smaller
+  than the invoice as a *part* payment, so an invoice built at the wrong total sits AUTHORISED with a
+  balance for ever while IMS — comparing the order total it sent against the order total it holds —
+  shows the order settled. A refusal you can see is recoverable; a receivable in the ledger at the
+  wrong total takes a credit note to undo.
+
+  **The remedy** is named on the failure: map the WooCommerce tax rate the order used (Tax Rates,
+  below) and re-import the order. The rebuilt document posts normally.
+
+  **"Disagree" is measured in the order's own currency.** The allowance is one posted minor unit
+  either way — a penny in GBP/EUR/USD, a whole yen in a 0-decimal currency (JPY, KRW, ISK, CLP, VND),
+  a fils in a 3-decimal one (KWD, BHD, JOD, OMR, TND) — and the figures in the message are printed at
+  that precision. It used to be a penny in every currency, which was wrong in both directions: in a
+  3-decimal currency a real ten-fils error read as "within a penny" and the invoice posted, and in a
+  0-decimal one WooCommerce's own whole-unit rounding read as a mismatch and correct orders were
+  refused.
+
+  **One case has no mapping that will help.** WooCommerce can tax a single shipping line at several
+  rates at once — a standard rate plus a regional surcharge, say — and an accounting invoice carries
+  exactly one tax type on shipping. If those rates happen to add up to a rate IMS holds (15% + 5%
+  where the order is 20%), the invoice is right and posts as usual. If they do not, no tax type
+  expresses the charge, and the message says so rather than sending you looking for a mapping. Such
+  an order has to be invoiced in the ledger by hand
 - The order number uses your configured WooCommerce prefix (e.g. `WC-1234`, set in Settings > Company > Document Numbering)
+- **The accounting invoice number comes from WooCommerce, not from IMS.** IMS reads `_wcpdf_invoice_number` — the number WooCommerce PDF Invoices & Packing Slips assigned and printed on the customer's PDF — and uses it *verbatim* as both the IMS invoice number and the `InvoiceNumber` on the Xero invoice. No prefix is added, so the Xero document, the customer's PDF and the WooCommerce order all carry the same number. The **Invoice Prefix** field for WooCommerce under Settings > Company > Document Numbering no longer affects it
 - Stock is auto-allocated from warehouses marked **Sync to Store**
+
+#### When WooCommerce has not numbered the invoice yet
+
+The PDF plugin assigns `_wcpdf_invoice_number` when it first creates the invoice document, which can
+happen slightly after IMS imports the order. When the number is missing, **IMS does not invent one
+and does not post anything to the accounting system.** The order still imports normally; the
+accounting sales invoice is held back and a warning appears in the activity log
+(`sales_invoice_number_unavailable`), naming the order and the meta key it looked for.
+
+This is deliberate. The accounting sales-invoice create is an *update-or-create on the invoice
+number*, so a document posted under a stand-in number cannot be renumbered later — a second post
+under the real number would create a **second invoice** rather than replacing the first. Holding the
+order back is recoverable; a wrongly numbered document in a live ledger is not.
+
+**It clears itself.** The invoice IMS would have posted is kept against the order, waiting for the
+number. As soon as WooCommerce assigns one and the order resyncs — a webhook redelivery, or the next
+order poll, which picks the order up precisely because writing that meta touches it — IMS records
+the number and queues the accounting invoice automatically, using the payload it built at import
+time (so the invoice date, tax treatment and payment registration are exactly what they would have
+been). The activity log shows `sales_invoice_number_captured`.
+
+There is nothing to do unless an order *stays* here. If one does, the order is not being resynced:
+check that WooCommerce actually generated the invoice document for it, and that order sync is
+running. You can always queue the sales invoice from the sales order by hand once the number shows.
+
+One case is called out separately, because the release can be a no-op through no fault of the order:
+if the accounting connector is disconnected, its sync is switched off, or Sales Invoices are set to
+**off**, queueing the released invoice does nothing at all. IMS checks that the accounting sync row
+really exists before it closes the hold, so the order stays held, its queue row says why, and the
+activity log gets `sales_invoice_release_not_queued`.
+
+**That one does not wait for the storefront.** Waiting for another order sync would be waiting for
+nothing: the event that would have caused one — WooCommerce writing the number — has already
+happened. Instead the WooCommerce reconcile job retries every held order that has a number and no
+accounting document, on its own schedule, so switching the connector or the Sales Invoices setting
+back on is enough — the invoices queue themselves on the next run without anyone touching the
+orders. While orders are stuck this way you get one `sales_invoice_release_still_stuck` warning per
+run naming the total, rather than one per order. Holds that can never be released — the sales order
+was deleted, or it has since been invoiced another way — are closed with a reason instead of being
+retried forever.
+
+#### If WooCommerce changes an order's invoice number
+
+IMS follows the storefront **until something has committed to the number** — that is, until an
+accounting document exists for the order, or a sales-invoice sync has been queued for it. Before
+that point a changed `_wcpdf_invoice_number` simply replaces the stored one (logged as
+`sales_invoice_number_corrected`).
+
+After that point the number is frozen and IMS keeps what it has, logging
+`sales_invoice_number_correction_refused` with both numbers. Renumbering then is not a correction:
+the accounting create is update-or-create on the number, so posting the new one would add a *second*
+document rather than renumber the first. The order's invoice in the accounting system and the
+customer's PDF have genuinely diverged, and somebody has to decide which is right.
+
+The same applies to orders that have **no** number recorded but already carry an accounting
+document — every WooCommerce order invoiced before this change is in that state, with a document
+numbered `INWC-…` in Xero. IMS does not fill the blank for those either (logged as
+`sales_invoice_number_capture_refused`): doing so would make the next invoice update try to renumber
+a live document onto the storefront's number.
 
 **WooCommerce "completed" orders** receive special handling: the system auto-allocates stock, creates shipments, applies any tracking information from the WC order meta (AST plugin), and transitions the shipments through to Shipped status.
 
@@ -238,6 +351,88 @@ Refunds created in WooCommerce are automatically synced to One Two Inventory:
 - **Monetary-only refunds** (no quantities) create a single refund line with the full amount and the WC refund reason
 
 Refunds are deduplicated by WooCommerce refund ID, so they are safe to re-process.
+
+**All of them, not the first ten.** WooCommerce returns refunds ten at a time unless asked for more, so an
+order with many separate refunds used to sync only its ten most recent. Every page is now read. If a page
+cannot be read, the sync keeps what it got and logs `wc_refund_read_incomplete` (WARNING) naming the order
+and how far it reached — until the rest arrive, that order shows a smaller refunded amount than the store
+does, and a 3PL despatch for it can be refused as uncovered. The next sweep re-reads the order from the
+first page, so it clears itself.
+
+### Parked refunds, and a refund parked against the wrong order
+
+A refund the system cannot apply safely is **parked** and appears in **Sync → Exceptions** under
+"WooCommerce refunds — parked". The refund, its credit note and its restock have not posted. **Retry**
+re-fetches that order's refunds fresh from WooCommerce and re-attempts it.
+
+A WooCommerce refund belongs to exactly one order, so a park recorded against the *wrong* order is an
+anomaly the system deliberately refuses to resolve by itself — it will not move one order's refund
+evidence onto another. Retry cannot fix it either: it re-fetches the order the park is sitting on,
+and that order does not have the refund. Meanwhile the refund's real order cannot have it applied,
+and neither order can be deleted.
+
+Use **"Wrong order"** on the parked row. It offers two things, and checks both with WooCommerce
+before changing anything:
+
+- **It belongs to another WooCommerce order** — give the WooCommerce **order ID**, which is the
+  `id=` in the address bar with that order open in WooCommerce (or the refund's own `parent_id`), and
+  is *not* necessarily the order number shown to the customer. The two are the same on a plain store
+  and differ wherever order numbering has been customised — and the wrong one addresses a different
+  order or none. One Two Inventory asks WooCommerce which refunds that order actually has, right now,
+  and refuses if this refund is not one of them. If it is, the park moves to that order and becomes
+  retryable there. The refund itself has still not been applied — retry it from its new order.
+- **WooCommerce no longer has it on this order** — for a refund that has since been deleted in
+  WooCommerce. One Two Inventory asks WooCommerce which refunds *this* order has and refuses if the
+  refund is still one of them. Dismissing only clears a park WooCommerce contradicts; it does not
+  apply the refund anywhere, so if money did leave the business, reassign it instead.
+
+Either way the WooCommerce answer it acted on — the order asked, the refunds returned, and the time —
+is recorded in the activity log alongside who did it.
+
+Both checks need WooCommerce's answer to be **complete**, because "this refund is not on that order"
+is what they turn on. One Two Inventory reads every page of an order's refunds and works out where
+the collection ends **from the pages themselves**. It does not take the store's page-count header for
+an answer, since a store that sends no header is indistinguishable from one reporting a single page.
+Nor does it compare a page against the size it *asked* for: `per_page` is a request, and a store
+configured to serve fewer (a hosting limit, a security plugin, a proxy) answers a request for a
+hundred with its own smaller page and no error at all — so "shorter than we asked for" would end the
+walk on the very first page of such a store and call a tenth of the refunds the whole list.
+
+**Only a page that comes back empty ends the walk.** A short page ends nothing, however short: the
+size a store serves is not fixed, and a page trimmed by a proxy or by a plugin shedding load looks
+exactly like the last page of a list. So the check keeps asking until a page comes back with nothing
+on it. That costs **one extra request** for any order whose refunds do not happen to fill their last
+page, and it is deliberate — a refusal can be retried, but a park dismissed over money that has
+already left the business cannot be undone.
+
+As a second guard, if the store states how many refunds the order has (the `X-WP-Total` header) and
+serves fewer than that, the check is refused: that is the signature of a page trimmed in transit,
+which no rule about page lengths can catch.
+
+**And a list that changes while it is being read is refused as well.** WooCommerce serves refunds a
+page at a time *by position* — "rows 100 to 199 of whatever is there when you ask" — so a refund
+created or deleted on that order in the middle of the read shifts every later row along, and a refund
+can slip through the gap between two pages without any page looking short. Nothing in the pages
+themselves reveals it, and the totals do not either: the list still carries the refund that was
+deleted, so it is one too long by exactly as much as it is one too short.
+
+Two things catch it. If the same refund is served twice, on different pages, the read is refused —
+that only happens when the list has moved. And **before a park is dismissed, the whole list is read a
+second time and the two answers must match**, refund for refund. The refund that goes missing goes
+missing because another one was deleted, and the store cannot serve that deleted refund again, so the
+two reads disagree and the dismissal is refused. If it keeps happening, that order is being refunded
+right now; leave the park alone until it settles.
+
+This is only required for **dismissing** a park, and doubles the requests that check makes.
+Reassigning is allowed by WooCommerce *listing* the refund on the order you named, and a list that is
+short can only fail to show something — it can never invent it. Dismissing is allowed by the refund
+being *absent*, and a list that is short produces absence out of nothing.
+
+If the read cannot be completed — the store errors, an order carries more refunds than the check will
+read, the list never ends within the pages the check reads, the store serves fewer refunds than it
+says the order has, the list changes while it is being read, or a refund comes back with no readable
+id — the recovery is **refused and nothing is changed**, rather than treating a list that might be
+short as proof the refund is missing.
 
 ## Invoice Notes and Customer PDF Downloads
 

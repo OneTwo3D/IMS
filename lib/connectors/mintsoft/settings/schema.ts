@@ -155,13 +155,44 @@ export function parseMintsoftPositiveId(value: string | null | undefined): numbe
  */
 export function mintsoftDeltaScopeChanged(
   next: { clientId: string; channelId: string; warehouseId: string },
-  prev: Pick<MintsoftSettings, 'mintsoft_client_id' | 'mintsoft_channel_id' | 'mintsoft_warehouse_id'>,
+  prev: MintsoftDeltaScope,
 ): boolean {
-  return (
-    next.clientId !== prev.mintsoft_client_id ||
-    next.channelId !== prev.mintsoft_channel_id ||
-    next.warehouseId !== prev.mintsoft_warehouse_id
-  )
+  return mintsoftDeltaScopeToken({
+    mintsoft_client_id: next.clientId,
+    mintsoft_channel_id: next.channelId,
+    mintsoft_warehouse_id: next.warehouseId,
+  }) !== mintsoftDeltaScopeToken(prev)
+}
+
+/** The three settings that define which orders the inbound delta can see. */
+export type MintsoftDeltaScope = Pick<
+  MintsoftSettings,
+  'mintsoft_client_id' | 'mintsoft_channel_id' | 'mintsoft_warehouse_id'
+>
+
+/**
+ * q66in.7.2 r3 (Codex r2 finding 2) — THE SCOPE AS ONE COMPARABLE VALUE.
+ *
+ * `saveMintsoftOrderDispatchSettings` discards the delta cursors when the scope moves, but the
+ * cursors are written by the SWEEP, from a separate process, and an in-flight sweep that started
+ * under the OLD scope re-upserts them after the delete — restoring an old-scope watermark and
+ * undoing the reset entirely. The sweep therefore has to carry the scope it started under and
+ * refuse to write cursors if it has since moved, which needs the scope as a single value it can
+ * hold across the run rather than a three-way comparison done at one call site.
+ *
+ * Values are already normalised (`''` = unset) and joined on NUL, which no setting value contains,
+ * so the token is injective: two different scopes can never collapse to one string. It is compared
+ * for EQUALITY only and never parsed back — it is an identity, not a serialization format.
+ *
+ * `mintsoftDeltaScopeChanged` is expressed in terms of it so the save's "did the scope move?" and
+ * the sweep's "is the scope still mine?" cannot drift into disagreeing about what the scope is.
+ */
+export function mintsoftDeltaScopeToken(scope: MintsoftDeltaScope): string {
+  return [
+    scope.mintsoft_client_id,
+    scope.mintsoft_channel_id,
+    scope.mintsoft_warehouse_id,
+  ].join('\u0000')
 }
 
 export async function getMintsoftSettings(): Promise<MintsoftSettings> {
@@ -202,4 +233,141 @@ export function mintsoftHasAuthMaterial(
     settings.mintsoft_api_key.trim()
       || (settings.mintsoft_username.trim() && settings.mintsoft_password.trim()),
   )
+}
+
+/**
+ * o3d-hl8l r5 (Codex r4 finding 2) — THE DELTA-RESET GENERATION.
+ *
+ * WHY THE SCOPE TOKEN COULD NOT BE THE FENCE. `saveMintsoftDeltaCursors` used to refuse a stale
+ * cursor write by comparing the scope token the run started under against the one held at save time.
+ * That detects "the scope is different now" and NOT "the cursors were reset while I was running" —
+ * and those are not the same question, because the token is a function of the CURRENT scope and can
+ * return to a value it already had. The operator corrects ClientId 89 → 101, sees the mistake and
+ * puts 89 back: two resets, two cleared cursor pairs, and a token that ends exactly where it began.
+ * An in-flight sweep that read its watermark under the first 89 then compares 89 against 89, passes,
+ * and writes an old-scope watermark straight back over BOTH resets. The delta then resumes from a
+ * point before the correction and the orders the correction was made to see never enter it.
+ *
+ * A GENERATION HAS NO VALUE TO RETURN TO. It is incremented once per committed reset, by whichever
+ * transaction holds the five dispatch setting rows `FOR UPDATE`, so every number comes from ONE
+ * SERIALIZED WRITER CHAIN: the lock is held to commit across the read and the increment. The
+ * ordering is therefore A LOCK ORDERING RATHER THAN A CLOCK READING, and no host clock — and no
+ * database clock either — participates. Two resets that restore the original scope still leave the
+ * generation two higher than the sweep is carrying, so the write is refused.
+ *
+ * The scope token is KEPT, because "did the scope move?" is still the question the save asks to
+ * decide whether to reset at all. It is no longer the question the cursor write asks.
+ */
+export const MINTSOFT_DELTA_GENERATION_KEY = 'mintsoft_order_delta_generation'
+
+/**
+ * The stored generation as a number.
+ *
+ * ABSENT (or empty) IS ZERO, not unknown: only the reset writes this row, so no row means no reset
+ * has ever committed, which is a fact and not a gap. A row that is present but NOT a non-negative
+ * integer is `null` — genuinely unattributable — and every caller treats that as "apply no change",
+ * because a value nobody can order cannot establish that a cursor write is current.
+ */
+export function parseMintsoftDeltaGeneration(raw: string | null | undefined): number | null {
+  if (raw == null) return 0
+  const trimmed = String(raw).trim()
+  if (trimmed === '') return 0
+  if (!/^\d+$/.test(trimmed)) return null
+  const parsed = Number.parseInt(trimmed, 10)
+  return Number.isSafeInteger(parsed) ? parsed : null
+}
+
+/**
+ * The generation a committing reset writes. An unreadable current value starts the chain again at 1
+ * rather than propagating the garbage — every run holding the unreadable value is refused anyway
+ * (it carries `null`), and every run holding a real number disagrees with 1 unless the chain really
+ * is that short.
+ */
+export function nextMintsoftDeltaGeneration(current: number | null): number {
+  return (current ?? 0) + 1
+}
+
+/**
+ * o3d-hl8l r6 (Codex r5 finding 3) — THE GENERATION HAS TO TRAVEL WITH THE CLAIM.
+ *
+ * WHAT ROUND 5 STILL COULD NOT SEE. The fence `saveMintsoftDeltaCursors` arms is a compare-and-swap
+ * inside our own code: a run hands back the generation it read, the write re-reads it under the
+ * dispatch row lock, and a mismatch discards the advance. That works for every writer that RUNS THAT
+ * CODE. A rolling deploy — or a rollback — puts a second instance in front of the SAME database
+ * running a BUILD FROM BEFORE THE FENCE, and that instance does not merely fail to attribute its
+ * write: it never asks the question at all. It executes its own `saveMintsoftDeltaCursors`, which
+ * upserts `mintsoft_order_delta_since` unconditionally, and no amount of checking on our side is
+ * reached. Round 5 treated the "carries a scope but no generation" payload as that instance; it is
+ * not — it is a payload shape that only OUR code can produce.
+ *
+ * SO THE CHECK MOVES INTO THE VALUE. A cursor row now stores the generation it was written under
+ * alongside the instant it claims, and the READER refuses a cursor it cannot attribute to the
+ * generation currently in force. An older instance writes a bare timestamp, exactly as it always
+ * did; the next reader sees a value with no stamp, cannot place it in the chain, and treats it as
+ * ABSENT — which restarts the delta from the lookback window rather than trusting a watermark that
+ * may have been established under a scope this installation has since abandoned.
+ *
+ * WHY "TREAT AS ABSENT" IS THE SAFE SIDE, and the only one. A watermark is one claim — "every
+ * changed order up to this instant has been applied". Discarding it costs a single wider Order/List
+ * window, which is idempotent: the sweep re-reads orders it has already applied and applies nothing.
+ * Trusting it costs the opposite and unrecoverable thing — if the stale value is LATER than what the
+ * current scope has ever fetched, every order changed in between is skipped and nothing ever says
+ * so. The asymmetry is why this refuses rather than merges, in the same words the write side uses.
+ *
+ * THE ONE-TIME COST OF ADOPTING IT is exactly that: on the first sweep after this ships, the
+ * existing unstamped cursors read as absent and the delta starts once from the lookback window. That
+ * is the same work a reset asks for, and it happens once.
+ */
+export type MintsoftDeltaCursorRefusal = 'absent' | 'unstamped' | 'unreadable' | 'superseded'
+
+export type MintsoftDeltaCursorDecode =
+  | { value: string; refusal: null }
+  | { value: null; refusal: MintsoftDeltaCursorRefusal }
+
+/**
+ * The stored form of a cursor: the instant it claims, and the reset generation in force when the
+ * run that claimed it started. JSON rather than a delimiter because the instant is operator-visible
+ * in `settings` and a delimiter would have to be one an ISO timestamp can never contain.
+ */
+export function encodeMintsoftDeltaCursor(generation: number, at: string): string {
+  return JSON.stringify({ g: generation, at })
+}
+
+/**
+ * Decode a stored cursor against the generation currently in force.
+ *
+ * Every "no" is NAMED, because they mean different things to whoever reads the log: `unstamped` is
+ * an instance that does not participate in the scheme (a pre-fence build, or the one-time migration
+ * above); `unreadable` is a stamped value nobody can order; `superseded` is a stamp from a
+ * generation the reset chain has moved past. All four produce the same conservative answer.
+ */
+export function decodeMintsoftDeltaCursor(
+  raw: string | null | undefined,
+  currentGeneration: number | null,
+): MintsoftDeltaCursorDecode {
+  const trimmed = typeof raw === 'string' ? raw.trim() : ''
+  if (!trimmed) return { value: null, refusal: 'absent' }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    // A bare ISO timestamp lands here: it is what every build before this fence wrote.
+    return { value: null, refusal: 'unstamped' }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { value: null, refusal: 'unstamped' }
+  }
+
+  const record = parsed as Record<string, unknown>
+  const at = typeof record.at === 'string' ? record.at.trim() : ''
+  const stamped = typeof record.g === 'number' && Number.isSafeInteger(record.g) && record.g >= 0 ? record.g : null
+  if (!at || stamped === null) return { value: null, refusal: 'unreadable' }
+
+  // A generation row nobody can order cannot establish that a cursor is current, which is the same
+  // rule `saveMintsoftDeltaCursors` applies to the write side.
+  if (currentGeneration === null || stamped !== currentGeneration) {
+    return { value: null, refusal: 'superseded' }
+  }
+  return { value: at, refusal: null }
 }

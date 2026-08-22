@@ -4,8 +4,9 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { parseCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
-import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
-import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { calculateCoverageByLine } from '@/lib/products/fulfillment-coverage'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import {
   sumPostedUnearnedReversal,
@@ -95,6 +96,11 @@ export type DailyBatchHistoryEntry = {
   externalTransactionId: string | null
   errorMessage: string | null
   retryCount: number
+  /**
+   * o3d-e2mz: the attempt this row is on, so the panel's per-row retry can name the attempt it was
+   * requested about. Optional because connectors whose processor stamps none report none.
+   */
+  attemptRevision?: number
   lines: Array<{ accountCode: string; description: string; debit: number; credit: number }>
 }
 
@@ -272,7 +278,16 @@ async function computePreview(): Promise<DailyBatchPreview> {
           refundStatus: true,
           totalBase: true,
           unearnedRevenueAmount: true,
-          lines: { select: { id: true, productId: true, qty: true, totalBase: true } },
+          lines: {
+            select: {
+              id: true,
+              productId: true,
+              qty: true,
+              totalBase: true,
+              // o3d-kouj: the recipe this line was allocated from — see lib/connectors/xero/daily-sync.ts.
+              fulfillmentRequirements: true,
+            },
+          },
           shipments: {
             select: {
               id: true,
@@ -398,7 +413,10 @@ async function computePreview(): Promise<DailyBatchPreview> {
         .filter((line) => !!line.productId)
         .map((line) => [
           line.id,
-          requirementsMapToRows(expandFulfillmentRequirementsDecimal(line.productId!, 1, bGraph)),
+          lineFulfillmentRequirements(line, bGraph).map((requirement) => ({
+            productId: requirement.productId,
+            factor: requirement.factor.toNumber(),
+          })),
         ]),
     )
     const orderLineById = new Map(order.lines.map((line) => [line.id, line]))
@@ -635,6 +653,7 @@ export async function getXeroDailyBatchHistory(
       externalTransactionId: row.externalTransactionId,
       errorMessage: row.errorMessage,
       retryCount: row.retryCount,
+      attemptRevision: row.attemptRevision,
       lines,
     }
 

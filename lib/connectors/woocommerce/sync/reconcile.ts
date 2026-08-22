@@ -1,5 +1,5 @@
 import { db } from '@/lib/db'
-import { isWcOrderWebhookPrimaryActive, syncNewWcOrders } from './order-import'
+import { isWcOrderWebhookPrimaryActive, retryHeldWcSalesInvoiceReleases, syncNewWcOrders } from './order-import'
 import { isWcProductWebhookPrimaryActive, syncAllWcProducts } from './product-sync'
 import { processQueuedWcStockSyncJobs } from './stock-sync-jobs'
 import { pushStockToWc } from './stock-sync'
@@ -28,6 +28,14 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
           lastReconciledAt: lastReconcile?.value ?? null,
         }
   }
+
+  // o3d-k26m.6 round 4: THE DRIVER for a sales invoice held back for its number and not released.
+  // A failed release leaves the hold PENDING, and the only other thing that would ever retry it is
+  // another import of that order — which happens only if WooCommerce touches the order again, and
+  // the number arriving was that touch. This runs on the cron's timer instead, so a hold stuck
+  // behind a disconnected accounting connector is picked up when the connector comes back rather
+  // than never. Unconditional: it is a database sweep of work already owed, not a WooCommerce call.
+  results.heldSalesInvoices = await retryHeldWcSalesInvoiceReleases()
 
   const productEnabled = await db.setting.findUnique({ where: { key: 'wc_sync_product_enabled' } })
   if (productEnabled?.value === 'true') {

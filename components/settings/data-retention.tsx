@@ -14,6 +14,8 @@ type Props = {
   stockMovementsValue: string
   syncLogsValue: string
   webhookEventsValue: string
+  wmsEventsValue: string
+  wmsSyncJobsValue: string
 }
 
 const FIELDS = [
@@ -21,8 +23,10 @@ const FIELDS = [
   { key: 'retention_purchase_orders_months', label: 'Purchase Orders', stateKey: 'purchaseOrders' as const, hint: 'Archive received, closed, invoiced, returned, or cancelled POs' },
   { key: 'retention_customers_months', label: 'Customers', stateKey: 'customers' as const, hint: 'Archive inactive customers' },
   { key: 'retention_stock_movements_months', label: 'Stock Movements', stateKey: 'stockMovements' as const, hint: 'Permanently delete movements' },
-  { key: 'retention_sync_logs_months', label: 'Sync Logs', stateKey: 'syncLogs' as const, hint: 'Permanently delete sync logs' },
+  { key: 'retention_sync_logs_months', label: 'Sync Logs', stateKey: 'syncLogs' as const, hint: 'Permanently delete settled sync logs (unfinished accounting work is kept)' },
   { key: 'retention_webhook_events_months', label: 'Webhook Events', stateKey: 'webhookEvents' as const, hint: 'Clear processed inbox payloads (keeps dedup + dead letters)' },
+  { key: 'retention_wms_events_months', label: 'WMS Inbound Events', stateKey: 'wmsEvents' as const, hint: 'Clear processed WMS callback payloads (keeps dedup + dead letters)' },
+  { key: 'retention_wms_sync_jobs_months', label: 'WMS Sync Runs', stateKey: 'wmsSyncJobs' as const, hint: 'Delete finished sync runs and their per-SKU log lines' },
 ] as const
 
 export function DataRetentionSetting({
@@ -32,6 +36,8 @@ export function DataRetentionSetting({
   stockMovementsValue,
   syncLogsValue,
   webhookEventsValue,
+  wmsEventsValue,
+  wmsSyncJobsValue,
 }: Props) {
   const [isPending, startTransition] = useTransition()
   const [values, setValues] = useState({
@@ -41,6 +47,8 @@ export function DataRetentionSetting({
     stockMovements: stockMovementsValue,
     syncLogs: syncLogsValue,
     webhookEvents: webhookEventsValue,
+    wmsEvents: wmsEventsValue,
+    wmsSyncJobs: wmsSyncJobsValue,
   })
   const [saved, setSaved] = useState(false)
 
@@ -57,9 +65,12 @@ export function DataRetentionSetting({
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
-        Set to 0 to keep records forever. Financial records (orders, customers) are soft-archived — hidden from lists but accessible via direct link. Operational data (movements, sync logs) is permanently deleted. Cleanup runs daily via <code className="text-xs bg-muted px-1 rounded">/api/cron/activity-cleanup</code>.
+        Set to 0 to keep records forever. Financial records (orders, customers) are soft-archived — hidden from lists but accessible via direct link. Operational data (movements, sync logs) is permanently deleted, with two exceptions kept for correctness rather than for history: an accounting sync row whose back-reference is still unresolved has its <em>content</em> cleared on schedule but keeps its identifying record, and a row for a payment or credit-note allocation already sent to the ledger is kept in full, because its existence is what stops the same money being sent twice. Cleanup runs daily via <code className="text-xs bg-muted px-1 rounded">/api/cron/activity-cleanup</code>.
       </p>
-      <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-6 gap-x-4 max-w-4xl">
+      <p className="text-xs text-muted-foreground">
+        One exception: accounting sync entries that are still <strong>pending, in progress or failed</strong> are never deleted by age. They are unfinished work, not history — the payload is what a retry posts, and deleting one while a worker still holds it would put a document in the ledger that nothing here records. They expire normally once they settle (synced or cancelled), so clearing them is a matter of resolving them on the Accounting Sync page.
+      </p>
+      <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-4 gap-x-4 max-w-4xl">
         {FIELDS.map((f) => (
           <div key={f.key} className="grid grid-rows-subgrid row-span-3 gap-0">
             <Label className="text-xs self-end pb-1">{f.label} (months)</Label>

@@ -314,7 +314,11 @@ test('production preflight rejects invalid and trust-everyone proxy ranges', asy
   })
 })
 
-test('production preflight warns when debug logging is enabled', async () => {
+// o3d-esha item 13: the old log-level check was the ONLY reader of LOG_LEVEL and
+// it read the value solely to comment on it ("LOG_LEVEL is not debug"), which
+// implied a logging control the codebase does not have — there is no logger
+// module, output is plain console.* at fixed severity. Preflight now says so.
+test('production preflight no longer implies LOG_LEVEL controls logging', async () => {
   await withStorageDirs(async (storage) => {
     const result = await runProductionPreflight({
       env: {
@@ -324,7 +328,12 @@ test('production preflight warns when debug logging is enabled', async () => {
     })
 
     assert.equal(result.ok, true)
-    assertStatus(result, 'log-level', 'warn')
+    assert.equal(result.checks.some((check) => check.id === 'log-level'), false)
+    assertStatus(result, 'retired-env-var:LOG_LEVEL', 'warn')
+
+    const check = result.checks.find((entry) => entry.id === 'retired-env-var:LOG_LEVEL')
+    assert.ok(check)
+    assert.match(check.message, /no logger module/)
   })
 })
 
@@ -397,5 +406,72 @@ test('production preflight output includes stable markers and display names', as
     assert.match(output, /- PASS NODE_ENV: NODE_ENV is production\./)
     assert.match(output, /- WARN FILE_SCAN_MODE: Invoice PDF scanning is explicitly disabled\./)
     assert.match(output, /Production preflight passed\./)
+  })
+})
+
+// o3d-tj6v: WC_SYNC_STATUSES / WC_USE_WEBHOOKS / WC_POLL_INTERVAL_MINUTES were
+// documented as controls and read by nothing. Deleting the documentation stops
+// new operators being misled; these checks are what tells the operators who
+// already have the installer-written lines in .env that they are not in force.
+test('production preflight warns that a retired environment variable is not in force and names the real control', async () => {
+  await withStorageDirs(async (storage) => {
+    const result = await runProductionPreflight({
+      env: { ...baseEnv(storage), WC_SYNC_STATUSES: 'processing' },
+    })
+
+    // Not a blocker: install.sh wrote this line into every existing .env, so
+    // failing here would block every upgrade rather than inform anyone.
+    assert.equal(result.ok, true)
+    assertStatus(result, 'retired-env-var:WC_SYNC_STATUSES', 'warn')
+
+    const check = result.checks.find((entry) => entry.id === 'retired-env-var:WC_SYNC_STATUSES')
+    assert.ok(check)
+    assert.match(check.message, /nothing reads it/)
+    assert.match(check.message, /wc_sync_order_statuses/)
+    assert.match(check.message, /Settings -> Sync -> WooCommerce/)
+  })
+})
+
+test('production preflight reports every retired environment variable that is set, and no others', async () => {
+  await withStorageDirs(async (storage) => {
+    const result = await runProductionPreflight({
+      env: { ...baseEnv(storage), WC_USE_WEBHOOKS: 'true', WC_POLL_INTERVAL_MINUTES: '5', WC_SYNC_STATUSES: '' },
+    })
+
+    const retired = result.checks.filter((check) => check.id.startsWith('retired-env-var:')).map((check) => check.id)
+    assert.deepEqual(retired.sort(), ['retired-env-var:WC_POLL_INTERVAL_MINUTES', 'retired-env-var:WC_USE_WEBHOOKS'])
+
+    const poll = result.checks.find((check) => check.id === 'retired-env-var:WC_POLL_INTERVAL_MINUTES')
+    assert.ok(poll)
+    // The poll cadence is the wc-reconcile cron schedule (lib/cron-jobs/woocommerce.ts),
+    // NOT the wc_sync_interval_minutes settings field, which has no runtime reader either.
+    assert.match(poll.message, /wc-reconcile cron schedule/)
+    assert.doesNotMatch(poll.message, /wc_sync_interval_minutes/)
+  })
+})
+
+test('production preflight never echoes the value of a retired environment variable', async () => {
+  await withStorageDirs(async (storage) => {
+    const secretish = 'retired-value-that-must-not-be-printed'
+    const result = await runProductionPreflight({
+      env: { ...baseEnv(storage), WC_SYNC_STATUSES: secretish },
+    })
+
+    const output = formatPreflightResult(result)
+    // Assert the warning IS emitted as well, so this cannot pass by the check
+    // simply not running — the retired set holds REDIS_PASSWORD-class secrets.
+    assert.match(output, /- WARN WC_SYNC_STATUSES: WC_SYNC_STATUSES is set but nothing reads it/)
+    assert.doesNotMatch(output, new RegExp(secretish))
+  })
+})
+
+test('production preflight passes the retired environment variable check when none are set', async () => {
+  await withStorageDirs(async (storage) => {
+    const result = await runProductionPreflight({
+      env: { ...baseEnv(storage), WC_SYNC_STATUSES: '', WC_USE_WEBHOOKS: '', WC_POLL_INTERVAL_MINUTES: '' },
+    })
+
+    assertStatus(result, 'retired-env-vars', 'pass')
+    assert.equal(result.checks.some((check) => check.id.startsWith('retired-env-var:')), false)
   })
 })

@@ -1275,12 +1275,23 @@ test('the fence has an index for the attempted-rows lookup it now makes (o3d-0m5
 })
 
 test('no other copy of the money-post date rule survives (o3d-0m56 r6, CRITICAL 1)', async () => {
-  // Finding 1 was a SECOND copy of one rule. The registration path in app/actions/sales.ts held a
-  // third, and a fourth would be found the same way it was: by a payment nobody can explain.
-  const source = await readFile(path.join(process.cwd(), 'app/actions/sales.ts'), 'utf8')
-  assert.equal(/payload\.paymentDate\.slice\(0, 10\)/.test(source), false,
-    'the registration path must date attempts from the shared function')
-  assert.ok(source.includes("pinnedAttemptDate('INVOICE_PAYMENT'"))
+  // Finding 1 was a SECOND copy of one rule. The registration path held a third, and a fourth would
+  // be found the same way it was: by a payment nobody can explain.
+  //
+  // SUPERSEDED LOCATION, SAME PROPERTY: o3d-ekn8 lifted that path out of the 'use server' file into
+  // lib/domain/accounting/invoice-payment-enqueue.ts so the connector could re-drive it. BOTH files
+  // are checked for the copy — the rule must not be re-spelt in either, and pinning only the new one
+  // would let a copy reappear in the old.
+  const enqueue = await readFile(
+    path.join(process.cwd(), 'lib/domain/accounting/invoice-payment-enqueue.ts'), 'utf8',
+  )
+  const salesActions = await readFile(path.join(process.cwd(), 'app/actions/sales.ts'), 'utf8')
+  for (const [name, source] of [['invoice-payment-enqueue.ts', enqueue], ['sales.ts', salesActions]] as const) {
+    assert.equal(/payload\.paymentDate\.slice\(0, 10\)/.test(source), false,
+      `${name} must date attempts from the shared function, not a local copy of the rule`)
+  }
+  assert.ok(enqueue.includes("pinnedAttemptDate('INVOICE_PAYMENT'"),
+    'the registration path must carry the attempt date from the shared money-post date rule')
 })
 
 /* ----------------- round 7, HIGH 1: one clock reading, carried, not two ----------------- */

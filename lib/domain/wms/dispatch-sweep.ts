@@ -4,9 +4,27 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import {
+  MINTSOFT_DELTA_GENERATION_KEY,
+  decodeMintsoftDeltaCursor,
+  encodeMintsoftDeltaCursor,
+  mintsoftDeltaScopeToken,
+  nextMintsoftDeltaGeneration,
+  parseMintsoftDeltaGeneration,
+  type MintsoftDeltaScope,
+} from '@/lib/connectors/mintsoft/settings/schema'
+import {
+  lockMintsoftDispatchSettings,
+  type MintsoftDispatchSettingsLockTx,
+} from '@/lib/connectors/mintsoft/settings/dispatch-settings-lock'
 import type { WmsConnector, WmsConnectorId, WmsOrderStatus, WmsOrderTracking } from '@/lib/connectors/wms/types'
 import { isWmsUnresolvableRecordError } from '@/lib/connectors/wms/errors'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
+// o3d-rbyg r4: the identity rule lives in its own module so the operator remedy in
+// `app/actions/sync-exceptions.ts` can apply THE SAME ONE without importing the sweep's world.
+import { bindWmsStatusToCandidate } from '@/lib/domain/wms/status-binding'
+export { bindWmsStatusToCandidate } from '@/lib/domain/wms/status-binding'
+export type { WmsStatusBinding } from '@/lib/domain/wms/status-binding'
 import { unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
 import { notify } from '@/lib/notifications'
@@ -99,6 +117,11 @@ export const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CAN
  * version of it: equal at the time, and free to drift apart afterwards, since
  * nothing failed if one side gained a state the other did not. Both sides now
  * call this, so a change to eligibility is a change to both by construction.
+ */
+/**
+ * o3d-rbyg: this is HALF the eligibility. The withdrawal fence is the other half, and it cannot
+ * live in this clause — see `screenWithdrawnOrders` in the core. A link parked by that fence sets
+ * `dispatchDeadLetteredAt`, which IS excluded here, so the exclusion is durable once it has fired.
  */
 export function dispatchCandidateWhere(connectorId: string) {
   return {
@@ -296,10 +319,16 @@ export function resolveDispatchJobOutcome(
   // job still reported SUCCEEDED with zero errors while the delta made no
   // forward progress, so a pinned watermark could repeat every sweep
   // indefinitely with nothing to alert on.
+  //
+  // o3d-rbyg round 2: withdrawalScreenFailures joins them. A screen the sweep cannot read now
+  // DEFERS every candidate in that list rather than shipping it, which is the safe answer — and a
+  // safe answer repeated every tick is a warehouse that has quietly stopped reconciling. It must
+  // be visible from the job, not only from a console line.
   degraded?: {
     unresolved?: number
     deltaWindowTruncated?: boolean
     deltaCoverageIncomplete?: boolean
+    withdrawalScreenFailures?: number
   },
 ): { status: 'SUCCEEDED' | 'PARTIAL'; effectiveErrors: number } {
   const effectiveErrors =
@@ -308,6 +337,7 @@ export function resolveDispatchJobOutcome(
     + (degraded?.unresolved ?? 0)
     + (degraded?.deltaWindowTruncated ? 1 : 0)
     + (degraded?.deltaCoverageIncomplete ? 1 : 0)
+    + (degraded?.withdrawalScreenFailures ?? 0)
   return { status: effectiveErrors > 0 ? 'PARTIAL' : 'SUCCEEDED', effectiveErrors }
 }
 
@@ -341,12 +371,20 @@ export type WmsDispatchCounters = {
   dispatched: number
   pending: number
   errors: number
+  /** o3d-rbyg: links this pass refused to fulfil because a withdrawal stands against the order. */
+  withheld: number
+  /**
+   * o3d-rbyg round 2: links this pass could not screen, so did not fulfil. Distinct from `withheld`
+   * — nothing is known against these orders and nothing durable was written; they are simply not
+   * dispatched on unread evidence, and the next sweep decides them.
+   */
+  deferred: number
 }
 
 export type WmsDispatchLog = {
   orderId: string
   externalOrderNumber: string
-  action: 'dispatched' | 'pending' | 'error'
+  action: 'dispatched' | 'pending' | 'error' | 'withheld' | 'deferred'
   reason: string
 }
 
@@ -397,6 +435,39 @@ export type WmsDispatchSweepDeps = {
    * Optional so a connector or test that predates the quarantine keeps its
    * previous behaviour (streak never advances, nothing is ever quarantined).
    */
+  /**
+   * o3d-rbyg: which of these orders has a withdrawal standing against it?
+   *
+   * THE FIFTH FULFILMENT PATH. The withdrawal fence guards the four moments at which an order is
+   * PUSHED — the batch screen, the pre-claim fence, the post-create recheck and the verify pass's
+   * promotion. None of them ever looks at an order again once its link is SYNCED, and this sweep is
+   * what carries a SYNCED link the rest of the way: `applyDispatch` writes the IMS shipment SHIPPED,
+   * relieves the stock and sends the storefront's despatch email. So an order withdrawn AFTER it was
+   * pushed — with its webhook missed, which is the whole premise of the fence — was fulfilled in
+   * full by this pass with nothing having asked.
+   *
+   * A LOCAL read, deliberately: the IMS markers and the durable suppression tombstone, never the
+   * storefront. This runs against every active link on every tick, so a per-order API call is out of
+   * the question, and a batched storefront screen would make a WooCommerce outage able to interfere
+   * with dispatch reconciliation for the whole shop. The tombstone exists precisely so the fence
+   * survives without a live read.
+   *
+   * Optional so a connector or test that predates the fence keeps its previous behaviour.
+   */
+  screenWithdrawnOrders?(orderIds: string[]): Promise<ReadonlySet<string>>
+  /**
+   * Take a withdrawn link OUT of the sweep and put it in front of a human.
+   *
+   * Not merely skipped: a skip repeats every tick, fulfils nothing, alerts nobody and leaves the
+   * order's stock reserved forever. Parking sets the link's dead-letter stamp — the same durable
+   * exclusion `dispatchCandidateWhere` already honours — so the link stops being polled, appears in
+   * the sync exception inbox, and an operator decides between cancelling it at the WMS, releasing
+   * the hold, or replaying the link once the withdrawal is resolved.
+   *
+   * Reports whether the park actually committed: a park that did not reach disk must not let the
+   * pass claim it decided this link.
+   */
+  parkWithdrawn?(candidate: WmsDispatchCandidate, reason: string): Promise<{ parked: boolean }>
   recordUnresolvedRead?(candidate: WmsDispatchCandidate, reason: string): Promise<{ count: number }>
   quarantineUnresolved?(
     candidate: WmsDispatchCandidate,
@@ -462,8 +533,28 @@ export type WmsDispatchSweepDeps = {
   // per-order reconcile. getDeltaState/saveDeltaState persist the watermark +
   // last-reconcile cursors (advanced only on a clean pass).
   fetchDelta?(sinceIso: string): Promise<import('@/lib/connectors/wms/types').WmsOrderStatus[]>
-  getDeltaState?(): Promise<{ watermark: string | null; lastReconcile: string | null }>
-  saveDeltaState?(state: { watermark?: string; lastReconcile?: string }): Promise<void>
+  //
+  // q66in.7.2 r3 (Codex r2 finding 2): `scope` is an OPAQUE identity of the delta's configured
+  // scope, read with the cursors at the start of the run and handed straight back to
+  // `saveDeltaState`. It exists because the cursor RESET and the cursor WRITE happen in different
+  // processes: `saveMintsoftOrderDispatchSettings` deletes both cursors when the scope moves, and a
+  // sweep already running under the OLD scope then re-upserts them from its own run — restoring an
+  // old-scope watermark over the reset, so the first query after the correction starts from a stale
+  // point and outstanding new-scope orders predating it never enter the delta. The reset was
+  // undone by a writer that had never heard of it. Handing the token back lets the implementation
+  // refuse its own write when the scope has moved underneath it; a `getDeltaState` that returns no
+  // token asks for no such check, which is what keeps a connector with no scope (or a test double)
+  // working unchanged.
+  //
+  // o3d-hl8l r5 (Codex r4 finding 2): `generation` is carried the same way and is now the thing the
+  // write is actually judged against. The token answers "is the scope different now?", which a
+  // scope changed and changed back answers with NO while both resets really happened; the
+  // generation is minted once per committed reset under the dispatch row lock, so a sweep that
+  // spanned either of them is refused. It is round-tripped rather than re-read at save time for the
+  // same reason the token is: the value being compared has to be the one the run's cursors came
+  // from, and only the run knows that.
+  getDeltaState?(): Promise<{ watermark: string | null; lastReconcile: string | null; scope?: string | null; generation?: number | null }>
+  saveDeltaState?(state: { watermark?: string; lastReconcile?: string; scope?: string | null; generation?: number | null }): Promise<void>
   // Active links (same eligibility as listCandidates) whose STABLE
   // externalOrderId is in the given set. This is the primary delta candidate
   // lookup: order numbers can be renamed while the Mintsoft ID remains stable.
@@ -504,6 +595,11 @@ export type WmsDispatchSweepDeps = {
  * shipment (idempotent per part), and only mark the IMS order SHIPPED once every part has
  * despatched — line-level at the storefront, atomic IMS-side. A partially-despatched order
  * stays pending.
+ *
+ * THIS is where completion is decided for a WMS-fulfilled order, and it is decided per WMS PART.
+ * `applyDispatch` therefore declares `EXTERNAL` completion authority downstream, so the IMS-side
+ * shortfall check (`findOrderShipmentShortfall`, o3d-0i5y) does not re-derive the same verdict from
+ * IMS shipment rows that were back-filled after the fact — see `OrderCompletionAuthority`.
  */
 async function reconcileSplitOrder(
   deps: WmsDispatchSweepDeps,
@@ -669,45 +765,22 @@ export async function reconcileOneOrder(
       unresolved: requireResolution || Boolean(expectedExternalOrderId),
     }
   }
-  // Merge evidence is ALWAYS by number (the survivor lists the numbers it absorbed),
-  // so it is only trustworthy when exactly one link claims that number. On a shared
-  // number we cannot tell which order was absorbed — refuse rather than repoint and
-  // dispatch the wrong one (Codex round 7). Applies to both passes.
-  const mergeProvenByNumber =
-    status.isMerged
-    && status.mergedOrderNumbers.includes(candidate.externalOrderNumber)
-    && mergeNumberUnique !== false
-
-  if (expectedExternalOrderId && status.externalOrderId !== expectedExternalOrderId) {
-    // A MERGE is the one legitimate stable-ID change (o3d-bjc.2.1): the survivor
-    // authoritatively names our order number among the numbers it folded in, so a
-    // different id is expected and the link is repointed just below.
-    if (!mergeProvenByNumber) {
-      // UNRESOLVED, not pending-and-clean: the delta said this order changed and
-      // the authoritative lookup handed back a different order, so its real state
-      // is unknown. Holding the watermark keeps the change in the next window.
-      return {
-        action: 'pending',
-        reason: `Order-number lookup returned stable ID ${status.externalOrderId || 'unknown'}; expected ${expectedExternalOrderId}`,
-        unresolved: true,
-      }
-    }
+  // o3d-rbyg r4: the binding rule lives in `bindWmsStatusToCandidate`, called rather than copied,
+  // because the operator's "record the despatch" remedy has to apply exactly this one. UNRESOLVED
+  // rather than pending-and-clean: the lookup handed back a record we cannot bind to this link, so
+  // its real state is unknown and the watermark must hold.
+  const binding = bindWmsStatusToCandidate(
+    status,
+    { externalOrderNumber: candidate.externalOrderNumber, externalOrderId: expectedExternalOrderId ?? null },
+    mergeNumberUnique,
+  )
+  if (!binding.bound) {
+    return { action: 'pending', reason: binding.reason, unresolved: true }
   }
 
   // Merge: the WMS merged this order into a survivor (combined "a+b" number); our original
   // WMS order is gone. Repoint the link to the survivor, then process under its number.
   if (status.isMerged && status.externalOrderNumber !== candidate.externalOrderNumber) {
-    if (!mergeProvenByNumber) {
-      // Either the survivor doesn't actually name our number, or the number has
-      // several claimants — we can't tell whether THIS order was absorbed.
-      return {
-        action: 'pending',
-        reason:
-          `Merge survivor ${status.externalOrderNumber} does not unambiguously name ${candidate.externalOrderNumber} `
-          + '— refusing to repoint on number evidence alone',
-        unresolved: true,
-      }
-    }
     await deps.repointLink(candidate.linkId, {
       externalOrderId: status.externalOrderId,
       externalOrderNumber: status.externalOrderNumber,
@@ -789,13 +862,22 @@ export async function runWmsDispatchSweepCore(
   deltaWindowTruncated: boolean
   /** True when the sweep pinned the watermark because it could not prove full coverage. */
   deltaCoverageIncomplete: boolean
+  /** o3d-rbyg round 2: candidate lists whose withdrawal screen could not be read (their links were deferred). */
+  withdrawalScreenFailures: number
 }> {
   // At least 1: a batchSize of 0 would poll nothing yet still look like "covered
   // the whole eligible set", which the truncation recovery below relies on.
   const batchSize = Math.max(1, options?.batchSize ?? DISPATCH_SWEEP_DEFAULT_BATCH_SIZE)
   const now = options?.now ?? new Date()
-  const counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0 }
+  const counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0, withheld: 0, deferred: 0 }
   const logs: WmsDispatchLog[] = []
+  // o3d-rbyg: orders this pass must not fulfil because a withdrawal stands against them. Filled by
+  // screenWithdrawn() below, once per candidate list, before anything is reconciled.
+  const withdrawnOrderIds = new Set<string>()
+  // o3d-rbyg round 2: orders whose screen FAILED. Not "clean" and not "withdrawn" — unknown, and an
+  // unknown must not be fulfilled irreversibly. Deferred by processOne, retried next tick.
+  const unscreenedOrderIds = new Set<string>()
+  let screenFailures = 0
 
   // --- Inbound Order/List delta (o3d-bjc) ---------------------------------
   // Only engages when the connector supplies a bulk delta AND the flag is on.
@@ -848,15 +930,26 @@ export async function runWmsDispatchSweepCore(
   // batch). Every active link was then authoritatively per-order verified, which is
   // the only sound basis for reseeding a watermark whose window had been truncated.
   let reconcileCoveredAllActive = false
+  // The identity of the delta SCOPE this run read its cursors under, handed back at save time so an
+  // in-flight old-scope pass cannot re-write cursors a scope change has since discarded
+  // (q66in.7.2 r3). Null when the deps expose no scope — no check is then asked for.
+  let deltaScopeToken: string | null = null
+  // The RESET GENERATION the cursors were read at, handed back at save time (o3d-hl8l r5). Null when
+  // the deps expose none — a connector with no delta scope, which asks for no check at all.
+  let deltaGeneration: number | null = null
   // Set when the delta fetch fails: the sweep still fails safe to the per-order
   // reconcile, but the failure is surfaced (job PARTIAL + errors) so a broken
   // primary path can't hide behind a SUCCEEDED job.
   let deltaError: string | null = null
 
   if (deltaActive) {
-    const state = deps.getDeltaState
-      ? await deps.getDeltaState()
-      : { watermark: null, lastReconcile: null }
+    const state: { watermark: string | null; lastReconcile: string | null; scope?: string | null; generation?: number | null } =
+      deps.getDeltaState
+        ? await deps.getDeltaState()
+        : { watermark: null, lastReconcile: null }
+    // Carried for the whole run and handed back at save time — see `getDeltaState` on the deps.
+    deltaScopeToken = state.scope ?? null
+    deltaGeneration = state.generation ?? null
     const overlapMs = (options?.deltaOverlapSeconds ?? DISPATCH_DELTA_DEFAULT_OVERLAP_SECONDS) * 1000
     const lookbackMs = (options?.deltaLookbackSeconds ?? DISPATCH_DELTA_DEFAULT_LOOKBACK_SECONDS) * 1000
     const intervalMs = (options?.reconcileIntervalSeconds ?? DISPATCH_DELTA_DEFAULT_RECONCILE_INTERVAL_SECONDS) * 1000
@@ -930,14 +1023,85 @@ export async function runWmsDispatchSweepCore(
   // never count as another reconcile failure (Codex: recordDispatchError
   // throwing inside the catch would have recursed into itself) nor abort the
   // rest of the pass.
+  //
+  // Returns whether this pass DECIDED the link. A deferral (see below) returns false, so the caller
+  // does not mark it processed: the reconcile pass screens its own list moments later, and a link
+  // the delta could not screen must be allowed a second, working screen in the same tick rather than
+  // waiting a whole interval on the first bad query.
   const processOne = async (
     candidate: WmsDispatchCandidate,
     preload: WmsOrderStatus | null | undefined,
     expectedExternalOrderId?: string,
     requireResolution = false,
     mergeNumberUnique?: boolean,
-  ) => {
+  ): Promise<boolean> => {
     counters.totalChecked += 1
+
+    // o3d-rbyg round 2, Codex finding 2: this candidate was never screened, so DEFER it.
+    //
+    // Round 1 let an unscreened candidate through and merely held the watermark. That is the trade
+    // the PUSH screen makes, and it is right there: an unreadable storefront says nothing about the
+    // order, and refusing would idle the warehouse on somebody else's outage — while the act it
+    // guards (a create) is reversible by the hold and cancel passes.
+    //
+    // NEITHER HALF OF THAT HOLDS HERE. The screen is a read of our OWN database, so its failure is
+    // not an independent outage the fence should absorb — it is the sweep being partly blind (an
+    // unmigrated suppression table, a statement timeout on the join) while the rest of the pass
+    // works perfectly and ships. And what it guards is not reversible: applyDispatch marks the
+    // shipment SHIPPED, consumes FIFO stock and sends the customer a despatch email that cannot be
+    // unsent. Deferral costs one sweep interval on an order the WMS has already despatched; the
+    // failure it prevents cannot be undone at any price.
+    //
+    // A defer is NOT a park: nothing durable is written, the link stays a candidate, and the very
+    // next tick with a working screen dispatches it. The pass is dirty either way, so the watermark
+    // is held and the job reports PARTIAL rather than a silent success.
+    if (unscreenedOrderIds.has(candidate.orderId)) {
+      counters.deferred += 1
+      logs.push({
+        orderId: candidate.orderId,
+        externalOrderNumber: candidate.externalOrderNumber,
+        action: 'deferred',
+        reason: 'The withdrawal screen could not be read, so this pass could not prove no withdrawal stands '
+          + 'against this order. Dispatch was NOT applied — no shipment, no stock relief and no despatch '
+          + 'email — and the link is retried on the next sweep. Nothing durable was written.',
+      })
+      // Deliberately NOT counted in linksDecided: the pass decided nothing about this link, and
+      // that counter is the denominator the unresolved-drift ratio is judged against.
+      passClean = false
+      return false
+    }
+
+    // o3d-rbyg: the fifth fulfilment path, fenced BEFORE the status is even looked at.
+    //
+    // Ahead of reconcileOneOrder rather than beside applyDispatch, because a split order dispatches
+    // through a different function (reconcileSplitOrder → pushPartialShipment) and a fence that
+    // guarded only the whole-order call would leave every split order unfenced. Nothing downstream
+    // of here may run for a withdrawn order: not the dispatch, not the partial shipments, not the
+    // merge repoint.
+    if (withdrawnOrderIds.has(candidate.orderId)) {
+      const reason = 'A withdrawal request stands against this order, so its WMS dispatch was NOT applied '
+        + '— no shipment, no stock relief and no despatch email. Cancel it at the WMS while the withdrawal '
+        + 'stands; if the warehouse has ALREADY despatched it, record the despatch from the sync exception '
+        + 'inbox (IMS confirms it with the WMS first). Once the withdrawal itself is resolved, replay this link.'
+      let parked = false
+      try {
+        parked = (await deps.parkWithdrawn?.(candidate, reason))?.parked ?? false
+      } catch (parkError) {
+        console.error('[wms-dispatch-sweep] withdrawal park failed:', parkError)
+      }
+      // A park that did not commit leaves the link a candidate again next tick, so this pass has
+      // NOT decided it — hold the watermark rather than let the change age out of the window.
+      if (!parked) passClean = false
+      counters.withheld += 1
+      linksDecided += 1
+      logs.push({
+        orderId: candidate.orderId,
+        externalOrderNumber: candidate.externalOrderNumber,
+        action: 'withheld',
+        reason: parked ? reason : `${reason} (the link could not be parked — it will be refused again next sweep)`,
+      })
+      return true
+    }
 
     let outcome: WmsDispatchOutcome
     try {
@@ -1009,6 +1173,7 @@ export async function runWmsDispatchSweepCore(
       action: outcome.action,
       reason,
     })
+    return true
   }
 
   // "Is this order number claimed by exactly one link?" — `undefined` when we never
@@ -1021,6 +1186,40 @@ export async function runWmsDispatchSweepCore(
   ): boolean | undefined => {
     const count = counts?.get(orderNumber)
     return count === undefined ? undefined : count === 1
+  }
+
+  /**
+   * o3d-rbyg: screen a candidate list against the durable withdrawal evidence, once, in bulk.
+   *
+   * A FAILURE HERE IS NOT SILENT AND IS NOT WAVED THROUGH (round 2, Codex finding 2). This is a
+   * read of our own database, so its failure is the sweep going partly blind rather than an outage
+   * somewhere else — and what the screen guards is irreversible. Every order in a list that could
+   * not be screened is DEFERRED by processOne: no dispatch, nothing durable written, the pass marked
+   * dirty so the watermark is held, and the whole list retried next tick.
+   *
+   * The failure is remembered PER ORDER rather than for the pass, so the second pass's own screen
+   * can clear it: the delta list and the reconcile list are screened separately, and one bad query
+   * against a 200-id chunk must not idle a candidate the other pass screened cleanly moments later.
+   */
+  const screenWithdrawn = async (list: WmsDispatchCandidate[]) => {
+    if (!deps.screenWithdrawnOrders || list.length === 0) return
+    const orderIds = [...new Set(list.map((entry) => entry.orderId))]
+    try {
+      const fenced = await deps.screenWithdrawnOrders(orderIds)
+      for (const orderId of fenced) withdrawnOrderIds.add(orderId)
+      // Screened cleanly: retract any earlier pass's failure for these same orders.
+      for (const orderId of orderIds) unscreenedOrderIds.delete(orderId)
+    } catch (screenError) {
+      passClean = false
+      screenFailures += 1
+      for (const orderId of orderIds) unscreenedOrderIds.add(orderId)
+      console.error(
+        `[wms-dispatch-sweep] withdrawal screen failed for ${orderIds.length} candidate(s) — their dispatch `
+        + 'is DEFERRED (nothing shipped, nothing parked) and the watermark is held, because this pass '
+        + 'cannot prove no withdrawal stands against them:',
+        screenError,
+      )
+    }
   }
 
   const processedLinkIds = new Set<string>()
@@ -1201,6 +1400,8 @@ export async function runWmsDispatchSweepCore(
       linksPerNumber = await deps.countLinksByOrderNumber([...mergedComponentNumbers])
     }
 
+    await screenWithdrawn(deltaCandidates)
+
     for (const candidate of deltaCandidates) {
       // Stable-id join is authoritative. A candidate without one is eligible
       // only through the split-only number lookup and is always force-fetched.
@@ -1287,7 +1488,7 @@ export async function runWmsDispatchSweepCore(
       // counting it here would mask exactly the slow path this metric exists to expose.
       if (preload && !preload.authoritativeReread) deltaPreloadServed += 1
       if (preload?.authoritativeReread) deltaAuthoritativeRereads += 1
-      await processOne(
+      const decidedByDelta = await processOne(
         effectiveCandidate,
         preload,
         idRow ? undefined : candidate.externalOrderId ?? undefined,
@@ -1296,7 +1497,7 @@ export async function runWmsDispatchSweepCore(
         true,
         claimantUniqueness(linksPerNumber, candidate.externalOrderNumber),
       )
-      processedLinkIds.add(candidate.linkId)
+      if (decidedByDelta) processedLinkIds.add(candidate.linkId)
     }
   }
 
@@ -1331,9 +1532,11 @@ export async function runWmsDispatchSweepCore(
     const reconcileClaimants = deps.countLinksByOrderNumber
       ? await deps.countLinksByOrderNumber(candidates.map((entry) => entry.externalOrderNumber))
       : null
+    await screenWithdrawn(candidates)
+
     for (const candidate of candidates) {
       if (processedLinkIds.has(candidate.linkId)) continue // already handled from the delta
-      await processOne(
+      const decided = await processOne(
         candidate,
         undefined,
         undefined,
@@ -1344,7 +1547,7 @@ export async function runWmsDispatchSweepCore(
         deltaWindowTruncated,
         claimantUniqueness(reconcileClaimants, candidate.externalOrderNumber),
       )
-      processedLinkIds.add(candidate.linkId)
+      if (decided) processedLinkIds.add(candidate.linkId)
     }
   }
 
@@ -1549,7 +1752,7 @@ export async function runWmsDispatchSweepCore(
   // instead of honouring the interval. The clean + fully-covered guard applies to
   // the WATERMARK, which is the thing that can lose data.
   if (deltaActive && deps.saveDeltaState) {
-    const toSave: { watermark?: string; lastReconcile?: string } = {}
+    const toSave: { watermark?: string; lastReconcile?: string; scope?: string | null } = {}
     // Watermark advances only when the delta pass covered EVERY changed link
     // (deltaCoverageComplete) — else a changed order beyond the batch would be
     // aged out. lastReconcile just tracks the per-order reconcile cadence.
@@ -1566,7 +1769,18 @@ export async function runWmsDispatchSweepCore(
     }
     if (ranReconcile) toSave.lastReconcile = now.toISOString()
     if (toSave.watermark !== undefined || toSave.lastReconcile !== undefined) {
-      await deps.saveDeltaState(toSave)
+      // The scope this run READ its cursors under. The implementation writes only if it still
+      // holds — an in-flight old-scope pass must not resurrect the cursors a scope change discarded.
+      // OMITTED, not nulled, when the deps expose no scope: absent is what "no check asked for"
+      // means on an optional field, and it keeps the saved payload byte-identical for a connector
+      // that has no scope at all.
+      await deps.saveDeltaState({
+        ...toSave,
+        ...(deltaScopeToken !== null ? { scope: deltaScopeToken } : {}),
+        // OMITTED the same way, and for the same reason: a payload that carries no generation is a
+        // caller that never read one, which the repository refuses rather than guesses at.
+        ...(deltaGeneration !== null ? { generation: deltaGeneration } : {}),
+      })
     }
   }
 
@@ -1586,6 +1800,11 @@ export async function runWmsDispatchSweepCore(
     // Likewise for coverage: the sweep pinned the watermark because it could not
     // prove it saw every changed order. Safe, but it must not look like success.
     deltaCoverageIncomplete: !deltaCoverageComplete,
+    // o3d-rbyg round 2: how many candidate lists could not be screened for withdrawals. Their
+    // orders were deferred rather than dispatched, which is safe — and, exactly like the two flags
+    // above, must not read as a clean sweep. A screen that fails every tick stops fulfilment
+    // silently otherwise.
+    withdrawalScreenFailures: screenFailures,
   }
 }
 
@@ -1597,6 +1816,278 @@ export type WmsDispatchSweepResult = {
   pending: number
   errors: number
   skippedReason?: string
+}
+
+/**
+ * q66in.7.2 r3 (Codex r2 finding 2) — WRITE THE INBOUND-DELTA CURSORS ONLY IF THE SCOPE IS STILL
+ * THE ONE THE RUN READ THEM UNDER.
+ *
+ * `saveMintsoftOrderDispatchSettings` DELETES both cursors, inside its own transaction, when the
+ * inbound-delta scope (ClientId / ChannelId / WarehouseId) moves — they describe orders the new
+ * scope cannot see. Round 2 made that decision trustworthy by reading the before-image under a row
+ * lock, so the audit can no longer claim a transition that never happened. It did not stop the
+ * cursors coming BACK: a sweep that started before the scope change commits is still holding an
+ * old-scope watermark, and its unconditional upsert put it straight back. The reset was undone by a
+ * writer that had never heard of it, the first query under the new scope resumed from a point
+ * belonging to the old one, and outstanding new-scope orders predating that point never entered the
+ * delta at all. Nothing about it was visible afterwards — the key is simply present again,
+ * indistinguishable from a sweep that ran normally.
+ *
+ * The guard is a compare-and-swap against the scope the run started under, taken under the SAME row
+ * lock the save takes. Reading the scope without the lock would not close the window: Postgres runs
+ * READ COMMITTED, so an unlocked SELECT inside this transaction is exactly as stale as one outside
+ * it, and the delete could still commit between the read and the upserts. Locking the five dispatch
+ * setting rows serialises this against the save outright — whichever transaction takes the lock
+ * first runs to completion, and the other sees the result.
+ *
+ * LOCK ORDER is identical on both sides (the five dispatch keys, then the two cursor keys), so the
+ * pair cannot cycle.
+ *
+ * A refused write is NOT an error. The pass did its work; its cursors are simply no longer
+ * meaningful. The next run reads the cleared cursors and restarts from the lookback window, which
+ * is exactly what the reset asked for. The refusal is returned (and logged) because a silently
+ * dropped advance is otherwise indistinguishable from a pass that never ran.
+ *
+ * `scope == null` means the caller asked for no check — a connector with no scope, or a test double
+ * that supplies no token — and the cursors are written unconditionally, as before.
+ */
+export type MintsoftDeltaCursorTx = MintsoftDispatchSettingsLockTx & {
+  setting: {
+    upsert(args: {
+      where: { key: string }
+      create: { key: string; value: string }
+      update: { value: string }
+    }): Promise<unknown>
+    findMany(args: {
+      where: { key: { in: string[] } }
+      select: { key: true; value: true }
+    }): Promise<Array<{ key: string; value: string | null }>>
+  }
+}
+
+/** What the RESET needs on top of the write side: it removes the cursor rows outright. */
+export type MintsoftDeltaResetTx = MintsoftDeltaCursorTx & {
+  setting: { deleteMany(args: { where: { key: { in: string[] } } }): Promise<unknown> }
+}
+
+/**
+ * The read side needs `findMany` and the write side needs `upsert`; kept as separate structural
+ * types so neither's doubles have to grow a delegate that path never calls.
+ */
+export type MintsoftDeltaCursorReadTx = MintsoftDispatchSettingsLockTx & {
+  setting: {
+    findMany(args: {
+      where: { key: { in: string[] } }
+      select: { key: true; value: true }
+    }): Promise<Array<{ key: string; value: string | null }>>
+  }
+}
+
+/** The two Setting keys the inbound-delta cursors live in, in the order both sides touch them. */
+export const MINTSOFT_DELTA_CURSOR_KEYS = ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'] as const
+
+/**
+ * The cursor rows PLUS the generation row, read as one set.
+ *
+ * The generation is read in the same `findMany` as the cursors, not in a follow-up query, for the
+ * same reason r4 moved the scope read inside the lock: evidence assembled across two statements can
+ * describe two different moments, and a fence that judges from it is deciding about a state that
+ * never existed. One statement, inside the transaction that already holds the dispatch rows
+ * `FOR UPDATE`, cannot straddle a reset.
+ */
+export const MINTSOFT_DELTA_STATE_KEYS = [...MINTSOFT_DELTA_CURSOR_KEYS, MINTSOFT_DELTA_GENERATION_KEY] as const
+
+/**
+ * q66in.7.2 r4 (Codex r3 finding 2) — READ THE CURSORS AND THE SCOPE THEY BELONG TO ATOMICALLY.
+ *
+ * Round 3's compare-and-swap is only as good as the pairing it compares. The token it checks against
+ * is supposed to be "the scope these cursors were read under", and the production wiring did not
+ * produce that: it issued a `findMany` for the two cursor rows and THEN a separate, unlocked
+ * `getMintsoftSettings()` for the scope. A scope change committing between those two reads hands the
+ * run an OLD-scope watermark paired with a NEW-scope token — and the CAS at save time then compares
+ * new against new, passes, and writes the old-scope watermark straight back over the reset. The
+ * guard was defeated by the very interleaving it was built for, because the evidence it decides from
+ * was assembled across the window rather than inside it.
+ *
+ * Both rows are read in ONE transaction holding the SAME five-row dispatch lock the save takes, so
+ * the pair is provably consistent: whichever transaction takes the lock first runs to completion,
+ * and the other sees the result. A run that reads before the change gets (old cursors, old token)
+ * and is refused at save time; one that reads after gets (cleared cursors, new token) and correctly
+ * restarts from the lookback window.
+ *
+ * LOCK ORDER is the same on every path that touches these rows — the five dispatch keys, then the
+ * two cursor keys — so the read, the save and the settings write cannot cycle.
+ */
+export async function readMintsoftDeltaCursors(
+  tx: MintsoftDeltaCursorReadTx,
+  lockScope: (tx: MintsoftDeltaCursorReadTx) => Promise<MintsoftDeltaScope>,
+): Promise<{ watermark: string | null; lastReconcile: string | null; scope: string; generation: number | null }> {
+  const scope = mintsoftDeltaScopeToken(await lockScope(tx))
+  const rows = await tx.setting.findMany({
+    where: { key: { in: [...MINTSOFT_DELTA_STATE_KEYS] } },
+    select: { key: true, value: true },
+  })
+  const map = new Map(rows.map((row) => [row.key, row.value]))
+  const generation = parseMintsoftDeltaGeneration(map.get(MINTSOFT_DELTA_GENERATION_KEY) ?? null)
+
+  // o3d-hl8l r6 (Codex r5 finding 3). THE CAS AT SAVE TIME ONLY BINDS WRITERS THAT RUN IT. A
+  // mixed-version deployment — a rolling restart, or a rollback — puts an instance from before the
+  // fence in front of this same row, and that instance writes a bare timestamp through code paths
+  // that never look at the generation at all. So the attribution is read out of the VALUE here:
+  // a cursor that cannot be placed in the current reset chain is treated as ABSENT, which restarts
+  // the delta from the lookback window instead of resuming from a claim nobody can vouch for.
+  const decoded = {
+    watermark: decodeMintsoftDeltaCursor(map.get('mintsoft_order_delta_since') ?? null, generation),
+    lastReconcile: decodeMintsoftDeltaCursor(map.get('mintsoft_order_reconcile_at') ?? null, generation),
+  }
+  for (const [name, result] of Object.entries(decoded)) {
+    // 'absent' is the ordinary cold start and says nothing worth a line in the log.
+    if (result.refusal && result.refusal !== 'absent') {
+      console.warn(
+        `[wms-dispatch-sweep] the inbound delta ${name} cursor cannot be attributed to reset generation `
+          + `${generation === null ? 'unreadable' : generation} (${result.refusal}) — ignoring it and `
+          + 'restarting from the lookback window rather than resuming from a claim this installation cannot place',
+      )
+    }
+  }
+
+  return {
+    watermark: decoded.watermark.value,
+    lastReconcile: decoded.lastReconcile.value,
+    scope,
+    generation,
+  }
+}
+
+/**
+ * o3d-hl8l r5 (Codex r4 finding 2) — THE RESET, AS ONE OPERATION BOTH SIDES SHARE.
+ *
+ * Clearing the cursors and minting the next generation is a single indivisible fact: cursors gone,
+ * and every sweep that read the old ones now unable to write. Splitting them across the settings
+ * action (which cleared) and this module (which fenced) is how the two drifted into answering
+ * different questions in the first place, so the reset lives here, beside the fence it arms, and
+ * `saveMintsoftOrderDispatchSettings` calls it.
+ *
+ * The caller MUST already hold the five dispatch setting rows `FOR UPDATE` — that lock is what makes
+ * the read-then-increment below a serialized chain rather than a race between two resets. It is not
+ * re-taken here, because taking it twice in one transaction would say the ordering is this
+ * function's to establish when it is the caller's.
+ */
+export async function resetMintsoftDeltaCursors(tx: MintsoftDeltaResetTx): Promise<{ generation: number }> {
+  const rows = await tx.setting.findMany({
+    where: { key: { in: [MINTSOFT_DELTA_GENERATION_KEY] } },
+    select: { key: true, value: true },
+  })
+  const current = parseMintsoftDeltaGeneration(rows[0]?.value ?? null)
+  const generation = nextMintsoftDeltaGeneration(current)
+
+  await tx.setting.deleteMany({ where: { key: { in: [...MINTSOFT_DELTA_CURSOR_KEYS] } } })
+  await tx.setting.upsert({
+    where: { key: MINTSOFT_DELTA_GENERATION_KEY },
+    create: { key: MINTSOFT_DELTA_GENERATION_KEY, value: String(generation) },
+    update: { value: String(generation) },
+  })
+  return { generation }
+}
+
+export type MintsoftDeltaCursorWriteResult =
+  | { written: true }
+  | { written: false; reason: 'cursors_reset' | 'generation_unknown' }
+
+/**
+ * o3d-hl8l r5 (Codex r4 finding 2) — REFUSE, RATHER THAN MERGE, AND DECIDE FROM THE GENERATION.
+ *
+ * REFUSAL RATHER THAN MERGE, deliberately. A watermark is not a set of facts that can be combined:
+ * it is one claim — "every changed order up to this instant has been applied" — and a run whose
+ * cursors were reset underneath it never established that claim for the new scope. There is nothing
+ * to merge with the cleared state, and taking the later of the two values would pick precisely the
+ * wrong one, because the RESET is the newer decision and the sweep's watermark is the older one
+ * wearing a fresher timestamp. So the advance is dropped whole and the next pass starts from the
+ * lookback window, which is what the reset asked for.
+ *
+ * WHY THE GENERATION AND NOT THE SCOPE TOKEN — see `MINTSOFT_DELTA_GENERATION_KEY`. The token is a
+ * function of the current scope, so a scope changed and changed back compares equal and the stale
+ * write goes through; the generation is minted once per committed reset under the dispatch row lock,
+ * so it never returns to a value a running sweep can be carrying. The comparison is an equality on
+ * numbers from one serialized writer chain — a lock ordering, not a clock reading, and no host
+ * participates.
+ *
+ * AN UNATTRIBUTABLE WRITE APPLIES NO CHANGE AT ALL. A caller that supplies a scope but NO generation
+ * read its cursors without ever seeing the generation row, so nothing about its write can be placed
+ * in the chain. It is refused rather than waved through on the weaker token — guessing here is
+ * exactly the ABA hole this replaces. A caller that supplies NEITHER asks for no check; that is an
+ * absent question, not an unanswerable one, and the two are kept distinguishable in the payload
+ * precisely so they can be treated differently.
+ *
+ * o3d-hl8l r6 (Codex r5 finding 3) — AND EVERY WRITE IS STAMPED, INCLUDING THE UNCHECKED ONE. The
+ * CAS above binds writers that execute it, which a mixed-version instance does not; the durable half
+ * of the fence is the generation written INTO the cursor value, which the reader checks (see
+ * `decodeMintsoftDeltaCursor`). So the generation is now read under the lock on EVERY path — for the
+ * comparison when one was asked for, and for the stamp always. The unchecked path therefore takes
+ * the lock too: a stamp read outside it could name a generation the reset had already moved past,
+ * which would write a cursor that is a lie rather than a refusal.
+ */
+export async function saveMintsoftDeltaCursors(
+  tx: MintsoftDeltaCursorTx,
+  state: { watermark?: string; lastReconcile?: string; scope?: string | null; generation?: number | null },
+  lockScope: (tx: MintsoftDeltaCursorTx) => Promise<MintsoftDeltaScope>,
+): Promise<MintsoftDeltaCursorWriteResult> {
+  if (state.scope != null && state.generation == null) {
+    console.warn(
+      '[wms-dispatch-sweep] the inbound delta cursor write carries no reset generation, so it '
+        + 'cannot be shown to be current — discarding the cursor advance',
+    )
+    return { written: false, reason: 'generation_unknown' }
+  }
+
+  // The lock is taken for its ORDERING, not for the scope it returns: holding the dispatch rows is
+  // what makes the generation read below and the reset that would move it mutually exclusive.
+  await lockScope(tx)
+  const rows = await tx.setting.findMany({
+    where: { key: { in: [MINTSOFT_DELTA_GENERATION_KEY] } },
+    select: { key: true, value: true },
+  })
+  const current = parseMintsoftDeltaGeneration(rows[0]?.value ?? null)
+
+  if (state.generation != null) {
+    if (current === null || current !== state.generation) {
+      console.warn(
+        '[wms-dispatch-sweep] the inbound delta cursors were reset during this pass (generation '
+          + `${state.generation} → ${current === null ? 'unreadable' : current}) — discarding the `
+          + 'cursor advance rather than restoring the cursors the reset cleared',
+      )
+      return { written: false, reason: 'cursors_reset' }
+    }
+  } else if (current === null) {
+    // No comparison was asked for, but a cursor still has to be STAMPED with a generation the
+    // reader can order, and there is no such number here. Writing it unstamped would leave a value
+    // the reader must then refuse — a cursor that never advances — so refuse at the write instead,
+    // where the reason is visible.
+    console.warn(
+      '[wms-dispatch-sweep] the reset generation row is unreadable, so a cursor written now could '
+        + 'not be attributed by any later reader — discarding the cursor advance',
+    )
+    return { written: false, reason: 'generation_unknown' }
+  }
+
+  const stamp = current ?? 0
+  if (state.watermark !== undefined) {
+    const value = encodeMintsoftDeltaCursor(stamp, state.watermark)
+    await tx.setting.upsert({
+      where: { key: 'mintsoft_order_delta_since' },
+      create: { key: 'mintsoft_order_delta_since', value },
+      update: { value },
+    })
+  }
+  if (state.lastReconcile !== undefined) {
+    const value = encodeMintsoftDeltaCursor(stamp, state.lastReconcile)
+    await tx.setting.upsert({
+      where: { key: 'mintsoft_order_reconcile_at' },
+      create: { key: 'mintsoft_order_reconcile_at', value },
+      update: { value },
+    })
+  }
+  return { written: true }
 }
 
 /** Prisma + active-connector wiring of the deps. */
@@ -1749,33 +2240,14 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       ? {
           fetchDelta: (sinceIso: string) => connector.fetchOrderDelta!(sinceIso),
           async getDeltaState() {
-            const rows = await db.setting.findMany({
-              where: { key: { in: ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'] } },
-              select: { key: true, value: true },
-            })
-            const map = new Map(rows.map((row) => [row.key, row.value]))
-            return {
-              watermark: map.get('mintsoft_order_delta_since') || null,
-              lastReconcile: map.get('mintsoft_order_reconcile_at') || null,
-            }
+            // The cursors AND the scope they belong to, read in one transaction under the same
+            // five-row lock the save takes (q66in.7.2 r4). Two separate unlocked reads could pair
+            // an old-scope watermark with a new-scope token, which is exactly what makes the CAS
+            // at save time wave the stale advance through — see readMintsoftDeltaCursors.
+            return db.$transaction((tx) => readMintsoftDeltaCursors(tx, lockMintsoftDispatchSettings))
           },
-          async saveDeltaState(state: { watermark?: string; lastReconcile?: string }) {
-            const writes: Array<Promise<unknown>> = []
-            if (state.watermark !== undefined) {
-              writes.push(db.setting.upsert({
-                where: { key: 'mintsoft_order_delta_since' },
-                create: { key: 'mintsoft_order_delta_since', value: state.watermark },
-                update: { value: state.watermark },
-              }))
-            }
-            if (state.lastReconcile !== undefined) {
-              writes.push(db.setting.upsert({
-                where: { key: 'mintsoft_order_reconcile_at' },
-                create: { key: 'mintsoft_order_reconcile_at', value: state.lastReconcile },
-                update: { value: state.lastReconcile },
-              }))
-            }
-            await Promise.all(writes)
+          async saveDeltaState(state: { watermark?: string; lastReconcile?: string; scope?: string | null; generation?: number | null }) {
+            await db.$transaction((tx) => saveMintsoftDeltaCursors(tx, state, lockMintsoftDispatchSettings))
           },
         }
       : {}),
@@ -1840,6 +2312,73 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           reconcileCheckedAt: null,
         },
       })
+    },
+    /**
+     * o3d-rbyg: the durable withdrawal evidence for a batch of orders, read LOCALLY — the IMS
+     * markers, or a standing WooCommerce suppression tombstone.
+     *
+     * Delegated to the withdrawal module rather than re-queried here (round 2): the exception inbox
+     * has to explain the very refusal this screen produces, and two copies of the query are how the
+     * fence and its explanation drift apart. Dynamically imported so the connector-agnostic sweep
+     * does not statically depend on a storefront connector.
+     */
+    async screenWithdrawnOrders(orderIds) {
+      const { screenLocalWithdrawalEvidence } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+      return screenLocalWithdrawalEvidence(orderIds)
+    },
+    async parkWithdrawn(candidate, reason) {
+      // Compare-and-set on the stamp being absent, exactly as the dead-letter and quarantine paths
+      // do: an overlapping sweep must not park the same link twice and raise two alerts.
+      const updated = await db.wmsOrderPushLink.updateMany({
+        where: { id: candidate.linkId, dispatchDeadLetteredAt: null },
+        data: { dispatchDeadLetteredAt: new Date(), dispatchLastError: reason },
+      })
+      // Already parked by a concurrent run: the link IS out of the sweep, which is what the caller
+      // needs to know. Reporting false would make it hold the watermark for a link it can never see
+      // again — the same trap quarantineUnresolved documents.
+      if (updated.count === 0) {
+        const existing = await db.wmsOrderPushLink.findUnique({
+          where: { id: candidate.linkId },
+          select: { dispatchDeadLetteredAt: true },
+        })
+        return { parked: Boolean(existing?.dispatchDeadLetteredAt) }
+      }
+
+      // COMMITTED above. Everything below is audit and alerting; a failure here must not report the
+      // park as having failed.
+      try {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: candidate.orderId,
+          tag: 'sync',
+          action: 'wms_dispatch_withheld_withdrawn',
+          description: `Dispatch reconciliation refused for WMS order ${candidate.externalOrderNumber}: ${reason}`,
+          metadata: {
+            orderId: candidate.orderId,
+            externalOrderNumber: candidate.externalOrderNumber,
+            connector: connectorId,
+            withdrawalFence: true,
+          },
+          level: 'WARNING',
+          resolveUser: false,
+        })
+        // Individually, never a broadcast: a null userId would expose order details to
+        // READONLY/SUPPLIER users (same reasoning as the dead-letter and quarantine alerts).
+        const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+        await Promise.all(admins.map((admin) => notify({
+          userId: admin.id,
+          type: 'error',
+          title: 'Dispatch withheld — withdrawal standing',
+          message: `Order ${candidate.externalOrderNumber} is withdrawn (or has a withdrawal standing against it) `
+            + 'but the WMS reports it active. IMS did NOT mark it shipped or email the customer. '
+            + 'Cancel it at the WMS — or, if the goods have already gone, record the despatch from the '
+            + 'exception inbox so the stock and the sub-ledger match reality.',
+          actionUrl: '/sync/exceptions',
+        })))
+      } catch (alertError) {
+        console.error('[wms-dispatch-sweep] withdrawal park alerting failed:', alertError)
+      }
+      return { parked: true }
     },
     async recordDispatchError(candidate, reason) {
       const link = await db.wmsOrderPushLink.update({
@@ -2242,7 +2781,7 @@ async function runWmsDispatchSweepLocked(
   })
 
   // Hoisted so a failure during persistence still reports the work the core did.
-  let counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0 }
+  let counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0, withheld: 0, deferred: 0 }
 
   try {
     const core = await runWmsDispatchSweepCore(deps, coreOptions)
@@ -2250,7 +2789,7 @@ async function runWmsDispatchSweepLocked(
     const {
       logs, deltaError, unresolved, deltaWindowTruncated, deltaCoverageIncomplete,
       deltaPreloadServed, deltaAuthoritativeRereads, deltaRowCount,
-      unresolvedQuarantined, unresolvedSystemic,
+      unresolvedQuarantined, unresolvedSystemic, withdrawalScreenFailures,
     } = core
 
     if (logs.length > 0) {
@@ -2260,6 +2799,15 @@ async function runWmsDispatchSweepLocked(
         dispatched: 'corrected',
         pending: 'noop',
         error: 'error',
+        // o3d-rbyg: a refused fulfilment is an EXCEPTION, not a quiet no-op. It is logged as an
+        // error row so the job's own log shows it; the link's dead-letter stamp is what puts it in
+        // the exception inbox, and `resolveDispatchJobOutcome` reads counters, not these rows, so
+        // this does not silently fail the job.
+        withheld: 'error',
+        // o3d-rbyg round 2: a DEFERRED link is not an error against the order — nothing is wrong
+        // with it and nothing was written. It is a noop row so the job's log still shows the pass
+        // saw it and chose not to act; the screen failure itself is the error row raised below.
+        deferred: 'noop',
       }
       await db.wmsSyncLog.createMany({
         data: logs.map((log) => ({
@@ -2287,6 +2835,25 @@ async function runWmsDispatchSweepLocked(
           action: 'error',
           reason: `Inbound Order/List delta fetch failed — fell back to the per-order reconcile this run: ${deltaError}`,
           payload: { deltaFailure: true, connector: connectorId } as Prisma.InputJsonValue,
+        },
+      })
+    }
+
+    // o3d-rbyg round 2: the same treatment for a screen that could not be read. The deferral is
+    // deliberate and safe, but a shop whose withdrawal screen has been failing for a day would
+    // otherwise see only SUCCEEDED jobs and a warehouse that had stopped despatching.
+    if (withdrawalScreenFailures > 0) {
+      await db.wmsSyncLog.create({
+        data: {
+          jobId: job.id,
+          sku: null,
+          productId: null,
+          action: 'error',
+          reason: `The withdrawal screen failed on ${withdrawalScreenFailures} candidate list(s) — `
+            + `${counters.deferred} link(s) were DEFERRED rather than dispatched, because this pass could not `
+            + 'prove no withdrawal stands against them. Nothing was shipped and nothing was parked; they are '
+            + 'retried next sweep.',
+          payload: { withdrawalScreenFailure: true, connector: connectorId, deferred: counters.deferred } as Prisma.InputJsonValue,
         },
       })
     }
@@ -2368,6 +2935,7 @@ async function runWmsDispatchSweepLocked(
       unresolved,
       deltaWindowTruncated,
       deltaCoverageIncomplete,
+      withdrawalScreenFailures,
     })
     await db.wmsSyncJob.update({
       where: { id: job.id },
@@ -2382,15 +2950,20 @@ async function runWmsDispatchSweepLocked(
       },
     })
 
-    if (counters.dispatched > 0 || effectiveErrors > 0) {
+    if (counters.dispatched > 0 || effectiveErrors > 0 || counters.withheld > 0 || counters.deferred > 0) {
       await logActivity({
         entityType: 'SYSTEM',
         tag: 'sync',
         action: deltaError ? 'wms_dispatch_sync_degraded' : 'wms_dispatch_sync',
-        level: deltaError ? 'WARNING' : undefined,
+        // o3d-rbyg round 2: a pass that deferred links is degraded in the same way a delta failure
+        // is — fulfilment did not happen, and the reason was ours.
+        level: deltaError || counters.deferred > 0 ? 'WARNING' : undefined,
         description: deltaError
           ? `WMS dispatch sync (${connectorId}) DEGRADED — inbound delta failed, ran per-order reconcile fallback: ${counters.totalChecked} checked, ${counters.dispatched} dispatched, ${counters.errors} order errors. Delta error: ${deltaError}`
-          : `WMS dispatch sync (${connectorId}): ${counters.totalChecked} checked, ${counters.dispatched} dispatched, ${counters.errors} errors.`,
+          : `WMS dispatch sync (${connectorId}): ${counters.totalChecked} checked, ${counters.dispatched} dispatched, ${counters.errors} errors`
+            + (counters.withheld > 0 ? `, ${counters.withheld} withheld (withdrawal standing)` : '')
+            + (counters.deferred > 0 ? `, ${counters.deferred} deferred (withdrawal screen unreadable)` : '')
+            + '.',
         metadata: { jobId: job.id, connector: connectorId, deltaError: deltaError ?? undefined, ...counters },
         resolveUser: false,
       })

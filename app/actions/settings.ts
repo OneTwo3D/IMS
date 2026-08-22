@@ -5,7 +5,7 @@ import { unstable_rethrow } from 'next/navigation'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import {
   INTEGRATION_PLUGIN_SETTING_KEYS,
   type IntegrationPluginId,
@@ -19,7 +19,7 @@ import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outco
 import { reconcileCrontab } from '@/lib/crontab-reconcile'
 import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
 import { toIsoCountryCode } from '@/lib/countries'
-import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
+import { getSettingValue, serializeSettingValue, SENSITIVE_SETTING_KEYS } from '@/lib/settings-store'
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
 import { maybeQueueTaxRateSync } from '@/lib/accounting/tax-rate-sync-trigger'
 import {
@@ -50,7 +50,7 @@ export type AdjustmentReason = {
 }
 
 export async function getAdjustmentReasons(activeOnly = false): Promise<AdjustmentReason[]> {
-  await requireAuth()
+  await requireInternalUser()
   return db.adjustmentReason.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
@@ -203,7 +203,7 @@ function normaliseTaxCategory(input: unknown): TaxCategoryValue {
 }
 
 export async function getTaxRates(activeOnly = true): Promise<TaxRateRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.taxRate.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
@@ -834,7 +834,20 @@ export async function generateMissingQuickBooksTaxRates(_taxRateIds: string[], _
 export type AccountCodeOption = { code: string; name: string; type: string }
 
 export async function getAccountCodes(): Promise<AccountCodeOption[]> {
-  await requireAuth()
+  // o3d-512h round 2 — the THIRD instance of the getEmailSettings class, and the
+  // one the reviewer predicted. listAccountCodes resolves the active connector and
+  // reads the stored chart of accounts (lib/connectors/xero/accounts.ts:
+  // listStoredAccounts → db.accountingAccount), which is EXACTLY the data this
+  // branch already guarded with requirePermission('sync') on
+  // xero-sync.ts:getAccountingAccounts. Guarding one endpoint onto a table while a
+  // sibling serves the same rows under requireAuth is not a boundary, it is a
+  // detour — and it survived the first sweep because the read happens two modules
+  // away, so nothing in this file looks like an accounting read.
+  //
+  // 'sync' matches the gate already established for this table, so ADMIN and
+  // MANAGER keep the reach they had through the sibling; the sole caller
+  // (/settings/inventory) gates on 'settings.company' and is ADMIN-only anyway.
+  await requirePermission('sync')
   const { listAccountCodes } = await import('@/lib/accounting')
   return listAccountCodes()
 }
@@ -844,14 +857,36 @@ export async function getAccountCodes(): Promise<AccountCodeOption[]> {
 // ---------------------------------------------------------------------------
 
 export async function getSetting(key: string): Promise<string | null> {
-  await requireAuth()
+  await requireInternalUser()
+  // o3d-512h: getSetting takes an arbitrary key and getSettingValue DECRYPTS the
+  // sensitive ones (lib/settings-store.ts:deserializeSettingValue), so with only
+  // requireAuth this 'use server' export handed any authenticated principal —
+  // WAREHOUSE, READONLY, even SUPPLIER — the SMTP password, the WooCommerce
+  // consumer secret, the Xero client secret and every other stored credential,
+  // just by naming the key.
+  //
+  // Gating the settings PAGES does not close this: a Server Action is its own
+  // addressable endpoint and is reached without going through any page. The
+  // legitimate callers of the sensitive keys are the backup and sales settings
+  // pages, which are ADMIN-only, so 'settings' costs them nothing.
+  if (SENSITIVE_SETTING_KEYS.has(key)) await requirePermission('settings')
   return getSettingValue(key)
 }
 
 export type UserOption = { id: string; name: string; email: string }
 
 export async function getUsers(): Promise<UserOption[]> {
-  await requireAuth()
+  // o3d-512h round 3 — this was the entry in the authentication-only inventory that
+  // was already unsafe when the inventory was written. It returns the ACTIVE STAFF
+  // DIRECTORY (id, display name, work email) for the sales-page assignee filter, and
+  // under requireAuth it returned it to SUPPLIER — an external company — as a
+  // ready-made phishing list against the buyer's own colleagues. The sibling that
+  // serves the same table, users.ts:getUsers, gates on 'settings.users'.
+  //
+  // Internal-principal, not 'settings.users': the legitimate caller is the sales page,
+  // which every internal role reaches. Pinning the reached model (below, in the
+  // inventory) is what stops the next edit from widening WHAT it returns.
+  await requireInternalUser()
   const rows = await db.user.findMany({
     where: { active: true },
     select: { id: true, name: true, email: true },
@@ -1109,7 +1144,7 @@ export type PurchaseUnitRow = {
 }
 
 export async function getPurchaseUnits(activeOnly = true): Promise<PurchaseUnitRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.purchaseUnit.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: { name: 'asc' },
@@ -1159,7 +1194,7 @@ export async function createPurchaseUnit(input: {
 
 /** Returns unique stock unit names from all purchase units, plus "pcs" */
 export async function getStockUnitOptions(): Promise<string[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.purchaseUnit.findMany({
     where: { active: true },
     select: { stockUnitName: true },
@@ -1248,7 +1283,7 @@ const warehouseFields = {
 } as const
 
 export async function getWarehousesForSettings(): Promise<WarehouseRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   return db.warehouse.findMany({
     orderBy: [{ isDefault: 'desc' }, { code: 'asc' }],
     select: warehouseFields,

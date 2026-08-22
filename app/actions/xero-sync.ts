@@ -23,10 +23,11 @@ import { processPendingXeroSync } from '@/lib/connectors/xero'
 import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/connectors/xero/settings'
 import { buildAccountingCallbackUri } from '@/lib/accounting/callback-url'
 import { getPublicAppUrl } from '@/lib/public-app-url'
-import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
+import { getSettingValue, maskSettingSecret, serializeSettingValue } from '@/lib/settings-store'
+import { applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { xeroGet } from '@/lib/connectors/xero/api'
-import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
+import { isMaskedSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
 import {
   assertIntegrationConnectionTestPassed,
   buildIntegrationConnectionFingerprint,
@@ -40,21 +41,79 @@ import {
 export type { XeroSettings } from '@/lib/connectors/xero/settings'
 
 /**
- * `sync` is the entitlement for every guarded export in this file, and ADMIN and MANAGER both
- * hold it.
+ * TWO GATES IN THIS FILE, AND THEY ANSWER TWO DIFFERENT QUESTIONS (o3d-512h round 3 + o3d-m3gy).
  *
- * These helpers used to be named `requireAdmin`, which SHADOWED `requireAdmin` from
- * @/lib/auth/server (that one is requireRole('ADMIN')). The name misled two separate review
- * passes into reporting that MANAGER crashes on the Integrations page - the reader sees
- * `requireAdmin()` and reasonably concludes ADMIN-only. They are renamed rather than merely
- * commented, because a comment did not stop it happening the second time. The gate agreement
- * across the whole page is asserted, not assumed, in tests/accounting/dashboard-read-gates.test.ts.
+ * WHAT ROUND 3 FIXED. The dispatcher note in app/actions/accounting-sync.ts justifies gating each
+ * dispatcher on the LOOSEST of its two branches' gates by saying "the stricter branch keeps enforcing
+ * its own on top", and names that stricter branch as the Xero one: "The Xero delegates use
+ * requireRole('ADMIN')". They did not. This module's local helper was `requirePermission('sync')`
+ * verbatim — identical to the dispatcher's own gate and to QuickBooks' — so a MANAGER passed the
+ * dispatcher and then passed the delegate too, and the "reach change per principal" table's claim
+ * that MANAGER "is still refused by the Xero delegate" was false for every export in this file. Round
+ * 3 fixed that by making the code true rather than the sentence smaller.
+ *
+ * WHAT THE MERGE FOUND, AND WHY THE FIX IS NOW SCOPED (o3d-m3gy). Round 3 applied the ADMIN role to
+ * EVERY export here, and stated the consequence as "MANAGER loses this tenant's Xero connection,
+ * settings, sync logs and readiness — it keeps the whole QuickBooks branch". On current
+ * `development` that second half is FALSE, and it is false for a reason that landed after round 3:
+ * app/(dashboard)/sync/page.tsx now treats a denial from ANY of its reads as FATAL (o3d-osl8), on the
+ * deliberate principle that a partial page is a dishonest answer to a denial. Seven of the page's
+ * reads route through this module, so an ADMIN-only read surface does not narrow MANAGER's reach —
+ * it replaces the whole /sync page with the generic error boundary, QuickBooks half included, and
+ * gives an operator "Go to Login" / "Try Again" for a refusal no retry can clear. That is
+ * tests/accounting/dashboard-read-gates.test.ts, and it is measuring a real user-visible outcome
+ * rather than restating a policy.
+ *
+ * So the strictness goes where the claim actually lives. The dispatcher note's own words are
+ * "saveXeroSettings → requireRole('ADMIN'), which still applies on its own path" and round 3's is
+ * "connector OAuth credentials are ADMIN business" — both about the CREDENTIAL surface, not about
+ * reading the connector's state:
+ *
+ *   requireSyncPermission        'sync'. The connector's STATE: settings (secret masked), connection
+ *                                status, connection-test state, account list, tax rates, sync logs,
+ *                                readiness, and running a sync. This is what the Integrations page
+ *                                renders, and MANAGER holds 'sync'.
+ *   requireXeroCredentialAdmin   'sync' AND the ADMIN role. Anything that WRITES the OAuth
+ *                                credentials or exercises them to establish a connection. This is the
+ *                                stricter frame the dispatcher note names, and it really does exist
+ *                                now: tests/security/accounting-dispatcher-authorization.test.ts
+ *                                asserts MANAGER through the dispatcher and refused by the delegate,
+ *                                on a WRITE dispatcher.
+ *
+ * These are not two answers to one question — that is the defect this merge exists to remove. They
+ * are the answers to "may this principal SEE the connector?" and "may it CHANGE the credentials?",
+ * and conflating them is what made the note false in the first place.
+ *
+ * ON THE NAME. `development` had renamed the local `requireAdmin` to `requireSyncPermission`, because
+ * `requireAdmin` SHADOWED `requireAdmin` from @/lib/auth/server and misled two separate review passes
+ * into reporting that MANAGER crashes on the Integrations page — the reader saw `requireAdmin()` and
+ * reasonably concluded ADMIN-only. That name is kept for the 'sync' gate, and the ADMIN one is named
+ * for what it guards rather than for a role, so neither name can mislead the next reader the same way.
  */
 async function requireSyncPermission() {
   return requirePermission('sync')
 }
 
-async function requireFreshAdmin() {
+/**
+ * The credential surface: 'sync' first, so a principal without it gets the NAMED permission denial
+ * the refusal tests assert on (WAREHOUSE / READONLY / FINANCE / SUPPLIER), then the ADMIN role check,
+ * which is the stricter claim and is what refuses MANAGER — MANAGER does hold 'sync'.
+ */
+async function requireXeroCredentialAdmin() {
+  await requirePermission('sync')
+  return requireRole('ADMIN')
+}
+
+/**
+ * The credential surface, with a step-up re-auth on top. Every caller of this writes or revokes the
+ * connection itself.
+ *
+ * Order matters: refuse on the STABLE facts (permission, then role) before asking for a step-up
+ * re-auth. Prompting a MANAGER to re-authenticate for something no amount of re-authentication will
+ * grant is a worse answer than "no".
+ */
+async function requireFreshXeroCredentialAdmin() {
+  await requireXeroCredentialAdmin()
   return requireFreshPermission('sync')
 }
 
@@ -63,8 +122,11 @@ async function requireFreshAdmin() {
 // ---------------------------------------------------------------------------
 
 export async function getXeroSettingsMasked(): Promise<XeroSettings & { secretMasked: boolean }> {
+  // o3d-1fel: returns xero_client_id in clear plus every account-mapping code.
+  // Only xero_client_secret is masked, so masking is not the access control.
+  await requireSyncPermission()
   const settings = await getXeroSettings()
-  const masked = maskSecret(settings.xero_client_secret)
+  const masked = maskSettingSecret('xero_client_secret', settings.xero_client_secret)
   return { ...settings, xero_client_secret: masked, secretMasked: !!settings.xero_client_secret }
 }
 
@@ -89,9 +151,9 @@ async function buildXeroConnectionFingerprint(): Promise<string> {
 
 export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireSyncPermission()
+    await requireXeroCredentialAdmin()
     if (shouldFreshGateSecretWrite(data, 'xero_client_secret')) {
-      await requireFreshAdmin()
+      await requireFreshXeroCredentialAdmin()
     }
 
     // Only run the readiness gate when the user is *transitioning* sync from
@@ -167,7 +229,7 @@ export async function getXeroConnectionTestState(): Promise<IntegrationConnectio
 }
 
 export async function testXeroConnection(): Promise<{ success: boolean; error?: string; message?: string }> {
-  await requireSyncPermission()
+  await requireXeroCredentialAdmin()
 
   const fingerprint = await buildXeroConnectionFingerprint()
   const [imsBaseCurrency, orgRes] = await Promise.all([
@@ -199,7 +261,7 @@ export async function saveXeroConnectionSettings(
   clientSecret: string,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
   try {
-    await requireFreshAdmin()
+    await requireFreshXeroCredentialAdmin()
 
     const nextClientId = clientId.trim()
     const nextClientSecretInput = clientSecret.trim()
@@ -271,7 +333,11 @@ export async function saveXeroConnectionSettings(
 export async function getXeroConnectionStatus(): Promise<{
   connected: boolean
   tenantName?: string
+  blockedReason?: string
+  hasStoredToken?: boolean
 }> {
+  // o3d-1fel: leaks the connected tenant NAME, not just a boolean.
+  await requireSyncPermission()
   return isConnected()
 }
 
@@ -283,7 +349,7 @@ export async function connectXero(
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   try {
     void origin
-    const session = await requireFreshAdmin()
+    const session = await requireFreshXeroCredentialAdmin()
 
     // Save credentials (never overwrite secret with masked value)
     const ops = [
@@ -321,7 +387,7 @@ export async function connectXero(
 
 export async function disconnectXero(): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireFreshAdmin()
+    await requireFreshXeroCredentialAdmin()
     await disconnect()
 
     await logActivity({
@@ -382,6 +448,10 @@ export async function syncAccountingAccountBalanceSnapshots(balanceDate?: string
 }
 
 export async function getAccountingAccounts(): Promise<Array<{ id: string; externalAccountId: string; code: string | null; name: string; type: string }>> {
+  // o3d-1fel: this reads the chart of accounts straight out of the database. A
+  // single-statement `return db.<model>.findMany(...)` is NOT a delegating
+  // facade — there is no downstream guard to inherit.
+  await requireSyncPermission()
   return db.accountingAccount.findMany({
     where: { connector: 'xero', active: true },
     select: { id: true, externalAccountId: true, code: true, name: true, type: true },
@@ -392,6 +462,9 @@ export async function getAccountingAccounts(): Promise<Array<{ id: string; exter
 export async function fetchXeroTaxRates(
   opts?: { allowCache?: boolean },
 ): Promise<Array<{ taxType: string; name: string; rate: number }>> {
+  // o3d-1fel: makes a LIVE outbound call to the tenant's Xero org, so leaving
+  // it open is request amplification as well as a data leak.
+  await requireSyncPermission()
   const result = await getXeroTaxRates(opts)
   return result?.taxRates ?? []
 }
@@ -409,11 +482,19 @@ export type XeroSyncLogRow = {
   externalTransactionId: string | null
   errorMessage: string | null
   retryCount: number
+  /**
+   * o3d-e2mz: which attempt this row is currently on. Any operator decision taken about what this
+   * row shows must carry this value back, so the decision can be refused when the row has moved on
+   * to a different attempt since it was read. 0 means no fence-aware processor has ever claimed it.
+   */
+  attemptRevision: number
   syncedAt: string | null
   createdAt: string
 }
 
 export async function getXeroSyncLogs(limit = 50): Promise<XeroSyncLogRow[]> {
+  // o3d-1fel: sync-log rows carry referenceId / externalTransactionId / errorMessage.
+  await requireSyncPermission()
   const rows = await db.accountingSyncLog.findMany({
     where: { connector: 'xero' },
     orderBy: { createdAt: 'desc' },
@@ -428,6 +509,7 @@ export async function getXeroSyncLogs(limit = 50): Promise<XeroSyncLogRow[]> {
     externalTransactionId: r.externalTransactionId,
     errorMessage: r.errorMessage,
     retryCount: r.retryCount,
+    attemptRevision: r.attemptRevision,
     syncedAt: r.syncedAt?.toISOString() ?? null,
     createdAt: r.createdAt.toISOString(),
   }))
@@ -476,9 +558,110 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
   }
 }
 
-export async function retryFailedXeroSync(entryId?: string): Promise<{ success: boolean; reset: number; refused?: number; error?: string }> {
+/**
+ * o3d-e2mz: what to TELL an operator whose per-row retry lost the attempt fence.
+ *
+ * Only the unfenced case needs anything added: a row at revision 0 can never be retried per-row, so a
+ * bare "cannot be tied to an attempt" reads as a dead end. Naming the bulk path is the difference
+ * between a refusal they can act on and one they cannot.
+ */
+function attemptFenceRefusalMessage(outcome: { reason: string; message: string }): string {
+  return outcome.reason === 'UNFENCED_ATTEMPT'
+    ? `${outcome.message} "Retry All" is deliberately unfenced and still re-queues it.`
+    : outcome.message
+}
+
+/**
+ * Recorded under its own action, NOT under `xero_manual_retry_refused` (o3d-0m56's name).
+ *
+ * The two refusals ask an operator for different things — "this decision is about an attempt that no
+ * longer exists, reload and look" versus "this money may already be in the ledger, reconcile it" — and
+ * filing them together would make every stale click look like a payment hazard.
+ */
+async function logAttemptFenceRefusal(
+  entryId: string,
+  expectedAttemptRevision: number | undefined,
+  reason: string,
+  message: string,
+): Promise<void> {
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'xero_retry_failed_refused',
+    tag: 'sync',
+    level: 'WARNING',
+    description: `Refused a Xero sync retry for ${entryId}: ${message}`,
+    metadata: { syncLogId: entryId, reason, expectedAttemptRevision },
+  })
+}
+
+/**
+ * Reset failed Xero sync rows so the processor picks them up again.
+ *
+ * TWO FENCES, ASKING DIFFERENT QUESTIONS, AND A ROW MUST PASS BOTH (o3d-0m56 + o3d-e2mz).
+ *
+ *   o3d-0m56 asks MAY THIS BE RE-POSTED AT ALL. Several FAILED rows for one reference under
+ *   DIFFERENT idempotency tokens mean any of them may have committed remotely, so re-posting picks a
+ *   token the ledger may never have seen and a second payment lands. And an UNAMBIGUOUS money row is
+ *   not safe either: by the time anyone clicks retry the remote deduplication window has closed, so
+ *   the ledger itself has to say the attempt is not already in it.
+ *
+ *   o3d-e2mz asks WHICH ATTEMPT THIS DECISION IS ABOUT. Without it the CAS was `(id, FAILED)`, and
+ *   status is not an identity: the reset can land on a LATER failure than the one the operator
+ *   judged, or on a failure of an attempt that posted a document they never saw.
+ *
+ * Neither implies the other. The first can clear a row whose attempt has since moved on; the second
+ * can be perfectly current about an attempt that must not be re-sent. So the per-row path runs the
+ * o3d-0m56 plan and then lands its reset through `applyFencedAttemptDecision` rather than a bare
+ * updateMany — one write, both preconditions.
+ *
+ * A per-row request that names no attempt is REFUSED rather than run unfenced, which is the rule
+ * applyFencedAttemptDecision applies to revision 0 for the same reason: a decision that cannot be
+ * tied to an attempt cannot be shown to be about the row it will hit.
+ *
+ * BULK ("Retry All", no entryId) takes the o3d-0m56 guard — it is the path that most needs it, since
+ * unguarded it re-queues every ambiguous scope at once, each row under its own token — and is
+ * deliberately NOT attempt-fenced: it is not a judgement about any particular attempt, only
+ * "re-queue whatever is failed now", and every row it touches goes FAILED -> PENDING, a status change
+ * a later fenced decision already detects (STATUS_MOVED). Getting back to FAILED requires a claim,
+ * which mints a new revision, so a stale decision cannot survive the round trip either.
+ */
+export async function retryFailedXeroSync(
+  entryId?: string,
+  expectedAttemptRevision?: number,
+): Promise<{ success: boolean; reset: number; refused?: number; error?: string }> {
   try {
     await requireSyncPermission()
+
+    // o3d-e2mz PREFLIGHT, before the o3d-0m56 machinery: both are cheap point reads, and a request
+    // that cannot name its attempt is refused without probing a ledger on its behalf.
+    if (entryId) {
+      if (expectedAttemptRevision === undefined) {
+        return {
+          success: false,
+          reset: 0,
+          error: `Retrying Xero sync row ${entryId} needs the attempt it was requested about, and none was `
+            + 'supplied, so it was NOT retried. Reload the sync log and retry from what it shows.',
+        }
+      }
+      // The fence CAS cannot also carry `connector`, and a connector never changes, so check it here.
+      // Without it an id belonging to another connector would be re-queued as if it were Xero's — and
+      // the candidate query below would simply return nothing, reporting a foreign id as "0 reset,
+      // success", which is the silent outcome this whole action exists to stop producing.
+      const row = await db.accountingSyncLog.findUnique({
+        where: { id: entryId },
+        select: { connector: true },
+      })
+      if (!row) {
+        return { success: false, reset: 0, error: `Accounting sync row ${entryId} no longer exists, so it was NOT retried.` }
+      }
+      if (row.connector !== 'xero') {
+        return {
+          success: false,
+          reset: 0,
+          error: `Accounting sync row ${entryId} belongs to the ${row.connector} connector, not Xero, so it was NOT retried.`,
+        }
+      }
+    }
 
     // o3d-0m56: refuse what the automatic enqueue refuses, and then some. Several FAILED rows
     // for one reference under DIFFERENT idempotency tokens mean any of them may have committed
@@ -497,7 +680,25 @@ export async function retryFailedXeroSync(entryId?: string): Promise<{ success: 
       // would return from the remote.
       orderBy: { createdAt: 'asc' },
     })
-    if (candidates.length === 0) return { success: true, reset: 0 }
+    if (candidates.length === 0) {
+      // A BULK sweep with nothing failed is a genuine no-op. A PER-ROW request is not: the operator
+      // asked about a specific row, and the candidate query is filtered to `status: FAILED`, so
+      // "no candidates" means the row exists (the preflight just read it) but has moved off FAILED.
+      // Returning success/0 here would report a refusal as a no-op — the o3d-e2mz defect wearing the
+      // o3d-0m56 filter. The fence is run precisely to produce the reason: its CAS cannot match, and
+      // it reads the row to say whether the STATUS or the ATTEMPT moved.
+      if (entryId === undefined || expectedAttemptRevision === undefined) return { success: true, reset: 0 }
+      const outcome = await applyFencedAttemptDecision(db, {
+        id: entryId,
+        expectedAttemptRevision,
+        expectedStatus: 'FAILED',
+        data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },
+      })
+      if (outcome.ok) return { success: true, reset: 1 }
+      const message = attemptFenceRefusalMessage(outcome)
+      await logAttemptFenceRefusal(entryId, expectedAttemptRevision, outcome.reason, message)
+      return { success: false, reset: 0, error: message }
+    }
 
     const scopeKey = (row: { type: string; referenceType: string; referenceId: string }) =>
       `${row.type}\u0000${row.referenceType}\u0000${row.referenceId}`
@@ -526,6 +727,15 @@ export async function retryFailedXeroSync(entryId?: string): Promise<{ success: 
     }
 
     let reset = 0
+    /**
+     * o3d-e2mz: the attempt-fence refusal, if the per-row write hit one. Logged after the loop.
+     *
+     * A REF CELL rather than a bare `let`, because the assignment happens inside the transaction
+     * callback below and TypeScript's control-flow analysis does not follow a closure write — it
+     * narrows the outer binding to `null` at the read site and the refusal becomes unreachable code
+     * that still compiles. A property on an object is not narrowed that way.
+     */
+    const attemptFence: { refusal: { reason: string; message: string } | null } = { refusal: null }
     const refusedIds = new Set<string>()
     const refusals: string[] = []
     const refusedByScope = new Map<string, { reason: string; tokenCount: number; ids: string[]; siblingIds: string[] }>()
@@ -625,12 +835,46 @@ export async function retryFailedXeroSync(entryId?: string): Promise<{ success: 
           })
         }
 
-        const result = allowedIds.length > 0
-          ? await tx.accountingSyncLog.updateMany({
+        // THE WRITE CARRIES BOTH FENCES (o3d-0m56 + o3d-e2mz).
+        //
+        // Everything above decided WHETHER these rows may be re-posted. The per-row path must also
+        // land on the attempt the operator judged, so its reset goes through the attempt fence rather
+        // than the `(id, FAILED)` compare-and-set — status is not an identity, and a row that failed
+        // again between the operator reading it and clicking retry is a different attempt wearing the
+        // same status. `allowedIds` holds at most one id here: the candidate query is filtered to
+        // `entryId`.
+        //
+        // The bulk path keeps the plain updateMany, deliberately (see the header): it makes no claim
+        // about any particular attempt, and fencing it would refuse every row that has never been
+        // fence-claimed while giving nothing back.
+        let result: { count: number }
+        if (allowedIds.length === 0) {
+          result = { count: 0 }
+        } else if (entryId !== undefined && expectedAttemptRevision !== undefined) {
+          const fenced = await applyFencedAttemptDecision(tx, {
+            id: allowedIds[0],
+            expectedAttemptRevision,
+            expectedStatus: 'FAILED',
+            data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },
+          })
+          result = { count: fenced.ok ? 1 : 0 }
+          if (!fenced.ok) {
+            // Counted through the SAME `refused` channel as the o3d-0m56 verdicts, so the caller is
+            // never told "0 reset" with no reason — but recorded under its OWN activity action
+            // (below), because the two refusals need different things from an operator and one name
+            // covering both would make an attempt that moved read as a money hazard.
+            attemptFence.refusal = {
+              reason: fenced.reason,
+              message: attemptFenceRefusalMessage(fenced),
+            }
+            refused.push({ id: allowedIds[0], reason: attemptFence.refusal.message, tokenCount: 1 })
+          }
+        } else {
+          result = await tx.accountingSyncLog.updateMany({
             where: { id: { in: allowedIds }, connector: 'xero', status: 'FAILED' },
             data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },
           })
-          : { count: 0 }
+        }
         return { count: result.count, refused, siblingIds }
       })
 
@@ -648,6 +892,10 @@ export async function retryFailedXeroSync(entryId?: string): Promise<{ success: 
           siblingIds: outcome.siblingIds,
         })
       }
+    }
+
+    if (attemptFence.refusal && entryId !== undefined) {
+      await logAttemptFenceRefusal(entryId, expectedAttemptRevision, attemptFence.refusal.reason, attemptFence.refusal.message)
     }
 
     for (const [, entry] of refusedByScope) {
@@ -724,6 +972,8 @@ const REQUIRED_ACCOUNTS: Array<{ key: keyof XeroSettings; label: string }> = [
 ]
 
 export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
+  // o3d-1fel: reads settings + tax rates + the granted OAuth scopes.
+  await requireSyncPermission()
   const [settings, connStatus, taxRates, granted] = await Promise.all([
     getXeroSettings(),
     isConnected(),

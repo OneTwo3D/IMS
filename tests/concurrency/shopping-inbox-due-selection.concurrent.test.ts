@@ -49,6 +49,9 @@ async function seed(
         topic: 'order.updated',
         payloadHash: `${connector}-${row.suffix}`,
         payloadJson: { id: row.suffix },
+        // o3d-wgl6: NOT NULL with no database default, so every insert has to state what it
+        // knows about the sending store. These rows are about selection ordering, not origin.
+        originAttestation: 'unproven:not-applicable',
         status: row.status,
         attempts: row.status === 'FAILED' ? 1 : 0,
         nextAttemptAt: row.nextAttemptAt ?? null,

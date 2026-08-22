@@ -217,6 +217,87 @@ You can record payments against a sales order:
 
 Payment records help you track outstanding balances on each order.
 
+### Deleting a payment the accounting system already holds
+
+A payment recorded here is registered against the invoice in your accounting system. Once that
+registration has been sent, **deleting the receipt here is refused** — deleting it would leave the
+ledger showing the invoice settled while One Two Inventory shows it unpaid, which is the
+"PAID IN LEDGER ONLY" state that then has to be chased by hand.
+
+The refusal names the document id and gives you the way out:
+
+1. Reverse (delete) the payment in the accounting system, where you can choose the date and deal
+   with any bank reconciliation it touches.
+2. Come back to the order and use **"I have reversed it — check and delete"** on that receipt.
+
+One Two Inventory then **asks the accounting system whether that payment is really gone** before it
+removes anything. If the accounting system still reports the payment, the deletion is refused again
+and tells you the status it saw — your word alone is never enough to remove a local receipt while a
+real ledger still holds the money. The retired sync row keeps the document id, so the order's
+history still shows which payment existed and was undone.
+
+A receipt whose registration is still queued (nothing has been sent yet) deletes normally, and the
+queued registration is cancelled with it. A receipt against a **credit note** settles the credit
+note rather than the invoice, so this check does not apply to it.
+
+#### When the registration was tried and failed
+
+A registration that was **attempted and recorded as failed, with no payment reference**, also
+refuses the deletion — and it refuses differently, because there is no document id for One Two
+Inventory to look up on its own.
+
+A failure does not mean nothing was posted. The accounting system is called *before* the result is
+written down, so a timeout, a dropped response or a worker that died mid-call is recorded as a
+failure even when the payment went through. One Two Inventory cannot tell the two apart on its own:
+the entry names no payment to look up, and an invoice showing no payment looks identical whether the
+payment was removed or never arrived.
+
+You resolve it, in this order:
+
+1. Open the invoice in the accounting system and look at its payments.
+2. **If a payment is there**, the attempt landed. Reverse (delete) it there, then copy its **payment
+   reference** into the box on the refusal and use **"Check that payment and delete"**. You are only
+   telling One Two Inventory *which payment to ask about* — it then asks the accounting system and
+   requires all five of these before anything is removed here: the payment is on **this order's
+   invoice**; that invoice is in **the same currency as this receipt** — otherwise the figures on
+   either side are not the same money and cannot be compared at all; it is for **exactly this
+   receipt's amount** (to the penny — a near-miss is refused, not rounded); it really is **gone**; and
+   **no other payment for that same amount is still standing on that invoice**. A mistyped reference,
+   a payment belonging to another invoice, an invoice raised in another currency, or a payment that is
+   still standing is refused by name, and you can correct it and try again.
+
+   The currency one only ever fires when something is already wrong: a receipt recorded in one
+   currency against an invoice raised in another. One Two Inventory will not convert between them
+   here — a converted figure is an estimate, and this check exists to avoid deleting a receipt on an
+   approximation. Correct whichever of the two records is wrong, then reverse it.
+
+   The last of the five is the one that surprises people, so it is worth saying plainly: if the
+   invoice still shows a payment for this receipt's amount, the check is refused even when the
+   payment you named really is deleted. An amount cannot tell two payments apart, and the case being
+   guarded against is the expensive one — the receipt's *own* payment still sitting on the invoice
+   while a different, identically valued deleted payment is named in its place. Either the payment
+   still on the invoice is this receipt's, in which case reverse **that** one and name it here, or it
+   belongs to another receipt on the order, in which case resolve this receipt's failed entry under
+   **Sync → Xero** instead. When it passes, the failed entry is retired with that reference
+   written onto it, so the order's history stops saying "outcome unknown" and starts saying which
+   payment existed and was undone — noted as identified by you and confirmed with the ledger.
+3. **If there is no payment**, retry the entry under **Sync → Xero**. When it posts, One Two
+   Inventory records the payment reference itself, and from then on the receipt falls under the
+   ordinary refusal above, which *can* check the reversal for you.
+
+If the order has no accounting invoice recorded, or more than one attempt failed without a
+reference, the check is refused instead: there is nothing to attribute the payment to in the first
+case, and no way to tell which attempt a single reference belongs to in the second.
+
+### "LEDGER OUTCOME UNKNOWN"
+
+An order (or a supplier bill) that is **not** marked paid here but carries one of these failed,
+reference-less attempts shows a red **LEDGER OUTCOME UNKNOWN** badge rather than reading as an
+ordinary unpaid document. It is not the same as "the ledger rejected it" and not the same as
+"nothing was sent": a payment may be sitting on the invoice in your accounting system with nothing
+here to match it. Check the invoice there before recording or registering another payment against
+it.
+
 ## Invoice Generation
 
 Invoices can be generated either manually or automatically. The trigger for automatic invoice generation is configurable in **Settings > Sales Settings**. Options include:
@@ -323,5 +404,7 @@ Delete is a **hard** delete: the order row and its lines are removed outright, s
 | WMS push link | **Cancel** the order, which withdraws the WMS order. |
 
 Deleting in any of these cases would strand the external document with nothing in IMS referencing it. Drafts, which never queue an accounting invoice, stay freely deletable.
+
+**On the order screen, Delete is greyed out once the refusal is predictable.** The order page knows about the accounting leg, so it disables the button and puts the reason (and the remedy) in its tooltip rather than letting you press it and read a refusal: "an accounting invoice is queued — cancel the order instead" while the invoice is only queued, and "finance has to raise a credit note or reversal" once one has actually been posted. The button stays visible, greyed, so the action is still discoverable. The other blockers in the list — the WMS push link, a daily batch, refunds and payments — are only known to the server, so those still come back as a refusal message when you press Delete.
 
 The check, the allocation release and the delete all run under a single lock on the order row, and the posting workers claim their work under that same lock before making a remote call — so no worker can start posting an order in the window between the check and the delete.

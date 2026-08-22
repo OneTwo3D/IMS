@@ -98,7 +98,12 @@ const CLAIMABLE_STATUSES = [
 ] as const
 const DEFAULT_CLAIM_LIMIT = 25
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000
-const DEFAULT_RETRY_BASE_DELAY_MS = 5 * 60 * 1000
+/**
+ * First-retry backoff floor. Exported because it is what an automatic connector retry is scheduled
+ * against, and therefore what decides whether a remote idempotency key is still alive when the retry
+ * lands — see lib/domain/accounting/idempotency-retention.ts.
+ */
+export const DEFAULT_RETRY_BASE_DELAY_MS = 5 * 60 * 1000
 const DEFAULT_RETRY_MAX_DELAY_MS = 60 * 60 * 1000
 const DEFAULT_RETRY_JITTER_MS = 30 * 1000
 const DEFAULT_MINIMUM_JITTER_RATIO = 0.05

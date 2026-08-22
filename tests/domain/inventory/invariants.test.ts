@@ -11,8 +11,11 @@ import {
   runInventoryInvariantReport,
   type InventoryInvariantFinding,
   type InventoryInvariantRows,
+  type InventoryInvariantShipmentLineRow,
   type InventoryInvariantSqlClient,
 } from '@/lib/domain/inventory/invariants'
+import { Prisma } from '@/app/generated/prisma/client'
+import { expandFulfillmentRequirementsDecimal } from '@/lib/products/kit-fulfillment'
 
 const CANONICAL_INVENTORY_INVARIANT_CODES = new Set([
   'stock_negative_quantity',
@@ -1995,4 +1998,460 @@ test('o3d-4kfh r3: the committed-coverage census does not run on a half-collecte
       false,
     )
   }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-aqke — THE KIT HALF OF THE COMMITTED-COVERAGE CENSUS.
+//
+// `allocation_committed_shipment_uncovered` is flat: per (lineId, warehouseId, productId). A kit
+// committed as 2xA + 1xB against a 2xA + 2xB recipe is covered on every one of those pairs and is
+// still half a kit. The transition seams refuse it; the SWEEP reported nothing.
+
+type CensusShipmentLine = {
+  lineId: string
+  productId: string
+  sku: string
+  qty: number
+  status: string
+  warehouseId: string
+  orderId: string
+  lineProductId: string
+  lineSku: string
+  lineProductType?: 'KIT' | 'SIMPLE'
+  /** o3d-kouj's per-line pin, as it sits in the jsonb column. */
+  linePin?: unknown
+}
+
+/**
+ * The double answers the two reads the census makes, and HONOURS both filters production relies on
+ * — non-PENDING, and "the sales line's product is a KIT". Those filters are the entire reason an
+ * unpaged read is affordable, so a double that ignored them would leave the scoping untested and
+ * make the census look cheaper than it is.
+ *
+ * o3d-aqke (Codex r1 finding 3): it also HONOURS THE SELECT for `fulfillmentRequirements`, and
+ * that is not decoration. A double that handed the pin back whether or not production asked for it
+ * would keep passing if the census dropped the field from its select — and that census would then
+ * see `undefined` on every line and answer the whole report from the CURRENT graph, silently.
+ */
+function kitCensusClient(input: {
+  shipmentLines: CensusShipmentLine[]
+  kits: Record<string, Array<{ componentId: string; qty: number }>>
+  onGraphRead?: () => void
+}) {
+  const seenWhere: unknown[] = []
+  const seenLineSelects: Array<Record<string, unknown>> = []
+  const client = {
+    shipmentLine: {
+      findMany: async ({ where, select }: {
+        where: {
+          shipment: { status: { not: string }; warehouseId?: string }
+          line: { product: { type: string } }
+        }
+        select: { line: { select: Record<string, unknown> } }
+      }) => {
+        seenWhere.push(where)
+        seenLineSelects.push(select.line.select)
+        const pinSelected = 'fulfillmentRequirements' in select.line.select
+        return input.shipmentLines
+          .filter((line) => line.status !== where.shipment.status.not)
+          .filter((line) => where.shipment.warehouseId == null || line.warehouseId === where.shipment.warehouseId)
+          .filter((line) => (line.lineProductType ?? 'KIT') === where.line.product.type)
+          .map((line) => ({
+            lineId: line.lineId,
+            productId: line.productId,
+            qty: line.qty,
+            product: { sku: line.sku },
+            line: {
+              productId: line.lineProductId,
+              sku: line.lineSku,
+              description: line.lineSku,
+              // Present ONLY when asked for — exactly as Prisma behaves, and as the pre-#625
+              // client behaves by rejecting the request outright.
+              ...(pinSelected ? { fulfillmentRequirements: line.linePin ?? null } : {}),
+            },
+            shipment: { orderId: line.orderId, warehouseId: line.warehouseId },
+          }))
+      },
+    },
+    product: {
+      findMany: async ({ where, select }: { where: { id: { in: string[] } }; select: Record<string, unknown> }) => {
+        input.onGraphRead?.()
+        return where.id.in.flatMap((id) => {
+          const components = input.kits[id]
+          if (!('productComponents' in select)) return [{ id, fulfillmentGraphVersion: 0 }]
+          return [{
+            id,
+            type: components ? 'KIT' : 'SIMPLE',
+            fulfillmentGraphVersion: 0,
+            productComponents: (components ?? []).map((component, index) => ({
+              componentId: component.componentId,
+              qty: component.qty,
+              component: { sku: component.componentId.toUpperCase(), type: 'SIMPLE', oversellAllowed: false },
+              sortOrder: index,
+            })),
+          }]
+        })
+      },
+    },
+  }
+  return { client, seenWhere, seenLineSelects }
+}
+
+const committedKitLine = (overrides: Partial<CensusShipmentLine>): CensusShipmentLine => ({
+  lineId: 'line-1',
+  productId: 'comp-a',
+  sku: 'COMP-A',
+  qty: 2,
+  status: 'PICKING',
+  warehouseId: 'warehouse-1',
+  orderId: 'order-1',
+  lineProductId: 'kit-1',
+  lineSku: 'KIT-1',
+  ...overrides,
+})
+
+test('o3d-aqke: a committed KIT set that is half a kit is reported by the census', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  const { client } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }, { componentId: 'comp-b', qty: 2 }] },
+    shipmentLines: [
+      committedKitLine({ productId: 'comp-a', sku: 'COMP-A', qty: 2 }),
+      committedKitLine({ productId: 'comp-b', sku: 'COMP-B', qty: 1 }),
+    ],
+  })
+
+  const findings = await collectDisproportionateCommittedKitFindings(client)
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].code, 'allocation_committed_kit_disproportionate')
+  assert.equal(findings[0].severity, 'critical')
+  assert.equal(findings[0].productId, 'comp-b', 'comp-b is the short one: 1 committed where 2 are required')
+  assert.equal(findings[0].warehouseId, 'warehouse-1')
+  assert.deepEqual(
+    (findings[0].details as { components: unknown[] }).components,
+    [
+      { productId: 'comp-a', sku: 'COMP-A', requiredPerKit: '2', committedQty: 2 },
+      { productId: 'comp-b', sku: 'COMP-B', requiredPerKit: '2', committedQty: 1 },
+    ],
+  )
+})
+
+test('o3d-aqke: a fractional KIT the column rounded is NOT reported (o3d-i4qd)', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  // 0.5 kits of (0.3333 x comp-a + 1 x comp-b): 0.16665 stored as 0.1667 beside an exact 0.5.
+  const { client } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 0.3333 }, { componentId: 'comp-b', qty: 1 }] },
+    shipmentLines: [
+      committedKitLine({ productId: 'comp-a', sku: 'COMP-A', qty: 0.1667 }),
+      committedKitLine({ productId: 'comp-b', sku: 'COMP-B', qty: 0.5 }),
+    ],
+  })
+
+  const findings = await collectDisproportionateCommittedKitFindings(client)
+
+  assert.deepEqual(findings, [], 'the census must not report what Decimal(12,4) itself rounded')
+})
+
+test('o3d-aqke: the census reads only non-PENDING lines on KIT sales lines', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  let graphReads = 0
+  const { client, seenWhere } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }, { componentId: 'comp-b', qty: 2 }] },
+    onGraphRead: () => { graphReads += 1 },
+    shipmentLines: [
+      // A PENDING draft is not a commitment, and a SIMPLE line has one requirement of factor 1.
+      committedKitLine({ productId: 'comp-a', qty: 2, status: 'PENDING' }),
+      committedKitLine({ productId: 'comp-b', qty: 1, status: 'PENDING' }),
+      committedKitLine({ lineId: 'line-2', productId: 'simple-1', qty: 5, lineProductType: 'SIMPLE' }),
+    ],
+    ...{},
+  })
+
+  const findings = await collectDisproportionateCommittedKitFindings(client, { warehouseId: 'warehouse-1' })
+
+  assert.deepEqual(findings, [])
+  assert.equal(graphReads, 0, 'no committed kit lines means the graph is never walked at all')
+  assert.deepEqual(seenWhere, [{
+    shipment: { status: { not: 'PENDING' }, warehouseId: 'warehouse-1' },
+    line: { product: { type: 'KIT' } },
+  }])
+})
+
+test('o3d-aqke: a graph the census cannot walk is REPORTED, not thrown', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  const { client } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }] },
+    shipmentLines: [committedKitLine({ productId: 'comp-a', qty: 2 })],
+  })
+  client.product.findMany = async () => { throw new Error('graph is mid-edit') }
+
+  const findings = await collectDisproportionateCommittedKitFindings(client)
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].code, 'allocation_committed_kit_census_unavailable')
+  assert.equal(findings[0].severity, 'warning')
+  assert.equal((findings[0].details as { reason: string }).reason, 'graph is mid-edit')
+})
+
+test('o3d-aqke: runInventoryInvariantReport surfaces the kit census in row mode', async () => {
+  // The wiring, not the pass: a report run the ordinary way must include the finding and count it.
+  const { client: kitClient } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }, { componentId: 'comp-b', qty: 2 }] },
+    shipmentLines: [
+      committedKitLine({ productId: 'comp-a', qty: 2 }),
+      committedKitLine({ productId: 'comp-b', qty: 1 }),
+    ],
+  })
+  const client = {
+    stockLevel: { async findMany() { return [] } },
+    costLayer: { async findMany() { return [] } },
+    stockMovement: { async findMany() { return [] } },
+    shipmentLine: {
+      async findMany(args: { where?: { line?: unknown } }): Promise<InventoryInvariantShipmentLineRow[]> {
+        // The row collector asks for SHIPPED lines; the kit census asks for non-PENDING KIT lines.
+        if (args.where?.line) {
+          return await kitClient.shipmentLine.findMany(args as never) as unknown as InventoryInvariantShipmentLineRow[]
+        }
+        return []
+      },
+    },
+    product: kitClient.product,
+  }
+
+  const report = await runInventoryInvariantReport({ client })
+
+  assert.equal(report.summary.total, 1)
+  assert.equal(report.summary.critical, 1)
+  assert.equal(report.findings[0].code, 'allocation_committed_kit_disproportionate')
+  assert.equal(report.findings[0].productId, 'comp-b')
+})
+
+test('o3d-aqke: the FLAT committed-coverage branch cannot see a half kit — the gap being closed', () => {
+  // Same commitment as the census test above, with allocation rows that match it exactly. Every
+  // (lineId, warehouseId, productId) pair is covered, so the flat branch is silent — which is the
+  // whole reason the graph-aware pass exists rather than a tightening of this one.
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [],
+    stockMovements: [],
+    shippedShipmentLines: [],
+    orderAllocations: [
+      { lineId: 'line-1', productId: 'comp-a', warehouseId: 'warehouse-1', qty: 2 },
+      { lineId: 'line-1', productId: 'comp-b', warehouseId: 'warehouse-1', qty: 1 },
+    ],
+    committedShipmentLines: [
+      {
+        lineId: 'line-1',
+        productId: 'comp-a',
+        qty: 2,
+        product: { sku: 'COMP-A' },
+        shipment: { orderId: 'order-1', warehouseId: 'warehouse-1' },
+      },
+      {
+        lineId: 'line-1',
+        productId: 'comp-b',
+        qty: 1,
+        product: { sku: 'COMP-B' },
+        shipment: { orderId: 'order-1', warehouseId: 'warehouse-1' },
+      },
+    ],
+  })
+
+  assert.deepEqual(
+    findings.filter((finding) => finding.code === 'allocation_committed_shipment_uncovered'),
+    [],
+    'covered product-by-product, and still half a kit',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-aqke (Codex r1 finding 3) — THE CENSUS MUST ASK THE PIN, NOT THE CURRENT GRAPH.
+//
+// Every row this census reads belongs to a COMMITTED shipment, and o3d-kouj (PR #625) pins a line's
+// fulfilment requirements the moment it holds an allocation row or a committed shipment line. So
+// the current component graph is, by construction, NOT the authority for anything the census looks
+// at. Expanding it anyway goes wrong in both directions: healthy rows read as broken after any
+// component edit, and — the money direction — a uniform rescale makes a genuinely half-shipped kit
+// read as perfectly proportional, which is the escape o3d-kouj exists to close.
+//
+// The pin is read through o3d-kouj's own seam, `lineFulfillmentRequirements`, which the census
+// IMPORTS. An earlier round of this branch injected a resolver instead, because o3d-kouj had not
+// merged yet; it has (PR #625), so these tests seed the REAL jsonb payload and let the real parser
+// read it. Nothing here stands in for the rule.
+
+/** The pin exactly as o3d-kouj writes it into the jsonb column. */
+function pin(requirements: Array<[string, string]>, productId = 'kit-1') {
+  return {
+    version: 1,
+    productId,
+    graphVersion: 4,
+    capturedAt: '2026-08-01T00:00:00.000Z',
+    requirements: requirements.map(([id, factor]) => ({ productId: id, factor })),
+  }
+}
+
+/**
+ * A pin the parser REFUSES: present, well-formed enough to be a payload, and recording no
+ * requirements at all. o3d-kouj treats an empty list as corruption rather than as "requires
+ * nothing", because a live expansion of a positive quantity always yields at least one requirement.
+ */
+const CORRUPT_PIN = { version: 1, productId: 'kit-1', graphVersion: 4, capturedAt: null, requirements: [] }
+
+test('o3d-aqke: a pinned line is judged against the recipe it SHIPPED under, not the edited one', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  // The catalogue now says 2 x comp-a + 2 x comp-b. The line shipped 2 and 1, which is exactly one
+  // whole kit of the recipe it was allocated from (2 x A + 1 x B) and half a kit of the new one.
+  // Without the pin the census reports a critical on a delivery nothing is wrong with.
+  const { client } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }, { componentId: 'comp-b', qty: 2 }] },
+    shipmentLines: [
+      committedKitLine({ productId: 'comp-a', sku: 'COMP-A', qty: 2, linePin: pin([['comp-a', '2'], ['comp-b', '1']]) }),
+      committedKitLine({ productId: 'comp-b', sku: 'COMP-B', qty: 1, linePin: pin([['comp-a', '2'], ['comp-b', '1']]) }),
+    ],
+  })
+
+  const findings = await collectDisproportionateCommittedKitFindings(client)
+
+  assert.deepEqual(findings, [], 'the shipment is a whole kit of the pinned recipe, and the pin is what it was allocated against')
+})
+
+test('o3d-aqke: the same rows ARE reported when the pin says they are half a kit', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  // The money direction, and the one a current-graph census cannot see at all. The catalogue has
+  // been rewritten to 2 x A + 1 x B, against which committed 2 and 1 is proportional. The line was
+  // allocated from 2 x A + 2 x B, so what actually left the warehouse was HALF a kit.
+  const { client } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }, { componentId: 'comp-b', qty: 1 }] },
+    shipmentLines: [
+      committedKitLine({ productId: 'comp-a', sku: 'COMP-A', qty: 2, linePin: pin([['comp-a', '2'], ['comp-b', '2']]) }),
+      committedKitLine({ productId: 'comp-b', sku: 'COMP-B', qty: 1, linePin: pin([['comp-a', '2'], ['comp-b', '2']]) }),
+    ],
+  })
+
+  const findings = await collectDisproportionateCommittedKitFindings(client)
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].code, 'allocation_committed_kit_disproportionate')
+  assert.equal(findings[0].productId, 'comp-b', '1 committed where the pinned recipe requires 2')
+  assert.deepEqual(
+    (findings[0].details as { components: unknown[] }).components,
+    [
+      { productId: 'comp-a', sku: 'COMP-A', requiredPerKit: '2', committedQty: 2 },
+      { productId: 'comp-b', sku: 'COMP-B', requiredPerKit: '2', committedQty: 1 },
+    ],
+    'and the finding quotes the PINNED factors, so the operator sees what the order was judged by',
+  )
+})
+
+test('o3d-aqke: an UNPINNED line still falls back to the current graph', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  // The degrade-to-previous-behaviour property. A line with no pin — never allocated under #625 —
+  // must answer exactly as it did before the seam existed.
+  const { client } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }, { componentId: 'comp-b', qty: 2 }] },
+    shipmentLines: [
+      committedKitLine({ productId: 'comp-a', sku: 'COMP-A', qty: 2 }),
+      committedKitLine({ productId: 'comp-b', sku: 'COMP-B', qty: 1 }),
+    ],
+  })
+
+  const findings = await collectDisproportionateCommittedKitFindings(client)
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].productId, 'comp-b')
+})
+
+test('o3d-aqke: the pin column is ALWAYS selected — a census that forgot it would answer from the current graph', async () => {
+  // SUPERSEDED ASSERTION, REWRITTEN WITH ITS REASON. This test used to assert the opposite: that
+  // the column was selected ONLY when a resolver was injected, because on this branch's old base
+  // o3d-kouj had not merged and asking a pre-#625 client for `fulfillmentRequirements` is a Prisma
+  // validation error that takes the whole invariant report down. o3d-kouj IS merged (PR #625), the
+  // column exists on every client this census can be handed, and the conditional went with the
+  // seam. What is worth guarding now is the other direction: dropping the field from the select
+  // would leave `lineFulfillmentRequirements` seeing `undefined` on every line and silently
+  // answering the entire census from the current graph — the exact substitution o3d-kouj forbids,
+  // with no error anywhere.
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  const seed = {
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }] },
+    shipmentLines: [committedKitLine({ productId: 'comp-a', qty: 2 })],
+  }
+
+  const census = kitCensusClient(seed)
+  await collectDisproportionateCommittedKitFindings(census.client)
+
+  assert.deepEqual(
+    census.seenLineSelects,
+    [{ productId: true, sku: true, description: true, fulfillmentRequirements: true }],
+  )
+})
+
+test('o3d-aqke: a pin that cannot be read is REPORTED, never quietly judged against the current graph', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  // o3d-kouj's parser fails closed, and this census must not undo that by catching the throw and
+  // falling back. Falling back would answer from the current graph under a claim of correctness,
+  // on the one line that already has something wrong with it. The line is left out and named.
+  const { client } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }, { componentId: 'comp-b', qty: 2 }] },
+    shipmentLines: [
+      committedKitLine({ productId: 'comp-a', sku: 'COMP-A', qty: 2, linePin: CORRUPT_PIN }),
+      committedKitLine({ productId: 'comp-b', sku: 'COMP-B', qty: 1, linePin: CORRUPT_PIN }),
+    ],
+  })
+
+  const findings = await collectDisproportionateCommittedKitFindings(client)
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].code, 'allocation_committed_kit_pin_unreadable')
+  assert.equal(findings[0].severity, 'warning')
+  assert.equal((findings[0].details as { lineId: string }).lineId, 'line-1')
+  assert.match((findings[0].details as { reason: string }).reason, /records no requirements at all/)
+  assert.equal(
+    findings.some((finding) => finding.code === 'allocation_committed_kit_disproportionate'),
+    false,
+    'and NOT also reported as disproportionate — that verdict would have come from the wrong recipe',
+  )
+})
+
+test('o3d-aqke: the census does not report three legitimate partial shipments as disproportionate', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  // Codex r1 finding 1, at the census. A KIT of 0.3333 x A + 0.6667 x B shipped in three passes of
+  // 1.5 kits stores A = round(0.49995) = 0.5000 and B = round(1.00005) = 1.0001 each time, so the
+  // committed totals are A = 1.5000 and B = 3.0003 — three half-up roundings deep. Judged as ONE
+  // rounding the bands are [4.50030.., 4.50060..) and [4.50014.., 4.50029..), which are disjoint,
+  // and the census raises a CRITICAL on three deliveries that are exactly right.
+  const partial = (productId: string, qty: number) => committedKitLine({ productId, sku: productId.toUpperCase(), qty })
+  const { client } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 0.3333 }, { componentId: 'comp-b', qty: 0.6667 }] },
+    shipmentLines: [
+      partial('comp-a', 0.5), partial('comp-b', 1.0001),
+      partial('comp-a', 0.5), partial('comp-b', 1.0001),
+      partial('comp-a', 0.5), partial('comp-b', 1.0001),
+    ],
+  })
+
+  const findings = await collectDisproportionateCommittedKitFindings(client)
+
+  assert.deepEqual(findings, [], 'three roundings of one coverage of 4.5 kits, not a disproportionate set')
+})
+
+test('o3d-aqke: the census still reports a component genuinely missing from the last partial', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  // The regression guard on the same shape: the third pass shipped comp-a but not comp-b. Two
+  // roundings of slack is 0.0001; this is 1.0001 out.
+  const partial = (productId: string, qty: number) => committedKitLine({ productId, sku: productId.toUpperCase(), qty })
+  const { client } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 0.3333 }, { componentId: 'comp-b', qty: 0.6667 }] },
+    shipmentLines: [
+      partial('comp-a', 0.5), partial('comp-b', 1.0001),
+      partial('comp-a', 0.5), partial('comp-b', 1.0001),
+      partial('comp-a', 0.5),
+    ],
+  })
+
+  const findings = await collectDisproportionateCommittedKitFindings(client)
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].code, 'allocation_committed_kit_disproportionate')
+  assert.equal(findings[0].productId, 'comp-b')
 })

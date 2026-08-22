@@ -1,6 +1,7 @@
 'use server'
 
 import { getActiveAccountingConnectorInfo } from '@/lib/accounting'
+import { requirePermission } from '@/lib/auth/server'
 import type {
   DailyBatchHistoryDay,
   DailyBatchPreview,
@@ -26,6 +27,8 @@ export type AccountingBatchHistoryEntry = {
   externalTransactionId: string | null
   errorMessage: string | null
   retryCount: number
+  /** o3d-e2mz: the attempt this row is on, for the panel's per-row retry. Absent for connectors that stamp none. */
+  attemptRevision?: number
   lines: Array<{ accountCode: string; description: string; debit: number; credit: number }>
 }
 
@@ -51,6 +54,7 @@ function mapHistoryEntry(
     externalTransactionId: entry.externalTransactionId,
     errorMessage: entry.errorMessage,
     retryCount: entry.retryCount,
+    attemptRevision: entry.attemptRevision,
     lines: entry.lines,
   }
 }
@@ -80,9 +84,31 @@ function emptyAccountingBatchPreview(): AccountingBatchPreview {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Connector dispatchers (o3d-512h)
+//
+// Same shape, and the same defect, as the accounting-sync.ts dispatchers: these
+// resolve the active connector and hand off to a guarded daily-batch action, and
+// the `accounting-batch.ts:*` allowlist entry justified having no guard of their
+// own with "connector facade -> guarded daily-batch actions".
+//
+// That was false on the fall-through path. When NEITHER connector is active each
+// of these answers from this module — `emptyAccountingBatchPreview()` / `[]` —
+// so there is no delegate and therefore no guard, and getActiveAccountingConnectorInfo
+// (a database-backed plugin-state read) has already run on behalf of a principal
+// that may not read anything here.
+//
+// Both branches' delegates agree on requirePermission('sync')
+// (xero-daily-batch.ts and quickbooks-daily-batch.ts alike), so this is an exact
+// match rather than a choice: ADMIN and MANAGER keep every path they had, and
+// WAREHOUSE / FINANCE / READONLY / SUPPLIER lose a fall-through answer and a
+// plugin-state read they could never have used.
+// ---------------------------------------------------------------------------
+
 export async function getAccountingBatchPreview(
   opts?: { force?: boolean },
 ): Promise<AccountingBatchPreview> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnectorInfo()
   if (connector?.id === 'xero') {
     const { getXeroDailyBatchPreview } = await import('@/app/actions/xero-daily-batch')
@@ -98,6 +124,7 @@ export async function getAccountingBatchPreview(
 export async function getAccountingBatchHistory(
   days = 30,
 ): Promise<AccountingBatchHistoryDay[]> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnectorInfo()
   if (connector?.id === 'xero') {
     const { getXeroDailyBatchHistory } = await import('@/app/actions/xero-daily-batch')
@@ -113,6 +140,7 @@ export async function getAccountingBatchHistory(
 }
 
 export async function refreshAccountingBatchPreview(): Promise<AccountingBatchPreview> {
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnectorInfo()
   if (connector?.id === 'xero') {
     const { refreshXeroDailyBatchPreview } = await import('@/app/actions/xero-daily-batch')

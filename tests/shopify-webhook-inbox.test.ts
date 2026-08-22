@@ -21,6 +21,7 @@ function makeRow(overrides: Partial<ShoppingWebhookEventRow> = {}): ShoppingWebh
     topic: 'orders/create',
     payloadHash: 'hash',
     payloadJson: { id: 123, secret_value: 'sentinel' },
+    originAttestation: 'unproven:not-applicable',
     status: WC_WEBHOOK_EVENT_STATUS.pending,
     attempts: 0,
     nextAttemptAt: null,

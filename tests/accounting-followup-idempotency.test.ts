@@ -10,6 +10,7 @@ import {
   buildFollowUpIdempotencySource,
   planFollowUpEnqueue,
   readFollowUpIdempotencyKey,
+  storedBodyMayHaveReachedTheLedger,
   withFollowUpIdempotencyKey,
 } from '@/lib/domain/accounting/followup-idempotency'
 
@@ -255,11 +256,11 @@ test('several FAILED money-moving rows REFUSE rather than guess which token comm
   // each with its own token. Any one may have committed; picking the newest is a guess.
   const plan = planFollowUpEnqueue({
     ...ORDER,
-    payload: { accountingInvoiceId: 'inv-9', amount: 120 },
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-new', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-new', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'refuse')
@@ -387,11 +388,11 @@ test('several FAILED rows do NOT refuse when none of them targeted this document
 test('only rows targeting THIS document count toward the ambiguity (o3d-h2wx)', () => {
   const plan = planFollowUpEnqueue({
     ...ORDER,
-    payload: { accountingInvoiceId: 'inv-9', amount: 120 },
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-other', payload: { accountingInvoiceId: 'inv-other', amount: 120 }, effectiveToken: 'log-other', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
-      { id: 'log-ambiguous', payload: { accountingInvoiceId: 'inv-9', amount: 110 }, effectiveToken: 'log-ambiguous', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-other', payload: { accountingInvoiceId: 'inv-other', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-other', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-ambiguous', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 110 }, effectiveToken: 'log-ambiguous', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'reuse')
@@ -419,18 +420,18 @@ test('a same-target money reuse reports pinned/pinned, so the log cannot lie (o3
   // described the exact opposite of what the target-changed path did.
   const pinned = planFollowUpEnqueue({
     ...ORDER,
-    payload: { accountingInvoiceId: 'inv-9', amount: 150 },
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 150 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(pinned.action === 'reuse' ? pinned.tokenDisposition : undefined, 'pinned')
   assert.equal(pinned.action === 'reuse' ? pinned.bodyDisposition : undefined, 'pinned')
 
   const rotated = planFollowUpEnqueue({
     ...ORDER,
-    payload: { accountingInvoiceId: 'inv-10', amount: 120 },
+    payload: { accountingInvoiceId: 'inv-10', bankAccountId: 'bank-1', amount: 120 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(rotated.action === 'reuse' ? rotated.tokenDisposition : undefined, 'rotated')
   assert.equal(rotated.action === 'reuse' ? rotated.bodyDisposition : undefined, 'fresh')
@@ -542,9 +543,9 @@ test('a token already being carried is authoritative over a newly-appeared row (
 test('a carried token that CONFLICTS with a surviving row refuses rather than picking one (o3d-h2wx)', () => {
   const plan = planFollowUpEnqueue({
     ...ORDER,
-    payload: { accountingInvoiceId: 'inv-9', amount: 120, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried-token' },
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried-token' },
     liveRowExists: false,
-    failedRows: [{ id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'a-different-token', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
+    failedRows: [{ id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'a-different-token', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
   })
   assert.equal(plan.action, 'refuse')
 })
@@ -556,11 +557,11 @@ test('ambiguity is counted in DISTINCT TOKENS, not rows (o3d-h2wx)', () => {
   // whichever committed, committed under that token, so pinning it is unambiguous.
   const sharedToken = planFollowUpEnqueue({
     ...ORDER,
-    payload: { accountingInvoiceId: 'inv-9', amount: 120 },
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'invoice-payment:payment:p1', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'invoice-payment:payment:p1', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'invoice-payment:payment:p1', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'invoice-payment:payment:p1', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(sharedToken.action, 'reuse')
@@ -572,11 +573,11 @@ test('ambiguity is counted in DISTINCT TOKENS, not rows (o3d-h2wx)', () => {
   // Genuinely distinct tokens still refuse — that is the case nothing can disambiguate.
   const distinct = planFollowUpEnqueue({
     ...ORDER,
-    payload: { accountingInvoiceId: 'inv-9', amount: 120 },
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-new', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-new', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'log-old', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(distinct.action, 'refuse')
@@ -589,12 +590,12 @@ test('rows sharing one token pin the OLDEST body, not the newest (o3d-h2wx)', ()
   // body would record a settlement the ledger never made.
   const plan = planFollowUpEnqueue({
     ...ORDER,
-    payload: { accountingInvoiceId: 'inv-9', amount: 200 },
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
     liveRowExists: false,
     // newest first, as both connectors order them
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 150 }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 150 }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120 }, effectiveToken: 'shared', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
     ],
   })
   assert.equal(plan.action, 'reuse')
@@ -695,6 +696,430 @@ test('completeness mirrors the connectors\' guards: falsy ids missing, zero amou
 
   const blankBank = withBodies({ accountingInvoiceId: 'inv-9', bankAccountId: '', amount: 120 })
   assert.equal(blankBank.action === 'reuse' ? blankBank.syncLogId : undefined, 'log-new')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-qsbs — an anchorless legacy money row could block a replacement document for ever.
+//
+// The issue blames `couldHaveCommittedThis`: a FAILED row with no recorded anchor is treated as
+// possibly targeting the document now being posted. That treatment is CORRECT and stays — for money
+// movement "unknown target" has to read as "possibly this one" — and the two non-money bullets in
+// the issue describe no defect at all, because `moneyMoving` gates both the body pin and the
+// refusal, so an anchorless INVOICE_EMAIL or WC_INVOICE_NOTE row has never blocked anything.
+//
+// The liveness cost the issue actually observed is paid two branches further down, and by a
+// different mechanism. An anchorless legacy INVOICE_PAYMENT row is anchorless precisely because it
+// has no `accountingInvoiceId` — which is also one of the fields the connector validates BEFORE it
+// builds a request. So that row provably never reached the ledger, and yet:
+//
+//   • with one such row the planner pinned its stored body, re-sending a request the connector
+//     rejects out of hand, for ever — the "corrected body never goes out" symptom; and
+//   • with two, their tokens were counted as candidates that "may have committed" and the scope
+//     refused permanently.
+//
+// Both now key on the same proof the module already trusted for choosing which body to pin. The
+// issue's own fix sketch — backfill `accountingInvoiceId` onto these rows from the parent invoice
+// sync row — is NOT implemented, and must not be: it would write the CURRENT invoice id onto a
+// historical attempt, asserting that the old attempt targeted a document that may not have existed
+// when it ran. That manufactures a match in the duplication direction, which is the one direction
+// this module never guesses in.
+// ---------------------------------------------------------------------------
+
+test('[o3d-qsbs] one unpostable legacy row pins its TOKEN but not its unusable body', () => {
+  // Missing bankAccountId, so `!accountingInvoiceId || !bankAccountId || amount == null` rejects it
+  // before any HTTP call. Pinning that body re-sends the same rejection every time and the payment
+  // never leaves. The token is still pinned — nothing rotates — because the point is only that this
+  // token was never seen remotely, so the RECOMPUTED body is safe to send under it.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-legacy', payload: { amount: 200 }, effectiveToken: 'log-legacy', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-legacy')
+  assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'pinned')
+  assert.equal(plan.action === 'reuse' ? plan.bodyDisposition : undefined, 'fresh', 'the unusable body must not be re-sent')
+  assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'log-legacy')
+  assert.equal(plan.action === 'reuse' ? plan.payload.bankAccountId : undefined, 'bank-1')
+  assert.equal(plan.action === 'reuse' ? plan.payload.amount : undefined, 200)
+})
+
+test('[o3d-qsbs] two unpostable legacy rows do not refuse — neither token ever left', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-newer', payload: { amount: 200 }, effectiveToken: 'log-newer', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-older', payload: { amount: 200 }, effectiveToken: 'log-older', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+    ],
+  })
+  assert.equal(plan.action, 'reuse', 'two tokens that were never sent are not two candidates for having committed')
+  assert.equal(plan.action === 'reuse' ? plan.bodyDisposition : undefined, 'fresh')
+})
+
+test('[o3d-qsbs] a POSTABLE row still refuses alongside an unpostable one', () => {
+  // The exclusion is a proof about ONE row, not a licence to ignore history. A complete body could
+  // have committed under its own token, so it and the carried/other candidate still conflict.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried-token' },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-complete', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 }, effectiveToken: 'log-complete', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      { id: 'log-legacy', payload: { amount: 200 }, effectiveToken: 'log-legacy', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+    ],
+  })
+  assert.equal(plan.action, 'refuse')
+  assert.match(plan.action === 'refuse' ? plan.reason : '', /2 different idempotency tokens/i)
+})
+
+test('[o3d-qsbs] an EMPTY stored payload is never proof that nothing posted', () => {
+  // `{}` is what retention's compaction leaves behind, and it is indistinguishable from a genuinely
+  // empty payload. Negating the postability check would read it as "provably never sent" — retention
+  // manufacturing evidence about a remote call — so it counts as a candidate token instead. Money
+  // types are not compacted today; the guard is here so that stays true by construction rather than
+  // by nobody having widened the compaction predicate yet.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried-token' },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-compacted', payload: {}, effectiveToken: 'log-compacted', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
+  })
+  assert.equal(plan.action, 'refuse', 'an unreadable history must not be read as an innocent one')
+})
+
+test('[o3d-qsbs] an UNREADABLE stored payload is never proof either', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried-token' },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-null', payload: null, effectiveToken: 'log-null', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
+  })
+  assert.equal(plan.action, 'refuse')
+})
+
+test('[o3d-qsbs] a compacted body is still never PINNED as the request', () => {
+  // The other half of the same distinction: `{}` proves nothing about what was sent, but it also
+  // cannot BE sent. An earlier retention attempt pinned exactly such an object as the request body
+  // and made money-moving retries permanently unusable (o3d-nepa round 1 finding 2).
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-compacted', payload: {}, effectiveToken: 'log-compacted', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'pinned')
+  assert.equal(plan.action === 'reuse' ? plan.bodyDisposition : undefined, 'fresh')
+  assert.equal(plan.action === 'reuse' ? plan.payload.amount : undefined, 200)
+})
+
+test('[o3d-qsbs] an UNSENDABLE row never displaces the token of one that may have committed', () => {
+  // Codex r10 #1. The split between "could this be sent" and "is there proof nothing left" is
+  // right, but token selection did not follow it through: `couldHaveCommitted[0]` is simply the
+  // NEWEST surviving row. Here the newest is a legacy body missing `accountingInvoiceId` and
+  // `bankAccountId`, so both connectors reject it before any HTTP call — it provably never posted,
+  // and its token was correctly excluded from the ambiguity count, so nothing refuses. The OLDER
+  // row is a complete body that may well have committed under `tok-sent`.
+  //
+  // Pinning the unsendable row's token sends the retry under a key the ledger has never seen while
+  // a payment under `tok-sent` may already stand: two payments against one invoice.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-unsendable', payload: { amount: 200 }, effectiveToken: 'tok-never-left', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      {
+        id: 'log-sendable',
+        payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
+        effectiveToken: 'tok-sent',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
+      },
+    ],
+  })
+
+  assert.equal(plan.action, 'reuse')
+  assert.equal(
+    plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined,
+    'tok-sent',
+    'the retry must go out under the token of the attempt that may have committed, not the one that provably never left',
+  )
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-sendable')
+  // ...and because that attempt may have committed, its BODY is pinned too: a recomputed amount
+  // under a token the ledger already saw records a settlement that never happened.
+  assert.equal(plan.action === 'reuse' ? plan.bodyDisposition : undefined, 'pinned')
+  assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'pinned')
+})
+
+test('[o3d-qsbs] the may-have-committed token wins even when the unsendable row is the only complete-looking one', () => {
+  // The same hazard where the unsendable row carries the anchor. `couldHaveCommittedThis` still
+  // matches both (the older row names the same invoice; the newer one names nothing, which reads as
+  // "possibly this one"), and the newer one is missing `bankAccountId` so it provably never posted.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-unsendable', payload: { accountingInvoiceId: 'inv-9', amount: 200 }, effectiveToken: 'tok-never-left', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY },
+      {
+        id: 'log-sendable',
+        payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 175 },
+        effectiveToken: 'tok-sent',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
+      },
+    ],
+  })
+
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'tok-sent')
+  // The pinned body is the one that may have posted — 175, not the recomputed 200.
+  assert.equal(plan.action === 'reuse' ? plan.payload.amount : undefined, 175)
+  assert.equal(plan.action === 'reuse' ? plan.bodyDisposition : undefined, 'pinned')
+})
+
+// --- o3d-19gy: a repair may not rewrite whose ledger the row was raised against ---------------
+//
+// Codex r1 finding 2 (CRITICAL). The connectors stamp the freshly-rebuilt follow-up payload with the
+// CURRENTLY connected organisation and hand it to this planner for both outcomes. On a revival that
+// stamp is not a fact about the new work — the row already records which organisation its earlier
+// attempt was made against, and that record is the only evidence the post-time guard has. Overwriting
+// it does not merely lose evidence, it FORGES agreement: a payment first attempted against
+// organisation A, revived while connected to B, still pinned to A's idempotency token, sailed through
+// a guard that was comparing B against B.
+//
+// cvj9's rule, literally: a marker may only be written by the row that actually took the action.
+
+const CONNECTION_KEY = '_connectionProvenance'
+
+test('o3d-19gy: a NON-MONEY revival carries the ROW own origin, not the current connection', () => {
+  // The path that actually rewrote it. The money path keeps the stored body wholesale and so kept the
+  // stamp by accident; this one rebuilds the body from the caller's freshly-stamped payload.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    type: 'INVOICE_PDF',
+    payload: { accountingInvoiceId: 'inv-9', invoiceNumber: 'INV-2', [CONNECTION_KEY]: 'xero:tenant-B' },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'log-old',
+      payload: { accountingInvoiceId: 'inv-9', [CONNECTION_KEY]: 'xero:tenant-A', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'original-key' },
+      effectiveToken: 'original-key',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
+    }],
+  })
+
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-old')
+  assert.equal(
+    plan.action === 'reuse' ? plan.payload[CONNECTION_KEY] : undefined,
+    'xero:tenant-A',
+    'the revived row must still say organisation A — it is the only evidence that A was ever involved',
+  )
+  // ...and the things that SHOULD be carried still are: A's token, and the fresh body.
+  assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'original-key')
+  assert.equal(plan.action === 'reuse' ? plan.payload.invoiceNumber : undefined, 'INV-2')
+})
+
+// PASSES UNDER REVERT, DELIBERATELY. The money path pins the stored body wholesale, so it carried the
+// stored stamp by accident rather than by rule. This pins that accident as a requirement: the next
+// person to "tidy" the money branch into rebuilding from the fresh payload would otherwise reopen
+// finding 2 on the only path where the body is A's as well as the token.
+test('o3d-19gy: a MONEY revival keeps organisation A on the row, so the post-time guard can still refuse', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-2', amount: 150, [CONNECTION_KEY]: 'xero:tenant-B' },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'log-old',
+      payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 120, [CONNECTION_KEY]: 'xero:tenant-A' },
+      effectiveToken: 'log-old',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
+    }],
+  })
+
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.payload[CONNECTION_KEY] : undefined, 'xero:tenant-A')
+  assert.equal(plan.action === 'reuse' ? plan.payload.amount : undefined, 120, 'and A body is still the pinned one')
+})
+
+test('o3d-19gy: a repair does not INVENT an origin for a legacy row that recorded none', () => {
+  // The row predates stamping. It took an action, under some organisation, and nobody wrote it down.
+  // Stamping the current one now would claim knowledge the repair does not have — the post-time verdict
+  // must go on reading this as `no-origin-recorded`, which is the truth, and (since Codex r3 finding 2)
+  // refuse it rather than wave it through.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    type: 'INVOICE_PDF',
+    payload: { accountingInvoiceId: 'inv-9', [CONNECTION_KEY]: 'xero:tenant-B' },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'log-legacy', remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY }],
+  })
+
+  assert.equal(plan.action, 'reuse')
+  assert.equal(
+    plan.action === 'reuse' ? CONNECTION_KEY in plan.payload : true,
+    false,
+    'no origin was recorded, and a repair is not a witness',
+  )
+})
+
+test('o3d-19gy: a spent row from ANOTHER organisation is left intact and the new work gets its own row', () => {
+  // Nothing is carried back on this branch — the token is freshly derived and the body recomputed — so
+  // reusing the row would be pure bookkeeping. Bookkeeping tidiness is not a reason to erase the only
+  // surviving trace that an attempt was made against organisation A. A new row costs one insert; it
+  // also avoids stranding B's legitimate work behind a post-time refusal it could never satisfy.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', amount: 120, [CONNECTION_KEY]: 'xero:tenant-B' },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'log-tenant-a',
+      payload: { accountingInvoiceId: 'inv-9', amount: 120, [CONNECTION_KEY]: 'xero:tenant-A' },
+      effectiveToken: 'log-tenant-a',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
+    }],
+  })
+
+  assert.equal(plan.action, 'create', 'organisation A row is not repurposed')
+  assert.equal(plan.action === 'create' ? plan.payload[CONNECTION_KEY] : undefined, 'xero:tenant-B')
+})
+
+// PASSES UNDER REVERT, DELIBERATELY — it is the control. A guard is only worth having if the ordinary
+// path is untouched by it, and this is the assertion that the new refusal did not swallow the common case.
+test('o3d-19gy: a spent row from the SAME organisation is still reused, so nothing ordinary changed', () => {
+  // The case that outranks the fix. Same organisation, different document: this is the ordinary
+  // spent-row reuse and it must be completely unaffected.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', amount: 120, [CONNECTION_KEY]: 'xero:tenant-B' },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'log-same-org',
+      payload: { accountingInvoiceId: 'inv-9', amount: 120, [CONNECTION_KEY]: 'xero:tenant-B' },
+      effectiveToken: 'log-same-org',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
+    }],
+  })
+
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-same-org')
+  assert.equal(plan.action === 'reuse' ? plan.payload[CONNECTION_KEY] : undefined, 'xero:tenant-B')
+})
+
+test('o3d-19gy: an UNREADABLE origin on the spent row is not treated as a match', () => {
+  // Two unreadable values are not "the same value". A row whose stamp cannot be read is a row something
+  // this module does not recognise has written, and repurposing it would destroy whatever it meant.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', amount: 120, [CONNECTION_KEY]: 'xero:tenant-B' },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'log-garbled',
+      payload: { accountingInvoiceId: 'inv-9', amount: 120, [CONNECTION_KEY]: 42 },
+      effectiveToken: 'log-garbled',
+      remoteAttemptedAt: null, attemptStampingCustodyAt: IN_CUSTODY,
+    }],
+  })
+
+  assert.equal(plan.action, 'create')
+})
+
+// ---------------------------------------------------------------------------
+// ONE PREDICATE FOR "DID THIS ATTEMPT REACH THE LEDGER" (o3d-m5qk)
+// ---------------------------------------------------------------------------
+//
+// Two branches arrived at this merge with a version of the question, and they answer differently on
+// exactly one input: an EMPTY `{}` body. The pin-selection predicate (`bodyCouldHaveReachedTheLedger`,
+// private) reads `{}` as "could not have been sent", because it is missing every required field. The
+// capacity guards must NOT read it that way: retention compacts a payload to `{}`, so reading a
+// compacted body as proof that nothing posted is retention manufacturing evidence about a remote call.
+// `storedBodyMayHaveReachedTheLedger` is built on `bodyProvesNoCallLeft` for that reason, and it is
+// the ONE definition both capacity guards import — the sales one and the supplier one.
+
+test('o3d-m5qk: a RETENTION-COMPACTED body is not proof that nothing posted', () => {
+  // The case the two branches disagreed about, and the one that pays a supplier twice if it goes the
+  // other way: `{}` is what a payload looks like after retention has compacted it away, and it is
+  // indistinguishable from a body that was never populated.
+  assert.equal(storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', {}), true)
+  assert.equal(storedBodyMayHaveReachedTheLedger('BILL_PAYMENT', {}), true)
+})
+
+test('o3d-m5qk: an unreadable or absent body is not proof either', () => {
+  for (const payload of [null, undefined, 'not an object', 42, ['array']]) {
+    assert.equal(
+      storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', payload),
+      true,
+      `${JSON.stringify(payload) ?? 'undefined'} must not be read as "nothing was sent"`,
+    )
+  }
+})
+
+test('o3d-m5qk: a PRESENT body missing a field the connector rejects pre-call IS proof', () => {
+  // The one sound "this did not post" signal in the system. Both connectors validate before they build
+  // a request, so a body they would have rejected never reached the wire — and this is the only
+  // exemption either capacity guard grants a FAILED money row.
+  assert.equal(
+    storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', { accountingInvoiceId: 'INV-1', amount: 10 }),
+    false,
+    'no bankAccountId: the Xero INVOICE_PAYMENT case returns before building a request',
+  )
+  assert.equal(
+    storedBodyMayHaveReachedTheLedger('BILL_PAYMENT', { bankAccountId: 'bank-1', amount: 10 }),
+    false,
+    'no accountingInvoiceId, and the supplier guard is the identical shape',
+  )
+  // A complete body could have been sent, so it counts against capacity.
+  assert.equal(
+    storedBodyMayHaveReachedTheLedger('BILL_PAYMENT', { accountingInvoiceId: 'INV-1', bankAccountId: 'b', amount: 10 }),
+    true,
+  )
+})
+
+test('o3d-m5qk: a legitimate ZERO amount is present, and an empty-string id is not', () => {
+  // Mirrors the connectors' guards exactly, which are not uniform: `!accountingInvoiceId` rejects an
+  // empty string, while `amount == null` accepts a zero. Getting either wrong misreads whether an
+  // attempt could have posted.
+  assert.equal(
+    storedBodyMayHaveReachedTheLedger('BILL_PAYMENT', { accountingInvoiceId: 'INV-1', bankAccountId: 'b', amount: 0 }),
+    true,
+    'a zero-value payment is a request the connector would have sent',
+  )
+  assert.equal(
+    storedBodyMayHaveReachedTheLedger('BILL_PAYMENT', { accountingInvoiceId: '', bankAccountId: 'b', amount: 10 }),
+    false,
+    'an empty id is falsy, and the connector rejects it before building anything',
+  )
+})
+
+test('o3d-m5qk: a type with no declared required fields answers "may have posted"', () => {
+  // Non-money follow-ups (PDF, attachment, note) have no pre-call validation to prove anything from, so
+  // nothing about them is ever proof that no call was made.
+  assert.equal(storedBodyMayHaveReachedTheLedger('INVOICE_PDF', {}), true)
+  assert.equal(storedBodyMayHaveReachedTheLedger('INVOICE_PDF', { anything: 1 }), true)
+})
+
+test('o3d-m5qk: the two capacity guards import the ONE predicate rather than deriving their own', async () => {
+  // The whole point of merging them. Two guards deriving "nothing was sent" differently would disagree
+  // about whether a document still has capacity, which for money is the entire question — and the
+  // disagreement would be invisible, because each one is individually reasonable.
+  const root = process.cwd()
+  for (const file of [
+    'lib/domain/accounting/invoice-payment-capacity.ts',
+    'lib/domain/accounting/payment-reversal.ts',
+  ]) {
+    const src = await readFile(path.join(root, file), 'utf8')
+    assert.ok(
+      src.includes("import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'"),
+      `${file} must import the shared predicate`,
+    )
+    assert.equal(
+      src.indexOf('REQUIRED_BODY_FIELDS'),
+      -1,
+      `${file} must not re-derive the required-field table — that is the second definition`,
+    )
+  }
 })
 
 /* --------------------------------------------------------------------------------------- *

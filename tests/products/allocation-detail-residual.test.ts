@@ -28,7 +28,13 @@ mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
 mock.module('next/navigation', { namedExports: { redirect: () => {} } })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
 mock.module('@/lib/auth/server', {
-  namedExports: { requireAuth: async () => ({}), requirePermission: async () => {} },
+  namedExports: {
+    requireAuth: async () => ({}),
+    // o3d-512h round 3: products.ts reads now gate on requireInternalUser — SUPPLIER is
+    // an external principal and never belonged on the internal catalogue endpoints.
+    requireInternalUser: async () => ({ user: { id: 'u1', role: 'ADMIN' } }),
+    requirePermission: async () => {},
+  },
 })
 mock.module('@/lib/shopping', {
   namedExports: {

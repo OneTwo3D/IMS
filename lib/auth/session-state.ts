@@ -154,3 +154,76 @@ export function sessionInvalidLoginMessage(reason: SessionInvalidLoginReason | n
       return null
   }
 }
+
+// ---------------------------------------------------------------------------
+// Is this session USABLE at all? (o3d-512h round 4, Codex finding 1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Codex round 4, finding 1 — THE SAME DEFECT, ONE LAYER DOWN.
+ *
+ * Round 3 deleted app/actions/allocation.ts's shadowing `requireAuth`, which
+ * checked only that a user id existed: no revocation check, no second-factor
+ * check. app/actions/supplier-portal.ts's `requireSupplier` was the same
+ * function wearing a different name, and round 3 kept it — the audit asked
+ * whether the SUPPLIER surface scoped rows correctly (it does) and never asked
+ * whether the session reaching it was still a valid one. A supplier whose login
+ * had been revoked, whose account had been deactivated, who had been reassigned
+ * to a different supplier, or who had a password but had not cleared the TOTP
+ * challenge, still got in.
+ *
+ * The reason three call sites drifted apart is that each one open-coded the same
+ * three checks next to its own way of refusing — a redirect, a 401 body, a null.
+ * So the CHECKS live here, once, and the call sites keep only their refusal:
+ *
+ *   * lib/auth/server.ts:requireAuth        -> redirect
+ *   * lib/auth/session-gates.ts:requireApiAuthSession -> 401 JSON
+ *   * app/actions/supplier-portal.ts:requireSupplier  -> null
+ *
+ * Adding a fourth kind of denial is now a change to this function, which every
+ * gate inherits, instead of a check somebody has to remember to copy.
+ *
+ * NOTE what this does NOT answer. It is an AUTHENTICATION-VALIDITY question:
+ * "is this session still the one we issued, and is it fully established". It
+ * says nothing about whether the principal may do the thing — that is the
+ * caller's authorization gate, and a supplier session that passes here is still
+ * an external principal.
+ */
+export type SessionAccessDenial =
+  | { reason: 'no-session' }
+  | { reason: 'session-invalid'; sessionInvalidReason: SessionInvalidReason }
+  | { reason: 'second-factor-pending' }
+
+/**
+ * The session fields the decision needs. Deliberately loose (optional, nullable)
+ * so it can be handed a next-auth session user, a decoded token, or a fixture
+ * without a cast — a stricter type here would only be satisfied by casting at
+ * the call sites, which is how a missing field becomes an assumed-false one.
+ */
+export type SessionAccessUser = {
+  sessionInvalidReason?: SessionInvalidReason | null
+  totpEnabled?: boolean | null
+  totpVerified?: boolean | null
+}
+
+/** The denial, or null when the session may proceed to its authorization gate. */
+export function sessionAccessDenial(
+  user: SessionAccessUser | null | undefined,
+): SessionAccessDenial | null {
+  if (!user) return { reason: 'no-session' }
+
+  // Revoked, deactivated, force-logged-out, or minted before a sessionVersion
+  // bump. Reassignment lands here too: app/actions/users.ts bumps sessionVersion
+  // whenever role/supplierId/active/email/password changes, so a supplier moved
+  // to a different company (or demoted out of SUPPLIER) carries a token whose
+  // version no longer matches and is refused on its next request.
+  if (user.sessionInvalidReason) {
+    return { reason: 'session-invalid', sessionInvalidReason: user.sessionInvalidReason }
+  }
+
+  // Password accepted, second factor not yet presented. Such a session is half
+  // authenticated and must not reach anything but the challenge itself.
+  if (user.totpEnabled && !user.totpVerified) return { reason: 'second-factor-pending' }
+
+  return null
+}

@@ -10,11 +10,34 @@ Four headline figures appear at the top of the dashboard:
 | KPI | What It Measures |
 |---|---|
 | **Gross Sales** | Total invoiced revenue before any deductions. |
-| **Net Sales** | Gross sales minus discounts, returns, and adjustments. |
+| **Net Sales** | Gross sales minus discounts and returns, where the return is recorded excluding VAT. |
 | **COGS** | Cost of goods sold, calculated from FIFO cost layers. |
 | **Margin** | Net sales minus COGS, shown as both a value and a percentage. |
 
 Each card shows the current period value, the comparison period value, and the percentage change between them.
+
+### Figures marked with a symbol
+
+Net sales is built from amounts that exclude VAT, so only a return that was also recorded excluding
+VAT can be subtracted from it. Older returns were recorded including VAT, and some cannot be proved
+either way. Those are **not** subtracted and are **not** converted -- converting needs the VAT rate
+that produced the original figure, which a mixed-rate order does not preserve. Instead the amount is
+reported separately, under "Not subtracted", and the figures derived from net sales are marked:
+
+| Mark | Meaning |
+|---|---|
+| (no mark) | Every return in the period could be subtracted. The figure is exact. |
+| `<=` | The true figure is **at most** this one. It is too high by at most the "Not subtracted" amount. |
+| `?` | A bound exists, but **which side of this figure the true one falls is not established.** |
+
+The `?` mark appears only on **Margin %**. Margin is a ratio, and an unsubtracted return reduces
+both the top and the bottom of it, so -- unlike net sales, profit and average order value, which can
+only fall -- the margin can move either way. Where the arithmetic cannot settle the direction, the
+percentage is still shown and only the claim about its direction is withheld.
+
+The percentage-change badges show a dash instead of a direction whenever either period carries an
+unsubtracted return, because the two periods withhold different amounts and the sign of the change
+is not established.
 
 
 ## Time Period Selector
@@ -47,7 +70,7 @@ Compare the selected period against a prior period to spot trends:
 
 ### Net Sales, COGS, and Margin %
 
-Three time-series charts track net sales, cost of goods sold, and margin percentage over the selected period. The horizontal axis adapts its granularity automatically:
+Three time-series charts track net sales, cost of goods sold, and margin percentage over the selected period. Hover any point to see its value; where that bucket carries an unsubtracted return the tooltip states the bound, using the same marks as the KPI cards above. The horizontal axis adapts its granularity automatically:
 
 - **Hourly** -- When viewing a single day.
 - **Daily** -- When viewing a week or month.
@@ -60,7 +83,11 @@ A waterfall chart showing how cash flows from opening balance through inflows an
 
 ## Best Sellers
 
-A ranked list of your top-selling products for the selected period, showing quantity sold and revenue generated.
+A ranked list of your top-selling products for the selected period, showing quantity sold net of returns and the revenue generated.
+
+Revenue here is net of returns on the same terms as the KPI cards: a credit recorded ex-VAT is subtracted, and a credit recorded VAT-inclusive or with no recorded basis is *not* -- subtracting it would remove VAT from a figure that never contained any. Where that happens the amount carries a `≤` and hovering it names the credit that was left out. Because the list is ranked by that same figure, the **order** carries the bound too: a product can sit above another purely on credit that could not be placed, and the tooltip says so.
+
+Quantity is not affected by any of this -- a returned unit is a returned unit whatever unit the money was recorded in -- so "sold net" is exact and never marked.
 
 
 ## Incoming Purchase Orders

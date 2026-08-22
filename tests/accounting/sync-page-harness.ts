@@ -109,6 +109,20 @@ export const state = {
      */
     rejectWith: null as Error | null,
   },
+  /**
+   * What the FailedSyncBanner's retry action returns, and every call it received (o3d-aouf).
+   *
+   * It used to be `async () => ({ success: true })` — uninstrumented, never invoked, present only
+   * so the banner module would link. A double that records nothing cannot fail, so the retry
+   * control had no coverage at all: deleting its onClick, dropping the router.refresh, or
+   * swallowing the error left the suite green. Shaped like `cancel` above for the same reasons.
+   */
+  retry: {
+    calls: [] as unknown[][],
+    result: { success: true, reset: 1 } as { success: boolean; reset?: number; error?: string },
+    /** Make the action REJECT rather than return, as its permission gate does. */
+    rejectWith: null as Error | null,
+  },
   /** router.refresh() calls made by client components under test. */
   refreshes: 0,
   /**
@@ -134,6 +148,7 @@ export function resetSyncPageState() {
   state.redirects = []
   state.salesOrderRows = []
   state.cancel = { calls: [], result: { success: true }, rejectWith: null }
+  state.retry = { calls: [], result: { success: true, reset: 1 }, rejectWith: null }
   state.refreshes = 0
   state.onRefresh = null
 }
@@ -240,7 +255,13 @@ export function installSyncPageMocks(options: { realPaymentMethodCombos?: boolea
         if (state.cancel.rejectWith) throw state.cancel.rejectWith
         return state.cancel.result
       },
-      retryFailedAccountingSync: async () => ({ success: true }),
+      // Imported by FailedSyncBanner. Records its arguments: "Retry all failed" must send NO
+      // entry id, and an entry id would scope it to one row (o3d-aouf).
+      retryFailedAccountingSync: async (...args: unknown[]) => {
+        state.retry.calls.push(args)
+        if (state.retry.rejectWith) throw state.retry.rejectWith
+        return state.retry.result
+      },
     },
   })
 

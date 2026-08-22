@@ -9,19 +9,56 @@ import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { logActivity } from '@/lib/activity-log'
 import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireFreshPermission, requireInternalUser, requirePermission } from '@/lib/auth/server'
+import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
+import { xeroGet } from '@/lib/connectors/xero/api'
+import {
+  HOLD_MOVED_REFUSAL,
+  NO_LEDGER_HOLD_REFUSAL,
+  PAYMENT_REGISTRATION_TYPE,
+  READABLE_REGISTRATION_STATUSES,
+  REGISTRATION_IN_FLIGHT_REFUSAL,
+  RETIRABLE_REGISTRATION_STATUSES,
+  UNDECIDED_ATTEMPTS_AMBIGUOUS_REFUSAL,
+  UNDECIDED_ATTEMPT_REVERSAL_REFUSAL,
+  UNVERIFIABLE_IN_FLIGHT_REFUSAL,
+  VERIFIABLE_REVERSAL_CONNECTORS,
+  assertedReversalNote,
+  buildAssertedReversalData,
+  buildVerifiedReversalData,
+  describeAttemptUndecidedRefusal,
+  describeLedgerHoldRefusal,
+  hasPostEvidence,
+  isReversedInLedger,
+  ledgerReversalNote,
+  normalizeAssertedPaymentReference,
+  canonicalCurrencyCode,
+  canonicalLedgerAmount,
+  refuseAssertedPaymentAmountMismatch,
+  refuseAssertedPaymentCurrencyMismatch,
+  refuseAssertedPaymentNotOnInvoice,
+  refuseAssertedPaymentStillOnInvoice,
+  refuseAssertedPaymentUnattributable,
+  refuseLedgerLookupFailure,
+  refuseLedgerStillHolds,
+  refuseUnverifiableConnector,
+  sameLedgerIdentifier,
+  splitPaymentRegistrations,
+  type LedgerReversalRefusalCode,
+  type PaymentDeleteRefusalCode,
+  type PaymentRegistrationRow,
+} from '@/lib/domain/accounting/payment-ledger-hold'
 import {
   queueAccountingSync,
   queueAccountingSyncTx,
   getAccountingSettings,
   getActiveAccountingConnectorInfo,
-  getPaymentAccountMap,
   isAccountingSyncTypeEnabled,
-  lookupPaymentAccount,
   type AccountingSettings,
 } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
+import { creditNoteLineTaxTypeResolver } from '@/lib/domain/sales/refund-posted-tax-identity'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata, pushSalesOrderStatus } from '@/lib/shopping'
@@ -53,27 +90,25 @@ import {
   type CreatedRefundLine,
   type RefundAccountingSyncRequest,
   type RefundCreationConflict,
+  type RefundExpectedTaxIdentity,
   type RefundRequestLine,
 } from '@/lib/domain/sales/refund-service'
 import {
   expectedSalesOrderLineTaxForeign,
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
+import { invoiceNumberIsExternallySupplied, resolveSalesInvoiceNumberForPost } from '@/lib/domain/accounting/sales-invoice-number'
+import { decideChargebackDiscountLine, readPostedSalesInvoiceDiscountForOrder } from '@/lib/domain/accounting/posted-document-discount'
 import {
-  decideInvoicePaymentRegistration,
-  invoicePaymentRowSetBlocker,
-  unresolvedInvoicePaymentAttempts,
-} from '@/lib/domain/accounting/invoice-payment-registration'
-import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
-import { attemptCouldHaveReachedTheLedger, effectiveTokenFor } from '@/lib/domain/accounting/followup-retry-guard'
-import { pinnedAttemptDate, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
-import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
+  loadInvoicePaymentSyncRows,
+  payloadPaymentId,
+  registerInvoicePaymentWithLedger,
+} from '@/lib/domain/accounting/invoice-payment-enqueue'
 import {
   aggregatePaymentSyncRows,
   effectivePaymentSyncRows,
   ledgerSalesInvoiceTotalForeign,
   settlementStatus,
-  type PaymentSyncRow,
   type SettlementVerdict,
 } from '@/lib/domain/accounting/settlement-status'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
@@ -151,6 +186,9 @@ export type SoRow = {
   refundStatus: 'NONE' | 'PARTIAL' | 'FULL'
   /// o3d-e1yb [wdraw]: set while an EU withdrawal request holds this order.
   withdrawalHoldAt: string | null
+  /// o3d-rbyg r4: WHICH request the hold is — carried to the release so the button cannot clear a
+  /// newer one filed since this page was drawn. Advances per new submission.
+  withdrawalHoldGeneration: number
   currency: string
   fxRateToBase: number
   customerName: string | null
@@ -425,6 +463,7 @@ const SO_SELECT = {
   status: true,
   refundStatus: true,
   withdrawalHoldAt: true,
+  withdrawalHoldGeneration: true,
   currency: true,
   fxRateToBase: true,
   customerName: true,
@@ -486,6 +525,7 @@ function mapSoRow(so: {
   status: string
   refundStatus: string
   withdrawalHoldAt: Date | null
+  withdrawalHoldGeneration: number
   currency: string
   fxRateToBase: unknown
   customerName: string | null
@@ -576,6 +616,7 @@ function mapSoRow(so: {
     status: so.status as SoStatus,
     refundStatus: so.refundStatus as 'NONE' | 'PARTIAL' | 'FULL',
     withdrawalHoldAt: so.withdrawalHoldAt ? so.withdrawalHoldAt.toISOString() : null,
+    withdrawalHoldGeneration: so.withdrawalHoldGeneration,
     currency: so.currency,
     fxRateToBase: Number(so.fxRateToBase),
     customerName: so.customerName,
@@ -664,7 +705,7 @@ export async function getSalesOrders(
   limit = 200,
   opts?: { includeCompleted?: boolean }
 ): Promise<SoRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const where: Prisma.SalesOrderWhereInput = { archived: { not: true } }
   if (!opts?.includeCompleted) {
     where.status = { notIn: ['COMPLETED', 'DELIVERED'] }
@@ -692,67 +733,6 @@ export async function getSalesOrders(
 }
 
 /**
- * Every INVOICE_PAYMENT sync row for one order (o3d-lgo.15) — the ledger's own account of what it was
- * told about this order's receipts. Scoped to the ACTIVE connector: rows left by a connector that is no
- * longer in use describe a ledger nobody is reconciling against, and judging today's settlement by them
- * would report a discrepancy against a system that has been switched off.
- */
-type InvoicePaymentSyncRow = PaymentSyncRow & {
-  paymentId: string | null
-  /** The mark this attempt would have written into the ledger (o3d-0m56). */
-  settlementMarker: string | null
-  /** The date that attempt sent, so a settlement in the ledger can be matched to it (o3d-0m56). */
-  paymentDate: string | null
-  /** False when the stored body was too incomplete for the connector to have made the call. */
-  couldHaveReachedLedger: boolean
-}
-
-async function loadInvoicePaymentSyncRows(
-  orderId: string,
-  connector: string | null,
-  /**
-   * The client to read through. Defaults to the global one; the registration path passes its
-   * TRANSACTION so the re-check happens under the same locks as the write it authorises (o3d-0m56).
-   */
-  client: { accountingSyncLog: { findMany: typeof db.accountingSyncLog.findMany } } = db,
-): Promise<InvoicePaymentSyncRow[]> {
-  if (!connector) return []
-  const rows = await client.accountingSyncLog.findMany({
-    where: { connector, type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: orderId },
-    select: { id: true, status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true },
-    orderBy: { createdAt: 'desc' },
-  })
-  return rows.map((r) => {
-    const payload = (r.payload && typeof r.payload === 'object' ? r.payload : {}) as Record<string, unknown>
-    return {
-      status: r.status,
-      externalTransactionId: r.externalTransactionId,
-      errorMessage: r.errorMessage,
-      retryCount: r.retryCount,
-      // The amount actually SENT, so a part payment is not mistaken for full settlement.
-      amount: typeof payload.amount === 'number' ? payload.amount : null,
-      // ...and the date it sent, because amount alone cannot tell one receipt from another
-      // (o3d-0m56). Both together are what identifies this attempt's payment in the ledger.
-      //
-      // Round 6, finding 1: taken from the SAME function the processors date their posts with,
-      // not from a fourth copy of `payload.paymentDate?.slice(0, 10)`. Copies of this rule are
-      // what let the probe go looking for a settlement on a day no post would ever create.
-      paymentDate: pinnedAttemptDate('INVOICE_PAYMENT', r.payload),
-      // Judged by the SAME rule the retry guard uses, so the two paths cannot disagree about
-      // which failed attempts could have reached the ledger.
-      couldHaveReachedLedger: attemptCouldHaveReachedTheLedger('INVOICE_PAYMENT', r.payload),
-      // The mark this attempt would have written into the ledger, derived exactly as its connector
-      // derives the token it posted under (o3d-0m56). Matching it identifies the attempt even if
-      // its amount or date has since been corrected there.
-      settlementMarker: connector === 'xero' || connector === 'quickbooks'
-        ? settlementMarkerFor(effectiveTokenFor(connector, { id: r.id, payload: r.payload }))
-        : null,
-      paymentId: payloadPaymentId(r.payload),
-    }
-  })
-}
-
-/**
  * What IMS claims has been RECEIVED against the order invoice, in the order currency — the figure the
  * ledger has to match.
  *
@@ -775,7 +755,7 @@ function claimedReceivedForeign(so: {
 }
 
 export async function getSalesOrder(id: string): Promise<SoDetail | null> {
-  await requireAuth()
+  await requireInternalUser()
   const so = await db.salesOrder.findUnique({
     where: { id },
     select: {
@@ -1322,6 +1302,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       pricesIncludeVat: true,
       discountAmount: true,
       accountingInvoiceId: true,
+      invoiceNumber: true,
       lines: {
         select: {
           sku: true,
@@ -1387,8 +1368,17 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   // the order (matching WC import), so it can be passed through directly.
   const discountForeign = roundDecimalNumber(so.discountAmount ?? 0, 2)
 
+  // o3d-k26m.1: prefer the number already recorded on the order over one derived here. See
+  // lib/domain/accounting/sales-invoice-number.ts — the create is an upsert on InvoiceNumber, so
+  // two routes deriving two numbers for one order post two documents.
+  const { invoiceNumber: accountingInvoiceNumber } = resolveSalesInvoiceNumberForPost({
+    persistedInvoiceNumber: so.invoiceNumber,
+    fallbackPrefix: manualPrefix,
+    orderReference: orderNumber,
+  })
+
   const payload = {
-    invoiceNumber: `${manualPrefix}${orderNumber}`,
+    invoiceNumber: accountingInvoiceNumber,
     contactName: so.customerName ?? 'Unknown',
     contactEmail: so.customerEmail ?? undefined,
     date: new Date().toISOString().slice(0, 10),
@@ -1916,27 +1906,23 @@ async function queueRefundAccountingActions(input: {
         select: { accountingTaxType: true },
       })
     : null
-  // Credit-note PRODUCT lines must apply the SAME per-line reverse-charge swap
-  // the original invoice did (audit H1), keyed on each sales line's own
-  // TaxRate.reverseCharge — or a refund of a reverse-charged sale posts under
-  // the standard code and the VAT return no longer balances.
-  const taxTypeBySalesLineId = new Map(
-    (orderForCN?.lines ?? []).map((line) => [
-      line.id,
-      resolveSalesLineTaxType({
-        baseTaxType: line.taxRate?.accountingTaxType,
-        reverseCharge: line.taxRate?.reverseCharge,
-        reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
-      }),
-    ]),
-  )
-  // Fallback for refund lines with no mapped sales line (shipping, ad-hoc):
-  // the order-level tax type WITHOUT the swap, mirroring exactly how the
-  // invoice posts its shipping/discount lines (shippingTaxType =
-  // orderDefaultTaxType, no swap). Swapping here would post credit-note
-  // shipping under the reverse-charge code while the invoice posted it under
-  // the standard code — an asymmetry the VAT return would flag.
-  const fallbackCnTaxType = cnTaxRate?.accountingTaxType ?? undefined
+  // The code each credit-note line carries, from the ONE definition the retry fence also reads
+  // (o3d-w00, Codex r10 #2) — the snapshot where there is one, else the line's own re-derived sales tax
+  // type, else the order default, else no code at all. Two definitions of this is a fence that checks a
+  // different set of lines from the set that posts.
+  //
+  // Credit-note PRODUCT lines must apply the SAME per-line reverse-charge swap the original invoice did
+  // (audit H1), keyed on each sales line's own TaxRate.reverseCharge — or a refund of a reverse-charged
+  // sale posts under the standard code and the VAT return no longer balances. The fallback for a line
+  // with no mapped sales line (shipping, ad-hoc) is the order-level tax type WITHOUT the swap, mirroring
+  // exactly how the invoice posts its shipping/discount lines (shippingTaxType = orderDefaultTaxType, no
+  // swap): swapping there would post credit-note shipping under the reverse-charge code while the
+  // invoice posted it under the standard code — an asymmetry the VAT return would flag.
+  const creditNoteTaxTypeOf = creditNoteLineTaxTypeResolver({
+    orderLines: orderForCN?.lines ?? [],
+    reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
+    orderDefaultTaxType: cnTaxRate?.accountingTaxType ?? null,
+  })
 
   await queueAccountingSync({
     type: 'CREDIT_NOTE',
@@ -1965,9 +1951,7 @@ async function queueRefundAccountingActions(input: {
         // actually validated — instead of re-predicting it from the order default here, which mis-taxed
         // deactivated-rate/reverse-charge/mixed-rate refunds. Fall back to the old prediction only for
         // legacy rows with no snapshot (created before the column existed).
-        taxType: line.accountingTaxType
-          ?? (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined)
-          ?? fallbackCnTaxType,
+        taxType: creditNoteTaxTypeOf(line) ?? undefined,
       })),
       // Every stored refund line is NET (o3d-w00): the WooCommerce monetary-only refund — the one caller
       // that had a gross amount — is now netted at source, so this correctly grosses every line up.
@@ -2100,7 +2084,23 @@ export async function createRefund(
   lines: RefundRequestLine[],
   reason: string,
   returnWarehouseId?: string,
-  options?: { internalBypassToken?: symbol; externalRefundId?: number; chargeback?: boolean },
+  options?: {
+    internalBypassToken?: symbol
+    externalRefundId?: number
+    chargeback?: boolean
+    /**
+     * o3d-w00 (Codex r3 #2): cap each order line / the shipping charge at its own remaining balance,
+     * inside the refund transaction's order lock. Internal-only, like the other provenance-bearing
+     * options: it is set by the exception inbox's hand-recording path.
+     */
+    enforcePerTargetBalances?: boolean
+    /**
+     * o3d-w00 (Codex r4 #2): the accounting tax identity each target was CONVERTED at, to be re-checked
+     * against the identity the credit note will actually post under, inside the refund transaction's
+     * order lock. Internal-only and a pure TIGHTENING — it can only refuse a refund, never widen one.
+     */
+    expectedTaxIdentities?: RefundExpectedTaxIdentity[]
+  },
   // Two independent outcomes ride alongside `error`:
   //   `conflict`   (o3d-6oyu.18) — the refund transaction refused this credit note because the
   //                OTHER reversal path (WC refund webhook vs payment-poller chargeback) had
@@ -2128,6 +2128,10 @@ export async function createRefund(
     if (!isInternal && (options?.chargeback || options?.externalRefundId != null)) {
       return { success: false, error: 'chargeback and externalRefundId may only be set by internal sync callers' }
     }
+    // o3d-w00 (Codex r3 #2): the per-target cap is a TIGHTENING, so a forged `true` cannot over-refund —
+    // but a forged `false` from a public caller could turn it off for the hand-recording path, so it is
+    // read only from an internal caller.
+    const enforcePerTargetBalances = isInternal && options?.enforcePerTargetBalances === true
 
     const { getNumberingFormats } = await import('./company')
     const [numbering, accountingSettings] = await Promise.all([
@@ -2139,7 +2143,16 @@ export async function createRefund(
 
     const refundResult = await createSalesOrderRefund(db, {
       orderId,
-      lines,
+      // o3d-w00 (Codex r7 #1/#4): `chargedTaxForeign` is what the SOURCE OF THE REFUND states this line
+      // bore, and the writer's posted-VAT fence checks the posting identity against it INSTEAD of
+      // against the order's own snapshot — so a forged value from a public caller could wave a divergent
+      // credit note straight through. Like chargeback/externalRefundId it is provenance-bearing, and
+      // like them it is honoured only from the trusted internal entry points (the WooCommerce sync).
+      // Stripped rather than rejected: a public caller has no way to send it deliberately, and the
+      // refund itself is still perfectly recordable against the order's own figures.
+      lines: isInternal
+        ? lines
+        : lines.map((line) => ({ ...line, chargedTaxForeign: undefined })),
       reason,
       returnWarehouseId,
       externalRefundId: options?.externalRefundId,
@@ -2149,6 +2162,17 @@ export async function createRefund(
       // COGS + restock suppressed). Used by the payment-poller on a payment reversal.
       chargeback: options?.chargeback,
       activeAccountingConnector: (await getActiveAccountingConnectorInfo())?.id,
+      // o3d-w00 (Codex r8 #6): the posted-VAT fence is gated on a credit note ACTUALLY being posted,
+      // which is not the same as an accounting plugin being enabled — both connector queues no-op when
+      // the connector's sync is off or its CREDIT_NOTE type is set to `off`. Gating on plugin
+      // activation refused (and quarantined) refunds on stores that had deliberately turned
+      // credit-note posting off, over a ledger entry nobody was going to write.
+      creditNotePostingEnabled: await isAccountingSyncTypeEnabled('CREDIT_NOTE'),
+      enforcePerTargetBalances,
+      // o3d-w00 (Codex r4 #2): like enforcePerTargetBalances this is a tightening, but a forged EMPTY
+      // list from a public caller would switch the fence off for the hand-recording path, so it is read
+      // only from an internal caller.
+      expectedTaxIdentities: isInternal ? options?.expectedTaxIdentities : undefined,
     })
     if (!refundResult.success) return refundResult
 
@@ -2425,7 +2449,11 @@ export async function createRefund(
 export async function raiseChargebackForReversedOrder(
   orderId: string,
   options?: { internalBypassToken?: symbol },
-): Promise<{ raised: boolean; reason?: string; error?: string }> {
+  // o3d-w00 (Codex r8 #3): `manualResolutionRequired` distinguishes an error the next poll can clear
+  // (a Xero outage, an unjournaled shipment) from one it cannot — the posted-VAT fence refusing to
+  // unwind the invoice at a rate the order never charged, which stands until an admin fixes the tax
+  // configuration. The poller must not hold paidAt on the second kind.
+): Promise<{ raised: boolean; reason?: string; error?: string; manualResolutionRequired?: boolean }> {
   // SECURITY: this is a privileged path — it calls createRefund with
   // INTERNAL_ACTION_BYPASS, skipping the sales.refund permission. As an export of a
   // 'use server' module it is reachable as a Server Function via direct POST, so it
@@ -2518,33 +2546,54 @@ export async function raiseChargebackForReversedOrder(
   // discount combined with prior partial refunds makes the remaining discount basis
   // ambiguous. Safe-skip both edge cases to manual; otherwise pass the discount through
   // as its own mirrored line (in BASE currency = discountAmount / fxRateToBase).
+  //
+  // o3d-356o: WHICH discount the invoice actually posted is a property of the DOCUMENT, not of
+  // today's settings. `decideChargebackDiscountLine` reads the mirrored POSTED sales-invoice
+  // event and only falls back to the live-setting proxy for orders that have no such event.
   let discountInput: { totalBase: number } | undefined
   if (decimalToNumber(order.discountAmount) > 0) {
     const cbSettings = await getAccountingSettings().catch(() => null)
-    // The invoice only posts a separate discount line when a discount account is
-    // configured (otherwise it posted full goods, no discount line). Without one we
-    // can't mirror it — safe-skip to manual. (Prior-refund orders were already skipped.)
-    if (!cbSettings?.discountAccount) {
+    const postedDiscount = await readPostedSalesInvoiceDiscountForOrder(db.accountingEvent, orderId)
+    const decision = decideChargebackDiscountLine({
+      orderDiscountAmount: decimalToNumber(order.discountAmount),
+      configuredDiscountAccount: cbSettings?.discountAccount,
+      posted: postedDiscount,
+    })
+    if (decision.action === 'manual') {
       await logActivity({
         entityType: 'SALES_ORDER',
         entityId: orderId,
         action: 'chargeback_requires_manual_handling',
         tag: 'accounting',
         level: 'WARNING',
-        description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount but no discount account is configured — auto-chargeback skipped; raise the credit note manually.`,
+        description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount, but ${decision.reason} — auto-chargeback skipped; raise the credit note manually.`,
         resolveUser: false,
       })
-      return { raised: false, reason: 'order-level discount but no discount account — manual chargeback required' }
+      return { raised: false, reason: `order-level discount: ${decision.reason} — manual chargeback required` }
     }
-    // Convert to the NET (ex-VAT) basis the credit note posts on (lineAmountsIncludeTax
-    // is false). discountAmount is stored in the order's inclusive/exclusive convention,
-    // so strip VAT when the order is tax-inclusive, then to base currency.
-    const fxRate = decimalToNumber(order.fxRateToBase) || 1
-    const vatPct = decimalToNumber(order.taxRatePercent)
-    const discountForeignNet = order.pricesIncludeVat && vatPct > 0
-      ? decimalToNumber(order.discountAmount) / (1 + vatPct)
-      : decimalToNumber(order.discountAmount)
-    discountInput = { totalBase: discountForeignNet / fxRate }
+    if (decision.action === 'mirror-discount') {
+      // Convert to the NET (ex-VAT) basis the credit note posts on (lineAmountsIncludeTax
+      // is false). discountAmount is stored in the order's inclusive/exclusive convention,
+      // so strip VAT when the order is tax-inclusive, then to base currency.
+      const fxRate = decimalToNumber(order.fxRateToBase) || 1
+      const vatPct = decimalToNumber(order.taxRatePercent)
+      const discountForeignNet = order.pricesIncludeVat && vatPct > 0
+        ? decimalToNumber(order.discountAmount) / (1 + vatPct)
+        : decimalToNumber(order.discountAmount)
+      discountInput = { totalBase: discountForeignNet / fxRate }
+    } else {
+      // no-discount-line: the invoice charged the full goods value, so the credit note must
+      // reverse the full goods value. Mirroring a discount line here would under-credit by it.
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'chargeback_discount_line_omitted',
+        tag: 'accounting',
+        level: 'INFO',
+        description: `Chargeback for order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} omits the order-level discount line: ${decision.reason}.`,
+        resolveUser: false,
+      })
+    }
   }
 
   const lines = buildChargebackRefundLines({
@@ -2592,6 +2641,25 @@ export async function raiseChargebackForReversedOrder(
   // accountingRetryRequired flag still drives the refund-accounting retry sweep that
   // re-queues the failed credit note.
   if (result.warning) return { raised: false, error: result.warning }
+  // o3d-w00 (Codex r8 #3): the posted-VAT fence refused the reversal — deliberate, non-transient, and
+  // already recorded on the order by the activity log below. Say so, so the poller reconciles payment
+  // truth and alerts finance on the first failure instead of holding paidAt against a poll that can
+  // never succeed on its own.
+  if (result.quarantine) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'chargeback_requires_manual_handling',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} but the ` +
+        `revenue unwind was refused: ${result.error ?? ''} Raise the credit note manually, or restore the ` +
+        'tax mapping and re-run the payment poller.',
+      resolveUser: false,
+    })
+    return { raised: false, error: result.error, manualResolutionRequired: true }
+  }
   return { raised: result.success, error: result.error }
 }
 
@@ -2606,6 +2674,10 @@ export async function retryRefundAccounting(
       refundId,
       accountingSettings,
       activeAccountingConnector: (await getActiveAccountingConnectorInfo())?.id,
+      // o3d-w00 (Codex r8 #4): the retry is a route into a credit note in its own right, so it re-asks
+      // both questions — will one post at all, and is the identity each line snapshotted still worth
+      // the VAT the money bore — against the tax table as it stands now.
+      creditNotePostingEnabled: await isAccountingSyncTypeEnabled('CREDIT_NOTE'),
     })
     if (!result.success) {
       const auditContext = await loadRefundAuditContext(refundId)
@@ -2798,7 +2870,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
 
 export async function deleteSalesOrder(id: string): Promise<{ success: boolean; error?: string }> {
   try {
-    await requirePermission('sales.create')
+    const session = await requirePermission('sales.create')
 
     // o3d-5r8: read the guards, release the allocations and delete the row under ONE
     // order-row lock. A hard delete destroys the only IMS handle on anything a posting
@@ -2838,7 +2910,18 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
       })
       if (blocker) return { error: blocker.message }
 
-      const released = await releaseOrderAllocationsInTx(tx, id, { cause: 'deleting the sales order' })
+      // o3d-6zr2: the pending-shipment retirement record is written through the transaction client,
+      // which cannot resolve a session, so the acting user has to be handed down from the action
+      // boundary. Without it, a draft shipment (and its tracking number) retired by an operator's
+      // delete was attributed to nobody.
+      const released = await releaseOrderAllocationsInTx(tx, id, {
+        cause: 'deleting the sales order',
+        userId: session.user.id,
+        // o3d-0i5y r10: the order does not survive this transaction, so a reversal journal keyed to
+        // it would resolve to nothing. The teardown refuses a posted A2 debit here rather than
+        // orphaning the journal or stranding the debit — see releaseOrderAllocationsInTx.
+        orderIsBeingDeleted: true,
+      })
       await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
       await tx.salesOrder.delete({ where: { id } })
       return { so, released }
@@ -3010,9 +3093,26 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
     const numbering = await getNumberingFormats()
     const result = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, id)
-      const so = await tx.salesOrder.findUnique({ where: { id }, select: { externalOrderNumber: true, orderNumber: true, invoiceNumber: true } })
+      const so = await tx.salesOrder.findUnique({
+        where: { id },
+        select: {
+          externalOrderNumber: true,
+          orderNumber: true,
+          invoiceNumber: true,
+          shoppingLinks: { select: { connector: true } },
+        },
+      })
       if (!so) throw new Error('Order not found')
       if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: getSalesOrderReference({ id, ...so }) }
+      // o3d-k26m.1: for a storefront that supplies its own invoice number, this column is where
+      // that number is recorded — minting into it posts the order to the ledger under a number
+      // the customer's invoice does not carry, and blocks the backfill that would have captured
+      // the real one. Refuse rather than fill the gap. Returned as a plain refusal, not thrown:
+      // the on-shipped trigger calls this for every order and a WooCommerce order having no IMS
+      // number is the normal case, not a failure to log.
+      if (invoiceNumberIsExternallySupplied(so.shoppingLinks.map((l) => l.connector))) {
+        return { externallySupplied: true as const, orderNumber: getSalesOrderReference({ id, ...so }) }
+      }
       const invNum = await nextDocumentNumber(tx, {
         key: 'invoice',
         prefix: numbering.inv_prefix,
@@ -3020,6 +3120,12 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
       await tx.salesOrder.update({ where: { id }, data: { invoiceNumber: invNum, invoicedAt: new Date() } })
       return { invoiceNumber: invNum, orderNumber: getSalesOrderReference({ id, ...so }) }
     })
+    if ('externallySupplied' in result) {
+      return {
+        success: false,
+        error: `Order ${result.orderNumber} takes its invoice number from the storefront (WooCommerce PDF Invoices). IMS will not generate one — the number appears once WooCommerce has created the invoice.`,
+      }
+    }
     revalidatePath(`/sales/${id}`)
     if (!options?.skipLog) {
       await logActivity({
@@ -3064,298 +3170,6 @@ export type PaymentRow = {
   reference: string | null
   notes: string | null
   paidAt: string
-}
-
-/** The local Payment row an INVOICE_PAYMENT was queued for, when the payload records one. */
-function payloadPaymentId(payload: unknown): string | null {
-  const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
-  return typeof p.paymentId === 'string' ? p.paymentId : null
-}
-
-/**
- * Register a manually-recorded sales receipt against the ledger invoice (o3d-lgo.15).
- *
- * An IMPORTED paid order registers its payment through the SALES_INVOICE follow-up (`_registerPayment`).
- * A receipt entered in IMS had no such path: the Payment row was created, the order went green, and the
- * ledger was never told — so it went on showing the invoice fully outstanding, for ever. This closes
- * that, on the same principle as markBillPaid: an operator recording a payment against a posted document
- * is an instruction to settle it in the ledger too.
- *
- * GUARDED, because the ledger may already know. Every refusal below leaves the payment recorded and the
- * settlement verdict visibly unsettled, which is the safe end: an operator can register it by hand, and
- * a second payment in a ledger nobody is watching cannot be undone by looking at IMS.
- *
- * Never throws — failing to register must not fail the receipt the operator just recorded.
- */
-async function registerInvoicePaymentWithLedger(params: {
-  orderId: string
-  orderReference: string
-  paymentId: string
-  amount: number
-  currency: string
-  method: string | null
-  reference: string | null
-  paidAt: Date
-}): Promise<void> {
-  const warn = async (action: string, description: string, metadata: Record<string, unknown>) => {
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: params.orderId,
-      action,
-      tag: 'accounting',
-      level: 'WARNING',
-      description,
-      metadata: { orderNumber: params.orderReference, paymentId: params.paymentId, ...metadata },
-    }).catch(() => { /* logging must never block the receipt */ })
-  }
-
-  try {
-    const [paymentSyncEnabled, so, connector] = await Promise.all([
-      // Not merely "is the connector on": if INVOICE_PAYMENT posting is off, queueAccountingSync would
-      // drop this silently, so treat it as nothing being expected rather than as a failure to report.
-      isAccountingSyncTypeEnabled('INVOICE_PAYMENT').catch(() => false),
-      db.salesOrder.findUnique({
-        where: { id: params.orderId },
-        select: {
-          accountingInvoiceId: true, currency: true, totalForeign: true, taxForeign: true, pricesIncludeVat: true,
-          shoppingLinks: { select: { connector: true }, take: 1 },
-        },
-      }),
-      getActiveAccountingConnectorInfo().catch(() => null),
-    ])
-    if (!so) return
-
-    const existing = paymentSyncEnabled && so.accountingInvoiceId
-      ? await loadInvoicePaymentSyncRows(params.orderId, connector?.id ?? null)
-      : []
-
-    // o3d-0m56: a FAILED or CANCELLED attempt does NOT prove the ledger is clear — the call may have
-    // committed before its response was lost. Recording another receipt beside one queues a fresh row
-    // under a NEW token, which posts a second payment without ever touching the retry guard. So when
-    // there is such an attempt, ask the ledger what it holds; the decision refuses unless the answer
-    // positively rules that attempt out.
-    //
-    // Conditional on purpose: this is a network read, and the ordinary receipt has no history to check.
-    const probeConnector = connector?.id === 'xero' || connector?.id === 'quickbooks' ? connector.id : null
-    const ledgerSettlements = so.accountingInvoiceId
-      && probeConnector
-      && unresolvedInvoicePaymentAttempts(existing, params.paymentId).length > 0
-      ? await (async () => {
-        const probe = await probeLedgerSettlement(probeConnector, {
-          type: 'INVOICE_PAYMENT',
-          payload: { accountingInvoiceId: so.accountingInvoiceId },
-        })
-        // A probe that could not answer stays null, which the decision reads as "refuse".
-        return probe.ok ? probe.records : null
-      })()
-      : null
-
-    const decision = decideInvoicePaymentRegistration({
-      syncEnabled: paymentSyncEnabled,
-      accountingInvoiceId: so.accountingInvoiceId,
-      orderCurrency: so.currency,
-      paymentCurrency: params.currency,
-      paymentAmount: params.amount,
-      paymentId: params.paymentId,
-      bankAccountId: paymentSyncEnabled && so.accountingInvoiceId
-        ? lookupPaymentAccount(await getPaymentAccountMap(), params.method ?? '', params.currency)
-        : null,
-      existing,
-      ledgerSettlements,
-      ledgerTotal: ledgerSalesInvoiceTotalForeign({
-        totalForeign: Number(so.totalForeign),
-        taxForeign: Number(so.taxForeign),
-        pricesIncludeVat: so.pricesIncludeVat,
-        // Only an IMPORTED tax-inclusive invoice posts at NET (o3d-cyn). An order raised in IMS posts at
-        // gross, and measuring its gross receipt against a net total refused every ordinary VAT receipt.
-        importedFromShop: so.shoppingLinks.length > 0,
-      }),
-    })
-
-    if (!decision.register) {
-      const amount = `${params.currency} ${params.amount.toFixed(2)}`
-      const tail = `Register it in the accounting connector by hand if it is genuinely owed.`
-      switch (decision.refusal) {
-        // Nothing is expected to post at all, so there is nothing to report.
-        case 'SYNC_DISABLED':
-          return
-        // Not a settlement fault — a payment cannot attach to an invoice the ledger has never seen, and
-        // the DOCUMENT sync is what to chase. But nothing re-registers this receipt when the invoice
-        // finally does post either, so say so once here rather than leave it to reconciliation.
-        case 'DOCUMENT_NOT_POSTED':
-          await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but its invoice has not posted to the ` +
-            `accounting connector yet, so the payment could not be registered there. Register it once the ` +
-            `invoice syncs, or record it in the ledger by hand.`,
-            { amount: params.amount, currency: params.currency, refusal: decision.refusal })
-          return
-        // addPayment rejects a currency mismatch, so this only fires if the order currency changed
-        // underneath the receipt. Registering the wrong currency is worse than not registering.
-        case 'CURRENCY_MISMATCH':
-          await warn('invoice_payment_not_registered',
-            `Recorded a ${params.currency} payment against ${params.orderReference}, which is in ` +
-            `${so.currency}. The payment was NOT registered in the accounting connector — register it there by hand.`,
-            { amount: params.amount, currency: params.currency, orderCurrency: so.currency, refusal: decision.refusal })
-          return
-        case 'NO_BANK_ACCOUNT':
-          await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but no bank account is mapped for method ` +
-            `"${params.method ?? ''}" / currency "${params.currency}". Add a mapping in Settings → ` +
-            `Accounting → Payment Account Mapping, then register the payment there.`,
-            { amount: params.amount, currency: params.currency, method: params.method, refusal: decision.refusal })
-          return
-        case 'LEDGER_HAS_LIVE_PAYMENT':
-          await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but a payment for this order has already ` +
-            `been sent to the accounting connector` +
-            (decision.alreadyRegistered != null ? ` (${params.currency} ${decision.alreadyRegistered.toFixed(2)})` : '') +
-            `, and IMS tracks one registration per order. Registering this one too would pay the invoice ` +
-            `twice, so it was not sent. ${tail}`,
-            {
-              amount: params.amount, currency: params.currency, refusal: decision.refusal,
-              alreadyRegistered: decision.alreadyRegistered, ledgerTotal: decision.ledgerTotal,
-            })
-          return
-        // o3d-0m56. The receipt stays recorded and visibly unsettled; what must not happen is a
-        // second payment landing in the ledger beside one that may already be there.
-        case 'UNRESOLVED_PAYMENT_ATTEMPT':
-          await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but an earlier attempt to register a ` +
-            `payment for this order failed or was cancelled without IMS being able to confirm what ` +
-            `reached the accounting connector` +
-            (decision.detail ? ` (${decision.detail})` : '') +
-            `. Sending this one could pay the invoice twice, so it was not sent. Check the invoice in ` +
-            `the ledger, then ${tail.charAt(0).toLowerCase()}${tail.slice(1)}`,
-            {
-              amount: params.amount, currency: params.currency, refusal: decision.refusal,
-              detail: decision.detail, ledgerTotal: decision.ledgerTotal,
-            })
-          return
-        case 'WOULD_OVERPAY':
-          await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but the invoice the accounting connector ` +
-            `holds is for ${params.currency} ${(decision.ledgerTotal ?? 0).toFixed(2)} — it would refuse a ` +
-            `larger payment. Check the invoice in the ledger: on a tax-inclusive imported order it can be ` +
-            `posted NET of VAT. ${tail}`,
-            {
-              amount: params.amount, currency: params.currency, refusal: decision.refusal,
-              alreadyRegistered: decision.alreadyRegistered, ledgerTotal: decision.ledgerTotal,
-            })
-          return
-      }
-    }
-
-    // ENQUEUE UNDER THE ORDER LOCK, and only if the receipt is still there. The Payment row committed
-    // before this runs, and deletePayment cancels a queued registration by looking for one — so a delete
-    // landing in between saw nothing to cancel, and this then posted a payment to the ledger for a
-    // receipt IMS had already deleted, with no warning anywhere (Codex, PR #582 round 1).
-    //
-    // deletePayment takes the same per-order lock, so serialising on it closes the window in both
-    // directions: either we find the payment gone and do nothing, or we queue first and the delete finds
-    // our row and retracts it.
-    const outcome = await db.$transaction(async (tx) => {
-      await lockSalesOrder(tx, params.orderId)
-      const stillRecorded = await tx.payment.findUnique({ where: { id: params.paymentId }, select: { id: true } })
-      if (!stillRecorded) return { outcome: 'receipt-deleted' as const }
-
-      // o3d-0m56 (Codex round 2): the decision above was taken against a row snapshot AND a ledger
-      // reading that both predate this transaction. Between them, another registration can have been
-      // queued, or an earlier attempt can have become unresolved — and neither would be visible to a
-      // verdict computed minutes ago. So the SAME rule is re-run here, under this scope's lock, and
-      // only the answer reached inside the transaction may authorise the write.
-      //
-      // The ledger records are deliberately NOT re-read: that is a network call, and holding an
-      // accounting lock across one would let a slow remote block every payment enqueue in the system.
-      // What changes fast is the local row set, which is what this re-reads.
-      if (probeConnector) {
-        await lockFollowUpScope(tx, {
-          connector: probeConnector,
-          type: 'INVOICE_PAYMENT',
-          referenceType: 'SalesOrder',
-          referenceId: params.orderId,
-        })
-        const current = await loadInvoicePaymentSyncRows(params.orderId, probeConnector, tx)
-        // Only the ROW-SET rules are re-checked: the invoice total has not moved, and the size
-        // checks were already made against the real figures.
-        const blocker = invoicePaymentRowSetBlocker({
-          paymentId: params.paymentId,
-          existing: current,
-          ledgerSettlements,
-        })
-        if (blocker.blocked) {
-          return { outcome: 'context-changed-guard' as const, refusal: blocker.refusal, detail: blocker.detail }
-        }
-      }
-
-      const queued = await queueAccountingSyncTx(tx, {
-        type: 'INVOICE_PAYMENT',
-        referenceType: 'SalesOrder',
-        referenceId: params.orderId,
-        payload: {
-          accountingInvoiceId: so.accountingInvoiceId,
-          bankAccountId: decision.bankAccountId,
-          amount: params.amount,
-          currency: params.currency,
-          paymentDate: params.paidAt.toISOString().slice(0, 10),
-          method: params.method ?? '',
-          reference: params.reference ?? undefined,
-          // Which local receipt this is, so deletePayment can retract exactly this row rather than any
-          // row that happens to share its amount.
-          paymentId: params.paymentId,
-        },
-        // Exactly once per recorded receipt, however many times this runs.
-        idempotencyKey: `invoice-payment:payment:${params.paymentId}`,
-      })
-      return { outcome: queued ? ('queued' as const) : ('context-changed' as const) }
-    }, STOCK_TX_OPTIONS)
-
-    // queueAccountingSyncTx RE-READS the posting context and returns false when it has since changed —
-    // the connector switched off, or INVOICE_PAYMENT posting disabled, between the check above and the
-    // write. Ignoring that boolean left the receipt accepted locally with no sync row, no warning and
-    // nothing to retry: the silent loss this whole issue is about (Codex, PR #582 round 8).
-    if (outcome.outcome === 'context-changed-guard') {
-      await warn('invoice_payment_not_registered',
-        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but the ` +
-        `order's payment registrations changed while this one was being queued, so it was not sent — ` +
-        `sending it now could pay the invoice twice. Check the order's sync rows and the ledger, then ` +
-        `register it by hand if it is genuinely owed.`,
-        {
-          amount: params.amount, currency: params.currency,
-          refusal: outcome.outcome === 'context-changed-guard' ? outcome.refusal : 'REGISTRATION_CONTEXT_CHANGED',
-          detail: outcome.outcome === 'context-changed-guard' ? outcome.detail : undefined,
-        })
-      return
-    }
-    if (outcome.outcome === 'context-changed') {
-      await warn('invoice_payment_not_registered',
-        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but ` +
-        `accounting sync for payments was switched off while it was being queued, so nothing was sent. ` +
-        `Re-enable it and register the payment, or record it in the ledger by hand.`,
-        { amount: params.amount, currency: params.currency, refusal: 'POSTING_CONTEXT_CHANGED' })
-    }
-  } catch (e) {
-    // Same shape as markBillPaid's queue failure: the receipt is recorded in IMS with nothing queued to
-    // tell the ledger, so nothing will ever retry and there is no FAILED row to notice — the row was
-    // never written. That is the quietest way the two systems disagree, so it is recorded as an ERROR.
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: params.orderId,
-      action: 'invoice_payment_not_queued',
-      tag: 'accounting',
-      level: 'ERROR',
-      description:
-        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but the ` +
-        `payment could not be queued for the accounting connector — the ledger still shows the invoice ` +
-        `outstanding and nothing will retry. Re-queue it, or record the payment in the ledger by hand.`,
-      metadata: {
-        orderNumber: params.orderReference,
-        paymentId: params.paymentId,
-        amount: params.amount,
-        currency: params.currency,
-        error: e instanceof Error ? e.message : String(e),
-      },
-    }).catch(() => { /* logging must never block the receipt either */ })
-  }
 }
 
 export async function addPayment(input: {
@@ -3566,7 +3380,123 @@ export async function addPayment(input: {
   }
 }
 
-export async function deletePayment(paymentId: string, orderId: string): Promise<{ success: boolean; error?: string }> {
+/**
+ * o3d-1vuv: a refusal raised from INSIDE a payment transaction.
+ *
+ * IT MUST THROW, NOT RETURN. Returning from a Prisma interactive transaction COMMITS it — so a
+ * refusal that `return`s after the retirement updateMany has already run would leave those
+ * registrations CANCELLED while telling the operator nothing was changed: some of a receipt's
+ * ledger registrations retired, the receipt itself still there, and no record of the half-write.
+ * Throwing is what makes "nothing was changed" true, and the two callers translate it back into
+ * their own typed refusal at the boundary.
+ */
+class PaymentTransactionRefusal extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message)
+    this.name = 'PaymentTransactionRefusal'
+  }
+}
+
+/**
+ * The INVOICE_PAYMENT registrations that NAME this receipt.
+ *
+ * o3d-1vuv: the query deliberately admits a row in ANY status that carries a document id, not just
+ * the live ones. The remote call is made BEFORE the result is written back (o3d-ju8t), so a FAILED
+ * registration can sit in front of a real payment in the ledger — and post evidence outranks status
+ * everywhere else in this codebase, so it must here too.
+ *
+ * AND IT ADMITS FAILED ROWS THAT CARRY NO DOCUMENT ID. Those are the ones the previous version could
+ * not see, and not seeing them was the whole defect: the splitter classifies what it is given, so a
+ * status the query omits is silently classified as "no registration exists" — the permissive answer.
+ * The status list therefore comes from READABLE_REGISTRATION_STATUSES, alongside the classification
+ * it feeds, so the two cannot drift apart again.
+ *
+ * Matching is by the payload's own paymentId and never by amount: an imported paid order carries a
+ * perfectly legitimate INVOICE_PAYMENT with no local Payment row behind it, and a row that names no
+ * payment is nobody's to retract (Codex, PR #582 round 2).
+ */
+async function readPaymentRegistrations(
+  client: Pick<typeof db, 'accountingSyncLog'>,
+  orderId: string,
+  paymentId: string,
+): Promise<PaymentRegistrationRow[]> {
+  const rows = await client.accountingSyncLog.findMany({
+    where: {
+      type: PAYMENT_REGISTRATION_TYPE,
+      referenceType: 'SalesOrder',
+      referenceId: orderId,
+      OR: [
+        { status: { in: [...READABLE_REGISTRATION_STATUSES] } },
+        { externalTransactionId: { not: null } },
+      ],
+    },
+    select: { id: true, connector: true, status: true, externalTransactionId: true, payload: true },
+  })
+  return rows
+    .filter((row) => payloadPaymentId(row.payload) === paymentId)
+    .map(({ id, connector, status, externalTransactionId }) => ({ id, connector, status, externalTransactionId }))
+}
+
+/**
+ * Remove the Payment row and settle paidAt. ONE implementation, shared by the ordinary delete and by
+ * the verified ledger reversal, so the two cannot disagree about when an order stops being paid.
+ */
+async function removePaymentAndSettlePaidAt(
+  tx: Prisma.TransactionClient,
+  input: {
+    paymentId: string
+    orderId: string
+    refundId: string | null
+    currency: string
+    totalForeign: unknown
+    paidAt: Date | null
+  },
+): Promise<boolean> {
+  await tx.payment.delete({ where: { id: input.paymentId } })
+  if (input.refundId) return false
+  const remainingPayments = await tx.payment.findMany({
+    where: { orderId: input.orderId, refundId: null },
+    select: { amount: true, currency: true },
+  })
+  const totalPaid = remainingPayments.reduce((sum, p) => {
+    if (p.currency !== input.currency) return sum
+    return sum + Number(p.amount)
+  }, 0)
+  const stillFullyPaid = totalPaid >= Number(input.totalForeign) - 0.0001
+  // Only a genuine paid → not-paid transition is a mismatch. An order that was never fully paid
+  // (e.g. shipped on credit terms) isn't flagged just because a partial payment was removed.
+  const becameUnpaid = input.paidAt !== null && !stillFullyPaid
+  await tx.salesOrder.update({
+    where: { id: input.orderId },
+    data: { paidAt: stillFullyPaid ? undefined : null },
+  })
+  return becameUnpaid
+}
+
+export type DeletePaymentResult = { success: boolean; error?: string; code?: PaymentDeleteRefusalCode }
+
+/**
+ * Delete a locally-recorded receipt — and REFUSE while the accounting system still holds a payment
+ * for it (o3d-1vuv).
+ *
+ * WHAT CHANGED, AND WHY IT IS A REFUSAL RATHER THAN A LOUDER WARNING.
+ *
+ * This used to succeed whatever state the INVOICE_PAYMENT registration was in: it deleted the local
+ * Payment, cleared paidAt, and logged `payment_external_reversal_required` — a WARNING asking
+ * somebody to reverse the payment in the connector by hand. The ledger went on showing the invoice
+ * settled. PR #582 made that visible as LEDGER_UNMATCHED; visible is not resolved, and a wrong
+ * figure in a real ledger is worse than a refusal.
+ *
+ * THE REFUSAL HAS A REMEDY, which is the part that was missing: reverseLedgerPayment below, which
+ * confirms with the accounting system that the payment really is gone before removing anything here.
+ *
+ * THE CHECK MOVED INSIDE THE TRANSACTION, and that is not cosmetic. The registration read and the
+ * retirement used to happen AFTER the Payment was already deleted, so a worker claiming the queued
+ * row in that window left the receipt deleted and the payment posting — the previous code could only
+ * report that afterwards. Now the retirement is compare-and-swapped in the SAME transaction as the
+ * delete, so a claim in the window ABORTS the delete instead of stranding a posted payment.
+ */
+export async function deletePayment(paymentId: string, orderId: string): Promise<DeletePaymentResult> {
   try {
     await requirePermission('sales.refund')
     const txResult = await db.$transaction(async (tx) => {
@@ -3591,87 +3521,54 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
       if (!payment || payment.orderId !== orderId) {
         return { error: 'Payment not found for this order' }
       }
-      await tx.payment.delete({ where: { id: paymentId } })
-      let becameUnpaid = false
+
+      // A refund payment settles a CREDIT NOTE, not this invoice, and is registered by a different
+      // path — so it has no INVOICE_PAYMENT registration to hold it back.
       if (!payment.refundId) {
-        const remainingPayments = await tx.payment.findMany({
-          where: { orderId, refundId: null },
-          select: { amount: true, currency: true },
-        })
-        const totalPaid = remainingPayments.reduce((sum, p) => {
-          if (p.currency !== so.currency) return sum
-          return sum + Number(p.amount)
-        }, 0)
-        const stillFullyPaid = totalPaid >= Number(so.totalForeign) - 0.0001
-        // Only a genuine paid → not-paid transition is a mismatch. An order that
-        // was never fully paid (e.g. shipped on credit terms) isn't flagged just
-        // because a partial payment was removed.
-        becameUnpaid = so.paidAt !== null && !stillFullyPaid
-        await tx.salesOrder.update({
-          where: { id: orderId },
-          data: { paidAt: stillFullyPaid ? undefined : null },
-        })
+        const registrations = await readPaymentRegistrations(tx, orderId, paymentId)
+        const { retirable, ledgerHold, undecided } = splitPaymentRegistrations(registrations)
+        if (ledgerHold.length > 0) {
+          const refusal = describeLedgerHoldRefusal(ledgerHold, getSalesOrderReference(so))
+          throw new PaymentTransactionRefusal(refusal.code, refusal.message)
+        }
+        // AFTER the ledger hold, because a row that names a document is the more useful thing to
+        // report: it tells the operator which payment to go and look at. An undecided attempt names
+        // none, and refuses on its own account — a FAILED registration is not proof that nothing was
+        // posted, and this is the delete that used to go through on exactly that assumption.
+        if (undecided.length > 0) {
+          const refusal = describeAttemptUndecidedRefusal(undecided, getSalesOrderReference(so))
+          throw new PaymentTransactionRefusal(refusal.code, refusal.message)
+        }
+        if (retirable.length > 0) {
+          // CANCELLED rather than deleted, because that is the retirement the processor already
+          // understands — it re-reads the live status after claiming and treats CANCELLED as an
+          // intentional no-op — and it leaves the audit trail intact.
+          const retired = await tx.accountingSyncLog.updateMany({
+            where: { id: { in: retirable.map((row) => row.id) }, status: { in: [...RETIRABLE_REGISTRATION_STATUSES] } },
+            data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.' },
+          })
+          // A row that did NOT transition was claimed by a worker between the read and this write, so
+          // it may be posting right now. Abort — the whole transaction rolls back and the receipt
+          // stays. This is the window the old post-transaction retirement could only report on.
+          if (retired.count !== retirable.length) {
+            // THROWN, so the rows that DID transition roll back with it. Returning here would commit
+            // a partial retirement under a message that says nothing was changed.
+            throw new PaymentTransactionRefusal(REGISTRATION_IN_FLIGHT_REFUSAL.code, REGISTRATION_IN_FLIGHT_REFUSAL.message)
+          }
+        }
       }
-      return { so, becameUnpaid, payment: { refundId: payment.refundId, amount: Number(payment.amount), currency: payment.currency } }
+
+      const becameUnpaid = await removePaymentAndSettlePaidAt(tx, {
+        paymentId,
+        orderId,
+        refundId: payment.refundId,
+        currency: so.currency,
+        totalForeign: so.totalForeign,
+        paidAt: so.paidAt,
+      })
+      return { so, becameUnpaid }
     }, STOCK_TX_OPTIONS)
     if ('error' in txResult) return { success: false, error: txResult.error }
-    if (!txResult.payment.refundId) {
-      const paymentLogs = await db.accountingSyncLog.findMany({
-        where: {
-          type: 'INVOICE_PAYMENT',
-          referenceType: 'SalesOrder',
-          referenceId: orderId,
-          status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
-        },
-        select: { id: true, status: true, payload: true },
-      })
-      // ONLY the row that NAMES this payment. Matching by amount instead used to retract whichever
-      // registration happened to be for the same figure — and an imported paid order carries a perfectly
-      // legitimate INVOICE_PAYMENT with no local Payment row behind it, so recording and then deleting an
-      // equal receipt would delete the imported order's own registration, or raise a false "reverse this
-      // in the ledger" warning about a payment that had nothing to do with the deletion (Codex, PR #582
-      // round 2). A row that names no payment is nobody's to retract.
-      const matchingLogs = paymentLogs.filter((log) => payloadPaymentId(log.payload) === paymentId)
-      // RETIRE the queued registration, guarded on the status we read — do not delete it blind. A worker
-      // can claim the row between the read above and this write, and deleting it then erased the only
-      // record of a payment the worker went on to post: the ledger kept the money, IMS kept nothing, not
-      // even the warning below (Codex, PR #582 round 3).
-      //
-      // CANCELLED rather than deleted, because that is the retirement the processor already understands —
-      // it re-reads the live status after claiming and treats CANCELLED as an intentional no-op — and it
-      // leaves the audit trail intact. The verdict reads a CANCELLED row as holding nothing, so an order
-      // whose only receipt was deleted goes back to plainly unpaid.
-      const pendingIds = matchingLogs.filter((log) => log.status === 'PENDING').map((log) => log.id)
-      let claimedUnderUs: string[] = []
-      if (pendingIds.length > 0) {
-        await db.accountingSyncLog.updateMany({
-          where: { id: { in: pendingIds }, status: 'PENDING' },
-          data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.' },
-        })
-        // Whichever ids did NOT transition were taken by a worker first, so they belong with the rows
-        // that need reversing in the ledger rather than being silently forgotten.
-        const survivors = await db.accountingSyncLog.findMany({
-          where: { id: { in: pendingIds }, status: { in: ['PROCESSING', 'SYNCED'] } },
-          select: { id: true },
-        })
-        claimedUnderUs = survivors.map((row) => row.id)
-      }
-      const externalLogs = [
-        ...matchingLogs.filter((log) => log.status === 'PROCESSING' || log.status === 'SYNCED'),
-        ...claimedUnderUs.map((id) => ({ id })),
-      ]
-      if (externalLogs.length > 0) {
-        await logActivity({
-          entityType: 'SALES_ORDER',
-          entityId: orderId,
-          action: 'payment_external_reversal_required',
-          tag: 'accounting',
-          level: 'WARNING',
-          description: `Deleted local payment for ${getSalesOrderReference(txResult.so)} after payment sync had already started; reverse the payment in the accounting connector if required.`,
-          metadata: { orderNumber: getSalesOrderReference(txResult.so), paymentId, accountingSyncLogIds: externalLogs.map((log) => log.id) },
-        })
-      }
-    }
     revalidatePath(`/sales/${orderId}`)
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -3698,6 +3595,10 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
     }
     return { success: true }
   } catch (e) {
+    // A refusal is a decision, not a fault: it must not be logged as an ERROR and must keep its code.
+    if (e instanceof PaymentTransactionRefusal) {
+      return { success: false, error: e.message, code: e.code as PaymentDeleteRefusalCode }
+    }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
@@ -3708,6 +3609,465 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
       metadata: null,
     })
     return { success: false, error: String(e) }
+  }
+}
+
+export type ReverseLedgerPaymentResult =
+  | { success: true }
+  | { success: false; error: string; code: LedgerReversalRefusalCode }
+  | FreshAuthFailureResult
+
+/**
+ * o3d-1vuv — THE REVERSAL PATH the warning used to stand in for.
+ *
+ * WHAT THE OPERATOR DOES, AND WHAT THIS ASSERTS ON THEIR BEHALF: nothing. They reverse the payment
+ * in the accounting system — where the authority over that ledger lives, and where the reversal may
+ * need a date, an unallocation or a bank-rec decision IMS has no business making — and then ask IMS
+ * to let the local receipt go. IMS does NOT take their word for it. It ASKS XERO whether that
+ * payment is really gone, and refuses BY NAME when the answer is anything but DELETED.
+ *
+ * WHY VERIFICATION IS NOT OPTIONAL HERE, unlike the operator assertions elsewhere in this codebase.
+ * settlementStatus reads a PENDING/PROCESSING/SYNCED registration as "the ledger holds a payment"
+ * and CANCELLED as holding nothing. Retiring the row on an unchecked claim would turn a real
+ * LEDGER_UNMATCHED discrepancy into a plain, undiscrepant UNPAID — it would delete the ALARM rather
+ * than the cause, and a mistaken claim would then never be contradicted by anything. An assertion is
+ * only acceptable where the fact cannot be computed, and this one can: the row already carries the
+ * Xero PaymentID, and one GET settles it.
+ *
+ * WHAT IS DELIBERATELY NOT BUILT HERE. IMS does not perform the reversal itself (the issue's option
+ * 2). That is a WRITE to the ledger and belongs with the connector's own posting machinery in
+ * lib/connectors/xero/sync-processor.ts and lib/domain/accounting/payment-reversal.ts — both of
+ * which branch o3d-batch-payidx is rewriting — so building it here would collide with that work
+ * rather than complement it. This is the read-only half, which needs none of it and is complete on
+ * its own: the operator can always finish the job, and IMS never destroys local state on an
+ * unchecked claim.
+ *
+ * `assertedPaymentReference` — THE UNDECIDED ATTEMPT'S WAY OUT (Codex round 2, finding 3).
+ *
+ * A FAILED registration naming no document refuses the delete, and round 1 offered the operator two
+ * branches: retry it, or "if a payment IS there, reverse it and delete this receipt". The second
+ * branch was a circle. Reversing a payment in Xero changes nothing about a row that names no
+ * document, so the delete refused again, with the same words, and there was nowhere else to go.
+ *
+ * The missing fact is small and the operator is holding it: WHICH payment. So they may name it, and
+ * naming it settles nothing on its own — IMS asks Xero about that payment AND about the invoice it
+ * claims to be on, and requires FIVE things of the answers before any local row is touched: the
+ * payment is on THIS order's ledger invoice; that invoice is denominated in THIS receipt's currency,
+ * so the figures on either side are quantities of the same money; it is for THIS receipt's amount,
+ * exactly; it is DELETED; and no payment for that same amount is STILL STANDING on the invoice. A
+ * mistyped reference, a payment from another invoice, an invoice in another currency, a payment that
+ * is still standing, a second payment of the same value: each refused by its own name. The operator
+ * supplies the question; the ledger still supplies the answer. Exactly the division
+ * `recoverRefundSyncPark` draws in app/actions/sync-exceptions.ts, and the opposite of accepting
+ * "I reversed it".
+ */
+export async function reverseLedgerPayment(
+  paymentId: string,
+  orderId: string,
+  assertedPaymentReference?: string,
+): Promise<ReverseLedgerPaymentResult> {
+  try {
+    // FRESH permission, unlike deletePayment's plain one. Deleting a receipt the ledger does not hold
+    // is an ordinary correction; retiring a registration for a document that DID post is a statement
+    // about a ledger, so it takes a session re-verified in the last 15 minutes.
+    const session = await requireFreshPermission('sales.refund')
+
+    const asserted = normalizeAssertedPaymentReference(assertedPaymentReference)
+
+    const payment = await db.payment.findUnique({
+      where: { id: paymentId },
+      // `currency` because `amount` is denominated in it: an amount without its unit cannot be
+      // compared with anything the ledger says, and comparing it anyway is Codex round 5's finding.
+      select: { orderId: true, refundId: true, amount: true, currency: true },
+    })
+    if (!payment || payment.orderId !== orderId) {
+      return { success: false, code: 'payment_missing', error: 'That receipt no longer exists on this order, so nothing was changed.' }
+    }
+    if (payment.refundId) {
+      return { success: false, code: NO_LEDGER_HOLD_REFUSAL.code, error: NO_LEDGER_HOLD_REFUSAL.message }
+    }
+    const orderForReference = await db.salesOrder.findUnique({
+      where: { id: orderId },
+      select: { id: true, orderNumber: true, externalOrderNumber: true, accountingInvoiceId: true },
+    })
+    if (!orderForReference) {
+      return { success: false, code: 'payment_missing', error: 'That order no longer exists, so nothing was changed.' }
+    }
+
+    const registrations = await readPaymentRegistrations(db, orderId, paymentId)
+    const { retirable, ledgerHold, undecided } = splitPaymentRegistrations(registrations)
+    // BEFORE the empty-hold check, and that order is the point. An undecided attempt puts nothing in
+    // `ledgerHold`, so checking emptiness first would answer "the accounting system does not hold a
+    // payment for this receipt" — a confident statement of exactly the fact nobody knows — and send
+    // the operator back to the ordinary delete, which now refuses. Two contradictory answers to one
+    // question is worse than either of them.
+    //
+    // What CAN resolve it is a payment reference the operator read off the invoice. Without one there
+    // is still nothing to look up, so the refusal stands exactly as before.
+    const assertedUndecided: PaymentRegistrationRow[] = []
+    if (undecided.length > 0) {
+      if (!asserted) {
+        return { success: false, code: UNDECIDED_ATTEMPT_REVERSAL_REFUSAL.code, error: UNDECIDED_ATTEMPT_REVERSAL_REFUSAL.message }
+      }
+      // ONE reference cannot speak for two attempts, and guessing which it belongs to would retire a
+      // row on evidence about a different one.
+      if (undecided.length > 1) {
+        return { success: false, code: UNDECIDED_ATTEMPTS_AMBIGUOUS_REFUSAL.code, error: UNDECIDED_ATTEMPTS_AMBIGUOUS_REFUSAL.message }
+      }
+      assertedUndecided.push(...undecided)
+    }
+    if (ledgerHold.length === 0 && assertedUndecided.length === 0) {
+      return { success: false, code: NO_LEDGER_HOLD_REFUSAL.code, error: NO_LEDGER_HOLD_REFUSAL.message }
+    }
+    const unsupported = [...ledgerHold, ...assertedUndecided].find((row) => !(VERIFIABLE_REVERSAL_CONNECTORS as readonly string[]).includes(row.connector))
+    if (unsupported) {
+      const refusal = refuseUnverifiableConnector(unsupported.connector)
+      return { success: false, code: refusal.code, error: refusal.message }
+    }
+    // A claimed registration with no document id yet: IMS asked the ledger to take this payment and
+    // has not learned what happened. There is nothing to look up, so there is nothing to confirm.
+    if (ledgerHold.some((row) => !hasPostEvidence(row))) {
+      return { success: false, code: UNVERIFIABLE_IN_FLIGHT_REFUSAL.code, error: UNVERIFIABLE_IN_FLIGHT_REFUSAL.message }
+    }
+
+    // ASK THE LEDGER. Outside any transaction — a network call inside one holds row locks for the
+    // duration of somebody else's outage.
+    for (const row of ledgerHold) {
+      const externalId = (row.externalTransactionId ?? '').trim()
+      const response = await xeroGet<{ Payments?: Array<{ PaymentID?: string; Status?: string }> }>(
+        `Payments/${encodeURIComponent(externalId)}`,
+      )
+      if (!response.ok) {
+        const refusal = refuseLedgerLookupFailure(externalId, response.error)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      const ledgerStatus = response.data?.Payments?.[0]?.Status
+      if (!isReversedInLedger(ledgerStatus)) {
+        const refusal = refuseLedgerStillHolds(externalId, ledgerStatus ?? 'unknown')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+    }
+
+    // AND ASK ABOUT THE PAYMENT THE OPERATOR NAMED. Same GET, a heavier burden of proof: the rows
+    // above were checked against a document id IMS WROTE DOWN ITSELF when the ledger returned it,
+    // and this one is checked against a reference a human typed. So the answer has to establish that
+    // the payment is the right one before it can establish that it is gone — anything less and the
+    // remedy becomes a way to delete a receipt by naming any deleted payment in the tenant.
+    const assertedReference = assertedUndecided.length > 0 ? asserted : null
+    if (assertedReference) {
+      const orderReference = getSalesOrderReference(orderForReference)
+      // WITHOUT A LEDGER INVOICE THERE IS NOTHING TO ATTRIBUTE THE PAYMENT TO. Refused rather than
+      // waved through: "it is deleted" is not evidence about THIS receipt unless it was on THIS
+      // document, and an unposted invoice cannot have carried it.
+      if (!orderForReference.accountingInvoiceId) {
+        const refusal = refuseAssertedPaymentUnattributable(orderReference)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      const ledgerInvoiceId = orderForReference.accountingInvoiceId
+      const response = await xeroGet<{
+        Payments?: Array<{ PaymentID?: string; Status?: string; Amount?: number; Invoice?: { InvoiceID?: string; CurrencyCode?: string } }>
+      }>(`Payments/${encodeURIComponent(assertedReference)}`)
+      if (!response.ok) {
+        const refusal = refuseLedgerLookupFailure(assertedReference, response.error)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      const found = response.data?.Payments?.[0]
+      if (!found) {
+        const refusal = refuseLedgerLookupFailure(assertedReference, 'the accounting system returned no payment with that reference')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      // FACT ONE: it is on this order's invoice.
+      const invoiceId = found.Invoice?.InvoiceID ?? null
+      if (!sameLedgerIdentifier(invoiceId, orderForReference.accountingInvoiceId)) {
+        const refusal = refuseAssertedPaymentNotOnInvoice(assertedReference, orderReference, invoiceId)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+
+      // WHAT IMS ITSELF HOLDS, read before the ledger is troubled a second time. Both are facts about
+      // the local receipt, both can be unreadable, and neither is a question for Xero — so a receipt
+      // IMS cannot state the currency or the amount of refuses here, with the invoice never asked.
+      const receiptCurrency = canonicalCurrencyCode(payment.currency)
+      if (receiptCurrency === null) {
+        const refusal = refuseLedgerLookupFailure(assertedReference, 'IMS cannot read this receipt\'s own currency, so no ledger amount can be matched to it')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      const receiptAmount = canonicalLedgerAmount(payment.amount)
+      if (receiptAmount === null) {
+        const refusal = refuseLedgerLookupFailure(assertedReference, 'IMS cannot read this receipt\'s own amount as a plain decimal, so no payment can be matched to it')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+
+      // THE INVOICE ITSELF, read once and used for the two facts that need it: WHAT UNIT this money is
+      // in, and WHAT IS STILL STANDING on the document. Read BEFORE any number is compared — round 4
+      // compared amounts first and asked the invoice afterwards, which meant the only comparison on the
+      // path ran before anything had established that the two sides were even denominated alike.
+      //
+      // ONE EXTRA REQUEST, on the asserted path only. The rows IMS wrote document ids for never come
+      // through here: their id was recorded by the processor from Xero's own response, so there is
+      // nothing to disambiguate. This is the price of accepting an id a human typed.
+      const invoiceResponse = await xeroGet<{
+        Invoices?: Array<{ InvoiceID?: string; CurrencyCode?: string; Payments?: Array<{ PaymentID?: string; Amount?: number }> }>
+      }>(`Invoices/${encodeURIComponent(ledgerInvoiceId)}`)
+      if (!invoiceResponse.ok) {
+        const refusal = refuseLedgerLookupFailure(ledgerInvoiceId, invoiceResponse.error)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      const ledgerInvoice = invoiceResponse.data?.Invoices?.[0]
+      const standingPayments = ledgerInvoice?.Payments
+      // An invoice with nothing on it answers with an EMPTY LIST; a response with no list at all is a
+      // question unanswered, and is refused rather than read as "nothing is standing there".
+      if (!ledgerInvoice || !Array.isArray(standingPayments)) {
+        const refusal = refuseLedgerLookupFailure(
+          ledgerInvoiceId,
+          'the accounting system did not list the payments standing on that invoice, so IMS cannot tell whether one for this receipt\'s amount is still on it',
+        )
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+
+      // FACT TWO: EVERY AMOUNT BELOW IS IN THE SAME UNIT AS THIS RECEIPT.
+      //
+      // Codex round 5's second finding, and the branch's own flag from round 4: comparing two decimal
+      // strings says nothing about whether they are the same MONEY. 100 GBP and 100 EUR are the same
+      // number. A Xero payment carries no currency of its own — it is denominated in ITS INVOICE'S
+      // currency, which is why the invoice is the thing asked — and `payments.amount` is denominated
+      // in `payments.currency`. When those two disagree, the exact comparison below is comparing
+      // quantities of different things, and the standing-payment fact after it is doing the same.
+      //
+      // Refused rather than converted. IMS has an FX rate and could turn one into the other, but a
+      // converted amount is an ESTIMATE, and an estimate is exactly what an exact comparison was
+      // introduced to eliminate. A receipt whose currency does not match its invoice is a defect in
+      // one of the two records, and the remedy is to correct it, not to reconcile around it.
+      const invoiceCurrency = canonicalCurrencyCode(ledgerInvoice.CurrencyCode)
+      if (invoiceCurrency === null) {
+        const refusal = refuseLedgerLookupFailure(
+          ledgerInvoiceId,
+          'the accounting system did not say what currency that invoice is in, so IMS cannot tell whether the payment on it is in this receipt\'s currency',
+        )
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      if (invoiceCurrency !== receiptCurrency) {
+        const refusal = refuseAssertedPaymentCurrencyMismatch(assertedReference, orderReference, invoiceCurrency, receiptCurrency)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      // AND THE PAYMENT'S OWN ACCOUNT OF ITS INVOICE, where the response gives one. It is the same
+      // document, so it can only agree; a ledger that contradicts itself about the denomination of
+      // this money is not a basis for deleting a receipt either. Absent, it is simply not asked — a
+      // nested object that omits the field states nothing, and treating silence as disagreement would
+      // make the whole remedy unreachable.
+      const paymentInvoiceCurrency = canonicalCurrencyCode(found.Invoice?.CurrencyCode)
+      if (paymentInvoiceCurrency !== null && paymentInvoiceCurrency !== receiptCurrency) {
+        const refusal = refuseAssertedPaymentCurrencyMismatch(assertedReference, orderReference, paymentInvoiceCurrency, receiptCurrency)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+
+      // FACT THREE: it is for this receipt's amount — EXACTLY, and not within a tolerance.
+      //
+      // A tolerance was Codex round 3's second finding and it deserved it: `|ledger - receipt| <= 0.005`
+      // admits a payment that is not even the same value, on the one path whose output deletes a
+      // receipt. Both sides are reduced to canonical decimal text instead, so `100`, `100.00` and the
+      // stored `Decimal(18, 4)` compare equal while `100.005` does not, and an amount neither side can
+      // state as a plain decimal is refused rather than coerced into a comparison.
+      //
+      // AND THE AMOUNT IS A FILTER, NOT AN IDENTIFIER. Equality here only rules candidates OUT; FACT
+      // FIVE is what stops a DIFFERENT payment of the same value from standing in for this receipt's.
+      const ledgerAmount = canonicalLedgerAmount(found.Amount)
+      if (ledgerAmount === null) {
+        const refusal = refuseLedgerLookupFailure(assertedReference, 'the accounting system reported no amount for that payment, so it cannot be matched to this receipt')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      if (ledgerAmount !== receiptAmount) {
+        const refusal = refuseAssertedPaymentAmountMismatch(assertedReference, ledgerAmount, receiptAmount)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      // FACT FOUR: it really is gone — the same test the checkable rows face, and the reason this is
+      // a verification rather than an acceptance of "I have reversed it".
+      if (!isReversedInLedger(found.Status)) {
+        const refusal = refuseLedgerStillHolds(assertedReference, found.Status ?? 'unknown')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+
+      // FACT FIVE: NOTHING THIS PAYMENT COULD BE CONFUSED WITH IS STILL STANDING ON THE INVOICE.
+      //
+      // Facts one to four are all satisfied by ANY deleted payment of this value on this invoice —
+      // including one that has nothing to do with this receipt. The case that costs money is exactly
+      // one shape: this receipt's own payment is STILL on the invoice, the operator names a different
+      // deleted payment of the same value, and IMS retires the registration and deletes the receipt
+      // while the ledger goes on showing the invoice settled. Nothing local is then left to contradict
+      // it, which is the state o3d-1vuv exists to make unreachable.
+      //
+      // That shape is visible from the invoice, so the invoice was asked. Any standing payment for this
+      // receipt's amount refuses — IMS cannot tell which of the two the reference describes, and the
+      // amount is the only thing it had to tell them apart with. Those amounts are in the invoice's
+      // currency, which FACT TWO has already required to be this receipt's, so the comparison is
+      // between two quantities of the same money.
+      for (const standing of standingPayments) {
+        const standingId = typeof standing?.PaymentID === 'string' ? standing.PaymentID : ''
+        // The named payment itself, still listed as standing on the invoice. It contradicts the
+        // DELETED status read moments ago, and the contradiction is resolved in the ledger's favour:
+        // reported by the same name as any other payment the ledger still holds.
+        if (sameLedgerIdentifier(standingId, assertedReference)) {
+          const refusal = refuseLedgerStillHolds(assertedReference, 'still listed on that invoice')
+          return { success: false, code: refusal.code, error: refusal.message }
+        }
+        const standingAmount = canonicalLedgerAmount(standing?.Amount)
+        if (standingAmount === null) {
+          const refusal = refuseLedgerLookupFailure(
+            ledgerInvoiceId,
+            `a payment still on that invoice${standingId ? ` (${standingId})` : ''} carries no readable amount, so IMS cannot rule out that it is the one this receipt created`,
+          )
+          return { success: false, code: refusal.code, error: refusal.message }
+        }
+        if (standingAmount === receiptAmount) {
+          const refusal = refuseAssertedPaymentStillOnInvoice(assertedReference, orderReference, standingId, receiptAmount)
+          return { success: false, code: refusal.code, error: refusal.message }
+        }
+      }
+    }
+
+    const now = new Date()
+    const note = ledgerReversalNote(ledgerHold.map((row) => row.externalTransactionId ?? ''), now)
+
+    const outcome = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      const so = await tx.salesOrder.findUnique({
+        where: { id: orderId },
+        select: { id: true, orderNumber: true, externalOrderNumber: true, currency: true, totalForeign: true, status: true, paidAt: true },
+      })
+      if (!so) throw new PaymentTransactionRefusal('payment_missing', 'Order not found')
+      const stillRecorded = await tx.payment.findUnique({ where: { id: paymentId }, select: { orderId: true } })
+      if (!stillRecorded || stillRecorded.orderId !== orderId) {
+        throw new PaymentTransactionRefusal('payment_missing', 'That receipt no longer exists on this order, so nothing was changed.')
+      }
+
+      // THE FENCE'S OTHER HALF: a registration that APPEARED since the check. The per-row
+      // compare-and-swap below can only fence rows this call already knows about, and the Xero GETs
+      // above take as long as Xero takes — long enough for the processor to claim a queued sibling,
+      // post it and record a failure with no document id. Deleting the receipt on top of that is the
+      // same defect as before, arrived at through a race instead of a misclassification. Re-read
+      // under the order lock and abandon if the answer has changed shape.
+      //
+      // "ACCOUNTED FOR" IS NOT "NONE". The asserted row is itself undecided and is expected to be
+      // here; what must not have appeared is an undecided attempt this call never checked with the
+      // ledger. Comparing by ID rather than by count, because a row that vanished and a row that
+      // arrived can leave the count unchanged.
+      const accountedFor = new Set(assertedUndecided.map((row) => row.id))
+      const freshUndecided = splitPaymentRegistrations(await readPaymentRegistrations(tx, orderId, paymentId)).undecided
+      if (freshUndecided.some((row) => !accountedFor.has(row.id))) {
+        throw new PaymentTransactionRefusal(HOLD_MOVED_REFUSAL.code, HOLD_MOVED_REFUSAL.message)
+      }
+
+      // THE FENCE. Each row is compare-and-swapped on the EXACT status and document id that was
+      // checked against the ledger. A row that has since been retried, re-posted or resolved carries
+      // a different one, and a conclusion drawn about the payment that was there must not land on a
+      // payment that is there now.
+      for (const row of ledgerHold) {
+        const moved = await tx.accountingSyncLog.updateMany({
+          where: {
+            id: row.id,
+            // The domain type carries `status` as a plain string so the decision module stays free of
+            // generated Prisma enums; it can only ever hold a value read off this same column.
+            status: row.status as Prisma.AccountingSyncLogWhereInput['status'],
+            externalTransactionId: row.externalTransactionId,
+          },
+          data: buildVerifiedReversalData(note),
+        })
+        // THROWN, so any row retired earlier in this loop rolls back with it. A `return` would commit
+        // a partial retirement while reporting that nothing changed.
+        if (moved.count !== 1) throw new PaymentTransactionRefusal(HOLD_MOVED_REFUSAL.code, HOLD_MOVED_REFUSAL.message)
+      }
+      // THE ASSERTED ROW, fenced the same way and on the ABSENCE of a document id as well as on the
+      // status. A retry that posted while Xero was being asked writes an id onto this row, and that
+      // id is a payment nobody has checked — the compare-and-swap misses, the whole thing rolls back,
+      // and the operator is told to look again rather than told the ledger is clear.
+      for (const row of assertedUndecided) {
+        const reference = assertedReference as string
+        const decided = await tx.accountingSyncLog.updateMany({
+          where: {
+            id: row.id,
+            status: row.status as Prisma.AccountingSyncLogWhereInput['status'],
+            externalTransactionId: null,
+          },
+          data: buildAssertedReversalData(
+            reference,
+            assertedReversalNote(reference, orderForReference.accountingInvoiceId ?? '', now),
+          ),
+        })
+        if (decided.count !== 1) throw new PaymentTransactionRefusal(HOLD_MOVED_REFUSAL.code, HOLD_MOVED_REFUSAL.message)
+      }
+      if (retirable.length > 0) {
+        const retired = await tx.accountingSyncLog.updateMany({
+          where: { id: { in: retirable.map((row) => row.id) }, status: { in: [...RETIRABLE_REGISTRATION_STATUSES] } },
+          data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.' },
+        })
+        if (retired.count !== retirable.length) {
+          // A queued sibling registration was claimed while this was being recorded. Reported as
+          // hold_moved rather than as a delete refusal: from here the remedy is the same — reload and
+          // look again — and the rows already retired roll back with the throw.
+          throw new PaymentTransactionRefusal('hold_moved', REGISTRATION_IN_FLIGHT_REFUSAL.message)
+        }
+      }
+
+      const becameUnpaid = await removePaymentAndSettlePaidAt(tx, {
+        paymentId,
+        orderId,
+        refundId: null,
+        currency: so.currency,
+        totalForeign: so.totalForeign,
+        paidAt: so.paidAt,
+      })
+      return { so, becameUnpaid }
+    }, STOCK_TX_OPTIONS)
+
+    revalidatePath(`/sales/${orderId}`)
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'payment_ledger_reversal_confirmed',
+      tag: 'accounting',
+      // WARNING, not INFO: a payment that reached a real ledger has been undone, and the row that
+      // proved it is now CANCELLED. It belongs in the level-filtered accounting views.
+      level: 'WARNING',
+      description:
+        `Deleted the receipt on ${getSalesOrderReference(outcome.so)} after confirming with the accounting `
+        + `system that its payment was reversed there (${[...ledgerHold.map((row) => row.externalTransactionId), ...(assertedReference ? [`${assertedReference} — identified by the operator`] : [])].join(', ')})`,
+      metadata: {
+        orderNumber: getSalesOrderReference(outcome.so),
+        paymentId,
+        // Both ends: which rows were retired, and the document ids the ledger was asked about. The
+        // ids stay on the rows too — a CANCELLED row that still names a document is a complete
+        // account of a payment that existed and was undone.
+        accountingSyncLogIds: [...ledgerHold.map((row) => row.id), ...assertedUndecided.map((row) => row.id)],
+        externalTransactionIds: ledgerHold.map((row) => row.externalTransactionId),
+        priorStatuses: [...ledgerHold.map((row) => row.status), ...assertedUndecided.map((row) => row.status)],
+        // WHOSE FACT IT WAS. A reference IMS read back off its own registration and one a human typed
+        // are different kinds of evidence, and an audit trail that cannot tell them apart cannot
+        // answer "who said this payment was the right one" a year later.
+        assertedPaymentReference: assertedReference,
+        assertedUndecidedLogIds: assertedUndecided.map((row) => row.id),
+        ledgerInvoiceId: assertedReference ? orderForReference.accountingInvoiceId : undefined,
+        verifiedAt: now.toISOString(),
+        userId: session.user.id,
+      },
+    })
+    if (isPaymentStatusMismatch(outcome.so.status, outcome.becameUnpaid)) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'payment_status_mismatch',
+        tag: 'sales',
+        level: 'WARNING',
+        description: `Order ${getSalesOrderReference(outcome.so)} is ${outcome.so.status} but is no longer fully paid after reversing a payment. Review whether the status should be reverted.`,
+        metadata: { orderNumber: getSalesOrderReference(outcome.so), status: outcome.so.status, paymentId },
+      })
+    }
+    return { success: true }
+  } catch (error) {
+    if (error instanceof PaymentTransactionRefusal) {
+      return { success: false, error: error.message, code: error.code as LedgerReversalRefusalCode }
+    }
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
   }
 }
 
@@ -3723,8 +4083,28 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
  * Clearing the marker is all this does. The order stays ON_HOLD and the
  * ordinary release path (moving it back to Processing) then applies, which
  * keeps this action reversible and keeps one code path for re-pushing.
+ *
+ * o3d-rbyg r4 (Codex r3 finding 1) — `expected.generation` IS NOT OPTIONAL, AND IT IS THE CALLER'S.
+ *
+ * The conditional update below was already generation-guarded, and the guard was already the right
+ * mechanism. It was simply being satisfied by a value this function had fetched microseconds
+ * earlier: `where: { withdrawalHoldGeneration: so.withdrawalHoldGeneration }` compares the current
+ * generation against itself, which closes the window between THIS read and THIS write and no other.
+ * The window that matters is longer — the page was drawn, an operator read it and decided, and (in
+ * the exception inbox's despatch remedy) a warehouse round trip happened in between. A customer who
+ * files a NEW withdrawal request inside that window had it cleared by a decision taken before it
+ * existed, silently, with an audit line saying a hold was released.
+ *
+ * So the caller states WHICH request it decided about, and a mismatch is refused BY NAME. Both
+ * checks stay: the explicit comparison is what produces a message an operator can act on, and the
+ * conditional update is what makes the write itself atomic against a submission landing between
+ * them.
  */
-export async function releaseWithdrawalHold(id: string, note?: string) {
+export async function releaseWithdrawalHold(
+  id: string,
+  expected: { generation: number },
+  note?: string,
+) {
   const session = await requirePermission('sales.process')
 
   const so = await db.salesOrder.findUnique({
@@ -3742,8 +4122,21 @@ export async function releaseWithdrawalHold(id: string, note?: string) {
   // `withdrawalHoldAt`, so comparing that cannot tell a new customer request
   // from the same hold — and a stale release would clear a hold the customer
   // has only just asked for. The generation advances per new submission.
+  if (!Number.isInteger(expected.generation)) {
+    return { success: false, error: 'The withdrawal request this release was for could not be identified — reload and try again' }
+  }
+  if (so.withdrawalHoldGeneration !== expected.generation) {
+    return {
+      success: false,
+      error:
+        `A NEWER withdrawal request has been filed against this order since this page was drawn `
+        + `(request ${expected.generation} → ${so.withdrawalHoldGeneration}). The hold was NOT released, `
+        + 'because releasing it would clear a request nobody has looked at. Reload and read the current request first.',
+    }
+  }
+
   const cleared = await db.salesOrder.updateMany({
-    where: { id, withdrawalHoldGeneration: so.withdrawalHoldGeneration, withdrawalHoldAt: { not: null } },
+    where: { id, withdrawalHoldGeneration: expected.generation, withdrawalHoldAt: { not: null } },
     data: { withdrawalHoldAt: null },
   })
   if (cleared.count === 0) {
@@ -3759,7 +4152,7 @@ export async function releaseWithdrawalHold(id: string, note?: string) {
     description:
       `Withdrawal hold released by ${session.user.email ?? session.user.id}`
       + `${note ? `: ${note}` : ''}. The order remains ON HOLD — move it back to Processing to re-push it to the warehouse.`,
-    metadata: { heldSince: so.withdrawalHoldAt, note: note ?? null },
+    metadata: { heldSince: so.withdrawalHoldAt, generation: expected.generation, note: note ?? null },
   })
 
   revalidatePath(`/sales/${id}`)

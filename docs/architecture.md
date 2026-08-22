@@ -161,6 +161,32 @@ The database and the invariant report intentionally overlap on core quantity int
 
 The CHECK constraints prevent new bad writes. The invariant report remains the read-only backstop for historical drift, manual SQL damage, and rollout verification.
 
+### The canonical quantity scale
+
+`ProductComponent.qty`, `SalesOrderLine.qty`, `OrderAllocation.qty` and `ShipmentLine.qty` are all `Decimal(12,4)`. A KIT fulfilment requirement is a *product* of those columns, so it is routinely **not representable** at four decimals — 0.5 kits of a 0.3333 component is 0.16665, and a nested kit's 0.3332 x 0.3332 is 0.11102224.
+
+The rule (o3d-i4qd): **quantise the computed side, never the stored side.** A requirement is rounded once, half-up (what Postgres `numeric(12,4)` does on write), *after* the whole multiplication — never per term — and only then compared against a persisted quantity. `canonicalFulfillmentQty` in `lib/products/fulfillment-coverage.ts` is that rounding, and `canonicalAllocationQty` is its allocation-side alias.
+
+Two consequences readers must respect:
+
+- **Proportionality of a kit's components is judged at the stored scale.** `findDisproportionateFulfillmentComponent` asks whether one coverage exists that rounds to every stored component quantity (each stored quantity stands for a half-ulp-wide band), instead of demanding `qty == coverage x factor` exactly. The exact form refused allocations the allocator had just written, and refused them at shipment confirmation — leaving the order allocated and unpickable.
+- **A coverage figure inferred from stored quantities carries `halfUlp / smallestFactor` of slack, in kit units** (`fulfillmentCoverageQuantisationSlack`). Any comparison of such a coverage against a demand figure must allow for it. It also shows the cost of very small component factors: at a factor of 0.0001, one ulp of that component is a whole kit of inferred coverage.
+
+`selectOrdersNeedingAllocation` therefore asks its question in **component units** — "is the stored component quantity below `round(netDemand x factor, 4)`" — with one half-ulp of slack per allocation row that fed the total, because each row was rounded on its own.
+
+### Structural product changes: an accepted write-skew residual
+
+Changing a product's `type` or its `parentId` is refused while the product has stock, reservations, or open sales/purchase/production/transfer documents. The refusal is a `SELECT`, plus (in the WooCommerce connector) the same predicate ANDed into the `UPDATE` and re-asserted immediately before commit.
+
+**That is not race-free, and it is not going to be** (o3d-0fok, decided). Under READ COMMITTED a blocker transaction that is uncommitted when our `UPDATE` takes its snapshot and commits before we do is invisible to us, and we are invisible to it. Only two things would close it, and both are rejected:
+
+- **A product-scoped lock every blocker writer takes.** The blocker writers are stock receipts, allocation, and the sales/purchase/production/transfer document writers — the hottest paths in the system. They would take a new lock, ordered against the sales-order lock and the component-graph write lock, to protect an occasional administrative edit. The deadlock surface that creates is a worse defect than the one it removes.
+- **SERIALIZABLE isolation.** Postgres SSI guarantees hold only among transactions that are *all* serializable, so raising only the structural writer buys nothing. Raising all of them is the same list of hot paths, plus retry loops.
+
+What holds instead: the window is narrowed to the width of the `UPDATE` statement (the predicate) and of the pre-commit re-assertion; the failure mode is a product whose type changed under a document that references it, which is visible and repairable rather than a silent quantity or money error; and the ordinary uncontended case — which is all of them in practice — is refused outright.
+
+One arm is weaker than the rest and is documented in place: `PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE` cannot express the open-stock-transfer arm, because `StockTransferLine` deliberately carries no foreign key to `Product` (orphaned lines must survive for audit). That arm is answered by a `SELECT` one statement earlier than the other four, at both boundaries.
+
 **Discount storage** — Discounts are stored separately as `discountStr` (the original input) and `discountAmount` (the computed value). Prices are never baked with discounts applied.
 
 **Tax rate snapshotting** — Sales and purchase order lines store `taxRateId` and rate snapshots at creation/edit time, ensuring historical accuracy if tax rates change later. `TaxRate` now represents a connector/reporting tax profile: it can carry ordered `TaxRateComponent` rows for compound rates, a reverse-charge flag, and a reporting category such as `DOMESTIC`, `REVERSE_CHARGE`, `EC_SALES`, or `OSS`. The effective rate is still written to the line snapshot so historical documents stay stable; component metadata remains available for connector mapping and VAT/reporting views.
@@ -347,7 +373,7 @@ There is no separate worker process. Background tasks are handled via HTTP endpo
 | WooCommerce reconcile | `GET /api/cron/wc-reconcile` | Daily | Backup reconciliation for WooCommerce orders/products plus stock catch-up and queued retry draining |
 | Mintsoft webhook sweeper | `GET /api/cron/mintsoft-webhook-sweeper` | Every 5 minutes | Drain persisted Mintsoft ASN booked-in webhook events and apply stock/PO effects asynchronously |
 | Delivery status | `GET /api/cron/delivery-status` | Every 15 min | Poll delivery tracking providers for shipment status updates |
-| WC withdrawal sweep | `GET /api/cron/wc-withdrawal-sweep` | Every 15 min | Re-check orders refused as EU withdrawals against the live storefront status, by order ID — the only route that does not depend on another event arriving |
+| WC withdrawal sweep | `GET /api/cron/wc-withdrawal-sweep` | Every 15 min | Two passes. (1) Re-check orders refused as EU withdrawals against the live storefront status, by order ID — the only route that does not depend on another event arriving. (2) Screen a bounded, rotating slice of the DISPATCH-ELIGIBLE links (100/run, the dispatch sweep's own eligibility) against the storefront and apply any withdrawal found, so an order withdrawn AFTER it was pushed becomes locally known before the dispatch sweep reconciles it. The storefront read lives here, not on the dispatch tick, so a WooCommerce outage cannot interfere with dispatch reconciliation; the residual bound is one rotation (ceil(eligible at rotation start/100) runs). A rotation's END is fixed when it STARTS (the highest eligible link id at that moment) and the slice is `cursor < id <= bound`, so links created while it runs belong to the NEXT rotation and cannot extend this one — without that upper bound a shop that keeps taking orders never empties the slice ahead of the cursor, the wrap never fires, and long-lived links behind it are screened once and never again. The position AND the rotation it belongs to are HELD together when a slice cannot be read. |
 | Auto-archive EOL | `GET /api/cron/auto-archive-eol` | Daily | Move EOL products with zero on-hand and zero incoming to ARCHIVED |
 
 All cron endpoints require the `CRON_SECRET` bearer header in production. Production startup fails fast if `CRON_SECRET` is unset, blank, or shorter than 32 characters. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; production never accepts localhost cron requests without the bearer header. After successful cron authentication each endpoint is rate-limited per job and source IP when a client IP is available; daily/hourly jobs default to one accepted run per hour, while 5-minute and 15-minute jobs use schedule-compatible hourly quotas with jitter headroom. Rate-limited calls return `429` with `Retry-After`. The default in-memory rate-limit backend is only process-local; multi-replica deployments must use `RATE_LIMIT_BACKEND=redis` with `REDIS_URL` so cron limits are cluster-wide. Rotating `CRON_SECRET` requires updating both `.env` and any external cron scheduler invocations in the same maintenance window because the application reads the environment value on restart. If a leaked or stale secret exhausts a cron quota during rotation, restart the memory backend or clear the Redis rate-limit keys.
@@ -419,7 +445,7 @@ Xero integration is implemented as a modular connector in `lib/connectors/xero/`
 - **Payment polling** — 15-min cron detects paid invoices (manual orders) and paid bills (POs) via Xero API
 - **Invoice PDF** — downloaded from Xero, saved locally, emailed to customer, download link pushed to WC order
 - **Payment method mapping** — composite `{method}:{currency}` key maps to Xero bank account codes
-- **OAuth 2.0** — tokens stored at `XERO_TOKEN_PATH`, refreshed before each API call
+- **OAuth 2.0** — access/refresh tokens stored encrypted in Postgres (`AccountingToken`), refreshed before each API call. There is no token file and no `XERO_TOKEN_PATH`
 - **Deep links** — "View in Xero" links on sales order and PO detail pages
 
 ### WooCommerce

@@ -4,6 +4,7 @@ import { useEffect, useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import { ChevronDown, ChevronUp, Pencil, X, Truck, PackageCheck, Ban, Loader2, Upload } from 'lucide-react'
 import { createWmsTransferAsn } from '@/app/actions/wms-asn'
+import { AsnBookedInRecheck } from '@/components/wms/asn-booked-in-recheck'
 import type {
   WmsCreateAsnInput,
   WmsTransferAsnState,
@@ -311,6 +312,15 @@ function WmsTransferAsnDialog({
                     <TableHead className="text-xs text-right">Expected</TableHead>
                     <TableHead className="text-xs text-right">Received</TableHead>
                     <TableHead className="text-xs">Created</TableHead>
+                    {/*
+                      o3d-hl8l r4: a transfer ASN goes through the SAME booked-in callback processor
+                      and the same maintenance-mode 503 fence as a purchase-order one, and this table
+                      was the half with no recovery control — so a refused callback here left the
+                      transfer IN_TRANSIT with destination stock unapplied and nothing an operator
+                      could press. Same component as the purchase-order table, so the two cannot
+                      drift apart again.
+                    */}
+                    {wmsAsnState.canManage && <TableHead className="text-xs text-right">Booked in</TableHead>}
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -321,6 +331,16 @@ function WmsTransferAsnDialog({
                       <TableCell className="text-right tabular-nums text-xs">{asn.totalExpectedQty}</TableCell>
                       <TableCell className="text-right tabular-nums text-xs">{asn.totalReceivedQty}</TableCell>
                       <TableCell className="text-xs text-muted-foreground">{formatDate(asn.createdAt)}</TableCell>
+                      {wmsAsnState.canManage && (
+                        <TableCell className="text-right">
+                          <AsnBookedInRecheck
+                            externalAsnId={asn.externalAsnId}
+                            lastCallbackAt={asn.lastCallbackAt}
+                            closed={Boolean(asn.closedAt)}
+                            connectorLabel={wmsAsnState.connectorLabel}
+                          />
+                        </TableCell>
+                      )}
                     </TableRow>
                   ))}
                 </TableBody>

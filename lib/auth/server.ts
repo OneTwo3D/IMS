@@ -15,15 +15,20 @@ import {
   PermissionDeniedError,
   type AuthSession,
 } from '@/lib/auth/session-gates'
-import { loginPathForSessionInvalidReason } from '@/lib/auth/session-state'
+import { loginPathForSessionInvalidReason, sessionAccessDenial } from '@/lib/auth/session-state'
+import { isAuthorizationDenial } from '@/lib/auth/session-gates'
 
 export type { Permission }
 export type { AuthSession } from '@/lib/auth/session-gates'
+// o3d-m3gy: ONE denial type and ONE predicate, re-exported here so callers that reach for them
+// through `@/lib/auth/server` — as the whole app does — do not have to know which module declares
+// them. `@/lib/auth/authorization-denial` re-exports the same symbols for the same reason.
 export {
   FreshAuthRequiredError,
   freshAuthFailureResult,
   PermissionDeniedError,
   isAuthorizationDenial,
+  type AuthorizationDenial,
 } from '@/lib/auth/session-gates'
 
 /**
@@ -33,18 +38,16 @@ export {
 export async function requireAuth(): Promise<AuthSession> {
   const session = await auth()
 
-  if (!session?.user) {
-    redirect('/login')
+  // The three checks themselves live in lib/auth/session-state.ts, shared with
+  // requireApiAuthSession and with the supplier portal's requireSupplier — see
+  // the note on sessionAccessDenial for why they are no longer open-coded here.
+  // This function owns only the REFUSAL: a redirect.
+  const denial = sessionAccessDenial(session?.user)
+  if (denial?.reason === 'no-session') redirect('/login')
+  if (denial?.reason === 'session-invalid') {
+    redirect(loginPathForSessionInvalidReason(denial.sessionInvalidReason))
   }
-
-  if (session.user.sessionInvalidReason) {
-    redirect(loginPathForSessionInvalidReason(session.user.sessionInvalidReason))
-  }
-
-  // If 2FA is enabled but not verified in this session, send to TOTP challenge
-  if (session.user.totpEnabled && !session.user.totpVerified) {
-    redirect('/2fa')
-  }
+  if (denial?.reason === 'second-factor-pending') redirect('/2fa')
 
   return session as AuthSession
 }
@@ -90,9 +93,76 @@ export async function requirePermission(permission: Permission): Promise<AuthSes
   if (!hasPermission(session.user.role, permission)) {
     // Typed, not a bare Error: callers that aggregate several reads must be able to tell a denial
     // from an unavailable dependency without matching on this message. See isAuthorizationDenial.
+    //
+    // o3d-m3gy: the message is spelt out here rather than derived by the constructor, which is how
+    // the sibling `AuthorizationDenialError(permission)` did it. It is byte-identical to what that
+    // produced, so nothing matching on 'Forbidden: missing permission …' changes — and the survivor's
+    // constructor has to take a message because a ROLE denial has no permission to derive one from.
     throw new PermissionDeniedError(`Forbidden: missing permission ${permission}`, permission)
   }
   return session
+}
+
+/**
+ * Requires an INTERNAL principal (o3d-512h round 3).
+ *
+ * `requireAuth` answers "is someone signed in". It cannot answer "is this one of
+ * ours", and SUPPLIER — a third party we issue a login to so it can quote its own
+ * RFQs — is signed in. Every `'use server'` export gated on requireAuth alone was
+ * therefore a supplier-reachable endpoint: app/actions/purchase-orders.ts:
+ * getPurchaseOrder handed a supplier session any purchase order by id, including
+ * other suppliers' prices, and getPurchaseOrders enumerated the lot.
+ *
+ * This is the boundary those reads needed. It is deliberately NOT a per-endpoint
+ * permission: picking one of those for each of ~70 endpoints would have been ~70
+ * guesses, several of which would lock out an internal role that legitimately
+ * reads the data (WAREHOUSE holds no 'analytics', FINANCE no 'stock_control').
+ * `internal` is held by every internal role and by no supplier, so it removes the
+ * external principal and costs no internal role anything — the narrowest change
+ * that actually closes the hole. Tightening individual endpoints further is a
+ * separate, per-endpoint argument.
+ *
+ * On the supplier's own surface this helper is the WRONG control and is
+ * deliberately absent: there, holding 'supplier_portal.*' is not sufficient
+ * either, because every supplier holds it. Those actions must scope to the
+ * session's own supplierId (see lib/security/supplier-portal-boundary.ts).
+ */
+export async function requireInternalUser(): Promise<AuthSession> {
+  return requirePermission('internal')
+}
+
+/**
+ * Page-boundary authorization (o3d-512h).
+ *
+ * A page is the entrance a principal reaches by typing the URL, so it needs a
+ * gate of its own: the sidebar hiding a link is not a boundary, and the
+ * (dashboard) layout only establishes AUTHENTICATION. This resolves the gate
+ * into a value so the page can render an explicit access-denied state instead
+ * of throwing into app/(dashboard)/error.tsx, which answers a stable role
+ * denial with "Go to Login" / "Try Again".
+ *
+ * Only an authorization denial is converted. Everything else keeps
+ * propagating — notably the NEXT_REDIRECT that requireAuth throws for an
+ * unauthenticated or 2FA-pending session, which MUST NOT be swallowed here or
+ * an anonymous visitor would be shown "access denied" instead of the login
+ * page.
+ *
+ * NOTE: this is a page-level control only. It does not protect the Server
+ * Actions the page calls — each of those is a separately addressable endpoint
+ * and needs its own guard.
+ */
+export type PageAuthorization =
+  | { authorized: true; session: AuthSession }
+  | { authorized: false; permission: Permission }
+
+export async function authorizePage(permission: Permission): Promise<PageAuthorization> {
+  try {
+    const session = await requirePermission(permission)
+    return { authorized: true, session }
+  } catch (error) {
+    if (isAuthorizationDenial(error)) return { authorized: false, permission }
+    throw error
+  }
 }
 
 export async function requireFreshPermission(
@@ -107,11 +177,18 @@ export async function requireFreshPermission(
 
 /**
  * Returns the current session or null — does not redirect.
+ *
+ * Round 4: this used to check `sessionInvalidReason` and stop there, so a
+ * password-only session that had not cleared the TOTP challenge came back as a
+ * session. app/actions/passkey.ts:getVerifiedSession compensated with its own
+ * second-factor check — correctly, and it keeps it — but the compensation was
+ * the caller's, which is precisely the arrangement that left requireSupplier
+ * with nothing. The predicate is shared now, so "usable session" means the same
+ * thing here as at every other gate.
  */
 export async function getSession(): Promise<AuthSession | null> {
   const session = await auth()
-  if (!session?.user) return null
-  if (session.user.sessionInvalidReason) return null
+  if (sessionAccessDenial(session?.user)) return null
   return session as AuthSession
 }
 

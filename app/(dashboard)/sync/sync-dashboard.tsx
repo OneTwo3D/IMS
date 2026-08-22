@@ -47,6 +47,8 @@ type Props = {
   accountingSettings: AccountingConnectorSettings & { secretMasked: boolean }
   accountingConnected: boolean
   accountingTenantName?: string
+  accountingBlockedReason?: string
+  accountingHasStoredToken?: boolean
   accountingConnectionTest: IntegrationConnectionTestState
   accountingAccounts: AccountingAccountRow[]
   accountingLogs: AccountingSyncLogRow[]
@@ -143,7 +145,7 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
-export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, accountingTaxRates, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, accountingSettings, accountingConnected, accountingTenantName, accountingConnectionTest, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, accountingReadiness, accountingBatchPreview, accountingBatchHistory, wmsData }: Props) {
+export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, accountingTaxRates, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, accountingSettings, accountingConnected, accountingTenantName, accountingBlockedReason, accountingHasStoredToken, accountingConnectionTest, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, accountingReadiness, accountingBatchPreview, accountingBatchHistory, wmsData }: Props) {
   const router = useRouter()
   const searchParams = useSearchParams()
   const requestedConnector = searchParams.get('connector')
@@ -266,6 +268,8 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
           settings: accountingSettings,
           connected: accountingConnected,
           tenantName: accountingTenantName,
+          blockedReason: accountingBlockedReason,
+          hasStoredToken: accountingHasStoredToken,
           connectionTest: accountingConnectionTest,
           accounts: accountingAccounts,
           logs: accountingLogs,

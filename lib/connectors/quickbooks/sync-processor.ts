@@ -9,6 +9,8 @@ import { createHash } from 'crypto'
 import { db } from '@/lib/db'
 import { activeAccountingIdProvenance, accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
+import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
 import { logActivity } from '@/lib/activity-log'
 import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
@@ -634,6 +636,8 @@ async function processEntry(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
+  // o3d-550x: the instant this worker claimed the row. Still needed after o3d-e2mz — this connector
+  // mints no attempt revision, so the claim is the ONLY fence its cancelled-order retirement has.
   claimedAt: Date,
 ): Promise<{ success: boolean; externalId?: string; invoiceNumber?: string; error?: string; skipped?: boolean }> {
   const requestId = buildQboRequestId(getIdempotencySource(entryId, type, referenceId, payload))
@@ -659,7 +663,21 @@ async function processEntry(
           return { success: false, error: `Sales order ${referenceId} not found before posting an invoice` }
         }
         if (so.status === 'CANCELLED') {
-          await db.$transaction((tx) => retireSalesInvoiceForCancelledOrder(tx, entryId, referenceId, claimedAt))
+          // o3d-550x (Codex r2, medium 2): the retirement fences on the claim as it reads AT THE WRITE,
+          // so it is handed the CLAIM rather than an instant. This connector never renews one, so the
+          // holder answers the instant it was given — the behaviour is unchanged, and the day a renewing
+          // lease appears here the holder is what changes, not this call.
+          //
+          // o3d-e2mz: this processor mints NO attempt revision, so it has no attempt to name and stays
+          // at UNCLAIMED_ATTEMPT_REVISION permanently. The retirement therefore runs on the claim fence
+          // alone and leaves the row at revision 0 rather than forging an attempt that never existed.
+          // Fencing this connector is out of scope.
+          await db.$transaction((tx) => retireSalesInvoiceForCancelledOrder(
+            tx,
+            { id: entryId, attemptRevision: UNCLAIMED_ATTEMPT_REVISION },
+            referenceId,
+            claimHeldFrom(claimedAt),
+          ))
           return { success: true, skipped: true }
         }
         customerId = so.customerId ?? undefined

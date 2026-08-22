@@ -54,6 +54,22 @@ function assertValidPrecision(precision: number): void {
   }
 }
 
+/**
+ * ISO 4217 minor-unit digits for a currency code — 2 for most, 0 for JPY/KRW/ISK, 3 for the Gulf
+ * dinars. Exported (o3d-5tf) so money tolerances can be expressed as a fraction of ONE MINOR UNIT
+ * instead of hard-coding a penny: a 0.005 threshold is half a minor unit in GBP, five whole minor
+ * units in KWD and a meaningless sliver in JPY.
+ *
+ * o3d-w00 leans on the same fact for a second reason: the minor unit is also how COARSELY a source
+ * may have quantised a money figure before IMS stored it, which is what sizes the rounding tolerance
+ * on any RATE derived from two such figures. Assuming the penny there gives a zero-decimal currency a
+ * bound a hundred times too tight. That is the same number, so it stays ONE exported function rather
+ * than a second name for it.
+ */
+export function currencyMinorUnits(currency: string): number {
+  return currencyPrecision(currency)
+}
+
 function currencyPrecision(currency: string): number {
   const normalizedCurrency = currency.trim().toUpperCase()
   if (!normalizedCurrency) return 2

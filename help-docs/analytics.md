@@ -48,6 +48,8 @@ Warehouse users can access the stock-position report family. Broader analytics r
 
 Inventory valuation and COGS only show accounting variance when matching account-balance snapshots have been ingested from the accounting connector. Missing snapshots are shown as explicit notices rather than inferred balances.
 
+Revenue and gross margin in the COGS Report are attributed from the original sales line behind each dispatch, so **refunds are not deducted**: a returned sale keeps its full revenue and margin there. The report says so in its notices and in the CSV export metadata. Inventory Turnover is a COGS-over-inventory-value ratio and no refund moves either input.
+
 ## Inventory Health and Demand Planning
 
 | Report | What it shows |
@@ -103,6 +105,10 @@ Products without a preferred supplier are listed under "Unassigned" and require 
 | **Throughput** | Shipment status activity by user and queue depth for picking, packing, and shipping work. |
 
 Revenue figures honour each order's `taxInclusive` flag: tax-exclusive orders use the line subtotal before VAT; tax-inclusive orders back-calculate revenue by removing VAT from the gross. Mixed-mode batches (some WC orders inclusive, some exclusive) sum correctly without double-counting.
+
+**Refunds are not deducted from Sales Analytics, Customer Mix or Gross Margin.** Those three report what was invoiced and dispatched, so a credited or returned order still contributes its full revenue, profit and margin. This is stated in each report's own notices and repeated in the CSV export's metadata rows. For a refund-aware net revenue, with the credits it could not place named beside it, use **Sales Statistics**.
+
+The **Returns** report shows each credit on its own recorded basis. Where a row -- or the period -- mixes ex-VAT and VAT-inclusive credits, no single total is shown, because adding the two gives an amount on neither basis; the net-basis, gross-basis and unproven-basis columns carry the whole credit instead, and rows with no single stated value sort last rather than among the zeroes.
 
 ## Purchasing and Supplier Analytics
 

@@ -488,9 +488,15 @@ test('a partial refusal is not reported as plain success (o3d-0m56)', async () =
   // The guard can allow SOME rows and refuse others in one call. Every wrapper between the
   // action and the UI dropped `refused`, so "Retry All" rendered "Reset N" while the refused
   // rows silently stayed FAILED.
+  // The PARAMETER LIST is matched loosely and across newlines on purpose. o3d-e2mz added a second
+  // parameter (expectedAttemptRevision) and both signatures wrapped onto several lines; a pattern
+  // anchored on the old one-line `(entryId?: string)` would have failed for a formatting change while
+  // saying "must carry refused through", which is not what it checks. What it checks — that the
+  // RETURN type still carries `refused?: number`, so a partial refusal cannot be reported as plain
+  // success — is unchanged and is still the only thing asserted.
   const files = {
-    'lib/connectors/accounting-registry.ts': /retryFailedSync\(entryId\?: string\): Promise<\{[^}]*refused\?: number/,
-    'app/actions/accounting-sync.ts': /retryFailedAccountingSync\([^)]*\): Promise<\{[^}]*refused\?: number/,
+    'lib/connectors/accounting-registry.ts': /retryFailedSync\([\s\S]*?\): Promise<\{[^}]*refused\?: number/,
+    'app/actions/accounting-sync.ts': /retryFailedAccountingSync\([\s\S]*?\): Promise<\{[^}]*refused\?: number/,
   }
   for (const [file, pattern] of Object.entries(files)) {
     const source = await readFile(path.join(process.cwd(), file), 'utf8')

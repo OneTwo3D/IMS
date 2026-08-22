@@ -8,7 +8,10 @@ import type { Prisma, ProductType } from '@/app/generated/prisma/client'
  *
  * This is NOT the correctness boundary, and it is NOT atomic. r4 claimed both and neither was true:
  *
- *   - NOT A SERIALIZATION BOUNDARY (r5 Codex finding 2). The component writers take
+ *   - NOT A SERIALIZATION BOUNDARY (r5 Codex finding 2), and it will not become one by taking a
+ *     lock: the remaining window is closed by the per-line fulfilment-requirement snapshot
+ *     (o3d-kouj), which makes the current graph stop being the authority for in-flight work at
+ *     all. The reasoning is written out on `loadFulfillmentProductGraph`. The component writers take
  *     `COMPONENT_GRAPH_WRITE_LOCK_KEY`; `allocateSalesOrder`, `confirmSalesOrderShipments` and the
  *     PENDING -> PICKING commitment do NOT take it. Under Postgres' default READ COMMITTED / MVCC
  *     snapshotting, this query can therefore see an empty blocker set while a concurrent transaction
@@ -31,9 +34,25 @@ import type { Prisma, ProductType } from '@/app/generated/prisma/client'
  *
  * What this IS: an early, cheap, operator-facing refusal that stops the ordinary (uncontended)
  * editor/import case from creating the corruption at all, so the dispatch-time check is a backstop
- * rather than the everyday experience. The durable fix remains a persisted immutable per-sales-line
- * fulfilment-requirement snapshot; fourteen modules expand the live graph today and a partial
- * rollout is worse than none, so it is not attempted here.
+ * rather than the everyday experience.
+ *
+ * o3d-kouj — WHAT CHANGED UNDER THIS GUARD, AND WHY IT STILL EARNS ITS PLACE. The durable fix this
+ * paragraph used to defer — a persisted immutable per-sales-line fulfilment-requirement snapshot —
+ * now exists (`lib/products/fulfillment-requirement-snapshot.ts`). Every reader resolves through it,
+ * so a line that has been allocated is no longer READ against the current graph at all, and the
+ * corruption described below can no longer be created by an edit that slips past this query: the
+ * order keeps requiring what it was allocated from.
+ *
+ * This guard is therefore no longer standing between an edit and a silent quantity error. What it
+ * still does is keep the CATALOGUE and the IN-FLIGHT WORK from diverging where a human can see it —
+ * an edit that lands while an order is being picked leaves the warehouse holding a pick list for a
+ * recipe the product no longer has, which is confusing even when every number is right. Its value
+ * is now operational rather than protective, and if it is ever relaxed the argument to make is that
+ * one, not "the snapshot has it covered" (it does) — see the note on the CAS below for the shape of
+ * the mistake that would be.
+ *
+ * NOT relaxed here, deliberately: this branch changed what the readers read, and loosening a
+ * refusal in the same change would make any regression impossible to attribute.
  *
  * THE CORRUPTION IT REFUSES. A KIT requires 2xA + 1xB; an order is allocated and its shipment is
  * PICKING, both holding A=2 / B=1. The kit is re-composed to 2xA + 2xB. Every FLAT check still
@@ -56,11 +75,13 @@ import type { Prisma, ProductType } from '@/app/generated/prisma/client'
  * either. A PICKING shipment on a CANCELLED order still blocks (units are physically picked), but
  * the exit is the repair action that discards it, never "dispatch it".
  *
- * THE RESIDUAL, STATED PLAINLY AND NOT SOLVED HERE: completed history still reads against the
- * CURRENT graph. A DELIVERED order's fulfilment analytics, its coverage figures and any later
- * report expand today's recipe, not the one it shipped under, so editing a KIT rewrites what past
- * orders appear to have required. That is filed as **o3d-kouj** and is not addressed by this guard
- * — permanently freezing the catalogue to protect history was the r4 behaviour and was worse.
+ * THE RESIDUAL THIS GUARD LEFT, AND WHERE IT WENT (o3d-kouj, now closed): completed history used to
+ * read against the CURRENT graph, so a DELIVERED order's fulfilment analytics, its coverage figures
+ * and any later report expanded today's recipe rather than the one it shipped under. That was never
+ * fixable here — permanently freezing the catalogue to protect history was the r4 behaviour and was
+ * strictly worse. It is fixed by the per-line snapshot instead: dispatch RETAINS the allocation
+ * rows, so a shipped line can never be re-captured, and its recipe is frozen at the moment it
+ * shipped for as long as the row exists.
  *
  * WHAT COUNTS AS AFFECTED. `expandFulfillmentRequirementsDecimal` recurses through a component ONLY
  * when that component's product type is KIT; a BOM is a fulfilment LEAF. So editing product P
@@ -320,7 +341,7 @@ const TERMINAL_REFUSING_ORDER_STATUSES = new Set(['CANCELLED'])
  *   - a PICKING/PACKED SHIPMENT blocker on a LIVE order clears by DISPATCHING that shipment, or by
  *     cancelling the whole order — `cancelSalesOrderFulfillmentState` deletes PENDING/PICKING/PACKED
  *     shipments outright. `SHIPMENT_TRANSITIONS` is forward-only and IMS has no per-shipment cancel
- *     (o3d-tv1q), which is why the message must not offer one;
+ *     (o3d-q8r6), which is why the message must not offer one;
  *   - a PICKING/PACKED SHIPMENT blocker on a CANCELLED order clears ONLY through the repair action
  *     (`discardCancelledOrderShipments`), which deletes the order's remaining non-dispatched
  *     shipments. Dispatch is refused on a cancelled order now (`transitionShipmentStatus`), and

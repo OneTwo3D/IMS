@@ -1,10 +1,19 @@
+import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { WC_WEBHOOK_EVENT_STATUS } from '@/lib/connectors/shopping-webhook-inbox'
+import { alignmentDryRunEvidenceQuery } from '@/lib/domain/wms/alignment-dry-run'
 import {
   UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
   backReferenceEvidenceTombstone,
 } from '@/lib/domain/accounting/back-reference-sweep'
+import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
+import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
+import {
+  compactableInboundEventWhere,
+  inboundEventCompactionData,
+  receiptEventCompactionData,
+} from '@/lib/domain/wms/inbound-event-retention'
 
 const RETENTION_KEYS = [
   'retention_sales_orders_months',
@@ -13,6 +22,8 @@ const RETENTION_KEYS = [
   'retention_stock_movements_months',
   'retention_sync_logs_months',
   'retention_webhook_events_months',
+  'retention_wms_events_months',
+  'retention_wms_sync_jobs_months',
 ] as const
 
 const DEFAULTS: Record<string, number> = {
@@ -27,6 +38,18 @@ const DEFAULTS: Record<string, number> = {
   // Only PROCESSED rows are compacted; DEAD_LETTER (failed, unresolved) and PENDING/FAILED (undelivered)
   // are left fully intact for investigation/replay.
   retention_webhook_events_months: 3,
+  // q66in.7.4: COMPACT resolved rows in the two inbound WMS event tables (wms_inbound_receipt_events,
+  // wms_webhook_events) after N months. Same 3-month default and the same compact-don't-delete rule
+  // as the shopping inbox above: the row is an idempotency tombstone, so only its payload expires,
+  // and only once the event has RESOLVED. See lib/domain/wms/inbound-event-retention.ts.
+  retention_wms_events_months: 3,
+  // q66in.7.4: DELETE finished WMS sync jobs after N months — which cascades their wms_sync_logs
+  // lines (the FK is ON DELETE CASCADE), the table the issue named as growing unbounded. Twelve
+  // months, deliberately: WmsMutationEvent — the audit-grade mutation timeline — keeps a full year
+  // and correlates to a run through its free-string `jobId`, so a shorter window here would leave
+  // the timeline pointing at runs that no longer exist. Tune this DOWN only together with
+  // WMS_MUTATION_EVENT_RETENTION_DAYS.
+  retention_wms_sync_jobs_months: 12,
 }
 
 async function getRetentionSettings(): Promise<Record<string, number>> {
@@ -56,6 +79,10 @@ function monthsAgo(months: number): Date {
  */
 export async function purgeExpiredData(): Promise<{
   syncLogsDeleted: number
+  /** Resolved inbound WMS event rows whose payload was cleared, keeping the idempotency tombstone (q66in.7.4). */
+  wmsInboundEventsCompacted: number
+  /** Finished WMS sync jobs deleted; their wms_sync_logs lines go with them by FK cascade (q66in.7.4). */
+  wmsSyncJobsDeleted: number
   /** Expired-but-unresolved accounting sync rows reduced to an attribution-only tombstone (o3d-9kek). */
   backReferenceEvidenceCompacted: number
   stockMovementsDeleted: number
@@ -66,6 +93,8 @@ export async function purgeExpiredData(): Promise<{
 }> {
   const settings = await getRetentionSettings()
   let syncLogsDeleted = 0
+  let wmsInboundEventsCompacted = 0
+  let wmsSyncJobsDeleted = 0
   let backReferenceEvidenceCompacted = 0
   let stockMovementsDeleted = 0
   let webhookEventsCompacted = 0
@@ -106,12 +135,32 @@ export async function purgeExpiredData(): Promise<{
       // may exist in the ledger, since no externalTransactionId was ever written. Deleting it by age
       // makes the order hard-deletable again.
       //
-      // An earlier revision of this branch exempted PROCESSING rows from deletion. That was
-      // REVERTED: it retains the full row — payload included, holding customer names, emails and
-      // financial lines — indefinitely, which contradicts the retention period the settings UI
-      // promises, and every connector switch would strand more. Doing it properly needs a compacted
-      // tombstone carrying only what the guard reads, which is tracked in o3d-nepa rather than
-      // bolted on here.
+      // o3d-nepa, THE ACTUAL P1: age alone never expires accounting work that CAN STILL BE POSTED.
+      // A PENDING, PROCESSING or FAILED row is not a log of something that happened — it is an
+      // UNFINISHED JOB carrying the payload a worker will post from, and both processors read the
+      // row and its payload BEFORE they conditionally claim it, so a worker can be holding the
+      // payload in memory while retention removes the row underneath it. The remote call still
+      // happens and nothing is left to record that it did. The hard-delete guard counts the same
+      // statuses (o3d-sref; o3d-ju8t: FAILED does NOT prove nothing was posted), so a deleted row
+      // reads as zero and the order becomes hard-deletable with a document standing in the ledger.
+      //
+      // An earlier revision of this branch exempted PROCESSING rows from deletion and was REVERTED,
+      // on the grounds that retaining the full row — payload included, holding customer names,
+      // emails and financial lines — contradicts the retention period the settings UI promises.
+      // That objection is answered by fixing the PROMISE rather than the data, because there is no
+      // version of this that keeps both: a compacted payload cannot be posted, so retaining
+      // unfinished work WHOLE is the only shape that works. What is retained is bounded by the
+      // OUTSTANDING WORK BACKLOG — visible and actionable on the failed-sync dashboard — not by
+      // history: every row leaves this exemption the moment it reaches SYNCED or CANCELLED and is
+      // then expired by age normally. components/settings/data-retention.tsx says so.
+      //
+      // THE STATUS LIST IS THE SHARED CONSTANT, NOT A LOCAL COPY. It is the same file PR #618
+      // (o3d-y14, branch o3d-y14-backfill-safety) introduces, byte for byte, so the two land as an
+      // identical add and #618's `applyWcCouponCorrection` — which counts these statuses under the
+      // sales-order lock and declines to correct an order that has any — reads the same set this
+      // delete refuses to touch. That function does not exist on this branch yet, which is why the
+      // constant's doc comment names a call site you will not find here; the drift it prevents is
+      // the whole reason neither side spells the statuses out.
       //
       // o3d-9kek: what this does NOT delete is UNRESOLVED BACK-REFERENCE EVIDENCE — a posted row
       // whose repair sweep has not reached a verdict on it. Deleting one of those does not just
@@ -129,9 +178,40 @@ export async function purgeExpiredData(): Promise<{
       // configured retention period indefinitely. That is the same defect as the reverted
       // PROCESSING exemption above, and it is fixed the same way the o3d-nepa note prescribes: a
       // compacted tombstone carrying only what a later reader must be able to see.
+      //
+      // o3d-nepa: and what it does not delete EITHER is a row whose existence is the only local
+      // guard against moving the same money in the ledger twice — a registered INVOICE_PAYMENT, an
+      // applied PURCHASE_CREDIT_NOTE_ALLOCATION, a sent BILL_PAYMENT. Those guards do not fail when
+      // their evidence is deleted; they answer "nothing has been sent" and mean it, and Xero's
+      // idempotency key expired six minutes after the original call, so nothing remote catches the
+      // second one. The back-reference clause above does not cover them: it requires an
+      // externalTransactionId AND one of the four DOCUMENT types, and the harm here comes from
+      // FOLLOW-UP types whose row matters whatever their status. See remote-money-evidence.ts for
+      // the three readers and for why this is not compaction (yet).
+      //
+      // THREE CLAUSES, THREE DIFFERENT QUESTIONS, AND NONE SUBSUMES ANOTHER:
+      //
+      //   status ∉ POSTABLE  — "can a document still be posted FROM this row?" PENDING carries no
+      //                        externalTransactionId at all, so the back-reference predicate never
+      //                        sees it; without this clause a PENDING SALES_INVOICE is still
+      //                        deleted by age with its payload.
+      //   type ∉ MONEY       — "is this row's bare existence the only thing suppressing a second
+      //                        remote call?" That is about FINISHED work — SYNCED and CANCELLED
+      //                        rows, which the status clause deliberately releases.
+      //   NOT UNRESOLVED_…   — "is this row the only evidence that a document was posted without
+      //                        being linked?" SYNCED/FAILED carrying an external id.
+      //
+      // Where the first and third overlap (FAILED with an external id) the row is retained by both
+      // and then COMPACTED below, which blanks the payload. That is safe rather than contradictory:
+      // an external id means the document already posted and both processors short-circuit to the
+      // follow-ups instead of re-posting when `externalTransactionId` is set, so no blanked payload
+      // is ever sent, and what the delete guard needs is only that the ROW SURVIVES — it counts
+      // rows, it does not read them.
       db.accountingSyncLog.deleteMany({
         where: {
           createdAt: { lt: cutoff },
+          status: { notIn: [...POSTABLE_ACCOUNTING_SYNC_STATUSES] },
+          type: { notIn: [...REMOTE_MONEY_EVIDENCE_TYPES] },
           NOT: UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
         },
       }),
@@ -139,9 +219,25 @@ export async function purgeExpiredData(): Promise<{
     syncLogsDeleted = wc.count + acct.count
 
     // The other half: expired-but-unresolved rows lose their CONTENT and keep their ATTRIBUTION.
-    // Ordered after the delete deliberately — the two predicates are exact complements, so a row
-    // belongs to one pass or the other and never both, and doing the delete first means a crash
-    // between them leaves rows un-compacted (repeated next run) rather than un-deleted.
+    // Ordered after the delete deliberately — the two predicates are MUTUALLY EXCLUSIVE (the delete
+    // requires NOT UNRESOLVED_…, this one requires it), so no row is both deleted and compacted, and
+    // doing the delete first means a crash between them leaves rows un-compacted (repeated next run)
+    // rather than un-deleted.
+    //
+    // They are no longer exact COMPLEMENTS, because o3d-nepa holds two further sets back from the
+    // delete without adding either of them here — both are in NEITHER pass, deliberately:
+    //
+    //   • the MONEY-EVIDENCE types. Compaction writes `payload: {}`, and a money row with a blank
+    //     body is the worst of both worlds — the follow-up planner can neither prove from it that
+    //     nothing was sent nor re-send it, which is exactly the shape that made money retries
+    //     permanently unusable in o3d-nepa's parked attempt (round 1 finding 2).
+    //   • POSTABLE rows with no external id (PENDING, PROCESSING, and FAILED that never posted).
+    //     These are unfinished JOBS, and the payload is the request a worker will build from, so
+    //     blanking it would destroy the work while leaving the row claiming it is still owed.
+    //
+    // A POSTABLE row that DOES carry an external id (FAILED, already posted) is in both the delete's
+    // exemption and this pass, and is compacted: its document exists, both processors short-circuit
+    // to the follow-ups rather than re-posting, so the payload is not what makes it postable.
     //
     // `backReferenceEvidenceCompactedAt: null` PERMANENTLY excludes already-compacted rows from THIS
     // PASS, so each daily run rewrites only the newly-eligible slice instead of the whole tombstone
@@ -185,6 +281,85 @@ export async function purgeExpiredData(): Promise<{
       data: { payloadJson: {}, lastError: null },
     })
     webhookEventsCompacted = count
+  }
+
+  // Inbound WMS event tables — COMPACT resolved rows (q66in.7.4). Both tables were previously
+  // untouched by every retention pass, so a payload (delivery addresses, contact names, line detail)
+  // and a full dry-run review image lived forever. The predicate — resolved only, never a
+  // dead-letter or a review that is still waiting — lives in lib/domain/wms/inbound-event-retention.ts
+  // next to the reasoning for it.
+  const wmsEventMonths = settings.retention_wms_events_months
+  if (wmsEventMonths > 0) {
+    const cutoff = monthsAgo(wmsEventMonths)
+    const [receipts, webhooks] = await Promise.all([
+      db.wmsInboundReceiptEvent.updateMany({
+        where: compactableInboundEventWhere(cutoff),
+        data: receiptEventCompactionData(Prisma.JsonNull),
+      }),
+      db.wmsWebhookEvent.updateMany({
+        where: compactableInboundEventWhere(cutoff),
+        data: inboundEventCompactionData(),
+      }),
+    ])
+    wmsInboundEventsCompacted = receipts.count + webhooks.count
+  }
+
+  // WMS sync jobs — hard delete FINISHED runs, which cascades their per-SKU wms_sync_logs lines
+  // (q66in.7.4). Deleting the parent is what bounds the child: a stock sync writes one log line per
+  // checked SKU per run, so the lines are the volume and the job is the only handle on them.
+  //
+  // WHAT THIS REFUSES TO DELETE, and why age alone is not a licence:
+  //   • A job that has not FINISHED (PENDING/RUNNING, or any row with a null finishedAt). An
+  //     unfinished run is either in flight or stuck; either way its lines are live state, and an old
+  //     timestamp on a stuck job is a REASON to keep it, not to remove it.
+  //   • THE ONE DRY RUN each unconfirmed ALIGN_TO_WMS binding is waiting on. The confirm-alignment
+  //     action refuses to arm live downward corrections without a completed dry run for that
+  //     warehouse, so that job is the unmet precondition of an outstanding operator decision and
+  //     deleting it silently revokes a confirmation nobody has made yet.
+  //
+  //     IT IS ONE ROW, NOT A WAREHOUSE (Codex r10 #3). An earlier revision excluded every STOCK_SYNC
+  //     job for the warehouse and called the imprecision "over-retains a little". It is not a
+  //     little: a stock sync writes one wms_sync_logs line per checked SKU per run and runs on a
+  //     schedule, so a single binding left unconfirmed pinned every run and every line for that
+  //     warehouse indefinitely — the highest-volume table here, exempted without bound by a
+  //     condition nothing forces anyone to clear. The exemption is now exactly the row
+  //     wms-connector-boundary-ok: q66in.7.4: naming the confirm helper the exemption mirrors is the point of the comment.
+  //     `confirmMintsoftAlignmentMode` would read, resolved through the SHARED query so the two
+  //     cannot drift: narrower than the confirm predicate deletes the evidence the operator is about
+  //     to be asked for, wider re-opens the unbounded exemption.
+  //
+  //     A binding with no qualifying dry run protects nothing — there is no decision pending on a
+  //     row that does not exist, and the operator has to run a fresh dry run either way.
+  const wmsJobMonths = settings.retention_wms_sync_jobs_months
+  if (wmsJobMonths > 0) {
+    const cutoff = monthsAgo(wmsJobMonths)
+    const pendingAlignmentBindings = await db.externalWmsBinding.findMany({
+      where: { stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmedAt: null },
+      select: { connector: true, warehouseId: true },
+    })
+    // Deduplicated on the SCOPE the query keys on, so two bindings of one connector on one warehouse
+    // resolve the same single job once.
+    const scopes = new Map(
+      pendingAlignmentBindings.map((row) => [`${row.connector}:${row.warehouseId}`, row] as const),
+    )
+    const protectedJobIds: string[] = []
+    for (const scope of scopes.values()) {
+      const evidence = await db.wmsSyncJob.findFirst({
+        ...alignmentDryRunEvidenceQuery(scope),
+        select: { id: true },
+      })
+      if (evidence) protectedJobIds.push(evidence.id)
+    }
+
+    const { count } = await db.wmsSyncJob.deleteMany({
+      where: {
+        startedAt: { lt: cutoff },
+        finishedAt: { not: null },
+        status: { in: ['SUCCEEDED', 'FAILED', 'PARTIAL'] },
+        ...(protectedJobIds.length > 0 ? { id: { notIn: protectedJobIds } } : {}),
+      },
+    })
+    wmsSyncJobsDeleted = count
   }
 
   // Stock movements — hard delete (exclude historical import types)
@@ -269,6 +444,8 @@ export async function purgeExpiredData(): Promise<{
   if (backReferenceEvidenceCompacted > 0) parts.push(`${backReferenceEvidenceCompacted} unresolved back-reference sync logs compacted`)
   if (stockMovementsDeleted > 0) parts.push(`${stockMovementsDeleted} stock movements deleted`)
   if (webhookEventsCompacted > 0) parts.push(`${webhookEventsCompacted} webhook events compacted`)
+  if (wmsInboundEventsCompacted > 0) parts.push(`${wmsInboundEventsCompacted} WMS inbound events compacted`)
+  if (wmsSyncJobsDeleted > 0) parts.push(`${wmsSyncJobsDeleted} WMS sync jobs deleted (with their log lines)`)
   if (salesOrdersArchived > 0) parts.push(`${salesOrdersArchived} sales orders archived`)
   if (purchaseOrdersArchived > 0) parts.push(`${purchaseOrdersArchived} purchase orders archived`)
   if (customersArchived > 0) parts.push(`${customersArchived} customers archived`)
@@ -279,10 +456,10 @@ export async function purgeExpiredData(): Promise<{
       action: 'cleanup',
       tag: 'system',
       description: `Data retention cleanup: ${parts.join(', ')}`,
-      metadata: { syncLogsDeleted, backReferenceEvidenceCompacted, stockMovementsDeleted, webhookEventsCompacted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
+      metadata: { syncLogsDeleted, backReferenceEvidenceCompacted, stockMovementsDeleted, webhookEventsCompacted, wmsInboundEventsCompacted, wmsSyncJobsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
       resolveUser: false,
     })
   }
 
-  return { syncLogsDeleted, backReferenceEvidenceCompacted, stockMovementsDeleted, webhookEventsCompacted, salesOrdersArchived, purchaseOrdersArchived, customersArchived }
+  return { syncLogsDeleted, backReferenceEvidenceCompacted, stockMovementsDeleted, webhookEventsCompacted, wmsInboundEventsCompacted, wmsSyncJobsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived }
 }

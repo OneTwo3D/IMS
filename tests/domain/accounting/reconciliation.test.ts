@@ -3,11 +3,13 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
+  DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS,
   MAX_RECONCILIATION_FINDINGS_PER_RUN,
   collectAccountingReconciliationRows,
   evaluateAccountingReconciliationRows,
   listAccountingReconciliationRuns,
   persistAccountingReconciliationReport,
+  reconciliationLookbackDate,
   updateAccountingReconciliationFindingStatus,
   type AccountingReconciliationReport,
   type AccountingReconciliationRows,
@@ -794,6 +796,12 @@ test('accounting reconciliation row collection selects required datasets', async
         return []
       },
     },
+    accountingEventLog: {
+      async findMany(args: unknown) {
+        calls.accountingEventLog = args
+        return []
+      },
+    },
   }
 
   await collectAccountingReconciliationRows(client)
@@ -803,6 +811,7 @@ test('accounting reconciliation row collection selects required datasets', async
   assert.ok(calls.salesOrderRefund)
   assert.ok(calls.accountingSyncLog)
   assert.ok(calls.accountingEvent)
+  assert.ok(calls.accountingEventLog)
   const salesOrderCall = calls.salesOrder as {
     where: {
       OR: Array<{
@@ -938,4 +947,423 @@ test('o3d-0qoo: a persisted batch ref with no mirrored event still reports the m
   assert.equal(finding!.orderId, 'order-1')
   // Reported against the reference the batch actually wrote, not a derived guess.
   assert.equal((finding!.details as { sourceEntityId: string }).sourceEntityId, A1_REF)
+})
+
+// o3d-cvj9: a *_INVOICE_UPDATE posts a REVISION of a document that already exists and the
+// connector hands back the id it gave the create, so a create plus its revisions legitimately
+// share one external reference. Before the mirrored revision could reach POSTED at all, the
+// update sync log never got an externalTransactionId, so this was never observable; it is now.
+function invoiceSyncLog(id: string, type: string, referenceId: string, externalTransactionId: string) {
+  return {
+    id,
+    connector: 'xero',
+    type,
+    status: 'SYNCED',
+    referenceType: 'SalesOrder',
+    referenceId,
+    externalTransactionId,
+    payload: { date: '2026-04-25' },
+  }
+}
+
+function duplicateReferenceFindings(rows: AccountingReconciliationRows, reference: string) {
+  return evaluateAccountingReconciliationRows(rows).filter((finding) => (
+    finding.code === 'duplicate_external_reference' &&
+    (finding.details as { externalReference?: string }).externalReference === reference
+  ))
+}
+
+test('a sales invoice and its update sharing one external id are not a duplicate reference', () => {
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    invoiceSyncLog('sync-invoice', 'SALES_INVOICE', 'order-1', 'INV-9'),
+    invoiceSyncLog('sync-invoice-update', 'SALES_INVOICE_UPDATE', 'order-1', 'INV-9'),
+  )
+
+  assert.deepEqual(duplicateReferenceFindings(rows, 'xero|INV-9'), [])
+})
+
+test('one external id claimed by two sales orders is still a duplicate reference', () => {
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    invoiceSyncLog('sync-invoice-update-1', 'SALES_INVOICE_UPDATE', 'order-1', 'INV-9'),
+    invoiceSyncLog('sync-invoice-update-2', 'SALES_INVOICE_UPDATE', 'order-2', 'INV-9'),
+  )
+
+  const findings = duplicateReferenceFindings(rows, 'xero|INV-9')
+  assert.equal(findings.length, 1, 'a reference spanning two source documents must stay critical')
+  assert.equal(findings[0].severity, 'critical')
+  assert.deepEqual(
+    (findings[0].details as { syncLogIds: string[] }).syncLogIds,
+    ['sync-invoice-update-1', 'sync-invoice-update-2'],
+  )
+})
+
+test('one document posted by two create sync logs is still a duplicate reference', () => {
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    invoiceSyncLog('sync-invoice-1', 'SALES_INVOICE', 'order-1', 'INV-9'),
+    invoiceSyncLog('sync-invoice-2', 'SALES_INVOICE', 'order-1', 'INV-9'),
+    invoiceSyncLog('sync-invoice-update', 'SALES_INVOICE_UPDATE', 'order-1', 'INV-9'),
+  )
+
+  const findings = duplicateReferenceFindings(rows, 'xero|INV-9')
+  assert.equal(findings.length, 1, 'two creates for one document is the double post the check exists for')
+  assert.deepEqual(
+    (findings[0].details as { syncLogIds: string[] }).syncLogIds,
+    ['sync-invoice-1', 'sync-invoice-2', 'sync-invoice-update'],
+  )
+})
+
+// o3d-cvj9 r2: the exemption above rests on `referenceType`/`referenceId`, which name the SOURCE
+// ROW a sync log was raised from — not the ledger document it posted. Those are not the same thing,
+// so a source key alone waved through pairings the mirror itself refuses: a sales invoice and a
+// purchase bill are different documents in Xero however their source rows happen to be keyed, and
+// `resolveDocumentRevisionExternalIdClaim` will not let one take the other's id. Reconciliation now
+// exempts exactly what the mirror permits — one document-revision FAMILY — and no more.
+
+function familySyncLog(id: string, type: string, referenceType: string, referenceId: string, externalTransactionId: string) {
+  return {
+    id,
+    connector: 'xero',
+    type,
+    status: 'SYNCED',
+    referenceType,
+    referenceId,
+    externalTransactionId,
+    payload: { date: '2026-04-25' },
+  }
+}
+
+test('o3d-cvj9 r2: a purchase-bill revision may not share a sales invoice reference, however the source rows are keyed', () => {
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    familySyncLog('sync-sales-invoice', 'SALES_INVOICE', 'SalesOrder', 'order-1', 'INV-9'),
+    familySyncLog('sync-bill-update', 'PURCHASE_INVOICE_UPDATE', 'SalesOrder', 'order-1', 'INV-9'),
+  )
+
+  const findings = duplicateReferenceFindings(rows, 'xero|INV-9')
+  assert.equal(findings.length, 1, 'a bill revision is not a revision of a sales invoice')
+  assert.equal(findings[0].severity, 'critical')
+  assert.deepEqual(
+    (findings[0].details as { syncLogIds: string[] }).syncLogIds,
+    ['sync-sales-invoice', 'sync-bill-update'],
+  )
+})
+
+test('o3d-cvj9 r2: two revisions of DIFFERENT families sharing one reference are a duplicate, create or no create', () => {
+  // No create row at all, so the `creates <= 1` half cannot see this one either.
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    familySyncLog('sync-invoice-update', 'SALES_INVOICE_UPDATE', 'SalesOrder', 'order-1', 'INV-9'),
+    familySyncLog('sync-bill-update', 'PURCHASE_INVOICE_UPDATE', 'SalesOrder', 'order-1', 'INV-9'),
+  )
+
+  const findings = duplicateReferenceFindings(rows, 'xero|INV-9')
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].severity, 'critical')
+})
+
+test('o3d-cvj9 r2: a type in NO revision family is its own family, never somebody else\'s revision', () => {
+  // CREDIT_NOTE neither creates nor revises a revisable document, so it counts as one create and
+  // would otherwise be exempted as the "create" a sales-invoice revision is allowed to follow.
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    familySyncLog('sync-credit-note', 'CREDIT_NOTE', 'SalesOrder', 'order-1', 'INV-9'),
+    familySyncLog('sync-invoice-update', 'SALES_INVOICE_UPDATE', 'SalesOrder', 'order-1', 'INV-9'),
+  )
+
+  const findings = duplicateReferenceFindings(rows, 'xero|INV-9')
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].severity, 'critical')
+})
+
+test('o3d-cvj9 r2: a purchase bill and ITS OWN update on one PO still share a reference legitimately', () => {
+  // The non-regression half: PURCHASE_INVOICE and PURCHASE_INVOICE_UPDATE are one family, and both
+  // are raised against the PurchaseOrder row, so this is the ordinary edited-bill shape.
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    familySyncLog('sync-bill', 'PURCHASE_INVOICE', 'PurchaseOrder', 'po-1', 'BILL-3'),
+    familySyncLog('sync-bill-update-1', 'PURCHASE_INVOICE_UPDATE', 'PurchaseOrder', 'po-1', 'BILL-3'),
+    familySyncLog('sync-bill-update-2', 'PURCHASE_INVOICE_UPDATE', 'PurchaseOrder', 'po-1', 'BILL-3'),
+  )
+
+  assert.deepEqual(duplicateReferenceFindings(rows, 'xero|BILL-3'), [])
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r7 (Codex r7, HIGH) — THE OPERATOR SURFACE FOR AN IDENTIFIER THAT MOVED ON A GUESS.
+//
+// The mirror answers a pair it cannot order, in the direction that converges, and says so. Round 6
+// then named the gap: the saying-so lived in an audit row's metadata and NOTHING LISTED IT. These
+// cover the listing — the read that finds the entries, and the finding that makes one checkable.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-cvj9 r7: the report reads the handovers made on an assumed order, bounded by its lookback', async () => {
+  const calls: Record<string, unknown> = {}
+  const client = {
+    salesOrder: { async findMany() { return [] } },
+    shipment: { async findMany() { return [] } },
+    salesOrderRefund: { async findMany() { return [] } },
+    accountingSyncLog: { async findMany() { return [] } },
+    accountingEvent: { async findMany() { return [] } },
+    accountingEventLog: {
+      async findMany(args: unknown) {
+        calls.accountingEventLog = args
+        return []
+      },
+    },
+  }
+
+  const toDate = new Date('2026-08-20T00:00:00.000Z')
+  const rows = await collectAccountingReconciliationRows(client, { lookbackDays: 30, toDate })
+
+  const call = calls.accountingEventLog as { where: { action?: string; createdAt?: { gte?: Date } }; take?: number }
+  assert.ok(call, 'the dataset is read at all — without this the finding can never fire in production')
+  assert.equal(
+    call.where.action,
+    'superseded_by_assumed_order',
+    'selected on the ASSUMED action alone, so a handover the stamps settled is never listed for review',
+  )
+  assert.deepEqual(
+    call.where.createdAt,
+    { gte: reconciliationLookbackDate(30, toDate) },
+    'bounded by the report window like every other dataset; an unbounded read re-reports for ever and stops being read',
+  )
+  assert.equal(rows.revisionClaimLogs?.length, 0, 'and the dataset reaches the evaluator, empty or not')
+})
+
+test('o3d-cvj9 r7: a claim that moved on an assumed order is reported for review, with both rows named', () => {
+  const rows = cleanRows()
+  rows.revisionClaimLogs = [{
+    id: 'log-1',
+    accountingEventId: 'event-holder',
+    action: 'superseded_by_assumed_order',
+    metadata: {
+      connector: 'xero',
+      externalId: 'INV-9',
+      orderingBasis: 'create_precedes_untimed_write',
+      supersededByEventId: 'event-revision',
+      syncType: 'SALES_INVOICE_UPDATE',
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+    },
+    createdAt: new Date('2026-08-19T10:06:00.000Z'),
+  }]
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+    .filter((finding) => finding.code === 'document_claim_moved_on_assumed_order')
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].severity, 'warning', 'unverified is not the same as broken — the critical next door is')
+  assert.equal(findings[0].accountingEventId, 'event-revision', 'keyed to the row that now holds the document id')
+  assert.deepEqual(findings[0].details, {
+    connector: 'xero',
+    externalId: 'INV-9',
+    orderingBasis: 'create_precedes_untimed_write',
+    releasedByEventId: 'event-holder',
+    holdingEventId: 'event-revision',
+    syncType: 'SALES_INVOICE_UPDATE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    movedAt: '2026-08-19T10:06:00.000Z',
+  })
+})
+
+test('o3d-cvj9 r7: an entry whose metadata lost the taker is still traced to a document, not dropped', () => {
+  // A finding an operator cannot act on is the failure this whole surface exists to avoid, so a
+  // malformed entry degrades to "here is the row that released the id" rather than to silence.
+  const rows = cleanRows()
+  rows.revisionClaimLogs = [{
+    id: 'log-1',
+    accountingEventId: 'event-holder',
+    action: 'superseded_by_assumed_order',
+    metadata: { connector: 'xero', externalId: 'INV-9' },
+    createdAt: new Date('2026-08-19T10:06:00.000Z'),
+  }]
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+    .filter((finding) => finding.code === 'document_claim_moved_on_assumed_order')
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].accountingEventId, 'event-holder')
+  assert.match(findings[0].message, /INV-9/)
+})
+
+test('o3d-cvj9 r7: fixtures that never read the dataset report neither a finding nor a row cap', () => {
+  // `revisionClaimLogs` is optional, and absent must stay distinguishable from empty: reading it as
+  // zero would make a dataset that was never queried look like one that returned nothing.
+  const rows = cleanRows()
+  assert.equal(rows.revisionClaimLogs, undefined)
+  assert.deepEqual(
+    evaluateAccountingReconciliationRows(rows)
+      .filter((finding) => finding.code === 'document_claim_moved_on_assumed_order'
+        || (finding.details as { dataset?: string })?.dataset === 'revisionClaimLogs'),
+    [],
+  )
+})
+
+// --- o3d-ecow: the legacy rows o3d-0qoo deliberately left alone ---
+
+/**
+ * The pre-migration Xero shape: the batch ref column is empty (those rows carry no persisted ref and
+ * never will), so the source key can only be DERIVED from the stage stamp and comes out bare — while
+ * the sync log and the mirrored event both carry the live `-<8 hex>` digest, because
+ * accounting-event-mirror copies the referenceId verbatim. Nothing else is wrong with these rows: the
+ * stamps agree with the batch date, and no midnight is crossed.
+ */
+function legacyDigestRows(): AccountingReconciliationRows {
+  const rows = persistedRefRows()
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    revenueDeferredBatchRef: null,
+    inventoryAllocatedBatchRef: null,
+  }
+  rows.shipments[0] = { ...rows.shipments[0], shipmentJournalBatchRef: null }
+  return rows
+}
+
+test('o3d-ecow: a LEGACY Xero row and the event it mirrored are one journal, not two findings', () => {
+  // Every healthy legacy Xero daily batch was reported TWICE: `source_*_without_event` going forward,
+  // because the derived `A1-<date>` never equalled the mirrored `A1-<date>-<digest>`, and
+  // `event_without_source` coming back, for the same reason from the other side. o3d-0qoo fixed the
+  // rows staged after its migration and said in as many words that it was leaving these alone.
+  const findings = evaluateAccountingReconciliationRows(legacyDigestRows())
+  const codes = findings.map((finding) => finding.code)
+
+  for (const code of DAILY_BATCH_SOURCE_CODES) {
+    assert.ok(!codes.includes(code), `${code} must not fire for a legacy row whose event carries a digest`)
+  }
+  assert.ok(!codes.includes('event_without_source'),
+    'and the same journal must not come back as an orphan event in the reverse direction')
+  assert.deepEqual(findings, [])
+})
+
+test('o3d-ecow: the bridge matches the batch the row NAMES, not any batch with a digest on it', () => {
+  // The bridge strips a digest; it must not strip the date with it. A legacy row stamped on the 24th
+  // whose only mirrored event belongs to the 23rd is a real gap, and both directions must still say so
+  // — otherwise the fix has replaced double-reporting with under-reporting, which is worse.
+  const rows = legacyDigestRows()
+  const wrongDay = 'A1-2026-04-23-abcd1234'
+  rows.accountingEvents = rows.accountingEvents.map((event) => (
+    event.type === 'DAILY_BATCH_REVENUE_DEFERRAL' ? { ...event, sourceEntityId: wrongDay } : event
+  ))
+  rows.syncLogs = rows.syncLogs.map((log) => (
+    log.type === 'DAILY_BATCH_REVENUE_DEFERRAL' ? { ...log, referenceId: wrongDay } : log
+  ))
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+  const codes = findings.map((finding) => finding.code)
+
+  assert.ok(codes.includes('source_order_revenue_deferral_without_event'),
+    'the row stamped on the 24th still has no mirrored event')
+  const orphan = findings.find((finding) => finding.code === 'event_without_source')
+  assert.ok(orphan, 'and the event on the 23rd still has no source')
+  assert.equal((orphan!.details as { sourceEntityId: string }).sourceEntityId, wrongDay)
+  assert.equal(codes.filter((code) => DAILY_BATCH_SOURCE_CODES.includes(code)).length, 1,
+    'A2 and Group B are untouched and stay clean')
+})
+
+test('o3d-ecow: a PERSISTED ref is matched exactly — the digest is not stripped to meet it', () => {
+  // The split o3d-0qoo drew, and the reason the bridge is carried per key rather than switched on for
+  // the whole module. A persisted ref IS the referenceId the batch wrote; a digest-suffixed event
+  // beside a bare persisted ref is a different journal, and bridging it would vouch for the wrong one.
+  const rows = persistedRefRows()
+  rows.salesOrders[0] = { ...rows.salesOrders[0], revenueDeferredBatchRef: 'A1-2026-04-24' }
+
+  const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+
+  assert.ok(codes.includes('source_order_revenue_deferral_without_event'),
+    'the persisted ref names a journal that was never mirrored')
+  assert.ok(codes.includes('event_without_source'),
+    'and the digest-suffixed event it sits beside is not that journal')
+})
+
+// --- o3d-ecow round 2: a same-day SPLIT is the one thing a bare key cannot resolve ---
+
+const A1_SPLIT_REF = 'A1-2026-04-24-99999999'
+
+/**
+ * The legacy shape, on a day whose A1 batch was SPLIT into two journals.
+ *
+ * Both journals posted and both mirrored, so the sync-log direction (which matches exactly) is
+ * clean. What is NOT clean is the bridge: strip the digest off either event and you get the same
+ * `A1-2026-04-24` the legacy row derives, so each journal answers for the other.
+ */
+function splitLegacyDigestRows(): AccountingReconciliationRows {
+  const rows = legacyDigestRows()
+  const a1Event = rows.accountingEvents.find((event) => event.type === 'DAILY_BATCH_REVENUE_DEFERRAL')!
+  const a1Log = rows.syncLogs.find((log) => log.type === 'DAILY_BATCH_REVENUE_DEFERRAL')!
+  rows.accountingEvents = [
+    ...rows.accountingEvents,
+    { ...a1Event, id: 'event-a1-split', sourceEntityId: A1_SPLIT_REF, externalId: 'journal-a1-split' },
+  ]
+  rows.syncLogs = [
+    ...rows.syncLogs,
+    { ...a1Log, id: 'sync-a1-split', referenceId: A1_SPLIT_REF, externalTransactionId: 'journal-a1-split' },
+  ]
+  return rows
+}
+
+test('o3d-ecow r2: one same-day split journal no longer vouches for another', () => {
+  // THE DEFECT. The bridge takes the digest off, and the digest is the ONLY thing separating two
+  // journals of the same group and date. So a legacy row whose own journal was never mirrored was
+  // satisfied by the OTHER split's event (forward), and a duplicate or orphaned split journal was
+  // satisfied by the other split's source rows (reverse) — each direction silently answered by a
+  // journal it was not asking about. Round 1 shipped that as a clean pass.
+  const findings = evaluateAccountingReconciliationRows(splitLegacyDigestRows())
+
+  assert.equal(findings.length, 1, `expected exactly one finding, got ${JSON.stringify(findings.map((f) => f.code))}`)
+  const [finding] = findings
+  assert.equal(finding.code, DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS)
+  assert.equal(finding.severity, 'warning')
+  const details = finding.details as { sourceEntityId: string; candidateSourceEntityIds: string[] }
+  assert.equal(details.sourceEntityId, 'A1-2026-04-24', 'reported against the bare key that cannot decide')
+  assert.deepEqual([...details.candidateSourceEntityIds].sort(), [A1_REF, A1_SPLIT_REF].sort(),
+    'and it names every journal the key matches, so a human can check them in the ledger')
+  assert.match(finding.message, /cannot be established/i)
+})
+
+test('o3d-ecow r2: the ambiguity is reported ONCE, not once per staged row', () => {
+  // A split day can carry thousands of staged orders. A finding each would say the same
+  // unresolvable thing thousands of times and push the rest of the report past the per-run cap.
+  const rows = splitLegacyDigestRows()
+  rows.salesOrders = [
+    rows.salesOrders[0],
+    { ...rows.salesOrders[0], id: 'order-2', orderNumber: 'SO-2', inventoryAllocatedDate: null },
+    { ...rows.salesOrders[0], id: 'order-3', orderNumber: 'SO-3', inventoryAllocatedDate: null },
+  ]
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+  assert.equal(findings.filter((f) => f.code === DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS).length, 1)
+  assert.equal(findings.length, 1, 'and nothing else fires: A2 and Group B are unsplit and still match')
+})
+
+test('o3d-ecow r2: an UNSPLIT legacy day still bridges silently — round 1 is not undone', () => {
+  // The whole point of the bridge is that a healthy legacy Xero batch stopped double-reporting. One
+  // journal for the key means the bare match names exactly that journal, and nothing is ambiguous.
+  assert.deepEqual(evaluateAccountingReconciliationRows(legacyDigestRows()), [])
+})
+
+test('o3d-ecow r2: a split day with PERSISTED refs is matched exactly and never goes near the bridge', () => {
+  // Persisted identity is the case o3d-0qoo built for: the row names its own journal, so a split is
+  // not ambiguous at all — and the journal nothing points at is a plain orphan, reported as one.
+  const rows = persistedRefRows()
+  const a1Event = rows.accountingEvents.find((event) => event.type === 'DAILY_BATCH_REVENUE_DEFERRAL')!
+  const a1Log = rows.syncLogs.find((log) => log.type === 'DAILY_BATCH_REVENUE_DEFERRAL')!
+  rows.accountingEvents = [
+    ...rows.accountingEvents,
+    { ...a1Event, id: 'event-a1-split', sourceEntityId: A1_SPLIT_REF, externalId: 'journal-a1-split' },
+  ]
+  rows.syncLogs = [
+    ...rows.syncLogs,
+    { ...a1Log, id: 'sync-a1-split', referenceId: A1_SPLIT_REF, externalTransactionId: 'journal-a1-split' },
+  ]
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+  const codes = findings.map((finding) => finding.code)
+  assert.ok(!codes.includes(DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS), 'nothing was bridged, so nothing is ambiguous')
+  const orphan = findings.find((finding) => finding.code === 'event_without_source')
+  assert.ok(orphan, 'the second journal has no source state of its own and is reported')
+  assert.equal((orphan!.details as { sourceEntityId: string }).sourceEntityId, A1_SPLIT_REF)
 })

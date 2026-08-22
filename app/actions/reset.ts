@@ -6,6 +6,7 @@ import { logActivity } from '@/lib/activity-log'
 import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
 import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
+import { UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
 
 export type ResetLevel = 'transactions' | 'products' | 'full'
 
@@ -97,7 +98,44 @@ async function clearTransactionScope() {
   // Sync / audit history
   await db.shoppingSyncLog.deleteMany({})
   await db.accountingSyncLog.deleteMany({})
-  await db.activityLog.deleteMany({})
+
+  // A RESET CLEARS IMS. IT CANNOT CLEAR XERO (o3d-550x; Codex r3, medium).
+  //
+  // Everything else on this list describes something that lives in this database, so deleting it is the
+  // whole point of a reset. `xero_posted_document_unrecorded` does not: it says a document was ACCEPTED
+  // BY XERO and its sync row can never name it — real money in somebody else's ledger, which no reset of
+  // ours voids, and which nothing in IMS can re-derive. That is the same sentence that earned it the
+  // retention exemption, and a factory reset is not a weaker eraser than a 90-day sweep; it is a
+  // stronger one.
+  //
+  // An earlier answer was that the reset "deletes the sync rows too", so the record has nothing left to
+  // point at. Read the other way round, that is the argument FOR keeping it: after the reset there is no
+  // sync row, no accounting event and no external id anywhere in IMS, so this row is not one of several
+  // traces of the document — it is the only one that ever existed, and the wording is self-contained
+  // (both ids, the reference it was for, and what to do about it), so it still means exactly what it
+  // meant before the rest of the row's world was deleted.
+  //
+  // The direct-create marker, the exemption's other half, is deliberately NOT kept: it is an open
+  // obligation about a sales order that this reset is deleting, so the thing it asks for cannot be done
+  // and nothing is lost by discharging it.
+  //
+  // WHERE AN OPERATOR SEES IT AFTERWARDS: /activity — filter level ERROR or tag `sync`, or search for
+  // the action name or either Xero id; the description is the full incident and its remedy. The
+  // breadcrumb below puts the count in the same list so nobody has to know to look.
+  await db.activityLog.deleteMany({ where: { action: { not: UNRECORDED_POSTED_DOCUMENT_ACTION } } })
+  const preserved = await db.activityLog.count({ where: { action: UNRECORDED_POSTED_DOCUMENT_ACTION } })
+  if (preserved > 0) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      tag: 'sync',
+      action: 'database_reset_preserved_unrecorded_documents',
+      level: 'WARNING',
+      description: `Database reset kept ${preserved} record(s) of Xero document(s) that IMS posted and `
+        + 'could never record. Those documents still exist in Xero and nothing else in IMS references '
+        + `them any more. Search this log for "${UNRECORDED_POSTED_DOCUMENT_ACTION}".`,
+      metadata: { preserved, action: UNRECORDED_POSTED_DOCUMENT_ACTION },
+    })
+  }
 
   // Reset WooCommerce transaction intake state so orders can be imported from
   // scratch after a transaction reset.
@@ -155,7 +193,6 @@ async function clearFullScope() {
   await db.externalWmsBinding.deleteMany({})
   await db.wmsConnection.deleteMany({})
   await db.accountingAccount.deleteMany({})
-  await db.accountingToken.deleteMany({})
 
   // Core company configuration / reference data
   await db.purchaseUnit.deleteMany({})
@@ -164,14 +201,41 @@ async function clearFullScope() {
   await db.taxRate.deleteMany({})
   await db.adjustmentReason.deleteMany({})
   await db.documentTemplate.deleteMany({})
-  // Under the plugin-selection lock: this deletes the plugin_* rows too, which is a connector
-  // change (to "none") for anything reading them — the third of the three real bypasses the
-  // orphan-cancel sweep's row locks had to fence (o3d-osl8 round 6, finding 2). A concurrent
-  // cancel then either commits before this or waits for it, instead of deciding what to discard
-  // from a selection this is deleting underneath it.
+  // THE TWO HALVES OF A CONNECTOR BINDING GO TOGETHER — ONE TRANSACTION, PIN BEFORE TOKEN (o3d-9tbz r7).
+  //
+  // A binding is two rows in two tables: the token in `accounting_tokens`, and the
+  // `xero_expected_tenant_id` pin in `settings`. Since r6 the sync READS ONE AS EVIDENCE ABOUT THE
+  // OTHER — a token row carrying a connection generation with no pin beside it means the pin was
+  // removed on its own, so the binding is unverifiable and every Xero sync halts, with a message about
+  // restored backups and hand-run deletes. That inference is only sound while every writer moves both
+  // halves together, and this one did not: the token was deleted six statements earlier, outside the
+  // transaction that deleted the settings.
+  //
+  // A reset cannot be told from tampering by a MARKER — a marker is a thing the tamper case can arrive
+  // carrying too. What distinguishes it is that a reset removes BOTH halves, so it leaves no token row
+  // for the halt to ask about. Two things make that true of every interleaving, not just the quiet one:
+  //
+  //   ONE TRANSACTION, so a failure between the two deletes cannot commit half of it.
+  //   THE PIN FIRST, because under READ COMMITTED each statement takes its OWN snapshot, and a
+  //   concurrent OAuth callback can still commit a whole binding between them. Deleting the pin first
+  //   makes every outcome a safe one. If the callback committed early enough for the wipe to take its
+  //   pin, it committed early enough for the delete below to take its token as well, so both go. If it
+  //   commits after the wipe, its pin survives; its token then either survives with it (a row inserted
+  //   after the delete's snapshot is outside it) or is deleted, leaving a PIN WITH NO TOKEN — an
+  //   instance that reports "not connected" and is repaired by connecting again, not one that halts.
+  //   The old order guaranteed the opposite and only the opposite: the callback's pin was always the
+  //   one wiped and its token always the one left behind, which is exactly the state the halt refuses,
+  //   reported to an operator who had done nothing but reset a database.
+  //
+  // Still under the plugin-selection lock: deleting the settings rows deletes the plugin_* rows, which
+  // is a connector change (to "none") for anything reading them — the third of the three real bypasses
+  // the orphan-cancel sweep's row locks had to fence (o3d-osl8 round 6, finding 2). A concurrent cancel
+  // then either commits before this or waits for it, instead of deciding what to discard from a
+  // selection this is deleting underneath it.
   await db.$transaction(async (tx) => {
     await lockIntegrationPluginSelection(tx)
     await tx.setting.deleteMany({})
+    await tx.accountingToken.deleteMany({})
   })
   await db.warehouse.deleteMany({})
   await db.organisation.deleteMany({})

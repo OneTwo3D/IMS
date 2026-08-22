@@ -33,6 +33,12 @@ type Row = {
   status: string
   createdAt: Date
   payload: Record<string, unknown> | null
+  /**
+   * o3d-e2mz: the attempt this row is at. The per-row retry is now fenced on it, so a double that
+   * did not carry it could only ever exercise the bulk path — and every per-row assertion below
+   * would have been testing a refusal instead of the guard it names.
+   */
+  attemptRevision: number
 }
 
 type Event = { kind: 'lock' | 'findMany' | 'updateMany'; detail: string }
@@ -47,7 +53,7 @@ const state = {
   probeCalls: [] as string[],
 }
 
-const SELECTABLE = new Set(['id', 'type', 'referenceType', 'referenceId', 'payload', 'status', 'connector'])
+const SELECTABLE = new Set(['id', 'type', 'referenceType', 'referenceId', 'payload', 'status', 'connector', 'attemptRevision'])
 
 function matches(row: Row, where: Record<string, unknown>): boolean {
   for (const [key, value] of Object.entries(where)) {
@@ -64,6 +70,13 @@ function matches(row: Row, where: Record<string, unknown>): boolean {
       // Never silently ignored: an unimplemented filter would widen the result set and could
       // make a broken guard look correct.
       throw new Error(`the accountingSyncLog double does not implement the filter "${key}"`)
+    }
+    // o3d-e2mz: attemptRevision is the one NUMERIC filter, and it is the fence's whole identity —
+    // an equality the double must honour exactly, never coerce.
+    if (key === 'attemptRevision') {
+      if (typeof value !== 'number') throw new Error(`attemptRevision must be compared as a number, got ${JSON.stringify(value)}`)
+      if (row.attemptRevision !== value) return false
+      continue
     }
     if (typeof value !== 'string') throw new Error(`unsupported filter shape for "${key}": ${JSON.stringify(value)}`)
     if ((row as unknown as Record<string, unknown>)[key] !== value) return false
@@ -94,9 +107,23 @@ function syncLogClient(txLabel: string) {
     },
     updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
       const hit = state.rows.filter((row) => matches(row, where))
-      for (const row of hit) if (typeof data.status === 'string') row.status = data.status
+      for (const row of hit) {
+        if (typeof data.status === 'string') row.status = data.status
+        // The BUMP is what stops the previous attempt's holder writing over this decision, so the
+        // double applies it: without it a second fenced write with the same expected revision would
+        // succeed, and the test would report the fence as working when it is inert.
+        if (typeof data.attemptRevision === 'number') row.attemptRevision = data.attemptRevision
+      }
       state.events.push({ kind: 'updateMany', detail: hit.map((row) => row.id).join(','), tx: txLabel })
       return { count: hit.length }
+    },
+    // Two readers: the action's connector pre-check, and applyFencedAttemptDecision's "what moved?"
+    // read after a lost CAS.
+    findUnique: async ({ where, select }: { where: { id: string }; select?: Record<string, boolean> }) => {
+      const hit = state.rows.find((row) => row.id === where.id)
+      if (!hit) return null
+      const fields = select ? Object.keys(select) : ['id', 'connector', 'status', 'attemptRevision']
+      return Object.fromEntries(fields.map((f) => [f, (hit as unknown as Record<string, unknown>)[f]]))
     },
   }
 }
@@ -163,8 +190,11 @@ const payload = (accountingInvoiceId: string, extra: Record<string, unknown> = {
   ({ accountingInvoiceId, bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01', ...extra })
 
 let clock = 0
-const row = (r: Omit<Row, 'createdAt' | 'connector'> & { connector: string }): Row =>
-  ({ ...r, createdAt: new Date(1_700_000_000_000 + (clock += 1000)) })
+const row = (r: Omit<Row, 'createdAt' | 'connector' | 'attemptRevision'> & { connector: string; attemptRevision?: number }): Row =>
+  // attemptRevision 1 by default: a row that has been claimed once and failed, which is what every
+  // FAILED row in these scenarios is. Revision 0 means "no processor ever fenced this row" and is
+  // refused per-row by construction (o3d-e2mz) — a state a separate test covers deliberately.
+  ({ attemptRevision: 1, ...r, createdAt: new Date(1_700_000_000_000 + (clock += 1000)) })
 
 function seed(connector: string) {
   clock = 0
@@ -215,9 +245,22 @@ const ACTIONS = [
 
 type RetryFn = (entryId?: string) => Promise<{ success: boolean; reset: number; refused?: number; error?: string }>
 
+/**
+ * o3d-e2mz: a per-row retry now carries the attempt the operator was looking at, and Xero refuses one
+ * that names none. The wrapper supplies the row's CURRENT revision, which is exactly what the sync log
+ * would have shown them — so every scenario below still exercises the o3d-0m56 guard rather than
+ * bouncing off the attempt preflight. QuickBooks stamps no revision and ignores the argument.
+ *
+ * Passing the live value is deliberate: a hard-coded one would go stale the moment a scenario revives a
+ * row, and the tests that are ABOUT a stale revision pass their own (see manual-retry-guard.test.ts).
+ */
 async function load(action: (typeof ACTIONS)[number]): Promise<RetryFn> {
   const mod = await import(action.module) as Record<string, unknown>
-  return mod[action.fn] as never
+  const impl = mod[action.fn] as (entryId?: string, expectedAttemptRevision?: number) => ReturnType<RetryFn>
+  return (entryId?: string) => impl(
+    entryId,
+    entryId === undefined ? undefined : state.rows.find((row) => row.id === entryId)?.attemptRevision,
+  )
 }
 
 for (const action of ACTIONS) {
@@ -450,7 +493,11 @@ test('quickbooks: rows sharing the generic idempotency key are NOT ambiguous (o3
   // the refusal is about the derivation rather than about an empty ledger.
   ledgerHoldsTheAttemptOn('inv-1')
   const { retryFailedXeroSync } = await import('@/app/actions/xero-sync')
-  assert.equal((await retryFailedXeroSync('a1')).success, false, 'Xero never sent that key')
+  assert.equal(
+    (await retryFailedXeroSync('a1', state.rows.find((row) => row.id === 'a1')?.attemptRevision)).success,
+    false,
+    'Xero never sent that key',
+  )
   assert.equal(statusOf('a1'), 'FAILED')
 })
 

@@ -26,7 +26,6 @@ test('shipping tax accumulates exactly across many rows (no float drift)', () =>
     lines: [],
     shippingTaxForeign: Array.from({ length: 10 }, () => '0.10'),
     orderTotal: '1.00',
-    pricesIncludeVat: false,
   })
   assert.equal(totals.taxForeign.toString(), '1')
   assert.equal(totals.totalForeign.toFixed(2), '1.00')
@@ -39,11 +38,9 @@ test('line tax + shipping tax accumulate without drift', () => {
       unitPriceForeign: '10.00',
       discountAmount: '0',
       taxForeign: '0.10',
-      taxRateValue: '0',
     })),
     shippingTaxForeign: ['0.10', '0.10'],
     orderTotal: '30.50',
-    pricesIncludeVat: false,
   })
   // 3 × 0.10 line tax + 2 × 0.10 shipping tax = 0.50 exactly.
   assert.equal(totals.taxForeign.toFixed(2), '0.50')
@@ -52,29 +49,35 @@ test('line tax + shipping tax accumulate without drift', () => {
   assert.equal(totals.totalForeign.toFixed(2), '30.50')
 })
 
-test('VAT-inclusive subtotal extracts net per line at the line rate', () => {
-  // gross 120.00 at 20% VAT → net 100.00.
+test('a VAT-INCLUSIVE store extracts NOTHING — the WC line amounts are already net (o3d-cyn)', () => {
+  // Woo reports `line_items[].subtotal` ex-tax on both price conventions, so a 2 × 50.00 line on a
+  // tax-inclusive store is net 100.00 carrying 20.00 of VAT, and the order grosses 120.00. This
+  // used to divide the already-net 100.00 by 1.2 and store 83.33, leaving the stored order unable
+  // to reconcile: 83.33 + 20.00 != 120.00.
   const totals = computeWcOrderForeignTotals({
     lines: [
-      { qty: 2, unitPriceForeign: '60.00', discountAmount: '0', taxForeign: '20.00', taxRateValue: '0.2' },
+      { qty: 2, unitPriceForeign: '50.00', discountAmount: '0', taxForeign: '20.00' },
     ],
     shippingTaxForeign: [],
     orderTotal: '120.00',
-    pricesIncludeVat: true,
   })
   assert.equal(totals.subtotalForeign.toFixed(2), '100.00')
   assert.equal(totals.taxForeign.toFixed(2), '20.00')
+  assert.equal(
+    totals.subtotalForeign.add(totals.taxForeign).toFixed(2),
+    totals.totalForeign.toFixed(2),
+    'subtotal + tax must reconcile to the Woo order total',
+  )
 })
 
-test('line discount is netted out of the gross before VAT extraction', () => {
-  // gross = 1 × 50.00 − 5.00 = 45.00; not VAT-inclusive so subtotal = 45.00.
+test('a line discount is netted out of the line amount, on the same ex-tax basis', () => {
+  // net = 1 × 50.00 − 5.00 = 45.00, and the discount is ex-tax like the line it came off.
   const totals = computeWcOrderForeignTotals({
     lines: [
-      { qty: 1, unitPriceForeign: '50.00', discountAmount: '5.00', taxForeign: '0', taxRateValue: '0' },
+      { qty: 1, unitPriceForeign: '50.00', discountAmount: '5.00', taxForeign: '0' },
     ],
     shippingTaxForeign: [],
     orderTotal: '45.00',
-    pricesIncludeVat: false,
   })
   assert.equal(totals.subtotalForeign.toFixed(2), '45.00')
 })

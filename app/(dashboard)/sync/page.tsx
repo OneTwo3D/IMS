@@ -369,6 +369,8 @@ export default async function SyncPage() {
           accountingSettings={dashboard.accountingSettings}
           accountingConnected={dashboard.accountingStatus.connected}
           accountingTenantName={dashboard.accountingStatus.tenantName}
+          accountingBlockedReason={dashboard.accountingStatus.blockedReason}
+          accountingHasStoredToken={dashboard.accountingStatus.hasStoredToken}
           accountingConnectionTest={dashboard.accountingConnectionTest}
           accountingAccounts={dashboard.accountingAccounts}
           accountingLogs={dashboard.accountingLogs}

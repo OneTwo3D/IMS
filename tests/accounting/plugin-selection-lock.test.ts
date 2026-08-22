@@ -946,6 +946,10 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             covered by the lexical inventory above.
  *   'pinned-lock-session'   — builds a small dedicated `pg` pool/client to hold ONE advisory lock on
  *                             a connection Prisma will not reassign. Takes a lock; writes nothing.
+ *   'names-the-tools-only'  — touches NO database at all, in any mode. It appears in this inventory
+ *                             because its own prose names `psql` / `prisma migrate` — which is the
+ *                             deliberately generous half of this scan working as intended, and is
+ *                             why the inventory is a classification rather than a filter.
  *   'seed'                  — a standalone client that WRITES this database, run from install.sh.
  *                             It takes no lock and cannot practically be made to (it runs before the
  *                             app is up); what keeps it safe is that it must not write a plugin key,
@@ -961,6 +965,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'provisioning-cli'
   | 'runtime-assembled-sql'
   | 'validates-external-sql'
+  | 'names-the-tools-only'
   | 'app-database-client'
   | 'pinned-lock-session'
   | 'seed'
@@ -977,10 +982,21 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'e2e/woocommerce-xero-bundle-refund.spec.ts': 'inline-sql-cli',
   'lib/backup-manifest.ts': 'runtime-assembled-sql',
   'lib/cost-layers.ts': 'runtime-assembled-sql',
+  // The direct-create marker deferral (o3d-z82a r4). Raw because `SET LOCAL statement_timeout`
+  // takes no bind parameters; the interpolated value is a numeric module constant, and the UPDATE
+  // itself is parameterised. It touches only `activity_logs` marker rows — never `settings`, so it
+  // cannot move a plugin key — and runs in its own transaction rather than the sweep's.
+  'lib/fulfillment/pre-fulfilment-reallocation.ts': 'runtime-assembled-sql',
   'lib/db/savepoint.ts': 'runtime-assembled-sql',
   'scripts/landed-cost-e2e-fixture.ts': 'runtime-assembled-sql',
   'scripts/backup.sh': 'dump-only',
   'scripts/check-prisma-drift.mjs': 'schema-diff-only',
+  // o3d-o8cp's documented-vs-read guard. It opens .env.example, CLAUDE.md, docs/ and the repo's
+  // TypeScript, and executes nothing anywhere; it is discovered here purely because its header
+  // explains that a PRIOR guard in this repo fired on `psql` and `prisma migrate` picked out of doc
+  // comments. Rewording that sentence to dodge this scan would delete the lesson to satisfy the
+  // detector, so it is classified instead.
+  'scripts/check-documented-env-vars.mjs': 'names-the-tools-only',
   'scripts/deploy.sh': 'migration-runner',
   'scripts/install.sh': 'migration-runner',
   'scripts/prisma-dev-db.sh': 'migration-runner',
@@ -1164,6 +1180,16 @@ const MIGRATIONS_THAT_MUTATE_SETTINGS: Record<string, string> = {
     'Deletes ONE key by exact literal match (accounting.money-attempt-stamping-since), the round-9 '
     + 'money-attempt epoch that `attemptStampingCustodyAt` replaces. Nothing reads it after this '
     + 'migration, so the delete cannot race a reader; it touches no plugin key and no other row.',
+  '20260819210000_xero_pin_write_consumes_release':
+    'Deletes ONE key by exact literal match (xero_pin_release_witness), in two places: the backfill, '
+    + 'and the body of the trigger it installs. Neither can reach a plugin key — the literal is the '
+    + 'whole WHERE clause, there is no pattern and no wholesale form. The trigger outlives the '
+    + 'migration and therefore fires at APPLICATION runtime, which is the part worth reviewing rather '
+    + 'than the deploy: it fires only from a write of xero_expected_tenant_id, inside that writer\'s '
+    + 'own transaction, and its only other statement clears three columns on the Xero accounting_tokens '
+    + 'row. A caller writing that key while the orphan-cancel sweep runs is serialized the way any two '
+    + 'writers of that row are; it takes no lock of its own and needs none, because the rows it '
+    + 'touches are not the ones the selection lock fences (o3d-9tbz r9).',
 }
 
 test('no migration performs a WHOLESALE settings mutation', () => {

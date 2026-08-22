@@ -1,4 +1,3 @@
-import { db } from '@/lib/db'
 
 /**
  * o3d-0m56 round 10 (Codex HIGH x3) — WHAT `remoteAttemptedAt IS NULL` PROVES, AND HOW THE ROW
@@ -153,6 +152,11 @@ export async function repairMoneyAttemptsOutsideStampingCustody(): Promise<numbe
   // `attemptStampingCustodyAt IS NULL` is the whole test, and it is the same predicate as the
   // partial index `accounting_sync_logs_money_attempt_uncustodied_idx`, so this statement is served
   // by an index that is empty in steady state rather than by a scan of every sync row ever written.
+  // Imported HERE rather than at module scope so the two PURE helpers above —
+  // `stampingCustodyOnCreate` and `stampingCustodyOnClaim` — can be reached without constructing a
+  // Prisma client. `sync-claim-fence.ts` now uses the claim helper to keep custody across every
+  // non-terminal release, and it is imported by modules whose tests build no database at all.
+  const { db } = await import('@/lib/db')
   return db.$executeRaw`
     UPDATE "accounting_sync_logs"
        SET "remoteAttemptedAt" = COALESCE("syncedAt", "processingStartedAt", "createdAt")

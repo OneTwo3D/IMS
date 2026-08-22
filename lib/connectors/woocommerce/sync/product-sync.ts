@@ -5,7 +5,6 @@
 import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import { getSettingValue } from '@/lib/settings-store'
 import { wcFetch, wcPut } from '../api'
 import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
@@ -23,7 +22,7 @@ import {
   WcProductWriteRaceError,
   WcSettingsVersionChangedError,
 } from './product-sync-errors'
-import { validateWooCommerceBaseUrl } from '../url-safety'
+import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentialsFromRows } from '../credentials'
 import type { ConnectorCredentials } from '../../types'
 import { toIsoCountryCode, DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
@@ -176,6 +175,11 @@ async function connectorTransformBlockerSummary(
  * predicate. That is write skew and it needs a lock the blocker writers take, or SERIALIZABLE
  * across all of them — neither exists (see PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE). This bounds
  * the window; it does not remove it, and nothing in this file may claim otherwise.
+ *
+ * AND NEITHER WILL EXIST: o3d-0fok accepted that residual permanently, with the reasoning written
+ * out on PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE and in docs/architecture.md. Read that before
+ * proposing a lock here — the connector is one of five callers, and a lock only one of them takes
+ * is not a lock.
  *
  * The blocked row's operator-facing WHY is read afterwards, one row at a time, because the set
  * query returns membership only. That read is on a path that has already decided to abort, so
@@ -607,18 +611,14 @@ async function snapshotProductSyncContext(): Promise<{
     await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(${WC_SYNC_ADVISORY_LOCK_KEY})`
     const rows = await tx.setting.findMany({
       where: {
-        key: { in: ['wc_url', 'wc_consumer_key', 'wc_consumer_secret', WC_SETTINGS_VERSION_KEY] },
+        key: { in: [...WC_CREDENTIAL_SETTING_KEYS, WC_SETTINGS_VERSION_KEY] },
       },
     })
-    const map = new Map(rows.map((row) => [row.key, row.value]))
-    const url = map.get('wc_url')
-    const key = map.get('wc_consumer_key')
-    const secret = map.get('wc_consumer_secret')
-    const syncVersion = map.get(WC_SETTINGS_VERSION_KEY) ?? '0'
-    const validatedUrl = url ? validateWooCommerceBaseUrl(url) : null
-    const creds: ConnectorCredentials | null = validatedUrl?.ok && key && secret
-      ? { url: validatedUrl.normalizedUrl, key, secret: decryptSettingValue('wc_consumer_secret', secret) }
-      : null
+    const syncVersion = rows.find((row) => row.key === WC_SETTINGS_VERSION_KEY)?.value ?? '0'
+    // o3d-ecbj: built by THE credential resolver, shared with getWcCredentials and the
+    // stock-sync snapshot, so an import and a stock push can never run under different
+    // credentials again.
+    const creds: ConnectorCredentials | null = resolveWcCredentialsFromRows(rows)
     return { creds, syncVersion }
   })
 }

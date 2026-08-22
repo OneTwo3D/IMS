@@ -1,3 +1,5 @@
+import { AccessDenied } from '@/components/auth/access-denied'
+import { authorizePage } from '@/lib/auth/server'
 import type { Metadata } from 'next'
 import { SlidersHorizontal, FolderTree } from 'lucide-react'
 import { Card } from '@/components/ui/card'
@@ -11,6 +13,13 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 export const metadata: Metadata = { title: 'Inventory Settings' }
 
 export default async function InventorySettingsPage() {
+  // o3d-512h: page-level authorization. The (dashboard) layout establishes only
+  // AUTHENTICATION, and the sidebar hiding a link is not a boundary — without
+  // this, any authenticated role that types the URL renders the page and its
+  // reads run. Must stay the FIRST statement so a denial performs no read.
+  const gate = await authorizePage('settings.company')
+  if (!gate.authorized) return <AccessDenied permission={gate.permission} />
+
   const pluginState = await getIntegrationPluginState()
   const [reasons, warehouses, accountCodes, categories] = await Promise.all([
     getAdjustmentReasons(),

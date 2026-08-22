@@ -11,7 +11,7 @@ import type { ReadableStream as NodeReadableStream } from 'stream/web'
 import { logActivity, redactActivityLogText } from '@/lib/activity-log'
 import { requireApiFreshAdmin } from '@/lib/auth/server'
 import { getBackupDir } from '@/lib/backup-storage'
-import { disableMaintenanceMode, enableMaintenanceMode } from '@/lib/maintenance-mode'
+import { disableMaintenanceMode, enableMaintenanceMode, recordMaintenanceHold } from '@/lib/maintenance-mode'
 import { sendEmail } from '@/lib/mailer'
 import { consumeAuthToken, deleteAuthToken, setAuthToken } from '@/lib/auth/token-store'
 import { db } from '@/lib/db'
@@ -71,6 +71,7 @@ export type BackupRestoreHandlerDeps = {
   deleteRestoreToken?: typeof deleteAuthToken
   enableMaintenance?: typeof enableMaintenanceMode
   disableMaintenance?: typeof disableMaintenanceMode
+  recordMaintenanceHold?: typeof recordMaintenanceHold
   runRestoreFile?: typeof runRestore
   validateBackupManifest?: typeof validateBackupManifestForFile
   getAvailableDiskBytes?: typeof getAvailableDiskBytes
@@ -584,33 +585,131 @@ export type RestoreLockContext = {
  *       `handleWcWebhook` checks it (first thing it does, before any write). A `shopify` delivery
  *       to the same route reaches `lib/connectors/shopify` unfenced — currently a 501 stub, so it
  *       is not a live writer, but it is not fenced either and will not become fenced by itself.
- * wms-connector-boundary-ok: o3d-osl8: naming which routes maintenance mode does NOT fence is the measured claim itself, not connector dispatch.
- *   app/api/webhooks/mintsoft/asn-booked-in            → NOT FENCED. Persists via
- * wms-connector-boundary-ok: o3d-osl8: naming which routes maintenance mode does NOT fence is the measured claim itself, not connector dispatch.
- *       `persistMintsoftWebhookEvent` with no maintenance check anywhere on the path.
- * wms-connector-boundary-ok: o3d-osl8: naming which routes maintenance mode does NOT fence is the measured claim itself, not connector dispatch.
- *   app/api/webhooks/shiphero/[event]                  → NOT FENCED. Persists via
- * wms-connector-boundary-ok: o3d-osl8: naming which routes maintenance mode does NOT fence is the measured claim itself, not connector dispatch.
- *       `persistShipheroWebhookEvent` with no maintenance check anywhere on the path.
+ * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
+ *   app/api/webhooks/mintsoft/asn-booked-in            → FENCED as of o3d-hl8l. The route consults
+ *       the flag as its FIRST statement, before the body is read and before the signature is
+ *       verified, so nothing on the persist path runs during a held restore.
+ * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
+ *   app/api/webhooks/shiphero/[event]                  → STILL NOT FENCED. Persists via
+ * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
+ *       `persistShipheroWebhookEvent` with no maintenance check anywhere on the path. Left as a
+ * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
+ *       stated gap by owner instruction (o3d-hl8l scoped the fix to the Mintsoft half); the row
+ *       below says `fenced: 'no'` because that is what the route does, not because nobody looked.
  *   app/api/accounting/callback                        → NOT FENCED. An inbound OAuth callback
  *       that writes credentials and activity rows.
  *
- * So two inbound webhook entry points write to the database throughout a held restore. That is
- * recorded as a GAP rather than closed here: fencing them is a change to live connector ingress
- * with its own durability question (a fenced WooCommerce delivery is retried by WooCommerce; a
- * wms-connector-boundary-ok: o3d-osl8: naming which routes maintenance mode does NOT fence is the measured claim itself, not connector dispatch.
- * dropped Mintsoft ASN may not be), and it does not belong in a restore-atomicity change. What
- * does belong here is that the operator is not told they are stopped when they are not.
+ * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
+ * o3d-hl8l CLOSED THE MINTSOFT HALF, and the durability question that deferred it. The choice was
+ * between fencing (and relying on sender retry) and persisting-then-deferring (the o3d-56b shape).
+ * Persisting loses either way: the ONLY caller that enables this flag is this endpoint, and the
+ * window it stays on for is a restore that may still be replaying — a row written into it is
+ * overwritten, so `202 accepted` would be a promise the restore breaks. A 503 promises nothing and
+ * is the standard retry signal.
+ *
+ * WHAT THE RESIDUAL RISK IS ACTUALLY BOUNDED BY (round 3, finding 1 — the third consecutive round in
+ * which this sentence claimed more than the code does). It said "the watchdog's open-ASN-past-ETA
+ * wms-connector-boundary-ok: o3d-hl8l: naming the recovery helper that cannot reach a refused callback is the correction itself.
+ * alert and the ASN replay". THE ASN REPLAY CANNOT REACH IT: `replayMintsoftBookedInEventsForAsn`
+ * re-drives receipt-event rows that already exist, and a refused callback leaves none — which
+ * o3d-hl8l round 2 established at the fence itself and then did not correct here. The recovery is
+ * wms-connector-boundary-ok: o3d-hl8l: naming the recovery that CAN reach it is the correction itself.
+ * `enqueueMintsoftBookedInRecheckForAsn` ("Re-check" on the purchase order's ASN table), which
+ * reconstructs the trigger and re-reads the quantities from the warehouse.
+ *
+ * ROUND 4, FINDING 1 — THE FOURTH CONSECUTIVE ROUND IN WHICH THIS PARAGRAPH OVERSTATED THE
+ * RECOVERY. Round 3 listed three bounds and called them a bound. Every one of them was conditional,
+ * and on a DEFAULT INSTALLATION none of them held: the sender may not retry (its behaviour, not
+ * ours); the "Re-check" control existed on the purchase-order ASN table ONLY, while stock-transfer
+ * ASNs go through the same callback processor and the same fence; and the watchdog that was named
+ * as the backstop was registered `defaultEnabled: false`, so it did not run. Their intersection —
+ * a transfer ASN, a sender that gives up, a watchdog nobody enabled — was an ASN left IN_TRANSIT
+ * with its destination stock never applied, and NOTHING anywhere that would ever say so.
+ *
+ * WHAT ACTUALLY RECOVERS IT NOW, in the order it happens:
+ *   • AT REFUSAL — the process log, and nothing else. `recordMaintenanceRefusal` in the webhook
+ *     route emits a line naming the route and the remedy. It writes NO database row, deliberately:
+ *     a row written into this window is being replayed over, and the fence runs before signature
+ *     verification, so persisting would mean writing rows from unauthenticated callers. THE ROW
+ *     THAT IS WRITTEN INSTEAD is about the WINDOW, not the callback — see the hold record below —
+ *     because the window is a thing this endpoint knows and is authenticated to record, while the
+ *     refusals are neither.
+ *   • THE 503 carries `Retry-After: 300`, so a sender that retries at all has a defined schedule
+ *     rather than whatever its own backoff decides.
+ *   • AUTOMATICALLY, WITHIN MINUTES OF THE WINDOW CLOSING — `disableMaintenanceMode` stamps
+ * wms-connector-boundary-ok: o3d-hl8l: the recovery is hosted on the Mintsoft sweeper; naming the job that carries it IS the correction.
+ *     `wms_booked_in_recheck_due_since` whenever a real window ends, and the Mintsoft webhook
+ *     sweeper (`defaultEnabled: true`, every five minutes, itself fenced so it cannot run during the
+ *     window) drains that stamp by re-checking EVERY open ASN — purchase-order and stock-transfer
+ *     alike, because the candidates come from `wms_asn_maps` rather than from whichever screens have
+ *     a button. See lib/domain/wms/post-maintenance-recheck.ts for why re-checking indiscriminately
+ *     is the only available targeting (the refusal is unrecordable, so there is no set of "the ones
+ *     that were refused") and why it is safe (a re-check reconstructs the TRIGGER; an ASN with
+ *     nothing outstanding books nothing in). The stamp is kept, not cleared, if any candidate threw
+ *     or the page truncated, so the next tick finishes the job.
+ *   • BY HAND, at any time — "Re-check" on the ASN, now present on BOTH the purchase-order and the
+ *     stock-transfer ASN tables (one shared component, so they cannot diverge again).
+ *   • THE ALERT — the WMS watchdog, NOW `defaultEnabled: true`, and only after ETA + 24h, or 7 days
+ *     for an ASN with no ETA recorded, or 7 days of renewed silence for one that had already had a
+ *     partial callback. It requires a WMS connector to be enabled and at least one active ADMIN to
+ *     notify, and it fires ONCE per ASN (deduped by `sloAlertedAt`, cleared only by a fresh callback
+ *     or a close). Its message names the Re-check remedy AND links to the screen that carries it for
+ *     that ASN's kind — it previously said "purchase order → ASNs" for a transfer ASN, sending the
+ *     reader to a page that could not act on it.
+ *
+ * So: a refused callback is recorded in the log, retried by any sender that honours a 503,
+ * automatically re-checked within about five minutes of the window closing, recoverable by one
+ * operator action on either kind of ASN, and alerted on a scale of days if it is still open for some
+ * other reason.
+ *
+ * ROUND 5, FINDING 1 — AND THE PATH ROUND 4 NAMED AS "NOT AUTOMATIC" WAS THE ONE THAT MATTERED.
+ *
+ * Round 4 closed the ordinary window and then wrote off the held one: the stamp is written by
+ * `disableMaintenanceMode`, the unconfirmed-backend branch below never calls it, so the operator
+ * cleared `system_maintenance_mode` by hand and no stamp was ever written. It said this was
+ * acceptable because nobody walks that path unattended. That reasoning is backwards. The held branch
+ * is the branch where the window lasts LONGEST — a timed-out restore plus however long it takes
+ * somebody to notice, quiesce the application and verify a backend — so it is the branch most likely
+ * to have refused callbacks, and it was the only one with no automatic recovery at all. "The remedy
+ * exists but this path skips it" is not a bound; it is the defect.
+ *
+ * WHAT CLOSES IT (lib/domain/system/maintenance-recovery.ts):
+ *   • THE HOLD IS RECORDED. `recordMaintenanceHold` writes `system_maintenance_hold` — why, when,
+ *     and the `(pid, backend_start)` that has to be gone — from the handler's catch, after the
+ *     decision to hold the gate and best-effort, because this write is to the database whose restore
+ *     just failed. A lost record degrades to round 4's behaviour, not to anything worse.
+ *   • THE EXCEPTION INBOX RENDERS IT, and counts it in the /sync banner total, so a held window is
+ *     visible from the application instead of only in a log line and an HTTP response nobody kept.
+ *   • "END THE HOLD" IS AN OPERATOR ACTION, and it is now the ONLY sanctioned clear. It re-reads the
+ *     flag and the record `FOR UPDATE`, re-checks the backend against `pg_stat_activity` at the
+ *     moment of the click, refuses by name if any precondition has moved — and STAMPS
+ *     `wms_booked_in_recheck_due_since` in the same transaction. That last part is the whole point:
+ *     the hand-written UPDATE ended the window and scheduled nothing.
+ *   • "RUN THE RE-CHECK NOW" drains that stamp on demand, for an installation whose five-minute cron
+ *     is disabled or whose scheduler is down — which is not a rare state on the day a restore was
+ *     needed. It refuses while the flag is still on, because a re-check issued into the window is
+ *     stopped at the same gate the callbacks were.
+ *
+ * WHAT IS STILL NOT CLAIMED. The backend check proves the backend has DETACHED, not that the
+ * application is quiet — the inbox row says so in those words, and the fence inventory below is
+ * still the honest statement of what maintenance mode reaches. And if the hold record is lost with
+ * the restore's rollback, there is no inbox row: the window is then ended the old way, by hand, and
+ * its refused callbacks fall back to the watchdog and the per-ASN Re-check.
+ *
+ * So ONE inbound webhook entry point and one OAuth callback still write to the database throughout
+ * a held restore, and the operator message below names them.
  *
  * WHAT IS THEREFORE CLAIMED, and nothing beyond it:
  *   • HELD: the accounting connector-selection advisory lock, on a leaked session. That serializes
  *     the writers inventoried in tests/accounting/plugin-selection-lock.test.ts and no others.
- *   • FENCED: scheduled jobs (`app/api/cron/*`), and WooCommerce webhooks only.
- * wms-connector-boundary-ok: o3d-osl8: naming which routes maintenance mode does NOT fence is the measured claim itself, not connector dispatch.
- *   • NOT FENCED: the Mintsoft and ShipHero webhook routes, the accounting OAuth callback,
- *     interactive writes from the dashboard, other API routes, and anything holding a direct
- *     database connection. The operator has to take the application out of service to stop those;
- *     the message below says so in those words rather than implying it is already down.
+ * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
+ *   • FENCED: scheduled jobs (`app/api/cron/*`), WooCommerce webhooks, and the Mintsoft ASN
+ *     booked-in webhook.
+ * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
+ *   • NOT FENCED: the ShipHero webhook route, the accounting OAuth callback, interactive writes
+ *     from the dashboard, other API routes, and anything holding a direct database connection. The
+ *     operator has to take the application out of service to stop those; the message below says so
+ *     in those words rather than implying it is already down.
  *
  * AND THE RECOVERY IS NOT "RESTART". Restarting drops the holder's session, which RELEASES the
  * advisory lock — the one protection that is real — while the restore backend may still be
@@ -623,8 +722,14 @@ export type RestoreLockContext = {
  * asserts the reach against the repository), rather than prose that drifts away from the code.
  */
 export const MAINTENANCE_MODE_REACH = {
+  // wms-connector-boundary-ok: o3d-hl8l: the fence inventory is measured from route paths; naming the route IS the measurement.
   /** Route-handler families that consult the flag before doing work. */
-  fenced: ['app/api/cron/*', 'lib/connectors/woocommerce/webhooks.ts'] as const,
+  fenced: [
+    'app/api/cron/*',
+    // wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
+    'app/api/webhooks/mintsoft/asn-booked-in/route.ts',
+    'lib/connectors/woocommerce/webhooks.ts',
+  ] as const,
   /** Everything else, stated so it cannot be quietly assumed. */
   notFenced: ['app/actions/* (interactive server actions)', 'all other app/api/* routes'] as const,
   /**
@@ -637,20 +742,36 @@ export const MAINTENANCE_MODE_REACH = {
    */
   inboundWebhooks: [
     { route: 'app/api/webhooks/shopping/[connector]/[resource]', fenced: 'woocommerce-only' },
-    // wms-connector-boundary-ok: o3d-osl8: naming which routes maintenance mode does NOT fence is the measured claim itself, not connector dispatch.
-    { route: 'app/api/webhooks/mintsoft/asn-booked-in', fenced: 'no' },
-    // wms-connector-boundary-ok: o3d-osl8: naming which routes maintenance mode does NOT fence is the measured claim itself, not connector dispatch.
+    // wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
+    { route: 'app/api/webhooks/mintsoft/asn-booked-in', fenced: 'yes' },
+    // wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
+    // Honestly 'no', not "unreviewed": o3d-hl8l deliberately scoped the fix to the Mintsoft half.
+    // wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
     { route: 'app/api/webhooks/shiphero/[event]', fenced: 'no' },
     { route: 'app/api/accounting/callback', fenced: 'no' },
   ] as const,
-  /** There is no UI for the flag: clearing it after a held restore is a database operation. */
-  hasOperatorControl: false,
+  /**
+   * o3d-hl8l r5 (Codex r4 finding 1): there IS a control now — Sync → Exceptions → "Maintenance
+   * window" — and it is the only clear that also stamps the booked-in re-check. It refuses unless
+   * the flag is really on, a hold was really recorded, and the named backend is really gone.
+   */
+  hasOperatorControl: true,
 } as const
 
 export class RestoreBackendNotConfirmedError extends Error {
-  constructor(message: string) {
+  /**
+   * The backend the operator has to see gone before the hold can be ended (o3d-hl8l r5).
+   *
+   * Carried on the error rather than recorded where it is thrown, because the recovery row is the
+   * HANDLER's to write: only the handler knows the redacted message, and only it is downstream of
+   * the decision to hold the gate — which must never be downstream of a database write.
+   */
+  readonly identity: RestoreBackendIdentity & { applicationName: string }
+
+  constructor(message: string, identity: RestoreBackendIdentity & { applicationName: string }) {
     super(message)
     this.name = 'RestoreBackendNotConfirmedError'
+    this.identity = identity
   }
 }
 
@@ -1033,18 +1154,22 @@ export async function runRestore(
           + `started ${identified.identity.backendStart}, may still be writing. `
           + 'The connector-selection lock is being HELD, not released, so connector-selection '
           + 'changes and orphaned-sync cancellation cannot interleave with it. Scheduled jobs '
-          + '(app/api/cron/*) and WooCommerce webhooks are stopped by maintenance mode. THE '
-          // wms-connector-boundary-ok: o3d-osl8: naming which routes maintenance mode does NOT fence is the measured claim itself, not connector dispatch.
-          + 'MINTSOFT AND SHIPHERO WEBHOOK ROUTES, THE ACCOUNTING OAUTH CALLBACK AND ALL '
+          // wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
+          + '(app/api/cron/*), WooCommerce webhooks and the Mintsoft ASN webhook are stopped by '
+          + 'maintenance mode. THE '
+          // wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
+          + 'SHIPHERO WEBHOOK ROUTE, THE ACCOUNTING OAUTH CALLBACK AND ALL '
           + 'INTERACTIVE WRITES FROM THE DASHBOARD ARE NOT STOPPED BY ANYTHING — take the '
           + 'application out of service to stop those. Do NOT '
           + 'restart yet: restarting releases the held lock. Confirm in pg_stat_activity that pid '
           + `${identified.identity.pid} with backend_start ${identified.identity.backendStart} is gone `
-          + '(terminate it if not), then restart, then clear maintenance mode — it is the '
-          + "`system_maintenance_mode` row in `settings` and there is no screen for it, so it stays "
-          + 'on until an operator sets it to false.'
+          + '(terminate it if not), then restart, then end the hold from Sync → Exceptions → '
+          + '"Maintenance window". That control re-checks this backend before it clears anything, '
+          + 'and clearing it there ALSO schedules the re-check for the warehouse callbacks refused '
+          + 'during the window — editing the `system_maintenance_mode` row in `settings` by hand '
+          + 'does neither.'
         lock.retainLock(reason)
-        throw new RestoreBackendNotConfirmedError(reason)
+        throw new RestoreBackendNotConfirmedError(reason, { ...identified.identity, applicationName })
       }
 
       throw new Error(
@@ -1087,6 +1212,7 @@ function withDefaults(deps: BackupRestoreHandlerDeps = {}): RequiredRestoreDeps 
     deleteRestoreToken: deps.deleteRestoreToken ?? deleteAuthToken,
     enableMaintenance: deps.enableMaintenance ?? enableMaintenanceMode,
     disableMaintenance: deps.disableMaintenance ?? disableMaintenanceMode,
+    recordMaintenanceHold: deps.recordMaintenanceHold ?? recordMaintenanceHold,
     runRestoreFile: deps.runRestoreFile ?? runRestore,
     validateBackupManifest: deps.validateBackupManifest ?? validateBackupManifestForFile,
     getAvailableDiskBytes: deps.getAvailableDiskBytes ?? getAvailableDiskBytes,
@@ -1325,8 +1451,9 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       // ROUND 10, FINDING 2, second half. Switching maintenance mode back off is the same shape of
       // mistake as releasing the lock: it reopens scheduled jobs and webhooks on the strength of an
       // assumption that the restore has stopped. When the backend could not be confirmed gone the
-      // flag stays on — but ONLY those two things are held off by it (MAINTENANCE_MODE_REACH), and
-      // the error the operator receives says so rather than implying the application is down.
+      // flag stays on — but ONLY the entry points inventoried in MAINTENANCE_MODE_REACH are held
+      // off by it, and the error the operator receives says so rather than implying the
+      // application is down.
       const backendUnconfirmed = error instanceof RestoreBackendNotConfirmedError
 
       // ROUND 12, FINDING 3. THE DECISION TO HOLD THE GATE IS MADE BEFORE ANY FALLIBLE AWAIT.
@@ -1342,13 +1469,37 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       if (backendUnconfirmed) holdMaintenance = true
 
       const message = redactRestoreErrorMessage(error instanceof Error ? error.message : String(error), resolvedDeps.env)
+
+      // o3d-hl8l r5 (Codex r4 finding 1): MAKE THE HELD WINDOW SOMETHING AN OPERATOR CAN SEE AND
+      // END. Until now this branch left the flag on with no screen and no record, so the only
+      // available clear was a hand-written UPDATE — which never stamped the booked-in re-check, so
+      // every callback the fence refused during the LONGEST kind of window fell back to a
+      // days-scale alert. This row is what the exception inbox renders and what the "End the hold"
+      // action re-checks the backend against before it clears anything.
+      //
+      // AFTER the gate decision above and best-effort by contract (`recordMaintenanceHold` catches
+      // its own failures): the database this writes to is the one whose restore just failed, so it
+      // is among the likeliest writes to be rejected here, and a protective decision must never be
+      // downstream of the thing it is protecting against.
+      let holdRecorded = false
+      if (error instanceof RestoreBackendNotConfirmedError) {
+        holdRecorded = await resolvedDeps.recordMaintenanceHold({
+          reason: message,
+          backendPid: error.identity.pid,
+          backendStart: error.identity.backendStart,
+          applicationName: error.identity.applicationName,
+        })
+      }
+
       try {
         await resolvedDeps.log({
           entityType: 'SYSTEM',
           tag: 'system',
           action: 'backup_restored',
           level: 'ERROR',
-          metadata: backendUnconfirmed ? { error: message, backendUnconfirmed: true, maintenanceModeHeld: true } : { error: message },
+          metadata: backendUnconfirmed
+            ? { error: message, backendUnconfirmed: true, maintenanceModeHeld: true, holdRecorded }
+            : { error: message },
           description: `Failed to restore backup: ${message}`,
         })
       } catch {

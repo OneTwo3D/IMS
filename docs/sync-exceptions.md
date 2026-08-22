@@ -4,18 +4,140 @@
 
 Replays always re-attempt the **original** work: payloads and idempotency keys are preserved, and every transition is a compare-and-set (a concurrent sweep or second click matches zero rows instead of double-applying). All replay actions require the `sync` permission; the high-risk ones (outbox, receipt events, refunds) additionally require fresh (step-up) authentication.
 
+**Preserving the key is not the same as being protected by it.** The compare-and-set stops *IMS* double-applying; whether the *remote system* deduplicates the re-post is the remote system's rule, and for Xero the key survives only 6 minutes — far less than any row spends in this inbox. Before replaying an accounting outbox row, check the ledger for the document: see [Retrying is not protected by idempotency](xero-sync.md#retrying-is-not-protected-by-idempotency--check-xero-first).
+
 ## Sections
 
 | Section | Source of truth | What it means | Replay |
 |---|---|---|---|
 | WMS order pushes — dead-lettered | `wms_order_push_links` `state=DEAD_LETTER` | The order never reached the warehouse (5 attempts exhausted, or a hold/cancel conflict) and will not fulfil | Reset to `PENDING_CREATE` for the next push sweep (`replayWmsOrderPush`; sweep eligibility still applies) |
 | Integration outbox — failed rows | `integration_outbox` `RETRYABLE_FAILED` / `PERMANENT_FAILED` | An accounting post, WooCommerce stock push, booked-in event or landed-cost journal exhausted its retries | Reset to `PENDING` with the original payload + idempotency key; or acknowledge as permanently failed. Note: a PERMANENT_FAILED WC stock row's *stock value* still self-heals via the daily force-all reconcile — the row records that the queued push failed |
-| WMS inbound events — dead-lettered | `wms_inbound_receipt_events` + `wms_webhook_events`, `processingStatus=DEAD` | A booked-in or order/inventory webhook exhausted its retries; its effect was **never applied** | Reset to `PENDING` (retry ladder restarted) for the relevant webhook sweeper. Distinct from `REQUIRES_REVIEW`, which is approved from the Mintsoft panel |
-| WooCommerce refunds — parked | `shopping_sync_logs` `PENDING`/`FAILED`, `FROM_CONNECTOR`, `SalesOrder` | A WC refund could not be applied (usually a >1p amount mismatch); no restock/credit note was posted | Re-runs `syncRefundsForOrder` — a **fresh fetch** from WooCommerce (dedup by `externalRefundId`), so a since-corrected refund now lands. The row is marked SYNCED only when the specific refund verifiably applied |
+| WMS inbound events — dead-lettered | `wms_inbound_receipt_events` + `wms_webhook_events`, `processingStatus=DEAD` | A booked-in or order/inventory webhook exhausted its retries; its effect was **never applied** | Reset to `PENDING` (retry ladder restarted) for the relevant webhook sweeper. Distinct from `REQUIRES_REVIEW`, which is approved from the Mintsoft panel. **Retention never touches these rows** (q66in.7.4): only `PROCESSED` rows are compacted, so a dead letter keeps the payload a replay re-attempts, however old it gets |
+| WooCommerce refunds — parked | `shopping_sync_logs` `PENDING`/`FAILED`, `FROM_CONNECTOR`, `SalesOrder` | A WC refund could not be applied (usually a >1p amount mismatch); no restock/credit note was posted — a park whose refund carried quantities says so, since those units are not back on hand | Re-runs `syncRefundsForOrder` — a **fresh fetch** from WooCommerce (dedup by `externalRefundId`), so a since-corrected refund now lands. The row is marked SYNCED only when the specific refund verifiably applied |
 | Dispatch reconciliation — dead-lettered | `wms_order_push_links.dispatchDeadLetteredAt` (6oyu.2) | The WMS despatched the order but IMS could not reconcile it (typically no IMS stock to consume); after 5 consecutive sweep failures the link is dead-lettered, leaves the sweep's candidate set, and admins are notified | Fix the order's stock position, then Replay — clears the dead-letter marker and failure streak so the next sweep retries |
 | WMS pushes — order-total mismatches | `wms_order_push_links.totalMismatchPence` | Advisory: the order pushed, but IMS and WMS totals drifted by >1p | Review the order, then clear the flag |
 | WooCommerce products — structure conflicts | `shopping_sync_logs` `QUARANTINED`, `FROM_CONNECTOR`, `Product` (o3d-y89x) | The product import refused to overwrite IMS-owned structure, so WooCommerce data went unapplied. One rule, four shapes: (a) a **variable** WC product paired with an IMS row that cannot be a parent — a KIT/BOM/VARIANT/NON_INVENTORY row, a row already somebody else's variation, a row that already has child rows its type does not allow, or a row carrying stock or open documents — so none of its variations were imported; (b) a **simple** WC product paired with an IMS **VARIABLE** row — its type and price went unwritten and its IMS variants remain; (c) a **simple** WC product paired with an IMS row that has child rows while its type says it cannot (a legacy half-flattened parent) — its type and price went unwritten too; (d) a variation SKU that resolved to a row belonging to a different IMS parent / that is itself a parent / whose type cannot be a variation / that carries stock or open documents. Orders for unimported SKUs import with no product and no allocation. An IMS KIT paired with a **simple** WC product is the ordinary bundle pairing and does **not** appear here. See [What the connector will NOT change](woocommerce.md#what-the-connector-will-not-change) | **None — and deliberately so.** The product is not marked SYNCED and the reconcile cursor does not advance past it, so the retry is automatic every run. Exactly one open row per pairing, and the next clean sync deletes it. Fix the mismatch in IMS or in WooCommerce; there is nothing to acknowledge (an acknowledge button could only hide a live conflict) |
 | Order reconciliation — drift | `wms_order_discrepancies` OPEN rows (q66in.4.4, cron `wms-order-reconcile`; runs also ledger onto `ORDER_RECONCILE` sync jobs) | Scheduled IMS-intent-vs-WMS-truth check: `NOT_PUSHED` (eligible order never reached the WMS), `MISSING_IN_WMS` (WMS lost a live order), `ACTIVE_AFTER_CANCEL` (cancelled order still live in the WMS — admins are belled on first detection; it may ship). Findings are durable: the capped sweep rotates least-recently-verified links and resolves a row only when that specific order re-verifies clean | `MISSING_IN_WMS`: Re-push (link reset to `PENDING_CREATE`; resolves the finding). Others: fix at the linked order / in the WMS |
+
+## Recording a quarantined WooCommerce refund by hand (o3d-w00)
+
+A parked refund row is `PENDING`/`FAILED` (retryable) or `QUARANTINED`. A QUARANTINED row was refused
+deliberately — an undeterminable gross→net basis, an order that is not uniformly taxed, or a credit
+note that would not come to what the storefront refunded (see *The posted-VAT fence* below) — so Retry
+only re-runs the same refusal. Those rows get a **Record manually** dialog: the operator says which
+parts of the order the money came off and how much of each, in **GROSS (tax-inclusive)** amounts.
+
+- Every order line **and the shipping charge** is an allocation target, each offered at what it has left
+  to refund after earlier credits.
+- The allocation must add up to the WooCommerce refund the park carries, to the penny. A park written
+  before the payload was retained cannot be recorded — use Retry first, which re-reads the refund from
+  WooCommerce and re-parks it with the payload.
+- The credit note is raised **line-linked**, stamped with the WooCommerce refund id (so a redelivery
+  dedups), and the park is resolved.
+- **Returned units come back with the money — and independently of it.** A quarantine stops the
+  automatic restock, so if the parked refund states refunded quantities, recording it by hand returns
+  those units to the default return warehouse and records them on the refund (the park's message names
+  them too). Every quantity the payload states on a line IMS can identify is carried, **whether or not
+  the operator allocated money to that line**: WooCommerce reports returned quantities on lines that
+  carry no refundable value (a fully discounted item, a free gift, a line credited on an earlier
+  refund), the automatic route restocks those units regardless, and a returned unit is a physical fact
+  rather than an opinion about value. Such a line is added to the refund at **zero value**, so nothing
+  is credited for it. If no active default return warehouse is configured, the recording is **refused**
+  rather than crediting the money and dropping the units — set one in Settings → Warehouses and record
+  the row again. A monetary-only park states no quantities and still records as money alone. Quantities
+  on lines IMS cannot match to a product are recorded in the activity-log metadata
+  (`unmatchedRefundedQty`) rather than refused — nobody, including the automatic route, can restock
+  those.
+
+### Why a target can be refused, and what fixes it
+
+Each gross amount is divided by the rate the credit note will actually be re-grossed at — the rate of
+the **accounting tax code** the refund line will carry, which is not always the rate the order line
+appears to show. The rate the part of the order was **charged** at is read from the order's own money,
+never from the current tax table, because a `TaxRate` row is mutable and editing one would otherwise
+rewrite what past orders appear to have been billed:
+
+- a sale line: `SalesOrderLine.totalForeign` / `taxForeign`;
+- **shipping**: IMS stores no shipping-VAT column, so it is the VAT the order records over and above
+  all of its lines (`SalesOrder.taxForeign` − Σ `SalesOrderLine.taxForeign`). `SalesOrder.taxRatePercent`
+  is deliberately NOT used — it is the order's *header* default, which is shipping's rate only on a
+  uniformly taxed order.
+
+Where the two cannot be shown to agree, the target is refused rather than converted at a rate that will
+not be used:
+
+| Refusal | Fix |
+|---|---|
+| The line's tax rate has no accounting tax code (so it falls back to the order default) | Map it in Settings → Tax Rates |
+| The code no IMS tax rate is mapped to, or that two rates price differently | Map one — and only one — sales rate to that code |
+| The code prices at a different rate from the one the line was charged at | Map the line's tax rate to a code that matches the rate it was sold at |
+| The order's default rate (`taxRateName`) is missing, renamed or deactivated — shipping has no identity | Restore/map that tax rate |
+| The line is reverse-charged but no reverse-charge sales tax code is set | Set it in Settings → Accounting |
+| The reverse-charge code has no IMS tax rate mapped to it | Map a 0% rate to it — an unmapped code is not a 0% one |
+| The line records no usable money (no stored net, or figures too small to fix a rate) | Allocate the refund to the parts of the order that carry the money |
+| "The VAT identity … changed while this refund was being recorded" | The tax configuration moved between the conversion and the posting. Nothing was credited — record the row again |
+
+## The posted-VAT fence (every refund, not just hand-recorded ones)
+
+Every refund line is stored **net** and its credit note is re-grossed by whatever the accounting tax
+code it posts under is worth. So `createSalesOrderRefund` — the single writer every route goes through
+(the refund dialog, the WooCommerce refund webhook and sweep, the payment poller's chargeback, and the
+Record-manually path) — checks, inside the refund transaction that holds the order lock, that the
+credit note would come to what the refund actually settles:
+
+- the identity is resolved and priced exactly as the posting resolves it. An identity that cannot be
+  established, that no tax rate is mapped to, or that two rates price differently is **refused** — an
+  unmapped code is not a 0% one;
+- what the money **bore** comes from the storefront when it states it (WooCommerce reports `total_tax`
+  on every refunded line and shipping line — restating a stated figure needs no tax-code mapping), and
+  otherwise from the order's own snapshot for that target;
+- the two are compared **in money** — `net + tax` against `net × (1 + posted rate)`, to within the
+  currency's minor unit — not as rates. A £2.00 line bearing £0.40 is an ordinary 20% line whose
+  *derived rate* is too uncertain to pin down, and refusing it would name no remedy anyone could carry
+  out; in money it is 2.40 against 2.40. The same line zero-rated against a 20% code is 2.00 against
+  2.40 and is still caught, at any size;
+- and then the refund is checked **as a whole**. A one-minor-unit tolerance is the right bound for one
+  leg and the wrong bound for a refund made of many: £1.00 charged at 19% posting under a 20% code is
+  out by exactly a penny every time, so a hundred such lines pass one by one while the credit note they
+  add up to is £1.00 over the storefront refund. The aggregate check sums each leg's rate divergence in
+  money and allows each leg only the rounding its own figures can actually carry — so legs that merely
+  round awkwardly never accumulate past the slack, while a systematic rate error crosses the bound by
+  the third leg;
+- a **chargeback's** shipping and order-discount legs are checked as **one figure**. Neither can be
+  checked alone on an order whose totals `createSalesOrder` wrote (the residue is `shipping VAT −
+  discount VAT`), but the automatic chargeback emits both legs, both under the order default, so their
+  combined net is exactly the amount that residue is the VAT of.
+
+A refusal creates nothing. A WooCommerce refund is parked `QUARANTINED` (with the payload, so it can be
+recorded by hand); the refund dialog shows the message. A **chargeback** refused this way is not a
+retry cursor: the payment really is gone in the ledger and the refusal stands until an admin changes
+the tax configuration, so the payment poller clears `paidAt`, alerts administrators and writes the
+audit entry on the **first** failure, carrying the reason — rather than holding `paidAt` and showing
+the order paid indefinitely. (A *transient* chargeback failure — an unjournaled shipment, a connector
+outage — still holds `paidAt` and is re-attempted.) The revenue unwind is then outstanding and visible;
+raise the credit note by hand, or restore the mapping and re-run the poller.
+
+The **accounting retry** (`retryRefundAccounting`, and the sweep behind it) is a route into a credit
+note in its own right — it re-queues or re-stages one for a refund that already exists — so it re-runs
+the same fence against the tax table as it stands at retry time. The identity snapshotted on each
+refund line fixes *which* code posts and nothing about what that code is *worth*; a rate edited,
+remapped or unmapped between the failure and the retry is caught there. A refusal leaves
+`accountingRetryRequired` set and records the reason on the refund, so the row stays visible until the
+mapping is restored.
+
+Two deliberate limits, so they are not mistaken for oversights:
+
+- the check runs only when a **credit note will actually be posted** — the connector is active, its
+  sync is enabled, and its `CREDIT_NOTE` type is not `off` (`isAccountingSyncTypeEnabled`). With no
+  ledger entry going to be written, nothing re-grosses the stored net lines, so there is no
+  credit-note total to be wrong about — and refusing would strand refunds on stores that map no
+  accounting tax codes at all. Gating on plugin *activation* alone would quarantine refunds on a store
+  that has deliberately switched credit-note posting off;
+- a **shipping** leg whose VAT is inseparable (an order-level discount whose VAT `createSalesOrder`
+  netted off the same total, on a non-WooCommerce order) is left unchecked rather than refused **on a
+  non-chargeback refund**: IMS holds no record of what shipping bore there, so there is nothing to
+  check against and no remedy to name. An order-level **discount** refund line is out of the per-leg
+  fence for the same reason — on a chargeback the two are checked together, as above.
 
 ## Relationship to other surfaces
 

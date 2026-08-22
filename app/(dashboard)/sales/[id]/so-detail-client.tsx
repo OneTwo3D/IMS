@@ -18,7 +18,7 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuIte
 import {
   updateSalesOrderStatus, createRefund, retryRefundAccounting, cloneSalesOrder, deleteSalesOrder,
   updateSalesOrderNotes, generateInvoiceNumber,
-  addPayment, deletePayment, releaseWithdrawalHold,
+  addPayment, deletePayment, reverseLedgerPayment, releaseWithdrawalHold,
   type SoDetail, type SoStatus,
 } from '@/app/actions/sales'
 import { sendSalesOrderEmail, sendInvoiceEmail } from '@/app/actions/email'
@@ -34,10 +34,12 @@ import type { RejectedAccountingDocumentUpdateWarning } from '@/lib/domain/accou
 import type { ProductType } from '@/app/generated/prisma/client'
 import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
+import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-affordance'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
+import { useStepUpReauth, isFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { hasPermission } from '@/lib/permissions'
 import { formatMoney } from '@/lib/utils'
 import { getTrackingUrl } from '@/lib/tracking'
@@ -473,13 +475,23 @@ function AllocationPanel({
           Stock Allocation
         </h2>
         <div className="flex items-center gap-1.5">
-          {['PROCESSING', 'ALLOCATED'].includes(status) && (
+          {/*
+            o3d-0i5y r3: PICKING and PACKING are here because they are where a SHORT order is LEFT.
+            Since r1 an order whose shipments all despatched while it still owed quantity is not
+            promoted to SHIPPED — it keeps the pre-shipment status it had — and the warning it raises
+            tells the operator to "allocate and ship the remainder". These two buttons ARE that
+            remedy, so gating them to PROCESSING/ALLOCATED made the instruction impossible to follow
+            from the very states the hold produces. The panel itself only renders when quantity is
+            genuinely outstanding (see showAllocations), so this does not offer re-allocation on an
+            order that is merely mid-pick and fully covered.
+          */}
+          {['PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(status) && (
             <Button variant="outline" size="sm" className="h-7 text-xs" onClick={handleReAllocate} disabled={isPending}>
               {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
               {allocations.length > 0 ? 'Re-Allocate' : 'Auto-Allocate'}
             </Button>
           )}
-          {allocations.length > 0 && status === 'ALLOCATED' && (
+          {allocations.length > 0 && ['ALLOCATED', 'PICKING', 'PACKING'].includes(status) && (
             <Button size="sm" className="h-7 text-xs" onClick={() => {
               startTransition(async () => {
                 const result = await confirmAllocations(orderId)
@@ -861,6 +873,23 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const [showPayment, setShowPayment] = useState<{ refundId?: string; creditNoteNumber?: string } | null>(null)
   const [visibleCols, setVisibleCols] = useState<Set<OptCol>>(new Set())
   const [error, setError] = useState('')
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
+  /**
+   * o3d-1vuv: a refusal from deletePayment, shown NEXT TO the receipt it refused rather than in the
+   * page-level error line far above the payments block. A refusal whose remedy is a button is
+   * useless if the operator cannot see both at once — and until this change the result of
+   * deletePayment was DISCARDED entirely, so the refusal would not have appeared anywhere at all.
+   */
+  const [paymentRefusal, setPaymentRefusal] = useState<{ paymentId: string; message: string; code?: string } | null>(null)
+  // o3d-1vuv: the payment reference an operator read off the invoice in the accounting system, for a
+  // registration that failed without recording one. IMS asks about THAT payment; it does not take the
+  // typing of it as a claim that anything was reversed.
+  const [assertedPaymentReference, setAssertedPaymentReference] = useState('')
+  // WHICH receipt is being resolved this way, held separately from the refusal CODE on purpose: the
+  // code changes with every answer the ledger gives ("that payment is on another invoice", "it is
+  // still AUTHORISED"), and a field that vanished on the first correctable mistake would put the
+  // operator straight back into the dead end this whole path exists to remove.
+  const [undecidedAttempt, setUndecidedAttempt] = useState<string | null>(null)
   const [allocations, setAllocations] = useState<AllocationRow[]>(initialAllocations)
   const [shipments, setShipments] = useState<ShipmentRow[]>(initialShipments)
   const requirementsByLine = new Map(fulfillmentRequirements.map((row) => [row.lineId, row.requirements]))
@@ -902,6 +931,15 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const nextActions = (STATUS_FLOW_SHIPMENTS[so.status] ?? []).filter((a) => a.target !== 'DELIVERED' || deliveryTrackingEnabled)
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
+  // o3d-0zy: predict the o3d-5r8 delete refusal instead of letting the operator walk into it. Every
+  // non-draft order queues a sales invoice, so with accounting sync on, Delete on a PENDING_PAYMENT
+  // order always refuses and Cancel is the actual path. Disabled-with-a-reason rather than hidden:
+  // other blockers (WMS push link, daily batch, refunds) are still only known to the server.
+  const deleteBlock = resolveSalesOrderDeleteBlock({
+    status: so.status,
+    accountingInvoiceId: so.accountingInvoiceId ?? null,
+    accountingSyncEnabled,
+  })
   // Refund is allowed once shipped, or to top up an already partially-refunded order.
   // Reads the orthogonal refundStatus so it keeps working once a partial refund no
   // longer forces the lifecycle status to PARTIALLY_REFUNDED (epic stage 3).
@@ -936,8 +974,16 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     return committed + refunded < l.qty
   })
 
-  // Show allocation panel when PROCESSING/ALLOCATED AND (no shipments OR unfulfilled lines remain)
-  const showAllocations = ['PROCESSING', 'ALLOCATED'].includes(so.status) && (!hasShipments || hasUnfulfilledLines)
+  // Show allocation panel when PROCESSING/ALLOCATED/PICKING/PACKING AND (no shipments OR unfulfilled
+  // lines remain).
+  //
+  // o3d-0i5y r3: PICKING/PACKING were added because they are the states a SHORT order is HELD in.
+  // The whole panel was hidden there, so an order that despatched everything raised against it while
+  // still owing quantity had no allocate button, no create-shipments button and no route forward at
+  // all — the r1 warning told the operator to ship the remainder from a screen that did not exist.
+  // `hasUnfulfilledLines` is what keeps this narrow: an order simply being picked, with every line
+  // covered by a committed shipment, shows nothing new.
+  const showAllocations = ['PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status) && (!hasShipments || hasUnfulfilledLines)
   // o3d-4kfh r6 (Codex finding 4): CANCELLED is in the list too, but ONLY so the operator can see
   // and discard shipments that are still sitting on a cancelled order. A cancelled order normally
   // has none — `cancelSalesOrderFulfillmentState` deletes them in the same transaction as the
@@ -990,6 +1036,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   }
 
   function handleDelete() {
+    // Belt and braces with the disabled button: the server refuses anyway, but there is no reason to
+    // send a request whose answer we already have.
+    if (deleteBlock) { setError(deleteBlock.reason); return }
     if (!confirm('Permanently delete this order?')) return
     startTransition(async () => {
       const result = await deleteSalesOrder(so.id)
@@ -1017,7 +1066,13 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     : settlement.status === 'NOT_SENT' ? ' · NOT SENT TO LEDGER'
     : settlement.status === 'PARTIALLY_SETTLED' ? ' · PART PAID IN LEDGER'
     : settlement.status === 'LEDGER_UNMATCHED' ? ' · PAID IN LEDGER ONLY'
+    // Not "rejected" and not "not sent": an attempt was made and what the ledger did with it was
+    // never recorded. Naming it as either of the other two sends someone to the wrong place.
+    : settlement.status === 'LEDGER_UNDECIDED' ? ' · LEDGER OUTCOME UNKNOWN'
     : settlement.status === 'OVER_SETTLED' ? ' · OVER-PAID IN LEDGER'
+    // o3d-nf9i r3: an operator's assertion is not the ledger's word. Shown as its own state so the
+    // badge never reads the same as a confirmed settlement.
+    : settlement.status === 'ASSERTED_UNVERIFIED' ? ' · ASSERTED, NOT VERIFIED'
     : ''
   // Neither badge above can speak for an order with no local payment rows, so the verdict needs its own
   // chip whenever there is something to say: a disagreement, or a payment still on its way.
@@ -1117,7 +1172,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             title={settlement.detail}
           >
             {settlement.discrepancy && <AlertTriangle className="h-3.5 w-3.5" />}
-            {settlement.status === 'LEDGER_UNMATCHED' ? 'PAID IN LEDGER ONLY' : `Paid${settlementSuffix}`}
+            {settlement.status === 'LEDGER_UNMATCHED' ? 'PAID IN LEDGER ONLY'
+              // NOT prefixed "Paid": nothing here is paid, and the whole point of the state is that
+              // nobody can say what the ledger holds.
+              : settlement.status === 'LEDGER_UNDECIDED' ? 'LEDGER OUTCOME UNKNOWN'
+              : `Paid${settlementSuffix}`}
           </span>
         )}
 
@@ -1152,7 +1211,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 )) return
                 setError('')
                 startTransition(async () => {
-                  const res = await releaseWithdrawalHold(so.id)
+                  // The request THIS PAGE showed, so a newer withdrawal filed since it was drawn is
+                  // refused rather than silently cleared (o3d-rbyg r4).
+                  const res = await releaseWithdrawalHold(so.id, { generation: so.withdrawalHoldGeneration })
                   if (!res.success) { setError(res.error ?? 'Could not release the withdrawal hold'); return }
                   router.refresh()
                 })
@@ -1230,9 +1291,19 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             </Button>
           )}
           {canDelete && (
-            <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" onClick={handleDelete} disabled={isPending}>
-              <Trash2 className="h-4 w-4 mr-1" />Delete
-            </Button>
+            // The title lives on the wrapper, not the button: a disabled button swallows pointer
+            // events in several browsers and would never show its own tooltip.
+            <span title={deleteBlock?.reason} className="inline-flex">
+              <Button
+                variant="outline"
+                size="sm"
+                className="text-destructive hover:text-destructive"
+                onClick={handleDelete}
+                disabled={isPending || deleteBlock !== null}
+              >
+                <Trash2 className="h-4 w-4 mr-1" />Delete
+              </Button>
+            </span>
           )}
 
           {/* More actions dropdown (PDF, Email, Clone) */}
@@ -1296,6 +1367,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
       )}
 
       {error && <p className="text-sm text-destructive">{error}</p>}
+      {/* o3d-1vuv: reverseLedgerPayment takes a FRESH session, so the step-up prompt has to be mounted. */}
+      {stepUpDialog}
 
       {/* Header info */}
       <div className="rounded-md border p-4 grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-3 text-sm">
@@ -1601,18 +1674,125 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             {so.payments.filter((p) => !p.refundId).length > 0 && (
               <div className="mt-2 space-y-1">
                 {so.payments.filter((p) => !p.refundId).map((p) => (
-                  <div key={p.id} className="flex items-center justify-between text-xs">
-                    <div className="flex items-center gap-2">
-                      <span className="text-muted-foreground">{formatDateTime(p.paidAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
-                      {p.method && <span className="text-muted-foreground">{p.method}</span>}
-                      {p.reference && <span className="font-mono text-muted-foreground">{p.reference}</span>}
+                  <div key={p.id} className="space-y-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-2">
+                        <span className="text-muted-foreground">{formatDateTime(p.paidAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                        {p.method && <span className="text-muted-foreground">{p.method}</span>}
+                        {p.reference && <span className="font-mono text-muted-foreground">{p.reference}</span>}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono font-medium">{money(p.amount)}</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!confirm('Delete this payment?')) return
+                            setPaymentRefusal(null)
+                            setUndecidedAttempt(null)
+                            startTransition(async () => {
+                              // o3d-1vuv: the result used to be DISCARDED, so a refusal — and before
+                              // this change, the "reverse this in the ledger by hand" warning — reached
+                              // nobody. It is now shown against the receipt it refused.
+                              const result = await deletePayment(p.id, so.id)
+                              if (result.success) { router.refresh(); return }
+                              setPaymentRefusal({ paymentId: p.id, message: result.error ?? 'Failed to delete the payment.', code: result.code })
+                              setUndecidedAttempt(result.code === 'registration_attempt_undecided' ? p.id : null)
+                            })
+                          }}
+                          className="text-muted-foreground hover:text-destructive"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono font-medium">{money(p.amount)}</span>
-                      <button type="button" onClick={() => { if (confirm('Delete this payment?')) startTransition(async () => { await deletePayment(p.id, so.id); router.refresh() }) }} className="text-muted-foreground hover:text-destructive">
-                        <Trash2 className="h-3 w-3" />
-                      </button>
-                    </div>
+                    {paymentRefusal?.paymentId === p.id && (
+                      <div className="rounded border border-destructive/40 bg-destructive/5 p-2 space-y-2">
+                        <p className="text-xs text-destructive whitespace-pre-line">{paymentRefusal.message}</p>
+                        {paymentRefusal.code === 'ledger_holds_payment' && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-6 text-xs"
+                            disabled={isPending}
+                            onClick={() => startTransition(async () => {
+                              // IMS asks the accounting system whether the payment is really gone; it
+                              // does NOT take this click as a claim that it is. A refusal here names
+                              // what the ledger actually said.
+                              const run = () => reverseLedgerPayment(p.id, so.id)
+                              let result = await run()
+                              if (isFreshAuthFailure(result) && await promptReauth()) result = await run()
+                              if (isFreshAuthFailure(result)) {
+                                setPaymentRefusal({ paymentId: p.id, message: 'Sign in again to confirm a ledger reversal.' })
+                                return
+                              }
+                              if (result.success) { setPaymentRefusal(null); router.refresh(); return }
+                              setPaymentRefusal({ paymentId: p.id, message: result.error, code: result.code })
+                            })}
+                          >
+                            {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Undo2 className="h-3 w-3 mr-1" />}
+                            I have reversed it — check and delete
+                          </Button>
+                        )}
+                        {undecidedAttempt === p.id && (
+                          /*
+                            THE UNDECIDED ATTEMPT'S WAY OUT. Round 1 showed no control here at all,
+                            on the grounds that there is nothing to check — true of IMS acting alone,
+                            and it left the "a payment IS there" half of the remedy walking back into
+                            this same refusal. The missing fact is WHICH payment, and the operator is
+                            looking at it. So they may name it, and naming it decides nothing: IMS
+                            asks the accounting system about that payment and requires it to be on
+                            this invoice, on an invoice in this receipt's own currency — an amount in
+                            another currency is a different quantity of a different thing — for
+                            exactly this amount, and gone; and requires that no payment for that same
+                            amount is still standing on the invoice, since the amount cannot tell two
+                            of them apart. No reference, no button.
+                          */
+                          <div className="space-y-2">
+                            <label className="block text-[11px] text-muted-foreground" htmlFor={`asserted-ref-${p.id}`}>
+                              Payment reference from the accounting system (the payment you reversed on this invoice)
+                            </label>
+                            <input
+                              id={`asserted-ref-${p.id}`}
+                              type="text"
+                              value={assertedPaymentReference}
+                              onChange={(e) => setAssertedPaymentReference(e.target.value)}
+                              placeholder="e.g. 2f1c9b3e-0d4a-4e7b-9c2f-8a6d5e4b3c21"
+                              className="w-full rounded border bg-background px-2 py-1 text-xs font-mono"
+                            />
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-6 text-xs"
+                              disabled={isPending || assertedPaymentReference.trim().length === 0}
+                              onClick={() => startTransition(async () => {
+                                const reference = assertedPaymentReference.trim()
+                                const run = () => reverseLedgerPayment(p.id, so.id, reference)
+                                let result = await run()
+                                if (isFreshAuthFailure(result) && await promptReauth()) result = await run()
+                                if (isFreshAuthFailure(result)) {
+                                  setPaymentRefusal({ paymentId: p.id, message: 'Sign in again to confirm a ledger reversal.', code: paymentRefusal.code })
+                                  return
+                                }
+                                if (result.success) {
+                                  setPaymentRefusal(null)
+                                  setAssertedPaymentReference('')
+                                  setUndecidedAttempt(null)
+                                  router.refresh()
+                                  return
+                                }
+                                // The refusal is REPLACED by whatever the ledger said — "that payment
+                                // is on another invoice", "it is still AUTHORISED" — and the field is
+                                // kept, because the next thing the operator does is correct it.
+                                setPaymentRefusal({ paymentId: p.id, message: result.error, code: result.code })
+                              })}
+                            >
+                              {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Undo2 className="h-3 w-3 mr-1" />}
+                              Check that payment and delete
+                            </Button>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1669,7 +1849,22 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="font-mono">{money(p.amount)}</span>
-                        <button type="button" onClick={() => { if (confirm('Delete?')) startTransition(async () => { await deletePayment(p.id, so.id); router.refresh() }) }} className="text-muted-foreground hover:text-destructive"><Trash2 className="h-3 w-3" /></button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!confirm('Delete?')) return
+                            setError('')
+                            startTransition(async () => {
+                              // A credit-note receipt settles a CREDIT NOTE, not this invoice, so it
+                              // has no INVOICE_PAYMENT registration and never hits the ledger-hold
+                              // refusal. It can still fail, and the failure used to be discarded.
+                              const result = await deletePayment(p.id, so.id)
+                              if (result.success) { router.refresh(); return }
+                              setError(result.error ?? 'Failed to delete the payment.')
+                            })
+                          }}
+                          className="text-muted-foreground hover:text-destructive"
+                        ><Trash2 className="h-3 w-3" /></button>
                       </div>
                     </div>
                   ))}

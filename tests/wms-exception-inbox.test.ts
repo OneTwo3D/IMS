@@ -44,10 +44,26 @@ function stuckLink(partial: Partial<StuckDispatchLink> & { orderId: string }): S
     dispatchUnresolvedCount: 0,
     dispatchUnresolvedError: null,
     dispatchUnresolvedAt: null,
-    order: { orderNumber: `SO-${partial.orderId}` },
+    order: { orderNumber: `SO-${partial.orderId}`, status: 'PROCESSING' },
     ...partial,
   }
 }
+
+test('[o3d-rbyg r2] a stuck row carries the order status the page picks its remedy from', () => {
+  // Finding 3's remedy differs by lifecycle state: a live order can have its despatch recorded, a
+  // CANCELLED one (an approved withdrawal) cannot — IMS refuses a shipment against it — so the page
+  // must be able to tell them apart from the row alone. It could not: the row did not carry status.
+  const [live, cancelled] = inbox.mergeStuckDispatchRows([
+    stuckLink({ orderId: 'live', dispatchDeadLetteredAt: new Date('2026-08-02T00:00:00Z'), order: { orderNumber: 'SO-live', status: 'ON_HOLD' } }),
+    stuckLink({ orderId: 'gone', dispatchDeadLetteredAt: new Date('2026-08-01T00:00:00Z'), order: { orderNumber: 'SO-gone', status: 'CANCELLED' } }),
+  ], 10)
+
+  assert.equal(live.orderStatus, 'ON_HOLD')
+  assert.equal(cancelled.orderStatus, 'CANCELLED')
+  // The merge itself claims nothing about withdrawals — the loader screens for that, against the
+  // same local evidence the dispatch fence reads.
+  assert.equal(live.withdrawalStanding, false)
+})
 
 test('[o3d-bjc.9] a NEW quarantine is not buried under a full page of older dead letters', () => {
   // The failure this pins: ordering by dispatchDeadLetteredAt first puts every

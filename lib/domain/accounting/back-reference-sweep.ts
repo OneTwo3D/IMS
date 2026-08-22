@@ -1,4 +1,4 @@
-import type { AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
+import type { AccountingLinkSource, AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
 import {
   BACK_REFERENCE_REPAIRABLE_STATUSES,
   BACK_REFERENCE_TYPES,
@@ -6,12 +6,18 @@ import {
   backReferenceIsMissing,
   followUpObligationClaim,
   isExternalDocumentIdConflict,
+  recoverPostedBusinessDate,
   resolvePurchaseOrderBackReference,
   syncTypeWritesBackReference,
   type AmbiguousPurchaseOrderAttribution,
   type BackReferenceDeps,
   type PurchaseOrderAttribution,
 } from './back-reference'
+import {
+  buildCompactedFollowUpLossActivity,
+  type CompactedFollowUpLossPhase,
+} from '@/lib/domain/accounting/compacted-followup-loss'
+import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 
 // ---------------------------------------------------------------------------
 // Connector-agnostic back-reference repair sweep (audit-H3, fixed by o3d-9kek)
@@ -97,6 +103,37 @@ import {
 //    the third time in this file that "this attempt failed" was allowed to mean "this row is
 //    finished". The obligation is now a COLUMN (backReferenceFollowUpsPendingAt), written BEFORE the
 //    repair touches anything and cleared only by a successful enqueue.
+//
+// AND ONE MORE, FOUND BY o3d-nf9i ROUND 3 — THE ONE THAT IS NOT ABOUT STARVATION AT ALL:
+//
+// 7. THE SWEEP LAUNDERED AN OPERATOR'S ASSERTION INTO THE LEDGER LINK. app/actions/
+//    accounting-settlement.ts lets a named human assert "this DID post, here is the document id".
+//    That writes `status='SYNCED'` + `externalTransactionId` — BYTE-IDENTICAL to what the
+//    connector's own writeback produces after a real, successful remote call — and that pair IS this
+//    sweep's candidate shape. So the next cron cycle picked the row up, found the document unlinked,
+//    and stamped the operator-typed string onto SalesOrder.accountingInvoiceId /
+//    PurchaseInvoice.accountingInvoiceId / SupplierCreditNote.accountingCreditNoteId.
+//
+//    That column is THE LEDGER LINK EVERY LATER READER TRUSTS. Once it is written, nothing
+//    downstream can tell an id the ledger issued from an id a human read off a screen: the
+//    follow-ups are enqueued from it (PDF, attachment, and the PAYMENT — money), the settlement
+//    verdict is derived against it, and the order delete guard treats it as post evidence. IMS never
+//    made a call, never read a document and never compared a figure; the whole point of
+//    AccountingSyncLog.settlementBasis is that AN OPERATOR'S BELIEF MUST NOT BECOME THE SYSTEM'S
+//    EVIDENCE, and this sweep was the path that converted the one into the other.
+//
+//    r3 shipped the basis column and made the MONEY-PATH READER fail closed on it
+//    (settlement-status.ts), and flagged in its own commit message that this sweep still stamped an
+//    asserted id without consulting the marker. It consults it now. An asserted row gets NO
+//    sweep-driven work: no id write, no follow-up enqueue. It is REFUSED — warned about once per
+//    recheck interval and deferred, exactly like an ambiguity, because like an ambiguity the remedy
+//    is a human act and unlike a transient failure no amount of re-running performs it.
+//
+//    NOT STAMPED, for the same reason an ambiguity is not: the refusal can clear. An operator who
+//    verifies the document in the ledger and links it by hand turns the row into "already linked,
+//    nothing outstanding", which the sweep then settles on the ordinary path without ever having
+//    promoted anything — a row whose document is ALREADY linked is stamped as usual, asserted or
+//    not, because nothing about that write comes from the assertion.
 //
 // DELIBERATELY NOT IN SCOPE: connector-TENANT isolation — AND THAT IS WHY THIS SWEEP IS BOUND FOR
 // XERO ONLY (r6 finding 1).
@@ -289,6 +326,17 @@ export type BackReferenceSweepRow = {
    * `owesFollowUps` in the loop below.
    */
   backReferenceFollowUpsPendingAt: Date | null
+  /**
+   * HOW this row reached its terminal status. NULL = the connector's own writeback, i.e. a call was
+   * made and the ledger answered. 'OPERATOR_ASSERTION' = a human typed a document id into the
+   * settlement dialog and IMS verified nothing (defect 7 above).
+   *
+   * READ FROM THE COLUMN, NEVER FROM `errorMessage`. The settlement note is prose written for a
+   * person, both connectors overwrite that column with the remote system's own words, and o3d-h2wx
+   * settled that it carries no provenance a reader may key on. The sweep does not even select
+   * errorMessage.
+   */
+  settlementBasis: string | null
 }
 
 /** The columns the sweep reads. `as const` so the Prisma client's row type resolves. */
@@ -304,6 +352,9 @@ export const BACK_REFERENCE_CANDIDATE_SELECT = {
   backReferenceAmbiguousLoggedAt: true,
   backReferenceEvidenceCompactedAt: true,
   backReferenceFollowUpsPendingAt: true,
+  // Defect 7. Without this column in the SELECT the gate below cannot run at all, and an
+  // operator-asserted id is indistinguishable from a connector-confirmed one at every later step.
+  settlementBasis: true,
 } as const
 
 /**
@@ -394,13 +445,29 @@ export type BackReferenceSweepClient = BackReferenceDeps & {
     findMany(args: BackReferenceCandidateQuery): Promise<BackReferenceSweepRow[]>
     update(args: { where: { id: string }; data: Record<string, unknown> }): Promise<unknown>
   }
+  /**
+   * The sweep asks the SalesOrder one question `BackReferenceDeps` does not (o3d-r5pj, Codex r10 #3):
+   * what invoice date does it ACTUALLY have?
+   *
+   * An intersection rather than a widened select, so each read keeps its own return type — the
+   * repair probe still gets `{ accountingInvoiceId }` and this one gets `{ invoicedAt }`, and a
+   * double cannot satisfy one by answering the other.
+   */
+  salesOrder: BackReferenceDeps['salesOrder'] & {
+    findUnique(args: { where: { id: string }; select: { invoicedAt: true } }): Promise<{ invoicedAt: Date | null } | null>
+  }
 }
 
 export type BackReferenceSweepActivity = {
   entityType: 'SYSTEM'
   action: string
   tag: string
-  level: 'INFO' | 'WARNING'
+  /**
+   * ERROR is reachable (o3d-e2mz r8): retiring a row because its sale is cancelled leaves a real
+   * document in the ledger that only a person can undo, which is not a warning about something that
+   * may resolve itself. Every other entry this sweep writes is still INFO or WARNING.
+   */
+  level: 'INFO' | 'WARNING' | 'ERROR'
   description: string
   metadata: Record<string, unknown>
 }
@@ -438,6 +505,29 @@ export type BackReferenceSweepDeps = {
     syncResult: { externalId?: string; invoiceNumber?: string },
   ) => Promise<void>
   now?: () => Date
+  /**
+   * IS THE SALE THIS ROW BELONGS TO STILL LIVE — and if not, retire the row (o3d-e2mz r8).
+   *
+   * THE GATE ITSELF LIVES HERE, in the sweep, and this is only the locked read it needs. That
+   * placement is the whole finding. Rounds 5–7 of o3d-e2mz closed the cancellation window one
+   * PRODUCER at a time and each ended with the same flag: the sweep has no cancellation check. This
+   * sweep is not a bystander that inherits whatever shape a row was left in — it is the CONSUMER,
+   * and the only place a cancelled sale's work is actually released: `accountingInvoiceId` +
+   * `invoicedAt` stamped onto the order, and INVOICE_PDF / INVOICE_EMAIL / WC_INVOICE_NOTE /
+   * INVOICE_PAYMENT enqueued off it. Gating producers can only ever cover the producers that were
+   * thought of, and the ORDINARY settle path is a counterexample needing no bug at all: a post that
+   * succeeds and then fails its back-reference or its follow-up enqueue is left FAILED with its id
+   * intact — this sweep's candidate shape, reached with nobody having asked about the sale.
+   *
+   * Why it is a dependency and not code in this file: the answer must be read UNDER THE SALES ORDER'S
+   * ROW LOCK, in the transaction that retires, and this module is deliberately free of both a
+   * transaction handle and the sales-order locking primitive. The connector binding owns those. What
+   * it must NOT own is the decision of where to ask, what the three answers mean, or what is counted
+   * and logged — all of that is below, once, so a second connector cannot inherit a different gate.
+   *
+   * Optional: a binding that supplies none releases exactly as it did before.
+   */
+  decideSaleRelease?: (row: BackReferenceSweepRow) => Promise<BackReferenceSweepRelease>
 }
 
 export type BackReferenceRepairResult = {
@@ -462,7 +552,39 @@ export type BackReferenceRepairResult = {
    * ever went up in the `repaired` column would hide that entirely.
    */
   followUpsDiscarded: number
+  /**
+   * Rows whose terminal outcome is an OPERATOR ASSERTION, so the sweep refused to write its
+   * document id onto anything or to build follow-ups from it (defect 7).
+   *
+   * Counted separately from `skippedAmbiguous` and from `failed` on purpose. It is not an
+   * attribution problem — the row names exactly one document — and it is not a failure, because
+   * nothing went wrong: the sweep declined to promote an unverified claim. Folding it into either
+   * would hide the population of rows waiting on a human to check a ledger, which is the only thing
+   * that clears them.
+   */
+  skippedUnverified: number
+  /**
+   * Rows RETIRED instead of released, because the SALE they belong to is cancelled (o3d-e2mz r8).
+   *
+   * Its own number, and not folded into `skippedAmbiguous` or `failed`, for the same reason
+   * `skippedUnverified` is: nothing failed and nothing is waiting to resolve itself. A decision was
+   * taken — this sale's work stops here — and the population it produces is the one an operator has
+   * to go and undo in the ledger.
+   */
+  retiredCancelledSale: number
 }
+
+/**
+ * What the sweep may do with ONE candidate row, decided under the sale's own row lock (o3d-e2mz r8).
+ *
+ * `SALE_UNREADABLE` carries WHY. A lock timeout, a deadlock and a genuinely broken read all end the
+ * same way — nothing released — but they need different operator responses, and a bare "could not be
+ * read" every fifteen minutes is a line nobody can act on.
+ */
+export type BackReferenceSweepRelease =
+  | { release: 'RELEASE' }
+  | { release: 'RETIRED' }
+  | { release: 'SALE_UNREADABLE'; error: string }
 
 export type BackReferenceCandidateCursor = { createdAt: Date; id: string }
 
@@ -471,6 +593,22 @@ export type BackReferenceCandidateCursor = { createdAt: Date; id: string }
  * one of them ends in a MANUAL action: the sweep has decided it cannot attribute the id safely,
  * and no amount of re-running changes that on its own.
  */
+/**
+ * What the BLOCKING bill's link provenance means for the person being asked to resolve the conflict
+ * (o3d-wf86). Reported, never acted on: telling an operator which candidate to check first is a
+ * different act from IMS deciding, and deciding needs the remote document, which this sweep does
+ * not read.
+ */
+const BLOCKING_LINK_PROVENANCE: Record<AccountingLinkSource | 'UNRECORDED', string> = {
+  BILL_KEYED_SYNC: 'That link was written by a sync row that named that bill directly, so it is the authoritative one and THIS row\'s '
+    + 'reference is the more likely mistake.',
+  PO_KEYED_REPAIR: 'That link was DEDUCED by an earlier repair from the purchase order\'s population, not reported by the ledger, so it '
+    + 'is a candidate for being the wrong one — check the remote bill against both before choosing.',
+  MANUAL: 'That link was set by an operator who confirmed it by hand, so treat it as correct unless you know why that decision changed.',
+  UNRECORDED: 'How that link was written was never recorded (it predates link provenance), so neither claim is proven — check the remote '
+    + 'bill against both.',
+}
+
 const AMBIGUITY_EXPLANATIONS: Record<AmbiguousPurchaseOrderAttribution['reason'], (a: AmbiguousPurchaseOrderAttribution) => string> = {
   MULTIPLE_SYNC_ROWS: (a) =>
     `${a.syncRowCount} posted bill sync rows reference this PO, so which bill this external id belongs to cannot be determined. Link them manually.`,
@@ -481,7 +619,12 @@ const AMBIGUITY_EXPLANATIONS: Record<AmbiguousPurchaseOrderAttribution['reason']
     + 'so there is no longer any evidence of which bill it posted. Check the accounting ledger and link the bill manually.',
   EXTERNAL_ID_LINKED_ELSEWHERE: (a) =>
     `this external id is already linked to bill ${a.linkedPurchaseInvoiceId ?? 'unknown'} on purchase order ${a.linkedPurchaseOrderId ?? 'unknown'}, `
-    + 'so it cannot also belong to a bill of this one. Either that link or this sync row is wrong — resolve it manually.',
+    + 'so it cannot also belong to a bill of this one. Either that link or this sync row is wrong — resolve it manually. '
+    // o3d-wf86: SAYS WHICH OF THE TWO IS UNPROVEN, which is the whole point of recording provenance.
+    // The refusal is unchanged — IMS still cannot adjudicate this without reading the remote bill —
+    // but "resolve it manually" with no indication of where to start is a instruction nobody can
+    // act on, and the blocking link having been a GUESS is the single most useful thing to know.
+    + BLOCKING_LINK_PROVENANCE[a.linkedAccountingInvoiceIdSource ?? 'UNRECORDED'],
   EXTERNAL_ID_CLAIMED_CONCURRENTLY: () =>
     'another bill claimed this external id while the repair was being written, so it is already attributed and was not copied. '
     + 'Confirm the surviving link is the right one.',
@@ -504,6 +647,32 @@ const AMBIGUITY_EXPLANATIONS: Record<AmbiguousPurchaseOrderAttribution['reason']
  *     it every cycle would let a backlog of unattributable legacy rows re-fill the head of
  *     the scan ACROSS runs and starve everything newer — the original bug wearing the
  *     other defect's clothes. Deferring it for the interval keeps both properties.
+ *
+ * WHAT THE ROW MUST BE, IS NOW A DISJUNCTION (o3d-p5j3). It used to be one thing — "a posted
+ * back-reference row" — expressed as `type IN (back-reference types) AND externalTransactionId IS
+ * NOT NULL`. r10 then started CLAIMING `backReferenceFollowUpsPendingAt` on the SYNCED write of
+ * EVERY sync type, in both connectors, while this query still admitted only that one shape. The
+ * marker was therefore written truthfully onto rows this sweep could never select, and stranded:
+ *
+ *   • INVOICE_PDF is the one that loses real work. Its own follow-ups are NESTED — a successful
+ *     PDF enqueues INVOICE_EMAIL and WC_INVOICE_NOTE — and the row fails BOTH old predicates at
+ *     once: INVOICE_PDF is not a back-reference type, and the PDF call returns no external id, so
+ *     the row is SYNCED with `externalTransactionId` NULL. A crash between the SYNCED commit and
+ *     the enqueue left a row that says "follow-ups owed" for ever, and the customer's invoice
+ *     email and WooCommerce note simply never happened.
+ *   • INVOICE_EMAIL, WC_INVOICE_NOTE, INVOICE_PAYMENT, BILL_PAYMENT, BILL_ATTACHMENT and the
+ *     journal types owe NOTHING to enqueueFollowUps, so their marker is a FALSE obligation. It is
+ *     harmless in the money direction but it is still a row asserting outstanding work, and while
+ *     nothing could select it, "which rows still owe follow-ups?" had no truthful answer at all.
+ *
+ * So the marker is now a candidate reason IN ITS OWN RIGHT. A row is examined when it is
+ * back-reference evidence OR when it says it owes follow-ups. The false markers drain (the
+ * enqueue is a no-op for their type and the row is stamped), and the real one — the PDF's nested
+ * pair — is finally rebuilt. Dropping the marker for PDF work was the alternative, and it is
+ * explicitly rejected: a row that owes work and says so beats one that owes work silently.
+ *
+ * The status predicate is deliberately NOT widened with it. PENDING/PROCESSING mean a sync is in
+ * flight that will run the follow-ups itself; only a settled row's obligation is this sweep's.
  */
 export function buildBackReferenceCandidateQuery(params: {
   connector: string
@@ -522,8 +691,13 @@ export function buildBackReferenceCandidateQuery(params: {
     connector: params.connector,
     // The same one definition the evidence predicate above reads (o3d-9kek r8).
     status: { in: [...BACK_REFERENCE_REPAIRABLE_STATUSES] },
-    externalTransactionId: { not: null },
-    type: { in: [...BACK_REFERENCE_SWEEP_TYPES] },
+    // Either reason is sufficient on its own (o3d-p5j3). Kept as two named clauses rather than a
+    // flattened condition because they are different questions about different populations, and a
+    // future edit that collapses them re-strands the marker.
+    OR: [
+      { type: { in: [...BACK_REFERENCE_SWEEP_TYPES] }, externalTransactionId: { not: null } },
+      { backReferenceFollowUpsPendingAt: { not: null } },
+    ],
     backReferenceCheckedAt: null,
     // NO PREDICATE ON backReferenceEvidenceCompactedAt, and that absence is deliberate (r4 finding
     // 3). Filtering tombstones out — which an earlier revision did — let RETENTION permanently
@@ -532,7 +706,8 @@ export function buildBackReferenceCandidateQuery(params: {
     // is scheduled by age and says nothing about whether the row is repairable. A tombstone still
     // carries every column the id write reads, so it stays a candidate for that write;
     // only its payload-dependent follow-ups are gone, and the loop handles that explicitly.
-    // Nested under AND because the keyset clause below also needs the top-level OR slot.
+    // Nested under AND because the top-level OR slot is taken by the candidate-reason disjunction
+    // above, and the keyset clause below needs a slot of its own too.
     AND: [notRecentlyAmbiguous],
   }
   if (params.after) {
@@ -563,7 +738,10 @@ export async function repairAccountingBackReferences(
   const now = deps.now ?? (() => new Date())
   const { connector, connectorLabel, activityActionPrefix: prefix } = deps
 
-  const result: BackReferenceRepairResult = { scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, followUpsDiscarded: 0 }
+  const result: BackReferenceRepairResult = {
+    scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, followUpsDiscarded: 0, skippedUnverified: 0,
+    retiredCancelledSale: 0,
+  }
   // One cutoff for the whole run, so every page of the scan agrees on which deferred rows
   // are due — a per-page `new Date()` would let a row fall on both sides of the boundary.
   const ambiguityRecheckBefore = new Date(now().getTime() - BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS)
@@ -695,6 +873,10 @@ export async function repairAccountingBackReferences(
         unlinkedBillCount: attribution.unlinkedBillCount,
         linkedPurchaseInvoiceId: attribution.linkedPurchaseInvoiceId ?? null,
         linkedPurchaseOrderId: attribution.linkedPurchaseOrderId ?? null,
+        // NULL means "never recorded", which is a different claim from "unknown to this report" —
+        // it is the answer for every bill linked before o3d-wf86 and it is deliberately not
+        // backfilled into a confident value.
+        linkedAccountingInvoiceIdSource: attribution.linkedAccountingInvoiceIdSource ?? null,
       },
     }))
   }
@@ -738,6 +920,70 @@ export async function repairAccountingBackReferences(
   }
 
   /**
+   * THE ROW'S OUTCOME IS AN OPERATOR'S ASSERTION, SO THERE IS NOTHING HERE TO REPAIR FROM
+   * (o3d-nf9i r3, Codex finding 1 — defect 7 at the top of this file).
+   *
+   * The sweep's entire premise is that `externalTransactionId` is a DURABLE RECORD OF A POST: the
+   * connector called the ledger, the ledger issued an id, the process then died before the id
+   * reached the source document. Re-applying it reproduces a write that was always going to happen.
+   *
+   * On an operator-settled row that premise is simply false. No call was made, no document was read,
+   * no figure was compared — a human looked at the accounting system and typed a string. Copying
+   * that string into `accountingInvoiceId` would make it THE LEDGER LINK, and from that moment
+   * nothing downstream can tell it from one the ledger issued: the follow-ups (PDF, attachment,
+   * PAYMENT) are built against it, the settlement verdict is derived from it, and the order delete
+   * guard reads it as post evidence. The basis column exists precisely so this reader can decline.
+   *
+   * WHY WARN-AND-DEFER RATHER THAN STAMP. The refusal is resolvable, by exactly one act: a human
+   * opens the document in the ledger, confirms it, and links it by hand — the same manual link every
+   * other refusal in this file asks for. When they do, the next sweep finds the document already
+   * linked and settles the row on the ordinary path, having promoted nothing. Stamping the row here
+   * would exclude it from that path for good, which is this file's oldest defect (starvation) wearing
+   * a seventh disguise. Deferring throttles the warning to one per recheck interval without
+   * retiring the row.
+   *
+   * NOT counted in `failed`: nothing failed. The sweep declined, deliberately, and `skippedUnverified`
+   * is the number that says how many rows are waiting on a person.
+   */
+  const reportUnverifiedAssertion = async (
+    row: BackReferenceSweepRow,
+    refused: 'the back-reference' | 'the follow-ups',
+  ) => {
+    result.skippedUnverified++
+    // Every asserted row in the candidate set carries one: refuseSettlement demands a document id
+    // for a POSTED assertion, and a NOT_POSTED assertion terminalises the row CANCELLED, which is
+    // outside BACK_REFERENCE_REPAIRABLE_STATUSES. The fallback exists so the warning degrades to
+    // words rather than to the string "null" if that ever stops being true.
+    const documentId = row.externalTransactionId ?? 'the document id on this row'
+    await warnAndDefer(row, () => ({
+      action: `${prefix}_backreference_unverified_assertion`,
+      description: `Refused ${refused} for ${row.referenceType} ${row.referenceId}: this ${connectorLabel} sync row's outcome was `
+        + 'recorded by an OPERATOR ASSERTION, not by the connector. Nobody called '
+        + `${connectorLabel} for it, nobody read the document and nobody compared an amount — document id `
+        + `${documentId} is a string a person typed after looking at a screen. `
+        + (refused === 'the back-reference'
+          ? 'Writing it onto the record would make it the ledger link everything downstream trusts, and an unverified '
+            + 'claim would then be indistinguishable from a confirmed one. '
+          : 'Building the follow-ups from it would send a PDF, an attachment or a PAYMENT against a document nothing has '
+            + 'checked. ')
+        + `Open ${documentId} in the accounting system. If it is the right document, link it to this `
+        + `${row.referenceType} by hand and this row settles itself on the next sweep. If it is not, correct the sync row `
+        + '— it must not be repaired from.',
+      metadata: {
+        syncLogId: row.id,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        externalId: row.externalTransactionId,
+        // The basis is REPORTED, not restated as a boolean: a reader of this entry can name what the
+        // row rested on rather than infer it from the fact that a refusal was written.
+        settlementBasis: row.settlementBasis,
+        refused,
+      },
+    }))
+  }
+
+  /**
    * THE TERMINAL POLICY for a tombstone's follow-ups (r4 finding 3).
    *
    * Retention compacts an expired-but-unresolved row to attribution only, which keeps everything the
@@ -754,20 +1000,81 @@ export async function repairAccountingBackReferences(
    */
   const reportDiscardedFollowUps = async (
     row: BackReferenceSweepRow,
-    phase: 'repaired' | 'already-applied',
+    phase: Extract<CompactedFollowUpLossPhase, 'repaired' | 'already-applied'>,
   ): Promise<boolean> => {
     result.followUpsDiscarded++
-    const preamble = phase === 'repaired'
-      ? `Re-applied the ${connectorLabel} back-reference for ${row.referenceType} ${row.referenceId}, but`
-      : `The ${connectorLabel} back-reference for ${row.referenceType} ${row.referenceId} is already applied, but`
+    // o3d-nepa r3: the message and its metadata come from the SHARED builder, because the connector
+    // processors announce the same loss from their own short-circuit and two hand-written copies of
+    // an operator-facing warning drift. See compacted-followup-loss.ts.
+    const persisted = await deps.logActivity(buildCompactedFollowUpLossActivity({
+      connectorLabel,
+      activityActionPrefix: prefix,
+      row,
+      phase,
+    }))
+    if (!persisted) {
+      console.error(`${prefix}: back-reference follow-up discard warning was not persisted; leaving row eligible`, row.id)
+    }
+    return persisted
+  }
+
+  /**
+   * MAY THIS REPAIR BE SETTLED, GIVEN WHAT IT COULD RECOVER ABOUT THE INVOICE DATE? (o3d-r5pj.)
+   *
+   * Only the SALES_INVOICE / SalesOrder pair writes `invoicedAt` at all, so every other pair
+   * settles unconditionally. For that one, a recovered business date means the repair reproduced
+   * the original write and there is nothing to report.
+   *
+   * A MISSING ONE IS A FACT ABOUT THIS ROW, NOT ABOUT THE ORDER (Codex r10 #3). An earlier revision
+   * warned on `businessDate === null` alone and told the operator the sale is "in NO reporting
+   * period". That is a different and often false claim: `recoverPostedBusinessDate` reads the
+   * PAYLOAD's own `date` field, and its absence — a compacted tombstone, a legacy body, a connector
+   * that never stored one — says nothing about `SalesOrder.invoicedAt`, which is also written by
+   * `app/actions/sales.ts` when a local invoice number is issued and can be set by an operator at
+   * any time. The repair passes NULL precisely so it LEAVES that column alone; reporting a date the
+   * order still has as missing sends a human to correct something that is already correct, and
+   * teaches them to ignore the warning that matters.
+   *
+   * So the order is ASKED. Only a sale that genuinely has no invoice date is warned about.
+   *
+   * That is deliberately not treated as an acceptable end state. The old behaviour — `new Date()`
+   * — put the sale in the WRONG period; writing nothing puts it in NO period. Both are wrong, and
+   * the only thing that makes the second acceptable is that it is ANNOUNCED. So this follows the
+   * same terminal policy the discarded follow-ups do, for the same reason: warn naming the
+   * document, and settle only once the warning is CONFIRMED PERSISTED. Stamping past a failed
+   * activity write would freeze a sale out of every VAT return with nothing anywhere saying so, and
+   * a stamped row is never looked at again.
+   *
+   * It settles rather than deferring for ever because the remedy is not something this sweep can
+   * observe: the operator sets the invoice date from the document in the ledger, on the ORDER, and
+   * nothing about the sync row changes when they do. Re-reporting daily for ever would be noise
+   * that never clears itself, which is how a warning stops being read.
+   */
+  const businessDateSettled = async (row: BackReferenceSweepRow, businessDate: Date | null): Promise<boolean> => {
+    if (row.type !== 'SALES_INVOICE' || row.referenceType !== 'SalesOrder') return true
+    if (businessDate !== null) return true
+    // Read AFTER the repair, so it reflects whatever the repair did (it deliberately did nothing to
+    // this column) plus anything else that ever set it. A throw propagates to the per-row handler,
+    // which counts a failure and leaves the row unstamped — the repair is not settled on a read
+    // that did not answer.
+    const order = await deps.db.salesOrder.findUnique({ where: { id: row.referenceId }, select: { invoicedAt: true } })
+    if (order === null) {
+      // The sale is gone. There is no reporting period to be missing from and no document to name,
+      // so there is nothing to announce — but say so once, because a repaired back-reference
+      // pointing at a deleted order is worth a line in the log.
+      console.warn(`${prefix}: invoice-date check skipped; sales order no longer exists`, row.referenceId)
+      return true
+    }
+    if (order.invoicedAt !== null) return true
     const persisted = await deps.logActivity({
       entityType: 'SYSTEM',
-      action: `${prefix}_backreference_followups_discarded`,
+      action: `${prefix}_backreference_invoice_date_unrecoverable`,
       tag: 'sync',
       level: 'WARNING',
-      description: `${preamble} its outstanding follow-ups (invoice PDF, payment registration or bill attachment) can no longer be `
-        + 'enqueued: this sync row outlived the retention period unresolved, so its payload was compacted away. The document is linked '
-        + `to external id ${row.externalTransactionId}; check whether its PDF, payment or attachment is missing and re-drive it manually.`,
+      description: `Linked ${connectorLabel} invoice ${row.externalTransactionId} to sales order ${row.referenceId}, but this sync row `
+        + 'no longer records the date the invoice was posted with, and the order has no invoice date of its own — both were checked. '
+        + 'A repair must not invent one: stamping the time the repair ran would move the sale into whichever VAT period this sweep '
+        + 'happened to run in. Until the invoice date is set from the document in the ledger, this sale is in NO reporting period.',
       metadata: {
         syncLogId: row.id,
         type: row.type,
@@ -775,13 +1082,86 @@ export async function repairAccountingBackReferences(
         referenceId: row.referenceId,
         externalId: row.externalTransactionId,
         compactedAt: row.backReferenceEvidenceCompactedAt?.toISOString() ?? null,
-        phase,
       },
     })
     if (!persisted) {
-      console.error(`${prefix}: back-reference follow-up discard warning was not persisted; leaving row eligible`, row.id)
+      console.error(`${prefix}: unrecoverable invoice-date warning was not persisted; leaving row eligible`, row.id)
     }
     return persisted
+  }
+
+  /**
+   * DISCHARGE A FOLLOW-UP OBLIGATION ON A ROW WITH NO BACK-REFERENCE OF ITS OWN (o3d-p5j3).
+   *
+   * There is no id to repair here — the row's type writes no back-reference, or the call returned
+   * no external id — so the ONLY outstanding work is the enqueue itself. That is the whole point:
+   * `backReferenceFollowUpsPendingAt` was being claimed on every connector SYNCED write while this
+   * sweep could select only back-reference evidence, so the obligation was recorded and then never
+   * consumed. INVOICE_PDF is the row where that cost real work: its follow-ups are NESTED
+   * (INVOICE_EMAIL and WC_INVOICE_NOTE), and it carries no external id, so it could never be a
+   * candidate under either half of the old predicate.
+   *
+   * Returns whether the row may now be STAMPED. Deliberately never touches `status`: unlike the
+   * repair path there is nothing here that turns a FAILED row into a successful one, and flipping
+   * a genuinely failed INVOICE_EMAIL to SYNCED because its marker was discharged would retire a
+   * failure nobody fixed.
+   *
+   * For most types the enqueue is a no-op — the connector's own dispatch has no branch for them —
+   * and that is the correct outcome rather than a special case: the marker was a FALSE obligation,
+   * calling the one function that decides what a type owes is how we find that out truthfully, and
+   * the row is then stamped and drains out of the column for good.
+   */
+  const settleOutstandingFollowUpsOnly = async (row: BackReferenceSweepRow): Promise<boolean> => {
+    if (row.backReferenceFollowUpsPendingAt === null) return true
+    // DEFECT 7, ON THE PATH THAT HAS NO ID TO WRITE. This row carries no back-reference, so nothing
+    // here can stamp a document id — but the enqueue is handed `row.externalTransactionId` as the
+    // syncResult's external id, and for an operator-settled row that is the asserted string. An
+    // INVOICE_PDF's nested email, or any allocation built from it, would then be work performed
+    // against a document nothing has checked. Refused before the marker is consumed, and NOT
+    // stamped, so the obligation survives for the sweep that runs after a human has verified it.
+    if (isOperatorAssertedSettlement(row.settlementBasis)) {
+      await reportUnverifiedAssertion(row, 'the follow-ups')
+      return false
+    }
+    result.checked++
+    // A compacted payload cannot rebuild anything, and enqueueing from `{}` would report success
+    // while doing nothing — the silent version of the loss. Same terminal policy as the linked
+    // case: warn, and settle only if the warning landed.
+    if (row.backReferenceEvidenceCompactedAt !== null) return reportDiscardedFollowUps(row, 'already-applied')
+    try {
+      await deps.enqueueFollowUps(
+        row.id,
+        row.type,
+        row.referenceType,
+        row.referenceId,
+        (row.payload ?? {}) as Record<string, unknown>,
+        { externalId: row.externalTransactionId ?? undefined },
+      )
+    } catch (followUpError) {
+      result.failed++
+      console.error(`${prefix}: outstanding follow-up enqueue failed`, row.id, followUpError)
+      await deps.logActivity({
+        entityType: 'SYSTEM',
+        action: `${prefix}_backreference_followup_deferred`,
+        tag: 'sync',
+        level: 'WARNING',
+        description: `Could not enqueue the outstanding ${connectorLabel} follow-ups recorded against ${row.type} for `
+          + `${row.referenceType} ${row.referenceId}: ${String(followUpError)}. The row is left unsettled and still marked as `
+          + 'owing them, so the next sweep retries them.',
+        metadata: { syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId },
+      })
+      return false
+    }
+    await deps.logActivity({
+      entityType: 'SYSTEM',
+      action: `${prefix}_backreference_followups_recovered`,
+      tag: 'sync',
+      level: 'INFO',
+      description: `Enqueued the outstanding ${connectorLabel} follow-ups recorded against ${row.type} for `
+        + `${row.referenceType} ${row.referenceId}; this row carries no back-reference of its own.`,
+      metadata: { syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId },
+    })
+    return true
   }
 
   // RESUME where the previous run stopped (r3 finding 4). A cursor that reset to null every
@@ -832,12 +1212,27 @@ export async function repairAccountingBackReferences(
         if (!row.externalTransactionId || !syncTypeWritesBackReference(row.type, row.referenceType)) {
           // Structurally incapable of carrying a back-reference. It would otherwise sit in
           // the candidate set for the row's whole retention life, consuming a slot.
+          //
+          // BUT IT CAN STILL OWE FOLLOW-UPS (o3d-p5j3), and stamping it here would clear the
+          // marker in the same write — destroying the obligation instead of discharging it, and
+          // doing so on exactly the row the widened candidate query was opened to reach. An
+          // INVOICE_PDF row is the case that costs real work: no external id, not a back-reference
+          // type, and a nested INVOICE_EMAIL + WC_INVOICE_NOTE pair that only the enqueue rebuilds.
+          if (!(await settleOutstandingFollowUpsOnly(row))) continue
           await markChecked(row.id)
           continue
         }
 
         const payload = (row.payload ?? {}) as Record<string, unknown>
         const invoiceNumber = typeof payload.invoiceNumber === 'string' ? payload.invoiceNumber : undefined
+        // THE POSTED DOCUMENT'S OWN BUSINESS DATE, recovered from the request that was sent
+        // (o3d-r5pj). Passed EXPLICITLY on every repair — as a Date when it is known and as `null`
+        // when it is not — so the repair can never fall through to applyBackReference's live-path
+        // default of `new Date()` by simply omitting the field. That default is correct for a post
+        // happening now and wrong for a reconstruction of one that happened months ago: VAT and
+        // currency reporting select on `invoicedAt`, so repair time moves the sale into a period it
+        // was never invoiced in.
+        const businessDate = recoverPostedBusinessDate(payload)
         const params = {
           connector,
           type: row.type,
@@ -845,6 +1240,7 @@ export async function repairAccountingBackReferences(
           referenceId: row.referenceId,
           externalId: row.externalTransactionId,
           invoiceNumber,
+          invoicedAt: businessDate,
         }
 
         // A PO-keyed row is attributed from the whole population for that PO, not from this
@@ -913,6 +1309,91 @@ export async function repairAccountingBackReferences(
          */
         const owesFollowUps = row.status === 'FAILED' || row.backReferenceFollowUpsPendingAt !== null
         const followUpsOnly = !missing && owesFollowUps && !evidenceOnly
+
+        // DEFECT 7 — THE GATE. Read from the persisted column, and read HERE rather than in the
+        // candidate query on purpose: a row excluded by the query would be silently invisible, and
+        // this refusal has to be ANNOUNCED, throttled and counted like every other refusal in this
+        // file. It sits after the probe because the probe decides WHICH refusal applies, and the
+        // probe is a read that promotes nothing.
+        //
+        // The two branches it blocks are the two that would convert the assertion into evidence:
+        //   • `missing` — the id write itself, which creates the ledger link.
+        //   • `followUpsOnly` — the PDF / attachment / PAYMENT built against the asserted id.
+        //
+        // It deliberately does NOT block the fall-through below. A row whose document is already
+        // linked, by a bill-keyed sync or by the human this refusal asks for, owes nothing and is
+        // stamped exactly as any other reconciled row is: that verdict is about the DOCUMENT's
+        // state, and no part of it comes from the assertion.
+        if (isOperatorAssertedSettlement(row.settlementBasis) && (missing || followUpsOnly)) {
+          await reportUnverifiedAssertion(row, missing ? 'the back-reference' : 'the follow-ups')
+          continue
+        }
+
+        // o3d-e2mz r8 — IS THERE STILL A SALE FOR THIS WORK TO BELONG TO? See `decideSaleRelease`.
+        //
+        // Placed HERE, after the probe and immediately before the first write, on purpose. A row that
+        // releases nothing needs no decision, and taking the order's row lock for every candidate on
+        // every run — most of them already reconciled — would contend with live allocation and
+        // cancellation work to decide nothing. It gates exactly the two branches that RELEASE:
+        // `missing` (the id write, which creates the ledger link) and `followUpsOnly` (the PDF,
+        // attachment and PAYMENT built from it). It deliberately does not gate the fall-through, which
+        // stamps a row whose document is already linked and releases nothing.
+        //
+        // A residual, stated: `settleOutstandingFollowUpsOnly` above handles rows that carry NO
+        // external id (an INVOICE_PDF with nested email/note) and is NOT gated, because a row without
+        // a document id was never in the population this finding is about. It is a narrower window
+        // than the one being closed, not a second gate that thinks this one is handling it.
+        if (deps.decideSaleRelease && (missing || followUpsOnly)) {
+          const release = await deps.decideSaleRelease(row)
+          if (release.release === 'RETIRED') {
+            result.retiredCancelledSale++
+            await deps.logActivity({
+              entityType: 'SYSTEM',
+              action: `${prefix}_backreference_repair_cancelled_sale`,
+              tag: 'sync',
+              level: 'ERROR',
+              description: `Did NOT repair the ${connectorLabel} back-reference for ${row.referenceType} ${row.referenceId}: `
+                + `the sale is CANCELLED. The document ${row.externalTransactionId} exists in ${connectorLabel} and is `
+                + `still named on sync row ${row.id}, but writing its id onto the cancelled order would have enqueued `
+                + "that sale's follow-ups — PDF, email, storefront note and PAYMENT. The row is retired instead; the "
+                + 'document in the ledger is real and is now the only thing left to undo — void or credit-note it.',
+              metadata: {
+                syncLogId: row.id,
+                type: row.type,
+                referenceType: row.referenceType,
+                referenceId: row.referenceId,
+                externalId: row.externalTransactionId,
+              },
+            })
+            continue
+          }
+          if (release.release === 'SALE_UNREADABLE') {
+            // FAIL CLOSED: release nothing, retire nothing, and count it as a failure — that is what
+            // it is, this pass could not establish the one fact it needs. Retiring would be a
+            // RETRACTION, and a retraction needs proof. The row stays in the candidate shape (it is
+            // NOT stamped), so the next sweep asks again having released nothing in between.
+            result.failed++
+            await deps.logActivity({
+              entityType: 'SYSTEM',
+              action: `${prefix}_backreference_repair_sale_unreadable`,
+              tag: 'sync',
+              level: 'WARNING',
+              description: `Deferred the ${connectorLabel} back-reference repair for ${row.referenceType} `
+                + `${row.referenceId}: the sales order could not be read, so it could not be proved live: `
+                + `${release.error}. Nothing was written onto the order and no follow-ups were enqueued; the next `
+                + 'sweep asks again.',
+              metadata: {
+                syncLogId: row.id,
+                type: row.type,
+                referenceType: row.referenceType,
+                referenceId: row.referenceId,
+                error: release.error,
+              },
+            })
+            continue
+          }
+        }
+
         if (!missing && !followUpsOnly) {
           if (evidenceOnly && owesFollowUps) {
             // Linked, but its follow-ups never ran — and the payload that would let them run is
@@ -1022,7 +1503,21 @@ export async function repairAccountingBackReferences(
           // A tombstone is stamped CHECKED but never flipped to SYNCED: its id write succeeded, so
           // there is nothing left for any future sweep to do, but its follow-ups were discarded
           // rather than done and calling that SYNCED would erase the only trace of it (r4 finding 3).
-          if (followUpsEnqueued) {
+          //
+          // AND ONLY IF THE SALE ENDED UP IN A REPORTING PERIOD (o3d-r5pj). The repair refuses to
+          // invent `invoicedAt`, so a row whose posted date could not be recovered can leave the
+          // sale with no invoice date at all — out of EVERY VAT and currency period rather than in
+          // the wrong one. Stamping that silently is the worse half of the original defect: the row
+          // would become non-repairable at the same moment it became invisible to reporting, and
+          // nothing downstream ever asks why an order has an accounting invoice id and no date.
+          //
+          // `businessDateSettled` therefore ASKS THE ORDER (Codex r10 #3) rather than inferring
+          // from the payload: an unrecoverable payload date is common and harmless when the order
+          // already carries a date, and the warning is spent only on the case that is actually
+          // wrong. When it does warn, it settles once the warning is CONFIRMED PERSISTED — the same
+          // terminal policy as the discarded follow-ups, because the remedy (a human reading the
+          // date off the ledger) is not something this sweep can observe.
+          if (followUpsEnqueued && await businessDateSettled(row, businessDate)) {
             await markChecked(row.id, row.status === 'FAILED' && !evidenceOnly ? { status: 'SYNCED', errorMessage: null } : undefined)
           }
 

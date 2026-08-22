@@ -24,6 +24,12 @@ type AllocationRow = {
    * the double, not a behaviour to encode.
    */
   fulfillmentGraphVersion?: number
+  /**
+   * o3d-0i5y r10: Group A2's RECORD — the units it has debited Allocated Inventory for, and
+   * (through `postedUnitCostBase`) the amount it debited. `undefined` is the NULL of a row A2 has
+   * never posted for.
+   */
+  costLayerSnapshot?: unknown
 }
 type ShipmentLineRow = { lineId: string; productId: string; warehouseId: string; status: string; qty: number }
 type SalesOrderLineRow = {
@@ -32,6 +38,8 @@ type SalesOrderLineRow = {
   productId: string
   qty: number
   sku: string
+  /** o3d-kouj: the line's PINNED fulfilment recipe; undefined is the NULL of a never-allocated line. */
+  fulfillmentRequirements?: unknown
 }
 /** A PENDING draft, with the label metadata a retirement has to report (o3d-4kfh r4). */
 type PendingShipmentRow = {
@@ -53,6 +61,8 @@ const state = {
   // anything, so every assertion about the post-edit state was made against a validator that had
   // been switched off (Codex review of o3d-4kfh).
   lines: [] as SalesOrderLineRow[],
+  /** o3d-kouj: every fulfilment-requirement pin written, in order. */
+  lineSnapshotWrites: [] as Array<{ lineId: string; payload: unknown }>,
   /**
    * o3d-4kfh r7 (Codex finding 1): `Product.fulfillmentGraphVersion`, keyed by productId, served
    * from `product.findMany` — the graph read.
@@ -94,6 +104,22 @@ const state = {
    * and could lose a purchased label's identity after the rows were already gone.
    */
   txActivity: [] as Record<string, unknown>[],
+  /**
+   * o3d-0i5y r11: what the LOCKED re-read of the (line, product) scope sees, keyed by warehouseId.
+   *
+   * This is how a test models the ONE writer the sales-order lock does not cover:
+   * `updateSnapshotsForCostLayerChange` rewrites `unitCostBase` in place on `order_allocations` when
+   * a landed cost lands late, and takes no order lock. Setting an entry here leaves the ORDINARY
+   * reads (`orderAllocation.findMany`) answering the pre-correction array while the FOR UPDATE read
+   * answers the corrected one — exactly the interleaving, and the only way a revert of the fix can
+   * be seen to write the stale value back out. null = every read sees the live row.
+   */
+  lockedScopeRecords: null as Record<string, unknown> | null,
+  /**
+   * Every statement the transaction issued, in order, so the ORDER of the record lock against the
+   * row writes can be asserted rather than assumed.
+   */
+  txCalls: [] as string[],
 }
 
 function decimalLikeToNumber(value: unknown): number {
@@ -102,6 +128,43 @@ function decimalLikeToNumber(value: unknown): number {
   if (typeof value === 'string') return Number(value)
   return (value as { toNumber(): number }).toNumber()
 }
+
+/**
+ * o3d-0i5y r10 — THE REVERSAL IS A JOURNAL, so the only assertion worth making about it is the
+ * amount. `@/lib/accounting` is the connector-agnostic enqueue `reverseOrphanedAllocationPosting`
+ * reaches for, dynamically at call time, which is why registering the mock here works.
+ *
+ * The ATTEMPT and the ROW it writes are recorded separately, because that separation is the whole
+ * of Codex finding 3: production's `queueAccountingSyncTx` writes nothing and throws nothing when
+ * no active connector posts the type, when the posting is suppressed, or when the order was deleted
+ * under it. A double whose enqueue could only ever succeed could not exercise the verification.
+ */
+type QueuedAccountingSync = {
+  type: string
+  referenceType: string
+  referenceId: string
+  payload: {
+    _reversalToken?: string
+    lines?: Array<{ accountCode: string; debit?: number; credit?: number }>
+  }
+}
+const queuedAccountingSyncs: QueuedAccountingSync[] = []
+const accountingSyncRows: QueuedAccountingSync[] = []
+let accountingEnqueueOutcome: 'writes' | 'silent-no-op' = 'writes'
+
+mock.module('@/lib/accounting', {
+  namedExports: {
+    getAccountingSettings: async () => ({ inventoryAccount: '630', allocatedInventoryAccount: '631' }),
+    queueAccountingSyncTx: async (_tx: unknown, params: QueuedAccountingSync) => {
+      queuedAccountingSyncs.push(params)
+      if (accountingEnqueueOutcome === 'silent-no-op') return false
+      accountingSyncRows.push(params)
+      return true
+    },
+    isAccountingSyncTypeEnabled: async () => true,
+    isDailyBatchPostingEnabled: async () => true,
+  },
+})
 
 mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
 mock.module('@/lib/activity-log', {
@@ -116,6 +179,7 @@ mock.module('@/lib/auth/server', {
   namedExports: {
     requirePermission: async () => ({ user: { id: 'user-test', role: 'ADMIN' } }),
     requireAuth: async () => ({ user: { id: 'user-test', role: 'ADMIN' } }),
+    requireInternalUser: async () => ({ user: { id: 'user-test', role: 'ADMIN' } }),
   },
 })
 mock.module('@/lib/shopping', {
@@ -126,7 +190,67 @@ mock.module('@/lib/shopping', {
 })
 
 const tx = {
-  $queryRaw: async () => [],
+  /**
+   * o3d-0i5y r11: TWO call shapes reach here and they are not the same question. `lockSalesOrder`
+   * takes a lock and wants nothing back; `lockAccountedRecordsForScope` is a ROW-RETURNING lock —
+   * it hands back the record each row of the (line, product) scope holds AS OF THE LOCK, which is
+   * the base the carry-over re-authors. Answering it with `[]` (as this double did while every raw
+   * statement here was only ever a lock) hands the writer an EMPTY BASE, so every record and
+   * reversal assertion in this file decides nothing.
+   */
+  $queryRaw: async (...args: unknown[]) => {
+    const first = args[0]
+    const text = first && typeof first === 'object' && 'sql' in (first as Record<string, unknown>)
+      ? String((first as { sql: unknown }).sql)
+      : Array.isArray(first)
+      ? first.join(' ')
+      : String(first)
+    const sql = text.replace(/\s+/g, ' ').trim()
+    state.txCalls.push(`$queryRaw:${sql}`)
+    if (sql.includes('order_allocations') && sql.includes('FOR UPDATE')) {
+      // Honours the (orderId, lineId, productId) predicate in the order the statement binds them,
+      // because the scope is the whole point: a double that returned every row would let the
+      // carry-over pool a record across lines it has no business speaking for.
+      const [orderId, lineId, productId] = ((first as { values?: unknown[] }).values ?? []) as string[]
+      return state.allocations
+        .filter((row) => row.orderId === orderId && row.lineId === lineId && row.productId === productId)
+        .map((row) => ({
+          lineId: row.lineId,
+          productId: row.productId,
+          warehouseId: row.warehouseId,
+          costLayerSnapshot: state.lockedScopeRecords && row.warehouseId in state.lockedScopeRecords
+            ? state.lockedScopeRecords[row.warehouseId]
+            : row.costLayerSnapshot ?? null,
+        }))
+    }
+    return []
+  },
+  // o3d-0i5y r10: the post-enqueue verification asks the DATABASE for the row the enqueue was
+  // supposed to create, under that enqueue's own predicate. It really searches the rows the enqueue
+  // wrote and really honours the `_reversalToken` JSON-path filter, so the answer is decided in
+  // production rather than hardcoded here.
+  accountingSyncLog: {
+    findFirst: async ({ where }: {
+      where: {
+        type?: string
+        referenceType?: string
+        referenceId?: string
+        payload?: { path: string[]; equals: unknown }
+      }
+    }) => accountingSyncRows.find((row) => {
+      if (where.type != null && row.type !== where.type) return false
+      if (where.referenceType != null && row.referenceType !== where.referenceType) return false
+      if (where.referenceId != null && row.referenceId !== where.referenceId) return false
+      if (where.payload != null) {
+        const value = where.payload.path.reduce<unknown>(
+          (node, key) => (node == null ? undefined : (node as Record<string, unknown>)[key]),
+          row.payload,
+        )
+        if (value !== where.payload.equals) return false
+      }
+      return true
+    }) ?? null,
+  },
   activityLog: {
     create: async ({ data }: { data: Record<string, unknown> }) => {
       state.txActivity.push(data)
@@ -168,21 +292,76 @@ const tx = {
     },
   },
   salesOrderLine: {
-    findMany: async ({ where }: { where: { orderId: string; id?: { in: string[] } } }) => state.lines
-      .filter((line) => line.orderId === where.orderId)
-      .filter((line) => !where.id || where.id.in.includes(line.id))
+    // o3d-kouj: `addAllocation` reads the ONE line it is about to pin, scoped by BOTH id and
+    // orderId — a line belonging to another order must come back as ABSENT here, or the double
+    // would hide the cross-order write the scoping exists to refuse.
+    findFirst: async ({ where }: { where: { id?: string; orderId?: string } }) => state.lines
+      .filter((line) => where.id == null || line.id === where.id)
+      .filter((line) => where.orderId == null || line.orderId === where.orderId)
       .map((line) => ({
         id: line.id,
         productId: line.productId,
         qty: line.qty,
         sku: line.sku,
         description: line.sku,
+        fulfillmentRequirements: line.fulfillmentRequirements ?? null,
+      }))[0] ?? null,
+    // o3d-kouj: the dormant-pin sweep selects only lines that CARRY a pin, so the filter is
+    // honoured rather than ignored — a double that returned every line would make the sweep look
+    // like it examined rows Postgres never hands it.
+    updateMany: async ({ where, data }: {
+      where: { id: { in: string[] }; orderId?: string }
+      data: { fulfillmentRequirements?: unknown }
+    }) => {
+      let count = 0
+      for (const line of state.lines) {
+        if (!where.id.in.includes(line.id)) continue
+        if (where.orderId != null && line.orderId !== where.orderId) continue
+        if ('fulfillmentRequirements' in data) {
+          state.lineSnapshotWrites.push({ lineId: line.id, payload: data.fulfillmentRequirements })
+          line.fulfillmentRequirements = undefined
+        }
+        count += 1
+      }
+      return { count }
+    },
+    findMany: async ({ where }: {
+      where: {
+        orderId?: string
+        id?: string | { in: string[] }
+        fulfillmentRequirements?: { not: unknown }
+      }
+    }) => state.lines
+      .filter((line) => where.orderId == null || line.orderId === where.orderId)
+      .filter((line) => {
+        if (where.id == null) return true
+        return typeof where.id === 'string' ? line.id === where.id : where.id.in.includes(line.id)
+      })
+      .filter((line) => where.fulfillmentRequirements == null || line.fulfillmentRequirements != null)
+      .map((line) => ({
+        id: line.id,
+        productId: line.productId,
+        qty: line.qty,
+        sku: line.sku,
+        description: line.sku,
+        fulfillmentRequirements: line.fulfillmentRequirements ?? null,
         // The r6 read, kept alive on purpose — see `state.lineProductGraphVersions`.
         product: {
           fulfillmentGraphVersion:
             state.lineProductGraphVersions[line.productId] ?? state.graphVersions[line.productId] ?? 0,
         },
       })),
+    // o3d-kouj: the pin write, mutating the SAME rows `findMany` answers from and round-tripping
+    // through JSON as jsonb does.
+    update: async ({ where, data }: { where: { id: string }; data: { fulfillmentRequirements?: unknown } }) => {
+      const line = state.lines.find((row) => row.id === where.id)
+      if (!line) throw new Error(`salesOrderLine.update: no line ${where.id}`)
+      if ('fulfillmentRequirements' in data) {
+        state.lineSnapshotWrites.push({ lineId: where.id, payload: data.fulfillmentRequirements })
+        line.fulfillmentRequirements = JSON.parse(JSON.stringify(data.fulfillmentRequirements))
+      }
+      return line
+    },
   },
   // SIMPLE unless `state.kits` says otherwise. validateAllocationIntegrity really does load the
   // graph, so it has to be answerable — and `addAllocation` EXPANDS it, so a double that could only
@@ -211,14 +390,23 @@ const tx = {
     // back), `status: { not: 'PENDING' }` is committed demand. A double that understood only one
     // of them would answer the other with the wrong set (o3d-4kfh).
     findMany: async ({ where }: {
-      where: { shipment: { status: string | { not: string } }; lineId?: { in: string[] } }
+      where: { shipment: { status: string | { not: string } }; lineId?: string | { in: string[] } }
     }) => state.shipmentLines
       .filter((line) => (
         typeof where.shipment.status === 'string'
           ? line.status === where.shipment.status
           : line.status !== where.shipment.status.not
       ))
-      .filter((line) => !where.lineId || where.lineId.in.includes(line.lineId))
+      // BOTH lineId shapes. `addAllocation` asks about ONE line by plain string; the coverage and
+      // residual readers ask with `{ in: [...] }`. Handling only the set form threw on the string
+      // form — invisible for as long as every fixture that reached it had no shipment lines at all,
+      // which is a hole in the double rather than a behaviour.
+      .filter((line) => {
+        if (where.lineId == null) return true
+        return typeof where.lineId === 'string'
+          ? line.lineId === where.lineId
+          : where.lineId.in.includes(line.lineId)
+      })
       .map((line) => ({
         lineId: line.lineId,
         productId: line.productId,
@@ -286,7 +474,7 @@ const tx = {
         orderId?: string
         lineId?: string | { in: string[] }
         warehouseId?: string
-        productId?: { in: string[] }
+        productId?: string | { in: string[] }
       }
     } = {}) => state
       .allocations
@@ -296,11 +484,45 @@ const tx = {
         return typeof where.lineId === 'string' ? row.lineId === where.lineId : where.lineId.in.includes(row.lineId)
       })
       .filter((row) => where?.warehouseId == null || row.warehouseId === where.warehouseId)
-      .filter((row) => where?.productId == null || where.productId.in.includes(row.productId))
+      // BOTH productId shapes. The residual/integrity readers ask with `{ in: [...] }`; the r10
+      // record carry-over asks about ONE product by plain string, because it speaks only for the
+      // (line, product) it is editing. Handling only the set form threw on the string form.
+      .filter((row) => {
+        if (where?.productId == null) return true
+        return typeof where.productId === 'string'
+          ? row.productId === where.productId
+          : where.productId.in.includes(row.productId)
+      })
       .map((row) => ({ ...row, fulfillmentGraphVersion: row.fulfillmentGraphVersion ?? 0 })),
-    update: async ({ where, data }: { where: { id: string }; data: { warehouseId?: string; qty?: unknown } }) => {
-      const row = state.allocations.find((candidate) => candidate.id === where.id)
+    // Answers BOTH `where` shapes production uses: the edit's own `{ id }`, and the r10 record
+    // write's `{ lineId_warehouseId_productId }` — the same compound unique the merge-target lookup
+    // above resolves by. A double that understood only `{ id }` would throw on the record write, and
+    // one that ignored the compound keys would put a carried record on whichever row came first.
+    update: async ({ where, data }: {
+      where: {
+        id?: string
+        lineId_warehouseId_productId?: { lineId: string; warehouseId: string; productId: string }
+      }
+      data: { warehouseId?: string; qty?: unknown; costLayerSnapshot?: unknown }
+    }) => {
+      const key = where.lineId_warehouseId_productId
+      const row = where.id
+        ? state.allocations.find((candidate) => candidate.id === where.id)
+        : state.allocations.find((candidate) => (
+          candidate.lineId === key!.lineId
+          && candidate.warehouseId === key!.warehouseId
+          && candidate.productId === key!.productId
+        ))
       if (!row) throw new Error('allocation not found')
+      state.txCalls.push(`orderAllocation.update:${row.id}:${'costLayerSnapshot' in data ? 'record' : 'row'}`)
+      // The WRITTEN VALUE is honoured, never forced to null: forcing it would assert a destructive
+      // rewrite as a requirement and make the carry-over unobservable (o3d-0i5y r8's lesson).
+      // Round-trips through JSON as jsonb does.
+      if ('costLayerSnapshot' in data) {
+        row.costLayerSnapshot = data.costLayerSnapshot == null
+          ? null
+          : JSON.parse(JSON.stringify(data.costLayerSnapshot))
+      }
       if (data.warehouseId) row.warehouseId = data.warehouseId
       // o3d-4kfh r7: `OrderAllocation.qty` is `@db.Decimal(12,4)` and Postgres rounds half-up ON
       // WRITE. A double that stored the caller's full precision let a test observe a row IMS could
@@ -320,6 +542,7 @@ const tx = {
       return row
     },
     delete: async ({ where }: { where: { id: string } }) => {
+      state.txCalls.push(`orderAllocation.delete:${where.id}`)
       const index = state.allocations.findIndex((row) => row.id === where.id)
       if (index >= 0) state.allocations.splice(index, 1)
       return {}
@@ -380,6 +603,12 @@ function seedLines(qty: number) {
   state.pendingShipments = []
   state.activity.length = 0
   state.txActivity.length = 0
+  state.lineSnapshotWrites.length = 0
+  queuedAccountingSyncs.length = 0
+  accountingSyncRows.length = 0
+  accountingEnqueueOutcome = 'writes'
+  state.lockedScopeRecords = null
+  state.txCalls.length = 0
 }
 
 /**
@@ -1111,5 +1340,796 @@ test('o3d-4kfh r7: addAllocation reserves the PERSISTED component quantity, not 
     reservedAt('warehouse-1'),
     3.3334,
     'and the reservation moved by the persisted row, so order B\'s 3 is neither topped up nor eaten into',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-kouj — `addAllocation` IS THE SECOND DOOR ONTO IN-FLIGHT STATE, AND IT PINS TOO.
+//
+// `allocateSalesOrder` is not the only writer of `OrderAllocation`. If the manual editor could give
+// a line its first allocation row without pinning, every reader would keep answering that line from
+// a graph free to move under it — a line the rest of the system believes is protected, and is not.
+// ---------------------------------------------------------------------------
+
+test('o3d-kouj: addAllocation pins the recipe when it gives a line its FIRST row', async () => {
+  seedLines(10)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 10, sku: 'KIT-1' }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 2 }] }
+  state.graphVersions = { 'kit-1': 6 }
+  state.stockLevels = [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 0 }]
+  state.allocations = []
+  state.shipmentLines = []
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 1)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(state.lineSnapshotWrites.map((write) => write.lineId), ['line-1'])
+  assert.deepEqual(state.lines[0].fulfillmentRequirements, {
+    version: 1,
+    productId: 'kit-1',
+    graphVersion: 6,
+    capturedAt: (state.lines[0].fulfillmentRequirements as { capturedAt: string }).capturedAt,
+    requirements: [{ productId: 'component-1', factor: '2' }],
+  })
+})
+
+test('o3d-kouj: addAllocation expands the PIN, and never re-pins a line that already holds rows', async () => {
+  // The kit has since been re-composed 2 -> 5. Adding one more kit to a line that is already
+  // in flight must add the PINNED two components, not five: the row it is topping up, the
+  // reservation behind it and the shipment lines already committed are all in the pinned units.
+  const pinned = {
+    version: 1,
+    productId: 'kit-1',
+    graphVersion: 6,
+    capturedAt: '2026-08-01T00:00:00.000Z',
+    requirements: [{ productId: 'component-1', factor: '2' }],
+  }
+  seedLines(10)
+  state.lines = [{
+    id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 10, sku: 'KIT-1',
+    fulfillmentRequirements: pinned,
+  }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 5 }] }
+  state.graphVersions = { 'kit-1': 11 }
+  state.stockLevels = [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 2 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', qty: 2 },
+  ]
+  state.shipmentLines = []
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 1)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(state.allocations[0].qty, 4, '2 already there plus the PINNED 2, not plus 5')
+  assert.equal(reservedAt('warehouse-1'), 4)
+  assert.deepEqual(state.lineSnapshotWrites, [], 'and the pin is not touched')
+  assert.deepEqual(state.lines[0].fulfillmentRequirements, pinned)
+})
+
+test('o3d-kouj: addAllocation REFUSES a line that belongs to another order', async () => {
+  // `lineId` arrives from the caller and nothing tied it to `orderId`. The lock is on the ORDER, so
+  // a foreign line is outside it — and every in-flight fact the action reads is scoped to
+  // `{ orderId, lineId }`, so another order's fully-allocated, half-picked line read as holding
+  // NOTHING, was judged capturable, and had its pinned recipe overwritten.
+  const pinned = {
+    version: 1,
+    productId: 'kit-1',
+    graphVersion: 6,
+    capturedAt: '2026-08-01T00:00:00.000Z',
+    requirements: [{ productId: 'component-1', factor: '2' }],
+  }
+  seedLines(10)
+  // line-1 belongs to order-1 and is in flight there: pinned, allocated, and picked.
+  state.lines = [{
+    id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 10, sku: 'KIT-1',
+    fulfillmentRequirements: pinned,
+  }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 5 }] }
+  state.graphVersions = { 'kit-1': 11 }
+  state.stockLevels = [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 50, reservedQty: 20 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', qty: 20 },
+  ]
+  state.shipmentLines = [
+    { lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', status: 'PICKING', qty: 20 },
+  ]
+  const { addAllocation } = await loadAction()
+
+  // order-2 names order-1's line.
+  const result = await addAllocation('order-2', 'line-1', 'kit-1', 'warehouse-1', 1)
+
+  assert.equal(result.success, false)
+  assert.match(
+    result.error ?? '',
+    /Line line-1 does not belong to order order-2/,
+    'the refusal names the line and the order, so an operator can see which pairing was wrong',
+  )
+  assert.equal(state.allocations.length, 1, 'no allocation row was attached to the foreign order')
+  assert.equal(state.allocations[0].qty, 20, "and order-1's own row is untouched")
+  assert.equal(reservedAt('warehouse-1'), 20, "nothing was taken out of the shared aggregate")
+  assert.deepEqual(state.lineSnapshotWrites, [], 'and no pin was written')
+  assert.deepEqual(
+    state.lines[0].fulfillmentRequirements,
+    pinned,
+    "order-1's pinned recipe survives — it is what its picked shipment was picked against",
+  )
+})
+
+test('o3d-kouj: a manual addition to a PINNED line stamps the PIN\'s graph version, not the current one', async () => {
+  // The column records the graph version the rows were EXPANDED from. A pinned line's rows come
+  // from the pin, so stamping the current version leaves the row claiming a provenance it does not
+  // have — and certifying itself as current, so that if the pin were ever lost the CAS (skipped per
+  // line only while a pin exists) would come back and find a row agreeing with a recipe it was
+  // never expanded from.
+  const pinned = {
+    version: 1,
+    productId: 'kit-1',
+    graphVersion: 6,
+    capturedAt: '2026-08-01T00:00:00.000Z',
+    requirements: [{ productId: 'component-1', factor: '2' }, { productId: 'component-2', factor: '1' }],
+  }
+  seedLines(10)
+  state.lines = [{
+    id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 10, sku: 'KIT-1',
+    fulfillmentRequirements: pinned,
+  }]
+  // The current recipe has moved on, both in shape and in version.
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 5 }] }
+  state.graphVersions = { 'kit-1': 11 }
+  state.stockLevels = [
+    { productId: 'component-1', warehouseId: 'warehouse-1', quantity: 50, reservedQty: 2 },
+    { productId: 'component-2', warehouseId: 'warehouse-1', quantity: 50, reservedQty: 0 },
+  ]
+  // NO allocation rows: the line is held in flight by a PICKED shipment instead, so it is not
+  // capturable (its pin stands) and BOTH components are CREATED by this addition — and the create
+  // branch is the only one that stamps a version at all.
+  state.allocations = []
+  // A complete PINNED component set, picked: 2 x component-1 + 1 x component-2 for one kit.
+  state.shipmentLines = [
+    { lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', status: 'PICKING', qty: 2 },
+    { lineId: 'line-1', productId: 'component-2', warehouseId: 'warehouse-1', status: 'PICKING', qty: 1 },
+  ]
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 1)
+
+  assert.equal(result.success, true, result.error)
+  const componentOne = state.allocations.find((row) => row.productId === 'component-1')
+  const componentTwo = state.allocations.find((row) => row.productId === 'component-2')
+  assert.ok(componentTwo, 'the pinned component the current recipe no longer mentions did get a row')
+  assert.equal(componentOne?.qty, 2, 'expanded from the PIN (factor 2), not the current recipe (5)')
+  assert.equal(componentTwo.qty, 1, 'and the pinned factor-1 component too')
+  assert.equal(
+    componentTwo.fulfillmentGraphVersion,
+    6,
+    "stamped with the PIN's version — the recipe these rows actually came from",
+  )
+  assert.notEqual(componentTwo.fulfillmentGraphVersion, 11, 'and emphatically not the current graph version')
+  assert.equal(componentOne?.fulfillmentGraphVersion, 6, 'both created rows carry the same honest provenance')
+  assert.deepEqual(state.lineSnapshotWrites, [], 'and a pinned line is never re-pinned by this path')
+})
+
+test('o3d-kouj: an UNPINNED line still stamps the CURRENT graph version', async () => {
+  // The bound on the rule. Without a pin the rows really were expanded from the current graph, so
+  // that is the honest stamp — and the CAS still reads it for those lines.
+  seedLines(10)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 10, sku: 'KIT-1' }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 5 }] }
+  state.graphVersions = { 'kit-1': 11 }
+  state.stockLevels = [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 50, reservedQty: 0 }]
+  state.allocations = []
+  state.shipmentLines = []
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 1)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(state.allocations[0].productId, 'component-1')
+  assert.equal(state.allocations[0].fulfillmentGraphVersion, 11)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-0i5y r10 (Codex round 10, finding 1) — THE MANUAL EDITOR AND GROUP A2'S POSTED RECORD.
+//
+// r9 gave the carry-over and the orphan reversal to `allocateSalesOrder`, the one caller that
+// declares its next set, and left this action out — the very action an operator uses to take units
+// off an order by hand. Every test below is asserted on the AMOUNT, because that is what the defect
+// is: pounds sitting in Allocated Inventory that nothing downstream will ever relieve.
+// ---------------------------------------------------------------------------------------------
+
+/** What A2 wrote when it posted these units: the pin, AND the amount it posted for each one. */
+const POSTED_AT_FOUR = (qty: string) => [{
+  costLayerId: 'layer-1',
+  qty,
+  unitCostBase: '4.000000',
+  postedUnitCostBase: '4.000000',
+}]
+
+/** Total units a row's record accounts for, read back through production's own parser. */
+async function recordedUnitsAt(warehouseId: string): Promise<string> {
+  const { parseCostLayerSnapshot, sumCostLayerSnapshotQty } = await import('@/lib/cost-layer-snapshots')
+  const row = state.allocations.find((candidate) => candidate.warehouseId === warehouseId)
+  return sumCostLayerSnapshotQty(parseCostLayerSnapshot(row?.costLayerSnapshot ?? null)).toString()
+}
+
+function reversalLines(): Array<[string, number | null, number | null]> | undefined {
+  return queuedAccountingSyncs[0]?.payload.lines?.map((line) => [line.accountCode, line.debit ?? null, line.credit ?? null])
+}
+
+test('o3d-0i5y r10: reducing an allocation by hand REVERSES the A2 debit of the units that left', async () => {
+  // 10 units at £4 = £40 already in Allocated Inventory. The operator drops the allocation to 6.
+  // The four units that left will never ship (Group B never credits) and were never invoiced (no
+  // refund reversal sees them), so before r10 their £16 stayed in Allocated Inventory for ever with
+  // Inventory understated by the same £16. The floor was doing its job the whole time — it stops
+  // those units being posted AGAIN, and says nothing about the pounds already there.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-a',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+  }]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(state.allocations[0].qty, 6)
+  assert.equal(await recordedUnitsAt('warehouse-1'), '6', 'the record is trimmed to the units the row still holds')
+  assert.equal(queuedAccountingSyncs.length, 1, 'and the four units that left are reversed')
+  assert.equal(queuedAccountingSyncs[0].type, 'ALLOCATION_REVERSAL')
+  assert.deepEqual(
+    reversalLines(),
+    [
+      ['630', 16, null],
+      ['631', null, 16],
+    ],
+    'DR Inventory £16 / CR Allocated Inventory £16 — 4 units at the £4 A2 recorded posting, leaving '
+    + 'exactly the £24 Group B will relieve when the remaining six ship',
+  )
+})
+
+test('o3d-0i5y r10: reducing an allocation to ZERO reverses the WHOLE posted debit', async () => {
+  // The limiting case, and the worst one: the row is deleted, so before r10 the record died with it
+  // and nothing surviving could say the £40 had ever been posted.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-a',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+  }]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 0)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(state.allocations, [], 'the row is gone')
+  assert.deepEqual(
+    reversalLines(),
+    [
+      ['630', 40, null],
+      ['631', null, 40],
+    ],
+    'all ten units at £4',
+  )
+})
+
+test('o3d-0i5y r10: the reversal is valued at what A2 POSTED, never at a pin a revaluation rewrote', async () => {
+  // `updateSnapshotsForCostLayerChange` has since rewritten `unitCostBase` on this row from £4 to
+  // £9. That revaluation posted to COGS/Inventory and never touched Allocated Inventory, so £4 a
+  // unit is still what stands there. Valuing from the live pin would take £36 out of an account
+  // that only ever received £40 for ten units.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-a',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: [{
+      costLayerId: 'layer-1',
+      qty: '10.000000',
+      unitCostBase: '9.000000',
+      postedUnitCostBase: '4.000000',
+    }],
+  }]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(
+    reversalLines(),
+    [
+      ['630', 16, null],
+      ['631', null, 16],
+    ],
+    'still £16 — the recorded amount, not 4 x the revalued £9',
+  )
+})
+
+test('o3d-0i5y r10: a record that cannot say what was posted for it reverses NOTHING, and is reported', async () => {
+  // Every entry written before r9 is this shape. A reversal posted wrongly is as bad as the
+  // original, so this needs positive evidence of the original — and the pin is not it.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-a',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: [{ costLayerId: 'layer-1', qty: '10.000000', unitCostBase: '4.000000' }],
+  }]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(queuedAccountingSyncs, [], 'no journal is invented from the live pin')
+  const reported = state.txActivity.filter((row) => row.action === 'allocation_reversal_unevidenced')
+  assert.equal(reported.length, 1, 'and the units that left are named for a human to settle by hand')
+  assert.match(String(reported[0].description), /4 recorded unit\(s\)/)
+})
+
+test('o3d-0i5y r10: a MERGE carries the source row\'s record onto the row that inherits its units', async () => {
+  // The merge deletes the source row outright, so before r10 its record went with it — and A2, on
+  // its next pass, read a destination row recording 2 units where 12 had been posted and posted the
+  // other ten a second time. Nothing reverses the first ten. Nothing is orphaned here: every unit is
+  // still on the order.
+  seedLines(12)
+  state.stockLevels = [
+    { productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 },
+    { productId: 'product-1', warehouseId: 'warehouse-2', quantity: 20, reservedQty: 2 },
+  ]
+  state.allocations = [
+    {
+      id: 'alloc-a',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 10,
+      costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+    },
+    {
+      id: 'alloc-b',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-2',
+      qty: 2,
+      costLayerSnapshot: POSTED_AT_FOUR('2.000000'),
+    },
+  ]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-2', 10)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(
+    state.allocations.map((row) => [row.warehouseId, row.qty]),
+    [['warehouse-2', 12]],
+    'one row is left, holding every unit',
+  )
+  assert.equal(
+    await recordedUnitsAt('warehouse-2'),
+    '12',
+    'and it records all twelve posted units — its own 2 plus the 10 the deleted source row carried',
+  )
+  assert.deepEqual(queuedAccountingSyncs, [], 'nothing left the order, so nothing is reversed')
+})
+
+test('o3d-0i5y r10 (GUARD): moving a row to an empty warehouse reverses nothing', async () => {
+  // The guard against the opposite failure — a reversal fired on a plain warehouse move would
+  // credit Allocated Inventory for units that are still on the order and still going to ship.
+  // Labelled a guard rather than a revert-detector: an in-place move keeps the row (and therefore
+  // its record) whatever the carry-over decides, so this passes under every mutation of the fix.
+  seedLines(10)
+  state.stockLevels = [
+    { productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 },
+    { productId: 'product-1', warehouseId: 'warehouse-2', quantity: 20, reservedQty: 0 },
+  ]
+  state.allocations = [{
+    id: 'alloc-a',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+  }]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-2', 10)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(await recordedUnitsAt('warehouse-2'), '10')
+  assert.deepEqual(queuedAccountingSyncs, [])
+})
+
+test('o3d-0i5y r10: a manual reduction whose reversal the queue DROPPED is detected, with the amount', async () => {
+  // The same silent no-op finding 3 closes on the allocator, reached through the manual editor:
+  // `queueAccountingSyncTx` returns having written nothing, and the rows carrying the evidence have
+  // already been trimmed in this same transaction.
+  seedLines(10)
+  accountingEnqueueOutcome = 'silent-no-op'
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-a',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+  }]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(accountingSyncRows.length, 0, 'the enqueue wrote nothing')
+  const reported = state.txActivity.filter((row) => row.action === 'allocation_reversal_unqueued')
+  assert.equal(reported.length, 1)
+  assert.equal(reported[0].level, 'ERROR')
+  assert.match(
+    String(reported[0].description),
+    /Allocation reversal of £16\.00 on order order-1 was NOT queued/,
+    'the exact amount a human now has to post by hand',
+  )
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-0i5y r11 (Codex round 11, finding 1) — THE MANUAL EDITOR'S WRITE, NOT ITS PLAN.
+//
+// r10 gave this action the carry-over and the reversal, and read the record it plans from at the
+// TOP of the transaction — the same defect r10 had just fixed in Group A2 one file away. The
+// sales-order lock this action holds does not cover `order_allocations`, and one writer touches
+// them without it: `updateSnapshotsForCostLayerChange`, the late-landed-cost correction, which
+// selects by cost layer across every table carrying a snapshot and takes no order lock at all.
+//
+// `state.lockedScopeRecords` is that interleaving: the ordinary reads still answer the array the
+// plan was drawn from, the FOR UPDATE read answers the corrected one.
+// ---------------------------------------------------------------------------------------------
+
+/** Total VALUE a row's record pins right now, read back through production's own parser. */
+async function recordedValueAt(warehouseId: string): Promise<string> {
+  const { parseCostLayerSnapshot, sumCostLayerSnapshot } = await import('@/lib/cost-layer-snapshots')
+  const row = state.allocations.find((candidate) => candidate.warehouseId === warehouseId)
+  return sumCostLayerSnapshot(parseCostLayerSnapshot(row?.costLayerSnapshot ?? null)).toString()
+}
+
+test('o3d-0i5y r11: a manual reduction KEEPS a landed-cost correction that lands between the plan and the write', async () => {
+  // 10 units pinned and posted by A2 at £4 — £40 into Allocated Inventory, `postedUnitCostBase`
+  // 4.000000. While the operator is editing, a landed cost reprices that layer £4 -> £5: the
+  // correction rewrites `unitCostBase` in place on this very row and posts the £10 difference to
+  // COGS/Inventory, never to Allocated Inventory — which is why `postedUnitCostBase` stays at £4.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-a',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+  }]
+  // Committed after this action's ordinary reads and before its write.
+  state.lockedScopeRecords = {
+    'warehouse-1': [{
+      costLayerId: 'layer-1',
+      qty: '10.000000',
+      unitCostBase: '5.000000',
+      postedUnitCostBase: '4.000000',
+    }],
+  }
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(state.allocations[0].qty, 6)
+  assert.equal(await recordedUnitsAt('warehouse-1'), '6', 'the record is still trimmed to the units the row holds')
+  assert.equal(
+    await recordedValueAt('warehouse-1'),
+    '30',
+    'and it is trimmed off the CORRECTED entry: 6 x £5. Written back off the plan it would say 6 x £4 = £24, '
+    + 'the correction would be gone, and Group B would relieve those six at £4 — £6 of real cost never '
+    + 'reaching cost of sales',
+  )
+  assert.equal(queuedAccountingSyncs.length, 1)
+  assert.deepEqual(
+    reversalLines(),
+    [
+      ['630', 16, null],
+      ['631', null, 16],
+    ],
+    'while the REVERSAL is unmoved at £16 — 4 units at the £4 A2 recorded posting. A revaluation '
+    + 'rewrites the pin and never `postedUnitCostBase`, so the two answers move independently and both are right',
+  )
+})
+
+test('o3d-0i5y r11: the record lock is taken BEFORE the first allocation-row write', async () => {
+  // Where the lock is taken is the whole of the fix: taken after the write it protects nothing, and
+  // taken at the top of the transaction it would run order_allocations -> stock_levels/cost_layers
+  // against the correction's cost_layers -> order_allocations, which is a real deadlock cycle.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-a',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+  }]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  const lockIndex = state.txCalls.findIndex((call) => (
+    call.startsWith('$queryRaw:') && call.includes('order_allocations') && call.includes('FOR UPDATE')
+  ))
+  const firstRowWrite = state.txCalls.findIndex((call) => call === 'orderAllocation.update:alloc-a:row')
+  assert.ok(lockIndex >= 0, 'the scope\'s records are row-locked')
+  assert.ok(firstRowWrite >= 0, 'and the row really is rewritten')
+  assert.ok(lockIndex < firstRowWrite, 'the lock comes first, so nothing can revalue the base between the two')
+  const orderLock = state.txCalls.findIndex((call) => call.includes('sales_orders') && call.includes('FOR UPDATE'))
+  assert.ok(orderLock >= 0 && orderLock < lockIndex, 'and the ORDER lock still comes before it — one ordering, unchanged')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-i4qd — THE INTEGRITY CHECKS MUST NOT REFUSE THE ROWS THE ALLOCATOR JUST WROTE.
+//
+// `OrderAllocation.qty` is `Decimal(12,4)` and a KIT requirement is a PRODUCT of `Decimal(12,4)`
+// factors, so the requirement is routinely NOT representable: 0.5 kits of a 0.3333 component is
+// 0.16665 and the column holds 0.1667. Both arms of `validateAllocationIntegrity` compared a
+// quantity the column had rounded against a coverage derived by dividing that rounded quantity by
+// the UNROUNDED factor, and refused. The refusal lands at shipment confirmation, so the order was
+// allocated and could never be picked.
+
+function allocationFor(productId: string): AllocationRow | undefined {
+  return state.allocations.find((row) => row.orderId === 'order-1' && row.productId === productId)
+}
+
+test('o3d-i4qd: a fractional KIT allocated to exactly its line is not "over-allocated"', async () => {
+  // One component at 0.3333, 0.5 kits ordered and 0.5 kits allocated. The row rounds UP to 0.1667,
+  // so the inferred coverage is 0.50015 against a remaining quantity of 0.5 — 0.00015 over, which
+  // is 150x the 1e-6 epsilon. That is the column's own rounding, not an over-allocation.
+  seedLines(0.5)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1' }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 0.3333 }] }
+  state.stockLevels = [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 0 }]
+  state.allocations = []
+  state.shipmentLines = []
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 0.5)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(allocationFor('component-1')?.qty, 0.1667, 'round(0.5 x 0.3333, 4)')
+  assert.equal(reservedAt('warehouse-1'), 0.1667, 'and the reservation follows the persisted row')
+})
+
+test('o3d-i4qd: a fractional KIT with TWO components keeps "matching quantities"', async () => {
+  // The shape that wedged hardest. One factor the column cannot hold beside one it can:
+  // 0.5 kits -> component-1 = 0.16665 stored as 0.1667, component-2 = 0.5 exactly. Inferring one
+  // coverage from the exact component (0.5) and multiplying it back out expects 0.16665, sees
+  // 0.1667, and refuses a set that is as proportional as `Decimal(12,4)` permits.
+  seedLines(0.5)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1' }]
+  state.kits = {
+    'kit-1': [{ componentId: 'component-1', qty: 0.3333 }, { componentId: 'component-2', qty: 1 }],
+  }
+  state.stockLevels = [
+    { productId: 'component-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 0 },
+    { productId: 'component-2', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 0 },
+  ]
+  state.allocations = []
+  state.shipmentLines = []
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 0.5)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(allocationFor('component-1')?.qty, 0.1667)
+  assert.equal(allocationFor('component-2')?.qty, 0.5)
+})
+
+test('o3d-i4qd: a genuinely disproportionate KIT set is STILL refused, by name', async () => {
+  // The regression guard for the permissiveness the fix buys. A kit re-composed from 2xA + 1xB to
+  // 2xA + 2xB leaves rows of A=2 / B=1: the coverage bands are [0.999975, 1.000025) and
+  // [0.499975, 0.500025), which share nothing. Half a kit, and it must not pass.
+  seedLines(1)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1' }]
+  state.kits = {
+    'kit-1': [{ componentId: 'component-a', qty: 2 }, { componentId: 'component-b', qty: 2 }],
+  }
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'component-a', warehouseId: 'warehouse-1', qty: 2 },
+    { id: 'alloc-b', orderId: 'order-1', lineId: 'line-1', productId: 'component-b', warehouseId: 'warehouse-1', qty: 1 },
+  ]
+  state.shipmentLines = []
+  const { validateAllocationIntegrity } = await import('@/lib/domain/sales/allocation-service')
+
+  const error = await validateAllocationIntegrity(tx as never, 'order-1')
+
+  assert.equal(error, 'Allocation for sales line KIT-1 in warehouse warehouse-1 must keep bundle components in matching quantities')
+})
+
+test('o3d-i4qd: a MISSING component is still an incomplete set, not a rounding band', async () => {
+  // The other regression guard: the proportionality band must not absorb a component that is
+  // simply absent. Zero of component-b is coverage zero, and the completeness arm owns that
+  // message — the band test must not reach it first with a different one.
+  seedLines(1)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1' }]
+  state.kits = {
+    'kit-1': [{ componentId: 'component-a', qty: 2 }, { componentId: 'component-b', qty: 2 }],
+  }
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'component-a', warehouseId: 'warehouse-1', qty: 2 },
+  ]
+  state.shipmentLines = []
+  const { validateAllocationIntegrity } = await import('@/lib/domain/sales/allocation-service')
+
+  const error = await validateAllocationIntegrity(tx as never, 'order-1')
+
+  assert.equal(error, 'Allocation for sales line KIT-1 in warehouse warehouse-1 does not contain a complete component set')
+})
+
+test('o3d-i4qd: real over-allocation of a fractional KIT is still refused', async () => {
+  // The slack on the remaining-quantity comparison is `halfUlp / smallestFactor` per warehouse
+  // group plus one — about 0.0003 kits here. A whole extra kit is four thousand times that.
+  seedLines(0.5)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1' }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 0.3333 }] }
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', qty: 0.5 },
+  ]
+  state.shipmentLines = []
+  const { validateAllocationIntegrity } = await import('@/lib/domain/sales/allocation-service')
+
+  const error = await validateAllocationIntegrity(tx as never, 'order-1')
+
+  assert.equal(error, 'Allocation for sales line KIT-1 exceeds the remaining quantity to fulfill')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-aqke (Codex r1 finding 1) — A ROW THAT RETAINS PARTIAL SHIPMENTS IS SEVERAL ROUNDINGS DEEP.
+//
+// `OrderAllocation.qty` is canonicalised ONCE, which is the rule. But the value it canonicalises is
+// `merge([fresh requirement, ...every retained ShipmentLine.qty])`, and each of those shipment
+// quantities was rounded to `Decimal(12,4)` on its own write. So the row inherits their rounding as
+// well as its own, and the one-ulp band that correctly describes a single write does not describe
+// it. A LEGITIMATE sequence of partial shipments was therefore refused as disproportionate — and
+// refused at the next shipment transition, after the goods were picked and packed, which is a
+// delivery permanently discarded rather than an inconvenience.
+
+/**
+ * The sequence, worked out in units, for a KIT of 0.3333 x A + 0.6667 x B ordered as 4.5 kits and
+ * shipped in three passes of 1.5 kits as stock arrives.
+ *
+ *   each pass:  A = round(1.5 x 0.3333, 4) = round(0.49995) = 0.5000   (+0.00005)
+ *               B = round(1.5 x 0.6667, 4) = round(1.00005) = 1.0001   (+0.00005)
+ *
+ * After two passes the row retains A = 1.0000 / B = 2.0002 and the third allocation merges the
+ * fresh 1.5 kits into it: A = 1.0000 + 0.49995 = 1.49995 -> 1.5000, B = 2.0002 + 1.00005 = 3.00025
+ * -> 3.0003. Three separate half-up roundings have accumulated in each component, in the SAME
+ * direction, and they are not the same size relative to the two factors.
+ *
+ * Judged as one rounding: A's band is [1.49995/0.3333, 1.50005/0.3333) = [4.50030.., 4.50060..),
+ * B's is [3.00025/0.6667, 3.00035/0.6667) = [4.50014.., 4.50029..). max(lower) 4.50030 is NOT below
+ * min(upper) 4.50029 — disjoint by four hundred-thousandths of a kit, and refused.
+ *
+ * Judged as the three roundings it is: A widens to [4.5, 4.50090..) and B to [4.5, 4.50044..),
+ * which share 4.5 — the coverage that actually produced them.
+ */
+function seedThreePartialsOfAFractionalKit() {
+  seedLines(4.5)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 4.5, sku: 'KIT-1' }]
+  state.kits = {
+    'kit-1': [{ componentId: 'component-a', qty: 0.3333 }, { componentId: 'component-b', qty: 0.6667 }],
+  }
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'component-a', warehouseId: 'warehouse-1', qty: 1.5 },
+    { id: 'alloc-b', orderId: 'order-1', lineId: 'line-1', productId: 'component-b', warehouseId: 'warehouse-1', qty: 3.0003 },
+  ]
+  // TWO committed passes, kept as separate rows because that is what they are in the database and
+  // separateness is the whole point: each one is its own rounding.
+  state.shipmentLines = [
+    { lineId: 'line-1', productId: 'component-a', warehouseId: 'warehouse-1', status: 'SHIPPED', qty: 0.5 },
+    { lineId: 'line-1', productId: 'component-b', warehouseId: 'warehouse-1', status: 'SHIPPED', qty: 1.0001 },
+    { lineId: 'line-1', productId: 'component-a', warehouseId: 'warehouse-1', status: 'SHIPPED', qty: 0.5 },
+    { lineId: 'line-1', productId: 'component-b', warehouseId: 'warehouse-1', status: 'SHIPPED', qty: 1.0001 },
+  ]
+}
+
+test('o3d-aqke: a row retaining two partial shipments is not refused for the rounding they brought', async () => {
+  seedThreePartialsOfAFractionalKit()
+  const { validateAllocationIntegrity } = await import('@/lib/domain/sales/allocation-service')
+
+  const error = await validateAllocationIntegrity(tx as never, 'order-1')
+
+  assert.equal(
+    error,
+    null,
+    'A = 1.5000 and B = 3.0003 are three half-up roundings of one coverage of 4.5 kits, not a disproportionate set',
+  )
+})
+
+test('o3d-aqke: the widened band still refuses a genuinely half-shipped kit on the same rows', async () => {
+  // The regression guard. Same kit, same two retained passes, but component-b's row is short by a
+  // whole 1.5 kits' worth (3.0003 -> 2.0002). Three roundings is 0.00015 of slack; this is 1.0001
+  // out, six thousand times that, and it must still be named.
+  seedThreePartialsOfAFractionalKit()
+  state.allocations[1].qty = 2.0002
+  const { validateAllocationIntegrity } = await import('@/lib/domain/sales/allocation-service')
+
+  const error = await validateAllocationIntegrity(tx as never, 'order-1')
+
+  assert.equal(
+    error,
+    'Allocation for sales line KIT-1 in warehouse warehouse-1 must keep bundle components in matching quantities',
+  )
+})
+
+test('o3d-aqke: addAllocation cannot expand a KIT into a leaf row bigger than the stock it checked', async () => {
+  // Codex r1 finding 2 on the MANUAL path. The feasibility test is in KIT units and the
+  // canonicalisation is per LEAF, afterwards: a kit of 0.75 x A against 1.000075 of A proves
+  // 1.33343.. kits available, and 1.3334 of them expand to 1.00005 of A, which Postgres stores as
+  // 1.0001 — more A than exists. `stock_levels_reserved_qty_lte_quantity` is VALIDATED, so that is
+  // not an over-booking a census can find later; it is a check violation that rolls the whole
+  // transaction back. Flooring the availability to the canonical scale first makes the kit-unit
+  // ceiling 1.33333.., so the request is REFUSED with a quantity, which is the answer an operator
+  // can act on.
+  seedLines(5)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 5, sku: 'KIT-1' }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 0.75 }] }
+  state.stockLevels = [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 1.000075, reservedQty: 0 }]
+  state.allocations = []
+  state.shipmentLines = []
+  const { addAllocation } = await loadAction()
+
+  const refused = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 1.3334)
+
+  assert.equal(refused.success, false)
+  assert.match(String(refused.error), /^Only 1\.3333/, 'the ceiling quoted is the one a Decimal(12,4) row can reach')
+  assert.deepEqual(state.allocations, [], 'and nothing was written')
+
+  const accepted = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 1.3333)
+
+  assert.equal(accepted.success, true, accepted.error)
+  assert.equal(allocationFor('component-1')?.qty, 1, 'round(1.3333 x 0.75, 4) = round(0.999975) = 1.0000')
+  assert.equal(
+    state.stockLevels[0].reservedQty <= state.stockLevels[0].quantity,
+    true,
+    'reservedQty 1.0000 fits inside quantity 1.000075 — the constraint holds, so the transaction commits',
   )
 })

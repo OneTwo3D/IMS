@@ -682,7 +682,11 @@ async function importWcFeeScenario() {
     refunds: [],
   }
 
-  const result = await importWcOrder(wcOrder)
+  // o3d-tj6v r5: the fixture builds its own WooCommerce payloads, so there is no `?status=`
+  // query behind them and the default gate would judge them against whatever the fixture
+  // database's "Import order statuses" setting happens to be. Preauthorised: the fixture IS
+  // the status filter for its own orders.
+  const result = await importWcOrder(wcOrder, { createAdmission: 'preauthorised-by-status-query' })
   if (!result.success || !result.orderId) {
     throw new Error(result.error ?? 'Failed to import WC fee order')
   }
@@ -973,7 +977,11 @@ async function seedWcFxCogsFlowScenario() {
     refunds: [],
   }
 
-  const result = await importWcOrder(wcOrder)
+  // o3d-tj6v r5: the fixture builds its own WooCommerce payloads, so there is no `?status=`
+  // query behind them and the default gate would judge them against whatever the fixture
+  // database's "Import order statuses" setting happens to be. Preauthorised: the fixture IS
+  // the status filter for its own orders.
+  const result = await importWcOrder(wcOrder, { createAdmission: 'preauthorised-by-status-query' })
   if (!result.success || !result.orderId) {
     throw new Error(result.error ?? 'Failed to import WC FX COGS order')
   }
@@ -1517,7 +1525,11 @@ async function importWcDiscountScenario() {
     refunds: [],
   }
 
-  const result = await importWcOrder(wcOrder)
+  // o3d-tj6v r5: the fixture builds its own WooCommerce payloads, so there is no `?status=`
+  // query behind them and the default gate would judge them against whatever the fixture
+  // database's "Import order statuses" setting happens to be. Preauthorised: the fixture IS
+  // the status filter for its own orders.
+  const result = await importWcOrder(wcOrder, { createAdmission: 'preauthorised-by-status-query' })
   if (!result.success || !result.orderId) {
     throw new Error(result.error ?? 'Failed to import WC discount order')
   }

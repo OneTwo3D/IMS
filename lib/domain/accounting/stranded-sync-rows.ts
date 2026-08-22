@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { describeSyncRowSettleability } from '@/lib/domain/accounting/sync-row-settlement'
 
 /**
  * o3d-osl8 item 1 — the STRANDED-ROW read model.
@@ -14,13 +15,18 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * WHICH type, against WHICH reference, and HOW LONG they have been stuck — which is what this
  * module produces.
  *
- * WHAT THIS IS NOT. Nothing here settles, cancels, retries or otherwise mutates a row. There is
- * no per-row remedy in this module and none anywhere else yet: the rows are LISTED, with enough
- * identity to go and look in the accounting system. Safely terminalising a PROCESSING row needs
- * an immutable claim/attempt generation on the row that the connectors' writeback also
- * compare-and-sets on (o3d-e2mz), so a settlement can fence one specific attempt and a late
- * writeback loses. Until that exists there is deliberately no `settleable` flag and no refusal
- * reason here: both would describe a capability that does not exist.
+ * WHAT THIS IS NOT. Nothing here mutates a row: this module decides what is LISTED and how it is
+ * described, never what happens to it. The per-row remedy now exists — settleAccountingSyncRow in
+ * app/actions/accounting-settlement.ts (o3d-nf9i / o3d-osl8 item 2) — so each row now also carries
+ * whether that control applies to it and, when it does not, WHY. An omitted control with no reason
+ * reads as "there is nothing to do here", which is the opposite of the truth for a row the operator
+ * can see and cannot clear.
+ *
+ * `settleable` is a UI affordance, NOT a permission and NOT a guarantee: it says the row's status
+ * and type admit an operator assertion and that it carries an attempt the assertion can be fenced
+ * to — or, for a row that carries none, that its attempt can be ADOPTED because nothing on a
+ * retired connector will ever claim it. Whether the assertion actually lands is decided by
+ * applyFencedAttemptDecision at write time, against the state then — never by this flag.
  *
  * Pure functions only, so the scoping rule — the part that must not drift back to being
  * active-connector-scoped — is unit-testable without a database, exactly as connector-orphans.ts
@@ -68,6 +74,7 @@ export type StrandedSyncRowSource = {
   externalTransactionId: string | null
   errorMessage: string | null
   createdAt: Date
+  attemptRevision: number
 }
 
 /** The row as the UI receives it: identifying detail, plus how long it has been stuck. */
@@ -83,6 +90,31 @@ export type StrandedSyncRow = {
   createdAt: string
   /** Whole days since the row was queued — the "how long has this been stuck" the count hid. */
   ageDays: number
+  /**
+   * o3d-e2mz: the attempt this row is currently on. Carried to the UI because a settlement must name
+   * the attempt it was made about, and the operator cannot name what they were never shown. 0 means
+   * no fence-aware processor has ever claimed it, which is every QuickBooks row and every row
+   * predating the fence.
+   */
+  attemptRevision: number
+  /** Whether the per-row settlement control applies. See the module comment: an affordance, not a guarantee. */
+  settleable: boolean
+  /**
+   * Why not, when `settleable` is false. Without this the UI silently omits the control and the
+   * operator is left to guess whether the row is fine or merely unfixable from here.
+   */
+  notSettleableReason: string | null
+  /**
+   * What the operator needs to know BEFORE asserting, when the row IS settleable. Facts about what
+   * can still contradict them — not a recommendation.
+   */
+  settlementCaveat: string | null
+  /**
+   * o3d-nf9i r3: true when this row is settleable only by ADOPTION — it carries no attempt revision
+   * and is settleable solely because nothing on a retired connector can ever claim it. Carried so
+   * the operator is told they are minting the attempt identity, not naming one they were shown.
+   */
+  requiresAttemptAdoption: boolean
 }
 
 export function describeStrandedSyncRow(row: StrandedSyncRowSource, now: Date): StrandedSyncRow {
@@ -98,6 +130,17 @@ export function describeStrandedSyncRow(row: StrandedSyncRowSource, now: Date): 
     errorMessage: row.errorMessage,
     createdAt: row.createdAt.toISOString(),
     ageDays: Math.floor(ageMs / 86_400_000),
+    attemptRevision: row.attemptRevision,
+    // ONE implementation of "which rows get a control", shared with the active connector's sync log.
+    //
+    // `unclaimable: true` UNCONDITIONALLY, and it is a property of this LIST rather than of the row:
+    // buildStrandedSyncRowWhere selects only rows whose connector is NOT the active one (or every
+    // unresolved row when no connector is active at all), so by construction nothing that
+    // participates in the attempt fence will ever claim anything on this page. That is exactly the
+    // precondition adoption needs — see describeAttemptAdoptionCaveat. Without it every row here is
+    // refused for ever as UNFENCED_ATTEMPT, and the per-row remedy this list points at does not
+    // exist for the population it was built for (o3d-nf9i r3, Codex finding 3).
+    ...describeSyncRowSettleability({ ...row, unclaimable: true }),
   }
 }
 
@@ -111,12 +154,12 @@ export type StrandedSyncRowPage = {
 /**
  * Turn a `take + 1` read into a page of `take` rows plus a truthful "there are more" flag.
  *
- * WHY `take + 1`. The list is READ-ONLY: there is no remedy here for a FAILED row (that needs
- * the claim generation, o3d-e2mz), so the oldest rows cannot be cleared by anything the operator
- * does on this page. A bare `take` with no truncation signal therefore means the oldest N rows
- * can starve every newer one FOREVER — a stranded row created today is invisible for as long as
- * 50 older FAILED rows sit in front of it, and nothing will ever move them. The extra row is how
- * the UI gets to say so.
+ * WHY `take + 1`. Truncation still has to be REPORTED, and the reason has only shifted rather than
+ * gone away. The per-row settlement control now exists, so an operator CAN clear rows from the front
+ * of this list — but only the settleable ones. A DAILY_BATCH row, or a PENDING row that no sweep
+ * reaches, is not clearable from this page at all, and a run of those at the head of the list starves every newer row behind them
+ * for as long as they sit there. A bare `take` with no truncation signal would hide that. The extra
+ * row is how the UI gets to say so.
  */
 export function pageStrandedSyncRows(
   sourceRows: StrandedSyncRowSource[],

@@ -4,6 +4,8 @@
  */
 
 import { db } from '@/lib/db'
+import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
+import { stampAccountingPayloadConnection } from '@/lib/connectors/accounting-connection-provenance'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -33,7 +35,7 @@ const SYNC_TYPE_SETTING: Record<string, keyof XeroSettings> = {
 }
 
 export async function queueXeroSync(params: {
-  type: 'SALES_INVOICE' | 'SALES_INVOICE_UPDATE' | 'CREDIT_NOTE' | 'PURCHASE_CREDIT_NOTE' | 'PURCHASE_CREDIT_NOTE_ALLOCATION' | 'COGS_REVERSAL' | 'STOCK_IN_TRANSIT' | 'STOCK_RECEIPT' | 'PURCHASE_INVOICE' | 'PURCHASE_INVOICE_UPDATE' | 'COGS_JOURNAL' | 'INVENTORY_ADJUSTMENT' | 'STOCK_ALLOCATION' | 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'DAILY_BATCH_INVENTORY_RECONCILIATION' | 'DAILY_BATCH_COGS_RECONCILIATION' | 'DAILY_BATCH_TRANSIT_RECONCILIATION' | 'UNEARNED_REV_REVERSAL' | 'BILL_PAYMENT' | 'INVOICE_PAYMENT' | 'BILL_ATTACHMENT' | 'INVOICE_PDF' | 'INVOICE_EMAIL' | 'WC_INVOICE_NOTE' | 'REALISED_FX_JOURNAL' | 'UNREALISED_FX_JOURNAL' | 'MANUFACTURING_JOURNAL' | 'MANUFACTURING_RECLASS' | 'TAX_RATE_SYNC'
+  type: 'SALES_INVOICE' | 'SALES_INVOICE_UPDATE' | 'CREDIT_NOTE' | 'PURCHASE_CREDIT_NOTE' | 'PURCHASE_CREDIT_NOTE_ALLOCATION' | 'COGS_REVERSAL' | 'STOCK_IN_TRANSIT' | 'STOCK_RECEIPT' | 'PURCHASE_INVOICE' | 'PURCHASE_INVOICE_UPDATE' | 'COGS_JOURNAL' | 'INVENTORY_ADJUSTMENT' | 'STOCK_ALLOCATION' | 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'DAILY_BATCH_INVENTORY_RECONCILIATION' | 'DAILY_BATCH_COGS_RECONCILIATION' | 'DAILY_BATCH_TRANSIT_RECONCILIATION' | 'UNEARNED_REV_REVERSAL' | 'ALLOCATION_REVERSAL' | 'BILL_PAYMENT' | 'INVOICE_PAYMENT' | 'BILL_ATTACHMENT' | 'INVOICE_PDF' | 'INVOICE_EMAIL' | 'WC_INVOICE_NOTE' | 'REALISED_FX_JOURNAL' | 'UNREALISED_FX_JOURNAL' | 'MANUFACTURING_JOURNAL' | 'MANUFACTURING_RECLASS' | 'TAX_RATE_SYNC'
   referenceType: string
   referenceId: string
   payload: Record<string, unknown>
@@ -46,11 +48,15 @@ export async function queueXeroSync(params: {
   const postingMode = settingKey ? settings[settingKey] : 'submitted'
   if (!postingMode || postingMode === 'off') return
 
-  const payload = {
+  // o3d-19gy: which CONNECTION this payload was composed for, recorded beside the posting mode because
+  // it is the same kind of fact — something about the queueing, not about the document. Read here, at
+  // enqueue, from the connection that resolved every id in the payload; the processor compares it
+  // against the connection it is about to post to and refuses a mismatch before anything is sent.
+  const payload = stampAccountingPayloadConnection({
     ...params.payload,
     _postingMode: postingMode,
     ...(params.idempotencyKey ? { _idempotencyKey: params.idempotencyKey } : {}),
-  }
+  }, await activeAccountingIdProvenance('xero'))
 
   if (params.idempotencyKey) {
     const existing = await db.accountingSyncLog.findFirst({

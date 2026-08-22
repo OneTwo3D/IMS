@@ -197,7 +197,14 @@ test('refreshShipmentCogsForCostLayerChange queues COGS revaluation sync for pos
   const tx = {
     $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
     shipment: {
-      findUnique: async () => ({ cogsBatchAmount: '20.00', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z') }),
+      // o3d-zpa7: `order.accountingInvoiceId` is the delete-protection precondition the enqueue now
+      // asserts (see the dedicated tests below). A journaled shipment always has one, by the A1 -> B
+      // chain, so the realistic row carries it.
+      findUnique: async () => ({
+        cogsBatchAmount: '20.00',
+        shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+        order: { id: 'order-1', accountingInvoiceId: 'INV-XERO-1' },
+      }),
       update: async (args: unknown) => {
         updates.push(args)
       },
@@ -234,10 +241,13 @@ test('refreshShipmentCogsForCostLayerChange queues COGS revaluation sync for pos
     // o3d-3zgy: this enqueue is order-scoped (a Shipment resolves through to its sales order) but
     // CANNOT hoist the order row lock — it runs inside a landed-cost transaction that discovers the
     // affected shipments mid-flight, after stock locks are held, so locking the order there inverts
-    // the lockSalesOrder-then-lockStockLevels ordering and can deadlock. The gap is declared in code
-    // rather than left silent, and asserted here so it cannot be dropped or quietly spread.
+    // the lockSalesOrder-then-lockStockLevels ordering and can deadlock. o3d-zpa7: what makes the
+    // unlocked write safe anyway is now ASSERTED at the call site rather than argued in a comment —
+    // the order carries an accountingInvoiceId, which makes deleteSalesOrder refuse unconditionally.
+    // Still asserted here so the acknowledgement cannot be dropped or quietly spread.
     unlockedOrderScopeReason:
-      'landed-cost revaluation discovers affected shipments mid-transaction, after stock locks (o3d-zpa7)',
+      'landed-cost revaluation discovers affected shipments mid-transaction, after stock locks; the order is '
+      + 'provably undeletable (accountingInvoiceId asserted above) so no lock is needed (o3d-zpa7)',
     payload: {
       date: new Date().toISOString().slice(0, 10),
       reference: 'Shipment COGS revaluation: shipment-1',
@@ -260,7 +270,14 @@ test('refreshShipmentCogsForCostLayerChange stamps the recalc-run nonce into the
   const tx = {
     $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
     shipment: {
-      findUnique: async () => ({ cogsBatchAmount: '20.00', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z') }),
+      // o3d-zpa7: `order.accountingInvoiceId` is the delete-protection precondition the enqueue now
+      // asserts (see the dedicated tests below). A journaled shipment always has one, by the A1 -> B
+      // chain, so the realistic row carries it.
+      findUnique: async () => ({
+        cogsBatchAmount: '20.00',
+        shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+        order: { id: 'order-1', accountingInvoiceId: 'INV-XERO-1' },
+      }),
       update: async () => {},
     },
     shipmentLine: {
@@ -291,7 +308,14 @@ test('refreshShipmentCogsForCostLayerChange does not claim the delta when COGS_R
   const tx = {
     $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
     shipment: {
-      findUnique: async () => ({ cogsBatchAmount: '20.00', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z') }),
+      // o3d-zpa7: `order.accountingInvoiceId` is the delete-protection precondition the enqueue now
+      // asserts (see the dedicated tests below). A journaled shipment always has one, by the A1 -> B
+      // chain, so the realistic row carries it.
+      findUnique: async () => ({
+        cogsBatchAmount: '20.00',
+        shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+        order: { id: 'order-1', accountingInvoiceId: 'INV-XERO-1' },
+      }),
       update: async () => {},
     },
     shipmentLine: {

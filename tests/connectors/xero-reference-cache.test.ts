@@ -31,6 +31,10 @@ mock.module('@/lib/security/connector-fetch', {
 mock.module('@/lib/connectors/xero/auth', {
   namedExports: {
     getAccessToken: async () => (tenantId === null ? null : { accessToken: 'tok', tenantId }),
+    // The disconnected branch now asks WHY there is no token, so that an env allow-list block reads as
+    // one instead of as a lost token (o3d-9tbz). A double missing this export made the call throw
+    // "getStoredTenantBlockReason is not a function" from inside the not-connected path.
+    getStoredTenantBlockReason: async () => null,
   },
 })
 // Date.now is used for TTL; make it controllable.

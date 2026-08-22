@@ -63,6 +63,7 @@ export type SalesOrderDeleteBlocker = {
   code:
     | 'wms_order_push_link'
     | 'wms_order_status_snapshot'
+    | 'committed_shipment'
     | 'accounting_sync_live'
     | 'accounting_document_exists'
     | 'daily_batch_staged'
@@ -255,10 +256,69 @@ export async function findSalesOrderDeleteBlocker(
   const shipments = await tx.shipment.findMany({
     where: { orderId },
     // shipmentJournalDate / shipmentJournalBatchRef are for the Group B check further down,
-    // read here so the guard makes one shipment query rather than two.
-    select: { id: true, shipmentJournalDate: true, shipmentJournalBatchRef: true },
+    // and `status` for the committed-shipment blocker immediately below — read here so the
+    // guard makes one shipment query rather than three.
+    select: { id: true, status: true, shipmentJournalDate: true, shipmentJournalBatchRef: true },
   })
   const shipmentIds = shipments.map((shipment) => shipment.id)
+
+  // 1c. A COMMITTED (non-PENDING) shipment is LOCAL evidence that fulfilment has started
+  // (o3d-2y1c). Until now this query existed only to collect shipment ids for the accounting
+  // checks, and nothing here blocked on a shipment at all — so a delete of an ALLOCATED order
+  // holding a PICKING or PACKED shipment reached `salesOrderLine.deleteMany` and died on
+  // `ShipmentLine.lineId`'s ON DELETE RESTRICT. The operator saw a raw foreign-key violation
+  // rather than a reason, and the whole transaction rolled back.
+  //
+  // The FK firing is the database doing its job; the fix is to refuse BEFORE it, with a message
+  // naming what blocks the delete and what can be done about it. This runs inside the same
+  // order-row lock as every other blocker, so a shipment confirmed between the check and the
+  // delete cannot slip through.
+  //
+  // PENDING is deliberately NOT a blocker. A PENDING shipment is a draft `confirmSalesOrderShipments`
+  // generated from the allocation rows, it is not a commitment anywhere else in the codebase
+  // (see UNCOMMITTED_SHIPMENT_STATUS), and `releaseOrderAllocationsInTx` — which the deleter calls
+  // before deleting the lines — retires every unbacked draft via `reconcilePendingShipments`, whose
+  // ShipmentLine rows cascade from Shipment. So the drafts are already gone by the time the lines
+  // are deleted, and blocking on them would make every ordinary confirmed-allocation order
+  // permanently undeletable. That half of the original o3d-2y1c report was fixed by PR #615.
+  //
+  // SHIPPED is included and is the most binding of the three: the stock has physically left, the
+  // dispatch stock movements and FIFO consumption are done, and the allocation rows those cost
+  // snapshots resolve through would go with the order. It can also now sit on an ALLOCATED (i.e.
+  // status-deletable) order, because `reconcileOrderAfterShipment` no longer promotes an order that
+  // shipped short to SHIPPED (o3d-0i5y) — so this blocker is what keeps that new state safe.
+  const committedShipments = shipments.filter((shipment) => String(shipment.status) !== 'PENDING')
+  if (committedShipments.length > 0) {
+    const byStatus = new Map<string, number>()
+    for (const shipment of committedShipments) {
+      const status = String(shipment.status)
+      byStatus.set(status, (byStatus.get(status) ?? 0) + 1)
+    }
+    const summary = [...byStatus.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([status, count]) => `${count} ${status.toLowerCase()}`)
+      .join(', ')
+    const hasDispatched = byStatus.has('SHIPPED')
+    blockers.push({
+      code: 'committed_shipment',
+      message:
+        `Cannot delete an order the warehouse has already started fulfilling (${summary}). `
+        + (hasDispatched
+          // Cancelling does NOT undo a dispatch — cancelSalesOrderFulfillmentState deletes the
+          // PENDING/PICKING/PACKED shipments and leaves SHIPPED ones alone — so do not offer it
+          // as the remedy for goods that have physically left.
+          ? 'A dispatched shipment is stock that has already left the building, and its cost '
+            + 'entries resolve through this order’s allocation rows — deleting the order would '
+            + 'strand them. Raise a refund or return for the dispatched units instead; an order '
+            + 'that has shipped is never a candidate for hard deletion.'
+          // PICKING/PACKED only: cancellation is a real, atomic remedy — it deletes those
+          // shipments in the same transaction as the allocation release.
+          : 'A picked or packed shipment is stock the warehouse is already holding against this '
+            + 'order. Cancel the order instead — cancelling deletes its picked and packed shipments '
+            + 'and releases the reservations in one step. A single shipment cannot be cancelled on '
+            + 'its own (o3d-q8r6), so the whole order is the unit of undo here.'),
+    })
+  }
   const orderKeyed: Prisma.AccountingSyncLogWhereInput[] = [
     { referenceType: 'SalesOrder', referenceId: orderId },
   ]
@@ -455,6 +515,12 @@ export async function findSalesOrderDeleteBlocker(
     'accounting_document_exists',
     'daily_batch_staged',
     'accounting_sync_live',
+    // o3d-2y1c: ranks below the accounting blockers (whose remedies are a ledger reversal or
+    // waiting on an in-flight call) and above the WMS ones. A dispatched shipment is a physical
+    // fact about goods; a WMS record is a fact about a document, and cancelling resolves the
+    // latter. Ranked as one code rather than splitting SHIPPED out, because both variants of the
+    // message are more specific than either WMS message.
+    'committed_shipment',
     'wms_order_status_snapshot',
     'wms_order_push_link',
   ]

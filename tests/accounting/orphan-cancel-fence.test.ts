@@ -211,6 +211,16 @@ mock.module('@/lib/auth/server', {
       }
       return { user: { id: 'u1', role: state.role } }
     },
+    // o3d-512h round 3: the internal-user gate this module now uses instead of requireAuth, because
+    // a SUPPLIER is AUTHENTICATED and requireAuth therefore admitted an external principal to
+    // internal actions. It is a REAL gate here, not a stub returning a session: a double that waved
+    // it through would make every "SUPPLIER is refused" assertion in this file vacuous.
+    requireInternalUser: async () => {
+      if (!hasPermission(state.role, 'internal' as Permission)) {
+        throw new PermissionDeniedError('Forbidden: missing permission internal', 'internal' as Permission)
+      }
+      return { user: { id: 'u1', role: state.role } }
+    },
     freshAuthFailureResult: () => null,
     PermissionDeniedError,
     isAuthorizationDenial,
@@ -496,3 +506,29 @@ test('the generic key-value writer is still not a way around the lock', async ()
 // is taken on Postgres's documented semantics. Two concurrent connections contending for real would
 // need a live-Postgres test in tests/concurrency/ (the *.concurrent.test.ts convention).
 // ---------------------------------------------------------------------------
+
+test('the cancel RECORDS that no remote call was made, on the same update as the status (o3d-o97 r6)', async () => {
+  // The only positive evidence anywhere in the system that a cancelled row's journal is in NO
+  // ledger. `recreateMissingDailyBatchLogs` rebuilds a daily batch only when it can see this, and
+  // refuses on every other cancelled row — so a sweep that stopped writing it would not corrupt
+  // anything, it would quietly strand every batch lost to a connector switch.
+  //
+  // It must be written by the SAME statement as the status and under the SAME `status: 'PENDING'`
+  // predicate, because that predicate is the entire proof: a PENDING row is pre-call, nothing was
+  // sent. A second statement, or a wider predicate, would let a row carry the claim without it.
+  state.activeConnector = 'xero'
+  state.pending = 4
+  state.processing = 0
+
+  const result = await cancel('quickbooks')
+
+  assert.equal(result.success, true)
+  assert.equal(state.updates.length, 1, 'one statement, so the claim cannot outlive its predicate')
+  assert.match(JSON.stringify(state.updates[0].where), /"status":"PENDING"/)
+  assert.equal(state.updates[0].data.status, 'CANCELLED')
+  assert.equal(
+    state.updates[0].data.abandonedBeforeRemoteCall,
+    true,
+    'without this the recreate sweep can never tell this row from one abandoned mid-flight',
+  )
+})

@@ -3,7 +3,15 @@ import { isIP } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 
+import {
+  INSTANCE_ROLE_ENV_VAR,
+  instanceRoleOptions,
+  invalidInstanceRoleRefusal,
+  readInstanceIdentity,
+  undeclaredInstanceNotice,
+} from '@/lib/ops/instance-identity'
 import { checkFileScanHealth, type FileScanResult } from '@/lib/security/file-scan'
+import { RETIRED_ENV_VARS } from '@/lib/ops/retired-env-vars'
 
 export type PreflightStatus = 'pass' | 'fail' | 'warn'
 
@@ -319,12 +327,83 @@ function checkRestoreFlags(checks: PreflightCheck[], env: Env): void {
   if (!anyEnabled) add(checks, 'pass', 'database-restore', 'ALLOW_DATABASE_RESTORE', 'Database restore flags are disabled.')
 }
 
-function checkLogLevel(checks: PreflightCheck[], env: Env): void {
-  if (envValue(env, 'LOG_LEVEL').toLowerCase() === 'debug') {
-    add(checks, 'warn', 'log-level', 'LOG_LEVEL', 'LOG_LEVEL is debug in production; revert after incident triage to avoid excessive sensitive metadata in logs.')
+/**
+ * Does this instance say what it is? (o3d-l89a)
+ *
+ * This preflight is the one place in the repo that already claims to know what a production instance
+ * looks like — it fails on `NODE_ENV !== 'production'` at the top — so it is where the declaration
+ * belongs. It is also the only place where asserting it costs a deploy step rather than a money path:
+ * preflight is run deliberately, before a release, and never in a request.
+ *
+ * THE THREE VERDICTS, and why they are not all the same severity:
+ *
+ *  - Present and NOT `production`: FAIL. Running the production preflight on an instance that has
+ *    declared itself stage is a mistake with no benign reading, and no existing host can hit it,
+ *    because no existing host sets the variable at all. This is the fail-closed half that ships today.
+ *  - Present and unrecognised, or contradicted by `E2E_TEST_MODE=1`: FAIL, for the same reason — the
+ *    operator stated something, and what they stated does not say "production".
+ *  - ABSENT: WARN. Every instance alive when this shipped is in this state, production included, so
+ *    failing here would break the release it is supposed to protect. This is step 1 of the two-step
+ *    rollout described in lib/ops/instance-identity.ts; the warning is the thing that gets the line
+ *    into production's .env so that step 2 can fail closed on absence.
+ */
+function checkInstanceRole(checks: PreflightCheck[], env: Env): void {
+  const identity = readInstanceIdentity(env)
+
+  if (identity.invalidDeclaration) {
+    add(checks, 'fail', 'instance-role', INSTANCE_ROLE_ENV_VAR, invalidInstanceRoleRefusal(identity))
     return
   }
-  add(checks, 'pass', 'log-level', 'LOG_LEVEL', 'LOG_LEVEL is not debug.')
+
+  if (identity.undeclared) {
+    add(checks, 'warn', 'instance-role', INSTANCE_ROLE_ENV_VAR, undeclaredInstanceNotice(identity))
+    return
+  }
+
+  if (identity.e2eTestMode) {
+    add(
+      checks,
+      'fail',
+      'instance-role',
+      INSTANCE_ROLE_ENV_VAR,
+      `${INSTANCE_ROLE_ENV_VAR}=${identity.rawDeclaration} but E2E_TEST_MODE=1 — an end-to-end test rig `
+        + 'is never the production instance. Unset E2E_TEST_MODE on the production server, or run this '
+        + 'preflight somewhere else.',
+    )
+    return
+  }
+
+  if (identity.declaredRole !== 'production') {
+    add(
+      checks,
+      'fail',
+      'instance-role',
+      INSTANCE_ROLE_ENV_VAR,
+      `${INSTANCE_ROLE_ENV_VAR}=${identity.declaredRole} — this instance has declared itself something `
+        + `other than production, so the production preflight does not apply to it. Allowed values: `
+        + `${instanceRoleOptions()}.`,
+    )
+    return
+  }
+
+  add(checks, 'pass', 'instance-role', INSTANCE_ROLE_ENV_VAR, 'Instance is declared as production.')
+}
+
+function checkRetiredEnvVars(checks: PreflightCheck[], env: Env): void {
+  const present = Object.keys(RETIRED_ENV_VARS).filter((name) => envValue(env, name) !== '')
+  if (present.length === 0) {
+    add(checks, 'pass', 'retired-env-vars', 'Retired environment variables', 'No retired environment variables are set.')
+    return
+  }
+  for (const name of present) {
+    add(
+      checks,
+      'warn',
+      `retired-env-var:${name}`,
+      name,
+      `${name} is set but nothing reads it, so it is not in force. ${RETIRED_ENV_VARS[name]} Remove the line from .env to avoid implying a control that does not exist.`,
+    )
+  }
 }
 
 export async function runProductionPreflight(options: PreflightOptions = {}): Promise<PreflightResult> {
@@ -336,6 +415,8 @@ export async function runProductionPreflight(options: PreflightOptions = {}): Pr
   } else {
     add(checks, 'pass', 'node-env', 'NODE_ENV', 'NODE_ENV is production.')
   }
+
+  checkInstanceRole(checks, env)
 
   checkSecret(checks, env, 'auth-secret', ['AUTH_SECRET', 'NEXTAUTH_SECRET'], 'Auth session secret')
   checkSecret(checks, env, 'cron-secret', ['CRON_SECRET'], 'Cron bearer secret')
@@ -373,7 +454,7 @@ export async function runProductionPreflight(options: PreflightOptions = {}): Pr
   checkTrustedProxyConfig(checks, env)
   await checkFileScanner(checks, env, options.scanHealth ?? ((scanEnv) => checkFileScanHealth({ env: scanEnv })))
   checkRestoreFlags(checks, env)
-  checkLogLevel(checks, env)
+  checkRetiredEnvVars(checks, env)
 
   return {
     ok: !checks.some((check) => check.status === 'fail'),

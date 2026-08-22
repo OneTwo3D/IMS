@@ -46,6 +46,96 @@ export type FulfillmentGraphNode = {
  */
 const MAX_FULFILLMENT_GRAPH_LOAD_ATTEMPTS = 3
 
+/**
+ * How many levels of KIT NESTING the walk will follow below the roots (o3d-57b0, carried in from
+ * o3d-ryyd).
+ *
+ * WHY A CAP AT ALL. The walk issues one `product.findMany` PER LEVEL and had no bound. Since the
+ * verify-and-re-walk loop above it can run three times, and it runs UNDER THE SALES ORDER LOCK that
+ * allocation and dispatch serialise on, an accidentally deep component graph is an unbounded query
+ * fan-out held inside the lock every other order is waiting behind. `graph.has()` stops it looping
+ * forever on a cycle; it does not stop a hundred round trips on a hundred-deep chain.
+ *
+ * WHY EIGHT. A kit of kits of kits is already unusual; eight levels is far past any real recipe and
+ * still cheap. If a real catalogue ever needs more, raise it deliberately — do not remove it.
+ *
+ * WHAT IT DOES NOT BOUND, stated plainly: `expandFulfillmentRequirementsDecimal` walks the SAME
+ * edges without memoising, so its cost is the number of distinct PATHS, not nodes. A diamond-shaped
+ * graph (many components that are the same kit) is still exponential in the depth this constant
+ * permits. The cap makes that exponent small and finite; it does not make the expansion linear —
+ * and "finite" is not "bounded": eight levels of a kit with five sub-kits each is 5^8 = 390,625
+ * visits, all of them inside the sales order lock. {@link MAX_FULFILLMENT_EXPANSION_VISITS} is the
+ * bound that closes it.
+ */
+const MAX_FULFILLMENT_GRAPH_DEPTH = 8
+
+/**
+ * How many component visits ONE expansion may make before it is refused (o3d-0fok, Codex r1
+ * finding 4).
+ *
+ * WHY THE DEPTH CAP IS NOT THIS CAP. {@link MAX_FULFILLMENT_GRAPH_DEPTH} bounds the LOAD: one
+ * `findMany` per level, so eight levels is eight round trips regardless of shape, and the loaded
+ * map holds at most one entry per distinct product. The EXPANSION is a different walk with a
+ * different cost model — `visit` recurses once per (path to a kit), not once per kit, so a diamond
+ * multiplies rather than merges. Both walks run under the sales order lock every other order
+ * serialises behind, which is the reason the depth cap exists at all; the argument for bounding one
+ * is the argument for bounding the other.
+ *
+ * WHY NOT MEMOISE INSTEAD, which would make the expansion linear and refuse nothing. Because
+ * `expand(K, q)` would have to be served as `q * expand(K, 1)`, and that REASSOCIATES the
+ * multiplication: `decimal.js` rounds to its configured precision at every step, and a
+ * `Decimal(12,4)` factor times a `Decimal(12,4)` factor already needs more significant digits than
+ * that. The results differ far below the fourth decimal place and could not change a canonical
+ * quantity — but this branch exists precisely because moving a rounding to a different point in a
+ * multiplication changes the answer, and buying a performance bound with an arithmetic change is
+ * not a trade to make here in passing. A memoised expander is worth building deliberately, with the
+ * associativity question answered on its own terms.
+ *
+ * WHY THIS NUMBER. A real recipe is tens of nodes; a hundred is a large one. Fifty thousand visits
+ * is three orders of magnitude past any catalogue and still tens of milliseconds of pure in-memory
+ * Decimal work, so it refuses only a graph whose expansion is pathological — and for that graph the
+ * alternative is not success, it is the order lock held for minutes while every other order queues.
+ * The remedy is the same one the depth cap names, and the error says so.
+ */
+const MAX_FULFILLMENT_EXPANSION_VISITS = 50_000
+
+/**
+ * Thrown when ONE expansion visits more component paths than {@link MAX_FULFILLMENT_EXPANSION_VISITS}.
+ */
+export class FulfillmentGraphExpansionError extends Error {
+  readonly productId: string
+
+  constructor(productId: string) {
+    super(
+      `Expanding the component requirements of product ${productId} visited more than `
+      + `${MAX_FULFILLMENT_EXPANSION_VISITS} component paths. The graph is within the `
+      + `${MAX_FULFILLMENT_GRAPH_DEPTH}-level nesting limit but is diamond-shaped — the same sub-kit `
+      + 'is reachable by many routes, and the walk costs paths rather than products, so it grows '
+      + 'multiplicatively. Refusing rather than holding the sales order lock open while it runs. '
+      + 'Flatten the repeated sub-kits into the parents that share them, or raise '
+      + 'MAX_FULFILLMENT_EXPANSION_VISITS deliberately if this recipe really is this shape.',
+    )
+    this.name = 'FulfillmentGraphExpansionError'
+    this.productId = productId
+  }
+}
+
+/** Thrown when the component graph nests deeper than {@link MAX_FULFILLMENT_GRAPH_DEPTH}. */
+export class FulfillmentGraphDepthError extends Error {
+  readonly productIds: string[]
+
+  constructor(productIds: string[]) {
+    super(
+      `The component graph nests more than ${MAX_FULFILLMENT_GRAPH_DEPTH} levels of KIT below the `
+      + `products being expanded (reached at ${productIds.join(', ')}). Refusing rather than holding `
+      + 'the sales order lock open for an unbounded number of queries. Flatten the kit structure, or '
+      + 'raise MAX_FULFILLMENT_GRAPH_DEPTH deliberately if the catalogue really is this deep.',
+    )
+    this.name = 'FulfillmentGraphDepthError'
+    this.productIds = productIds
+  }
+}
+
 /** Thrown when the graph could not be read as ONE consistent snapshot. Fail-closed, never silent. */
 export class FulfillmentGraphSnapshotError extends Error {
   readonly movedProductIds: string[]
@@ -87,9 +177,10 @@ export class FulfillmentGraphSnapshotError extends Error {
  *     `sortOrder`, the KIT/SIMPLE split, cycle handling, the `?? 0` defaults — in a second language.
  *     The atomicity is worth having; a second divergent implementation of the expansion is not the
  *     price to pay for it here.
- *   - CAPTURING EVERY NODE'S VERSION AND VALIDATING THE COMPLETE SET AT THE CAS is the real end
- *     state, but it needs `OrderAllocation.fulfillmentGraphVersion` to become a set rather than one
- *     `Int`. That is the full graph-version CAS filed as o3d-57b0 and explicitly out of scope.
+ *   - CAPTURING EVERY NODE'S VERSION AND VALIDATING THE COMPLETE SET AT THE CAS was once described
+ *     as the real end state, needing `OrderAllocation.fulfillmentGraphVersion` to become a set
+ *     rather than one `Int`. It is not the end state and it is not going to be built — see the
+ *     closing note on o3d-57b0 below.
  *
  * So: walk as before, then RE-READ the version of every node the walk visited, in ONE statement,
  * and compare it against what the walk captured. Versions only ever increment
@@ -117,11 +208,28 @@ export class FulfillmentGraphSnapshotError extends Error {
  *
  * WHAT REMAINS OPEN, STATED PLAINLY. An edit committing AFTER tR is invisible to this function and
  * to the whole calling transaction — nothing on these paths takes `COMPONENT_GRAPH_WRITE_LOCK_KEY`
- * against graph writers. This NARROWS the window to "after the graph read" instead of closing it;
- * serialising allocation and commitment against component writers is o3d-57b0 and is not done here.
+ * against graph writers. This NARROWS the window to "after the graph read" instead of closing it.
  * Nor does this make the CAS a whole-graph CAS: the stamp is still the ROOT's version, so a
  * descendant edit is caught only because the bump reaches the root. What changed is that the root
  * version now certifies the recipe the caller actually expanded.
+ *
+ * AND THE REMAINING WINDOW IS NOW HARMLESS, WHICH IS WHY THE LOCK IS NOT COMING (o3d-57b0, SUBSUMED
+ * BY o3d-kouj). Closing it would mean making allocation and commitment take the component-graph
+ * write lock — a change to the allocation and commitment WRITE PROTOCOLS that coarsens the lock
+ * every order already serialises on. The per-line immutable fulfilment-requirement snapshot removes
+ * the question instead of answering it: `allocateSalesOrder` pins THIS map's expansion onto the
+ * sales line in the same transaction as the rows, and from that moment every reader asks the line,
+ * not the product. An edit committing after tR changes the catalogue and changes nothing about what
+ * that order requires — so there is no interleaving left for a lock to exclude or a CAS to detect.
+ *
+ * What the loss of the CAS costs, stated honestly: for a line with NO snapshot — never allocated
+ * since o3d-kouj shipped — the window above is exactly as open as it was, and the CAS still runs
+ * for those lines. It is skipped per line, not switched off; see
+ * `findStaleFulfillmentGraphAllocation`.
+ *
+ * What o3d-57b0's subsumption did NOT cover, and is done here, is the DEPTH BOUND — see
+ * {@link MAX_FULFILLMENT_GRAPH_DEPTH}. That defect is about how long this walk holds the order
+ * lock, which no snapshot design changes, and it gets WORSE under any fix that coarsens the lock.
  */
 export async function loadFulfillmentProductGraph(
   client: FulfillmentClient,
@@ -172,11 +280,15 @@ async function walkFulfillmentProductGraph(
 ): Promise<Map<string, FulfillmentGraphNode>> {
   const graph = new Map<string, FulfillmentGraphNode>()
   const queue = [...roots]
+  // Level 0 is the roots themselves, so the cap counts NESTING below them.
+  let depth = 0
 
   while (queue.length > 0) {
     const batch = queue.filter((id) => !graph.has(id))
     queue.length = 0
     if (batch.length === 0) continue
+    if (depth > MAX_FULFILLMENT_GRAPH_DEPTH) throw new FulfillmentGraphDepthError(batch)
+    depth += 1
 
     const rows = await client.product.findMany({
       where: { id: { in: batch } },
@@ -225,8 +337,18 @@ export function expandFulfillmentRequirementsDecimal(
   graph: Map<string, FulfillmentGraphNode>,
 ): Map<string, Prisma.Decimal> {
   const totals = new Map<string, Prisma.Decimal>()
+  // o3d-0fok (Codex r1 finding 4): the walk costs PATHS, not products, so a diamond within the
+  // depth cap is still multiplicative. Every visit and every leaf accumulation is one unit of the
+  // budget, so it bounds the whole walk rather than merely its depth.
+  let visits = 0
 
   function addRequirement(componentProductId: string, requiredQty: Prisma.Decimal) {
+    // Counted as work too: a visit is bounded by the budget, but a single visit iterates the whole
+    // component list, so a very WIDE node is unbounded work under one visit.
+    visits += 1
+    if (visits > MAX_FULFILLMENT_EXPANSION_VISITS) {
+      throw new FulfillmentGraphExpansionError(productId)
+    }
     totals.set(
       componentProductId,
       (totals.get(componentProductId) ?? new Prisma.Decimal(0)).add(requiredQty),
@@ -234,6 +356,10 @@ export function expandFulfillmentRequirementsDecimal(
   }
 
   function visit(currentProductId: string, currentQty: Prisma.Decimal, stack: Set<string>) {
+    visits += 1
+    if (visits > MAX_FULFILLMENT_EXPANSION_VISITS) {
+      throw new FulfillmentGraphExpansionError(productId)
+    }
     if (!currentQty.isFinite() || currentQty.lte(0)) return
     const node = graph.get(currentProductId)
     if (!node) {
@@ -282,6 +408,19 @@ export function listFulfillmentLeafProductIds(
   return [...ids]
 }
 
+/**
+ * How many whole units of `productId` one warehouse's stock can cover, by WALKING the graph.
+ *
+ * o3d-kouj — NO PRODUCTION PATH USES THIS ANY MORE, and new ones should not. Feasibility has to be
+ * decided from the same requirement set the allocation rows are expanded from
+ * (`availableQtyFromRequirements` in fulfillment-coverage.ts), or a line pinned to an older recipe
+ * has its feasibility judged by one kit and its rows written from another. The walk also asks each
+ * branch of a DIAMOND independently, so it sees a shared leaf's whole stock once per path and can
+ * authorise an allocation whose own merged rows exceed what is there.
+ *
+ * Kept because it is the reference the requirement-set form is checked against, and because the two
+ * agree exactly for a tree — which is the argument that the change was a fix and not a rewrite.
+ */
 export function getFulfillmentAvailableQtyDecimal(
   productId: string,
   warehouseId: string,

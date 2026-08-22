@@ -1,0 +1,36 @@
+-- o3d-9tbz Codex r6: an ABSENT pin was an exemption from the split-binding refusal, and therefore a
+-- way to switch that refusal off.
+--
+-- Round 5 halts the sync when the pin and the stored token name different organisations, and it
+-- deliberately exempts a token with NO pin beside it: that is what every connection made before the
+-- pin existed looks like, and it is the state `provision-xero-demo.ts --clear-tenant-pin` produces on
+-- purpose so a human can re-consent after a ~28-day Demo reset.
+--
+-- The exemption is the bypass. Removing the xero_expected_tenant_id row from the settings table by hand
+-- turns a refused instance into an unconstrained one, and restoring the settings table and
+-- accounting_tokens from DIFFERENT backups — the exact scenario the refusal was written for — lands in
+-- the same place, since a settings dump taken before the pin was written has no pin row to restore.
+--
+-- WHAT SEPARATES THE TWO. `connectionGeneration` is minted by `bindXeroTenant`, inside the one
+-- transaction that also writes the pin, and `disconnect()` deletes the token and the pin together. So
+-- a token row carrying a generation is proof that a pin was written beside it and that nothing IMS
+-- does removed it: pin absent + generation present = the pin was deleted, and the sync halts. A row
+-- with no generation predates that column and is evidence of nothing, so it stays exempt exactly as
+-- before — no working installation goes offline on this deploy.
+--
+-- THIS COLUMN IS THE LEGITIMATE RELEASE. The documented recovery must keep working, so it now clears
+-- the pin and stamps this column in ONE transaction: a released connection is not halted. Stamping it
+-- requires writing to accounting_tokens, which is precisely what removing a settings row and a
+-- cross-backup restore do not do — that is the whole difference between the two states.
+--
+-- (This migration touches accounting_tokens only. The settings table appears here in prose because the
+-- state being described lives in it; the migration scanner in tests/accounting/plugin-selection-lock
+-- matches on text, so the mutating SQL shape is deliberately not spelled out in these comments.)
+--
+-- Carried unchanged through every refresh (and named in the refresh's write-time predicate, so a
+-- refresh in flight across a release cannot un-release the row), and cleared by the next binding,
+-- which writes a pin again and ends the release.
+--
+-- NULLABLE. NULL means "never released", which is what every existing row means and what every
+-- QuickBooks row will keep meaning — the QuickBooks equivalents are tracked separately (o3d-8prh).
+ALTER TABLE "accounting_tokens" ADD COLUMN "pinReleasedAt" TIMESTAMP(3);

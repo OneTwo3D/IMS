@@ -115,7 +115,8 @@ Role assignment is validated on both client and server to prevent privilege esca
 The system includes a role-based access control (RBAC) layer defined in `lib/permissions.ts`. Permissions control:
 
 - **Sidebar filtering** — each role sees only the navigation items relevant to their access level
-- **Server action authorisation** — all mutations (allocation, email sending, sync operations, etc.) verify the user's role before executing
+- **Server action authorisation** — every server action verifies the caller's permission before executing. A server action is a directly callable HTTP endpoint, so this is the boundary; hiding a menu item or gating a page is not
+- **Internal vs external principals** — every role except **Supplier** holds the `internal` permission. Supplier is an *external* party, so the reads that any signed-in staff member may perform (products, customers, sales and purchase orders, stock, warehouses, the user list) require `internal` and refuse a supplier session outright
 - **API route protection** — cron endpoints require the `CRON_SECRET` bearer header in production
 
 
@@ -127,7 +128,12 @@ Users with the **Supplier** role access a dedicated portal with its own navigati
 - **Purchase Orders** — view purchase orders addressed to their supplier company
 - **My Products** — view products linked to their supplier (without financial data such as prices, margins, or COGS)
 
-Supplier users are linked to a supplier company record. They cannot access prices, margins, COGS data, or analytics. Line ownership is verified server-side to prevent suppliers from viewing or modifying other suppliers' data.
+Supplier users are linked to a supplier company record. They cannot access prices, margins, COGS data, or analytics.
+
+Two separate controls keep a supplier inside its own data, and they are not substitutes for one another:
+
+- **Outside the portal**, a supplier is refused entirely. The internal purchasing, sales, inventory and settings endpoints require a permission no supplier holds, so a supplier session cannot read another company's orders even by calling the endpoint directly.
+- **Inside the portal**, a permission proves nothing — every supplier holds the same supplier-portal permissions. Each query is therefore filtered by the signed-in user's own supplier id, and any record fetched by id is re-checked for ownership before it is returned. Asking for another supplier's RFQ by id returns nothing.
 
 
 ## Sessions

@@ -27,14 +27,17 @@ export type InvoicePaymentRegistrationRefusal =
   | 'CURRENCY_MISMATCH'
   /** No bank account is mapped for this payment method/currency. */
   | 'NO_BANK_ACCOUNT'
-  /** A registration for this order is already live in the ledger — only one at a time can be tracked. */
-  | 'LEDGER_HAS_LIVE_PAYMENT'
   /**
    * An earlier attempt for this order is FAILED or CANCELLED and cannot be shown to be absent from
    * the ledger, so a second receipt could settle the same invoice twice (o3d-0m56).
    */
   | 'UNRESOLVED_PAYMENT_ATTEMPT'
-  /** This receipt alone is larger than the invoice it settles, so the ledger would refuse it. */
+  /**
+   * A live registration exists whose AMOUNT cannot be read, so the remaining capacity on the invoice
+   * cannot be computed. Refusing is the only sound answer: unknown must not read as zero (o3d-cjt8).
+   */
+  | 'LEDGER_AMOUNT_UNKNOWN'
+  /** This receipt does not fit in what is left of the invoice after what the ledger already holds. */
   | 'WOULD_OVERPAY'
 
 export type InvoicePaymentRegistrationDecision =
@@ -68,6 +71,13 @@ export type ExistingInvoicePaymentSync = {
    * was rejected before any HTTP call. Undefined means unknown, which reads as "it could have".
    */
   couldHaveReachedLedger?: boolean
+  /**
+   * The LEDGER DOCUMENT this row settles (o3d-hbgo). A row that names a different invoice paid an
+   * invoice this order no longer has — deleted and re-posted — so it says nothing about how much of
+   * the CURRENT invoice is outstanding. Null on rows queued before the payload recorded it, which
+   * has to read as "possibly this one": for money, unknown is not the same as irrelevant.
+   */
+  accountingInvoiceId?: string | null
 }
 
 /**
@@ -76,6 +86,12 @@ export type ExistingInvoicePaymentSync = {
  *
  * Exported because the caller needs to know whether to ASK the ledger at all — the probe is a
  * network read and must not run on every receipt, only on the ones with a history.
+ *
+ * DELIBERATELY NOT DOCUMENT-SCOPED, unlike the capacity filter below. o3d-hbgo drops a row naming a
+ * different invoice because it consumes none of THIS invoice's capacity — a statement about
+ * arithmetic. This question is not about capacity: an attempt whose response was lost may hold a
+ * payment in the ledger under whatever document it named, and a re-posted invoice does not make that
+ * payment go away. Narrowing this by document would discard exactly the evidence it exists to weigh.
  */
 export function unresolvedInvoicePaymentAttempts(
   existing: ExistingInvoicePaymentSync[],
@@ -86,6 +102,14 @@ export function unresolvedInvoicePaymentAttempts(
     && (r.paymentId == null || r.paymentId !== paymentId)
     && r.couldHaveReachedLedger !== false)
 }
+
+/**
+ * Sub-penny slack, so an exact settlement is not refused by float noise. Exported because the
+ * POST-SITE capacity guard (invoice-payment-capacity.ts) must apply the identical tolerance: two
+ * guards on one arithmetic that round differently would refuse at the enqueue and allow at the post,
+ * or the reverse.
+ */
+export const CAPACITY_EPSILON = 0.005
 
 export function decideInvoicePaymentRegistration(input: {
   syncEnabled: boolean
@@ -116,103 +140,39 @@ export function decideInvoicePaymentRegistration(input: {
   if (input.orderCurrency !== input.paymentCurrency) return { register: false, refusal: 'CURRENCY_MISMATCH' }
   if (!input.bankAccountId) return { register: false, refusal: 'NO_BANK_ACCOUNT' }
 
-  // ONE LIVE REGISTRATION PER ORDER, and that is the database's rule, not a policy invented here:
-  // accounting_sync_logs_followup_live_unique is a UNIQUE index on (connector, type, referenceType,
-  // referenceId) for live INVOICE_PAYMENT rows. Queueing a second one does not merely double-pay — it
-  // violates the constraint, and the caller's catch would turn a receipt the operator believed recorded
-  // into an error log nobody reads (Codex, PR #582 round 2).
+  // CAPACITY, NOT OCCUPANCY (o3d-cjt8). This used to refuse whenever ANY live INVOICE_PAYMENT row
+  // existed, because accounting_sync_logs_followup_live_unique permitted exactly one live row per ORDER
+  // — so a second receipt did not merely risk double-paying, it violated the constraint. That key named
+  // the wrong thing: a Xero Payment is per RECEIPT against a DOCUMENT, not per order, and an order can
+  // legitimately receive a deposit and a balance. The index is now scoped to
+  // (…, accountingInvoiceId, paymentId), so the database no longer stands in the way — and it no longer
+  // stands in the way of an OVERPAYMENT either, because "the parts must not exceed the whole" is
+  // arithmetic and no unique index can express it. That arithmetic is done here.
   //
-  // It also covers what this guard was written for: an imported order's receipt is registered by the
-  // SALES_INVOICE follow-up WITHOUT ever creating a local Payment row, so IMS's own payment rows do not
-  // bound what the ledger has been told. Refusing on the ledger's own live row does.
+  // BOTH RULES SURVIVE THE o3d-cjt8 / o3d-0m56 MERGE, and they are different questions.
   //
-  // FAILED and CANCELLED rows do not hold the LIVE SLOT — the index ignores them, so a second row can
-  // be written beside one. That is a statement about the index, and it was read here as a statement
-  // about the ledger, which it is not: an attempt whose call committed but whose response was lost is
-  // FAILED, and deleting a receipt CANCELS a row that may already have settled. They are handled below
-  // on their own terms (o3d-0m56) rather than dropped here.
+  // o3d-cjt8 made the live-follow-up index RECEIPT-scoped, so "one live registration per order" is
+  // gone: a deposit and a balance may each register, and what stops an overpayment is arithmetic
+  // below. That retired this branch's LEDGER_HAS_LIVE_PAYMENT refusal, exactly as this file's own
+  // comment predicted it would ("Making the index receipt-scoped ... is o3d-cjt8").
   //
-  // Making the index receipt-scoped, so part payments can each register, is o3d-cjt8: it needs a
-  // migration and a look at existing rows, and until then a refusal an operator can read beats an insert
-  // that throws.
-  const blocker = invoicePaymentRowSetBlocker(input)
-  if (blocker.blocked) {
-    return {
-      register: false,
-      refusal: blocker.refusal,
-      alreadyRegistered: blocker.alreadyRegistered,
-      ledgerTotal: input.ledgerTotal,
-      detail: blocker.detail,
-    }
-  }
-
-  // Nothing is registered, so this receipt stands alone — and if it alone exceeds the invoice, the ledger
-  // would reject it. The live case for this is a gross receipt against an imported tax-inclusive invoice,
-  // which posts at NET (o3d-cyn): refusing names the numbers, where letting it through produces a Xero
-  // rejection an operator has to decode.
-  if (input.paymentAmount > input.ledgerTotal + 0.005) {
-    return { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered: 0, ledgerTotal: input.ledgerTotal }
-  }
-  return { register: true, bankAccountId: input.bankAccountId }
-}
-
-export type InvoicePaymentRowSetBlocker =
-  | { blocked: false }
-  | {
-      blocked: true
-      refusal: 'LEDGER_HAS_LIVE_PAYMENT' | 'UNRESOLVED_PAYMENT_ATTEMPT'
-      alreadyRegistered?: number
-      detail?: string
-    }
-
-/**
- * The two rules that depend on the ORDER'S OTHER SYNC ROWS rather than on this receipt's own size.
- *
- * Split out because they have to be evaluated TWICE (o3d-0m56, Codex round 2): once to decide, and
- * again inside the transaction that writes, under the scope lock, because the row set can change
- * between the two and a verdict about the past cannot authorise a payment in the present. The
- * amount checks do not need re-running — the invoice total does not move — and re-running them
- * from a caller that only has the row set would refuse everything.
- */
-export function invoicePaymentRowSetBlocker(input: {
-  paymentId: string
-  existing: ExistingInvoicePaymentSync[]
-  ledgerSettlements: LedgerSettlementRecord[] | null
-}): InvoicePaymentRowSetBlocker {
-  const live = input.existing.filter(
-    (r) => r.status !== 'FAILED' && r.status !== 'CANCELLED'
-    // Our OWN row, if this ever runs twice for one receipt: the idempotency key already makes the second
-    // queue a no-op, so treating it as an obstacle would refuse the retry for its own success.
-    && (r.paymentId == null || r.paymentId !== input.paymentId),
-  )
-  if (live.length > 0) {
-    const known = live.filter((r) => typeof r.amount === 'number')
-    return {
-      blocked: true,
-      refusal: 'LEDGER_HAS_LIVE_PAYMENT',
-      // Absent when a row records no amount: unknown must not read as zero in the operator's message.
-      alreadyRegistered: known.length === live.length
-        ? known.reduce((sum, r) => sum + (r.amount as number), 0)
-        : undefined,
-    }
-  }
-
-  // THE OTHER WAY BACK TO THE LEDGER (o3d-0m56, Codex review). o3d-h2wx and the manual-retry guard both
-  // protect the RETRY of a failed payment row. Neither is involved here: recording another receipt
-  // beside a FAILED attempt queues a brand-new row under a NEW idempotency token, which posts a second
-  // payment against the same invoice without touching either guard — and it is the likelier operator
-  // action, because a failed payment looks like nothing happened.
+  // WHAT IT DID NOT RETIRE is o3d-0m56's question, and reading it as retired would be the whole
+  // defect. Capacity is measured from rows that are LIVE. A FAILED or CANCELLED attempt is not live
+  // and consumes no capacity — correctly, for arithmetic — but it is also not proof that the ledger
+  // is clear: a call that committed before its response was lost is FAILED (o3d-ju8t), and deleting
+  // a receipt CANCELS a row that may already have settled. Recording another receipt beside one
+  // queues a fresh row under a NEW idempotency token, which posts a second payment without ever
+  // touching the retry guard — and the capacity sum, having ignored the failed row, sees room for it.
   //
-  // So an unresolved attempt has to be settled the same way the retry settles it: by asking the ledger
-  // whether the attempt's own payment is there. Anything short of a positive "it is not" refuses. The
-  // cost is a receipt that has to be registered by hand while an old failed row sits unresolved; the
-  // alternative is an invoice paid twice with nothing in IMS to show for it.
+  // So the unresolved-attempt question is asked FIRST, before any arithmetic, because the arithmetic
+  // cannot see it.
   const unresolved = unresolvedInvoicePaymentAttempts(input.existing, input.paymentId)
   if (unresolved.length > 0) {
     if (input.ledgerSettlements === null) {
       return {
-        blocked: true,
+        register: false,
         refusal: 'UNRESOLVED_PAYMENT_ATTEMPT',
+        ledgerTotal: input.ledgerTotal,
         detail: 'the accounting connector could not be asked what it already holds',
       }
     }
@@ -223,13 +183,113 @@ export function invoicePaymentRowSetBlocker(input: {
       )
       if (verdict.outcome === 'clear') continue
       return {
-        blocked: true,
+        register: false,
         refusal: 'UNRESOLVED_PAYMENT_ATTEMPT',
+        ledgerTotal: input.ledgerTotal,
         detail: verdict.outcome === 'present'
           ? `the ledger already holds ${verdict.detail}, which matches an earlier ${attempt.status} attempt`
           : verdict.reason,
       }
     }
   }
-  return { blocked: false }
+
+  // FAILED and CANCELLED rows hold nothing — the ledger rejected them or never saw them — so they free
+  // the capacity again, exactly as the index's live-status predicate does.
+  const live = input.existing.filter(
+    (r) => r.status !== 'FAILED' && r.status !== 'CANCELLED'
+    // Our OWN row, if this ever runs twice for one receipt: the idempotency key already makes the second
+    // queue a no-op, so treating it as an obstacle would refuse the retry for its own success.
+    && (r.paymentId == null || r.paymentId !== input.paymentId)
+    // o3d-hbgo, read side: a row that settled a DIFFERENT ledger document paid an invoice this order no
+    // longer has (deleted and re-posted). It consumes none of the current invoice's capacity, and
+    // counting it would strand every payment on the replacement — silently, and for ever. A row that
+    // names NO document stays counted: unknown has to read as "possibly this one".
+    && (r.accountingInvoiceId == null || r.accountingInvoiceId === input.accountingInvoiceId),
+  )
+
+  // An unreadable amount cannot be arithmetic. Treating it as zero would let this receipt through on the
+  // assumption that the ledger holds nothing, which is precisely what is not known.
+  if (live.some((r) => typeof r.amount !== 'number')) {
+    return { register: false, refusal: 'LEDGER_AMOUNT_UNKNOWN', ledgerTotal: input.ledgerTotal }
+  }
+
+  const alreadyRegistered = live.reduce((sum, r) => sum + (r.amount as number), 0)
+  // What is LEFT of the invoice. With no live rows this is the whole invoice, which is exactly the
+  // single-receipt rule this replaced — so the case that rule was written for still refuses, and now
+  // the part-payment case does too. Refusing here names the numbers, where letting it through produces
+  // a Xero rejection an operator has to decode.
+  //
+  // The case originally in view — a gross receipt against an imported tax-inclusive invoice, which
+  // posted at NET — is gone since o3d-cyn: both construction paths now post at the order's gross. What
+  // is left is every OTHER way a receipt can exceed its document (a credited or part-refunded invoice, a
+  // mistyped amount), the invoices imported and posted before that fix, and now the deposit-plus-balance
+  // case the receipt-scoped index deliberately admits.
+  if (input.paymentAmount > input.ledgerTotal - alreadyRegistered + CAPACITY_EPSILON) {
+    return { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered, ledgerTotal: input.ledgerTotal }
+  }
+  return { register: true, bankAccountId: input.bankAccountId }
+}
+
+/**
+ * `invoicePaymentRowSetBlocker` WAS HERE, AND IS GONE (o3d-0m56 rebased onto o3d-cjt8).
+ *
+ * It existed to split the two rules that depend on the order's other sync rows out of the decision,
+ * so the caller could re-run just those inside the transaction that writes — the amount checks were
+ * excluded because the caller "has the row set and nothing else", and re-running them there would
+ * have refused every receipt.
+ *
+ * Both halves of that premise are now false, and in the direction that makes the split unsafe rather
+ * than merely redundant:
+ *
+ *   • o3d-cjt8 made the double-registration protection ARITHMETIC. Once the live-follow-up index is
+ *     receipt-scoped, two racing receipts both insert cleanly and the invoice is over-settled, so the
+ *     capacity sum is precisely the thing that must be re-run under the lock. A re-check that
+ *     deliberately does not judge size would have re-opened the race it was written to close.
+ *   • The caller no longer has only the row set: `registerInvoicePaymentWithLedger` hoists its whole
+ *     `decisionInput` and re-runs `decideInvoicePaymentRegistration` under the lock with `existing`
+ *     refreshed and nothing else changed.
+ *
+ * So there is ONE decision function, evaluated twice, rather than a decision and a partial copy of
+ * it that could drift. See invoice-payment-enqueue.ts for the re-run.
+ */
+
+/**
+ * WHICH LOCAL RECEIPTS ARE STILL WAITING TO BE REGISTERED (o3d-ekn8).
+ *
+ * `decideInvoicePaymentRegistration` refuses a receipt recorded BEFORE its invoice posts with
+ * DOCUMENT_NOT_POSTED — correctly, since a payment cannot attach to a document the ledger has never
+ * seen. The defect was that nothing re-visited it once the SALES_INVOICE finally landed: the receipt
+ * stayed recorded, the ledger stayed unsettled, and only the red settlement verdict said so.
+ *
+ * That is an ORDERING problem, not a uniqueness one — no key was wrong, a moment was missed. So the fix
+ * is not a key change but a re-drive at the moment the refusal stops applying (the CREATE posting and
+ * writing back accountingInvoiceId), running the SAME guarded decision rather than a second, laxer copy
+ * of it.
+ *
+ * This picks the receipts to re-drive, and is deliberately timid, because the caller's re-drive path
+ * does NOT go through planFollowUpEnqueue and so cannot pin a remote idempotency token:
+ *
+ *  - A receipt with ANY sync row of its own is left alone. A live row is already on its way; a FAILED
+ *    row may have committed remotely before failing (o3d-ju8t), and re-driving it would post under a
+ *    token the ledger has never seen — the o3d-h2wx double-payment. Those belong to the retry path,
+ *    which is built to pin the token, and to the operator, who can see them.
+ *  - An UNATTRIBUTED live row (paymentId null) suppresses EVERY receipt on the order. That is the
+ *    imported-order shape: the SALES_INVOICE follow-up registers the receipt with no local Payment row
+ *    at all, so it cannot be matched to one, and for money "which receipt is this?" unanswered has to
+ *    read as "possibly that one".
+ *
+ * Refunds are the caller's business to exclude: they settle a credit note, not this invoice.
+ */
+export function selectReceiptsAwaitingRegistration<T extends { id: string }>(input: {
+  receipts: T[]
+  existing: ExistingInvoicePaymentSync[]
+}): T[] {
+  const unattributedLive = input.existing.some(
+    (r) => r.status !== 'FAILED' && r.status !== 'CANCELLED' && r.paymentId == null,
+  )
+  if (unattributedLive) return []
+  const spokenFor = new Set(
+    input.existing.map((r) => r.paymentId).filter((id): id is string => typeof id === 'string'),
+  )
+  return input.receipts.filter((receipt) => !spokenFor.has(receipt.id))
 }

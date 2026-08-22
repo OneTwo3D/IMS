@@ -3,10 +3,13 @@
 import { Fragment, useState, useTransition } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, CheckCircle2, Inbox, Loader2, RotateCcw } from 'lucide-react'
+import { ArrowLeft, CheckCircle2, Inbox, Loader2, PackageCheck, PencilLine, RotateCcw, Split, XCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { buttonVariants } from '@/components/ui/button-variants'
 import { Card } from '@/components/ui/card'
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import {
   Table,
   TableBody,
@@ -20,6 +23,10 @@ import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from 
 import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
 import {
   clearPennyMismatchFlag,
+  dismissWithdrawnDispatch,
+  endHeldMaintenanceWindow,
+  recordWithdrawnDespatch,
+  runPostMaintenanceRecheckNow,
   replayDeadReceiptEvent,
   replayDeadWebhookEvent,
   replayOutboxException,
@@ -27,8 +34,13 @@ import {
   replayStuckDispatch,
   retryUnresolvedDriftCohort,
   repushMissingWmsOrder,
+  recordRefundParkManually,
   retryRefundSyncPark,
+  recoverRefundSyncPark,
   type ExceptionInboxData,
+  type RefundParkAllocationInput,
+  type RefundParkAllocationTarget,
+  type RefundSyncParkRow,
 } from '@/app/actions/sync-exceptions'
 
 type Props = {
@@ -57,6 +69,11 @@ export function ExceptionsClient({ data }: Props) {
   // already armed, against whatever cohort came back. Keying it to the exact set
   // means any change to that set disarms it by construction.
   const [confirmingIsolate, setConfirmingIsolate] = useState<string | null>(null)
+  // o3d-54p: which refund park (if any) has its recovery panel open. One at a time, and NEVER
+  // pre-armed: the panel opens with no outcome chosen, so a stray click cannot assert anything.
+  const [recoveringParkId, setRecoveringParkId] = useState<string | null>(null)
+  // o3d-w00 (Codex r1 #3): the park currently being hand-recorded, or null.
+  const [recordingPark, setRecordingPark] = useState<RefundSyncParkRow | null>(null)
 
   async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
     const result = await run()
@@ -85,10 +102,28 @@ export function ExceptionsClient({ data }: Props) {
   }
 
   const empty = data.summary.total === 0
+  // Bound once so the button can hand the action the hold THIS RENDER SAW, rather than the action
+  // ending whatever hold happens to be recorded when the click lands (o3d-hl8l r6).
+  const hold = data.maintenanceRecovery.hold
 
   return (
     <div className="space-y-4">
       {stepUpDialog}
+      {recordingPark ? (
+        <RecordRefundManuallyDialog
+          row={recordingPark}
+          isPending={isPending}
+          onClose={() => setRecordingPark(null)}
+          onSubmit={(allocations, reason) => {
+            const park = recordingPark
+            runAction(
+              () => recordRefundParkManually(park.id, allocations, reason),
+              'Refund recorded manually — the credit note was raised and the row is resolved.',
+            )
+            setRecordingPark(null)
+          }}
+        />
+      ) : null}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-semibold flex items-center gap-2">
@@ -111,6 +146,80 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-8 text-center text-muted-foreground">
           <CheckCircle2 className="h-8 w-8 mx-auto mb-2 text-emerald-600" />
           No open sync exceptions — every queue is clean.
+        </Card>
+      ) : null}
+
+      {hold || data.maintenanceRecovery.recheckDueSince ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`Maintenance window (${data.summary.maintenanceRecovery})`}
+            detail="While maintenance mode is on, inbound warehouse callbacks are refused with a 503 and NOTHING is written — the fence runs before the signature is verified, so a refused callback cannot leave a row. Recovery is by re-checking the ASNs afterwards, which is what these controls schedule and run."
+            shown={data.summary.maintenanceRecovery}
+            total={data.summary.maintenanceRecovery}
+          />
+          {hold ? (
+            <div className="rounded-lg border border-amber-300 bg-amber-50/60 p-3 space-y-2">
+              <p className="text-sm font-medium">
+                Maintenance mode is HELD after a restore whose database backend could not be confirmed gone.
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Held {formatDateTime(hold.heldAt)} · backend pid{' '}
+                <span className="font-mono">{hold.backendPid}</span>, started{' '}
+                <span className="font-mono">{hold.backendStart}</span>
+              </p>
+              <p className="text-xs text-muted-foreground">{hold.reason}</p>
+              <p className="text-xs text-muted-foreground">
+                Ending the hold clears maintenance mode AND schedules a re-check of every open ASN, which is how the
+                callbacks refused during the window are recovered. It refuses unless that backend is gone from
+                pg_stat_activity at the moment you click — but the check only proves the backend has detached, not that
+                the application is quiet. Take the application out of service first if it is not already.
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={isPending}
+                onClick={() => runAction(
+                  // The hold THIS PAGE IS SHOWING, handed to the action so it can refuse if the row
+                  // under the lock is a different restore's (o3d-hl8l r6). The action re-reads and
+                  // compares; nothing here is trusted as a precondition.
+                  () => endHeldMaintenanceWindow({
+                    backendPid: hold.backendPid,
+                    backendStart: hold.backendStart,
+                    heldAt: hold.heldAt,
+                  }),
+                  'Ended the held maintenance window — a warehouse booked-in re-check is now due.',
+                )}
+              >
+                <RotateCcw className="h-3 w-3 mr-1" />End the hold
+              </Button>
+            </div>
+          ) : null}
+          {data.maintenanceRecovery.recheckDueSince ? (
+            <div className="rounded-lg border p-3 space-y-2">
+              <p className="text-sm font-medium">
+                A booked-in re-check is due for the maintenance window that ended{' '}
+                {formatDateTime(data.maintenanceRecovery.recheckDueSince)}.
+              </p>
+              <p className="text-xs text-muted-foreground">
+                The warehouse webhook sweeper drains this automatically about every five minutes. Run it here if that
+                job is disabled or the scheduler is down. A re-check reconstructs the callback trigger and applies only
+                what is still outstanding, so an ASN with nothing owed books nothing in.
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={isPending}
+                onClick={() => runAction(
+                  runPostMaintenanceRecheckNow,
+                  'Re-checked the open ASNs for the closed maintenance window.',
+                )}
+              >
+                <RotateCcw className="h-3 w-3 mr-1" />Run the re-check now
+              </Button>
+            </div>
+          ) : null}
         </Card>
       ) : null}
 
@@ -260,7 +369,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`WooCommerce refunds — parked (${data.summary.refundSyncParks})`}
-            detail="Refunds that could not be applied (usually an amount mismatch). The refund/restock/credit-note has NOT posted. Retry re-fetches the order's refunds fresh from WooCommerce."
+            detail="Refunds that could not be applied. The refund/restock/credit-note has NOT posted, but the money HAS left WooCommerce. Retry re-fetches the order's refunds fresh from WooCommerce — use it for an amount mismatch fixed at the store. A QUARANTINED row was refused deliberately (its VAT could not be determined) and retry cannot clear it: record it manually against the order lines it covers."
             shown={data.refundSyncParks.length}
             total={data.summary.refundSyncParks}
           />
@@ -277,34 +386,91 @@ export function ExceptionsClient({ data }: Props) {
             </TableHeader>
             <TableBody>
               {data.refundSyncParks.map((row) => (
-                <TableRow key={row.id}>
-                  <TableCell>
-                    {row.orderId
-                      ? <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
-                      : '—'}
-                  </TableCell>
-                  <TableCell className="text-xs font-mono">{row.externalRefundId ?? '—'}</TableCell>
-                  <TableCell className="text-xs">{row.status}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.errorMessage ?? ''}>{row.errorMessage ?? '—'}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.createdAt)}</TableCell>
-                  <TableCell className="text-right">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={isPending}
-                      onClick={() => runAction(async () => {
-                        const result = await retryRefundSyncPark(row.id)
-                        if ('success' in result && result.success && !result.synced) {
-                          return { success: false, error: 'Retried, but the refund still did not apply — the amount mismatch likely persists in WooCommerce.' }
-                        }
-                        return result
-                      }, 'Refund re-synced and applied.')}
-                    >
-                      <RotateCcw className="h-3 w-3 mr-1" />Retry
-                    </Button>
-                  </TableCell>
-                </TableRow>
+                <Fragment key={row.id}>
+                  <TableRow>
+                    <TableCell>
+                      {row.orderId
+                        ? <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
+                        : '—'}
+                      {/* "id", not "#": this is the value the recovery panel asks for and the one the
+                          REST path addresses, and it is not necessarily the order number WooCommerce
+                          shows the customer. */}
+                      {row.wcOrderId ? <span className="ml-2 text-[11px] text-muted-foreground font-mono">WC id {row.wcOrderId}</span> : null}
+                    </TableCell>
+                    <TableCell className="text-xs font-mono">{row.externalRefundId ?? '—'}</TableCell>
+                    <TableCell className="text-xs">{row.status}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.errorMessage ?? ''}>{row.errorMessage ?? '—'}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.createdAt)}</TableCell>
+                    <TableCell className="text-right space-x-1 whitespace-nowrap">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => runAction(async () => {
+                          const result = await retryRefundSyncPark(row.id)
+                          if ('success' in result && result.success && !result.synced) {
+                            // o3d-w00: a QUARANTINED park is refused for a reason that is NOT an
+                            // amount mismatch (undeterminable VAT basis, non-uniform tax), so naming
+                            // one cause here would send the operator to the wrong remedy.
+                            return { success: false, error: 'Retried, but the refund still did not apply — see the row\'s error.' }
+                          }
+                          return result
+                        }, 'Refund re-synced and applied.')}
+                      >
+                        <RotateCcw className="h-3 w-3 mr-1" />Retry
+                      </Button>
+                      {/*
+                        o3d-54p. Retry is the right first move and stays the default; this is the way
+                        OUT of the park Retry can never resolve — one recorded against the WRONG
+                        order, where every retry re-fetches an order that does not have this refund
+                        and the true owner's refund create fails closed on the park forever.
+                      */}
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        disabled={isPending || !row.orderId || !row.externalRefundId}
+                        title="This park is on the wrong order — check WooCommerce and move or dismiss it"
+                        onClick={() => setRecoveringParkId(recoveringParkId === row.id ? null : row.id)}
+                      >
+                        <Split className="h-3 w-3 mr-1" />Wrong order
+                      </Button>
+                      {/* o3d-w00 (Codex r1 #3): the only route out of a QUARANTINED park. */}
+                      {row.manuallyRecordable ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={isPending}
+                          onClick={() => setRecordingPark(row)}
+                        >
+                          <PencilLine className="h-3 w-3 mr-1" />Record manually
+                        </Button>
+                      ) : null}
+                    </TableCell>
+                  </TableRow>
+                  {recoveringParkId === row.id ? (
+                    <TableRow>
+                      <TableCell colSpan={6} className="bg-muted/30">
+                        <RecoverRefundParkPanel
+                          row={row}
+                          busy={isPending}
+                          onCancel={() => setRecoveringParkId(null)}
+                          onSubmit={(assertion) => {
+                            setRecoveringParkId(null)
+                            runAction(
+                              () => recoverRefundSyncPark(row.id, { observedOrderId: row.orderId as string, ...assertion }),
+                              assertion.outcome === 'REASSIGN'
+                                ? 'WooCommerce confirmed the refund on that order; the park moved there and is retryable from its new order.'
+                                : 'WooCommerce did not list that refund on this order; the park is dismissed and no longer blocks it.',
+                            )
+                          }}
+                        />
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                </Fragment>
               ))}
             </TableBody>
           </Table>
@@ -315,7 +481,14 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`Dispatch reconciliation — dead-lettered orders (${data.summary.stuckDispatches})`}
-            detail="The WMS despatched these orders but IMS could not reconcile them (typically no IMS stock to consume). After repeated failures the sweep stops retrying; fix the order's stock position, then replay."
+            detail={
+              'The WMS despatched these orders but IMS could not reconcile them (typically no IMS stock to consume). '
+              + 'After repeated failures the sweep stops retrying; fix the order\u2019s stock position, then replay. '
+              + 'Rows marked WITHDRAWAL STANDING are different: IMS refused to fulfil them because the customer asked to '
+              + 'withdraw the order, so a replay would only refuse them again. If the warehouse had already despatched, '
+              + 'record the despatch \u2014 IMS confirms it with the WMS first, then books the shipment, the stock and the '
+              + 'despatch notification, and the request becomes a return.'
+            }
             shown={data.stuckDispatches.length}
             total={data.summary.stuckDispatches}
           />
@@ -339,7 +512,14 @@ export function ExceptionsClient({ data }: Props) {
                   </TableCell>
                   <TableCell className="text-xs font-mono">{row.externalOrderNumber ?? '—'}</TableCell>
                   <TableCell className="text-xs">
-                    {row.kind === 'unresolved' ? (
+                    {row.withdrawalStanding ? (
+                      <span
+                        className="font-medium"
+                        title="A withdrawal stands against this order, so IMS refused to mark it shipped, relieve stock or email the customer. Replaying re-runs the same check and holds it back again."
+                      >
+                        Withdrawal standing
+                      </span>
+                    ) : row.kind === 'unresolved' ? (
                       <span title="The WMS answered, but its record could not be read as a dispatch state. Quarantined so it stops holding the inbound sync back.">
                         Unreadable record
                       </span>
@@ -351,15 +531,56 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.reason ?? ''}>{row.reason ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.deadLetteredAt ? formatDateTime(row.deadLetteredAt) : '—'}</TableCell>
                   <TableCell className="text-right">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={isPending}
-                      onClick={() => runAction(() => replayStuckDispatch(row.orderId), 'Dispatch reconciliation re-queued for the next sweep.')}
-                    >
-                      <RotateCcw className="h-3 w-3 mr-1" />Replay
-                    </Button>
+                    <div className="flex justify-end gap-2">
+                      {/*
+                        o3d-rbyg round 2: the remedy a withheld withdrawal actually needs. A CANCELLED
+                        order (an APPROVED withdrawal) cannot carry a shipment in IMS at all, so it is
+                        offered Dismiss instead — clearing the row without pretending the goods came back.
+                      */}
+                      {row.withdrawalStanding ? (
+                        row.orderStatus === 'CANCELLED' ? (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={isPending}
+                            title="The order is cancelled, so IMS records no shipment for it. This clears the exception row; anything already despatched is handled as a return."
+                            onClick={() => runAction(
+                              () => dismissWithdrawnDispatch(row.orderId),
+                              'Cleared. The order stays cancelled — handle anything already despatched as a return.',
+                            )}
+                          >
+                            <XCircle className="h-3 w-3 mr-1" />Dismiss
+                          </Button>
+                        ) : (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={isPending}
+                            title="Confirms with the WMS that the goods have gone, releases the withdrawal hold, then books the shipment, the stock relief and the despatch notification."
+                            onClick={() => runAction(
+                              () => recordWithdrawnDespatch(row.orderId),
+                              'Despatch recorded — the shipment, the stock relief and the despatch notification were applied.',
+                            )}
+                          >
+                            <PackageCheck className="h-3 w-3 mr-1" />Record despatch
+                          </Button>
+                        )
+                      ) : null}
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        title={row.withdrawalStanding
+                          ? 'Only once the withdrawal itself is resolved — otherwise the sweep refuses this order again.'
+                          : undefined}
+                        onClick={() => runAction(() => replayStuckDispatch(row.orderId), 'Dispatch reconciliation re-queued for the next sweep.')}
+                      >
+                        <RotateCcw className="h-3 w-3 mr-1" />Replay
+                      </Button>
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}
@@ -656,5 +877,303 @@ function SectionHeading({ title, detail, shown, total }: { title: string; detail
         {capped ? ` Showing the ${shown} most recent of ${total}.` : ''}
       </p>
     </div>
+  )
+}
+
+
+/**
+ * o3d-54p — the operator's end of the cross-order refund-park recovery.
+ *
+ * DELIBERATELY MINIMAL, and deliberately NOT a recommendation. It offers exactly the two things an
+ * operator can be right about, and prescribes neither:
+ *
+ *   REASSIGN  "WooCommerce refund N belongs to WooCommerce order X, not this one."
+ *   DISMISS   "WooCommerce no longer has this refund on this order at all."
+ *
+ * NEITHER IS BELIEVED ON ITS OWN. The server asks WooCommerce, fresh, before it writes anything, and
+ * refuses with the specific contradiction when the answer disagrees — a reassign whose named order
+ * does not have the refund, or a dismissal of a park WooCommerce still confirms. So the wording here
+ * says what IMS will CHECK, not what it will assume, because an operator who thinks this button
+ * moves a refund on their say-so will use it where they should have used Retry.
+ *
+ * The panel opens with no outcome selected and the confirm button disabled. There is no default,
+ * because a default here is a recommendation about somebody else's money.
+ */
+function RecoverRefundParkPanel({
+  row,
+  busy,
+  onCancel,
+  onSubmit,
+}: {
+  row: RefundSyncParkRow
+  busy: boolean
+  onCancel: () => void
+  onSubmit: (assertion: { outcome: 'REASSIGN'; wcOrderId: number } | { outcome: 'DISMISS'; reason?: string }) => void
+}) {
+  const [outcome, setOutcome] = useState<'REASSIGN' | 'DISMISS' | null>(null)
+  const [wcOrderId, setWcOrderId] = useState('')
+  const [reason, setReason] = useState('')
+
+  const parsedWcOrderId = Number(wcOrderId.trim())
+  const wcOrderIdValid = wcOrderId.trim() !== '' && Number.isSafeInteger(parsedWcOrderId) && parsedWcOrderId > 0
+  const canSubmit = !busy && (outcome === 'DISMISS' || (outcome === 'REASSIGN' && wcOrderIdValid))
+
+  return (
+    <div className="space-y-3 py-2 text-xs">
+      <p className="text-muted-foreground max-w-3xl">
+        A WooCommerce refund belongs to exactly one order. While refund{' '}
+        <span className="font-mono">{row.externalRefundId}</span> is parked here, its real order cannot have
+        it applied — the refund, the credit note and the restock are all refused — and neither order can be
+        deleted. Open the refund in WooCommerce and read its parent order off the refund itself before
+        choosing.
+      </p>
+      <div className="flex flex-wrap gap-4">
+        <label className="flex items-center gap-2">
+          <input type="radio" name={`recover-${row.id}`} checked={outcome === 'REASSIGN'} onChange={() => setOutcome('REASSIGN')} />
+          <span>It belongs to another WooCommerce order</span>
+        </label>
+        <label className="flex items-center gap-2">
+          <input type="radio" name={`recover-${row.id}`} checked={outcome === 'DISMISS'} onChange={() => setOutcome('DISMISS')} />
+          <span>WooCommerce no longer has it on this order</span>
+        </label>
+      </div>
+
+      {outcome === 'REASSIGN' ? (
+        <div className="space-y-1 max-w-sm">
+          {/*
+            THE ID, NOT THE ORDER NUMBER. What is typed here is sent to WooCommerce verbatim as
+            /orders/{value}/refunds, which addresses an order by its ID. On a plain store the two
+            happen to be equal, so the wrong label costs nothing and reads as correct — but the
+            moment a sequential-order-number plugin is in use they diverge, and then an operator who
+            does what the label says supplies a number that addresses SOMEBODY ELSE'S order or no
+            order at all. A refund reassigned onto the wrong order is the very fault this panel
+            exists to repair. The nearest wrong answer is also the most visible one: the IMS order
+            number in the row above this panel is not a WooCommerce id either.
+          */}
+          <label className="block text-muted-foreground" htmlFor={`wc-order-${row.id}`}>
+            WooCommerce order ID that holds this refund
+          </label>
+          <Input
+            id={`wc-order-${row.id}`}
+            inputMode="numeric"
+            value={wcOrderId}
+            onChange={(event) => setWcOrderId(event.target.value)}
+            placeholder={row.wcOrderId ? `not ${row.wcOrderId}` : 'e.g. 10432'}
+          />
+          <p className="text-muted-foreground">
+            The ID, not the order number the customer sees — read it off the <span className="font-mono">id=</span>{' '}
+            in the address bar while the order is open in WooCommerce, or off the refund&apos;s own{' '}
+            <span className="font-mono">parent_id</span>. They are the same number on a plain store and
+            different ones wherever order numbering is customised{row.wcOrderId ? <> — this park&apos;s own order is ID <span className="font-mono">{row.wcOrderId}</span></> : null}.
+          </p>
+          <p className="text-muted-foreground">
+            IMS will ask WooCommerce which refunds that order actually has, right now, and refuse if this
+            refund is not one of them. If it is, the park moves there as PENDING and becomes retryable from
+            that order — the refund itself has still not been applied.
+          </p>
+        </div>
+      ) : null}
+
+      {outcome === 'DISMISS' ? (
+        <div className="space-y-1 max-w-lg">
+          <label className="block text-muted-foreground" htmlFor={`dismiss-reason-${row.id}`}>
+            What you found (optional, recorded on the park)
+          </label>
+          <Input
+            id={`dismiss-reason-${row.id}`}
+            value={reason}
+            onChange={(event) => setReason(event.target.value)}
+            placeholder="e.g. refund deleted in WooCommerce on 12 Aug"
+          />
+          <p className="text-muted-foreground">
+            IMS will ask WooCommerce which refunds THIS order actually has, right now, and refuse if this
+            refund is still one of them. Dismissing only removes a park WooCommerce contradicts — it does
+            not apply the refund anywhere, so if the money did leave the business, reassign it instead
+            wherever its real order is known.
+          </p>
+          {row.wcOrderId ? null : (
+            <p className="text-destructive">
+              This order has no WooCommerce link, so there is no order for IMS to ask about and a dismissal
+              cannot be verified. Reassign it to the order that really holds the refund instead.
+            </p>
+          )}
+        </div>
+      ) : null}
+
+      <div className="flex gap-2">
+        <Button
+          type="button"
+          size="sm"
+          disabled={!canSubmit}
+          onClick={() => {
+            if (outcome === 'REASSIGN' && wcOrderIdValid) onSubmit({ outcome: 'REASSIGN', wcOrderId: parsedWcOrderId })
+            else if (outcome === 'DISMISS') onSubmit(reason.trim() ? { outcome: 'DISMISS', reason: reason.trim() } : { outcome: 'DISMISS' })
+          }}
+        >
+          Check WooCommerce and recover
+        </Button>
+        <Button type="button" size="sm" variant="ghost" onClick={onCancel}>Cancel</Button>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * o3d-w00 (Codex r1 #3): the completion path for a QUARANTINED refund park.
+ *
+ * The refund was refused because IMS could not work out how to record it — an undeterminable gross→net
+ * basis, or an order that is not uniformly taxed. Retry re-runs that same decision, so it can never
+ * clear. What IMS is missing is the one thing only a person knows: which parts of the order the refunded
+ * money covered. Entering that here raises the credit note against them (each carrying its own VAT
+ * identity) and resolves the row.
+ *
+ * Amounts are GROSS (tax-inclusive) — Codex r2 #2. The credit note has to SETTLE the storefront refund,
+ * so the split must add up to the figure WooCommerce returned, and gross is the only figure the operator
+ * has: net entry would mean hand-dividing by each line's rate until the total happened to land. The
+ * server converts each amount at the rate that target will be re-grossed at, and refuses the recording
+ * if the total does not match the parked refund.
+ *
+ * Codex r2 #3: SHIPPING is one of the targets. Without it a refund that included postage could not be
+ * described here at all.
+ */
+function RecordRefundManuallyDialog({
+  row,
+  isPending,
+  onSubmit,
+  onClose,
+}: {
+  row: RefundSyncParkRow
+  isPending: boolean
+  onSubmit: (allocations: RefundParkAllocationInput[], reason: string) => void
+  onClose: () => void
+}) {
+  const [reason, setReason] = useState('')
+  const [amounts, setAmounts] = useState<Record<string, string>>({})
+  const targetKey = (target: RefundParkAllocationTarget) => target.lineId ?? 'shipping'
+  const allocated = Object.values(amounts).reduce((sum, value) => sum + (Number(value) || 0), 0)
+  const parkedGross = row.refundGrossForeign == null ? null : Number(row.refundGrossForeign)
+  const reconciled = parkedGross != null && Number.isFinite(parkedGross) && Math.abs(allocated - parkedGross) <= 0.005
+  const outstanding = parkedGross == null ? 0 : parkedGross - allocated
+
+  return (
+    <Dialog open onOpenChange={() => { if (!isPending) onClose() }}>
+      <DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Record WooCommerce refund {row.externalRefundId} manually</DialogTitle>
+        </DialogHeader>
+        {parkedGross == null ? (
+          // The reconciliation has nothing to check against, so recording is closed — but not a dead
+          // end: Retry re-reads the refund from WooCommerce and re-parks it with the payload, and
+          // restores the quarantine if that fetch fails.
+          <div className="space-y-3">
+            <p className="text-sm">
+              This park does not carry the WooCommerce refund it came from, so an amount recorded here could not be
+              checked against the refund it settles.
+            </p>
+            <p className="text-sm text-muted-foreground">
+              Use <strong>Retry</strong> on this row first — that re-reads the refund from WooCommerce and stores it —
+              then record it manually. Retry cannot double-credit: the refund is still quarantined, so nothing posts.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <p className="text-xs text-muted-foreground">
+              This refund could not be converted automatically, so no credit note exists — but the money has already
+              been returned to the customer in WooCommerce. Split it across the parts of the order it actually covered.
+              Enter <strong>GROSS (tax-inclusive)</strong> amounts; each is converted to net at the VAT rate its credit
+              will be posted at, and the split must add up to the refund exactly.
+            </p>
+            <div className="space-y-1.5">
+              <Label htmlFor="record-refund-reason">Reason / reference *</Label>
+              <Input
+                id="record-refund-reason"
+                value={reason}
+                onChange={(event) => setReason(event.target.value)}
+                placeholder="e.g. WC refund 7101 — 2 units returned at 20%, plus the postage"
+                className="h-9 text-sm"
+              />
+            </div>
+            <Table containerClassName="rounded-md border" className="min-w-[560px]">
+              <TableHeader className="bg-muted/40">
+                <TableRow>
+                  <TableHead>Order line</TableHead>
+                  <TableHead>VAT</TableHead>
+                  <TableHead className="text-right">Left to refund (gross)</TableHead>
+                  <TableHead className="text-right w-32">Refund gross</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {row.allocationTargets.map((target) => (
+                  <TableRow key={targetKey(target)}>
+                    <TableCell className="text-xs">
+                      {target.kind === 'shipping'
+                        ? <span className="font-medium">{target.description}</span>
+                        : <>{target.sku ? `${target.sku} — ` : ''}{target.description}</>}
+                      {/* o3d-w00 (Codex r3 #1): a target whose posted VAT identity can't be established
+                          can't be allocated to — the credit note would come to a different figure than
+                          the refund it settles. Say so here, with the fix, rather than let the operator
+                          type an amount the server will refuse. */}
+                      {target.unrecordableReason ? (
+                        <span className="mt-1 block text-[11px] text-amber-700">{target.unrecordableReason}</span>
+                      ) : null}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {target.taxRateName ?? 'none'} ({(Number(target.vatRate) * 100).toFixed(0)}%)
+                    </TableCell>
+                    <TableCell className="text-right text-xs font-mono">{target.remainingGrossForeign}</TableCell>
+                    <TableCell>
+                      <Input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        disabled={Boolean(target.unrecordableReason)}
+                        value={amounts[targetKey(target)] ?? ''}
+                        onChange={(event) => setAmounts((previous) => ({ ...previous, [targetKey(target)]: event.target.value }))}
+                        className="h-7 text-sm text-right w-28 ml-auto font-mono"
+                      />
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            <div className="flex justify-end text-sm">
+              <div className="space-y-0.5 text-right">
+                <div>
+                  WooCommerce refunded: <span className="ml-2 font-mono font-medium">{row.refundGrossForeign} {row.currency ?? ''}</span>
+                </div>
+                <div className={reconciled ? 'text-emerald-700' : 'text-amber-700'}>
+                  Allocated (gross): <span className="ml-2 font-mono font-medium">{allocated.toFixed(2)}</span>
+                  {reconciled ? ' — matches' : ` — ${outstanding > 0 ? `${outstanding.toFixed(2)} still to allocate` : `${Math.abs(outstanding).toFixed(2)} over`}`}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={onClose} disabled={isPending}>
+            {parkedGross == null ? 'Close' : 'Cancel'}
+          </Button>
+          {parkedGross == null ? null : (
+            <Button
+              type="button"
+              // The server re-checks all of this; disabling here just stops a submission that cannot succeed.
+              disabled={isPending || !reconciled || !reason.trim()}
+              onClick={() => onSubmit(
+                row.allocationTargets
+                  .map((target) => ({
+                    lineId: target.lineId,
+                    lineKind: target.kind,
+                    grossAmountForeign: Number(amounts[targetKey(target)]) || 0,
+                  }))
+                  .filter((allocation) => allocation.grossAmountForeign > 0),
+                reason,
+              )}
+            >
+              {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Record refund
+            </Button>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }

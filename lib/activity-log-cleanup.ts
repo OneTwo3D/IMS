@@ -1,10 +1,54 @@
 import { db } from '@/lib/db'
+import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
+import { UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
 
 const DEFAULTS: Record<string, number> = {
   INFO: 30,
   WARNING: 60,
   ERROR: 90,
 }
+/**
+ * Actions exempt from retention, because they are STATE rather than history.
+ *
+ * TWO KINDS QUALIFY, and they are exempt for opposite-looking reasons:
+ *
+ * (1) AN OPEN OBLIGATION, which something else must CLEAR. A direct-create marker says an order
+ * entered fulfilment and its allocation coverage has not been verified yet. Deleting it does not age
+ * out a record — it silently discharges the obligation, and the resolver then reads "no marker" as
+ * "already resolved" and can never write the shortfall record (o3d-z82a, Codex review). For this kind
+ * the clearing responsibility has to be a MECHANISM, not a hope: here it is
+ * `sweepUnresolvedDirectCreateMarkers`, run from the reallocation-sweep cron, where every marker older
+ * than the import's grace window is answered under the order lock and deleted on EVERY outcome —
+ * covered, no demand, handed back to the sweep, recorded as a shortfall, or an order that no longer
+ * exists. An earlier revision claimed this exemption was bounded when the only other resolver was a
+ * WooCommerce redelivery of that same order, which for most orders never arrives; markers whose own
+ * import failed to resolve them accumulated with nothing to clear them (Codex review r4).
+ *
+ * (2) THE ONLY SURVIVING RECORD OF SOMETHING THAT HAPPENED OUTSIDE THIS DATABASE, which nothing can
+ * rebuild. `xero_posted_document_unrecorded` (o3d-550x; Codex r2, medium 1) says: a document was
+ * accepted by Xero, and its sync row can never name it — either the row already names a DIFFERENT
+ * document a competing worker posted, or the row is gone. Both documents are real money in the ledger.
+ * Nothing in IMS points at the displaced one except this row, and nothing re-derives it: the sync row
+ * names the other id and reads as perfectly settled, and no Xero call can tell which of two documents
+ * for one reference was the accident. Ageing it out does not expire a log line, it converts a recorded
+ * duplicate into an invisible one — the exact outcome the branch that writes it exists to prevent.
+ *
+ * A kind-(2) exemption does NOT need a clearing mechanism, and demanding one would be asking for the
+ * wrong thing: the resolution happens in Xero, by a person voiding or crediting the duplicate, and IMS
+ * cannot observe that. What it needs instead is to be bounded, and it is — one row per incident, and an
+ * incident requires a claim to age out WHILE its request is on the wire and the replacement to post and
+ * record before the displaced worker returns. Each one is an operator-facing exception that somebody is
+ * expected to look at. If they ever became common the correct response is to fix the duplication, not
+ * to start deleting the evidence of it.
+ *
+ * The predicate is `<> ALL`, NOT `<> ANY`. `action <> ANY(ARRAY['a','b'])` is true when the
+ * action differs from AT LEAST ONE element, so `'a' <> 'b'` alone satisfies it and a row whose
+ * action IS exempt gets deleted anyway. With one entry the two forms agree, which is exactly
+ * what makes it a landmine: it would work until the day someone added a second action. THIS IS THAT
+ * DAY — the array below now has two entries, and `<> ALL` is what makes both of them hold.
+ */
+const RETAINED_ACTIONS = [DIRECT_CREATE_PENDING_ACTION, UNRECORDED_POSTED_DOCUMENT_ACTION]
+
 const DELETE_BATCH_SIZE = 10_000
 const DEFAULT_CRON_RUN_RETENTION_DAYS = 90
 
@@ -53,6 +97,7 @@ export async function purgeExpiredActivityLogs() {
             FROM "activity_logs"
             WHERE level = ${level}::"ActivityLogLevel"
               AND "createdAt" < ${cutoff}
+              AND action <> ALL(${RETAINED_ACTIONS}::text[])
             ORDER BY "createdAt" ASC
             LIMIT ${DELETE_BATCH_SIZE}
           )
