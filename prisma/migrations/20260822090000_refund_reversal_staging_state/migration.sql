@@ -1,0 +1,46 @@
+-- o3d-2sm1 (Codex r1, CRITICAL) — A WITNESS FOR WHETHER A REFUND'S REVERSAL STAGING COMMITTED.
+--
+-- WITHOUT THIS FILE THE BRANCH IS WORSE THAN THE BUG. `prisma migrate deploy` applies migrations,
+-- not schema.prisma, so on production this column would not exist: the INSERT in
+-- createSalesOrderRefund and the staging UPDATE both throw on an unknown column — the first kills
+-- every refund, the second rolls back inside the staging transaction and takes the un-stage with
+-- it. Nothing degrades quietly here; it stops.
+--
+-- WHAT IT IS FOR (the full argument lives in lib/domain/sales/refund-reversal-record.ts).
+--
+--   sales_order_refunds.reversal_staging_state
+--     The state this whole issue is about — reversals STAGED and never recorded — was decided until
+--     now by `accounting_allocated_relief_amount IS NOT NULL AND accounting_retry_syncs IS NULL`.
+--     Both of those columns are nullable, were never backfilled, and were both added AFTER the
+--     two-commit window they were being asked about. On a row written before them the answer is
+--     NULL/NULL, which that predicate read as "staging never committed" — so a genuinely lost
+--     legacy reversal, the exact row it exists to catch, was reported as fine, and a legacy row
+--     that never staged at all was reported the same way. It could not distinguish the two in
+--     either direction.
+--
+--     Three states, each written by a transaction that actually sees the event:
+--       'NOT_STAGED'  by the INSERT that creates the refund, in the transaction that creates it.
+--       'STAGED'      by stageRefundAccountingReversals, in the same UPDATE as
+--                     accounting_allocated_relief_amount and the statement immediately before the
+--                     un-stage of sales_orders.revenue_deferred_date — so it commits with the
+--                     un-stage or rolls back with it.
+--       NULL          nobody spoke for this row. UNDECIDABLE, and each reader says so: the retry
+--                     refuses rather than reporting success and letting its caller clear the flag,
+--                     and the invariant reports it as its own warning, never as a confirmed loss.
+--
+-- NULLABLE WITH NO DEFAULT, deliberately. Postgres would fill every existing row with a default,
+-- and that value would be the database vouching for a staging it never witnessed — which is exactly
+-- how `reversal_staged BOOLEAN NOT NULL DEFAULT false` came to be useless for this question. The
+-- same refusal o3d-s36z made, and the same one this branch made when it started writing '[]' for an
+-- empty stage without promoting the historical NULLs.
+--
+-- NO BACKFILL STATEMENT IN THIS FILE, and none should be added later. The pre-fix set is bounded
+-- (rows still carrying accounting_retry_required with a NULL accounting_retry_syncs) and cannot be
+-- reconstructed; it can only be named, which the accounting invariant now does.
+--
+-- DEPLOY ORDER: this migration must be applied BEFORE the application code that writes either
+-- value. It adds a nullable column and touches no existing row, so it is safe to apply ahead of the
+-- deploy and safe to leave in place if the deploy is rolled back.
+
+-- AlterTable
+ALTER TABLE "sales_order_refunds" ADD COLUMN "reversal_staging_state" TEXT;

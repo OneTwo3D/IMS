@@ -5,7 +5,7 @@ import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-re
 import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 import { loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
-import { reversalStagedButNeverRecorded } from '@/lib/domain/sales/refund-reversal-record'
+import { reversalRecordVerdict } from '@/lib/domain/sales/refund-reversal-record'
 
 export type AccountingInvariantSeverity = 'info' | 'warning' | 'critical'
 
@@ -136,6 +136,12 @@ type ReversalNeverRecordedRefundRow = {
   accountingRetrySyncs: unknown
   accountingWarning: string | null
   allocatedReliefAmount?: DecimalLike
+  /**
+   * o3d-2sm1 (Codex r1): the witness. Optional here for the same reason it is nullable in the
+   * database — a row written before the column existed carries nothing, and that absence is the
+   * third state, not the second.
+   */
+  reversalStagingState?: unknown
   order?: {
     orderNumber?: string | null
     externalOrderNumber?: string | null
@@ -883,9 +889,10 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     })
   }
 
-  // o3d-2sm1 — A REVERSAL THAT WAS STAGED AND NEVER SENT, NAMED WHERE SOMEONE SEES IT.
+  // o3d-2sm1 — A REVERSAL THAT WAS STAGED AND NEVER SENT, NAMED WHERE SOMEONE SEES IT — AND, IN ITS
+  // OWN WORDS, THE ROWS THAT CANNOT SAY WHICH THEY ARE.
   //
-  // `stageRefundAccountingReversals` committed for this refund — `allocatedReliefAmount` is written
+  // `stageRefundAccountingReversals` committed for this refund — `reversalStagingState` is written
   // in the same transaction, in the statement before the un-stage — and the syncs it produced were
   // never recorded. The COGS reversal, the unearned reversal and the allocation reversal exist
   // nowhere: not as sync logs, not on the refund, and not derivable any more, because the same
@@ -904,26 +911,53 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
   // staging committed while the order is still A1-deferred lost its syncs too, but a retry re-derives
   // them from the stamps that are still there, so it is recoverable rather than lost.
   for (const refund of rows.reversalNeverRecordedRefunds) {
-    if (!reversalStagedButNeverRecorded(refund)) continue
+    const verdict = reversalRecordVerdict(refund)
+    if (verdict === 'nothing-lost') continue
     if (refund.order?.revenueDeferredDate) continue
     const order = refund.order ?? null
     const label = order?.orderNumber ?? order?.externalOrderNumber ?? refund.orderId
+    const details = {
+      orderNumber: label,
+      orderStatus: order?.status ?? null,
+      refundStatus: order?.refundStatus ?? null,
+      revenueDeferredDate: order?.revenueDeferredDate ?? null,
+      unearnedRevenueAmount: decimalToNumber(order?.unearnedRevenueAmount ?? 0),
+      allocatedReliefAmount: decimalToNumber(refund.allocatedReliefAmount ?? 0),
+      totalBase: decimalToNumber(refund.totalBase),
+      accountingWarning: refund.accountingWarning,
+    }
+    if (verdict === 'undecidable') {
+      // -----------------------------------------------------------------------------------------
+      // o3d-2sm1 (Codex r1): SAID, NOT CLAIMED — AND NOT DROPPED.
+      //
+      // This row predates `reversalStagingState`, so nothing in the database distinguishes "staging
+      // committed and its record was lost" from "staging never ran". Reporting it as the critical
+      // above would be a fabricated accusation on every historical row that still owes accounting,
+      // and the critical has to stay trustworthy because it is the only thing that says a reversal
+      // WAS lost. Dropping it would recreate the silence this whole issue is about.
+      //
+      // So it gets its own code and its own severity: a standing warning naming a row an operator
+      // has to decide by hand, against the ledger. It is bounded (the flag is the query's bound) and
+      // it cannot grow — every refund created from here on carries a witness — and it clears when
+      // the operator clears the flag, which is the same act that answers the question.
+      // -----------------------------------------------------------------------------------------
+      findings.push({
+        severity: 'warning',
+        code: 'refund_reversal_record_undecidable',
+        orderId: refund.orderId,
+        refundId: refund.id,
+        message: `Refund ${refund.creditNoteNumber ?? refund.id} on order ${label} still owes accounting and predates the record of whether its reversals were staged — it cannot be told apart from one whose staged reversals were lost, and the order's revenue deferral is already gone, so it must be decided against the ledger by hand`,
+        details: { ...details, reversalStagingState: null },
+      })
+      continue
+    }
     findings.push({
       severity: 'critical',
       code: 'refund_reversal_staged_never_recorded',
       orderId: refund.orderId,
       refundId: refund.id,
       message: `Refund ${refund.creditNoteNumber ?? refund.id} on order ${label} staged its accounting reversals but no record of them was ever written — they were never queued and cannot be derived again`,
-      details: {
-        orderNumber: label,
-        orderStatus: order?.status ?? null,
-        refundStatus: order?.refundStatus ?? null,
-        revenueDeferredDate: order?.revenueDeferredDate ?? null,
-        unearnedRevenueAmount: decimalToNumber(order?.unearnedRevenueAmount ?? 0),
-        allocatedReliefAmount: decimalToNumber(refund.allocatedReliefAmount ?? 0),
-        totalBase: decimalToNumber(refund.totalBase),
-        accountingWarning: refund.accountingWarning,
-      },
+      details,
     })
   }
 
@@ -1125,8 +1159,11 @@ export async function collectAccountingInvariantRows(
     // filter (the state is written by the FULL-refund un-stage, the one refundStatus the per-order
     // query excludes), no status filter and no retention window — an unraised COGS/unearned/
     // allocation reversal does not expire, and both daily-batch windows have already let the order
-    // go. `evaluateAccountingInvariantRows` narrows this set to the rows whose staging actually
-    // committed; see `reversalStagedButNeverRecorded`.
+    // go. `evaluateAccountingInvariantRows` sorts this set into the rows whose staging demonstrably
+    // committed (critical), the rows too old to say either way (warning) and the rest; see
+    // `reversalRecordVerdict`. The query deliberately does NOT filter on the witness column — a row
+    // that carries no witness is precisely the one that has to be reported as undecidable, and
+    // filtering it out here would be the silence this whole issue is about.
     client.salesOrderRefund.findMany({
       where: { accountingRetryRequired: true },
       select: {
@@ -1138,6 +1175,7 @@ export async function collectAccountingInvariantRows(
         accountingRetrySyncs: true,
         accountingWarning: true,
         allocatedReliefAmount: true,
+        reversalStagingState: true,
         order: {
           select: {
             orderNumber: true,

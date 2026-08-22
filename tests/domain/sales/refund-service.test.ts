@@ -14,6 +14,10 @@ import {
   type RefundAccountingSyncRequest,
   type RefundServiceClient,
 } from '@/lib/domain/sales/refund-service'
+import {
+  REVERSAL_STAGING_NOT_STAGED,
+  REVERSAL_STAGING_STAGED,
+} from '@/lib/domain/sales/refund-reversal-record'
 import type { AccountingSettings } from '@/lib/accounting'
 import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 import { takeShipmentAccountedEntries } from '@/lib/connectors/xero/daily-sync'
@@ -123,6 +127,9 @@ type Refund = {
   allocatedReliefAmount?: number | null
   allocationBasisUnresolved?: string | null
   accountingRetrySyncs?: unknown
+  // o3d-2sm1 (Codex r1): the witness. ABSENT on a fixture means what a NULL column means — the row
+  // was written before the column existed, and nothing can say what happened to it.
+  reversalStagingState?: string | null
   totalsBasis?: string | null
   source?: string | null
 }
@@ -7008,7 +7015,7 @@ test('o3d-2sm1: a persist that never lands takes the un-stage down with it', asy
 
 test('o3d-2sm1: a retry REFUSES a reversal that was staged and never recorded, instead of reporting success', async () => {
   // A row left behind by a build without the transaction above, reconstructed exactly: staging
-  // COMMITTED (it wrote `allocatedReliefAmount` in the same transaction as the un-stage, so the
+  // COMMITTED (it wrote `reversalStagingState` in the same transaction as the un-stage, so the
   // order's stamps are gone) and the syncs were never recorded (`accountingRetrySyncs` NULL).
   const state = sm1StagedState()
   state.orders[0].revenueDeferredDate = null
@@ -7029,6 +7036,9 @@ test('o3d-2sm1: a retry REFUSES a reversal that was staged and never recorded, i
     accountingWarning: null,
     accountingRetrySyncs: null,
     allocatedReliefAmount: 20,
+    // The witness the staging transaction wrote one statement before the un-stage. This — not the
+    // nullable amount beside it — is what makes the row a PROVEN loss rather than an unreadable one.
+    reversalStagingState: REVERSAL_STAGING_STAGED,
   })
   state.refundLines.push({
     id: 'refund-line-1',
@@ -7084,6 +7094,8 @@ test('o3d-2sm1: a refund whose staging genuinely staged NOTHING is still retried
     accountingWarning: 'Refund was created, but accounting queueing failed',
     accountingRetrySyncs: [],
     allocatedReliefAmount: 0,
+    // Its staging DID commit — it just had nothing to stage.
+    reversalStagingState: REVERSAL_STAGING_STAGED,
   })
 
   const staged = await retrySalesOrderRefundAccounting(createClient(state), {
@@ -7093,10 +7105,12 @@ test('o3d-2sm1: a refund whose staging genuinely staged NOTHING is still retried
   assert.equal(staged.success, true, 'an empty LIST is staging that ran and staged nothing')
   assert.deepEqual(staged.success ? staged.accountingSyncs : null, [])
 
-  // And the other direction: a refund on an order that was never revenue-deferred at all never ran
-  // staging, so it has no `allocatedReliefAmount` and is likewise not a lost reversal.
+  // And the other direction: a refund whose staging demonstrably never ran — the witness written at
+  // INSERT is still standing, and nothing has promoted it — is likewise not a lost reversal, even
+  // with `accountingRetrySyncs` NULL. This is the half that keeps the refusal from being blanket.
   state.refunds[0].accountingRetrySyncs = null
   state.refunds[0].allocatedReliefAmount = null
+  state.refunds[0].reversalStagingState = REVERSAL_STAGING_NOT_STAGED
   const neverStaged = await retrySalesOrderRefundAccounting(createClient(state), {
     refundId: 'refund-1',
     accountingSettings,
@@ -7127,4 +7141,213 @@ test('o3d-2sm1: staging that produced no syncs RECORDS the empty list rather tha
     [],
     'and the row says so with a written empty list, not an absence',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1, Codex r1 (CRITICAL) — THE ROWS THAT PREDATE EVERY COLUMN THE ANSWER WAS BUILT ON.
+//
+// Round 1 decided "was a reversal staged and never recorded?" with
+// `allocatedReliefAmount != null && accountingRetrySyncs == null`. Both columns are nullable, were
+// never backfilled, and were both added AFTER the two-commit window they were being asked about.
+// A row written before them answers NULL/NULL — which that predicate read as FALSE, i.e. "staging
+// never committed, carry on". The genuinely lost legacy reversal, the exact row the check exists
+// for, was waved through; so was the legacy row that never staged anything. The answer was
+// uninformative in both directions, and on the retry path "carry on" means reporting success and
+// letting `retryRefundAccounting` write `accountingRetryRequired: false` — which erases the last
+// durable trace of the loss AND the invariant query's own bound.
+//
+// The two fixtures below are DELIBERATELY SEPARATE and describe genuinely different histories. One
+// really did lose a staged reversal; the other never staged one. In the database they are identical
+// — that is the finding — so the fix cannot be to guess between them. It is to say so, which both
+// tests assert, and to keep the flag standing so the row is still there to be decided by hand.
+// ---------------------------------------------------------------------------
+
+/**
+ * A PRE-WITNESS ROW WHOSE REVERSAL WAS GENUINELY LOST. The order was A1-deferred and A2-staged; a
+ * full refund's staging computed all three reversals, un-staged the order (both stamps gone,
+ * `refundStatus: 'FULL'`) and the process died before the syncs were recorded. Because the row
+ * predates `accounting_allocated_relief_amount` as well, even the relief figure the round-1
+ * predicate leaned on is absent — which is precisely why it read the row as "nothing was staged".
+ */
+function sm1PreWitnessLostRow(): State {
+  const state = sm1StagedState()
+  state.orders[0].revenueDeferredDate = null
+  state.orders[0].revenueDeferredBatchRef = null
+  state.orders[0].inventoryAllocatedDate = null
+  state.orders[0].refundStatus = 'FULL'
+  state.refunds.push({
+    id: 'refund-1',
+    orderId: 'order-1',
+    creditNoteNumber: 'CN-2026-00001',
+    externalRefundId: null,
+    reason: 'Goodwill full refund',
+    totalForeign: 100,
+    totalBase: 100,
+    returnWarehouseId: null,
+    totalsBasis: 'NET',
+    accountingRetryRequired: true,
+    accountingWarning: null,
+    accountingRetrySyncs: null,
+    // Written before EITHER column existed. Not "zero relief" and not "no witness recorded" — no
+    // writer was ever able to speak for this row at all.
+    allocatedReliefAmount: null,
+  })
+  state.refundLines.push({
+    id: 'refund-line-1',
+    refundId: 'refund-1',
+    salesOrderLineId: null,
+    productId: null,
+    description: 'Monetary refund',
+    qty: 0,
+    unitPriceForeign: 0,
+    unitPriceBase: 0,
+    totalForeign: 100,
+    totalBase: 100,
+  })
+  return state
+}
+
+/**
+ * A PRE-WITNESS ROW THAT NEVER STAGED ANYTHING. A different history entirely: this order was never
+ * revenue-deferred and never A2-staged, so no reversal was ever owed. The refund is flagged only
+ * because the credit-note enqueue failed afterwards — the shape `credit-note-order-discount` and
+ * the external-fulfillment writer both produce. It is a PARTIAL refund, so nothing un-staged
+ * anything; the order's null deferral date is original, not a residue.
+ */
+function sm1PreWitnessNeverStagedRow(): State {
+  const state = baseState({})
+  state.orders[0].refundStatus = 'PARTIAL'
+  state.refunds.push({
+    id: 'refund-1',
+    orderId: 'order-1',
+    creditNoteNumber: 'CN-2026-00002',
+    externalRefundId: null,
+    reason: 'Partial goodwill',
+    totalForeign: 40,
+    totalBase: 40,
+    returnWarehouseId: null,
+    totalsBasis: 'NET',
+    accountingRetryRequired: true,
+    accountingWarning: 'Refund was created, but accounting queueing failed',
+    accountingRetrySyncs: null,
+    allocatedReliefAmount: null,
+  })
+  state.refundLines.push({
+    id: 'refund-line-1',
+    refundId: 'refund-1',
+    salesOrderLineId: null,
+    productId: null,
+    description: 'Monetary refund',
+    qty: 0,
+    unitPriceForeign: 0,
+    unitPriceBase: 0,
+    totalForeign: 40,
+    totalBase: 40,
+  })
+  return state
+}
+
+test('o3d-2sm1 Codex r1: a PRE-WITNESS row whose staged reversal was lost is NOT waved through as "nothing was staged"', async () => {
+  // THE REGRESSION. Under round 1 this returned success with an empty sync list, and its caller
+  // then cleared `accountingRetryRequired` — the loss the whole issue is about, re-run by the fix
+  // that was meant to catch it, on the only rows that can still be in that state.
+  const state = sm1PreWitnessLostRow()
+  assert.equal(state.refunds[0].allocatedReliefAmount, null, 'the round-1 discriminator is absent')
+  assert.equal(state.refunds[0].reversalStagingState, undefined, 'and so is the witness — it predates both')
+
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, false, 'success here is what drops the reversal and clears the flag behind it')
+  assert.match(
+    String(result.success ? '' : result.error),
+    /predates the record of whether its accounting reversals were staged/,
+    'and it refuses on the honest ground — undecidable, not "staged and lost"',
+  )
+  assert.equal(
+    state.refunds[0]?.accountingRetryRequired,
+    true,
+    'the flag survives, so the row stays inside the invariant query that reports it',
+  )
+  assert.equal(state.refunds[0]?.accountingRetrySyncs ?? null, null, 'and nothing was invented onto the row')
+})
+
+test('o3d-2sm1 Codex r1: a PRE-WITNESS row that never staged anything gets the SAME answer, and it is not called a loss', async () => {
+  // THE OTHER DIRECTION, on its own fixture and its own history — a partial refund on an order that
+  // was never revenue-deferred, so no reversal was ever owed. In the database it is byte-identical
+  // to the row above, which is the finding: no predicate can separate them. What it must not do is
+  // pick one and assert it. It refuses on the same undecidable ground, and the wording never claims
+  // a reversal was staged.
+  const state = sm1PreWitnessNeverStagedRow()
+  assert.equal(state.orders[0].revenueDeferredDate, null, 'never deferred — nothing was ever owed here')
+
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, false)
+  const error = String(result.success ? '' : result.error)
+  assert.match(error, /predates the record of whether its accounting reversals were staged/)
+  assert.doesNotMatch(
+    error,
+    /staged but the record of them was never written/,
+    'the confirmed-loss wording is reserved for rows that carry the witness',
+  )
+  assert.match(error, /if nothing was owed, clear this flag by hand/, 'and the remedy for THIS history is named')
+  assert.equal(state.refunds[0]?.accountingRetryRequired, true, 'refusing costs an operator a manual clear, not the record')
+})
+
+test('o3d-2sm1 Codex r1: the witness is written at INSERT and promoted by the staging transaction', async () => {
+  // What makes the three states distinguishable GOING FORWARD, and why a NULL can be read as "this
+  // row predates the column" rather than "nothing was staged": every row minted from here on says
+  // which it is, from the moment it exists.
+  const state = sm1StagedState()
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Customer cancelled',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(
+    state.refunds[0]?.reversalStagingState,
+    REVERSAL_STAGING_STAGED,
+    'staging committed, so the witness it wrote one statement before the un-stage is standing',
+  )
+  assert.equal(state.orders[0].revenueDeferredDate, null, 'and the un-stage it commits with did happen')
+})
+
+test('o3d-2sm1 Codex r1: a staging that rolls back leaves the witness at NOT_STAGED', async () => {
+  // The witness is only proof because it shares the staging transaction's fate. The persist fails,
+  // the transaction rolls back, and the row is left saying exactly what is true of it: born under
+  // code that keeps the column, nothing staged. A retry then re-derives from the stamps the
+  // rollback preserved — no refusal, because there is nothing undecidable about this row.
+  const state = sm1StagedState()
+
+  await createSalesOrderRefund(clientFailingOnlyTheSyncPersist(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Customer cancelled',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(
+    state.refunds[0]?.reversalStagingState,
+    REVERSAL_STAGING_NOT_STAGED,
+    'the promotion rolled back with the staging that wrote it',
+  )
+  assert.equal(state.refunds[0]?.accountingRetryRequired, true, 'and the row still owes its accounting')
+
+  const retry = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: state.refunds[0]!.id,
+    accountingSettings,
+  })
+  assert.equal(retry.success, true, 'a witnessed never-staged row is recoverable, not refused')
 })

@@ -6,6 +6,10 @@ import {
   evaluateAccountingInvariantRows,
   type AccountingInvariantRows,
 } from '@/lib/domain/accounting/invariants'
+import {
+  REVERSAL_STAGING_NOT_STAGED,
+  REVERSAL_STAGING_STAGED,
+} from '@/lib/domain/sales/refund-reversal-record'
 
 const A1_DATE = new Date('2026-01-01T10:00:00.000Z')
 const A2_DATE = new Date('2026-01-01T11:00:00.000Z')
@@ -945,6 +949,10 @@ test('o3d-2sm1: a reversal that was staged and never recorded is reported, on a 
     accountingRetrySyncs: null,
     accountingWarning: null,
     allocatedReliefAmount: 20,
+    // o3d-2sm1 (Codex r1): the witness the staging transaction wrote one statement before the
+    // un-stage. THIS is what makes the row a confirmed loss; the nullable amount above cannot,
+    // because it is NULL on every row written before it existed.
+    reversalStagingState: REVERSAL_STAGING_STAGED,
     order: {
       orderNumber: 'SO-GONE',
       externalOrderNumber: null,
@@ -982,11 +990,12 @@ test('o3d-2sm1: a refund that recorded an EMPTY stage, or never staged at all, i
       accountingRetrySyncs: [],
       accountingWarning: 'Refund was created, but accounting queueing failed',
       allocatedReliefAmount: 0,
+      reversalStagingState: REVERSAL_STAGING_STAGED,
       order: { orderNumber: 'SO-A', externalOrderNumber: null, status: 'SHIPPED', refundStatus: 'FULL', revenueDeferredDate: null },
     },
     {
-      // Staging never ran: the order was never revenue-deferred, so there is no relief figure and
-      // the null date means what it looks like.
+      // Staging never ran: the order was never revenue-deferred, so the null date means what it
+      // looks like — and the row SAYS so, because the witness written at INSERT is still standing.
       id: 'refund-never-staged',
       orderId: 'order-b',
       creditNoteNumber: 'CN-B',
@@ -995,6 +1004,7 @@ test('o3d-2sm1: a refund that recorded an EMPTY stage, or never staged at all, i
       accountingRetrySyncs: null,
       accountingWarning: 'Refund was created, but accounting queueing failed',
       allocatedReliefAmount: undefined,
+      reversalStagingState: REVERSAL_STAGING_NOT_STAGED,
       order: { orderNumber: 'SO-B', externalOrderNumber: null, status: 'SHIPPED', refundStatus: 'PARTIAL', revenueDeferredDate: null },
     },
     {
@@ -1009,28 +1019,30 @@ test('o3d-2sm1: a refund that recorded an EMPTY stage, or never staged at all, i
       accountingRetrySyncs: null,
       accountingWarning: null,
       allocatedReliefAmount: 20,
+      reversalStagingState: REVERSAL_STAGING_STAGED,
       order: { orderNumber: 'SO-C', externalOrderNumber: null, status: 'SHIPPED', refundStatus: 'PARTIAL', revenueDeferredDate: A1_DATE },
     },
   ]
 
-  assert.deepEqual(
-    evaluateAccountingInvariantRows(rows).filter((row) => row.code === 'refund_reversal_staged_never_recorded'),
-    [],
-  )
+  const findings = evaluateAccountingInvariantRows(rows)
+  assert.deepEqual(findings.filter((row) => row.code === 'refund_reversal_staged_never_recorded'), [])
+  // o3d-2sm1 (Codex r1): and not as the undecidable warning either. Every row here CARRIES a
+  // witness, so each one is decided on evidence — the third state is for rows that have none.
+  assert.deepEqual(findings.filter((row) => row.code === 'refund_reversal_record_undecidable'), [])
 })
 
 test('o3d-o97 r4 + o3d-2sm1: the refund queries carry no refundStatus, status or retention filter', async () => {
   // The row sets are only as visible as their queries. Every filter on the sales-order query is
   // right there and fatal here, so this pins each predicate to exactly the one condition that
   // bounds it. A window or a status filter added to either would silence its report again.
-  const refundQueries: Array<{ where: unknown }> = []
+  const refundQueries: Array<{ where: unknown; select?: Record<string, unknown> }> = []
   const client = {
     salesOrder: { async findMany() { return [] } },
     shipment: { async findMany() { return [] } },
     accountingSyncLog: { async findMany() { return [] } },
     salesOrderRefund: {
       async findMany(args: unknown) {
-        refundQueries.push(args as { where: unknown })
+        refundQueries.push(args as { where: unknown; select?: Record<string, unknown> })
         return []
       },
     },
@@ -1051,4 +1063,105 @@ test('o3d-o97 r4 + o3d-2sm1: the refund queries carry no refundStatus, status or
       { accountingRetryRequired: true },
     ],
   )
+
+  // o3d-2sm1 (Codex r1): AND THE WITNESS IS READ, NOT FILTERED ON. A row carrying no witness is
+  // exactly the one that has to be reported as undecidable, so narrowing the query by it — the
+  // obvious "only look at rows we can decide" optimisation — would drop the whole third state and
+  // recreate the silence. It belongs in the select and nowhere near the where.
+  assert.equal(refundQueries[1]?.select?.reversalStagingState, true, 'the witness is selected')
+  assert.equal(
+    Object.keys(refundQueries[1]?.where as Record<string, unknown>).includes('reversalStagingState'),
+    false,
+    'and never used to bound the set',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1, Codex r1 (CRITICAL) — THE PRE-WITNESS ROWS, NAMED WITHOUT BEING ACCUSED.
+//
+// Round 1 decided this from `allocatedReliefAmount != null && accountingRetrySyncs == null`, and
+// both columns are NULL on every row written before they existed. So the genuinely lost legacy
+// reversal answered "no finding" — the report was silent about the only rows that can still be in
+// this state — and so did the legacy row that never staged anything.
+//
+// The rows below are byte-identical in the database and describe opposite histories. Neither may be
+// reported as a confirmed loss (that would put a fabricated accusation on every historical row that
+// still owes accounting, and the critical has to stay trustworthy) and neither may be dropped
+// (that is the silence). They get their own code, at warning, and stay until an operator decides
+// them against the ledger — which is the same act that clears the flag they are bounded by.
+// ---------------------------------------------------------------------------
+
+function preWitnessRefundRow(overrides: Partial<AccountingInvariantRows['reversalNeverRecordedRefunds'][number]>) {
+  return {
+    id: 'refund-pre-witness',
+    orderId: 'order-pre-witness',
+    creditNoteNumber: 'CN-OLD',
+    totalBase: 100,
+    accountingRetryRequired: true,
+    // Both of the columns round 1 read. NULL on this row because neither existed when it was
+    // written — not because either event happened.
+    accountingRetrySyncs: null,
+    allocatedReliefAmount: undefined,
+    accountingWarning: null,
+    ...overrides,
+  }
+}
+
+test('o3d-2sm1 Codex r1: a PRE-WITNESS row whose reversal was genuinely lost is reported, not silently cleared', () => {
+  // The order was A1-deferred and A2-staged, a FULL refund's staging un-staged it, and the syncs
+  // were never recorded. Round 1 produced no finding at all for this — the exact row the report
+  // exists to surface.
+  const rows = cleanRows()
+  rows.reversalNeverRecordedRefunds = [preWitnessRefundRow({
+    id: 'refund-old-lost',
+    orderId: 'order-old-lost',
+    order: {
+      orderNumber: 'SO-OLD-LOST',
+      externalOrderNumber: null,
+      status: 'SHIPPED',
+      refundStatus: 'FULL',
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: 100,
+    },
+  })]
+
+  const findings = evaluateAccountingInvariantRows(rows)
+  assert.deepEqual(
+    findings.filter((row) => row.code === 'refund_reversal_staged_never_recorded'),
+    [],
+    'not asserted as a confirmed loss — nothing on the row can prove that',
+  )
+  const undecidable = findings.find((row) => row.code === 'refund_reversal_record_undecidable')
+  assert.ok(undecidable, 'but reported, which round 1 did not do at all')
+  assert.equal(undecidable.severity, 'warning')
+  assert.equal(undecidable.refundId, 'refund-old-lost')
+  assert.match(undecidable.message, /predates the record of whether its reversals were staged/)
+})
+
+test('o3d-2sm1 Codex r1: a PRE-WITNESS row that never staged anything gets the same warning, on its own fixture', () => {
+  // The converse history — a PARTIAL refund on an order that was never revenue-deferred, flagged
+  // only by a failed credit-note enqueue, so no reversal was ever owed. Identical in the database
+  // to the row above, which is why the report must describe the ambiguity rather than resolve it:
+  // calling this one a lost reversal would be the cry-wolf the critical cannot afford.
+  const rows = cleanRows()
+  rows.reversalNeverRecordedRefunds = [preWitnessRefundRow({
+    id: 'refund-old-never-staged',
+    orderId: 'order-old-never-staged',
+    accountingWarning: 'Refund was created, but accounting queueing failed',
+    order: {
+      orderNumber: 'SO-OLD-CLEAN',
+      externalOrderNumber: null,
+      status: 'SHIPPED',
+      refundStatus: 'PARTIAL',
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: null,
+    },
+  })]
+
+  const findings = evaluateAccountingInvariantRows(rows)
+  assert.deepEqual(findings.filter((row) => row.code === 'refund_reversal_staged_never_recorded'), [])
+  const undecidable = findings.find((row) => row.code === 'refund_reversal_record_undecidable')
+  assert.ok(undecidable, 'named rather than dropped — an operator still has to decide it')
+  assert.equal(undecidable.severity, 'warning')
+  assert.equal((undecidable.details as { reversalStagingState: unknown }).reversalStagingState, null)
 })

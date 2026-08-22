@@ -17,7 +17,11 @@ import { addMoney, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type 
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
-import { reversalStagedButNeverRecorded } from '@/lib/domain/sales/refund-reversal-record'
+import {
+  REVERSAL_STAGING_NOT_STAGED,
+  REVERSAL_STAGING_STAGED,
+  reversalRecordVerdict,
+} from '@/lib/domain/sales/refund-reversal-record'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { findOverAllocatedRefundTarget, overAllocatedRefundTargetMessage } from '@/lib/domain/sales/refund-target-balances'
@@ -2634,6 +2638,12 @@ async function stageRefundAccountingReversals(
       data: {
         allocatedReliefAmount: allocationReversal,
         allocationBasisUnresolved: unresolvedNote,
+        // o3d-2sm1 (Codex r1): THE WITNESS. Written here — one statement before the un-stage below,
+        // inside this transaction — so it commits with the un-stage or rolls back with it. It is
+        // what lets a later reader tell "this refund's staging committed" from "the column did not
+        // exist when this row was written", which no nullable amount on this row can say: NULL is
+        // the same on both. See lib/domain/sales/refund-reversal-record.ts.
+        reversalStagingState: REVERSAL_STAGING_STAGED,
       },
     })
 
@@ -3816,6 +3826,12 @@ export async function createSalesOrderRefund(
         // accountingRetryRequired true, which the replay path at `existingChargeback` and
         // the unresolved-accounting guard both already know how to act on.
         accountingRetryRequired: Boolean(so.revenueDeferredDate && input.accountingSettings),
+        // o3d-2sm1 (Codex r1): the OTHER half of the witness. This transaction sees the row come
+        // into existence, so it can attest that as of now nothing has been staged for it — and,
+        // more importantly, that this row was born under code that keeps the column at all. That
+        // is what makes a NULL here mean "written before the column existed" rather than "nothing
+        // was staged", and it is only true because it is written at INSERT and never backfilled.
+        reversalStagingState: REVERSAL_STAGING_NOT_STAGED,
       },
       select: { id: true },
     })
@@ -4427,10 +4443,11 @@ export async function retrySalesOrderRefundAccounting(
           chargeback: true,
           accountingRetryRequired: true,
           accountingRetrySyncs: true,
-          // o3d-2sm1: the footprint `stageRefundAccountingReversals` leaves in the same transaction
-          // as the un-stage. Read here so the short-circuit below can tell a refund whose staging
-          // committed from one on an order that was never revenue-deferred at all.
-          allocatedReliefAmount: true,
+          // o3d-2sm1: the witness `stageRefundAccountingReversals` writes in the same transaction as
+          // the un-stage, and `createSalesOrderRefund` writes at INSERT. Read here so the
+          // short-circuit below can tell a refund whose staging committed from one that never
+          // staged — and can tell BOTH from a row too old to carry the column at all.
+          reversalStagingState: true,
           order: {
             select: {
               id: true,
@@ -4538,22 +4555,58 @@ export async function retrySalesOrderRefundAccounting(
       }
       // o3d-2sm1: THE ORDER'S DEFERRAL BEING GONE IS NOT PROOF THAT NOTHING WAS OWED — it is
       // equally what a full refund's OWN un-stage leaves behind. Which of the two this row is, is
-      // decided by `reversalStagedButNeverRecorded`, never by the missing date on its own.
+      // decided by `reversalRecordVerdict`, never by the missing date on its own.
       if (!refund.order.revenueDeferredDate) {
-        // Re-staging is not the alternative, and the omission is worth stating: every reversal
-        // amount is derived from the stamps the un-stage removed. `openAllocatedContra` is computed
-        // only under `stagedA2?.inventoryAllocatedDate`, so a re-stage here would credit the lines'
-        // allocated basis UNCAPPED, take no residue and record no refusal — a fabricated figure in
-        // place of a missing one. It fails instead: `accountingRetryRequired` stays set (nothing on
-        // this path clears it), the refund keeps its retry affordance and its standing
-        // reversal-evidence findings, and a human raises the reversal from records that still exist.
-        if (reversalStagedButNeverRecorded(refund)) {
+        // Re-staging is not the alternative on either branch below, and the omission is worth
+        // stating: every reversal amount is derived from the stamps the un-stage removed.
+        // `openAllocatedContra` is computed only under `stagedA2?.inventoryAllocatedDate`, so a
+        // re-stage here would credit the lines' allocated basis UNCAPPED, take no residue and
+        // record no refusal — a fabricated figure in place of a missing one. Failing instead leaves
+        // `accountingRetryRequired` set (nothing on this path clears it), so the refund keeps its
+        // retry affordance and its standing reversal-evidence findings, and a human raises the
+        // reversal from records that still exist.
+        const recordVerdict = reversalRecordVerdict(refund)
+        if (recordVerdict === 'staged-never-recorded') {
           return {
             success: false,
             error: 'This refund\'s accounting reversals were staged but the record of them was never '
               + 'written, and the same staging cleared the order\'s revenue deferral — so no retry can '
               + 'derive them again. Raise the COGS/unearned/allocated-inventory reversals manually against '
               + 'the refund\'s own cost snapshots and reconcile the order before clearing this flag.',
+          }
+        }
+        // -----------------------------------------------------------------------------------------
+        // o3d-2sm1 (Codex r1): UNDECIDABLE REFUSES TOO, AND THE RISK THAT BUYS IS THE CHEAP ONE.
+        //
+        // This row predates `reversalStagingState`, so the database cannot say whether its staging
+        // committed. The two errors available are not comparable:
+        //
+        //   Proceeding wrongly is IRREVERSIBLE. "Proceed" here does not re-derive anything — it
+        //   returns success with an empty sync list, and `retryRefundAccounting` then writes
+        //   `accountingRetryRequired: false` and `accountingRetrySyncs: DbNull`. That erases the
+        //   only durable mark that this refund's accounting was ever unfinished, AND the bound of
+        //   the invariant query that reports it. If the staging had in fact committed, the reversal
+        //   is dropped exactly as it was dropped the first time, and nothing can find the row again.
+        //
+        //   Refusing wrongly is RECOVERABLE and cheap. It costs one operator the automatic clearing
+        //   of a flag on a refund that owed nothing; the flag is still clearable by hand once the
+        //   ledger has been checked, which is what the message asks for, and "nothing was owed" is
+        //   named in it as a legitimate answer so the check is short.
+        //
+        // Asymmetric and irreversible against recoverable and cheap: fail closed, the standing
+        // choice on this path since o3d-mrwu (absent data must not be read as a positive fact on an
+        // irreversible path). The set is bounded and shrinking — every refund created from here on
+        // carries a witness, so no new row can ever be undecidable.
+        // -----------------------------------------------------------------------------------------
+        if (recordVerdict === 'undecidable') {
+          return {
+            success: false,
+            error: 'This refund predates the record of whether its accounting reversals were staged, so '
+              + 'nothing here can tell a reversal that was staged and lost from one that was never owed — '
+              + 'and the order\'s revenue deferral is already gone either way, so no retry can derive it. '
+              + 'Check whether a COGS/unearned/allocated-inventory reversal was posted for this refund: if '
+              + 'it was not and one was due, raise it manually from the refund\'s own cost snapshots; if '
+              + 'nothing was owed, clear this flag by hand. Retrying cannot decide it.',
           }
         }
         return {
