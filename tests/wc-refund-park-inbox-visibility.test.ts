@@ -616,3 +616,157 @@ test('[o3d-xnwu r8] and the hold queue does not select a refund park, whatever t
   const data = await getExceptionInboxData()
   assert.deepEqual(data.refundSyncParks.map((row) => row.id).sort(), ['log-1', 'log-2'])
 })
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu r8 CUTOVER (Codex HIGH) — THE DISCRIMINATOR IS ONLY SAFE ONCE THE OLD WRITER IS STOPPED.
+//
+// The steady state above is sound. What is NOT safe is the window in which the migration has been
+// applied and the PREDECESSOR BINARY IS STILL SERVING. That binary selects held sales invoices by
+// `payload.reason` alone — the operator-controlled string this whole finding is about — so it can
+// recreate the exact collision `recordKind` exists to remove, AFTER the backfill has run.
+//
+// The migration now states quiescence as a REQUIREMENT with two verification queries that must both
+// return zero. These two tests pin the behaviour under a BOTCHED cutover so it is a known quantity
+// rather than an assumption, and they are deliberately the two cases Codex named:
+//
+//   (a) an old-binary-created NULL hold — invisible to both new predicates, and REPAIRABLE by
+//       re-running the backfill, which is what the verification queries are for;
+//   (b) an old writer OVERWRITING an already-stamped park — NOT repairable, invisible to both
+//       verification queries, and the r8 defect back in full.
+//
+// AUTOMATING THE DEPLOY SEQUENCE IS NOT THIS BRANCH'S WORK. It is o3d-2sm1.1 ("the deploy script
+// migrates before stopping the predecessor"), and this migration is recorded on that issue.
+// ---------------------------------------------------------------------------
+
+/**
+ * THE PREDECESSOR'S OWN PREDICATE, copied deliberately: `heldSalesInvoiceQueueWhere` as it reads in
+ * the binary that is still serving during the cutover — every clause of today's version EXCEPT
+ * `recordKind`. It is a literal here rather than an import because the point is that it belongs to
+ * a version of the code this worktree no longer contains, and it must not silently acquire the fix.
+ */
+const OLD_HELD_INVOICE_QUEUE_WHERE = {
+  connector: 'woocommerce',
+  direction: 'FROM_CONNECTOR',
+  status: 'PENDING',
+  entityType: 'SalesOrder',
+  entityId: 'so-A',
+  payload: { path: ['reason'], equals: HOSTILE_INVOICE_HOLD_REASON },
+}
+
+/**
+ * VERIFICATION QUERY 2 from the migration, in this table's Prisma vocabulary: "no unstamped park".
+ * It is the wider of the two — every actionable row that has not named its family — so an unstamped
+ * HOLD is counted by it as well, which is exactly what the SQL does.
+ */
+const UNSTAMPED_ACTIONABLE_WHERE = {
+  recordKind: null,
+  connector: 'woocommerce',
+  direction: 'FROM_CONNECTOR',
+  entityType: 'SalesOrder',
+  entityId: { not: null },
+  status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+}
+
+function unstampedActionableCount() {
+  return state.parks.filter((row) => matches(row as unknown as Record<string, unknown>, UNSTAMPED_ACTIONABLE_WHERE)).length
+}
+
+test('[o3d-xnwu r8 cutover] a hold the OLD binary wrote is unstamped, lost by both queues, and repairable', async () => {
+  // CASE (a). The migration is applied, the backfill has run, and the predecessor is still serving:
+  // it writes a hold that knows nothing about `recordKind`. Both new predicates ask for the stamp BY
+  // NAME, so the row falls out of everything — the invoice is never released and nothing lists it.
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const legacyHold = heldInvoiceRow({ id: 'hold-legacy', recordKind: null })
+  state.parks = [legacyHold]
+
+  const holdWhere = heldSalesInvoiceQueueWhere({ salesOrderId: 'so-A' }) as unknown as Record<string, unknown>
+  assert.equal(
+    matches(legacyHold as unknown as Record<string, unknown>, holdWhere),
+    false,
+    'the release sweep cannot see it, so the order stays PROCESSING and permanently un-invoiced',
+  )
+
+  const { getExceptionInboxData } = await inbox()
+  assert.deepEqual(
+    (await getExceptionInboxData()).refundSyncParks.map((row) => row.id),
+    [],
+    'and the recovery inbox does not list it either — it is invisible everywhere, not merely misfiled',
+  )
+
+  // THE VERIFICATION QUERY IS WHAT CATCHES IT, which is why the migration makes a non-zero answer a
+  // hard stop rather than a note.
+  assert.equal(unstampedActionableCount(), 1, 'verification query 2 returns non-zero — the cutover has failed')
+
+  // …AND IT IS REPAIRABLE: re-running the backfill stamps the cell (statement 1 recognises the hold
+  // by a shape the store cannot forge), and the queue finds it again.
+  legacyHold.recordKind = 'WC_HELD_SALES_INVOICE'
+  assert.equal(unstampedActionableCount(), 0, 'both verification queries return 0 once the backfill is re-run')
+  assert.equal(
+    matches(legacyHold as unknown as Record<string, unknown>, holdWhere),
+    true,
+    'and the invoice is released after all — case (a) costs a repair, not the evidence',
+  )
+})
+
+test('[o3d-xnwu r8 cutover] the OLD writer overwrites an already-stamped park, and no backfill can repair it', async () => {
+  // CASE (b), AND THIS IS THE ONE THAT MAKES QUIESCENCE A REQUIREMENT. The park is already stamped —
+  // the backfill ran, everything looks correct — and the predecessor's hold queue selects it anyway,
+  // because its only discriminator is a `reason` string the operator typed into WooCommerce.
+  const stampedPark = parkRow({
+    id: 'log-1',
+    status: 'PENDING',
+    entityId: 'so-A',
+    payload: wcRefund({ reason: HOSTILE_INVOICE_HOLD_REASON }),
+  })
+  state.parks = [stampedPark]
+
+  const { heldSalesInvoiceQueueWhere } = await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  assert.equal(
+    matches(stampedPark as unknown as Record<string, unknown>, OLD_HELD_INVOICE_QUEUE_WHERE),
+    true,
+    'the OLD binary selects the stamped park — the stamp means nothing to a predicate that never asks for it',
+  )
+  assert.equal(
+    matches(stampedPark as unknown as Record<string, unknown>, heldSalesInvoiceQueueWhere({ salesOrderId: 'so-A' }) as unknown as Record<string, unknown>),
+    false,
+    'while the NEW binary does not — the control, or this test would be about a fix that never worked',
+  )
+
+  // THE OLD BINARY'S WRITE: holdWcSalesInvoiceForMissingNumber does a findFirst on the predicate
+  // above and UPDATES what it finds. It does not know the column exists, so it leaves it alone.
+  const hold = heldInvoiceRow()
+  Object.assign(stampedPark, {
+    status: 'PENDING',
+    externalId: hold.externalId,
+    errorMessage: hold.errorMessage,
+    payload: hold.payload,
+  })
+
+  assert.equal(stampedPark.recordKind, 'WC_REFUND_PARK', 'THE STAMP NOW LIES: it says park, the row is a hold')
+  assert.equal(
+    (stampedPark.payload as { metaKey?: string }).metaKey,
+    '_wcpdf_invoice_number',
+    'and the WooCommerce refund evidence this park existed to hold is simply gone',
+  )
+
+  // NOT REPAIRABLE, AND NOT DETECTABLE. The backfill statements only ever write a NULL cell, and
+  // both verification queries ask for a NULL cell, so the cutover check passes over the wreckage.
+  assert.equal(unstampedActionableCount(), 0, 'both verification queries return 0 — they cannot see case (b)')
+
+  // AND THE r8 DEFECT IS BACK IN FULL: an invoice hold listed as an actionable refund park, with
+  // "Wrong order" and "Dismiss" offered on it.
+  const { getExceptionInboxData, recoverRefundSyncPark } = await inbox()
+  assert.deepEqual(
+    (await getExceptionInboxData()).refundSyncParks.map((row) => row.id),
+    ['log-1'],
+    'the recovery inbox lists an invoice hold as a refund park — exactly the defect recordKind removed',
+  )
+
+  const dismissed = await recoverRefundSyncPark('log-1', { observedOrderId: 'so-A', outcome: 'DISMISS' })
+  assert.equal(dismissed.success, true, 'and the DISMISS is allowed, on a row that is not a refund at all')
+  assert.equal(
+    state.parks[0].status,
+    'SYNCED',
+    'which is precisely how a RELEASED hold is retired — so the release sweep never returns and the order is never invoiced',
+  )
+})
