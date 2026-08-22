@@ -19,7 +19,12 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
-import { normalizeOrderDiscountBase } from '@/lib/sales-currency'
+import {
+  StaleDailyBatchDeferralError,
+  assertRevenueDeferralsUnchanged,
+  logStaleDailyBatchDeferral,
+  revenueDeferralAmount,
+} from '@/lib/domain/accounting/daily-batch-discount-fence'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
   mirrorAccountingSyncLogToEvent,
@@ -103,17 +108,6 @@ function round2(value: number): number {
 
 function round2Decimal(value: Decimal): number {
   return roundQuantity(value, GL_BASE_PRECISION).toNumber()
-}
-
-function normalizeDeferredDiscountBase(order: {
-  fxRateToBase: Prisma.Decimal | number | null
-  discountAmount: Prisma.Decimal | number | null
-  pricesIncludeVat: boolean
-  taxRatePercent: Prisma.Decimal | number | null
-  shoppingLinks?: Array<{ connector: string }>
-  lines?: Array<{ totalBase: Prisma.Decimal | number | null; taxRate?: { rate: Prisma.Decimal | number | null } | null }>
-}): number {
-  return normalizeOrderDiscountBase(order, order.lines)
 }
 
 function makeLayerKey(productId: string, warehouseId: string): string {
@@ -966,13 +960,12 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     result.hasMore.groupA1 = orderWindow.hasMore
 
     if (orders.length > 0) {
-      const orderDeferrals = orders.map((order) => {
-        const discountBase = normalizeDeferredDiscountBase(order)
-        return {
-          orderId: order.id,
-          amount: round2(Number(order.subtotalBase) + Number(order.shippingBase ?? 0) - discountBase),
-        }
-      })
+      // o3d-y14: derived through the SAME function the in-transaction fence re-derives with, so a
+      // disagreement can only mean the ORDER moved — never that the two sides do different sums.
+      const orderDeferrals = orders.map((order) => ({
+        orderId: order.id,
+        amount: revenueDeferralAmount(order),
+      }))
       let totalRevenueDeferred = 0
       const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
 
@@ -999,6 +992,12 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       const referenceId = buildDailyBatchReferenceId('A1', today, orders.map((order) => order.id))
 
       await db.$transaction(async (tx) => {
+        // o3d-y14: every figure below — the payload, the journal total and the per-order stamp —
+        // was derived from a read taken OUTSIDE this transaction and without a lock. Re-derive it
+        // now that the member rows are locked, and refuse the whole group rather than persist a
+        // deferral the order itself contradicts. See daily-batch-discount-fence.ts.
+        await assertRevenueDeferralsUnchanged(tx, orderDeferrals)
+
         if (journalLines.length > 0) {
           await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_REVENUE_DEFERRAL',
@@ -1036,6 +1035,9 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       result.groupA1 = orders.length
     }
   } catch (e) {
+    // o3d-y14: the fence aborts the transaction, so nothing recorded the refusal. Log it here,
+    // OUTSIDE the rolled-back transaction, before it becomes one more line in result.errors.
+    if (e instanceof StaleDailyBatchDeferralError) await logStaleDailyBatchDeferral(XERO_CONNECTOR, e)
     result.errors.push(`Group A1 error: ${String(e)}`)
   }
 

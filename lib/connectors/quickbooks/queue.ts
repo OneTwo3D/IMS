@@ -8,7 +8,11 @@ import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
 import { getQuickBooksSettings, type QuickBooksSettings } from './settings'
-import { lockOrderForAccountingEnqueue } from '@/lib/domain/accounting/enqueue-order-guard'
+import {
+  findStaleOrderLevelDiscount,
+  lockOrderForAccountingEnqueue,
+  logStaleOrderDiscountEnqueue,
+} from '@/lib/domain/accounting/enqueue-order-guard'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 
@@ -67,6 +71,7 @@ export async function queueQuickBooksSync(params: {
 
   try {
     let mirrorErrorMessage: string | null = null
+    let staleDiscount: { payloadDiscount: number; liveDiscount: number } | null = null
     await db.$transaction(async (tx) => {
       // o3d-hrak: join the sales-order delete protocol. The hard delete locks the order and
       // checks for live accounting work; without taking the SAME lock here, a poster holding a
@@ -91,6 +96,19 @@ export async function queueQuickBooksSync(params: {
           `[accounting-queue] skipping ${params.type} for deleted ${params.referenceType} ${params.referenceId}`,
         )
         return
+      }
+
+      // o3d-y14: the lock serialises the INSERT, not the CONSTRUCTION of `payload`. See the twin
+      // comment in lib/connectors/xero/queue.ts — a producer that read the order's discount before
+      // the coupon backfill corrected it must not be allowed to queue the superseded figure.
+      if (typeof lockedOrderId === 'string') {
+        staleDiscount = await findStaleOrderLevelDiscount(tx, {
+          type: params.type,
+          referenceType: params.referenceType,
+          orderId: lockedOrderId,
+          payload,
+        })
+        if (staleDiscount) return
       }
 
       const log = await tx.accountingSyncLog.create({
@@ -123,6 +141,7 @@ export async function queueQuickBooksSync(params: {
         mirrorErrorMessage = `QuickBooks sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`
       }
     })
+    if (staleDiscount) await logStaleOrderDiscountEnqueue('quickbooks', params, staleDiscount)
     if (mirrorErrorMessage) {
       await logActivity({
         entityType: 'SYSTEM',

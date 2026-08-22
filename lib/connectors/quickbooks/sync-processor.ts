@@ -9,6 +9,7 @@ import { createHash } from 'crypto'
 import { db } from '@/lib/db'
 import { activeAccountingIdProvenance, accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { readClaimedSyncLogPayload } from '@/lib/domain/accounting/claimed-sync-payload'
 import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
 import { logActivity } from '@/lib/activity-log'
@@ -422,9 +423,20 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
     if (claim.count === 0) continue
 
     result.processed++
-    const payload = (entry.payload ?? {}) as SyncPayload
+    // o3d-5ct: RE-READ the payload now that the claim has succeeded, instead of posting the
+    // snapshot taken by the findMany above. That snapshot was read BEFORE the claim, so a corrective
+    // writer could have rewritten the row in between and this worker would still post the old
+    // figure — and then mirror it into the AccountingEvent as the posted document. No predicate the
+    // writer adds can close that: it cannot reach a value already in this process's memory. Claiming
+    // first and reading second is what makes the read authoritative, because the claim's status
+    // transition stops anyone else claiming the row.
+    //
+    // The pre-claim snapshot survives only as the seed value: if the re-read itself throws, the
+    // catch below records a FAILURE with it. Nothing is posted on that path.
+    let payload = (entry.payload ?? {}) as SyncPayload
 
     try {
+      payload = await readClaimedSyncLogPayload(db, entry.id) as SyncPayload
       // Idempotency guard: if a previous run already posted to QBO but failed
       // during follow-up work, don't re-post. Skip straight to follow-ups.
       if (entry.externalTransactionId) {

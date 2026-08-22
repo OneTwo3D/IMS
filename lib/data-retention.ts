@@ -127,13 +127,11 @@ export async function purgeExpiredData(): Promise<{
           },
         },
       }),
-      // o3d-sref / o3d-nepa: this deletes by AGE ALONE, and that is a KNOWN, PRE-EXISTING gap in
-      // the order delete guard's evidence — not one introduced here.
+      // o3d-nepa / o3d-y14: age alone NEVER expires accounting work that can still be posted.
       //
-      // A row that is unresolved (PROCESSING with a taken claim, or FAILED, which o3d-ju8t
-      // established does NOT prove nothing was posted) is the guard's only evidence that a document
-      // may exist in the ledger, since no externalTransactionId was ever written. Deleting it by age
-      // makes the order hard-deletable again.
+      // A PENDING, PROCESSING or FAILED row is not a log of something that happened — it is an
+      // UNFINISHED JOB carrying the payload a worker will post from. Deleting one does not merely
+      // lose an audit trail:
       //
       // o3d-nepa, THE ACTUAL P1: age alone never expires accounting work that CAN STILL BE POSTED.
       // A PENDING, PROCESSING or FAILED row is not a log of something that happened — it is an
@@ -154,15 +152,29 @@ export async function purgeExpiredData(): Promise<{
       // history: every row leaves this exemption the moment it reaches SYNCED or CANCELLED and is
       // then expired by age normally. components/settings/data-retention.tsx says so.
       //
-      // THE STATUS LIST IS THE SHARED CONSTANT, NOT A LOCAL COPY. It is the same file PR #618
-      // (o3d-y14, branch o3d-y14-backfill-safety) introduces, byte for byte, so the two land as an
-      // identical add and #618's `applyWcCouponCorrection` — which counts these statuses under the
-      // sales-order lock and declines to correct an order that has any — reads the same set this
-      // delete refuses to touch. That function does not exist on this branch yet, which is why the
-      // constant's doc comment names a call site you will not find here; the drift it prevents is
-      // the whole reason neither side spells the statuses out.
+      // THE STATUS LIST IS THE SHARED CONSTANT, NOT A LOCAL COPY. o3d-nepa and PR #618 (o3d-y14,
+      // branch o3d-y14-backfill-safety) introduced postable-sync-statuses.ts byte for byte
+      // identically, so the two landed as the same add. BOTH READERS ARE NOW IN THE TREE: #618's
+      // `applyWcCouponCorrection` counts these statuses under the sales-order row lock and declines
+      // to correct an order that has any, because a queued payload is a SNAPSHOT built from the
+      // pre-correction amount. Deleting the row by age would turn that decided fact into a false
+      // one — the backfill would count zero, permanently stamp the order as corrected, and the
+      // worker would still post the understated invoice. That is the same set this delete refuses
+      // to touch, and if the two ever drift the hole reopens silently, which is the whole reason
+      // neither side spells the statuses out.
       //
-      // o3d-9kek: what this does NOT delete is UNRESOLVED BACK-REFERENCE EVIDENCE — a posted row
+      // So the exemption is keyed on the SHARED constant both readers use — if the two sets ever
+      // drift the hole reopens silently, which is why neither side spells the statuses out.
+      //
+      // AN EARLIER REVISION of this branch exempted PROCESSING only, and was reverted on the
+      // grounds that retaining whole rows contradicts the retention period the settings UI
+      // promises. That objection is answered by fixing the PROMISE rather than the data, because
+      // there is no version of this that keeps both: a compacted payload cannot be posted, so
+      // retaining unfinished work whole is the only shape that works. What is retained is bounded
+      // by the OUTSTANDING WORK BACKLOG (visible and actionable on the failed-sync dashboard), not
+      // by history — every row leaves the exemption the moment it reaches SYNCED or CANCELLED, and
+      // is then expired by age normally. components/settings/data-retention.tsx says so.
+      // o3d-9kek: what this ALSO does not delete is UNRESOLVED BACK-REFERENCE EVIDENCE — a posted row
       // whose repair sweep has not reached a verdict on it. Deleting one of those does not just
       // lose an audit trail: deleting a COMPETING sibling turns an ambiguity the sweep was
       // refusing to guess at into an apparent certainty (one unlinked bill, one surviving

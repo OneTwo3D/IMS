@@ -132,6 +132,13 @@ const db = {
   },
   accountingSyncLog: {
     async findMany() { return state.syncRows.map((row) => ({ ...row })) },
+    // o3d-5ct: the processor RE-READS the payload after its claim succeeds, instead of posting the
+    // pre-claim snapshot it listed with. Without this the re-read throws, the per-entry catch marks
+    // the job failed, and the back-reference path under test is never reached at all.
+    async findUnique(args: { where: { id: string } }) {
+      const row = state.syncRows.find((candidate) => candidate.id === args.where.id)
+      return row ? { payload: row.payload } : null
+    },
     async updateMany() { return { count: 1 } },
     async update(args: { where: { id: string }; data: Record<string, unknown> }) {
       const row = state.syncRows.find((candidate) => candidate.id === args.where.id)

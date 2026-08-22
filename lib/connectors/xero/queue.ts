@@ -11,7 +11,11 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
 import { getXeroSettings, type XeroSettings } from './settings'
 import { scheduleXeroAccountingOutbox } from './outbox'
-import { lockOrderForAccountingEnqueue } from '@/lib/domain/accounting/enqueue-order-guard'
+import {
+  findStaleOrderLevelDiscount,
+  lockOrderForAccountingEnqueue,
+  logStaleOrderDiscountEnqueue,
+} from '@/lib/domain/accounting/enqueue-order-guard'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 
@@ -75,6 +79,7 @@ export async function queueXeroSync(params: {
 
   try {
     let mirrorErrorMessage: string | null = null
+    let staleDiscount: { payloadDiscount: number; liveDiscount: number } | null = null
     await db.$transaction(async (tx) => {
       // o3d-hrak: join the sales-order delete protocol. The hard delete locks the order and
       // checks for live accounting work; without taking the SAME lock here, a poster holding a
@@ -99,6 +104,22 @@ export async function queueXeroSync(params: {
           `[accounting-queue] skipping ${params.type} for deleted ${params.referenceType} ${params.referenceId}`,
         )
         return
+      }
+
+      // o3d-y14: the lock above serialises the INSERT, not the CONSTRUCTION of `payload`. A
+      // producer can read the order's discount, be overtaken here by the coupon backfill (which
+      // corrects the column under this same lock, having correctly counted zero queue rows), and
+      // then insert a payload built from the superseded amount. Refusing a stale snapshot is what
+      // makes the backfill's locked count mean what it claims. A missing invoice is recoverable by
+      // re-queueing; a posted one that disagrees with the order is not.
+      if (typeof lockedOrderId === 'string') {
+        staleDiscount = await findStaleOrderLevelDiscount(tx, {
+          type: params.type,
+          referenceType: params.referenceType,
+          orderId: lockedOrderId,
+          payload,
+        })
+        if (staleDiscount) return
       }
 
       const log = await tx.accountingSyncLog.create({
@@ -134,6 +155,7 @@ export async function queueXeroSync(params: {
         mirrorErrorMessage = `Xero sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`
       }
     })
+    if (staleDiscount) await logStaleOrderDiscountEnqueue('xero', params, staleDiscount)
     if (mirrorErrorMessage) {
       await logActivity({
         entityType: 'SYSTEM',

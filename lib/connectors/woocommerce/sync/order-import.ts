@@ -1916,6 +1916,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // Coupon CODES are kept for display; the money lives on the lines (o3d-y14).
           discountStr: orderDiscount.discountStr,
           discountAmount: orderLevelDiscountForeign,
+          // o3d-9te: say WHICH meaning the amount above carries, in the same write that
+          // computes it. Without this the only evidence of import provenance is a
+          // timestamp, and this row's `createdAt` is BACKDATED to the Woo order date by
+          // the initial import (useWcDateAsCreatedAt below) — so a historical order
+          // imported today looks, to any cutoff, like a pre-fix order. The corrective
+          // backfill refuses to reinterpret an amount whose model it cannot establish.
+          discountModel: 'LINE_ALLOCATED',
           notes: wcOrder.customer_note || null,
           paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : null,
           shoppingLinks: {

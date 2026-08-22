@@ -112,6 +112,26 @@ enum RefundDisposition {
   FULL
 }
 
+// o3d-9te: WHAT SalesOrder.discountAmount MEANS on this row, recorded by whoever wrote it.
+//
+// The o3d-y14 double-count existed because two different meanings shared one column and
+// nothing on the row said which was stored. `SalesOrder.createdAt` cannot answer it — the
+// WooCommerce initial import backdates that field to the historical Woo order date
+// (importWcOrder's useWcDateAsCreatedAt), so a legacy-dated order can have been imported
+// yesterday. This enum is the answer written down at the moment the value is computed.
+//
+// NULL means "not recorded", which is the honest state of every row written before this
+// column existed, of native/manual orders, and of any connector that has not adopted it. It
+// is NOT a synonym for the pre-fix meaning: a consumer that must know MUST treat NULL as
+// unknown and refuse to reinterpret the amount.
+enum OrderDiscountModel {
+  // The storefront allocated its cart coupon INTO the line items (each
+  // SalesOrderLine.discountAmount carries its share), and discountAmount holds ONLY the
+  // unallocated residual — normally zero. Written by the post-o3d-y14 WooCommerce importer
+  // and by the o3d-y14 backfill on rows it corrects.
+  LINE_ALLOCATED
+}
+
 enum ShipmentStatus {
   PENDING
   PICKING
@@ -1698,6 +1718,21 @@ model SalesOrder {
   trackingNumber    String?
   discountStr       String?    // order-level discount input e.g. "10%" or "5.00"
   discountAmount    Decimal    @db.Decimal(18, 4) @default(0) // computed order discount in foreign currency
+  // o3d-9te: what discountAmount above MEANS, stamped in the same write that computes it.
+  // NULL = not recorded (pre-column rows, native orders); see OrderDiscountModel.
+  discountModel     OrderDiscountModel? @map("discount_model")
+  // o3d-y14 r4 finding 1: the DURABLE record that the o3d-y14 backfill RESTATED this row's
+  // order-level discount, plus the ledger evidence it read under the correction's own lock.
+  // NULL = never restated (see lib/domain/accounting/discount-restatement.ts). Written in the SAME
+  // update as discountAmount + discountModel, so a restated row can never be markerless.
+  //
+  // WHY IT IS NOT INFERRED. A chargeback must reverse what the INVOICE charged, and for a restated
+  // row the live column deliberately disagrees with it. The absence of a mirrored AccountingEvent,
+  // of accountingInvoiceId and of a SYNCED sync log was previously read as "nothing ever posted" —
+  // but the mirror is best-effort, the back-reference write can fail (o3d-9kek) and retention
+  // DELETES the sync log, so all three can vanish while a real Xero invoice stands. This column is
+  // the only statement about that moment that nothing prunes.
+  discountRestatement Json?         @map("discount_restatement")
   invoiceNumber     String?    // generated invoice reference
   invoicedAt        DateTime?
   paymentDueAt      DateTime?

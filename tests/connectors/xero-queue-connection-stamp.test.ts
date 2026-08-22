@@ -69,7 +69,20 @@ mock.module('@/lib/activity-log', {
   namedExports: { logActivity: async () => undefined },
 })
 mock.module('@/lib/domain/accounting/enqueue-order-guard', {
-  namedExports: { lockOrderForAccountingEnqueue: async () => 'order-1' },
+  // o3d-y14 (#618) added the stale-order-discount fence to this module and queueXeroSync now calls
+  // it under the same lock. A namedExports mock REPLACES the module, so omitting the two new exports
+  // made the queue die on "findStaleOrderLevelDiscount is not a function" before it ever reached the
+  // connection stamp this file is about.
+  //
+  // `null` is "the payload's discount agrees with the order" — the ordinary state, and the only one
+  // that lets the enqueue proceed to the insert being asserted on here. The fence's own behaviour is
+  // covered in tests/domain/accounting/enqueue-discount-fence.ts; modelling a STALE snapshot here
+  // would silently turn every case below into a refusal that queues nothing.
+  namedExports: {
+    lockOrderForAccountingEnqueue: async () => 'order-1',
+    findStaleOrderLevelDiscount: async () => null,
+    logStaleOrderDiscountEnqueue: async () => {},
+  },
 })
 
 async function queueXeroSync(params: Parameters<

@@ -373,6 +373,20 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'Account setting key (out of scope by owner instruction).',
   },
   {
+    file: 'lib/connectors/woocommerce/sync/coupon-discount-backfill.ts',
+    figures: ['margin', 'revenueDeferredBatchRef', 'unearnedRevenueAmount'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'o3d-y14 coupon double-count correction. It publishes no figure to any reader: `revenueDeferredBatchRef` and `unearnedRevenueAmount` are read only to REFUSE a correction on an order whose Group A1 deferral was already computed from the amount being changed, and `margin` is the English word in two doc comments about a cutoff decided by a narrow margin rather than an identifier. Nothing here nets, renders or exports revenue, so no refund basis applies.',
+  },
+  {
+    file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts',
+    figures: ['revenueDeferredBatchRef', 'unearnedRevenueAmount'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'o3d-y14 operator handoff describing what a corrected order needs doing to it in the accounting system. The two fields are quoted as EVIDENCE in that description — which batch staged the deferral and what it staged — never summed, netted or rendered as a report figure.',
+  },
+  {
     file: 'lib/connectors/xero/daily-sync.ts',
     figures: ['proportionalRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueProportion', 'revenueRecognizedAmount', 'runningRevenue', 'totalRevenue', 'totalRevenueDeferred', 'unearnedRevenueAmount', 'xero_unearned_revenue_account'],
     treatment: 'not-refund-sensitive',
@@ -394,6 +408,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'Account setting key.',
   },
   {
+    file: 'lib/domain/accounting/daily-batch-discount-fence.ts',
+    figures: ['assertRevenueDeferralsUnchanged', 'revenueDeferralAmount', 'revenueDeferredBatchRef', 'unearnedRevenueAmount'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'o3d-y14 Group A1 fence. It re-derives each order’s deferral under the batch’s own row locks purely to COMPARE it with the figure the unlocked read produced, and refuses the group on a disagreement — the amount is never published, and the only thing it can cause is that no journal is staged at all. The deferral figure it re-derives is the ledger posting already declared under xero/daily-sync.ts.',
+  },
+  {
     file: 'lib/domain/accounting/daily-batch-preview.ts',
     figures: ['revenueDeferredDate', 'totalRevenue'],
     treatment: 'not-refund-sensitive',
@@ -413,6 +434,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     treatment: 'not-refund-sensitive',
     reason:
       'Deferred-revenue true-up posting. It moves a ledger balance, not a report figure; no refund basis question arises.',
+  },
+  {
+    file: 'lib/domain/accounting/discount-restatement.ts',
+    figures: ['revenueDeferredBatchRef'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'o3d-y14 restatement record — the persisted basis saying an order’s discount was rewritten after its invoice posted. `revenueDeferredBatchRef` is stored as part of that provenance so a later reader knows which batch had already consumed the old figure. Provenance, not a money figure; no refund can move it.',
   },
   {
     file: 'lib/domain/accounting/invariants.ts',
@@ -506,6 +534,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     treatment: 'not-refund-sensitive',
     reason:
       'PDF page margins — a layout inset, not a money figure.',
+  },
+  {
+    file: 'scripts/backfill-wc-coupon-order-discount.ts',
+    figures: ['revenueDeferredBatchRef'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'o3d-y14 backfill CLI. It reports which orders it would correct and which it refuses; `revenueDeferredBatchRef` appears only as the refusal evidence for an order whose Group A1 deferral already consumed the pre-correction discount. The script computes no revenue, profit or margin.',
   },
   {
     file: 'scripts/commerce-accounting-e2e-fixture.ts',
