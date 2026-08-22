@@ -227,24 +227,75 @@ function requireFollowUpsEnqueued(entryId: string, outcome: FollowUpEnqueueOutco
  * Status goes back to PENDING, or FAILED once the retries are exhausted — the same bound every other
  * failure on this loop observes, so a permanently refusable row cannot spin for ever.
  */
+function postedRowRetryColumns(entry: { retryCount: number }, errorMessage: string) {
+  const retryCount = entry.retryCount + 1
+  return {
+    status: retryCount >= MAX_RETRIES ? ('FAILED' as const) : ('PENDING' as const),
+    retryCount,
+    errorMessage,
+    processingStartedAt: null,
+  }
+}
+
 async function markSyncLogForFollowUpRetry(
   entry: { id: string; retryCount: number },
   error: unknown,
 ): Promise<void> {
-  const retryCount = entry.retryCount + 1
   await db.accountingSyncLog.update({
     where: { id: entry.id },
-    data: {
-      status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
-      retryCount,
+    data: postedRowRetryColumns(
+      entry,
       // Covers both callers: the fresh-post arm sends only REFUSALS here, the short-circuit arm
       // sends every follow-up failure. The refusal's own text says "REFUSED and nothing was queued",
       // so the prefix does not need to claim which happened — and claiming it would be wrong for
       // half the rows that now reach this line.
-      errorMessage: `QuickBooks follow-up work did not complete after connector post: ${String(error)}`,
-      processingStartedAt: null,
-    },
+      `QuickBooks follow-up work did not complete after connector post: ${String(error)}`,
+    ),
   })
+}
+
+/**
+ * THE SAME TRANSITION, FOR A CALLER THAT DOES NOT KNOW WHETHER THE ROW IS POSTED (Codex r4, HIGH).
+ *
+ * THE EXTERNAL ID IS POST EVIDENCE, AND A FAILED MIRROR CONTRADICTS A DOCUMENT THAT EXISTS. That is
+ * already the established principle on this branch — {@link markSyncLogForFollowUpRetry} was written
+ * for it, and round 2 moved the short-circuit arm's follow-up failures onto it for exactly this
+ * reason. What round 2 did not do was make the GENERIC OUTER CATCH obey it. That handler still asked
+ * only "have the retries run out?", and on the last one it stamped the mirrored AccountingEvent
+ * FAILED — over a row whose `externalTransactionId` says the document is in QuickBooks.
+ *
+ * AND IT IS UNTRUE FOR A TRANSIENT ERROR EXACTLY AS IT IS FOR A REFUSAL. The reasons are properties
+ * of the LEDGER, not of the exception: the document exists, the mirror already says POSTED, and the
+ * id is what makes the retry resume at the follow-ups instead of posting a second document. A
+ * database blip on a posted row is not evidence the post came undone.
+ *
+ * THE ROUTES THAT REACH IT. Round 2's inner catch covers the short-circuit arm's follow-up work
+ * only. Everything else on that arm still lands here: the payload re-read
+ * (`readClaimedSyncLogPayload`), the SYNCED/POSTED transaction itself, `logActivity`, a throw from
+ * `markSyncLogForFollowUpRetry`. And on the FRESH-POST arm the row acquires an id mid-iteration —
+ * `entry.externalTransactionId` is the PRE-CLAIM snapshot and is still null in memory — so a failure
+ * after that transaction commits is a failure on a posted row that no in-memory test can recognise.
+ * That is why this asks the DATABASE, in the statement that writes.
+ *
+ * FENCED, NOT READ-THEN-WRITE. `where: { externalTransactionId: { not: null } }` makes the question
+ * and the answer one statement, so a post that lands between them cannot be written over — and its
+ * sibling below is fenced the opposite way, so the two are mutually exclusive by construction rather
+ * than by the order they are called in. `count === 0` means the row names no document (or is gone),
+ * and the caller falls through to the ordinary failure.
+ *
+ * Writes NO mirrored event. That is the whole point, and it is why this is a separate statement from
+ * the main-failure transaction rather than a flag on it.
+ */
+async function markPostedSyncLogRetryPreservingEvidence(
+  client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  entry: { id: string; retryCount: number },
+  errorMessage: string,
+): Promise<boolean> {
+  const updated = await client.accountingSyncLog.updateMany({
+    where: { id: entry.id, externalTransactionId: { not: null } },
+    data: postedRowRetryColumns(entry, errorMessage),
+  })
+  return updated.count > 0
 }
 
 /**
@@ -821,6 +872,9 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
     } catch (e) {
       const errorMessage = String(e)
       if (isRateLimitError(errorMessage)) {
+        // Not evidence-aware, and does not need to be: a backoff writes no mirrored event at all, so
+        // there is nothing here that could contradict a document in the ledger. It still re-asserts
+        // custody on the claim (o3d-anu8), which is a separate rule and not one this may drop.
         await db.accountingSyncLog.updateMany(stampingCustodyOnClaim({
           where: { id: entry.id },
           processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
@@ -833,8 +887,27 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         const retryCount = entry.retryCount + 1
         const finalFailure = retryCount >= MAX_RETRIES
         await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
+          // EVIDENCE FIRST (Codex r4, HIGH). THE EXTERNAL ID IS POST EVIDENCE, AND A FAILED MIRROR
+          // CONTRADICTS A DOCUMENT THAT EXISTS — so before this handler may record a failed post it
+          // has to establish that there is no post to contradict, and it has to do that against the
+          // DATABASE. `entry` is the PRE-CLAIM snapshot: on the fresh-post arm the row acquires its
+          // id mid-iteration and `entry.externalTransactionId` is still null in memory, so an
+          // in-memory test would answer "not posted" about a document that is in QuickBooks.
+          //
+          // Round 3 closed the follow-up ROUTE on the short-circuit arm. Everything else on that arm
+          // still arrives here — the payload re-read, the SYNCED/POSTED transaction, the activity
+          // write, a throw from the follow-up transition itself — and arrived at a handler that, on
+          // the last retry, stamped the mirrored event FAILED over the POSTED one written moments
+          // earlier. It is untrue for a transient error exactly as it is for a refusal: the reasons
+          // are facts about the ledger, not about the exception.
+          //
+          // TWO MUTUALLY EXCLUSIVE FENCED STATEMENTS, one transaction. Each carries the opposite
+          // predicate on `externalTransactionId`, so which one applies is decided by the row at the
+          // moment of the write rather than by a read taken before it — a post that commits between
+          // them cannot be written over, and neither can both land.
+          if (await markPostedSyncLogRetryPreservingEvidence(tx, entry, errorMessage)) return
+          const failed = await tx.accountingSyncLog.updateMany({
+            where: { id: entry.id, externalTransactionId: null },
             data: {
               status: finalFailure ? 'FAILED' : 'PENDING',
               retryCount,
@@ -842,7 +915,11 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               processingStartedAt: null,
             },
           })
-          if (finalFailure) {
+          // AND THE MIRROR FOLLOWS THE WRITE THAT LANDED, not the intention. `count === 0` here means
+          // the row named a document by the time this statement ran (or is gone) — either way this
+          // handler has recorded nothing, and a FAILED mirror written beside a write that matched
+          // nothing would be the same lie by another route.
+          if (failed.count > 0 && finalFailure) {
             await updateMirroredEventForSyncLog(tx, {
               syncLogId: entry.id,
               type: entry.type,

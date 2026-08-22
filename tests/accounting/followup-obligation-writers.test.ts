@@ -149,6 +149,25 @@ const state = {
   /** Sync-log ids whose obligation RELEASE must fail. */
   failReleaseFor: new Set<string>(),
   /**
+   * Sync-log ids whose SYNCED/POSTED transaction must fail (Codex r4).
+   *
+   * A NON-FOLLOW-UP failure on a row that already carries an external id — the case round 3's inner
+   * catch does not cover and the generic outer handler did. It is a real route: the short-circuit arm
+   * writes SYNCED and the mirrored POSTED event in one transaction, and a database error there throws
+   * straight past every local catch.
+   */
+  failSyncedWriteFor: new Set<string>(),
+  /**
+   * Activity actions whose write must THROW (Codex r4), as distinct from
+   * `unpersistableActivityActions`, which only makes the persisted variant return false.
+   *
+   * The fresh-post arm awaits `logActivity` inside its follow-up catch WITHOUT a `.catch()` — the
+   * short-circuit arm has one, that arm does not — so a failed announcement there lands in the outer
+   * handler at the one moment `entry.externalTransactionId` is stale: the row was committed with its
+   * id moments earlier, and the in-memory snapshot still says null.
+   */
+  throwingActivityActions: new Set<string>(),
+  /**
    * Activity actions whose PERSISTED write must report failure (o3d-nepa r3). `logActivityPersisted`
    * returns false rather than throwing when the row cannot be written, and a double that always
    * returned true could not tell a warning that landed from one that did not — which is the whole
@@ -205,6 +224,10 @@ const syncLogClient = {
     if (args.data.backReferenceFollowUpsPendingAt === null && state.failReleaseFor.has(row.id)) {
       record('release.attempted-and-failed')
       throw new Error('transient: could not clear the obligation')
+    }
+    if (args.data.status === 'SYNCED' && state.failSyncedWriteFor.has(row.id)) {
+      record('synced.attempted-and-failed')
+      throw new Error('transient: the SYNCED transaction could not be written')
     }
     Object.assign(row, args.data)
     record('syncLog.update', args.data)
@@ -316,7 +339,12 @@ const db = {
 mock.module('@/lib/db', { namedExports: { db } })
 mock.module('@/lib/activity-log', {
   namedExports: {
-    logActivity: async (entry: { action: string }) => { state.activities.push(entry) },
+    logActivity: async (entry: { action: string }) => {
+      state.activities.push(entry)
+      if (state.throwingActivityActions.has(entry.action)) {
+        throw new Error(`transient: could not write the ${entry.action} activity row`)
+      }
+    },
     logActivityPersisted: async (entry: { action: string }) => {
       state.activities.push(entry)
       return !state.unpersistableActivityActions.has(entry.action)
@@ -414,6 +442,8 @@ function reset(connector = 'xero') {
   state.outbox = []
   state.failFollowUpsFor.clear()
   state.failReleaseFor.clear()
+  state.failSyncedWriteFor.clear()
+  state.throwingActivityActions.clear()
   state.unpersistableActivityActions.clear()
   state.mirror.length = 0
   ledgerVerdict = { clear: true }
@@ -1281,4 +1311,104 @@ test('[o3d-peh1 r2] the already-posted arm still settles normally once the refus
   assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'the obligation is discharged only now')
   assert.equal(state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 1)
   assert.deepEqual(mirrorFailures(), [])
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 4 (Codex HIGH) — THE OUTER HANDLER COULD STILL MARK AN ALREADY-POSTED DOCUMENT FAILED.
+//
+// Round 3 gave the short-circuit arm's FOLLOW-UP WORK a catch of its own and routed it to the
+// transition that writes no mirrored event. That closed one route. The generic outer handler was
+// not touched, and it still asked only "have the retries run out?" — so a failure ANYWHERE ELSE on
+// that arm reached it and, on the last retry, stamped the mirrored AccountingEvent FAILED for a
+// document that is in the ledger. The routes are real and none of them is follow-up work:
+//
+//   • the SYNCED/POSTED transaction itself, and the payload re-read before it (short-circuit arm);
+//   • the announcement inside the FRESH-POST arm's follow-up catch, which is awaited with no
+//     `.catch()` of its own — and which fires at the one moment `entry.externalTransactionId` is
+//     STALE, because the row acquired its id in this same iteration and the snapshot still says null.
+//
+// THE PRINCIPLE, RESTATED BECAUSE IT IS THE WHOLE FIX: THE EXTERNAL ID IS POST EVIDENCE, AND A
+// FAILED MIRROR CONTRADICTS A DOCUMENT THAT EXISTS. It is untrue for a transient error exactly as it
+// is for a refusal — the reasons are facts about the ledger, not about the exception. So the outer
+// handler now asks the DATABASE, in the statement that writes.
+// ---------------------------------------------------------------------------
+
+test('[o3d-peh1 r4] a NON-follow-up failure on an already-posted row never records it as a failed post', async () => {
+  reset('quickbooks')
+  // blankRow() carries XBILL-1, so this row takes the short-circuit — and the thing that fails is
+  // the SYNCED/POSTED transaction, which round 3's inner catch does not cover at all.
+  state.syncRows = [{ ...blankRow(), retryCount: QBO_MAX_RETRIES - 1 }]
+  state.failSyncedWriteFor.add('log-1')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.failed, 1, 'the failure is real and counted')
+  assert.ok(
+    state.journal.some((entry) => entry.op === 'synced.attempted-and-failed'),
+    'and it happened where this test says it did — not in follow-up work',
+  )
+  assert.equal(subject().status, 'FAILED', 'the retry budget is still bounded — that part is unchanged')
+  assert.equal(subject().retryCount, QBO_MAX_RETRIES)
+  assert.deepEqual(
+    mirrorFailures(),
+    [],
+    'THE POINT: the document is in QuickBooks, so nothing may write the mirrored event FAILED for it',
+  )
+  assert.equal(subject().externalTransactionId, 'XBILL-1', 'post evidence survives the terminal transition')
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date || subject().backReferenceFollowUpsPendingAt === null,
+    'the obligation column is not disturbed by the failure transition',
+  )
+  assert.match(String(subject().errorMessage), /SYNCED transaction could not be written/)
+})
+
+test('[o3d-peh1 r4] and on the FRESH-POST arm, where the in-memory snapshot still says "not posted"', async () => {
+  // THE CASE NO IN-MEMORY TEST COULD GET RIGHT. `entry` is the PRE-CLAIM snapshot: this row starts
+  // with no external id, acquires one when the SYNCED transaction commits, and then the follow-up
+  // catch's announcement throws. `entry.externalTransactionId` is still null in memory while the row
+  // in the database names a document — so the handler has to ask the database, in the write.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
+  state.failFollowUpsFor.add('log-1')
+  state.throwingActivityActions.add('quickbooks_followup_error')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.failed, 1)
+  assert.equal(
+    subject().externalTransactionId,
+    'XBILL-1',
+    'the post committed in this very iteration — the document IS in QuickBooks',
+  )
+  assert.ok(
+    state.mirror.some((entry) => entry.status === 'POSTED'),
+    'and the mirror says so, which is what a FAILED write would then contradict',
+  )
+  assert.equal(subject().status, 'FAILED', 'the retries are exhausted, so this is the terminal write')
+  assert.deepEqual(mirrorFailures(), [], 'and it still writes no FAILED mirror over a live document')
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date,
+    'the obligation survives too: the follow-ups were never enqueued',
+  )
+})
+
+test('[o3d-peh1 r4] a main-post failure on a row with NO document is recorded exactly as before', async () => {
+  // THE CONTROL, and the one that stops the fix being "never mirror a failure". A row that never
+  // posted has no evidence to protect: the terminal write must still stamp the mirrored event FAILED,
+  // because that is the truth about it. Without this the change would be indistinguishable from
+  // deleting the FAILED mirror altogether.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
+  state.failSyncedWriteFor.add('log-1')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.failed, 1)
+  assert.equal(subject().externalTransactionId, null, 'nothing was ever posted for this row')
+  assert.equal(subject().status, 'FAILED')
+  assert.deepEqual(
+    mirrorFailures().map((entry) => entry.syncLogId),
+    ['log-1'],
+    'so the mirrored event IS stamped FAILED — the evidence check is a fence, not a blanket refusal',
+  )
 })
