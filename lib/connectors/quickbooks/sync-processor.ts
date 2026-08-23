@@ -20,7 +20,12 @@ import { pushJournalEntry } from './journals'
 import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
-import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import {
+  liveRowOccupiesFollowUpSlot,
+  planFollowUpEnqueue,
+  readFollowUpIdempotencyKey,
+  type FollowUpPayload,
+} from '@/lib/domain/accounting/followup-idempotency'
 import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
@@ -178,15 +183,46 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
  * WORST-FIRST, as o3d-nf9i established for aggregation: one asserted occupant is enough for the
  * suppression to rest on an assertion, because any of them may be the only reason this is skipped.
  *
- * DELIBERATELY NOT PORTED HERE: Xero's `liveRowOccupiesFollowUpSlot` anchor comparison (o3d-hbgo),
- * which narrows the live set to rows targeting the SAME external document. That is a different
- * finding about a different defect, and mixing it in would change which rows this returns as well as
- * how they are described. The scope predicate is unchanged; only the basis is new.
+ * PORTED HERE (o3d-hbgo, this branch) — AND ONLY A ROW TARGETING THE SAME DOCUMENT OCCUPIES THE SLOT.
+ *
+ * The o3d-anu8 note that stood here said Xero's `liveRowOccupiesFollowUpSlot` was "deliberately not
+ * ported: a different finding about a different defect". That was the right call for THAT branch — it
+ * would have changed which rows this returns as well as how they are described — and it is the wrong
+ * state to leave behind, because the defect it declined to fix is fully live on this connector:
+ *
+ *   A SalesOrder's invoice is deleted and re-posted to a NEW QuickBooks invoice. The SYNCED
+ *   INVOICE_PAYMENT row from the FIRST invoice still matches (connector, type, referenceType,
+ *   referenceId), so `exists` is true, `planFollowUpEnqueue` skips, and the REPLACEMENT invoice is
+ *   never settled. Silently — a skip logs nothing. Same shape for INVOICE_PDF: the order keeps the
+ *   PDF of the invoice it no longer has.
+ *
+ * WHAT MAKES IT SAFE TO NARROW NOW, which was not obviously true when it was declined. The partial
+ * unique index `accounting_sync_logs_followup_live_unique` is keyed on the `connector` COLUMN, so
+ * 20260819120000 made it anchor-scoped for BOTH connectors at once. Since then the database has
+ * ALREADY permitted two live QuickBooks rows in this scope that name different documents, and this
+ * coarse lookup has been the only thing standing in the way — an application guard stricter than its
+ * own backstop, in the direction that loses work. Narrowing it makes the two agree rather than
+ * loosening anything the database was enforcing.
+ *
+ * AND IT DOES NOT OPEN A DOUBLE-PAY. The rows this now lets through name a DIFFERENT invoice from
+ * every live row on the order; the payment they post settles a document nothing has settled. A row
+ * that records NO anchor still occupies the slot (`liveRowOccupiesFollowUpSlot` treats an unanchored
+ * stored payload as matching), so legacy rows written before the payload carried one keep suppressing,
+ * exactly as they do today: for money, unknown target has to read as "possibly this one".
+ *
+ * ONE PREDICATE, NOT A SECOND SPELLING OF IT. The comparison is imported, not copied — the two
+ * connectors reach one rule, as they already do for the settlement basis below.
+ *
+ * `asserted` IS NARROWED WITH IT, and that is not incidental. Judged over every live row, an
+ * operator's assertion about the RETIRED invoice would refuse the enqueue for the REPLACEMENT — the
+ * o3d-anu8 refusal firing on a document its assertion never named, which is the same category error
+ * this fix removes, arriving by the other route.
  */
 async function hasExistingSyncLog(
   type: AccountingSyncType,
   referenceType: string,
   referenceId: string,
+  payload: SyncPayload,
 ): Promise<{ exists: boolean; asserted: boolean }> {
   const liveRows = await db.accountingSyncLog.findMany({
     where: {
@@ -196,14 +232,16 @@ async function hasExistingSyncLog(
       referenceId,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
     },
+    // payload, because the anchors that say WHICH DOCUMENT this row settles live inside the JSON; and
     // settlementBasis, because the occupying row is what makes the enqueue a silent skip and a SYNCED
     // row is written by TWO things — the processor's writeback after QuickBooks answered, and an
     // operator typing a document id into the settlement dialog.
-    select: { settlementBasis: true },
+    select: { payload: true, settlementBasis: true },
   })
+  const occupying = liveRows.filter((row) => liveRowOccupiesFollowUpSlot(row.payload, payload as FollowUpPayload))
   return {
-    exists: liveRows.length > 0,
-    asserted: liveRows.some((row) => isOperatorAssertedSettlement(row.settlementBasis)),
+    exists: occupying.length > 0,
+    asserted: occupying.some((row) => isOperatorAssertedSettlement(row.settlementBasis)),
   }
 }
 
@@ -220,7 +258,7 @@ export async function enqueueFollowUpSyncLog(
   /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
   attempt = 0,
 ): Promise<void> {
-  const live = await hasExistingSyncLog(type, referenceType, referenceId)
+  const live = await hasExistingSyncLog(type, referenceType, referenceId, payload)
   const liveRowExists = live.exists
   // o3d-h2wx: a FAILED row is REUSED rather than replaced. The QuickBooks Request-Id is
   // derived from the entry id, so a replacement row posts the retry under a request id
@@ -1356,6 +1394,27 @@ async function enqueueSalesInvoiceFollowUps(
     referenceId,
     invoiceNumber: syncResult.invoiceNumber,
   })
+
+  // o3d-ekn8, CROSS-PORTED FROM THE XERO PATH (this branch) — REGISTER THE RECEIPTS THAT WERE
+  // RECORDED BEFORE THIS INVOICE EXISTED.
+  //
+  // `registerInvoicePaymentWithLedger` refuses a receipt with DOCUMENT_NOT_POSTED while the order has
+  // no accountingInvoiceId, and nothing ever came back for it once the invoice landed: the receipt
+  // stayed recorded, the ledger stayed unsettled, and the only sign was a red NOT_SENT verdict
+  // somebody had to notice. The re-drive that closes it shipped on the Xero connector ONLY, and the
+  // receipt-registration path it re-drives is connector-agnostic — this processor posts INVOICE_PAYMENT
+  // rows itself — so on QuickBooks the defect was still whole.
+  //
+  // THIS IS THE MOMENT THE REFUSAL STOPS APPLYING, and the ordering that makes it so is the same here
+  // as there: `updateBackReference` runs immediately before `enqueueFollowUps`, so the re-read below
+  // sees the id this post just wrote. It re-runs the SAME guarded decision — currency, bank-account
+  // mapping and invoice capacity are all re-checked per receipt — rather than a second, laxer copy.
+  //
+  // Imported dynamically so the connector does not take a static dependency on the sales domain, and
+  // awaited but never allowed to throw: the invoice HAS posted, and a receipt that could not be
+  // re-registered must not turn that into a failed sync entry.
+  const { registerDeferredOrderReceipts } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
+  await registerDeferredOrderReceipts(referenceId)
 }
 
 async function enqueuePurchaseInvoiceFollowUps(
