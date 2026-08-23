@@ -38,6 +38,27 @@
 //    WHERE "recordKind" IS NULL
 //      AND connector = 'woocommerce';
 //
+// COVERAGE, AND WHY SILENCE IS NOT SUCCESS
+//
+// This hook used to exit 0 the moment no verify.sql existed anywhere, printing one
+// line and executing nothing. CI and the deploy both reported success — and a hook
+// that silently passes is worse than no hook, because it is believed. So:
+//
+//   * every run prints what ran AND what did not: how many migrations exist, how many
+//     declare checks, which declarations were skipped because their migration is not
+//     applied, and how many checks actually executed;
+//   * a run that executed NO checks says so in a banner, and says that a zero exit
+//     means nothing was checked rather than nothing was wrong;
+//   * prisma/migrations/verification-required.txt names the migrations that MUST
+//     declare a verify.sql. A named migration with no verify.sql is a coverage gap.
+//
+// Coverage gaps are FATAL under --strict and reported-but-not-fatal otherwise, and
+// the split is deliberate. --strict is for CI, where a missing file is a repo-hygiene
+// defect and the PR is the place to fix it. The deploy scripts run without it, because
+// refusing to start a built and migrated application over a file that is absent from
+// the repository would turn a documentation gap into an outage. What stops a cutover
+// is a check that RAN and failed.
+//
 // WHAT THIS CANNOT DO, stated because the branches that asked for it said so first:
 // verification catches a predecessor that CREATED rows. It cannot catch one that
 // OVERWROTE an already-correct row — both of o3d-xnwu's queries return zero while
@@ -53,6 +74,7 @@ import { config as loadDotenv } from 'dotenv'
 import pg from 'pg'
 
 export const VERIFY_FILENAME = 'verify.sql'
+export const REQUIRED_FILENAME = 'verification-required.txt'
 
 /**
  * Pure: given the migration directory names present on disk and the set recorded as
@@ -133,22 +155,101 @@ export function verdict(checks, errors) {
 
 export function findMigrationsWithVerify(migrationsDir) {
   if (!existsSync(migrationsDir)) return []
+  return listMigrationDirectories(migrationsDir).filter((name) =>
+    existsSync(join(migrationsDir, name, VERIFY_FILENAME)),
+  )
+}
+
+export function listMigrationDirectories(migrationsDir) {
+  if (!existsSync(migrationsDir)) return []
   return readdirSync(migrationsDir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
-    .filter((name) => existsSync(join(migrationsDir, name, VERIFY_FILENAME)))
     .sort()
+}
+
+/** Pure: the migration names a `verification-required.txt` names. Comments and blanks ignored. */
+export function parseRequiredList(text) {
+  return String(text ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/#.*$/, '').trim())
+    .filter((line) => line.length > 0)
+    .sort()
+}
+
+export function readRequiredList(migrationsDir) {
+  const file = join(migrationsDir, REQUIRED_FILENAME)
+  if (!existsSync(file)) return []
+  return parseRequiredList(readFileSync(file, 'utf8'))
+}
+
+/**
+ * Pure: which required migrations declare nothing, and which required names have
+ * rotted away. A name that is not on disk is reported separately from one that is on
+ * disk without a verify.sql — the first is a stale list, the second is missing cover.
+ */
+export function assessCoverage(allMigrations, migrationsWithVerify, requiredNames) {
+  const onDisk = new Set(allMigrations)
+  const declared = new Set(migrationsWithVerify)
+  const missing = []
+  const stale = []
+  for (const name of [...requiredNames].sort()) {
+    if (!onDisk.has(name)) stale.push(name)
+    else if (!declared.has(name)) missing.push(name)
+  }
+  return { required: [...requiredNames].sort(), missing, stale, satisfied: missing.length === 0 && stale.length === 0 }
+}
+
+/** What ran, what did not, and what was never declared. Printed on every run. */
+function reportCoverage({ allMigrations, withVerify, coverage, strict, ran, skipped, checkCount }) {
+  console.log('Post-migration verification coverage:')
+  console.log(`  migrations on disk     : ${allMigrations.length}`)
+  console.log(`  declaring ${VERIFY_FILENAME}   : ${withVerify.length}`)
+  console.log(`  required to declare it : ${coverage.required.length}`)
+  console.log(`  declarations executed  : ${ran.length}`)
+  console.log(`  checks executed        : ${checkCount}`)
+
+  for (const name of ran) console.log(`  [ran]     ${name}/${VERIFY_FILENAME}`)
+  for (const name of skipped) console.log(`  [SKIPPED] ${name}/${VERIFY_FILENAME} — its migration is not recorded as applied`)
+  for (const name of coverage.missing) {
+    console.log(`  [MISSING] ${name} is required to declare ${VERIFY_FILENAME} and does not`)
+  }
+  for (const name of coverage.stale) {
+    console.log(`  [STALE]   ${name} is listed in ${REQUIRED_FILENAME} but is not a migration in this tree`)
+  }
+
+  if (checkCount === 0) {
+    console.log('')
+    console.log('  ============================================================')
+    console.log('  NOTHING WAS VERIFIED. This run executed zero checks.')
+    console.log('  A zero exit here means nothing was CHECKED, not that nothing')
+    console.log(`  is wrong. Declare checks in prisma/migrations/<name>/${VERIFY_FILENAME}.`)
+    console.log('  ============================================================')
+  }
+  if (!coverage.satisfied && !strict) {
+    console.log('')
+    console.log(`  Coverage gaps above are reported, not fatal, outside --strict: a missing file`)
+    console.log(`  in the repository must not stop a built and migrated application from starting.`)
+    console.log(`  CI runs this hook with --strict, which is where they fail.`)
+  }
 }
 
 async function main() {
   loadDotenv({ path: '.env.local', override: false, quiet: true })
   loadDotenv({ path: '.env', override: false, quiet: true })
 
+  const strict = process.argv.includes('--strict') || process.env.IMS_VERIFY_COVERAGE_STRICT === '1'
   const migrationsDir = process.env.PRISMA_MIGRATIONS_DIR ?? 'prisma/migrations'
+  const allMigrations = listMigrationDirectories(migrationsDir)
   const withVerify = findMigrationsWithVerify(migrationsDir)
+  const coverage = assessCoverage(allMigrations, withVerify, readRequiredList(migrationsDir))
 
   if (withVerify.length === 0) {
-    console.log(`No migration declares ${VERIFY_FILENAME}; nothing to verify.`)
+    reportCoverage({ allMigrations, withVerify, coverage, strict, ran: [], skipped: [], checkCount: 0 })
+    if (strict && !coverage.satisfied) {
+      console.error('\nCoverage assertion FAILED: the migrations above are required to declare verification checks.')
+      process.exitCode = 1
+    }
     return
   }
 
@@ -163,15 +264,17 @@ async function main() {
 
   const allChecks = []
   const allErrors = []
+  let runnable = []
+  let unapplied = []
 
   try {
     const applied = await client.query(
       `SELECT migration_name FROM _prisma_migrations WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL`,
     )
-    const { runnable, unapplied } = selectVerificationFiles(
+    ;({ runnable, unapplied } = selectVerificationFiles(
       withVerify,
       applied.rows.map((row) => row.migration_name),
-    )
+    ))
 
     for (const name of unapplied) {
       allErrors.push(`${name} declares ${VERIFY_FILENAME} but is not recorded as applied — the migration step did not do what this run assumed.`)
@@ -197,6 +300,22 @@ async function main() {
   for (const check of allChecks) {
     const label = check.passed ? 'ok  ' : 'FAIL'
     console.log(`  [${label}] ${check.migration}: ${check.name} = ${check.violations}`)
+  }
+
+  reportCoverage({
+    allMigrations,
+    withVerify,
+    coverage,
+    strict,
+    ran: runnable,
+    skipped: unapplied,
+    checkCount: allChecks.length,
+  })
+
+  if (strict && !coverage.satisfied) {
+    allErrors.push(
+      `coverage assertion: ${[...coverage.missing, ...coverage.stale].join(', ')} — see prisma/migrations/${REQUIRED_FILENAME}.`,
+    )
   }
 
   const result = verdict(allChecks, allErrors)

@@ -25,18 +25,54 @@
 #   2. the cron entries             (crontab -u $APP_USER — the easy ones to forget:
 #                                    nothing runs between ticks, but each tick drives
 #                                    a queue worker. Fenced, then restored verbatim.)
-#   3. anything else still attached (scripts/check-db-writers.mjs asks Postgres, so a
-#                                    writer nobody enumerated still blocks the migration)
+#   3. anything else still attached (CONNECT is revoked from the application role for
+#                                    the window, and scripts/check-db-writers.mjs then
+#                                    asks Postgres, so a writer nobody enumerated
+#                                    still blocks the migration)
 #
 # ON A POST-STOP FAILURE THE OLD VERSION STAYS DOWN. Restarting it against a migrated
 # schema is the window this order exists to close. Fix and re-run — every step is
 # idempotent and a re-run adopts the fence.
 #
+# THE THREE FENCES, AND WHEN EACH IS ESTABLISHED (o3d-2sm1.2).
+#
+#   1. THE REBOOT FENCE — a systemd drop-in carrying `AssertPathExists=!<marker>`,
+#      installed and VERIFIED BEFORE the migration starts, not from the exit trap. A
+#      fence that only exists if the script lives long enough to install it is not a
+#      fence: power loss or a SIGKILL during the migration skips the trap entirely and
+#      the predecessor comes back on the next boot against a migrated schema. It is a
+#      drop-in rather than `systemctl mask` because masking symlinks the unit NAME to
+#      /dev/null under /etc/systemd/system, which fails outright for a unit whose own
+#      file lives there — and `mask --runtime` is erased by the very reboot it is meant
+#      to survive. Installation is checked against `systemctl show -p DropInPaths`;
+#      an unverifiable fence fails the deploy before anything is stopped.
+#
+#   2. THE CRON FENCE — the whole crontab commented out, backed up verbatim once, and
+#      restored only after the new version answers its health check.
+#
+#   3. THE CONNECTION FENCE — CONNECT revoked from the application role for the length
+#      of the window (scripts/fence-db-connections.mjs), so the drain is continuous
+#      rather than a snapshot that anything can connect after. It needs a privileged
+#      connection of its own (DEPLOY_ADMIN_DATABASE_URL); without one this script says
+#      SO, LOUDLY, and falls back to the snapshot probe rather than implying a fence it
+#      does not have. It is released in the exit trap as well as on success, because a
+#      revoke nobody undoes is an application that cannot connect at all.
+#
+# A RE-RUN ADOPTS ALL THREE BEFORE IT REBUILDS. Finding the marker used to print a
+# warning and carry on pulling and building for minutes while a rebooted or
+# operator-started service served the half-migrated schema again. Adoption is now the
+# first thing after the lock: re-stop, re-establish and verify the reboot fence,
+# confirm cron is still fenced, and release any connection fence left standing.
+#
 # Usage:
 #   bash update.sh              # pull latest from git and redeploy
-#   bash update.sh --dry-run    # print the plan; change nothing
+#   bash update.sh --dry-run    # print the plan; change nothing (works unprivileged)
 #   bash update.sh --no-git     # skip git pull (use current files)
 #   bash update.sh --skip-build # skip npm build (migrations + restart only)
+#
+# IMS_APP_DIR / IMS_DATA_DIR / IMS_BACKUP_DIR / IMS_SERVICE_UNIT override the paths
+# below. They exist so that --dry-run can be exercised against a fixture instead of
+# the live installation; a real update leaves them unset.
 # =============================================================================
 
 set -euo pipefail
@@ -58,8 +94,6 @@ header() {
   echo -e "${BOLD}${BLUE}============================================================${RESET}"
   echo ""
 }
-
-[[ $EUID -ne 0 ]] && die "Run as root: sudo bash update.sh"
 
 run_as_user() {
   local user="$1"
@@ -91,9 +125,10 @@ run_git_as_user() {
 
 APP_NAME="one-two-inventory"
 APP_USER="imsapp"
-APP_DIR="/opt/${APP_NAME}"
-DATA_DIR="/var/lib/${APP_NAME}"
-BACKUP_DIR="/var/backups/${APP_NAME}"
+APP_DIR="${IMS_APP_DIR:-/opt/${APP_NAME}}"
+DATA_DIR="${IMS_DATA_DIR:-/var/lib/${APP_NAME}}"
+BACKUP_DIR="${IMS_BACKUP_DIR:-/var/backups/${APP_NAME}}"
+SERVICE_UNIT="${IMS_SERVICE_UNIT:-${APP_NAME}.service}"
 DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
 DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
 DEPLOY_SSH_KEY_PATH="${DEPLOY_SSH_DIR}/id_ed25519"
@@ -118,6 +153,12 @@ for arg in "$@"; do
   esac
 done
 
+# --dry-run changes nothing, so it does not need root. A real update stops a systemd
+# unit and rewrites another user's crontab, so that one does.
+if [[ $EUID -ne 0 ]] && ! $DRY_RUN; then
+  die "Run as root: sudo bash update.sh  (--dry-run works unprivileged)"
+fi
+
 [[ -d "$APP_DIR" ]] || die "App directory ${APP_DIR} not found. Run install.sh first."
 [[ -f "${APP_DIR}/.env" ]] || die ".env not found. Run install.sh first."
 
@@ -130,6 +171,10 @@ if [[ -f "${DEPLOY_META_FILE}" ]]; then
   set +a
 fi
 
+# May be absent from .env, and `set -u` is on. Empty means "no privileged connection",
+# which the connection fence reports as NOT FENCED rather than silently skipping.
+DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL:-}"
+
 START_TIME=$(date +%s)
 
 # ---------------------------------------------------------------------------
@@ -138,16 +183,28 @@ START_TIME=$(date +%s)
 # FENCE_ARMED means: from here on, nothing in this script restarts what it stopped.
 # A "rollback" that brings the old version back up against a MIGRATED schema is the
 # exact window this order exists to close, so on a post-stop failure the correct
-# state is DOWN — and, when a migration was attempted, masked, so a reboot does not
-# quietly undo it. Fix the cause and re-run: every step below is idempotent.
+# state is DOWN — and fenced against a reboot by the drop-in installed before the
+# migration started, so a power cut does not quietly undo it. Fix the cause and re-run:
+# every step below is idempotent, and a re-run adopts all three fences before it builds.
 # ---------------------------------------------------------------------------
 FENCE_ARMED=false
 FENCE_MASK=false
 DEPLOY_OK=false
 CRON_FENCED=false
 CURRENT_STEP="startup"
+BACKUP_FILE=""
 FENCE_FILE="${DATA_DIR}/DEPLOY-FENCED"
 CRON_BACKUP="${DATA_DIR}/crontab-${APP_USER}.bak"
+FENCE_DROPIN_DIR="/etc/systemd/system/${SERVICE_UNIT}.d"
+FENCE_DROPIN_FILE="${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
+DB_FENCE_DIR="${DATA_DIR}/deploy"
+DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
+DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"
+DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE}"
+# The connection the migration itself runs through. It becomes the privileged URL when
+# the connection fence engages, because the fence closes the app role out and the
+# migration must not be closed out with it.
+MIGRATION_DATABASE_URL="${DATABASE_URL}"
 
 run() {
   if $DRY_RUN; then
@@ -155,6 +212,169 @@ run() {
     return 0
   fi
   "$@"
+}
+
+# ---------------------------------------------------------------------------
+# The reboot fence.
+#
+# The marker file is the condition; the drop-in is what makes systemd honour it. They
+# are written together and BEFORE anything is stopped, so that a machine which loses
+# power mid-migration comes back with the unit refusing to start rather than serving a
+# half-migrated schema. `systemctl mask` is not usable for this unit: a mask is a
+# symlink at /etc/systemd/system/<unit>, which is where a locally-installed unit file
+# already lives, and `mask --runtime` writes to /run, which a reboot erases.
+# ---------------------------------------------------------------------------
+write_fence_marker() {
+  local reason="$1" status="${2:-0}"
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would write ${FENCE_FILE}"
+    return 0
+  fi
+  mkdir -p "${DATA_DIR}"
+  {
+    echo "fenced_at=$(date -Iseconds)"
+    echo "reason=${reason}"
+    echo "failed_step=${CURRENT_STEP}"
+    echo "exit_status=${status}"
+    echo "migration_attempted=${FENCE_MASK}"
+    echo "pre_migration_backup=${BACKUP_FILE:-none}"
+    echo "cron_backup=${CRON_BACKUP}"
+    echo "db_connect_fence_state=${DB_FENCE_STATE}"
+    echo "release_db_connect_fence=${DB_FENCE_RELEASE_CMD}"
+  } > "${FENCE_FILE}"
+  chmod 600 "${FENCE_FILE}"
+}
+
+verify_reboot_fence() {
+  [[ -f "${FENCE_FILE}" ]] || { error "Reboot fence NOT verified: the marker ${FENCE_FILE} does not exist."; return 1; }
+
+  local dropins
+  dropins="$(systemctl show -p DropInPaths --value "${SERVICE_UNIT}" 2>/dev/null || true)"
+  if [[ "${dropins}" == *"${FENCE_DROPIN_FILE}"* ]]; then
+    success "Reboot fence verified: systemd reports ${FENCE_DROPIN_FILE} loaded for ${SERVICE_UNIT}."
+    return 0
+  fi
+  if systemctl cat "${SERVICE_UNIT}" 2>/dev/null | grep -qF "${FENCE_DROPIN_FILE}"; then
+    success "Reboot fence verified: ${FENCE_DROPIN_FILE} appears in 'systemctl cat ${SERVICE_UNIT}'."
+    return 0
+  fi
+  error "Reboot fence NOT verified: systemd does not report ${FENCE_DROPIN_FILE} for ${SERVICE_UNIT}."
+  return 1
+}
+
+install_reboot_fence() {
+  local reason="$1"
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would write ${FENCE_FILE} and ${FENCE_DROPIN_FILE}, daemon-reload, and verify with systemctl show -p DropInPaths"
+    return 0
+  fi
+
+  write_fence_marker "${reason}"
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    error "systemctl is not available: there is NO reboot fence. Nothing stops this host"
+    error "from starting the old version against a migrated schema after a reboot."
+    return 1
+  fi
+
+  mkdir -p "${FENCE_DROPIN_DIR}"
+  cat > "${FENCE_DROPIN_FILE}" <<EOF
+[Unit]
+# Installed by scripts/update.sh (o3d-2sm1.2) for the length of a cutover.
+# While the marker below exists this unit must not start — not by hand, and not on
+# boot. update.sh removes both once the new build has answered its health check.
+AssertPathExists=!${FENCE_FILE}
+EOF
+  chmod 644 "${FENCE_DROPIN_FILE}"
+
+  if ! systemctl daemon-reload; then
+    error "systemctl daemon-reload failed; the reboot fence is NOT active."
+    return 1
+  fi
+  verify_reboot_fence
+}
+
+remove_reboot_fence() {
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would remove ${FENCE_DROPIN_FILE}, daemon-reload, and delete ${FENCE_FILE}"
+    return 0
+  fi
+  rm -f "${FENCE_DROPIN_FILE}"
+  rmdir "${FENCE_DROPIN_DIR}" 2>/dev/null || true
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || warn "daemon-reload failed while lifting the reboot fence."
+  fi
+  # The marker is the condition, so deleting it is what actually lifts the fence. A
+  # drop-in left behind is untidy rather than dangerous, but say so.
+  rm -f "${FENCE_FILE}"
+  [[ -e "${FENCE_DROPIN_FILE}" ]] && warn "Could not remove ${FENCE_DROPIN_FILE}; it is inert without ${FENCE_FILE}, but remove it by hand."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# The connection fence. See scripts/fence-db-connections.mjs for what it can and
+# cannot promise; the important part here is that a failure to RELEASE it is an
+# application that cannot reach its database at all, so every path releases it and
+# every path that cannot says exactly what to run by hand.
+# ---------------------------------------------------------------------------
+fence_db_connections() {
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/fence-db-connections.mjs --fence"
+    return 0
+  fi
+  if [[ ! -f "${DB_FENCE_SCRIPT}" ]]; then
+    warn "${DB_FENCE_SCRIPT} is not in this checkout: NOT FENCED, the drain below is a snapshot only."
+    return 0
+  fi
+
+  mkdir -p "${DB_FENCE_DIR}"
+  chown "${APP_USER}:${APP_USER}" "${DB_FENCE_DIR}"
+  chmod 700 "${DB_FENCE_DIR}"
+
+  local rc=0
+  run_as_user "${APP_USER}" env \
+    DATABASE_URL="${DATABASE_URL}" \
+    DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+    node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" || rc=$?
+
+  case "${rc}" in
+    0)
+      MIGRATION_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}"
+      success "Connection fence up: new application connections are refused for the window."
+      ;;
+    3)
+      warn "THE DATABASE IS NOT FENCED. What follows is a SNAPSHOT, not a fence:"
+      warn "nothing stops a client connecting between the probe and the end of the migration."
+      warn "Set DEPLOY_ADMIN_DATABASE_URL (docs/installation.md) to make this a real fence."
+      ;;
+    *)
+      die "The connection fence failed (exit ${rc}). Nothing has been migrated."
+      ;;
+  esac
+}
+
+release_db_connections() {
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would run: ${DB_FENCE_RELEASE_CMD}"
+    return 0
+  fi
+  [[ -f "${DB_FENCE_STATE}" ]] || return 0
+  [[ -f "${DB_FENCE_SCRIPT}" ]] || { error "Cannot release the connection fence: ${DB_FENCE_SCRIPT} is missing."; return 1; }
+
+  if run_as_user "${APP_USER}" env \
+      DATABASE_URL="${DATABASE_URL}" \
+      DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+      node "${DB_FENCE_SCRIPT}" --release --state-file="${DB_FENCE_STATE}"; then
+    MIGRATION_DATABASE_URL="${DATABASE_URL}"
+    success "Connection fence released."
+    return 0
+  fi
+
+  error "THE CONNECTION FENCE COULD NOT BE RELEASED. The application role still has no"
+  error "CONNECT on this database, so the application cannot start until this is undone:"
+  error "  ${DB_FENCE_RELEASE_CMD}"
+  error "or, by hand as a superuser, the GRANT statements recorded in ${DB_FENCE_STATE}."
+  return 1
 }
 
 on_exit() {
@@ -171,32 +391,35 @@ on_exit() {
     if $FENCE_MASK; then
       echo -e "  schema      : a migration was attempted; the database may be MIGRATED"
       echo -e "                while nothing is serving. That is the intended safe state."
-      echo -e "  restore     : ${BACKUP_FILE:-<no pre-migration backup was taken>}"
+      if [[ -n "${BACKUP_FILE}" ]]; then
+        echo -e "  restore     : ${BACKUP_FILE}"
+      else
+        echo -e "  restore     : NO usable pre-migration dump exists for this run. Either it"
+        echo -e "                was not reached or the dump did not finish, and a partial dump"
+        echo -e "                is not a restore point. Use the most recent completed backup"
+        echo -e "                in ${BACKUP_DIR} and expect to lose the writes made since it."
+      fi
     fi
     echo -e "  service     : STOPPED, and left that way on purpose."
+    echo -e "  reboot      : ${SERVICE_UNIT} is fenced by ${FENCE_DROPIN_FILE};"
+    echo -e "                it will not start on boot while ${FENCE_FILE} exists."
     echo -e "  cron        : ${APP_USER} entries left FENCED (commented out)."
     echo ""
-    echo -e "  Do NOT start ${APP_NAME}.service by hand. Fix the cause and re-run this"
+    echo -e "  Do NOT start ${SERVICE_UNIT} by hand. Fix the cause and re-run this"
     echo -e "  script; it adopts this fence and every step is idempotent."
     echo -e "  State: ${FENCE_FILE}"
     echo ""
 
     if ! $DRY_RUN; then
-      mkdir -p "${DATA_DIR}"
-      {
-        echo "fenced_at=$(date -Iseconds)"
-        echo "failed_step=${CURRENT_STEP}"
-        echo "exit_status=${status}"
-        echo "migration_attempted=${FENCE_MASK}"
-        echo "pre_migration_backup=${BACKUP_FILE:-none}"
-        echo "cron_backup=${CRON_BACKUP}"
-      } > "${FENCE_FILE}"
-      chmod 600 "${FENCE_FILE}"
-
-      systemctl stop "${APP_NAME}.service" >/dev/null 2>&1 || true
-      if $FENCE_MASK; then
-        systemctl mask "${APP_NAME}.service" >/dev/null 2>&1 || true
+      # Belt and braces: re-stop first, in case a Restart= policy, an operator or a
+      # race brought it back between the failure and here.
+      systemctl stop "${SERVICE_UNIT}" >/dev/null 2>&1 || true
+      if ! install_reboot_fence "update failed at ${CURRENT_STEP}"; then
+        echo -e "${RED}${BOLD} THE REBOOT FENCE IS NOT IN PLACE. This host may start the old version${RESET}" >&2
+        echo -e "${RED}${BOLD} against a migrated schema on its next boot. Stop it by hand.${RESET}" >&2
       fi
+      write_fence_marker "update failed at ${CURRENT_STEP}" "${status}"
+      release_db_connections || true
     fi
   fi
 
@@ -262,16 +485,61 @@ unfence_cron() {
 CURRENT_STEP="preflight"
 header "Preflight"
 
-if [[ -f "${FENCE_FILE}" ]]; then
-  warn "Adopting an existing fence — a previous run stopped here:"
-  sed 's/^/         /' "${FENCE_FILE}"
-  warn "Continuing; every step is idempotent."
-fi
-
 if ! $DRY_RUN; then
   mkdir -p "${DATA_DIR}"
   exec 9>"${DATA_DIR}/update.lock"
   flock -n 9 || die "Another update holds ${DATA_DIR}/update.lock. Refusing to run two cutovers at once."
+fi
+
+# Adoption is the FIRST thing after the lock, before the pull and long before the
+# build. A previous run that failed after the stop left this host in a state where a
+# reboot, a Restart= policy or an operator can have the predecessor serving a
+# half-migrated schema again; spending minutes building while that is true is exactly
+# the window the deploy order exists to close. Re-stop, re-fence, verify, then carry on.
+adopt_cron_fence() {
+  command -v crontab >/dev/null 2>&1 || return 0
+  if [[ ! -f "${CRON_BACKUP}" ]]; then
+    info "No crontab backup from the previous run; its cron entries were never fenced."
+    return 0
+  fi
+  # The backup is the ORIGINAL crontab and must survive until this run finishes.
+  CRON_FENCED=true
+  local current active
+  current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
+  active="$(printf '%s\n' "${current}" | grep -cE '^[[:space:]]*[^#[:space:]]' || true)"
+  if [[ "${active}" -gt 0 ]]; then
+    warn "${active} cron line(s) are active again; re-fencing them."
+    fence_cron
+  else
+    success "Cron is still fenced; ${CRON_BACKUP} holds the original."
+  fi
+}
+
+if [[ -f "${FENCE_FILE}" ]]; then
+  warn "Adopting an existing fence — a previous run stopped here:"
+  sed 's/^/         /' "${FENCE_FILE}"
+
+  FENCE_ARMED=true
+  if grep -qE '^migration_attempted=true$' "${FENCE_FILE}" 2>/dev/null; then
+    FENCE_MASK=true
+  fi
+
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would re-stop ${SERVICE_UNIT}, re-establish and verify the reboot"
+    echo -e "${YELLOW}[DRY]${RESET}   fence, confirm the cron fence, and release any standing connection fence"
+  else
+    info "Re-stopping ${SERVICE_UNIT} before anything else — it may have been started since."
+    systemctl stop "${SERVICE_UNIT}" >/dev/null 2>&1 || true
+    install_reboot_fence "adopted at $(date -Iseconds)" \
+      || die "Could not re-establish the reboot fence. Refusing to continue: a reboot could start the old version against a migrated schema."
+    adopt_cron_fence
+    # Released here rather than carried: the build below may need the database, and the
+    # window is re-fenced at drain-verify anyway. Releasing now also proves the release
+    # path works before the migration depends on it.
+    release_db_connections \
+      || die "A connection fence from the previous run could not be released; fix that before re-running."
+  fi
+  warn "Fence adopted. Continuing; every step is idempotent."
 fi
 
 if ! $NO_GIT; then
@@ -374,8 +642,16 @@ if ! $SKIP_BUILD && ! $DRY_RUN; then
   info "New BUILD_ID: $(cat "${APP_DIR}/.next/BUILD_ID")"
 fi
 
+# Said HERE, while nothing has been stopped, because the post-migration hook can only
+# report a coverage gap once the schema has already moved.
 VERIFY_COUNT=$(find "${APP_DIR}/prisma/migrations" -mindepth 2 -maxdepth 2 -name 'verify.sql' -type f 2>/dev/null | wc -l)
+REQUIRED_COUNT=$(grep -cE '^[[:space:]]*[^#[:space:]]' "${APP_DIR}/prisma/migrations/verification-required.txt" 2>/dev/null || true)
 info "Migrations declaring a post-migration verification: ${VERIFY_COUNT}"
+info "Migrations required to declare one: ${REQUIRED_COUNT:-0}"
+if [[ "${VERIFY_COUNT}" -eq 0 ]]; then
+  warn "No migration in this tree declares a verification check: the post-migration hook"
+  warn "will execute nothing. A pass from it will mean nothing was checked."
+fi
 success "Artefact validated."
 
 # ---------------------------------------------------------------------------
@@ -384,13 +660,21 @@ success "Artefact validated."
 CURRENT_STEP="fence-writers"
 header "Stopping and draining every writer"
 
-FENCE_ARMED=true
+# BEFORE the stop, and before the migration: a fence that is only installed on the way
+# out does not exist for a run that is killed rather than exiting. Installing it here
+# also means a failure to install it costs nothing — the old version is still up, the
+# schema has not moved, and FENCE_ARMED is still false, so the failure banner does not
+# claim an outage that has not happened.
 FENCE_MASK=true
+install_reboot_fence "cutover started $(date -Iseconds)" \
+  || die "Refusing to stop the old version without a verified reboot fence: a reboot mid-migration would start it again against a migrated schema."
+
+FENCE_ARMED=true
 
 fence_cron
 
-info "Stopping ${APP_NAME}.service"
-run systemctl stop "${APP_NAME}.service"
+info "Stopping ${SERVICE_UNIT}"
+run systemctl stop "${SERVICE_UNIT}"
 success "Service stopped."
 
 # ---------------------------------------------------------------------------
@@ -398,14 +682,21 @@ success "Service stopped."
 #
 # "Drained" means STOPPED, not idle, and the database is the only authority on that.
 # An enumeration of writers is a guess about the box; pg_stat_activity is the answer.
+#
+# Two steps, in this order. The FENCE shuts the door — new application connections are
+# refused for the rest of the window — and only then does the PROBE assert the room is
+# empty. Probing alone is a snapshot: check-db-writers closes its connection, and the
+# dump and the migration open theirs afterwards, with nothing holding the gap.
 # ---------------------------------------------------------------------------
 CURRENT_STEP="drain-verify"
 header "Proving the writers are gone"
 
+fence_db_connections
+
 if $DRY_RUN; then
   echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/check-db-writers.mjs"
 else
-  run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
+  run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
     node "${APP_DIR}/scripts/check-db-writers.mjs" \
     || die "Another client is still connected to the database. Stop it and re-run; nothing has been migrated."
   success "No other client backends on the database."
@@ -422,24 +713,34 @@ fi
 CURRENT_STEP="migrate"
 header "Pre-migration database backup (nothing is serving)"
 
-BACKUP_FILE="${BACKUP_DIR}/pre-update-$(date +%Y%m%d-%H%M%S).sql.gz"
+# BACKUP_FILE is the name the failure banner offers as the restore point, so it is set
+# ONLY once pg_dump has actually finished. The dump runs to a `.part` file first: a
+# truncated dump is not a restore point, and naming one as though it were is worse than
+# admitting there is none.
+BACKUP_TARGET="${BACKUP_DIR}/pre-update-$(date +%Y%m%d-%H%M%S).sql.gz"
 if $DRY_RUN; then
-  echo -e "${YELLOW}[DRY]${RESET}   would pg_dump to ${BACKUP_FILE}"
+  echo -e "${YELLOW}[DRY]${RESET}   would pg_dump to ${BACKUP_TARGET}"
 else
   mkdir -p "${BACKUP_DIR}"
-  info "Backing up database to ${BACKUP_FILE}..."
-  pg_dump "${DATABASE_URL}" | gzip > "${BACKUP_FILE}"
+  info "Backing up database to ${BACKUP_TARGET}..."
+  BACKUP_PARTIAL="${BACKUP_TARGET}.part"
+  if ! pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_PARTIAL}"; then
+    rm -f "${BACKUP_PARTIAL}"
+    die "pg_dump did not complete; the partial file has been deleted. Nothing has been migrated and there is no restore point for this run."
+  fi
+  mv "${BACKUP_PARTIAL}" "${BACKUP_TARGET}"
+  BACKUP_FILE="${BACKUP_TARGET}"
   success "Backup saved: ${BACKUP_FILE}"
   ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --
 fi
 
 header "Running database migrations"
-run run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
+run run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   npx prisma migrate deploy --schema prisma/schema.prisma
 success "Migrations applied."
 
 header "Validating database schema"
-run run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
+run run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   node "${APP_DIR}/scripts/check-prisma-drift.mjs"
 success "Database schema matches prisma/schema.prisma."
 
@@ -456,20 +757,28 @@ header "Running the migrations' own verification checks"
 if $DRY_RUN; then
   echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/run-migration-verifications.mjs"
 else
-  run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
+  run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
     node "${APP_DIR}/scripts/run-migration-verifications.mjs" \
     || die "A migration's verification check did not return zero. The new version has NOT been started."
-  success "All declared verification checks returned zero."
+  success "Every declared verification check returned zero (see the coverage report above for what was NOT declared)."
 fi
 
 # ---------------------------------------------------------------------------
 # @deploy-phase: start
+#
+# The fences come down in the order that keeps the new version startable: the database
+# first (it cannot serve a database it may not connect to), then the reboot fence.
 # ---------------------------------------------------------------------------
 CURRENT_STEP="start"
 header "Starting the new version"
 
-run systemctl unmask "${APP_NAME}.service" >/dev/null 2>&1 || true
-run systemctl start "${APP_NAME}.service"
+release_db_connections \
+  || die "Refusing to start the application while it has no CONNECT on its own database."
+remove_reboot_fence
+# Lifts a mask left by an older revision of this script, which used `systemctl mask`
+# from its exit trap. Harmless when there is none.
+run systemctl unmask "${SERVICE_UNIT}" >/dev/null 2>&1 || true
+run systemctl start "${SERVICE_UNIT}"
 success "Application service started."
 
 # ---------------------------------------------------------------------------
@@ -492,7 +801,7 @@ else
     sleep 1
   done
   if ! $READY; then
-    journalctl -u "${APP_NAME}.service" -n 60 --no-pager >&2 || true
+    journalctl -u "${SERVICE_UNIT}" -n 60 --no-pager >&2 || true
     die "The new version did not answer /api/health within 60s. Leaving it stopped rather than restoring the old one."
   fi
   success "Health check passed — app is responding."
@@ -501,6 +810,8 @@ fi
 # Cron goes back last, and only once the new version has answered: restoring the
 # queue workers before that would hand them to a server that may still fail.
 unfence_cron
+# Already removed with the reboot fence in the start phase; kept so a re-run that took
+# a different path cannot leave a marker that would refuse the next boot.
 run rm -f "${FENCE_FILE}"
 
 DEPLOY_OK=true
@@ -514,7 +825,7 @@ if $DRY_RUN; then
 else
   header "Update complete (${ELAPSED}s)"
 fi
-echo -e "  ${BOLD}systemctl status ${APP_NAME}.service${RESET}  — check service health"
-echo -e "  ${BOLD}journalctl -u ${APP_NAME}.service -f${RESET}  — view live logs"
+echo -e "  ${BOLD}systemctl status ${SERVICE_UNIT}${RESET}  — check service health"
+echo -e "  ${BOLD}journalctl -u ${SERVICE_UNIT} -f${RESET}  — view live logs"
 echo ""
 echo -e "${GREEN}Done.${RESET}"

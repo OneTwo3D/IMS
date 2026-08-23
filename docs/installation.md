@@ -425,7 +425,15 @@ npm run build
 
 # Stop and drain every writer BEFORE the schema moves
 crontab -u imsapp -l > /var/lib/one-two-inventory/crontab.bak   # then comment the jobs out
+mkdir -p /etc/systemd/system/one-two-inventory.service.d        # reboot fence, BEFORE the migration
+printf '[Unit]\nAssertPathExists=!/var/lib/one-two-inventory/DEPLOY-FENCED\n' \
+  > /etc/systemd/system/one-two-inventory.service.d/zz-deploy-fence.conf
+touch /var/lib/one-two-inventory/DEPLOY-FENCED
+systemctl daemon-reload
+systemctl show -p DropInPaths --value one-two-inventory.service # VERIFY it took
 systemctl stop one-two-inventory.service
+node scripts/fence-db-connections.mjs --fence \
+  --state-file=/var/lib/one-two-inventory/deploy/db-connect-fence.json  # optional; see below
 node scripts/check-db-writers.mjs          # refuses if anything is still connected
 
 # Migrate with nothing serving, and run the migrations' own checks
@@ -434,6 +442,11 @@ node scripts/check-prisma-drift.mjs
 node scripts/run-migration-verifications.mjs
 
 # Only now start the new version — and if any step above failed, leave it stopped
+node scripts/fence-db-connections.mjs --release \
+  --state-file=/var/lib/one-two-inventory/deploy/db-connect-fence.json
+rm -f /etc/systemd/system/one-two-inventory.service.d/zz-deploy-fence.conf
+rm -f /var/lib/one-two-inventory/DEPLOY-FENCED
+systemctl daemon-reload
 systemctl start one-two-inventory.service
 crontab -u imsapp /var/lib/one-two-inventory/crontab.bak       # restore cron last
 ```
@@ -481,12 +494,46 @@ only defence. (o3d-2sm1.1)
    directly and refuses to migrate while any other client backend holds a connection. That is the
    check that catches the writer nobody enumerated.
 
+**A snapshot is not a fence** (o3d-2sm1.2). Step 4 on its own closes its connection, and the dump
+and the migration then open theirs; nothing stops a client connecting in the gap. So the scripts
+first revoke `CONNECT` on the database from the application role for the length of the window
+(`scripts/fence-db-connections.mjs --fence`), drain what is already attached, and only then take
+the snapshot. The revoke is released on every exit path, including the failure trap, because a
+revoke nobody undoes is an application that cannot reach its database at all.
+
+That fence needs a privileged connection of its own, `DEPLOY_ADMIN_DATABASE_URL`:
+
+| Variable | Purpose |
+| --- | --- |
+| `DEPLOY_ADMIN_DATABASE_URL` | A superuser or database-owner connection, as a **different role** from `DATABASE_URL`. Used only by the deploy scripts, and only for the migration window. No ACL can tell "the migration" apart from "the application" when both log in as one role, so without a separate role there is no fence to install. While it is in use the migration runs through this connection, which means objects a migration creates are **owned by this role** — point it at the role that owns the schema today. |
+
+Leave it unset and the deploy still runs: it prints `THE DATABASE IS NOT FENCED`, says exactly what
+that does not protect against, and falls back to the snapshot probe. It does not pretend.
+
+**The reboot fence is installed before the migration, and verified.** Each unit gets a drop-in at
+`/etc/systemd/system/<unit>.d/zz-deploy-fence.conf` carrying
+`AssertPathExists=!<state-dir>/FENCED`, written *before* anything is stopped — a fence installed
+only from the exit trap does not exist for a run that is SIGKILLed or loses power mid-migration,
+which is exactly when it is needed. It is a drop-in and not `systemctl mask` because a mask is a
+symlink at `/etc/systemd/system/<unit>`, which is where a locally-installed unit file already
+lives (the mask fails outright), and `mask --runtime` lives in `/run`, which the reboot erases.
+The scripts check the install against `systemctl show -p DropInPaths` and refuse to stop the
+predecessor if they cannot confirm it.
+
 **On a failure after the stop, the old version stays down.** A "rollback" that restarts the
 predecessor against a migrated schema puts you back in the window the order exists to close. The
-scripts leave the service stopped, mask it (so a reboot does not undo that), write a state file
-recording the failed step, and print what to do. Fix the cause and re-run — every step is
-idempotent and a re-run adopts the existing fence. Do not start the service by hand to "restore
-service" while a migration has been applied and the new build has not started.
+scripts leave the service stopped and fenced against a reboot, write a state file recording the
+failed step and the command that releases the connection fence, and print what to do. Fix the
+cause and re-run — every step is idempotent, and **a re-run adopts all three fences before it
+rebuilds**: it re-stops the service, re-establishes and verifies the reboot fence, confirms cron is
+still fenced and releases any standing connection fence, all before it pulls or builds. Do not
+start the service by hand to "restore service" while a migration has been applied and the new
+build has not started.
+
+**The pre-migration dump is recorded as a restore point only once `pg_dump` succeeds.** It is
+written to a `.part` file and renamed on completion; if it fails, the partial file is deleted and
+the failure banner says there is no restore point for this run rather than naming a truncated
+file as one.
 
 Never run two versions of IMS against the same database at once — no rolling restart, no
 blue/green overlap, no second instance left running on another port.
@@ -525,6 +572,23 @@ SELECT 'shopping_sync_logs missing recordKind' AS check_name,
 
 A check that is only meaningful for one cutover is exactly the right shape: it returns zero for
 ever after, and the day it does not, something restarted a predecessor.
+
+**Coverage is declared, and an absent declaration is visible** (o3d-2sm1.2). The hook used to exit
+0 the moment no `verify.sql` existed anywhere — which is the state this repository was in — so CI
+and the deploy both reported success having executed nothing. Now:
+
+- every run prints what ran and what did not: migrations on disk, how many declare checks, which
+  declarations were skipped because their migration is not applied, and how many checks executed;
+- a run that executed **no** checks prints `NOTHING WAS VERIFIED` and says that a zero exit means
+  nothing was checked, not that nothing is wrong;
+- `prisma/migrations/verification-required.txt` names the migrations that **must** declare a
+  `verify.sql` — the ones whose safety argument depends on which binary was serving while they ran.
+
+A named migration that declares nothing is a coverage gap. It **fails** under `--strict`, which is
+how the `Schema Guardrails` CI job runs the hook, because a missing file is a defect for the pull
+request to fix. The deploy scripts run it **without** `--strict` and report the gap instead:
+refusing to start a built and migrated application over a file absent from the repository would
+turn a documentation gap into an outage. What stops a cutover is a check that ran and failed.
 
 **You do not have to get this right for accounting money posts to stay safe**, and it is worth
 knowing why, because a rollback is a deploy nobody plans. Money posts (customer receipts, supplier

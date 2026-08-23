@@ -1,0 +1,26 @@
+# Migrations that MUST declare a post-migration verification (verify.sql).
+# =============================================================================
+# One migration directory name per line; `#` starts a comment. Read by
+# scripts/run-migration-verifications.mjs, which reports a listed migration that
+# declares nothing as a coverage gap — fatal under --strict (CI), reported but
+# not fatal during a cutover, because a file missing from the repository must
+# not stop a built and migrated application from starting.
+#
+# WHAT BELONGS HERE. A migration whose safety argument depends on WHICH BINARY
+# was serving while it ran. Those are the migrations o3d-2sm1.1 exists for: the
+# deploy order stops the predecessor first, and the verify.sql is the second
+# line that says out loud whether that actually held. A migration that only adds
+# an index, or a column nothing writes across the window, does not belong here.
+#
+# REMOVING A LINE IS A DECISION, not tidying. It says the cutover this migration
+# needed watching over is no longer worth asserting on every deploy.
+
+# Adds sales_order_refunds.reversal_staging_state, a NULLABLE column with no
+# default whose whole point is that NULL means "no writer spoke for this row".
+# Its own migration.sql says a predecessor serving across the window lands rows
+# NULL and can then clear accounting_retry_required, putting them outside the
+# accounting invariant's only bound — unrecoverable. The check this migration
+# owes is therefore: how many refunds exist that the deploy window could have
+# left undecidable. It returns zero for ever after, and the day it does not,
+# something served across a migration.
+20260822090000_refund_reversal_staging_state

@@ -950,6 +950,10 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             because its own prose names `psql` / `prisma migrate` — which is the
  *                             deliberately generous half of this scan working as intended, and is
  *                             why the inventory is a classification rather than a filter.
+ *   'deploy-connection-fence'— connects during a deploy cutover and changes DATABASE-LEVEL
+ *                             privileges only: REVOKE/GRANT CONNECT, plus pg_terminate_backend.
+ *                             It writes no row in any table, so it cannot move a plugin key.
+ *
  *   'deploy-read-only-probe'— connects during a deploy cutover and only READS. It takes no lock and
  *                             needs none: it runs in the window scripts/deploy.sh opens by stopping
  *                             every writer, and its whole job is to describe that window
@@ -974,6 +978,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'app-database-client'
   | 'pinned-lock-session'
   | 'deploy-read-only-probe'
+  | 'deploy-connection-fence'
   | 'seed'
 > = {
   'app/api/backup/restore/route.ts': 'replays-external-sql',
@@ -1010,6 +1015,13 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // and `prisma migrate deploy` — neither executes either tool, and neither writes anything.
   'scripts/check-db-writers.mjs': 'deploy-read-only-probe',
   'scripts/run-migration-verifications.mjs': 'deploy-read-only-probe',
+  // o3d-2sm1.2's cutover fence, and the ONLY entry here that writes to this database
+  // outside the application. It writes no rows at all: its statements are REVOKE and
+  // GRANT CONNECT on the database itself, taken for the length of a migration window
+  // and released on every exit path. It cannot touch `settings`, so it cannot move a
+  // plugin key; what it can do — and what this classification is here to keep visible
+  // — is leave the application unable to connect if a release is ever dropped.
+  'scripts/fence-db-connections.mjs': 'deploy-connection-fence',
   'scripts/deploy.sh': 'migration-runner',
   'scripts/install.sh': 'migration-runner',
   'scripts/prisma-dev-db.sh': 'migration-runner',

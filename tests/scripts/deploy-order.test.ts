@@ -181,3 +181,140 @@ test('the pre-migration backup is taken while nothing is serving', () => {
   assert.notEqual(dump, -1)
   assert.ok(dump > drain, 'pg_dump must run after the writers are stopped')
 })
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.2 — the fences themselves, asserted where they are ESTABLISHED rather
+// than where they are described. Round 1 of the review found the reboot fence was
+// installed only from the exit trap, so power loss or a SIGKILL during the migration
+// bypassed it entirely, and that a re-run warned about an existing fence and then
+// spent minutes rebuilding while a restarted service served the half-migrated schema.
+// Both of those read correctly in the header comment at the time, which is why these
+// assertions look at code lines and at ORDER.
+// ---------------------------------------------------------------------------
+
+/** Like `codeLine`, but ignores the `[DRY]` echoes that merely NAME a step. */
+function realCodeLine(lines: string[], pattern: RegExp | string, from = 0): number {
+  const matches = (line: string) => (typeof pattern === 'string' ? line.includes(pattern) : pattern.test(line))
+  for (let index = from; index < lines.length; index += 1) {
+    if (isCode(lines[index]) && !lines[index].includes('[DRY]') && matches(lines[index])) return index
+  }
+  return -1
+}
+
+function phaseEnd(lines: string[], phase: string): number {
+  const start = phaseLine(lines, phase)
+  const next = lines.findIndex((line, index) => index > start && /^#\s*@deploy-phase:/.test(line.trim()))
+  return next === -1 ? lines.length : next
+}
+
+for (const [name, lines] of [
+  ['deploy.sh', DEPLOY_LINES],
+  ['update.sh', UPDATE_LINES],
+] as const) {
+  test(`${name} installs the reboot fence BEFORE it stops anything, not from the exit trap`, () => {
+    const fenceWriters = phaseLine(lines, 'fence-writers')
+    const install = codeLine(lines, 'install_reboot_fence', fenceWriters)
+    const stop = codeLine(lines, /systemctl stop/, fenceWriters)
+    const migrate = phaseLine(lines, 'migrate')
+
+    assert.notEqual(install, -1, 'the stop phase must install the reboot fence')
+    assert.ok(install < stop, 'the fence must be installed before the service is stopped')
+    assert.ok(install < migrate, 'the fence must be installed before the schema can move')
+  })
+
+  test(`${name} verifies the reboot fence took rather than assuming the command worked`, () => {
+    const source = lines.join('\n')
+    assert.match(
+      source,
+      /systemctl show -p DropInPaths/,
+      'installation must be checked against what systemd actually loaded',
+    )
+    assert.match(source, /AssertPathExists=!/, 'the fence must be a condition systemd enforces on start')
+    // `systemctl mask` cannot mask a unit whose own file lives in /etc/systemd/system,
+    // and --runtime masking is erased by the reboot it is meant to survive.
+    assert.ok(
+      !/^\s*(run )?systemctl mask\b/m.test(source),
+      'the reboot fence must not be systemctl mask; it does not work for a locally-defined unit',
+    )
+  })
+
+  test(`${name} fails the deploy when the fence cannot be verified`, () => {
+    const fenceWriters = phaseLine(lines, 'fence-writers')
+    const install = codeLine(lines, 'install_reboot_fence', fenceWriters)
+    const guard = lines.slice(install, install + 4).join('\n')
+    assert.match(guard, /\|\||die/, 'an unverifiable fence must stop the deploy, not warn')
+  })
+
+  test(`${name} adopts an existing fence before it pulls, installs or builds`, () => {
+    const preflight = phaseLine(lines, 'preflight')
+    const build = phaseLine(lines, 'build')
+
+    const stop = codeLine(lines, /systemctl stop/, preflight)
+    const reinstall = codeLine(lines, 'install_reboot_fence', preflight)
+    const cron = codeLine(lines, 'adopt_cron_fence', preflight)
+    const release = codeLine(lines, 'release_db_connections', preflight)
+
+    for (const [what, at] of [
+      ['re-stop the service', stop],
+      ['re-establish the reboot fence', reinstall],
+      ['confirm the cron fence', cron],
+      ['release any standing connection fence', release],
+    ] as const) {
+      assert.notEqual(at, -1, `adoption must ${what}`)
+      assert.ok(at < build, `adoption must ${what} BEFORE the build phase`)
+    }
+  })
+
+  test(`${name} fences connections continuously, and releases them in the trap`, () => {
+    const drain = phaseLine(lines, 'drain-verify')
+    const fence = realCodeLine(lines, 'fence_db_connections', drain)
+    const probe = realCodeLine(lines, 'check-db-writers.mjs', drain)
+    const migrate = phaseLine(lines, 'migrate')
+
+    assert.notEqual(fence, -1, 'the drain must shut the door, not only look through it')
+    assert.ok(fence < probe, 'the fence goes up before the snapshot is taken')
+    assert.ok(probe < migrate, 'and both happen before the schema moves')
+
+    const trapStart = lines.findIndex((line) => line.startsWith('on_exit() {'))
+    const trapEnd = lines.findIndex((line) => line.startsWith('trap on_exit EXIT'))
+    const trapBody = lines.slice(trapStart, trapEnd).filter(isCode).join('\n')
+    assert.match(
+      trapBody,
+      /release_db_connections/,
+      'a revoke nobody undoes is an application that cannot reach its database',
+    )
+    assert.match(trapBody, /install_reboot_fence/, 'the trap re-establishes the reboot fence it may have lifted')
+  })
+
+  test(`${name} lifts the connection fence before it starts the new build`, () => {
+    const start = phaseLine(lines, 'start')
+    const release = codeLine(lines, 'release_db_connections', start)
+    const startService = codeLine(lines, /systemctl start/, start)
+    assert.notEqual(release, -1, 'the fence must come down in the start phase')
+    assert.ok(release < startService, 'the application cannot serve a database it may not connect to')
+  })
+}
+
+test('update.sh records a backup path only once pg_dump has succeeded', () => {
+  // The failure banner names BACKUP_FILE as the restore point. Setting it before the
+  // dump advertised a partial file as a restore point whenever pg_dump failed.
+  const migrate = phaseLine(UPDATE_LINES, 'migrate')
+  const dump = codeLine(UPDATE_LINES, /pg_dump/, migrate)
+  const assign = codeLine(UPDATE_LINES, /^BACKUP_FILE="/, migrate)
+
+  assert.notEqual(dump, -1)
+  assert.equal(assign, -1, 'BACKUP_FILE must not be assigned a path before the dump runs')
+
+  const body = UPDATE_LINES.slice(migrate, phaseEnd(UPDATE_LINES, 'migrate')).filter(isCode).join('\n')
+  assert.match(body, /\.part/, 'the dump must land on a partial name first')
+  assert.match(body, /BACKUP_FILE="\$\{BACKUP_TARGET\}"/, 'and be adopted only after it completes')
+
+  const trapStart = UPDATE_LINES.findIndex((line) => line.startsWith('on_exit() {'))
+  const trapEnd = UPDATE_LINES.findIndex((line) => line.startsWith('trap on_exit EXIT'))
+  const trapBody = UPDATE_LINES.slice(trapStart, trapEnd).join('\n')
+  assert.match(
+    trapBody,
+    /NO usable pre-migration dump/,
+    'and the failure path must say what to do when there is no restore point',
+  )
+})

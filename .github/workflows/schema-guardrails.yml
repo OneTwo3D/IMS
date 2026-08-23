@@ -16,6 +16,7 @@ on:
       - "scripts/install.sh"
       - "scripts/update.sh"
       - "scripts/check-db-writers.mjs"
+      - "scripts/fence-db-connections.mjs"
       - "scripts/run-migration-verifications.mjs"
   push:
     branches:
@@ -34,6 +35,7 @@ on:
       - "scripts/install.sh"
       - "scripts/update.sh"
       - "scripts/check-db-writers.mjs"
+      - "scripts/fence-db-connections.mjs"
       - "scripts/run-migration-verifications.mjs"
 
 jobs:
@@ -83,7 +85,13 @@ jobs:
       # the new build (o3d-2sm1.1). Running it here means a migration's declared
       # verification queries are exercised against a real migrated database on every
       # PR, instead of first being executed during a production cutover.
+      #
+      # --strict additionally FAILS when a migration named in
+      # prisma/migrations/verification-required.txt declares no verify.sql. The deploy
+      # scripts run the same hook without it: a missing file in the repository is a
+      # defect for the PR to fix, not a reason to refuse to start a built and migrated
+      # application. Until o3d-2sm1.2 this hook exited 0 having executed nothing at all.
       - name: Run the migrations' post-migration verification checks
-        run: node scripts/run-migration-verifications.mjs
+        run: node scripts/run-migration-verifications.mjs --strict
       - name: Run DB-backed concurrency regressions
         run: npm run test:concurrency

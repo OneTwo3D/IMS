@@ -1,8 +1,15 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
+import { join } from 'node:path'
+
 import {
+  assessCoverage,
   evaluateFileResults,
+  findMigrationsWithVerify,
+  listMigrationDirectories,
+  parseRequiredList,
+  readRequiredList,
   selectVerificationFiles,
   verdict,
 } from '@/scripts/run-migration-verifications.mjs'
@@ -101,4 +108,57 @@ test('quiescence means no other client backend at all — idle counts', () => {
   assert.equal(busy.count, 1)
   assert.match(busy.lines[0], /pid 4242/)
   assert.match(busy.lines[0], /state=idle/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.2 — the hook used to exit 0 the moment no verify.sql existed, and this
+// repository contains none, so CI and the deploy both reported success having
+// executed nothing. A hook that silently passes is worse than no hook, because it is
+// believed. Coverage is therefore DECLARED, and an absent declaration is visible.
+// ---------------------------------------------------------------------------
+
+test('the required list ignores comments and blank lines', () => {
+  assert.deepEqual(
+    parseRequiredList('# why this exists\n\n  20260822090000_a  \n20260101000000_b # trailing\n'),
+    ['20260101000000_b', '20260822090000_a'],
+  )
+  assert.deepEqual(parseRequiredList(''), [])
+})
+
+test('a required migration that declares nothing is a coverage gap, not a pass', () => {
+  const coverage = assessCoverage(
+    ['20260822090000_a', '20260822120000_b'],
+    ['20260822120000_b'],
+    ['20260822090000_a'],
+  )
+  assert.deepEqual(coverage.missing, ['20260822090000_a'])
+  assert.deepEqual(coverage.stale, [])
+  assert.equal(coverage.satisfied, false)
+})
+
+test('a required name that is not a migration at all is reported separately', () => {
+  // A stale list and a missing file are different defects: one means the list rotted,
+  // the other means the cover was never written. Collapsing them hides the first.
+  const coverage = assessCoverage(['20260822090000_a'], ['20260822090000_a'], ['20260101000000_renamed'])
+  assert.deepEqual(coverage.missing, [])
+  assert.deepEqual(coverage.stale, ['20260101000000_renamed'])
+  assert.equal(coverage.satisfied, false)
+})
+
+test('coverage is satisfied only when every required migration declares its checks', () => {
+  const coverage = assessCoverage(['m1', 'm2'], ['m1'], ['m1'])
+  assert.equal(coverage.satisfied, true)
+  assert.deepEqual(coverage.missing, [])
+})
+
+test('this repository names at least one migration that must declare checks', () => {
+  // The point of the assertion is that it is not vacuous. An empty required list would
+  // make the coverage report a second hook that always passes — the exact shape the
+  // finding condemned.
+  const required = readRequiredList(join(process.cwd(), 'prisma', 'migrations'))
+  assert.ok(required.length > 0, 'prisma/migrations/verification-required.txt must name the cutover-critical migrations')
+
+  const onDisk = listMigrationDirectories(join(process.cwd(), 'prisma', 'migrations'))
+  const coverage = assessCoverage(onDisk, findMigrationsWithVerify(join(process.cwd(), 'prisma', 'migrations')), required)
+  assert.deepEqual(coverage.stale, [], 'every name in the required list must be a migration that exists')
 })
