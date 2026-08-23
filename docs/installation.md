@@ -417,25 +417,114 @@ cd /opt/one-two-inventory
 git fetch origin
 git reset --hard origin/<deployed-branch>
 
-# Install dependencies
+# Install dependencies and BUILD FIRST, while the old version is still serving the
+# schema it was written against (see "Deploy order" below — this order matters)
 npm ci --omit=dev
-
-# Run database migrations
 npx prisma generate --schema prisma/schema.prisma
-npx prisma migrate deploy --schema prisma/schema.prisma
-
-# Rebuild
 npm run build
 
-# Restart
-systemctl restart one-two-inventory.service
+# Stop and drain every writer BEFORE the schema moves
+crontab -u imsapp -l > /var/lib/one-two-inventory/crontab.bak   # then comment the jobs out
+systemctl stop one-two-inventory.service
+node scripts/check-db-writers.mjs          # refuses if anything is still connected
+
+# Migrate with nothing serving, and run the migrations' own checks
+npx prisma migrate deploy --schema prisma/schema.prisma
+node scripts/check-prisma-drift.mjs
+node scripts/run-migration-verifications.mjs
+
+# Only now start the new version — and if any step above failed, leave it stopped
+systemctl start one-two-inventory.service
+crontab -u imsapp /var/lib/one-two-inventory/crontab.bak       # restore cron last
 ```
 
 ### Deploy order, and what happens on a rollback
 
-Stop the old process, then start the new one. Never run two versions of IMS against the same
-database at once — no rolling restart, no blue/green overlap, no second instance left running on
-another port. `scripts/update.sh` and `scripts/deploy.sh` already do this.
+The order is:
+
+```
+build -> validate -> STOP AND DRAIN EVERY WRITER -> migrate -> verify -> start
+```
+
+`scripts/update.sh` and `scripts/deploy.sh` implement exactly that, and
+`tests/scripts/deploy-order.test.ts` fails if the steps are reordered.
+
+**Why the migration comes after the stop and not before it.** These scripts used to migrate
+first and build second, which left the OLD version serving the MIGRATED schema for the whole
+length of a build — minutes. Every safety argument of the form "the new code is what writes to
+the new column" is false for that window. Two migrations measured what it costs:
+
+- a refund-reversal witness column: the old binary keeps inserting rows without it, and its own
+  retry then clears `accounting_retry_required`, which is the accounting invariant's only bound.
+  Once that is cleared the row leaves every query that could find it again — unrecoverable.
+- a shopping-sync discriminator column: the old binary still selects held sales invoices by an
+  operator-typed payload field, so it can overwrite an already-stamped row. That case is neither
+  repairable nor detectable — the migration's own verification queries return zero while the
+  damage stands.
+
+The second case is why quiescence cannot be a post-hoc check. Verification catches an old binary
+that *created* rows; nothing catches one that *overwrote* them. Stopping the writer first is the
+only defence. (o3d-2sm1.1)
+
+**"Drained" means stopped, not idle.** The scripts stop, in order:
+
+1. the application service (`systemctl stop`, so a `Restart=` policy cannot undo it);
+2. any remaining process whose working directory is the app directory — matched by
+   `/proc/<pid>/cwd`, so a second instance serving a different tree and a different database is
+   never touched;
+3. the cron entries in the service user's crontab. These are the easy ones to forget: nothing
+   runs between ticks, so the box looks quiet, but each tick drives a queue worker (accounting
+   sync, the WooCommerce webhook inbox, the WMS sweeper, refund reservation release). They are
+   commented out for the window and restored **verbatim** from a backup once the new version has
+   answered its health check;
+4. anything else still connected — `scripts/check-db-writers.mjs` asks `pg_stat_activity`
+   directly and refuses to migrate while any other client backend holds a connection. That is the
+   check that catches the writer nobody enumerated.
+
+**On a failure after the stop, the old version stays down.** A "rollback" that restarts the
+predecessor against a migrated schema puts you back in the window the order exists to close. The
+scripts leave the service stopped, mask it (so a reboot does not undo that), write a state file
+recording the failed step, and print what to do. Fix the cause and re-run — every step is
+idempotent and a re-run adopts the existing fence. Do not start the service by hand to "restore
+service" while a migration has been applied and the new build has not started.
+
+Never run two versions of IMS against the same database at once — no rolling restart, no
+blue/green overlap, no second instance left running on another port.
+
+### Post-migration verification: `verify.sql`
+
+A migration can declare checks that must pass **after the schema has moved and before the new
+build is allowed to serve**. Put them in
+
+```
+prisma/migrations/<migration_name>/verify.sql
+```
+
+Prisma reads only `migration.sql` from a migration directory, so this file is invisible to
+`prisma migrate deploy` and carries no checksum risk. `scripts/run-migration-verifications.mjs`
+runs every such file whose migration is recorded as applied — from the deploy scripts during a
+cutover, and from the `Schema Guardrails` CI job against a freshly migrated database on every PR.
+
+The contract:
+
+- every statement returns **exactly one row** with **exactly** the columns `check_name` (text)
+  and `violations` (an integer count);
+- every `violations` must be `0` — anything else fails the deploy and the new build is not
+  started;
+- the checks are read-only, and they must stay true afterwards, because they run on every later
+  deploy too.
+
+```sql
+-- rows the predecessor created without the new discriminator
+SELECT 'shopping_sync_logs missing recordKind' AS check_name,
+       count(*)                                AS violations
+  FROM shopping_sync_logs
+ WHERE "recordKind" IS NULL
+   AND connector = 'woocommerce';
+```
+
+A check that is only meaningful for one cutover is exactly the right shape: it returns zero for
+ever after, and the day it does not, something restarted a predecessor.
 
 **You do not have to get this right for accounting money posts to stay safe**, and it is worth
 knowing why, because a rollback is a deploy nobody plans. Money posts (customer receipts, supplier

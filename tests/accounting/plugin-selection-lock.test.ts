@@ -950,6 +950,11 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             because its own prose names `psql` / `prisma migrate` — which is the
  *                             deliberately generous half of this scan working as intended, and is
  *                             why the inventory is a classification rather than a filter.
+ *   'deploy-read-only-probe'— connects during a deploy cutover and only READS. It takes no lock and
+ *                             needs none: it runs in the window scripts/deploy.sh opens by stopping
+ *                             every writer, and its whole job is to describe that window
+ *                             (pg_stat_activity) or to check what the migration just did. It writes
+ *                             nothing, so it cannot move a plugin key. o3d-2sm1.1.
  *   'seed'                  — a standalone client that WRITES this database, run from install.sh.
  *                             It takes no lock and cannot practically be made to (it runs before the
  *                             app is up); what keeps it safe is that it must not write a plugin key,
@@ -968,6 +973,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'names-the-tools-only'
   | 'app-database-client'
   | 'pinned-lock-session'
+  | 'deploy-read-only-probe'
   | 'seed'
 > = {
   'app/api/backup/restore/route.ts': 'replays-external-sql',
@@ -997,6 +1003,13 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // comments. Rewording that sentence to dodge this scan would delete the lesson to satisfy the
   // detector, so it is classified instead.
   'scripts/check-documented-env-vars.mjs': 'names-the-tools-only',
+  // o3d-2sm1.1's two cutover probes. `check-db-writers.mjs` reads pg_stat_activity to prove the
+  // predecessor is STOPPED before a migration is applied; `run-migration-verifications.mjs` runs
+  // the read-only checks a migration declares in its own verify.sql, after the schema has moved and
+  // before the new build is started. Both are found by this scan because their prose names `psql`
+  // and `prisma migrate deploy` — neither executes either tool, and neither writes anything.
+  'scripts/check-db-writers.mjs': 'deploy-read-only-probe',
+  'scripts/run-migration-verifications.mjs': 'deploy-read-only-probe',
   'scripts/deploy.sh': 'migration-runner',
   'scripts/install.sh': 'migration-runner',
   'scripts/prisma-dev-db.sh': 'migration-runner',
