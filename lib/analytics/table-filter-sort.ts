@@ -233,3 +233,70 @@ export function savedViewDropNotice(
   }
   return `${subject}: ${parts.join('; and ')}. Everything else is as you saved it.`
 }
+
+// ---------------------------------------------------------------------------
+// Whose saved view is it?
+// ---------------------------------------------------------------------------
+
+/**
+ * o3d-8u4h round 3. THE THREE STAT PAGES SHARE ONE SAVED-VIEW RECORD, AND ONE OF THEM READ ALL OF IT.
+ *
+ * `getSavedViews` reads a single `Setting` row — `sales_stats_views` — and all three clients save
+ * into it. They tell their views apart by a PREFIX on the stored tab key: the purchase page writes
+ * `po_<tab>`, the inventory page writes `inv_<tab>`, and the sales page writes its tab key bare.
+ *
+ * The purchase and inventory pickers filtered on that prefix. THE SALES PICKER OFFERED EVERY VIEW
+ * IN THE RECORD, including the other two pages' — and `loadView` then indexed its own
+ * `TAB_FIELDS` with the stored key. `TAB_FIELDS['po_aging']` is `undefined`, `sanitiseSavedView`
+ * calls `.map` on it, and the whole Sales Analytics page comes down with a TypeError. Not a corner
+ * case: saving a purchase view and then opening Sales is all it takes, and the crash is on the
+ * REPORT, not on the view.
+ *
+ * That is the same defect family this module was written for — A KEY STORED SOMEWHERE ELSE, USED
+ * WITHOUT VALIDATION — one level up from the column keys. `presentColumns` already refuses to
+ * render a column key the tab does not own; this refuses to load a TAB key the page does not own.
+ *
+ * A PREFIX TEST IS NOT ENOUGH ON ITS OWN, which is why this resolves against the page's own tab
+ * list rather than just stripping. `po_` on the front does not prove the remainder is still a tab:
+ * a retired purchase tab would sail through `startsWith('po_')` and land back on `TAB_FIELDS[...]
+ * === undefined` — the identical crash, from the page that thought it was already filtered. And
+ * the sales page cannot use a prefix test at all, because its prefix is the empty string, which
+ * every stored key starts with; membership in its own tab list is the only thing that separates
+ * `aging` from `po_aging`.
+ *
+ * Returns the page's OWN tab key, or null for a view that belongs to another report.
+ */
+export function resolveSavedViewTab<T extends string>(
+  viewTab: string,
+  prefix: string,
+  ownTabs: readonly T[],
+): T | null {
+  if (prefix.length > 0 && !viewTab.startsWith(prefix)) return null
+  const key = viewTab.slice(prefix.length)
+  return (ownTabs as readonly string[]).includes(key) ? (key as T) : null
+}
+
+/**
+ * The views a picker may offer: the ones this page can actually load.
+ *
+ * Filtering the picker is the fix a reader sees; `resolveSavedViewTab` in the load path is the fix
+ * that holds. Both, because the picker's list is a render of props that can be a revision behind
+ * the click — and because a guard nothing can reach is a guard nobody can test.
+ */
+export function ownedSavedViews<V extends { tab: string }, T extends string>(
+  views: readonly V[],
+  prefix: string,
+  ownTabs: readonly T[],
+): V[] {
+  return views.filter((view) => resolveSavedViewTab(view.tab, prefix, ownTabs) !== null)
+}
+
+/**
+ * What the page says when it is asked for a view it cannot load. Same persistent block as
+ * `savedViewDropNotice` — the reader who most needs it is the one who cannot hover — and it names
+ * the stored tab, because that is the only thing that tells them which report to open instead.
+ */
+export function foreignSavedViewNotice(name: string | undefined, viewTab: string): string {
+  const subject = name ? `Saved view “${name}”` : 'That saved view'
+  return `${subject} belongs to a different analytics report (it was saved on the “${viewTab}” tab), so it was not loaded here. Nothing on this page has changed. Open it from the report it was saved on.`
+}

@@ -14,7 +14,7 @@ import { saveView, type SalesStatRow, type SalesStatSummary, type ShipmentRow, t
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
-import { filterAndSortRows, presentColumns, presentColumnKeys, sanitiseSavedView } from '@/lib/analytics/table-filter-sort'
+import { filterAndSortRows, presentColumns, presentColumnKeys, sanitiseSavedView, resolveSavedViewTab, ownedSavedViews, foreignSavedViewNotice } from '@/lib/analytics/table-filter-sort'
 import { boundSuffix, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 
 type Tab = 'products' | 'shipments' | 'details' | 'invoices' | 'refunds' | 'aging'
@@ -242,6 +242,17 @@ const TAB_FIELDS: Record<Tab, FieldDef[]> = {
   aging: AGING_FIELDS,
 }
 
+/**
+ * o3d-8u4h round 3: the tabs THIS page owns, and the prefix its own saved views are stored under.
+ *
+ * All three stat pages write into the one `sales_stats_views` settings row and tell their views
+ * apart by this prefix; the sales page has never used one, so its keys are stored bare. Derived
+ * from TAB_FIELDS rather than written out again, so a tab added or retired here cannot leave the
+ * ownership test naming a set of tabs that no longer matches the report.
+ */
+const TAB_KEYS = Object.keys(TAB_FIELDS) as Tab[]
+const SAVED_VIEW_TAB_PREFIX = ''
+
 const DEFAULT_COLS: Record<Tab, string[]> = {
   products: ['sku', 'name', 'barcode', 'mpn', 'qtySold', 'netQty', 'grossRevenue', 'discounts', 'netRevenue', 'cogs', 'grossProfit', 'marginPct', 'orderCount'],
   shipments: ['productName', 'orderNumber', 'trackingNumber', 'sku', 'barcode', 'mpn', 'customerName', 'salesRep', 'qty', 'shippingService', 'shippedAt'],
@@ -449,6 +460,8 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
   const { rows, summary } = productStats
   const fields = TAB_FIELDS[tab]
   const visibleCols = visibleColsMap[tab]
+  // The saved views this page can actually load — the picker offers no other (o3d-8u4h round 3).
+  const ownViews = ownedSavedViews(savedViews, SAVED_VIEW_TAB_PREFIX, TAB_KEYS)
 
   function setVisibleCols(cols: string[]) {
     setVisibleColsMap((prev) => ({ ...prev, [tab]: cols }))
@@ -467,7 +480,15 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
   // rows no longer carry reads as an unknown for every row, and an unknown answers no numeric
   // comparison, so the rule rejects every row and the operator sees an unexplained empty report.
   function loadView(view: SavedView) {
-    const t = view.tab as Tab
+    // o3d-8u4h round 3: THE STORED TAB IS VALIDATED BEFORE IT INDEXES ANYTHING. One settings row
+    // holds all three pages' views, and this picker used to offer every one of them and then read
+    // `TAB_FIELDS[view.tab]` — `undefined` for a purchase or inventory view, and `sanitiseSavedView`
+    // maps over it, so a legitimate `po_aging` view took the whole Sales page down with a TypeError.
+    // The picker below is filtered to this page's own views, and this refuses the rest by NAME
+    // rather than by trusting the list that produced the click: props can be a revision behind, and
+    // a guard nothing can reach is a guard no test can exercise.
+    const t = resolveSavedViewTab(view.tab, SAVED_VIEW_TAB_PREFIX, TAB_KEYS)
+    if (t === null) { setViewNotice(foreignSavedViewNotice(view.name, view.tab)); return }
     const clean = sanitiseSavedView({ name: view.name, columns: view.columns, filters: view.filters }, TAB_FIELDS[t])
     setTab(t)
     // COLUMNS ARE PUT INTO STATE VERBATIM, AND FILTERED AT EVERY RENDER PATH INSTEAD. Deliberate,
@@ -698,11 +719,14 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
               onClick={() => handleTabChange(t.key)}>{t.label}</button>
           ))}
           <div className="ml-auto flex shrink-0 items-center gap-1.5 pb-1 pl-2">
-            {savedViews.length > 0 && (
+            {ownViews.length > 0 && (
+              // The `find` deliberately searches the FULL list, not `ownViews`: an id this page does
+              // not own must reach `loadView` and be refused there with a sentence, rather than
+              // silently doing nothing.
               <select onChange={(e) => { const v = savedViews.find((sv) => sv.id === e.target.value); if (v) loadView(v); e.target.value = '' }}
                 className="h-7 rounded-md border border-input bg-background px-2 text-xs" defaultValue="">
                 <option value="" disabled>Saved Views…</option>
-                {savedViews.map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}
+                {ownViews.map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}
               </select>
             )}
             <Button variant={filterRules.length > 0 ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => setShowFilterDialog(true)}>

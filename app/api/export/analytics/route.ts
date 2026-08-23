@@ -11,6 +11,7 @@ import {
   SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED,
   SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS,
   SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS,
+  SUPPLIER_BILLED_ROUNDING_RECONCILIATION,
 } from '@/lib/domain/purchasing/supplier-payment-basis'
 
 export async function GET(req: NextRequest) {
@@ -203,6 +204,9 @@ export async function GET(req: NextRequest) {
           dueAmount: SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED,
           billedWithPaymentMarker: SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS,
           billedWithoutPaymentMarker: SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS,
+          // o3d-8u4h round 3: a spreadsheet reader is the one most likely to sum the columns, and
+          // the only one who cannot ask why the sum came out to the penny it did.
+          billedAmount: SUPPLIER_BILLED_ROUNDING_RECONCILIATION,
         },
       )
     }

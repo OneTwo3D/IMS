@@ -14,7 +14,7 @@ import { saveView, type SavedView } from '@/app/actions/sales-stats'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
-import { filterAndSortRows, presentColumns, presentColumnKeys, sanitiseSavedView } from '@/lib/analytics/table-filter-sort'
+import { filterAndSortRows, presentColumns, presentColumnKeys, sanitiseSavedView, resolveSavedViewTab, ownedSavedViews, foreignSavedViewNotice } from '@/lib/analytics/table-filter-sort'
 
 type Tab = 'onhand' | 'movements' | 'allocations' | 'reorder'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -116,6 +116,15 @@ const TAB_FIELDS: Record<Tab, FieldDef[]> = {
   reorder: REORDER_FIELDS,
 }
 
+/**
+ * o3d-8u4h round 3: the tabs THIS page owns, and the prefix its own saved views are stored under.
+ * Derived from TAB_FIELDS so a retired tab cannot leave the ownership test out of date — and the
+ * membership test matters on top of the prefix, because `inv_<retired tab>` passes `startsWith`
+ * and still indexes TAB_FIELDS with a key that is not there.
+ */
+const TAB_KEYS = Object.keys(TAB_FIELDS) as Tab[]
+const SAVED_VIEW_TAB_PREFIX = 'inv_'
+
 const DEFAULT_COLS: Record<Tab, string[]> = {
   onhand: ['sku', 'name', 'type', 'barcode', 'mpn', 'warehouseCode', 'quantity', 'reservedQty', 'available', 'inventoryValue', 'stockUnit'],
   movements: ['type', 'sku', 'productName', 'fromWarehouse', 'toWarehouse', 'qty', 'unitCostBase', 'totalValueBase', 'note', 'createdAt'],
@@ -214,6 +223,8 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
 
   const fields = TAB_FIELDS[tab]
   const visibleCols = visibleColsMap[tab]
+  // The saved views this page can actually load — the picker offers no other (o3d-8u4h round 3).
+  const ownViews = ownedSavedViews(savedViews, SAVED_VIEW_TAB_PREFIX, TAB_KEYS)
 
   function setVisibleCols(cols: string[]) {
     setVisibleColsMap((prev) => ({ ...prev, [tab]: cols }))
@@ -229,7 +240,11 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
   // rows no longer carry reads as an unknown for every row, and an unknown answers no numeric
   // comparison, so the rule rejects every row and the operator sees an unexplained empty report.
   function loadView(v: SavedView) {
-    const t = v.tab.replace('inv_', '') as Tab
+    // o3d-8u4h round 3: RESOLVED, NOT STRIPPED — see the sales client. `replace('inv_', '')`
+    // answers a key for any string, including one this page has no TAB_FIELDS entry for, and the
+    // crash then happens inside sanitiseSavedView rather than anywhere near the bad key.
+    const t = resolveSavedViewTab(v.tab, SAVED_VIEW_TAB_PREFIX, TAB_KEYS)
+    if (t === null) { setViewNotice(foreignSavedViewNotice(v.name, v.tab)); return }
     const clean = sanitiseSavedView({ name: v.name, columns: v.columns, filters: v.filters }, TAB_FIELDS[t])
     setTab(t)
     // COLUMNS ARE PUT INTO STATE VERBATIM, AND FILTERED AT EVERY RENDER PATH INSTEAD. Deliberate,
@@ -348,9 +363,11 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
         <div className="flex items-center gap-1 overflow-x-auto overflow-y-hidden">
           {TABS.map((t) => (<button key={t.key} type="button" className={`shrink-0 px-3 sm:px-4 py-2 text-sm font-medium border-b-2 transition-colors -mb-px ${tab === t.key ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground'}`} onClick={() => handleTabChange(t.key)}>{t.label}</button>))}
           <div className="ml-auto flex shrink-0 items-center gap-1.5 pb-1 pl-2">
-            {savedViews.filter((v) => v.tab.startsWith('inv_')).length > 0 && (
+            {/* The `find` searches the FULL list on purpose: an id this page does not own must
+                reach loadView and be refused there with a sentence, not silently ignored. */}
+            {ownViews.length > 0 && (
               <select onChange={(e) => { const v = savedViews.find((sv) => sv.id === e.target.value); if (v) loadView(v); e.target.value = '' }} className="h-7 rounded-md border border-input bg-background px-2 text-xs" defaultValue="">
-                <option value="" disabled>Saved Views…</option>{savedViews.filter((v) => v.tab.startsWith('inv_')).map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}</select>
+                <option value="" disabled>Saved Views…</option>{ownViews.map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}</select>
             )}
             <Button variant={filterRules.length > 0 ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => setShowFilter(true)}><Filter className="h-3 w-3 mr-0.5" />Filter{filterRules.length > 0 ? ` (${filterRules.length})` : ''}</Button>
             <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowColPicker(true)}><Settings2 className="h-3 w-3 mr-0.5" />Columns</Button>

@@ -121,30 +121,36 @@ export const SUPPLIER_DISCOUNT_TOTAL_NOT_RECORDED =
 export const SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS =
   'Billed value of bills carrying NO payment marker, aged from the INVOICE date. Not an overdue figure and not a balance owed: no payment amount is recorded, supplier credit notes are not netted off it, and the due date on the bill is not used. It states what was billed and never marked.'
 
+/**
+ * o3d-8u4h round 3: HOW THE ROW IS MADE TO ADD UP, said to the reader who was told to add it up.
+ *
+ * The columns invite a check — Billed = the two marker groups, and the four age bands = the
+ * without-marker group — and a bill is stored to four decimal places while the report publishes
+ * two. Rounding the total and the parts separately breaks that check by a penny. So each figure is
+ * summed exactly and rounded once, and the rounding residue is then placed by a stated rule instead
+ * of being left where it fell.
+ */
+export const SUPPLIER_BILLED_ROUNDING_RECONCILIATION =
+  'Reconciled to the penny. Bills are stored to four decimal places and this report publishes two: every figure is summed at full precision and rounded once (half away from zero), and the rounding residue — never more than a penny or two — is then added to the LARGEST component of each split, so that the two marker groups add back to Billed and the four age bands add back to the without-marker group exactly, on screen and in the exported file. One component therefore carries the residue by rule rather than by accident; no component is claimed exact to the penny in isolation.'
+
 /** What the with-marker column measures, which is an amount BILLED and not an amount paid. */
 export const SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS =
   'Billed value of bills carrying a payment marker (PurchaseInvoice.paidAt), whoever stamped it. An amount BILLED, not an amount paid and not a settled debt: the marker carries no amount, and markBillPaid stamps it even when only part of the bill was paid.'
 
 /**
- * Split a supplier's bills by whether a payment marker is present on them.
+ * Does this bill carry a payment marker?
  *
- * The only judgement in here is that `paidAt == null` means "no marker" and anything else means
- * "a marker". Explicitly `== null` rather than falsy: a Date is never falsy, but an undefined column
- * on a partially-selected row would be, and reading an absent field as "marked" is the direction
- * that would take a bill out of the ageing bands on no evidence at all.
+ * The only judgement in the split, and the whole of it. Explicitly `== null` rather than falsy: a
+ * Date is never falsy, but an undefined column on a partially-selected row would be, and reading an
+ * absent field as "marked" is the direction that would take a bill out of the ageing bands on no
+ * evidence at all.
  *
- * Returns UNROUNDED accumulators. The caller rounds once, at the end, for the same reason the net
- * amount does — rounding each bill first and summing gives a different penny.
+ * o3d-8u4h round 3: this used to be `billedPaymentMarkerSplit`, which also SUMMED the two groups —
+ * in floating point, because this file may not import Prisma (see the note above: its sentences are
+ * read by a client component, and a Prisma import here would drag the client into a browser chunk).
+ * The summing moved to the caller, which now aggregates in `Prisma.Decimal` and reconciles the
+ * rounded groups back to the rounded total. A predicate is all the domain rule ever was.
  */
-export function billedPaymentMarkerSplit(
-  invoices: readonly { totalBase: unknown; paidAt: Date | null | undefined }[],
-): { withMarker: number; withoutMarker: number } {
-  let withMarker = 0
-  let withoutMarker = 0
-  for (const invoice of invoices) {
-    const amount = Number(invoice.totalBase)
-    if (invoice.paidAt == null) withoutMarker += amount
-    else withMarker += amount
-  }
-  return { withMarker, withoutMarker }
+export function hasPaymentMarker(invoice: { paidAt: Date | null | undefined }): boolean {
+  return invoice.paidAt != null
 }
