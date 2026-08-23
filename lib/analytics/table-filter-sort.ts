@@ -116,3 +116,26 @@ export function filterAndSortRows<T extends object>(
   const col = sortCol
   return [...result].sort((a, b) => compareCells(cellValue(a, col), cellValue(b, col), sortDir))
 }
+
+/**
+ * The columns a tab can actually render, out of the columns something ASKED it to render.
+ *
+ * o3d-8u4h. A saved view stores its column keys verbatim in the database, and a column key can stop
+ * existing — the supplier-aging buckets were renamed from `overdue*` to `unsettledBilled*` precisely
+ * because "overdue" claimed a relation the report does not measure. The stat tables then rendered
+ * the header and the body from the SAME key list but disagreed about unknown keys: the header
+ * skipped a key it had no field definition for, and the body still emitted a cell for it. One
+ * missing header and a full row of cells means EVERY COLUMN AFTER IT SHIFTS ONE PLACE LEFT, so the
+ * figures are read under the wrong headings — a silent misreading, not a visible break.
+ *
+ * Filtering once, here, is what keeps the two loops agreeing by construction. It is a general
+ * property of these tables rather than a supplier-aging fix: any renamed or retired column in any of
+ * the three stat clients reaches this same shape through an old saved view.
+ */
+export function presentColumns(
+  columns: readonly string[],
+  fields: readonly { key: string }[],
+): string[] {
+  const known = new Set(fields.map((field) => field.key))
+  return columns.filter((key) => known.has(key))
+}

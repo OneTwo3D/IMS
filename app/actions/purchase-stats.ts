@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { COMMITTED_PURCHASE_ORDER_WHERE, INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { headerDiscountedReturnCreditBase } from '@/lib/domain/purchasing/return-credit-basis'
+import { billedSettlementSplit } from '@/lib/domain/purchasing/supplier-payment-basis'
 
 // ---------------------------------------------------------------------------
 // Product purchase stats (Products tab)
@@ -261,7 +262,13 @@ export type SupplierAgingRow = {
   supplierName: string
   /** VAT-INCLUSIVE committed spend: PurchaseOrder.totalBase, which is net goods + VAT + freight. */
   grossAmount: number
-  discounts: number
+  /**
+   * ALWAYS WITHHELD (o3d-8u4h). Was a hardcoded `0`. A discount TOTAL cannot be assembled: the
+   * per-line part is already folded into the stored line totals and survives only in foreign
+   * currency under the order's own tax convention, and the header part alone is a part, not a
+   * total. See SUPPLIER_DISCOUNT_TOTAL_NOT_RECORDED.
+   */
+  discounts: number | null
   /** Returned value at the EX-VAT line cost — PurchaseOrderLine.unitCostBase is always net. */
   refunds: number
   /**
@@ -272,13 +279,38 @@ export type SupplierAgingRow = {
   landedCosts: number
   tax: number
   totalAmount: number
+  /** Sum of PurchaseInvoice.totalBase — VAT-INCLUSIVE, and every bill, settled or not. */
   billedAmount: number
-  paidAmount: number
-  dueAmount: number
-  overdue0_30: number
-  overdue31_60: number
-  overdue61_90: number
-  overdue91plus: number
+  /**
+   * o3d-8u4h. The two halves of `billedAmount`, split on whether a settlement was ever recorded
+   * against the bill. Amounts BILLED, on the same VAT-inclusive basis as `billedAmount`, and named
+   * so: neither is an amount paid. `billedAmount === settledBilledAmount + unsettledBilledAmount`,
+   * which the reader can check across the row.
+   */
+  settledBilledAmount: number
+  unsettledBilledAmount: number
+  /**
+   * ALWAYS WITHHELD (o3d-8u4h). Was a hardcoded `0`, which asserted that nothing had ever been
+   * paid to this supplier. No amount paid to a supplier is recorded anywhere in the schema.
+   * See SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED.
+   */
+  paidAmount: number | null
+  /**
+   * ALWAYS WITHHELD (o3d-8u4h). Was `billedAmount` — i.e. the whole bill, forever. Due is billed
+   * less paid, and paid is not a recorded quantity; supplier credit notes reduce what is owed too.
+   * `unsettledBilledAmount` is the nearest thing that IS known, and says what it is.
+   */
+  dueAmount: number | null
+  /**
+   * o3d-8u4h: was `overdue0_30`/`31_60`/`61_90`/`91plus`. Same four age bands, cut from the INVOICE
+   * date, but now over bills carrying NO recorded settlement — a settled bill no longer ages
+   * forever — and no longer called "overdue", because that is a relation to a DUE DATE which this
+   * report does not measure. See SUPPLIER_UNSETTLED_BILLED_BASIS.
+   */
+  unsettledBilled0_30: number
+  unsettledBilled31_60: number
+  unsettledBilled61_90: number
+  unsettledBilled91plus: number
   poCount: number
   avgLeadTimeDays: number | null
 }
@@ -299,7 +331,9 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
           // discount was not merely mishandled — it was NOT VISIBLE to this query at all.
           subtotalBase: true,
           lines: { select: { totalBase: true } },
-          invoices: { select: { totalBase: true, invoiceDate: true } },
+          // o3d-8u4h: `paidAt` is the ONLY settlement fact the schema holds for a supplier bill.
+          // Without it in the select, every bill aged forever and Due was the whole ledger.
+          invoices: { select: { totalBase: true, invoiceDate: true, paidAt: true } },
           returns: { select: { lines: { select: { qtyReturned: true, poLine: { select: { unitCostBase: true } } } } } },
         },
       },
@@ -309,7 +343,8 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
   const now = Date.now()
   return suppliers.map((s) => {
     let grossAmount = 0, tax = 0, landedCosts = 0, billedAmount = 0, refunds = 0
-    let overdue0_30 = 0, overdue31_60 = 0, overdue61_90 = 0, overdue91plus = 0
+    let settledBilled = 0, unsettledBilled = 0
+    let unsettled0_30 = 0, unsettled31_60 = 0, unsettled61_90 = 0, unsettled91plus = 0
     const leadTimes: number[] = []
 
     for (const po of s.purchaseOrders) {
@@ -317,10 +352,17 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
       tax += Number(po.taxBase)
       landedCosts += Number(po.directFreightBase)
       refunds += headerDiscountedReturnCreditBase(po)
+      const split = billedSettlementSplit(po.invoices)
+      settledBilled += split.settled
+      unsettledBilled += split.unsettled
       for (const inv of po.invoices) {
         const t = Number(inv.totalBase); billedAmount += t
+        // o3d-8u4h: A BILL THAT WAS SETTLED STOPS AGEING. It used to age forever, because nothing
+        // in this loop had ever looked at a settlement, so a bill paid two years ago sat in the
+        // 91+ column for good. The buckets are the UNSETTLED billed value now, and are named that.
+        if (inv.paidAt != null) continue
         const d = Math.round((now - inv.invoiceDate.getTime()) / 86400000)
-        if (d > 90) overdue91plus += t; else if (d > 60) overdue61_90 += t; else if (d > 30) overdue31_60 += t; else overdue0_30 += t
+        if (d > 90) unsettled91plus += t; else if (d > 60) unsettled61_90 += t; else if (d > 30) unsettled31_60 += t; else unsettled0_30 += t
       }
       if (po.poSentAt && po.receivedAt) { const d = Math.round((po.receivedAt.getTime() - po.poSentAt.getTime()) / 86400000); if (d > 0 && d < 365) leadTimes.push(d) }
     }
@@ -357,16 +399,34 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
     // round 3 had just repaired (an order total on one basis, a credit on another), only the
     // mismatched axis was the DISCOUNT rather than the VAT, so leaving it produced a `netAmount`
     // that was again neither convention.
+    //
+    // o3d-8u4h: AND THREE OF THE FIGURES BELOW WERE NOT CALCULATIONS AT ALL.
+    //
+    // `paidAmount: 0`, `discounts: 0` and `dueAmount: billedAmount` were not calculations that came
+    // out wrong. They were quantities THIS SYSTEM DOES NOT HOLD, published as measurements — and a
+    // zero in a Paid column is the strongest claim available: "nothing has ever been paid to this
+    // supplier". They are `null` now, which is o3d-iigc's rule applied unchanged: a figure that
+    // cannot be stated publishes nothing, while the related total that IS known stays on the row.
+    //
+    // What is known is what was BILLED, so `billedAmount` is untouched and is now split into the
+    // bills carrying a settlement flag and those not carrying one. Those two are amounts billed,
+    // not amounts paid, and they are named for that — the flag carries no amount, and `markBillPaid`
+    // will set it on a part-payment, so summing settled bills under the word "Paid" would just move
+    // the same false claim one column over. lib/domain/purchasing/supplier-payment-basis.ts carries
+    // the whole reasoning and the sentences the page and the CSV show the reader.
     return {
       supplierId: s.id, supplierName: s.name,
-      grossAmount: Math.round(grossAmount * 100) / 100, discounts: 0,
+      grossAmount: Math.round(grossAmount * 100) / 100, discounts: null,
       refunds: Math.round(refunds * 100) / 100, netAmount: Math.round((grossAmount - tax - refunds) * 100) / 100,
       landedCosts: Math.round(landedCosts * 100) / 100, tax: Math.round(tax * 100) / 100,
       totalAmount: Math.round(grossAmount * 100) / 100,
-      billedAmount: Math.round(billedAmount * 100) / 100, paidAmount: 0,
-      dueAmount: Math.round(billedAmount * 100) / 100,
-      overdue0_30: Math.round(overdue0_30 * 100) / 100, overdue31_60: Math.round(overdue31_60 * 100) / 100,
-      overdue61_90: Math.round(overdue61_90 * 100) / 100, overdue91plus: Math.round(overdue91plus * 100) / 100,
+      billedAmount: Math.round(billedAmount * 100) / 100,
+      settledBilledAmount: Math.round(settledBilled * 100) / 100,
+      unsettledBilledAmount: Math.round(unsettledBilled * 100) / 100,
+      paidAmount: null,
+      dueAmount: null,
+      unsettledBilled0_30: Math.round(unsettled0_30 * 100) / 100, unsettledBilled31_60: Math.round(unsettled31_60 * 100) / 100,
+      unsettledBilled61_90: Math.round(unsettled61_90 * 100) / 100, unsettledBilled91plus: Math.round(unsettled91plus * 100) / 100,
       poCount: s.purchaseOrders.length,
       avgLeadTimeDays: leadTimes.length ? Math.round(leadTimes.reduce((a, b) => a + b, 0) / leadTimes.length) : null,
     }

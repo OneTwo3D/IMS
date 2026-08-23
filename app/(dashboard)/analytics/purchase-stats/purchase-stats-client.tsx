@@ -11,11 +11,17 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { ProductLink } from '@/components/inventory/product-link'
 import type { PurchaseProductRow, ReceivedGoodsRow, BillRow, SupplierAgingRow, PurchaseDetailRow } from '@/app/actions/purchase-stats'
+import {
+  SUPPLIER_DISCOUNT_TOTAL_NOT_RECORDED,
+  SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED,
+  SUPPLIER_SETTLED_BILLED_BASIS,
+  SUPPLIER_UNSETTLED_BILLED_BASIS,
+} from '@/lib/domain/purchasing/supplier-payment-basis'
 import { saveView, type SavedView } from '@/app/actions/sales-stats'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
-import { filterAndSortRows } from '@/lib/analytics/table-filter-sort'
+import { filterAndSortRows, presentColumns } from '@/lib/analytics/table-filter-sort'
 
 type Tab = 'products' | 'received' | 'bills' | 'aging' | 'details'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -68,9 +74,14 @@ const AGING_FIELDS: FieldDef[] = [
   { key: 'discounts', label: 'Discounts', type: 'number' }, { key: 'refunds', label: 'Refunds', type: 'number' },
   { key: 'netAmount', label: 'Net Amount (ex-VAT)', type: 'number' }, { key: 'landedCosts', label: 'Landed Costs', type: 'number' },
   { key: 'tax', label: 'Tax', type: 'number' }, { key: 'totalAmount', label: 'Total', type: 'number' },
-  { key: 'billedAmount', label: 'Billed', type: 'number' }, { key: 'dueAmount', label: 'Due', type: 'number' },
-  { key: 'overdue0_30', label: '0-30d', type: 'number' }, { key: 'overdue31_60', label: '31-60d', type: 'number' },
-  { key: 'overdue61_90', label: '61-90d', type: 'number' }, { key: 'overdue91plus', label: '91d+', type: 'number' },
+  { key: 'billedAmount', label: 'Billed', type: 'number' },
+  // o3d-8u4h: the two halves of Billed, split on whether a settlement was ever recorded. They are
+  // amounts BILLED and are labelled so — Paid stayed off this table because it cannot be measured.
+  { key: 'settledBilledAmount', label: 'Settled (billed)', type: 'number' },
+  { key: 'unsettledBilledAmount', label: 'Unsettled (billed)', type: 'number' },
+  { key: 'dueAmount', label: 'Due', type: 'number' },
+  { key: 'unsettledBilled0_30', label: 'Unsettled 0-30d', type: 'number' }, { key: 'unsettledBilled31_60', label: 'Unsettled 31-60d', type: 'number' },
+  { key: 'unsettledBilled61_90', label: 'Unsettled 61-90d', type: 'number' }, { key: 'unsettledBilled91plus', label: 'Unsettled 91d+', type: 'number' },
 ]
 
 const DETAIL_FIELDS: FieldDef[] = [
@@ -96,7 +107,7 @@ const DEFAULT_COLS: Record<Tab, string[]> = {
   products: ['sku', 'name', 'type', 'barcode', 'mpn', 'supplierName', 'qtyOrdered', 'qtyReceived', 'totalBase', 'avgUnitCostBase', 'incomingQty', 'poCount', 'createdAt'],
   received: ['productName', 'poReference', 'supplierName', 'grnReference', 'sku', 'warehouseCode', 'qtyReceived', 'status', 'totalBase', 'landedUnitCostBase', 'unitCostBase', 'receivedAt'],
   bills: ['poReference', 'supplierName', 'invoiceNumber', 'productName', 'sku', 'qtyBilled', 'invoiceDate', 'status', 'totalForeign', 'totalBase', 'supplierInvoiceUrl'],
-  aging: ['supplierName', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus'],
+  aging: ['supplierName', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'settledBilledAmount', 'unsettledBilledAmount', 'dueAmount', 'unsettledBilled0_30', 'unsettledBilled31_60', 'unsettledBilled61_90', 'unsettledBilled91plus'],
   details: ['productName', 'reference', 'sku', 'barcode', 'mpn', 'type', 'supplierName', 'status', 'qty', 'totalBase', 'createdAt'],
 }
 
@@ -226,7 +237,7 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
   function isRightAligned(key: string): boolean {
     const f = fields.find((fd) => fd.key === key)
     if (f?.type === 'number') return true
-    if (['totalBase', 'totalForeign', 'qtyReceived', 'qtyBilled', 'unitCostBase', 'landedUnitCostBase', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus', 'qty', 'unitCostForeign'].includes(key)) return true
+    if (['totalBase', 'totalForeign', 'qtyReceived', 'qtyBilled', 'unitCostBase', 'landedUnitCostBase', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'settledBilledAmount', 'unsettledBilledAmount', 'dueAmount', 'unsettledBilled0_30', 'unsettledBilled31_60', 'unsettledBilled61_90', 'unsettledBilled91plus', 'qty', 'unitCostForeign'].includes(key)) return true
     return false
   }
 
@@ -260,18 +271,28 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
       // o3d-iigc round 2: WHICH total this is, on the figure itself — 'net' beside a Gross column
       // and a Tax column otherwise reads as either net-of-VAT or net-of-returns, and it is both.
       if (key === 'netAmount') return <span className="tabular-nums text-xs font-mono font-medium" title="Ex-VAT: the gross total less its own VAT, less returns valued at the ex-VAT line cost AFTER the order's header discount">{fmtBase(v)}</span>
-      if (key === 'discounts') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtBase(v) : '—'}</span>
+      // o3d-8u4h: WITHHELD, AND THE CELL SAYS SO WHEN YOU ASK IT. `v > 0 ? … : '—'` used to render a
+      // hardcoded 0 as a dash, which looked identical to this and meant the opposite: it claimed the
+      // supplier gave no discount. A withheld figure is `null` now, and the tooltip carries the
+      // reason rather than leaving the reader to guess which of the two dashes they are looking at.
+      if (key === 'discounts') return <span className="tabular-nums text-xs font-mono text-muted-foreground" title={v == null ? SUPPLIER_DISCOUNT_TOTAL_NOT_RECORDED : undefined}>{v == null ? '—' : fmtBase(v)}</span>
       // o3d-iigc round 4: this is the credit AS THE NET AMOUNT SUBTRACTS IT — scaled onto the order's
       // post-header-discount goods value — so the three columns a reader can see (Gross, Tax,
       // Refunds) still subtract to the Net Amount printed beside them.
       if (key === 'refunds') return <span className="tabular-nums text-xs font-mono text-orange-600" title="Return credit at the ex-VAT line cost, reduced by the order's header discount so it is on the same basis as the Net Amount it is subtracted from">{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'landedCosts' || key === 'tax') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'billedAmount') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
-      if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'overdue0_30') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'overdue31_60') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'overdue61_90') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'overdue91plus') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'billedAmount') return <span className="tabular-nums text-xs font-mono" title="VAT-inclusive value of every supplier bill on this supplier's committed POs, settled or not">{fmtBase(v)}</span>
+      if (key === 'settledBilledAmount') return <span className="tabular-nums text-xs font-mono text-muted-foreground" title={SUPPLIER_SETTLED_BILLED_BASIS}>{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'unsettledBilledAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`} title={SUPPLIER_UNSETTLED_BILLED_BASIS}>{v > 0 ? fmtBase(v) : '—'}</span>
+      // o3d-8u4h: WITHHELD. This cell used to print the whole billed ledger in red, forever, under
+      // the word "Due" — the report had no payment offset of any kind, so it was asserting that
+      // every bill ever raised was still owed. Due is billed less paid; paid is not a quantity this
+      // system holds. Unsettled (billed) beside it is what IS known, and is named for what it is.
+      if (key === 'dueAmount') return <span className="tabular-nums text-xs font-mono text-muted-foreground" title={v == null ? SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED : undefined}>{v == null ? '—' : fmtBase(v)}</span>
+      if (key === 'unsettledBilled0_30') return <span className="tabular-nums text-xs font-mono" title={SUPPLIER_UNSETTLED_BILLED_BASIS}>{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'unsettledBilled31_60') return <span className="tabular-nums text-xs font-mono" title={SUPPLIER_UNSETTLED_BILLED_BASIS}>{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'unsettledBilled61_90') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600' : ''}`} title={SUPPLIER_UNSETTLED_BILLED_BASIS}>{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'unsettledBilled91plus') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`} title={SUPPLIER_UNSETTLED_BILLED_BASIS}>{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'supplierName') return <span className="font-medium whitespace-nowrap text-xs">{v}</span>
     }
     if (tabKey === 'details') {
@@ -292,7 +313,11 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
   // Render helper for non-product tabs (not a component — avoids re-creation during render)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   function renderGenericTable(data: any[], tabKey: Tab, emptyMsg: string) {
-    const cols = visibleColsMap[tabKey]
+    // o3d-8u4h: ONLY THE COLUMNS THIS TAB STILL HAS. A saved view stores column keys verbatim, so a
+    // view saved before the supplier-aging rename still asks for `overdue0_30`. The header skipped
+    // the unknown key and the BODY still emitted a cell for it, so every column after it in that row
+    // shifted one place left and its figures were read under the wrong heading.
+    const cols = presentColumns(visibleColsMap[tabKey], TAB_FIELDS[tabKey])
     return (
       <div className="rounded-md border">
         <div className="flex items-center justify-between px-3 py-1.5 bg-muted/30 border-b">

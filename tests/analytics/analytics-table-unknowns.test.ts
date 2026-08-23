@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { filterAndSortRows, matchesFilterRule, compareCells } from '@/lib/analytics/table-filter-sort'
+import { filterAndSortRows, matchesFilterRule, compareCells, presentColumns } from '@/lib/analytics/table-filter-sort'
 
 /**
  * o3d-iigc round 2, Codex finding 3: the analytics tables sorted and filtered a WITHHELD figure as
@@ -168,4 +168,35 @@ test('a field the row does not have at all is an unknown, not a zero (o3d-iigc)'
 
 test('an empty rule value still filters nothing out (o3d-iigc control)', () => {
   assert.deepEqual(refs(filterAndSortRows(AGING, [rule('netTotal', '<', '')], null, 'asc')), ['SO-1', 'SO-2', 'SO-3', 'SO-4'])
+})
+
+// ---------------------------------------------------------------------------
+// A saved view that outlived one of its columns (o3d-8u4h)
+// ---------------------------------------------------------------------------
+
+test('a retired column key is dropped ONCE, so header and body cannot disagree (o3d-8u4h)', () => {
+  // The supplier-aging buckets were renamed `overdue*` -> `unsettledBilled*`, because "overdue"
+  // claims a relation to a due date the report does not measure. A view saved before that rename
+  // still asks for the old keys. The table rendered its header and its body from the same list but
+  // treated unknown keys differently — the header skipped them, the body still emitted a cell — so
+  // one dead key shifted every column after it one place LEFT and the figures were read under the
+  // wrong headings. Silent, and worse than a blank column.
+  const fields = [
+    { key: 'supplierName' }, { key: 'billedAmount' },
+    { key: 'unsettledBilled0_30' }, { key: 'unsettledBilled91plus' },
+  ]
+  const savedView = ['supplierName', 'overdue0_30', 'billedAmount', 'overdue91plus', 'unsettledBilled91plus']
+
+  const cols = presentColumns(savedView, fields)
+  assert.deepEqual(cols, ['supplierName', 'billedAmount', 'unsettledBilled91plus'])
+  // The property that matters is not the list itself but that ONE list now feeds both loops: every
+  // key that survives has a field definition, so a header exists for every cell.
+  for (const key of cols) assert.ok(fields.some((f) => f.key === key), `${key} has no field definition`)
+})
+
+test('a view naming only live columns is passed through untouched (o3d-8u4h control)', () => {
+  const fields = [{ key: 'supplierName' }, { key: 'billedAmount' }]
+  assert.deepEqual(presentColumns(['billedAmount', 'supplierName'], fields), ['billedAmount', 'supplierName'])
+  // Order is the VIEW's, not the field list's — a saved view is a saved column ORDER as well.
+  assert.notDeepEqual(presentColumns(['billedAmount', 'supplierName'], fields), ['supplierName', 'billedAmount'])
 })

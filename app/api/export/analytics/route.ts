@@ -7,6 +7,11 @@ import { toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { netLinearFigureBound } from '@/lib/domain/sales/refund-basis-analytics'
+import {
+  SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED,
+  SUPPLIER_SETTLED_BILLED_BASIS,
+  SUPPLIER_UNSETTLED_BILLED_BASIS,
+} from '@/lib/domain/purchasing/supplier-payment-basis'
 
 export async function GET(req: NextRequest) {
   const session = await requireApiAuth()
@@ -159,14 +164,44 @@ export async function GET(req: NextRequest) {
     }
     case 'po_aging': {
       const rows = await getSupplierAging()
+      // o3d-8u4h: THE WITHHELD FIGURE REACHES THE FILE AS AN EMPTY CELL, NOT AS A ZERO.
+      //
+      // `dueAmount` used to export the whole billed ledger, forever, because nothing had ever
+      // looked at a settlement. It is withheld now — due is billed less paid, and no amount paid to
+      // a supplier is recorded anywhere — and `?? ''` is the same treatment the customer-aging
+      // export already gives its withheld `netTotal`: empty, so a spreadsheet does not sum it, and
+      // so nobody mistakes it for a measured nought.
+      //
+      // The two columns that replace it are amounts BILLED, split on whether a settlement was ever
+      // recorded, and `settledBilledAmount + unsettledBilledAmount === billedAmount` in the file.
+      // The four age bands are the unsettled billed value; a settled bill no longer ages forever,
+      // and they are no longer called `overdue`, because a file reader has no tooltip either and
+      // "overdue" claims a relation to a due date this report does not measure.
       const data = rows.map((r) => ({ supplierName: r.supplierName, grossAmount: r.grossAmount.toFixed(2),
         // o3d-iigc round 4: `refunds` is the credit ON THE NET AMOUNT'S OWN BASIS — ex-VAT line cost
         // reduced by the order's header discount — so grossAmount - tax - refunds still reproduces
         // netAmountExVat in the spreadsheet.
         refunds: r.refunds.toFixed(2),
         // o3d-iigc round 2: the basis travels with the figure — a CSV reader has no tooltip.
-        netAmountExVat: r.netAmount.toFixed(2), landedCosts: r.landedCosts.toFixed(2), tax: r.tax.toFixed(2), totalAmount: r.totalAmount.toFixed(2), billedAmount: r.billedAmount.toFixed(2), dueAmount: r.dueAmount.toFixed(2), overdue0_30: r.overdue0_30.toFixed(2), overdue31_60: r.overdue31_60.toFixed(2), overdue61_90: r.overdue61_90.toFixed(2), overdue91plus: r.overdue91plus.toFixed(2), poCount: r.poCount, avgLeadTimeDays: r.avgLeadTimeDays }))
-      return csvResponse(toCsv(data, ['supplierName', 'grossAmount', 'refunds', 'netAmountExVat', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus', 'poCount', 'avgLeadTimeDays']), `supplier-aging-${date}.csv`)
+        netAmountExVat: r.netAmount.toFixed(2), landedCosts: r.landedCosts.toFixed(2), tax: r.tax.toFixed(2), totalAmount: r.totalAmount.toFixed(2),
+        billedAmount: r.billedAmount.toFixed(2),
+        settledBilledAmount: r.settledBilledAmount.toFixed(2), unsettledBilledAmount: r.unsettledBilledAmount.toFixed(2),
+        dueAmount: r.dueAmount?.toFixed(2) ?? '',
+        unsettledBilled0_30: r.unsettledBilled0_30.toFixed(2), unsettledBilled31_60: r.unsettledBilled31_60.toFixed(2),
+        unsettledBilled61_90: r.unsettledBilled61_90.toFixed(2), unsettledBilled91plus: r.unsettledBilled91plus.toFixed(2),
+        poCount: r.poCount, avgLeadTimeDays: r.avgLeadTimeDays }))
+      return csvResponse(
+        toCsv(data, ['supplierName', 'grossAmount', 'refunds', 'netAmountExVat', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'settledBilledAmount', 'unsettledBilledAmount', 'dueAmount', 'unsettledBilled0_30', 'unsettledBilled31_60', 'unsettledBilled61_90', 'unsettledBilled91plus', 'poCount', 'avgLeadTimeDays']),
+        `supplier-aging-${date}.csv`,
+        // Report-level, because the reason is the same on every row: the export metadata rides both
+        // the X-IMS-Export-Metadata header and `#` comment rows at the foot of the file, so an empty
+        // cell in a downloaded spreadsheet still comes with the sentence explaining it.
+        {
+          dueAmount: SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED,
+          settledBilledAmount: SUPPLIER_SETTLED_BILLED_BASIS,
+          unsettledBilledAmount: SUPPLIER_UNSETTLED_BILLED_BASIS,
+        },
+      )
     }
     case 'po_details': {
       const rows = await getPurchaseDetails(dateFrom, dateTo)
