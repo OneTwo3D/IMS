@@ -331,6 +331,7 @@ export function ConnectorOrphanBanner({
                             referenceId={row.referenceId}
                             settleable={row.settleable}
                             notSettleableReason={row.notSettleableReason}
+                            settleableOutcomes={row.settleableOutcomes}
                             caveat={row.settlementCaveat}
                             onSettled={() => router.refresh()}
                           />

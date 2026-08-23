@@ -1178,8 +1178,9 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                                 tokens. Until now that refusal was a dead end — "resolve these rows
                                 manually" with no manual path in the app. This is that path.
                                 Rendered only where a settlement could actually land: the helper returns
-                                `settleable: false` for PENDING/terminal rows, DAILY_BATCH types and rows
-                                at attempt revision 0, and the component then shows the reason instead.
+                                `settleable: false` for PENDING/terminal rows and rows at attempt revision
+                                0, and the component then shows the reason instead. A DAILY_BATCH row is
+                                settleable POSTED only — see settleableSettlementOutcomes.
                               */}
                               {settlementApplies && (
                                 <SettleSyncRowControl
@@ -1191,6 +1192,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                                   referenceId={log.referenceId}
                                   settleable={settlement.settleable}
                                   notSettleableReason={settlement.notSettleableReason}
+                                  settleableOutcomes={settlement.settleableOutcomes}
                                   caveat={settlement.settlementCaveat}
                                   onSettled={() => router.refresh()}
                                 />

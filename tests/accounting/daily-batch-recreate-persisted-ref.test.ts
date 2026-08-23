@@ -22,6 +22,9 @@ type SyncLogRow = {
   // fixture keeps meaning "no external id, and no record that the call was never made".
   externalTransactionId?: string | null
   abandonedBeforeRemoteCall?: boolean | null
+  // o3d-jit6 r2 #2: 'OPERATOR_ASSERTION' when the row reached SYNCED because a person typed a
+  // document id into the per-row settlement action rather than because the connector posted it.
+  settlementBasis?: string | null
   id?: string
 }
 type CreatedLog = { connector: string; type: string; referenceId: string; payload: Record<string, unknown> }
@@ -114,6 +117,7 @@ mock.module('@/lib/db', {
             status: row.status,
             externalTransactionId: row.externalTransactionId ?? null,
             abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null,
+            settlementBasis: row.settlementBasis ?? null,
           })),
       },
       $transaction: async (fn: (client: unknown) => Promise<unknown>) => fn(tx),
@@ -762,4 +766,92 @@ test('Xero: one cancelled split blocks only ITS half — the other half still re
   assert.match(String(created[0].payload.narration), /1 order\(s\), £25\.00/)
   assert.equal(refusals.length, 1)
   assert.match(refusals[0], /log-a1-aaaa, CANCELLED/)
+})
+
+// --- o3d-jit6 r2 #2: a SYNCED row that is SYNCED only because somebody said so ---
+//
+// The per-row settlement action admits the POSTED assertion for DAILY_BATCH rows — deliberately, and
+// r1 finding 3 made it the ONLY exit from a batch wedged by the dispatch fence. It writes exactly the
+// shape the connector's own success writes: status SYNCED plus an externalTransactionId. SYNCED is
+// the first entry in LIVE_DAILY_BATCH_STATUSES, so the block itself is right. What was wrong is that
+// it was SILENT: an operator's belief and Xero's receipt produced the identical, unreported skip, so
+// a batch whose journal is not actually in the accounts would be suppressed for ever with nothing to
+// look at. The basis column is what tells them apart.
+
+test('o3d-jit6 r2#2: a SYNCED row settled BY HAND blocks the rebuild and is REPORTED, not silently skipped', async () => {
+  reset()
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80 }]
+  syncLogs = [{
+    connector: 'xero',
+    type: 'DAILY_BATCH_INVENTORY_ALLOC',
+    referenceId: XERO_A2_REF,
+    status: 'SYNCED',
+    externalTransactionId: 'MJ-typed-by-a-human',
+    settlementBasis: 'OPERATOR_ASSERTION',
+    id: 'log-a2-asserted',
+  }]
+
+  const refusals = await runXeroSweep()
+
+  assert.deepEqual(created, [], 'still blocked: if the journal IS there, a rebuild posts £80 twice')
+  assert.equal(refusals.length, 1, 'but never silently — nothing has confirmed that journal exists')
+  assert.match(refusals[0], /log-a2-asserted, SYNCED, external id MJ-typed-by-a-human/)
+  assert.match(refusals[0], /settled BY HAND/)
+  assert.match(refusals[0], /never read the document/)
+  assert.match(refusals[0], /no sweep will ever raise it again/,
+    'the operator has to be told what a wrong assertion costs, or the report is noise')
+})
+
+test('o3d-jit6 r2#2: a SYNCED row the CONNECTOR wrote is still a silent skip', async () => {
+  // The other half of the same decision, and the one that keeps the run readable. Absence of an
+  // assertion IS the confirmation case (nothing is back-filled), so an ordinary posted batch must not
+  // start reporting itself every day — a report every run for a batch that is genuinely fine is how a
+  // real refusal stops being read.
+  reset()
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: XERO_A2_REF, allocationBatchAmount: 80 }]
+  syncLogs = [{
+    connector: 'xero',
+    type: 'DAILY_BATCH_INVENTORY_ALLOC',
+    referenceId: XERO_A2_REF,
+    status: 'SYNCED',
+    externalTransactionId: 'MJ-from-xero',
+    settlementBasis: null,
+    id: 'log-a2-confirmed',
+  }]
+
+  const refusals = await runXeroSweep()
+
+  assert.deepEqual(created, [])
+  assert.deepEqual(refusals, [], 'a confirmed post needs no chasing')
+})
+
+test('o3d-jit6 r2#2: one asserted row among the live ones is enough to report the batch', async () => {
+  // Worst-first, and the split batch is where it bites: A1-…-aaaa was posted by the connector and
+  // A1-…-bbbb was asserted by hand. Reporting only when EVERY live row is asserted would let the
+  // sound half vouch for the doubtful one, which is the same "another row vouches for this batch"
+  // mistake o3d-0qoo r1 removed from the probe itself.
+  reset()
+  salesOrderRows.a1 = [
+    { revenueDeferredDate: new Date('2026-07-20T09:00:00.000Z'), revenueDeferredBatchRef: 'A1-2026-07-20-aaaaaaaa', unearnedRevenueAmount: 100 },
+    { revenueDeferredDate: new Date('2026-07-20T17:30:00.000Z'), revenueDeferredBatchRef: 'A1-2026-07-20-bbbbbbbb', unearnedRevenueAmount: 25 },
+  ]
+  syncLogs = [
+    { connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-20-aaaaaaaa', status: 'SYNCED', id: 'log-a1-aaaa' },
+    {
+      connector: 'xero',
+      type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+      referenceId: 'A1-2026-07-20-bbbbbbbb',
+      status: 'SYNCED',
+      externalTransactionId: 'MJ-asserted',
+      settlementBasis: 'OPERATOR_ASSERTION',
+      id: 'log-a1-bbbb',
+    },
+  ]
+
+  const refusals = await runXeroSweep()
+
+  assert.deepEqual(created, [])
+  assert.equal(refusals.length, 1, 'exactly the doubtful half is reported')
+  assert.match(refusals[0], /log-a1-bbbb/)
+  assert.doesNotMatch(refusals[0], /log-a1-aaaa/, 'the confirmed split is not dragged into the report')
 })

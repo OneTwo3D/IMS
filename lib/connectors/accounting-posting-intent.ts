@@ -46,6 +46,25 @@ export type AccountingPostingIntent = {
   connector: string
   /** The stored payload, exactly as it came out of the database — including its origin stamp. */
   payload: unknown
+  /**
+   * o3d-dzip: the row's `connectionProvenance` column — the half of its origin record that survives
+   * retention's payload compaction. Read from the SAME `findUnique` as `payload`
+   * (readClaimedSyncLogOriginRecord), so the pair can never be assembled from two moments.
+   *
+   * REQUIRED, not optional, and that is the point: an intent built without it would silently narrow
+   * every verdict back to the payload, and a compacted row would go back to reading as
+   * `no-origin-recorded` while looking exactly like a checked one. The compiler is what stops a call
+   * site being added that forgets.
+   */
+  connectionProvenance: string | null
+  /**
+   * o3d-dzip (Codex r1 finding 1): the row's `backReferenceEvidenceCompactedAt`, from that same
+   * `findUnique`. It is the only durable evidence that a SILENT payload is silent because retention
+   * emptied it rather than because something rewrote it, and without it the verdict cannot accept the
+   * column alone. REQUIRED for the same reason as the column: an intent that omitted it would turn
+   * every compacted row back into a refusal while still looking checked.
+   */
+  backReferenceEvidenceCompactedAt: Date | null
   type: string
   referenceType: string
   referenceId: string
@@ -90,6 +109,8 @@ export function accountingPostingIntentRefusal(connector: string, tenantId: stri
 
   return accountingPayloadConnectionVerdict({
     payload: intent.payload,
+    connectionProvenance: intent.connectionProvenance,
+    backReferenceEvidenceCompactedAt: intent.backReferenceEvidenceCompactedAt,
     activeProvenance: accountingIdProvenanceFor(connector, tenantId),
     type: intent.type,
     referenceType: intent.referenceType,

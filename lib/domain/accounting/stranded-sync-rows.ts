@@ -1,5 +1,8 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { describeSyncRowSettleability } from '@/lib/domain/accounting/sync-row-settlement'
+import {
+  describeSyncRowSettleability,
+  type SettlementOutcome,
+} from '@/lib/domain/accounting/sync-row-settlement'
 
 /**
  * o3d-osl8 item 1 — the STRANDED-ROW read model.
@@ -115,6 +118,12 @@ export type StrandedSyncRow = {
    * the operator is told they are minting the attempt identity, not naming one they were shown.
    */
   requiresAttemptAdoption: boolean
+  /**
+   * o3d-jit6 (Codex r1 finding 3): which assertions this row admits. `['POSTED']` for a DAILY_BATCH
+   * row — recording the journal's id is safe and is the only exit such a row has; cancelling it is
+   * what would let the recreate sweep post the batch twice.
+   */
+  settleableOutcomes: readonly SettlementOutcome[]
 }
 
 export function describeStrandedSyncRow(row: StrandedSyncRowSource, now: Date): StrandedSyncRow {

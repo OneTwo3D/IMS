@@ -19,6 +19,7 @@ import {
   type SettleAccountingSyncRowInput,
   type SettleAccountingSyncRowResult,
 } from '@/app/actions/accounting-settlement'
+import type { SettlementOutcome } from '@/lib/domain/accounting/sync-row-settlement'
 
 /**
  * o3d-nf9i + o3d-osl8 item 2 — the operator's end of the ONE settlement mechanism.
@@ -57,6 +58,15 @@ type SettleSyncRowProps = {
   settleable: boolean
   /** Why not. Rendered in place of the control: a silently absent button reads as "nothing to do". */
   notSettleableReason: string | null
+  /**
+   * Which assertions this row admits (o3d-jit6, Codex r1 finding 3). A DAILY_BATCH row admits POSTED
+   * only: recording the journal id leaves it SYNCED, which is what the batch recreators and the order
+   * delete guard already read as "this batch posted", while CANCELLED would tell both of them the
+   * opposite and let an order be deleted out from under a journal that contains it. The offered
+   * button and the server's refusal come from ONE decision — `describeSyncRowSettleability` — so a
+   * button can never be shown for an assertion the action would refuse.
+   */
+  settleableOutcomes: readonly SettlementOutcome[]
   /** What the operator should know before asserting. Facts, not a recommendation. */
   caveat: string | null
   onSettled: () => void
@@ -110,6 +120,7 @@ function SettleSyncRowDialog({
   referenceType,
   referenceId,
   caveat,
+  settleableOutcomes,
   onSettled,
   onClose,
 }: SettleSyncRowProps & { onClose: () => void }) {
@@ -191,22 +202,29 @@ function SettleSyncRowDialog({
             </p>
             {caveat && <p className="text-xs font-medium">{caveat}</p>}
             <div className="flex gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant={outcome === 'POSTED' ? 'default' : 'outline'}
-                onClick={() => setOutcome('POSTED')}
-              >
-                It DID post
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant={outcome === 'NOT_POSTED' ? 'default' : 'outline'}
-                onClick={() => setOutcome('NOT_POSTED')}
-              >
-                It did NOT post
-              </Button>
+              {settleableOutcomes.includes('POSTED') && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={outcome === 'POSTED' ? 'default' : 'outline'}
+                  onClick={() => setOutcome('POSTED')}
+                >
+                  It DID post
+                </Button>
+              )}
+              {/* Omitted, not disabled, for a row whose type refuses it — and the caveat above says
+                  why. A disabled button an operator cannot read a reason from is the same dead end as
+                  a refusal with no remedy. */}
+              {settleableOutcomes.includes('NOT_POSTED') && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={outcome === 'NOT_POSTED' ? 'default' : 'outline'}
+                  onClick={() => setOutcome('NOT_POSTED')}
+                >
+                  It did NOT post
+                </Button>
+              )}
             </div>
             {outcome === 'POSTED' && (
               <div className="space-y-1">
