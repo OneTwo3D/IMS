@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
@@ -207,6 +209,36 @@ function phaseEnd(lines: string[], phase: string): number {
   return next === -1 ? lines.length : next
 }
 
+/**
+ * The text of one top-level shell function, from `name() {` to the `}` in column 0.
+ *
+ * Used by the durability tests below to RUN the shipped code rather than to describe it:
+ * a re-implementation of the marker writer would pass while the script wrote something
+ * else, which is the failure mode this whole file exists to prevent.
+ */
+function shellFunction(source: string, name: string): string {
+  const start = source.indexOf(`\n${name}() {\n`)
+  assert.notEqual(start, -1, `the script must define ${name}()`)
+  const rest = source.slice(start + 1)
+  const end = rest.indexOf('\n}\n')
+  assert.notEqual(end, -1, `${name}() must be closed by a } in column 0`)
+  return rest.slice(0, end + 2)
+}
+
+/**
+ * The regex the script's ADOPTION path greps the marker with, taken from the script itself.
+ *
+ * Every occurrence must be the SAME pattern: the writer confirms what it wrote with it and
+ * the next run decides hold-or-release with it, and a marker written under one pattern and
+ * read under another is the whole defect in a different disguise.
+ */
+function adoptionPredicate(source: string): string {
+  const found = [...source.matchAll(/grep -qE '(\^schema_touched=true\$)'/g)].map((match) => match[1])
+  assert.ok(found.length >= 2, 'the marker must be written under, and adopted through, the same predicate')
+  assert.equal(new Set(found).size, 1, 'and every use of it must be identical')
+  return found[0]
+}
+
 for (const [name, lines] of [
   ['deploy.sh', DEPLOY_LINES],
   ['update.sh', UPDATE_LINES],
@@ -305,11 +337,15 @@ for (const [name, lines] of [
     assert.match(source, /schema_touched=\$\{SCHEMA_TOUCHED\}/, 'and be recorded in the marker for the next run')
 
     // Set BEFORE the migration command, never after: an interrupted or half-applied
-    // migration is precisely the case it exists for.
-    const set = realCodeLine(lines, /^\s*SCHEMA_TOUCHED=true$/, phaseLine(lines, 'migrate'))
+    // migration is precisely the case it exists for. And set by mark_schema_touched, which
+    // also PERSISTS it — see the durability tests below.
+    const mark = realCodeLine(lines, /^\s*mark_schema_touched$/, phaseLine(lines, 'migrate'))
     const migrateCmd = realCodeLine(lines, 'prisma migrate deploy', phaseLine(lines, 'migrate'))
-    assert.notEqual(set, -1, 'the migrate phase must record that the schema may have moved')
-    assert.ok(set < migrateCmd, 'the flag must be set before `prisma migrate deploy` is invoked, not after it returns')
+    assert.notEqual(mark, -1, 'the migrate phase must record that the schema may have moved')
+    assert.ok(mark < migrateCmd, 'the flag must be set before `prisma migrate deploy` is invoked, not after it returns')
+
+    const marker = shellFunction(lines.join('\n'), 'mark_schema_touched')
+    assert.match(marker, /^\s*SCHEMA_TOUCHED=true$/m, 'and mark_schema_touched is where the flag is raised')
   })
 
   test(`${name} holds the connection fence on a failure after the migration started, and releases it before`, () => {
@@ -530,3 +566,473 @@ test('install.sh never restarts what it stopped on a post-stop failure', () => {
   assert.match(trapBody, /if \$\{SCHEMA_TOUCHED\}; then/, 'and holds the connection fence only once the schema may have moved')
   assert.match(trapBody, /release_db_connections/, 'while a pre-migration failure still releases it')
 })
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.4 (Codex r3, CRITICAL) — A HARD INTERRUPTION LEFT `schema_touched=false`.
+//
+// Round 3 set SCHEMA_TOUCHED in shell memory immediately before Prisma ran and left the
+// DURABLE marker to the exit trap. A SIGKILL, an OOM kill or a power cut during
+// `prisma migrate deploy` never reaches a trap: the file on disk still said
+// `schema_touched=false`, and the next run's adoption — which reads that file and nothing
+// else — RELEASED the connection fence over a half-migrated schema. That is the CRITICAL
+// the previous round fixed, arriving through the one path the trap cannot cover.
+//
+// These tests RUN the shipped marker writer (extracted verbatim from the script) rather
+// than describing it, because a re-implementation would pass while the script wrote
+// something else. The hard kill is modelled the only way it can be: the trap is never
+// invoked, and what is on disk at that moment is all there is.
+// ---------------------------------------------------------------------------
+
+const INSTALL_SOURCE = INSTALL_LINES.join('\n')
+
+const MARKER_CASES = [
+  {
+    name: 'deploy.sh',
+    source: DEPLOY_LINES.join('\n'),
+    markerFn: 'write_fence_marker',
+    markerCall: 'write_fence_marker "cutover started"',
+    preamble: (dir: string) => `
+DRY_RUN=false
+BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+STATE_DIR='${dir}'
+FENCE_FILE="\${STATE_DIR}/FENCED"
+CURRENT_STEP=migrate
+FENCE_MASK=true
+SCHEMA_TOUCHED=false
+DB_FENCE_UP=true
+APP_DIR_REAL=/opt/app
+PORT=3000
+CRON_BACKUP="\${STATE_DIR}/crontab.bak"
+SERVICE_UNITS=(app.service)
+DB_FENCE_STATE="\${STATE_DIR}/db-connect-fence.json"
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
+ok() { :; }
+die() { echo "die: $*" >&2; exit 1; }
+`,
+  },
+  {
+    name: 'update.sh',
+    source: UPDATE_LINES.join('\n'),
+    markerFn: 'write_fence_marker',
+    markerCall: 'write_fence_marker "cutover started"',
+    preamble: (dir: string) => `
+DRY_RUN=false
+BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+DATA_DIR='${dir}'
+FENCE_FILE="\${DATA_DIR}/DEPLOY-FENCED"
+CURRENT_STEP=migrate
+FENCE_MASK=true
+SCHEMA_TOUCHED=false
+DB_FENCE_UP=true
+BACKUP_FILE=''
+CRON_BACKUP="\${DATA_DIR}/crontab.bak"
+DB_FENCE_STATE="\${DATA_DIR}/db-connect-fence.json"
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
+success() { :; }
+die() { echo "die: $*" >&2; exit 1; }
+`,
+  },
+  {
+    name: 'install.sh',
+    source: INSTALL_SOURCE,
+    markerFn: 'write_cutover_marker',
+    markerCall: 'write_cutover_marker "cutover started"',
+    preamble: (dir: string) => `
+DATA_DIR='${dir}'
+FENCE_FILE="\${DATA_DIR}/DEPLOY-FENCED"
+CUTOVER_STEP=migrate
+APP_DIR=/opt/app
+APP_NAME=one-two-inventory
+FENCE_ARMED=true
+SCHEMA_TOUCHED=false
+DB_FENCE_UP=true
+CRON_BACKUP="\${DATA_DIR}/crontab.bak"
+DB_FENCE_STATE="\${DATA_DIR}/db-connect-fence.json"
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
+success() { :; }
+die() { echo "die: $*" >&2; exit 1; }
+`,
+  },
+] as const
+
+/** Run the script's OWN marker functions, then walk away — exactly what a SIGKILL leaves. */
+function runMarkerHarness(entry: (typeof MARKER_CASES)[number], call: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'ims-marker-'))
+  try {
+    const program = [
+      'set -euo pipefail',
+      entry.preamble(dir),
+      shellFunction(entry.source, entry.markerFn),
+      shellFunction(entry.source, 'mark_schema_touched'),
+      call,
+    ].join('\n')
+    execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    return readFileSync(join(dir, entry.name === 'deploy.sh' ? 'FENCED' : 'DEPLOY-FENCED'), 'utf8')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+for (const entry of MARKER_CASES) {
+  test(`${entry.name} persists schema_touched BEFORE prisma, so a hard kill is adopted as a migration attempt`, () => {
+    // THE KILL. mark_schema_touched runs and the process ends there — no exit trap, no
+    // second write, nothing. What follows is the only evidence the next run will have.
+    const marker = runMarkerHarness(entry, 'mark_schema_touched')
+
+    assert.match(
+      marker,
+      /^schema_touched=true$/m,
+      'the marker on disk must already say the schema may have moved before prisma is invoked',
+    )
+
+    // AND IT IS READ THROUGH ADOPTION'S OWN PREDICATE, not through a paraphrase of it.
+    const predicate = adoptionPredicate(entry.source)
+    const dir = mkdtempSync(join(tmpdir(), 'ims-adopt-'))
+    try {
+      const file = join(dir, 'marker')
+      execFileSync('bash', ['-c', `cat > "${file}"`], { input: marker })
+      const status = execFileSync('bash', [
+        '-c',
+        `grep -qE '${predicate}' "${file}" && echo HOLD || echo RELEASE`,
+      ], { encoding: 'utf8' }).trim()
+      assert.equal(
+        status,
+        'HOLD',
+        'adoption must read this marker as "a migration was attempted" and HOLD the connection fence',
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${entry.name} still records schema_touched=false for a kill BEFORE the migration`, () => {
+    // The other half of the distinction, and the reason this is not just "always hold": a
+    // run killed while stopping writers or arming a fence has moved nothing, and a revoke
+    // nobody undoes is an application that cannot reach its database.
+    const marker = runMarkerHarness(entry, entry.markerCall)
+    assert.match(marker, /^schema_touched=false$/m, 'nothing had moved, so adoption must release')
+
+    const predicate = adoptionPredicate(entry.source)
+    const dir = mkdtempSync(join(tmpdir(), 'ims-adopt-'))
+    try {
+      const file = join(dir, 'marker')
+      execFileSync('bash', ['-c', `cat > "${file}"`], { input: marker })
+      const status = execFileSync('bash', [
+        '-c',
+        `grep -qE '${predicate}' "${file}" && echo HOLD || echo RELEASE`,
+      ], { encoding: 'utf8' }).trim()
+      assert.equal(status, 'RELEASE', 'a pre-migration kill must not leave the database unreachable')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${entry.name} raises the flag ONLY where it is also persisted, and before prisma runs`, () => {
+    // The defect was a flag raised in shell memory next to the migration command with the
+    // durable write left to a trap that a SIGKILL never reaches. So there is exactly ONE
+    // place the flag is raised, and it is the function that writes and flushes the marker:
+    // a second `SCHEMA_TOUCHED=true` anywhere is that defect coming back.
+    const lines = entry.source.split(/\r?\n/)
+    const marker = shellFunction(entry.source, 'mark_schema_touched')
+    assert.match(marker, /^\s*SCHEMA_TOUCHED=true$/m, 'mark_schema_touched() is where it is raised')
+
+    // Only two raises are legitimate: inside mark_schema_touched (which persists it), and
+    // adoption CARRYING FORWARD a raise a previous run already persisted. Anything else is
+    // a flag that exists only in memory — the defect, back again.
+    const markerLines = new Set(marker.split(/\r?\n/))
+    for (let index = 0; index < lines.length; index += 1) {
+      if (!/^[ \t]*SCHEMA_TOUCHED=true$/.test(lines[index])) continue
+      const carriedForward = /grep -qE '\^schema_touched=true\$'/.test(lines[index - 1] ?? '')
+      assert.ok(
+        markerLines.has(lines[index]) || carriedForward,
+        `SCHEMA_TOUCHED is raised at line ${index + 1} neither by mark_schema_touched() nor by reading the persisted marker`,
+      )
+    }
+
+    // And the LAST call to mark_schema_touched precedes the migration: an interrupted,
+    // half-applied or killed migration is exactly what the flag is for, so a call after
+    // prisma returns would be false for every case it exists to cover.
+    const migrateCmd = realCodeLine(lines, 'prisma migrate deploy')
+    assert.notEqual(migrateCmd, -1, 'the script must actually run the migration')
+    let lastMark = -1
+    for (let index = 0; index < lines.length; index += 1) {
+      if (isCode(lines[index]) && !lines[index].includes('[DRY]') && /^\s*mark_schema_touched$/.test(lines[index])) {
+        lastMark = index
+      }
+    }
+    assert.notEqual(lastMark, -1, 'mark_schema_touched must be called')
+    assert.ok(lastMark < migrateCmd, 'every call to it must come before `prisma migrate deploy`')
+  })
+
+  test(`${entry.name} flushes the marker instead of leaving it in the page cache`, () => {
+    // A marker that only reached the page cache is not evidence a power cut leaves behind,
+    // and a power cut is half of what this flag is for.
+    const writer = shellFunction(entry.source, entry.markerFn)
+    assert.match(writer, /\bsync\b/, 'the marker write must be flushed to disk')
+
+    const mark = shellFunction(entry.source, 'mark_schema_touched')
+    assert.match(
+      mark,
+      /grep -qE '\^schema_touched=true\$'/,
+      'and mark_schema_touched must confirm what actually landed on disk',
+    )
+    assert.match(mark, /\bdie\b/, 'refusing to migrate when the attempt cannot be recorded')
+  })
+
+  test(`${entry.name} records which fence is actually standing in the marker`, () => {
+    const marker = runMarkerHarness(entry, 'mark_schema_touched')
+    assert.match(
+      marker,
+      /^db_connect_fence=held$/m,
+      'the marker must say whether the connection fence is up, not leave the operator to guess',
+    )
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.4 (Codex r3, HIGH) — KNOWN-UNFENCED DEPLOYMENTS WERE ALLOWED TO MIGRATE.
+//
+// Exit 3 from scripts/fence-db-connections.mjs means CONNECT was NOT revoked. Round 3
+// warned and fell back to the point-in-time probe, which is the same mistake the probe
+// itself was: a sibling server or a legacy process can connect at any moment after the
+// snapshot. A fence you know is absent is not a degraded fence, it is no fence.
+// ---------------------------------------------------------------------------
+
+for (const [name, source] of [
+  ['deploy.sh', DEPLOY_LINES.join('\n')],
+  ['update.sh', UPDATE_LINES.join('\n')],
+  ['install.sh', INSTALL_SOURCE],
+] as const) {
+  test(`${name} aborts when the database could not be fenced (exit 3)`, () => {
+    const fence = shellFunction(source, 'fence_db_connections')
+    const exitThree = fence.slice(fence.indexOf('\n    3)'))
+    assert.notEqual(fence.indexOf('\n    3)'), -1, 'exit 3 must be handled explicitly')
+    assert.match(exitThree, /\bdie\b/, 'exit 3 must abort the cutover, not warn and carry on')
+    assert.ok(
+      !/^\s*warn "THE DATABASE IS NOT FENCED/m.test(fence),
+      'the "NOT FENCED, continuing anyway" fallback must be gone',
+    )
+    assert.ok(
+      !/snapshot only\."\s*$/m.test(fence),
+      'a missing fence script must not degrade to a snapshot either',
+    )
+  })
+
+  test(`${name} refuses a migration it could never fence, before anything is stopped`, () => {
+    // The commonest reason a fence is impossible is knowable without asking the database,
+    // and discovering it at drain-verify would cost an outage for an unset variable.
+    const guard = shellFunction(source, 'require_fenceable_database')
+    assert.match(guard, /DEPLOY_ADMIN_DATABASE_URL/, 'it must require the privileged connection')
+    assert.match(guard, /\bdie\b/, 'and refuse rather than warn')
+
+    const lines = source.split(/\r?\n/)
+    const call = realCodeLine(lines, /^\s*require_fenceable_database$/)
+    assert.notEqual(call, -1, 'the guard must actually be called')
+    const stop = realCodeLine(lines, /systemctl stop/, call)
+    const migrate = realCodeLine(lines, 'prisma migrate deploy', call)
+    assert.ok(call < migrate, 'and called before the schema can move')
+    assert.ok(stop === -1 || call < stop, 'and before the predecessor is stopped, so a refusal costs no outage')
+  })
+
+  test(`${name} re-establishes the connection fence when the start or health check fails`, () => {
+    // The fence and the reboot marker come down BEFORE `systemctl start` and the health
+    // check, because the new build cannot serve a database it may not connect to. If either
+    // then fails the trap used to announce a HELD fence — one it had already released.
+    const refence = shellFunction(source, 'refence_db_connections')
+    assert.match(refence, /--fence/, 'the trap-safe re-fence must actually re-apply the revoke')
+    assert.ok(!/\bdie\b/.test(refence), 'and must never die, because it runs inside the exit trap')
+
+    const trapName = name === 'install.sh' ? 'on_cutover_exit' : 'on_exit'
+    const trap = shellFunction(source, trapName)
+    const attempt = trap.indexOf('refence_db_connections')
+    const heldClaim = trap.indexOf('DELIBERATELY LEFT UP')
+    const markerWrite = trap.search(/write_(fence|cutover)_marker "[^"]*failed/)
+    assert.notEqual(attempt, -1, 'the failure path must try to put the fence back')
+    assert.ok(attempt < heldClaim, 'the claim "the fence is held" must be made true before it is printed')
+    assert.match(trap, /NOT IN PLACE/, 'and when it cannot be, the failure path must say so instead')
+    assert.ok(
+      markerWrite > attempt,
+      'the marker must be written last, so it records the fence state that is true on exit',
+    )
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.4 (Codex r3, HIGH) — THE INSTALLER DID NOT RECOGNISE A RUNNING LEGACY
+// INSTALLATION.
+//
+// Upgrade detection looked at the new systemd unit and the crontab only — while the script
+// explicitly supports, and later removes, PM2-managed instances. A PM2-run installation was
+// therefore not "existing": nothing was fenced, nothing was stopped, and the migration ran
+// with the old binary live, on the launcher the cutover was written to remove.
+// ---------------------------------------------------------------------------
+
+test('install.sh recognises a legacy PM2 installation and an app-directory process as existing', () => {
+  const detect = shellFunction(INSTALL_SOURCE, 'upgrade_in_place')
+  assert.match(detect, /legacy_pm2_present/, 'a PM2-managed instance is an existing installation')
+  assert.match(detect, /app_dir_pids/, 'and so is any node process serving the app directory')
+
+  const pm2 = shellFunction(INSTALL_SOURCE, 'legacy_pm2_present')
+  assert.match(pm2, /pm2-\$\{APP_USER\}/, 'the pm2 systemd unit counts')
+  assert.match(pm2, /\.pm2/, 'and so does a PM2 home in the app directory')
+
+  const pids = shellFunction(INSTALL_SOURCE, 'app_dir_pids')
+  assert.match(pids, /\/proc\/\$\{pid\}\/cwd/, 'processes are scoped by working directory')
+  assert.match(
+    pids,
+    /app_real/,
+    'and compared against the resolved app directory, so a different tree on another port is untouched',
+  )
+})
+
+test('install.sh stops and drains the legacy launchers BEFORE every migration', () => {
+  const stopper = shellFunction(INSTALL_SOURCE, 'stop_legacy_launchers')
+  assert.match(stopper, /pm2 delete/, 'the PM2 app must be deleted')
+  assert.match(stopper, /pm2 kill/, 'and the daemon killed')
+  assert.match(stopper, /disable --now "pm2-/, 'and disabled, so a reboot does not bring it back')
+  assert.match(stopper, /kill -9/, 'a process that will not go is killed, not left writing')
+
+  const cutover = codeLine(INSTALL_LINES, /^if upgrade_in_place; then$/)
+  const call = realCodeLine(INSTALL_LINES, /^  stop_legacy_launchers$/, cutover)
+  const migrate = realCodeLine(INSTALL_LINES, 'prisma migrate deploy', cutover)
+  assert.notEqual(call, -1, 'the cutover must stop the launchers the unit file does not cover')
+  assert.ok(call < migrate, 'and stop them before the schema moves, not after it')
+
+  // The removal used to live beside the systemd unit install, AFTER the migration.
+  const unitInstall = realCodeLine(INSTALL_LINES, /^systemctl daemon-reload$/)
+  assert.ok(
+    unitInstall === -1 || call < unitInstall,
+    'the legacy removal must no longer happen only after the schema has moved',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// The exit-3 refusal, EXECUTED rather than read. `fence_db_connections` is extracted
+// verbatim from each script and run against a stub fence script that exits 3 — the code
+// path a real "CONNECT was not revoked" takes. It must leave the shell with a non-zero
+// status and say what is wrong; a warning that returns 0 is the defect this closes.
+// ---------------------------------------------------------------------------
+
+const FENCE_HARNESS = [
+  {
+    name: 'deploy.sh',
+    source: DEPLOY_LINES.join('\n'),
+    preamble: (dir: string) => `
+DRY_RUN=false
+BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+APP_USER="$(id -un)"
+STATE_DIR='${dir}'
+DB_FENCE_SCRIPT='${dir}/fence.mjs'
+DB_FENCE_STATE='${dir}/db-connect-fence.json'
+DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
+MIGRATION_DATABASE_URL=''
+DB_FENCE_UP=false
+info() { :; }
+ok() { :; }
+warn() { echo "WARN: $*"; }
+die() { echo "DIE: $*" >&2; exit 1; }
+as_app_user() { "$@"; }
+chown() { :; }
+`,
+  },
+  {
+    name: 'update.sh',
+    source: UPDATE_LINES.join('\n'),
+    preamble: (dir: string) => `
+DRY_RUN=false
+BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+APP_USER="$(id -un)"
+DB_FENCE_DIR='${dir}'
+DB_FENCE_SCRIPT='${dir}/fence.mjs'
+DB_FENCE_STATE='${dir}/db-connect-fence.json'
+DATABASE_URL='postgres://app@127.0.0.1/nowhere'
+DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
+MIGRATION_DATABASE_URL=''
+DB_FENCE_UP=false
+info() { :; }
+success() { :; }
+warn() { echo "WARN: $*"; }
+die() { echo "DIE: $*" >&2; exit 1; }
+run_as_user() { shift; "$@"; }
+chown() { :; }
+`,
+  },
+  {
+    name: 'install.sh',
+    source: INSTALL_SOURCE,
+    preamble: (dir: string) => `
+BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+APP_USER="$(id -un)"
+APP_DIR='${dir}'
+DB_FENCE_DIR='${dir}'
+DB_FENCE_SCRIPT='${dir}/fence.mjs'
+DB_FENCE_STATE='${dir}/db-connect-fence.json'
+DATABASE_URL='postgres://app@127.0.0.1/nowhere'
+DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
+MIGRATION_DATABASE_URL=''
+DB_FENCE_UP=false
+info() { :; }
+success() { :; }
+warn() { echo "WARN: $*"; }
+error() { echo "ERROR: $*" >&2; }
+die() { echo "DIE: $*" >&2; exit 1; }
+run_as_user() { shift; "$@"; }
+chown() { :; }
+`,
+  },
+] as const
+
+for (const entry of FENCE_HARNESS) {
+  test(`${entry.name} exits non-zero when the fence script reports CONNECT was not revoked`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-fence3-'))
+    try {
+      execFileSync('bash', ['-c', `printf 'process.exit(3)\\n' > "${dir}/fence.mjs"`])
+      const program = [
+        'set -euo pipefail',
+        entry.preamble(dir),
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'echo "REACHED THE MIGRATION"',
+      ].join('\n')
+
+      let status = 0
+      let output = ''
+      try {
+        output = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+      } catch (error) {
+        const failure = error as { status?: number; stdout?: string; stderr?: string }
+        status = failure.status ?? -1
+        output = `${failure.stdout ?? ''}${failure.stderr ?? ''}`
+      }
+
+      assert.notEqual(status, 0, 'exit 3 from the fence script must abort the cutover')
+      assert.ok(!output.includes('REACHED THE MIGRATION'), 'and nothing after it may run')
+      assert.match(output, /COULD NOT BE FENCED/, 'and it must say the database is not held closed')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${entry.name} treats a successful fence as the only way past the drain`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-fence0-'))
+    try {
+      execFileSync('bash', ['-c', `printf 'process.exit(0)\\n' > "${dir}/fence.mjs"`])
+      const program = [
+        'set -euo pipefail',
+        entry.preamble(dir),
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'echo "FENCE_UP=${DB_FENCE_UP} MIGRATION_URL=${MIGRATION_DATABASE_URL}"',
+      ].join('\n')
+      const output = execFileSync('bash', ['-c', program], { encoding: 'utf8' })
+      assert.match(output, /FENCE_UP=true/, 'a fence that took must be recorded as standing')
+      assert.match(
+        output,
+        /MIGRATION_URL=postgres:\/\/admin@/,
+        'and the migration must then run through the privileged connection, not the fenced-out one',
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}

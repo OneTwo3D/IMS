@@ -1970,6 +1970,19 @@ model SalesOrderRefund {
   // accountingRetrySyncs are NULL on every pre-existing row, so none of the three can tell a genuine
   // lost reversal from a row that predates them. See lib/domain/sales/refund-reversal-record.ts.
   reversalStagingState String? @map("reversal_staging_state")
+  // o3d-2sm1.4: DID THIS ROW EXIST BEFORE reversalStagingState DID? Written once, by the migration
+  // that added the column above, under the ACCESS EXCLUSIVE lock of its own ALTER TABLE — so it
+  // marks exactly the rows present at that instant and nothing can be inserted in the middle of it.
+  // The default is then flipped to false, so every row inserted afterwards carries false.
+  //
+  // It exists because the post-migration check has to tell a LEGACY NULL (legitimate: the column is
+  // deliberately not backfilled) from a NULL minted AFTER the column existed by a binary that never
+  // heard of it — the predecessor writing across the cutover. The first revision of that check
+  // compared createdAt against _prisma_migrations.started_at, and CURRENT_TIMESTAMP is fixed at
+  // TRANSACTION START in Postgres: a predecessor transaction that began before the migration and
+  // committed after it produced a row that looked legacy and was not. No writer sets this column;
+  // it is decided by construction, not by a clock. See the migration and its verify.sql.
+  reversalStagingStatePredatesColumn Boolean @default(false) @map("reversal_staging_state_predates_column")
   refundedAt      DateTime   @default(now())
   createdAt       DateTime   @default(now())
 

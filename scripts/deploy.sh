@@ -63,9 +63,16 @@
 #   3. THE CONNECTION FENCE — CONNECT revoked from the application role AND from PUBLIC
 #      for the length of the window (scripts/fence-db-connections.mjs), so the drain is
 #      CONTINUOUS instead of a snapshot that anything may connect after. It needs a
-#      privileged connection of its own (DEPLOY_ADMIN_DATABASE_URL); without one this
-#      script says so LOUDLY and falls back to the snapshot probe rather than implying a
-#      fence it does not have.
+#      privileged connection of its own (DEPLOY_ADMIN_DATABASE_URL).
+#
+#      AND IT IS MANDATORY (o3d-2sm1.4, Codex r3 HIGH). Round 2 warned on exit 3 — "CONNECT
+#      was not revoked" — and carried on with the point-in-time probe. That is the same
+#      mistake the probe itself was: a sibling server, a missed cron tick or an operator's
+#      psql can attach at any moment after the snapshot. The earlier reasoning was that a
+#      missing admin connection should not block a deploy; it was wrong, because a fence you
+#      know is absent is not a degraded fence, it is no fence. Exit 3 now ABORTS, and the
+#      cheapest half of the question — is DEPLOY_ADMIN_DATABASE_URL set at all — is asked in
+#      the VALIDATE phase, while the predecessor is still up and a refusal costs nothing.
 #
 #      WHEN IT IS RELEASED, AND WHEN IT IS DELIBERATELY HELD (o3d-2sm1.3, Codex r2
 #      CRITICAL). Round 2 released it from the exit trap unconditionally, and adoption
@@ -91,6 +98,22 @@
 #      build included — through DEPLOY_ADMIN_DATABASE_URL. It comes down in the start
 #      phase, once the migration, the drift check and every declared verification have
 #      passed and the new build is about to start.
+#
+#      AND "SCHEMA_TOUCHED" IS WRITTEN TO DISK BEFORE PRISMA RUNS, NOT BY THE EXIT TRAP
+#      (o3d-2sm1.4, Codex r3 CRITICAL). Round 2 set the flag in shell memory immediately
+#      before the migration and left the durable marker to the trap. A SIGKILL, an OOM kill
+#      or a power cut mid-migration never reaches a trap: the marker on disk still said
+#      `schema_touched=false`, adoption read that byte, and RELEASED the fence over a
+#      half-migrated schema — the exact CRITICAL the previous round fixed, arriving through
+#      the one path the trap cannot cover. mark_schema_touched() writes and flushes it
+#      first, and refuses to migrate if it cannot.
+#
+#      AND A FAILED START DOES NOT GET TO CLAIM THE FENCE IS UP (o3d-2sm1.4, Codex r3 HIGH).
+#      The start phase releases the fence before `systemctl start` and the health check,
+#      because the new build cannot serve a database it may not connect to. A failure in
+#      either then arrived at a banner announcing a HELD fence over a database the
+#      application role could already reach. The trap now re-stops, RE-ESTABLISHES the
+#      fence, and prints — and records in the marker — which of the two is actually true.
 #
 # A RE-RUN ADOPTS ALL THREE BEFORE IT REBUILDS. Finding the marker used to print a
 # warning and then pull, install, generate and BUILD — minutes during which a rebooted
@@ -189,7 +212,7 @@ for arg in "$@"; do
     --skip-build)   SKIP_BUILD=true ;;
     --skip-migrate) SKIP_MIGRATE=true; SKIP_MIGRATE_FLAG="--skip-migrate" ;;
     --restart-only) SKIP_BUILD=true; SKIP_MIGRATE=true; SKIP_MIGRATE_FLAG="--restart-only" ;;
-    --help|-h)      sed -n '3,150p' "$0"; exit 0 ;;
+    --help|-h)      sed -n '3,179p' "$0"; exit 0 ;;
     *) die "Unknown option: $arg (try --help)" ;;
   esac
 done
@@ -243,10 +266,23 @@ as_app_user() {
 #                   or may be half-moved. This is the flag the connection fence is held
 #                   by: intending to migrate is not the same as having started, and the
 #                   database must stay unreachable only for the second (o3d-2sm1.3).
+#                   IT IS PERSISTED AND FLUSHED TO DISK BEFORE PRISMA IS INVOKED, not
+#                   left in shell memory for the exit trap to write out (o3d-2sm1.4,
+#                   Codex r3 CRITICAL). A SIGKILL or a power cut during the migration
+#                   never reaches the trap, so a flag that only lives in memory leaves
+#                   a marker saying `schema_touched=false` — and the next run's
+#                   adoption reads exactly that byte and RELEASES the connection fence
+#                   over a half-migrated schema. See mark_schema_touched().
+#   DB_FENCE_UP     the connection fence is standing RIGHT NOW, as far as this process
+#                   knows. Not the same as SCHEMA_TOUCHED: the start phase releases the
+#                   fence while SCHEMA_TOUCHED stays true, and a failure to start or a
+#                   failed health check must then not report a fence that is no longer
+#                   there (o3d-2sm1.4, Codex r3 HIGH). The trap re-establishes it.
 # ---------------------------------------------------------------------------
 FENCE_ARMED=false
 FENCE_MASK=false
 SCHEMA_TOUCHED=false
+DB_FENCE_UP=false
 DEPLOY_OK=false
 CRON_FENCED=false
 CURRENT_STEP="startup"
@@ -286,9 +322,45 @@ write_fence_marker() {
     echo "cron_backup=${CRON_BACKUP}"
     echo "units=${SERVICE_UNITS[*]:-none}"
     echo "db_connect_fence_state=${DB_FENCE_STATE}"
+    # What the operator reading this file is actually looking at. Printing "held" from a
+    # SCHEMA_TOUCHED branch that had already released it is how a fence that does not
+    # exist gets read as one (Codex r3 HIGH).
+    echo "db_connect_fence=$($DB_FENCE_UP && echo held || echo released)"
     echo "release_db_connect_fence=${DB_FENCE_RELEASE_CMD}"
   } > "$FENCE_FILE"
   chmod 600 "$FENCE_FILE"
+  # DURABILITY. Everything above is a page-cache write until something flushes it, and
+  # the one caller that cannot afford that is mark_schema_touched(): the marker exists
+  # precisely for the run that is killed or loses power a moment later.
+  sync "$FENCE_FILE" 2>/dev/null || sync || true
+}
+
+# THE SCHEMA IS ABOUT TO MOVE — SAY SO ON DISK BEFORE IT DOES (o3d-2sm1.4, Codex r3
+# CRITICAL).
+#
+# The flag used to be set in shell memory immediately before Prisma ran, and the marker
+# on disk was only refreshed by the exit trap. A kill -9, an OOM kill or a power cut
+# during `prisma migrate deploy` never reaches that trap, so the durable marker still
+# said `schema_touched=false` — and the next run's adoption, which reads that file and
+# nothing else, would RELEASE the connection fence and let the application straight back
+# onto a half-migrated schema. That is the CRITICAL the previous round fixed, surviving
+# through the one path the trap cannot cover.
+#
+# So the order here is: set the flag, write the marker, flush it, and only then invoke
+# Prisma. Writing it costs one fsync; not writing it costs the exact failure this whole
+# script exists to prevent.
+mark_schema_touched() {
+  # A dry run neither stops nor migrates anything, so the flag stays false and the
+  # failure banner keeps telling the truth about a run that touched nothing.
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would record schema_touched=true in ${FENCE_FILE} and flush it BEFORE invoking prisma"
+    return 0
+  fi
+  SCHEMA_TOUCHED=true
+  write_fence_marker "migration about to be invoked at $(date -Iseconds)"
+  grep -qE '^schema_touched=true$' "$FENCE_FILE" || die \
+    "Could not record schema_touched=true in ${FENCE_FILE}. Refusing to migrate: a migration whose interruption cannot be recorded would be adopted as one that never started."
+  ok "Recorded schema_touched=true in ${FENCE_FILE} (flushed) — an interrupted migration is now recoverable."
 }
 
 verify_reboot_fence() {
@@ -382,10 +454,8 @@ fence_db_connections() {
     echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/fence-db-connections.mjs --fence  (as ${APP_USER})"
     return 0
   fi
-  if [[ ! -f "$DB_FENCE_SCRIPT" ]]; then
-    warn "${DB_FENCE_SCRIPT} is not in this checkout: NOT FENCED, the probe below is a snapshot only."
-    return 0
-  fi
+  [[ -f "$DB_FENCE_SCRIPT" ]] || die \
+    "${DB_FENCE_SCRIPT} is not in this checkout, so this run cannot hold the database closed for the migration window. A snapshot probe is not a fence. Restore the script (it ships with the app) and re-run; nothing has been migrated."
 
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
@@ -397,17 +467,48 @@ fence_db_connections() {
   case "$rc" in
     0)
       MIGRATION_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}"
+      DB_FENCE_UP=true
       ok "Connection fence up: new application connections are refused for the window."
       ;;
     3)
-      warn "THE DATABASE IS NOT FENCED. What follows is a SNAPSHOT, not a fence: nothing"
-      warn "stops a client connecting between the probe and the end of the migration."
-      warn "Set DEPLOY_ADMIN_DATABASE_URL (docs/installation.md) to make this a real fence."
+      # EXIT 3 IS "CONNECT WAS NOT REVOKED", AND IT ABORTS (o3d-2sm1.4, Codex r3 HIGH).
+      #
+      # Round 2 warned and fell back to the point-in-time probe. That was wrong in exactly
+      # the way the probe itself was wrong: a sibling server, a cron tick the crontab fence
+      # missed, an operator's psql or a `next dev` in another worktree can attach at any
+      # moment AFTER the snapshot and write across the migration. A fence we know is absent
+      # is not a degraded fence, it is no fence — and the earlier reasoning that a missing
+      # admin connection should not block a deploy traded a configuration problem for the
+      # data-loss window this whole script exists to close.
+      die "THE DATABASE COULD NOT BE FENCED (exit 3): CONNECT was NOT revoked, so nothing stops a client attaching between now and the end of the migration. Refusing to migrate — the reason is printed above. Fix it (usually: set DEPLOY_ADMIN_DATABASE_URL to a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL, see docs/installation.md) and re-run. Nothing has been migrated."
       ;;
     *)
       die "The connection fence failed (exit ${rc}). Nothing has been migrated."
       ;;
   esac
+}
+
+# Preflight for the fence, asked while the predecessor is still up and the schema has
+# not moved. The database can only answer some of the reasons a fence is impossible (a
+# superuser application role, a CONNECT that arrives through role membership), but the
+# commonest one by far — no privileged connection at all — is knowable from here, and
+# discovering it at drain-verify would cost an outage for a missing environment variable.
+require_fenceable_database() {
+  # A dry run stops nothing and migrates nothing, so it REPORTS the refusal instead of
+  # being it: the point of --dry-run is to find out what a real run would do, and "it would
+  # refuse, here is why" is the most useful thing it can print.
+  if $DRY_RUN && { [[ -z "$DEPLOY_ADMIN_DATABASE_URL" ]] || [[ ! -f "$DB_FENCE_SCRIPT" ]]; }; then
+    warn "A REAL RUN WOULD BE REFUSED HERE: the migration window cannot be fenced."
+    warn "DEPLOY_ADMIN_DATABASE_URL is not set (or ${DB_FENCE_SCRIPT##*/} is missing), so CONNECT"
+    warn "could not be revoked for the window and nothing would stop a client attaching across"
+    warn "the migration. See docs/installation.md. Nothing has been changed by this dry run."
+    return 0
+  fi
+  [[ -n "$DEPLOY_ADMIN_DATABASE_URL" ]] || die \
+    "DEPLOY_ADMIN_DATABASE_URL is not set, so this deploy has no privileged connection that would survive revoking CONNECT from the application role — the database cannot be held closed for the migration window. Set it (a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL; docs/installation.md) and re-run. Nothing has been stopped and nothing has been migrated."
+  [[ -f "$DB_FENCE_SCRIPT" ]] || die \
+    "${DB_FENCE_SCRIPT} is missing from this checkout, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
+  ok "A connection fence is possible: DEPLOY_ADMIN_DATABASE_URL is set and ${DB_FENCE_SCRIPT##*/} is present."
 }
 
 release_db_connections() {
@@ -421,6 +522,7 @@ release_db_connections() {
   if as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
       node "$DB_FENCE_SCRIPT" --release --state-file="$DB_FENCE_STATE"; then
     MIGRATION_DATABASE_URL=""
+    DB_FENCE_UP=false
     ok "Connection fence released."
     return 0
   fi
@@ -430,6 +532,34 @@ release_db_connections() {
   echo -e "${RED}[ERROR]${RESET}   ${DB_FENCE_RELEASE_CMD}" >&2
   echo -e "${RED}[ERROR]${RESET} or, by hand as a superuser, the GRANTs recorded in ${DB_FENCE_STATE}." >&2
   return 1
+}
+
+# RE-ESTABLISH A FENCE THE START PHASE ALREADY RELEASED (o3d-2sm1.4, Codex r3 HIGH).
+#
+# The start phase releases the connection fence and deletes the reboot marker BEFORE
+# `systemctl start` and the health check, because the new build cannot serve a database
+# it may not connect to. If the start or the health check then fails, SCHEMA_TOUCHED is
+# still true and the failure banner used to announce that the fence was HELD — while the
+# application role had CONNECT back and the service's own Restart= policy was free to
+# reattach. An operator reading "the fence is up" about a fence that is down is worse
+# than being told there is none.
+#
+# So the trap re-fences after it has re-stopped the units, and reports what it actually
+# achieved. This is deliberately NOT `fence_db_connections`: that one dies on a failure,
+# and dying inside an exit trap loses the status and the banner.
+refence_db_connections() {
+  $DB_FENCE_UP && return 0
+  $DRY_RUN && return 1
+  [[ -f "$DB_FENCE_SCRIPT" ]] || return 1
+  [[ -n "$DEPLOY_ADMIN_DATABASE_URL" ]] || return 1
+
+  local rc=0
+  as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+    node "$DB_FENCE_SCRIPT" --fence --state-file="$DB_FENCE_STATE" || rc=$?
+  [[ "$rc" -eq 0 ]] || return 1
+  DB_FENCE_UP=true
+  MIGRATION_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}"
+  return 0
 }
 
 # Adopt a fence a previous run left standing after it had started migrating, instead of
@@ -546,7 +676,8 @@ on_exit() {
     if $SCHEMA_TOUCHED; then
       echo -e "  schema      : a migration was RUNNING; the database may be MIGRATED or"
       echo -e "                half-migrated while nothing is serving. That is the intended"
-      echo -e "                safe state, and the connection fence below is held for it."
+      echo -e "                safe state; what the connection fence is doing about it is"
+      echo -e "                stated below, once this run has finished making it true."
     elif $FENCE_MASK; then
       echo -e "  schema      : untouched — this run stopped before the migration was invoked."
     fi
@@ -576,7 +707,6 @@ on_exit() {
           echo -e "${RED}${BOLD} against a migrated schema on its next boot. Stop it by hand.${RESET}" >&2
         fi
       fi
-      write_fence_marker "deploy failed at ${CURRENT_STEP}" "${status}"
       # THE CONNECTION FENCE IS HELD IF THE SCHEMA WAS TOUCHED, AND ONLY THEN.
       #
       # An earlier round released it here unconditionally, so that a failure could not
@@ -585,18 +715,42 @@ on_exit() {
       # once `prisma migrate deploy` has been invoked the schema is in an unknown state,
       # and releasing CONNECT there lets the application reconnect to exactly that. The
       # correct state is unreachable, and stated.
+      #
+      # "HELD" IS A CLAIM, SO IT IS MADE TRUE BEFORE IT IS PRINTED (Codex r3 HIGH). The
+      # start phase releases the fence before `systemctl start` and the health check, so a
+      # failure in either arrives here with SCHEMA_TOUCHED true and the fence already
+      # DOWN. Re-establish it — the units have just been re-stopped above — and say which
+      # of the two actually happened.
       if $SCHEMA_TOUCHED; then
-        echo -e "${RED}${BOLD} THE CONNECTION FENCE IS DELIBERATELY LEFT UP.${RESET}" >&2
-        echo -e "${RED}  A migration was already running when this failed, so the schema may be${RESET}" >&2
-        echo -e "${RED}  half-applied. The application role has no CONNECT on this database and${RESET}" >&2
-        echo -e "${RED}  must not get it back until a re-run has migrated, checked drift and passed${RESET}" >&2
-        echo -e "${RED}  every declared verification. A re-run adopts this fence and recovers${RESET}" >&2
-        echo -e "${RED}  through DEPLOY_ADMIN_DATABASE_URL.${RESET}" >&2
-        echo -e "${RED}  To release it by hand instead (only once you know the schema is sound):${RESET}" >&2
-        echo -e "${RED}    ${DB_FENCE_RELEASE_CMD}${RESET}" >&2
+        if ! $DB_FENCE_UP; then
+          warn "The connection fence had already been released for the start; re-establishing it."
+          refence_db_connections || true
+        fi
+        if $DB_FENCE_UP; then
+          echo -e "${RED}${BOLD} THE CONNECTION FENCE IS DELIBERATELY LEFT UP.${RESET}" >&2
+          echo -e "${RED}  A migration was already running when this failed, so the schema may be${RESET}" >&2
+          echo -e "${RED}  half-applied. The application role has no CONNECT on this database and${RESET}" >&2
+          echo -e "${RED}  must not get it back until a re-run has migrated, checked drift and passed${RESET}" >&2
+          echo -e "${RED}  every declared verification. A re-run adopts this fence and recovers${RESET}" >&2
+          echo -e "${RED}  through DEPLOY_ADMIN_DATABASE_URL.${RESET}" >&2
+          echo -e "${RED}  To release it by hand instead (only once you know the schema is sound):${RESET}" >&2
+          echo -e "${RED}    ${DB_FENCE_RELEASE_CMD}${RESET}" >&2
+        else
+          echo -e "${RED}${BOLD} THE CONNECTION FENCE IS NOT IN PLACE, AND THE SCHEMA MAY HAVE MOVED.${RESET}" >&2
+          echo -e "${RED}  This run released it in order to start the new build, and could not put it${RESET}" >&2
+          echo -e "${RED}  back. The application role CAN connect to a database whose schema is in an${RESET}" >&2
+          echo -e "${RED}  unknown state, so the only thing keeping it off is that the service is${RESET}" >&2
+          echo -e "${RED}  stopped and fenced against a reboot. Do NOT start it. Close the database by${RESET}" >&2
+          echo -e "${RED}  hand, or re-run this script, which re-establishes the fence before it${RESET}" >&2
+          echo -e "${RED}  rebuilds:${RESET}" >&2
+          echo -e "${RED}    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE}${RESET}" >&2
+        fi
       else
         release_db_connections || true
       fi
+      # LAST, so the marker records the fence state that is true when this process
+      # exits rather than the one that was true before the re-fence was attempted.
+      write_fence_marker "deploy failed at ${CURRENT_STEP}" "${status}"
     fi
   fi
 
@@ -811,6 +965,14 @@ else
   warn "the post-migration hook will execute nothing, and a pass from it will mean nothing"
   warn "was checked. prisma/migrations/verification-required.txt says which must declare one."
 fi
+
+# AN EFFECTIVE FENCE IS MANDATORY FOR A MIGRATION, and the cheapest half of that answer
+# is knowable here — before the stop, while a refusal costs nothing. The rest of it can
+# only be had by asking the database, which drain-verify does; that one costs an outage,
+# so do not spend it on an unset environment variable.
+if ! $SKIP_MIGRATE; then
+  require_fenceable_database
+fi
 ok "Artefact validated."
 
 # ---------------------------------------------------------------------------
@@ -939,14 +1101,16 @@ if ! $SKIP_MIGRATE; then
   step "Migrate (nothing is serving)"
 
   if $DRY_RUN; then
+    mark_schema_touched
     echo -e "${YELLOW}[DRY]${RESET}   would run: npx prisma migrate deploy  (as ${APP_USER})"
     echo -e "${YELLOW}[DRY]${RESET}   from that point a failure would HOLD the connection fence rather than release it"
     echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/check-prisma-drift.mjs  (as ${APP_USER})"
   else
-    # FROM HERE THE SCHEMA MAY HAVE MOVED. Set BEFORE the command, not after it: a
-    # migration that is interrupted, times out or half-applies is exactly the case the
-    # flag exists for, and one set afterwards would be false for all of them.
-    SCHEMA_TOUCHED=true
+    # FROM HERE THE SCHEMA MAY HAVE MOVED. Recorded ON DISK and flushed BEFORE the
+    # command, not after it and not from the exit trap: a migration that is interrupted,
+    # times out, half-applies or is SIGKILLed is exactly the case the flag exists for,
+    # and a flag that only ever reached shell memory is false for every one of them.
+    mark_schema_touched
     as_app_user_db npx prisma migrate deploy --schema prisma/schema.prisma
     ok "Migrations applied."
 

@@ -452,14 +452,42 @@ DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
 #     HELD on one at or after it — releasing there would let the application reconnect
 #     to a schema in an unknown state. Every step inside the window that touches the
 #     database runs through MIGRATION_DATABASE_URL, which is the privileged connection
-#     while the fence is up.
+#     while the fence is up. IT IS MANDATORY for an existing installation (o3d-2sm1.4,
+#     Codex r3 HIGH): exit 3 from the fence script means CONNECT was NOT revoked, and a
+#     fence you know is absent is not a degraded fence but no fence, so it aborts rather
+#     than falling back to a point-in-time probe anything may connect after. Whether the
+#     privileged connection exists at all is checked BEFORE the stop.
+#
+# WHAT COUNTS AS AN EXISTING INSTALLATION (o3d-2sm1.4, Codex r3 HIGH). Not only the new
+# systemd unit and an active crontab: this script also supports, and below removes,
+# installations run under PM2. Detecting only the new unit meant a PM2-run installation
+# was never recognised, so nothing was fenced, nothing was stopped, and the migration ran
+# with the old binary live — the defect this cutover exists to close, on the launcher the
+# cutover was written to remove. `upgrade_in_place` now also answers yes to a PM2 daemon,
+# a `pm2-<user>` unit, an ${APP_DIR}/.pm2 home, or any node process whose working directory
+# IS the app directory; and `stop_legacy_launchers` stops, disables and deletes all of them
+# BEFORE the migration.
+#
+# AND `schema_touched` IS WRITTEN AND FLUSHED BEFORE PRISMA IS INVOKED (Codex r3 CRITICAL),
+# because a SIGKILL or a power cut mid-migration never reaches the exit trap that used to
+# write it — and a marker saying the schema was never touched is read by the next run's
+# adoption as licence to release the fence over a half-migrated schema.
 #
 # A FIRST INSTALL FENCES NOTHING, and that is not an oversight: there is no service,
 # no crontab and no data, so there is no writer to stop and no cutover to survive.
 # ---------------------------------------------------------------------------
 UPGRADE_EXISTING=false
 FENCE_ARMED=false
+# `prisma migrate deploy` HAS BEEN INVOKED. Persisted and flushed BEFORE Prisma is invoked
+# (o3d-2sm1.4, Codex r3 CRITICAL): a SIGKILL or a power cut during the migration never
+# reaches the exit trap, so a flag that only lives in shell memory leaves a marker saying
+# `schema_touched=false` — and the next run's adoption reads exactly that byte and RELEASES
+# the connection fence over a half-migrated schema. See mark_schema_touched().
 SCHEMA_TOUCHED=false
+# Is the connection fence standing RIGHT NOW? Not the same question as SCHEMA_TOUCHED: the
+# start step releases the fence while SCHEMA_TOUCHED stays true, so a failure to start must
+# not report a fence that is no longer there (Codex r3 HIGH).
+DB_FENCE_UP=false
 CRON_FENCED=false
 CUTOVER_STEP="startup"
 FENCE_FILE="${DATA_DIR}/DEPLOY-FENCED"
@@ -477,8 +505,44 @@ DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_
 MIGRATION_DATABASE_URL=""
 DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL:-}"
 
+# Every node/npm/next process whose working directory IS this app directory. Scoped by
+# /proc/<pid>/cwd rather than by a bare pgrep pattern, so a second instance serving a
+# DIFFERENT tree against a DIFFERENT database (the full-chain e2e rig) is never touched.
+# This installer's own children are excluded by pid.
+app_dir_pids() {
+  command -v pgrep >/dev/null 2>&1 || return 0
+  local app_real pid cwd
+  app_real="$(readlink -f "${APP_DIR}" 2>/dev/null || echo "${APP_DIR}")"
+  for pid in $(pgrep -f 'next-server|next dev|next start|npm run dev|npm start|npm run start|PM2|pm2' 2>/dev/null || true); do
+    [[ "${pid}" == "$$" || "${pid}" == "${PPID}" ]] && continue
+    cwd="$(readlink -f "/proc/${pid}/cwd" 2>/dev/null || true)"
+    [[ "${cwd}" == "${app_real}" ]] && echo "${pid}"
+  done
+  return 0
+}
+
+# A PM2-managed instance of this app, which this installer explicitly supports and later
+# removes. Every probe here is READ-ONLY on purpose: `pm2 jlist` would be the direct question,
+# but asking it SPAWNS a PM2 daemon under whatever PM2_HOME it is given, so a detector that
+# used it would create the very thing it is looking for on a box that had none. The PM2 home
+# and the boot unit are what a real PM2 installation leaves behind; a PM2 process actually
+# running is caught by app_dir_pids() instead.
+legacy_pm2_present() {
+  [[ -d "${APP_DIR}/.pm2" ]] && return 0
+  [[ -f "/etc/systemd/system/pm2-${APP_USER}.service" ]] && return 0
+  systemctl list-unit-files "pm2-${APP_USER}.service" --no-legend --no-pager 2>/dev/null | grep -q . && return 0
+  return 1
+}
+
 # Is there something here to break? The unit FILE, not `is-active`: a previous install
 # whose service is merely stopped still has a crontab, a database and a schema.
+#
+# AND NOT ONLY THE NEW UNIT (o3d-2sm1.4, Codex r3 HIGH). This script supports — and below,
+# removes — installations run under PM2, and it detects an app-directory node process by
+# its working directory. Checking only the systemd unit file and the crontab meant a
+# PM2-run installation was NOT recognised as existing, so no fence was installed, nothing
+# was stopped, and the migration ran with the old binary live: the exact defect the cutover
+# was added to close, on the launcher the cutover was written to remove.
 upgrade_in_place() {
   if [[ -f "/etc/systemd/system/${APP_NAME}.service" ]]; then
     return 0
@@ -488,7 +552,52 @@ upgrade_in_place() {
       return 0
     fi
   fi
+  if legacy_pm2_present; then
+    return 0
+  fi
+  if [[ -n "$(app_dir_pids)" ]]; then
+    return 0
+  fi
   return 1
+}
+
+# STOP AND DRAIN THE LAUNCHERS THE UNIT FILE DOES NOT COVER, before the migration rather
+# than after it. This block used to live next to the systemd unit install — AFTER the
+# schema had moved — so on a PM2 installation the old binary was still serving for the
+# whole migration and only killed once it was over.
+stop_legacy_launchers() {
+  if command -v systemctl >/dev/null 2>&1; then
+    # Disabled as well as stopped: a reboot must not bring the predecessor back either,
+    # and the AssertPathExists drop-in only fences ${APP_NAME}.service.
+    systemctl disable --now "pm2-${APP_USER}" >/dev/null 2>&1 || true
+  fi
+  if command -v pm2 >/dev/null 2>&1; then
+    env PM2_HOME="${APP_DIR}/.pm2" pm2 delete "${APP_NAME}" >/dev/null 2>&1 || true
+    env PM2_HOME="${APP_DIR}/.pm2" pm2 kill >/dev/null 2>&1 || true
+  fi
+
+  local pids pid still
+  pids="$(app_dir_pids)"
+  [[ -n "${pids}" ]] || { success "No legacy launcher and no stray app-directory process."; return 0; }
+
+  info "Stopping process(es) still running in ${APP_DIR}:"
+  for pid in ${pids}; do
+    echo "         ${pid}  $(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | cut -c1-100)"
+  done
+  for pid in ${pids}; do kill "${pid}" 2>/dev/null || true; done
+  for _ in $(seq 1 10); do
+    sleep 1
+    still=""
+    for pid in ${pids}; do kill -0 "${pid}" 2>/dev/null && still="${still} ${pid}"; done
+    [[ -z "${still}" ]] && break
+  done
+  for pid in ${pids}; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      warn "  SIGKILL ${pid}"
+      kill -9 "${pid}" 2>/dev/null || true
+    fi
+  done
+  success "Legacy launchers and stray app-directory processes stopped."
 }
 
 write_cutover_marker() {
@@ -505,9 +614,36 @@ write_cutover_marker() {
     echo "cron_backup=${CRON_BACKUP}"
     echo "units=${APP_NAME}.service"
     echo "db_connect_fence_state=${DB_FENCE_STATE}"
+    # What the operator reading this file is actually looking at. A SCHEMA_TOUCHED branch
+    # printing "held" about a fence the start step had already released is how a fence that
+    # does not exist gets read as one (Codex r3 HIGH).
+    echo "db_connect_fence=$(${DB_FENCE_UP} && echo held || echo released)"
     echo "release_db_connect_fence=${DB_FENCE_RELEASE_CMD}"
   } > "${FENCE_FILE}"
   chmod 600 "${FENCE_FILE}"
+  # DURABILITY. Everything above is a page-cache write until something flushes it, and the
+  # one caller that cannot afford that is mark_schema_touched(): the marker exists precisely
+  # for the run that is killed or loses power a moment later.
+  sync "${FENCE_FILE}" 2>/dev/null || sync || true
+}
+
+# THE SCHEMA IS ABOUT TO MOVE — SAY SO ON DISK BEFORE IT DOES (o3d-2sm1.4, Codex r3 CRITICAL).
+#
+# The flag used to be set in shell memory immediately before Prisma ran, with the durable
+# marker written only by the exit trap. A kill -9, an OOM kill or a power cut during
+# `prisma migrate deploy` never reaches that trap, so the marker still said
+# `schema_touched=false` — and the next run's adoption, which reads that file and nothing
+# else, RELEASED the connection fence and let the application back onto a half-migrated
+# schema. Set the flag, write the marker, flush it, then invoke Prisma.
+mark_schema_touched() {
+  SCHEMA_TOUCHED=true
+  # A FIRST install has no predecessor, no fence and no marker to adopt: nothing was
+  # stopped, so there is nothing for a later run to recover. Only a cutover writes one.
+  ${FENCE_ARMED} || return 0
+  write_cutover_marker "migration about to be invoked at $(date -Iseconds)"
+  grep -qE '^schema_touched=true$' "${FENCE_FILE}" || die \
+    "Could not record schema_touched=true in ${FENCE_FILE}. Refusing to migrate: a migration whose interruption cannot be recorded would be adopted as one that never started."
+  success "Recorded schema_touched=true in ${FENCE_FILE} (flushed) — an interrupted migration is now recoverable."
 }
 
 verify_reboot_fence() {
@@ -591,10 +727,8 @@ unfence_cron() {
 # The continuous half of the drain. check-db-writers.mjs snapshots pg_stat_activity and
 # closes; the migration opens its own connection afterwards with nothing holding the gap.
 fence_db_connections() {
-  if [[ ! -f "${DB_FENCE_SCRIPT}" ]]; then
-    warn "${DB_FENCE_SCRIPT} is not in this checkout: NOT FENCED, the probe below is a snapshot only."
-    return 0
-  fi
+  [[ -f "${DB_FENCE_SCRIPT}" ]] || die \
+    "${DB_FENCE_SCRIPT} is not in this checkout, so this run cannot hold the database closed for the migration window. A snapshot probe is not a fence. Restore the script (it ships with the app) and re-run; nothing has been migrated."
   mkdir -p "${DB_FENCE_DIR}"
   chown "${APP_USER}:${APP_USER}" "${DB_FENCE_DIR}"
   chmod 700 "${DB_FENCE_DIR}"
@@ -608,17 +742,34 @@ fence_db_connections() {
   case "${rc}" in
     0)
       MIGRATION_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}"
+      DB_FENCE_UP=true
       success "Connection fence up: new application connections are refused for the window."
       ;;
     3)
-      warn "THE DATABASE IS NOT FENCED. What follows is a SNAPSHOT, not a fence: nothing stops"
-      warn "a client connecting between the probe and the end of the migration. Set"
-      warn "DEPLOY_ADMIN_DATABASE_URL (docs/installation.md) to make this a real fence."
+      # EXIT 3 IS "CONNECT WAS NOT REVOKED", AND IT ABORTS (o3d-2sm1.4, Codex r3 HIGH).
+      # Warning and falling back to the probe repeats the mistake the probe itself was:
+      # anything may attach after the snapshot and write across the migration. A fence we
+      # know is absent is not a degraded fence, it is no fence.
+      die "THE DATABASE COULD NOT BE FENCED (exit 3): CONNECT was NOT revoked, so nothing stops a client attaching between now and the end of the migration. Refusing to migrate an EXISTING installation — the reason is printed above. Fix it (usually: set DEPLOY_ADMIN_DATABASE_URL to a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL, see docs/installation.md) and re-run. Nothing has been migrated."
       ;;
     *)
       die "The connection fence failed (exit ${rc}). Nothing has been migrated."
       ;;
   esac
+}
+
+# Asked BEFORE the stop, while the existing installation is still serving and a refusal
+# costs nothing. The database can only answer some of the reasons a fence is impossible (a
+# superuser application role, a CONNECT arriving through role membership) and the drain step
+# asks it those; the commonest reason of all — no privileged connection at all — is knowable
+# from here, and paying an outage to discover an unset variable is not a trade. A FIRST
+# install never reaches this: there is no existing database to hold closed.
+require_fenceable_database() {
+  [[ -n "${DEPLOY_ADMIN_DATABASE_URL}" ]] || die \
+    "An existing installation was detected, so its database must be held closed while the schema moves — but DEPLOY_ADMIN_DATABASE_URL is not set, so this run has no privileged connection that would survive revoking CONNECT from the application role. Set it (a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL; docs/installation.md) and re-run. Nothing has been stopped and nothing has been migrated."
+  [[ -f "${DB_FENCE_SCRIPT}" ]] || die \
+    "${DB_FENCE_SCRIPT} is missing from this checkout, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
+  success "A connection fence is possible: DEPLOY_ADMIN_DATABASE_URL is set and fence-db-connections.mjs is present."
 }
 
 release_db_connections() {
@@ -629,6 +780,7 @@ release_db_connections() {
         DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
         node "${DB_FENCE_SCRIPT}" --release --state-file="${DB_FENCE_STATE}" ); then
     MIGRATION_DATABASE_URL="${DATABASE_URL}"
+    DB_FENCE_UP=false
     success "Connection fence released."
     return 0
   fi
@@ -637,6 +789,27 @@ release_db_connections() {
   error "  ${DB_FENCE_RELEASE_CMD}"
   error "or, by hand as a superuser, the GRANT statements recorded in ${DB_FENCE_STATE}."
   return 1
+}
+
+# RE-ESTABLISH A FENCE THE START STEP ALREADY RELEASED (o3d-2sm1.4, Codex r3 HIGH). The
+# fences come down before `systemctl enable --now`, because the new build cannot serve a
+# database it may not connect to; a failure there arrives at the trap with SCHEMA_TOUCHED
+# still true and the fence already DOWN, and announcing a HELD fence then tells the operator
+# about something that does not exist. Deliberately NOT fence_db_connections: that one dies,
+# and dying inside an exit trap loses the status and the banner.
+refence_db_connections() {
+  ${DB_FENCE_UP} && return 0
+  [[ -f "${DB_FENCE_SCRIPT}" ]] || return 1
+  [[ -n "${DEPLOY_ADMIN_DATABASE_URL}" ]] || return 1
+  local rc=0
+  ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
+      DATABASE_URL="${DATABASE_URL}" \
+      DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+      node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" ) || rc=$?
+  [[ "${rc}" -eq 0 ]] || return 1
+  DB_FENCE_UP=true
+  MIGRATION_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}"
+  return 0
 }
 
 # A previous cutover — this installer's, deploy.sh's or update.sh's — that failed after
@@ -695,7 +868,8 @@ on_cutover_exit() {
   if ${SCHEMA_TOUCHED}; then
     error "  schema      : a migration was RUNNING; the database may be MIGRATED or"
     error "                half-migrated while nothing is serving. That is the intended"
-    error "                safe state, and the connection fence is held for it."
+    error "                safe state; what the connection fence is doing about it is"
+    error "                stated below, once this run has finished making it true."
   else
     error "  schema      : untouched — this run stopped before the migration was invoked."
   fi
@@ -708,13 +882,33 @@ on_cutover_exit() {
   systemctl stop "${APP_NAME}.service" >/dev/null 2>&1 || true
   install_reboot_fence "install failed at ${CUTOVER_STEP}" >/dev/null 2>&1 \
     || error "THE REBOOT FENCE IS NOT IN PLACE. This host may start the old version against a migrated schema on its next boot. Stop it by hand."
-  write_cutover_marker "install failed at ${CUTOVER_STEP}" "${status}"
+  # "HELD" IS A CLAIM, SO IT IS MADE TRUE BEFORE IT IS PRINTED (Codex r3 HIGH). The start
+  # step releases the fence before `systemctl enable --now`, so a failure there arrives with
+  # SCHEMA_TOUCHED true and the fence already DOWN. Re-establish it — the service has just
+  # been re-stopped above — and then say which of the two actually happened.
   if ${SCHEMA_TOUCHED}; then
-    error "  THE CONNECTION FENCE IS DELIBERATELY LEFT UP. Release it only once you know"
-    error "  the schema is sound:  ${DB_FENCE_RELEASE_CMD}"
+    if ! ${DB_FENCE_UP}; then
+      warn "The connection fence had already been released for the start; re-establishing it."
+      refence_db_connections || true
+    fi
+    if ${DB_FENCE_UP}; then
+      error "  THE CONNECTION FENCE IS DELIBERATELY LEFT UP. Release it only once you know"
+      error "  the schema is sound:  ${DB_FENCE_RELEASE_CMD}"
+    else
+      error "  THE CONNECTION FENCE IS NOT IN PLACE, AND THE SCHEMA MAY HAVE MOVED. This run"
+      error "  released it in order to start the application and could not put it back, so the"
+      error "  application role CAN connect to a database whose schema is in an unknown state."
+      error "  The only thing keeping it off is that ${APP_NAME}.service is stopped and fenced"
+      error "  against a reboot. Do NOT start it. Close the database by hand, or re-run this"
+      error "  installer, which re-establishes the fence before it migrates:"
+      error "    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE}"
+    fi
   else
     release_db_connections || true
   fi
+  # LAST, so the marker records the fence state that is true when this process exits rather
+  # than the one that was true before the re-fence was attempted.
+  write_cutover_marker "install failed at ${CUTOVER_STEP}" "${status}"
   exit "${status}"
 }
 
@@ -1486,6 +1680,11 @@ if upgrade_in_place; then
   # leaves the marker, the drop-in and a stopped service rather than a running one.
   trap on_cutover_exit EXIT
 
+  # BEFORE ANYTHING IS STOPPED. An existing installation's database has to be held closed
+  # while its schema moves, and discovering at the drain step that it cannot be would cost
+  # an outage for a missing environment variable.
+  require_fenceable_database
+
   CUTOVER_STEP="adopt"
   adopt_existing_fence
 
@@ -1502,6 +1701,12 @@ if upgrade_in_place; then
 
   info "systemctl stop ${APP_NAME}.service"
   systemctl stop "${APP_NAME}.service" >/dev/null 2>&1 || true
+
+  # AND THE LAUNCHERS THE UNIT DOES NOT COVER. A PM2-managed instance and a stray
+  # app-directory node process are writers exactly like the unit is, and this block used to
+  # run AFTER the migration — so on a PM2 installation the old binary served the whole
+  # window (o3d-2sm1.4, Codex r3 HIGH).
+  stop_legacy_launchers
 
   if command -v ss >/dev/null 2>&1; then
     for _ in $(seq 1 15); do
@@ -1535,10 +1740,11 @@ cd "${APP_DIR}"
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   npx prisma generate --schema prisma/schema.prisma
 CUTOVER_STEP="migrate"
-# FROM HERE THE SCHEMA MAY HAVE MOVED. Set BEFORE the command: an interrupted or
-# half-applied migration is exactly what this flag exists for, and one set afterwards
-# would be false for every such case.
-SCHEMA_TOUCHED=true
+# FROM HERE THE SCHEMA MAY HAVE MOVED. Recorded ON DISK and flushed BEFORE the command, not
+# after it and not from the exit trap: an interrupted, half-applied or SIGKILLed migration
+# is exactly what this flag exists for, and one that only ever reached shell memory is false
+# for every one of those cases.
+mark_schema_touched
 run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   npx prisma migrate deploy --schema prisma/schema.prisma
 success "Database migrations applied."
@@ -1636,12 +1842,13 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-# Remove legacy PM2-managed instances when upgrading an older install.
-systemctl disable "pm2-${APP_USER}" 2>/dev/null || true
-if command -v pm2 >/dev/null 2>&1; then
-  env PM2_HOME="${APP_DIR}/.pm2" pm2 delete "${APP_NAME}" 2>/dev/null || true
-  env PM2_HOME="${APP_DIR}/.pm2" pm2 kill 2>/dev/null || true
-fi
+# Legacy PM2 instances are stopped, disabled and deleted by stop_legacy_launchers() in the
+# cutover above — BEFORE the migration, not here. Removing them at this point meant a
+# PM2-run installation kept writing for the whole length of the schema change (o3d-2sm1.4).
+# stop_legacy_launchers is idempotent, so run it again on the way past: between the drain
+# and here the installer has rewritten the unit file, and a PM2 daemon resurrected by
+# anything in between must not be serving when the new unit starts.
+stop_legacy_launchers
 
 # ---------------------------------------------------------------------------
 # THE FENCES COME DOWN HERE, and in the order that keeps the new build startable:

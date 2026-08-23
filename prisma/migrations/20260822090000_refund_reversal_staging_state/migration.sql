@@ -42,6 +42,54 @@
 ALTER TABLE "sales_order_refunds" ADD COLUMN "reversal_staging_state" TEXT;
 
 -- =================================================================================================
+-- AND ONE DISCRIMINATOR THAT SAYS WHICH ROWS PREDATE THE COLUMN (o3d-2sm1.4, Codex r3 HIGH).
+-- =================================================================================================
+--
+-- WHAT IT IS FOR. verify.sql has to separate two populations of NULL:
+--
+--   * a LEGACY row, written before this column existed. Legitimately NULL — the column is
+--     deliberately not backfilled — and it must never make the post-migration check non-zero, or the
+--     check is red for ever from the first deploy and stops meaning anything.
+--   * a row minted AFTER the column existed by a binary that has never heard of it. That is the
+--     predecessor writing across the cutover, which is the entire thing this migration and the
+--     stop-before-migrate deploy order exist to detect.
+--
+-- WHY NOT A TIMESTAMP, WHICH IS WHAT ROUND 1 OF verify.sql USED. It compared `createdAt` against
+-- `_prisma_migrations.started_at`. `createdAt` defaults to CURRENT_TIMESTAMP, and Postgres fixes
+-- CURRENT_TIMESTAMP AT TRANSACTION START — it is `now()`, not `clock_timestamp()`. A predecessor
+-- transaction that BEGAN before this migration and COMMITTED after it therefore stamps a row with a
+-- pre-migration timestamp, and the check reads it as legacy. That is precisely the row the check
+-- exists to find, and the clock is what hides it. (Prisma's client-side `@default(now())` is no
+-- better: it is the client's clock, and the client here is the predecessor.)
+--
+-- SO THE BOUND IS DRAWN BY CONSTRUCTION INSTEAD. The ALTER TABLE above takes an ACCESS EXCLUSIVE
+-- lock on `sales_order_refunds`, so at the moment this statement runs every transaction that had
+-- already inserted a row has committed and released its RowExclusiveLock, and no other transaction
+-- can insert until this migration commits. Adding a NOT NULL column with DEFAULT true therefore
+-- marks EXACTLY the rows that exist under that lock — no clock is consulted and no row can be
+-- inserted in the middle of it. The default is then flipped to false, so every row inserted
+-- afterwards is distinguishable from a legacy one by what is physically stored in it:
+--
+--   predates = true   the row was there when the column was added.        Legacy. NULL is expected.
+--   predates = false  the row was inserted after this migration committed. A NULL state here was
+--                     written by a binary that does not set the column — the cutover window.
+--
+-- The second ALTER changes only the default for FUTURE inserts (pg_attrdef); it does not touch the
+-- value stored for the rows the first statement marked (pg_attribute.attmissingval), which is what
+-- makes the pair a boundary rather than a rewrite. Both run inside this migration's transaction and
+-- under the same lock.
+--
+-- THIS IS NOT THE MECHANISM ROUNDS 2-4 KEPT RE-ADDING. It mints nothing about STAGING and vouches
+-- for nothing the database did not witness: it records only that a row existed when a column was
+-- added, which the database observes directly and no writer can contradict. `reversal_staging_state`
+-- itself stays nullable, undefaulted and un-backfilled, and NULL still means "nobody spoke for this
+-- row" everywhere the application reads it.
+ALTER TABLE "sales_order_refunds"
+    ADD COLUMN "reversal_staging_state_predates_column" BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE "sales_order_refunds"
+    ALTER COLUMN "reversal_staging_state_predates_column" SET DEFAULT false;
+
+-- =================================================================================================
 -- NO TRIGGERS. THE COLUMN IS WRITTEN BY THE APPLICATION AND BY NOTHING ELSE — DELIBERATELY, AFTER
 -- THREE ATTEMPTS TO MAKE THE DATABASE WRITE IT.
 -- =================================================================================================

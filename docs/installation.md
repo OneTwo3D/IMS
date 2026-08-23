@@ -44,13 +44,26 @@ For full Proxmox + Cloudflare + OpenLiteSpeed tenant rollout, see [Automated Ten
 This is supported and expected — the installer reads back the `.env` a previous run wrote, preserves
 the secrets it cannot re-mint (`SETTINGS_ENCRYPTION_KEY`, `AUTH_SECRET`, `CRON_SECRET`) and keeps a
 working `REDIS_URL`. Because it is an upgrade entrypoint, it applies **the same cutover sequence as
-`scripts/deploy.sh` and `scripts/update.sh`** (o3d-2sm1.3). When it finds an existing service unit or
-a live crontab it:
+`scripts/deploy.sh` and `scripts/update.sh`** (o3d-2sm1.3).
 
-1. adopts any cutover fence a previous run left standing;
+**What counts as an existing installation** (o3d-2sm1.4): the `one-two-inventory.service` unit
+*file* (not `is-active` — a stopped service still has a crontab, a database and a schema), an active
+crontab line, **a legacy PM2 installation** (a `pm2-<user>` unit, an `${APP_DIR}/.pm2` home, or the
+app registered with a PM2 daemon), or **any node process whose working directory is the app
+directory**. Detecting only the new unit meant a PM2-run installation — which this script explicitly
+supports and removes — was never recognised, so nothing was fenced, nothing was stopped, and the
+migration ran with the old binary live. PM2 is now stopped, disabled and deleted, and stray
+app-directory processes are terminated (`SIGTERM`, then `SIGKILL`), **before** the migration rather
+than after it.
+
+When it finds one it:
+
+1. refuses immediately unless the migration window can be fenced (see
+   [the connection fence](#deploy-order-and-what-happens-on-a-rollback)), and adopts any cutover
+   fence a previous run left standing;
 2. installs and **verifies** the reboot-fence drop-in, before anything is stopped;
-3. stops the service, fences the crontab, waits for the port, revokes `CONNECT` for the window and
-   proves nothing else is connected;
+3. stops the service **and every legacy launcher**, fences the crontab, waits for the port, revokes
+   `CONNECT` for the window and proves nothing else is connected;
 4. migrates, checks for drift, and runs the migrations' own `verify.sql` checks;
 5. seeds, bootstraps and builds — all through the connection that survives the fence;
 6. releases the connection fence, lifts the reboot fence, starts the service, and only then restores
@@ -542,7 +555,24 @@ exists to close. The distinction is whether the schema was **touched**, meaning
 | --- | --- |
 | Before the migration was invoked (build, validation, a writer that would not stop, an unarmable fence) | **Released.** Nothing has moved, and a revoke nobody undoes is an application that cannot reach its database at all. |
 | At or after the migration was invoked, including a failed drift check or a failed verification | **Held**, with the command to release it by hand printed. The schema may be half-applied; nothing may connect until a re-run has migrated, checked drift and verified. |
+| At the start or the health check, *after* the fence had been released for the start | **Re-established**, then held. See below. |
 | Everything passed | Released in the start phase, immediately before the new build starts — the only place a release follows a migration. |
+
+**`schema_touched` is written to disk and flushed *before* Prisma is invoked** (o3d-2sm1.4). It used
+to be set in shell memory next to the migration command, with the durable marker written by the exit
+trap. A `SIGKILL`, an OOM kill or a power cut during `prisma migrate deploy` never reaches a trap, so
+the marker on disk still said `schema_touched=false` — and the next run's adoption, which reads that
+file and nothing else, **released** the connection fence over a half-migrated schema. Each script now
+records and flushes the flag first and refuses to migrate if it cannot: a hard kill at any point from
+that moment on leaves a marker that adoption reads as *hold*.
+
+**A failed start does not get to claim the fence is up** (o3d-2sm1.4). The start phase releases the
+connection fence and removes the reboot marker *before* `systemctl start` and the health check,
+because the new build cannot serve a database it may not connect to. If either then fails, the
+failure path re-stops the service, **re-establishes the connection fence**, and prints — and records
+in the marker as `db_connect_fence=held|released` — which of the two is actually true. If it cannot
+put the fence back it says `THE CONNECTION FENCE IS NOT IN PLACE` rather than describing one that
+does not exist.
 
 A re-run **adopts** a held fence rather than releasing it: it re-applies the revoke (which re-drains
 anything that attached in between, while keeping the *original* recorded grants so the eventual
@@ -556,8 +586,23 @@ That fence needs a privileged connection of its own, `DEPLOY_ADMIN_DATABASE_URL`
 | --- | --- |
 | `DEPLOY_ADMIN_DATABASE_URL` | A superuser or database-owner connection, as a **different role** from `DATABASE_URL`. Used only by the deploy scripts, and only for the migration window. No ACL can tell "the migration" apart from "the application" when both log in as one role, so without a separate role there is no fence to install. While it is in use the migration runs through this connection, which means objects a migration creates are **owned by this role** — point it at the role that owns the schema today. |
 
-Leave it unset and the deploy still runs: it prints `THE DATABASE IS NOT FENCED`, says exactly what
-that does not protect against, and falls back to the snapshot probe. It does not pretend.
+**The fence is mandatory for an existing database** (o3d-2sm1.4). Earlier revisions treated exit 3
+from `scripts/fence-db-connections.mjs` — "CONNECT was **not** revoked" — as a warning and carried on
+with the point-in-time probe. That repeats the mistake the probe itself was: a sibling server, a cron
+tick the crontab fence missed, an operator's `psql` or a `next dev` in another worktree can attach at
+any moment *after* the snapshot and write across the migration. A fence you know is absent is not a
+degraded fence, it is no fence. So:
+
+* `scripts/deploy.sh`, `scripts/update.sh` and `scripts/install.sh` **abort on exit 3**, with the
+  fence script's own reason printed above the refusal, and nothing is migrated;
+* whether the privileged connection exists at all is checked **before anything is stopped** — in the
+  `validate` phase for `deploy.sh`/`update.sh`, and before the stop in `install.sh`'s upgrade cutover
+  — so a missing environment variable costs a refusal, not an outage. The reasons only the database
+  can give (a superuser application role, a `CONNECT` arriving through role membership) are still
+  found at `drain-verify`, and those do cost the stop;
+* a **first install** has no existing database to hold closed, so it never asks;
+* `--dry-run` **reports** the refusal (`A REAL RUN WOULD BE REFUSED HERE`) and exits 0, because a dry
+  run stops nothing and migrates nothing, and its whole job is to tell you what a real run would do.
 
 **The reboot fence is installed before the migration, and verified.** Each unit gets a drop-in at
 `/etc/systemd/system/<unit>.d/zz-deploy-fence.conf` carrying
