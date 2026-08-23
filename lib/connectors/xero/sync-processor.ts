@@ -81,7 +81,7 @@ import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accountin
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import {
   buildCompactedFollowUpLossActivity,
-  isCompactedFollowUpEvidence,
+  compactionDiscardedFollowUps,
 } from '@/lib/domain/accounting/compacted-followup-loss'
 import {
   guardInvoicePaymentCapacity,
@@ -159,6 +159,18 @@ class CompactedFollowUpLossUnrecorded extends Error {}
  * r4 finding 1: it runs AFTER `enqueueFollowUps`, not before. Throwing from here is how the release
  * is withheld, and putting it first made that throw withhold the ENQUEUE as well — including the
  * follow-ups that survive compaction and would have gone out fine. The gate is on the release only.
+ *
+ * o3d-bqw7 / o3d-kemx — AND THE STAMP IS NOT THE LOSS. r4 warned whenever the compaction stamp was
+ * set, which says the payload was thrown away; the warning claims the row's outstanding follow-ups
+ * can no longer be enqueued. Those are different facts, and the module header above says so: some
+ * follow-ups are rebuilt from columns compaction KEEPS, and some types owe none at all — a
+ * `CREDIT_NOTE` tombstone was warned about on every pass while having nothing to lose.
+ *
+ * Two costs, and the second is the one that moves work rather than noise. Because this announcement
+ * gates the RELEASE, a warning that is both FALSE and unwritable holds an already-posted row at
+ * PENDING and re-drives it every pass, for ever. So the guard is now `compactionDiscardedFollowUps`,
+ * which answers per type from an exhaustive table — see compacted-followup-loss.ts for why it fails
+ * towards WARNING on a type it does not recognise.
  */
 async function announceCompactedFollowUpLoss(entry: {
   id: string
@@ -168,7 +180,7 @@ async function announceCompactedFollowUpLoss(entry: {
   externalTransactionId: string | null
   backReferenceEvidenceCompactedAt: Date | null
 }): Promise<void> {
-  if (!isCompactedFollowUpEvidence(entry)) return
+  if (compactionDiscardedFollowUps(entry).length === 0) return
   // logActivityPersisted, NOT logActivity: the release below is conditional on having warned, and
   // logActivity swallows its own write failures and resolves regardless — which is the same
   // "reported success, did nothing" shape as the empty enqueue this exists to catch.

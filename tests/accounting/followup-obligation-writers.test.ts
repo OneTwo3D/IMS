@@ -139,7 +139,10 @@ const state = {
   syncRows: [] as SyncRow[],
   bills: [] as BillRow[],
   journal: [] as Journal,
-  activities: [] as Array<{ action: string; level?: string; description?: string }>,
+  // o3d-bqw7: `metadata` is CAPTURED, not dropped. The discard warning now carries what was
+  // actually lost as data rather than only as prose, and a double that swallowed the field would
+  // make "the warning names the right follow-up" unassertable while looking asserted.
+  activities: [] as Array<{ action: string; level?: string; description?: string; metadata?: Record<string, unknown> }>,
   outbox: [] as Array<Record<string, unknown>>,
   /** Sync-log ids whose follow-up enqueue must fail (a transient database error inside it). */
   failFollowUpsFor: new Set<string>(),
@@ -634,6 +637,116 @@ test('[o3d-nepa r3] a discard warning that could NOT be written leaves the oblig
     /compacted/,
     'and the row says why it did not settle, rather than reporting a generic follow-up failure',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-bqw7 + o3d-kemx — THE STAMP IS BROADER THAN THE LOSS, AND THE FALSE HALF HOLDS WORK.
+//
+// r3/r4 warned whenever the compaction stamp was set. The stamp says "the payload was thrown away";
+// the warning claims "its outstanding follow-ups can no longer be enqueued". A `CREDIT_NOTE` row is
+// a back-reference type, so retention DOES compact it — and neither connector's `enqueueFollowUps`
+// has a `CREDIT_NOTE` branch, so it has never owed a follow-up of any kind. Every one of those rows
+// was warned about, about nothing.
+//
+// The second half is o3d-kemx and it is not noise. The announcement GATES THE RELEASE, so a warning
+// that is false AND unwritable holds an already-posted row at PENDING and re-drives it on every
+// pass. These two tests are deliberately written as the ABSENCE of a warning and the PRESENCE of a
+// settle — asserting that a warning appeared is what the old behaviour would also pass.
+// ---------------------------------------------------------------------------
+
+/**
+ * A sales CREDIT_NOTE tombstone: compacted by retention (it is in BACK_REFERENCE_SWEEP_TYPES), and
+ * owed nothing that the payload was carrying. The PURCHASE_INVOICE tombstone above is its opposite
+ * and stays the control — if the narrowing were wrong in the other direction that test goes red.
+ */
+function compactedCreditNoteRow(): SyncRow {
+  return {
+    ...blankRow(),
+    type: 'CREDIT_NOTE',
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    externalTransactionId: 'XCN-1',
+    status: 'PENDING',
+    payload: {},
+    backReferenceEvidenceCompactedAt: new Date('2026-01-05T00:00:00Z'),
+  }
+}
+
+test('[o3d-bqw7] a tombstone whose type owes NO payload-built follow-up is not warned about', async () => {
+  reset()
+  state.syncRows = [compactedCreditNoteRow()]
+
+  const result = await runDirect()
+
+  assert.equal(result.succeeded, 1)
+  assert.equal(
+    discardWarning(),
+    undefined,
+    'nothing was discarded: CREDIT_NOTE has no branch in enqueueFollowUps, so the payload was carrying no work',
+  )
+  assert.equal(subject().status, 'SYNCED')
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'and the obligation is discharged, because it was met')
+})
+
+test('[o3d-kemx] a FALSE discard warning that cannot be written must not hold an already-posted row', async () => {
+  // The stranding, exactly. The row lost nothing, so there is nothing to announce — and with the
+  // announcement narrowed the failing activity log is never consulted. Before the narrowing this
+  // row went back to PENDING with the obligation still claimed, every pass, for as long as the log
+  // kept failing: a posted document held open by a warning about a loss that never happened.
+  reset()
+  state.syncRows = [compactedCreditNoteRow()]
+  state.unpersistableActivityActions.add(DISCARD_ACTION)
+
+  const result = await runDirect()
+
+  assert.equal(result.failed, 0, 'an unwritable warning about nothing is not a reason to fail the row')
+  assert.equal(result.succeeded, 1)
+  assert.equal(subject().status, 'SYNCED', 'the document posted and the row says so')
+  assert.equal(subject().retryCount, 0, 'and it was not re-driven')
+  assert.equal(
+    subject().backReferenceFollowUpsPendingAt,
+    null,
+    'the obligation is released: it was discharged by an enqueue that correctly had nothing to do',
+  )
+})
+
+test('[o3d-bqw7] a REAL discard still warns, and names what was discarded rather than the whole menu', async () => {
+  // The control for both tests above, and the assertion that the narrowing did not merely delete
+  // the alarm. A PURCHASE_INVOICE tombstone loses its supplier-invoice attachment — the path is
+  // gone with the payload — so the warning must fire AND must say which follow-up that is. The old
+  // wording listed "invoice PDF, payment registration or bill attachment" on every row, including
+  // the two of the three this row could never have owed.
+  reset()
+  state.syncRows = [compactedRow()]
+
+  await runDirect()
+
+  const warning = discardWarning()
+  assert.ok(warning, 'a real loss is still announced')
+  assert.match(String(warning.description), /the supplier invoice attachment can no longer be enqueued/)
+  assert.equal(
+    /invoice PDF/.test(String(warning.description)),
+    false,
+    'a PURCHASE_INVOICE never owed a PDF follow-up; naming one sends the operator looking for work that never existed',
+  )
+  assert.deepEqual(warning.metadata?.discardedFollowUps, ['the supplier invoice attachment'])
+})
+
+test('[o3d-bqw7] a SALES_INVOICE tombstone is warned about its PAYMENT, and told the PDF survived', async () => {
+  // The mixed case. Both halves are load-bearing: the payment is gated on `payload._registerPayment`
+  // and is genuinely gone, while the INVOICE_PDF is built from externalTransactionId + referenceId
+  // and is enqueued on this very pass. A warning that named the PDF as lost would be contradicted
+  // by the row sitting in the queue next to it.
+  reset()
+  state.syncRows = [compactedSalesInvoiceRow()]
+
+  await runDirect()
+
+  const warning = discardWarning()
+  assert.ok(warning, 'the payment registration really is unrecoverable')
+  assert.match(String(warning.description), /the payment registration can no longer be enqueued/)
+  assert.match(String(warning.description), /The invoice PDF is built from columns compaction keeps/)
+  assert.equal(pdfFollowUps().length, 1, 'and it was in fact enqueued, which is why it must not be reported as lost')
 })
 
 test('[o3d-nepa r3] an INTACT row is not warned about — the check is the stamp, not an empty payload', async () => {

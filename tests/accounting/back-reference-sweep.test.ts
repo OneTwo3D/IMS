@@ -63,6 +63,8 @@ type BillRow = {
 type OrderRow = { id: string; accountingInvoiceId: string | null; invoiceNumber?: string | null; invoicedAt?: Date | null }
 /** Supplier (purchase) credit note — PURCHASE_CREDIT_NOTE / ACCPAYCREDIT (r6 finding 2). */
 type CreditNoteRow = { id: string; accountingCreditNoteId: string | null }
+/** o3d-bqw7: the SALES-side credit note's holder. See the `refunds` note on Store. */
+type RefundRow = { id: string; accountingCreditNoteId: string | null }
 
 const SYNC_COLUMNS = new Set([
   'id', 'connector', 'type', 'referenceType', 'referenceId', 'externalTransactionId',
@@ -123,6 +125,13 @@ type Store = {
   orders: OrderRow[]
   /** Optional so the existing stores need no edit; defaulted in makeHarness. */
   creditNotes?: CreditNoteRow[]
+  /**
+   * o3d-bqw7: SalesOrderRefund rows, the holder for the `CREDIT_NOTE` pair. Backed by the store
+   * rather than stubbed for the same reason `supplierCreditNote` was in r6 finding 2 — the stub
+   * answered `null` and threw on write, so no test could drive a sales credit note through the
+   * sweep at all, and "a CREDIT_NOTE tombstone is warned about nothing" was invisible.
+   */
+  refunds?: RefundRow[]
 }
 
 /**
@@ -192,6 +201,7 @@ type Harness = {
 
 function makeHarness(store: Store): Harness {
   store.creditNotes ??= []
+  store.refunds ??= []
   const activities: BackReferenceSweepActivity[] = []
   const followUps: Harness['followUps'] = []
   const calls = { candidateQueries: 0, syncRowsRead: 0, probes: 0, billUpdates: 0, transactions: 0, rawStatements: [] as Array<{ sql: string; values: unknown[] }> }
@@ -285,8 +295,18 @@ function makeHarness(store: Store): Harness {
       },
     },
     salesOrderRefund: {
-      async findUnique() { return null },
-      async update() { throw new Error('unexpected salesOrderRefund.update') },
+      async findUnique(args: { where: { id: string } }) {
+        calls.probes++
+        if (failProbeFor.has(args.where.id)) throw new Error('probe blew up')
+        const refund = store.refunds!.find((candidate) => candidate.id === args.where.id)
+        return refund ? { accountingCreditNoteId: refund.accountingCreditNoteId } : null
+      },
+      async update(args: { where: { id: string }; data: Record<string, unknown> }) {
+        const refund = store.refunds!.find((candidate) => candidate.id === args.where.id)
+        if (!refund) throw new Error(`fake db: no sales order refund ${args.where.id}`)
+        Object.assign(refund, args.data)
+        return refund
+      },
     },
     purchaseInvoice: {
       async findUnique(args: { where: { id: string } }) {
@@ -1544,6 +1564,103 @@ test('[o3d-9kek r6 f2] a TOMBSTONED supplier credit note is still id-repaired, f
   // Not flipped to SYNCED: the allocation was abandoned, not done.
   assert.equal(harness.store.syncRows[0].status, 'FAILED')
   assert.ok(harness.store.syncRows[0].backReferenceCheckedAt)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-bqw7 + o3d-kemx — THE SWEEP'S HALF OF THE SAME NARROWING.
+//
+// r4 finding 3 made a tombstone announce its discarded follow-ups and settle only once the warning
+// landed. That is right for the rows that lost something. It was applied to every tombstone, and a
+// SALES CREDIT_NOTE is a back-reference type — so retention compacts it — that owes no follow-up on
+// either connector. The sweep therefore warned about it, and, because the warning gates the stamp,
+// a failing activity log kept it in the candidate set for ever: re-probed, re-warned and never
+// settled, over a loss that never happened.
+// ---------------------------------------------------------------------------
+
+function salesCreditNoteRow(index: number, overrides: Partial<SyncRow> = {}): SyncRow {
+  return {
+    id: `log-scn-${String(index).padStart(4, '0')}`,
+    connector: 'xero',
+    type: 'CREDIT_NOTE',
+    referenceType: 'SalesOrderRefund',
+    referenceId: `refund-${index}`,
+    externalTransactionId: `XSCN-${index}`,
+    status: 'FAILED',
+    payload: { invoiceNumber: `SCN-${index}` },
+    createdAt: at(index),
+    backReferenceCheckedAt: null,
+    backReferenceAmbiguousLoggedAt: null,
+    backReferenceEvidenceCompactedAt: null,
+    backReferenceFollowUpsPendingAt: null,
+    settlementBasis: null,
+    ...overrides,
+  }
+}
+
+test('[o3d-bqw7] a repaired CREDIT_NOTE tombstone is settled WITHOUT a discard warning', async () => {
+  const harness = makeHarness({
+    syncRows: [salesCreditNoteRow(1, { payload: {}, backReferenceEvidenceCompactedAt: at(500) })],
+    bills: [],
+    orders: [],
+    refunds: [{ id: 'refund-1', accountingCreditNoteId: null }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 1, 'the id write needs only columns the tombstone keeps')
+  assert.equal(harness.store.refunds![0].accountingCreditNoteId, 'XSCN-1')
+  assert.equal(run.followUpsDiscarded, 0, 'nothing was discarded — CREDIT_NOTE has no follow-up branch to lose')
+  assert.equal(
+    harness.activities.find((entry) => entry.action === 'xero_backreference_followups_discarded'),
+    undefined,
+    'an alarm that fires when nothing was lost trains the operator to ignore the one that matters',
+  )
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'and the row is settled on this pass')
+})
+
+test('[o3d-kemx] a CREDIT_NOTE tombstone settles even when the discard warning cannot be written', async () => {
+  // The stranding. The warning gates the stamp, so before the narrowing this row was left eligible
+  // on every pass for as long as the activity log kept failing — a repaired, linked, already-posted
+  // document held in the candidate set by a warning about a loss that never happened.
+  const harness = makeHarness({
+    syncRows: [salesCreditNoteRow(1, { payload: {}, backReferenceEvidenceCompactedAt: at(500) })],
+    bills: [],
+    orders: [],
+    refunds: [{ id: 'refund-1', accountingCreditNoteId: null }],
+  })
+  harness.failActivityFor.add('xero_backreference_followups_discarded')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 1)
+  assert.ok(
+    harness.store.syncRows[0].backReferenceCheckedAt,
+    'the row must leave the candidate set: there is no discard to announce, so nothing is being lost with it',
+  )
+  assert.equal(run.failed, 0)
+})
+
+test('[o3d-kemx] a tombstone that DID lose follow-ups is still held back by an unwritable warning', async () => {
+  // The control, and the half that must not move. A PURCHASE_CREDIT_NOTE tombstone loses its
+  // allocation, so the terminal policy still applies in full: warn, and settle only once the warning
+  // is on record. If this went green with the narrowing, the narrowing would have deleted the alarm
+  // rather than aimed it.
+  const harness = makeHarness({
+    syncRows: [creditNoteRow(1, { payload: {}, backReferenceEvidenceCompactedAt: at(500) })],
+    bills: [],
+    orders: [],
+    creditNotes: [{ id: 'scn-1', accountingCreditNoteId: null }],
+  })
+  harness.failActivityFor.add('xero_backreference_followups_discarded')
+
+  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(harness.store.creditNotes![0].accountingCreditNoteId, 'XCN-1', 'the id write is idempotent and still lands')
+  assert.equal(
+    harness.store.syncRows[0].backReferenceCheckedAt,
+    null,
+    'unstamped: settling past a warning nobody received would destroy the work and the notice together',
+  )
 })
 
 test('[o3d-9kek r6 f3] an external id already held by another order is REPORTED and deferred, not console-only', async () => {

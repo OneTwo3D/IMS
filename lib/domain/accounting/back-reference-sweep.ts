@@ -15,6 +15,7 @@ import {
 } from './back-reference'
 import {
   buildCompactedFollowUpLossActivity,
+  compactionDiscardedFollowUps,
   type CompactedFollowUpLossPhase,
 } from '@/lib/domain/accounting/compacted-followup-loss'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
@@ -1124,10 +1125,16 @@ export async function repairAccountingBackReferences(
       return false
     }
     result.checked++
-    // A compacted payload cannot rebuild anything, and enqueueing from `{}` would report success
-    // while doing nothing — the silent version of the loss. Same terminal policy as the linked
-    // case: warn, and settle only if the warning landed.
-    if (row.backReferenceEvidenceCompactedAt !== null) return reportDiscardedFollowUps(row, 'already-applied')
+    // A compacted payload cannot rebuild anything the payload was carrying, and enqueueing from
+    // `{}` would report success while doing nothing — the silent version of the loss. Same terminal
+    // policy as the linked case: warn, and settle only if the warning landed.
+    //
+    // o3d-bqw7: ASKED OF THE TYPE, not of the stamp. A tombstone whose type owes no payload-built
+    // follow-up lost nothing, and warning about it is both a false alarm and — because the warning
+    // gates the settle — a way to hold the row for ever behind a failing activity log. Those rows
+    // fall through to the ordinary enqueue below, which is the honest way to find out what the type
+    // owes rather than a second opinion about it.
+    if (compactionDiscardedFollowUps(row).length > 0) return reportDiscardedFollowUps(row, 'already-applied')
     try {
       await deps.enqueueFollowUps(
         row.id,
@@ -1284,6 +1291,19 @@ export async function repairAccountingBackReferences(
         // here on branches on that distinction rather than on the row as a whole, which is the
         // difference between discarding unrecoverable work and retiring recoverable work.
         const evidenceOnly = row.backReferenceEvidenceCompactedAt !== null
+        /**
+         * AND SEPARATELY: DID THIS TOMBSTONE LOSE ANYTHING? (o3d-bqw7 / o3d-kemx.)
+         *
+         * `evidenceOnly` says the payload is gone, which is what decides whether anything may be
+         * REBUILT from it. It is not the same question as whether anything was LOST, and conflating
+         * them made every tombstone carry the terminal discard warning — including a `CREDIT_NOTE`,
+         * whose type owes no follow-up on either connector, so there was never anything to discard.
+         *
+         * The distinction matters here for the same reason it matters in the processors: the
+         * warning GATES THE SETTLE, so a false one on a row that lost nothing keeps that row in the
+         * candidate set for ever whenever the activity log is failing.
+         */
+        const discardsFollowUps = compactionDiscardedFollowUps(row).length > 0
 
         /**
          * DOES THIS ROW STILL OWE ITS FOLLOW-UPS? (Codex r9 finding 1.)
@@ -1405,7 +1425,7 @@ export async function repairAccountingBackReferences(
             // marker existed the condition was `status === 'FAILED'`, so a SYNCED row whose
             // follow-ups were outstanding when retention compacted it was stamped in silence: the
             // one case where the loss is BOTH permanent and unannounced.
-            if (!(await reportDiscardedFollowUps(row, 'already-applied'))) continue
+            if (discardsFollowUps && !(await reportDiscardedFollowUps(row, 'already-applied'))) continue
           }
           // Linked, nothing outstanding: reconciled. Stamped, so it never occupies a slot again.
           await markChecked(row.id)
@@ -1469,7 +1489,7 @@ export async function repairAccountingBackReferences(
           // discarded, and settle only if the warning landed.
           let followUpsEnqueued = true
           if (evidenceOnly) {
-            if (!(await reportDiscardedFollowUps(row, 'repaired'))) followUpsEnqueued = false
+            if (discardsFollowUps && !(await reportDiscardedFollowUps(row, 'repaired'))) followUpsEnqueued = false
           } else {
             try {
               await deps.enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, {

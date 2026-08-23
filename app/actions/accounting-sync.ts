@@ -24,6 +24,14 @@ import { effectiveTokenFor, isMoneyMovingSyncType } from '@/lib/domain/accountin
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { decideSettledRowReconciliation } from '@/lib/domain/accounting/settled-row-reconciliation'
 import {
+  cancelledSaleReleaseNote,
+  describeCancelledSaleRelease,
+  SALE_SCOPED_RELEASE_REFERENCE_TYPE,
+  type ReleaseSaleState,
+} from '@/lib/domain/accounting/cancelled-sale-release'
+import { applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
+import {
   summarizeCrossConnectorOrphans,
   type ConnectorOrphanSummary,
 } from '@/lib/domain/accounting/connector-orphans'
@@ -800,6 +808,115 @@ export async function reconcileSettledAccountingSyncRow(
     })
     revalidatePath('/sync')
     return { success: true, externalTransactionId: decision.externalTransactionId }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+/**
+ * RE-CHECK THE SALE AND RELEASE A ROW THE SWEEP RETIRED (o3d-psvi).
+ *
+ * The one exit from the state described at the top of
+ * lib/domain/accounting/cancelled-sale-release.ts: a sales-order document that really did post, whose
+ * sync row was retired to CANCELLED because the sale was not live at the time, and whose sale is live
+ * again. Without it the operator can see a real invoice sitting unlinked in the ledger and has no
+ * button that changes anything, while every other control answers "already CANCELLED".
+ *
+ * IT POSTS NOTHING AND ASSERTS NOTHING. It reads the sale under the sale's own row lock, inside the
+ * transaction that writes, and on that evidence alone moves the row back to SYNCED so the ordinary
+ * back-reference repair sweep can finish the link and the outstanding follow-ups. Every judgement
+ * about WHETHER the work is owed stays where it already lives — the sweep re-reads the sale itself
+ * before it releases anything, so a sale that is cancelled again between this call and the next pass
+ * is retired again rather than repaired.
+ *
+ * THE READ IS INSIDE THE WRITE'S TRANSACTION AND UNDER THE ORDER LOCK. Reading the sale first and
+ * writing afterwards is the check/use race the sweep's own gate was rewritten to close: a
+ * cancellation landing in between would be overwritten by a decision taken before it.
+ *
+ * FENCED ON THE ATTEMPT the operator was shown, and on `expectedStatus: 'CANCELLED'`, so a row that
+ * moved under them — released by somebody else, retired again, re-driven — is refused rather than
+ * written over. Both existing entry points (per-row retry and Retry All) stay FAILED-only; this is a
+ * separate affordance because the two CANCELLED terminal states it has to tell apart are
+ * indistinguishable to a status filter.
+ */
+export async function releaseRetiredAccountingSyncRowForLiveSale(
+  entryId: string,
+  expectedAttemptRevision: number,
+): Promise<{ success: boolean; error?: string }> {
+  await requirePermission('settings')
+  try {
+    const row = await db.accountingSyncLog.findUnique({
+      where: { id: entryId },
+      select: {
+        id: true, connector: true, type: true, status: true, referenceType: true, referenceId: true,
+        externalTransactionId: true, settlementBasis: true, backReferenceCheckedAt: true,
+      },
+    })
+    if (!row) return { success: false, error: 'That sync entry no longer exists.' }
+
+    const now = new Date()
+    const outcome = await db.$transaction(async (tx) => {
+      // The sale is read HERE, not before the transaction: `describeCancelledSaleRelease` refuses on
+      // what the sale says, and a decision taken outside the lock is a decision about a row that can
+      // move before it is spent.
+      let sale: ReleaseSaleState
+      if (row.referenceType !== SALE_SCOPED_RELEASE_REFERENCE_TYPE) {
+        // Not a sale-scoped row at all; the decision refuses on the reference type and never reads a
+        // state, so nothing is locked for it. Naming it UNREADABLE would be a different, wrong reason.
+        sale = 'MISSING'
+      } else {
+        try {
+          await lockSalesOrder(tx, row.referenceId)
+          const order = await tx.salesOrder.findUnique({ where: { id: row.referenceId }, select: { status: true } })
+          sale = order === null ? 'MISSING' : order.status === 'CANCELLED' ? 'CANCELLED' : 'LIVE'
+        } catch {
+          // THE THIRD STATE. Not "the sale is gone" — "nobody can speak for it right now". Collapsing
+          // this into CANCELLED is the fail-closed reading that created the stranded row in the first
+          // place, and repeating it in the recovery would make the recovery unable to recover.
+          sale = 'UNREADABLE'
+        }
+      }
+
+      const decision = describeCancelledSaleRelease(row, sale)
+      if (!decision.release) return { released: false as const, reason: decision.reason }
+
+      const applied = await applyFencedAttemptDecision(tx, {
+        id: row.id,
+        expectedAttemptRevision,
+        expectedStatus: 'CANCELLED',
+        data: {
+          status: 'SYNCED',
+          // The retirement cleared this. The row is being recorded as posted again, and the only
+          // instant this code can honestly name is now — the original post time did not survive.
+          syncedAt: now,
+          errorMessage: cancelledSaleReleaseNote(row.externalTransactionId ?? '', now),
+        },
+      })
+      if (!applied.ok) return { released: false as const, reason: applied.message }
+      return { released: true as const }
+    })
+
+    if (!outcome.released) return { success: false, error: outcome.reason }
+
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'accounting_sync_row_released_for_live_sale',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Released the retired ${row.type} sync row for ${row.referenceType} ${row.referenceId}: the sales `
+        + 'order is live again, so the document it already posted can be linked. Nothing was sent to the accounting '
+        + 'system; the back-reference repair sweep will write the link and enqueue the outstanding follow-ups.',
+      metadata: {
+        syncLogId: row.id,
+        connector: row.connector,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        externalTransactionId: row.externalTransactionId,
+      },
+    })
+    revalidatePath('/sync')
+    return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }
   }
