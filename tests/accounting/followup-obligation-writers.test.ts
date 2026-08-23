@@ -1683,35 +1683,32 @@ test('[o3d-qn21] a no-identifier operation is escalated as a REPLAY, never as a 
     'named as the effect this particular operation has, not as a generic "side effect"',
   )
 
-  // Codex MEDIUM — QUEUED, NOT SENT, AND SETTLING DOES NOT UNSEND WHAT IS ALREADY QUEUED.
-  // `INVOICE_EMAIL` succeeds by writing a PENDING email-outbox row; the outbox cron delivers it
-  // afterwards. So the sweep leaves a queued copy behind on every pass, and settling the sync row
-  // stops the sweep WITHOUT cancelling any of them. An operator following the old wording checked a
-  // mail log, settled the row, and the copies already queued went out anyway.
+  // Codex MEDIUM — QUEUED, NOT SENT. `INVOICE_EMAIL` succeeds by writing a PENDING email-outbox row;
+  // the outbox cron delivers it afterwards. So the sweep leaves a queued copy behind on every pass.
   assert.doesNotMatch(
     description,
     /IS SENT TO THE CUSTOMER, once per sweep/,
-    'the old wording described a send that has already finished, so nothing was left to cancel',
+    'the old wording described a send that has already finished, so nothing was left to say',
   )
   assert.match(description, /PENDING/, 'the record says the copies are pending, not delivered')
-  assert.match(
-    description,
-    /SETTLING THE ROW CANCELS NOTHING THAT IS ALREADY QUEUED/,
-    'the limit of settling is stated, because that is the step the operator would otherwise trust',
-  )
-  assert.match(
-    description,
-    /before you settle, list every PENDING accounting-invoice email-outbox row for this order/,
-    'and the inspection is ordered BEFORE the settlement, which is the only order that works',
-  )
+
+  // ROUND 3, Codex HIGH — AND NEITHER STEP OF THE REMEDY THAT REPLACED IT WAS PERFORMABLE. The
+  // outbox has no cancelled state and no control that removes an unsent row, and the settlement
+  // action refuses every QuickBooks row (UNFENCED_ATTEMPT, permanently). Both instructions are gone;
+  // the message names the impossibilities and the one lever that does work. Each step is walked
+  // against the shipped code in tests/accounting/qbo-remedy-is-performable.test.ts.
+  assert.doesNotMatch(description, /cancel the rest/, 'there is no operation that cancels a queued copy')
+  assert.doesNotMatch(description, /then settle sync row log-1 by hand/, 'and none that settles this row')
+  assert.match(description, /IMS CANNOT CANCEL A QUEUED COPY/)
+  assert.match(description, /WHAT YOU CANNOT DO: settle sync row log-1 by hand/)
   assert.match(
     description,
     /kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order id/,
-    'named precisely enough to actually run, rather than "check the outbox"',
+    'the half that IS runnable — counting them — is still named precisely enough to run',
   )
-  assert.match(description, /cancel the rest/, 'and the operator is told to cancel them')
-  assert.match(description, /settle sync row log-1 by hand/, 'and how to make the replay stop')
+  assert.match(description, /quickbooks_sync_enabled/, 'and the one lever that stops the replay is named')
   assert.match(description, /o3d-qn21/, 'and the durable fix is named, so the reader can see it is tracked')
+  assert.match(description, /o3d-3lhp/, 'as are the two missing operations')
 
   // The console line and the durable record are the SAME wording — one incident, one story.
   assert.equal(escalation.level, 'ERROR')

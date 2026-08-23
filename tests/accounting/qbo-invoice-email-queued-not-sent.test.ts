@@ -102,7 +102,7 @@ test('Codex MEDIUM: every replay adds ANOTHER pending copy — settling the row 
   )
 })
 
-test('Codex MEDIUM: the escalation tells the operator to cancel the queued copies BEFORE settling', async () => {
+test('Codex MEDIUM (round 3): the escalation names the queued copies and the fact that IMS cannot cancel them', async () => {
   const { describeUnpersistedQboPost } = await import('@/lib/domain/accounting/unrecorded-posted-document')
 
   const description = describeUnpersistedQboPost(
@@ -122,33 +122,36 @@ test('Codex MEDIUM: the escalation tells the operator to cancel the queued copie
     /IS SENT TO THE CUSTOMER, once per sweep/,
     'the old wording described a finished send, which left the operator nothing to do but reconcile',
   )
+  // Round 3 replaced this sentence rather than keeping it: "settling cancels nothing that is already
+  // queued" still implied a settlement the operator could go and perform, and they cannot.
+  assert.doesNotMatch(description, /SETTLING THE ROW CANCELS NOTHING THAT IS ALREADY QUEUED/)
   assert.match(
     description,
-    /SETTLING THE ROW CANCELS NOTHING THAT IS ALREADY QUEUED/,
-    'said explicitly, because the settlement is the step the reader would otherwise trust to end it',
+    /WHAT YOU CANNOT DO: settle sync row log-1 by hand/,
+    'the step the reader would otherwise trust to end it is named as unavailable, not merely as insufficient',
   )
 
-  // The instruction has to be runnable, and it has to select the rows the first two tests produced.
-  assert.match(description, /before you settle, list every PENDING accounting-invoice email-outbox row/)
+  // ROUND 3 (Codex HIGH). The instruction this test used to pin — "keep at most the one copy the
+  // customer should receive, and cancel the rest", then settle — WAS NOT PERFORMABLE. The outbox has
+  // no cancelled state and no operator control removes an unsent row, and the settlement action
+  // refuses every QuickBooks row. A remedy has to be a thing an operator can do, so the message now
+  // names the impossibility instead of instructing past it.
+  assert.doesNotMatch(description, /cancel the rest/, 'there is no operation that cancels a queued copy')
+  assert.match(description, /IMS CANNOT CANCEL A QUEUED COPY/)
+  assert.match(description, /every copy already queued WILL be delivered/)
+
+  // What survives is the part that IS runnable: the query still has to select the rows the first two
+  // tests produced, because counting them and warning the customer is the whole of what can be done.
   for (const fragment of ['kind ACCOUNTING_INVOICE', 'referenceType SalesOrder', 'referenceId = the order id']) {
     assert.ok(
       description.includes(fragment),
       `the query the operator is told to run must name ${fragment}, which is what queueEmail actually writes`,
     )
   }
-  assert.match(description, /cancel the rest/)
-  assert.match(
-    description,
-    /any pending row you leave behind is still sent after the sync row is settled/,
-    'and the consequence of skipping it is spelled out, not left to be inferred',
-  )
+  assert.match(description, /tell the customer how many copies are on their way/)
 
-  // The ordering is the fix. "Cancel" must come before "settle sync row" in the sentence the operator
-  // reads top to bottom, otherwise the record still describes a settlement that ends the incident.
-  assert.ok(
-    description.indexOf('cancel the rest') < description.indexOf('settle sync row log-1 by hand'),
-    'inspect and cancel FIRST, settle second',
-  )
+  // tests/accounting/qbo-remedy-is-performable.test.ts walks every step of this message against the
+  // shipped code — the outbox enum, the settlement action, and the sync toggle it does name.
 })
 
 test('Codex MEDIUM: the outbox caveat stays on the email operation only', async () => {

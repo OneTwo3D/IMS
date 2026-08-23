@@ -102,11 +102,21 @@ async function clearTransactionScope() {
   // A RESET CLEARS IMS. IT CANNOT CLEAR XERO — OR QUICKBOOKS (o3d-550x; Codex r3 medium, Codex HIGH).
   //
   // Everything else on this list describes something that lives in this database, so deleting it is the
-  // whole point of a reset. The unrecorded-posted-document records do not: each one says a document was
-  // ACCEPTED BY A REMOTE LEDGER and its sync row can never name it — real money in somebody else's
-  // books, which no reset of ours voids, and which nothing in IMS can re-derive. That is the same
-  // sentence that earned them the retention exemption, and a factory reset is not a weaker eraser than
-  // a 90-day sweep; it is a stronger one.
+  // whole point of a reset. The unrecorded-posted-document records do not: each one says AN EFFECT
+  // LANDED OUTSIDE IMS and its sync row can never name it, and nothing in IMS can re-derive it. That is
+  // the same sentence that earned them the retention exemption, and a factory reset is not a weaker
+  // eraser than a 90-day sweep; it is a stronger one.
+  //
+  // "AN EFFECT", NOT "A DOCUMENT" — round 3, Codex MEDIUM. Folding the pair into one exemption made
+  // the breadcrumb speak for both action names at once, and it kept the Xero sentence: every preserved
+  // row was described as a document still standing in a ledger. The QuickBooks action does not mean
+  // only that. The same name covers the four no-identifier operations in
+  // lib/domain/accounting/unrecorded-posted-document.ts — a bill attachment, a stored invoice PDF, an
+  // invoice email QUEUED to a customer, a WooCommerce note — none of which is a ledger document and
+  // one of which is not even finished. Preserving them is still right, because the record is the only
+  // thing that says the effect repeated; describing them all as ledger documents sends the reader to
+  // the wrong system. The breadcrumb below says what is true of the WHOLE set and lets each record
+  // speak for itself.
   //
   // BOTH ACTIONS, FROM THE ONE PLACE THE PAIR IS NAMED. This exemption originally spelled out a single
   // constant — the Xero one — and read as complete: it compiled, its test passed, and the sentence
@@ -141,9 +151,16 @@ async function clearTransactionScope() {
       tag: 'sync',
       action: 'database_reset_preserved_unrecorded_documents',
       level: 'WARNING',
-      description: `Database reset kept ${preserved} record(s) of document(s) that IMS posted to an `
-        + 'accounting ledger and could never record. Those documents still exist in Xero or QuickBooks '
-        + 'and nothing else in IMS references them any more. Search this log for '
+      description: `Database reset kept ${preserved} record(s) of things IMS did against an accounting `
+        + 'connector and could never record. THEY ARE NOT ALL LEDGER DOCUMENTS. Some name a document '
+        + 'Xero or QuickBooks accepted and still holds — real money in somebody else\'s books, which no '
+        + 'reset of ours voids. The rest name an effect that landed somewhere else and can repeat: a '
+        + 'file attached to a QuickBooks bill, an invoice PDF written over the stored copy, an invoice '
+        + 'email queued to a customer, a note written onto a WooCommerce order. Each record says which '
+        + 'it is, what the effect was and what can be done about it. Nothing else in IMS references any '
+        + 'of them any more — and for a queued-email one, this reset has just emptied the email outbox '
+        + 'too, so the copies that record tells you to count are gone with it and the count cannot be '
+        + 'made after the fact. Search this log for '
         + `${UNRECORDED_POSTED_DOCUMENT_ACTIONS.map((action) => `"${action}"`).join(' or ')}.`,
       metadata: { preserved, actions: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS] },
     })

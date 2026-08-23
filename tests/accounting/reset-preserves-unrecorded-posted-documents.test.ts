@@ -214,6 +214,43 @@ test('Codex HIGH: BOTH connectors\' records survive the same reset, and are coun
   )
 })
 
+test('Codex MEDIUM (round 3): the breadcrumb describes the WHOLE preserved set, not only the ledger half', async () => {
+  // Folding the pair into one exemption made this sentence speak for both action names at once, and
+  // it kept the Xero wording: "documents that IMS posted to an accounting ledger … those documents
+  // still exist in Xero or QuickBooks". The QuickBooks action does not mean only that. The SAME name
+  // is written for the four no-identifier operations — a bill attachment, a stored invoice PDF, an
+  // invoice email QUEUED to a customer, a note on a WooCommerce order — none of which is a ledger
+  // document, and one of which has not finished happening. A reader told to go and look in the
+  // ledger for those finds nothing, and concludes the record is stale.
+  reset([INCIDENT, QBO_INCIDENT])
+
+  await runReset('full')
+
+  const breadcrumb = state.activity.find((row) => row.action === 'database_reset_preserved_unrecorded_documents')
+  assert.ok(breadcrumb)
+
+  // The claim that was false of part of the set.
+  assert.doesNotMatch(
+    breadcrumb.description,
+    /Those documents still exist in Xero or QuickBooks/,
+    'that is true of the Xero records and of a QuickBooks document post — and of nothing else preserved here',
+  )
+  assert.match(breadcrumb.description, /NOT ALL LEDGER DOCUMENTS/)
+
+  // What IS true of the whole set: each one names an effect, and the record says which.
+  assert.match(breadcrumb.description, /Each record says which/)
+  for (const effect of ['attached to a QuickBooks bill', 'invoice PDF', 'email queued to a customer', 'WooCommerce order']) {
+    assert.ok(breadcrumb.description.includes(effect), `the non-document effects are named: ${effect}`)
+  }
+
+  // And the half-truth this same reset creates: the queued copies a record tells the reader to count
+  // were deleted by `emailOutbox.deleteMany({})` a few lines above the exemption.
+  assert.match(breadcrumb.description, /emptied the email outbox/)
+
+  // Unchanged: the ledger half is still stated, because it is still true of part of the set.
+  assert.match(breadcrumb.description, /Xero or QuickBooks accepted and still holds/)
+})
+
 test('Codex r3 medium + HIGH: the exemption is in the DELETE, and it names the whole pair', async () => {
   reset([INCIDENT])
 

@@ -173,19 +173,50 @@ export type UnpersistedQboPost = {
  * describes a protection that is not there sends an operator looking for a duplicate to reconcile
  * when what they need to do is stop a send from repeating.
  *
- * The `check` is what the operator does about the effect; the `effect` is what the replay costs.
- *
  * ONE OF THE FOUR SUCCEEDS BY QUEUEING RATHER THAN BY DOING (Codex MEDIUM). `INVOICE_EMAIL` does not
  * send anything: it writes a PENDING row into the email outbox and returns success, and a separate
- * outbox cron delivers it later. That changes the remedy, not just the wording. For the other three
- * the effect is already finished by the time an operator reads the record, so "settle the row" is the
- * whole of the stopping half — nothing further is pending. For the email, settling the row stops the
- * SWEEP adding more copies and CANCELS NOTHING THAT IS ALREADY QUEUED: every sweep so far has left a
- * PENDING outbox row behind it, and each of those is still going to be delivered to the customer
- * after the sync row is settled. So the check has to be done FIRST and has to be about the outbox,
- * not about the mailbox: find the pending accounting-invoice rows for this order and cancel the ones
- * the customer should not receive, THEN settle. An operator told only to "check what was sent" would
- * look at a mail log, see one delivery, settle the row, and watch the rest arrive afterwards.
+ * outbox cron delivers it later. For the other three the effect is already finished by the time an
+ * operator reads the record; for the email, more of it is still coming.
+ *
+ * -----------------------------------------------------------------------------------------------
+ * ROUND 3 (Codex HIGH): A REMEDY MUST BE PERFORMABLE, AND THIS ONE WAS NOT — EITHER HALF OF IT.
+ * -----------------------------------------------------------------------------------------------
+ * The wording told an operator to cancel the queued outbox rows and then settle the sync row.
+ * NEITHER STEP EXISTS IN THE SHIPPED CODE, and this is the THIRD time on this branch that a remedy
+ * has been written without being walked through the tree first. Each step below was checked against
+ * the code before this comment was written, and there is a test that walks them again.
+ *
+ *   CANCEL THE QUEUED ROWS — there is nothing to cancel WITH. `EmailOutboxStatus` is PENDING,
+ *   PROCESSING, SENT, FAILED; none of them means "deliberately not delivered", and the model carries
+ *   no cancelled-at column. Every status write lives inside the outbox cron, which terminalises a
+ *   row only by SENDING it or by exhausting five attempts. No server action, route handler or screen
+ *   removes an individual unsent row — the only authenticated removal in the tree is
+ *   `emailOutbox.deleteMany({})` inside the factory reset, i.e. the whole database. There is not
+ *   even a page on which the rows the instruction says to enumerate can be seen.
+ *
+ *   THEN SETTLE THE ROW — the settlement action refuses this exact row. It requires a fenced attempt
+ *   revision, and the QuickBooks processor stamps none, so every QuickBooks row sits at revision 0
+ *   and is answered UNFENCED_ATTEMPT for ever; the adoption escape hatch needs the row's connector
+ *   NOT to be the active one, which cannot hold for the connector that just produced the incident.
+ *   The control is not rendered on any QuickBooks view either. And "mark it SYNCED, or FAILED" named
+ *   an outcome the action cannot produce at all: it emits SYNCED or CANCELLED.
+ *
+ * WHY THE MESSAGE WAS FIXED RATHER THAN THE HOLE. Providing the operation is not contained here.
+ * The cancel needs a new outbox state — a schema change and a migration — and reusing FAILED would
+ * be a lie the outbox's own sender writes for suppressed recipients and exhausted attempts, making
+ * its failure signal unreadable, while deleting the row would destroy the only evidence a copy was
+ * queued. The settle needs a QuickBooks attempt fence, and THIS BRANCH ALREADY TRIED THAT: the
+ * no-identifier dispatch machinery of rounds 6 and 7 was reverted after four rounds precisely
+ * because the connector lacks the primitives (a claim is not proof of dispatch; a failure is not
+ * proof of no effect). Rebuilding it inside a wording fix is the same mistake with a deadline.
+ *
+ * SO THE MESSAGE NOW SAYS ONLY WHAT CAN BE DONE, NAMES WHAT CANNOT, AND POINTS AT THE FILED WORK
+ * (o3d-3lhp). The one real lever it names was verified the same way as the refusals: turning
+ * `quickbooks_sync_enabled` off stops the stale-claim sweep AND the manual sync, because both gate
+ * on it before the processor is reached. It is a blunt lever — it stops every QuickBooks row — and
+ * the message says that too, rather than implying a per-row control that does not exist.
+ *
+ * The `check` is what the operator does about the effect; the `effect` is what the replay costs.
  */
 const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<AccountingSyncType, { effect: string; check: string }>> = {
   BILL_ATTACHMENT: {
@@ -200,12 +231,13 @@ const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<AccountingSyncType, { ef
     effect: 'ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — one more PENDING '
       + 'accounting-invoice row in the email outbox per sweep, every one of which the outbox sender '
       + 'will deliver',
-    check: 'this operation succeeds by QUEUEING, not by sending, so SETTLING THE ROW CANCELS NOTHING '
-      + 'THAT IS ALREADY QUEUED — before you settle, list every PENDING accounting-invoice email-outbox '
-      + 'row for this order (kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order '
-      + 'id), keep at most the one copy the customer should receive, and cancel the rest; any pending '
-      + 'row you leave behind is still sent after the sync row is settled, and tell the customer if '
-      + 'more than one copy has already gone out',
+    check: 'this operation succeeds by QUEUEING, not by sending, and IMS CANNOT CANCEL A QUEUED COPY. '
+      + 'EmailOutbox has four states — PENDING, PROCESSING, SENT, FAILED — none of which means '
+      + '"deliberately not delivered", and no action, route or screen removes an unsent row, so every '
+      + 'copy already queued WILL be delivered and there is nothing to press. What you CAN do: count '
+      + 'them, by querying the email outbox directly for kind ACCOUNTING_INVOICE, referenceType '
+      + 'SalesOrder, referenceId = the order id (no page in IMS lists them), and tell the customer how '
+      + 'many copies are on their way',
   },
   WC_INVOICE_NOTE: {
     effect: 'a second invoice note is written onto the WooCommerce order, once per sweep',
@@ -226,7 +258,8 @@ const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<AccountingSyncType, { ef
  *   • ONE OF THE FOUR NO-IDENTIFIER OPERATIONS above. No id came back and no Request-Id was ever
  *     sent, so nothing deduplicates the re-attempt: stale-claim recovery REPLAYS THE EFFECT
  *     OUTRIGHT, and goes on replaying it every sweep for as long as the row stays claimed. That
- *     reader has to be told to go and look at the effect, and to settle the row so it stops.
+ *     reader has to be told to go and look at the effect — and told, in the same breath, that the
+ *     per-row stop they would reach for does not exist and what the blunt one is (round 3).
  */
 export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: unknown): string {
   const { entry, postedExternalId } = incident
@@ -240,10 +273,19 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
       + 'holds this worker\'s claim and no mirrored accounting event was written, so once that claim goes '
       + `stale THE SWEEP WILL RECLAIM THE ROW AND RUN THE OPERATION AGAIN OUTRIGHT — ${noRequestId.effect}, `
       + 'unbounded, because no retry is consumed while the row never leaves PROCESSING. '
-      + `REMEDY: ${noRequestId.check}; then settle sync row ${entry.id} by hand (mark it SYNCED, or FAILED `
-      + 'if the operation must not run again) so the sweep stops re-running it. This is the known hole '
-      + 'o3d-qn21 — the durable fix is a pre-post dispatch record, not this message, and until it lands '
-      + 'this record is the only thing that says the effect repeated.'
+      + `WHAT TO DO ABOUT THE EFFECT: ${noRequestId.check}. `
+      + `WHAT YOU CANNOT DO: settle sync row ${entry.id} by hand. The settlement action refuses EVERY `
+      + 'QuickBooks row — this connector stamps no attempt revision, so its rows stay at revision 0 and '
+      + 'the attempt fence answers UNFENCED_ATTEMPT permanently — and the settle control is not rendered '
+      + 'on any QuickBooks view. It could not mark a row FAILED in any case: its only two outcomes are '
+      + 'SYNCED and CANCELLED. '
+      + 'THE ONE LEVER THAT STOPS THE REPEAT is turning QuickBooks sync OFF (Sync settings, the Sync '
+      + 'Enabled toggle, i.e. quickbooks_sync_enabled). The stale-claim sweep and the manual sync both '
+      + 'gate on it and both stop. It stops EVERY QuickBooks row, not this one, and it recalls nothing '
+      + 'already queued or already done; until it is off, the effect above repeats every sweep. '
+      + 'This is the known hole o3d-qn21, and the missing operations — an outbox cancel, and a per-row '
+      + 'remediation that fences the attempt and terminalises it — are filed as o3d-3lhp. Until those '
+      + 'land this record is the only thing that says the effect repeated.'
   }
   return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as `
     + `${postedExternalId ?? '(no id returned)'}, but IMS could not record that id: ${String(cause)}. `
