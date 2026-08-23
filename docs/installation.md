@@ -39,6 +39,29 @@ The script performs the following steps:
 For unattended installation, use `--non-interactive` and set configuration values as environment variables.
 For full Proxmox + Cloudflare + OpenLiteSpeed tenant rollout, see [Automated Tenant Provisioning](tenant-provisioning.md).
 
+### Re-running the installer over an existing installation
+
+This is supported and expected — the installer reads back the `.env` a previous run wrote, preserves
+the secrets it cannot re-mint (`SETTINGS_ENCRYPTION_KEY`, `AUTH_SECRET`, `CRON_SECRET`) and keeps a
+working `REDIS_URL`. Because it is an upgrade entrypoint, it applies **the same cutover sequence as
+`scripts/deploy.sh` and `scripts/update.sh`** (o3d-2sm1.3). When it finds an existing service unit or
+a live crontab it:
+
+1. adopts any cutover fence a previous run left standing;
+2. installs and **verifies** the reboot-fence drop-in, before anything is stopped;
+3. stops the service, fences the crontab, waits for the port, revokes `CONNECT` for the window and
+   proves nothing else is connected;
+4. migrates, checks for drift, and runs the migrations' own `verify.sql` checks;
+5. seeds, bootstraps and builds — all through the connection that survives the fence;
+6. releases the connection fence, lifts the reboot fence, starts the service, and only then restores
+   the crontab, before the managed cron block is spliced back in.
+
+On a failure after the stop it leaves the service **stopped and fenced** and never restarts it, on
+exactly the same terms as the deploy scripts — see [Deploy order](#deploy-order-and-what-happens-on-a-rollback).
+It previously migrated with the old service and the old cron writers live, which is the defect that
+order exists to remove. A **first** install fences nothing, deliberately: there is no service, no
+crontab and no data, so there is no writer to stop.
+
 
 ## Configuration Prompts
 
@@ -496,10 +519,36 @@ only defence. (o3d-2sm1.1)
 
 **A snapshot is not a fence** (o3d-2sm1.2). Step 4 on its own closes its connection, and the dump
 and the migration then open theirs; nothing stops a client connecting in the gap. So the scripts
-first revoke `CONNECT` on the database from the application role for the length of the window
-(`scripts/fence-db-connections.mjs --fence`), drain what is already attached, and only then take
-the snapshot. The revoke is released on every exit path, including the failure trap, because a
-revoke nobody undoes is an application that cannot reach its database at all.
+first revoke `CONNECT` on the database from the application role **and from PUBLIC** (the default
+database ACL grants it to PUBLIC, so revoking from the role alone changes nothing) for the length
+of the window (`scripts/fence-db-connections.mjs --fence`), drain what is already attached, and only
+then take the snapshot.
+
+**The fence proves it took, rather than assuming the revoke worked** (o3d-2sm1.3). A grant can reach
+the application role through **role membership**, which no examination of the ACL entries the script
+itself removed can see. So after the revokes it asks the database directly —
+`has_database_privilege(<app role>, current_database(), 'CONNECT')` must be false — and fails with
+the granting roles named if it is not. A deploy must not revoke from a shared role, so this is
+reported rather than worked around: make the application role's `CONNECT` a direct grant, or run the
+cutover with the writers stopped and no connection fence.
+
+**When the fence is released, and when it is deliberately held** (o3d-2sm1.3). Releasing it from the
+failure path unconditionally — which is what the previous revision did — lets the application
+reconnect to a database whose schema is in an unknown state, which is the exact window this order
+exists to close. The distinction is whether the schema was **touched**, meaning
+`prisma migrate deploy` had been invoked:
+
+| Where the run failed | The connection fence |
+| --- | --- |
+| Before the migration was invoked (build, validation, a writer that would not stop, an unarmable fence) | **Released.** Nothing has moved, and a revoke nobody undoes is an application that cannot reach its database at all. |
+| At or after the migration was invoked, including a failed drift check or a failed verification | **Held**, with the command to release it by hand printed. The schema may be half-applied; nothing may connect until a re-run has migrated, checked drift and verified. |
+| Everything passed | Released in the start phase, immediately before the new build starts — the only place a release follows a migration. |
+
+A re-run **adopts** a held fence rather than releasing it: it re-applies the revoke (which re-drains
+anything that attached in between, while keeping the *original* recorded grants so the eventual
+release restores the truth) and runs every database-touching recovery step — the rebuild included —
+through `DEPLOY_ADMIN_DATABASE_URL`. Adopting a held fence without that variable set is fatal: the
+application role has no `CONNECT` and the run would have no connection to recover through.
 
 That fence needs a privileged connection of its own, `DEPLOY_ADMIN_DATABASE_URL`:
 
@@ -526,9 +575,16 @@ scripts leave the service stopped and fenced against a reboot, write a state fil
 failed step and the command that releases the connection fence, and print what to do. Fix the
 cause and re-run — every step is idempotent, and **a re-run adopts all three fences before it
 rebuilds**: it re-stops the service, re-establishes and verifies the reboot fence, confirms cron is
-still fenced and releases any standing connection fence, all before it pulls or builds. Do not
-start the service by hand to "restore service" while a migration has been applied and the new
-build has not started.
+still fenced and adopts or releases any standing connection fence (per the table above), all before
+it pulls or builds. Do not start the service by hand to "restore service" while a migration has been
+applied and the new build has not started.
+
+**A re-run over a migration attempt may not skip the migration** (o3d-2sm1.3). While adopting a
+marker whose `migration_attempted=true`, `scripts/deploy.sh` **refuses** `--skip-migrate` and
+`--restart-only`: the schema may be half-applied, and starting the service without re-running
+`migrate -> drift -> verify` would start it against exactly that. `--skip-build` is still allowed,
+and is usually what you want — the build ran before the stop, so the artefact on disk is already the
+new one.
 
 **The pre-migration dump is recorded as a restore point only once `pg_dump` succeeds.** It is
 written to a `.part` file and renamed on completion; if it fails, the partial file is deleted and
@@ -557,7 +613,11 @@ The contract:
 - every statement returns **exactly one row** with **exactly** the columns `check_name` (text)
   and `violations` (an integer count);
 - every `violations` must be `0` — anything else fails the deploy and the new build is not
-  started;
+  started. "Anything else" includes a count that is **NULL** or is not an integer, which is an
+  **error**, not a pass: `Number(null)` and `Number('')` are both `0`, and the counts most likely to
+  come back null are exactly those from a check that found nothing to aggregate over (`SUM` or `MAX`
+  over an empty input, a scalar subquery that matched no row). A check that cannot fail is not a
+  check (o3d-2sm1.3);
 - the checks are read-only, and they must stay true afterwards, because they run on every later
   deploy too.
 
@@ -583,6 +643,23 @@ and the deploy both reported success having executed nothing. Now:
   nothing was checked, not that nothing is wrong;
 - `prisma/migrations/verification-required.txt` names the migrations that **must** declare a
   `verify.sql` — the ones whose safety argument depends on which binary was serving while they ran.
+
+This repository's required migration, `20260822090000_refund_reversal_staging_state`, now declares
+its checks (o3d-2sm1.3 — the coverage gate was previously red by design, which is the fastest way to
+teach everyone to ignore a mandatory gate). They are derived from what that migration's own prose
+says is dangerous:
+
+1. **no refund written after the cutover began without a staging witness.** Legacy rows are
+   legitimately `NULL` — the column is deliberately not backfilled — so the check is bounded by
+   `_prisma_migrations.started_at` for that migration. Every refund created from that moment is
+   written by code that sets the column, so a `NULL` one was minted by a predecessor still serving.
+2. **none of those already outside the accounting invariant's only bound**, i.e. with
+   `accounting_retry_required` cleared and no recorded sync list. That is the subset the migration
+   calls unrecoverable — no sweep will look at such a row again. It is deliberately a subset of the
+   first check; separating them is about what the failure report tells the person reading it.
+3. **no value in the column that neither application writer mints.** The migration ships no trigger,
+   no default and no backfill, and a third value would make `reversalRecordVerdict` fall through to
+   `undecidable` — silencing itself rather than failing.
 
 A named migration that declares nothing is a coverage gap. It **fails** under `--strict`, which is
 how the `Schema Guardrails` CI job runs the hook, because a missing file is a defect for the pull

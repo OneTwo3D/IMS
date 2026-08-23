@@ -9,6 +9,7 @@ import {
   findMigrationsWithVerify,
   listMigrationDirectories,
   parseRequiredList,
+  parseViolationCount,
   readRequiredList,
   selectVerificationFiles,
   verdict,
@@ -161,4 +162,55 @@ test('this repository names at least one migration that must declare checks', ()
   const onDisk = listMigrationDirectories(join(process.cwd(), 'prisma', 'migrations'))
   const coverage = assessCoverage(onDisk, findMigrationsWithVerify(join(process.cwd(), 'prisma', 'migrations')), required)
   assert.deepEqual(coverage.stale, [], 'every name in the required list must be a migration that exists')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.3 (Codex r2, MEDIUM) — A NULL COUNT WAS COERCED INTO A PASSING ZERO.
+//
+// `Number(null)` and `Number('')` are both 0, so a check whose count came back NULL was
+// RECORDED AS PASSING — and the counts most likely to be null are exactly the ones from
+// a check that found nothing to aggregate over (SUM/MAX over an empty input, a scalar
+// subquery that matched no row). A check that cannot fail is the hook's original defect
+// one level in.
+// ---------------------------------------------------------------------------
+
+test('a null or empty violation count is an ERROR, never a pass', () => {
+  for (const raw of [null, undefined, '', '   ']) {
+    const parsed = parseViolationCount(raw)
+    assert.equal(parsed.ok, false, `${JSON.stringify(raw)} must not parse as a count`)
+  }
+  assert.match(String(parseViolationCount(null).reason), /null/i)
+})
+
+test('only a non-negative integer counts, whatever its wire type', () => {
+  assert.deepEqual(parseViolationCount(0), { ok: true, value: 0 })
+  assert.deepEqual(parseViolationCount('7'), { ok: true, value: 7 })
+  assert.deepEqual(parseViolationCount(' 7 '), { ok: true, value: 7 })
+  assert.deepEqual(parseViolationCount(BigInt(12)), { ok: true, value: 12 })
+
+  for (const raw of [-1, '-1', 1.5, '1.5', 'many', true, false, {}, Number.NaN]) {
+    assert.equal(parseViolationCount(raw).ok, false, `${String(raw)} must be refused`)
+  }
+})
+
+test('a check whose count is null blocks the start rather than reporting zero violations', () => {
+  const evaluated = evaluateFileResults('m', [result([{ check_name: 'sum over an empty set', violations: null }])])
+  assert.equal(evaluated.checks.length, 0, 'it must not be recorded as a passing check')
+  assert.match(evaluated.errors[0], /never a pass/)
+  assert.equal(verdict(evaluated.checks, evaluated.errors).ok, false)
+})
+
+test('the migration this repository requires to declare checks now declares them', () => {
+  // The coverage file has named 20260822090000_refund_reversal_staging_state since
+  // o3d-2sm1.2 and nothing satisfied it, so the CI command was red by design. A
+  // mandatory gate that is intentionally failing teaches everyone to ignore it.
+  const migrationsDir = join(process.cwd(), 'prisma', 'migrations')
+  const coverage = assessCoverage(
+    listMigrationDirectories(migrationsDir),
+    findMigrationsWithVerify(migrationsDir),
+    readRequiredList(migrationsDir),
+  )
+  assert.deepEqual(coverage.missing, [], 'every required migration must ship a verify.sql')
+  assert.deepEqual(coverage.stale, [])
+  assert.equal(coverage.satisfied, true, 'node scripts/run-migration-verifications.mjs --strict must be able to pass')
 })

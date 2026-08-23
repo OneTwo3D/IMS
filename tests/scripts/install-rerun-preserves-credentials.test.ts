@@ -504,3 +504,32 @@ test('o3d-l89a r4: a genuinely absent .env still mints — the refusal must not 
   assert.match(stdout, /STATE<<<absent>>>/)
   assert.match(stdout, /KEY<<<__WOULD_MINT__>>>/, 'a first install has nothing to preserve, and minting there is correct')
 })
+
+test('a re-run keeps the privileged cutover connection it never minted', async () => {
+  // o3d-2sm1.3 — the installer now performs a fenced cutover when it finds an existing
+  // installation, and a real connection fence needs DEPLOY_ADMIN_DATABASE_URL. Nothing
+  // prompts for it and nothing mints it: an operator sets it deliberately as a role
+  // separate from the application's. The heredoc rewrites .env whole, so a value this
+  // script does not carry forward is one a re-run silently deletes — and the cost of that
+  // is not visible, because the NEXT upgrade simply falls back to the snapshot probe.
+  const source = await readScript()
+  const appDir = await appDirectory()
+  const admin = 'postgresql://deployadmin:pw@localhost:5432/one_two_inventory'
+
+  const first = await runInstaller(
+    source,
+    appDir,
+    `INSTALL_REDIS=y; REDIS_PORT=6379; DEPLOY_ADMIN_DATABASE_URL=${JSON.stringify(admin)}`,
+  )
+  assert.equal(first.DEPLOY_ADMIN_DATABASE_URL, admin, 'precondition: the first run wrote it')
+
+  const second = await runInstaller(source, appDir, 'INSTALL_REDIS=y; REDIS_PORT=6379')
+  assert.equal(second.DEPLOY_ADMIN_DATABASE_URL, admin, 'the re-run dropped the cutover admin connection')
+
+  const third = await runInstaller(
+    source,
+    appDir,
+    'INSTALL_REDIS=y; REDIS_PORT=6379; DEPLOY_ADMIN_DATABASE_URL=postgresql://other@localhost/x',
+  )
+  assert.equal(third.DEPLOY_ADMIN_DATABASE_URL, 'postgresql://other@localhost/x', 'an explicit value must still win')
+})

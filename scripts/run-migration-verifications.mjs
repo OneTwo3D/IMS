@@ -20,7 +20,10 @@
 //   * The file contains one or more SQL statements. Every statement must return
 //     EXACTLY ONE ROW with EXACTLY the columns `check_name` (text) and `violations`
 //     (an integer count).
-//   * Every `violations` must be 0. Anything else fails the deploy.
+//   * Every `violations` must be 0. Anything else fails the deploy — and "anything else" includes
+//     a count that is NULL or is not an integer, which is an ERROR rather than a pass. See
+//     `parseViolationCount`: `Number(null)` and `Number('')` are both 0, so a check aggregating
+//     over an empty input used to be recorded as having passed.
 //   * The checks are read-only. They run with nothing serving, after the schema has
 //     moved and BEFORE the new build is started, so they cannot depend on the new
 //     code having run.
@@ -95,6 +98,45 @@ export function selectVerificationFiles(directoriesWithVerify, appliedMigrationN
 }
 
 /**
+ * Pure: the violation count a statement returned, or a refusal.
+ *
+ * `Number(...)` was doing this job, and `Number(null)` and `Number('')` are both 0 — so a check
+ * whose count came back NULL was RECORDED AS PASSING. That is the hook's original defect one level
+ * in: `SUM(...)` over an empty input returns NULL, `MAX(...)` over no rows returns NULL, and a
+ * scalar subquery that matched nothing returns NULL, so the counts most likely to be null are
+ * exactly the ones from a check that found nothing to look at. A check that cannot fail is not a
+ * check. `pg` hands back bigint as a decimal STRING, which is why a string is accepted at all — but
+ * only one that is entirely digits, so 'many', '', '1.5' and NaN are refused rather than coerced.
+ *
+ * @param {unknown} raw
+ * @returns {{ ok: boolean, value?: number, reason?: string }}
+ */
+export function parseViolationCount(raw) {
+  if (raw === null || raw === undefined) {
+    return { ok: false, reason: 'NULL — a count that is null means the check produced no answer, not that it found nothing' }
+  }
+  if (typeof raw === 'boolean') {
+    return { ok: false, reason: `${raw} — a boolean is not a count` }
+  }
+  if (typeof raw === 'bigint') {
+    return raw < 0n
+      ? { ok: false, reason: `${raw} — a count cannot be negative` }
+      : { ok: true, value: Number(raw) }
+  }
+  if (typeof raw === 'number') {
+    return Number.isSafeInteger(raw) && raw >= 0
+      ? { ok: true, value: raw }
+      : { ok: false, reason: `${raw} — not a non-negative integer count` }
+  }
+  if (typeof raw === 'string') {
+    return /^\d+$/.test(raw.trim()) && raw.trim().length > 0
+      ? { ok: true, value: Number(raw.trim()) }
+      : { ok: false, reason: `${JSON.stringify(raw)} — not a non-negative integer count` }
+  }
+  return { ok: false, reason: `${String(raw)} — not a non-negative integer count` }
+}
+
+/**
  * Pure: check one file's results against the contract and collect its checks.
  * `results` is what `pg` returns for a multi-statement simple query: one Result per
  * statement (pg returns a bare Result when the file holds a single statement).
@@ -125,17 +167,17 @@ export function evaluateFileResults(migrationName, results) {
       return
     }
 
-    const violations = Number(row.violations)
-    if (!Number.isFinite(violations) || !Number.isInteger(violations) || violations < 0) {
-      errors.push(`${position} returned violations=${String(row.violations)}, which is not a non-negative integer count.`)
+    const parsed = parseViolationCount(row.violations)
+    if (!parsed.ok) {
+      errors.push(`${position} returned violations=${parsed.reason}. Every check must return a non-negative integer count; a null one is an ERROR, never a pass.`)
       return
     }
 
     checks.push({
       migration: migrationName,
       name: String(row.check_name),
-      violations,
-      passed: violations === 0,
+      violations: parsed.value,
+      passed: parsed.value === 0,
     })
   })
 

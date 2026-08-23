@@ -265,7 +265,7 @@ for (const [name, lines] of [
     }
   })
 
-  test(`${name} fences connections continuously, and releases them in the trap`, () => {
+  test(`${name} fences connections continuously, before the snapshot and before the schema moves`, () => {
     const drain = phaseLine(lines, 'drain-verify')
     const fence = realCodeLine(lines, 'fence_db_connections', drain)
     const probe = realCodeLine(lines, 'check-db-writers.mjs', drain)
@@ -284,6 +284,89 @@ for (const [name, lines] of [
       'a revoke nobody undoes is an application that cannot reach its database',
     )
     assert.match(trapBody, /install_reboot_fence/, 'the trap re-establishes the reboot fence it may have lifted')
+  })
+
+  // -------------------------------------------------------------------------
+  // o3d-2sm1.3 (Codex r2, CRITICAL) — the failure and adoption paths were reopening
+  // the database before the schema was known to be safe. The trap released CONNECT
+  // after ANY post-stop failure, a failed or interrupted migration included, and
+  // adoption released it too — so the application could reconnect to a schema in an
+  // unknown state, which is the exact window this branch exists to close.
+  //
+  // The tension that must not be traded away: the earlier round put the release in the
+  // trap so a failure could not leave the database unreachable, and that is still right
+  // for failures BEFORE any migration attempt. The distinction is whether the schema
+  // was touched, so these assert the CONDITION, not the presence of a call.
+  // -------------------------------------------------------------------------
+
+  test(`${name} tracks "the schema may have moved" separately from "this run intends to migrate"`, () => {
+    const source = lines.filter(isCode).join('\n')
+    assert.match(source, /^SCHEMA_TOUCHED=false$/m, 'the flag must start false')
+    assert.match(source, /schema_touched=\$\{SCHEMA_TOUCHED\}/, 'and be recorded in the marker for the next run')
+
+    // Set BEFORE the migration command, never after: an interrupted or half-applied
+    // migration is precisely the case it exists for.
+    const set = realCodeLine(lines, /^\s*SCHEMA_TOUCHED=true$/, phaseLine(lines, 'migrate'))
+    const migrateCmd = realCodeLine(lines, 'prisma migrate deploy', phaseLine(lines, 'migrate'))
+    assert.notEqual(set, -1, 'the migrate phase must record that the schema may have moved')
+    assert.ok(set < migrateCmd, 'the flag must be set before `prisma migrate deploy` is invoked, not after it returns')
+  })
+
+  test(`${name} holds the connection fence on a failure after the migration started, and releases it before`, () => {
+    const trapStart = lines.findIndex((line) => line.startsWith('on_exit() {'))
+    const trapEnd = lines.findIndex((line) => line.startsWith('trap on_exit EXIT'))
+    const trapBody = lines.slice(trapStart, trapEnd)
+
+    const release = trapBody.findIndex((line) => isCode(line) && /release_db_connections/.test(line))
+    assert.notEqual(release, -1, 'a failure that never touched the schema must still release the fence')
+
+    // The branch the release actually sits in: walk back from it to the nearest `else`,
+    // and from there to the `if` that opened it. Anything else would assert only that
+    // the two strings appear in the same function.
+    const lastCodeBefore = (from: number, pattern: RegExp): number => {
+      for (let index = from - 1; index >= 0; index -= 1) {
+        if (isCode(trapBody[index]) && pattern.test(trapBody[index])) return index
+      }
+      return -1
+    }
+    const elseAt = lastCodeBefore(release, /^\s*else$/)
+    assert.notEqual(elseAt, -1, 'the release must sit in the ELSE of a guard, not run unconditionally')
+    const guard = lastCodeBefore(elseAt, /^\s*if \$SCHEMA_TOUCHED; then$/)
+    assert.notEqual(
+      guard,
+      -1,
+      'and that guard must be $SCHEMA_TOUCHED: holding is what happens once the schema may have moved',
+    )
+    assert.match(
+      trapBody.join('\n'),
+      /DELIBERATELY LEFT UP/,
+      'a held fence must say it is held on purpose and how to undo it by hand',
+    )
+  })
+
+  test(`${name} adopts a held connection fence instead of releasing it, and recovers through the admin connection`, () => {
+    const preflight = phaseLine(lines, 'preflight')
+    const build = phaseLine(lines, 'build')
+
+    const readsFlag = codeLine(lines, "schema_touched=true", preflight)
+    assert.notEqual(readsFlag, -1, 'adoption must read whether the previous run had started migrating')
+    assert.ok(readsFlag < build, 'and read it before anything is rebuilt')
+
+    const adopt = codeLine(lines, 'adopt_db_connections', preflight)
+    assert.notEqual(adopt, -1, 'a fence left standing after a migration attempt is adopted, not released')
+    assert.ok(adopt < build, 'adoption happens before the rebuild, which runs inside the held fence')
+
+    const source = lines.filter(isCode).join('\n')
+    assert.match(
+      source,
+      /DEPLOY_ADMIN_DATABASE_URL is not set/,
+      'adopting a held fence without a privileged connection must fail loudly, not proceed',
+    )
+    assert.match(
+      source,
+      /MIGRATION_DATABASE_URL/,
+      'every recovery step that needs the database goes through the admin connection',
+    )
   })
 
   test(`${name} lifts the connection fence before it starts the new build`, () => {
@@ -317,4 +400,133 @@ test('update.sh records a backup path only once pg_dump has succeeded', () => {
     /NO usable pre-migration dump/,
     'and the failure path must say what to do when there is no restore point',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.3 (Codex r2, HIGH) — `--restart-only` could start after a failed migration.
+//
+// Adoption read that a migration had been attempted and preserved the reboot mask, but
+// never rejected the flags that skip the migration. A re-run after a failed migration or
+// a failed verification could therefore start the service having re-run NEITHER — against
+// exactly the half-applied schema the fence exists to keep it away from.
+// ---------------------------------------------------------------------------
+
+test('deploy.sh refuses --skip-migrate and --restart-only while adopting a migration attempt', () => {
+  const preflight = phaseLine(DEPLOY_LINES, 'preflight')
+  const build = phaseLine(DEPLOY_LINES, 'build')
+
+  const guard = codeLine(DEPLOY_LINES, /if \$FENCE_MASK && \$SKIP_MIGRATE; then/, preflight)
+  assert.notEqual(guard, -1, 'adoption must reject a run that would skip the migration')
+  assert.ok(guard < build, 'and reject it before spending minutes on a build it will not be allowed to start')
+
+  const refusal = DEPLOY_LINES.slice(guard, guard + 4).join('\n')
+  assert.match(refusal, /\bdie\b/, 'the refusal must stop the run, not warn')
+  assert.match(refusal, /--skip-migrate|SKIP_MIGRATE_FLAG/, 'and name the flag the operator typed')
+
+  // --restart-only is --skip-build plus --skip-migrate, so it is caught by the same
+  // guard; the message has to be able to say which one was typed.
+  assert.match(
+    DEPLOY_LINES.join('\n'),
+    /--restart-only\) SKIP_BUILD=true; SKIP_MIGRATE=true; SKIP_MIGRATE_FLAG="--restart-only"/,
+    '--restart-only must record itself as the flag that will be refused',
+  )
+})
+
+test('deploy.sh still allows --skip-build on a re-run, because the build on disk is the NEW one', () => {
+  // The rebuild happens before the stop, so a fence adopted after a failed migration
+  // already has the new artefact on disk. Refusing --skip-build would make every
+  // recovery pay for a build it does not need; refusing --skip-migrate is what matters.
+  const source = DEPLOY_LINES.filter(isCode).join('\n')
+  assert.ok(
+    !/\$FENCE_MASK && \$SKIP_BUILD/.test(source),
+    '--skip-build must not be swept into the same refusal',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.3 — install.sh is a SUPPORTED UPGRADE ENTRYPOINT with the original defect.
+//
+// It explicitly supports being re-run over an existing installation — it reads back the
+// previous .env, preserves the secrets it cannot re-mint, keeps a working REDIS_URL —
+// and it migrated while the existing service and cron writers were live. That is the
+// same defect deploy.sh and update.sh had, on the path most likely to be used by someone
+// who does not know the deploy order.
+// ---------------------------------------------------------------------------
+
+const INSTALL_LINES = readFileSync(join(process.cwd(), 'scripts/install.sh'), 'utf8').split(/\r?\n/)
+
+test('install.sh detects an existing installation and stops every writer before it migrates', () => {
+  const cutover = codeLine(INSTALL_LINES, /^if upgrade_in_place; then$/)
+  assert.notEqual(cutover, -1, 'a re-run over an existing installation must be detected')
+
+  const migrate = realCodeLine(INSTALL_LINES, 'prisma migrate deploy', cutover)
+  const fence = realCodeLine(INSTALL_LINES, 'install_reboot_fence', cutover)
+  const stop = realCodeLine(INSTALL_LINES, /systemctl stop/, cutover)
+  const cron = realCodeLine(INSTALL_LINES, /^  fence_cron$/, cutover)
+  const dbFence = realCodeLine(INSTALL_LINES, /^  fence_db_connections$/, cutover)
+  const probe = realCodeLine(INSTALL_LINES, 'check-db-writers.mjs', cutover)
+
+  for (const [what, at] of [
+    ['install the reboot fence', fence],
+    ['stop the service', stop],
+    ['fence the cron writers', cron],
+    ['revoke CONNECT for the window', dbFence],
+    ['prove nothing else is connected', probe],
+  ] as const) {
+    assert.notEqual(at, -1, `the upgrade cutover must ${what}`)
+    assert.ok(at < migrate, `it must ${what} BEFORE the schema moves`)
+  }
+  assert.ok(fence < stop, 'the reboot fence is installed before the stop, not on the way out')
+  assert.ok(dbFence < probe, 'the fence shuts the door before the probe asserts the room is empty')
+})
+
+test('install.sh verifies its reboot fence with systemd and never uses systemctl mask', () => {
+  const source = INSTALL_LINES.join('\n')
+  assert.match(source, /systemctl show -p DropInPaths/, 'the drop-in must be checked against what systemd loaded')
+  assert.match(source, /AssertPathExists=!/, 'the fence must be a condition systemd enforces on start')
+  assert.ok(
+    !/^\s*systemctl mask\b/m.test(source),
+    'a mask cannot work for a unit whose own file lives in /etc/systemd/system',
+  )
+})
+
+test('install.sh runs the post-migration verification hook before it starts anything', () => {
+  const hook = realCodeLine(INSTALL_LINES, 'run-migration-verifications.mjs')
+  const start = realCodeLine(INSTALL_LINES, /systemctl enable --now/)
+  assert.notEqual(hook, -1, 'the installer must run the migrations\' own checks too')
+  assert.ok(hook < start, 'and pass them before the service is started')
+})
+
+test('install.sh lifts the fences immediately before the start, and restores cron after it', () => {
+  const start = realCodeLine(INSTALL_LINES, /systemctl enable --now/)
+  const release = realCodeLine(INSTALL_LINES, /^release_db_connections \\$/)
+  const removeFence = realCodeLine(INSTALL_LINES, /^remove_reboot_fence$/)
+  const unfence = realCodeLine(INSTALL_LINES, /^unfence_cron$/)
+
+  assert.notEqual(release, -1, 'the connection fence must come down before the start')
+  assert.ok(release < start, 'the application cannot serve a database it may not connect to')
+  assert.ok(removeFence > release && removeFence < start, 'and the AssertPathExists marker must go before the start too')
+
+  assert.notEqual(unfence, -1, 'the crontab must be restored')
+  assert.ok(unfence > start, 'but only once the new build is running')
+
+  // The crontab block is spliced from the LIVE crontab, so restoring it after the splice
+  // would leave every fenced line commented out and the queue workers silently off.
+  const splice = realCodeLine(INSTALL_LINES, /crontab -u "\$\{APP_USER\}" -l .* \| awk/)
+  assert.notEqual(splice, -1, 'the managed cron block is spliced into whatever the crontab currently holds')
+  assert.ok(unfence < splice, 'cron must be unfenced BEFORE the managed block is spliced into it')
+})
+
+test('install.sh never restarts what it stopped on a post-stop failure', () => {
+  const trapStart = INSTALL_LINES.findIndex((line) => line.startsWith('on_cutover_exit() {'))
+  assert.notEqual(trapStart, -1, 'the upgrade cutover must have a failure path')
+  const trapEnd = INSTALL_LINES.findIndex((line, index) => index > trapStart && line === '}')
+  const trapBody = INSTALL_LINES.slice(trapStart, trapEnd).filter(isCode).join('\n')
+
+  assert.ok(!/systemctl\s+start/.test(trapBody), 'the failure path must never start the service again')
+  assert.ok(!/systemctl\s+enable/.test(trapBody), 'nor re-enable it')
+  assert.ok(!/systemctl\s+unmask/.test(trapBody), 'nor lift the fence')
+  assert.ok(/systemctl stop/.test(trapBody), 'it re-stops rather than restarts')
+  assert.match(trapBody, /if \$\{SCHEMA_TOUCHED\}; then/, 'and holds the connection fence only once the schema may have moved')
+  assert.match(trapBody, /release_db_connections/, 'while a pre-migration failure still releases it')
 })

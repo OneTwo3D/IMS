@@ -33,6 +33,18 @@
 //     owns the schema today, or the migration will create tables the application
 //     cannot read. docs/installation.md says the same thing next to the variable.
 //
+//   * It cannot revoke a grant that arrives through ROLE MEMBERSHIP. A REVOKE names a grantee, and
+//     `imsapp` may hold CONNECT because it is a member of some other role that holds it — revoking
+//     from `imsapp` and from PUBLIC then changes nothing an application would notice. Examining the
+//     ACL entries this script itself just removed cannot see that, so after the revokes it ASKS THE
+//     DATABASE: `has_database_privilege(appRole, current_database(), 'CONNECT')` must be false. If
+//     it is still true the fence did NOT take and this exits 1 with the granting roles named. It
+//     does not go on to revoke from those roles — they are shared with other principals and a deploy
+//     has no business rewriting them — so the operator's fix is to make the application role's
+//     CONNECT a direct grant, or to run the cutover with the writers stopped and no fence at all.
+//     This is the same lesson as revoking from PUBLIC: ask the database what is true rather than
+//     reasoning about what you changed.
+//
 //   * It cannot survive a power cut mid-window in the sense of undoing itself. If the
 //     box dies while fenced, CONNECT stays revoked and the application cannot start
 //     until `--release` runs. That is the intended failure direction — down, not
@@ -150,6 +162,7 @@ export function planConnectionFence(facts) {
     adminIsOwner,
     publicHasConnect,
     appRoleHasConnect,
+    appRoleHasEffectiveConnect,
   } = facts
 
   if (!appRole) {
@@ -182,6 +195,16 @@ export function planConnectionFence(facts) {
   if (appRoleHasConnect) revoke.push(appRole)
 
   if (revoke.length === 0) {
+    // Asked of the database, not of the ACL: a role can hold CONNECT with no ACL entry of its own.
+    // The two answers are different refusals and must not be collapsed — one is a database already
+    // closed, the other is one this script cannot close.
+    if (appRoleHasEffectiveConnect) {
+      return {
+        fenceable: false,
+        reason: `neither PUBLIC nor ${appRole} holds CONNECT DIRECTLY, yet ${appRole} can still connect — the grant reaches it through role membership, which a deploy must not revoke because those roles are shared. Make the application role's CONNECT a direct grant to make this fenceable.`,
+        revoke: [],
+      }
+    }
     return {
       fenceable: false,
       reason: `neither PUBLIC nor ${appRole} holds CONNECT on this database already — nothing to revoke, and nothing this script can add.`,
@@ -190,6 +213,28 @@ export function planConnectionFence(facts) {
   }
 
   return { fenceable: true, reason: '', revoke }
+}
+
+/**
+ * Pure: did the revokes actually shut the application out?
+ *
+ * `stillConnects` is `has_database_privilege(appRole, current_database(), 'CONNECT')` read AFTER the
+ * revokes committed. It accounts for membership, for PUBLIC and for superuser status, which is
+ * exactly what an ACL diff cannot. A fence that reports armed while the application can still
+ * connect is worse than none, because the whole deploy proceeds believing the door is shut.
+ *
+ * @param {{ appRole: string, stillConnects: boolean, grantingRoles?: string[] }} facts
+ * @returns {{ fenced: boolean, reason: string }}
+ */
+export function assessEffectiveFence({ appRole, stillConnects, grantingRoles = [] }) {
+  if (!stillConnects) return { fenced: true, reason: '' }
+  const via = grantingRoles.length > 0
+    ? ` The grant reaches it through: ${grantingRoles.join(', ')}.`
+    : ' No role membership was identified, so the grant is held some other way (a superuser bit, or a grant made between the read and now).'
+  return {
+    fenced: false,
+    reason: `THE FENCE DID NOT TAKE. CONNECT was revoked from every grantee that held it directly, and ${appRole} can STILL connect to this database.${via} A deploy must not revoke from a shared role, so this cannot be fixed from here.`,
+  }
 }
 
 /** Pure: the exact statements a fence applies, and the ones that undo it. */
@@ -251,6 +296,34 @@ async function readFacts(client, appRole) {
   return rows[0]
 }
 
+/**
+ * The only question that matters: can the application role connect RIGHT NOW? Postgres answers it
+ * accounting for direct grants, PUBLIC, role membership and the superuser bit all at once, which is
+ * why this is asked of the database instead of inferred from the ACL entries we removed.
+ */
+async function readEffectiveConnect(client, appRole) {
+  if (!appRole) return { stillConnects: false, grantingRoles: [] }
+  const { rows } = await client.query(
+    `SELECT has_database_privilege($1, current_database(), 'CONNECT') AS still_connects`,
+    [appRole],
+  )
+  const stillConnects = rows[0]?.still_connects === true
+  if (!stillConnects) return { stillConnects: false, grantingRoles: [] }
+
+  // Name the culprits so the operator has somewhere to go. A role the application is a member of
+  // that holds CONNECT in its own right is the usual answer.
+  const { rows: sources } = await client.query(
+    `SELECT r.rolname
+       FROM pg_roles r
+      WHERE r.rolname <> $1
+        AND pg_has_role($1, r.oid, 'USAGE')
+        AND has_database_privilege(r.rolname, current_database(), 'CONNECT')
+      ORDER BY r.rolname`,
+    [appRole],
+  )
+  return { stillConnects: true, grantingRoles: sources.map((row) => row.rolname) }
+}
+
 async function otherClientBackends(client) {
   const { rows } = await client.query(
     `SELECT pid, COALESCE(application_name, '') AS application_name, COALESCE(usename, '') AS usename
@@ -295,6 +368,7 @@ async function doFence(client, options) {
         adminIsOwner: facts.admin_role === facts.owner_role,
         publicHasConnect: granteeHasConnect(facts.datacl, facts.owner_role, PUBLIC_GRANTEE),
         appRoleHasConnect: granteeHasConnect(facts.datacl, facts.owner_role, appRole),
+        appRoleHasEffectiveConnect: (await readEffectiveConnect(client, appRole)).stillConnects,
       })
 
   if (!plan.fenceable) {
@@ -333,6 +407,26 @@ async function doFence(client, options) {
     throw error
   }
   for (const statement of revokes) console.log(`  ${statement}`)
+
+  // ASK THE DATABASE WHETHER THE DOOR IS SHUT. Everything above reasons about ACL entries, and an
+  // ACL entry is not the whole answer: CONNECT can reach the application role through membership of
+  // another role, in which case both revokes ran, both succeeded, and the application can still
+  // connect. Reporting "fenced" there is the worst outcome available — the migration then runs
+  // believing nothing else can attach. Draining is deliberately NOT attempted before this check:
+  // terminating backends we cannot keep out is disruption without a fence.
+  const effective = await readEffectiveConnect(client, appRole)
+  const assessment = assessEffectiveFence({
+    appRole,
+    stillConnects: effective.stillConnects,
+    grantingRoles: effective.grantingRoles,
+  })
+  if (!assessment.fenced) {
+    console.error(assessment.reason)
+    console.error('The fence is left standing so nothing is half-applied; undo it with --release before starting the application:')
+    for (const statement of grants) console.error(`  ${statement}`)
+    return EXIT_ERROR
+  }
+  console.log(`Verified: has_database_privilege('${appRole}', current_database(), 'CONNECT') is false.`)
 
   // Revoking CONNECT stops NEW connections; the ones already open keep writing.
   const deadline = Date.now() + Math.max(1, options.timeoutSeconds) * 1000

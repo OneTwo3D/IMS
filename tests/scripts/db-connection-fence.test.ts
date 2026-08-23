@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { test } from 'node:test'
 
 import {
   PUBLIC_GRANTEE,
+  assessEffectiveFence,
   buildGrantStatements,
   buildRevokeStatements,
   granteeHasConnect,
@@ -28,6 +31,7 @@ function facts(overrides: Record<string, unknown> = {}) {
     adminIsOwner: false,
     publicHasConnect: true,
     appRoleHasConnect: false,
+    appRoleHasEffectiveConnect: false,
     ...overrides,
   }
 }
@@ -126,4 +130,63 @@ test('the role to fence is the one the application connects as', () => {
   assert.equal(parseRoleFromConnectionString('postgresql://localhost/ims'), '')
   assert.equal(parseRoleFromConnectionString(''), '')
   assert.equal(parseRoleFromConnectionString('not a url'), '')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.3 (Codex r2, HIGH) — INHERITED ROLE PRIVILEGES BYPASS THE FENCE.
+//
+// The plan examines DIRECT ACL entries for PUBLIC and the login role and then declares
+// success. Postgres grants also arrive through role membership, so CONNECT can still be
+// held after both revokes — and the fence would report armed while the application can
+// still connect, which is worse than no fence because the whole deploy proceeds
+// believing the door is shut. The answer is the same as revoking from PUBLIC: ask the
+// database what is TRUE rather than reasoning about what you changed.
+// ---------------------------------------------------------------------------
+
+test('a fence that did not take is a failure, not an armed fence', () => {
+  const took = assessEffectiveFence({ appRole: 'imsapp', stillConnects: false })
+  assert.equal(took.fenced, true)
+
+  const didNot = assessEffectiveFence({
+    appRole: 'imsapp',
+    stillConnects: true,
+    grantingRoles: ['app_readers', 'ims_all'],
+  })
+  assert.equal(didNot.fenced, false)
+  assert.match(didNot.reason, /THE FENCE DID NOT TAKE/)
+  assert.match(didNot.reason, /app_readers, ims_all/, 'the roles that still grant CONNECT must be named')
+})
+
+test('a fence that did not take says so even when no granting role could be identified', () => {
+  // has_database_privilege accounts for the superuser bit and for a grant made between
+  // the read and the revoke, neither of which shows up as a role membership. Reporting
+  // "fenced" because the search came back empty is the same defect one level in.
+  const unexplained = assessEffectiveFence({ appRole: 'imsapp', stillConnects: true, grantingRoles: [] })
+  assert.equal(unexplained.fenced, false)
+  assert.match(unexplained.reason, /No role membership was identified/)
+})
+
+test('CONNECT held only through membership is refused as unfenceable, not reported as already closed', () => {
+  // Both cases have nothing to revoke. One is a database already shut; the other is one
+  // this script CANNOT shut, because the grant lives on a role shared with other
+  // principals. Collapsing them would let a deploy read "nothing to revoke" as safe.
+  const inherited = planConnectionFence(
+    facts({ publicHasConnect: false, appRoleHasConnect: false, appRoleHasEffectiveConnect: true }),
+  )
+  assert.equal(inherited.fenceable, false)
+  assert.match(inherited.reason, /through role membership/)
+  assert.deepEqual(inherited.revoke, [])
+
+  const genuinelyClosed = planConnectionFence(
+    facts({ publicHasConnect: false, appRoleHasConnect: false, appRoleHasEffectiveConnect: false }),
+  )
+  assert.match(genuinelyClosed.reason, /nothing to revoke/)
+})
+
+test('the effective check is what the fence script actually asks the database', () => {
+  // The assertion that matters is not that a pure function exists but that the SQL is
+  // there: a plan verified only against parsed ACL text is the finding, not the fix.
+  const source = readFileSync(join(process.cwd(), 'scripts/fence-db-connections.mjs'), 'utf8')
+  assert.match(source, /has_database_privilege\(\$1, current_database\(\), 'CONNECT'\)/)
+  assert.match(source, /assessEffectiveFence\(/)
 })
