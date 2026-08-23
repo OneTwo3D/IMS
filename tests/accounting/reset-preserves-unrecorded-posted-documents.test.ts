@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import { UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
+import {
+  QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+  UNRECORDED_POSTED_DOCUMENT_ACTION,
+  UNRECORDED_POSTED_DOCUMENT_ACTIONS,
+} from '@/lib/domain/accounting/unrecorded-posted-document'
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 
 // ---------------------------------------------------------------------------
@@ -20,6 +24,16 @@ import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-r
 //
 // The exemption's OTHER half is deliberately not kept, and that asymmetry is the test: a direct-create
 // marker is an open obligation about a sales order this reset is deleting, so it goes.
+//
+// Codex HIGH — AND IT WAS ONLY EVER HALF DONE. The exemption named ONE constant, the Xero one, which
+// is why it read as correct: it compiled, the tests below passed, and every sentence written about it
+// was true. The QuickBooks incident carries its OWN action name, so `{ not: <the Xero string> }`
+// deleted all of them — and that row is the only thing naming a document QuickBooks accepted and IMS
+// could not write down. The reset was destroying the evidence while logging that it had kept it.
+//
+// The fix is the pair as a value (`UNRECORDED_POSTED_DOCUMENT_ACTIONS`), so the delete, the count and
+// the breadcrumb all read the same list, and the tests below now assert the QuickBooks record survives
+// the same three resets the Xero one does.
 // ---------------------------------------------------------------------------
 
 type ActivityRow = { action: string; description: string; level?: string }
@@ -38,11 +52,20 @@ function reset(rows: ActivityRow[]) {
   state.activityDeleteArgs = null
 }
 
-function actionOf(where: unknown): { not?: string; is?: string } {
+/**
+ * The activity-log filter, read the way Prisma would. `notIn`/`in` are what the reset issues now that
+ * the exemption is a PAIR — the old single-string `not`/equality forms are still understood here so
+ * that a regression back to naming one action is caught by the surviving-record assertions rather
+ * than by this helper silently ignoring the argument.
+ */
+function actionOf(where: unknown): { keep?: string[]; select?: string[] } {
   const action = (where as { action?: unknown } | undefined)?.action
-  if (typeof action === 'string') return { is: action }
-  if (action && typeof action === 'object' && typeof (action as { not?: unknown }).not === 'string') {
-    return { not: (action as { not: string }).not }
+  if (typeof action === 'string') return { select: [action] }
+  if (action && typeof action === 'object') {
+    const record = action as { not?: unknown; notIn?: unknown; in?: unknown }
+    if (typeof record.not === 'string') return { keep: [record.not] }
+    if (Array.isArray(record.notIn)) return { keep: record.notIn.filter((value): value is string => typeof value === 'string') }
+    if (Array.isArray(record.in)) return { select: record.in.filter((value): value is string => typeof value === 'string') }
   }
   return {}
 }
@@ -53,12 +76,12 @@ const activityLog = {
     state.activityDeleteArgs = args
     const filter = actionOf(args?.where)
     const before = state.activity.length
-    state.activity = state.activity.filter((row) => (filter.not ? row.action === filter.not : false))
+    state.activity = state.activity.filter((row) => (filter.keep ? filter.keep.includes(row.action) : false))
     return { count: before - state.activity.length }
   },
   count: async (args?: { where?: unknown }) => {
     const filter = actionOf(args?.where)
-    return state.activity.filter((row) => (filter.is ? row.action === filter.is : true)).length
+    return state.activity.filter((row) => (filter.select ? filter.select.includes(row.action) : true)).length
   },
   create: async ({ data }: { data: ActivityRow }) => {
     state.activity.push(data)
@@ -115,6 +138,13 @@ const INCIDENT: ActivityRow = {
     + 'already names a DIFFERENT document (INV-XERO-FIRST). REMEDY: open both ids in Xero.',
 }
 
+const QBO_INCIDENT: ActivityRow = {
+  action: QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+  level: 'ERROR',
+  description: 'QuickBooks SALES_INVOICE for SalesOrder order-2 POSTED as QBO-INV-9, but IMS could not '
+    + 'record that id. REMEDY: open the id above in QuickBooks.',
+}
+
 const ORDINARY: ActivityRow = { action: 'order_created', level: 'INFO', description: 'ordinary history' }
 const MARKER: ActivityRow = { action: DIRECT_CREATE_PENDING_ACTION, level: 'WARNING', description: 'open obligation' }
 
@@ -143,15 +173,63 @@ test('Codex r3 medium: a transaction reset keeps the record of a document that e
   )
 })
 
-test('Codex r3 medium: the exemption is in the DELETE, not a filter applied afterwards', async () => {
+test('Codex HIGH: a transaction reset keeps the QUICKBOOKS record too', async () => {
+  // THE DEFECT, DIRECTLY. The QuickBooks incident is the same kind of thing as the Xero one — a
+  // document a remote ledger accepted that nothing in IMS names — and it is the ONLY record of it.
+  // Under the single-constant exemption `{ not: <the Xero action> }` matched it and deleted it, and
+  // the reset then logged a breadcrumb saying the evidence had been preserved.
+  reset([QBO_INCIDENT, ORDINARY])
+
+  const result = await runReset('transactions')
+
+  assert.equal(result.success, true)
+  const kept = state.activity.filter((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION)
+  assert.equal(kept.length, 1, 'the document is still in QuickBooks after the reset, so its only record must be too')
+  assert.match(kept[0].description, /QBO-INV-9/, 'and it still names the identifier that exists nowhere else')
+  assert.ok(!state.activity.some((row) => row.action === 'order_created'), 'ordinary history still goes')
+})
+
+test('Codex HIGH: BOTH connectors\' records survive the same reset, and are counted together', async () => {
+  // The pair read as one list, on the delete AND on the count that feeds the breadcrumb. A fix that
+  // exempted both but counted one would under-report the preserved evidence in the only place an
+  // operator is told it exists.
+  reset([INCIDENT, QBO_INCIDENT, ORDINARY, MARKER])
+
+  await runReset('full')
+
+  assert.deepEqual(
+    state.activity.filter((row) => UNRECORDED_POSTED_DOCUMENT_ACTIONS.includes(row.action)).map((row) => row.action).sort(),
+    [...UNRECORDED_POSTED_DOCUMENT_ACTIONS].sort(),
+    'one record per connector, both still here',
+  )
+  const breadcrumb = state.activity.find((row) => row.action === 'database_reset_preserved_unrecorded_documents')
+  assert.ok(breadcrumb)
+  assert.match(breadcrumb.description, /2 record/, 'the count covers both, so the breadcrumb is not half a report')
+  assert.match(breadcrumb.description, new RegExp(UNRECORDED_POSTED_DOCUMENT_ACTION), 'and names the Xero action')
+  assert.match(breadcrumb.description, new RegExp(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION), 'and the QuickBooks one')
+  assert.deepEqual(
+    (breadcrumb as unknown as { metadata?: { actions?: string[] } }).metadata?.actions,
+    [...UNRECORDED_POSTED_DOCUMENT_ACTIONS],
+    'the metadata carries the whole list, so the breadcrumb is searchable for either',
+  )
+})
+
+test('Codex r3 medium + HIGH: the exemption is in the DELETE, and it names the whole pair', async () => {
   reset([INCIDENT])
 
   await runReset('transactions')
 
   assert.deepEqual(
     state.activityDeleteArgs,
-    { where: { action: { not: UNRECORDED_POSTED_DOCUMENT_ACTION } } },
-    'the reset must never issue an unrestricted activityLog.deleteMany({})',
+    { where: { action: { notIn: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS] } } },
+    'the reset must never issue an unrestricted activityLog.deleteMany({}), and never name one of a pair',
+  )
+  const exempted = (state.activityDeleteArgs as { where: { action: { notIn: string[] } } }).where.action.notIn
+  assert.ok(exempted.includes(UNRECORDED_POSTED_DOCUMENT_ACTION))
+  assert.ok(exempted.includes(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION))
+  assert.ok(
+    !exempted.includes(DIRECT_CREATE_PENDING_ACTION),
+    'and the pair is NOT the retention sweep\'s whole exempt list — the open obligation still goes',
   )
 })
 

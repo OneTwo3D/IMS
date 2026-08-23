@@ -121,6 +121,32 @@ export class PostedDocumentEvidenceUnwritten extends Error {
 /** The one action name for the QuickBooks incident. Retention exempts exactly this string. */
 export const QBO_UNRECORDED_POSTED_DOCUMENT_ACTION = 'quickbooks_posted_document_unrecorded'
 
+/**
+ * BOTH CONNECTORS' INCIDENTS, NAMED ONCE, SO NOBODY CAN PROTECT ONE AND FORGET THE OTHER.
+ *
+ * The two constants above describe the SAME class of thing — a document that exists in somebody
+ * else's ledger which nothing in IMS points at, and which nothing in IMS can re-derive — arrived at
+ * by two different accidents on two different connectors. Every eraser in this codebase that spares
+ * one of them has to spare the other, and there is no rule that makes that happen: an exemption
+ * written as a single constant name LOOKS complete, compiles, passes its own test, and is wrong only
+ * for the member of the pair the author was not thinking about. The activity-log retention sweep
+ * shipped correct because both were in front of the author at once; the factory reset shipped
+ * exempting only Xero, and quietly deleted every QuickBooks incident record (Codex HIGH).
+ *
+ * So the pair is a value, not a convention. An eraser imports THIS, and a third connector's incident
+ * becomes one edit here rather than a hunt through every deleter in the tree.
+ *
+ * It is deliberately NOT the activity-log sweep's whole exempt list: that list also carries the
+ * direct-create marker, which is an OPEN OBLIGATION rather than evidence of a remote document, and
+ * which a factory reset is right to discharge because the order it is about is being deleted too.
+ * The two kinds are exempt for different reasons and the erasers treat them differently, so folding
+ * them into one constant would be the same mistake wearing the opposite hat.
+ */
+export const UNRECORDED_POSTED_DOCUMENT_ACTIONS: readonly string[] = [
+  UNRECORDED_POSTED_DOCUMENT_ACTION,
+  QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+]
+
 export type UnpersistedQboPost = {
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
   /** What QuickBooks accepted, and what this process could not write down. */
@@ -148,6 +174,18 @@ export type UnpersistedQboPost = {
  * when what they need to do is stop a send from repeating.
  *
  * The `check` is what the operator does about the effect; the `effect` is what the replay costs.
+ *
+ * ONE OF THE FOUR SUCCEEDS BY QUEUEING RATHER THAN BY DOING (Codex MEDIUM). `INVOICE_EMAIL` does not
+ * send anything: it writes a PENDING row into the email outbox and returns success, and a separate
+ * outbox cron delivers it later. That changes the remedy, not just the wording. For the other three
+ * the effect is already finished by the time an operator reads the record, so "settle the row" is the
+ * whole of the stopping half — nothing further is pending. For the email, settling the row stops the
+ * SWEEP adding more copies and CANCELS NOTHING THAT IS ALREADY QUEUED: every sweep so far has left a
+ * PENDING outbox row behind it, and each of those is still going to be delivered to the customer
+ * after the sync row is settled. So the check has to be done FIRST and has to be about the outbox,
+ * not about the mailbox: find the pending accounting-invoice rows for this order and cancel the ones
+ * the customer should not receive, THEN settle. An operator told only to "check what was sent" would
+ * look at a mail log, see one delivery, settle the row, and watch the rest arrive afterwards.
  */
 const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<AccountingSyncType, { effect: string; check: string }>> = {
   BILL_ATTACHMENT: {
@@ -159,8 +197,15 @@ const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<AccountingSyncType, { ef
     check: 'confirm the invoice PDF stored against the order is the document you expect',
   },
   INVOICE_EMAIL: {
-    effect: 'ANOTHER COPY OF THE INVOICE EMAIL IS SENT TO THE CUSTOMER, once per sweep',
-    check: 'check what was sent for this order and, if the customer was mailed more than once, tell them',
+    effect: 'ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — one more PENDING '
+      + 'accounting-invoice row in the email outbox per sweep, every one of which the outbox sender '
+      + 'will deliver',
+    check: 'this operation succeeds by QUEUEING, not by sending, so SETTLING THE ROW CANCELS NOTHING '
+      + 'THAT IS ALREADY QUEUED — before you settle, list every PENDING accounting-invoice email-outbox '
+      + 'row for this order (kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order '
+      + 'id), keep at most the one copy the customer should receive, and cancel the rest; any pending '
+      + 'row you leave behind is still sent after the sync row is settled, and tell the customer if '
+      + 'more than one copy has already gone out',
   },
   WC_INVOICE_NOTE: {
     effect: 'a second invoice note is written onto the WooCommerce order, once per sweep',

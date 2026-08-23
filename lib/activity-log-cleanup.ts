@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
-import { QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
+import { UNRECORDED_POSTED_DOCUMENT_ACTIONS } from '@/lib/domain/accounting/unrecorded-posted-document'
 
 const DEFAULTS: Record<string, number> = {
   INFO: 30,
@@ -53,12 +53,14 @@ const DEFAULTS: Record<string, number> = {
  */
 const RETAINED_ACTIONS = [
   DIRECT_CREATE_PENDING_ACTION,
-  UNRECORDED_POSTED_DOCUMENT_ACTION,
-  // o3d-peh1 r5 — the same kind-(2) exemption on the other connector, for the other way a real
-  // document ends up unreferenced: QuickBooks accepted the post and returned an id, and the
-  // transaction that would have made that id durable failed. The row names no document, so nothing
-  // re-derives the identifier and no later sync attempt can: it exists only in this record.
-  QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+  // o3d-peh1 r5 — BOTH connectors' unrecorded-document records, spread from the one place the pair
+  // is named. The QuickBooks twin is the same kind-(2) exemption arrived at the other way: the post
+  // was accepted and returned an id, and the transaction that would have made that id durable
+  // failed, so the row names no document and no later sync attempt can re-derive the identifier.
+  // Spreading the pair rather than listing its members is the point: this sweep got both because
+  // both were in front of the author, and the factory reset — writing the same exemption from
+  // memory — named only Xero, and so deleted every QuickBooks incident record (Codex HIGH).
+  ...UNRECORDED_POSTED_DOCUMENT_ACTIONS,
 ]
 
 const DELETE_BATCH_SIZE = 10_000

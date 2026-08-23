@@ -1679,10 +1679,37 @@ test('[o3d-qn21] a no-identifier operation is escalated as a REPLAY, never as a 
   )
   assert.match(
     description,
-    /ANOTHER COPY OF THE INVOICE EMAIL IS SENT TO THE CUSTOMER/,
+    /ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER/,
     'named as the effect this particular operation has, not as a generic "side effect"',
   )
-  assert.match(description, /REMEDY: check what was sent for this order/, 'the operator is told what to check')
+
+  // Codex MEDIUM — QUEUED, NOT SENT, AND SETTLING DOES NOT UNSEND WHAT IS ALREADY QUEUED.
+  // `INVOICE_EMAIL` succeeds by writing a PENDING email-outbox row; the outbox cron delivers it
+  // afterwards. So the sweep leaves a queued copy behind on every pass, and settling the sync row
+  // stops the sweep WITHOUT cancelling any of them. An operator following the old wording checked a
+  // mail log, settled the row, and the copies already queued went out anyway.
+  assert.doesNotMatch(
+    description,
+    /IS SENT TO THE CUSTOMER, once per sweep/,
+    'the old wording described a send that has already finished, so nothing was left to cancel',
+  )
+  assert.match(description, /PENDING/, 'the record says the copies are pending, not delivered')
+  assert.match(
+    description,
+    /SETTLING THE ROW CANCELS NOTHING THAT IS ALREADY QUEUED/,
+    'the limit of settling is stated, because that is the step the operator would otherwise trust',
+  )
+  assert.match(
+    description,
+    /before you settle, list every PENDING accounting-invoice email-outbox row for this order/,
+    'and the inspection is ordered BEFORE the settlement, which is the only order that works',
+  )
+  assert.match(
+    description,
+    /kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order id/,
+    'named precisely enough to actually run, rather than "check the outbox"',
+  )
+  assert.match(description, /cancel the rest/, 'and the operator is told to cancel them')
   assert.match(description, /settle sync row log-1 by hand/, 'and how to make the replay stop')
   assert.match(description, /o3d-qn21/, 'and the durable fix is named, so the reader can see it is tracked')
 
@@ -1710,7 +1737,7 @@ test('[o3d-qn21] the replay that message warns about is real — three sweeps, t
   ageTheClaim()
   await runQuickBooks()
 
-  assert.equal(emailsSent, 3, 'one email per sweep — the replay the record now warns about, unbounded')
+  assert.equal(emailsSent, 3, 'one queued copy per sweep — the replay the record now warns about, unbounded')
   assert.equal(subject().status, 'PROCESSING', 'the row never leaves PROCESSING, which is why it recurs')
   assert.equal(subject().retryCount, 0, 'and no retry is consumed, so nothing bounds it')
 })
