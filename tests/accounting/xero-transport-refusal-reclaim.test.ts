@@ -28,6 +28,7 @@ import {
   type CreateDispatchClient,
 } from '@/lib/domain/accounting/create-dispatch-record'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
+import { STAMPED_MONEY_TYPES } from '@/lib/domain/accounting/money-attempt-provenance'
 import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
 
 /**
@@ -78,6 +79,80 @@ type Row = {
   /** The marker. Write-once by database trigger in production; nothing here may move it. */
   createDispatchedAt: Date | null
   createDispatchIdempotencyKey: string | null
+  /**
+   * THE THREE COLUMNS THE WELDED REFUSAL READS (o3d-anu8 r3), modelled because the release now
+   * carries a predicate over them. Leaving them off the row would not have made the refusal
+   * harmless — it would have made it UNEVALUATED, which is the same shape of defect as ignoring
+   * the `where` altogether: the test would report the refusal as absent and as satisfied alike.
+   *
+   * `type` is COGS_JOURNAL because that is the only producer of `reason: 'transport-refused'` —
+   * the manual-journal path is the one create that mints a dispatch marker. `remoteAttemptedAt`
+   * is null because "nothing was sent" is this file's whole premise, and custody is null because
+   * the minting fence has just forfeited it (`renewClaimForRemoteWrite` moves
+   * `processingStartedAt` without re-asserting custody, so the database trigger nulls it). That
+   * is the exact row state a real hand-back releases, and it is one conjunct — the type — away
+   * from being refused. See the pinning test at the end of the round-4 block.
+   */
+  type: string
+  remoteAttemptedAt: Date | null
+}
+
+/**
+ * A PRISMA `where` IS A TREE, AND SINCE o3d-anu8 THE ONE UNDER TEST IS ONE.
+ *
+ * `releaseClaimForRetry` no longer passes the caller's predicate through: it builds the whole
+ * `updateMany` argument with `stampingCustodyOnClaim`, which AND-s `CUSTODY_MAY_BE_RESTORED` — a
+ * `NOT` over a `type: { in: [...] }` — onto it. So the statement that reaches this double is
+ * `{ AND: [ { id, status, processingStartedAt, attemptRevision }, { NOT: { ... } } ] }`.
+ *
+ * A matcher that walked only the top level reads `AND` as a COLUMN NAME, finds no such column on
+ * the row, and answers "no match" for every write there has ever been. That is not a small
+ * inaccuracy: it turns the eight behavioural tests here red AND turns the four fence tests green
+ * for a reason that has nothing to do with the fence, because a double that never matches proves
+ * a displaced owner releases nothing just as loudly as a correct fence does.
+ *
+ * So this understands exactly the operators the statement under test uses — `AND`, `OR`, `NOT`,
+ * `in`, `not`, and scalar/Date/null equality — and THROWS on anything else. An unrecognised
+ * operator, or a column the row does not model, means the double has stopped modelling the
+ * statement; that has to be loud, because its silent form is a `false` that reads as a working
+ * fence.
+ */
+function valueMatches(actual: unknown, expected: unknown): boolean {
+  if (expected instanceof Date) return (actual as Date | null)?.valueOf() === expected.valueOf()
+  if (expected !== null && typeof expected === 'object') {
+    const filter = expected as Record<string, unknown>
+    const keys = Object.keys(filter)
+    if (keys.length === 1 && keys[0] === 'in') {
+      return (filter.in as unknown[]).includes(actual)
+    }
+    if (keys.length === 1 && keys[0] === 'not') return !valueMatches(actual, filter.not)
+    throw new Error(`the double does not model the filter ${JSON.stringify(keys)} — it is not modelling the statement`)
+  }
+  return actual === expected
+}
+
+function whereMatches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
+  for (const [key, expected] of Object.entries(where)) {
+    if (key === 'AND') {
+      if (!(expected as Array<Record<string, unknown>>).every((clause) => whereMatches(row, clause))) return false
+      continue
+    }
+    if (key === 'OR') {
+      if (!(expected as Array<Record<string, unknown>>).some((clause) => whereMatches(row, clause))) return false
+      continue
+    }
+    if (key === 'NOT') {
+      // Prisma's `NOT` over several fields negates their CONJUNCTION, which is what the recursion
+      // gives: the refusal excludes a row only when type AND custody AND stamp all say so.
+      if (whereMatches(row, expected as Record<string, unknown>)) return false
+      continue
+    }
+    if (!(key in row)) {
+      throw new Error(`the double does not model column "${key}" — it cannot say whether this write matches`)
+    }
+    if (!valueMatches(row[key], expected)) return false
+  }
+  return true
 }
 
 function makeRowStore(row: Partial<Row> & { id: string }) {
@@ -90,25 +165,17 @@ function makeRowStore(row: Partial<Row> & { id: string }) {
     errorMessage: null,
     createDispatchedAt: null,
     createDispatchIdempotencyKey: null,
+    type: 'COGS_JOURNAL',
+    remoteAttemptedAt: null,
     ...row,
   }
   const writes: Array<{ where: Record<string, unknown>; data: Record<string, unknown> }> = []
-
-  const matches = (where: Record<string, unknown>): boolean => {
-    for (const [key, expected] of Object.entries(where)) {
-      const actual = (state as unknown as Record<string, unknown>)[key]
-      if (expected instanceof Date) {
-        if ((actual as Date | null)?.valueOf() !== expected.valueOf()) return false
-      } else if (actual !== expected) return false
-    }
-    return true
-  }
 
   const client = {
     accountingSyncLog: {
       updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
         writes.push({ where, data })
-        if (!matches(where)) return { count: 0 }
+        if (!whereMatches(state as unknown as Record<string, unknown>, where)) return { count: 0 }
         Object.assign(state, data)
         return { count: 1 }
       },
@@ -307,6 +374,81 @@ test('o3d-jit6 r4: the release keeps attempt-stamping custody, like every other 
   assert.equal(store.state.attemptStampingCustodyAt?.valueOf(), T_REFUSAL.valueOf())
 })
 
+test('o3d-jit6 r4 x o3d-anu8 r3: the custody refusal is carried, evaluated, and does not bite a hand-back', async () => {
+  // WHY THIS TEST EXISTS. `releaseClaimForRetry` no longer just writes custody, it AND-s a REFUSAL
+  // into the predicate: a money row carrying neither custody nor an attempt stamp is not claimed at
+  // all, because restoring custody to it would rewrite "undetermined" into `attemptProvenNeverMade`'s
+  // positive proof. That refusal now sits in front of THIS release too, and the row a transport
+  // refusal produces is two-thirds of the way to matching it:
+  //
+  //   custody NULL             — `renewClaimForRemoteWrite` moves `processingStartedAt` when it opens
+  //                              the lease and again in the fence that mints the marker, and neither
+  //                              re-asserts custody, so the forfeit trigger takes it. A releasing
+  //                              worker holding its own claim is therefore NOT a worker holding
+  //                              custody, whatever the claim fence's comment says.
+  //   remoteAttemptedAt NULL   — the premise of the whole file. Nothing was sent.
+  //
+  // What keeps the release landing is the THIRD conjunct, the type. So it is pinned here, from both
+  // sides, rather than left as an accident nobody would notice being lost.
+  const refused = makeRowStore({
+    id: 'log-1', processingStartedAt: T_DISPATCH, attemptRevision: 4,
+    attemptStampingCustodyAt: null, remoteAttemptedAt: null, type: 'COGS_JOURNAL',
+  })
+  assert.equal(
+    await releaseUnsentTransportRefusal(
+      refused.client, 'log-1', claimHeldFrom(T_DISPATCH), ATTEMPT, MESSAGE, T_REFUSAL,
+    ),
+    true,
+    'the row that provably sent nothing IS handed back',
+  )
+
+  // AND THE REFUSAL REALLY IS IN THE PREDICATE — asserted on the statement, so "it landed" cannot be
+  // "the double never looked". `reason: 'transport-refused'` is produced by the manual-journal path
+  // alone, which is why COGS_JOURNAL is the type above.
+  const where = refused.writes.at(-1)?.where as { AND?: Array<Record<string, unknown>> }
+  const custody = where.AND?.find((clause) => 'NOT' in clause)?.NOT as Record<string, unknown> | undefined
+  assert.ok(custody, 'the welded refusal must be AND-ed onto the fence, not merged into it')
+  assert.deepEqual(custody.type, { in: [...STAMPED_MONEY_TYPES] })
+  assert.equal(custody.attemptStampingCustodyAt, null)
+  assert.equal(custody.remoteAttemptedAt, null)
+  assert.ok(!STAMPED_MONEY_TYPES.includes(refused.state.type as never), 'and the released type is outside its scope')
+
+  // THE OTHER SIDE, WHICH IS WHAT MAKES THE ABOVE MEAN SOMETHING. The identical row under a money
+  // type IS refused. If a money type ever grows a create-dispatch marker and a transport refusal,
+  // this is the row that could not be handed back — so the failure is written down here rather than
+  // discovered as a payment stuck in PROCESSING for fifteen minutes past its replay window.
+  for (const moneyType of STAMPED_MONEY_TYPES) {
+    const money = makeRowStore({
+      id: 'log-1', processingStartedAt: T_DISPATCH, attemptRevision: 4,
+      attemptStampingCustodyAt: null, remoteAttemptedAt: null, type: moneyType,
+    })
+    assert.equal(
+      await releaseUnsentTransportRefusal(
+        money.client, 'log-1', claimHeldFrom(T_DISPATCH), ATTEMPT, MESSAGE, T_REFUSAL,
+      ),
+      false,
+      `${moneyType}: the refusal bites — this is the state a money hand-back must never be in`,
+    )
+    assert.equal(money.state.status, 'PROCESSING')
+
+    // AND IT NEVER IS, for a reason that is a property of the money path rather than of this one:
+    // `authoriseMoneyPost` stamps `remoteAttemptedAt` BEFORE it runs the callback that holds the
+    // claim fence, so by the time any money entry can reach a refusal its stamp is already set and
+    // the third conjunct is already false.
+    const stamped = makeRowStore({
+      id: 'log-1', processingStartedAt: T_DISPATCH, attemptRevision: 4,
+      attemptStampingCustodyAt: null, remoteAttemptedAt: T_DISPATCH, type: moneyType,
+    })
+    assert.equal(
+      await releaseUnsentTransportRefusal(
+        stamped.client, 'log-1', claimHeldFrom(T_DISPATCH), ATTEMPT, MESSAGE, T_REFUSAL,
+      ),
+      true,
+      `${moneyType}: a stamped money row releases normally, which is every money row that got this far`,
+    )
+  }
+})
+
 /* ------------------------------------------------------------------------------------------------
  * THE WIRING, WHICH NO UNIT ABOVE CAN SEE.
  * ---------------------------------------------------------------------------------------------- */
@@ -475,16 +617,6 @@ type JobRow = {
 }
 type World = { sync: Row; job: JobRow; activity: Array<Record<string, unknown>> }
 
-function whereMatches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
-  for (const [key, expected] of Object.entries(where)) {
-    const actual = row[key]
-    if (expected instanceof Date) {
-      if ((actual as Date | null)?.valueOf() !== expected.valueOf()) return false
-    } else if (actual !== expected) return false
-  }
-  return true
-}
-
 function updateManyOn(get: () => Record<string, unknown>) {
   return async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
     const row = get()
@@ -507,6 +639,9 @@ function makeWorld(options: { sync?: Partial<Row>; activityLogFails?: boolean } 
       errorMessage: null,
       createDispatchedAt: T_DISPATCH,
       createDispatchIdempotencyKey: KEY,
+      // See the note on `Row`: the state a real hand-back releases from, refusal columns included.
+      type: 'COGS_JOURNAL',
+      remoteAttemptedAt: null,
       ...options.sync,
     },
     job: {

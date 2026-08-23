@@ -66,16 +66,6 @@ export type SalesOrderDeleteBlocker = {
     | 'wms_order_status_snapshot'
     | 'committed_shipment'
     | 'accounting_sync_live'
-    /**
-     * A row that reads as POSTED only because an operator SAID SO (o3d-jit6 r2, Codex finding 2).
-     *
-     * Its own code rather than a variation on `accounting_sync_live`'s wording, because the two make
-     * genuinely different claims about the outside world and prescribe different next actions: one
-     * says a document exists and must be reversed, the other says somebody BELIEVES one exists and
-     * nothing has checked. Ranked between them, so an order carrying both is described by the
-     * confirmed evidence first and still told about the assertion.
-     */
-    | 'accounting_sync_asserted'
     | 'accounting_document_exists'
     | 'daily_batch_staged'
     | 'parked_refund'
@@ -391,29 +381,7 @@ export async function findSalesOrderDeleteBlocker(
     return 4
   }
   const liveDocument = [...candidateDocuments].sort((a, b) => rank(a) - rank(b))[0] ?? null
-  // Every asserted row is named, even when a confirmed document outranks it — blockers are collected
-  // precisely because several can apply at once with remedies that are not interchangeable, and
-  // "verify this claim" is not the same instruction as "reverse this document".
-  const assertedDocuments = candidateDocuments.filter(
-    (row) => asserted(row) && (row.externalTransactionId || row.status === 'SYNCED'),
-  )
-  if (assertedDocuments.length > 0) {
-    const describe = assertedDocuments
-      .map((row) => `${row.connector} ${row.type}${row.externalTransactionId ? ` ${row.externalTransactionId}` : ''}`)
-      .join(', ')
-    blockers.push({
-      code: 'accounting_sync_asserted',
-      message:
-        `Cannot delete an order whose accounting document is recorded as POSTED ON AN OPERATOR'S `
-        + `ASSERTION (${describe}). Somebody looked in the accounting system and typed that document id `
-        + 'here; IMS never made the call, never read the document and never compared its amount, so this '
-        + 'is a belief the delete would act on rather than a confirmation. Open the document in the '
-        + 'accounting system and check it. If it is there, it needs an explicit reversal or credit note '
-        + 'before this order can go — cancelling the order does NOT reverse it. If it is NOT there, the '
-        + 'id is wrong and the order\'s accounting is unresolved: correct it before deleting anything.',
-    })
-  }
-  if (liveDocument && !asserted(liveDocument)) {
+  if (liveDocument) {
     blockers.push({
       code: 'accounting_sync_live',
       // The remedy depends on whether the document is ALREADY IN THE LEDGER, which is what
@@ -526,27 +494,9 @@ export async function findSalesOrderDeleteBlocker(
         referenceType: 'DailyBatch',
         ...referenceWhere,
       },
-      // o3d-jit6 r2 #2: a DAILY_BATCH row is the one family whose ONLY per-row settlement is the
-      // POSTED assertion (`settleableSettlementOutcomes`), so an asserted SYNCED batch row is not a
-      // corner case here — it is the intended exit from a stuck batch, and it reaches this reader
-      // looking exactly like a batch the connector posted.
-      select: { id: true, connector: true, referenceId: true, status: true, settlementBasis: true },
+      select: { id: true, connector: true, referenceId: true, status: true },
     })
     if (!liveBatch) continue
-    if (isOperatorAssertedSettlement(liveBatch.settlementBasis)) {
-      blockers.push({
-        code: 'accounting_sync_asserted',
-        message:
-          `Cannot delete an order included in the ${batch.label} daily accounting batch ` +
-          `(${liveBatch.connector} ${liveBatch.referenceId}), whose row was settled BY HAND as "it DID ` +
-          'post". That is an operator\'s assertion, not something the accounting system confirmed — the ' +
-          'batch journal may or may not be there. Confirm the journal covers this batch before doing ' +
-          'anything irreversible: if it exists, finance must reverse the batch entry; if it does not, ' +
-          'this order\'s value is missing from the accounts and no sweep will raise it again, because ' +
-          'the same assertion blocks the batch recreate.',
-      })
-      continue
-    }
     blockers.push({
       code: 'daily_batch_staged',
       message:
@@ -597,12 +547,6 @@ export async function findSalesOrderDeleteBlocker(
     'parked_refund',
     'accounting_document_exists',
     'daily_batch_staged',
-    // o3d-jit6 r2 #2. ABOVE `accounting_sync_live`, below the two blockers that rest on evidence
-    // nobody typed. Only one blocker is ever returned, so this placement is a decision about what an
-    // operator is told: an unverified post claim has to be settled before any of the softer remedies
-    // below it — cancel, wait, retire the queued row — can be trusted at all, because each of them
-    // assumes the claim is either true or false and this is the one that says nobody knows.
-    'accounting_sync_asserted',
     'accounting_sync_live',
     // o3d-2y1c: ranks below the accounting blockers (whose remedies are a ledger reversal or
     // waiting on an in-flight call) and above the WMS ones. A dispatched shipment is a physical
