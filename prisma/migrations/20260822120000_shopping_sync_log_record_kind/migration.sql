@@ -92,10 +92,15 @@ UPDATE "shopping_sync_logs"
 --   2. APPLY THIS MIGRATION. Additive and nullable, so it is metadata-only.
 --   3. RUN THE TWO UPDATE STATEMENTS ABOVE (they are part of this file and run with it). They only
 --      ever write a NULL cell, so they are idempotent and safe to re-run at any time.
---   4. RUN BOTH VERIFICATION QUERIES BELOW. THE CUTOVER FAILS UNLESS BOTH RETURN ZERO. A non-zero
---      answer means something wrote this table after step 1 — i.e. the old binary was still live —
---      and the correct response is to stop it, re-run step 3, and re-verify. Do not start the new
---      build on a non-zero answer.
+--   4. THE VERIFICATION CHECKS RUN, AND THE DEPLOY SCRIPT RUNS THEM. They are declared beside this
+--      file as `verify.sql`, in the form scripts/run-migration-verifications.mjs executes: three
+--      statements, each returning one row of (check_name, violations), every count required to be
+--      zero. The script runs them after the schema has moved and BEFORE the new build is started,
+--      and refuses to start it on any non-zero answer. This step is therefore ENFORCED, not merely
+--      written down — which is the whole difference from the previous revision of this block, where
+--      the same queries sat in a comment that nothing executed. A non-zero answer means something
+--      wrote this table after step 1, i.e. the predecessor was still live; the response is to stop
+--      it, re-run step 3, and re-verify.
 --   5. START THE NEW BUILD. From this moment every park and every hold is stamped as it is written,
 --      and both predicates require the stamp.
 --
@@ -118,20 +123,43 @@ UPDATE "shopping_sync_logs"
 --       invoice payload. THE COLLISION IS BACK, SILENTLY. That is the whole reason step 1 is a
 --       requirement rather than a preference.
 --
---       AND THE VERIFICATION QUERIES CANNOT SEE (b). A row overwritten this way has a non-NULL
---       recordKind and every column of a park, so both queries below return 0 while the damage is
---       already done. Verification catches an old binary that CREATED rows; nothing catches one
---       that OVERWROTE them. Stopping the writer first is the only defence against (b), which is
---       why step 1 is a step and not a note.
+--       AND IT IS DETECTABLE — AN EARLIER REVISION OF THIS BLOCK SAID IT WAS NOT, AND THAT WAS
+--       WRONG (Codex MEDIUM). The claim was that an overwritten row "has a non-NULL recordKind and
+--       every column of a park", so nothing distinguishes it. It does not have every column of a
+--       park: it KEEPS THE PARK STAMP while ACQUIRING THE HELD-INVOICE PAYLOAD SHAPE, and that
+--       combination is a contradiction no legitimate writer can produce. The payload shape is the
+--       one the backfill above already trusts to tell the families apart — a top-level
+--       accountingPayload OBJECT, a salesOrderId equal to the row's own entityId, and a metaKey —
+--       none of which an operator can introduce through WooCommerce's refund dialog, where the only
+--       thing they control is the free-text `reason`. So "stamped WC_REFUND_PARK *and* matching the
+--       full held-invoice shape" selects exactly the rows (b) creates, and nothing else: a genuine
+--       hold carries the hold stamp, and a genuine park carries a refund body.
 --
--- AUTOMATING THIS IS NOT THIS FILE'S JOB, AND IT ALREADY HAS AN OWNER: o3d-2sm1.1 — "the deploy
--- script applies the migration and leaves the PREDECESSOR serving against the migrated schema".
--- That issue carries the safe order (build -> validate -> stop and drain the predecessor -> migrate
--- -> start the new build) and the rule that the old binary stays fenced off on any post-stop
--- failure. This migration is recorded on it as another one that needs quiescence, so the two are
--- solved together. Until it lands, the requirement above is enforced by a human reading it and by
--- the two queries below — which is loud and verifiable, and is deliberately preferred to a
--- half-owned mechanism invented here.
+--       That is check 3 in verify.sql, and it is mandatory like the other two: the cutover fails and
+--       the new build is not started if it returns anything but zero. Saying this failure mode was
+--       invisible was worse than leaving it unchecked — it told an operator there was no point
+--       looking, so the damage would have stood unqueried rather than undetectable.
+--
+--       WHAT IS STILL NOT COVERED, stated so the correction does not overclaim: the old release
+--       sweep can also flip a mis-selected park to FAILED or SYNCED and replace its errorMessage
+--       WITHOUT touching the payload. That row keeps a refund body, so it has no contradictory
+--       shape to query for. It is a lesser corruption — the refund evidence survives — but it is
+--       real, and stopping the writer first remains the defence for it. Which is why step 1 is a
+--       step and not a note: check 3 is the second line, not a licence to skip the first.
+--
+-- AUTOMATING THIS IS NOT THIS FILE'S JOB, AND IT HAS AN OWNER WHO HAS DONE IT: o3d-2sm1.1, on
+-- branch o3d-batch-deployseq — "the deploy script applies the migration and leaves the PREDECESSOR
+-- serving against the migrated schema". That branch reorders every supported entrypoint to
+-- build -> validate -> stop and drain -> migrate -> verify -> start, fences the predecessor off on
+-- any post-stop failure, and adds the verification hook (scripts/run-migration-verifications.mjs)
+-- that executes the checks a migration declares in verify.sql. This migration is recorded on it as
+-- one that needs quiescence.
+--
+-- SO THE DIVISION OF LABOUR IS: that branch owns the ORDER (step 1, which is the only defence
+-- against (b) and against the errorMessage rewrite), and this migration owns the CHECKS — declared
+-- next to this file rather than described in it, so they are run by the script instead of by
+-- somebody remembering to. deploy.sh is deliberately NOT edited here: two branches rewriting the
+-- same script would conflict and one would silently win.
 --
 -- A LEGACY PARK THAT ESCAPES ANYWAY STILL FAILS LOUDLY: an unstamped park is not found by
 -- upsertRefundPark's own park lookup, so the next delivery of that refund tries to INSERT a second
@@ -139,24 +167,19 @@ UPDATE "shopping_sync_logs"
 -- changed by this migration — it stays keyed on (connector, "externalId") over the wider predicate,
 -- so the failure mode is a unique violation somebody sees rather than two live parks for one refund.
 --
--- VERIFICATION QUERIES — BOTH MUST RETURN 0. Run them at step 4, and again after any repair.
+-- VERIFICATION QUERIES — ALL THREE MUST RETURN 0. They live in `verify.sql` beside this file, NOT
+-- in this comment, and that is the point of them: the deploy script runs that file at step 4 and
+-- will not start the new build on a non-zero count. Copying them back into this block would
+-- recreate the exact thing the hook exists to end — a check that can only be read.
 --
---   -- 1. NO UNSTAMPED HOLD. Every held sales invoice must say so, or it is never released.
---   SELECT count(*) FROM "shopping_sync_logs"
---    WHERE "recordKind" IS NULL
---      AND connector = 'woocommerce' AND direction = 'FROM_CONNECTOR'
---      AND "entityType" = 'SalesOrder' AND status = 'PENDING' AND "entityId" IS NOT NULL
---      AND jsonb_typeof(payload) = 'object'
---      AND payload->>'reason' = 'missing_wc_invoice_number'
---      AND jsonb_typeof(payload->'accountingPayload') = 'object'
---      AND payload->>'salesOrderId' = "entityId"
---      AND payload->>'metaKey' IS NOT NULL;
+--   1. shopping_sync_logs unstamped held sales invoice   — an old binary CREATED a hold after the
+--                                                          backfill; it would never be released.
+--   2. shopping_sync_logs unstamped refund park          — an old binary CREATED a park after the
+--                                                          backfill; the inbox cannot see it.
+--   3. shopping_sync_logs park stamp over a held-invoice payload
+--                                                        — an old binary OVERWROTE a stamped park
+--                                                          with an invoice hold; case (b) above.
 --
---   -- 2. NO UNSTAMPED PARK. Every actionable row this table holds must name its family, or the
---   --    recovery inbox cannot see it.
---   SELECT count(*) FROM "shopping_sync_logs"
---    WHERE "recordKind" IS NULL
---      AND connector = 'woocommerce' AND direction = 'FROM_CONNECTOR'
---      AND "entityType" = 'SalesOrder' AND "entityId" IS NOT NULL
---      AND status IN ('PENDING', 'FAILED', 'QUARANTINED');
+-- 1 and 2 are repairable by re-running the two UPDATE statements above. 3 is not, and is an
+-- incident: the refund evidence on those rows has been replaced.
 -- ---------------------------------------------------------------------------------------------
