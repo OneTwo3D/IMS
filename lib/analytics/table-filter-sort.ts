@@ -121,21 +121,115 @@ export function filterAndSortRows<T extends object>(
  * The columns a tab can actually render, out of the columns something ASKED it to render.
  *
  * o3d-8u4h. A saved view stores its column keys verbatim in the database, and a column key can stop
- * existing — the supplier-aging buckets were renamed from `overdue*` to `unsettledBilled*` precisely
- * because "overdue" claimed a relation the report does not measure. The stat tables then rendered
- * the header and the body from the SAME key list but disagreed about unknown keys: the header
- * skipped a key it had no field definition for, and the body still emitted a cell for it. One
- * missing header and a full row of cells means EVERY COLUMN AFTER IT SHIFTS ONE PLACE LEFT, so the
- * figures are read under the wrong headings — a silent misreading, not a visible break.
+ * existing — the supplier-aging buckets were renamed twice, first away from `overdue*` (which
+ * claimed a relation to a due date the report does not measure) and then away from `unsettled*`
+ * (which claimed a settlement a payment marker does not prove). The stat tables rendered the header
+ * and the body from the SAME key list but disagreed about unknown keys: the header skipped a key it
+ * had no field definition for, and the body still emitted a cell for it. One missing header and a
+ * full row of cells means EVERY COLUMN AFTER IT SHIFTS ONE PLACE LEFT, so the figures are read under
+ * the wrong headings — a silent misreading, not a visible break.
  *
- * Filtering once, here, is what keeps the two loops agreeing by construction. It is a general
- * property of these tables rather than a supplier-aging fix: any renamed or retired column in any of
- * the three stat clients reaches this same shape through an old saved view.
+ * Filtering once, before every loop of a render path, is what keeps those loops agreeing by
+ * construction. It is a general property of these tables rather than a supplier-aging fix: any
+ * renamed or retired column in any of the three stat clients reaches this same shape through an old
+ * saved view. Round 2 found the fix had been applied to ONE of the four render paths — the purchase
+ * page's generic table — while the sales page's generic table, and three footer rows that emit a
+ * `<td>` for every key unconditionally, still shifted.
  */
 export function presentColumns(
   columns: readonly string[],
   fields: readonly { key: string }[],
 ): string[] {
+  return presentColumnKeys(columns, fields.map((field) => field.key))
+}
+
+/**
+ * The same filter where the authority is a RENDERER MAP rather than a field list.
+ *
+ * The products tabs render from a `Record<string, {label, render, footer}>` whose keys are not
+ * identical to the tab's filterable field list, and the honest filter for a render path is "what
+ * this loop can actually draw". Passing the field list there would let a key the map has no entry
+ * for through — which is the defect, one indirection along.
+ */
+export function presentColumnKeys(columns: readonly string[], known: Iterable<string>): string[] {
+  const keys = known instanceof Set ? known : new Set(known)
+  return columns.filter((key) => keys.has(key))
+}
+
+// ---------------------------------------------------------------------------
+// Loading a saved view that outlived part of the report
+// ---------------------------------------------------------------------------
+
+export type SavedViewFilterLike = { field: string; operator: string; value: string }
+
+export type SanitisedSavedView<F extends SavedViewFilterLike> = {
+  /** The saved column order, minus the keys this tab no longer has. */
+  columns: string[]
+  /** The saved filters, minus the rules whose field this tab no longer has. */
+  filters: F[]
+  droppedColumns: string[]
+  droppedFilterFields: string[]
+  /**
+   * A SENTENCE FOR THE READER, or null when the view loaded intact. Rendered persistently above the
+   * table — not as a tooltip, because the reader who most needs it is the one who cannot hover.
+   */
+  notice: string | null
+}
+
+/**
+ * o3d-8u4h round 2. A saved view is loaded verbatim, and the report it was saved against moves.
+ *
+ * Columns were already being filtered at render. FILTERS WERE NOT, and a filter rule is the more
+ * dangerous half: a rule on a field the rows no longer carry reads as an unknown for every row, and
+ * an unknown answers no numeric comparison (the three-valued rule this module already applies), so
+ * the rule REJECTS EVERY ROW. The operator sees an empty report and no reason for it — the table
+ * says "0 rows" and nothing else, which reads as "this supplier has no bills" rather than "your
+ * saved filter names a column that no longer exists".
+ *
+ * Dropping the rule rather than applying it is the choice that fails visibly instead of silently:
+ * the report shows its rows, and the notice says which rule was dropped and why. Keeping the rule
+ * would preserve a filter the reader cannot see, edit or reason about, and preserving it "for
+ * fidelity" is fidelity to a question nobody can now ask.
+ */
+export function sanitiseSavedView<F extends SavedViewFilterLike>(
+  view: { name?: string; columns: readonly string[]; filters: readonly F[] },
+  fields: readonly { key: string }[],
+): SanitisedSavedView<F> {
   const known = new Set(fields.map((field) => field.key))
-  return columns.filter((key) => known.has(key))
+  const columns = view.columns.filter((key) => known.has(key))
+  const droppedColumns = view.columns.filter((key) => !known.has(key))
+  const filters = view.filters.filter((rule) => known.has(rule.field))
+  const droppedFilterFields = view.filters.filter((rule) => !known.has(rule.field)).map((rule) => rule.field)
+  return {
+    columns,
+    filters,
+    droppedColumns,
+    droppedFilterFields,
+    notice: savedViewDropNotice(view.name, droppedColumns, droppedFilterFields),
+  }
+}
+
+/** The sentence `sanitiseSavedView` puts on screen. Exported so it can be asserted on its own. */
+export function savedViewDropNotice(
+  name: string | undefined,
+  droppedColumns: readonly string[],
+  droppedFilterFields: readonly string[],
+): string | null {
+  if (droppedColumns.length === 0 && droppedFilterFields.length === 0) return null
+  const subject = name ? `Saved view “${name}”` : 'This saved view'
+  const parts: string[] = []
+  if (droppedColumns.length > 0) {
+    parts.push(
+      `${droppedColumns.length === 1 ? 'a column it saved is' : `${droppedColumns.length} columns it saved are`}` +
+      ` no longer on this report (${droppedColumns.join(', ')}), so ${droppedColumns.length === 1 ? 'it was' : 'they were'} left out`,
+    )
+  }
+  if (droppedFilterFields.length > 0) {
+    parts.push(
+      `${droppedFilterFields.length === 1 ? 'a filter names' : `${droppedFilterFields.length} filters name`}` +
+      ` a field this report no longer has (${droppedFilterFields.join(', ')}), and ${droppedFilterFields.length === 1 ? 'it was dropped rather than applied' : 'they were dropped rather than applied'}` +
+      ': a filter on an absent field matches no row, so keeping it would have emptied the table with no explanation',
+    )
+  }
+  return `${subject}: ${parts.join('; and ')}. Everything else is as you saved it.`
 }

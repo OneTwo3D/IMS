@@ -24,19 +24,36 @@
  *                                 refundId -> SalesOrderRefund. There is no supplier side to it,
  *                                 so no row anywhere carries an amount paid to a supplier.
  *
- *   `PurchaseInvoice.paidAt`      EXISTS. A nullable timestamp — a SETTLEMENT FLAG with a date,
- *   + paymentAccountId/Name       plus which bank account and reference were used. No amount.
- *   + paymentReference
+ *   `PurchaseInvoice.paidAt`      EXISTS. A nullable timestamp — a PAYMENT MARKER: a date somebody
+ *   + paymentAccountId/Name       or something stamped on the bill, plus which bank account and
+ *   + paymentReference            reference were quoted. NO AMOUNT.
  *
- * So "was this bill settled" is recorded and "how much was paid" is not, and the flag is weaker
- * than it looks in two directions:
+ * So "has a payment been marked against this bill" is recorded and "how much was paid" is not, and
+ * the marker is weaker than it looks in two directions:
  *
- *   * `markBillPaid` accepts an explicit `input.amountForeign`, so an operator can set `paidAt`
- *     while paying part of a bill. The flag is an OPERATOR ASSERTION, and app/actions/
- *     purchase-orders.ts already says so in as many words: "paidAt says IMS was told the bill was
- *     paid" — it keeps a separate `settlement` verdict for whether the LEDGER agrees.
- *   * the Xero poller sets it from `FullyPaidOnDate`, which is full settlement; the QuickBooks
+ *   * `markBillPaid` accepts an explicit `input.amountForeign` AND STAMPS `paidAt` REGARDLESS, so
+ *     an operator can mark a bill while paying part of it. The marker is an OPERATOR ASSERTION, and
+ *     app/actions/purchase-orders.ts already says so in as many words: "paidAt says IMS was told
+ *     the bill was paid" — it keeps a separate `settlement` verdict for whether the LEDGER agrees.
+ *   * the Xero poller sets it from `FullyPaidOnDate`, which IS full settlement; the QuickBooks
  *     poller and the reversal path can clear it again.
+ *
+ * -----------------------------------------------------------------------------------------------
+ * ROUND 2, AND WHY THESE COLUMNS ARE NOT CALLED "SETTLED" AND "UNSETTLED"
+ * -----------------------------------------------------------------------------------------------
+ * Round 1 split Billed into `settledBilledAmount` / `unsettledBilledAmount`. That still published
+ * A SETTLEMENT RELATION THE MARKER DOES NOT PROVE. "Settled" means the debt is discharged; the
+ * marker says only that a date was stamped, and the very same round established that `markBillPaid`
+ * accepts a partial amount and stamps it anyway. So a part-paid bill was published as fully settled
+ * — its whole billed value in the settled column — AND, because the buckets were narrowed to
+ * "unsettled" bills, it left the ageing report altogether. The residue nobody has paid became
+ * invisible at exactly the moment the first instalment was recorded.
+ *
+ * The correction is the one this file already made when it refused to sum marked bills under Paid,
+ * carried the rest of the way: NAME THE TWO GROUPS AFTER THE RAW EVIDENCE. There is a marker on the
+ * bill, or there is not. `billedWithPaymentMarker` / `billedWithoutPaymentMarker`, everywhere — the
+ * server action, the column headings, the CSV — and the four age bands are the without-marker
+ * population, named for that too. Neither word now implies an amount or a discharge.
  *
  * -----------------------------------------------------------------------------------------------
  * THE SHAPE, WHICH IS o3d-iigc's RULE APPLIED UNCHANGED
@@ -50,7 +67,7 @@
  * Applied here:
  *
  *   Paid       WITHHELD. An amount paid is not a recorded quantity. Summing the totals of bills
- *              whose flag is set would publish an amount BILLED under the word PAID, which is the
+ *              carrying a marker would publish an amount BILLED under the word PAID, which is the
  *              same defect one step further on — and o3d-anu8 has just finished stopping seven
  *              other readers from promoting an operator assertion into system evidence.
  *
@@ -60,19 +77,25 @@
  *
  *   Discounts  WITHHELD. See SUPPLIER_DISCOUNT_TOTAL_NOT_RECORDED.
  *
- *   Billed     UNCHANGED, and Settled/Unsettled are ADDED beside it. How much was BILLED on the
- *              bills carrying a settlement flag, and on those not carrying one, is not in doubt:
- *              both are sums of `PurchaseInvoice.totalBase`. They are amounts billed, and they are
- *              named for what they are rather than for what a reader would like them to be.
- *              `billedAmount = settledBilledAmount + unsettledBilledAmount`, checkable in the row.
+ *   Billed     UNCHANGED, and the two marker groups are ADDED beside it. How much was BILLED on the
+ *              bills carrying a payment marker, and on those carrying none, is not in doubt: both
+ *              are sums of `PurchaseInvoice.totalBase`. They are amounts billed, grouped by a
+ *              marker, and they are named for exactly that.
+ *              `billedAmount = billedWithPaymentMarker + billedWithoutPaymentMarker`, checkable in
+ *              the row, so a reader can see nothing was lost in the split.
  *
- *   The four   The NUMBER survives and the RELATION is withheld. The population is narrowed to
- *   buckets    bills with no settlement flag, so a settled bill stops ageing forever; the name
- *              changes from `overdue*` to `unsettledBilled*`, because "overdue" is a relation to a
- *              DUE DATE and these buckets are cut from the INVOICE date. Renaming rather than
- *              re-anchoring: `PurchaseInvoice.dueDate` is nullable, so switching the anchor would
- *              silently mix two different clocks in one column, which is a product decision and
- *              not this defect.
+ *   The four   The NUMBER survives and the RELATION is withheld. The population is the bills with
+ *   buckets    NO payment marker, so a marked bill stops ageing; the name changes from `overdue*`,
+ *              because "overdue" is a relation to a DUE DATE and these buckets are cut from the
+ *              INVOICE date. Renaming rather than re-anchoring: `PurchaseInvoice.dueDate` is
+ *              nullable, so switching the anchor would silently mix two different clocks in one
+ *              column, which is a product decision and not this defect.
+ *
+ * A PART-PAID BILL IS STILL COUNTED WHOLE ON THE MARKED SIDE, and that is not a residual lie — it
+ * is the honest consequence of the naming. The column claims the BILLED value of the bills carrying
+ * a marker, which is exactly what it sums. It does not claim that value was paid, and it does not
+ * claim the debt is gone. What the report cannot do is tell you how much of that bill is still
+ * outstanding, and it says so rather than guessing.
  *
  * NOTHING HERE NEEDS A SCHEMA CHANGE, and that is deliberate. A supplier-payment model would let
  * Paid and Due be measured, and it is a feature: new tables, migrations, a recording UI and a
@@ -88,40 +111,40 @@
 
 /** Why Paid and Due are empty wherever this report renders or exports them. */
 export const SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED =
-  'Withheld: IMS records no amount paid to a supplier. A bill carries a settlement flag and date (PurchaseInvoice.paidAt) and no payment amount, and the Payment model is sales-only, so neither Paid nor Due can be measured. They are left empty rather than shown as 0, because a 0 would read as "nothing has been paid". Settled and Unsettled beside them report the BILLED value of bills with and without a recorded settlement, which is known.'
+  'Withheld: IMS records no amount paid to a supplier. A bill carries a payment marker — a date (PurchaseInvoice.paidAt) with no amount — and the Payment model is sales-only, so neither Paid nor Due can be measured. They are left empty rather than shown as 0, because a 0 would read as "nothing has been paid". The two Billed columns beside them report the BILLED value of bills with and without that marker, which is known.'
 
 /** Why the Discounts column is empty rather than carrying the part of the discount that IS exact. */
 export const SUPPLIER_DISCOUNT_TOTAL_NOT_RECORDED =
   'Withheld: a discount total cannot be assembled. Per-line discounts are already folded into the stored line totals and survive only as PurchaseOrderLine.discountAmount, in FOREIGN currency and in whichever tax convention that order used (VAT-inclusive when pricesIncludeVat is set). Only the header order discount is exactly recoverable in base currency ex-VAT, and publishing that part alone under a Discounts column would publish a part as a total. Gross, Net and Total are all already net of every discount the order applied.'
 
-/** What the four age buckets, and the Unsettled total, actually measure. */
-export const SUPPLIER_UNSETTLED_BILLED_BASIS =
-  'Billed value of bills carrying no recorded settlement, aged from the INVOICE date. This is not an overdue figure: no payment amount is recorded, supplier credit notes are not netted off it, and the due date recorded on the bill itself is not used. It states what was billed and not marked settled.'
+/** What the four age buckets, and the without-marker total, actually measure. */
+export const SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS =
+  'Billed value of bills carrying NO payment marker, aged from the INVOICE date. Not an overdue figure and not a balance owed: no payment amount is recorded, supplier credit notes are not netted off it, and the due date on the bill is not used. It states what was billed and never marked.'
 
-/** What the Settled column measures, which is an amount BILLED and not an amount paid. */
-export const SUPPLIER_SETTLED_BILLED_BASIS =
-  'Billed value of bills an operator or the accounting connector marked as settled. An amount BILLED, not an amount paid: the settlement flag carries no amount, and a bill can be flagged while only part of it was paid.'
+/** What the with-marker column measures, which is an amount BILLED and not an amount paid. */
+export const SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS =
+  'Billed value of bills carrying a payment marker (PurchaseInvoice.paidAt), whoever stamped it. An amount BILLED, not an amount paid and not a settled debt: the marker carries no amount, and markBillPaid stamps it even when only part of the bill was paid.'
 
 /**
- * Split a supplier's bills by whether a settlement was ever recorded against them.
+ * Split a supplier's bills by whether a payment marker is present on them.
  *
- * The only judgement in here is that `paidAt == null` means "no settlement recorded" and anything
- * else means "one was". Explicitly `== null` rather than falsy: a Date is never falsy, but an
- * undefined column on a partially-selected row would be, and reading an absent field as "settled"
- * is the direction that would hide money.
+ * The only judgement in here is that `paidAt == null` means "no marker" and anything else means
+ * "a marker". Explicitly `== null` rather than falsy: a Date is never falsy, but an undefined column
+ * on a partially-selected row would be, and reading an absent field as "marked" is the direction
+ * that would take a bill out of the ageing bands on no evidence at all.
  *
  * Returns UNROUNDED accumulators. The caller rounds once, at the end, for the same reason the net
  * amount does — rounding each bill first and summing gives a different penny.
  */
-export function billedSettlementSplit(
+export function billedPaymentMarkerSplit(
   invoices: readonly { totalBase: unknown; paidAt: Date | null | undefined }[],
-): { settled: number; unsettled: number } {
-  let settled = 0
-  let unsettled = 0
+): { withMarker: number; withoutMarker: number } {
+  let withMarker = 0
+  let withoutMarker = 0
   for (const invoice of invoices) {
     const amount = Number(invoice.totalBase)
-    if (invoice.paidAt == null) unsettled += amount
-    else settled += amount
+    if (invoice.paidAt == null) withoutMarker += amount
+    else withMarker += amount
   }
-  return { settled, unsettled }
+  return { withMarker, withoutMarker }
 }

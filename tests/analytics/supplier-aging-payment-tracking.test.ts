@@ -23,10 +23,17 @@ import { parseCsv } from '@/lib/csv'
  * nothing, while the related total that IS known stays on the row.
  *
  *   Paid, Due, Discounts   withheld — `null`, never `0`
- *   Billed                 unchanged, and split into Settled / Unsettled BILLED value, because how
- *                          much was BILLED on each side of the flag is not in doubt
- *   the four buckets       the number survives and the relation is withheld: unsettled bills only,
+ *   Billed                 unchanged, and split into the BILLED value of the bills carrying a
+ *                          payment marker and of those carrying none, because how much was BILLED
+ *                          on each side of the marker is not in doubt
+ *   the four buckets       the number survives and the relation is withheld: unmarked bills only,
  *                          and no longer called `overdue`
+ *
+ * ROUND 2 (Codex finding 1): AND THE TWO NEW COLUMNS ARE NO LONGER CALLED SETTLED / UNSETTLED.
+ * Round 1's names published a settlement relation `paidAt` does not prove — `markBillPaid` accepts
+ * a partial amount and stamps the marker anyway, which this same branch established — so a
+ * part-paid bill was reported as fully settled AND left every age band. They are named after the
+ * raw evidence now: `billedWithPaymentMarker` / `billedWithoutPaymentMarker`.
  *
  * EVERY ASSERTION BELOW IS ON WHAT THE REPORT PUBLISHES — the row and the exported file. A test that
  * checked a call or a log line would reproduce the very defect: the old code called nothing and
@@ -42,7 +49,7 @@ mock.module('@/lib/auth/server', {
 
 const DAY = 86400000
 
-/** A bill: VAT-inclusive `totalBase`, plus the settlement flag or the absence of one. */
+/** A bill: VAT-inclusive `totalBase`, plus the payment marker or the absence of one. */
 function bill(totalBase: number, ageDays: number, paidAt: Date | null = null) {
   return { totalBase, invoiceDate: new Date(Date.now() - ageDays * DAY), paidAt }
 }
@@ -135,7 +142,7 @@ test('supplier aging: Discounts is WITHHELD — a part of a discount is not a di
 // What replaces them, and what it is allowed to claim
 // ---------------------------------------------------------------------------
 
-test('supplier aging: Billed splits into Settled and Unsettled, and the row adds up (o3d-8u4h)', async () => {
+test('supplier aging: Billed splits by PAYMENT MARKER, and the row adds up (o3d-8u4h)', async () => {
   SUPPLIERS = [{
     id: 'sup-1', name: 'Acme',
     purchaseOrders: [po({
@@ -146,22 +153,22 @@ test('supplier aging: Billed splits into Settled and Unsettled, and the row adds
   const r = await agingRow()
 
   assert.equal(r.billedAmount, 3000)
-  assert.equal(r.settledBilledAmount, 1200, 'the ONE bill carrying a settlement flag, at its billed value')
-  assert.equal(r.unsettledBilledAmount, 1800)
+  assert.equal(r.billedWithPaymentMarker, 1200, 'the ONE bill carrying a payment marker, at its billed value')
+  assert.equal(r.billedWithoutPaymentMarker, 1800)
   // Checkable across the row by the reader, which is the property that makes the split honest.
-  assert.equal(r.settledBilledAmount + r.unsettledBilledAmount, r.billedAmount)
+  assert.equal(r.billedWithPaymentMarker + r.billedWithoutPaymentMarker, r.billedAmount)
 })
 
-test('supplier aging: a bill settled long ago STOPS AGEING (o3d-8u4h)', async () => {
-  // The headline case from the issue: a settled bill used to sit in the 91+ column forever, because
-  // nothing in the function had ever looked at a settlement.
+test('supplier aging: a bill marked paid long ago STOPS AGEING (o3d-8u4h)', async () => {
+  // The headline case from the issue: a marked bill used to sit in the 91+ column forever, because
+  // nothing in the function had ever looked at `paidAt`.
   SUPPLIERS = [{
     id: 'sup-1', name: 'Acme',
     purchaseOrders: [po({
       totalBase: 5000, taxBase: 0,
       bills: [
-        bill(2000, 400, new Date(Date.now() - 380 * DAY)), // paid 380 days ago, invoiced 400
-        bill(700, 400),                                    // same age, never settled
+        bill(2000, 400, new Date(Date.now() - 380 * DAY)), // marked 380 days ago, invoiced 400
+        bill(700, 400),                                    // same age, never marked
         bill(300, 75),
         bill(200, 45),
         bill(100, 5),
@@ -170,24 +177,24 @@ test('supplier aging: a bill settled long ago STOPS AGEING (o3d-8u4h)', async ()
   }]
   const r = await agingRow()
 
-  // 700, not 2,700: the settled bill is gone from the bucket.
-  assert.equal(r.unsettledBilled91plus, 700)
-  assert.notEqual(r.unsettledBilled91plus, 2700, 'the settled bill must not age forever')
-  assert.equal(r.unsettledBilled61_90, 300)
-  assert.equal(r.unsettledBilled31_60, 200)
-  assert.equal(r.unsettledBilled0_30, 100)
+  // 700, not 2,700: the marked bill is gone from the bucket.
+  assert.equal(r.billedWithoutPaymentMarker91plus, 700)
+  assert.notEqual(r.billedWithoutPaymentMarker91plus, 2700, 'the marked bill must not age forever')
+  assert.equal(r.billedWithoutPaymentMarker61_90, 300)
+  assert.equal(r.billedWithoutPaymentMarker31_60, 200)
+  assert.equal(r.billedWithoutPaymentMarker0_30, 100)
 
-  // The buckets are exactly the unsettled billed value, split by invoice age — nothing lost, and
-  // nothing counted that the Unsettled total does not also carry.
+  // The buckets are exactly the without-marker billed value, split by invoice age — nothing lost,
+  // and nothing counted that the without-marker total does not also carry.
   assert.equal(
-    r.unsettledBilled0_30 + r.unsettledBilled31_60 + r.unsettledBilled61_90 + r.unsettledBilled91plus,
-    r.unsettledBilledAmount,
+    r.billedWithoutPaymentMarker0_30 + r.billedWithoutPaymentMarker31_60 + r.billedWithoutPaymentMarker61_90 + r.billedWithoutPaymentMarker91plus,
+    r.billedWithoutPaymentMarker,
   )
-  assert.equal(r.unsettledBilledAmount, 1300)
-  assert.equal(r.settledBilledAmount, 2000)
+  assert.equal(r.billedWithoutPaymentMarker, 1300)
+  assert.equal(r.billedWithPaymentMarker, 2000)
 })
 
-test('supplier aging: a supplier whose every bill is settled shows an empty ageing profile (o3d-8u4h)', async () => {
+test('supplier aging: a supplier whose every bill is marked shows an empty ageing profile (o3d-8u4h)', async () => {
   SUPPLIERS = [{
     id: 'sup-2', name: 'Prompt Payer Ltd',
     purchaseOrders: [po({
@@ -198,9 +205,9 @@ test('supplier aging: a supplier whose every bill is settled shows an empty agei
   const r = await agingRow('Prompt Payer Ltd')
 
   // Was 1,200 in the 91+ column, in red, for the rest of time.
-  assert.equal(r.unsettledBilled91plus, 0)
-  assert.equal(r.unsettledBilledAmount, 0)
-  assert.equal(r.settledBilledAmount, 1200)
+  assert.equal(r.billedWithoutPaymentMarker91plus, 0)
+  assert.equal(r.billedWithoutPaymentMarker, 0)
+  assert.equal(r.billedWithPaymentMarker, 1200)
   assert.equal(r.billedAmount, 1200, 'billed is still billed — the bill did not stop existing')
 })
 
@@ -214,9 +221,9 @@ test('supplier aging: rounding still happens ONCE, across the split (o3d-8u4h)',
   }]
   const r = await agingRow()
 
-  assert.equal(r.unsettledBilledAmount, 133.33, 'summed then rounded; per-bill rounding would say 133.34')
-  assert.equal(r.unsettledBilled0_30, 133.33)
-  assert.equal(r.settledBilledAmount, 66.67)
+  assert.equal(r.billedWithoutPaymentMarker, 133.33, 'summed then rounded; per-bill rounding would say 133.34')
+  assert.equal(r.billedWithoutPaymentMarker0_30, 133.33)
+  assert.equal(r.billedWithPaymentMarker, 66.67)
 })
 
 // ---------------------------------------------------------------------------
@@ -241,21 +248,99 @@ test('supplier-aging CSV: Due is an EMPTY cell, and the file carries the reason 
   assert.notEqual(row.dueAmount, '1200.00')
 
   assert.equal(row.billedAmount, '1200.00')
-  assert.equal(row.settledBilledAmount, '700.00')
-  assert.equal(row.unsettledBilledAmount, '500.00')
+  assert.equal(row.billedWithPaymentMarker, '700.00')
+  assert.equal(row.billedWithoutPaymentMarker, '500.00')
   assert.equal(
-    Number(row.settledBilledAmount) + Number(row.unsettledBilledAmount),
+    Number(row.billedWithPaymentMarker) + Number(row.billedWithoutPaymentMarker),
     Number(row.billedAmount),
     'the columns in the file must reconcile — a reader has only the file',
   )
 
   // The word that claimed a relation to a due date this report does not measure.
   assert.ok(!header.some((h) => h.startsWith('overdue')), 'the overdue columns must not come back')
-  assert.ok(header.includes('unsettledBilled91plus'))
-  assert.equal(row.unsettledBilled91plus, '500.00')
+  assert.ok(header.includes('billedWithoutPaymentMarker91plus'))
+  assert.equal(row.billedWithoutPaymentMarker91plus, '500.00')
 
   // The metadata rows at the foot of the file (and the X-IMS-Export-Metadata header) say WHY the
   // cell is empty, so the emptiness is a statement rather than a gap.
   assert.match(body, /# IMS export metadata/)
   assert.match(body, /IMS records no amount paid to a supplier/)
+})
+
+// ---------------------------------------------------------------------------
+// Round 2 (Codex finding 1): the split must not publish a settlement the marker cannot prove
+// ---------------------------------------------------------------------------
+
+test('supplier aging: a PART-PAID bill is not published as settled, and does not leave the report (o3d-8u4h round 2)', async () => {
+  // markBillPaid takes an explicit amount and stamps `paidAt` regardless, so this bill — £1,200
+  // billed, £300 actually paid — carries the marker while £900 of it is still owed. Round 1 put its
+  // whole £1,200 in a column headed "Settled (billed)" and, because the age bands were narrowed to
+  // "unsettled" bills, took the row out of the ageing profile entirely: the residue nobody has paid
+  // became invisible at the moment the first instalment was recorded.
+  SUPPLIERS = [{
+    id: 'sup-1', name: 'Acme',
+    purchaseOrders: [po({
+      totalBase: 1500, taxBase: 0,
+      bills: [bill(1200, 200, new Date(Date.now() - 150 * DAY)), bill(300, 10)],
+    })],
+  }]
+  const r = await agingRow()
+
+  // The figure is unchanged — it is the BILLED value of the bills carrying a marker, and that is
+  // exactly what it sums. What changed is that no field on this row now claims a settlement.
+  assert.equal(r.billedWithPaymentMarker, 1200)
+  assert.equal(r.billedWithoutPaymentMarker, 300)
+  assert.equal(r.billedWithPaymentMarker + r.billedWithoutPaymentMarker, r.billedAmount)
+
+  // The names that made the claim are GONE from the published row, not merely unused.
+  assert.ok(!('settledBilledAmount' in r), 'a "settled" figure is a settlement claim in a field name')
+  assert.ok(!('unsettledBilledAmount' in r))
+  assert.ok(!Object.keys(r).some((k) => /settl/i.test(k)), Object.keys(r).join(','))
+  assert.ok(!Object.keys(r).some((k) => /^overdue/.test(k)))
+
+  // And nothing anywhere on the row says how much of that bill is still owed, because nothing can.
+  assert.equal(r.paidAmount, null)
+  assert.equal(r.dueAmount, null)
+})
+
+test('supplier aging: every published key names the MARKER, not a settlement (o3d-8u4h round 2)', async () => {
+  SUPPLIERS = [{
+    id: 'sup-1', name: 'Acme',
+    purchaseOrders: [po({ totalBase: 100, taxBase: 0, bills: [bill(100, 5)] })],
+  }]
+  const r = await agingRow()
+
+  for (const key of ['billedWithPaymentMarker', 'billedWithoutPaymentMarker',
+    'billedWithoutPaymentMarker0_30', 'billedWithoutPaymentMarker31_60',
+    'billedWithoutPaymentMarker61_90', 'billedWithoutPaymentMarker91plus']) {
+    assert.ok(key in r, `${key} missing from the published row`)
+  }
+})
+
+test('supplier-aging CSV: the file names the marker too, and says the marker can be partial (o3d-8u4h round 2)', async () => {
+  SUPPLIERS = [{
+    id: 'sup-1', name: 'Acme',
+    purchaseOrders: [po({
+      totalBase: 1500, taxBase: 0,
+      bills: [bill(1200, 200, new Date(Date.now() - 150 * DAY)), bill(300, 10)],
+    })],
+  }]
+  const body = await exportBody()
+  const header = body.split('\r\n')[0].split(',')
+  const [row] = parseCsv(body)
+
+  assert.ok(header.includes('billedWithPaymentMarker'), header.join(','))
+  assert.ok(header.includes('billedWithoutPaymentMarker'))
+  assert.ok(header.includes('billedWithoutPaymentMarker91plus'))
+  // A spreadsheet column heading is the whole label a file reader gets, so the word that made the
+  // claim must not survive anywhere in it.
+  assert.ok(!header.some((h) => /settl/i.test(h)), header.join(','))
+  assert.ok(!header.some((h) => /^overdue/.test(h)))
+
+  assert.equal(row.billedWithPaymentMarker, '1200.00')
+  assert.equal(row.billedWithoutPaymentMarker, '300.00')
+
+  // The metadata has to carry the limitation itself, not just the column name: a reader who sees
+  // £1,200 under "billed with a payment marker" must be told the marker can sit on a part-payment.
+  assert.match(body, /markBillPaid stamps it even when only part of the bill was paid/)
 })

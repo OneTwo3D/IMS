@@ -25,7 +25,7 @@ import { parseCsv } from '@/lib/csv'
  *
  * SO THIS FILE IS A GUARD, NOT A REPAIR, and it guards the join that o3d-8u4h has just created.
  * That issue added VAT-INCLUSIVE billing figures to this very row — `billedAmount`,
- * `settledBilledAmount`, `unsettledBilledAmount`, all sums of `PurchaseInvoice.totalBase` — sitting
+ * `billedWithPaymentMarker`, `billedWithoutPaymentMarker`, all sums of `PurchaseInvoice.totalBase` — sitting
  * beside an ex-VAT `netAmount` and a net `refunds`. Gross-basis money next to net-basis money in one
  * accumulator loop is precisely the arrangement that produced the original defect, so every case
  * below carries BILLS as well as a return and asserts that the billing side does not reach the net
@@ -54,7 +54,7 @@ type PoOpts = {
   /** Unit cost as stored on the PO line: EX-VAT, and PRE header discount. */
   returnLines?: { qtyReturned: number; unitCostBase: number }[]
   /** Supplier bills: VAT-INCLUSIVE totals, i.e. the OTHER basis. */
-  bills?: { totalBase: number; ageDays: number; settled?: boolean }[]
+  bills?: { totalBase: number; ageDays: number; marked?: boolean }[]
 }
 
 function po(o: PoOpts) {
@@ -70,7 +70,7 @@ function po(o: PoOpts) {
     invoices: (o.bills ?? []).map((b) => ({
       totalBase: b.totalBase,
       invoiceDate: new Date(Date.now() - b.ageDays * 86400000),
-      paidAt: b.settled ? new Date(Date.now() - 86400000) : null,
+      paidAt: b.marked ? new Date(Date.now() - 86400000) : null,
     })),
     returns: o.returnLines?.length
       ? [{ lines: o.returnLines.map((l) => ({ qtyReturned: l.qtyReturned, poLine: { unitCostBase: l.unitCostBase } })) }]
@@ -116,20 +116,20 @@ test('supplier aging: the issue own worked example — 900.00, and not 1,100.00 
 
   // The gross-basis billing figures o3d-8u4h added sit on this row and stay out of the subtraction.
   assert.equal(r.billedAmount, 1200)
-  assert.equal(r.unsettledBilledAmount, 1200)
+  assert.equal(r.billedWithoutPaymentMarker, 1200)
   assert.equal(r.grossAmount - r.tax - r.refunds, r.netAmount, 'the reader can check it from the columns beside it')
 })
 
 test('supplier aging: both axes at once — VAT and header discount, with bills on the row (o3d-azdf)', async () => {
   // 1,000 of goods less a 10% header discount = 900 net, +180 VAT = 1,080 gross. One of ten units
-  // returned; `unitCostBase` is still the PRE-discount 100. Two bills, one settled, one not.
+  // returned; `unitCostBase` is still the PRE-discount 100. Two bills, one carrying a payment marker, one not.
   SUPPLIERS = [{
     id: 'sup-1', name: 'Acme',
     purchaseOrders: [po({
       preDiscountNet: 1000, postDiscountNet: 900, taxBase: 180,
       returnLines: [{ qtyReturned: 1, unitCostBase: 100 }],
       bills: [
-        { totalBase: 600, ageDays: 120, settled: true },
+        { totalBase: 600, ageDays: 120, marked: true },
         { totalBase: 480, ageDays: 20 },
       ],
     })],
@@ -146,15 +146,15 @@ test('supplier aging: both axes at once — VAT and header discount, with bills 
 
   // Billing is on the OTHER basis and stays there.
   assert.equal(r.billedAmount, 1080)
-  assert.equal(r.settledBilledAmount, 600)
-  assert.equal(r.unsettledBilledAmount, 480)
+  assert.equal(r.billedWithPaymentMarker, 600)
+  assert.equal(r.billedWithoutPaymentMarker, 480)
   assert.equal(r.grossAmount - r.tax - r.refunds, r.netAmount)
 })
 
 test('supplier aging: a fully returned, fully billed PO leaves NO surviving spend (o3d-azdf)', async () => {
   // The customer-aging shape from o3d-iigc, on the purchase side: a fully credited order that reads
   // as some surviving amount is the signature of a cross-basis subtraction. Here the whole order
-  // comes back, so the ex-VAT figure is exactly 0 — while 1,200 is still BILLED and unsettled.
+  // comes back, so the ex-VAT figure is exactly 0 — while 1,200 is still BILLED and carries no payment marker.
   SUPPLIERS = [{
     id: 'sup-1', name: 'Acme',
     purchaseOrders: [po({
@@ -172,7 +172,7 @@ test('supplier aging: a fully returned, fully billed PO leaves NO surviving spen
   // And the billing side is untouched by the return, because a return is not a payment and this
   // report does not net supplier credit notes off what was billed.
   assert.equal(r.billedAmount, 1200)
-  assert.equal(r.unsettledBilled91plus, 1200)
+  assert.equal(r.billedWithoutPaymentMarker91plus, 1200)
 })
 
 test('supplier-aging CSV: net and billed columns reconcile SEPARATELY in the file (o3d-azdf)', async () => {
@@ -181,7 +181,7 @@ test('supplier-aging CSV: net and billed columns reconcile SEPARATELY in the fil
     purchaseOrders: [po({
       preDiscountNet: 1000, postDiscountNet: 900, taxBase: 180,
       returnLines: [{ qtyReturned: 1, unitCostBase: 100 }],
-      bills: [{ totalBase: 600, ageDays: 120, settled: true }, { totalBase: 480, ageDays: 20 }],
+      bills: [{ totalBase: 600, ageDays: 120, marked: true }, { totalBase: 480, ageDays: 20 }],
     })],
   }]
   const { GET } = await import('@/app/api/export/analytics/route')
@@ -197,7 +197,7 @@ test('supplier-aging CSV: net and billed columns reconcile SEPARATELY in the fil
     'the net family reconciles on the net basis',
   )
   assert.equal(
-    Number(row.settledBilledAmount) + Number(row.unsettledBilledAmount),
+    Number(row.billedWithPaymentMarker) + Number(row.billedWithoutPaymentMarker),
     Number(row.billedAmount),
     'the billed family reconciles on the gross basis, and the two families never cross',
   )

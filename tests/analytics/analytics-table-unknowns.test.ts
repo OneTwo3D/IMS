@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { filterAndSortRows, matchesFilterRule, compareCells, presentColumns } from '@/lib/analytics/table-filter-sort'
+import { filterAndSortRows, matchesFilterRule, compareCells, presentColumns, presentColumnKeys, sanitiseSavedView, savedViewDropNotice } from '@/lib/analytics/table-filter-sort'
 
 /**
  * o3d-iigc round 2, Codex finding 3: the analytics tables sorted and filtered a WITHHELD figure as
@@ -175,20 +175,21 @@ test('an empty rule value still filters nothing out (o3d-iigc control)', () => {
 // ---------------------------------------------------------------------------
 
 test('a retired column key is dropped ONCE, so header and body cannot disagree (o3d-8u4h)', () => {
-  // The supplier-aging buckets were renamed `overdue*` -> `unsettledBilled*`, because "overdue"
-  // claims a relation to a due date the report does not measure. A view saved before that rename
-  // still asks for the old keys. The table rendered its header and its body from the same list but
+  // The supplier-aging buckets have been renamed TWICE — away from `overdue*`, because "overdue"
+  // claims a relation to a due date the report does not measure, and then away from `unsettled*`,
+  // because that claimed a settlement a payment marker does not prove. A view saved before either
+  // rename still asks for the old keys. The table rendered its header and its body from the same list but
   // treated unknown keys differently — the header skipped them, the body still emitted a cell — so
   // one dead key shifted every column after it one place LEFT and the figures were read under the
   // wrong headings. Silent, and worse than a blank column.
   const fields = [
     { key: 'supplierName' }, { key: 'billedAmount' },
-    { key: 'unsettledBilled0_30' }, { key: 'unsettledBilled91plus' },
+    { key: 'billedWithoutPaymentMarker0_30' }, { key: 'billedWithoutPaymentMarker91plus' },
   ]
-  const savedView = ['supplierName', 'overdue0_30', 'billedAmount', 'overdue91plus', 'unsettledBilled91plus']
+  const savedView = ['supplierName', 'overdue0_30', 'billedAmount', 'unsettledBilledAmount', 'billedWithoutPaymentMarker91plus']
 
   const cols = presentColumns(savedView, fields)
-  assert.deepEqual(cols, ['supplierName', 'billedAmount', 'unsettledBilled91plus'])
+  assert.deepEqual(cols, ['supplierName', 'billedAmount', 'billedWithoutPaymentMarker91plus'])
   // The property that matters is not the list itself but that ONE list now feeds both loops: every
   // key that survives has a field definition, so a header exists for every cell.
   for (const key of cols) assert.ok(fields.some((f) => f.key === key), `${key} has no field definition`)
@@ -199,4 +200,74 @@ test('a view naming only live columns is passed through untouched (o3d-8u4h cont
   assert.deepEqual(presentColumns(['billedAmount', 'supplierName'], fields), ['billedAmount', 'supplierName'])
   // Order is the VIEW's, not the field list's — a saved view is a saved column ORDER as well.
   assert.notDeepEqual(presentColumns(['billedAmount', 'supplierName'], fields), ['supplierName', 'billedAmount'])
+})
+
+// ---------------------------------------------------------------------------
+// And the FILTERS a saved view carries, which were never sanitised at all (o3d-8u4h round 2)
+// ---------------------------------------------------------------------------
+
+const AGING_FIELD_DEFS = [
+  { key: 'supplierName' }, { key: 'billedAmount' }, { key: 'billedWithPaymentMarker' },
+  { key: 'billedWithoutPaymentMarker91plus' },
+]
+
+test('a saved filter on a renamed field is DROPPED, because applying it rejects every row (o3d-8u4h round 2)', () => {
+  // The rule was valid when it was saved. `overdue91plus` is not a field these rows carry any more,
+  // so `cellValue` answers null for every row and — by this module's own three-valued rule — the
+  // rule matches nothing. Applying it empties the report; the operator sees "0 rows" and is given
+  // no reason, which reads as "this supplier has no bills".
+  const view = {
+    name: 'Aged debt',
+    columns: ['supplierName', 'overdue91plus', 'billedAmount'],
+    filters: [
+      { field: 'overdue91plus', operator: '>', value: '0' },
+      { field: 'billedAmount', operator: '>', value: '100' },
+    ],
+  }
+  const clean = sanitiseSavedView(view, AGING_FIELD_DEFS)
+
+  assert.deepEqual(clean.columns, ['supplierName', 'billedAmount'])
+  assert.deepEqual(clean.droppedColumns, ['overdue91plus'])
+  assert.deepEqual(clean.filters.map((f) => f.field), ['billedAmount'], 'the still-valid rule survives untouched')
+  assert.deepEqual(clean.droppedFilterFields, ['overdue91plus'])
+
+  // Proof of the consequence, rather than of the sanitiser's own bookkeeping: the same rows, run
+  // through the real filter with the saved rules and with the sanitised ones.
+  const rows = [{ supplierName: 'Acme', billedAmount: 1500 }]
+  assert.deepEqual(filterAndSortRows(rows, view.filters, null, 'asc'), [], 'the saved rules reject every row')
+  assert.deepEqual(filterAndSortRows(rows, clean.filters, null, 'asc'), rows)
+})
+
+test('the drop is STATED, and the sentence names the field and the reason (o3d-8u4h round 2)', () => {
+  const notice = sanitiseSavedView(
+    { name: 'Aged debt', columns: ['supplierName', 'overdue91plus'], filters: [{ field: 'overdue0_30', operator: '<', value: '5' }] },
+    AGING_FIELD_DEFS,
+  ).notice
+
+  assert.ok(notice, 'something was dropped, so something must be said')
+  assert.match(notice!, /Aged debt/)
+  assert.match(notice!, /overdue91plus/)
+  assert.match(notice!, /overdue0_30/)
+  assert.match(notice!, /matches no row/)
+})
+
+test('a view whose every key is live is passed through with NOTHING said (o3d-8u4h round 2 control)', () => {
+  const clean = sanitiseSavedView(
+    { name: 'Clean', columns: ['billedAmount', 'supplierName'], filters: [{ field: 'billedAmount', operator: '>', value: '0' }] },
+    AGING_FIELD_DEFS,
+  )
+  assert.deepEqual(clean.columns, ['billedAmount', 'supplierName'], 'and the saved ORDER is the view’s, not the field list’s')
+  assert.equal(clean.droppedColumns.length, 0)
+  assert.equal(clean.droppedFilterFields.length, 0)
+  assert.equal(clean.notice, null, 'a notice for a view that loaded intact is noise')
+  assert.equal(savedViewDropNotice('Clean', [], []), null)
+})
+
+test('presentColumnKeys filters against a RENDERER MAP, which is what a products tab can draw (o3d-8u4h round 2)', () => {
+  // The products tabs render from a Record of renderers whose keys are not the tab's field list, so
+  // the honest filter for those render paths is "what this loop can actually draw" — header, body
+  // AND the totals row, which used to emit a <td> for every key unconditionally.
+  const renderers = { sku: 1, qtyOrdered: 1, totalBase: 1 }
+  assert.deepEqual(presentColumnKeys(['sku', 'overdue91plus', 'totalBase'], Object.keys(renderers)), ['sku', 'totalBase'])
+  assert.deepEqual(presentColumnKeys(['sku'], new Set(['sku', 'totalBase'])), ['sku'])
 })

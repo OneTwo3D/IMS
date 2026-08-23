@@ -14,7 +14,7 @@ import { saveView, type SalesStatRow, type SalesStatSummary, type ShipmentRow, t
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
-import { filterAndSortRows } from '@/lib/analytics/table-filter-sort'
+import { filterAndSortRows, presentColumns, presentColumnKeys, sanitiseSavedView } from '@/lib/analytics/table-filter-sort'
 import { boundSuffix, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 
 type Tab = 'products' | 'shipments' | 'details' | 'invoices' | 'refunds' | 'aging'
@@ -397,6 +397,23 @@ function SaveViewDialog({ tab, columns, filters, onClose }: { tab: string; colum
   )
 }
 
+/**
+ * o3d-8u4h round 2: what a saved view could not bring with it, said out loud.
+ *
+ * A view saved before a column was renamed still names the old key, and a FILTER on a since-renamed
+ * field rejects every row — so the operator used to get an empty report and no reason for it.
+ */
+function SavedViewNotice({ notice, onDismiss }: { notice: string; onDismiss: () => void }) {
+  return (
+    <div data-saved-view-notice="true" className="flex items-start gap-2 rounded-md border border-orange-300 bg-orange-50 dark:bg-orange-950/20 px-3 py-2 text-xs text-orange-900 dark:text-orange-200">
+      <span className="flex-1">{notice}</span>
+      <button type="button" onClick={onDismiss} className="shrink-0 text-orange-900/60 dark:text-orange-200/60 hover:text-orange-900 dark:hover:text-orange-200" aria-label="Dismiss">
+        <X className="h-3 w-3" />
+      </button>
+    </div>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Cell renderer helpers
 // ---------------------------------------------------------------------------
@@ -427,6 +444,7 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
   const [showSaveView, setShowSaveView] = useState(false)
   const [sortCol, setSortCol] = useState<string | null>(null)
   const [sortDir, setSortDir] = useState<SortDir>('desc')
+  const [viewNotice, setViewNotice] = useState<string | null>(null)
 
   const { rows, summary } = productStats
   const fields = TAB_FIELDS[tab]
@@ -442,14 +460,26 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
   }
 
   function handleTabChange(t: Tab) {
-    setTab(t); setFilterRules([]); setSortCol(null)
+    setTab(t); setFilterRules([]); setSortCol(null); setViewNotice(null)
   }
 
+  // o3d-8u4h round 2: sanitised on the way in — COLUMNS AND FILTERS ALIKE. A rule on a field these
+  // rows no longer carry reads as an unknown for every row, and an unknown answers no numeric
+  // comparison, so the rule rejects every row and the operator sees an unexplained empty report.
   function loadView(view: SavedView) {
     const t = view.tab as Tab
+    const clean = sanitiseSavedView({ name: view.name, columns: view.columns, filters: view.filters }, TAB_FIELDS[t])
     setTab(t)
+    // COLUMNS ARE PUT INTO STATE VERBATIM, AND FILTERED AT EVERY RENDER PATH INSTEAD. Deliberate,
+    // and the reason is that there must be exactly ONE rule about a key this tab cannot render.
+    // Sanitising here as well would make the per-render-path filters unreachable — dead guards that
+    // no test can exercise and the next reviewer has to take on trust — while the render paths are
+    // where the invariant actually lives: header, body and totals row must read the SAME list. The
+    // notice below still names the columns that will not appear, so the reader is told either way.
     setVisibleColsMap((prev) => ({ ...prev, [t]: view.columns }))
-    setFilterRules(view.filters.map((f) => ({ ...f, id: makeId() })))
+    setFilterRules(clean.filters.map((f) => ({ ...f, id: makeId() })))
+    setSortCol(null)
+    setViewNotice(clean.notice)
   }
 
   // Generic filter + sort for any tab data. o3d-iigc round 2: the rules live in
@@ -602,7 +632,13 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
   // Render helper for non-product tabs (not a component — avoids re-creation during render)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   function renderGenericTable(data: any[], tabKey: Tab, emptyMsg: string) {
-    const cols = visibleColsMap[tabKey]
+    // o3d-8u4h round 2: ONLY THE COLUMNS THIS TAB STILL HAS, filtered ONCE for both loops below.
+    //
+    // Round 1 claimed this fix was global and applied it to the purchase page alone. Here the
+    // header still skipped a key it had no field definition for while the BODY emitted a cell for
+    // it, so one stale key from a saved view shifted every column after it one place left and the
+    // figures were read under the wrong headings.
+    const cols = presentColumns(visibleColsMap[tabKey], TAB_FIELDS[tabKey])
     return (
       <div className="rounded-md border">
         <div className="flex items-center justify-between px-3 py-1.5 bg-muted/30 border-b">
@@ -612,6 +648,8 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
           <TableHeader className="bg-muted/50">
             <TableRow>
               {cols.map((key) => {
+                // `cols` was filtered against this same field list, so the lookup cannot miss; the
+                // guard is the type narrowing, not a second, divergent skip rule.
                 const f = TAB_FIELDS[tabKey].find((fd) => fd.key === key)
                 if (!f) return null
                 return <ColHeader key={key} colKey={key} label={f.label} align={isRightAligned(key) ? 'right' : 'left'} />
@@ -683,8 +721,13 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
         </div>
       </div>
 
-      {/* Products tab with dynamic columns + footer */}
-      {tab === 'products' && (
+      {viewNotice && <SavedViewNotice notice={viewNotice} onDismiss={() => setViewNotice(null)} />}
+
+      {/* Products tab with dynamic columns + footer. o3d-8u4h round 2: filtered ONCE, before all
+          three loops, against the renderer map — which is what these loops can actually draw. */}
+      {tab === 'products' && (() => {
+        const cols = presentColumnKeys(visibleCols, Object.keys(productColRenderers))
+        return (
         <div className="rounded-md border">
           <div className="flex items-center justify-between px-3 py-1.5 bg-muted/30 border-b">
             <span className="text-xs text-muted-foreground">{filteredProducts.length} of {rows.length} products</span>
@@ -692,9 +735,8 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
           <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-22rem)]">
             <TableHeader className="bg-muted/50">
               <TableRow>
-                {visibleCols.map((key) => {
+                {cols.map((key) => {
                   const col = productColRenderers[key]
-                  if (!col) return null
                   return <ColHeader key={key} colKey={key} label={col.label} align={col.align === 'right' ? 'right' : 'left'} />
                 })}
               </TableRow>
@@ -702,9 +744,8 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
             <TableBody className="divide-y">
               {filteredProducts.map((r) => (
                 <TableRow key={r.productId}>
-                  {visibleCols.map((key) => {
+                  {cols.map((key) => {
                     const col = productColRenderers[key]
-                    if (!col) return null
                     return <TableCell key={key} className={col.align === 'right' ? 'text-right' : ''}>{col.render(r)}</TableCell>
                   })}
                 </TableRow>
@@ -712,16 +753,16 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
             </TableBody>
             <tfoot className="border-t bg-muted/30 text-sm font-medium">
               <tr>
-                {visibleCols.map((key) => {
+                {cols.map((key) => {
                   const col = productColRenderers[key]
-                  if (!col) return null
                   return <td key={key} className={`px-3 py-2 ${col.align === 'right' ? 'text-right' : ''}`}>{col.footer?.() ?? ''}</td>
                 })}
               </tr>
             </tfoot>
           </Table>
         </div>
-      )}
+        )
+      })()}
 
       {/* Other tabs — generic filterable/sortable tables */}
       {tab === 'shipments' && renderGenericTable(filteredShipments, 'shipments', 'No shipments found.')}
@@ -733,7 +774,9 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
       {/* Dialogs */}
       {showFilterDialog && <FilterDialog fields={fields} rules={filterRules} onApply={setFilterRules} onClose={() => setShowFilterDialog(false)} />}
       {showColPicker && <ColumnPickerDialog fields={fields} visible={visibleCols} onApply={setVisibleCols} onClose={() => setShowColPicker(false)} />}
-      {showSaveView && <SaveViewDialog tab={tab} columns={visibleCols} filters={filterRules} onClose={() => setShowSaveView(false)} />}
+      {/* o3d-8u4h round 2: validated on SAVE as well as on load — a dead key should not be written
+          back into the saved row to be re-read by the next reader. */}
+      {showSaveView && <SaveViewDialog tab={tab} columns={presentColumns(visibleCols, fields)} filters={filterRules.filter((r) => fields.some((f) => f.key === r.field))} onClose={() => setShowSaveView(false)} />}
     </div>
   )
 }
