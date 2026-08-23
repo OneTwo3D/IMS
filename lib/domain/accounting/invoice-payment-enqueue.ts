@@ -15,8 +15,9 @@ import {
   getActiveAccountingConnectorInfo,
   getPaymentAccountMap,
   isAccountingSyncTypeEnabled,
+  isAccountingSyncTypeEnabledFor,
   lookupPaymentAccount,
-  queueAccountingSyncTx,
+  queueAccountingSyncTxWithOutcome,
 } from '@/lib/accounting'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
@@ -117,6 +118,44 @@ export function payloadPaymentId(payload: unknown): string | null {
 }
 
 /**
+ * IMMUTABLE EVIDENCE OF THE POST THAT JUST HAPPENED (o3d-ekn8 r2, Codex HIGH).
+ *
+ * The deferred re-drive runs at one instant: straight after a SALES_INVOICE CREATE returned, on the
+ * connector that made the call, with the ledger id that call returned in hand. Everything it needs to
+ * decide is therefore already known at the call site — and every one of those facts is MUTABLE if it is
+ * looked up again instead. `getActiveAccountingConnectorInfo` answers "which connector is switched on
+ * NOW", and `salesOrder.accountingInvoiceId` answers "which document does this order point at NOW"; a
+ * connector swap or a delete-and-re-post between the post and the re-drive silently redirects the whole
+ * re-drive onto a ledger, or a document, that is not the one this evidence is about.
+ *
+ * So the evidence travels IN rather than being re-derived. Re-resolving after a pin is the race being
+ * closed, not a check of it — the same correction o3d-2sm1 r8/r9 made for the refund hand-off, where the
+ * answer has to name the connector it was GIVEN against.
+ */
+export type PostedInvoiceEvidence = {
+  /** The connector whose processor made the call — not whichever one is active when this runs. */
+  connector: 'xero' | 'quickbooks'
+  /** The ledger invoice id THIS attempt returned — not whatever the order points at when this runs. */
+  accountingInvoiceId: string
+}
+
+/**
+ * Thrown to ROLL BACK a registration that was written under a connector this call did not pin.
+ *
+ * `queueAccountingSyncTx` resolves the active connector for ITSELF, after the pin was taken, so a clean
+ * `queued` says a row exists and says nothing about which ledger it was written for. The capacity
+ * arithmetic above it was measured against the PINNED connector's rows, so a row written for the other
+ * one is measured against nothing at all. Throwing out of the transaction is what makes that
+ * unwritten rather than merely reported.
+ */
+class PinnedConnectorMoved extends Error {
+  constructor(readonly wroteFor: string | null) {
+    super(`accounting connector moved to ${wroteFor ?? 'none'} under a pinned payment registration`)
+    this.name = 'PinnedConnectorMoved'
+  }
+}
+
+/**
  * Register a manually-recorded sales receipt against the ledger invoice (o3d-lgo.15).
  *
  * An IMPORTED paid order registers its payment through the SALES_INVOICE follow-up (`_registerPayment`).
@@ -140,6 +179,13 @@ export async function registerInvoicePaymentWithLedger(params: {
   method: string | null
   reference: string | null
   paidAt: Date
+  /**
+   * The post this registration is a consequence of (o3d-ekn8 r2). Supplied ONLY by the deferred
+   * re-drive, which has it; the operator-entered receipt path has no such post behind it and passes
+   * nothing, so it keeps resolving the active connector and reading the order's current invoice id.
+   * An ADDITION, not a substitution.
+   */
+  postedUnder?: PostedInvoiceEvidence
 }): Promise<void> {
   const warn = async (action: string, description: string, metadata: Record<string, unknown>) => {
     await logActivity({
@@ -153,11 +199,19 @@ export async function registerInvoicePaymentWithLedger(params: {
     }).catch(() => { /* logging must never block the receipt */ })
   }
 
+  const pinned = params.postedUnder ?? null
+
   try {
-    const [paymentSyncEnabled, so, connector] = await Promise.all([
+    const [paymentSyncEnabled, so, activeConnector] = await Promise.all([
       // Not merely "is the connector on": if INVOICE_PAYMENT posting is off, queueAccountingSync would
       // drop this silently, so treat it as nothing being expected rather than as a failure to report.
-      isAccountingSyncTypeEnabled('INVOICE_PAYMENT').catch(() => false),
+      //
+      // o3d-ekn8 r2: when a post is pinned, the question is whether the PINNED connector posts payments
+      // — the active-connector form would answer about whatever is switched on now, which is not an
+      // answer about the connector that just posted this invoice at all.
+      (pinned
+        ? isAccountingSyncTypeEnabledFor(pinned.connector, 'INVOICE_PAYMENT')
+        : isAccountingSyncTypeEnabled('INVOICE_PAYMENT')).catch(() => false),
       db.salesOrder.findUnique({
         where: { id: params.orderId },
         select: {
@@ -165,12 +219,37 @@ export async function registerInvoicePaymentWithLedger(params: {
           shoppingLinks: { select: { connector: true }, take: 1 },
         },
       }),
-      getActiveAccountingConnectorInfo().catch(() => null),
+      // Not resolved at all when a connector was pinned: a second resolution can agree with the pin
+      // while the write did not, which is the race rather than a check of it.
+      pinned ? Promise.resolve(null) : getActiveAccountingConnectorInfo().catch(() => null),
     ])
     if (!so) return
 
-    const existing = paymentSyncEnabled && so.accountingInvoiceId
-      ? await loadInvoicePaymentSyncRows(params.orderId, connector?.id ?? null)
+    const connectorId: PostedInvoiceEvidence['connector'] | null = pinned ? pinned.connector : (activeConnector?.id ?? null)
+
+    // o3d-ekn8 r2: THE DOCUMENT THIS RECEIPT WOULD SETTLE. Pinned, it is the id the post returned — but
+    // only while the order still points at it. If the invoice has been deleted and re-posted since (or
+    // the back-reference write lost its race), the order now names a DIFFERENT document, and neither
+    // answer is safe: settling the pinned one pays a retired invoice, and settling the current one
+    // registers a receipt against a post this evidence says nothing about. Refuse and say so — the next
+    // SALES_INVOICE post re-drives, and the message names the hand remedy.
+    if (pinned && so.accountingInvoiceId !== pinned.accountingInvoiceId) {
+      await warn('invoice_payment_not_registered',
+        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but the ` +
+        `invoice that had just posted (${pinned.accountingInvoiceId}) is no longer the one this order points ` +
+        `at (${so.accountingInvoiceId ?? 'none'}) — it was re-posted while the receipt was being registered. ` +
+        `Nothing was sent. Re-run the invoice sync for this order, or register the payment in the ledger by hand.`,
+        {
+          amount: params.amount, currency: params.currency, refusal: 'DOCUMENT_MOVED',
+          postedInvoiceId: pinned.accountingInvoiceId, currentInvoiceId: so.accountingInvoiceId,
+          connector: pinned.connector,
+        })
+      return
+    }
+    const accountingInvoiceId = pinned ? pinned.accountingInvoiceId : so.accountingInvoiceId
+
+    const existing = paymentSyncEnabled && accountingInvoiceId
+      ? await loadInvoicePaymentSyncRows(params.orderId, connectorId)
       : []
 
     // o3d-0m56: a FAILED or CANCELLED attempt does NOT prove the ledger is clear — the call may have
@@ -180,14 +259,14 @@ export async function registerInvoicePaymentWithLedger(params: {
     // positively rules that attempt out.
     //
     // Conditional on purpose: this is a network read, and the ordinary receipt has no history to check.
-    const probeConnector = connector?.id === 'xero' || connector?.id === 'quickbooks' ? connector.id : null
-    const ledgerSettlements = so.accountingInvoiceId
+    const probeConnector = connectorId
+    const ledgerSettlements = accountingInvoiceId
       && probeConnector
       && unresolvedInvoicePaymentAttempts(existing, params.paymentId).length > 0
       ? await (async () => {
         const probe = await probeLedgerSettlement(probeConnector, {
           type: 'INVOICE_PAYMENT',
-          payload: { accountingInvoiceId: so.accountingInvoiceId },
+          payload: { accountingInvoiceId },
         })
         // A probe that could not answer stays null, which the decision reads as "refuse".
         return probe.ok ? probe.records : null
@@ -202,12 +281,12 @@ export async function registerInvoicePaymentWithLedger(params: {
     // enqueue in the system. What changes fast is the local row set, which is what IS re-read.
     const decisionInput = {
       syncEnabled: paymentSyncEnabled,
-      accountingInvoiceId: so.accountingInvoiceId,
+      accountingInvoiceId,
       orderCurrency: so.currency,
       paymentCurrency: params.currency,
       paymentAmount: params.amount,
       paymentId: params.paymentId,
-      bankAccountId: paymentSyncEnabled && so.accountingInvoiceId
+      bankAccountId: paymentSyncEnabled && accountingInvoiceId
         ? lookupPaymentAccount(await getPaymentAccountMap(), params.method ?? '', params.currency)
         : null,
       existing,
@@ -334,7 +413,7 @@ export async function registerInvoicePaymentWithLedger(params: {
     // deletePayment takes the same per-order lock, so serialising on it closes the window in both
     // directions: either we find the payment gone and do nothing, or we queue first and the delete finds
     // our row and retracts it.
-    const outcome = await db.$transaction(async (tx) => {
+    const runEnqueue = () => db.$transaction(async (tx) => {
       await lockSalesOrder(tx, params.orderId)
       // o3d-0m56: AND the follow-up scope lock, taken before the rows are re-read.
       //
@@ -358,6 +437,17 @@ export async function registerInvoicePaymentWithLedger(params: {
       }
       const stillRecorded = await tx.payment.findUnique({ where: { id: params.paymentId }, select: { id: true } })
       if (!stillRecorded) return 'receipt-deleted' as const
+      // o3d-ekn8 r2: and the order still points at the document this post returned. The check above ran
+      // before the lock; the delete-and-re-post that moves it takes the same order lock, so this is the
+      // read that actually decides. Without it the pin is only ever tested in a window that has since
+      // reopened.
+      if (pinned) {
+        const current = await tx.salesOrder.findUnique({
+          where: { id: params.orderId },
+          select: { accountingInvoiceId: true },
+        })
+        if (current?.accountingInvoiceId !== pinned.accountingInvoiceId) return 'document-moved' as const
+      }
       // RE-DECIDE UNDER THE LOCK (o3d-cjt8). While one live registration per ORDER was the rule, the
       // unique index caught two receipts racing: the loser got a P2002. Now that the index is scoped to
       // the receipt, both would insert cleanly and the invoice would be over-settled — because "the
@@ -366,15 +456,15 @@ export async function registerInvoicePaymentWithLedger(params: {
       // same client, or the check-then-act window is simply moved rather than closed.
       const underLock = decideInvoicePaymentRegistration({
         ...decisionInput,
-        existing: await loadInvoicePaymentSyncRows(params.orderId, connector?.id ?? null, tx),
+        existing: await loadInvoicePaymentSyncRows(params.orderId, connectorId, tx),
       })
       if (!underLock.register) return { refused: underLock } as const
-      const queued = await queueAccountingSyncTx(tx, {
+      const enqueued = await queueAccountingSyncTxWithOutcome(tx, {
         type: 'INVOICE_PAYMENT',
         referenceType: 'SalesOrder',
         referenceId: params.orderId,
         payload: {
-          accountingInvoiceId: so.accountingInvoiceId,
+          accountingInvoiceId,
           bankAccountId: underLock.bankAccountId,
           amount: params.amount,
           currency: params.currency,
@@ -388,8 +478,35 @@ export async function registerInvoicePaymentWithLedger(params: {
         // Exactly once per recorded receipt, however many times this runs.
         idempotencyKey: `invoice-payment:payment:${params.paymentId}`,
       })
-      return queued ? ('queued' as const) : ('context-changed' as const)
+      // THE ROW IS WRITTEN UNDER THE CONNECTOR THE ENQUEUE RESOLVED FOR ITSELF (o3d-ekn8 r2). A clean
+      // `queued` says a row exists; `connector` is the only thing that says which ledger it is for. The
+      // capacity arithmetic that licensed this write was measured against the PINNED connector's rows,
+      // so a row written for the other one was measured against nothing — roll it back rather than
+      // report it, because a payment queued to a ledger nobody reckoned it against is what this whole
+      // path exists to prevent.
+      if (pinned && enqueued.queued && enqueued.connector !== pinned.connector) {
+        throw new PinnedConnectorMoved(enqueued.connector)
+      }
+      return enqueued.queued ? ('queued' as const) : ('context-changed' as const)
     }, STOCK_TX_OPTIONS)
+
+    let outcome: Awaited<ReturnType<typeof runEnqueue>>
+    try {
+      outcome = await runEnqueue()
+    } catch (moved) {
+      if (!(moved instanceof PinnedConnectorMoved)) throw moved
+      await warn('invoice_payment_not_registered',
+        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but the ` +
+        `active accounting connector changed from ${pinned?.connector ?? 'none'} to ` +
+        `${moved.wroteFor ?? 'none'} while the payment was being queued, so the registration would have ` +
+        `been sent to a ledger it was never measured against. Nothing was sent. Register the payment in ` +
+        `the accounting connector by hand, or re-run the invoice sync for this order.`,
+        {
+          amount: params.amount, currency: params.currency, refusal: 'PINNED_CONNECTOR_MOVED',
+          pinnedConnector: pinned?.connector ?? null, wroteFor: moved.wroteFor,
+        })
+      return
+    }
 
     // queueAccountingSyncTx RE-READS the posting context and returns false when it has since changed —
     // the connector switched off, or INVOICE_PAYMENT posting disabled, between the check above and the
@@ -400,6 +517,19 @@ export async function registerInvoicePaymentWithLedger(params: {
     // — the operator sees one message naming the reason, not a silent no-op.
     if (typeof outcome === 'object' && 'refused' in outcome) {
       await reportRefusal(outcome.refused)
+      return
+    }
+    if (outcome === 'document-moved') {
+      await warn('invoice_payment_not_registered',
+        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but its ` +
+        `invoice was re-posted while the payment was being queued, so the document this receipt was ` +
+        `measured against (${pinned?.accountingInvoiceId ?? 'unknown'}) is no longer the one the order ` +
+        `holds. Nothing was sent. Re-run the invoice sync for this order, or register the payment in the ` +
+        `ledger by hand.`,
+        {
+          amount: params.amount, currency: params.currency, refusal: 'DOCUMENT_MOVED',
+          postedInvoiceId: pinned?.accountingInvoiceId ?? null,
+        })
       return
     }
     if (outcome === 'context-changed') {
@@ -453,12 +583,22 @@ export async function registerInvoicePaymentWithLedger(params: {
  * may already have posted. Sequential by design: each call re-reads the live rows, so the second receipt
  * is measured against an invoice the first has already consumed part of.
  *
+ * PINNED TO THE POST THAT TRIGGERED IT (o3d-ekn8 r2, Codex HIGH). The caller holds the two facts this
+ * whole re-drive is about — the connector that made the call, and the invoice id that call returned —
+ * and both are MUTABLE if looked up again here instead. Re-reading them meant a connector switched
+ * between the post and this line sent the receipts to the wrong ledger, and a delete-and-re-post
+ * between them settled a document this post knows nothing about; neither leaves a trace beyond a
+ * settlement figure that stops adding up. So they travel in, and every check below is made against
+ * them rather than against whatever is live now.
+ *
  * Never throws: a follow-up enqueue must not fail the sync entry that posted the invoice.
  */
-export async function registerDeferredOrderReceipts(orderId: string): Promise<void> {
+export async function registerDeferredOrderReceipts(
+  orderId: string,
+  posted: PostedInvoiceEvidence,
+): Promise<void> {
   try {
-    if (!(await isAccountingSyncTypeEnabled('INVOICE_PAYMENT').catch(() => false))) return
-    const connector = await getActiveAccountingConnectorInfo().catch(() => null)
+    if (!(await isAccountingSyncTypeEnabledFor(posted.connector, 'INVOICE_PAYMENT').catch(() => false))) return
     const order = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: {
@@ -476,15 +616,43 @@ export async function registerDeferredOrderReceipts(orderId: string): Promise<vo
     })
     if (!order || !order.accountingInvoiceId || order.payments.length === 0) return
 
+    // The order must still point at the document this post returned. It normally does — updateBackReference
+    // runs immediately before this — but "normally" is the whole of the old guarantee, and a re-post in
+    // between would have this re-drive settle receipts against an invoice nobody here has seen posted.
+    if (order.accountingInvoiceId !== posted.accountingInvoiceId) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'deferred_invoice_payment_registration_skipped',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `The invoice that just posted (${posted.accountingInvoiceId}) is no longer the one this order ` +
+          `points at (${order.accountingInvoiceId}), so the receipts recorded before it were NOT registered ` +
+          `— they would have settled a document this post did not create. Re-run the invoice sync for this ` +
+          `order, or register the payments in the accounting connector by hand.`,
+        metadata: {
+          orderId,
+          connector: posted.connector,
+          postedInvoiceId: posted.accountingInvoiceId,
+          currentInvoiceId: order.accountingInvoiceId,
+        },
+      }).catch(() => { /* logging must never block the follow-up */ })
+      return
+    }
+
     const awaiting = selectReceiptsAwaitingRegistration({
       receipts: order.payments,
-      existing: await loadInvoicePaymentSyncRows(order.id, connector?.id ?? null),
+      // Scoped to the connector that POSTED, not the active one: rows belonging to a ledger this post
+      // was not made against cannot say whether this post's receipts still need registering.
+      existing: await loadInvoicePaymentSyncRows(order.id, posted.connector),
     })
     if (awaiting.length === 0) return
 
     const orderReference = getSalesOrderReference(order)
     for (const receipt of awaiting) {
       await registerInvoicePaymentWithLedger({
+        postedUnder: posted,
         orderId: order.id,
         orderReference,
         paymentId: receipt.id,

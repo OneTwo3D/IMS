@@ -409,15 +409,21 @@ test('the registration re-decides INSIDE the write transaction, under both locks
   )
   const fnAt = source.indexOf('export async function registerInvoicePaymentWithLedger')
   assert.notEqual(fnAt, -1, 'the registration path must still exist')
-  const at = source.indexOf('const outcome = await db.$transaction(async (tx) => {', fnAt)
+  // o3d-ekn8 r2 named the transaction body so it can be run inside a try/catch — the pinned-connector
+  // fence throws out of it to UNWRITE a row queued for a ledger this registration was not measured
+  // against. The property pinned here is unchanged: everything below still happens inside it.
+  const at = source.indexOf('const runEnqueue = () => db.$transaction(async (tx) => {', fnAt)
   assert.notEqual(at, -1)
   const body = source.slice(at, source.indexOf('}, STOCK_TX_OPTIONS)', at))
 
   const orderLockAt = body.indexOf('await lockSalesOrder(tx, params.orderId)')
   const scopeLockAt = body.indexOf('await lockFollowUpScope(tx, {')
-  const readAt = body.indexOf('loadInvoicePaymentSyncRows(params.orderId, connector?.id ?? null, tx)')
+  const readAt = body.indexOf('loadInvoicePaymentSyncRows(params.orderId, connectorId, tx)')
   const decideAt = body.indexOf('decideInvoicePaymentRegistration({')
-  const queueAt = body.indexOf('queueAccountingSyncTx(tx, {')
+  const queueAt = body.indexOf('queueAccountingSyncTxWithOutcome(tx, {')
+  // o3d-ekn8 r2: and the PINNED document is re-read through the same transaction, after the locks and
+  // before the decision — the pre-lock comparison runs in a window the order lock has since reopened.
+  const pinRecheckAt = body.indexOf('select: { accountingInvoiceId: true },')
 
   assert.ok(orderLockAt !== -1, 'the order lock serialises this against deletePayment')
   assert.ok(scopeLockAt > orderLockAt,
@@ -429,6 +435,11 @@ test('the registration re-decides INSIDE the write transaction, under both locks
   // not to each other — an ordering assertion between the two would be about formatting, not sequence.
   assert.ok(decideAt > scopeLockAt, 'the decision must be re-taken under the locks')
   assert.ok(queueAt > readAt && queueAt > decideAt, 'and the write must come after both')
+  assert.ok(pinRecheckAt > scopeLockAt && pinRecheckAt < queueAt,
+    'the pinned document is re-read under the locks too, or the pin is only ever tested in a window '
+    + 'the order lock has since reopened')
+  assert.match(body, /throw new PinnedConnectorMoved\(enqueued\.connector\)/,
+    'and a row written under a connector this call did not pin is rolled back, not reported as queued')
   assert.match(body.slice(decideAt, decideAt + 400), /if \(!underLock\.register\) return \{ refused: underLock \}/,
     'a refused re-decision must abandon the enqueue')
 

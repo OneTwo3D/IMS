@@ -1327,6 +1327,9 @@ async function enqueueSalesInvoiceFollowUps(
   syncResult: { externalId?: string; invoiceNumber?: string },
 ): Promise<void> {
   if (referenceType !== 'SalesOrder' || !syncResult.externalId) return
+  // Captured once, so the id handed to the deferred re-drive below is provably the one THIS post
+  // returned rather than a re-read of a narrowed property.
+  const postedInvoiceId: string = syncResult.externalId
 
   if (payload._registerPayment) {
     const paymentMap = await getPaymentAccountMap()
@@ -1414,7 +1417,16 @@ async function enqueueSalesInvoiceFollowUps(
   // awaited but never allowed to throw: the invoice HAS posted, and a receipt that could not be
   // re-registered must not turn that into a failed sync entry.
   const { registerDeferredOrderReceipts } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
-  await registerDeferredOrderReceipts(referenceId)
+  // PINNED TO THIS POST (o3d-ekn8 r2, Codex HIGH). Handing over only the order id made the callee
+  // re-derive both of the facts this hand-off is about — it asked which connector is active NOW and
+  // which document the order points at NOW — while the authoritative answers were sitting right here:
+  // this processor made the call, and `syncResult.externalId` is the id the call returned. A connector
+  // swap or a delete-and-re-post between the post and the re-drive silently redirected it. Re-resolving
+  // after a pin is the race being closed, not a check of it, so the evidence goes IN.
+  await registerDeferredOrderReceipts(referenceId, {
+    connector: 'quickbooks',
+    accountingInvoiceId: postedInvoiceId,
+  })
 }
 
 async function enqueuePurchaseInvoiceFollowUps(

@@ -56,6 +56,9 @@ function txClient() {
   return {
     accountingSyncLog: { findMany: async () => state.syncRows },
     payment: { findUnique: async ({ where }: { where: { id: string } }) => state.payments.find((p) => p.id === where.id) ?? null },
+    // o3d-ekn8 r2: the pinned document is re-read UNDER THE LOCK, so the transaction client has to be
+    // able to answer for the order too.
+    salesOrder: { findUnique: async () => ({ ...state.order, payments: state.payments }) },
     // o3d-0m56 took a SECOND lock inside this transaction: `lockFollowUpScope` is a
     // `pg_advisory_xact_lock` issued through `$executeRaw`, on top of the sales-order row lock
     // (`$queryRaw ... FOR UPDATE`). Both are no-ops here — this file drives one caller at a time and
@@ -81,10 +84,13 @@ mock.module('@/lib/domain/sales/allocation-service', {
 mock.module('@/lib/accounting', {
   namedExports: {
     isAccountingSyncTypeEnabled: async () => true,
+    // o3d-ekn8 r2: the re-drive now asks the EXPLICIT-connector form, because the answer has to be about
+    // the connector that posted rather than whichever one is active when the re-drive runs.
+    isAccountingSyncTypeEnabledFor: async () => true,
     getActiveAccountingConnectorInfo: async () => ({ id: 'xero' }),
     getPaymentAccountMap: async () => ({ default: 'BANK-1' }),
     lookupPaymentAccount: () => 'BANK-1',
-    queueAccountingSyncTx: async (
+    queueAccountingSyncTxWithOutcome: async (
       _tx: unknown,
       params: { type: string; payload: Record<string, unknown>; idempotencyKey?: string },
     ) => {
@@ -99,14 +105,16 @@ mock.module('@/lib/accounting', {
         retryCount: 0,
         payload: params.payload,
       })
-      return true
+      // The enqueue names the connector the row was WRITTEN under (o3d-2sm1 r8), which the pinned
+      // registration fences on.
+      return { queued: true, connector: 'xero' }
     },
   },
 })
 
 async function redrive() {
   const m = await import('@/lib/domain/accounting/invoice-payment-enqueue')
-  return m.registerDeferredOrderReceipts('order-1')
+  return m.registerDeferredOrderReceipts('order-1', { connector: 'xero', accountingInvoiceId: 'INV-1' })
 }
 
 test.beforeEach(() => {
