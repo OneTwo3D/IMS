@@ -24,10 +24,19 @@ const capture: {
   settingRows: Array<{ key: string; value: string }>
   accountingDelete?: DeleteArgs
   accountingCompact?: UpdateArgs
+  /**
+   * o3d-bqw7 r2: the compaction SELECTS before it writes, because it now derives a per-row record
+   * from the payload it is about to erase. The predicate that decides WHICH rows are compacted
+   * therefore lives on the read, and every selection assertion below is aimed at this.
+   */
+  accountingCompactSelect?: { where: Record<string, unknown> }
+  compactPagesServed: number
 } = {
   settingRows: [],
   accountingDelete: undefined,
   accountingCompact: undefined,
+  accountingCompactSelect: undefined,
+  compactPagesServed: 0,
 }
 
 function noopDelegate() {
@@ -52,7 +61,21 @@ mock.module('@/lib/db', {
         },
         updateMany: async (args: UpdateArgs) => {
           capture.accountingCompact = args
-          return { count: 0 }
+          return { count: 1 }
+        },
+        // One page, then exhaustion — enough to drive the loop through exactly one row so the
+        // tombstone write can be captured.
+        findMany: async (args: { where: Record<string, unknown> }) => {
+          capture.accountingCompactSelect = { where: args.where }
+          if (capture.compactPagesServed > 0) return []
+          capture.compactPagesServed++
+          return [{
+            id: 'log-1',
+            type: 'SALES_INVOICE',
+            referenceType: 'SalesOrder',
+            externalTransactionId: 'XINV-1',
+            payload: { _registerPayment: true },
+          }]
         },
       },
       stockMovement: noopDelegate(),
@@ -129,16 +152,29 @@ function row(overrides: Row = {}): Row {
 function resetCaptures(): void {
   capture.accountingDelete = undefined
   capture.accountingCompact = undefined
+  capture.accountingCompactSelect = undefined
+  capture.compactPagesServed = 0
 }
 
-async function runRetention(): Promise<{ deleteWhere: Record<string, unknown>; compact: UpdateArgs }> {
+async function runRetention(): Promise<{
+  deleteWhere: Record<string, unknown>
+  compact: UpdateArgs
+  perRowWhere: Record<string, unknown>
+}> {
   const { purgeExpiredData } = await import('@/lib/data-retention')
   capture.settingRows = [{ key: 'retention_sync_logs_months', value: '6' }]
   resetCaptures()
   await purgeExpiredData()
   assert.ok(capture.accountingDelete, 'retention must still delete expired accounting sync logs')
+  assert.ok(capture.accountingCompactSelect, 'retention must SELECT the rows it compacts — the per-row record is derived from the payload it erases')
   assert.ok(capture.accountingCompact, 'retention must COMPACT the rows it refuses to delete — an exemption alone is unbounded')
-  return { deleteWhere: capture.accountingDelete.where, compact: capture.accountingCompact }
+  return {
+    deleteWhere: capture.accountingDelete.where,
+    // The selection predicate and the write, kept together under one name so every assertion in this
+    // file goes on meaning what it meant when the compaction was a single `updateMany`.
+    compact: { where: capture.accountingCompactSelect.where, data: capture.accountingCompact.data },
+    perRowWhere: capture.accountingCompact.where,
+  }
 }
 
 async function captureDeletePredicate(): Promise<Record<string, unknown>> {
@@ -243,7 +279,10 @@ test('[o3d-9kek r3 f3] the tombstone keeps the attribution and drops the persona
   // referenceType, referenceId, externalTransactionId and status all survive.
   // Those are exactly what the PurchaseOrder resolver counts, which is what stops retention
   // turning "two claimants, refuse" into "one claimant, confidently wrong".
-  assert.deepEqual(Object.keys(compact.data).sort(), ['backReferenceEvidenceCompactedAt', 'errorMessage', 'payload'])
+  assert.deepEqual(
+    Object.keys(compact.data).sort(),
+    ['backReferenceEvidenceCompactedAt', 'errorMessage', 'followUpObligations', 'payload'],
+  )
   // In particular it must not settle the row behind the operator's back: a compacted row is
   // evidence, not a verdict, and stamping it checked would also make it deletable next run.
   assert.equal('backReferenceCheckedAt' in compact.data, false)
@@ -397,4 +436,48 @@ test('[o3d-nepa] an unfinished job keeps its PAYLOAD — it is not compacted eit
   // compacted by this pass, because its document already exists and both processors short-circuit
   // to the follow-ups instead of re-posting when externalTransactionId is set.
   assert.equal(matches(row({ type: 'SALES_INVOICE', status: 'FAILED', externalTransactionId: 'XINV-1' }), compact.where), true)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-bqw7 r2 (Codex HIGH) — WHAT THE ROW OWED, WRITTEN BEFORE THE PAYLOAD THAT SAID SO IS ERASED.
+//
+// The discard warning downstream used to answer "what did this row lose?" from its TYPE, and a type
+// is coarser than the truth: a SALES_INVOICE owes a payment registration only when its payload
+// carried `_registerPayment`. This is the one moment that question can be answered — after it, the
+// payload the answer is derived from does not exist.
+// ---------------------------------------------------------------------------
+
+test('[o3d-bqw7 r2] the compaction records what the row OWED, derived from the payload it is erasing', async () => {
+  const { compact } = await runRetention()
+
+  // The harness serves a SALES_INVOICE whose payload carries `_registerPayment`, so both obligations
+  // are recorded — and it is recorded in the SAME `data` as `payload: {}`, which is the property that
+  // makes it derivable at all.
+  assert.deepEqual(compact.data.followUpObligations, ['payment-registration', 'invoice-pdf'])
+  assert.deepEqual(compact.data.payload, {}, 'in the same statement that empties the payload')
+})
+
+test('[o3d-bqw7 r2] the record is KEYS, never a copy of the payload', async () => {
+  const { compact } = await runRetention()
+
+  // Compaction exists to remove names, addresses, line descriptions and amounts. A record that
+  // reintroduced any of them would defeat the retention policy it lives inside, so this asserts the
+  // shape rather than trusting the reading: every element is a short lower-case key.
+  const recorded = compact.data.followUpObligations as unknown[]
+  assert.ok(Array.isArray(recorded))
+  for (const entry of recorded) {
+    assert.equal(typeof entry, 'string')
+    assert.match(String(entry), /^[a-z][a-z-]{2,40}$/)
+  }
+})
+
+test('[o3d-bqw7 r2] each row is written on its own, re-asserting that it is not already compacted', async () => {
+  const { perRowWhere } = await runRetention()
+
+  // A bulk UPDATE cannot compute a different value per row without moving the enqueue's gate
+  // conditions into SQL, where they would drift from the branches they mirror. Writing per row means
+  // a concurrent run — or the sweep settling the row between the select and this write — must not have
+  // its work overwritten by a tombstone computed from state it has moved on from.
+  assert.equal(perRowWhere.id, 'log-1')
+  assert.equal(perRowWhere.backReferenceEvidenceCompactedAt, null)
 })

@@ -8,6 +8,9 @@ import {
   buildCompactedFollowUpLossActivity,
   compactionDiscardedFollowUps,
   compactionFollowUpVerdict,
+  compactionRebuildableFollowUps,
+  classifyCompactedFollowUpLoss,
+  followUpObligationsOwedBy,
   isCompactedFollowUpEvidence,
   isCompactedFollowUpLoss,
 } from '@/lib/domain/accounting/compacted-followup-loss'
@@ -98,4 +101,173 @@ test('[o3d-bqw7] the warning quotes the table instead of listing everything a to
   assert.match(activity.description, /The invoice PDF is built from columns compaction keeps/)
   assert.deepEqual(activity.metadata.discardedFollowUps, ['the payment registration'])
   assert.deepEqual(activity.metadata.rebuiltFollowUps, ['the invoice PDF'])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-bqw7 ROUND 2 (Codex HIGH) — A TYPE IS STILL COARSER THAN THE TRUTH.
+//
+// A SALES_INVOICE does not inherently owe a payment registration: both connectors gate that enqueue
+// on `payload._registerPayment`, and the ordinary sales path composes payloads without it. So the
+// round-1 type table went on warning about tombstones that lost nothing — and because the warning
+// GATES the obligation release, a false one that is also unwritable holds an already-posted row at
+// PENDING for ever, which is the o3d-kemx shape the narrowing existed to end.
+//
+// The answer is a per-ROW record, derived from the payload at the one moment it can be: the
+// compaction that erases it.
+// ---------------------------------------------------------------------------
+
+function recordedRow(type: string, followUpObligations: unknown) {
+  return { ...row(type), followUpObligations }
+}
+
+test('[o3d-bqw7 r2] the ORDINARY sales invoice owes only a PDF — the payment gate is a payload flag', () => {
+  // The population the type table was wrong about. An order invoiced with no receipt recorded
+  // against it never reaches the payment branch, so a tombstone of it lost nothing recoverable.
+  assert.deepEqual(
+    followUpObligationsOwedBy({
+      type: 'SALES_INVOICE' as AccountingSyncType,
+      referenceType: 'SalesOrder',
+      externalTransactionId: 'XINV-1',
+      payload: { invoiceNumber: 'INV-1', currency: 'GBP' },
+    }),
+    ['invoice-pdf'],
+  )
+  // ...and the paid-at-import order, which does.
+  assert.deepEqual(
+    followUpObligationsOwedBy({
+      type: 'SALES_INVOICE' as AccountingSyncType,
+      referenceType: 'SalesOrder',
+      externalTransactionId: 'XINV-1',
+      payload: { _registerPayment: true, _paymentAmount: 120 },
+    }),
+    ['payment-registration', 'invoice-pdf'],
+  )
+})
+
+test('[o3d-bqw7 r2] a row with NO document id owes nothing — every enqueue branch returns before it', () => {
+  assert.deepEqual(
+    followUpObligationsOwedBy({
+      type: 'SALES_INVOICE' as AccountingSyncType,
+      referenceType: 'SalesOrder',
+      externalTransactionId: null,
+      payload: { _registerPayment: true },
+    }),
+    [],
+  )
+})
+
+test('[o3d-bqw7 r2] the two purchase obligations are read from their own payload gates', () => {
+  assert.deepEqual(
+    followUpObligationsOwedBy({
+      type: 'PURCHASE_INVOICE' as AccountingSyncType,
+      referenceType: 'PurchaseOrder',
+      externalTransactionId: 'XBILL-1',
+      payload: { supplierInvoicePath: '/files/bill.pdf' },
+    }),
+    ['supplier-invoice-attachment'],
+  )
+  // No stored path, so `enqueuePurchaseInvoiceFollowUps` returns before it enqueues: nothing owed.
+  assert.deepEqual(
+    followUpObligationsOwedBy({
+      type: 'PURCHASE_INVOICE' as AccountingSyncType,
+      referenceType: 'PurchaseOrder',
+      externalTransactionId: 'XBILL-1',
+      payload: {},
+    }),
+    [],
+  )
+  assert.deepEqual(
+    followUpObligationsOwedBy({
+      type: 'PURCHASE_CREDIT_NOTE' as AccountingSyncType,
+      referenceType: 'SupplierCreditNote',
+      externalTransactionId: 'XCN-1',
+      payload: { allocateToInvoiceId: 'XBILL-1', allocateAmount: 12 },
+    }),
+    ['supplier-credit-note-allocation'],
+  )
+  // Allocation amount of zero: the enqueue refuses it, so nothing is owed and nothing is lost.
+  assert.deepEqual(
+    followUpObligationsOwedBy({
+      type: 'PURCHASE_CREDIT_NOTE' as AccountingSyncType,
+      referenceType: 'SupplierCreditNote',
+      externalTransactionId: 'XCN-1',
+      payload: { allocateToInvoiceId: 'XBILL-1', allocateAmount: 0 },
+    }),
+    [],
+  )
+})
+
+test('[o3d-bqw7 r2] a SALES_INVOICE tombstone that recorded no payment obligation discards NOTHING', () => {
+  // THE FALSE WARNING, GONE. Under the type table this row was told it had lost "the payment
+  // registration" — a payment nothing ever owed.
+  const recorded = recordedRow('SALES_INVOICE', ['invoice-pdf'])
+  assert.deepEqual(classifyCompactedFollowUpLoss(recorded), {
+    discarded: [],
+    rebuilt: ['the invoice PDF'],
+    basis: 'row-record',
+  })
+  assert.equal(isCompactedFollowUpLoss(recorded), false, 'and so there is no warning to gate the release on')
+
+  // ...while the row that DID owe one still says so, in full.
+  const owed = recordedRow('SALES_INVOICE', ['payment-registration', 'invoice-pdf'])
+  assert.deepEqual(compactionDiscardedFollowUps(owed), ['the payment registration'])
+  assert.deepEqual(compactionRebuildableFollowUps(owed), ['the invoice PDF'])
+  assert.equal(isCompactedFollowUpLoss(owed), true)
+})
+
+test('[o3d-bqw7 r2] a row compacted BEFORE the record existed keeps the over-broad type answer, for ever', () => {
+  // Not a stopgap: the payload its obligations would have to be derived from is exactly what
+  // retention already threw away, so no backfill can ever give it one. Over-reporting is the safe
+  // direction — an over-broad warning is noise, an under-broad one loses a payment in silence.
+  for (const noRecord of [undefined, null, 'not-an-array', [1, 2], { invoice: true }]) {
+    const legacy = recordedRow('SALES_INVOICE', noRecord)
+    assert.deepEqual(
+      classifyCompactedFollowUpLoss(legacy),
+      { discarded: ['the payment registration'], rebuilt: ['the invoice PDF'], basis: 'type-table' },
+      `a ${JSON.stringify(noRecord) ?? 'undefined'} record must not be read as "nothing was owed"`,
+    )
+  }
+})
+
+test('[o3d-bqw7 r2] an EMPTY record is an answer, and a missing one is not', () => {
+  // The distinction the whole column rests on. `[]` is a row that answered "nothing"; `null` is a row
+  // that cannot answer at all.
+  assert.deepEqual(classifyCompactedFollowUpLoss(recordedRow('PURCHASE_INVOICE', [])), {
+    discarded: [], rebuilt: [], basis: 'row-record',
+  })
+  assert.deepEqual(classifyCompactedFollowUpLoss(recordedRow('PURCHASE_INVOICE', null)), {
+    discarded: ['the supplier invoice attachment'], rebuilt: [], basis: 'type-table',
+  })
+})
+
+test('[o3d-bqw7 r2] an obligation key this release does not recognise still WARNS', () => {
+  // Same rule as the unrecognised TYPE, one level down: the record was written by a release that knew
+  // about an obligation this one does not, and under-reporting loses a payment in silence.
+  const future = recordedRow('SALES_INVOICE', ['invoice-pdf', 'some-obligation-added-later'])
+  const verdict = classifyCompactedFollowUpLoss(future)
+  assert.equal(verdict.discarded.length, 1)
+  assert.match(verdict.discarded[0], /some-obligation-added-later/)
+  assert.deepEqual(verdict.rebuilt, ['the invoice PDF'])
+  assert.equal(isCompactedFollowUpLoss(future), true)
+})
+
+test('[o3d-bqw7 r2] the warning names what the ROW recorded, and says which basis it used', () => {
+  const activity = buildCompactedFollowUpLossActivity({
+    connectorLabel: 'Xero',
+    activityActionPrefix: 'xero',
+    row: recordedRow('SALES_INVOICE', ['payment-registration', 'invoice-pdf']),
+    phase: 'processor-short-circuit',
+  })
+  assert.match(activity.description, /the payment registration can no longer be/)
+  assert.match(activity.description, /invoice PDF is built from columns compaction keeps/)
+  assert.equal(activity.metadata.classificationBasis, 'row-record')
+
+  const legacy = buildCompactedFollowUpLossActivity({
+    connectorLabel: 'Xero',
+    activityActionPrefix: 'xero',
+    row: recordedRow('SALES_INVOICE', null),
+    phase: 'processor-short-circuit',
+  })
+  assert.equal(legacy.metadata.classificationBasis, 'type-table',
+    'a reader must be able to tell an answer from a fallback without guessing')
 })

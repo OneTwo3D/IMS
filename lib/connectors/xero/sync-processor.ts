@@ -24,9 +24,11 @@ import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
 import {
   carryAccountingOriginRecord,
+  carryAccountingOriginRecordFrom,
   mintAccountingConnectionProvenanceColumn,
   readAccountingPayloadConnectionStamp,
   type AccountingConnectionStamp,
+  type AccountingOriginRecord,
 } from '@/lib/connectors/accounting-connection-provenance'
 import { withAccountingPostingIntent } from '@/lib/connectors/accounting-posting-intent'
 import { xeroUploadAttachment, xeroPost } from './api'
@@ -171,6 +173,14 @@ class CompactedFollowUpLossUnrecorded extends Error {}
  * PENDING and re-drives it every pass, for ever. So the guard is now `compactionDiscardedFollowUps`,
  * which answers per type from an exhaustive table — see compacted-followup-loss.ts for why it fails
  * towards WARNING on a type it does not recognise.
+ *
+ * r2 (Codex HIGH) — AND A TYPE IS STILL COARSER THAN THE TRUTH. A SALES_INVOICE owes a payment
+ * registration only when its payload carried `_registerPayment`, and the ordinary sales path composes
+ * payloads without it, so a type-level answer went on warning about tombstones that lost nothing. The
+ * guard now reads the row's OWN record of what it owed, written by retention's compaction in the same
+ * statement that emptied the payload it was derived from; a row compacted before that record existed
+ * has none and keeps the over-broad type answer, for ever, because the payload it would have to be
+ * derived from is exactly what was thrown away.
  */
 async function announceCompactedFollowUpLoss(entry: {
   id: string
@@ -179,6 +189,12 @@ async function announceCompactedFollowUpLoss(entry: {
   referenceId: string
   externalTransactionId: string | null
   backReferenceEvidenceCompactedAt: Date | null
+  /**
+   * o3d-bqw7 r2: what this row RECORDED that it owed, written by the compaction that erased the
+   * payload it was owed from. NULL means no record — the classification falls back to the type table,
+   * which over-reports, which is the safe direction.
+   */
+  followUpObligations?: unknown
 }): Promise<void> {
   if (compactionDiscardedFollowUps(entry).length === 0) return
   // logActivityPersisted, NOT logActivity: the release below is conditional on having warned, and
@@ -1003,10 +1019,16 @@ export function isUniqueConstraintViolation(error: unknown): boolean {
  */
 type FollowUpOriginEvidence =
   /**
-   * The stored payload of the row whose post issued the ids in this follow-up. Its record is carried
-   * VERBATIM — including its absence, which then refuses.
+   * The COMPLETE DURABLE ORIGIN RECORD of the row whose post issued the ids in this follow-up — its
+   * payload, its `connectionProvenance` column and retention's `backReferenceEvidenceCompactedAt`.
+   * Carried VERBATIM where the payload speaks, including its absence, which then refuses.
+   *
+   * o3d-bqw7 r2 (Codex HIGH): the payload ALONE was not the record. Compaction writes `payload: {}`
+   * and keeps the column, so on a tombstone — precisely the rows this pipeline classifies as still
+   * having a REBUILDABLE invoice PDF — the payload said nothing, the follow-up was created unstamped,
+   * and it could never post. The classification was a claim the code did not honour.
    */
-  | { from: 'postedRow'; payload: unknown }
+  | { from: 'postedRow'; record: AccountingOriginRecord }
   /** Nothing in hand observed the origin. The row is created carrying no record, and cannot post. */
   | { from: 'unobserved' }
 
@@ -1096,10 +1118,11 @@ export async function enqueueFollowUpSyncLog(
   // So there is no read of the live connection on this path at all. A caller that took the post hands
   // over that row's payload and its record travels; a caller that did not hands over nothing and the row
   // is born with no record, which `accountingPayloadConnectionVerdict` refuses rather than assumes.
-  payload = carryAccountingOriginRecord(
-    payload,
-    origin.from === 'postedRow' ? origin.payload : undefined,
-  ) as SyncPayload
+  payload = (origin.from === 'postedRow'
+    // o3d-bqw7 r2: the COMPLETE record, so a retention tombstone hands on the organisation its
+    // durable column still names instead of handing on the silence its emptied payload holds.
+    ? carryAccountingOriginRecordFrom(payload, origin.record)
+    : carryAccountingOriginRecord(payload, undefined)) as SyncPayload
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
   const live = await hasExistingSyncLog(type, referenceType, referenceId, payload)
@@ -1344,7 +1367,7 @@ export async function enqueueFollowUpSyncLog(
           // asking again — asking again is what "look it up" would reintroduce.
           retry: () => enqueueFollowUpSyncLog(
             type, referenceType, referenceId, plan.payload,
-            { from: 'postedRow', payload: plan.payload }, attempt + 1,
+            { from: 'postedRow', record: { payload: plan.payload, connectionProvenance: null } }, attempt + 1,
           ),
       })
       return
@@ -1368,7 +1391,7 @@ export async function enqueueFollowUpSyncLog(
         attempt,
         retry: () => enqueueFollowUpSyncLog(
           type, referenceType, referenceId, plan.payload,
-          { from: 'postedRow', payload: plan.payload }, attempt + 1,
+          { from: 'postedRow', record: { payload: plan.payload, connectionProvenance: null } }, attempt + 1,
         ),
       })
       return
@@ -3655,7 +3678,11 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           // catch below returns the row to PENDING still carrying `backReferenceFollowUpsPendingAt`,
           // and the next pass announces. Re-running the enqueue on that pass is a no-op — it is
           // idempotent through `hasExistingSyncLog` and the partial unique index (audit-42co).
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId },
+            // o3d-bqw7 r2: the row's COMPLETE origin record. This is the tombstone path — `payload` here
+            // is `{}` — so the durable column is the only half that still names an organisation, and
+            // without it the invoice PDF this enqueue raises could never post.
+            { payload, ...origin })
           await announceCompactedFollowUpLoss(entry)
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
@@ -3780,7 +3807,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
+          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
+            // The record this post was made under, read in the same statement as the payload.
+            { payload, ...origin })
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
           await markSyncLogForFollowUpRetry(attempt, entry, followUpError)
@@ -4199,7 +4228,11 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           // catch below returns the row to PENDING still carrying `backReferenceFollowUpsPendingAt`,
           // and the next pass announces. Re-running the enqueue on that pass is a no-op — it is
           // idempotent through `hasExistingSyncLog` and the partial unique index (audit-42co).
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId },
+            // o3d-bqw7 r2: the row's COMPLETE origin record. This is the tombstone path — `payload` here
+            // is `{}` — so the durable column is the only half that still names an organisation, and
+            // without it the invoice PDF this enqueue raises could never post.
+            { payload, ...origin })
           await announceCompactedFollowUpLoss(entry)
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
@@ -4347,7 +4380,9 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
+          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
+            // The record this post was made under, read in the same statement as the payload.
+            { payload, ...origin })
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
@@ -6127,8 +6162,11 @@ export async function repairXeroBackReferences(limit = DEFAULT_BACK_REFERENCE_SW
     // What the connector supplies is only the part the connector-agnostic module cannot hold: the
     // locked read and the retirement, in one transaction on the Xero database handle.
     decideSaleRelease,
-    enqueueFollowUps: (entryId, type, referenceType, referenceId, payload, syncResult) =>
-      enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult),
+    // o3d-bqw7 r2: the sweep now hands over the row's COMPLETE durable origin record, not just its
+    // payload — a tombstone's payload is `{}` and its `connectionProvenance` column is the only half
+    // left speaking, so without it every follow-up the sweep rebuilds is born unable to post.
+    enqueueFollowUps: (entryId, type, referenceType, referenceId, payload, syncResult, origin) =>
+      enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult, origin),
   }, { limit })
 }
 
@@ -6438,8 +6476,15 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
         amount: item.amount,
         sourceEntryId: 'reenqueue-sweep',
       }, origin.outcome === 'inherited'
-        ? { from: 'postedRow', payload: origin.payload }
-        : { from: 'unobserved' })
+        // PAYLOAD ONLY HERE, DELIBERATELY, and unchanged by o3d-bqw7 r2. `selectIssuingPostOriginRecord`
+        // chooses AMONG several candidate rows by what each payload records, and returns the payload
+        // rather than a row, so there is no single row whose durable column this could honestly be
+        // paired with. A compacted issuing row therefore still hands on nothing and the allocation
+        // refuses at post time — which is what it did yesterday, and is the safe direction. Nothing
+        // classifies a PURCHASE_CREDIT_NOTE allocation as REBUILT after compaction, so no claim
+        // anywhere depends on it being raisable from a tombstone.
+        ? { from: 'postedRow' as const, record: { payload: origin.payload, connectionProvenance: null } }
+        : { from: 'unobserved' as const })
       result.enqueued++
       await logActivity({
         entityType: 'SYSTEM',
@@ -6479,6 +6524,7 @@ async function enqueueSalesInvoiceFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string; invoiceNumber?: string },
+  origin: AccountingOriginRecord,
 ): Promise<void> {
   if (referenceType !== 'SalesOrder' || !syncResult.externalId) return
 
@@ -6525,7 +6571,7 @@ async function enqueueSalesInvoiceFollowUps(
             currency,
             method,
             sourceEntryId: entryId,
-          }, { from: 'postedRow', payload })
+          }, { from: 'postedRow', record: origin })
         }
       }
     }
@@ -6536,7 +6582,7 @@ async function enqueueSalesInvoiceFollowUps(
     referenceId,
     invoiceNumber: syncResult.invoiceNumber,
     sourceEntryId: entryId,
-  }, { from: 'postedRow', payload })
+  }, { from: 'postedRow', record: origin })
 
   // o3d-ekn8: receipts recorded BEFORE this invoice existed were refused with DOCUMENT_NOT_POSTED and
   // nothing ever came back for them. This is the moment that refusal stops applying — the CREATE has
@@ -6557,13 +6603,14 @@ async function enqueuePurchaseInvoiceFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string },
+  origin: AccountingOriginRecord,
 ): Promise<void> {
   if ((referenceType !== 'PurchaseInvoice' && referenceType !== 'PurchaseOrder') || !syncResult.externalId || !payload.supplierInvoicePath) return
   await enqueueFollowUpSyncLog('BILL_ATTACHMENT', referenceType, referenceId, {
     accountingInvoiceId: syncResult.externalId,
     supplierInvoicePath: payload.supplierInvoicePath,
     sourceEntryId: entryId,
-  }, { from: 'postedRow', payload })
+  }, { from: 'postedRow', record: origin })
 }
 
 async function enqueuePurchaseCreditNoteFollowUps(
@@ -6572,6 +6619,7 @@ async function enqueuePurchaseCreditNoteFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string },
+  origin: AccountingOriginRecord,
 ): Promise<void> {
   // audit-v08m: after the ACCPAYCREDIT posts, allocate it to the bill it offsets.
   // Needs both the credit's new external id and the bill's external id. The bill
@@ -6591,18 +6639,25 @@ async function enqueuePurchaseCreditNoteFollowUps(
     // retry of a pinned request was no longer the same request (Codex review, r2 #3).
     date: (payload.date as string | undefined)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
     sourceEntryId: entryId,
-  }, { from: 'postedRow', payload })
+  }, { from: 'postedRow', record: origin })
 }
 
 /**
  * Fan a posted row out into the follow-up work it owes.
  *
- * `payload` IS THE ORIGIN EVIDENCE, not just the source of fields (Codex r3 finding 1). It is the stored
- * payload of the row that posted — whether this call comes from the processor moments after the post, or
- * from the back-reference sweep days later for a row whose process died before its follow-ups ran — and
- * the record it carries is the only thing that knows which organisation the external ids being handed on
- * belong to. Every `enqueueFollowUpSyncLog` below therefore passes `{ from: 'postedRow', payload }`, and
- * none of them reads the live connection.
+ * THE POSTING ROW'S ORIGIN RECORD IS THE EVIDENCE, not just the source of fields (Codex r3 finding 1).
+ * It belongs to the row that posted — whether this call comes from the processor moments after the post,
+ * or from the back-reference sweep days later for a row whose process died before its follow-ups ran —
+ * and it is the only thing that knows which organisation the external ids being handed on belong to.
+ * Every `enqueueFollowUpSyncLog` below therefore passes `{ from: 'postedRow', record: origin }`, and none
+ * of them reads the live connection.
+ *
+ * THE RECORD IS BOTH HALVES (o3d-bqw7 r2, Codex HIGH). `payload` alone was the evidence until a
+ * retention tombstone showed what that costs: compaction empties the payload and KEEPS
+ * `connectionProvenance`, so the rows whose follow-ups this pipeline still claims to rebuild handed on
+ * nothing at all, and the rows they created could never post. `origin` carries the payload, the column
+ * and retention's compaction instant together, which is the only combination
+ * `readAccountingOriginRecord` will decide from.
  *
  * A row whose payload recorded nothing hands nothing on, and the follow-up refuses at post time instead
  * of being addressed to whoever is connected. That is the same answer the parent row itself would now
@@ -6616,19 +6671,27 @@ async function enqueueFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string; invoiceNumber?: string },
+  /**
+   * o3d-bqw7 r2 (Codex HIGH) — THE COMPLETE DURABLE ORIGIN RECORD OF THE POSTING ROW, not just its
+   * payload. On a retention tombstone the payload is `{}` and the organisation is recorded only in
+   * the `connectionProvenance` column; handing on the payload alone created follow-ups that could
+   * never post, which made "the invoice PDF survives compaction" a claim this pipeline did not
+   * honour.
+   */
+  origin: AccountingOriginRecord,
 ): Promise<void> {
   if (type === 'SALES_INVOICE') {
-    await enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
+    await enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin)
     return
   }
 
   if (type === 'PURCHASE_INVOICE') {
-    await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
+    await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin)
     return
   }
 
   if (type === 'PURCHASE_CREDIT_NOTE') {
-    await enqueuePurchaseCreditNoteFollowUps(entryId, referenceType, referenceId, payload, syncResult)
+    await enqueuePurchaseCreditNoteFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin)
     return
   }
 
@@ -6643,13 +6706,13 @@ async function enqueueFollowUps(
     if (order?.customerEmail) {
       await enqueueFollowUpSyncLog(
         'INVOICE_EMAIL', referenceType, referenceId, { referenceId, sourceEntryId: entryId },
-        { from: 'postedRow', payload },
+        { from: 'postedRow', record: origin },
       )
     }
     if (order?.shoppingLinks.length) {
       await enqueueFollowUpSyncLog(
         'WC_INVOICE_NOTE', referenceType, referenceId, { referenceId, sourceEntryId: entryId },
-        { from: 'postedRow', payload },
+        { from: 'postedRow', record: origin },
       )
     }
   }

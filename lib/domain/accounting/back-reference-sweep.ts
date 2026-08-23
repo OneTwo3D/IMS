@@ -338,6 +338,33 @@ export type BackReferenceSweepRow = {
    * errorMessage.
    */
   settlementBasis: string | null
+  /**
+   * o3d-bqw7 r2: the durable half of the row's ORIGIN record. Read because a tombstone's payload is
+   * `{}` and this column is then the only thing that names the organisation its external ids came
+   * from — without it every follow-up the sweep rebuilds from a tombstone is born unable to post.
+   */
+  connectionProvenance: string | null
+  /**
+   * o3d-bqw7 r2: what this row RECORDED that it owed, written by the compaction that erased the
+   * payload it was owed from. NULL = no record; the classification falls back to the type table.
+   */
+  followUpObligations: unknown
+}
+
+/**
+ * A row's COMPLETE durable origin record, assembled from the three columns that are one fact
+ * (o3d-bqw7 r2). Never built from the payload alone — see `readAccountingOriginRecord`.
+ */
+function sweepRowOriginRecord(row: BackReferenceSweepRow): {
+  payload: unknown
+  connectionProvenance: string | null
+  backReferenceEvidenceCompactedAt: Date | null
+} {
+  return {
+    payload: row.payload,
+    connectionProvenance: row.connectionProvenance,
+    backReferenceEvidenceCompactedAt: row.backReferenceEvidenceCompactedAt,
+  }
 }
 
 /** The columns the sweep reads. `as const` so the Prisma client's row type resolves. */
@@ -356,6 +383,11 @@ export const BACK_REFERENCE_CANDIDATE_SELECT = {
   // Defect 7. Without this column in the SELECT the gate below cannot run at all, and an
   // operator-asserted id is indistinguishable from a connector-confirmed one at every later step.
   settlementBasis: true,
+  // o3d-bqw7 r2. Both are only ever read for a TOMBSTONE, and both are useless if selected later:
+  // the origin column is what a tombstone hands on in place of its emptied payload, and the
+  // obligation record is what tells a tombstone that lost a payment from one that lost nothing.
+  connectionProvenance: true,
+  followUpObligations: true,
 } as const
 
 /**
@@ -504,6 +536,21 @@ export type BackReferenceSweepDeps = {
     referenceId: string,
     payload: Record<string, unknown>,
     syncResult: { externalId?: string; invoiceNumber?: string },
+    /**
+     * o3d-bqw7 r2 (Codex HIGH) — THE ROW'S COMPLETE DURABLE ORIGIN RECORD, which is the payload
+     * TOGETHER WITH `connectionProvenance` and retention's compaction instant.
+     *
+     * The payload alone is the whole record for an ordinary row and NOT the whole record for a
+     * tombstone: compaction empties the payload and keeps the column. Handing over the payload alone
+     * therefore created follow-ups carrying no origin at all — refused at post time as
+     * `no-origin-recorded` — for exactly the rows this module classifies as still having a
+     * REBUILDABLE invoice PDF. The classification was a claim the pipeline could not deliver.
+     */
+    origin: {
+      payload: unknown
+      connectionProvenance: string | null | undefined
+      backReferenceEvidenceCompactedAt?: Date | null
+    },
   ) => Promise<void>
   now?: () => Date
   /**
@@ -1134,7 +1181,13 @@ export async function repairAccountingBackReferences(
     // gates the settle — a way to hold the row for ever behind a failing activity log. Those rows
     // fall through to the ordinary enqueue below, which is the honest way to find out what the type
     // owes rather than a second opinion about it.
-    if (compactionDiscardedFollowUps(row).length > 0) return reportDiscardedFollowUps(row, 'already-applied')
+    //
+    // o3d-bqw7 r2: AND THE ENQUEUE RUNS FIRST EITHER WAY. r1 returned here on a discarding tombstone
+    // without calling it, which silently dropped the follow-ups the very same classification calls
+    // REBUILT — an invoice PDF is assembled from `externalTransactionId` and `referenceId`, both of
+    // which a tombstone keeps. The processor short-circuit already had this order for the reason
+    // o3d-nepa r4 gives: the announcement gates the RELEASE, it must never gate the enqueue.
+    const discarded = compactionDiscardedFollowUps(row)
     try {
       await deps.enqueueFollowUps(
         row.id,
@@ -1143,6 +1196,7 @@ export async function repairAccountingBackReferences(
         row.referenceId,
         (row.payload ?? {}) as Record<string, unknown>,
         { externalId: row.externalTransactionId ?? undefined },
+        sweepRowOriginRecord(row),
       )
     } catch (followUpError) {
       result.failed++
@@ -1159,6 +1213,9 @@ export async function repairAccountingBackReferences(
       })
       return false
     }
+    // AND ONLY NOW THE TERMINAL DISCARD. The rebuildable half has gone out; what is left is work this
+    // tombstone can never recover, and the marker may be consumed only once that is on record.
+    if (discarded.length > 0) return reportDiscardedFollowUps(row, 'already-applied')
     await deps.logActivity({
       entityType: 'SYSTEM',
       action: `${prefix}_backreference_followups_recovered`,
@@ -1425,6 +1482,27 @@ export async function repairAccountingBackReferences(
             // marker existed the condition was `status === 'FAILED'`, so a SYNCED row whose
             // follow-ups were outstanding when retention compacted it was stamped in silence: the
             // one case where the loss is BOTH permanent and unannounced.
+            //
+            // o3d-bqw7 r2 (Codex HIGH): THE RECOVERABLE HALF GOES OUT FIRST. r1 announced and settled
+            // without ever calling the enqueue, which threw away the follow-ups the same
+            // classification calls REBUILT — an invoice PDF is assembled from `externalTransactionId`
+            // and `referenceId`, both of which a tombstone keeps. Enqueue, then announce: the
+            // announcement gates the SETTLE (o3d-nepa r4) and must never gate the work.
+            try {
+              await deps.enqueueFollowUps(
+                row.id,
+                row.type,
+                row.referenceType,
+                row.referenceId,
+                (row.payload ?? {}) as Record<string, unknown>,
+                { externalId: row.externalTransactionId ?? undefined },
+                sweepRowOriginRecord(row),
+              )
+            } catch (followUpError) {
+              result.failed++
+              console.error(`${prefix}: tombstone follow-up enqueue failed`, row.id, followUpError)
+              continue
+            }
             if (discardsFollowUps && !(await reportDiscardedFollowUps(row, 'already-applied'))) continue
           }
           // Linked, nothing outstanding: reconciled. Stamped, so it never occupies a slot again.
@@ -1481,21 +1559,27 @@ export async function repairAccountingBackReferences(
           // The follow-ups (PDF, payment, attachment) never ran on the original failed pass —
           // enqueue them now. The connector's own idempotency makes this safe to repeat.
           //
-          // Unless this is a tombstone, in which case they CANNOT be rebuilt (r4 finding 3): the
-          // payload they are constructed from was cleared at the retention cutoff. Calling
-          // enqueueFollowUps with `{}` would not fail — it would enqueue nothing and return
-          // normally, and the row would then be stamped reconciled with the payment or PDF silently
-          // missing. The terminal policy is stated instead of simulated: warn, naming what was
-          // discarded, and settle only if the warning landed.
+          // A tombstone's PAYLOAD-BUILT follow-ups cannot be rebuilt (r4 finding 3): the payload they
+          // are constructed from was cleared at the retention cutoff. Calling enqueueFollowUps with
+          // `{}` would not fail for them — it would enqueue nothing and return normally, and the row
+          // would then be stamped reconciled with the payment silently missing. The terminal policy is
+          // stated instead of simulated: warn, naming what was discarded, and settle only if the
+          // warning landed.
+          //
+          // o3d-bqw7 r2 (Codex HIGH): AND A TOMBSTONE GOES THROUGH THE ENQUEUE TOO. r1 skipped it
+          // entirely, which silently dropped the follow-ups the classification itself calls REBUILT —
+          // an invoice PDF is assembled from `externalTransactionId` and `referenceId`, both of which
+          // a tombstone keeps, and the processor short-circuit has always enqueued them. Skipping here
+          // left the same claim true on one path and false on the other. The order is the o3d-nepa r4
+          // order on both: ENQUEUE, then announce, because the announcement gates the RELEASE and must
+          // never gate the work it is announcing the loss of.
           let followUpsEnqueued = true
-          if (evidenceOnly) {
-            if (discardsFollowUps && !(await reportDiscardedFollowUps(row, 'repaired'))) followUpsEnqueued = false
-          } else {
+          {
             try {
               await deps.enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, {
                 externalId: row.externalTransactionId,
                 invoiceNumber,
-              })
+              }, sweepRowOriginRecord(row))
             } catch (followUpError) {
               followUpsEnqueued = false
               console.error(`${prefix}: back-reference follow-up enqueue failed`, row.id, followUpError)
@@ -1509,6 +1593,15 @@ export async function repairAccountingBackReferences(
                   + 'so the next sweep retries them.',
                 metadata: { syncLogId: row.id, referenceType: row.referenceType, referenceId: row.referenceId },
               })
+            }
+            // The terminal half, announced only after the recoverable half has gone out, and only
+            // when this row RECORDED that it owed something the compaction took away. After the
+            // per-row narrowing there is no false warning left here to hold a row behind a failing
+            // activity log — but a TRUE one still holds it, which is the existing policy and the
+            // whole reason the announcement is persisted rather than best-effort.
+            if (followUpsEnqueued && evidenceOnly && discardsFollowUps
+              && !(await reportDiscardedFollowUps(row, 'repaired'))) {
+              followUpsEnqueued = false
             }
           }
           // A row whose back-reference is now applied is fully reconciled — but ONLY if its

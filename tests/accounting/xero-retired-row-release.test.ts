@@ -31,6 +31,12 @@ type OrderRow = { status: string; accountingInvoiceId: string | null }
 let salesOrders: Map<string, OrderRow> = new Map()
 /** How many of the next row-LOCK attempts must fail — a lock timeout, or a lost deadlock. */
 let lockFailures = 0
+/**
+ * o3d-psvi r2: run when the sales-order row lock is TAKEN, which is the instant a writer that was
+ * queued behind it has just finished. It is how a concurrent sweep verdict is landed in the window
+ * the in-transaction re-read exists to close.
+ */
+let onSaleLock: (() => void) | null = null
 
 const accountingSyncLog = new Proxy({}, {
   get: (_target, prop: string) => (args: never) => (store.delegate[prop] as (a: never) => Promise<unknown>)(args),
@@ -67,6 +73,9 @@ const dbStub = {
       lockFailures -= 1
       throw new Error('could not lock the sales order row')
     }
+    const landed = onSaleLock
+    onSaleLock = null
+    landed?.()
     return []
   },
   $executeRaw: async () => 1,
@@ -156,6 +165,7 @@ function reset(order: OrderRow, overrides: Record<string, unknown> = {}) {
   store = createSyncLogStore([syncLogRow({ ...SALES_CANDIDATE, ...overrides })])
   activity.length = 0
   lockFailures = 0
+  onSaleLock = null
   salesOrders = new Map([['order-1', { ...order }]])
 }
 
@@ -306,4 +316,89 @@ test('[o3d-psvi] a CANCELLED row that names no document is refused — releasing
   assert.equal(result.success, false)
   assert.match(String(result.error), /names no document/)
   assert.match(String(result.error), /Raise the invoice again from the sales order/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psvi ROUND 2 (Codex HIGH) — THE REMEDY WAS UNREACHABLE FOR THE POPULATION IT WAS WRITTEN FOR.
+//
+// `applyFencedAttemptDecision` refuses revision 0 as UNFENCED_ATTEMPT unless adoption is asked for,
+// and this action never asked. Revision 0 is not a corner case: the attempt-revision migration left
+// every pre-existing row there, and the sweep's own retirement deliberately does NOT advance a row
+// that is still at 0 (a bump would invent an attempt nothing ever made). So the one control written
+// to rescue a retired row refused exactly the retired rows there are, and its refusal named a claim
+// that was never coming — a refusal with no remedy, which is the failure this issue is named for.
+//
+// These tests drive the WHOLE round trip on a revision-0 row, because "the action returned success"
+// is precisely the assertion that would have passed while the remedy did nothing.
+// ---------------------------------------------------------------------------
+
+/** Retire a LEGACY row — one no fence-aware processor has ever claimed — through the real sweep. */
+async function retireLegacyBySweep() {
+  await (await loadSweep())()
+  const retired = store.get('log-1')
+  assert.equal(retired?.status, 'CANCELLED', 'precondition: the sweep retired the row')
+  assert.equal(
+    retired?.attemptRevision,
+    0,
+    'precondition: the sweep deliberately does NOT advance a row nothing has ever claimed',
+  )
+  activity.length = 0
+  return retired!
+}
+
+test('[o3d-psvi r2] a LEGACY row at revision 0 is released, and the sweep then finishes the job', async () => {
+  reset({ status: 'CANCELLED', accountingInvoiceId: null }, { attemptRevision: 0 })
+  await retireLegacyBySweep()
+
+  salesOrders.set('order-1', { status: 'PROCESSING', accountingInvoiceId: null })
+
+  const released = await (await loadRelease())('log-1', 0)
+  assert.deepEqual(released, { success: true }, 'the remedy must be performable for the rows it exists for')
+
+  const row = store.get('log-1')
+  assert.equal(row?.status, 'SYNCED')
+  assert.equal(row?.backReferenceCheckedAt, null)
+  assert.equal(row?.externalTransactionId, 'XERO-INV-1', 'nothing was sent to the ledger')
+  assert.equal(row?.attemptRevision, 1, 'adoption bumps to 1 exactly as a processor\'s first claim would')
+
+  // THE PART THAT MAKES IT A REMEDY RATHER THAN A STATUS CHANGE.
+  const result = await (await loadSweep())()
+  assert.equal(salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1', 'the link is finally written')
+  assert.deepEqual(followUpTypes(), ['INVOICE_PAYMENT', 'INVOICE_PDF'], 'and the withheld follow-ups are enqueued')
+  assert.equal(result.repaired, 1)
+})
+
+test('[o3d-psvi r2] the adoption is still a COMPARE-AND-SWAP — a second one loses', async () => {
+  // Revision zero is fenced BY THE REVISION: it only ever moves up, so `(id, CANCELLED, 0)` is
+  // strictly stronger than the `(id, CANCELLED)` identity check adoption is accused of degrading to.
+  // Once the first release has taken the row to 1, the same call cannot land again.
+  reset({ status: 'CANCELLED', accountingInvoiceId: null }, { attemptRevision: 0 })
+  await retireLegacyBySweep()
+  salesOrders.set('order-1', { status: 'PROCESSING', accountingInvoiceId: null })
+
+  assert.deepEqual(await (await loadRelease())('log-1', 0), { success: true })
+
+  const second = await (await loadRelease())('log-1', 0)
+  assert.equal(second.success, false)
+  assert.equal(store.get('log-1')?.attemptRevision, 1, 'the row moved once, not twice')
+})
+
+test('[o3d-psvi r2] a row STAMPED between the operator\'s read and the write is refused, not released', async () => {
+  // THE REASON THE ROW'S SHAPE IS RE-READ UNDER THE LOCK. The revision cannot testify to this: an
+  // adoption deliberately accepts a revision that has NOT moved, so the row's own columns are the only
+  // witness left. Releasing a stamped row produces a tidy-looking SYNCED row that no later pass ever
+  // looks at — a remedy nothing performs, which is the whole of this issue.
+  reset({ status: 'CANCELLED', accountingInvoiceId: null }, { attemptRevision: 0 })
+  await retireLegacyBySweep()
+  salesOrders.set('order-1', { status: 'PROCESSING', accountingInvoiceId: null })
+
+  // The sweep reaches a verdict while this call is waiting on the sales-order lock.
+  onSaleLock = () => { store.get('log-1')!.backReferenceCheckedAt = new Date('2026-08-22T00:00:00.000Z') }
+
+  const result = await (await loadRelease())('log-1', 0)
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /already reached a verdict/)
+  assert.match(String(result.error), /external-id release command/, 'and it names a remedy that IS performable')
+  assert.equal(store.get('log-1')?.status, 'CANCELLED', 'nothing was written')
 })

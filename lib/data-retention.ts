@@ -7,6 +7,7 @@ import {
   UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
   backReferenceEvidenceTombstone,
 } from '@/lib/domain/accounting/back-reference-sweep'
+import { followUpObligationsOwedBy } from '@/lib/domain/accounting/compacted-followup-loss'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
 import {
@@ -14,6 +15,13 @@ import {
   inboundEventCompactionData,
   receiptEventCompactionData,
 } from '@/lib/domain/wms/inbound-event-retention'
+
+/**
+ * Rows read per page by the back-reference evidence compaction (o3d-bqw7 r2). Small on purpose: the
+ * population is the unresolved-posted backlog, not the history, and each page is fully consumed
+ * before the next is read.
+ */
+const BACK_REFERENCE_EVIDENCE_COMPACTION_PAGE_SIZE = 100
 
 const RETENTION_KEYS = [
   'retention_sales_orders_months',
@@ -262,14 +270,67 @@ export async function purgeExpiredData(): Promise<{
     // keeps every column the id write needs and stays a candidate for it; what is genuinely lost is
     // only the payload-dependent follow-ups, which the sweep discards under an explicit terminal
     // policy and warns about.
-    const { count: compacted } = await db.accountingSyncLog.updateMany({
-      where: {
-        createdAt: { lt: cutoff },
-        ...UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
-        backReferenceEvidenceCompactedAt: null,
-      },
-      data: backReferenceEvidenceTombstone(new Date()),
-    })
+    //
+    // o3d-bqw7 r2 — AND IT RECORDS WHAT THE ROW OWED, WHICH IS WHY THIS IS NO LONGER ONE STATEMENT.
+    //
+    // The discard warning downstream claims "this row's outstanding follow-ups can no longer be
+    // enqueued", and it used to answer that from the row's TYPE. A type is coarser than the truth: a
+    // SALES_INVOICE owes a payment registration only when its payload carries `_registerPayment`, and
+    // the ordinary sales path composes payloads without it — so tombstones that lost nothing were
+    // warned about, and because the warning gates the obligation release, a false one that is also
+    // unwritable holds an already-posted row at PENDING for ever.
+    //
+    // The only moment that question can be answered truthfully is THIS one: after it, the payload the
+    // answer is derived from does not exist. So the compaction reads each row, derives what it owed
+    // and writes that down in the SAME statement that empties the payload. Per row rather than one
+    // `updateMany`, because a bulk UPDATE cannot compute a different value per row without moving the
+    // enqueue's gate conditions into SQL, where they would drift from the branches they mirror.
+    //
+    // The volume is not the whole table: the predicate is `createdAt < cutoff` AND unresolved AND
+    // holding an external id AND one of four types AND not already compacted, and each daily run only
+    // sees the slice that has newly crossed the cutoff.
+    //
+    // FAILING PART-WAY IS SAFE. Each row is its own statement, and a row that was not reached simply
+    // keeps its payload and is compacted on the next run — the same property the single `updateMany`
+    // had, for the same reason (`backReferenceEvidenceCompactedAt: null` excludes what is done).
+    const compactableWhere = {
+      createdAt: { lt: cutoff },
+      ...UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
+      backReferenceEvidenceCompactedAt: null,
+    }
+    let compacted = 0
+    // Paged from the head each time rather than by cursor: every row this loop touches LEAVES the
+    // predicate, so the next page is always what is left.
+    for (;;) {
+      const page = await db.accountingSyncLog.findMany({
+        where: compactableWhere,
+        select: { id: true, type: true, referenceType: true, externalTransactionId: true, payload: true },
+        orderBy: { createdAt: 'asc' },
+        take: BACK_REFERENCE_EVIDENCE_COMPACTION_PAGE_SIZE,
+      })
+      if (page.length === 0) break
+      const now = new Date()
+      // A page whose rows all decline the write would otherwise be re-read for ever: the select and
+      // the write ask the same question, so that cannot happen for a reason this loop could fix.
+      let writtenThisPage = 0
+      for (const row of page) {
+        const { count } = await db.accountingSyncLog.updateMany({
+          // Re-asserted in the WHERE, not just relied on from the read: a concurrent run, or the
+          // sweep settling the row between the select and this write, must not have its work
+          // overwritten by a tombstone computed from state it has moved on from.
+          where: { id: row.id, backReferenceEvidenceCompactedAt: null },
+          data: {
+            ...backReferenceEvidenceTombstone(now),
+            // Keys only — no name, address, amount or document text. See the migration.
+            followUpObligations: followUpObligationsOwedBy(row),
+          },
+        })
+        compacted += count
+        writtenThisPage += count
+      }
+      if (writtenThisPage === 0) break
+      if (page.length < BACK_REFERENCE_EVIDENCE_COMPACTION_PAGE_SIZE) break
+    }
     backReferenceEvidenceCompacted = compacted
   }
 

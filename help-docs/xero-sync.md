@@ -1667,7 +1667,29 @@ about what it could not do: check the activity log after a bulk retry over old f
 The follow-ups that **do** survive compaction are still queued in that situation. A sales invoice
 tombstone, for example, keeps everything the invoice-PDF job needs, so the retry enqueues it even
 when the warning itself could not be written down — only the *settling* of the row waits for the
-warning, never the work.
+warning, never the work. **The repair sweep queues them too**, which it previously did not: it used
+to announce the loss and settle a tombstone without calling the enqueue at all, which threw away the
+same PDF the warning was telling you had survived.
+
+**The warning names what the row actually owed, not what its type could owe.** A sales invoice only
+owes a payment registration when the payment was recorded on it at the time it was queued — an order
+invoiced with no receipt against it never owed one, and a tombstone of it lost nothing. Retention
+therefore writes down what each row owed at the moment it compacts it, from the payload it is about
+to erase, and the warning is raised only for what that record names. Two consequences worth knowing:
+
+- rows compacted **before this shipped** carry no such record, and there is no way to give them one —
+  the payload it would be derived from is exactly what was thrown away. Those rows keep the older,
+  broader answer, so a sales invoice tombstone from before the change is still reported as having
+  lost a payment registration even when it never owed one. The activity entry says which it was:
+  `classificationBasis` is `row-record` for a row that answered for itself and `type-table` for one
+  that could not;
+- a row that owed nothing recoverable is now **settled silently**, with no warning at all. That is
+  the intended outcome, not a missing alarm: there was nothing to lose.
+
+A follow-up rebuilt from a tombstone also carries the organisation the original row was raised
+against — recorded in a column retention does not touch — so it can be posted. Before, it was queued
+carrying nothing and refused at the socket, which meant the PDF the table promised never actually
+went out.
 
 **Do not cancel one of these rows to tidy it away.** Cancelling is irreversible in two ways the row
 gives no warning about: a cancelled row is no longer a repair candidate, so the link that was still
@@ -1761,7 +1783,10 @@ It refuses, naming what to do instead, when:
 - the order **no longer exists** — same answer: the document is real, undo it in Xero;
 - the order **could not be read** — nothing was changed and this is not a verdict about the sale, only about that moment. Try again;
 - the row's outcome was recorded by an **operator assertion** rather than by Xero — the document id is unverified, so open it in Xero and link it to the order by hand;
-- the **repair sweep has already reached a verdict** on the row — releasing it would produce a row no later pass looks at. Use the external-id release command instead.
+- the **repair sweep has already reached a verdict** on the row — releasing it would produce a row no later pass looks at. Use the external-id release command instead. The row is re-read under the order's lock inside the transaction that writes, so a sweep verdict landing while you press the button is caught rather than overwritten;
+- the row has **moved on to a different attempt** since the page was rendered. Reload and judge what the list shows.
+
+**Rows that have never been picked up by a processor can be released too.** Historic rows — and any row the sweep retires before a processor ever claimed it — carry no attempt of their own. The release adopts such a row instead of refusing it: the write is still a compare-and-swap, so if anything claims or moves the row first, the release loses and tells you what changed.
 
 Releasing needs the **settings** permission.
 
