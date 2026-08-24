@@ -346,6 +346,11 @@ FENCE_DROPINS_CREATED=()
 # The point of no return: the new build has answered its health check. Nothing after this may
 # stop it, re-fence it or revoke CONNECT again (o3d-2sm1.5, Codex r4 HIGH).
 PAST_POINT_OF_NO_RETURN=false
+# Does a unit this run manages serve the app with `next dev`? A development server compiles
+# from source and reports the literal build id `development`, so it CANNOT serve a production
+# build id and the build-id proof below can never be established from it. That is "cannot
+# prove", not "proven wrong" (o3d-2sm1.5, r6 CRITICAL).
+DEV_SERVER_UNIT=false
 
 CRON_BACKUP="${STATE_DIR}/crontab-${APP_USER}.bak"
 DB_FENCE_SCRIPT="${APP_DIR_REAL}/scripts/fence-db-connections.mjs"
@@ -757,8 +762,18 @@ refence_db_connections() {
     node "$DB_FENCE_SCRIPT" --fence --state-file="$DB_FENCE_STATE" || rc=$?
   [[ "$rc" -eq 0 ]] || return 1
   DB_FENCE_UP=true
+  # DO NOT SUBSTITUTE THE ADMIN URL WHEN THE COMPOSER REFUSES (o3d-2sm1.5, r6).
+  # `--print-migration-url` throws precisely so that a migration can never run AS THE ADMIN
+  # while the log announces the application role; catching that throw and assigning
+  # DEPLOY_ADMIN_DATABASE_URL substitutes exactly the URL it refused to emit. Fail loudly and
+  # leave it empty instead: the fence is up, and nothing this trap does next needs the URL.
+  local url_rc=0
   MIGRATION_DATABASE_URL="$(as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$DB_FENCE_SCRIPT" --print-migration-url 2>/dev/null)" || MIGRATION_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}"
+    node "$DB_FENCE_SCRIPT" --print-migration-url)" || url_rc=$?
+  if [[ "$url_rc" -ne 0 || -z "$MIGRATION_DATABASE_URL" ]]; then
+    MIGRATION_DATABASE_URL=""
+    warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
+  fi
   return 0
 }
 
@@ -1050,6 +1065,36 @@ if [[ "${#SERVICE_UNITS[@]}" -gt 0 ]]; then
 else
   warn "Launcher: no systemd unit serves ${APP_DIR_REAL}; falling back to pid stop + 'nohup npm start'."
 fi
+
+# IS ONE OF THEM A DEVELOPMENT SERVER? (o3d-2sm1.5, r6 CRITICAL)
+#
+# The selector above matches on WorkingDirectory, and on a stage box the unit that resolves to
+# this app dir is `next dev` (ims-stage-dev.service), not `next start`. Such a unit is STILL
+# selected on purpose: it is a live writer into this database, so it must be stopped and
+# drained for the migration exactly like a production unit. What it cannot do is take part in
+# the build-id proof — `next dev` compiles from source and answers with the literal build id
+# `development`, which is eleven characters and therefore clears the scrape's length filter.
+# Treating that as "the build on disk is NOT serving" made the mismatch branch fire on every
+# single run: build, stop, migrate, start, health pass, then a die with the point of no return
+# still false, so the trap re-stopped the units it had just correctly started, installed the
+# reboot fence and held the CONNECT revoke. A migrated schema, nothing serving and the app role
+# locked out of its own database, deterministically. Recorded here so the proof phase can say
+# "cannot prove" rather than "proven wrong".
+unit_is_dev_server() {
+  local unit="$1" exec_start
+  exec_start="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true)"
+  [[ "$exec_start" == *"next dev"* || "$exec_start" == *"run dev"* || "$exec_start" == *"run-dev"* ]]
+}
+
+for unit in "${SERVICE_UNITS[@]:-}"; do
+  [[ -n "$unit" ]] || continue
+  if unit_is_dev_server "$unit"; then
+    DEV_SERVER_UNIT=true
+    warn "${unit} runs a DEVELOPMENT server (\`next dev\`). It is still stopped and drained for the"
+    warn "migration, but it cannot serve a production build id, so the build-id proof after the"
+    warn "restart will report 'cannot prove' rather than identifying a stale predecessor."
+  fi
+done
 
 # Adoption, and it is the FIRST thing that touches this box after the lock and the unit
 # detection — before the pull, before `npm ci`, before the build. Warning about a fence
@@ -1509,39 +1554,62 @@ else
   # release has already passed", leaving the old build serving a migrated schema with the
   # deploy reporting success. Before the point of no return existed, the trap tore that down.
   #
-  # So the flag is armed only on POSITIVE proof, by one of two channels:
-  #   1. the BUILD_ID embedded in what HEALTH_URL served equals the BUILD_ID on disk. A
-  #      MISMATCH IS FATAL, not a warning — it is the stale-predecessor case, named.
-  #   2. an asset under /_next/static/<BUILD_ID>/ answers 200. Only a process whose own
-  #      BUILD_ID is that one serves that path, so a 200 is the new code identifying itself.
-  #      This is the channel that works when HEALTH_PATH is a JSON route with no build id in it.
-  # Neither answering is NOT a pass. Nothing is proven, so nothing may be declared irreversible.
+  # So the flag is armed only on POSITIVE proof, and by ONE channel: an asset under
+  # /_next/static/<BUILD_ID>/ answering 200. Next matches that prefix against a directory
+  # snapshot taken at startup, so only a process whose own build id is that one serves it —
+  # a 200 is the new code identifying itself, and it works when HEALTH_PATH is a JSON route
+  # with no build id in it.
+  #
+  # THE SCRAPED BUILD ID IS EVIDENCE, NOT A VERDICT (o3d-2sm1.5, r6 CRITICAL). An earlier
+  # round made a scraped id that differs from the one on disk FATAL. That was wrong, and it
+  # was an outage on every run of this script on a box whose unit is a dev server: `next dev`
+  # answers with the literal build id `development`, eleven characters, so the scrape is
+  # non-empty, the mismatch branch fires, and the trap tears down the service it had just
+  # correctly started — migrated schema, nothing serving, app role locked out. The scrape is
+  # also a regex over whatever HTML the health path happens to return; a page that embeds no
+  # build id, embeds a different one, or embeds one behind a CDN is not evidence of a stale
+  # predecessor. So a mismatch WARNS and means "not proven". Not proven is still not a pass:
+  # without the asset channel nothing below is declared irreversible either way.
   # ---------------------------------------------------------------------------
   if [[ -z "$NEW_BUILD_ID" && -f "${APP_DIR_REAL}/.next/BUILD_ID" ]]; then
     NEW_BUILD_ID="$(cat "${APP_DIR_REAL}/.next/BUILD_ID")"
   fi
   [[ -n "$NEW_BUILD_ID" ]] || die "No BUILD_ID on disk, so nothing can prove which build answered ${HEALTH_URL}."
 
-  SERVED_ID="$(curl -sS "$HEALTH_URL" 2>/dev/null | grep -oE '\\?"b\\?":\\?"[A-Za-z0-9_-]+\\?"' | head -1 | grep -oE '[A-Za-z0-9_-]{10,}' | tail -1 || true)"
+  # --max-time, like every other curl on this path: without it a server that accepts the
+  # connection and then stalls hangs the deploy for ever, post-migration, with the fence
+  # already down and no timeout to end it (o3d-2sm1.5, r6).
+  SERVED_ID="$(curl -sS --max-time 10 "$HEALTH_URL" 2>/dev/null | grep -oE '\\?"b\\?":\\?"[A-Za-z0-9_-]+\\?"' | head -1 | grep -oE '[A-Za-z0-9_-]{10,}' | tail -1 || true)"
   if [[ -n "$SERVED_ID" ]]; then
     if [[ "$SERVED_ID" == "$NEW_BUILD_ID" ]]; then
-      NEW_BUILD_SERVING=true
-      ok "Served BUILD_ID matches disk (${NEW_BUILD_ID})."
+      info "The build id in what ${HEALTH_URL} served matches disk (${NEW_BUILD_ID})."
+    elif [[ "$SERVED_ID" == "development" ]]; then
+      warn "${HEALTH_URL} was served by a DEVELOPMENT server (build id 'development'). A dev server compiles from source and can never report the production build id ${NEW_BUILD_ID}, so this is 'cannot prove', not a stale predecessor."
+      DEV_SERVER_UNIT=true
     else
-      die "Served BUILD_ID (${SERVED_ID}) is NOT the build on disk (${NEW_BUILD_ID}). The process answering ${HEALTH_URL} is not this release — a predecessor is still holding port ${PORT}. It is serving a MIGRATED schema, so it is being stopped rather than left up."
+      warn "The build id scraped from ${HEALTH_URL} (${SERVED_ID}) is not the build on disk (${NEW_BUILD_ID}). That is NOT proof either way — the scrape is a regex over whatever that path returns. The asset channel below decides."
     fi
+  fi
+
+  BUILD_ASSET="$(ls "${APP_DIR_REAL}/.next/static/${NEW_BUILD_ID}" 2>/dev/null | head -1 || true)"
+  if [[ -n "$BUILD_ASSET" ]] \
+    && curl -fsS --max-time 5 "http://127.0.0.1:${PORT}/_next/static/${NEW_BUILD_ID}/${BUILD_ASSET}" >/dev/null 2>&1; then
+    NEW_BUILD_SERVING=true
+    ok "The process on port ${PORT} serves /_next/static/${NEW_BUILD_ID}/ — it is this build."
   fi
 
   if ! $NEW_BUILD_SERVING; then
-    BUILD_ASSET="$(ls "${APP_DIR_REAL}/.next/static/${NEW_BUILD_ID}" 2>/dev/null | head -1 || true)"
-    if [[ -n "$BUILD_ASSET" ]] \
-      && curl -fsS --max-time 5 "http://127.0.0.1:${PORT}/_next/static/${NEW_BUILD_ID}/${BUILD_ASSET}" >/dev/null 2>&1; then
-      NEW_BUILD_SERVING=true
-      ok "The process on port ${PORT} serves /_next/static/${NEW_BUILD_ID}/ — it is this build."
+    if $DEV_SERVER_UNIT; then
+      # Not a teardown. The unit this run stopped, migrated behind and restarted is a dev
+      # server; it is serving THIS working tree, which is the new code, and it simply has no
+      # production build id to offer. Nothing is proven, so the point of no return stays
+      # false and the trap keeps its teardown for a later failure — but the absence of proof
+      # here is a property of the launcher, not evidence of a stale predecessor.
+      warn "Cannot prove which build is answering ${HEALTH_URL}: a development server holds port ${PORT}, and /_next/static/${NEW_BUILD_ID}/ is a production artefact it does not serve. The service is up; the release is NOT being declared irreversible."
+    else
+      die "Something answered ${HEALTH_URL}, but nothing proved it was BUILD_ID ${NEW_BUILD_ID}. A predecessor still holding port ${PORT} answers that path too, and the schema has already moved. Refusing to declare the release irreversible on the strength of an open port."
     fi
   fi
-
-  $NEW_BUILD_SERVING || die "Something answered ${HEALTH_URL}, but nothing proved it was BUILD_ID ${NEW_BUILD_ID}. A predecessor still holding port ${PORT} answers that path too, and the schema has already moved. Refusing to declare the release irreversible on the strength of an open port."
 fi
 
 # ---------------------------------------------------------------------------

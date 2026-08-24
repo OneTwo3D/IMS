@@ -981,11 +981,20 @@ refence_db_connections() {
       node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" ) || rc=$?
   [[ "${rc}" -eq 0 ]] || return 1
   DB_FENCE_UP=true
+  # DO NOT SUBSTITUTE THE ADMIN URL WHEN THE COMPOSER REFUSES (o3d-2sm1.5, r6).
+  # `--print-migration-url` throws precisely so that a migration can never run AS THE ADMIN
+  # while the log announces the application role; catching that throw and assigning
+  # DEPLOY_ADMIN_DATABASE_URL substitutes exactly the URL it refused to emit. Fail loudly and
+  # leave it empty instead: the fence is up, and nothing this trap does next needs the URL.
+  local url_rc=0
   MIGRATION_DATABASE_URL="$( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --print-migration-url 2>/dev/null )" \
-    || MIGRATION_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}"
+    node "${DB_FENCE_SCRIPT}" --print-migration-url )" || url_rc=$?
+  if [[ "${url_rc}" -ne 0 || -z "${MIGRATION_DATABASE_URL}" ]]; then
+    MIGRATION_DATABASE_URL=""
+    warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
+  fi
   return 0
 }
 

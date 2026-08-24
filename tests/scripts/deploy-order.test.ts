@@ -1617,9 +1617,8 @@ for (const [name, lines] of [
         .filter(isCode)
         .join('\n')
       assert.ok(
-        /_next\/static\/\$\{NEW_BUILD_ID\}/.test(window) ||
-          /"\$SERVED_ID"\s*==\s*"\$NEW_BUILD_ID"/.test(window),
-        `NEW_BUILD_SERVING=true at line ${proof.index + 1} is not preceded by either proof channel`,
+        /_next\/static\/\$\{NEW_BUILD_ID\}/.test(window),
+        `NEW_BUILD_SERVING=true at line ${proof.index + 1} is not preceded by the build-id-scoped asset fetch`,
       )
     }
   })
@@ -1640,15 +1639,102 @@ for (const [name, lines] of [
   })
 }
 
-test('deploy.sh treats a served BUILD_ID that is not the one on disk as fatal, not as a warning', () => {
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (r6, CRITICAL) — AND MAKING THAT MISMATCH FATAL WAS A DETERMINISTIC OUTAGE.
+//
+// The round above made a scraped build id that differs from the one on disk `die`. But
+// detect_service_units selects any unit whose WorkingDirectory resolves to the app dir, and on
+// this host that is ims-stage-dev.service — a `next dev` server. A dev server's build id is the
+// literal string `development`: eleven characters, so it clears the scrape's {10,} filter, the
+// id is non-empty, and the mismatch branch fires on EVERY run. Sequence: build, stop, migrate,
+// start, health pass, then die — with PAST_POINT_OF_NO_RETURN still false and the fence armed,
+// so the trap re-stopped the units it had just correctly started, installed the reboot fence
+// and held the CONNECT revoke. Migrated schema, nothing serving, application role locked out of
+// its own database. Every time.
+//
+// A mismatch means NOT PROVEN. Only the build-id-scoped asset channel proves, and it is the one
+// that arms the flag; a scrape over whatever HTML the health path returns is evidence, never a
+// verdict.
+// ---------------------------------------------------------------------------
+
+test('deploy.sh treats a served build id that is not the one on disk as unproven, not as fatal', () => {
   const source = DEPLOY_LINES.filter(isCode).join('\n')
   assert.ok(
-    !/warn "Served BUILD_ID/.test(source),
-    'a stale predecessor holding the port is the failure this exists to catch; warning about it arms the flag anyway',
+    !/die "Served BUILD_ID/.test(source),
+    'a scraped id that differs is not proof of a stale predecessor, and killing the deploy there tears down a service that is serving',
   )
   assert.match(
     source,
-    /die "Served BUILD_ID \(\$\{SERVED_ID\}\) is NOT the build on disk/,
-    'the mismatch must stop the deploy while the trap can still stop the predecessor',
+    /warn "The build id scraped from \$\{HEALTH_URL\}/,
+    'the mismatch must still be reported — it is evidence, it is just not a verdict',
+  )
+  // And it must not arm the proof either: the branch that reports the mismatch is a warn and
+  // nothing else. Measured, so this cannot pass by the string simply being absent.
+  const mismatch = DEPLOY_LINES.findIndex((line) => isCode(line) && /warn "The build id scraped from/.test(line))
+  assert.notEqual(mismatch, -1, 'the mismatch branch must exist for this to be asserting anything')
+  const branch = DEPLOY_LINES.slice(mismatch, mismatch + 4)
+    .filter(isCode)
+    .join('\n')
+  assert.ok(!/NEW_BUILD_SERVING=true/.test(branch), 'the mismatch branch must not arm the proof')
+})
+
+test('deploy.sh cannot prove a build id from a development server, and does not call that a stale predecessor', () => {
+  const source = DEPLOY_LINES.filter(isCode).join('\n')
+  assert.match(
+    source,
+    /unit_is_dev_server\(\)/,
+    'the script must be able to tell that a unit it selected runs `next dev`',
+  )
+  assert.match(
+    source,
+    /DEV_SERVER_UNIT=true/,
+    'and record it, so the proof phase can distinguish "cannot prove" from "proven wrong"',
+  )
+  // The dev unit is still SELECTED, so it is still stopped and drained for the migration: it
+  // is a live writer into this database. Excluding it from selection would leave it writing
+  // through the migration, which is worse than not being able to prove a build id.
+  const detect = DEPLOY_LINES.findIndex((line) => isCode(line) && /^detect_service_units\(\)/.test(line))
+  const devCheck = DEPLOY_LINES.findIndex((line) => isCode(line) && /^unit_is_dev_server\(\)/.test(line))
+  assert.ok(detect !== -1 && devCheck > detect, 'the dev-server test must be a separate observation, not a filter inside the selector')
+  assert.ok(
+    !/unit_is_dev_server "\$unit" && continue|unit_is_dev_server[^\n]*\|\| echo "\$unit"/.test(source),
+    'a dev unit must not be filtered out of SERVICE_UNITS — it is a writer that has to be stopped',
+  )
+  // And the teardown is kept for the case it was written for: an unidentified process.
+  assert.match(
+    source,
+    /if \$DEV_SERVER_UNIT; then[\s\S]*?else\s*\n\s*die "Something answered/,
+    'an unidentified process on the port is still fatal; only the dev-server case is downgraded',
   )
 })
+
+test('the build-id scrape is bounded by --max-time like every other curl on that path', () => {
+  const scrape = DEPLOY_LINES.find((line) => isCode(line) && /SERVED_ID="\$\(curl/.test(line))
+  assert.ok(scrape, 'deploy.sh must scrape the served build id')
+  assert.match(
+    scrape as string,
+    /--max-time \d+/,
+    'a server that accepts and then stalls would hang the deploy for ever, post-migration, with the fence down',
+  )
+})
+
+for (const [name, lines] of [
+  ['deploy.sh', DEPLOY_LINES],
+  ['update.sh', UPDATE_LINES],
+  ['install.sh', INSTALL_LINES],
+] as const) {
+  test(`${name}'s trap does not substitute the admin URL for a migration URL the composer refused`, () => {
+    const source = lines.filter(isCode).join('\n')
+    // `--print-migration-url` throws precisely to stop a migration running AS THE ADMIN while
+    // the log announces the application role. Catching that throw and assigning
+    // DEPLOY_ADMIN_DATABASE_URL substitutes exactly the URL it refused to emit.
+    assert.ok(
+      !/--print-migration-url[\s\S]{0,80}\|\|\s*MIGRATION_DATABASE_URL="\$\{?DEPLOY_ADMIN_DATABASE_URL\}?"/.test(source),
+      'the refusal must not be caught and answered with the very URL it refused',
+    )
+    assert.ok(
+      !/--print-migration-url 2>\/dev\/null/.test(source),
+      'and the reason it refused must not be discarded',
+    )
+  })
+}
