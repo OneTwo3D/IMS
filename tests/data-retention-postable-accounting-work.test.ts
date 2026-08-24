@@ -42,6 +42,8 @@ type SyncRow = {
   backReferenceEvidenceCompactedAt?: Date | null
   /** o3d-nepa: the orphan sweep's record that it cancelled a PENDING — pre-call — row. */
   abandonedBeforeRemoteCall?: boolean | null
+  /** o3d-nepa round 4: 'OPERATOR_ASSERTION' when a human settled the row NOT_POSTED. */
+  settlementBasis?: string | null
   payload?: Record<string, unknown>
 }
 
@@ -73,6 +75,7 @@ type Where = {
   backReferenceCheckedAt?: null
   backReferenceEvidenceCompactedAt?: null
   abandonedBeforeRemoteCall?: boolean | null
+  settlementBasis?: string | null
   NOT?: Where
   AND?: Where[]
   OR?: Where[]
@@ -111,6 +114,13 @@ function matches(row: SyncRow, where: Where): boolean {
   if ('abandonedBeforeRemoteCall' in where && (row.abandonedBeforeRemoteCall ?? null) !== where.abandonedBeforeRemoteCall) {
     return false
   }
+  // o3d-nepa round 4 added the operator-assertion arm, spelled as
+  // `{ settlementBasis: null } OR NOT { settlementBasis: 'OPERATOR_ASSERTION' }`. WITHOUT THIS LINE
+  // the double is silently wrong in the dangerous direction rather than the loud one: the inner
+  // `NOT` clause would match every row, so the negation would always be false and the whole arm
+  // would rest on the null test alone — an operator-settled row would look retained here while the
+  // database deleted it, and every test in this file would still pass.
+  if ('settlementBasis' in where && (row.settlementBasis ?? null) !== where.settlementBasis) return false
   if (where.externalTransactionId === null && (row.externalTransactionId ?? null) !== null) return false
   if (where.externalTransactionId && row.externalTransactionId == null) return false
   if ('backReferenceCheckedAt' in where && (row.backReferenceCheckedAt ?? null) !== null) return false
@@ -434,4 +444,66 @@ test('[o3d-nepa] a young unresolved abandonment is untouched by both passes — 
 
   assert.equal(result.backReferenceEvidenceCompacted, 0, 'compaction is scheduled by age, like the delete')
   assert.deepEqual(store.accounting[0].payload, { customer: 'A Person' })
+})
+
+test('[o3d-nepa round 4] an operator-SETTLED cancelled row is DELETED, not kept for ever', async () => {
+  // THE DEFECT. "Resolved" was keyed solely on `abandonedBeforeRemoteCall`, and exactly one writer
+  // ever sets it — the orphan sweep, over a PENDING row. An operator who opened the ledger, saw
+  // nothing, and settled the row NOT_POSTED produced a CANCELLED row with `settlementBasis =
+  // OPERATOR_ASSERTION` and NO flag, so retention held it back for ever as a compacted tombstone.
+  // That assertion is a STRONGER resolution than the flag, not a weaker one.
+  const purgeExpiredData = await loadPurge()
+  seed()
+  store.accounting = [
+    {
+      id: 'operator-settled',
+      createdAt: OLD,
+      status: 'CANCELLED',
+      type: 'SALES_INVOICE',
+      abandonedBeforeRemoteCall: null,
+      externalTransactionId: null,
+      settlementBasis: 'OPERATOR_ASSERTION',
+      payload: { customer: 'A Person' },
+    },
+    // The control, so this is about the assertion and not about the cutoff or the status.
+    {
+      id: 'nobody-resolved',
+      createdAt: OLD,
+      status: 'CANCELLED',
+      type: 'SALES_INVOICE',
+      abandonedBeforeRemoteCall: null,
+      externalTransactionId: null,
+      settlementBasis: null,
+      payload: { customer: 'A Person' },
+    },
+  ]
+
+  const result = await purgeExpiredData()
+
+  assert.equal(result.syncLogsDeleted, 1)
+  assert.deepEqual(store.accounting.map((row) => row.id), ['nobody-resolved'])
+  assert.equal(result.backReferenceEvidenceCompacted, 1, 'and only the unresolved one becomes a tombstone')
+})
+
+test('[o3d-nepa round 4] an operator settlement that NAMES a document is still kept', async () => {
+  // `buildCancelledSaleSettlementData` writes CANCELLED + an operator assertion + a real document
+  // id, for a POSTED assertion whose sale is cancelled. The external id is the ledger's own receipt
+  // and outranks every resolution, so this row must survive exactly as the pre-call-proved one with
+  // an id does. Without this the round-4 arm would delete post evidence.
+  const purgeExpiredData = await loadPurge()
+  seed()
+  store.accounting = [{
+    id: 'settled-but-posted',
+    createdAt: OLD,
+    status: 'CANCELLED',
+    type: 'SALES_INVOICE',
+    abandonedBeforeRemoteCall: null,
+    externalTransactionId: 'XINV-77',
+    settlementBasis: 'OPERATOR_ASSERTION',
+  }]
+
+  const result = await purgeExpiredData()
+
+  assert.equal(result.syncLogsDeleted, 0)
+  assert.ok(store.accounting.some((row) => row.id === 'settled-but-posted'))
 })

@@ -422,7 +422,15 @@ function unpersistedQboPostRecord(incident: UnpersistedQboPost, description: str
  * claim-time marker and it was unsound twice over (a claim is not proof of dispatch, and a failure is
  * not proof of no effect), so the machinery was reverted and the hole was filed instead. What
  * `describeUnpersistedQboPost` does is refuse to describe a protection these four do not have — it
- * tells the operator the effect will repeat, what the effect is, and to settle the row so it stops.
+ * tells the operator the effect will repeat, what the effect is, and WHAT CAN AND CANNOT BE PRESSED.
+ *
+ * IT DOES NOT SAY "SETTLE THE ROW" (round 3), AND IT DOES NOT SAY "YOU NEVER CAN" EITHER (round 4).
+ * The settlement action refuses this row WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR — no attempt
+ * revision, so UNFENCED_ATTEMPT — and no QuickBooks log view renders the control. Once QuickBooks is
+ * not the active connector the same row is settleable BY ADOPTION from the stranded-sync-rows banner,
+ * which is the one per-row way to stop this replay. Do not re-add a bare "settle the row" here, and
+ * do not restate the refusal as an absolute: both wordings have now been wrong, in opposite
+ * directions. The single authority on the wording is `describeUnpersistedQboPost`.
  *
  * Returns whether the id is now durable. `false` means the caller must NOT continue into the
  * follow-ups and must NOT let the outer handler see this iteration.

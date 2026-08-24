@@ -296,7 +296,11 @@ test('STEP 2: the message does not tell an operator to settle a QuickBooks row (
   for (const type of ['INVOICE_EMAIL', 'BILL_ATTACHMENT', 'INVOICE_PDF', 'WC_INVOICE_NOTE']) {
     const description = await incidentMessage(type)
     assert.doesNotMatch(description, /then settle sync row log-1 by hand/, `${type} still names an unperformable step`)
-    assert.match(description, /WHAT YOU CANNOT DO: settle sync row log-1 by hand/, type)
+    assert.match(
+      description,
+      /WHAT YOU CANNOT DO WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR: settle sync row log-1 by hand/,
+      type,
+    )
     assert.match(description, /UNFENCED_ATTEMPT/, type)
   }
 })
@@ -360,4 +364,94 @@ test('STEP 4: the message says the lever is BLUNT, because it stops every QuickB
   assert.match(description, /recalls nothing already queued or already done/)
   // And it points at the filed work rather than implying the hole is closed.
   assert.match(description, /o3d-3lhp/)
+})
+
+// ---------------------------------------------------------------------------
+// STEP 5 — THE REFUSAL IS NOT AN ABSOLUTE, AND THE RECORD MUST NOT SAY IT IS (round 4, Codex HIGH)
+//
+// Round 3 wrote "the settlement action refuses EVERY QuickBooks row … and the settle control is not
+// rendered on any QuickBooks view", unqualified — in the one record that is exempt from BOTH
+// retention and the factory reset, so a wrong absolute in it outlives everything else. Both halves
+// hold only while QuickBooks is the ACTIVE connector, and STEP 2 above already settles this very row
+// with Xero active. These tests walk the whole per-row remedy against the shipped code and then
+// require the record to point at it.
+// ---------------------------------------------------------------------------
+
+test('STEP 5: the record no longer states the refusal as an absolute (round 4)', async () => {
+  for (const type of ['INVOICE_EMAIL', 'BILL_ATTACHMENT', 'INVOICE_PDF', 'WC_INVOICE_NOTE']) {
+    const description = await incidentMessage(type)
+    // The two sentences that were false the moment QuickBooks stopped being active.
+    assert.doesNotMatch(description, /refuses EVERY QuickBooks row/, `${type} still claims a universal refusal`)
+    assert.doesNotMatch(description, /not rendered on any QuickBooks view/, `${type} still claims no view has the control`)
+    assert.doesNotMatch(description, /THE ONE LEVER THAT STOPS THE REPEAT/, `${type} still calls the blunt lever the only one`)
+    // What it says instead: the refusal, scoped; and the blunt lever, named as blunt rather than only.
+    assert.match(description, /WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR/, type)
+    assert.match(description, /THE BLUNT LEVER, AVAILABLE NOW/, type)
+  }
+})
+
+test('STEP 5: and it points at the stranded-rows banner, by name, as the per-row remedy (round 4)', async () => {
+  const description = await incidentMessage()
+  assert.match(description, /THE PER-ROW REMEDY DOES EXIST ONCE QUICKBOOKS IS NO LONGER THE ACTIVE CONNECTOR/)
+  assert.match(description, /STRANDED SYNC ROWS/, 'the operator has to be told WHERE the control is')
+  assert.match(description, /BY ADOPTION/, 'and why a revision-0 row is settleable there')
+  // Xero-first resolution, so this can become true without a deliberate retirement.
+  assert.match(description, /XERO-FIRST/)
+  assert.match(description, /both connectors enabled is a guarded state/)
+})
+
+test('STEP 5: the stranded read model DOES mark this exact row settleable, by adoption (round 4)', async () => {
+  const { buildStrandedSyncRowWhere, describeStrandedSyncRow } = await import('@/lib/domain/accounting/stranded-sync-rows')
+
+  // The row the incident describes, with Xero now active.
+  const row = incidentRow()
+  const where = buildStrandedSyncRowWhere('xero') as { status: { in: string[] }; connector?: { not: string } }
+  assert.ok(where.status.in.includes('PROCESSING'), 'a PROCESSING row is in the stranded population')
+  assert.equal(where.connector?.not, 'xero', 'and the list is scoped to rows NOT on the active connector')
+  assert.notEqual(row.connector, 'xero', 'so this QuickBooks row is selected by it')
+
+  const described = describeStrandedSyncRow(
+    {
+      id: row.id,
+      connector: row.connector,
+      type: row.type,
+      status: row.status,
+      referenceType: row.referenceType,
+      referenceId: row.referenceId,
+      externalTransactionId: row.externalTransactionId,
+      errorMessage: row.errorMessage,
+      createdAt: new Date('2026-08-01T00:00:00.000Z'),
+      attemptRevision: row.attemptRevision,
+    },
+    new Date('2026-08-10T00:00:00.000Z'),
+  )
+  assert.equal(described.settleable, true, 'the control IS offered for this row — which is what the record denied')
+  assert.equal(described.requiresAttemptAdoption, true, 'and it is offered by adoption, at revision 0')
+  assert.equal(described.notSettleableReason, null)
+})
+
+test('STEP 5: and the settlement it offers actually terminalises this row and releases the claim (round 4)', async () => {
+  const { settleAccountingSyncRow } = await import('@/app/actions/accounting-settlement')
+
+  // The ONE difference from STEP 2's refusal: which connector is active.
+  state.activeConnector = 'xero'
+  const settled = await settleAccountingSyncRow('log-1', {
+    observedStatus: 'PROCESSING',
+    observedAttemptRevision: 0,
+    outcome: 'NOT_POSTED',
+  })
+  assert.equal(settled.success, true, 'the record said this could never be done')
+  assert.equal(state.rows[0].status, 'CANCELLED', 'the row is terminal, so the stale-claim sweep has nothing to reclaim')
+  assert.equal(state.rows[0].processingStartedAt, null, 'and the claim is released rather than left standing')
+  assert.ok(state.activity.length >= 1, 'with the operator assertion recorded against their name')
+})
+
+test('STEP 5: the banner that lists those rows renders the settle control for them (round 4)', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const banner = await readFile(path.join(process.cwd(), 'app/(dashboard)/sync/connector-orphan-banner.tsx'), 'utf8')
+  // The claim the record used to deny is a rendering claim, so it is checked against the renderer.
+  assert.match(banner, /strandedRows\.map/, 'the banner lists the stranded rows')
+  assert.match(banner, /<SettleSyncRowControl/, 'and renders the settle control inside that list')
+  assert.match(banner, /settleable=\{row\.settleable\}/, 'driven by the read model asserted above')
 })

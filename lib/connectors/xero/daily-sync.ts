@@ -58,7 +58,7 @@ import { buildTransitReconciliationSweepJournal, loadTransitGlReconciliation } f
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
-import { abandonmentProvesNoRemoteCall } from '@/lib/domain/accounting/unresolved-abandoned-claim'
+import { cancelledClaimIsResolved } from '@/lib/domain/accounting/unresolved-abandoned-claim'
 import {
   dailyBatchLiveRefs,
   foldDailyBatchRow,
@@ -632,7 +632,7 @@ const LIVE_DAILY_BATCH_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
  * o3d-nepa: and "no row at all" is only trustworthy because RETENTION NO LONGER PRODUCES IT for the
  * rows this verdict blocks on. Deleting an unresolved abandoned row by age moved it out of the
  * BLOCKED-unproved arm and into ALLOWED — silently, and with no reader failing anywhere — so the
- * refusal below became a rebuild. Retention now keeps exactly the rows `abandonmentProvesNoRemoteCall`
+ * refusal below became a rebuild. Retention now keeps exactly the rows `cancelledClaimIsResolved`
  * calls unproved, and compacts their payload instead; the columns this function selects all survive.
  *
  * A row bearing an `externalTransactionId` blocks whatever its status says: that id exists only
@@ -733,10 +733,16 @@ async function dailyBatchRecreateVerdict(
     }
   }
   // Read from the SHARED rule, not restated (o3d-nepa). Retention's delete predicate asks the same
-  // question of the same columns — "is this abandonment proof that nothing was sent?" — and it is
+  // question of the same columns — "is this cancelled row's abandonment resolved?" — and it is
   // this reader's `rows.length === 0` arm that a wrong answer there turns into a duplicate journal.
   // Two spellings of one rule is how that hole reopens silently.
-  const unproved = rows.filter((row) => !abandonmentProvesNoRemoteCall(row))
+  //
+  // The rule's OPERATOR-ASSERTION arm (round 4) is unreachable from here and must stay so:
+  // `isSettleableAccountingSyncType` refuses DAILY_BATCH_* at every status, so no row this function
+  // ever reads can carry `settlementBasis = OPERATOR_ASSERTION`. The column is selected anyway,
+  // because handing a shared rule a row with the field missing is how a silent `undefined` becomes
+  // a verdict.
+  const unproved = rows.filter((row) => !cancelledClaimIsResolved(row))
   if (unproved.length === 0) return { blocked: false, refusal: null }
   const describe = unproved
     .map((row) => `${row.referenceId} (${row.id}, ${row.status}${row.externalTransactionId ? `, external id ${row.externalTransactionId}` : ''})`)

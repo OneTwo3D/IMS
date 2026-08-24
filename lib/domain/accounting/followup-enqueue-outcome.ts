@@ -1,13 +1,21 @@
 // ---------------------------------------------------------------------------
 // o3d-peh1 — A REFUSAL THAT ITS CALLERS CANNOT SEE IS A NO-OP THAT REPORTS SUCCESS.
 //
-// `enqueueFollowUpSyncLog` has three ways of declining to enqueue a follow-up, and every one of them
-// is a deliberate, correct refusal: an ambiguous idempotency-token history, a ledger that will not
-// say the attempt is absent, and a live sibling holding the scope under a token that is not ours.
-// Each wrote a WARNING to the activity log and then RETURNED NORMALLY, and `Promise<void>` gave the
-// caller nothing to read. So every caller — the connector's own post path, the credit-note
-// re-enqueue sweep, and above all `repairXeroBackReferences` — treated the refusal as "the follow-ups
-// are enqueued".
+// `enqueueFollowUpSyncLog` has TWO ways of declining to enqueue a follow-up, and both are
+// deliberate, correct refusals: an ambiguous idempotency-token history, and a ledger that will not
+// say the attempt is absent. Each wrote a WARNING to the activity log and then RETURNED NORMALLY,
+// and `Promise<void>` gave the caller nothing to read. So every caller — the connector's own post
+// path, the credit-note re-enqueue sweep, and above all `repairXeroBackReferences` — treated the
+// refusal as "the follow-ups are enqueued".
+//
+// THE THIRD CASE IS NOT A REFUSAL AND MUST NOT BE GIVEN A REASON CODE (round 4, Codex LOW). A live
+// sibling holding the scope under a DIFFERENT idempotency token is resolved by
+// `resolveLostFollowUpRevival`, which either answers FOLLOW_UPS_ENQUEUED (the live row carries OUR
+// token, so the work IS queued) or THROWS. Nothing on that path constructs an outcome, so the
+// `slot_lost` reason this union used to declare was unconstructible: a caller could branch on it
+// for ever and never see it, and a reader would believe a refusal existed that in fact surfaces as
+// an exception. It was removed rather than wired up — the throw is the correct behaviour, since the
+// unique index gives the slot away and retrying cannot recover it.
 //
 // The worst of those is the back-reference sweep, because it does not merely continue: it SETTLES.
 // It marks the parent row SYNCED, clears `backReferenceFollowUpsPendingAt` — the last record that
@@ -31,14 +39,16 @@
  * Why a follow-up enqueue declined. These are the machine keys that already appear in the
  * `*_followup_enqueue_refused` activity metadata, so an operator reading the log and a caller
  * branching on the outcome are naming the same thing.
+ *
+ * EVERY MEMBER IS CONSTRUCTED SOMEWHERE. A reason nothing can produce is worse than no reason at
+ * all: it advertises a branch that never runs and describes a refusal an operator will never see.
+ * See the header on `slot_lost`, which was exactly that.
  */
 export type FollowUpEnqueueRefusalReason =
   /** `planFollowUpEnqueue` refused: several FAILED rows for this scope under DIFFERENT tokens. */
   | 'plan_refused'
   /** o3d-0m56: the ledger would not confirm the attempt is absent, so re-posting could duplicate it. */
   | 'ledger_not_clear'
-  /** A live row owns the scope under a different idempotency token, or the enqueue race was lost. */
-  | 'slot_lost'
 
 export type FollowUpEnqueueRefusal = {
   type: string

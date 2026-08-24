@@ -194,12 +194,43 @@ export type UnpersistedQboPost = {
  *   `emailOutbox.deleteMany({})` inside the factory reset, i.e. the whole database. There is not
  *   even a page on which the rows the instruction says to enumerate can be seen.
  *
- *   THEN SETTLE THE ROW — the settlement action refuses this exact row. It requires a fenced attempt
- *   revision, and the QuickBooks processor stamps none, so every QuickBooks row sits at revision 0
- *   and is answered UNFENCED_ATTEMPT for ever; the adoption escape hatch needs the row's connector
- *   NOT to be the active one, which cannot hold for the connector that just produced the incident.
- *   The control is not rendered on any QuickBooks view either. And "mark it SYNCED, or FAILED" named
- *   an outcome the action cannot produce at all: it emits SYNCED or CANCELLED.
+ *   THEN SETTLE THE ROW — the settlement action refuses this exact row WHILE QUICKBOOKS IS THE
+ *   ACTIVE CONNECTOR. It requires a fenced attempt revision, and the QuickBooks processor stamps
+ *   none, so every QuickBooks row sits at revision 0 and is answered UNFENCED_ATTEMPT; the adoption
+ *   escape hatch needs the row's connector NOT to be the active one, which does not hold at the
+ *   instant the incident is raised. The control is not rendered on any QuickBooks LOG view either.
+ *   And "mark it SYNCED, or FAILED" named an outcome the action cannot produce at all: it emits
+ *   SYNCED or CANCELLED.
+ *
+ * ----------------------------------------------------------------------------------------------
+ * ROUND 4 (Codex HIGH): AND THAT REFUSAL IS NOT AN ABSOLUTE — IT IS A FACT ABOUT WHICH CONNECTOR
+ * IS ACTIVE, WHICH IS THE ONE THING THE READER OF THIS RECORD IS MOST LIKELY TO CHANGE.
+ * ----------------------------------------------------------------------------------------------
+ * Round 3 wrote "the settlement action refuses EVERY QuickBooks row … and the settle control is not
+ * rendered on any QuickBooks view", unqualified. Both halves are true only while QuickBooks is
+ * ACTIVE, and the branch's own test proves it: tests/accounting/qbo-remedy-is-performable.test.ts
+ * settles this very row successfully with Xero active. The live path, walked end to end:
+ *
+ *   • PROCESSING is in SETTLEABLE_ACCOUNTING_SYNC_STATUSES, and these four types are not
+ *     DAILY_BATCH_*, so neither the status nor the type gate refuses;
+ *   • `describeStrandedSyncRow` passes `unclaimable: true` UNCONDITIONALLY, so a revision-0 row is
+ *     settleable BY ADOPTION rather than refused UNFENCED_ATTEMPT;
+ *   • `buildStrandedSyncRowWhere` selects PROCESSING rows whose connector is NOT the active one —
+ *     which is exactly this row, once QuickBooks stops being active;
+ *   • and the connector-orphan banner renders `SettleSyncRowControl` for every row it lists.
+ *
+ * So retiring QuickBooks — an ordinary act, and plausibly the very one an operator reading this
+ * record takes — makes the row settleable PER ROW and lets the unbounded replay be stopped for this
+ * row alone. It does not even need a deliberate retirement: `resolveActiveAccountingConnector` is
+ * XERO-FIRST, so enabling Xero is enough while QuickBooks stays enabled (both-enabled is a guarded
+ * state, not an impossible one), and the accounting-sync cron takes the Xero branch and returns
+ * before the QuickBooks processor in that state too.
+ *
+ * WHY GETTING THIS WRONG COSTS MORE HERE THAN ANYWHERE ELSE. This record is exempt from BOTH
+ * retention (the ERROR-level exemption below) and the factory reset. It is the permanent
+ * operator-facing account of a live remote effect, so a wrong ABSOLUTE in it outlives every other
+ * statement in the system. The message therefore qualifies the refusal and POINTS AT THE STRANDED
+ * SYNC ROWS BANNER — the one place the per-row control is rendered for this row.
  *
  * WHY THE MESSAGE WAS FIXED RATHER THAN THE HOLE. Providing the operation is not contained here.
  * The cancel needs a new outbox state — a schema change and a migration — and reusing FAILED would
@@ -274,17 +305,32 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
       + `stale THE SWEEP WILL RECLAIM THE ROW AND RUN THE OPERATION AGAIN OUTRIGHT — ${noRequestId.effect}, `
       + 'unbounded, because no retry is consumed while the row never leaves PROCESSING. '
       + `WHAT TO DO ABOUT THE EFFECT: ${noRequestId.check}. `
-      + `WHAT YOU CANNOT DO: settle sync row ${entry.id} by hand. The settlement action refuses EVERY `
-      + 'QuickBooks row — this connector stamps no attempt revision, so its rows stay at revision 0 and '
-      + 'the attempt fence answers UNFENCED_ATTEMPT permanently — and the settle control is not rendered '
-      + 'on any QuickBooks view. It could not mark a row FAILED in any case: its only two outcomes are '
-      + 'SYNCED and CANCELLED. '
-      + 'THE ONE LEVER THAT STOPS THE REPEAT is turning QuickBooks sync OFF (Sync settings, the Sync '
+      + `WHAT YOU CANNOT DO WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR: settle sync row ${entry.id} by `
+      + 'hand. The settlement action refuses it — this connector stamps no attempt revision, so its rows '
+      + 'stay at revision 0 and the attempt fence answers UNFENCED_ATTEMPT — and the settle control is '
+      + 'not rendered on any QuickBooks LOG view. It could not mark a row FAILED in any case: its only '
+      + 'two outcomes are SYNCED and CANCELLED. '
+      + 'THE BLUNT LEVER, AVAILABLE NOW, is turning QuickBooks sync OFF (Sync settings, the Sync '
       + 'Enabled toggle, i.e. quickbooks_sync_enabled). The stale-claim sweep and the manual sync both '
       + 'gate on it and both stop. It stops EVERY QuickBooks row, not this one, and it recalls nothing '
       + 'already queued or already done; until it is off, the effect above repeats every sweep. '
+      + `AND THE PER-ROW REMEDY DOES EXIST ONCE QUICKBOOKS IS NO LONGER THE ACTIVE CONNECTOR — the `
+      + 'refusal above is a fact about WHICH CONNECTOR IS ACTIVE, not about this row for ever. The '
+      + 'active connector is resolved XERO-FIRST, so enabling Xero is enough on its own (both connectors '
+      + 'enabled is a guarded state, not an impossible one) and no deliberate retirement is needed; the '
+      + 'accounting-sync cron then takes the Xero branch and never reaches the QuickBooks processor, so '
+      + `the replay stops there too. Sync row ${entry.id} then appears in the STRANDED SYNC ROWS list in `
+      + 'the connector-orphan banner on the Sync screen — that list selects unresolved rows on a '
+      + 'NON-ACTIVE connector, PROCESSING included, and it is the one view that renders the Settle '
+      + 'control for this row. It is settled there BY ADOPTION: nothing that participates in the attempt '
+      + 'fence can ever claim a row on a connector that is not active, so the abandoned attempt in front '
+      + 'of you is the only one this row can have had, and the adoption is itself compare-and-swapped on '
+      + '(row, revision 0, status). Settling it NOT_POSTED terminalises it CANCELLED and releases the '
+      + 'claim, so the sweep stops replaying THIS operation without stopping every other QuickBooks row. '
+      + '(Settling is an assertion about the OUTSIDE world and does not undo anything already done or '
+      + 'already queued — the copies above still arrive.) '
       + 'This is the known hole o3d-qn21, and the missing operations — an outbox cancel, and a per-row '
-      + 'remediation that fences the attempt and terminalises it — are filed as o3d-3lhp. Until those '
+      + 'remediation that works WITHOUT retiring the connector — are filed as o3d-3lhp. Until those '
       + 'land this record is the only thing that says the effect repeated.'
   }
   return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as `

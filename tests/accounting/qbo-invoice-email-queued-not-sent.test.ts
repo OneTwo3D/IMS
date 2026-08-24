@@ -127,9 +127,14 @@ test('Codex MEDIUM (round 3): the escalation names the queued copies and the fac
   assert.doesNotMatch(description, /SETTLING THE ROW CANCELS NOTHING THAT IS ALREADY QUEUED/)
   assert.match(
     description,
-    /WHAT YOU CANNOT DO: settle sync row log-1 by hand/,
+    /WHAT YOU CANNOT DO WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR: settle sync row log-1 by hand/,
     'the step the reader would otherwise trust to end it is named as unavailable, not merely as insufficient',
   )
+  // Round 4: unavailable WHILE QUICKBOOKS IS ACTIVE, which is not the same as unavailable. The
+  // unqualified sentence hid the only per-row remedy there is.
+  assert.doesNotMatch(description, /refuses EVERY QuickBooks row/)
+  assert.match(description, /THE PER-ROW REMEDY DOES EXIST ONCE QUICKBOOKS IS NO LONGER THE ACTIVE CONNECTOR/)
+  assert.match(description, /STRANDED SYNC ROWS/)
 
   // ROUND 3 (Codex HIGH). The instruction this test used to pin — "keep at most the one copy the
   // customer should receive, and cancel the rest", then settle — WAS NOT PERFORMABLE. The outbox has

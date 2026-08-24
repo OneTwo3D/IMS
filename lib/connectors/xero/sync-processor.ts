@@ -1273,11 +1273,22 @@ export async function enqueueFollowUpSyncLog(
   //   one that ran.
   //
   //   o3d-peh1 — AND REVISION 0 IS FENCED BY THE REVISION ITSELF, WHICH IS WHY IT IS NO LONGER
-  //   REFUSED. `attemptRevision` only ever moves UP: every writer sets it through
-  //   `nextAttemptRevision`, and nothing anywhere resets it. So `(id, FAILED, attemptRevision: 0)` is
-  //   a STRICTLY STRONGER predicate than the `(id, FAILED)` ABA — a row that has been claimed since
-  //   the read is at 1 or more and matches nothing. The ABA that made revision 0 dangerous also
-  //   cannot occur: getting from FAILED back to FAILED requires a claim, and a claim mints 1.
+  //   REFUSED. ON THIS CONNECTOR. `attemptRevision` only ever moves UP here: every Xero writer sets
+  //   it through `nextAttemptRevision`, and nothing anywhere resets it. So `(id, FAILED,
+  //   attemptRevision: 0)` is a STRICTLY STRONGER predicate than the `(id, FAILED)` ABA — a row that
+  //   has been claimed since the read is at 1 or more and matches nothing. The ABA that made
+  //   revision 0 dangerous also cannot occur: getting from FAILED back to FAILED requires a claim,
+  //   and A XERO CLAIM MINTS 1.
+  //
+  //   THAT ARGUMENT IS XERO-ONLY AND MUST NOT BE READ AS CONNECTOR-GENERAL (round 4, Codex LOW).
+  //   The QuickBooks processor mints NO attempt revision at all: `retryFailedQuickBooksSync` drives
+  //   FAILED -> PENDING and its claim leaves the row at 0, so a QuickBooks row goes
+  //   FAILED -> PENDING -> FAILED WITHOUT THE REVISION MOVING, and the twin of the revival below
+  //   (lib/connectors/quickbooks/sync-processor.ts, the `plan.action === 'reuse'` CAS) carries no
+  //   revision clause whatsoever — it is `{ id, status: 'FAILED' }`, the exact ABA this paragraph
+  //   declares impossible. That is PRE-EXISTING there, not something this change introduced, and
+  //   closing it needs the QuickBooks attempt fence that rounds 6 and 7 failed to build out of
+  //   claim-time markers. It is filed as o3d-rw0w; do not port this justification across.
   //
   //   Refusing it instead was a DEAD END, and that is the defect this replaces. The migration left
   //   every pre-existing FAILED Xero payment and allocation at revision 0; FAILED rows are not

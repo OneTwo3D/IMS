@@ -1700,7 +1700,11 @@ test('[o3d-qn21] a no-identifier operation is escalated as a REPLAY, never as a 
   assert.doesNotMatch(description, /cancel the rest/, 'there is no operation that cancels a queued copy')
   assert.doesNotMatch(description, /then settle sync row log-1 by hand/, 'and none that settles this row')
   assert.match(description, /IMS CANNOT CANCEL A QUEUED COPY/)
-  assert.match(description, /WHAT YOU CANNOT DO: settle sync row log-1 by hand/)
+  assert.match(description, /WHAT YOU CANNOT DO WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR: settle sync row log-1 by hand/)
+  // Round 4 (Codex HIGH): qualified, and pointing at the stranded-rows banner — the unqualified
+  // version denied the one per-row remedy that exists.
+  assert.doesNotMatch(description, /refuses EVERY QuickBooks row/)
+  assert.match(description, /STRANDED SYNC ROWS/)
   assert.match(
     description,
     /kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order id/,

@@ -63,9 +63,17 @@ import type { MirroredEventWriteGuard } from '@/lib/domain/accounting/accounting
  *
  * WHAT IS STILL REFUSED, and none of it is arbitrary: see SETTLEABLE_ACCOUNTING_SYNC_STATUSES
  * (PENDING, SYNCED, CANCELLED), settleableSettlementOutcomes (DAILY_BATCH_*), and the fence's own
- * UNFENCED_ATTEMPT — which is what refuses every QuickBooks row, because that processor stamps no
- * attempt revision and its rows therefore stay at 0 forever. That is not a regression: a QuickBooks
- * row cannot be settled today either, and settling one under a one-sided fence would prove nothing.
+ * UNFENCED_ATTEMPT — which is what refuses a QuickBooks row WHILE QUICKBOOKS IS THE ACTIVE
+ * CONNECTOR, because that processor stamps no attempt revision and its rows therefore stay at 0.
+ *
+ * THAT IS A QUALIFIED STATEMENT AND IT MUST STAY ONE (round 4, Codex HIGH). It is NOT true that a
+ * QuickBooks row can never be settled: `unclaimable` (below) is a fact about the INSTALLATION, and
+ * describeStrandedSyncRow passes it unconditionally for every row on a NON-ACTIVE connector. So the
+ * moment QuickBooks stops being active — which needs no deliberate retirement, since
+ * resolveActiveAccountingConnector is XERO-FIRST — its revision-0 rows become settleable BY
+ * ADOPTION and the stranded-rows banner renders the control for them. Writing the refusal as an
+ * absolute anywhere it is read by an operator (see lib/domain/accounting/unrecorded-posted-document.ts)
+ * hides the only per-row remedy that exists.
  *
  * Pure functions only, so the decision — which statuses are settleable, the data patch per outcome,
  * the mirror guard, and the refusal vocabulary — is unit-testable without a database, exactly as
@@ -272,6 +280,17 @@ export type SettlementAssertion =
 export type SettlementRefusalCode =
   | 'pending_not_settleable'
   | 'already_terminal'
+  /**
+   * A status that is neither settleable, nor PENDING, nor terminal.
+   *
+   * UNREACHABLE FROM `refuseSettlement` (round 4, Codex LOW), and that is stated rather than left to
+   * be discovered: that function is only ever handed a row READ FROM THE DATABASE, and
+   * `AccountingSyncStatus` has exactly five members — PENDING, PROCESSING, SYNCED, FAILED,
+   * CANCELLED — all five of which are answered by the three branches above it. It exists for the
+   * ACTION's pre-read check, where `observedStatus` arrives from the client as a bare `string` and
+   * can be anything at all, and as the arm that keeps the code total if the enum ever grows. Do not
+   * write an operator-facing message that promises this code from a database row.
+   */
   | 'status_not_settleable'
   | 'daily_batch_not_settleable'
   | 'missing_external_id'
