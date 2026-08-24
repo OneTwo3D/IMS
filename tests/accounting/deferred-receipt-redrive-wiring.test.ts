@@ -23,6 +23,9 @@ const state = {
   queued: [] as QueuedRow[],
   activity: [] as Array<{ action: string; level: string; description: string; metadata: Record<string, unknown> }>,
   payments: [] as Array<{ id: string; amount: number; currency: string; method: string | null; reference: string | null; paidAt: Date }>,
+  // o3d-ekn8 r4: WHICH connector the enqueue reports the row was written under. The pinned
+  // registration fences on this, so it has to be able to differ from the pin.
+  enqueueConnector: 'xero' as string,
   order: {
     id: 'order-1',
     orderNumber: 'SO-1',
@@ -122,7 +125,10 @@ mock.module('@/lib/accounting', {
       if (params.idempotencyKey && state.syncRows.some((row) =>
         ['PENDING', 'PROCESSING', 'SYNCED'].includes(row.status)
         && (row.payload as Record<string, unknown>)._idempotencyKey === params.idempotencyKey)) {
-        return { queued: true, connector: 'xero' }
+        // o3d-ekn8 r4: and it says SO. `queued: true` here means "the work is on the queue", not
+        // "this call put it there" — the caller that rolls the write back needs to know the
+        // difference, because there is nothing to roll back and the existing row still posts.
+        return { queued: true, reason: 'already-queued', connector: state.enqueueConnector }
       }
       state.queued.push({ type: params.type, payload: params.payload, idempotencyKey: params.idempotencyKey })
       // A queued row is immediately live and visible to the next receipt's capacity read — which is the
@@ -138,7 +144,7 @@ mock.module('@/lib/accounting', {
       })
       // The enqueue names the connector the row was WRITTEN under (o3d-2sm1 r8), which the pinned
       // registration fences on.
-      return { queued: true, connector: 'xero' }
+      return { queued: true, connector: state.enqueueConnector }
     },
   },
 })
@@ -159,6 +165,7 @@ test.beforeEach(() => {
   state.order.taxForeign = 0
   state.order.pricesIncludeVat = false
   state.order.shoppingLinks = []
+  state.enqueueConnector = 'xero'
 })
 
 test('each receipt is measured against what the PREVIOUS one already consumed', async () => {
@@ -266,33 +273,74 @@ function rowForRetiredInvoice(idempotencyKey: string) {
 
 const ONE_RECEIPT = [{ id: 'pay-1', amount: 100, currency: 'GBP', method: 'card', reference: null, paidAt: new Date('2026-08-01') }]
 
-test('[o3d-ekn8 r3] the SELECTOR no longer treats a retired document\'s row as speaking for the receipt', async () => {
-  // Isolated to the first gate: the old row carries an ANCHORED key for INV-1, so the enqueue's
-  // idempotency short-circuit cannot fire whatever the key is, and only the selection rule decides.
+// ---------------------------------------------------------------------------
+// o3d-ekn8 r4 (Codex HIGH) — AND THEN THE ANCHORING WENT ONE STEP TOO FAR.
+//
+// r3's two tests here asserted that a SYNCED row for pay-1 against INV-1 leaves pay-1 free to be
+// registered AGAINST INV-2 — the same payment id, queued a second time. That is silent
+// over-settlement replacing silent under-settlement. The row is the record of a payment that was
+// actually SENT, and "the old document has been deleted, so its payment went with it" is an
+// assumption about a ledger nothing in this path has read. On QuickBooks a deleted invoice leaves
+// its payment behind as an unapplied credit, and the customer is credited twice.
+//
+// So the receipt is still SELECTED — that is what keeps o3d-ekn8's "never silently unsettled"
+// property, because the guarded decision then runs and REPORTS — and the decision refuses, naming
+// the row an operator has to go and read. Cancelling that row is the one thing that is evidence
+// rather than assumption, and it is what re-opens the path.
+// ---------------------------------------------------------------------------
+
+test('[o3d-ekn8 r4] a retired document\'s row for THIS receipt refuses, loudly, instead of queueing a second payment', async () => {
+  // The old row carries an ANCHORED key for INV-1, so the enqueue's idempotency short-circuit cannot
+  // fire whatever the key is: nothing but the decision decides this.
   state.order.accountingInvoiceId = 'INV-2'
   state.syncRows = [rowForRetiredInvoice('invoice-payment:payment:pay-1:invoice:INV-1')]
   state.payments = [...ONE_RECEIPT]
 
   await redrive('INV-2')
 
-  assert.equal(state.queued.length, 1, 'the replacement invoice is still owed this receipt')
-  assert.equal(state.queued[0].payload.accountingInvoiceId, 'INV-2', 'and it is registered against the REPLACEMENT')
-  assert.equal(state.queued[0].payload.paymentId, 'pay-1')
+  assert.equal(state.queued.length, 0, 'pay-1 has already been sent to the ledger once')
+  const refusals = state.activity.filter((a) => a.action === 'invoice_payment_not_registered')
+  assert.equal(refusals.length, 1, 'and it is REPORTED — silence is the failure o3d-ekn8 exists to prevent')
+  assert.equal(refusals[0].metadata.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
+  assert.match(refusals[0].description, /already registered/i)
+  assert.match(refusals[0].description, /INV-1/, 'the message names the document to go and read')
+  assert.match(refusals[0].description, /cancel the earlier sync row/i, 'and the remedy that clears it')
 })
 
-test('[o3d-ekn8 r3] the whole re-drive settles the REPLACEMENT invoice, legacy un-anchored key and all', async () => {
-  // Both gates, in the shape production actually presents: the surviving row was written before the
-  // key carried a document, so it holds `invoice-payment:payment:pay-1`. With the anchor missing from
-  // the key the enqueue would find that row, report `queued` and write nothing — the second gate — so
-  // relaxing the selector alone would have changed nothing an operator could see.
+test('[o3d-ekn8 r4] an UN-ATTRIBUTED live row on the retired document refuses too', async () => {
+  // It cannot be shown to belong to some other receipt, and for money unknown reads as "possibly
+  // this one" — the direction that can only ever withhold, never duplicate.
   state.order.accountingInvoiceId = 'INV-2'
-  state.syncRows = [rowForRetiredInvoice('invoice-payment:payment:pay-1')]
+  state.syncRows = [{
+    ...rowForRetiredInvoice('invoice-payment:payment:pay-1:invoice:INV-1'),
+    payload: { amount: 100, accountingInvoiceId: 'INV-1', _idempotencyKey: 'x' },
+  }]
   state.payments = [...ONE_RECEIPT]
 
   await redrive('INV-2')
 
-  assert.equal(state.queued.length, 1, 'the replacement invoice is settled rather than left outstanding for ever')
-  assert.equal(state.queued[0].payload.accountingInvoiceId, 'INV-2')
+  assert.equal(state.queued.length, 0)
+  assert.equal(
+    state.activity.filter((a) => a.metadata.refusal === 'SETTLED_ON_RETIRED_DOCUMENT').length,
+    1,
+  )
+})
+
+test('[o3d-ekn8 r4] once the retired row is CANCELLED the replacement invoice IS settled, key and all', async () => {
+  // Cancelling it is an operator asserting they read the ledger and the old payment is gone — the one
+  // fact this code cannot establish for itself. o3d-ekn8's outcome then holds exactly as before: the
+  // replacement is settled rather than left outstanding for ever, under a key anchored to INV-2 so
+  // the retired row can never claim to be this one. The legacy un-anchored key is used deliberately,
+  // because that is the shape production presents and it is what the anchor exists to defeat.
+  state.order.accountingInvoiceId = 'INV-2'
+  state.syncRows = [{ ...rowForRetiredInvoice('invoice-payment:payment:pay-1'), status: 'CANCELLED' }]
+  state.payments = [...ONE_RECEIPT]
+
+  await redrive('INV-2')
+
+  assert.equal(state.queued.length, 1, 'the replacement is settled rather than left outstanding for ever')
+  assert.equal(state.queued[0].payload.accountingInvoiceId, 'INV-2', 'and against the REPLACEMENT')
+  assert.equal(state.queued[0].payload.paymentId, 'pay-1')
   assert.equal(
     state.queued[0].idempotencyKey,
     'invoice-payment:payment:pay-1:invoice:INV-2',
@@ -381,4 +429,68 @@ test('[o3d-ekn8 r3] the same order registers normally when nothing moves under t
 
   assert.equal(state.queued.length, 1)
   assert.deepEqual(state.activity.filter((a) => a.action === 'invoice_payment_not_registered'), [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-ekn8 r4 (Codex MEDIUM) — THE ROLLBACK THAT ROLLS NOTHING BACK.
+//
+// The pinned registration throws out of its transaction when the enqueue reports a row written for a
+// connector other than the pinned one, so the write is UNDONE and the operator is told nothing was
+// sent. But `queueAccountingSync` reports `queued: true` WITHOUT WRITING when its idempotency
+// short-circuit finds a live row under the same key. Throwing there rolls back an empty transaction:
+// the pre-existing PENDING row is untouched and WILL post, and "Nothing was sent" is the one message
+// that guarantees nobody goes looking for it.
+// ---------------------------------------------------------------------------
+
+test('[o3d-ekn8 r4] a row this call WROTE for the wrong connector is rolled back, and says so', async () => {
+  state.payments = [...ONE_RECEIPT]
+  state.enqueueConnector = 'quickbooks'
+
+  await redrive('INV-1')
+
+  const refusals = state.activity.filter((a) => a.metadata.refusal === 'PINNED_CONNECTOR_MOVED')
+  assert.equal(refusals.length, 1)
+  assert.equal(refusals[0].metadata.rolledBack, true)
+  assert.equal(refusals[0].metadata.wroteFor, 'quickbooks')
+  assert.match(refusals[0].description, /Nothing was sent/)
+})
+
+test('[o3d-ekn8 r4] but a row that was ALREADY QUEUED elsewhere is not rolled back, and is not reported as unsent', async () => {
+  // The short-circuit's real shape: a concurrent registration for the SAME receipt commits while this
+  // one is queued behind the order lock, so the selection saw nothing and the enqueue finds a live row
+  // under the same key. The row is this receipt's own, so the re-decision under the lock excludes it
+  // from the capacity sum (`live` drops our own row) and registers — and the fence then fires on a
+  // call that wrote nothing.
+  state.payments = [...ONE_RECEIPT]
+  state.enqueueConnector = 'quickbooks'
+  onOrderLock = () => {
+    state.syncRows = [{
+      id: 'log-live',
+      status: 'PENDING',
+      externalTransactionId: null,
+      errorMessage: null,
+      retryCount: 0,
+      payload: {
+        amount: 100,
+        accountingInvoiceId: 'INV-1',
+        paymentId: 'pay-1',
+        _idempotencyKey: 'invoice-payment:payment:pay-1:invoice:INV-1',
+      },
+    }]
+  }
+
+  await redrive('INV-1')
+
+  assert.equal(state.queued.length, 0, 'the enqueue short-circuited, so nothing was written to roll back')
+  assert.equal(state.syncRows.length, 1, 'and the row that was already there is untouched — it will post')
+  const refusals = state.activity.filter((a) => a.metadata.refusal === 'PINNED_CONNECTOR_MOVED')
+  assert.equal(refusals.length, 1)
+  assert.equal(refusals[0].metadata.rolledBack, false, 'there was no write to undo')
+  assert.ok(
+    !/Nothing was sent/.test(refusals[0].description),
+    'telling an operator nothing was sent, while a live row is still going to post, is the defect',
+  )
+  assert.match(refusals[0].description, /ALREADY QUEUED/)
+  assert.match(refusals[0].description, /STILL LIVE AND WILL POST/)
+  assert.match(refusals[0].description, /cancel it/i, 'and the message names what to do about it')
 })

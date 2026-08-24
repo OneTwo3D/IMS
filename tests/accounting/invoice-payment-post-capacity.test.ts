@@ -33,7 +33,7 @@ const ENTRY = 'entry-under-test'
  * complete — or unreadable — reports, i.e. the ordinary case, and the only case that is safe to
  * assume when nothing is known. A test that wants the provably-never-sent row has to say so.
  */
-type RegDefaults = 'bodyCouldHavePosted' | 'settlementBasis' | 'provenNeverAttempted'
+type RegDefaults = 'bodyCouldHavePosted' | 'settlementBasis' | 'provenNeverAttempted' | 'paymentId'
 
 function reg(
   row: Omit<PostedInvoicePaymentRegistration, RegDefaults>
@@ -46,7 +46,10 @@ function reg(
   // Codex round 2: `provenNeverAttempted: false` for the same reason again. "Cannot prove nothing
   // was sent" is the ordinary reading of a FAILED money row, and a default of `true` would silently
   // clear every ambiguity test in this file.
-  return { bodyCouldHavePosted: true, settlementBasis: null, provenNeverAttempted: false, ...row }
+  // o3d-ekn8 r4: `paymentId: null` is the un-attributed row — the shape of everything queued before
+  // the payload recorded which receipt it was for. It is the ordinary case and the one that has to
+  // read as "possibly this one", so a test about a SPECIFIC receipt has to name it.
+  return { bodyCouldHavePosted: true, settlementBasis: null, provenNeverAttempted: false, paymentId: null, ...row }
 }
 
 function decide(overrides: Partial<Parameters<typeof decideInvoicePaymentPost>[0]> = {}) {
@@ -241,12 +244,80 @@ test('this entry s OWN earlier FAILED state never blocks its own retry', () => {
   assert.equal(verdict.post, true)
 })
 
-test('a posted registration against a DIFFERENT document consumes none of this invoice s capacity', () => {
-  // o3d-hbgo: the order's invoice was deleted and re-posted. The old payment settled an invoice this
+test('ANOTHER receipt s registration against a DIFFERENT document consumes none of this invoice s capacity', () => {
+  // o3d-hbgo: the order's invoice was deleted and re-posted. That payment settled an invoice this
   // order no longer has, and counting it would strand every payment on the replacement, for ever.
+  //
+  // o3d-ekn8 r4 narrowed this to what o3d-hbgo actually established: it is an ARITHMETIC statement
+  // about capacity, and it holds for a payment that was for a DIFFERENT RECEIPT. Both receipts are
+  // named here, because a row that could be speaking for THIS one is evidence and not arithmetic —
+  // see the two tests below.
   const verdict = decide({
     amount: 100,
-    registrations: [reg({ id: 'other', status: 'SYNCED', amount: 100, accountingInvoiceId: 'INV-0' })],
+    registrations: [
+      reg({ id: ENTRY, status: 'PENDING', amount: 100, accountingInvoiceId: 'INV-1', paymentId: 'pay-2' }),
+      reg({ id: 'other', status: 'SYNCED', amount: 100, accountingInvoiceId: 'INV-0', paymentId: 'pay-1' }),
+    ],
+  })
+  assert.equal(verdict.post, true)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-ekn8 r4 (Codex HIGH) — THE ANCHORING TRADED SILENT UNDER-SETTLEMENT FOR SILENT
+// OVER-SETTLEMENT.
+//
+// Receipt P is SYNCED against invoice A. The order's invoice id moves to B — reachable, because the
+// delete guard swallows the back-reference write failure. EVERY gate then discards that row: the
+// selector, the enqueue's `live` filter, the anchored idempotency key, and this guard, all narrowed
+// identically. The row is SYNCED, so the unresolved-attempt probe never consults the ledger. Nothing
+// between the selector and the remote payment POST could catch it, and a SECOND payment posts for
+// the same receipt.
+//
+// The safety argument — "the old document has been deleted, so its payment went with it" — is an
+// assumption about a ledger this code never reads. On QuickBooks a deleted invoice leaves its
+// payment as an UNAPPLIED CREDIT: the customer is credited twice.
+//
+// This guard is the backstop, because it is the one gate no enqueue path can skip.
+// ---------------------------------------------------------------------------
+
+test('[o3d-ekn8 r4] THIS receipt s own registration against a RETIRED document refuses the post', () => {
+  const verdict = decide({
+    amount: 100,
+    registrations: [
+      reg({ id: ENTRY, status: 'PENDING', amount: 100, accountingInvoiceId: 'INV-1', paymentId: 'pay-1' }),
+      // The payment that was actually SENT, against the invoice that has since been deleted.
+      reg({ id: 'retired', status: 'SYNCED', amount: 100, accountingInvoiceId: 'INV-0', paymentId: 'pay-1' }),
+    ],
+  })
+  assert.equal(verdict.post, false, 'sending this would pay the same receipt twice')
+  assert.equal(verdict.post === false && verdict.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
+  assert.deepEqual(verdict.post === false && verdict.ambiguousIds, ['retired'], 'and it names the row to go and read')
+})
+
+test('[o3d-ekn8 r4] an UN-ATTRIBUTED registration against a retired document refuses too', () => {
+  // The legacy shape: queued before the payload recorded which receipt it was for. It cannot be
+  // shown to belong to a different receipt, and for money unknown reads as "possibly this one".
+  const verdict = decide({
+    amount: 100,
+    registrations: [
+      reg({ id: ENTRY, status: 'PENDING', amount: 100, accountingInvoiceId: 'INV-1', paymentId: 'pay-1' }),
+      reg({ id: 'retired', status: 'SYNCED', amount: 100, accountingInvoiceId: 'INV-0', paymentId: null }),
+    ],
+  })
+  assert.equal(verdict.post, false)
+  assert.equal(verdict.post === false && verdict.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
+})
+
+test('[o3d-ekn8 r4] a CANCELLED retired-document row clears it — that is the operator saying they read the ledger', () => {
+  // The only thing that IS evidence. Cancelling the row is a human asserting the ledger no longer
+  // holds that payment, which is the fact this code cannot establish for itself — so the replacement
+  // invoice becomes settleable again, and o3d-ekn8's "never silently unsettled for ever" survives.
+  const verdict = decide({
+    amount: 100,
+    registrations: [
+      reg({ id: ENTRY, status: 'PENDING', amount: 100, accountingInvoiceId: 'INV-1', paymentId: 'pay-1' }),
+      reg({ id: 'retired', status: 'CANCELLED', amount: 100, accountingInvoiceId: 'INV-0', paymentId: 'pay-1' }),
+    ],
   })
   assert.equal(verdict.post, true)
 })

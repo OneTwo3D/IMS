@@ -149,7 +149,19 @@ export type PostedInvoiceEvidence = {
  * unwritten rather than merely reported.
  */
 class PinnedConnectorMoved extends Error {
-  constructor(readonly wroteFor: string | null) {
+  constructor(
+    readonly wroteFor: string | null,
+    /**
+     * o3d-ekn8 r4 (Codex MEDIUM) — DID THIS CALL ACTUALLY WRITE THE ROW?
+     *
+     * `queueAccountingSyncTx` reports `queued: true` WITHOUT WRITING when its idempotency
+     * short-circuit finds a live row under the same key. Throwing then rolls back an empty
+     * transaction: the pre-existing PENDING row is untouched and WILL post, so the operator must not
+     * be told "nothing was sent". The two cases need different messages, and this is what separates
+     * them.
+     */
+    readonly alreadyQueued: boolean,
+  ) {
     super(`accounting connector moved to ${wroteFor ?? 'none'} under a pinned payment registration`)
     this.name = 'PinnedConnectorMoved'
   }
@@ -380,6 +392,25 @@ export async function registerInvoicePaymentWithLedger(params: {
               detail: refused.detail, ledgerTotal: refused.ledgerTotal,
             })
           return
+        // o3d-ekn8 r4: a LIVE row for this receipt settles a document the order no longer points at —
+        // the invoice was deleted and re-posted. Every document-scoped filter drops that row, which is
+        // right for capacity and wrong for evidence: it is the record of a payment that was SENT, and
+        // nothing here has read the ledger to see whether deleting the old document took it away.
+        case 'SETTLED_ON_RETIRED_DOCUMENT':
+          await warn('invoice_payment_not_registered',
+            `Recorded ${amount} against ${params.orderReference}, but this receipt is ALREADY REGISTERED ` +
+            `in the accounting connector against a different document (${refused.detail ?? 'unnamed'}) — ` +
+            `that invoice was deleted and re-posted, so the order now points somewhere else. The earlier ` +
+            `payment was actually sent, and on some connectors a deleted invoice leaves its payment behind ` +
+            `as an unapplied credit, so sending this one could credit the customer twice. Nothing was sent. ` +
+            `Open that payment in the accounting system: if it is genuinely gone, cancel the earlier sync ` +
+            `row on the Accounting Sync page and the next invoice sync will register this receipt against ` +
+            `the new document. ${tail}`,
+            {
+              amount: params.amount, currency: params.currency, refusal: refused.refusal,
+              detail: refused.detail, ledgerTotal: refused.ledgerTotal,
+            })
+          return
         // o3d-anu8: a registration on this invoice was SETTLED BY AN OPERATOR, so the figure IMS holds
         // for it is what IMS meant to send and not what the ledger recorded. There IS a document id
         // to go and read, which is what separates this from LEDGER_AMOUNT_UNKNOWN, so the message
@@ -522,7 +553,7 @@ export async function registerInvoicePaymentWithLedger(params: {
       // report it, because a payment queued to a ledger nobody reckoned it against is what this whole
       // path exists to prevent.
       if (pinned && enqueued.queued && enqueued.connector !== pinned.connector) {
-        throw new PinnedConnectorMoved(enqueued.connector)
+        throw new PinnedConnectorMoved(enqueued.connector, enqueued.reason === 'already-queued')
       }
       return enqueued.queued ? ('queued' as const) : ('context-changed' as const)
     }, STOCK_TX_OPTIONS)
@@ -532,15 +563,28 @@ export async function registerInvoicePaymentWithLedger(params: {
       outcome = await runEnqueue()
     } catch (moved) {
       if (!(moved instanceof PinnedConnectorMoved)) throw moved
-      await warn('invoice_payment_not_registered',
+      const head =
         `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but the ` +
         `active accounting connector changed from ${pinned?.connector ?? 'none'} to ` +
         `${moved.wroteFor ?? 'none'} while the payment was being queued, so the registration would have ` +
-        `been sent to a ledger it was never measured against. Nothing was sent. Register the payment in ` +
-        `the accounting connector by hand, or re-run the invoice sync for this order.`,
+        `been sent to a ledger it was never measured against.`
+      // o3d-ekn8 r4: the rollback only rolls something back if this call WROTE something. On the
+      // idempotency short-circuit it did not — a live row was already there under the other
+      // connector, the transaction had nothing in it to undo, and that row is still going to post.
+      // Telling an operator "nothing was sent" there is the one message that stops them looking.
+      await warn('invoice_payment_not_registered',
+        moved.alreadyQueued
+          ? `${head} A registration for this receipt was ALREADY QUEUED under ` +
+            `${moved.wroteFor ?? 'none'} before this ran, so there was nothing to roll back and THAT ROW ` +
+            `IS STILL LIVE AND WILL POST. Check it on the Accounting Sync page: cancel it if it must not ` +
+            `go to that ledger, and re-run the invoice sync for this order afterwards.`
+          : `${head} Nothing was sent. Register the payment in ` +
+            `the accounting connector by hand, or re-run the invoice sync for this order.`,
         {
           amount: params.amount, currency: params.currency, refusal: 'PINNED_CONNECTOR_MOVED',
           pinnedConnector: pinned?.connector ?? null, wroteFor: moved.wroteFor,
+          // Whether the throw actually undid a write, or found the work already queued elsewhere.
+          rolledBack: !moved.alreadyQueued,
         })
       return
     }

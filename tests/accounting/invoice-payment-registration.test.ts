@@ -248,16 +248,117 @@ test('an attempt that PROVABLY never posted does not block the receipt (o3d-0m56
 // o3d-hbgo, read side: WHICH ledger document a registration settled
 // ---------------------------------------------------------------------------
 
-test('o3d-hbgo: a payment registered against a RETIRED invoice leaves the replacement fully open', () => {
+test('o3d-hbgo: ANOTHER receipt s payment against a RETIRED invoice leaves the replacement fully open', () => {
   // The order's invoice was deleted in the ledger and re-posted as INV-2. The SYNCED row settled INV-1,
   // which no longer exists — it consumed none of INV-2. Counting it would refuse every payment on the
   // replacement for ever, and the operator would be told the invoice was already settled when it is not.
+  //
+  // o3d-ekn8 r4: this is an ARITHMETIC statement about capacity, and it holds for a payment made for a
+  // DIFFERENT RECEIPT (`pay-old`, not the `pay-new` being decided). A row that could be speaking for
+  // THIS receipt is evidence rather than arithmetic — see the block below.
   const d = decideInvoicePaymentRegistration({
     ...base,
     accountingInvoiceId: 'INV-2',
     existing: [{ status: 'SYNCED', amount: 100, paymentId: 'pay-old', accountingInvoiceId: 'INV-1' }],
   })
   assert.equal(d.register, true)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-ekn8 r4 (Codex HIGH) — THE ANCHORING TRADED SILENT UNDER-SETTLEMENT FOR SILENT
+// OVER-SETTLEMENT.
+//
+// Receipt P is SYNCED against invoice A. The order's invoice id moves to B — reachable, because the
+// delete guard swallows the back-reference write failure. Every gate then discards that row: the
+// selector drops it, this `live` filter drops it, the anchored idempotency key misses it, and the
+// post-site capacity guard is narrowed identically. The row is SYNCED, so the unresolved-attempt
+// probe never consults the ledger. Nothing between the selector and the remote payment POST could
+// catch it.
+//
+// The safety argument — "the old document has been deleted" — is an assumption about a ledger this
+// code never reads, and it inverts the module's own rule that for money unknown must read as
+// "possibly this one". On QuickBooks a deleted invoice leaves its payment as an UNAPPLIED CREDIT:
+// the customer is credited twice.
+// ---------------------------------------------------------------------------
+
+test('[o3d-ekn8 r4] THIS receipt s own SYNCED row on a retired document refuses, instead of being discarded', () => {
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    existing: [{
+      status: 'SYNCED',
+      amount: 100,
+      paymentId: 'pay-new',
+      accountingInvoiceId: 'INV-1',
+      externalTransactionId: 'PAY-XYZ',
+    }],
+  })
+  assert.equal(d.register, false, 'registering again pays the same receipt twice')
+  assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
+  assert.match(
+    (d.register === false && d.detail) || '',
+    /INV-1.*PAY-XYZ/,
+    'and it names the document and the payment an operator has to go and read',
+  )
+})
+
+test('[o3d-ekn8 r4] an UN-ATTRIBUTED live row on a retired document refuses too', () => {
+  // It cannot be shown to belong to a DIFFERENT receipt, and this module's own rule is that unknown
+  // reads as "possibly this one".
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    existing: [{ status: 'SYNCED', amount: 100, paymentId: null, accountingInvoiceId: 'INV-1' }],
+  })
+  assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
+})
+
+test('[o3d-ekn8 r4] a PENDING row for this receipt on a retired document refuses as well', () => {
+  // Not only SYNCED: a row still in flight against the old document will post to it.
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    existing: [{ status: 'PENDING', amount: 100, paymentId: 'pay-new', accountingInvoiceId: 'INV-1' }],
+  })
+  assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
+})
+
+test('[o3d-ekn8 r4] a CANCELLED retired-document row clears it — that is a human saying they read the ledger', () => {
+  // The one thing that IS evidence, and the reason this refusal is not a permanent dead end: an
+  // operator cancelling the row asserts the ledger no longer holds that payment, which is the fact
+  // the code cannot establish for itself. o3d-ekn8's "never silently unsettled for ever" survives —
+  // the refusal above is WARNED about and names this remedy.
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    existing: [{ status: 'CANCELLED', amount: 100, paymentId: 'pay-new', accountingInvoiceId: 'INV-1' }],
+  })
+  assert.equal(d.register, true)
+})
+
+test('[o3d-ekn8 r4] it is asked BEFORE the capacity arithmetic, which cannot see the row at all', () => {
+  // The `live` filter drops the retired row, so the sum reports the whole invoice as free. Ordering
+  // the gate after the arithmetic would let a receipt that happens to fit straight through.
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    paymentAmount: 1,
+    ledgerTotal: 100,
+    existing: [{ status: 'SYNCED', amount: 100, paymentId: 'pay-new', accountingInvoiceId: 'INV-1' }],
+  })
+  assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT',
+    'a receipt that fits the replacement invoice is still the same receipt already paid')
+})
+
+test('[o3d-ekn8 r4] a row on the CURRENT document is untouched by it — that is the capacity rule s business', () => {
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    paymentAmount: 40,
+    ledgerTotal: 100,
+    existing: [{ status: 'SYNCED', amount: 60, paymentId: 'pay-old', accountingInvoiceId: 'INV-2' }],
+  })
+  assert.equal(d.register, true, 'a deposit and a balance on the SAME document are what o3d-cjt8 admits')
 })
 
 test('our OWN failed row does not block this receipt (o3d-0m56)', () => {
@@ -438,7 +539,11 @@ test('the registration re-decides INSIDE the write transaction, under both locks
   assert.ok(pinRecheckAt > scopeLockAt && pinRecheckAt < queueAt,
     'the pinned document is re-read under the locks too, or the pin is only ever tested in a window '
     + 'the order lock has since reopened')
-  assert.match(body, /throw new PinnedConnectorMoved\(enqueued\.connector\)/,
+  // o3d-ekn8 r4: the throw carries whether this call actually WROTE the row. The enqueue reports
+  // `queued: true` without writing when its idempotency short-circuit finds a live row, and rolling
+  // back an empty transaction while telling the operator "nothing was sent" is the one message that
+  // stops anyone looking for the row that is still going to post.
+  assert.match(body, /throw new PinnedConnectorMoved\(enqueued\.connector, enqueued\.reason === 'already-queued'\)/,
     'and a row written under a connector this call did not pin is rolled back, not reported as queued')
   assert.match(body.slice(decideAt, decideAt + 400), /if \(!underLock\.register\) return \{ refused: underLock \}/,
     'a refused re-decision must abandon the enqueue')
