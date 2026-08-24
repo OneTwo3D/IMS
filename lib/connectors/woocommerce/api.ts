@@ -77,6 +77,53 @@ export const WC_REQUEST_TIMEOUT_MS = 120_000
  */
 export const WC_PAGINATION_UNKNOWN = -1
 
+/**
+ * THE CEILING ON A COLLECTION WALK THAT ENDS ON AN EMPTY PAGE, not on `x-wp-totalpages`.
+ *
+ * o3d-xnwu — THE EMPTY-PAGE RULE WAS APPLIED TO THE WALKS THAT RETURN A LIST AND SKIPPED IN THE
+ * ONES THAT MOVE A CURSOR, which is the wrong way round. `fetchAllWcRefundsForOrder`,
+ * `fetchAllWcVariations` and the category mirror all end only on an empty page and treat a
+ * truncated read as an error. The bulk product sync, the bulk order import, the historical order
+ * import and the initial import all ended on `page > totalPages` — and `totalPages` is a header.
+ *
+ * That is not a theoretical gap. `readWcCountHeader` answers `WC_PAGINATION_UNKNOWN` for an EMPTY
+ * `x-wp-totalpages` and the caller's default of 1 for an ABSENT one, so a store that sends either
+ * gave the bulk product sync the first 100 products, NO ERROR, and therefore an ADVANCED CURSOR —
+ * permanently skipping every product beyond page 1 whose `date_modified` predates the new
+ * watermark. The sentinel was added so a caller "that CHECKS for it can say so out loud"; these
+ * four did not check it, and the same commit that added the sentinel also owned the cursor rule.
+ *
+ * ENDING ON AN EMPTY PAGE MAKES THE HEADER IRRELEVANT TO TERMINATION, which is why it is the fix
+ * rather than a special case for the sentinel: the walk keeps asking until the store says "nothing
+ * more", whatever it did or did not put in a header. `totalPages` survives only as progress text.
+ *
+ * The cost is exactly one extra request per walk — the empty page that proves the ending — which is
+ * the cost the other three walks already pay and document.
+ *
+ * AND A CEILING IS MANDATORY, because "keep asking until it is empty" against a store that ignores
+ * `page` never terminates. 1000 pages is 100,000 rows at the `per_page: 100` every one of these
+ * walks uses, which is far beyond any window they are ever pointed at (all four are scoped by a
+ * cursor, a date range or a status set), and reaching it is reported as an INCOMPLETE READ rather
+ * than passed off as an ending — so the cursor is held and the run is retried, exactly as
+ * `fetchAllWcVariations` does at its own ceiling.
+ */
+export const MAX_WC_PAGE_WALK_PAGES = 1000
+
+/**
+ * The message a walk that never reached an empty page reports.
+ *
+ * ONE WORDING for all four walks, because the thing being said is the same fact and the response is
+ * the same: this was a TRUNCATED READ, nothing about the collection has been established, and the
+ * cursor must not move past what was read.
+ */
+export function describeUnendedWcPageWalk(collection: string, pagesRead: number): string {
+  return `The WooCommerce ${collection} walk did not reach an empty page within ${pagesRead} page(s) `
+    + `(ceiling ${MAX_WC_PAGE_WALK_PAGES}). A walk that ends on the page-count header rather than on an `
+    + 'empty page can be truncated by a store that sends no readable x-wp-totalpages, so this is reported '
+    + 'as an INCOMPLETE READ: nothing is treated as the end of the collection and the sync cursor is not '
+    + 'advanced past it. It will be retried.'
+}
+
 /** Exported for test: the NaN this replaced is the silent truncation itself (o3d-jcx). */
 export function readWcCountHeader(raw: string | null, whenAbsent: number): number {
   if (raw === null) return whenAbsent

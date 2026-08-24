@@ -368,14 +368,23 @@ same one up. And if the store serves **fewer variations than it says the product
 refused rather than applied — a truncated variation list applied as if whole is the silent
 incompleteness this connector exists to avoid.
 
-**How the connector decides it has read a whole list.** Every paged read here — variations,
-categories, tax rates, refunds — ends on an **empty page**, never on what the response headers say.
-A store that does not send a page count is indistinguishable from one reporting a single page, and
-`per_page` is a request rather than a grant, so a store that answers with its own smaller page size
-does so with no error at all. Ending on either would silently import the first page of a list and
-report it as the lot. Each walk also has a page ceiling so that a store ignoring the `page` parameter
-is not asked for ever; reaching that ceiling is reported as an incomplete read, not treated as the
-end of the collection.
+**How the connector decides it has read a whole list.** Every paged read here ends on an **empty
+page**, never on what the response headers say — variations, categories, tax rates and refunds, and
+now the four bulk walks as well: the **product sync**, the **order import sweep**, the **historical
+order import** and the **initial import**. A store that does not send a page count is
+indistinguishable from one reporting a single page, and `per_page` is a request rather than a grant,
+so a store that answers with its own smaller page size does so with no error at all. Ending on
+either would silently import the first page of a list and report it as the lot. Each walk also has a
+page ceiling so that a store ignoring the `page` parameter is not asked for ever; reaching that
+ceiling is reported as an incomplete read, not treated as the end of the collection.
+
+The four bulk walks are the ones with something to lose from getting this wrong, because three of
+them **move a cursor**. A truncated read that looked clean would advance the product or order sync
+cursor past everything it never asked for, and nothing re-reads behind a cursor — so an incomplete
+walk is recorded as an **error**, which is exactly the condition those cursors already refuse to
+advance on. The initial import goes further: a truncated read **fails the pass outright**, because
+that pass is what unlocks ongoing live order sync, and a backfill cut short at its first page has
+still "imported at least one order".
 
 ### What the connector will NOT change
 

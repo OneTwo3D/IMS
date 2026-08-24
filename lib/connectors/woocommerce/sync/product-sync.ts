@@ -6,7 +6,7 @@ import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { getSettingValue } from '@/lib/settings-store'
-import { wcFetch, wcPut, WC_PAGINATION_UNKNOWN } from '../api'
+import { wcFetch, wcPut, WC_PAGINATION_UNKNOWN, MAX_WC_PAGE_WALK_PAGES, describeUnendedWcPageWalk } from '../api'
 import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
 import { isPermanentProductSyncConflict, WcVariationLimitExceededError } from './product-sync-errors'
 import {
@@ -1449,8 +1449,34 @@ export const MAX_WC_VARIATION_PAGES =
  *
  * Checked BETWEEN pages, so one in-flight request may overshoot it — that is the
  * "+ WC_REQUEST_TIMEOUT_MS" term in the invariant.
+ *
+ * AND IT HAS TO COVER THE PAGE CEILING, WHICH IS THE RELATIONSHIP NOTHING USED TO STATE (o3d-xnwu,
+ * Codex LOW). The two variation ceilings are sized against DIFFERENT worst cases —
+ * MAX_WC_VARIATIONS_PER_PRODUCT against the write transaction, MAX_WC_VARIATION_PAGES against the
+ * stingiest page size a store grants — and neither was ever compared to this one. Put together they
+ * describe a real product: the largest SUPPORTED product against the stingiest SUPPORTED store
+ * needs MAX_WC_VARIATION_PAGES (101) round trips, and every one of them has to fit inside this
+ * budget or the walk throws the transient above. Transient means retried; retried means the same
+ * 101 requests against the same slow store; so a product on the wrong side of that line RETRIES FOR
+ * EVER, makes no progress, and produces no operator-facing signal at all — the throw is a webhook
+ * item failure, not a "this product cannot be imported" line.
+ *
+ * WC_VARIATION_PAGE_LATENCY_ALLOWANCE_MS below names the per-request allowance this budget implies,
+ * and tests/wc-variation-fetch-budget.test.ts asserts it is a plausible one. Raising either ceiling
+ * without raising this budget fails there rather than in production.
  */
 export const WC_VARIATION_FETCH_BUDGET_MS = 5 * 60_000
+
+/**
+ * The per-round-trip time this budget leaves when the walk actually needs its whole page ceiling.
+ *
+ * Derived, not chosen — it exists so the relationship between the three constants is a value
+ * something can assert about rather than a division somebody has to notice. If it drops below what
+ * a WooCommerce variations page plausibly takes, the largest supported product on the stingiest
+ * supported store can never be imported and will retry silently for ever.
+ */
+export const WC_VARIATION_PAGE_LATENCY_ALLOWANCE_MS =
+  WC_VARIATION_FETCH_BUDGET_MS / MAX_WC_VARIATION_PAGES
 
 /**
  * How many SKUs go into one `WHERE sku IN (...)` (o3d-jcx).
@@ -1541,7 +1567,14 @@ async function fetchAllWcVariations(
       throw new Error(
         `Fetching variations for WC product ${wcParentId} exceeded its ${WC_VARIATION_FETCH_BUDGET_MS}ms `
         + `budget after ${page - 1} page(s) and ${byId.size} variation(s); refusing to keep a claimed `
-        + 'webhook item in flight past the inbox reclaim window. Nothing was written and it will be retried.',
+        + 'webhook item in flight past the inbox reclaim window. Nothing was written and it will be retried. '
+        // The signal the retry loop otherwise never gives (o3d-xnwu, Codex LOW). Transient means the
+        // same walk runs again against the same store, so if the store is simply slower than
+        // WC_VARIATION_PAGE_LATENCY_ALLOWANCE_MS per page this never succeeds and nothing else says so.
+        + `The budget allows about ${Math.round(WC_VARIATION_PAGE_LATENCY_ALLOWANCE_MS)}ms per request across `
+        + `the ${MAX_WC_VARIATION_PAGES}-page ceiling; if this product keeps failing here the store is `
+        + 'serving variation pages more slowly than that, and the budget (or the store) has to change — '
+        + 'retrying alone will not clear it.',
       )
     }
 
@@ -2214,6 +2247,11 @@ export async function syncAllWcProducts(
 
   let page = 1
   let totalPages = 1
+  /**
+   * o3d-xnwu: the walk ends on an EMPTY PAGE, not on `totalPages`. Until this is true the run is an
+   * incomplete read and the cursor below must not move — see describeUnendedWcPageWalk.
+   */
+  let endedOnEmptyPage = false
 
   async function reportProgress(message: string, currentPage = page) {
     if (!onProgress) return
@@ -2232,7 +2270,10 @@ export async function syncAllWcProducts(
 
   await reportProgress('Preparing WooCommerce product import...', 0)
 
-  while (page <= totalPages) {
+  // THE CEILING, NOT THE HEADER. `totalPages` is progress text from here on: a store that sends an
+  // empty or absent `x-wp-totalpages` used to end this walk after page one with NO error, and the
+  // cursor below advanced past every product it never asked for (o3d-xnwu).
+  while (page <= MAX_WC_PAGE_WALK_PAGES) {
     await reportProgress(
       `Fetching WooCommerce products... page ${page}${totalPages > 1 ? ` / ${totalPages}` : ''}`,
     )
@@ -2258,6 +2299,15 @@ export async function syncAllWcProducts(
     totalPages = tp
     if (totalItems > 0) totalProducts = totalItems
     const products = data as WcFullProduct[]
+
+    // THE ONLY PROOF OF AN ENDING (o3d-xnwu). Checked before any work, so the empty page costs one
+    // request and contributes nothing; and checked instead of `page > totalPages`, so a store that
+    // says nothing readable about how many pages it has cannot truncate this walk silently.
+    if (products.length === 0) {
+      endedOnEmptyPage = true
+      break
+    }
+
     if (totalProducts === 0) totalProducts = products.length
 
     await reportProgress('Importing WooCommerce products...')
@@ -2343,6 +2393,14 @@ export async function syncAllWcProducts(
   // webhook path has had since o3d-gtk, and the automatic re-drive is filed as a follow-up; it is
   // not a reason to keep the cursor pinned, because a pinned cursor re-reads the WHOLE catalogue
   // every cycle for ever and still never imports the conflicted product.
+  // A WALK THAT NEVER ENDED IS AN ERROR, AND IT LANDS IN `errors` SO THE CURSOR IS HELD (o3d-xnwu).
+  // Not in `permanentErrors`: nothing about the catalogue is established by a truncated read, and a
+  // retry against a store that starts sending the header again succeeds. `break` on a fetch error
+  // above already pushed its own error, so this only fires on a clean walk that ran out of ceiling.
+  if (!endedOnEmptyPage && result.errors.length === 0) {
+    result.errors.push(describeUnendedWcPageWalk('product', page - 1))
+  }
+
   if (result.errors.length === 0) {
     const cursorAt = new Date().toISOString()
     await db.$transaction(async (tx) => {

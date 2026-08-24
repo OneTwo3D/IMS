@@ -2,7 +2,7 @@ import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { notify } from '@/lib/notifications'
-import { wcFetch } from './api'
+import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeUnendedWcPageWalk } from './api'
 import {
   HISTORICAL_IMPORT_UNIT_COST,
   buildStockMovementValueFields,
@@ -113,8 +113,12 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
     let page = 1
     let totalPages = 1
     const perPage = 100
+    // o3d-xnwu: this walk ends on an EMPTY PAGE, not on `x-wp-totalpages`. A store that sends no
+    // readable page count reports 1, and this import would then treat the first 100 orders of the
+    // window as the whole window and finish 'done' — a silent partial backfill.
+    let endedOnEmptyPage = false
 
-    while (page <= totalPages) {
+    while (page <= MAX_WC_PAGE_WALK_PAGES) {
       const processed = progress.ordersProcessed + progress.ordersSkipped
       progress.currentPage = page
       progress.message = progress.totalOrders > 0
@@ -153,6 +157,12 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
       progress.totalPages = totalPages
       if (result.totalItems > 0) progress.totalOrders = result.totalItems
       const orders = result.data as WcOrder[]
+
+      // THE ONLY PROOF OF AN ENDING (o3d-xnwu).
+      if (orders.length === 0) {
+        endedOnEmptyPage = true
+        break
+      }
 
       // Batch all movements for this page
       const batch: {
@@ -198,6 +208,13 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
       }
 
       page++
+    }
+
+    // A walk that never reached an empty page read only part of the window, and this job has no
+    // cursor to hold — so the incompleteness is recorded as a page error, which the summary line
+    // below already counts and reports (o3d-xnwu).
+    if (!endedOnEmptyPage) {
+      progress.errors.push(describeUnendedWcPageWalk('historical order', page - 1))
     }
 
     progress.status = 'done'

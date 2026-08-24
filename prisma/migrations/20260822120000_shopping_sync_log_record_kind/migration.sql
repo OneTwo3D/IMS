@@ -92,15 +92,20 @@ UPDATE "shopping_sync_logs"
 --   2. APPLY THIS MIGRATION. Additive and nullable, so it is metadata-only.
 --   3. RUN THE TWO UPDATE STATEMENTS ABOVE (they are part of this file and run with it). They only
 --      ever write a NULL cell, so they are idempotent and safe to re-run at any time.
---   4. THE VERIFICATION CHECKS RUN, AND THE DEPLOY SCRIPT RUNS THEM. They are declared beside this
---      file as `verify.sql`, in the form scripts/run-migration-verifications.mjs executes: three
+--   4. RUN THE VERIFICATION CHECKS. They are declared beside this file as `verify.sql`: three
 --      statements, each returning one row of (check_name, violations), every count required to be
---      zero. The script runs them after the schema has moved and BEFORE the new build is started,
---      and refuses to start it on any non-zero answer. This step is therefore ENFORCED, not merely
---      written down — which is the whole difference from the previous revision of this block, where
---      the same queries sat in a comment that nothing executed. A non-zero answer means something
---      wrote this table after step 1, i.e. the predecessor was still live; the response is to stop
---      it, re-run step 3, and re-verify.
+--      zero.
+--
+--      *** ON THIS BRANCH YOU RUN THEM BY HAND. *** The runner they are written for,
+--      `scripts/run-migration-verifications.mjs`, DOES NOT EXIST HERE. It is on the sibling branch
+--      o3d-batch-deployseq (o3d-2sm1.1), which is not an ancestor of this one, and until that
+--      branch merges nothing in this tree executes verify.sql. Feed it to psql against the
+--      migrated database yourself, read all three counts, and do not start the new build unless
+--      every one is 0.
+--
+--      A non-zero answer means something wrote this table after step 1, i.e. the predecessor was
+--      still live. The response is to stop it, establish what the rows are (see check 2's caveat in
+--      verify.sql — the repair is NOT unconditional), and re-verify.
 --   5. START THE NEW BUILD. From this moment every park and every hold is stamped as it is written,
 --      and both predicates require the stamp.
 --
@@ -109,7 +114,8 @@ UPDATE "shopping_sync_logs"
 --   (a) THE OLD BINARY CREATES UNSTAMPED ROWS. A hold or a park written between the backfill and
 --       the new build carries a NULL recordKind and is invisible to BOTH new predicates: the hold
 --       is never released, so the order is never invoiced, and the park is never listed in the
---       recovery inbox. This one IS repairable — re-running step 3 stamps it — which is why the
+--       recovery inbox. This one IS repairable — re-running step 3 stamps it, ONCE THE ROWS HAVE
+--       BEEN LOOKED AT (check 2 is a superset; see its caveat in verify.sql) — which is why the
 --       verification queries below exist and why a non-zero answer is a hard stop.
 --
 --   (b) THE OLD BINARY OVERWRITES AN ALREADY-STAMPED PARK, AND THIS IS NOT REPAIRABLE.
@@ -136,9 +142,10 @@ UPDATE "shopping_sync_logs"
 --       hold carries the hold stamp, and a genuine park carries a refund body.
 --
 --       That is check 3 in verify.sql, and it is mandatory like the other two: the cutover fails and
---       the new build is not started if it returns anything but zero. Saying this failure mode was
---       invisible was worse than leaving it unchecked — it told an operator there was no point
---       looking, so the damage would have stood unqueried rather than undetectable.
+--       the new build is not started if it returns anything but zero. On this branch "fails" means
+--       YOU stop, because nothing here runs the file — see the branch note below. Saying this
+--       failure mode was invisible was worse than leaving it unchecked; saying a script enforces it
+--       when no such script exists is the same mistake in the other direction.
 --
 --       WHAT IS STILL NOT COVERED, stated so the correction does not overclaim: the old release
 --       sweep can also flip a mis-selected park to FAILED or SYNCED and replace its errorMessage
@@ -147,19 +154,36 @@ UPDATE "shopping_sync_logs"
 --       real, and stopping the writer first remains the defence for it. Which is why step 1 is a
 --       step and not a note: check 3 is the second line, not a licence to skip the first.
 --
--- AUTOMATING THIS IS NOT THIS FILE'S JOB, AND IT HAS AN OWNER WHO HAS DONE IT: o3d-2sm1.1, on
--- branch o3d-batch-deployseq — "the deploy script applies the migration and leaves the PREDECESSOR
--- serving against the migrated schema". That branch reorders every supported entrypoint to
--- build -> validate -> stop and drain -> migrate -> verify -> start, fences the predecessor off on
--- any post-stop failure, and adds the verification hook (scripts/run-migration-verifications.mjs)
--- that executes the checks a migration declares in verify.sql. This migration is recorded on it as
--- one that needs quiescence.
+-- ---------------------------------------------------------------------------------------------
+-- WHAT THIS BRANCH DOES AND DOES NOT GIVE YOU. READ THIS BEFORE TRUSTING ANY SENTENCE ABOVE.
 --
--- SO THE DIVISION OF LABOUR IS: that branch owns the ORDER (step 1, which is the only defence
--- against (b) and against the errorMessage rewrite), and this migration owns the CHECKS — declared
--- next to this file rather than described in it, so they are run by the script instead of by
--- somebody remembering to. deploy.sh is deliberately NOT edited here: two branches rewriting the
--- same script would conflict and one would silently win.
+-- NEITHER STEP 1 NOR STEP 4 IS AUTOMATED ON THIS BRANCH. Both are MANUAL, and this file used to say
+-- otherwise — four times over — which was worse than saying nothing, because an operator who
+-- believes the deploy enforces quiescence has no reason to enforce it themselves.
+--
+--   * `scripts/run-migration-verifications.mjs` DOES NOT EXIST IN THIS TREE. verify.sql is written
+--     in the form that runner expects, and nothing here executes it.
+--   * `scripts/deploy.sh` IN THIS TREE RUNS migrate -> build -> stop -> start. So on this branch
+--     the PREDECESSOR SERVES THROUGH THE ALTER, THROUGH BOTH BACKFILL STATEMENTS AND THROUGH THE
+--     WHOLE BUILD — which is precisely failure mode (b) below, the one this file calls not
+--     repairable. Applying this migration with `bash scripts/deploy.sh` and nothing else is the
+--     unsafe cutover, not the safe one.
+--
+-- THE MERGE DEPENDENCY, STATED AS A DEPENDENCY: this migration must not be applied by an automated
+-- deploy until o3d-batch-deployseq (o3d-2sm1.1) is merged. That branch reorders every supported
+-- entrypoint to build -> validate -> stop and drain -> migrate -> verify -> start, fences the
+-- predecessor off on any post-stop failure, and adds the runner that executes verify.sql. This
+-- migration is recorded on it as one that needs quiescence. Until it lands, the ONLY safe way to
+-- apply this is by hand, in the order above: stop the app, `prisma migrate deploy`, run verify.sql
+-- through psql, then build and start.
+--
+-- WHY THE SPLIT IS STILL THE RIGHT ONE: deploy.sh is deliberately NOT edited here, because two
+-- branches rewriting the same script would conflict and one would silently win. That branch owns
+-- the ORDER (step 1, the only defence against (b) and against the errorMessage rewrite) and this
+-- migration owns the CHECKS. The split is defensible only because this paragraph exists — a
+-- migration that declares checks nothing runs, while claiming they are enforced, is worse than one
+-- that asks a human to run them.
+-- ---------------------------------------------------------------------------------------------
 --
 -- A LEGACY PARK THAT ESCAPES ANYWAY STILL FAILS LOUDLY: an unstamped park is not found by
 -- upsertRefundPark's own park lookup, so the next delivery of that refund tries to INSERT a second
@@ -168,18 +192,23 @@ UPDATE "shopping_sync_logs"
 -- so the failure mode is a unique violation somebody sees rather than two live parks for one refund.
 --
 -- VERIFICATION QUERIES — ALL THREE MUST RETURN 0. They live in `verify.sql` beside this file, NOT
--- in this comment, and that is the point of them: the deploy script runs that file at step 4 and
--- will not start the new build on a non-zero count. Copying them back into this block would
--- recreate the exact thing the hook exists to end — a check that can only be read.
+-- in this comment: a second copy is a check that can drift from the one that is actually run. On a
+-- branch where nothing runs it, run it yourself.
 --
 --   1. shopping_sync_logs unstamped held sales invoice   — an old binary CREATED a hold after the
 --                                                          backfill; it would never be released.
---   2. shopping_sync_logs unstamped refund park          — an old binary CREATED a park after the
---                                                          backfill; the inbox cannot see it.
+--   2. shopping_sync_logs unstamped refund park          — an unstamped row of PARK SHAPE. Usually
+--                                                          an old binary that CREATED a park after
+--                                                          the backfill — but it is a SUPERSET, and
+--                                                          the repair is not unconditional. Read
+--                                                          check 2's own comment before acting.
 --   3. shopping_sync_logs park stamp over a held-invoice payload
 --                                                        — an old binary OVERWROTE a stamped park
 --                                                          with an invoice hold; case (b) above.
 --
--- 1 and 2 are repairable by re-running the two UPDATE statements above. 3 is not, and is an
--- incident: the refund evidence on those rows has been replaced.
+-- 1 is repairable by re-running the two UPDATE statements above. 2 is repairable ONLY once the rows
+-- have been confirmed to be refund parks: statement 2 stamps whatever it matches as
+-- 'WC_REFUND_PARK', which puts the row in the recovery inbox with "Wrong order" / "Dismiss" refund
+-- actions on it — the r8 defect, recreated by the remedy. 3 is not repairable, and is an incident:
+-- the refund evidence on those rows has been replaced.
 -- ---------------------------------------------------------------------------------------------

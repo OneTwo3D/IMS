@@ -4,7 +4,7 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { wcFetch } from '../api'
+import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeUnendedWcPageWalk } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
@@ -2611,11 +2611,15 @@ export async function syncNewWcOrders(
     })
   }
 
-  // Fetch orders page by page
+  // Fetch orders page by page — ENDING ON AN EMPTY PAGE, not on `x-wp-totalpages` (o3d-xnwu).
+  // `totalPages` is a header, and `readWcCountHeader` answers the caller's default of 1 for an
+  // absent one; ending on it let a store that sends none truncate this sweep to 100 orders with no
+  // error, after which the cursor below advanced past everything it had never asked for.
   let page = 1
   let totalPages = 1
+  let endedOnEmptyPage = false
 
-  while (page <= totalPages) {
+  while (page <= MAX_WC_PAGE_WALK_PAGES) {
     const params: Record<string, string> = {
       status: statuses.join(','),
       per_page: '100',
@@ -2630,6 +2634,13 @@ export async function syncNewWcOrders(
 
     totalPages = tp
     const orders = data as WcFullOrder[]
+
+    // THE ONLY PROOF OF AN ENDING (o3d-xnwu). Before any work, so it costs one request and imports
+    // nothing.
+    if (orders.length === 0) {
+      endedOnEmptyPage = true
+      break
+    }
 
     for (const order of orders) {
       // Normalised on both sides (o3d-tj6v r4). `getWithdrawalStatuses` already returns normalised
@@ -2725,6 +2736,13 @@ export async function syncNewWcOrders(
     }
 
     page++
+  }
+
+  // A truncated read is a fetch error by another name, so it goes in `errors` and the cursor below
+  // is held (o3d-xnwu). The `break` on a fetch error above pushed its own, so this only fires on a
+  // clean walk that ran out of ceiling without ever being told the collection had ended.
+  if (!endedOnEmptyPage && result.errors.length === 0) {
+    result.errors.push(describeUnendedWcPageWalk('order', page - 1))
   }
 
   // Only advance the cursor after a fully clean run. Advancing after a fetch

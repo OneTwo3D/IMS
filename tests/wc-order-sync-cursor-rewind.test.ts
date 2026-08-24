@@ -50,6 +50,11 @@ mock.module('@/lib/connectors/woocommerce/api', {
       return { data: [], totalPages: 1, totalItems: 0 }
     },
     wcPut: async () => ({ data: null }),
+    // o3d-xnwu: see the note in wc-product-sync-type-preservation.test.ts. The store above already
+    // answers every page with an empty list, which is what now ends the walk.
+    MAX_WC_PAGE_WALK_PAGES: 1000,
+    describeUnendedWcPageWalk: (collection: string, pagesRead: number) =>
+      `The WooCommerce ${collection} walk did not reach an empty page within ${pagesRead} page(s).`,
   },
 })
 

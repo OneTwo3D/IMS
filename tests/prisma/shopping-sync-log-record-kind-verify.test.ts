@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import test from 'node:test'
 
 // ---------------------------------------------------------------------------
@@ -55,6 +55,8 @@ type Row = {
   direction: string
   entityType: string
   entityId: string | null
+  /** o3d-xnwu: check 2 now requires one — every park has it, several other row families do not. */
+  externalId: string | null
   status: string
   payload: Record<string, unknown> | null
 }
@@ -198,6 +200,8 @@ const base: Row = {
   direction: 'FROM_CONNECTOR',
   entityType: 'SalesOrder',
   entityId: 'order-1',
+  // upsertRefundPark always supplies one, and the partial unique index requires it.
+  externalId: '991',
   status: 'PENDING',
   payload: refundPayloadWithTypedReason,
 }
@@ -331,31 +335,90 @@ test('the migration prose no longer tells an operator that case (b) is invisible
   )
 })
 
-test('the cutover requirement is now ENFORCED by the script, not merely written down', () => {
-  // The HIGH this branch answers: the migration told a human to run two queries and then start the
-  // build. Nothing checked that they had. Step 4 now names the file the deploy hook executes and says
-  // what happens on a non-zero answer, and the sibling branch that runs it is named so a reader can
-  // see where the mechanism lives.
+test('the migration does NOT claim a runner this branch does not have', () => {
+  // THE CRITICAL this round answers. The previous revision said, four times over, that
+  // scripts/run-migration-verifications.mjs executes these checks after the schema moves and before
+  // the new build starts — "ENFORCED, not merely written down". THAT SCRIPT IS NOT IN THIS TREE. It
+  // is on o3d-batch-deployseq, which is not an ancestor of HEAD. A migration that promises an
+  // automated guard it does not have is worse than one that asks a human, because the human then
+  // has no reason to act.
   const migration = readFileSync(`${MIGRATION_DIR}/migration.sql`, 'utf8')
+  const verify = readFileSync(VERIFY, 'utf8')
 
-  assert.match(migration, /THE DEPLOY SCRIPT RUNS THEM/, 'the checks are executed, not recited')
-  assert.match(migration, /run-migration-verifications\.mjs/, 'and the runner is named')
-  assert.match(migration, /BEFORE the new build is started/, 'at the point where refusing still helps')
-  assert.match(migration, /ENFORCED, not merely/, 'in those words, where the old revision only asked')
-  assert.match(migration, /o3d-2sm1\.1/, 'the issue that owns the deploy order')
+  // The load-bearing fact, checked against the filesystem rather than against prose. The day the
+  // sibling merges, this test is what says the wording may be upgraded again.
+  assert.equal(
+    existsSync('scripts/run-migration-verifications.mjs'),
+    false,
+    'the runner has landed — the "NOT ON THIS BRANCH" wording in migration.sql and verify.sql is now '
+    + 'stale and must be re-tightened to say the checks are enforced',
+  )
+
+  for (const [name, text] of [['migration.sql', migration], ['verify.sql', verify]] as const) {
+    assert.match(text, /NOT (EXIST IN THIS TREE|ON THIS BRANCH)/, `${name} must say the runner is absent`)
+    assert.match(text, /MANUAL/, `${name} must say what the operator has to do instead`)
+    assert.match(text, /o3d-batch-deployseq/, `${name} names the branch the runner arrives with`)
+  }
+
+  // The merge dependency, stated as a dependency rather than as background reading.
+  assert.match(migration, /THE MERGE DEPENDENCY/, 'the dependency is named as one')
   assert.match(
     migration,
-    /ALL THREE MUST RETURN 0/,
-    'and the summary block counts three checks, not the two it used to inline',
+    /must not be applied by an automated\s*\n?--\s*deploy until o3d-batch-deployseq/,
+    'and says what may not happen until it lands',
   )
-  assert.doesNotMatch(
-    migration,
-    /BOTH VERIFICATION QUERIES BELOW/,
-    'the old instruction pointed at queries in a comment; there are none left to point at',
-  )
-  // The SQL itself must not be duplicated back into the comment: a copy is a check that can drift
-  // from the one the deploy actually runs, which is the failure the hook exists to end.
+
+  // And the actual order this branch's deploy.sh runs, said out loud, because it is the thing that
+  // makes an unattended run the UNSAFE cutover rather than the safe one.
+  assert.match(migration, /migrate -> build -> stop -> start/, 'the order in THIS tree is stated')
+  assert.match(migration, /failure mode \(b\)/, 'and tied to the failure it produces')
+
+  // The claims that were false are gone, not merely softened.
+  assert.doesNotMatch(migration, /ENFORCED, not merely/, 'nothing enforces it here')
+  assert.doesNotMatch(migration, /THE DEPLOY SCRIPT RUNS THEM/, 'no script in this tree runs them')
+
+  // What survives: the checks are still declared, still counted, and still not copied back inline.
+  assert.match(migration, /run-migration-verifications\.mjs/, 'the runner is still named, as the thing that is absent')
+  assert.match(migration, /ALL THREE MUST RETURN 0/)
   assert.doesNotMatch(migration, /SELECT count\(\*\) FROM "shopping_sync_logs"/, 'no second copy of the checks')
+})
+
+test('this branch deploy.sh really does migrate before it stops the predecessor', () => {
+  // The assertion behind the sentence above — read from the script rather than believed. If the
+  // order is ever fixed here, the migration prose describing it becomes wrong and this fails.
+  const deploy = readFileSync('scripts/deploy.sh', 'utf8')
+  const migrateAt = deploy.indexOf('prisma migrate deploy')
+  const stopAt = deploy.indexOf("NEXT_PIDS=$(pgrep -f 'next-server|next start'")
+  assert.ok(migrateAt > 0 && stopAt > 0, 'both steps must be found, or this test asserts nothing')
+  assert.ok(
+    migrateAt < stopAt,
+    'deploy.sh now stops the predecessor before migrating — migration.sql must stop saying it does not',
+  )
+})
+
+test('check 2 is described as the SUPERSET it is, and its repair is not unconditional', () => {
+  // MEDIUM. The header claimed the only thing that could make any check non-zero was a predecessor
+  // writing the table. Check 2 counts ANY unstamped row of park shape, so the next row family with
+  // an entityId trips it on every deploy — written by the CURRENT binary. And the prescribed
+  // response, "re-run the two updates", stamps such a row 'WC_REFUND_PARK', which puts it in the
+  // recovery inbox with "Wrong order" / "Dismiss" refund actions on it: the r8 defect, recreated by
+  // the remedy.
+  const verify = readFileSync(VERIFY, 'utf8')
+  const migration = readFileSync(`${MIGRATION_DIR}/migration.sql`, 'utf8')
+
+  assert.match(verify, /CHECK 2 IS A SUPERSET/, 'the header no longer gives all three the narrow meaning')
+  assert.match(verify, /READ THIS BEFORE ACTING ON A NON-ZERO ANSWER/, 'and check 2 carries its own caveat')
+  assert.match(verify, /Wrong order/, 'the caveat names what the blind repair would do to the row')
+  assert.match(verify, /CHECK 2 IS REPAIRABLE ONLY AFTER THE ROWS HAVE\s*\n?--\s*BEEN IDENTIFIED|REPAIRABLE ONLY AFTER THE ROWS HAVE/,
+    'and the header says the repair is conditional')
+  assert.match(migration, /repairable ONLY once the rows\s*\n?-- have been confirmed|repairable ONLY once the rows/,
+    'and so does the migration summary')
+
+  // Narrowed as far as the columns allow: a row family that carries an order id but no store-side
+  // id no longer trips it.
+  const withoutExternalId: Row = { ...base, recordKind: null, externalId: null }
+  assert.equal(selects(1, withoutExternalId), false, 'no externalId, no park — the narrowing is real')
+  assert.equal(selects(1, { ...withoutExternalId, externalId: '991' }), true, 'and it still catches a real one')
 })
 
 test('deploy.sh is deliberately untouched by this branch', () => {

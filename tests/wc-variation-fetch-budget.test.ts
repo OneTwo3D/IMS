@@ -8,6 +8,7 @@ import {
   PRODUCT_WRITE_TX_MAX_WAIT_MS,
   PRODUCT_WRITE_TX_TIMEOUT_MS,
   WC_VARIATION_FETCH_BUDGET_MS,
+  WC_VARIATION_PAGE_LATENCY_ALLOWANCE_MS,
   WC_VARIATION_PAGE_SIZE,
 } from '@/lib/connectors/woocommerce/sync/product-sync'
 import { getWcWebhookStaleProcessingMs } from '@/lib/connectors/shopping-webhook-inbox'
@@ -69,5 +70,51 @@ test('o3d-jcx: the unbounded fetch could not have fitted the transaction budget'
     budgetPerStatementMs >= 10,
     `only ${budgetPerStatementMs.toFixed(2)}ms per statement is left for ${MAX_WC_VARIATIONS_PER_PRODUCT} `
     + `variations inside a ${PRODUCT_WRITE_TX_TIMEOUT_MS}ms transaction`,
+  )
+})
+
+test('o3d-xnwu: the TIME budget can carry the PAGE ceiling — the relationship the two ceilings never had', () => {
+  // THE GAP THIS CLOSES. MAX_WC_VARIATIONS_PER_PRODUCT is sized against the write transaction and
+  // MAX_WC_VARIATION_PAGES against the stingiest page size a store grants. Neither was ever
+  // compared to WC_VARIATION_FETCH_BUDGET_MS — yet the two together describe a REAL product: the
+  // largest supported product on the stingiest supported store needs every one of those pages, and
+  // all of them have to fit inside the budget.
+  //
+  // If they do not, the walk throws its TRANSIENT budget error, the item is retried, the retry
+  // makes exactly the same 101 requests against exactly the same store, and the product retries for
+  // ever with no progress and no operator-facing line — the throw is a webhook item failure, not a
+  // "this product cannot be imported" record.
+  const roundTripsForTheWorstSupportedProduct = Math.ceil(MAX_WC_VARIATIONS_PER_PRODUCT / 10) + 1
+  assert.ok(
+    MAX_WC_VARIATION_PAGES >= roundTripsForTheWorstSupportedProduct,
+    'precondition: the page ceiling must at least admit that product (asserted above too)',
+  )
+
+  // The allowance the budget implies for each of those round trips, named as a constant so the
+  // relationship is a value rather than a division somebody has to spot.
+  assert.equal(
+    WC_VARIATION_PAGE_LATENCY_ALLOWANCE_MS,
+    WC_VARIATION_FETCH_BUDGET_MS / MAX_WC_VARIATION_PAGES,
+    'the allowance must be derived from the two constants, not chosen independently of them',
+  )
+
+  // One full second per variations page is the floor. Below that the walk is betting on a store
+  // faster than most WooCommerce installs serve a 100-row collection, and losing the bet costs an
+  // unimportable product that nothing reports.
+  assert.ok(
+    WC_VARIATION_PAGE_LATENCY_ALLOWANCE_MS >= 1_000,
+    `${WC_VARIATION_FETCH_BUDGET_MS}ms across a ${MAX_WC_VARIATION_PAGES}-page ceiling leaves only `
+    + `${WC_VARIATION_PAGE_LATENCY_ALLOWANCE_MS.toFixed(0)}ms per request. The largest supported product on `
+    + 'the stingiest supported store cannot be fetched in that, so it would throw transiently and retry '
+    + 'for ever with no progress and no operator signal. Raise WC_VARIATION_FETCH_BUDGET_MS with the '
+    + 'ceilings, or lower MAX_WC_VARIATIONS_PER_PRODUCT.',
+  )
+
+  // And the budget must still fit under the reclaim window after any such rise — the invariant the
+  // second test in this file owns. Restated as a dependency so raising the budget to satisfy the
+  // assertion above cannot silently break that one.
+  assert.ok(
+    WC_VARIATION_FETCH_BUDGET_MS + WC_REQUEST_TIMEOUT_MS < getWcWebhookStaleProcessingMs({}),
+    'raising the fetch budget must not push the worst case past the inbox reclaim window',
   )
 })

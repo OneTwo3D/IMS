@@ -193,6 +193,11 @@ mock.module('@/lib/connectors/woocommerce/api', {
       return { data: [], totalPages: 1, totalItems: 0, error: null }
     },
     wcPut: async () => ({ data: null, error: null }),
+    // o3d-xnwu: the walks now end on an EMPTY PAGE and bound themselves with the shared ceiling, so
+    // a module double that omits these leaves `page <= undefined` and the loop never runs at all.
+    MAX_WC_PAGE_WALK_PAGES: 1000,
+    describeUnendedWcPageWalk: (collection: string, pagesRead: number) =>
+      `The WooCommerce ${collection} walk did not reach an empty page within ${pagesRead} page(s).`,
   },
 })
 

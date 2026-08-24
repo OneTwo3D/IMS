@@ -60,10 +60,18 @@ mock.module('@/lib/notifications', {
 
 mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
+    // o3d-xnwu: PAGE-AWARE, because the walk now ends on an empty page rather than on totalPages.
+    // A double that serves the same orders for every page would be a store ignoring `page`, which is
+    // exactly what the new ceiling exists to stop being asked for ever.
     wcFetch: async (_path: string, params: Record<string, string>) => {
       fetchCalls.push(params)
-      return { data: wcOrders.current, totalPages: 1, totalItems: wcOrders.current.length }
+      const page = Number(params.page ?? '1')
+      const rows = page === 1 ? wcOrders.current : []
+      return { data: rows, totalPages: 1, totalItems: wcOrders.current.length }
     },
+    MAX_WC_PAGE_WALK_PAGES: 1000,
+    describeUnendedWcPageWalk: (collection: string, pagesRead: number) =>
+      `The WooCommerce ${collection} walk did not reach an empty page within ${pagesRead} page(s).`,
   },
 })
 
