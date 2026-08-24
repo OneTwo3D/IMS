@@ -52,6 +52,7 @@ import {
 } from '@/lib/domain/accounting/back-reference'
 import { stampSyncedAtFromDatabaseClock } from './synced-at-clock'
 import { claimHeldFrom, heldClaimWhere, releaseClaimForRetry, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
+import { isMoneyMovingSyncType } from '@/lib/domain/accounting/followup-retry-guard'
 import {
   FOLLOW_UPS_ENQUEUED,
   combineFollowUpEnqueueOutcomes,
@@ -1127,9 +1128,13 @@ async function recordEnqueueRestingOnAssertion(
  * cheaper to pin directly than through a full post-and-follow-up loop.
  *
  * o3d-peh1 — IT RETURNS WHETHER THE FOLLOW-UP IS ACTUALLY OWED, and every path out of it says so.
- * Three of them decline deliberately (an ambiguous token history, a ledger that will not confirm the
- * attempt is absent, a slot lost to a live row under another token), and each used to write a WARNING
- * and then return `void` — which every caller read as "enqueued". The back-reference sweep read it
+ * THREE of them decline deliberately, and they are the whole of `FollowUpEnqueueRefusalReason`: an
+ * ambiguous token history, a ledger that will not confirm the attempt is absent, and a revival
+ * target with no attempt revision whose type the ledger probe does not speak for. A live row holding
+ * the scope under a DIFFERENT token is NOT one of them: `resolveLostFollowUpRevival` either answers
+ * FOLLOW_UPS_ENQUEUED or THROWS, and the `slot_lost` code that once said otherwise was removed as
+ * unconstructible (o3d-peh1 r4). The first two used to write a WARNING and then return `void`, which
+ * every caller read as "enqueued". The back-reference sweep read it
  * that way while SETTLING the parent row, so a money follow-up that was never re-enqueued was logged
  * as recovered. The refusal is now part of the return type, so a caller that settles on it is a
  * compile error rather than a silent loss.
@@ -1307,12 +1312,67 @@ export async function enqueueFollowUpSyncLog(
   // and a clear ledger says nothing about which attempt this write will land on. Both refusals leave
   // the row FAILED and visible, which is the state it was already in; posting twice is not.
   //
-  // With revision 0 now revivable, the o3d-0m56 ledger question is the only one left to ask before a
-  // reuse, and it is asked for EVERY reuse — including the revision-0 ones, which is the whole point
-  // of asking it. A legacy row is the case most likely to have posted and lost its response.
+  // With revision 0 now revivable, the o3d-0m56 ledger question is the one left to ask before a
+  // reuse — BUT IT IS ONLY ASKED OF MONEY-MOVING TYPES, and round 4 wrote that it "is asked for EVERY
+  // reuse" as though it were not (round 5, Codex MEDIUM). `ledgerClearsFollowUpRevival` returns
+  // `{ clear: true }` without probing anything when `isMoneyMovingSyncType(type)` is false, and there
+  // is no ledger to probe for an email, a PDF, a store note or an attachment — none of them creates a
+  // document.
   const reuseAttempt: AttemptRef | null = plan.action === 'reuse'
     ? { id: plan.syncLogId, attemptRevision: failedAttemptRevisions.get(plan.syncLogId) ?? UNCLAIMED_ATTEMPT_REVISION }
     : null
+
+  // SO THE HALF OF ROUND 4's REFUSAL THAT NOTHING REPLACED IS KEPT.
+  //
+  // Round 4 removed a blanket refusal of revision-0 reuse targets. For a MONEY type that was right:
+  // the CAS carries `attemptRevision: 0`, which is strictly stronger than the `(id, FAILED)` ABA, and
+  // the ledger probe now answers the separate question of whether the attempt already committed. For
+  // every other type the second half is missing, and it is missing for the population that most needs
+  // it: the migration left every pre-existing FAILED row at revision 0, so "revision 0 means never
+  // claimed" is true of rows this binary created and FALSE of legacy ones — which reached FAILED by
+  // running, up to MAX_RETRIES times, and for INVOICE_EMAIL that means the customer may already hold
+  // the invoice. `POST_EFFECT.INVOICE_EMAIL` says it in as many words: the email CANNOT be recalled.
+  //
+  // Refusing does NOT strand the work silently. The refusal is part of the return type, so the
+  // back-reference sweep reports it and declines to settle the parent instead of logging a recovery
+  // that did not happen, and the message names a remedy that exists today: the bulk "Retry All" on
+  // the sync log is not attempt-fenced, drives the row FAILED -> PENDING, and the processor's own
+  // claim then mints revision 1 — after which this reuse is fenced like any other. That makes an
+  // unrecallable duplicate a deliberate human act rather than something a sweep does on its own,
+  // which is the most this can honestly offer while no evidence about the effect exists.
+  //
+  // NOT PORTED TO QUICKBOOKS. That processor's reuse CAS carries no revision clause at all, so it has
+  // a different and larger hole; it is filed as o3d-rw0w and closing it needs the QuickBooks attempt
+  // fence, not this refusal.
+  if (reuseAttempt
+    && reuseAttempt.attemptRevision === UNCLAIMED_ATTEMPT_REVISION
+    && !isMoneyMovingSyncType(type)) {
+    const message = `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: the FAILED row it would `
+      + `revive (${reuseAttempt.id}) carries no attempt revision, and ${type} creates no ledger document, so nothing `
+      + 'can establish whether its effect already happened — a row left at revision 0 predates the attempt fence and '
+      + 'reached FAILED by RUNNING, so reviving it could repeat an effect that cannot be taken back. Nothing was '
+      + 'queued and the row is unchanged. Check whether the effect landed (see the row\'s own type), and if it should '
+      + 'run again use Retry All on the accounting sync log: that re-queues the row, the processor\'s claim stamps an '
+      + 'attempt, and every later revival of it is fenced.'
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_followup_enqueue_refused',
+      tag: 'sync',
+      level: 'WARNING',
+      description: message,
+      metadata: {
+        type,
+        referenceType,
+        referenceId,
+        syncLogId: reuseAttempt.id,
+        reason: 'unprobed_unfenced_reuse',
+        failedRowIds: failedRows.map((row) => row.id),
+      },
+    })
+    return refusedFollowUpEnqueue({
+      type, referenceType, referenceId, reason: 'unprobed_unfenced_reuse', message, syncLogId: reuseAttempt.id,
+    })
+  }
 
   const evidence = await ledgerClearsFollowUpRevival({
     connector: XERO_CONNECTOR,

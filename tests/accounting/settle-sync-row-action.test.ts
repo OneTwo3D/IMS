@@ -55,6 +55,14 @@ const state = {
   /** Which connector the installation has active, for the adoption gate (r3 finding 3). */
   activeConnector: 'xero' as string | null,
   /**
+   * The connectors whose sync toggle is ON — the OTHER half of the adoption gate (round 5, Codex
+   * HIGH #1). Both manual Sync actions gate on `<connector>_sync_enabled` and never resolve the
+   * active connector, so a row off the active connector whose toggle is on can still be reclaimed.
+   * Default empty: the connector being retired here is also quiesced, which is what the r3 tests
+   * below were written against.
+   */
+  syncEnabled: new Set<string>(),
+  /**
    * Every ordered side effect, so "the lock is taken FIRST, before the sync row is touched" is an
    * assertion rather than a hope.
    */
@@ -156,6 +164,15 @@ function makeClient() {
         }
         state.activity.push(data)
         return data
+      },
+    },
+    // Round 5: `readAccountingSyncEnabledValue` reads the connector's own sync toggle, exactly as
+    // triggerXeroSync / triggerQuickBooksSync do (`enabled?.value !== 'true'`), so an absent row is
+    // OFF rather than unknown.
+    setting: {
+      findUnique: async ({ where }: { where: { key: string } }) => {
+        const connector = where.key.replace(/_sync_enabled$/, '')
+        return state.syncEnabled.has(connector) ? { key: where.key, value: 'true' } : null
       },
     },
   }
@@ -287,6 +304,9 @@ test.beforeEach(() => {
   // A LIVE sale by default: the ordinary case, and the one every pre-existing test assumes.
   state.sale = { status: 'CONFIRMED' }
   state.activeConnector = 'xero'
+  // Round 5: no connector's sync is enabled by default, so a retired connector is genuinely
+  // quiesced — which is what every adoption test below assumes. The tests that care set it.
+  state.syncEnabled = new Set()
   state.ops = []
 })
 
@@ -891,6 +911,59 @@ test('with NO connector active, every unresolved row is adoptable — nothing is
   const result = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
   assert.equal(result.success, true)
   assert.equal(stored().attemptRevision, 1)
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 5 (Codex HIGH #1) — "NOT THE ACTIVE CONNECTOR" WAS ONLY HALF THE ADOPTION PRECONDITION.
+//
+// The four tests above all leave every sync toggle off, so their retired connector is genuinely
+// unreachable. Turn one on and the premise collapses: `triggerQuickBooksSync` gates on
+// `quickbooks_sync_enabled` and NOTHING ELSE, so a QuickBooks row is claimable by anyone holding
+// `sync` whichever connector is active. Adopting there settles a row the next press reclaims.
+// ---------------------------------------------------------------------------
+
+test('[round 5] a retired-connector row is NOT adopted while that connector’s sync toggle is on', async () => {
+  const settle = await loadAction()
+  state.activeConnector = 'xero'
+  state.syncEnabled = new Set(['quickbooks'])
+  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 0 })]
+
+  const result = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
+
+  assert.equal(result.success, false)
+  assert.equal('code' in result ? result.code : null, 'CONNECTOR_STILL_CLAIMABLE')
+  assert.match('error' in result ? result.error : '', /quickbooks_sync_enabled/, 'the operator is given the lever')
+  assert.equal(stored().status, 'FAILED', 'nothing was written')
+  assert.equal(stored().attemptRevision, 0)
+  assert.equal(settlementAudit().length, 0, 'and no assertion was recorded against anyone’s name')
+})
+
+test('[round 5] the toggle is the ONLY difference between that refusal and the adoption', async () => {
+  const settle = await loadAction()
+  state.activeConnector = 'xero'
+  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 0 })]
+
+  state.syncEnabled = new Set(['quickbooks'])
+  assert.equal((await settle('log-1', notPosted({ observedAttemptRevision: 0 }))).success, false)
+
+  state.syncEnabled = new Set()
+  const settled = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
+  assert.equal(settled.success, true)
+  assert.equal(stored().attemptRevision, 1, 'the adoption mints the attempt once nothing can claim the row')
+})
+
+test('[round 5] a FENCED row on a still-enabled retired connector settles as before', async () => {
+  // The claimability question is only ever asked of revision 0. A row carrying a real attempt is
+  // fenced on that attempt, and a concurrent claim loses the CAS — this must not gate it.
+  const settle = await loadAction()
+  state.activeConnector = 'xero'
+  state.syncEnabled = new Set(['quickbooks'])
+  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 3 })]
+
+  const result = await settle('log-1', notPosted({ observedAttemptRevision: 3 }))
+
+  assert.equal(result.success, true)
+  assert.equal(stored().attemptRevision, 4)
 })
 
 // ---------------------------------------------------------------------------

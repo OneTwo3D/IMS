@@ -204,6 +204,17 @@ async function incidentMessage(type = 'INVOICE_EMAIL') {
   )
 }
 
+/**
+ * ROUND 5 (Codex HIGH #1): retiring the connector is only HALF the adoption precondition. The other
+ * half is `quickbooks_sync_enabled` being off, because `triggerQuickBooksSync` gates on that alone.
+ * Every test below that expects an adoption to succeed sets both, and the two tests at the end pin
+ * what happens when only the first is set.
+ */
+function retireQuickBooks() {
+  state.activeConnector = 'xero'
+  state.settings.set('quickbooks_sync_enabled', 'false')
+}
+
 test.beforeEach(() => {
   state.rows = [incidentRow()]
   state.activity = []
@@ -278,7 +289,7 @@ test('STEP 2: it is refused because QuickBooks is ACTIVE, not because it is unre
   // active connector is the only difference between these two runs.
   const { settleAccountingSyncRow } = await import('@/app/actions/accounting-settlement')
 
-  state.activeConnector = 'xero'
+  retireQuickBooks()
   const adopted = await settleAccountingSyncRow('log-1', {
     observedStatus: 'PROCESSING', observedAttemptRevision: 0, outcome: 'NOT_POSTED',
   })
@@ -313,7 +324,7 @@ test('STEP 3: a settlement that DOES succeed can only produce SYNCED or CANCELLE
   const { settleAccountingSyncRow } = await import('@/app/actions/accounting-settlement')
   // A fenced row on a retired connector — the one shape this action does settle — so the two
   // outcomes are observed rather than read off a type.
-  state.activeConnector = 'xero'
+  retireQuickBooks()
 
   state.rows = [incidentRow({ connector: 'quickbooks', status: 'FAILED', attemptRevision: 4, type: 'INVOICE_PAYMENT' })]
   const notPosted = await settleAccountingSyncRow('log-1', {
@@ -392,7 +403,10 @@ test('STEP 5: the record no longer states the refusal as an absolute (round 4)',
 
 test('STEP 5: and it points at the stranded-rows banner, by name, as the per-row remedy (round 4)', async () => {
   const description = await incidentMessage()
-  assert.match(description, /THE PER-ROW REMEDY DOES EXIST ONCE QUICKBOOKS IS NO LONGER THE ACTIVE CONNECTOR/)
+  // Round 5 corrected the CONDITION this sentence states — it is now a conjunction, and STEP 6
+  // pins both halves — but the claim it makes is still the one round 4 was raised to add: the
+  // per-row remedy is not impossible, it is conditional.
+  assert.match(description, /THE PER-ROW REMEDY DOES EXIST/)
   assert.match(description, /STRANDED SYNC ROWS/, 'the operator has to be told WHERE the control is')
   assert.match(description, /BY ADOPTION/, 'and why a revision-0 row is settleable there')
   // Xero-first resolution, so this can become true without a deliberate retirement.
@@ -424,6 +438,9 @@ test('STEP 5: the stranded read model DOES mark this exact row settleable, by ad
       attemptRevision: row.attemptRevision,
     },
     new Date('2026-08-10T00:00:00.000Z'),
+    // Round 5: the loader's answer, and this test's scenario is the one where it is YES — Xero
+    // active AND quickbooks_sync_enabled off. The NO case is the two tests at the end of this file.
+    () => true,
   )
   assert.equal(described.settleable, true, 'the control IS offered for this row — which is what the record denied')
   assert.equal(described.requiresAttemptAdoption, true, 'and it is offered by adoption, at revision 0')
@@ -433,8 +450,9 @@ test('STEP 5: the stranded read model DOES mark this exact row settleable, by ad
 test('STEP 5: and the settlement it offers actually terminalises this row and releases the claim (round 4)', async () => {
   const { settleAccountingSyncRow } = await import('@/app/actions/accounting-settlement')
 
-  // The ONE difference from STEP 2's refusal: which connector is active.
-  state.activeConnector = 'xero'
+  // The only difference from STEP 2's refusal: QuickBooks is no longer active AND its sync toggle
+  // is off, which is the whole adoption precondition (round 5).
+  retireQuickBooks()
   const settled = await settleAccountingSyncRow('log-1', {
     observedStatus: 'PROCESSING',
     observedAttemptRevision: 0,
@@ -454,4 +472,173 @@ test('STEP 5: the banner that lists those rows renders the settle control for th
   assert.match(banner, /strandedRows\.map/, 'the banner lists the stranded rows')
   assert.match(banner, /<SettleSyncRowControl/, 'and renders the settle control inside that list')
   assert.match(banner, /settleable=\{row\.settleable\}/, 'driven by the read model asserted above')
+})
+
+// ---------------------------------------------------------------------------
+// STEP 6 — THE REMEDY'S OWN PRECONDITION WAS FALSE FOR EXACTLY THESE ROWS (round 5, Codex HIGH #1)
+//
+// Round 4 told the operator that enabling Xero is "enough on its own" and that the replay "stops
+// there too". Both are about the CRON. The QuickBooks manual Sync action gates on
+// `quickbooks_sync_enabled` and never resolves the active connector, so in the state round 4
+// directs an operator into — Xero enabled, QuickBooks still enabled — the button still runs the
+// processor and its stale-claim sweep reclaims the row the operator just settled.
+//
+// Every test here DRIVES THE SHIPPED CODE. The premise is established by calling
+// `triggerQuickBooksSync` rather than by reading it, and the refusal by calling
+// `settleAccountingSyncRow`.
+//
+// REVERT EVIDENCE (each verified by putting that one thing back and re-running this file):
+//   * reverting `isStrandedRowUnclaimable` to `activeConnector !== connector` fails
+//     "the settlement is REFUSED while QuickBooks sync is still enabled".
+//   * dropping the `readAccountingSyncEnabledValue` term from `adoptAttempt` in
+//     app/actions/accounting-settlement.ts fails the same test.
+//   * deleting the CONNECTOR_STILL_CLAIMABLE early return fails "…and it is refused with the LEVER,
+//     not with the fence's absolute".
+// ---------------------------------------------------------------------------
+
+test('STEP 6: the QuickBooks Sync BUTTON still runs with Xero active — the premise, exercised (round 5)', async () => {
+  const { triggerQuickBooksSync } = await import('@/app/actions/quickbooks-sync')
+
+  // Exactly the state round 4's message tells the operator to create.
+  state.activeConnector = 'xero'
+  state.settings = new Map([['quickbooks_sync_enabled', 'true']])
+
+  const ran = await triggerQuickBooksSync()
+  assert.equal(ran.success, true)
+  assert.equal(
+    state.processorRan,
+    true,
+    'retiring QuickBooks as the ACTIVE connector does not stop this path — it never asks which connector is active',
+  )
+
+  // The control run: the toggle is the only thing that does stop it, which is why it is the
+  // precondition rather than the active connector.
+  state.processorRan = false
+  state.settings = new Map([['quickbooks_sync_enabled', 'false']])
+  const refused = await triggerQuickBooksSync()
+  assert.equal(refused.success, false)
+  assert.equal(state.processorRan, false)
+})
+
+test('STEP 6: the settlement is REFUSED while QuickBooks sync is still enabled (round 5)', async () => {
+  const { settleAccountingSyncRow } = await import('@/app/actions/accounting-settlement')
+
+  state.activeConnector = 'xero'
+  state.settings = new Map([['quickbooks_sync_enabled', 'true']])
+
+  const result = await settleAccountingSyncRow('log-1', {
+    observedStatus: 'PROCESSING',
+    observedAttemptRevision: 0,
+    outcome: 'NOT_POSTED',
+  })
+
+  assert.equal(result.success, false, 'adopting here is a settlement the next press of the Sync button overwrites')
+  // NOTHING was written, so the operator is not left believing a claim was released.
+  assert.equal(state.rows[0].status, 'PROCESSING')
+  assert.equal(state.rows[0].processingStartedAt !== null, true, 'the claim still stands')
+  assert.equal(state.activity.length, 0)
+})
+
+test('STEP 6: …and it is refused with the LEVER, not with the fence’s absolute (round 5)', async () => {
+  const { settleAccountingSyncRow } = await import('@/app/actions/accounting-settlement')
+
+  state.activeConnector = 'xero'
+  state.settings = new Map([['quickbooks_sync_enabled', 'true']])
+  const result = await settleAccountingSyncRow('log-1', {
+    observedStatus: 'PROCESSING', observedAttemptRevision: 0, outcome: 'NOT_POSTED',
+  })
+
+  assert.equal('code' in result ? result.code : null, 'CONNECTOR_STILL_CLAIMABLE')
+  const error = 'error' in result ? result.error : ''
+  assert.match(error, /quickbooks_sync_enabled/, 'the one thing that changes the answer')
+  // UNFENCED_ATTEMPT's own message ends "this row cannot be settled per-attempt" — the same wrong
+  // absolute round 4 existed to remove, restated where an operator would act on it.
+  assert.doesNotMatch(error, /cannot be settled per-attempt/)
+})
+
+test('STEP 6: turning the toggle off is the ONLY difference that makes it settle (round 5)', async () => {
+  const { settleAccountingSyncRow } = await import('@/app/actions/accounting-settlement')
+
+  state.activeConnector = 'xero'
+  state.settings = new Map([['quickbooks_sync_enabled', 'true']])
+  const refused = await settleAccountingSyncRow('log-1', {
+    observedStatus: 'PROCESSING', observedAttemptRevision: 0, outcome: 'NOT_POSTED',
+  })
+  assert.equal(refused.success, false)
+
+  // One variable changed.
+  state.settings = new Map([['quickbooks_sync_enabled', 'false']])
+  const settled = await settleAccountingSyncRow('log-1', {
+    observedStatus: 'PROCESSING', observedAttemptRevision: 0, outcome: 'NOT_POSTED',
+  })
+  assert.equal(settled.success, true)
+  assert.equal(state.rows[0].status, 'CANCELLED')
+  assert.equal(state.rows[0].processingStartedAt, null, 'the claim is released')
+})
+
+test('STEP 6: an ABSENT toggle row counts as off, exactly as the Sync action reads it (round 5)', async () => {
+  const { settleAccountingSyncRow } = await import('@/app/actions/accounting-settlement')
+
+  // `triggerQuickBooksSync` does `enabled?.value !== 'true'`, so no row at all is OFF. Treating a
+  // missing row as unknown-and-therefore-claimable would strand every install that never wrote it.
+  state.activeConnector = 'xero'
+  state.settings = new Map()
+  const settled = await settleAccountingSyncRow('log-1', {
+    observedStatus: 'PROCESSING', observedAttemptRevision: 0, outcome: 'NOT_POSTED',
+  })
+  assert.equal(settled.success, true)
+  assert.equal(state.rows[0].status, 'CANCELLED')
+})
+
+test('STEP 6: the record names BOTH conditions and no longer says the replay stops on Xero alone (round 5)', async () => {
+  for (const type of ['INVOICE_EMAIL', 'BILL_ATTACHMENT', 'INVOICE_PDF', 'WC_INVOICE_NOTE']) {
+    const description = await incidentMessage(type)
+    // The sentence that was true of the cron and false of the button.
+    assert.doesNotMatch(description, /so the replay stops there too/, `${type} still says Xero alone stops the replay`)
+    assert.doesNotMatch(description, /enabling Xero is enough on its own/, type)
+    // What it says instead: both conditions, the button named, and the toggle named.
+    assert.match(description, /NEEDS BOTH OF TWO THINGS/, type)
+    assert.match(description, /IT DOES NOT STOP THE MANUAL SYNC/, type)
+    assert.match(description, /TURN quickbooks_sync_enabled OFF AS WELL/, type)
+    // And the order that keeps it a PER-ROW remedy rather than a permanent shutdown, since the
+    // toggle it now requires is the same blunt lever that stops every other QuickBooks row.
+    assert.match(description, /then turn quickbooks_sync_enabled back\s+on/, type)
+    assert.doesNotMatch(description, /without stopping every other QuickBooks row/, type)
+  }
+})
+
+test('STEP 6: the record states the stranded list’s limit rather than promising the row will appear (round 5)', async () => {
+  const description = await incidentMessage()
+  assert.match(description, /IT IS NOT A COMPLETE LIST/)
+  assert.match(description, /50 OLDEST/, 'the limit the Sync page actually passes')
+  assert.match(description, /sorts LAST/, 'a fresh incident is at the bottom, which is what makes the limit bite')
+})
+
+test('STEP 6: and that claim about the list is true of the shipped read model (round 5)', async () => {
+  const { buildStrandedSyncRowOrderBy, pageStrandedSyncRows } = await import('@/lib/domain/accounting/stranded-sync-rows')
+
+  // "oldest first" and "a fresh incident sorts LAST" are the same fact, and it is this ordering.
+  assert.deepEqual(buildStrandedSyncRowOrderBy(), [{ createdAt: 'asc' }, { id: 'asc' }])
+
+  // And a row past the limit is genuinely dropped rather than shown — driven, not read.
+  const rows = Array.from({ length: 51 }, (_, i) => ({
+    id: `log-${String(i).padStart(3, '0')}`,
+    connector: 'quickbooks',
+    type: 'INVOICE_EMAIL',
+    status: 'PROCESSING',
+    referenceType: 'SalesOrder',
+    referenceId: `order-${i}`,
+    externalTransactionId: null,
+    errorMessage: null,
+    createdAt: new Date(Date.UTC(2026, 0, 1) + i * 3_600_000),
+    attemptRevision: 0,
+  }))
+  const page = pageStrandedSyncRows(rows, 50, new Date('2026-08-10T00:00:00.000Z'), () => true)
+  assert.equal(page.rows.length, 50)
+  assert.equal(page.hasMore, true, 'the truncation is REPORTED — which is what the record tells the operator to read')
+  assert.equal(
+    page.rows.some((row) => row.id === 'log-050'),
+    false,
+    'the newest row — the one a fresh incident would be — is the one that falls off the page',
+  )
 })

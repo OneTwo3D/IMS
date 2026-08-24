@@ -93,3 +93,68 @@ test('[o3d-peh1 r4] the revision-0 revival argument is marked Xero-only, and the
     'if this ever gains a revision clause the comment and o3d-rw0w both need updating',
   )
 })
+
+/**
+ * o3d-batch-ret ROUND 5 (Codex MEDIUM) — AND THE PROSE MUST COUNT THE SAME SET.
+ *
+ * The test at the top of this file parses the UNION DECLARATION. That is exactly what let the defect
+ * it was written for survive in the same two files: `back-reference-sweep.ts` and
+ * `xero/sync-processor.ts` both went on describing "three deliberate refusals … a slot lost to a
+ * live row under another token" for two rounds after `slot_lost` was deleted, because nothing reads
+ * a comment. A reader taking either file at its word believes in a refusal that cannot be
+ * constructed — the precise property the union test exists to guarantee, asserted one layer up.
+ *
+ * The count is derived from the union rather than hard-coded, so ADDING a member (round 5 added
+ * `unprobed_unfenced_reuse`) fails every prose site that was not updated with it.
+ *
+ * REVERT EVIDENCE: changing any one of the three sites back to "three"/"THREE" while the union holds
+ * two members, or leaving one at "TWO" now that it holds three, fails
+ * "every prose description of the refusal set counts the same set".
+ */
+
+/** The files that state the size of the refusal set in prose, and the phrase that introduces it. */
+const PROSE_SITES: ReadonlyArray<{ file: string; marker: RegExp }> = [
+  { file: 'lib/domain/accounting/back-reference-sweep.ts', marker: /enqueue has ([A-Z]+) deliberate refusals/ },
+  { file: 'lib/connectors/xero/sync-processor.ts', marker: /([A-Z]+) of them decline deliberately/ },
+  { file: 'tests/accounting/back-reference-sweep.test.ts', marker: /declines on purpose in ([A-Z]+) cases/ },
+]
+
+const NUMBER_WORDS = ['ZERO', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX']
+
+test('[round 5] every prose description of the refusal set counts the same set', async () => {
+  const outcome = await source('lib/domain/accounting/followup-enqueue-outcome.ts')
+  const union = outcome.slice(
+    outcome.indexOf('export type FollowUpEnqueueRefusalReason'),
+    outcome.indexOf('export type FollowUpEnqueueRefusal ='),
+  )
+  const declared = [...union.matchAll(/\|\s*'([a-z_]+)'/g)].map((m) => m[1])
+  assert.ok(declared.length > 0, 'the union must actually be parsed, or this test asserts nothing')
+  const expected = NUMBER_WORDS[declared.length]
+  assert.ok(expected, `no word for ${declared.length} refusals — extend NUMBER_WORDS`)
+
+  for (const site of PROSE_SITES) {
+    const text = await source(site.file)
+    const found = site.marker.exec(text)
+    assert.ok(found, `${site.file} no longer states how many refusals there are — the marker must match, or this asserts nothing`)
+    assert.equal(
+      found[1],
+      expected,
+      `${site.file} says ${found[1]} refusals; the union declares ${declared.length} (${declared.join(', ')})`,
+    )
+  }
+})
+
+test('[round 5] and none of them lists the lost slot as one of the refusals', async () => {
+  // The specific ghost: `resolveLostFollowUpRevival` answers FOLLOW_UPS_ENQUEUED or THROWS, so it
+  // constructs no outcome at all. Naming it beside the real refusals is what made the count wrong.
+  for (const site of PROSE_SITES) {
+    const text = await source(site.file)
+    const found = site.marker.exec(text)
+    assert.ok(found, `${site.file}: the marker must match, or this asserts nothing`)
+    // The sentence the count introduces — the list itself, up to the end of that thought.
+    const listing = text.slice(found.index, found.index + 600)
+    const claimsItIsOne = /a slot lost to a live row under another token[^.]*\)/.test(listing)
+      || /, and a slot lost to a live row/.test(listing)
+    assert.equal(claimsItIsOne, false, `${site.file} still lists the lost slot among the refusals`)
+  }
+})

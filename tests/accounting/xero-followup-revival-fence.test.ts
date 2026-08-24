@@ -439,3 +439,112 @@ test('o3d-peh1: a ledger refusal is RETURNED to the caller, not only written to 
   assert.deepEqual(scheduled, [])
   assert.ok(activity.some((entry) => entry.action === 'xero_followup_enqueue_refused'))
 })
+
+// ---------------------------------------------------------------------------
+// o3d-batch-ret ROUND 5 (Codex MEDIUM) — WHAT ROUND 4 REMOVED FOR MONEY, IT ALSO REMOVED FOR
+// EVERYTHING ELSE, AND ONLY MONEY GOT A REPLACEMENT.
+//
+// Round 4 deleted the blanket `unfenced_reuse_target` refusal of revision-0 reuse targets, on the
+// argument that the CAS carries `attemptRevision: 0` (strictly stronger than the `(id, FAILED)` ABA)
+// and that `ledgerClearsFollowUpRevival` now asks, for EVERY reuse, whether the attempt already
+// committed. The second half is only true of money-moving types: the probe returns `{ clear: true }`
+// before reading anything when `isMoneyMovingSyncType` is false — and there is no ledger to read for
+// an email, a PDF, a store note or an attachment, none of which creates a document.
+//
+// A revision-0 FAILED row is exactly the population the fence cannot reason about: the migration left
+// every pre-existing FAILED row at 0, so "revision 0 means never claimed" is true of rows this binary
+// created and FALSE of legacy ones — which reached FAILED by RUNNING, up to MAX_RETRIES times. For
+// INVOICE_EMAIL that is a customer invoice the connector's own POST_EFFECT table says CANNOT be
+// recalled.
+//
+// These drive the real `enqueueFollowUpSyncLog` and assert what it RETURNED and what it did to the
+// store. `ledgerClearsFollowUpRevival` is mocked CLEAR throughout this file, so a test that passes
+// here cannot be passing because the probe refused.
+//
+// REVERT EVIDENCE: deleting the `unprobed_unfenced_reuse` branch from
+// lib/connectors/xero/sync-processor.ts fails "a revision-0 INVOICE_EMAIL is REFUSED, not revived".
+// ---------------------------------------------------------------------------
+
+function failedEmailRow(overrides: Partial<Parameters<typeof syncLogRow>[0]> = {}) {
+  return syncLogRow({
+    id: 'log-mail',
+    connector: 'xero',
+    type: 'INVOICE_EMAIL',
+    status: 'FAILED',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    // What the migration gave every row that predates the fence — including ones that ran.
+    attemptRevision: 0,
+    errorMessage: 'Xero timed out',
+    payload: { referenceId: 'order-1' },
+    ...overrides,
+  })
+}
+
+test('[round 5] a revision-0 INVOICE_EMAIL is REFUSED, not revived — nothing established the effect had not happened', async () => {
+  reset([failedEmailRow()])
+  // The probe is CLEAR, so nothing here is passing because the ledger said no.
+  ledgerVerdict = { clear: true }
+
+  const outcome = await (await loadEnqueue())(
+    'INVOICE_EMAIL', 'SalesOrder', 'order-1', { referenceId: 'order-1' }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD },
+  )
+
+  assert.equal(outcome.enqueued, false, 'the caller must be able to see the follow-up is still owed')
+  const refusals = outcome.enqueued ? [] : outcome.refusals
+  assert.equal(refusals.length, 1)
+  assert.equal(refusals[0].reason, 'unprobed_unfenced_reuse')
+  assert.equal(refusals[0].syncLogId, 'log-mail')
+  assert.match(refusals[0].message, /Retry All/, 'and it names a remedy that exists today')
+
+  // Nothing was written and nothing was queued, so the customer does not get a second copy.
+  const row = store.get('log-mail')
+  assert.equal(row?.status, 'FAILED', 'refusing is not retiring — the row is left exactly as it was')
+  assert.equal(row?.attemptRevision, 0)
+  assert.deepEqual(scheduled, [], 'no outbox row, so the processor never re-sends it')
+  assert.ok(activity.some((entry) => entry.action === 'xero_followup_enqueue_refused'))
+})
+
+test('[round 5] the SAME row at a real attempt revision is revived — the refusal is about revision 0 alone', async () => {
+  // One variable changed. A row carrying an attempt was claimed by a binary that stamps, so
+  // "revision 0 means never claimed" is not being relied on for it.
+  reset([failedEmailRow({ attemptRevision: 4 })])
+
+  const outcome = await (await loadEnqueue())(
+    'INVOICE_EMAIL', 'SalesOrder', 'order-1', { referenceId: 'order-1' }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD },
+  )
+
+  assert.equal(outcome.enqueued, true)
+  assert.equal(store.get('log-mail')?.status, 'PENDING')
+  assert.equal(scheduled.length, 1)
+})
+
+test('[round 5] and a revision-0 MONEY row is still revived — round 4’s fix is intact', async () => {
+  // The half of round 4 that IS replaced: the ledger probe speaks for money-moving types, so the
+  // refusal must not come back for them. This is the regression guard in the other direction.
+  reset([failedPaymentRow({ attemptRevision: 0 })])
+  ledgerVerdict = { clear: true }
+
+  const outcome = await (await loadEnqueue())(
+    'INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD },
+  )
+
+  assert.equal(outcome.enqueued, true, 'refusing a revision-0 money row was the dead end round 4 removed')
+  assert.equal(store.get('log-pay')?.status, 'PENDING')
+  assert.equal(store.get('log-pay')?.attemptRevision, 0, 'still left at 0 so the claim mints the first attempt')
+})
+
+test('[round 5] a CREATE is untouched — the refusal is about reviving a row, not about the type', async () => {
+  // No FAILED row to reuse, so there is no earlier attempt to be uncertain about and the follow-up
+  // must still be queued. Refusing here would strand every first email on this connector.
+  reset([])
+
+  const outcome = await (await loadEnqueue())(
+    'INVOICE_EMAIL', 'SalesOrder', 'order-1', { referenceId: 'order-1' }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD },
+  )
+
+  assert.equal(outcome.enqueued, true)
+  assert.equal(store.rows.length, 1)
+  assert.equal(store.rows[0].status, 'PENDING')
+  assert.deepEqual(activity.filter((entry) => entry.action === 'xero_followup_enqueue_refused'), [])
+})

@@ -1,9 +1,10 @@
 // ---------------------------------------------------------------------------
 // o3d-peh1 — A REFUSAL THAT ITS CALLERS CANNOT SEE IS A NO-OP THAT REPORTS SUCCESS.
 //
-// `enqueueFollowUpSyncLog` has TWO ways of declining to enqueue a follow-up, and both are
-// deliberate, correct refusals: an ambiguous idempotency-token history, and a ledger that will not
-// say the attempt is absent. Each wrote a WARNING to the activity log and then RETURNED NORMALLY,
+// `enqueueFollowUpSyncLog` has THREE ways of declining to enqueue a follow-up, and all are
+// deliberate, correct refusals: an ambiguous idempotency-token history, a ledger that will not say
+// the attempt is absent, and a revival target that carries no attempt revision AND whose type the
+// ledger probe does not speak for. The first two wrote a WARNING to the activity log and then RETURNED NORMALLY,
 // and `Promise<void>` gave the caller nothing to read. So every caller — the connector's own post
 // path, the credit-note re-enqueue sweep, and above all `repairXeroBackReferences` — treated the
 // refusal as "the follow-ups are enqueued".
@@ -49,6 +50,21 @@ export type FollowUpEnqueueRefusalReason =
   | 'plan_refused'
   /** o3d-0m56: the ledger would not confirm the attempt is absent, so re-posting could duplicate it. */
   | 'ledger_not_clear'
+  /**
+   * o3d-batch-ret round 5 (Codex MEDIUM): the revival target carries NO attempt revision AND its type
+   * is one the ledger probe does not speak for, so nothing established that the effect has not
+   * already happened.
+   *
+   * Round 4 removed a blanket refusal of revision-0 reuse targets and replaced it with
+   * `ledgerClearsFollowUpRevival`. That replacement is real for money-moving types and a NO-OP for
+   * every other one — it returns `{ clear: true }` before probing anything when
+   * `isMoneyMovingSyncType` is false. A revision-0 FAILED row is exactly the legacy population the
+   * fence cannot reason about (the migration left every pre-existing FAILED row at 0, so "revision 0
+   * means never claimed" is true of fresh rows and false of those), and for INVOICE_EMAIL the effect
+   * is a customer invoice email that CANNOT be recalled. So the half of round 4's refusal that its
+   * replacement does not cover is kept: the revival is refused, visibly, with a remedy.
+   */
+  | 'unprobed_unfenced_reuse'
 
 export type FollowUpEnqueueRefusal = {
   type: string

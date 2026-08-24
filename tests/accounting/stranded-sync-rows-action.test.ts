@@ -26,6 +26,10 @@ const state = {
   rows: [] as Record<string, unknown>[],
   /** What count() returns. */
   total: 0,
+  /** Sync toggles as rows in `settings`. Absent means the connector's sync is OFF (round 5). */
+  settings: new Map<string, string>(),
+  /** Every settings read the loader issued, so "it asked" is observable rather than assumed. */
+  settingQueries: [] as { where: Record<string, unknown> }[],
 }
 
 mock.module('@/lib/auth/server', {
@@ -55,6 +59,14 @@ mock.module('@/lib/db', {
         count: async (args: { where: Record<string, unknown> }) => {
           state.counts.push(args)
           return state.total
+        },
+      },
+      setting: {
+        findMany: async (args: { where: { key: { in: string[] } } }) => {
+          state.settingQueries.push(args)
+          return args.where.key.in
+            .filter((key) => state.settings.has(key))
+            .map((key) => ({ key, value: state.settings.get(key)! }))
         },
       },
     },
@@ -88,6 +100,8 @@ test.beforeEach(() => {
   state.counts = []
   state.rows = []
   state.total = 0
+  state.settings = new Map()
+  state.settingQueries = []
 })
 
 test('the stranded loader requires the `sync` permission, and reads NOTHING without it', async () => {
@@ -229,4 +243,70 @@ test('the rows come back described, with age and identifying detail', async () =
   assert.equal(row.errorMessage, 'HTTP 500 from QuickBooks')
   assert.equal(row.ageDays, 3)
   assert.equal(typeof row.createdAt, 'string')
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 5 (Codex HIGH #1) — THE LOADER ASKS WHETHER ANYTHING CAN STILL CLAIM THESE ROWS.
+//
+// It used to report every row on a non-active connector as adoptable, which offered the Settle
+// control for QuickBooks rows the QuickBooks Sync button can still reclaim. These drive the real
+// loader and assert what it PUT ON THE ROW, not what it read.
+// ---------------------------------------------------------------------------
+
+test('[round 5] the loader reads the sync toggle for the connectors on the page, and no others', async () => {
+  const getStrandedAccountingSyncRows = await loadLoader()
+  state.activeConnector = 'xero'
+  state.rows = [dbRow({ connector: 'quickbooks' })]
+
+  await getStrandedAccountingSyncRows()
+
+  assert.equal(state.settingQueries.length, 1, 'one query, not one per row')
+  assert.deepEqual(
+    state.settingQueries[0].where,
+    { key: { in: ['quickbooks_sync_enabled'] } },
+    'only the toggle a row on this page actually needs — xero has no row here',
+  )
+})
+
+test('[round 5] a page with no rows asks for no toggles at all', async () => {
+  const getStrandedAccountingSyncRows = await loadLoader()
+  state.rows = []
+  await getStrandedAccountingSyncRows()
+  assert.deepEqual(state.settingQueries, [], 'nothing to describe means nothing to look up')
+})
+
+test('[round 5] the toggle decides whether the row is offered the settle control', async () => {
+  const getStrandedAccountingSyncRows = await loadLoader()
+  state.activeConnector = 'xero'
+  state.rows = [dbRow({ connector: 'quickbooks', status: 'PROCESSING', attemptRevision: 0 })]
+
+  // Still enabled: the manual Sync button would reclaim it, so adoption is withheld WITH the lever.
+  state.settings = new Map([['quickbooks_sync_enabled', 'true']])
+  const claimable = (await getStrandedAccountingSyncRows()).rows[0]
+  assert.equal(claimable.settleable, false)
+  assert.equal(claimable.requiresAttemptAdoption, false)
+  assert.match(claimable.notSettleableReason ?? '', /quickbooks_sync_enabled/)
+
+  // One variable changed.
+  state.settings = new Map([['quickbooks_sync_enabled', 'false']])
+  const quiesced = (await getStrandedAccountingSyncRows()).rows[0]
+  assert.equal(quiesced.settleable, true)
+  assert.equal(quiesced.requiresAttemptAdoption, true)
+  assert.equal(quiesced.notSettleableReason, null)
+})
+
+test('[round 5] two connectors on one page get two different answers', async () => {
+  // With no accounting plugin enabled, buildStrandedSyncRowWhere selects EVERY unresolved row, so
+  // the page really can carry both — and one connector being quiesced says nothing about the other.
+  const getStrandedAccountingSyncRows = await loadLoader()
+  state.activeConnector = null
+  state.rows = [
+    dbRow({ id: 'log-x', connector: 'xero', status: 'PROCESSING', attemptRevision: 0 }),
+    dbRow({ id: 'log-q', connector: 'quickbooks', status: 'PROCESSING', attemptRevision: 0 }),
+  ]
+  state.settings = new Map([['quickbooks_sync_enabled', 'true']])
+
+  const byId = new Map((await getStrandedAccountingSyncRows()).rows.map((row) => [row.id, row]))
+  assert.equal(byId.get('log-x')?.settleable, true, 'xero_sync_enabled has no row, so xero is quiesced')
+  assert.equal(byId.get('log-q')?.settleable, false, 'quickbooks can still be swept by its own button')
 })

@@ -2454,9 +2454,10 @@ test('[o3d-bqw7 r2] a TRUE discard warning that cannot be written still holds it
 // ---------------------------------------------------------------------------
 // o3d-peh1 — THE ENQUEUE REFUSED, AND THE SWEEP REPORTED THE ROW AS RECOVERED.
 //
-// `enqueueFollowUps` declines on purpose in three cases (an ambiguous idempotency-token history, a
-// ledger that will not confirm the attempt is absent, a slot lost to a live row under another
-// token). Every one of them logged a WARNING and then returned normally, and the dependency was
+// `enqueueFollowUps` declines on purpose in THREE cases — an ambiguous idempotency-token history, a
+// ledger that will not confirm the attempt is absent, and a revival target with no attempt revision
+// whose type the ledger probe does not speak for; together they are the whole of
+// `FollowUpEnqueueRefusalReason`. Each logged a WARNING and then returned normally, and the dependency was
 // typed `Promise<void>`, so this sweep — which is a CALLER THAT ACTS ON THE RETURN — read the
 // refusal as success and settled on it: parent row stamped and flipped SYNCED, the follow-up
 // obligation marker cleared, and `xero_backreference_followups_recovered` written to the log, while

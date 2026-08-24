@@ -474,7 +474,10 @@ test('a revision-0 row that NOTHING can ever claim is settleable by adoption, wi
   assert.equal(s.requiresAttemptAdoption, true)
   assert.equal(s.notSettleableReason, null)
   assert.match(s.settlementCaveat ?? '', /MINTS one/)
-  assert.match(s.settlementCaveat ?? '', /while quickbooks is not the active connector/)
+  // Round 5: the caveat now states the WHOLE precondition rather than half of it — the manual Sync
+  // button gates on the connector's own toggle and never asks which connector is active.
+  assert.match(s.settlementCaveat ?? '', /neither the active connector nor sync-enabled/)
+  assert.match(s.settlementCaveat ?? '', /not the manual Sync button/)
   // The status caveat is still carried: a FAILED row is not proof that nothing posted.
   assert.match(s.settlementCaveat ?? '', /NOT proof that nothing posted/)
 })

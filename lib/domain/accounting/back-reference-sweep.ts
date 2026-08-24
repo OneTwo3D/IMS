@@ -537,9 +537,13 @@ export type BackReferenceSweepDeps = {
   /**
    * MUST report whether the follow-ups were ACTUALLY ENQUEUED (o3d-peh1).
    *
-   * The connector's enqueue has three deliberate refusals — an ambiguous idempotency-token history,
-   * a ledger that will not confirm the attempt is absent, a slot lost to a live row under another
-   * token — and each of them used to write a warning and return `void`. This sweep read that as
+   * The connector's enqueue has THREE deliberate refusals, and they are exactly the members of
+   * `FollowUpEnqueueRefusalReason`: an ambiguous idempotency-token history, a ledger that will not
+   * confirm the attempt is absent, and a revival target with no attempt revision whose type the
+   * ledger probe does not speak for. A SLOT LOST TO A LIVE ROW UNDER ANOTHER TOKEN IS NOT ONE OF
+   * THEM — `resolveLostFollowUpRevival` answers FOLLOW_UPS_ENQUEUED or throws, and the `slot_lost`
+   * code that once said otherwise was removed as unconstructible (o3d-peh1 r4). The first two used
+   * to write a warning and return `void`. This sweep read that as
    * success and SETTLED on it: parent row stamped, `backReferenceFollowUpsPendingAt` cleared,
    * `*_backreference_followups_recovered` logged, while the money-moving child was still FAILED and
    * had never been re-enqueued. Same defect family as the compacted-payload enqueue this file

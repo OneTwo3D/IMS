@@ -133,7 +133,11 @@ test('Codex MEDIUM (round 3): the escalation names the queued copies and the fac
   // Round 4: unavailable WHILE QUICKBOOKS IS ACTIVE, which is not the same as unavailable. The
   // unqualified sentence hid the only per-row remedy there is.
   assert.doesNotMatch(description, /refuses EVERY QuickBooks row/)
-  assert.match(description, /THE PER-ROW REMEDY DOES EXIST ONCE QUICKBOOKS IS NO LONGER THE ACTIVE CONNECTOR/)
+  // Round 5: the condition is a CONJUNCTION — not the active connector AND its sync toggle off,
+  // because the manual Sync button gates on the toggle alone. See STEP 6 in
+  // tests/accounting/qbo-remedy-is-performable.test.ts, which drives both halves.
+  assert.match(description, /THE PER-ROW REMEDY DOES EXIST, BUT IT NEEDS BOTH OF TWO THINGS/)
+  assert.match(description, /TURN quickbooks_sync_enabled OFF AS WELL/)
   assert.match(description, /STRANDED SYNC ROWS/)
 
   // ROUND 3 (Codex HIGH). The instruction this test used to pin — "keep at most the one copy the
