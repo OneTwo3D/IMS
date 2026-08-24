@@ -225,8 +225,8 @@ test('[o3d-ekn8] a receipt recorded before the QuickBooks invoice posted IS regi
   assert.equal(payments[0].payload.amount, 100)
   assert.equal(
     payments[0].idempotencyKey,
-    'invoice-payment:payment:pay-1',
-    'keyed to the RECEIPT, so a re-drive of the same receipt is a no-op rather than a second payment',
+    'invoice-payment:payment:pay-1:invoice:QBINV-9',
+    'keyed to the RECEIPT AND THE DOCUMENT, so a re-drive is a no-op while a re-POST is not (o3d-ekn8 r3)',
   )
 })
 

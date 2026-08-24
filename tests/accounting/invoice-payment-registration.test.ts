@@ -473,6 +473,7 @@ test('o3d-ekn8: a receipt with no sync row at all is the one waiting to be regis
   const awaiting = selectReceiptsAwaitingRegistration({
     receipts,
     existing: [{ status: 'SYNCED', amount: 40, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' }],
+    accountingInvoiceId: 'INV-1',
   })
   assert.deepEqual(awaiting.map((r) => r.id), ['pay-2'])
 })
@@ -484,6 +485,7 @@ test('o3d-ekn8: a receipt whose own attempt FAILED is left to the retry path, no
   const awaiting = selectReceiptsAwaitingRegistration({
     receipts,
     existing: [{ status: 'FAILED', amount: 40, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' }],
+    accountingInvoiceId: 'INV-1',
   })
   assert.deepEqual(awaiting.map((r) => r.id), ['pay-2'])
 })
@@ -495,6 +497,7 @@ test('o3d-ekn8: an UNATTRIBUTED live registration suppresses every receipt on th
   const awaiting = selectReceiptsAwaitingRegistration({
     receipts,
     existing: [{ status: 'SYNCED', amount: 100, paymentId: null, accountingInvoiceId: 'INV-1' }],
+    accountingInvoiceId: 'INV-1',
   })
   assert.deepEqual(awaiting, [])
 })
@@ -505,8 +508,44 @@ test('o3d-ekn8: an unattributed row that is CANCELLED holds nothing back', () =>
   const awaiting = selectReceiptsAwaitingRegistration({
     receipts,
     existing: [{ status: 'CANCELLED', amount: 100, paymentId: null, accountingInvoiceId: 'INV-1' }],
+    accountingInvoiceId: 'INV-1',
   })
   assert.deepEqual(awaiting.map((r) => r.id), ['pay-1', 'pay-2'])
+})
+
+test('[o3d-ekn8 r3] a row naming a RETIRED document does not speak for its receipt', () => {
+  // o3d-hbgo's rule, on the WRITE side. The invoice was deleted in the ledger and re-posted as INV-2;
+  // pay-1's row settled INV-1, an invoice this order no longer has. Keyed on the receipt alone this
+  // returned an empty list, and the replacement was never settled by anything — silently, because a
+  // gate that selects nothing has nothing to report.
+  const awaiting = selectReceiptsAwaitingRegistration({
+    receipts,
+    existing: [{ status: 'SYNCED', amount: 100, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' }],
+    accountingInvoiceId: 'INV-2',
+  })
+  assert.deepEqual(awaiting.map((r) => r.id), ['pay-1', 'pay-2'])
+})
+
+test('[o3d-ekn8 r3] an UNATTRIBUTED live row on a RETIRED document suppresses nothing', () => {
+  // The same narrowing applied to the other rule, and for the same reason: a registration nobody can
+  // match to a receipt still says nothing about a document it was not made against.
+  const awaiting = selectReceiptsAwaitingRegistration({
+    receipts,
+    existing: [{ status: 'SYNCED', amount: 100, paymentId: null, accountingInvoiceId: 'INV-1' }],
+    accountingInvoiceId: 'INV-2',
+  })
+  assert.deepEqual(awaiting.map((r) => r.id), ['pay-1', 'pay-2'])
+})
+
+test('[o3d-ekn8 r3] a row that names NO document keeps suppressing, whichever invoice is asked about', () => {
+  // Unknown must read as "possibly this one" — the only direction that cannot let a second payment
+  // out. Mirrors the read side, which counts an unanchored row against the current invoice.
+  const awaiting = selectReceiptsAwaitingRegistration({
+    receipts,
+    existing: [{ status: 'SYNCED', amount: 100, paymentId: 'pay-1', accountingInvoiceId: null }],
+    accountingInvoiceId: 'INV-2',
+  })
+  assert.deepEqual(awaiting.map((r) => r.id), ['pay-2'])
 })
 
 // ---------------------------------------------------------------------------

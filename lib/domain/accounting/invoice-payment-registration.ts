@@ -329,18 +329,45 @@ export function decideInvoicePaymentRegistration(input: {
  *    at all, so it cannot be matched to one, and for money "which receipt is this?" unanswered has to
  *    read as "possibly that one".
  *
+ * BOTH RULES ARE ASKED OF THE DOCUMENT, NOT ONLY OF THE ORDER (o3d-ekn8 r3). Every row above is first
+ * narrowed to those that can speak about the invoice being registered against, by the same test
+ * `decideInvoicePaymentRegistration` applies on the read side. Keying this on the receipt alone left
+ * one write-side gate document-blind while the read side was not, and a deleted-and-re-posted invoice
+ * walked straight through the gap: the retired document's row spoke for the receipt, nothing was
+ * awaiting, and the replacement was never settled — with no refusal recorded, because a gate that
+ * returns an empty list has nothing to report.
+ *
  * Refunds are the caller's business to exclude: they settle a credit note, not this invoice.
  */
 export function selectReceiptsAwaitingRegistration<T extends { id: string }>(input: {
   receipts: T[]
   existing: ExistingInvoicePaymentSync[]
+  /**
+   * o3d-ekn8 r3 (Codex HIGH) — THE DOCUMENT THESE RECEIPTS WOULD BE REGISTERED AGAINST.
+   *
+   * Without it this gate was keyed on the RECEIPT alone, and that made it blind to the exact case
+   * o3d-hbgo taught the read side to see: an invoice deleted in the ledger and re-posted as a new
+   * document. The receipt's old row still names it, so the receipt read as spoken for, nothing was
+   * awaiting, and this function returned an empty list — SILENTLY. The replacement invoice then
+   * stayed unsettled for ever with no log line anywhere, which is the same loss o3d-ekn8 exists to
+   * close, arriving through a different door.
+   */
+  accountingInvoiceId: string
 }): T[] {
-  const unattributedLive = input.existing.some(
+  // SCOPED TO THE DOCUMENT, mirroring `decideInvoicePaymentRegistration`'s `live` filter exactly
+  // rather than restating a second opinion about it: a row that settled a DIFFERENT ledger document
+  // paid an invoice this order no longer has, so it says nothing about what the CURRENT invoice is
+  // still owed. A row that names NO document keeps speaking — for money, unknown must read as
+  // "possibly this one" — which is the direction that can only ever withhold work, never duplicate it.
+  const aboutThisDocument = input.existing.filter(
+    (r) => r.accountingInvoiceId == null || r.accountingInvoiceId === input.accountingInvoiceId,
+  )
+  const unattributedLive = aboutThisDocument.some(
     (r) => r.status !== 'FAILED' && r.status !== 'CANCELLED' && r.paymentId == null,
   )
   if (unattributedLive) return []
   const spokenFor = new Set(
-    input.existing.map((r) => r.paymentId).filter((id): id is string => typeof id === 'string'),
+    aboutThisDocument.map((r) => r.paymentId).filter((id): id is string => typeof id === 'string'),
   )
   return input.receipts.filter((receipt) => !spokenFor.has(receipt.id))
 }

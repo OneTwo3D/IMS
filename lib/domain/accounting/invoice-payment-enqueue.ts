@@ -170,6 +170,35 @@ class PinnedConnectorMoved extends Error {
  *
  * Never throws — failing to register must not fail the receipt the operator just recorded.
  */
+/**
+ * o3d-ekn8 r3 (Codex HIGH) — THE ENQUEUE'S IDEMPOTENCY KEY CARRIES THE DOCUMENT ANCHOR.
+ *
+ * `queueAccountingSync` short-circuits on this key: it looks for a live row on the same
+ * (connector, type, referenceType, referenceId) whose payload holds it, and REPORTS `queued: true`
+ * WITHOUT WRITING ANYTHING when it finds one. Keyed on the receipt alone, that short-circuit was the
+ * second document-blind write-side gate — an invoice deleted and re-posted found the retired
+ * document's row under the same key and reported the replacement's payment as already queued, so
+ * relaxing the selector above it would have changed nothing.
+ *
+ * The anchor makes this key agree with the two things it sits between, rather than being a third
+ * opinion:
+ *
+ *   • `accounting_sync_logs_followup_live_unique` is already (connector, type, referenceType,
+ *     referenceId, accountingInvoiceId, creditNoteId, paymentId) — receipt AND document. Two live
+ *     registrations for one (receipt, document) are still refused by the database, so anchoring the
+ *     key cannot open a second payment on the same invoice; it only stops the key claiming a
+ *     DIFFERENT document's row as this one.
+ *   • `buildFollowUpIdempotencySource` already folds the payload anchors into the REMOTE token, so
+ *     the ledger key and the local key now name the same thing.
+ *
+ * A live row queued before this shipped carries the un-anchored key and will not be matched. Such a
+ * row is refused by the unique index above rather than double-posted — a loud failure, not a silent
+ * second payment — and only for the rows that were in flight at the moment of deploy.
+ */
+export function invoicePaymentEnqueueKey(paymentId: string, accountingInvoiceId: string): string {
+  return `invoice-payment:payment:${paymentId}:invoice:${accountingInvoiceId}`
+}
+
 export async function registerInvoicePaymentWithLedger(params: {
   orderId: string
   orderReference: string
@@ -404,6 +433,14 @@ export async function registerInvoicePaymentWithLedger(params: {
       await reportRefusal(decision)
       return
     }
+    // Unreachable — `decideInvoicePaymentRegistration` refuses DOCUMENT_NOT_POSTED before anything
+    // else can say `register: true`. Asserted rather than cast away, because the idempotency key
+    // below is built FROM this id (o3d-ekn8 r3): a key silently assembled around `null` would collapse
+    // every unanchored receipt into one slot, which is the blindness this round is closing.
+    if (!accountingInvoiceId) {
+      await reportRefusal({ register: false, refusal: 'DOCUMENT_NOT_POSTED' })
+      return
+    }
 
     // ENQUEUE UNDER THE ORDER LOCK, and only if the receipt is still there. The Payment row committed
     // before this runs, and deletePayment cancels a queued registration by looking for one — so a delete
@@ -475,8 +512,8 @@ export async function registerInvoicePaymentWithLedger(params: {
           // row that happens to share its amount.
           paymentId: params.paymentId,
         },
-        // Exactly once per recorded receipt, however many times this runs.
-        idempotencyKey: `invoice-payment:payment:${params.paymentId}`,
+        // Exactly once per recorded receipt AND DOCUMENT, however many times this runs.
+        idempotencyKey: invoicePaymentEnqueueKey(params.paymentId, accountingInvoiceId),
       })
       // THE ROW IS WRITTEN UNDER THE CONNECTOR THE ENQUEUE RESOLVED FOR ITSELF (o3d-ekn8 r2). A clean
       // `queued` says a row exists; `connector` is the only thing that says which ledger it is for. The
@@ -646,6 +683,11 @@ export async function registerDeferredOrderReceipts(
       // Scoped to the connector that POSTED, not the active one: rows belonging to a ledger this post
       // was not made against cannot say whether this post's receipts still need registering.
       existing: await loadInvoicePaymentSyncRows(order.id, posted.connector),
+      // o3d-ekn8 r3 — AND TO THE DOCUMENT THIS POST RETURNED. `posted.accountingInvoiceId`, not the
+      // order's column: the two are equal here (the check above refuses otherwise) and the pin is the
+      // one that is evidence. Without it a receipt already registered against a RETIRED invoice read
+      // as spoken for, and the replacement invoice was never settled by anything.
+      accountingInvoiceId: posted.accountingInvoiceId,
     })
     if (awaiting.length === 0) return
 
