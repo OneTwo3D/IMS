@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
@@ -18,6 +20,22 @@ import {
   quoteIdent,
   verifyRelease,
 } from '@/scripts/fence-db-connections.mjs'
+
+/** Run the shipped script from a directory with no .env, and report what it said. */
+function runFenceScript(args: string[], env: Record<string, string | undefined>) {
+  try {
+    const stdout = execFileSync('node', [join(process.cwd(), 'scripts/fence-db-connections.mjs'), ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, ...env },
+      cwd: mkdtempSync(join(tmpdir(), 'ims-fence-')),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    return { status: 0, output: stdout }
+  } catch (error) {
+    const failure = error as { status?: number; stdout?: string; stderr?: string }
+    return { status: failure.status ?? -1, output: `${failure.stdout ?? ''}${failure.stderr ?? ''}` }
+  }
+}
 
 // o3d-2sm1.2 — check-db-writers.mjs SNAPSHOTS pg_stat_activity and closes; the dump
 // and the migration open their own connections afterwards, and nothing stops another
@@ -339,9 +357,50 @@ test('a space in a role name is escaped for libpq rather than splitting the opti
   assert.equal(new URL(url).searchParams.get('options'), '-c role=ims\\ app')
 })
 
-test('a connection string that cannot be parsed is returned unchanged rather than corrupted', () => {
-  assert.equal(buildMigrationConnectionString('not a url', 'imsapp'), 'not a url')
-  assert.equal(buildMigrationConnectionString('', 'imsapp'), '')
+// o3d-2sm1.5 (Codex r5, MEDIUM) — THE FALLBACK REACHED THE CRITICAL THROUGH THE FIX.
+//
+// This used to assert that unparseable input came back UNCHANGED, which is a connection with
+// no `role=` on it at all: the migration then ran as the ADMIN, creating objects the
+// application cannot use, while the deploy log announced the application role. Silently
+// correct-looking, and exactly the defect the `-c role=` mechanism exists to close.
+test('an admin connection string that cannot be parsed is refused, not returned unchanged', () => {
+  assert.throws(
+    () => buildMigrationConnectionString('not a url', 'imsapp'),
+    /cannot be parsed as a URL/,
+    'returning it unchanged runs the migration as the admin while claiming otherwise',
+  )
+  assert.throws(() => buildMigrationConnectionString('', 'imsapp'), /No admin connection string/)
+  assert.throws(() => buildMigrationConnectionString('postgresql://admin@h/ims', ''), /No application role/)
+})
+
+test('a role name carrying a tab or a newline is refused, because libpq splits options on those too', () => {
+  // The escape covered `\`, space and `'`. libpq's option parser treats tab, newline, carriage
+  // return, form feed and vertical tab as separators exactly as it treats a space, so `role=`
+  // would be silently truncated and the migration would run as the admin.
+  for (const whitespace of ['\t', '\n', '\r', '\f', '\v']) {
+    assert.throws(
+      () => buildMigrationConnectionString('postgresql://admin@h/ims', `ims${whitespace}app`),
+      /contains whitespace that libpq/,
+      `a role name containing ${JSON.stringify(whitespace)} must be refused, not escaped-and-hoped`,
+    )
+  }
+  // A plain space is still escaped rather than refused: it is the one libpq's backslash
+  // escape is documented to cover, and the assertion above it proves it round-trips.
+  assert.equal(
+    new URL(buildMigrationConnectionString('postgresql://admin@h/ims', 'ims app')).searchParams.get('options'),
+    '-c role=ims\\ app',
+  )
+})
+
+test('--print-migration-url exits non-zero rather than printing a URL with no role on it', () => {
+  const result = runFenceScript(['--print-migration-url', '--app-role=imsapp'], {
+    DEPLOY_ADMIN_DATABASE_URL: 'this is not a url',
+    DATABASE_URL: 'postgresql://imsapp@127.0.0.1:5432/ims',
+    DIRECT_URL: '',
+  })
+  assert.notEqual(result.status, 0, 'a URL the migration cannot run as the app role through is not a URL to emit')
+  assert.match(result.output, /cannot be parsed as a URL/)
+  assert.ok(!/^this is not a url$/m.test(result.output), 'and the unusable string must not be printed as if it were the answer')
 })
 
 // ---------------------------------------------------------------------------

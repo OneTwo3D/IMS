@@ -580,9 +580,14 @@ REBOOT_FENCE_INSTALLED=false
 # remove exactly that and leave an already-standing fence alone.
 FENCE_MARKER_PREEXISTED=false
 FENCE_DROPIN_CREATED=false
-# The point of no return: the new build has answered its health check. Nothing after this may
-# stop it, re-fence it or revoke CONNECT again (o3d-2sm1.5, Codex r4 HIGH).
+# The point of no return: the new build has answered its health check AND been shown to be
+# the process that answered. Nothing after this may stop it, re-fence it or revoke CONNECT
+# again (o3d-2sm1.5, Codex r4 HIGH).
 PAST_POINT_OF_NO_RETURN=false
+# Did anything PROVE that the build on disk is the process answering the port? An open port
+# is not that proof (o3d-2sm1.5, Codex r5 HIGH).
+NEW_BUILD_SERVING=false
+NEW_BUILD_ID=""
 # The connection every database step inside the window runs through. Set to the
 # application URL when the window opens and swapped for the privileged one if and when
 # the connection fence engages, because the fence shuts the application role out and
@@ -2179,11 +2184,41 @@ if ! ${INSTALL_HEALTHY}; then
 fi
 success "Health check passed — the application is answering ${INSTALL_HEALTH_URL}."
 
+# ---------------------------------------------------------------------------
+# AND WHICH BUILD IS ANSWERING? (o3d-2sm1.5, Codex r5 HIGH)
+#
+# /api/health is process liveness and touches no database. On an UPGRADE re-run a predecessor
+# still holding port ${APP_PORT} answers it exactly as well as the new build does — and the
+# point of no return below was armed by that answer alone, after which the trap explicitly
+# REFUSES to stop the service. The old build would have been left serving a MIGRATED schema,
+# with the installer reporting success.
+#
+# /_next/static/<BUILD_ID>/ is served only by the process whose own build id is that one, so a
+# 200 there is the new code identifying itself. Nothing else available here distinguishes the
+# two processes, and "nothing proved it" must not be read as "proven".
+# ---------------------------------------------------------------------------
+[[ -f "${APP_DIR}/.next/BUILD_ID" ]] \
+  || die "No .next/BUILD_ID after the build, so nothing can prove which build answered ${INSTALL_HEALTH_URL}."
+NEW_BUILD_ID="$(cat "${APP_DIR}/.next/BUILD_ID")"
+BUILD_ASSET="$(ls "${APP_DIR}/.next/static/${NEW_BUILD_ID}" 2>/dev/null | head -1 || true)"
+if [[ -n "${BUILD_ASSET}" ]] \
+  && curl -fsS --max-time 5 "http://127.0.0.1:${APP_PORT}/_next/static/${NEW_BUILD_ID}/${BUILD_ASSET}" >/dev/null 2>&1; then
+  NEW_BUILD_SERVING=true
+  success "The process on port ${APP_PORT} serves /_next/static/${NEW_BUILD_ID}/ — it is this build."
+else
+  die "Something answered ${INSTALL_HEALTH_URL}, but nothing proved it was BUILD_ID ${NEW_BUILD_ID}. A predecessor still holding port ${APP_PORT} answers that route too, and the schema has already moved. Refusing to declare the installation irreversible on the strength of an open port."
+fi
+
 # THE POINT OF NO RETURN (o3d-2sm1.5, Codex r4 HIGH). The new build is serving and everything
 # that could reject this release has passed. Nothing below may stop it, re-fence it or revoke
 # CONNECT again: a failure in the cron restore, the nginx config or the log rotation is
 # something to fix by hand, not a reason to tear down a working installation.
-PAST_POINT_OF_NO_RETURN=true
+#
+# ARMED ONLY BY THE PROOF ABOVE: `$NEW_BUILD_SERVING` is false until the build on disk was
+# shown to be the process on the port (o3d-2sm1.5, Codex r5 HIGH).
+if $NEW_BUILD_SERVING; then
+  PAST_POINT_OF_NO_RETURN=true
+fi
 
 # Cron goes back only once the new build is running, and BEFORE the crontab block below
 # is spliced in — splicing into a fenced crontab would preserve the commented-out lines

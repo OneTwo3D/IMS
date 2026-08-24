@@ -277,6 +277,10 @@ DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_
 # only says this run intends to migrate: the failure banner used to describe a drop-in that
 # may never have been installed (o3d-2sm1.5, Codex r4 HIGH).
 REBOOT_FENCE_INSTALLED=false
+# Did anything PROVE that the build on disk is the process answering the port? Nothing may be
+# declared irreversible until it has (o3d-2sm1.5, Codex r5 HIGH).
+NEW_BUILD_SERVING=false
+NEW_BUILD_ID=""
 # Rollback bookkeeping for install_reboot_fence(): what THIS call created, so a failure can
 # remove exactly that and leave an already-standing fence alone.
 FENCE_MARKER_PREEXISTED=false
@@ -1220,12 +1224,44 @@ else
     die "The new version did not answer /api/health within 60s. Leaving it stopped rather than restoring the old one."
   fi
   success "Health check passed — app is responding."
+
+  # ---------------------------------------------------------------------------
+  # AND WHICH BUILD IS IT? (o3d-2sm1.5, Codex r5 HIGH)
+  #
+  # /api/health is process liveness. A PREDECESSOR still holding port ${APP_PORT} answers it
+  # exactly as well as the new version does — and the point of no return below was armed by
+  # that answer alone, after which the trap explicitly REFUSES to stop the service. The old
+  # build would have been left serving a migrated schema, with the update reporting success.
+  #
+  # /_next/static/<BUILD_ID>/ is served only by the process whose OWN build id is that one,
+  # so a 200 there is the new code identifying itself. Nothing else here can distinguish the
+  # two processes, and "nothing proved it" must not read as "proven".
+  # ---------------------------------------------------------------------------
+  if [[ -f "${APP_DIR}/.next/BUILD_ID" ]]; then
+    NEW_BUILD_ID="$(cat "${APP_DIR}/.next/BUILD_ID")"
+  else
+    die "No .next/BUILD_ID after the build, so nothing can prove which version answered /api/health."
+  fi
+  BUILD_ASSET="$(ls "${APP_DIR}/.next/static/${NEW_BUILD_ID}" 2>/dev/null | head -1 || true)"
+  if [[ -n "${BUILD_ASSET}" ]] \
+    && curl -fsS --max-time 5 "http://127.0.0.1:${APP_PORT}/_next/static/${NEW_BUILD_ID}/${BUILD_ASSET}" >/dev/null 2>&1; then
+    NEW_BUILD_SERVING=true
+    success "The process on port ${APP_PORT} serves /_next/static/${NEW_BUILD_ID}/ — it is this build."
+  else
+    die "Something answered /api/health on port ${APP_PORT}, but nothing proved it was BUILD_ID ${NEW_BUILD_ID}. A predecessor still holding the port answers that route too, and the schema has already moved. Refusing to declare the update irreversible on the strength of an open port."
+  fi
 fi
 
 # PAST THE POINT OF NO RETURN (o3d-2sm1.5, Codex r4 HIGH). The new version is serving; what
 # is left is cleanup, and a cleanup failure must not stop, re-fence and lock out a deployment
 # that has already succeeded.
-PAST_POINT_OF_NO_RETURN=true
+#
+# ARMED ONLY BY THE PROOF ABOVE: `$NEW_BUILD_SERVING` is false until the build on disk was
+# shown to be the process on the port. The trap's refusal to stop the service is defensible
+# only once that is established (o3d-2sm1.5, Codex r5 HIGH).
+if $NEW_BUILD_SERVING || $DRY_RUN; then
+  PAST_POINT_OF_NO_RETURN=true
+fi
 FENCE_ARMED=false
 
 CURRENT_STEP="unfence-cron"

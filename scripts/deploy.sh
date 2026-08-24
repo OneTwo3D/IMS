@@ -1146,6 +1146,9 @@ $SKIP_MIGRATE && warn "--skip-migrate: no migration will be applied, so no reboo
 # ---------------------------------------------------------------------------
 CURRENT_STEP="build"
 NEW_BUILD_ID=""
+# Did anything PROVE that the build on disk is the process answering the port? Nothing may
+# be declared irreversible until it has (o3d-2sm1.5, Codex r5 HIGH).
+NEW_BUILD_SERVING=false
 if ! $SKIP_BUILD; then
   step "Build (predecessor still serving the OLD schema)"
 
@@ -1494,14 +1497,51 @@ else
   fi
   ok "Server is answering ${HEALTH_URL}."
 
-  if [[ -n "$NEW_BUILD_ID" ]]; then
-    SERVED_ID="$(curl -sS "$HEALTH_URL" 2>/dev/null | grep -oE '\\?"b\\?":\\?"[A-Za-z0-9_-]+\\?"' | head -1 | grep -oE '[A-Za-z0-9_-]{10,}' | tail -1 || true)"
-    if [[ -n "$SERVED_ID" && "$SERVED_ID" != "$NEW_BUILD_ID" ]]; then
-      warn "Served BUILD_ID (${SERVED_ID}) does not match disk (${NEW_BUILD_ID}) — check which process answered."
-    elif [[ -n "$SERVED_ID" ]]; then
-      ok "Served BUILD_ID matches disk."
+  # ---------------------------------------------------------------------------
+  # WHICH BUILD IS ANSWERING? (o3d-2sm1.5, Codex r5 HIGH)
+  #
+  # "Something answered the port" is not proof that THIS release is serving, and the point
+  # of no return below is armed by it. HEALTH_PATH defaults to /login, which touches no
+  # database and which the PREDECESSOR serves just as happily; the BUILD_ID comparison was
+  # a `warn`; and when the scrape regex missed, SERVED_ID was empty and the mismatch branch
+  # was skipped entirely. So a stale predecessor still holding the port armed the flag — and
+  # the trap then explicitly REFUSED to stop it, printing "everything that could reject this
+  # release has already passed", leaving the old build serving a migrated schema with the
+  # deploy reporting success. Before the point of no return existed, the trap tore that down.
+  #
+  # So the flag is armed only on POSITIVE proof, by one of two channels:
+  #   1. the BUILD_ID embedded in what HEALTH_URL served equals the BUILD_ID on disk. A
+  #      MISMATCH IS FATAL, not a warning — it is the stale-predecessor case, named.
+  #   2. an asset under /_next/static/<BUILD_ID>/ answers 200. Only a process whose own
+  #      BUILD_ID is that one serves that path, so a 200 is the new code identifying itself.
+  #      This is the channel that works when HEALTH_PATH is a JSON route with no build id in it.
+  # Neither answering is NOT a pass. Nothing is proven, so nothing may be declared irreversible.
+  # ---------------------------------------------------------------------------
+  if [[ -z "$NEW_BUILD_ID" && -f "${APP_DIR_REAL}/.next/BUILD_ID" ]]; then
+    NEW_BUILD_ID="$(cat "${APP_DIR_REAL}/.next/BUILD_ID")"
+  fi
+  [[ -n "$NEW_BUILD_ID" ]] || die "No BUILD_ID on disk, so nothing can prove which build answered ${HEALTH_URL}."
+
+  SERVED_ID="$(curl -sS "$HEALTH_URL" 2>/dev/null | grep -oE '\\?"b\\?":\\?"[A-Za-z0-9_-]+\\?"' | head -1 | grep -oE '[A-Za-z0-9_-]{10,}' | tail -1 || true)"
+  if [[ -n "$SERVED_ID" ]]; then
+    if [[ "$SERVED_ID" == "$NEW_BUILD_ID" ]]; then
+      NEW_BUILD_SERVING=true
+      ok "Served BUILD_ID matches disk (${NEW_BUILD_ID})."
+    else
+      die "Served BUILD_ID (${SERVED_ID}) is NOT the build on disk (${NEW_BUILD_ID}). The process answering ${HEALTH_URL} is not this release — a predecessor is still holding port ${PORT}. It is serving a MIGRATED schema, so it is being stopped rather than left up."
     fi
   fi
+
+  if ! $NEW_BUILD_SERVING; then
+    BUILD_ASSET="$(ls "${APP_DIR_REAL}/.next/static/${NEW_BUILD_ID}" 2>/dev/null | head -1 || true)"
+    if [[ -n "$BUILD_ASSET" ]] \
+      && curl -fsS --max-time 5 "http://127.0.0.1:${PORT}/_next/static/${NEW_BUILD_ID}/${BUILD_ASSET}" >/dev/null 2>&1; then
+      NEW_BUILD_SERVING=true
+      ok "The process on port ${PORT} serves /_next/static/${NEW_BUILD_ID}/ — it is this build."
+    fi
+  fi
+
+  $NEW_BUILD_SERVING || die "Something answered ${HEALTH_URL}, but nothing proved it was BUILD_ID ${NEW_BUILD_ID}. A predecessor still holding port ${PORT} answers that path too, and the schema has already moved. Refusing to declare the release irreversible on the strength of an open port."
 fi
 
 # ---------------------------------------------------------------------------
@@ -1517,7 +1557,12 @@ fi
 # cleanup step failed on a deploy that had already succeeded. From here a failure is
 # reported and left for a human; nothing tears the deploy down.
 # ---------------------------------------------------------------------------
-PAST_POINT_OF_NO_RETURN=true
+# ARMED ONLY BY THE PROOF ABOVE. `$NEW_BUILD_SERVING` stays false unless the health phase
+# established that the BUILD_ID on disk is the one answering — an open port is not that, and
+# the trap's refusal to stop the service is only defensible once it is.
+if $NEW_BUILD_SERVING || $DRY_RUN; then
+  PAST_POINT_OF_NO_RETURN=true
+fi
 FENCE_ARMED=false
 
 CURRENT_STEP="unfence-cron"

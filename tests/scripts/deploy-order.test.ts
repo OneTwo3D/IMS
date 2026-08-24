@@ -1219,7 +1219,9 @@ for (const [name, lines, trapName] of [
     const source = lines.join('\n')
     assert.match(source, /^PAST_POINT_OF_NO_RETURN=false$/m, 'the flag must start false')
 
-    const raise = realCodeLine(lines, /^PAST_POINT_OF_NO_RETURN=true$/)
+    // Indented since o3d-2sm1.5 Codex r5: it is now inside the `if` that requires the build
+    // on disk to have been PROVEN to be the process answering the port.
+    const raise = realCodeLine(lines, /^\s*PAST_POINT_OF_NO_RETURN=true\s*$/)
     assert.notEqual(raise, -1, 'and be raised once the new build has answered')
 
     // It is raised AFTER the health check and BEFORE the cleanup that used to be able to
@@ -1446,3 +1448,207 @@ for (const entry of FENCE_INSTALL_CASES) {
     }
   })
 }
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 — NOTHING ASSERTED THAT THE CHECK CLOSING THE CRITICAL WAS WIRED IN AT ALL.
+//
+// scripts/check-app-db-object-access.mjs is the only step in the pipeline that asks about the
+// APPLICATION role; every other one (prisma, the drift check, the verification hook, pg_dump)
+// runs on the admin connection that owns whatever the migration created. It is therefore the
+// step that closes o3d-2sm1.5, and it was invoked by three scripts and asserted by none.
+//
+// Measured, on this file, before these tests existed:
+//   `|| die` -> `|| true` in all three scripts .......... 288/288 green
+//   the invocation deleted outright ..................... 288/288 green
+//
+// So: it is called, it is called in the right place, and its failure STOPS the deploy. The
+// third is the one the mutations went through, so the guard is read from the call's own
+// continuation rather than by looking for a `die` somewhere nearby.
+// ---------------------------------------------------------------------------
+
+/**
+ * The line that RUNS the check — not the one that assigns its path to a variable, and not the
+ * `[[ -f ... ]]` preflight that proves only that a file exists.
+ */
+const OBJECT_ACCESS_INVOCATION = /node\s+.*(check-app-db-object-access\.mjs|DB_OBJECT_ACCESS_SCRIPT)/
+
+/** The call line plus every backslash-continued line that belongs to it. */
+function callContinuation(lines: string[], index: number): string {
+  let text = lines[index]
+  let cursor = index
+  while (/\\\s*$/.test(lines[cursor]) && cursor + 1 < lines.length) {
+    cursor += 1
+    text += `\n${lines[cursor]}`
+  }
+  return text
+}
+
+for (const [name, lines, startPattern] of [
+  ['deploy.sh', DEPLOY_LINES, /systemctl start|npm start/],
+  ['update.sh', UPDATE_LINES, /systemctl start/],
+  ['install.sh', INSTALL_LINES, /systemctl enable --now/],
+] as const) {
+  test(`${name} asks the database whether the application role can use what the migration just created`, () => {
+    const call = realCodeLine(lines, OBJECT_ACCESS_INVOCATION)
+    assert.notEqual(
+      call,
+      -1,
+      'without this call nothing in the pipeline asks about the APPLICATION role, and an ' +
+        'admin-owned schema deploys green while every request fails with "permission denied"',
+    )
+
+    const migrate = realCodeLine(lines, 'prisma migrate deploy')
+    assert.notEqual(migrate, -1)
+    assert.ok(call > migrate, 'there is nothing to check until the schema has moved')
+
+    const start = realCodeLine(lines, startPattern, call)
+    assert.notEqual(start, -1, 'the script must start the service after the check')
+    assert.ok(
+      call < start,
+      'and the answer must be known BEFORE the new build serves: after the start it is an outage, not a gate',
+    )
+  })
+
+  test(`${name} STOPS when the application role cannot use the schema, rather than noting it`, () => {
+    const call = realCodeLine(lines, OBJECT_ACCESS_INVOCATION)
+    assert.notEqual(call, -1)
+    const continuation = callContinuation(lines, call)
+
+    assert.match(
+      continuation,
+      /\|\|\s*(\\\s*\n\s*)?die\b/,
+      'a schema the application cannot use must `die`; `|| true` was a mutation this file passed',
+    )
+    assert.ok(
+      !/\|\|\s*(true|:|warn|info|success|echo)\b/.test(continuation),
+      'and the guard must not be satisfied by a no-op continuation',
+    )
+  })
+
+  test(`${name} names the role to ask about, instead of letting it fall back to the admin`, () => {
+    // During the fenced window DATABASE_URL is the PRIVILEGED url. A check that resolved its
+    // role from there would ask whether the deploy admin can use the objects the deploy admin
+    // just created — yes, for every one of them. The fence state file records the role whose
+    // CONNECT was revoked, which is the application.
+    const continuation = callContinuation(lines, realCodeLine(lines, OBJECT_ACCESS_INVOCATION))
+    assert.match(
+      continuation,
+      /--state-file=|--app-role=/,
+      'the call must name the role it asks about, or the answer is about the wrong role',
+    )
+  })
+}
+
+test('the CI path filter covers the object-access check, not only its three siblings', () => {
+  // The workflow re-runs the schema guardrails when a deploy script or one of its helpers
+  // changes. It listed check-db-writers, fence-db-connections and run-migration-verifications
+  // — and not the one that closes the CRITICAL, so a change to it ran no guardrail at all.
+  const workflow = readFileSync(join(process.cwd(), '.github/workflows/schema-guardrails.yml'), 'utf8')
+  const filters = [...workflow.matchAll(/^\s+- "(scripts\/[^"]+)"$/gm)].map((match) => match[1])
+  const siblings = filters.filter((path) => path === 'scripts/check-db-writers.mjs').length
+  assert.ok(siblings >= 2, 'the pull_request and push filters both list the sibling scripts')
+  assert.equal(
+    filters.filter((path) => path === 'scripts/check-app-db-object-access.mjs').length,
+    siblings,
+    'the object-access check must be listed wherever its siblings are',
+  )
+  assert.match(
+    workflow,
+    /check-app-db-object-access\.mjs/,
+    'and CI must actually run it against the migrated database, not merely watch the file',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r5, HIGH) — THE POINT OF NO RETURN WAS ARMED BY "SOMETHING ANSWERED THE
+// PORT".
+//
+// The health poll proves a socket accepted a request. It does not prove WHICH process. In
+// deploy.sh HEALTH_PATH defaults to /login, which touches no database and which the
+// PREDECESSOR serves just as happily; the BUILD_ID comparison was a `warn`; and when the
+// scrape regex missed, the served id was empty and the mismatch branch was skipped outright.
+// update.sh and install.sh poll /api/health, which is process liveness and nothing else.
+//
+// So a stale predecessor still holding the port armed PAST_POINT_OF_NO_RETURN — and the trap
+// then explicitly REFUSED to stop it, printing "everything that could reject this release has
+// already passed", leaving the OLD build serving a MIGRATED schema with the deploy reporting
+// success. Before the point of no return existed, that same trap tore it down: the fix turned
+// a recoverable case into a permanent one.
+//
+// The flag must therefore be armed by POSITIVE PROOF, and a mismatch must be fatal.
+// ---------------------------------------------------------------------------
+
+for (const [name, lines] of [
+  ['deploy.sh', DEPLOY_LINES],
+  ['update.sh', UPDATE_LINES],
+  ['install.sh', INSTALL_LINES],
+] as const) {
+  test(`${name} arms the point of no return only when the build on disk was PROVEN to be serving`, () => {
+    const arm = lines.findIndex((line) => isCode(line) && /^\s*PAST_POINT_OF_NO_RETURN=true\s*$/.test(line))
+    assert.notEqual(arm, -1, 'the script must have a point of no return')
+
+    // The nearest preceding line of code must be the `if` that guards it. An unconditional
+    // arming is the defect: it is reached by an open port and nothing else.
+    let previous = arm - 1
+    while (previous >= 0 && !isCode(lines[previous])) previous -= 1
+    assert.match(
+      lines[previous],
+      /^\s*if\s+.*\$NEW_BUILD_SERVING/,
+      'PAST_POINT_OF_NO_RETURN=true must be guarded by the proof, not merely follow the health poll',
+    )
+  })
+
+  test(`${name} sets that proof only from evidence the NEW build answered, never from the poll`, () => {
+    const source = lines.filter(isCode).join('\n')
+    assert.match(
+      source,
+      /_next\/static\/\$\{NEW_BUILD_ID\}/,
+      'the proof channel is an asset only the process with THAT build id serves',
+    )
+
+    const proofs = lines
+      .map((line, index) => ({ line, index }))
+      .filter((entry) => isCode(entry.line) && /^\s*NEW_BUILD_SERVING=true\s*$/.test(entry.line))
+    assert.ok(proofs.length > 0, 'something must be able to establish the proof, or no deploy ever completes')
+
+    for (const proof of proofs) {
+      const window = lines
+        .slice(Math.max(0, proof.index - 8), proof.index)
+        .filter(isCode)
+        .join('\n')
+      assert.ok(
+        /_next\/static\/\$\{NEW_BUILD_ID\}/.test(window) ||
+          /"\$SERVED_ID"\s*==\s*"\$NEW_BUILD_ID"/.test(window),
+        `NEW_BUILD_SERVING=true at line ${proof.index + 1} is not preceded by either proof channel`,
+      )
+    }
+  })
+
+  test(`${name} refuses to arm it when nothing identified the process on the port`, () => {
+    // "Nothing proved it" must not read as "proven". The schema has already moved, so the
+    // recoverable outcome is the trap's teardown, not a green deploy over the old build.
+    const source = lines.filter(isCode).join('\n')
+    assert.match(
+      source,
+      /die "Something answered [^"]*nothing proved it was BUILD_ID/,
+      'an unidentified process on the port must be fatal while the trap can still tear it down',
+    )
+    assert.ok(
+      !/NEW_BUILD_SERVING=true[^\n]*\|\|/.test(source),
+      'and the proof must not be set by a fallback that cannot fail',
+    )
+  })
+}
+
+test('deploy.sh treats a served BUILD_ID that is not the one on disk as fatal, not as a warning', () => {
+  const source = DEPLOY_LINES.filter(isCode).join('\n')
+  assert.ok(
+    !/warn "Served BUILD_ID/.test(source),
+    'a stale predecessor holding the port is the failure this exists to catch; warning about it arms the flag anyway',
+  )
+  assert.match(
+    source,
+    /die "Served BUILD_ID \(\$\{SERVED_ID\}\) is NOT the build on disk/,
+    'the mismatch must stop the deploy while the trap can still stop the predecessor',
+  )
+})

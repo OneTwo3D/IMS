@@ -637,9 +637,44 @@ It is not taken on trust:
   admin cannot `SET ROLE` to the application role, naming the `GRANT` that fixes it;
 * `scripts/check-app-db-object-access.mjs` runs after **every** migration, before the new build
   starts, and asks the database — about the **application** role, which is the one question none
-  of the other steps ask — whether it can `SELECT/INSERT/UPDATE/DELETE` every table, `SELECT`
-  every view and `USAGE/SELECT/UPDATE` every sequence. Anything it cannot use fails the deploy
-  and is reported with its owner.
+  of the other steps ask — whether it can `SELECT`, `INSERT`, `UPDATE` and `DELETE` every table,
+  `SELECT` every view, `USAGE`/`SELECT`/`UPDATE` every sequence, `EXECUTE` every function (this
+  repo's migrations create trigger functions that **gate writes**), and `USAGE` every enum, domain
+  and range type. Schemas are asked about directly, so a schema that is **empty** and unusable
+  fails rather than contributing no rows and therefore no failure. Anything it cannot use fails
+  the deploy and is reported with its owner and the exact privileges missing.
+
+  **Every privilege is asked for separately, and that matters.**
+  `has_table_privilege(role, oid, 'SELECT, INSERT, UPDATE, DELETE')` is **ANY, not ALL** — a role
+  holding `SELECT` and nothing else answers `true` — and `has_sequence_privilege(role, oid,
+  'USAGE, SELECT, UPDATE')` answers `true` for a role holding `SELECT` and no `USAGE`, which is
+  exactly the "serial column fails `INSERT`" case this check exists to catch. A comma-separated
+  list would therefore turn a read-only grant into a green check over a database the application
+  cannot write. `tests/scripts/app-db-object-access.test.ts` proves it against a real Postgres in
+  CI's `fresh-db-drift` job.
+
+  It also **refuses to answer about the wrong role**. During the fenced window `DATABASE_URL` is
+  the *admin* URL, and asking whether the admin can use the objects the admin just created answers
+  yes for every one of them. So the role comes from `--app-role`, then from the fence state file;
+  a state file that exists but cannot be read or names no role is **fatal** rather than a silent
+  fall-through, the `-c role=` option on `DATABASE_URL` outranks its username, and a fall-through
+  that lands on the deploy admin is refused outright.
+
+**The point of no return needs proof, not an open port** (o3d-2sm1.5). Past the health check the
+exit trap deliberately stops tearing the deploy down: the new build is serving, and a failed cron
+restore must not become an outage plus a database lockout. That is only defensible if the new build
+really *is* the one serving. A health poll proves a socket accepted a request — `deploy.sh`'s
+`HEALTH_PATH` defaults to `/login` and `update.sh`/`install.sh` poll `/api/health`, all of which a
+**stale predecessor still holding the port** answers just as happily. So all three scripts now arm
+the flag only on positive proof:
+
+* the `BUILD_ID` in what the health URL served equals the `BUILD_ID` on disk — and a **mismatch is
+  fatal**, not the warning it used to be; or
+* an asset under `/_next/static/<BUILD_ID>/` answers `200`, which only the process whose own build
+  id is that one can do.
+
+If neither is established the deploy **fails while the trap can still stop the predecessor**, rather
+than reporting success over an old build serving a migrated schema.
 
 **The fence is mandatory for an existing database** (o3d-2sm1.4). Earlier revisions treated exit 3
 from `scripts/fence-db-connections.mjs` — "CONNECT was **not** revoked" — as a warning and carried on

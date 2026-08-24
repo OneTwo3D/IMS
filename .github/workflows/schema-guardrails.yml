@@ -18,6 +18,7 @@ on:
       - "scripts/check-db-writers.mjs"
       - "scripts/fence-db-connections.mjs"
       - "scripts/run-migration-verifications.mjs"
+      - "scripts/check-app-db-object-access.mjs"
   push:
     branches:
       - main
@@ -37,6 +38,7 @@ on:
       - "scripts/check-db-writers.mjs"
       - "scripts/fence-db-connections.mjs"
       - "scripts/run-migration-verifications.mjs"
+      - "scripts/check-app-db-object-access.mjs"
 
 jobs:
   migration-scope:
@@ -93,5 +95,14 @@ jobs:
       # application. Until o3d-2sm1.2 this hook exited 0 having executed nothing at all.
       - name: Run the migrations' post-migration verification checks
         run: node scripts/run-migration-verifications.mjs --strict
+      # The check that closes o3d-2sm1.5, exercised against a REAL migrated database rather
+      # than only against its own source text. `has_table_privilege(role, oid, 'SELECT,
+      # INSERT, UPDATE, DELETE')` is ANY and not ALL, so a comma-separated list answers TRUE
+      # for a read-only grant — a green check over a database the application cannot write.
+      # The test creates a role with SELECT and nothing else and requires the check to fail.
+      - name: Prove the application role can use what a migration creates
+        env:
+          RUN_DB_OBJECT_ACCESS_TEST: "1"
+        run: npx tsx --test --experimental-test-module-mocks tests/scripts/app-db-object-access.test.ts
       - name: Run DB-backed concurrency regressions
         run: npm run test:concurrency

@@ -349,14 +349,39 @@ export function assessMigrationRole({ adminRole, appRole, adminIsSuperuser, admi
  * whole value is then percent-encoded, because `+` is NOT decoded as a space here and using
  * URLSearchParams would produce exactly that. An `options` already present is preserved and
  * appended to rather than overwritten.
+ *
+ * IT THROWS RATHER THAN RETURNING THE INPUT (o3d-2sm1.5, Codex r5 MEDIUM). Returning the admin
+ * URL unchanged on unparseable input produced a connection with NO `role=` at all — the
+ * migration then ran as the admin, creating objects the application cannot use, while the
+ * deploy log announced that it was running as the application role. That is precisely the
+ * CRITICAL this whole mechanism exists to close, reached through its own fallback. Same for a
+ * role name carrying a tab or a newline: libpq's option parser splits on those exactly as it
+ * splits on a space, and the resulting `role=` would be silently truncated, so it is refused
+ * rather than escaped-and-hoped.
  */
 export function buildMigrationConnectionString(adminConnectionString, appRole) {
-  if (!adminConnectionString || !appRole) return adminConnectionString ?? ''
+  if (!adminConnectionString) {
+    throw new Error('No admin connection string to compose a migration URL from.')
+  }
+  if (!appRole) {
+    throw new Error('No application role, so there is no role for the migration to run as.')
+  }
+  if (/[\t\n\r\f\v]/.test(String(appRole))) {
+    throw new Error(
+      `The application role name ${JSON.stringify(String(appRole))} contains whitespace that libpq's ` +
+        'option parser treats as a separator, so `role=` would be silently truncated and the migration ' +
+        'would run as the admin. Refusing to compose that URL.',
+    )
+  }
   let url
   try {
     url = new URL(adminConnectionString)
   } catch {
-    return adminConnectionString
+    throw new Error(
+      'The admin connection string cannot be parsed as a URL, so `options=-c role=' +
+        `${appRole}\` cannot be added to it. Returning it unchanged would run the migration AS THE ADMIN ` +
+        'while the deploy announced the application role — the exact failure this composes a URL to avoid.',
+    )
   }
   const escaped = String(appRole).replace(/([\\ '])/g, '\\$1')
   const existing = url.searchParams.get('options')
