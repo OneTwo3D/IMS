@@ -492,11 +492,21 @@ crontab -u imsapp /var/lib/one-two-inventory/crontab.bak       # restore cron la
 The order is:
 
 ```
-build -> validate -> STOP AND DRAIN EVERY WRITER -> migrate -> verify -> start
+build -> validate -> STOP AND DRAIN EVERY WRITER -> migrate -> verify -> start -> health
 ```
 
-`scripts/update.sh` and `scripts/deploy.sh` implement exactly that, and
-`tests/scripts/deploy-order.test.ts` fails if the steps are reordered.
+`scripts/update.sh`, `scripts/deploy.sh` **and `scripts/install.sh`'s upgrade cutover** implement
+exactly that, and `tests/scripts/deploy-order.test.ts` fails if the steps are reordered.
+
+`install.sh` did not, until o3d-2sm1.5: its order was stop → drain → migrate → verify → seed →
+bootstrap → **build** → start, which inverts the founding premise of this whole order — everything
+that can reject a release must reject it while the predecessor is still up — on the entrypoint this
+page says follows the same sequence. A TypeScript error costs nothing on `deploy.sh`; there it left
+the service stopped, cron fenced, the schema migrated and the connection fence held. The build now
+runs before the stop. The **seed and the bootstrap deliberately did not move with it**: they are
+not validations that can reject a release, they are writes, and they need the schema the migration
+has just applied — running them before the stop would be new code writing to the old schema, the
+exact overlap this order exists to prevent.
 
 **Why the migration comes after the stop and not before it.** These scripts used to migrate
 first and build second, which left the OLD version serving the MIGRATED schema for the whole
@@ -532,10 +542,26 @@ only defence. (o3d-2sm1.1)
 
 **A snapshot is not a fence** (o3d-2sm1.2). Step 4 on its own closes its connection, and the dump
 and the migration then open theirs; nothing stops a client connecting in the gap. So the scripts
-first revoke `CONNECT` on the database from the application role **and from PUBLIC** (the default
-database ACL grants it to PUBLIC, so revoking from the role alone changes nothing) for the length
-of the window (`scripts/fence-db-connections.mjs --fence`), drain what is already attached, and only
-then take the snapshot.
+first revoke `CONNECT` on the database from **every grantee that holds it directly** — the
+application role, PUBLIC (the default database ACL grants it to PUBLIC, so revoking from the role
+alone changes nothing) and any other role with a direct grant — for the length of the window
+(`scripts/fence-db-connections.mjs --fence`), drain what is already attached, and only then take
+the snapshot.
+
+**Every grantee, not two of them** (o3d-2sm1.5). It used to revoke from PUBLIC and the application
+role and call the database held closed. A third role with a direct `CONNECT` grant — monitoring,
+BI, a backup job, a second application — was terminated by the drain and **reconnected
+immediately**, for the whole length of the migration, while every header and this page said the
+database was fenced. The set of grantees is derived from the ACL itself now; the only exclusion is
+the admin role the deploy is connected as, because revoking from that would lock the deploy out of
+its own recovery. The drain's terminate and its confirming read are both unconditional: an empty
+first sample, taken microseconds after the revoke committed, is not proof that a backend which was
+mid-authentication has gone.
+
+`--release` restores exactly the grantees that were revoked. It cannot restore the **grantor**: a
+grant originally made by `postgres` comes back recorded as made by the deploy admin. The privilege
+is identical and every `has_database_privilege()` answer is the same; what changes is who may
+revoke it later.
 
 **The fence proves it took, rather than assuming the revoke worked** (o3d-2sm1.3). A grant can reach
 the application role through **role membership**, which no examination of the ACL entries the script
@@ -584,7 +610,36 @@ That fence needs a privileged connection of its own, `DEPLOY_ADMIN_DATABASE_URL`
 
 | Variable | Purpose |
 | --- | --- |
-| `DEPLOY_ADMIN_DATABASE_URL` | A superuser or database-owner connection, as a **different role** from `DATABASE_URL`. Used only by the deploy scripts, and only for the migration window. No ACL can tell "the migration" apart from "the application" when both log in as one role, so without a separate role there is no fence to install. While it is in use the migration runs through this connection, which means objects a migration creates are **owned by this role** — point it at the role that owns the schema today. |
+| `DEPLOY_ADMIN_DATABASE_URL` | A superuser or database-owner connection, as a **different role** from `DATABASE_URL`. Used only by the deploy scripts, and only for the migration window. No ACL can tell "the migration" apart from "the application" when both log in as one role, so without a separate role there is no fence to install. |
+
+**Who the migration runs as, which is not who it connects as** (o3d-2sm1.5). This table used to
+end with *"objects a migration creates are owned by this role — point it at the role that owns the
+schema today"*, and that is advice nobody can follow: `install.sh` makes the **application** role
+the database owner, and the fence **refuses outright** when the admin role *is* the application
+role. The only fenceable configuration is therefore a separate **superuser** admin — and every
+`CREATE TABLE`, `INDEX` and `SEQUENCE` a migration made through it was owned by that superuser
+with no grant to the application role.
+
+Nothing in the pipeline could see it. `prisma migrate deploy`, the drift check, the verification
+hook and `pg_dump` all use **the same admin connection**, which owns the new objects and reads
+them perfectly; the health check hits a route that touches no database. The deploy reported
+success and every request touching the new table failed with `permission denied`.
+
+So the migration **connects as the admin and runs as the application role**: the deploy composes
+the migration URL with `options=-c role=<app role>`, which Postgres applies at connection start.
+Authentication — and therefore the `CONNECT` check the fence revokes — is still the admin's, so
+the fence still holds; ownership is the application's, so the fenced path leaves the database in
+exactly the state an unfenced migration would.
+
+It is not taken on trust:
+
+* `scripts/fence-db-connections.mjs --preflight` **refuses before anything is stopped** if the
+  admin cannot `SET ROLE` to the application role, naming the `GRANT` that fixes it;
+* `scripts/check-app-db-object-access.mjs` runs after **every** migration, before the new build
+  starts, and asks the database — about the **application** role, which is the one question none
+  of the other steps ask — whether it can `SELECT/INSERT/UPDATE/DELETE` every table, `SELECT`
+  every view and `USAGE/SELECT/UPDATE` every sequence. Anything it cannot use fails the deploy
+  and is reported with its owner.
 
 **The fence is mandatory for an existing database** (o3d-2sm1.4). Earlier revisions treated exit 3
 from `scripts/fence-db-connections.mjs` — "CONNECT was **not** revoked" — as a warning and carried on
@@ -595,17 +650,22 @@ degraded fence, it is no fence. So:
 
 * `scripts/deploy.sh`, `scripts/update.sh` and `scripts/install.sh` **abort on exit 3**, with the
   fence script's own reason printed above the refusal, and nothing is migrated;
-* whether the privileged connection exists at all is checked **before anything is stopped** — in the
-  `validate` phase for `deploy.sh`/`update.sh`, and before the stop in `install.sh`'s upgrade cutover
-  — so a missing environment variable costs a refusal, not an outage. The reasons only the database
-  can give (a superuser application role, a `CONNECT` arriving through role membership) are still
-  found at `drain-verify`, and those do cost the stop;
+* the fence is checked **before anything is stopped** by *running* it — `--preflight` opens the same
+  admin connection and asks the same questions as `--fence`, and revokes, terminates and writes
+  nothing. It used to be a `[[ -f scripts/fence-db-connections.mjs ]]`, which proves a file exists
+  and nothing about whether it works: `dotenv` was a **devDependency** while the documented manual
+  upgrade runs `npm ci --omit=dev`, so the fence died with a missing module at `drain-verify`,
+  **after the stop** — an outage for an import (o3d-2sm1.5). `dotenv` is a runtime dependency now,
+  and the preflight is what would catch the next one;
+* the reasons only the database can give — a superuser application role, a `CONNECT` arriving
+  through role membership, an admin that cannot `SET ROLE` to the application role — are answered by
+  that same preflight, so they too cost a refusal rather than the stop;
 * a **first install** has no existing database to hold closed, so it never asks;
 * `--dry-run` **reports** the refusal (`A REAL RUN WOULD BE REFUSED HERE`) and exits 0, because a dry
   run stops nothing and migrates nothing, and its whole job is to tell you what a real run would do.
 
-**The reboot fence is installed before the migration, and verified.** Each unit gets a drop-in at
-`/etc/systemd/system/<unit>.d/zz-deploy-fence.conf` carrying
+**The reboot fence is installed before the migration, verified, and rolled back if it cannot be.**
+Each unit gets a drop-in at `/etc/systemd/system/<unit>.d/zz-deploy-fence.conf` carrying
 `AssertPathExists=!<state-dir>/FENCED`, written *before* anything is stopped — a fence installed
 only from the exit trap does not exist for a run that is SIGKILLed or loses power mid-migration,
 which is exactly when it is needed. It is a drop-in and not `systemctl mask` because a mask is a
@@ -613,6 +673,35 @@ symlink at `/etc/systemd/system/<unit>`, which is where a locally-installed unit
 lives (the mask fails outright), and `mask --runtime` lives in `/run`, which the reboot erases.
 The scripts check the install against `systemctl show -p DropInPaths` and refuse to stop the
 predecessor if they cannot confirm it.
+
+**A failed install leaves nothing behind** (o3d-2sm1.5). The marker went down first, then the
+drop-in, then the reload, then the verify — and any failure after that first line returned into a
+`die` while the fence was not yet armed, so the exit trap did nothing and neither the marker nor
+the drop-in was removed. The operator read a clean abort: *refusing to stop the predecessor,
+nothing changed*. Nothing had, except an `AssertPathExists=!` now pointing at a marker that
+existed — invisible until the next reboot, when the unit failed its assertion with nothing on the
+box connecting that to a deploy that had "changed nothing". The install now removes exactly what
+**that call** created, and never a fence that was already standing (an adoption, or the exit
+trap's own re-install).
+
+**A migration needs a unit to fence** (o3d-2sm1.5). With no systemd unit serving the tree the
+install used to warn and return success, so the `|| die` at every call site never fired: the
+predecessor was stopped and the schema migrated with no reboot fence at all, and the failure
+banner then described one. That is the exit-3 reasoning again, so `deploy.sh` refuses a migration
+on a unit-less host in the `validate` phase, before anything is stopped, and names
+`IMS_SERVICE_UNIT`. The `nohup npm start` fallback is unaffected for `--skip-migrate` and
+`--restart-only`, which move no schema. The state file records
+`reboot_fence=installed|absent` and the failure banner prints whichever is true.
+
+**There is a point of no return** (o3d-2sm1.5). Once the new build has answered its health check
+the deploy has succeeded, and what is left is cleanup. The success flag used to be set only after
+the cron restore and the marker removal, so under `set -e` a failing `crontab` reached the exit
+trap with the fence still armed — and the trap **stopped the service that had just passed its
+health check**, re-fenced it and re-revoked `CONNECT`. A cron-restore failure became a full outage
+plus a database lockout on a deploy that had already succeeded. Past the health check nothing
+tears the deploy down: the failure is printed with the commands to finish the cleanup by hand.
+`install.sh`'s upgrade cutover, which previously had **no health check at all**, now polls
+`/api/health` before it restores cron and calls the upgrade complete.
 
 **On a failure after the stop, the old version stays down.** A "rollback" that restarts the
 predecessor against a migrated schema puts you back in the window the order exists to close. The
@@ -695,9 +784,16 @@ teach everyone to ignore a mandatory gate). They are derived from what that migr
 says is dangerous:
 
 1. **no refund written after the cutover began without a staging witness.** Legacy rows are
-   legitimately `NULL` — the column is deliberately not backfilled — so the check is bounded by
-   `_prisma_migrations.started_at` for that migration. Every refund created from that moment is
-   written by code that sets the column, so a `NULL` one was minted by a predecessor still serving.
+   legitimately `NULL` — the column is deliberately not backfilled — so the check needs a bound.
+   That bound is **a discriminator the migration itself draws, not a clock** (o3d-2sm1.4): the
+   first revision compared `createdAt` against `_prisma_migrations.started_at`, and
+   `CURRENT_TIMESTAMP` is fixed at *transaction start*, so a predecessor transaction that began
+   before the migration and committed after it stamps a pre-migration timestamp and looks legacy
+   while being exactly the row the check exists to find. `migration.sql` instead adds
+   `reversal_staging_state_predates_column NOT NULL DEFAULT true` under its own `ALTER TABLE`'s
+   `ACCESS EXCLUSIVE` lock — marking precisely the rows that exist at that instant, with none
+   insertable in the middle of it — and then flips the default to `false`. A `NULL` state on a row
+   marked `false` was minted by a predecessor still serving, and no clock is consulted.
 2. **none of those already outside the accounting invariant's only bound**, i.e. with
    `accounting_retry_required` cleared and no recorded sync list. That is the subset the migration
    calls unrecoverable — no sweep will look at such a row again. It is deliberately a subset of the
@@ -705,6 +801,17 @@ says is dangerous:
 3. **no value in the column that neither application writer mints.** The migration ships no trigger,
    no default and no backfill, and a third value would make `reversalRecordVerdict` fall through to
    `undecidable` — silencing itself rather than failing.
+
+**And there is a way out when check 1 is red** (o3d-2sm1.5). These checks run on every subsequent
+deploy, so a non-zero count does not clear itself: once a predecessor has minted such a row — or a
+**partial restore** has put pre-migration rows back into a migrated database, where they arrive
+with the post-migration default `predates = false` — every deploy from then on is refused by a
+count nobody can act on, and a gate that can only be red is a gate everyone learns to ignore. The
+route out is a **repair**, documented in the migration's own `verify.sql`: decide a
+predecessor-minted row's state from the accounting ledger and write it, or, for rows a restore
+brought back, set `reversal_staging_state_predates_column = true` **scoped to the ids the restore
+actually returned** — never to "everything currently red", which would relabel a predecessor's
+rows as legacy and destroy the evidence. Neither is something a deploy script runs.
 
 A named migration that declares nothing is a coverage gap. It **fails** under `--strict`, which is
 how the `Schema Guardrails` CI job runs the hook, because a missing file is a defect for the pull

@@ -61,6 +61,32 @@
 -- after the migration commits gets the new default, false, whenever it happens to have started. The
 -- column is NOT NULL, so there is no third answer and no "cannot answer" case to encode.
 --
+-- WHAT TO DO WHEN CHECK 1 IS RED, WHICH IS NOT "NOTHING" (o3d-2sm1.5, Codex r4 MEDIUM). These
+-- checks run on EVERY subsequent deploy, so a non-zero count does not clear itself: once a
+-- predecessor has minted such a row — or a PARTIAL RESTORE has put pre-migration rows back into a
+-- migrated database, where they arrive with the post-migration default `predates = false` — every
+-- deploy from then on is refused, for ever, by a count nobody can act on. A gate that can only be
+-- red is a gate everyone learns to ignore, which is the failure this file's own coverage argument
+-- warns about. So the way out is written down, and it is a REPAIR rather than a silencing:
+--
+--   * A ROW THE PREDECESSOR MINTED. Decide its state from the accounting ledger the way
+--     `reversalRecordVerdict` would (lib/domain/sales/refund-reversal-record.ts) and write the
+--     answer: `UPDATE "sales_order_refunds" SET "reversal_staging_state" = 'NOT_STAGED' | 'STAGED'
+--     WHERE id = ...`. Check 2 says which of these are already outside the invariant's bound, and
+--     those are the ones to look at first — for them the ledger read is the only remaining
+--     evidence. Setting the column is what makes the row decidable again; it is not what makes the
+--     check pass, it is the same act.
+--
+--   * A ROW RESTORED FROM A PRE-MIGRATION BACKUP. It genuinely predates the column, and the only
+--     reason it says otherwise is that the restore replayed an INSERT against the migrated table
+--     and picked up the new default. Say what is true:
+--     `UPDATE "sales_order_refunds" SET "reversal_staging_state_predates_column" = true
+--        WHERE id IN (...)` — scoped to the ids the restore actually brought back, never to
+--     "everything currently red", because that would relabel a predecessor's rows as legacy and
+--     lose exactly the evidence these checks exist to preserve.
+--
+-- Record which rows were repaired and why. Neither statement is something a deploy script runs.
+--
 -- WHAT THESE CHECKS CANNOT DO, for the same reason the runner's own header gives: they catch a
 -- predecessor that CREATED rows. They cannot catch one that cleared the flag on a LEGACY row during
 -- the window — nothing on the row records when it was cleared. Stopping the writer before the

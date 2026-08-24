@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -271,10 +271,26 @@ for (const [name, lines] of [
   })
 
   test(`${name} fails the deploy when the fence cannot be verified`, () => {
+    // THIS USED TO BE `assert.match(fourLines, /\|\||die/)`, which any `||` in the window
+    // satisfies — `|| true` included. So it asserted that the shell contains a pipe symbol.
+    // What has to be true is that the call's OWN continuation is a `die`, so read the
+    // continuation: from the call line, follow backslash-continued lines, and require that
+    // what they contain is `|| die` and not `|| warn`, `|| true` or a bare `||`.
     const fenceWriters = phaseLine(lines, 'fence-writers')
     const install = codeLine(lines, 'install_reboot_fence', fenceWriters)
-    const guard = lines.slice(install, install + 4).join('\n')
-    assert.match(guard, /\|\||die/, 'an unverifiable fence must stop the deploy, not warn')
+    assert.notEqual(install, -1, 'the stop phase must install the reboot fence')
+
+    let continuation = lines[install]
+    let index = install
+    while (/\\\s*$/.test(lines[index]) && index + 1 < lines.length) {
+      index += 1
+      continuation += `\n${lines[index]}`
+    }
+    assert.match(continuation, /\|\|\s*(\\\s*\n\s*)?die\b/, 'an unverifiable fence must `die`, not warn or `|| true`')
+    assert.ok(
+      !/\|\|\s*(true|:|warn|info)\b/.test(continuation),
+      'and the guard must not be satisfied by a no-op continuation',
+    )
   })
 
   test(`${name} adopts an existing fence before it pulls, installs or builds`, () => {
@@ -927,6 +943,7 @@ DB_FENCE_STATE='${dir}/db-connect-fence.json'
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
 MIGRATION_DATABASE_URL=''
 DB_FENCE_UP=false
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
 info() { :; }
 ok() { :; }
 warn() { echo "WARN: $*"; }
@@ -949,6 +966,7 @@ DATABASE_URL='postgres://app@127.0.0.1/nowhere'
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
 MIGRATION_DATABASE_URL=''
 DB_FENCE_UP=false
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
 info() { :; }
 success() { :; }
 warn() { echo "WARN: $*"; }
@@ -971,6 +989,7 @@ DATABASE_URL='postgres://app@127.0.0.1/nowhere'
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
 MIGRATION_DATABASE_URL=''
 DB_FENCE_UP=false
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
 info() { :; }
 success() { :; }
 warn() { echo "WARN: $*"; }
@@ -1016,7 +1035,19 @@ for (const entry of FENCE_HARNESS) {
   test(`${entry.name} treats a successful fence as the only way past the drain`, () => {
     const dir = mkdtempSync(join(tmpdir(), 'ims-fence0-'))
     try {
-      execFileSync('bash', ['-c', `printf 'process.exit(0)\\n' > "${dir}/fence.mjs"`])
+      // The stub answers --print-migration-url the way the real script does, and exits 0 for
+      // --fence. Anything else the shell might do with the admin URL is then visible in
+      // MIGRATION_DATABASE_URL.
+      writeFileSync(
+        join(dir, 'fence.mjs'),
+        [
+          "if (process.argv.includes('--print-migration-url')) {",
+          "  process.stdout.write('postgres://admin@127.0.0.1/nowhere?options=-c%20role%3Dimsapp\\n')",
+          '}',
+          'process.exit(0)',
+          '',
+        ].join('\n'),
+      )
       const program = [
         'set -euo pipefail',
         entry.preamble(dir),
@@ -1030,6 +1061,385 @@ for (const entry of FENCE_HARNESS) {
         output,
         /MIGRATION_URL=postgres:\/\/admin@/,
         'and the migration must then run through the privileged connection, not the fenced-out one',
+      )
+      // o3d-2sm1.5 (Codex r4, CRITICAL): the privileged connection is a SUPERUSER (the fence
+      // refuses every other fenceable shape), so a migration that merely runs THROUGH it owns
+      // everything it creates and the application role gets no grant at all. The URL the shell
+      // adopts must be the composed one, carrying the role the migration runs as.
+      assert.match(
+        output,
+        /MIGRATION_URL=[^\s]*options=-c%20role%3Dimsapp/,
+        'the migration URL must carry `options=-c role=<app role>`, or the fenced migration creates objects the application cannot use',
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${entry.name} refuses to migrate when the migration URL cannot be composed`, () => {
+    // The fence took, so the application role has no CONNECT and the schema is about to move.
+    // Falling back to the bare admin URL here is exactly the defect — it succeeds, and leaves
+    // a database the application cannot use. It has to abort while nothing has been migrated.
+    const dir = mkdtempSync(join(tmpdir(), 'ims-fenceurl-'))
+    try {
+      writeFileSync(
+        join(dir, 'fence.mjs'),
+        ["if (process.argv.includes('--print-migration-url')) process.exit(1)", 'process.exit(0)', ''].join('\n'),
+      )
+      const program = [
+        'set -euo pipefail',
+        entry.preamble(dir),
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'echo "REACHED THE MIGRATION"',
+      ].join('\n')
+
+      let status = 0
+      let output = ''
+      try {
+        output = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+      } catch (error) {
+        const failure = error as { status?: number; stdout?: string; stderr?: string }
+        status = failure.status ?? -1
+        output = `${failure.stdout ?? ''}${failure.stderr ?? ''}`
+      }
+
+      assert.notEqual(status, 0, 'a migration URL that cannot be composed must abort the cutover')
+      assert.ok(!output.includes('REACHED THE MIGRATION'), 'and nothing after it may run')
+      assert.match(output, /application cannot use|produced nothing/, 'and it must say why')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r4, CRITICAL) — install.sh BUILT INSIDE THE STOPPED WINDOW.
+//
+// Its order was stop -> drain -> migrate -> verify -> seed -> bootstrap -> BUILD -> start,
+// which inverts this branch's founding premise — everything that can reject a release must
+// reject it while the predecessor is still up — on the entrypoint the docs say follows the
+// same sequence as the other two. A TypeScript error costs nothing on deploy.sh; there it
+// left the service stopped, cron fenced, the schema migrated and the connection fence held.
+//
+// The previous revision of this file asserted NOTHING about install.sh's build position, so
+// it was shaped to pass on the code as written. These are the assertions it was missing.
+// ---------------------------------------------------------------------------
+
+test('install.sh builds and validates BEFORE it stops anything', () => {
+  const build = realCodeLine(INSTALL_LINES, /npm run build --prefix/)
+  const generate = realCodeLine(INSTALL_LINES, /npx prisma generate/)
+  const validate = realCodeLine(INSTALL_LINES, /\.next\/BUILD_ID/)
+
+  // Anchored on the block that opens the stopped window, so a `systemctl stop` inside a
+  // FUNCTION DEFINITION (adopt_existing_fence, the exit trap) is not mistaken for the one in
+  // the linear flow — those are defined near the top of the file and would make this pass by
+  // accident.
+  const stopBlock = codeLine(INSTALL_LINES, /^if \$\{UPGRADE_EXISTING\}; then$/)
+  assert.notEqual(stopBlock, -1, 'the stop/drain block must be its own guarded section')
+  assert.ok(build < stopBlock, 'and the build must precede the whole of it')
+
+  const fence = realCodeLine(INSTALL_LINES, /^\s*install_reboot_fence "install\.sh cutover started/, stopBlock)
+  const stop = realCodeLine(INSTALL_LINES, /^\s*systemctl stop "\$\{APP_NAME\}\.service"/, stopBlock)
+  const cron = realCodeLine(INSTALL_LINES, /^\s*fence_cron$/, stopBlock)
+  const dbFence = realCodeLine(INSTALL_LINES, /^\s*fence_db_connections$/, stopBlock)
+  const migrate = realCodeLine(INSTALL_LINES, 'prisma migrate deploy', stopBlock)
+
+  assert.notEqual(build, -1, 'the installer must build the application')
+  assert.notEqual(generate, -1, 'and generate the Prisma client')
+  assert.notEqual(validate, -1, 'and check the artefact actually landed')
+
+  for (const [what, at] of [
+    ['install the reboot fence', fence],
+    ['stop the service', stop],
+    ['fence the cron writers', cron],
+    ['revoke CONNECT for the window', dbFence],
+    ['apply the migration', migrate],
+  ] as const) {
+    assert.notEqual(at, -1, `the cutover must ${what}`)
+    assert.ok(
+      build < at,
+      `the build must run BEFORE the step that would ${what} — a failed build must not leave a stopped service behind`,
+    )
+  }
+
+  assert.ok(generate < build, 'the Prisma client is generated before the build that needs it')
+  assert.ok(build < validate, 'the artefact is validated after the build')
+  assert.ok(validate < stop, 'and the validation must be able to reject the release before the stop')
+})
+
+test('install.sh keeps the seed and the bootstrap INSIDE the window, after the migration', () => {
+  // They deliberately did NOT move with the build. They are not validations that can reject a
+  // release; they are writes, and they need the schema the migration has just applied.
+  // Running them before the stop would be new code writing to the OLD schema — the overlap
+  // the whole order exists to prevent.
+  const migrate = realCodeLine(INSTALL_LINES, 'prisma migrate deploy')
+  const seed = realCodeLine(INSTALL_LINES, /npm run db:seed/)
+  const bootstrap = realCodeLine(INSTALL_LINES, /node "\$\{BOOTSTRAP_SCRIPT\}"/)
+  const start = realCodeLine(INSTALL_LINES, /systemctl enable --now/)
+
+  assert.notEqual(seed, -1, 'the installer must seed')
+  assert.notEqual(bootstrap, -1, 'and bootstrap the admin/settings')
+  assert.ok(migrate < seed, 'the seed writes rows that need the migrated schema')
+  assert.ok(migrate < bootstrap, 'and so does the bootstrap')
+  assert.ok(seed < start && bootstrap < start, 'both run with nothing serving, before the start')
+})
+
+test('install.sh health-checks the new build before it calls the cutover complete', () => {
+  // The cutover had no health check at all: it started the unit and restored cron, so a new
+  // build that failed on its first request was reported as a successful upgrade.
+  const start = realCodeLine(INSTALL_LINES, /systemctl enable --now/)
+  const health = realCodeLine(INSTALL_LINES, /curl -fsS[^\n]*INSTALL_HEALTH_URL/)
+  const unfence = realCodeLine(INSTALL_LINES, /^unfence_cron$/)
+
+  assert.notEqual(health, -1, 'the installer must poll the new build before declaring success')
+  assert.ok(start < health, 'after the start')
+  assert.ok(health < unfence, 'and before the cron writers are handed back to it')
+
+  const source = INSTALL_LINES.join('\n')
+  assert.match(source, /did not answer \$\{INSTALL_HEALTH_URL\}/, 'a health check that never fails is not a health check')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r4, HIGH) — THE POINT OF NO RETURN.
+//
+// DEPLOY_OK was set only after the cron restore and the marker removal, so under `set -e` a
+// failing `crontab` reached the exit trap with the fence still armed — and the trap then
+// STOPPED the service that had just passed its health check, re-fenced it and RE-REVOKED
+// CONNECT. A cron-restore failure became a full outage plus a database lockout on a deploy
+// that had already succeeded.
+// ---------------------------------------------------------------------------
+
+for (const [name, lines, trapName] of [
+  ['deploy.sh', DEPLOY_LINES, 'on_exit'],
+  ['update.sh', UPDATE_LINES, 'on_exit'],
+  ['install.sh', INSTALL_LINES, 'on_cutover_exit'],
+] as const) {
+  test(`${name} does not tear down a deploy that has already passed its health check`, () => {
+    const source = lines.join('\n')
+    assert.match(source, /^PAST_POINT_OF_NO_RETURN=false$/m, 'the flag must start false')
+
+    const raise = realCodeLine(lines, /^PAST_POINT_OF_NO_RETURN=true$/)
+    assert.notEqual(raise, -1, 'and be raised once the new build has answered')
+
+    // It is raised AFTER the health check and BEFORE the cleanup that used to be able to
+    // trigger the teardown.
+    const health = realCodeLine(lines, name === 'install.sh' ? /curl -fsS[^\n]*INSTALL_HEALTH_URL/ : /READY=true/)
+    const unfence = realCodeLine(lines, /^\s*unfence_cron$/, raise)
+    assert.notEqual(health, -1, 'there must be a health check to be past')
+    assert.ok(health < raise, 'the point of no return is reached only once the health check has passed')
+    assert.notEqual(unfence, -1, 'and the cron restore happens after it')
+
+    // The trap consults it FIRST, before the armed-fence teardown, and that branch neither
+    // stops the service nor re-establishes any fence.
+    const trap = shellFunction(source, trapName)
+    const guardAt = trap.indexOf('PAST_POINT_OF_NO_RETURN')
+    const armedAt = trap.search(/\$\{?FENCE_ARMED\}?/)
+    assert.notEqual(guardAt, -1, 'the failure path must ask whether the deploy had already succeeded')
+    assert.ok(guardAt < armedAt, 'and ask it BEFORE the branch that stops and re-fences')
+
+    const branch = trap.slice(guardAt, armedAt)
+    assert.ok(!/systemctl\s+stop/.test(branch), 'a post-health failure must never stop the service')
+    assert.ok(!/refence_db_connections/.test(branch), 'nor re-revoke CONNECT on a database it is serving')
+    assert.ok(!/install_reboot_fence/.test(branch), 'nor re-fence it against a reboot')
+    assert.match(branch, /crontab -u/, 'it must instead say how to finish the cleanup by hand')
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r4, CRITICAL) — A FAILED REBOOT-FENCE INSTALL LEFT THE FENCE BEHIND.
+//
+// The marker was written first, then the drop-ins, then the reload, then the verify. Any
+// failure after that first line returned 1 into a `|| die` — but FENCE_ARMED was still false,
+// so the trap did nothing, and neither the marker nor the drop-in was removed. The operator
+// saw a clean abort. The next reboot saw a unit that would not start.
+//
+// This RUNS the shipped install/rollback pair against a systemctl that fails, because a
+// re-implementation of the rollback would pass while the script did something else.
+// ---------------------------------------------------------------------------
+
+const FENCE_INSTALL_CASES = [
+  {
+    name: 'deploy.sh',
+    source: DEPLOY_LINES.join('\n'),
+    markerFn: 'write_fence_marker',
+    preamble: (dir: string) => `
+DRY_RUN=false
+BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+STATE_DIR='${dir}'
+FENCE_FILE="\${STATE_DIR}/FENCED"
+FENCE_DROPIN_NAME='zz-deploy-fence.conf'
+CURRENT_STEP=fence-writers
+FENCE_MASK=true
+SCHEMA_TOUCHED=false
+DB_FENCE_UP=false
+FENCE_ARMED=false
+REBOOT_FENCE_INSTALLED=false
+FENCE_MARKER_PREEXISTED=false
+FENCE_DROPINS_CREATED=()
+APP_DIR_REAL=/opt/app
+PORT=3000
+CRON_BACKUP="\${STATE_DIR}/crontab.bak"
+SERVICE_UNITS=(app.service)
+DB_FENCE_STATE="\${STATE_DIR}/db-connect-fence.json"
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
+ok() { :; }
+warn() { :; }
+die() { echo "die: $*" >&2; exit 1; }
+fence_dropin_file() { echo "${dir}/dropins/$1.d/\${FENCE_DROPIN_NAME}"; }
+systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
+`,
+  },
+  {
+    name: 'update.sh',
+    source: UPDATE_LINES.join('\n'),
+    markerFn: 'write_fence_marker',
+    preamble: (dir: string) => `
+DRY_RUN=false
+BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+DATA_DIR='${dir}'
+FENCE_FILE="\${DATA_DIR}/DEPLOY-FENCED"
+SERVICE_UNIT=app.service
+FENCE_DROPIN_DIR="${dir}/dropins/app.service.d"
+FENCE_DROPIN_FILE="\${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
+CURRENT_STEP=fence-writers
+FENCE_MASK=true
+SCHEMA_TOUCHED=false
+DB_FENCE_UP=false
+FENCE_ARMED=false
+REBOOT_FENCE_INSTALLED=false
+FENCE_MARKER_PREEXISTED=false
+FENCE_DROPIN_CREATED=false
+BACKUP_FILE=''
+CRON_BACKUP="\${DATA_DIR}/crontab.bak"
+DB_FENCE_STATE="\${DATA_DIR}/db-connect-fence.json"
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
+success() { :; }
+warn() { :; }
+error() { :; }
+die() { echo "die: $*" >&2; exit 1; }
+systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
+`,
+  },
+  {
+    name: 'install.sh',
+    source: INSTALL_SOURCE,
+    markerFn: 'write_cutover_marker',
+    preamble: (dir: string) => `
+DATA_DIR='${dir}'
+FENCE_FILE="\${DATA_DIR}/DEPLOY-FENCED"
+FENCE_DROPIN_DIR="${dir}/dropins/app.service.d"
+FENCE_DROPIN_FILE="\${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
+CUTOVER_STEP=fence-writers
+APP_DIR=/opt/app
+APP_NAME=one-two-inventory
+FENCE_ARMED=false
+SCHEMA_TOUCHED=false
+DB_FENCE_UP=false
+REBOOT_FENCE_INSTALLED=false
+FENCE_MARKER_PREEXISTED=false
+FENCE_DROPIN_CREATED=false
+CRON_BACKUP="\${DATA_DIR}/crontab.bak"
+DB_FENCE_STATE="\${DATA_DIR}/db-connect-fence.json"
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
+success() { :; }
+warn() { :; }
+error() { :; }
+die() { echo "die: $*" >&2; exit 1; }
+systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
+`,
+  },
+] as const
+
+function runFenceInstallHarness(entry: (typeof FENCE_INSTALL_CASES)[number], prelude: string) {
+  const dir = mkdtempSync(join(tmpdir(), 'ims-fenceinstall-'))
+  try {
+    const program = [
+      'set -uo pipefail',
+      entry.preamble(dir),
+      prelude,
+      shellFunction(entry.source, entry.markerFn),
+      shellFunction(entry.source, 'verify_reboot_fence'),
+      shellFunction(entry.source, 'rollback_reboot_fence_install'),
+      shellFunction(entry.source, 'install_reboot_fence'),
+      'install_reboot_fence "a cutover that is about to fail" && echo INSTALL_OK || echo INSTALL_FAILED',
+    ].join('\n')
+    const output = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    const markerName = entry.name === 'deploy.sh' ? 'FENCED' : 'DEPLOY-FENCED'
+    return {
+      output,
+      markerExists: existsSync(join(dir, markerName)),
+      markerBody: existsSync(join(dir, markerName)) ? readFileSync(join(dir, markerName), 'utf8') : '',
+      dir,
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+for (const entry of FENCE_INSTALL_CASES) {
+  test(`${entry.name} removes the marker it wrote when the reboot fence cannot be installed`, () => {
+    const result = runFenceInstallHarness(entry, '')
+    assert.match(result.output, /INSTALL_FAILED/, 'a daemon-reload that fails must fail the install')
+    assert.equal(
+      result.markerExists,
+      false,
+      'and must leave no marker behind: the caller dies with FENCE_ARMED still false, so nothing else will ever remove it — and the next reboot refuses to start a unit nobody connected to a deploy that "changed nothing"',
+    )
+  })
+
+  test(`${entry.name} does NOT remove a marker that was already standing`, () => {
+    // The other half, and the reason this is not just "delete the marker on failure":
+    // install_reboot_fence is also how an ADOPTED fence is re-established and how the exit
+    // trap puts one back. Rolling those back would lift a fence the host is relying on.
+    const result = runFenceInstallHarness(
+      entry,
+      [
+        'mkdir -p "$(dirname "${FENCE_FILE}")"',
+        'printf "fenced_at=earlier\\nschema_touched=true\\n" > "${FENCE_FILE}"',
+        'FENCE_ARMED=true',
+      ].join('\n'),
+    )
+    assert.match(result.output, /INSTALL_FAILED/, 'the install still fails')
+    assert.equal(result.markerExists, true, 'but the fence a previous run left standing survives')
+  })
+}
+
+for (const entry of FENCE_INSTALL_CASES) {
+  test(`${entry.name} records reboot_fence=installed in the marker only once systemd has confirmed it`, () => {
+    // The marker is written BEFORE the drop-in is verified, because a kill between the two must
+    // leave a marker rather than a fence nobody can undo. So it initially says `absent`, and the
+    // install has to correct it — otherwise the file the next run and the operator read describes
+    // a fence that was in fact installed as one that was not.
+    const dir = mkdtempSync(join(tmpdir(), 'ims-fenceok-'))
+    try {
+      const preamble = entry
+        .preamble(dir)
+        // systemctl succeeds, and `show -p DropInPaths` reports the drop-in, so verify passes.
+        .replace(
+          /systemctl\(\) \{[^\n]*\n/,
+          entry.name === 'deploy.sh'
+            ? 'systemctl() { if [ "$1" = show ]; then fence_dropin_file app.service; fi; return 0; }\n'
+            : 'systemctl() { if [ "$1" = show ]; then echo "${FENCE_DROPIN_FILE}"; fi; return 0; }\n',
+        )
+      const program = [
+        'set -uo pipefail',
+        preamble,
+        shellFunction(entry.source, entry.markerFn),
+        shellFunction(entry.source, 'verify_reboot_fence'),
+        shellFunction(entry.source, 'rollback_reboot_fence_install'),
+        shellFunction(entry.source, 'install_reboot_fence'),
+        'install_reboot_fence "a cutover that is about to succeed" && echo INSTALL_OK || echo INSTALL_FAILED',
+      ].join('\n')
+      const output = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+      assert.match(output, /INSTALL_OK/, `the fence must install cleanly in this harness: ${output}`)
+
+      const markerName = entry.name === 'deploy.sh' ? 'FENCED' : 'DEPLOY-FENCED'
+      const body = readFileSync(join(dir, markerName), 'utf8')
+      assert.match(
+        body,
+        /^reboot_fence=installed$/m,
+        'the marker must record the fence that is actually loaded, not the one that was intended',
       )
     } finally {
       rmSync(dir, { recursive: true, force: true })

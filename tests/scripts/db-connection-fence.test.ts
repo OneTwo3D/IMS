@@ -6,6 +6,9 @@ import { test } from 'node:test'
 import {
   PUBLIC_GRANTEE,
   assessEffectiveFence,
+  assessMigrationRole,
+  buildMigrationConnectionString,
+  listDirectConnectGrantees,
   buildGrantStatements,
   buildRevokeStatements,
   granteeHasConnect,
@@ -189,4 +192,197 @@ test('the effective check is what the fence script actually asks the database', 
   const source = readFileSync(join(process.cwd(), 'scripts/fence-db-connections.mjs'), 'utf8')
   assert.match(source, /has_database_privilege\(\$1, current_database\(\), 'CONNECT'\)/)
   assert.match(source, /assessEffectiveFence\(/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r4, HIGH) — THE "CONTINUOUS" FENCE COVERED EXACTLY TWO GRANTEES.
+//
+// It revoked from PUBLIC and the application role and then called the database held closed.
+// Any third role with a direct CONNECT grant — monitoring, BI, a backup job, a second
+// application — was terminated by the drain and RECONNECTED IMMEDIATELY, for the whole
+// length of the migration, while the script's header and the docs claimed otherwise.
+// ---------------------------------------------------------------------------
+
+test('every named role holding CONNECT directly is listed, and PUBLIC is not one of them', () => {
+  const acl = '{owner=CTc/owner,=Tc/owner,imsapp=c/owner,metabase=c/owner,readonly=T/owner}'
+  assert.deepEqual(listDirectConnectGrantees(acl, 'owner'), ['owner', 'imsapp', 'metabase'])
+  assert.ok(!listDirectConnectGrantees(acl, 'owner').includes(''), 'PUBLIC is handled separately')
+  // A NULL datacl is the defaults: CONNECT to PUBLIC and everything to the owner.
+  assert.deepEqual(listDirectConnectGrantees(null, 'owner'), ['owner'])
+  assert.deepEqual(listDirectConnectGrantees('', 'owner'), ['owner'])
+})
+
+test('the fence revokes from a third grantee, not only from PUBLIC and the application role', () => {
+  const plan = planConnectionFence(
+    facts({
+      appRoleHasConnect: true,
+      directConnectGrantees: ['imsapp', 'metabase', 'backupbot'],
+    }),
+  )
+  assert.equal(plan.fenceable, true)
+  assert.deepEqual(
+    plan.revoke,
+    [PUBLIC_GRANTEE, 'imsapp', 'metabase', 'backupbot'],
+    'a monitoring or BI role that keeps CONNECT is terminated by the drain and back a moment later',
+  )
+  assert.deepEqual(
+    buildRevokeStatements('ims', plan.revoke).length,
+    4,
+    'and every one of them is a statement the fence actually runs',
+  )
+  assert.deepEqual(
+    buildGrantStatements('ims', plan.revoke).length,
+    4,
+    'and one the release actually restores',
+  )
+})
+
+test('the fence never revokes CONNECT from the role the deploy itself is connected as', () => {
+  // Revoking from the admin would lock the deploy out of the recovery it has to run: the
+  // migration, the drift check, the verification hook and the release all reconnect as it.
+  const plan = planConnectionFence(
+    facts({
+      appRoleHasConnect: true,
+      directConnectGrantees: ['imsapp', 'deployadmin'],
+    }),
+  )
+  assert.deepEqual(plan.revoke, [PUBLIC_GRANTEE, 'imsapp'])
+  assert.ok(!plan.revoke.includes('deployadmin'), 'the admin keeps CONNECT or the recovery has no connection')
+})
+
+test('a grantee is revoked once even when both the ACL and the app-role flag name it', () => {
+  const plan = planConnectionFence(
+    facts({ appRoleHasConnect: true, directConnectGrantees: ['imsapp'] }),
+  )
+  assert.deepEqual(plan.revoke, [PUBLIC_GRANTEE, 'imsapp'])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r4, CRITICAL) — WHO THE MIGRATION RUNS AS.
+//
+// The fence forces the migration through the ADMIN connection, and whatever runs a CREATE
+// owns what it creates. install.sh makes the APPLICATION role the database owner and this
+// script refuses when admin == app, so the only fenceable configuration is a separate
+// SUPERUSER admin — and every object a migration created was owned by that superuser with no
+// grant to the application. The drift check, the verification hook and pg_dump all share the
+// admin connection, so nothing in the pipeline could see it.
+// ---------------------------------------------------------------------------
+
+test('a superuser admin may run the migration as the application role', () => {
+  const verdict = assessMigrationRole({
+    adminRole: 'deployadmin',
+    appRole: 'imsapp',
+    adminIsSuperuser: true,
+    adminCanSetAppRole: false,
+  })
+  assert.equal(verdict.usable, true)
+})
+
+test('a non-superuser admin may only do it if it is a member of the application role', () => {
+  const member = assessMigrationRole({
+    adminRole: 'owneradmin',
+    appRole: 'imsapp',
+    adminIsSuperuser: false,
+    adminCanSetAppRole: true,
+  })
+  assert.equal(member.usable, true)
+
+  const stranger = assessMigrationRole({
+    adminRole: 'owneradmin',
+    appRole: 'imsapp',
+    adminIsSuperuser: false,
+    adminCanSetAppRole: false,
+  })
+  assert.equal(stranger.usable, false, 'otherwise the migration would create objects owned by the admin')
+  assert.match(stranger.reason, /permission denied/, 'and the refusal must name the symptom the operator would otherwise see')
+  assert.match(stranger.reason, /GRANT imsapp TO owneradmin/, 'and the statement that fixes it')
+})
+
+test('a connection string with no role has nothing to run the migration as', () => {
+  const verdict = assessMigrationRole({
+    adminRole: 'deployadmin',
+    appRole: '',
+    adminIsSuperuser: true,
+    adminCanSetAppRole: true,
+  })
+  assert.equal(verdict.usable, false)
+})
+
+test('the migration URL authenticates as the admin and runs as the application role', () => {
+  const url = buildMigrationConnectionString('postgresql://deployadmin:pw@127.0.0.1:5432/ims', 'imsapp')
+  const parsed = new URL(url)
+  assert.equal(parsed.username, 'deployadmin', 'authentication stays the admin, which is what keeps the fence effective')
+  assert.equal(parsed.pathname, '/ims')
+  assert.equal(parsed.searchParams.get('options'), '-c role=imsapp', 'and the session runs as the application role')
+})
+
+test('the migration URL preserves the parameters already on the admin connection', () => {
+  const url = buildMigrationConnectionString(
+    'postgresql://deployadmin@h/ims?schema=public&options=-c%20statement_timeout%3D0',
+    'imsapp',
+  )
+  const parsed = new URL(url)
+  assert.equal(parsed.searchParams.get('schema'), 'public')
+  assert.equal(
+    parsed.searchParams.get('options'),
+    '-c statement_timeout=0 -c role=imsapp',
+    'an existing options value is appended to, not overwritten',
+  )
+})
+
+test('a space in a role name is escaped for libpq rather than splitting the options value', () => {
+  // libpq splits `options` on whitespace, so an unescaped space would make `role=ims` and a
+  // stray argument. And the value is percent-encoded, not form-encoded: `+` is not a space here.
+  const url = buildMigrationConnectionString('postgresql://admin@h/ims', 'ims app')
+  assert.ok(url.includes('options=-c%20role%3Dims%5C%20app'), url)
+  assert.ok(!url.includes('+'), 'a form-encoded space would reach Postgres as a literal plus')
+  assert.equal(new URL(url).searchParams.get('options'), '-c role=ims\\ app')
+})
+
+test('a connection string that cannot be parsed is returned unchanged rather than corrupted', () => {
+  assert.equal(buildMigrationConnectionString('not a url', 'imsapp'), 'not a url')
+  assert.equal(buildMigrationConnectionString('', 'imsapp'), '')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r4, HIGH) — AN EMPTY FIRST READ SKIPPED THE DRAIN ENTIRELY.
+//
+// The terminate ran only if the FIRST read of pg_stat_activity found something, and the settle
+// loop was skipped when it did not — so a single sample taken microseconds after the revoke
+// committed was the whole proof that the room was empty. A backend that was mid-authentication
+// when the revoke landed is not in pg_stat_activity yet and is attached a moment later.
+//
+// Structural, deliberately: the shape of the guard is the defect, and asserting it needs a live
+// server that can race the revoke. What it asserts is that the terminate has NO length guard and
+// that a read follows the loop.
+// ---------------------------------------------------------------------------
+
+test('the drain terminates unconditionally and confirms with a second read', () => {
+  const source = readFileSync(join(process.cwd(), 'scripts/fence-db-connections.mjs'), 'utf8')
+  const doFence = source.slice(source.indexOf('async function doFence('), source.indexOf('async function doRelease('))
+
+  const terminate = doFence.indexOf('pg_terminate_backend')
+  assert.notEqual(terminate, -1, 'the fence must drain what is already attached')
+
+  // Nothing between the start of the drain section and the terminate may make it conditional
+  // on a prior read having found backends.
+  const beforeTerminate = doFence.slice(doFence.lastIndexOf('const deadline', terminate), terminate)
+  assert.ok(
+    !/if \(remaining\.length > 0\)/.test(beforeTerminate),
+    'the terminate must not be skipped because one sample happened to be empty',
+  )
+
+  const afterLoop = doFence.slice(doFence.lastIndexOf('while (remaining.length > 0'))
+  assert.match(
+    afterLoop,
+    /if \(remaining\.length === 0\)[\s\S]{0,200}otherClientBackends/,
+    'and an empty result must be confirmed by a second read after a settle, not accepted first time',
+  )
+})
+
+test('the fence refuses to call a database drained while anything is still attached', () => {
+  const source = readFileSync(join(process.cwd(), 'scripts/fence-db-connections.mjs'), 'utf8')
+  const doFence = source.slice(source.indexOf('async function doFence('), source.indexOf('async function doRelease('))
+  assert.match(doFence, /Refusing to call the database drained/)
+  assert.match(doFence, /return EXIT_ERROR/)
 })

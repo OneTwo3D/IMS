@@ -15,9 +15,10 @@
 #   6. Prompts for all configuration values
 #   7. Creates the app system user
 #   8. Clones the repository (or copies local files)
-#   9. Installs npm dependencies and builds the app
-#  10. Runs database migrations
-#  11. Writes the systemd service
+#   9. Installs npm dependencies, then BUILDS the app while any existing installation is
+#      still serving (nothing is stopped until the artefact has been validated)
+#  10. Stops and drains every writer, then runs database migrations
+#  11. Writes the systemd service and health-checks the new build
 #  12. Configures nginx reverse proxy
 #  13. Sets up cron jobs (FX rates, activity cleanup, backups, WC sync, delivery status)
 #  14. Prints post-install summary
@@ -310,6 +311,32 @@ require_preserved_secrets() {
   die "${APP_DIR}/.env exists but does not carry ${missing[*]}. This installer writes all of ${IRREVERSIBLE_SECRET_KEYS[*]} on every run, so a file missing one was truncated or hand-edited — it is NOT a fresh installation. Refusing to mint new ones: a new SETTINGS_ENCRYPTION_KEY makes every encrypted setting already in the database permanently undecryptable, a new AUTH_SECRET invalidates every session, and a new CRON_SECRET makes the crontab this script wrote unauthorised. Restore the missing line(s) from your backup or from the running service's environment, or set IMS_INSTALL_REMINT_SECRETS=yes if this really is a fresh start and the existing data is expendable."
 }
 
+# dotenv's own quoting rule, applied to a value read back out of .env.
+#
+# read_existing_env() stores the raw right-hand side, which is right for everything THIS SCRIPT
+# writes (it writes bare values with no trailing comments, so a round trip through its own file is
+# exact). It is not right for a value an OPERATOR hand-edits, and DEPLOY_ADMIN_DATABASE_URL is now
+# exactly that: mandatory, set by hand, and a URL that invites quoting. Carried forward raw, a
+# perfectly ordinary `DEPLOY_ADMIN_DATABASE_URL="postgres://..."  # deploy admin` is written back
+# out unquoted, complete with a double quote at each end and the words "deploy admin" on the end.
+#
+# The rule followed is dotenv's, because dotenv is what reads this file everywhere else: a quoted
+# value ends at its closing quote, an unquoted one ends at the first whitespace-preceded `#`.
+# (o3d-2sm1.5, Codex r4 MEDIUM — the same defect the deploy.sh `grep | cut` had.)
+unquote_env_value() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  case "${value}" in
+    \"*) value="${value#\"}"; value="${value%%\"*}" ;;
+    \'*) value="${value#\'}"; value="${value%%\'*}" ;;
+    *)
+      value="${value%%[[:space:]]#*}"
+      value="${value%"${value##*[![:space:]]}"}"
+      ;;
+  esac
+  printf '%s' "${value}"
+}
+
 # The value the previous run wrote, or the supplied fallback on a first install.
 existing_env() {
   local key="$1" fallback="${2:-}"
@@ -434,9 +461,23 @@ DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
 # neither repairable nor detectable. An upgrade path with that defect is not less
 # dangerous for being called "install".
 #
-# So a re-run over an existing installation now performs the same sequence:
+# So a re-run over an existing installation now performs the same sequence deploy.sh and
+# update.sh do — AND IN THE SAME ORDER (o3d-2sm1.5, Codex r4 CRITICAL):
 #
-#   stop and drain every writer -> migrate -> drift -> verify -> build -> start
+#   build -> validate -> stop and drain every writer -> migrate -> drift -> object access
+#         -> verify -> seed -> bootstrap -> start -> health
+#
+# The order this comment used to describe put the BUILD inside the stopped window — after
+# the migration and the verification — which inverts this branch's founding premise
+# (everything that can reject a release must reject it while the predecessor is still up)
+# on the entrypoint the docs say follows the same sequence. A TypeScript error costs
+# nothing on deploy.sh; here it left the service stopped, cron fenced, the schema migrated
+# and the connection fence held.
+#
+# The SEED and the BOOTSTRAP deliberately stay inside the window. They are not validations
+# that can reject a release; they are writes, and they need the schema the migration has
+# just applied. Running them before the stop would have new code writing to the old schema
+# — the overlap this whole order exists to prevent.
 #
 # and the same three fences, established in the same order and with the same rules:
 #
@@ -447,8 +488,11 @@ DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
 #     which the reboot it exists to survive erases.
 #   * THE CRON FENCE comments the whole crontab out, from a verbatim backup taken once,
 #     and restores it only once the new service has been started.
-#   * THE CONNECTION FENCE revokes CONNECT from the application role AND from PUBLIC
-#     for the window. It is RELEASED on a failure before the migration was invoked and
+#   * THE CONNECTION FENCE revokes CONNECT from EVERY grantee that holds it directly —
+#     the application role, PUBLIC, and any other role with a direct grant (o3d-2sm1.5,
+#     Codex r4 HIGH: revoking from two of them left a monitoring or BI role terminated by
+#     the drain and reconnected a moment later, for the whole migration, while every
+#     header said the database was held closed) — for the window. It is RELEASED on a failure before the migration was invoked and
 #     HELD on one at or after it — releasing there would let the application reconnect
 #     to a schema in an unknown state. Every step inside the window that touches the
 #     database runs through MIGRATION_DATABASE_URL, which is the privileged connection
@@ -456,7 +500,36 @@ DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
 #     Codex r3 HIGH): exit 3 from the fence script means CONNECT was NOT revoked, and a
 #     fence you know is absent is not a degraded fence but no fence, so it aborts rather
 #     than falling back to a point-in-time probe anything may connect after. Whether the
-#     privileged connection exists at all is checked BEFORE the stop.
+#     privileged connection exists at all is checked BEFORE the stop, by RUNNING the fence
+#     script in `--preflight` mode rather than by checking that the file exists (o3d-2sm1.5,
+#     Codex r4 HIGH: the file-exists check passed while the script itself could not start,
+#     its dependency being a devDependency and the documented manual upgrade running
+#     `npm ci --omit=dev` — an outage after the stop, for a missing import).
+#
+#     AND THE MIGRATION RUNS AS THE APPLICATION ROLE (o3d-2sm1.5, Codex r4 CRITICAL). This
+#     installer makes the APPLICATION role the database owner, and the fence refuses when
+#     the admin role IS the application role — so the only fenceable configuration is a
+#     separate SUPERUSER admin, and every table, index and sequence a migration created
+#     through it was owned by that superuser with no grant to the application. Nothing in
+#     the pipeline could see it: prisma, the drift check and the verification hook all
+#     share the admin connection and read everything perfectly. So MIGRATION_DATABASE_URL
+#     carries `options=-c role=<app role>` — it CONNECTS as the admin, which is what keeps
+#     the fence effective, and RUNS AS the application role, which is what makes the fenced
+#     path leave the database exactly as an unfenced one would. And it is not taken on
+#     trust: scripts/check-app-db-object-access.mjs asks the database, after the migration,
+#     whether the APPLICATION role can use each table, view and sequence, and fails the
+#     install if not.
+#
+#     A FAILED REBOOT-FENCE INSTALL LEAVES NOTHING BEHIND (o3d-2sm1.5, Codex r4 CRITICAL).
+#     The marker went down first, then the drop-in, then the reload, then the verify, and
+#     any failure after that first line returned into a `die` with FENCE_ARMED still false
+#     — so the trap did nothing and the marker stayed, invisible until the next reboot
+#     refused to start the unit. The install now removes exactly what that call created.
+#
+#     AND THERE IS A POINT OF NO RETURN. Once the new build has answered its health check
+#     — which this cutover previously did not have at all — nothing tears it down: a
+#     failure in nginx, hardening, log rotation or the cron restore is reported, with the
+#     commands to finish by hand, and the service is left running.
 #
 # WHAT COUNTS AS AN EXISTING INSTALLATION (o3d-2sm1.4, Codex r3 HIGH). Not only the new
 # systemd unit and an active crontab: this script also supports, and below removes,
@@ -497,7 +570,19 @@ FENCE_DROPIN_FILE="${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
 DB_FENCE_DIR="${DATA_DIR}/deploy"
 DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"
+DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"
 DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE}"
+# Is the reboot fence ACTUALLY loaded by systemd right now? Distinct from FENCE_ARMED, which
+# only says this run has stopped something: the failure banner used to describe a drop-in that
+# may never have been installed (o3d-2sm1.5, Codex r4 HIGH).
+REBOOT_FENCE_INSTALLED=false
+# Rollback bookkeeping for install_reboot_fence(): what THIS call created, so a failure can
+# remove exactly that and leave an already-standing fence alone.
+FENCE_MARKER_PREEXISTED=false
+FENCE_DROPIN_CREATED=false
+# The point of no return: the new build has answered its health check. Nothing after this may
+# stop it, re-fence it or revoke CONNECT again (o3d-2sm1.5, Codex r4 HIGH).
+PAST_POINT_OF_NO_RETURN=false
 # The connection every database step inside the window runs through. Set to the
 # application URL when the window opens and swapped for the privileged one if and when
 # the connection fence engages, because the fence shuts the application role out and
@@ -611,6 +696,8 @@ write_cutover_marker() {
     echo "app_dir=${APP_DIR}"
     echo "migration_attempted=${FENCE_ARMED}"
     echo "schema_touched=${SCHEMA_TOUCHED}"
+    # Whether a drop-in is ACTUALLY loaded, not whether one was intended (o3d-2sm1.5).
+    echo "reboot_fence=$(${REBOOT_FENCE_INSTALLED} && echo installed || echo absent)"
     echo "cron_backup=${CRON_BACKUP}"
     echo "units=${APP_NAME}.service"
     echo "db_connect_fence_state=${DB_FENCE_STATE}"
@@ -662,11 +749,48 @@ verify_reboot_fence() {
   return 1
 }
 
+# A FAILED INSTALL LEAVES NOTHING BEHIND (o3d-2sm1.5, Codex r4 CRITICAL).
+#
+# The marker went down first, then the drop-in, then the reload, then the verify — and any
+# failure after that first line returned 1 into a `|| die` while FENCE_ARMED was still false.
+# The trap therefore did nothing, neither the marker nor the drop-in was removed, and the
+# operator read a clean abort: nothing changed. Nothing had, except an AssertPathExists=! on a
+# marker that now existed — invisible until the next reboot, when the unit failed its
+# assertion with nothing connecting that to an install that had "changed nothing".
+#
+# The rollback removes only what THIS call created: install_reboot_fence is also how an
+# adopted fence is re-established and how the exit trap puts one back.
+rollback_reboot_fence_install() {
+  if ${FENCE_DROPIN_CREATED}; then
+    rm -f "${FENCE_DROPIN_FILE}"
+    rmdir "${FENCE_DROPIN_DIR}" 2>/dev/null || true
+    command -v systemctl >/dev/null 2>&1 && { systemctl daemon-reload >/dev/null 2>&1 || true; }
+    FENCE_DROPIN_CREATED=false
+  fi
+  # The marker is the condition, so removing it is what actually lifts the fence: it goes
+  # only if this call created it AND nothing is relying on it.
+  if ! ${FENCE_MARKER_PREEXISTED} && ! ${FENCE_ARMED}; then
+    rm -f "${FENCE_FILE}"
+  fi
+  return 0
+}
+
 install_reboot_fence() {
   local reason="$1"
+  FENCE_MARKER_PREEXISTED=false
+  [[ -f "${FENCE_FILE}" ]] && FENCE_MARKER_PREEXISTED=true
+  FENCE_DROPIN_CREATED=false
+  REBOOT_FENCE_INSTALLED=false
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    error "systemctl is not available: there is NO reboot fence."
+    rollback_reboot_fence_install
+    return 1
+  fi
+
   write_cutover_marker "${reason}"
-  command -v systemctl >/dev/null 2>&1 || { error "systemctl is not available: there is NO reboot fence."; return 1; }
   mkdir -p "${FENCE_DROPIN_DIR}"
+  [[ -f "${FENCE_DROPIN_FILE}" ]] || FENCE_DROPIN_CREATED=true
   cat > "${FENCE_DROPIN_FILE}" <<FENCEEOF
 [Unit]
 # Installed by scripts/install.sh for the length of an upgrade cutover.
@@ -675,8 +799,21 @@ install_reboot_fence() {
 AssertPathExists=!${FENCE_FILE}
 FENCEEOF
   chmod 644 "${FENCE_DROPIN_FILE}"
-  systemctl daemon-reload || { error "systemctl daemon-reload failed; the reboot fence is NOT active."; return 1; }
-  verify_reboot_fence
+  if ! systemctl daemon-reload; then
+    error "systemctl daemon-reload failed; the reboot fence is NOT active."
+    rollback_reboot_fence_install
+    return 1
+  fi
+  if ! verify_reboot_fence; then
+    rollback_reboot_fence_install
+    return 1
+  fi
+  REBOOT_FENCE_INSTALLED=true
+  # Re-written now that the answer is known. The marker is the file the NEXT run (and the
+  # operator after a hard kill) reads, and it was written before the drop-in was verified —
+  # so it said `reboot_fence=absent` about a fence that had just been installed.
+  write_cutover_marker "${reason}"
+  return 0
 }
 
 remove_reboot_fence() {
@@ -741,9 +878,23 @@ fence_db_connections() {
 
   case "${rc}" in
     0)
-      MIGRATION_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}"
+      # THE MIGRATION CONNECTS AS THE ADMIN AND RUNS AS THE APPLICATION ROLE (o3d-2sm1.5,
+      # Codex r4 CRITICAL). This installer makes the APPLICATION role the database owner, and
+      # the fence refuses when admin == app — so the only fenceable configuration here is a
+      # separate SUPERUSER admin, and with the bare admin URL every table, index and sequence
+      # a migration created was owned by that superuser with no grant to the application at
+      # all. Invisible to the whole pipeline: prisma, the drift check and the verification
+      # hook share this same admin connection and read everything perfectly.
+      MIGRATION_DATABASE_URL="$( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
+        DATABASE_URL="${DATABASE_URL}" \
+        DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+        node "${DB_FENCE_SCRIPT}" --print-migration-url )" || die \
+        "The connection fence is up but the migration URL could not be composed, so the migration would run as the deploy admin and create objects the application cannot use. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
+      [[ -n "${MIGRATION_DATABASE_URL}" ]] || die \
+        "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       DB_FENCE_UP=true
       success "Connection fence up: new application connections are refused for the window."
+      success "The migration will connect as the deploy admin and RUN AS the application role, so what it creates is owned by the application."
       ;;
     3)
       # EXIT 3 IS "CONNECT WAS NOT REVOKED", AND IT ABORTS (o3d-2sm1.4, Codex r3 HIGH).
@@ -769,7 +920,24 @@ require_fenceable_database() {
     "An existing installation was detected, so its database must be held closed while the schema moves — but DEPLOY_ADMIN_DATABASE_URL is not set, so this run has no privileged connection that would survive revoking CONNECT from the application role. Set it (a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL; docs/installation.md) and re-run. Nothing has been stopped and nothing has been migrated."
   [[ -f "${DB_FENCE_SCRIPT}" ]] || die \
     "${DB_FENCE_SCRIPT} is missing from this checkout, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
-  success "A connection fence is possible: DEPLOY_ADMIN_DATABASE_URL is set and fence-db-connections.mjs is present."
+  [[ -f "${DB_OBJECT_ACCESS_SCRIPT}" ]] || die \
+    "${DB_OBJECT_ACCESS_SCRIPT} is missing from this checkout, so nothing would check that the application role can use what the migration creates. Nothing has been stopped and nothing has been migrated."
+
+  # AND IT IS RUN, NOT LOOKED AT (o3d-2sm1.5, Codex r4 HIGH). This used to be `[[ -f ... ]]`,
+  # which proves a file exists and nothing about whether it works — and its own dependency was
+  # a devDependency while the documented manual upgrade runs `npm ci --omit=dev`, so the fence
+  # died with a missing module at drain-verify, AFTER the stop. --preflight runs the same
+  # imports, opens the same admin connection and asks the same questions as --fence, and
+  # revokes, terminates and writes nothing.
+  local rc=0
+  ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
+      DATABASE_URL="${DATABASE_URL}" \
+      DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+      node "${DB_FENCE_SCRIPT}" --preflight ) || rc=$?
+  [[ "${rc}" -eq 0 ]] || die \
+    "The migration window could NOT be fenced (fence preflight exit ${rc}); the reason is printed above. Refusing to migrate an EXISTING installation. Nothing has been stopped and nothing has been migrated."
+
+  success "A connection fence is possible, and fence-db-connections.mjs proved it by asking the database."
 }
 
 release_db_connections() {
@@ -808,7 +976,11 @@ refence_db_connections() {
       node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" ) || rc=$?
   [[ "${rc}" -eq 0 ]] || return 1
   DB_FENCE_UP=true
-  MIGRATION_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}"
+  MIGRATION_DATABASE_URL="$( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
+    DATABASE_URL="${DATABASE_URL}" \
+    DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+    node "${DB_FENCE_SCRIPT}" --print-migration-url 2>/dev/null )" \
+    || MIGRATION_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}"
   return 0
 }
 
@@ -842,7 +1014,10 @@ adopt_existing_fence() {
         "A connection fence is standing (${DB_FENCE_STATE}) but DEPLOY_ADMIN_DATABASE_URL is not set, so this run has no connection that survives it. Set it, or release the fence by hand: ${DB_FENCE_RELEASE_CMD}"
       warn "The previous run had already started migrating: HOLDING the connection fence."
       fence_db_connections
-      [[ "${MIGRATION_DATABASE_URL}" == "${DEPLOY_ADMIN_DATABASE_URL}" ]] || die \
+      # Non-empty, not "equal to the admin URL": the migration URL is the admin URL with
+      # `options=-c role=<app role>` merged in, so an equality test would fail on every
+      # successful re-fence (o3d-2sm1.5).
+      { ${DB_FENCE_UP} && [[ -n "${MIGRATION_DATABASE_URL}" ]]; } || die \
         "The standing connection fence could not be re-established, so this run has no privileged connection to recover through."
     fi
   else
@@ -857,6 +1032,31 @@ adopt_existing_fence() {
 # so the correct state after a post-stop failure is DOWN — and fenced against a reboot.
 on_cutover_exit() {
   local status=$?
+
+  # THE POINT OF NO RETURN (o3d-2sm1.5, Codex r4 HIGH). Past the health check the new build is
+  # serving and every gate has passed; the rest of this installer is nginx, hardening, log
+  # rotation and cron. A failure there must not stop the service, re-fence it and re-revoke
+  # CONNECT — that turns a cleanup fault into an outage plus a database lockout on an install
+  # that had already succeeded.
+  if ${PAST_POINT_OF_NO_RETURN}; then
+    echo ""
+    warn "=========================================================================="
+    warn " THE APPLICATION IS UP — a step AFTER the health check failed"
+    warn "=========================================================================="
+    warn "  failed step : ${CUTOVER_STEP}"
+    warn "  exit status : ${status}"
+    warn "  service     : RUNNING and answering its health check. It is NOT being stopped."
+    if ${CRON_FENCED}; then
+      warn "  cron        : may still be FENCED. Restore it by hand:"
+      warn "                  crontab -u ${APP_USER} ${CRON_BACKUP}"
+    fi
+    if [[ -f "${FENCE_FILE}" ]]; then
+      warn "  marker      : ${FENCE_FILE} still exists and would refuse the next boot."
+      warn "                Remove it once you are happy: rm -f ${FENCE_FILE}"
+    fi
+    exit "${status}"
+  fi
+
   ${FENCE_ARMED} || exit "${status}"
 
   echo ""
@@ -873,8 +1073,16 @@ on_cutover_exit() {
   else
     error "  schema      : untouched — this run stopped before the migration was invoked."
   fi
-  error "  service     : STOPPED, and fenced by ${FENCE_DROPIN_FILE} so a reboot"
-  error "                cannot start it either while ${FENCE_FILE} exists."
+  if ${REBOOT_FENCE_INSTALLED}; then
+    error "  service     : STOPPED, and fenced by ${FENCE_DROPIN_FILE} so a reboot"
+    error "                cannot start it either while ${FENCE_FILE} exists."
+  else
+    # Printed unconditionally once, describing a drop-in that may never have been installed
+    # (o3d-2sm1.5, Codex r4 HIGH). The re-install below corrects this line.
+    error "  service     : STOPPED, and there is NO verified reboot fence: this host may"
+    error "                start it again on its next boot. The re-install below says"
+    error "                whether that could be put right."
+  fi
   error "  cron        : ${APP_USER} entries left FENCED (commented out)."
   error "  Do NOT start ${APP_NAME}.service by hand. Fix the cause and re-run this"
   error "  installer, scripts/update.sh or scripts/deploy.sh — each adopts this fence."
@@ -1571,9 +1779,10 @@ CRON_SECRET="$(existing_env CRON_SECRET "$(openssl rand -hex 32)")"
 # fence needs is something an operator sets deliberately — a role separate from the
 # application's — so all this installer has to do is not LOSE it. The heredoc below
 # rewrites .env whole, and a variable this script does not carry forward is one a re-run
-# silently deletes; losing this one would quietly downgrade the next upgrade's connection
-# fence to the snapshot-only fallback. An explicit value in the environment still wins.
-DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL:-$(existing_env DEPLOY_ADMIN_DATABASE_URL)}"
+# silently deletes; losing this one now makes the NEXT upgrade refuse to migrate at all
+# (there is no snapshot-only fallback any more). An explicit value in the environment
+# still wins.
+DEPLOY_ADMIN_DATABASE_URL="$(unquote_env_value "${DEPLOY_ADMIN_DATABASE_URL:-$(existing_env DEPLOY_ADMIN_DATABASE_URL)}")"
 # The last moment before the mint becomes a FACT. Nothing above has been written anywhere — the
 # three values are still only shell variables — and the heredoc below is what commits them. A `.env`
 # that was read but is missing any of them was truncated or hand-edited rather than absent, and
@@ -1631,8 +1840,11 @@ CRON_SECRET=${CRON_SECRET}
 
 # The privileged connection the deploy scripts use to hold the database closed for a
 # migration window (docs/installation.md, "A snapshot is not a fence"). A superuser or
-# database-owner connection as a DIFFERENT role from DATABASE_URL. Empty means every
-# cutover falls back to a snapshot probe and says so out loud.
+# database-owner connection as a DIFFERENT role from DATABASE_URL. It is REQUIRED for any
+# cutover that migrates: empty means the migration is REFUSED before anything is stopped,
+# not that it falls back to a snapshot probe (o3d-2sm1.4). The migration connects as this
+# role and SET ROLEs to the application role, so what it creates is owned by the
+# application (o3d-2sm1.5).
 DEPLOY_ADMIN_DATABASE_URL=${DEPLOY_ADMIN_DATABASE_URL}
 
 NEXT_PUBLIC_TURNSTILE_SITE_KEY=${NEXT_PUBLIC_TURNSTILE_SITE_KEY}
@@ -1663,30 +1875,79 @@ run_as_user "${APP_USER}" npm ci --include=dev --prefix "${APP_DIR}" 2>&1 | \
 success "Dependencies installed."
 
 # ---------------------------------------------------------------------------
-# 10a. Stop and drain every writer — ONLY when there is one (o3d-2sm1.3)
+# 10a. Detect an upgrade, and adopt any fence a previous run left standing (o3d-2sm1.3)
 #
 # See "THE UPGRADE CUTOVER FENCE" at the top of this file for why. In short: this
 # installer is a supported way to upgrade an existing installation, and it used to
 # migrate with the old service and the old crontab still writing. Nothing below starts
 # anything again on a failure.
+#
+# ADOPTION AND THE FENCE PREFLIGHT COME BEFORE THE BUILD, THE STOP COMES AFTER IT
+# (o3d-2sm1.5, Codex r4 CRITICAL). This block used to run the stop, the drain, the
+# migration and the verification and only THEN seed, bootstrap and build — which inverts
+# this branch's founding premise on the one entrypoint the docs say follows the same
+# sequence. A TypeScript error costs nothing on deploy.sh; here it left the service
+# stopped, cron fenced, the schema migrated and the connection fence held. So: adopt here,
+# build here, and stop below.
 # ---------------------------------------------------------------------------
 MIGRATION_DATABASE_URL="${DATABASE_URL}"
 
 if upgrade_in_place; then
   UPGRADE_EXISTING=true
-  header "Existing installation detected — stopping and draining every writer"
+  header "Existing installation detected — this run is an upgrade cutover"
 
   # Installed before anything is armed, so that a kill or a power cut anywhere below
   # leaves the marker, the drop-in and a stopped service rather than a running one.
   trap on_cutover_exit EXIT
 
-  # BEFORE ANYTHING IS STOPPED. An existing installation's database has to be held closed
-  # while its schema moves, and discovering at the drain step that it cannot be would cost
-  # an outage for a missing environment variable.
+  # BEFORE ANYTHING IS STOPPED, AND BEFORE THE BUILD. An existing installation's database
+  # has to be held closed while its schema moves, and discovering at the drain step that it
+  # cannot be would cost an outage for a missing environment variable — or, once, for a
+  # missing node module.
   require_fenceable_database
 
   CUTOVER_STEP="adopt"
+  # A fence a previous run left standing is adopted here, so a rebuild that has to run
+  # inside a HELD fence gets MIGRATION_DATABASE_URL before the build needs it.
   adopt_existing_fence
+fi
+
+# ---------------------------------------------------------------------------
+# 11b. Build — while the existing installation is still serving the OLD schema
+#
+# The long step, and the one most likely to reject a release. Everything that can say no
+# must say it here, where the predecessor is still up and the schema has not moved.
+# ---------------------------------------------------------------------------
+CUTOVER_STEP="build"
+header "Generating Prisma client"
+
+cd "${APP_DIR}"
+run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
+  npx prisma generate --schema prisma/schema.prisma
+success "Prisma client generated."
+
+header "Building Next.js application (existing installation still serving)"
+
+# DATABASE_URL is passed explicitly (Next.js does not override an inherited value with
+# the one in .env) so that a build inside an ADOPTED, still-held fence goes through the
+# privileged connection. Outside one, MIGRATION_DATABASE_URL IS DATABASE_URL and nothing
+# changes; inside one, without it, anything the build touches in the database fails with
+# "permission denied for database" — the fence working as intended, presenting as a build
+# error.
+run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
+  npm run build --prefix "${APP_DIR}"
+success "Build complete."
+
+CUTOVER_STEP="validate"
+[[ -f "${APP_DIR}/.next/BUILD_ID" ]] || die \
+  ".next/BUILD_ID is missing after the build — refusing to stop a working installation for an artefact that is not there."
+success "Artefact validated: BUILD_ID $(cat "${APP_DIR}/.next/BUILD_ID")."
+
+# ---------------------------------------------------------------------------
+# 10c. Stop and drain every writer — ONLY when there is one
+# ---------------------------------------------------------------------------
+if ${UPGRADE_EXISTING}; then
+  header "Stopping and draining every writer"
 
   CUTOVER_STEP="fence-writers"
   # BEFORE the stop and long before the migration: a fence installed on the way out
@@ -1725,7 +1986,9 @@ if upgrade_in_place; then
   # and the migration opens its own afterwards with nothing holding the gap.
   fence_db_connections
   info "Asking Postgres whether anything else is still connected..."
-  ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
+  ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
+      DATABASE_URL="${MIGRATION_DATABASE_URL}" \
+      DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
       node "${APP_DIR}/scripts/check-db-writers.mjs" ) \
     || die "Another client is still connected to the target database. Stop it and re-run; the migration has NOT been applied."
   success "No other client backends on the target database."
@@ -1736,9 +1999,9 @@ fi
 
 header "Running database migrations"
 
+# The Prisma client was generated in the build step above, while the predecessor was still
+# serving; regenerating it here would only add work to the stopped window.
 cd "${APP_DIR}"
-run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  npx prisma generate --schema prisma/schema.prisma
 CUTOVER_STEP="migrate"
 # FROM HERE THE SCHEMA MAY HAVE MOVED. Recorded ON DISK and flushed BEFORE the command, not
 # after it and not from the exit trap: an interrupted, half-applied or SIGKILLed migration
@@ -1755,6 +2018,21 @@ run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
   node "${APP_DIR}/scripts/check-prisma-drift.mjs"
 success "Database schema matches prisma/schema.prisma."
 
+# AND THAT THE APPLICATION CAN ACTUALLY USE WHAT JUST LANDED (o3d-2sm1.5, Codex r4 CRITICAL).
+# Everything above — prisma, the drift check — runs on the ADMIN connection, which owns
+# whatever the migration created and reads all of it. So an ownership mistake in a fenced
+# window was invisible to the entire pipeline: success reported, and every request touching
+# the new table failing with "permission denied". This asks the database about the
+# APPLICATION role, the one question none of the other steps ask.
+header "Checking the application role can use what the migration created"
+
+run_as_user "${APP_USER}" env \
+  DATABASE_URL="${MIGRATION_DATABASE_URL}" \
+  DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+  node "${DB_OBJECT_ACCESS_SCRIPT}" --state-file="${DB_FENCE_STATE}" \
+  || die "The migration left objects the application role cannot use — see above. Nothing has been started."
+success "The application role can use everything in the database."
+
 # ---------------------------------------------------------------------------
 # 10b. The migrations' own verification checks
 #
@@ -1766,7 +2044,9 @@ success "Database schema matches prisma/schema.prisma."
 CUTOVER_STEP="verify-migrations"
 header "Running the migrations' own verification checks"
 
-run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
+run_as_user "${APP_USER}" env \
+  DATABASE_URL="${MIGRATION_DATABASE_URL}" \
+  DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
   node "${APP_DIR}/scripts/run-migration-verifications.mjs" \
   || die "A migration's verification check did not return zero. Nothing has been started."
 success "Every declared verification check returned zero (the coverage report above says what was NOT declared)."
@@ -1805,17 +2085,18 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
   success "Bootstrap configuration complete."
 fi
 
-header "Building Next.js application"
-
-# DATABASE_URL is passed explicitly (Next.js does not override an inherited value with
-# the one in .env) so that a build inside a fenced window goes through the privileged
-# connection. Outside one, MIGRATION_DATABASE_URL IS DATABASE_URL and nothing changes;
-# inside one, without it, anything the build touches in the database fails with
-# "permission denied for database" — the fence working as intended, presenting as a
-# build error.
-run_as_user "${APP_USER}" env DATABASE_URL="${MIGRATION_DATABASE_URL}" \
-  npm run build --prefix "${APP_DIR}"
-success "Build complete."
+# The build does NOT live here any more (o3d-2sm1.5, Codex r4 CRITICAL). It ran above,
+# before the stop, with the existing installation still serving the old schema — which is
+# the order deploy.sh and update.sh have and the order the docs describe for all three. A
+# build in this position spends minutes of a stopped window on the step most likely to fail,
+# and a TypeScript error here left the service stopped, cron fenced, the schema migrated and
+# the connection fence held.
+#
+# The SEED and the BOOTSTRAP above deliberately did NOT move with it. They are not
+# validations that can reject a release; they are writes, and they need the schema the
+# migration has just applied. Running them before the stop would write to the OLD schema from
+# the NEW code — the very overlap this order exists to prevent — so their place is here, with
+# nothing serving and the new schema in force.
 
 # ---------------------------------------------------------------------------
 # 12. Application systemd service
@@ -1868,6 +2149,41 @@ remove_reboot_fence
 systemctl enable --now "${APP_NAME}.service"
 
 success "Application service started and registered with systemd."
+
+# ---------------------------------------------------------------------------
+# 12b. HEALTH CHECK (o3d-2sm1.5, Codex r4 MEDIUM)
+#
+# The cutover had none: it started the unit and declared the upgrade complete, so a new
+# build that failed on its first request restored cron and reported success. deploy.sh and
+# update.sh both poll before they call it done; this is the entrypoint most likely to be used
+# by someone who does not know the deploy order, so it is the last place to leave it out.
+#
+# A failure here is a post-stop failure like any other: the trap re-stops, re-fences and says
+# so. It does NOT restore the old version.
+# ---------------------------------------------------------------------------
+CUTOVER_STEP="health"
+header "Health check"
+
+INSTALL_HEALTH_URL="http://127.0.0.1:${APP_PORT}/api/health"
+INSTALL_HEALTHY=false
+for _ in $(seq 1 90); do
+  if curl -fsS --max-time 3 "${INSTALL_HEALTH_URL}" >/dev/null 2>&1; then
+    INSTALL_HEALTHY=true
+    break
+  fi
+  sleep 1
+done
+if ! ${INSTALL_HEALTHY}; then
+  journalctl -u "${APP_NAME}.service" -n 60 --no-pager >&2 || true
+  die "The application did not answer ${INSTALL_HEALTH_URL} within 90s. Leaving it stopped rather than declaring the upgrade complete."
+fi
+success "Health check passed — the application is answering ${INSTALL_HEALTH_URL}."
+
+# THE POINT OF NO RETURN (o3d-2sm1.5, Codex r4 HIGH). The new build is serving and everything
+# that could reject this release has passed. Nothing below may stop it, re-fence it or revoke
+# CONNECT again: a failure in the cron restore, the nginx config or the log rotation is
+# something to fix by hand, not a reason to tear down a working installation.
+PAST_POINT_OF_NO_RETURN=true
 
 # Cron goes back only once the new build is running, and BEFORE the crontab block below
 # is spliced in — splicing into a fenced crontab would preserve the commented-out lines

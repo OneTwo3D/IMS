@@ -104,6 +104,7 @@ async function runInstallerCapturing(
     ${sliceOptionalBlock(source, 'redact_url_credentials() {') ?? ''}
     ${sliceOptionalBlock(source, 'redis_url_credential_state() {') ?? ''}
     ${sliceOptionalBlock(source, 'load_existing_env() {') ?? ''}
+    ${sliceOptionalBlock(source, 'unquote_env_value() {') ?? ''}
     ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
     ${sliceOptionalBlock(source, 'require_preserved_secrets() {') ?? ''}
     ${sliceOptionalBlock(source, 'prompt() {') ?? ''}
@@ -309,7 +310,8 @@ test('a preserved credential is never echoed as a prompt default', async () => {
       ${sliceOptionalBlock(source, 'redact_url_credentials() {') ?? ''}
       ${sliceOptionalBlock(source, 'redis_url_credential_state() {') ?? ''}
       ${sliceOptionalBlock(source, 'load_existing_env() {') ?? ''}
-      ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
+      ${sliceOptionalBlock(source, 'unquote_env_value() {') ?? ''}
+    ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
       ${sliceOptionalBlock(source, 'prompt() {') ?? ''}
       ${sliceOptionalBlock(source, 'prompt_yn() {') ?? ''}
       load_existing_env "\${APP_DIR}/.env"
@@ -353,6 +355,7 @@ async function loadEnvState(
     APP_DIR=${JSON.stringify(appDir)}
     declare -A EXISTING_ENV=()
     ${sliceOptionalBlock(source, 'load_existing_env() {') ?? 'load_existing_env() { :; }'}
+    ${sliceOptionalBlock(source, 'unquote_env_value() {') ?? ''}
     ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
     load_existing_env "\${APP_DIR}/.env"
     printf 'STATE<<<%s>>>\\n' "\${ENV_FILE_STATE:-__ABSENT__}"

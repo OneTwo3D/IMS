@@ -1015,6 +1015,13 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // and `prisma migrate deploy` — neither executes either tool, and neither writes anything.
   'scripts/check-db-writers.mjs': 'deploy-read-only-probe',
   'scripts/run-migration-verifications.mjs': 'deploy-read-only-probe',
+  // o3d-2sm1.5's post-migration ownership assertion. It runs one SELECT over pg_class and asks
+  // has_table_privilege / has_sequence_privilege / has_schema_privilege ABOUT THE APPLICATION ROLE
+  // — the one question the drift check, the verification hook and pg_dump cannot ask, because they
+  // all run on the admin connection that OWNS whatever the migration just created. It writes
+  // nothing; it is found by this scan because its prose names `prisma migrate deploy` while
+  // explaining which step left the objects unusable.
+  'scripts/check-app-db-object-access.mjs': 'deploy-read-only-probe',
   // o3d-2sm1.2's cutover fence, and the ONLY entry here that writes to this database
   // outside the application. It writes no rows at all: its statements are REVOKE and
   // GRANT CONNECT on the database itself, taken for the length of a migration window
