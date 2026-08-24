@@ -50,6 +50,10 @@ type SyncRow = {
    * 'OPERATOR_ASSERTION' = a human typed a document id in and IMS verified nothing.
    */
   settlementBasis: string | null
+  /** o3d-bqw7 r2: the durable half of the row's origin record — what a tombstone hands on. */
+  connectionProvenance?: string | null
+  /** o3d-bqw7 r2: what the row RECORDED that it owed, written when its payload was erased. */
+  followUpObligations?: unknown
 }
 
 type BillRow = {
@@ -63,6 +67,8 @@ type BillRow = {
 type OrderRow = { id: string; accountingInvoiceId: string | null; invoiceNumber?: string | null; invoicedAt?: Date | null }
 /** Supplier (purchase) credit note — PURCHASE_CREDIT_NOTE / ACCPAYCREDIT (r6 finding 2). */
 type CreditNoteRow = { id: string; accountingCreditNoteId: string | null }
+/** o3d-bqw7: the SALES-side credit note's holder. See the `refunds` note on Store. */
+type RefundRow = { id: string; accountingCreditNoteId: string | null }
 
 const SYNC_COLUMNS = new Set([
   'id', 'connector', 'type', 'referenceType', 'referenceId', 'externalTransactionId',
@@ -123,6 +129,13 @@ type Store = {
   orders: OrderRow[]
   /** Optional so the existing stores need no edit; defaulted in makeHarness. */
   creditNotes?: CreditNoteRow[]
+  /**
+   * o3d-bqw7: SalesOrderRefund rows, the holder for the `CREDIT_NOTE` pair. Backed by the store
+   * rather than stubbed for the same reason `supplierCreditNote` was in r6 finding 2 — the stub
+   * answered `null` and threw on write, so no test could drive a sales credit note through the
+   * sweep at all, and "a CREDIT_NOTE tombstone is warned about nothing" was invisible.
+   */
+  refunds?: RefundRow[]
 }
 
 /**
@@ -152,7 +165,22 @@ type Harness = {
   store: Store
   client: BackReferenceSweepClient
   activities: BackReferenceSweepActivity[]
-  followUps: Array<{ entryId: string; referenceType: string; referenceId: string }>
+  followUps: Array<{
+    entryId: string
+    referenceType: string
+    referenceId: string
+    /**
+     * o3d-bqw7 r2: the COMPLETE durable origin record the sweep handed over — payload, the
+     * `connectionProvenance` column and retention's compaction instant. Recorded because on a
+     * tombstone the payload is `{}` and the column is the only half still naming an organisation:
+     * passing the payload alone produced follow-ups that could never post.
+     */
+    origin: {
+      payload: unknown
+      connectionProvenance: string | null | undefined
+      backReferenceEvidenceCompactedAt?: Date | null
+    }
+  }>
   calls: {
     candidateQueries: number
     syncRowsRead: number
@@ -192,6 +220,7 @@ type Harness = {
 
 function makeHarness(store: Store): Harness {
   store.creditNotes ??= []
+  store.refunds ??= []
   const activities: BackReferenceSweepActivity[] = []
   const followUps: Harness['followUps'] = []
   const calls = { candidateQueries: 0, syncRowsRead: 0, probes: 0, billUpdates: 0, transactions: 0, rawStatements: [] as Array<{ sql: string; values: unknown[] }> }
@@ -285,8 +314,18 @@ function makeHarness(store: Store): Harness {
       },
     },
     salesOrderRefund: {
-      async findUnique() { return null },
-      async update() { throw new Error('unexpected salesOrderRefund.update') },
+      async findUnique(args: { where: { id: string } }) {
+        calls.probes++
+        if (failProbeFor.has(args.where.id)) throw new Error('probe blew up')
+        const refund = store.refunds!.find((candidate) => candidate.id === args.where.id)
+        return refund ? { accountingCreditNoteId: refund.accountingCreditNoteId } : null
+      },
+      async update(args: { where: { id: string }; data: Record<string, unknown> }) {
+        const refund = store.refunds!.find((candidate) => candidate.id === args.where.id)
+        if (!refund) throw new Error(`fake db: no sales order refund ${args.where.id}`)
+        Object.assign(refund, args.data)
+        return refund
+      },
     },
     purchaseInvoice: {
       async findUnique(args: { where: { id: string } }) {
@@ -382,9 +421,17 @@ function sweepDeps(harness: Harness, now?: () => Date, overrides: { cursorStore?
       harness.activities.push(entry)
       return true
     },
-    enqueueFollowUps: async (entryId: string, _type: string, referenceType: string, referenceId: string) => {
+    enqueueFollowUps: async (
+      entryId: string,
+      _type: string,
+      referenceType: string,
+      referenceId: string,
+      _payload: Record<string, unknown>,
+      _syncResult: { externalId?: string; invoiceNumber?: string },
+      origin: Harness['followUps'][number]['origin'],
+    ) => {
       if (harness.failFollowUpsFor.has(entryId)) throw new Error('follow-up enqueue failed')
-      harness.followUps.push({ entryId, referenceType, referenceId })
+      harness.followUps.push({ entryId, referenceType, referenceId, origin })
     },
   } as Parameters<typeof repairAccountingBackReferences>[0]
 }
@@ -409,6 +456,10 @@ function salesInvoiceRow(index: number, overrides: Partial<SyncRow> = {}): SyncR
     backReferenceEvidenceCompactedAt: null,
     backReferenceFollowUpsPendingAt: null,
     settlementBasis: null,
+    // o3d-bqw7 r2: an ordinary row records its origin in its payload and has no per-row obligation
+    // record; a tombstone factory below overrides both.
+    connectionProvenance: null,
+    followUpObligations: null,
     ...overrides,
   }
 }
@@ -668,7 +719,15 @@ test('[o3d-9kek r9 f1] a SYNCED row TOMBSTONED while it still owed follow-ups is
 
   assert.equal(run.repaired, 0, 'the id was already there')
   assert.equal(run.followUpsDiscarded, 1)
-  assert.deepEqual(harness.followUps, [], 'a `{}` payload cannot rebuild a PDF or a payment')
+  // o3d-bqw7 r2: the tombstone STILL GOES THROUGH THE ENQUEUE, because the classification says an
+  // invoice PDF survives compaction — it is assembled from `externalTransactionId` and `referenceId`,
+  // both of which a tombstone keeps. Skipping the call made that claim false on this path. What
+  // cannot be rebuilt is the PAYMENT, which is what the discard below announces.
+  assert.deepEqual(
+    harness.followUps.map((entry) => entry.entryId),
+    ['log-0001'],
+    'the follow-ups compaction did NOT take away are still raised',
+  )
   const discarded = harness.activities.find((entry) => entry.action === 'xero_backreference_followups_discarded')
   assert.ok(discarded, 'the loss is permanent, so it must be announced')
   assert.equal(discarded.level, 'WARNING')
@@ -1312,7 +1371,8 @@ test('[o3d-9kek r4 f3] a retention TOMBSTONE is still repaired — only its foll
   // payload would not throw — it would enqueue nothing and return normally — so the loss has to be
   // reported explicitly or it is invisible.
   assert.equal(run.followUpsDiscarded, 1)
-  assert.deepEqual(harness.followUps, [])
+  // o3d-bqw7 r2: and the REBUILDABLE half is still raised — see the enqueue-then-announce order.
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-0001'])
   const discarded = harness.activities.find((entry) => entry.action === 'xero_backreference_followups_discarded')
   assert.ok(discarded, 'the discard is permanent, so it must be announced')
   assert.equal(discarded.level, 'WARNING')
@@ -1356,7 +1416,8 @@ test('[o3d-9kek r4 f3] a FAILED TOMBSTONE whose id is already applied is settled
 
   assert.equal(run.repaired, 0, 'nothing was re-applied — the id was already there')
   assert.equal(run.followUpsDiscarded, 1)
-  assert.deepEqual(harness.followUps, [], 'a `{}` payload cannot rebuild a PDF or a payment')
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-0001'],
+    'o3d-bqw7 r2: the PDF is built from columns the tombstone keeps, so it is still raised')
   assert.ok(harness.activities.some((entry) => entry.action === 'xero_backreference_followups_discarded'))
   assert.ok(harness.store.syncRows[0].backReferenceCheckedAt)
   assert.equal(harness.store.syncRows[0].status, 'FAILED', 'not SYNCED: the follow-ups were abandoned, not completed')
@@ -1447,6 +1508,10 @@ function creditNoteRow(index: number, overrides: Partial<SyncRow> = {}): SyncRow
     backReferenceEvidenceCompactedAt: null,
     backReferenceFollowUpsPendingAt: null,
     settlementBasis: null,
+    // o3d-bqw7 r2: an ordinary row records its origin in its payload and has no per-row obligation
+    // record; a tombstone factory below overrides both.
+    connectionProvenance: null,
+    followUpObligations: null,
     ...overrides,
   }
 }
@@ -1500,7 +1565,10 @@ test('[o3d-9kek r6 f2] a supplier credit note whose id write failed is REPAIRED 
   // A FAILED row whose back-reference is now applied AND whose follow-ups were enqueued is fully
   // reconciled: Xero's enqueueFollowUps routes PURCHASE_CREDIT_NOTE to its allocation follow-up,
   // so this is not a no-op branch.
-  assert.deepEqual(harness.followUps, [{ entryId: 'log-cn-0001', referenceType: 'SupplierCreditNote', referenceId: 'scn-1' }])
+  assert.deepEqual(
+    harness.followUps.map(({ entryId, referenceType, referenceId }) => ({ entryId, referenceType, referenceId })),
+    [{ entryId: 'log-cn-0001', referenceType: 'SupplierCreditNote', referenceId: 'scn-1' }],
+  )
   assert.equal(harness.store.syncRows[0].status, 'SYNCED')
   assert.ok(harness.store.syncRows[0].backReferenceCheckedAt)
   assert.ok(harness.activities.some((entry) => entry.action === 'xero_backreference_repaired'))
@@ -1539,11 +1607,116 @@ test('[o3d-9kek r6 f2] a TOMBSTONED supplier credit note is still id-repaired, f
   assert.equal(run.repaired, 1)
   assert.equal(harness.store.creditNotes![0].accountingCreditNoteId, 'XCN-1')
   assert.equal(run.followUpsDiscarded, 1)
-  assert.deepEqual(harness.followUps, [], 'the allocation follow-up cannot be rebuilt from `{}`')
+  // o3d-bqw7 r2: the sweep hands the tombstone to the enqueue like any other row. What the ALLOCATION
+  // cannot do is be rebuilt — `enqueuePurchaseCreditNoteFollowUps` reads `allocateToInvoiceId` and
+  // `allocateAmount` off a payload that is now `{}` and enqueues nothing — and that is what the
+  // discard warning below is about. Nothing classifies it as REBUILT.
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-cn-0001'])
   assert.ok(harness.activities.some((entry) => entry.action === 'xero_backreference_followups_discarded'))
   // Not flipped to SYNCED: the allocation was abandoned, not done.
   assert.equal(harness.store.syncRows[0].status, 'FAILED')
   assert.ok(harness.store.syncRows[0].backReferenceCheckedAt)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-bqw7 + o3d-kemx — THE SWEEP'S HALF OF THE SAME NARROWING.
+//
+// r4 finding 3 made a tombstone announce its discarded follow-ups and settle only once the warning
+// landed. That is right for the rows that lost something. It was applied to every tombstone, and a
+// SALES CREDIT_NOTE is a back-reference type — so retention compacts it — that owes no follow-up on
+// either connector. The sweep therefore warned about it, and, because the warning gates the stamp,
+// a failing activity log kept it in the candidate set for ever: re-probed, re-warned and never
+// settled, over a loss that never happened.
+// ---------------------------------------------------------------------------
+
+function salesCreditNoteRow(index: number, overrides: Partial<SyncRow> = {}): SyncRow {
+  return {
+    id: `log-scn-${String(index).padStart(4, '0')}`,
+    connector: 'xero',
+    type: 'CREDIT_NOTE',
+    referenceType: 'SalesOrderRefund',
+    referenceId: `refund-${index}`,
+    externalTransactionId: `XSCN-${index}`,
+    status: 'FAILED',
+    payload: { invoiceNumber: `SCN-${index}` },
+    createdAt: at(index),
+    backReferenceCheckedAt: null,
+    backReferenceAmbiguousLoggedAt: null,
+    backReferenceEvidenceCompactedAt: null,
+    backReferenceFollowUpsPendingAt: null,
+    settlementBasis: null,
+    // o3d-bqw7 r2: an ordinary row records its origin in its payload and has no per-row obligation
+    // record; a tombstone factory below overrides both.
+    connectionProvenance: null,
+    followUpObligations: null,
+    ...overrides,
+  }
+}
+
+test('[o3d-bqw7] a repaired CREDIT_NOTE tombstone is settled WITHOUT a discard warning', async () => {
+  const harness = makeHarness({
+    syncRows: [salesCreditNoteRow(1, { payload: {}, backReferenceEvidenceCompactedAt: at(500) })],
+    bills: [],
+    orders: [],
+    refunds: [{ id: 'refund-1', accountingCreditNoteId: null }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 1, 'the id write needs only columns the tombstone keeps')
+  assert.equal(harness.store.refunds![0].accountingCreditNoteId, 'XSCN-1')
+  assert.equal(run.followUpsDiscarded, 0, 'nothing was discarded — CREDIT_NOTE has no follow-up branch to lose')
+  assert.equal(
+    harness.activities.find((entry) => entry.action === 'xero_backreference_followups_discarded'),
+    undefined,
+    'an alarm that fires when nothing was lost trains the operator to ignore the one that matters',
+  )
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'and the row is settled on this pass')
+})
+
+test('[o3d-kemx] a CREDIT_NOTE tombstone settles even when the discard warning cannot be written', async () => {
+  // The stranding. The warning gates the stamp, so before the narrowing this row was left eligible
+  // on every pass for as long as the activity log kept failing — a repaired, linked, already-posted
+  // document held in the candidate set by a warning about a loss that never happened.
+  const harness = makeHarness({
+    syncRows: [salesCreditNoteRow(1, { payload: {}, backReferenceEvidenceCompactedAt: at(500) })],
+    bills: [],
+    orders: [],
+    refunds: [{ id: 'refund-1', accountingCreditNoteId: null }],
+  })
+  harness.failActivityFor.add('xero_backreference_followups_discarded')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 1)
+  assert.ok(
+    harness.store.syncRows[0].backReferenceCheckedAt,
+    'the row must leave the candidate set: there is no discard to announce, so nothing is being lost with it',
+  )
+  assert.equal(run.failed, 0)
+})
+
+test('[o3d-kemx] a tombstone that DID lose follow-ups is still held back by an unwritable warning', async () => {
+  // The control, and the half that must not move. A PURCHASE_CREDIT_NOTE tombstone loses its
+  // allocation, so the terminal policy still applies in full: warn, and settle only once the warning
+  // is on record. If this went green with the narrowing, the narrowing would have deleted the alarm
+  // rather than aimed it.
+  const harness = makeHarness({
+    syncRows: [creditNoteRow(1, { payload: {}, backReferenceEvidenceCompactedAt: at(500) })],
+    bills: [],
+    orders: [],
+    creditNotes: [{ id: 'scn-1', accountingCreditNoteId: null }],
+  })
+  harness.failActivityFor.add('xero_backreference_followups_discarded')
+
+  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(harness.store.creditNotes![0].accountingCreditNoteId, 'XCN-1', 'the id write is idempotent and still lands')
+  assert.equal(
+    harness.store.syncRows[0].backReferenceCheckedAt,
+    null,
+    'unstamped: settling past a warning nobody received would destroy the work and the notice together',
+  )
 })
 
 test('[o3d-9kek r6 f3] an external id already held by another order is REPORTED and deferred, not console-only', async () => {
@@ -2140,4 +2313,112 @@ test('[o3d-nf9i r3] an asserted PURCHASE_INVOICE id is not written onto a bill e
   assert.equal(run.skippedUnverified, 1)
   assert.equal(run.skippedAmbiguous, 0, 'this is not an attribution problem — the row names exactly one bill')
   assert.equal(harness.calls.billUpdates, 0)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-bqw7 ROUND 2 (Codex HIGH) — THE SWEEP'S HALF OF THE TWO REMAINING DEFECTS.
+//
+// (a) The classification says an invoice PDF SURVIVES compaction, and the sweep was handing the
+//     enqueue only the compacted `{}` payload as origin evidence — so the follow-up it claims
+//     survives could not be raised: it would be born with no record of which organisation issued the
+//     id it carries, and refused at post time. The complete durable record travels now.
+//
+// (b) A SALES_INVOICE does not inherently owe a payment registration. A tombstone that RECORDED what
+//     it owed is judged on that record instead of on its type, so a row that lost nothing is not
+//     warned about — and, since the warning gates the settle, is not held behind a failing activity
+//     log either.
+// ---------------------------------------------------------------------------
+
+test('[o3d-bqw7 r2] the sweep hands the enqueue the tombstone\'s COMPLETE origin record, not its emptied payload', async () => {
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, {
+      payload: {},
+      backReferenceEvidenceCompactedAt: at(500),
+      // The half that survives compaction, and the only half still naming an organisation.
+      connectionProvenance: 'xero:tenant-A',
+      followUpObligations: ['payment-registration', 'invoice-pdf'],
+    })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+
+  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(harness.followUps.length, 1, 'the rebuildable follow-ups are raised')
+  assert.deepEqual(harness.followUps[0].origin, {
+    payload: {},
+    connectionProvenance: 'xero:tenant-A',
+    backReferenceEvidenceCompactedAt: at(500),
+  }, 'all three columns are one record — the payload alone cannot speak for a tombstone')
+})
+
+test('[o3d-bqw7 r2] a tombstone that recorded NO payment obligation is settled in silence', async () => {
+  // The ordinary sales order: invoiced with no receipt recorded against it, so `_registerPayment` was
+  // never on the payload and no payment registration was ever owed. Under the type table this row was
+  // warned about on every pass — and while the activity log was failing, held at unsettled for ever.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, {
+      payload: {},
+      backReferenceEvidenceCompactedAt: at(500),
+      connectionProvenance: 'xero:tenant-A',
+      followUpObligations: ['invoice-pdf'],
+    })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 1, 'the link is still written')
+  assert.equal(run.followUpsDiscarded, 0, 'nothing was lost, so nothing is discarded')
+  assert.deepEqual(
+    harness.activities.filter((entry) => entry.action === 'xero_backreference_followups_discarded'),
+    [],
+    'and no alarm is raised about a payment this row never owed',
+  )
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-0001'], 'the PDF is still raised')
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'and the row settles')
+})
+
+test('[o3d-bqw7 r2] a tombstone with no obligation record keeps the over-broad TYPE answer', async () => {
+  // Every row compacted before the record existed. No backfill can ever give it one — the payload its
+  // obligations would be derived from is exactly what retention threw away — so it goes on being
+  // warned about, which is noise rather than silence.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, {
+      payload: {},
+      backReferenceEvidenceCompactedAt: at(500),
+      followUpObligations: null,
+    })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.followUpsDiscarded, 1)
+  const discarded = harness.activities.find((entry) => entry.action === 'xero_backreference_followups_discarded')
+  assert.ok(discarded, 'a row that cannot answer for itself is still warned about')
+  assert.equal(discarded.metadata.classificationBasis, 'type-table')
+})
+
+test('[o3d-bqw7 r2] a TRUE discard warning that cannot be written still holds its row', async () => {
+  // The existing policy, unchanged and deliberately so: the announcement gates the settle, because a
+  // stamped row is one no later pass looks at. What the narrowing removed is the FALSE warning that
+  // could hold a row this way over a loss that never happened.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, {
+      payload: {},
+      backReferenceEvidenceCompactedAt: at(500),
+      followUpObligations: ['payment-registration', 'invoice-pdf'],
+    })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  harness.failActivityFor.add('xero_backreference_followups_discarded')
+
+  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null,
+    'not settled: the loss is permanent and nobody has been told')
 })

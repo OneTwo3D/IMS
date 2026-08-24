@@ -292,3 +292,81 @@ test('o3d-dzip r1#1: the compaction instant is read from the SAME statement as t
     'and there is only one read',
   )
 })
+
+// ---------------------------------------------------------------------------
+// o3d-bqw7 r2 (Codex HIGH) — AND THE FOLLOW-UP A TOMBSTONE RAISES MUST BE ABLE TO POST.
+//
+// `compacted-followup-loss.ts` classifies a tombstone's invoice PDF as REBUILT: it is assembled from
+// `externalTransactionId` and `referenceId`, both of which compaction keeps. The processor duly
+// enqueued one — and handed the enqueue the COMPACTED PAYLOAD as its origin evidence, so the row it
+// created carried no origin at all and was refused at post time as `no-origin-recorded`. The
+// classification was a claim the pipeline did not honour.
+// ---------------------------------------------------------------------------
+
+test('[o3d-bqw7 r2] a follow-up inherited from a TOMBSTONE can actually post', async () => {
+  const { carryAccountingOriginRecordFrom, accountingPayloadConnectionVerdict } = await mod()
+
+  // The source row exactly as retention leaves it.
+  const tombstone = { payload: {}, connectionProvenance: ACTIVE, backReferenceEvidenceCompactedAt: COMPACTED_AT }
+
+  const followUp = carryAccountingOriginRecordFrom({ accountingInvoiceId: 'XINV-1', referenceId: 'so-1' }, tombstone)
+
+  // The follow-up is a NEW row: it has no column of its own yet, so everything the guard will read
+  // has to be in the payload it was born with.
+  const verdict = accountingPayloadConnectionVerdict({
+    payload: followUp,
+    connectionProvenance: null,
+    activeProvenance: ACTIVE,
+    ...WHAT,
+  })
+  assert.equal(verdict.decision, 'match')
+  assert.equal(verdict.mayPost, true, 'the PDF the table calls REBUILT must be raisable, not merely enqueueable')
+})
+
+test('[o3d-bqw7 r2] and it is still caught when the organisation has changed underneath it', async () => {
+  const { carryAccountingOriginRecordFrom, accountingPayloadConnectionVerdict } = await mod()
+  const tombstone = { payload: {}, connectionProvenance: OTHER, backReferenceEvidenceCompactedAt: COMPACTED_AT }
+
+  const followUp = carryAccountingOriginRecordFrom({ accountingInvoiceId: 'XINV-1' }, tombstone)
+  const verdict = accountingPayloadConnectionVerdict({
+    payload: followUp, connectionProvenance: null, activeProvenance: ACTIVE, ...WHAT,
+  })
+  assert.equal(verdict.decision, 'mismatch')
+  assert.equal(verdict.mayPost, false, 'inheriting must not become a way of being permitted')
+})
+
+test('[o3d-bqw7 r2] an ORDINARY row is carried verbatim, exactly as before', async () => {
+  const { carryAccountingOriginRecord, carryAccountingOriginRecordFrom } = await mod()
+  const ordinary = { payload: { _connectionProvenance: ACTIVE, amount: 12 }, connectionProvenance: null }
+
+  assert.deepEqual(
+    carryAccountingOriginRecordFrom({ accountingInvoiceId: 'XINV-1' }, ordinary),
+    carryAccountingOriginRecord({ accountingInvoiceId: 'XINV-1' }, ordinary.payload),
+    'where the payload speaks, nothing about the answer changes',
+  )
+})
+
+test('[o3d-bqw7 r2] a payload REWRITTEN after the insert inherits NOTHING, column or no column', async () => {
+  const { carryAccountingOriginRecordFrom, accountingPayloadConnectionVerdict } = await mod()
+  // Not a tombstone: the payload has keys and no stamp, so it was rewritten by a writer the column
+  // never saw. `readAccountingOriginRecord` calls that unreadable, and unreadable inherits nothing.
+  const rewritten = { payload: { amount: 12 }, connectionProvenance: ACTIVE, backReferenceEvidenceCompactedAt: null }
+
+  const followUp = carryAccountingOriginRecordFrom({ accountingInvoiceId: 'XINV-1' }, rewritten)
+  assert.equal('_connectionProvenance' in followUp, false)
+  const verdict = accountingPayloadConnectionVerdict({
+    payload: followUp, connectionProvenance: null, activeProvenance: ACTIVE, ...WHAT,
+  })
+  assert.equal(verdict.mayPost, false, 'the column must not vouch, one step out, for content it never saw')
+})
+
+test('[o3d-bqw7 r2] a caller-stamped origin on the BODY is discarded, not merged', async () => {
+  const { carryAccountingOriginRecordFrom } = await mod()
+  const tombstone = { payload: {}, connectionProvenance: ACTIVE, backReferenceEvidenceCompactedAt: COMPACTED_AT }
+
+  const followUp = carryAccountingOriginRecordFrom(
+    { accountingInvoiceId: 'XINV-1', _connectionProvenance: OTHER },
+    tombstone,
+  )
+  assert.equal(followUp._connectionProvenance, ACTIVE, 'a marker may only be written by the row that took the action')
+})

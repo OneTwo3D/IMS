@@ -1,0 +1,55 @@
+-- o3d-bqw7 round 2 — WHAT THE ROW ACTUALLY OWED, WRITTEN BEFORE THE PAYLOAD THAT SAID SO IS ERASED.
+--
+-- THE DEFECT THIS CLOSES. Retention compacts an expired-but-unresolved accounting sync row to an
+-- attribution-only tombstone: the columns the back-reference write needs survive, and `payload`
+-- becomes `{}`. The follow-ups constructed from that payload are then unrecoverable, and the sweep
+-- and the processors announce that loss in a WARNING — which also GATES the release of the row's
+-- follow-up obligation, so an announcement that cannot be written holds the row at PENDING and
+-- re-drives it on every pass, for ever.
+--
+-- Round 1 narrowed the guard from "the payload was thrown away" to "a row of this TYPE loses
+-- something", which removed the whole CREDIT_NOTE false-alarm population. It did not go far enough,
+-- and the residue is the same defect one level up: a SALES_INVOICE does not inherently owe a payment
+-- registration. Both connectors gate that enqueue on `payload._registerPayment`, and the ordinary
+-- sales path — an order invoiced without a receipt recorded against it — composes a payload without
+-- it. Every one of those tombstones was warned about a payment registration that was never owed.
+--
+-- A TYPE CANNOT ANSWER A PER-ROW QUESTION, so the row answers it. `follow_up_obligations` holds a
+-- JSON array of obligation KEYS ("payment-registration", "invoice-pdf", …) computed from the payload
+-- by retention's own compaction, in the SAME statement that empties it. That timing is the whole
+-- point: after the compaction there is nothing left to derive it from, and before the compaction
+-- there is no reason to spend a write on it.
+--
+-- IT IS A RECORD OF WHAT WAS OWED, NOT A COPY OF WHAT WAS SENT. Keys only — no customer or supplier
+-- name, no email address, no delivery address, no line description, no amount, no document text.
+-- Compaction exists to remove exactly those, and a record that reintroduced any of them would defeat
+-- the retention policy it lives inside. The keys are a closed vocabulary defined in
+-- lib/domain/accounting/compacted-followup-loss.ts.
+--
+-- NULL IS NOT AN EMPTY ARRAY, and the distinction is load-bearing:
+--
+--   NULL   no record. Every row compacted before this column existed, and every row that was never
+--          compacted at all. Readers FALL BACK to the per-type table, which is what they did
+--          yesterday — so this deploy changes nothing for historical tombstones, and there is no
+--          moment at which a row is judged by a record that does not exist.
+--   []     recorded, and this row owed NOTHING. No warning, and — because the warning gates the
+--          release — no way for a failing activity log to strand it.
+--   [...]  recorded, and this is what it owed. The classification names those, and only those.
+--
+-- The fallback direction is deliberate and permanent: an over-broad warning is noise, an under-broad
+-- one loses a payment in silence.
+--
+-- NOT BACKFILLED, and it cannot be: the payload a historical tombstone's obligations would have to be
+-- derived from is precisely what retention already threw away. Inventing one would be the database
+-- vouching for a body it never saw — the same shortcut refused for `connection_provenance`.
+--
+-- NO TRIGGER, deliberately, and the contrast with `connection_provenance` and `create_dispatched_at`
+-- is the reason. Those two are read as PERMISSION and as PROHIBITION about money leaving the system,
+-- so tampering with them has to be self-declaring. This column decides only whether a WARNING is
+-- printed and whether a settled row may be stamped; its failure mode is noise, and its fallback
+-- (the type table) is the pre-existing behaviour. A trigger would be ceremony without a threat.
+--
+-- ADDITIVE AND NON-BLOCKING: one nullable column, no default, no index — it is read only on a row
+-- already located by its primary key or already selected by the sweep's candidate index. On
+-- PostgreSQL 11+ this is a catalogue-only change and takes no table rewrite.
+ALTER TABLE "accounting_sync_logs" ADD COLUMN "follow_up_obligations" JSONB;

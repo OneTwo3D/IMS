@@ -1667,7 +1667,29 @@ about what it could not do: check the activity log after a bulk retry over old f
 The follow-ups that **do** survive compaction are still queued in that situation. A sales invoice
 tombstone, for example, keeps everything the invoice-PDF job needs, so the retry enqueues it even
 when the warning itself could not be written down — only the *settling* of the row waits for the
-warning, never the work.
+warning, never the work. **The repair sweep queues them too**, which it previously did not: it used
+to announce the loss and settle a tombstone without calling the enqueue at all, which threw away the
+same PDF the warning was telling you had survived.
+
+**The warning names what the row actually owed, not what its type could owe.** A sales invoice only
+owes a payment registration when the payment was recorded on it at the time it was queued — an order
+invoiced with no receipt against it never owed one, and a tombstone of it lost nothing. Retention
+therefore writes down what each row owed at the moment it compacts it, from the payload it is about
+to erase, and the warning is raised only for what that record names. Two consequences worth knowing:
+
+- rows compacted **before this shipped** carry no such record, and there is no way to give them one —
+  the payload it would be derived from is exactly what was thrown away. Those rows keep the older,
+  broader answer, so a sales invoice tombstone from before the change is still reported as having
+  lost a payment registration even when it never owed one. The activity entry says which it was:
+  `classificationBasis` is `row-record` for a row that answered for itself and `type-table` for one
+  that could not;
+- a row that owed nothing recoverable is now **settled silently**, with no warning at all. That is
+  the intended outcome, not a missing alarm: there was nothing to lose.
+
+A follow-up rebuilt from a tombstone also carries the organisation the original row was raised
+against — recorded in a column retention does not touch — so it can be posted. Before, it was queued
+carrying nothing and refused at the socket, which meant the PDF the table promised never actually
+went out.
 
 **Do not cancel one of these rows to tidy it away.** Cancelling is irreversible in two ways the row
 gives no warning about: a cancelled row is no longer a repair candidate, so the link that was still
@@ -1741,9 +1763,32 @@ The sync log at **Integrations → Xero** shows queued transactions for the **cu
 - **Synced** — Successfully pushed to Xero (shows Xero transaction ID)
 - **Failed** — Failed after 5 retries (shows error message)
 
-- **Cancelled** — Retired without posting (for example the sales order was cancelled before its invoice went out). Not an error, and not re-queued by any sweep.
+- **Cancelled** (shown as **Retired**) — the row was taken out of the queue rather than completed. Usually nothing was posted (a sales order cancelled before its invoice went out, an orphaned queue row swept up). **Sometimes something was**: when the repair sweep retires a row because the sale is not live, the Xero document it names is real and is kept on the row on purpose. No sweep re-queues a retired row.
 
 Failed entries can be investigated via the error message and retried by resetting their status in the database.
+
+#### Releasing a retired row after the sale comes back
+
+If a retired row still shows a **Xero document id** and its sales order is **live again** — an order cancelled by mistake in WooCommerce and then reinstated, which pushes the live status back into IMS — the document is sitting in Xero with nothing linking it to the order, and no other control on this page applies: Retry and Retry All only ever touch `FAILED` rows, and the settle control answers that a recorded outcome cannot be rewritten.
+
+The **release** button (the undo arrow) on that row is the way out. It:
+
+- re-reads the sales order **under that order's row lock, inside the transaction that writes**, so a cancellation landing at the same moment cannot be overwritten by a decision taken just before it;
+- releases the row back to `SYNCED` **only if the order is live**, so the ordinary back-reference repair sweep picks it up on its next run and writes the link and the outstanding follow-ups (PDF, email, storefront note, payment);
+- **sends nothing to Xero**, either way. The document already posted; this only decides whether IMS may finish linking it.
+
+It refuses, naming what to do instead, when:
+
+- the order is **still cancelled** — the document must not be revived. Void or credit-note it in Xero, or reinstate the order first;
+- the order **no longer exists** — same answer: the document is real, undo it in Xero;
+- the order **could not be read** — nothing was changed and this is not a verdict about the sale, only about that moment. Try again;
+- the row's outcome was recorded by an **operator assertion** rather than by Xero — the document id is unverified, so open it in Xero and link it to the order by hand;
+- the **repair sweep has already reached a verdict** on the row — releasing it would produce a row no later pass looks at. Use the external-id release command instead. The row is re-read under the order's lock inside the transaction that writes, so a sweep verdict landing while you press the button is caught rather than overwritten;
+- the row has **moved on to a different attempt** since the page was rendered. Reload and judge what the list shows.
+
+**Rows that have never been picked up by a processor can be released too.** Historic rows — and any row the sweep retires before a processor ever claimed it — carry no attempt of their own. The release adopts such a row instead of refusing it: the write is still a compare-and-swap, so if anything claims or moves the row first, the release loses and tells you what changed.
+
+Releasing needs the **settings** permission.
 
 ### Payments IMS refuses to send
 
@@ -1825,6 +1870,8 @@ there is nothing to settle, and if it is not, reverse it in Xero before recordin
 - **cancelled** — retires the row to `CANCELLED` instead, writes nothing onto the order, enqueues no follow-ups, and raises an ERROR naming the Xero document that is now the only thing left to undo;
 - **unreadable** — defers: nothing is written, nothing is retired, the row keeps its status and the next sweep asks again. A WARNING records the deferral.
 
+A retirement is **not** the end of the story if the sale comes back: see *Releasing a retired row after the sale comes back* above. The retirement is deliberately fail-closed, and the release is the operator's way to answer it once the sale can be proved live again.
+
 Only rows whose reference is a **sales order** are gated this way. A supplier bill has no sale behind it, and a refund credit note is very often the direct consequence of the cancellation — refusing to finish *that* back-reference would strand the very document the cancellation created.
 
 The sweep result (returned by the cron endpoint and by manual sync) reports these as `retiredCancelledSale`, alongside `checked` / `repaired` / `failed` / `skippedAmbiguous`.
@@ -1873,7 +1920,10 @@ cancelled. Reverse the document in Xero instead.
 **What cannot be settled, and why the control says so instead of disappearing:**
 
 - **Pending** rows — nothing was sent, so there is nothing to assert. The ordinary sweeps retire them.
-- **Synced** and **Cancelled** rows — the outcome is already recorded and must not be rewritten.
+- **Synced** and **Cancelled** rows — the outcome is already recorded and must not be rewritten. A
+  **Cancelled** row that still names a Xero document, on a sales order that is live again, has its own
+  control — see *Releasing a retired row after the sale comes back*. It does not settle the row; it
+  hands it back to the repair sweep.
 - **Daily batch** rows — a batch row covers every order staged into it, so cancelling one could let an
   order be deleted while a recreate is still building a journal containing its value. Reverse the
   journal in Xero and let the batch sweep re-derive it.

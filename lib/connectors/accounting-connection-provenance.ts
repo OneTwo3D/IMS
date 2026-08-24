@@ -419,6 +419,52 @@ export function carryAccountingOriginRecord<T extends Record<string, unknown>>(
   }
 }
 
+/**
+ * THE SAME INHERITANCE, FROM A COMPLETE DURABLE RECORD (o3d-bqw7 r2, Codex HIGH).
+ *
+ * `carryAccountingOriginRecord` inherits from the source PAYLOAD, and that is the whole record for
+ * every ordinary row. It is not the whole record for a RETENTION TOMBSTONE: compaction writes
+ * `payload: {}` and keeps `connection_provenance`, so the payload of the very rows whose realm is
+ * least knowable says nothing at all. Handing that payload on as origin evidence produced a follow-up
+ * born with NO record, which `accountingPayloadConnectionVerdict` refuses as `no-origin-recorded`.
+ *
+ * That is why this exists. `compacted-followup-loss.ts` classifies a tombstone's invoice PDF as
+ * REBUILT — built from columns compaction keeps — and the processor duly enqueues one, but the row it
+ * enqueued could never post: the classification was a claim the pipeline did not honour. Carrying the
+ * COMPLETE record makes the claim true.
+ *
+ * IT ADDS NO NEW READER. Where the payload speaks it is copied verbatim, byte for byte, by the
+ * function above — nothing about a non-compacted source changes. Where it is silent the answer comes
+ * from {@link readAccountingOriginRecord}, which is already the only thing allowed to combine the two
+ * halves, and which accepts the column ALONE only for a verifiably compacted row.
+ *
+ * A record that is `absent` or `unreadable` inherits NOTHING, and the follow-up is born unstamped and
+ * refuses. That is the same answer the source row itself would get, which is the property that keeps
+ * the chain sound: a follow-up can never be MORE permitted than the post it descends from.
+ */
+export function carryAccountingOriginRecordFrom<T extends Record<string, unknown>>(
+  body: T,
+  source: AccountingOriginRecord,
+): Record<string, unknown> {
+  // The payload still speaks for itself wherever it can — including UNREADABLY, which must travel so
+  // the follow-up refuses for the same reason its parent would.
+  if (readAccountingPayloadConnectionStamp(source.payload).state !== 'absent') {
+    return carryAccountingOriginRecord(body, source.payload)
+  }
+  const { [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: _stampedByTheCaller, ...withoutCallerOrigin } = body
+  const stamp = readAccountingOriginRecord(source)
+  if (stamp.state === 'stamped') {
+    return { ...withoutCallerOrigin, [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: stamp.provenance }
+  }
+  if (stamp.state === 'raised-disconnected') {
+    return { ...withoutCallerOrigin, [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: ACCOUNTING_CONNECTION_RAISED_DISCONNECTED }
+  }
+  // `absent` (nothing recorded anywhere) and `unreadable` (the two halves describe two different
+  // moments) both inherit nothing. Absence already refuses; writing a marker to say "I looked and
+  // found nothing" would be the repair stamping a claim about itself rather than about the origin.
+  return withoutCallerOrigin
+}
+
 /** Why a queued payload may or may not be posted to the connection now in hand. */
 export type AccountingConnectionDecision =
   /** The stamp names the connection the request is about to use. */

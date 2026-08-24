@@ -7,6 +7,7 @@ import {
   UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
   backReferenceEvidenceTombstone,
 } from '@/lib/domain/accounting/back-reference-sweep'
+import { followUpObligationsOwedBy } from '@/lib/domain/accounting/compacted-followup-loss'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
 import {
@@ -14,6 +15,30 @@ import {
   inboundEventCompactionData,
   receiptEventCompactionData,
 } from '@/lib/domain/wms/inbound-event-retention'
+
+/**
+ * Rows read per page by the back-reference evidence compaction (o3d-bqw7 r2). Small on purpose: the
+ * population is the unresolved-posted backlog, not the history, and each page is fully consumed
+ * before the next is read.
+ */
+const BACK_REFERENCE_EVIDENCE_COMPACTION_PAGE_SIZE = 100
+
+/**
+ * Hard ceiling on rows this compaction touches in ONE run (o3d-bqw7 r3).
+ *
+ * It is the only PER-ROW loop in the purge — every sibling compaction below is a single bulk
+ * statement whose cost the database bounds for us — and its page loop reads from the head until the
+ * predicate is empty. That is fine for the steady state (a day's worth of rows crossing the cutoff)
+ * and unbounded for the states that are not steady: the first run after this shipped, a connector
+ * reconnected after months of unswept rows, a retention period shortened by an operator. Those cost
+ * one statement per row, in a nightly job that holds a connection while it runs.
+ *
+ * Capping it costs nothing, because the work is RESUMABLE by construction: every compacted row
+ * leaves the predicate for good (`backReferenceEvidenceCompactedAt` is no longer null), so the next
+ * run continues from where this one stopped rather than repeating it. The bound is on the run, not
+ * on the backlog.
+ */
+const BACK_REFERENCE_EVIDENCE_COMPACTION_MAX_ROWS = 5_000
 
 const RETENTION_KEYS = [
   'retention_sales_orders_months',
@@ -262,14 +287,100 @@ export async function purgeExpiredData(): Promise<{
     // keeps every column the id write needs and stays a candidate for it; what is genuinely lost is
     // only the payload-dependent follow-ups, which the sweep discards under an explicit terminal
     // policy and warns about.
-    const { count: compacted } = await db.accountingSyncLog.updateMany({
-      where: {
-        createdAt: { lt: cutoff },
-        ...UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
-        backReferenceEvidenceCompactedAt: null,
-      },
-      data: backReferenceEvidenceTombstone(new Date()),
-    })
+    //
+    // o3d-bqw7 r2 — AND IT RECORDS WHAT THE ROW OWED, WHICH IS WHY THIS IS NO LONGER ONE STATEMENT.
+    //
+    // The discard warning downstream claims "this row's outstanding follow-ups can no longer be
+    // enqueued", and it used to answer that from the row's TYPE. A type is coarser than the truth: a
+    // SALES_INVOICE owes a payment registration only when its payload carries `_registerPayment`, and
+    // the ordinary sales path composes payloads without it — so tombstones that lost nothing were
+    // warned about, and because the warning gates the obligation release, a false one that is also
+    // unwritable holds an already-posted row at PENDING for ever.
+    //
+    // The only moment that question can be answered truthfully is THIS one: after it, the payload the
+    // answer is derived from does not exist. So the compaction reads each row, derives what it owed
+    // and writes that down in the SAME statement that empties the payload. Per row rather than one
+    // `updateMany`, because a bulk UPDATE cannot compute a different value per row without moving the
+    // enqueue's gate conditions into SQL, where they would drift from the branches they mirror.
+    //
+    // The volume is not the whole table: the predicate is `createdAt < cutoff` AND unresolved AND
+    // holding an external id AND one of four types AND not already compacted, and each daily run only
+    // sees the slice that has newly crossed the cutoff. It is nonetheless the ONLY per-row loop in
+    // this purge, so it is BOUNDED by BACK_REFERENCE_EVIDENCE_COMPACTION_MAX_ROWS as well as by the
+    // predicate — see that constant for why a cap costs nothing here.
+    //
+    // FAILING PART-WAY IS SAFE. Each row is its own statement, and a row that was not reached simply
+    // keeps its payload and is compacted on the next run — the same property the single `updateMany`
+    // had, for the same reason (`backReferenceEvidenceCompactedAt: null` excludes what is done).
+    //
+    // o3d-psvi — AND A ROW AN OPERATOR HAS JUST RE-OPENED IS NOT EXPIRED.
+    //
+    // `releaseRetiredAccountingSyncRowForLiveSale` puts a retired row back in front of the repair
+    // sweep by writing SYNCED while leaving `backReferenceCheckedAt` null and keeping the document
+    // id — which is EXACTLY this predicate. And such a row is OLD BY CONSTRUCTION: it was retired
+    // long enough ago for somebody to notice and press the button. Compacting on `createdAt` alone
+    // would therefore race the sweep for precisely the rows the release exists to rescue, and the
+    // race is not harmless — the payload is what the PAYMENT registration is rebuilt from, so
+    // compacting first means the sweep rebuilds only the PDF and warns that the payment is
+    // unrecoverable, which is the opposite of what the release told the operator would happen.
+    //
+    // So the age test reads the row's LAST COMPLETION as well as its birth: a row whose `syncedAt`
+    // falls inside the retention window is recent WORK, whatever its `createdAt` says. That is a
+    // DEFERRAL and not an exemption — it moves with the cutoff, so a released row that nothing ever
+    // finishes becomes compactable one full retention period later and the bound this compaction
+    // exists to impose still holds.
+    const compactableWhere = {
+      createdAt: { lt: cutoff },
+      OR: [{ syncedAt: null }, { syncedAt: { lt: cutoff } }],
+      ...UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
+      backReferenceEvidenceCompactedAt: null,
+    }
+    let compacted = 0
+    let examined = 0
+    // Paged from the head each time rather than by cursor: every row this loop touches LEAVES the
+    // predicate, so the next page is always what is left.
+    for (;;) {
+      const remaining = BACK_REFERENCE_EVIDENCE_COMPACTION_MAX_ROWS - examined
+      if (remaining <= 0) break
+      const page = await db.accountingSyncLog.findMany({
+        where: compactableWhere,
+        select: { id: true, type: true, referenceType: true, externalTransactionId: true, payload: true },
+        orderBy: { createdAt: 'asc' },
+        take: Math.min(BACK_REFERENCE_EVIDENCE_COMPACTION_PAGE_SIZE, remaining),
+      })
+      if (page.length === 0) break
+      examined += page.length
+      const now = new Date()
+      // A page whose rows all decline the write would otherwise be re-read for ever. The select and
+      // the write now ask LITERALLY the same question, so a decline means a concurrent writer moved
+      // the row out of the predicate — in which case the next select will not return it either, and
+      // re-reading the page is work with no end. Stop and let the next run see the settled state.
+      let writtenThisPage = 0
+      for (const row of page) {
+        const { count } = await db.accountingSyncLog.updateMany({
+          // THE WHOLE SELECTION PREDICATE, RE-ASSERTED — not just the row id and the compaction stamp
+          // (o3d-bqw7 r3, Codex HIGH). The read and the write are separate statements, so every
+          // column the selection turned on is a column a concurrent writer can turn off in between:
+          // the sweep stamping `backReferenceCheckedAt` or repairing the row, an operator retry
+          // taking FAILED back to PENDING, `decideSaleRelease` retiring it to CANCELLED. Narrowing
+          // this to `{ id, backReferenceEvidenceCompactedAt: null }` compacted such a row ANYWAY —
+          // payload emptied, error message cleared, and an obligation record computed from a payload
+          // the row had already moved on from, which is the one way this pass can UNDER-report what
+          // is owed. Re-asserting the predicate makes the write a no-op instead, and the row is
+          // re-selected on the next run if it is still eligible.
+          where: { ...compactableWhere, id: row.id },
+          data: {
+            ...backReferenceEvidenceTombstone(now),
+            // Keys only — no name, address, amount or document text. See the migration.
+            followUpObligations: followUpObligationsOwedBy(row),
+          },
+        })
+        compacted += count
+        writtenThisPage += count
+      }
+      if (writtenThisPage === 0) break
+      if (page.length < BACK_REFERENCE_EVIDENCE_COMPACTION_PAGE_SIZE) break
+    }
     backReferenceEvidenceCompacted = compacted
   }
 

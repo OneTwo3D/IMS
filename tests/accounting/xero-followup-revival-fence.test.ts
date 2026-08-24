@@ -164,10 +164,19 @@ const REQUEST = { accountingInvoiceId: 'inv-9', amount: 120 }
  */
 const POSTED_ROW_PAYLOAD = {}
 
+/**
+ * o3d-bqw7 r2: the enqueue now takes the posting row's COMPLETE durable origin record — the payload
+ * TOGETHER WITH its `connectionProvenance` column and retention's compaction instant — because on a
+ * tombstone the payload is `{}` and the column is the only half left speaking. These tests are about
+ * the revival fence and not about provenance, so the record here is an ordinary uncompacted row: an
+ * empty payload and no column, which reads exactly as the bare payload did.
+ */
+const POSTED_ROW_ORIGIN = { from: 'postedRow' as const, record: { payload: POSTED_ROW_PAYLOAD, connectionProvenance: null } }
+
 test('o3d-e2mz r3: reviving a FAILED follow-up CASes on the attempt it read, and advances it', async () => {
   reset([failedPaymentRow()])
 
-  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
   const revive = store.updateManyWheres.at(-1) as Record<string, unknown>
   assert.equal(revive.attemptRevision, 4, 'the revival must be a compare-and-swap on the attempt it planned against')
@@ -192,7 +201,7 @@ test('o3d-e2mz r3: a revival planned against one attempt does not land on a LATE
     })
   }
 
-  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
   const attempted = store.updateManyWheres.filter((where) => 'attemptRevision' in where)
   assert.deepEqual(
@@ -216,7 +225,7 @@ test('o3d-e2mz r3: a FAILED row carrying no attempt revision is REFUSED, not rev
   // It fails closed and says so, rather than risking a second payment on the invoice.
   reset([failedPaymentRow({ attemptRevision: 0 })])
 
-  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
   const row = store.get('log-pay')
   assert.equal(row?.status, 'FAILED', 'the unfenceable row must be left exactly as it was')
@@ -233,7 +242,7 @@ test('o3d-e2mz r3: an enqueue with no FAILED row to reuse still creates one, unf
   // The create path has no attempt to fence on — the row does not exist yet — and must keep working.
   reset([])
 
-  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
   assert.equal(store.rows.length, 1)
   assert.equal(store.rows[0].status, 'PENDING')
@@ -285,7 +294,7 @@ const RELIANCE_ACTION = 'xero_followup_enqueue_rests_on_operator_assertion'
 test('[o3d-anu8] the reliance record is written INSIDE the enqueue, after the row it describes exists', async () => {
   reset([assertedNotPostedRow()])
 
-  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
   assert.equal(store.rows.length, 2, 'the enqueue really happened')
   const record = durableActivity.find((entry) => entry.action === RELIANCE_ACTION)
@@ -303,7 +312,7 @@ test('[o3d-anu8] a LEDGER refusal after the plan leaves no record claiming a pay
   reset([assertedNotPostedRow()])
   ledgerVerdict = { clear: false, reason: 'Xero already holds a settlement of 120.00 dated 2026-08-01' }
 
-  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
   assert.equal(store.rows.length, 1, 'nothing was enqueued')
   assert.deepEqual(durableActivity.filter((entry) => entry.action === RELIANCE_ACTION), [],
@@ -317,7 +326,7 @@ test('[o3d-anu8] an UNFENCEABLE reuse target leaves no record either', async () 
   // the reuse candidate; the asserted row is what cleared the ambiguity that would otherwise refuse.
   reset([assertedNotPostedRow(), failedPaymentRow({ attemptRevision: 0 })])
 
-  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
   assert.equal(store.get('log-pay')?.status, 'FAILED', 'the unfenceable row is left exactly as it was')
   assert.deepEqual(scheduled, [], 'and nothing was queued')
@@ -331,7 +340,7 @@ test('[o3d-anu8] an UNFENCEABLE reuse target leaves no record either', async () 
 test('[o3d-anu8] a REVIVAL cleared by an assertion is recorded too, and after the revival', async () => {
   reset([assertedNotPostedRow(), failedPaymentRow()])
 
-  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
   assert.equal(store.get('log-pay')?.status, 'PENDING', 'the revival happened')
   const record = durableActivity.find((entry) => entry.action === RELIANCE_ACTION)
@@ -345,7 +354,7 @@ test('[o3d-anu8] an unwritable record ABORTS the enqueue rather than leaving an 
 
   const enqueue = await loadEnqueue()
   await assert.rejects(
-    () => enqueue('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD }),
+    () => enqueue('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN),
     /activity log unavailable/,
     'the failure must propagate — swallowing it is what let the post commit unrecorded',
   )
@@ -358,7 +367,7 @@ test('[o3d-anu8] an unwritable record ABORTS the enqueue rather than leaving an 
 test('[o3d-anu8] a scope with NO assertion in it writes nothing — this is not a per-enqueue warning', async () => {
   reset([failedPaymentRow()])
 
-  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD })
+  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
   assert.equal(store.get('log-pay')?.status, 'PENDING')
   assert.deepEqual(durableActivity, [], 'an ordinary revival rests on the connector s own history')

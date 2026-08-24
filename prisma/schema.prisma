@@ -2332,6 +2332,12 @@ model AccountingSyncLog {
   /// outcome (app/actions/accounting-settlement.ts) and IMS verified NOTHING about it — no call was
   /// made, no figure was compared, only a document id was typed in.
   ///
+  /// o3d-psvi r3: 'OPERATOR_RELEASE' is the third value — a row the sweep retired to CANCELLED that
+  /// an operator put back in front of it (releaseRetiredAccountingSyncRowForLiveSale). The STATUS
+  /// was reached by a human, so it must not read as a connector writeback; the DOCUMENT ID was not,
+  /// because that control refuses an asserted row outright, so the readers that fail closed on an
+  /// unverified id must not fire for it. See lib/domain/accounting/sync-row-settlement.ts.
+  ///
   /// It exists because a verdict has to carry its basis. Without this column a settled row is
   /// byte-identical to a connector-confirmed one, and every reader that asks "did this post?" —
   /// most importantly lib/domain/accounting/settlement-status.ts, which then compares the amount
@@ -2535,6 +2541,29 @@ model AccountingSyncLog {
   /// permission, so tampering clears it; this one is a prohibition, so tampering must not.
   createDispatchedAt           DateTime? @map("create_dispatched_at")
   createDispatchIdempotencyKey String?   @map("create_dispatch_idempotency_key")
+
+  /// o3d-bqw7 r2 — WHAT THIS ROW ACTUALLY OWED, recorded before retention erased the payload it was
+  /// owed from.
+  ///
+  /// The discard warning claims "this row's outstanding follow-ups can no longer be enqueued". r1
+  /// answered that from the row's TYPE, which was already a narrowing of answering it from the
+  /// compaction stamp — but a type is still coarser than the truth. A SALES_INVOICE does not
+  /// inherently owe a payment registration: the enqueue is gated on `payload._registerPayment`, and
+  /// the ordinary sales path composes payloads without it. So a type-level answer goes on warning
+  /// about rows that lost nothing, and because the warning GATES the obligation release, a false
+  /// warning that is also unwritable holds an already-posted row at PENDING for ever.
+  ///
+  /// This is the per-ROW answer: a JSON array of obligation KEYS, written by retention's compaction
+  /// in the same statement that empties the payload — computed FROM that payload, while it is still
+  /// there to be read. It is a record of what was OWED, never a copy of what was sent: no names, no
+  /// addresses, no amounts, no document text. That is what lets it survive a compaction whose whole
+  /// purpose is to remove exactly those things.
+  ///
+  /// NULL is not an empty list. NULL means NO RECORD — every row compacted before this column
+  /// existed, and every row that was never compacted at all — and readers fall back to the type
+  /// table for those, which OVER-reports. That direction is deliberate and permanent: an over-broad
+  /// warning is noise, an under-broad one loses a payment in silence.
+  followUpObligations Json? @map("follow_up_obligations")
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.

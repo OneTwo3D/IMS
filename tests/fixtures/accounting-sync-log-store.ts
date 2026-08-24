@@ -47,6 +47,15 @@ export type SyncLogRow = {
    */
   remoteAttemptedAt: Date | null
   attemptStampingCustodyAt: Date | null
+  /**
+   * o3d-dzip / o3d-bqw7 r2 — the two columns a RETENTION TOMBSTONE answers with once its payload is
+   * `{}`: which organisation raised it, and what it recorded that it owed. Carried here because the
+   * sweep now selects both and hands the first on as origin evidence; a double that answered
+   * `undefined` would make every tombstone hand on nothing and every classification fall back to the
+   * type table, i.e. exactly the two defects under test.
+   */
+  connectionProvenance: string | null
+  followUpObligations: unknown
 }
 
 export function syncLogRow(overrides: Partial<SyncLogRow> & { id: string }): SyncLogRow {
@@ -71,6 +80,10 @@ export function syncLogRow(overrides: Partial<SyncLogRow> & { id: string }): Syn
     settlementBasis: null,
     remoteAttemptedAt: null,
     attemptStampingCustodyAt: null,
+    // An ordinary row: its origin lives in its payload, and nothing has recorded an obligation
+    // because nothing has erased its payload.
+    connectionProvenance: null,
+    followUpObligations: null,
     ...overrides,
   }
 }
