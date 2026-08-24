@@ -229,7 +229,60 @@ test('o3d-92fu: a VALIDATION_FAILED link that ALREADY spent remote attempts stil
     STAMPS,
   )
   assert.equal(blocker?.code, 'wms_order_push_link')
-  assert.match(blocker!.message, /3 push attempt\(s\) were made before its payload became invalid/)
+  assert.match(blocker!.message, /3 push attempt\(s\) may already have been dispatched/)
+})
+
+test('o3d-2k5r: a VALIDATION_FAILED link with a pushedAt STAMP blocks, even at attempts 0', async () => {
+  // The condition that protects a RELEASED link, and the one nothing was asserting: the release
+  // pass resets attempts and nulls the external id on a link whose WMS order really was created,
+  // so `pushedAt` is the sole surviving discriminator. Dropping it from the predicate — reading
+  // it as always-null — hands the deleter an order the warehouse holds.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: {
+        state: 'VALIDATION_FAILED', externalOrderId: null, externalOrderNumber: null,
+        attempts: 0, pushedAt: new Date('2026-08-01T10:00:00.000Z'),
+      },
+    }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'wms_order_push_link')
+  // And it must not cite the attempts counter, which here reads 0 and argues for the delete.
+  assert.match(blocker!.message, /a push to the warehouse is recorded against it/)
+  assert.doesNotMatch(blocker!.message, /0 push attempt/)
+})
+
+test('o3d-2k5r: a VALIDATION_FAILED link converted from a CLAIM (attempts 1) blocks', async () => {
+  // The critical case. claimForCreate writes PENDING_CREATE at the schema default of attempts 0
+  // BEFORE the remote call; the increment lives in a catch that a process kill never reaches. The
+  // disposition write is what marks such a converted claim ambiguous, and this is the guard reading
+  // that mark rather than the silence it replaced.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ pushLink: { state: 'VALIDATION_FAILED', externalOrderId: null, externalOrderNumber: null, attempts: 1, pushedAt: null } }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'wms_order_push_link')
+  assert.match(blocker!.message, /may already have reached the warehouse management system/)
+})
+
+test('o3d-2k5r: provesNoRemoteWmsCall — an ABSENT link is the ONLY unconditional proof', async () => {
+  const { provesNoRemoteWmsCall } = await import('@/lib/domain/wms/order-push-sweep')
+  const clean = { state: 'VALIDATION_FAILED', attempts: 0, pushedAt: null, externalOrderId: null }
+
+  // No link at all: nothing was ever claimed, so nothing was ever called.
+  assert.equal(provesNoRemoteWmsCall(null), true)
+  // A disposition the pre-call path CREATED is the single exception.
+  assert.equal(provesNoRemoteWmsCall(clean), true)
+  // A bare claim is NOT proof — it is written immediately before the remote call.
+  assert.equal(provesNoRemoteWmsCall({ ...clean, state: 'PENDING_CREATE' }), false)
+  // Nor is a dead letter, which has exactly the same three columns as the clean case.
+  assert.equal(provesNoRemoteWmsCall({ ...clean, state: 'DEAD_LETTER' }), false)
+  // Each of the three columns is load-bearing on its own.
+  assert.equal(provesNoRemoteWmsCall({ ...clean, attempts: 1 }), false)
+  assert.equal(provesNoRemoteWmsCall({ ...clean, pushedAt: new Date() }), false)
+  assert.equal(provesNoRemoteWmsCall({ ...clean, externalOrderId: 'wms-1' }), false)
 })
 
 test('o3d-92fu: a VALIDATION_FAILED link carrying an external id still blocks', async () => {

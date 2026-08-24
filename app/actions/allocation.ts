@@ -54,6 +54,7 @@ import {
   type OrderCompletionAuthority,
 } from '@/lib/domain/sales/shipment-service'
 import { resolveRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
+import { describeRepackReallocation } from '@/lib/domain/sales/repack-recovery-report'
 import {
   allocationScopeKey,
   dispatchedAllocationLines,
@@ -1296,28 +1297,17 @@ export async function reopenShipmentForRepackAction(
     revalidateSalesAllocationPaths(orderId)
 
     // The revert COMMITTED whatever happens next — it is its own transaction — so this reports
-    // honestly rather than pretending the whole recovery ran. Each of these leaves the order in a
-    // state an operator can still work: the shipment is a draft, and "Create Shipments" rebuilds
-    // it. What has NOT happened is the reservation netting, and saying so is the point.
-    if (realloc.refused) {
-      return {
-        success: true,
-        orderId,
-        warning: `Shipment reopened, but stock could not be re-allocated because order ${reopened.orderRef} still has `
-          + 'another committed (picking or packed) shipment. Reopen that one too — or dispatch it — and the '
-          + 'refunded units\u2019 reservation will be released then.',
-      }
-    }
-    if (!realloc.success) {
-      return {
-        success: true,
-        orderId,
-        warning: `Shipment reopened, but re-allocating order ${reopened.orderRef} did not complete`
-          + `${realloc.error ? ` (${realloc.error})` : ''}. The refunded units may still be reserved; `
-          + 'run allocation on this order again before rebuilding the shipment.',
-      }
-    }
-    return { success: true, orderId }
+    // honestly rather than pretending the whole recovery ran. Each outcome leaves the order in a
+    // state an operator can still work: the shipment is a draft, and "Create Shipments" rebuilds it.
+    //
+    // o3d-2k5r: which outcome it is cannot be read off `success` alone. `success: false` with
+    // `committed: true` is the BACKORDER path — the transaction COMMITTED, the refunded units'
+    // reservation was released, and `onReconciledInTx` (immediately before that commit) already
+    // resolved the durable backstop rows. The old wording sent the operator to "run allocation
+    // again" for a retry whose durable driver had just been consumed. The three-way decision lives
+    // in describeRepackReallocation, where it is tested.
+    const warning = describeRepackReallocation(reopened.orderRef, realloc)
+    return warning ? { success: true, orderId, warning } : { success: true, orderId }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
     return { success: false, error: message }

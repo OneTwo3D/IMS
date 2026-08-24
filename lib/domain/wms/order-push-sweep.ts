@@ -65,6 +65,52 @@ export function shouldGrantCreateClaim(
   if (!existing.lastAttemptAt) return true
   return attemptedAt.getTime() - existing.lastAttemptAt.getTime() >= leaseMs
 }
+
+/**
+ * o3d-2k5r — the ONE rule for "no remote WMS call was ever made for this order", written once
+ * so no reader has to re-derive it from the columns and get it wrong.
+ *
+ * THE ONLY UNCONDITIONAL PROOF IS AN ABSENT LINK. Every other answer is a claim about a row
+ * that was written by SOMETHING, and every writer of this row except one writes it either
+ * side of a connector call whose outcome it may never learn.
+ *
+ * The single exception is a VALIDATION_FAILED disposition that `recordValidationFailure`
+ * CREATED — buildPushInput threw on purely local data before anything was claimed, so
+ * pushOrder was demonstrably never invoked. That is recorded as attempts 0 / pushedAt null /
+ * externalOrderId null, and the writer is what makes those columns mean it:
+ *
+ *   - It refuses outright while a PENDING_CREATE claim's lease is still fresh, so it can
+ *     never stamp itself over a worker that is mid-push.
+ *   - When it converts an EXPIRED PENDING_CREATE claim it raises `attempts` to at least
+ *     AMBIGUOUS_ATTEMPTS. A claim exists only because a worker was about to call the WMS,
+ *     and `attempts` is incremented on the remote-failure path by a write that is itself
+ *     `.catch(() => {})`-swallowed and does not run at all if the process is killed — so a
+ *     pre-existing claim at attempts 0 means "a call was dispatched and the outcome is
+ *     unknown", NOT "nothing happened".
+ *
+ * `attempts` therefore counts REMOTE CALLS THAT MAY HAVE BEEN DISPATCHED, not remote calls
+ * known to have failed. That is the reading the hard-delete guard needs, and it is the only
+ * reading that is safe when the answer is used to erase the last local record of a
+ * warehouse order.
+ */
+export const AMBIGUOUS_ATTEMPTS = 1
+
+/**
+ * Does this WmsOrderPushLink prove that nothing was ever sent to the WMS for its order?
+ *
+ * Pure, exported, and shared by the writer's tests and the hard-delete guard so the two
+ * cannot drift. `null` (no link at all) is the only unconditional yes.
+ */
+export function provesNoRemoteWmsCall(
+  link: { state: string; attempts: number; pushedAt: Date | null; externalOrderId: string | null } | null,
+): boolean {
+  if (!link) return true
+  if (link.state !== 'VALIDATION_FAILED') return false
+  // All three, and not as belt-and-braces: a VALIDATION_FAILED link can carry a real external
+  // id or a pushedAt stamp (it pushed, then its payload stopped building), and either is
+  // positive evidence the warehouse holds the order.
+  return link.attempts === 0 && link.pushedAt === null && link.externalOrderId === null
+}
 const DEFAULT_BATCH_SIZE = 25
 /** o3d-rbyg: shared empty result for the live withdrawal screen — "nothing withdrawn", not "unknown". */
 const EMPTY_ORDER_ID_SET: ReadonlySet<string> = new Set<string>()
@@ -202,8 +248,11 @@ type CandidateLine = {
 export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, number>): WmsOrderPushLine[] {
   const pushLines: WmsOrderPushLine[] = []
   for (const line of lines) {
-    // A line with no SKU can't be fulfilled by the WMS — fail the whole order
-    // (caught → retried → dead-lettered) rather than silently dropping the line.
+    // A line with no SKU can't be fulfilled by the WMS — fail the whole order rather than
+    // silently dropping the line. o3d-92fu: the create pass builds the payload BEFORE it
+    // claims anything, so this no longer retries and dead-letters; it parks the order
+    // VALIDATION_FAILED (no claim, no remote call) and the revalidation pass re-queues it
+    // once the SKU is filled in.
     if (!line.sku) throw new Error('Sales order has a line with no SKU; cannot push to WMS')
     const orderedQty = num(line.qty) || 1
     // Refunded units must not be pushed to the WMS for fulfilment (refund state is
@@ -400,8 +449,15 @@ export interface WmsOrderPushPort {
    * claimForCreate and deleteSalesOrder take, and applies ONLY while the link is still absent or
    * PENDING_CREATE.
    *
-   * Returns false when the order no longer exists or the link has moved on; the caller then simply
-   * skips it, exactly as it does for a refused claim.
+   * o3d-2k5r — and it refuses while a PENDING_CREATE claim's LEASE IS STILL FRESH, because a
+   * fresh claim is a worker that is inside pushOrder right now. Only an EXPIRED claim is
+   * converted, and converting one marks the disposition AMBIGUOUS (attempts >= AMBIGUOUS_ATTEMPTS):
+   * a claim exists only because a remote call was about to be made, and nothing durable records
+   * whether it was. Only a disposition this method CREATED — no link existed at all — proves no
+   * call was made. See provesNoRemoteWmsCall, which is what the hard-delete guard reads.
+   *
+   * Returns false when the order no longer exists, the link has moved on, or another worker's
+   * claim is still live; the caller then simply skips it, exactly as it does for a refused claim.
    */
   recordValidationFailure(
     orderId: string,
@@ -683,10 +739,11 @@ export async function runWmsOrderPushSweepCore(
         // Under the ORDER LOCK, and only while the link is still absent or PENDING_CREATE — the
         // candidate list was read before this, so a concurrent worker may already have pushed the
         // order, and stamping this over a SYNCED link would strand a live warehouse order outside
-        // every other pass. `attempts` is preserved rather than incremented: it counts REMOTE
-        // attempts, this failure made none, and it is what the delete guard reads to tell a link
-        // that only ever failed locally (attempts 0 — provably never reached the WMS) from one that
-        // failed REMOTELY first and only later stopped building (attempts > 0 — still ambiguous).
+        // every other pass. It also refuses while a claim's lease is still fresh, and marks the
+        // disposition AMBIGUOUS when it converts an expired one — `attempts` is a floor on remote
+        // calls that MAY have been dispatched, and only a disposition written with NO pre-existing
+        // link proves none was. That distinction is the whole licence the delete guard acts on;
+        // the rule lives in provesNoRemoteWmsCall so it is stated once.
         let recorded = false
         try {
           recorded = await port.recordValidationFailure(order.id, connectorId, message, ts)
@@ -1446,15 +1503,47 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         if (locked.length === 0) return false
         const existing = await tx.wmsOrderPushLink.findUnique({
           where: { orderId },
-          select: { state: true, attempts: true },
+          select: { state: true, attempts: true, lastAttemptAt: true },
         })
-        // Absent or PENDING_CREATE only. Any other state belongs to a worker that has already
-        // talked to the WMS, and this failure has no standing to overwrite it.
-        if (existing && existing.state !== 'PENDING_CREATE') return false
+        // o3d-2k5r: ONE predicate, and deliberately THE CLAIM'S OWN. It answers both questions
+        // this write has to get right, and an earlier version asked them separately — a state
+        // check that shouldGrantCreateClaim already subsumes, which no test could ever fail.
+        //
+        //  1. Has the link MOVED ON? Any state other than PENDING_CREATE (SYNCED, PENDING_VERIFY,
+        //     DEAD_LETTER, HELD, CANCELLED) belongs to a worker that has already talked to the
+        //     WMS. Stamping VALIDATION_FAILED over a SYNCED link keeps its externalOrderId while
+        //     dropping the order out of the update, hold, cancel and dispatch passes — a live
+        //     warehouse order with nothing watching it.
+        //  2. Is a PENDING_CREATE claim still LIVE? The state alone cannot tell "a claim nobody is
+        //     using" from "a worker is inside pushOrder right now" — which is exactly why the
+        //     claim gates on a lease. This write is a full state change plus a new lastAttemptAt,
+        //     so on a fresh claim it would overwrite a live push AND move its lease clock forward.
+        //     The cron rate-limits sweeps but does not serialise them, so overlapping passes are
+        //     the designed-for case, not a freak race.
+        //
+        // The caller already treats false as "another worker owns this" and simply re-checks the
+        // order next sweep.
+        if (existing && !shouldGrantCreateClaim(existing, attemptedAt)) return false
         await tx.wmsOrderPushLink.upsert({
           where: { orderId },
+          // CREATED here = provably pre-call: no link existed, so no worker had claimed the order
+          // and pushOrder cannot have been invoked. attempts 0 is the hard-delete guard's proof,
+          // and this branch is the ONLY writer entitled to mint it (see provesNoRemoteWmsCall).
           create: { orderId, connector, state: 'VALIDATION_FAILED', attempts: 0, lastError: error, lastAttemptAt: attemptedAt },
-          update: { state: 'VALIDATION_FAILED', lastError: error, lastAttemptAt: attemptedAt },
+          // CONVERTED from an EXPIRED claim = AMBIGUOUS. The claim was written immediately before
+          // a pushOrder call; the increment that would have recorded that call lives in a catch
+          // whose own write is `.catch(() => {})` and which does not run at all if the worker was
+          // killed. So a pre-existing claim still sitting at attempts 0 means "a call was
+          // dispatched and we never learned the outcome". Raising it to AMBIGUOUS_ATTEMPTS is what
+          // stops the guard reading that silence as proof and hard-deleting an order the warehouse
+          // may be picking. `increment` is deliberately not used: attempts is a floor on calls that
+          // may have been made, and re-parking the same link must not inflate it toward MAX_ATTEMPTS.
+          update: {
+            state: 'VALIDATION_FAILED',
+            attempts: Math.max(existing?.attempts ?? 0, AMBIGUOUS_ATTEMPTS),
+            lastError: error,
+            lastAttemptAt: attemptedAt,
+          },
         })
         return true
       })
