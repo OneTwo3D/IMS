@@ -8,14 +8,13 @@ import {
 /**
  * THE SHIPMENT LIFECYCLE IS FORWARD-ONLY, AND THAT IS THE PRODUCT GAP FILED AS o3d-q8r6.
  *
- * Once a shipment is PICKING or PACKED there is no way to undo it short of cancelling the WHOLE
- * order (`cancelSalesOrderFulfillmentState`, which deletes the PENDING/PICKING/PACKED shipments in
- * the same transaction as the allocation release). A mis-picked or mis-packed shipment therefore
- * cannot be corrected in place: the operator can dispatch something they know is wrong, or lose
- * everything else on the order. Four refusal sites now name this gap as the remedy they cannot
- * offer — the deallocation refusal, the component-graph edit blockers, the committed-shipment
- * delete blocker, and the o3d-339 packed-before-refund dispatch message, which already tells an
- * operator to "unpack or cancel this shipment" and names a button that does not exist.
+ * THIS MAP is forward-only. Getting a PICKING/PACKED shipment back to a draft is done by ONE
+ * dedicated operation, `reopenShipmentForRepack` (lib/domain/sales/shipment-service.ts, o3d-2k5),
+ * and NOT by an edge here — see decision (4) below for why. Everything this comment says about the
+ * map remains true; what has changed is that the four refusal sites which used to name a gap now
+ * name that operation: the deallocation refusal, the component-graph edit blockers, the
+ * committed-shipment delete blocker, and the o3d-339 packed-before-refund dispatch message (which
+ * used to say "unpack or cancel this shipment" and named a button that did not exist).
  *
  * o3d-q8r6 lists FOUR DECISIONS a fix has to make. THREE OF THEM THE CODE ALREADY DECIDES, and are
  * recorded here so whoever builds this does not re-derive them — one of them WRONGLY, because the
@@ -58,16 +57,27 @@ import {
  *     row total is unchanged by construction, and therefore so is `reservedQty`. Any implementation
  *     that touches `reservedQty` on this edge is wrong.
  *
- * (4) WHO MAY DO IT? — OWNER DECISION, and it cannot be inferred. `updateShipmentStatus` requires
- *     `sales.process`, which the WAREHOUSE role holds (lib/permissions.ts), so a reverse edge added
- *     to this map is available to warehouse staff for free. Whether unpacking should instead be
- *     manager-gated is a business call: there is no `sales.unpack` permission today, and adding one
- *     changes the RBAC matrix for every role. Both shapes are buildable; nothing in the code prefers
- *     one.
+ * (4) WHO MAY DO IT? — ANSWERED, at `sales.process`, and answered OUTSIDE this map (o3d-2k5).
  *
- * Until (4) is answered this map stays forward-only. o3d-2k5 (rebuild a PACKED shipment after a
- * partial refund) is deferred under o3d-q8r6 for the same reason: all three shapes it could take
- * land on these decisions.
+ *     The two shapes were: a reverse edge here, reachable from `updateShipmentStatus` and therefore
+ *     available to every `sales.process` holder (which the WAREHOUSE role has); or a new
+ *     manager-gated `sales.unpack` permission, which changes the RBAC matrix for every role.
+ *
+ *     What settled it was not the permission at all but the WRITE PROTOCOL. Reverting a shipment is
+ *     only half an operation: the order must then be re-allocated with the NARROW
+ *     `refuseIfCommittedShipmentsExist` (which is only passable BECAUSE the revert removed the last
+ *     committed shipment) and the deferred refund-reservation-release backstop rows resolved inside
+ *     that same transaction. An edge in this map is reachable without either, so it would let a
+ *     caller perform one third of a recovery and leave the order with an un-netted draft and a
+ *     backstop row still deferred. `reopenShipmentForRepack` + `reopenShipmentForRepackAction` are
+ *     therefore the only door, and this map stays forward-only for every generic caller.
+ *
+ *     The permission is `sales.process` — the one that already moves a shipment through pick, pack
+ *     and DISPATCH. Reopening is strictly less consequential than the dispatch that permission
+ *     already allows (a dispatch writes stock movements and COGS and is undone only by a refund or
+ *     a return), so withholding the undo from the person trusted with the do is not a defensible
+ *     line. If the owner wants it manager-gated after all, it is one `requirePermission` call in
+ *     `reopenShipmentForRepackAction` — precisely because there is no edge here to widen it.
  */
 export const SHIPMENT_TRANSITIONS = {
   PENDING: ['PICKING'],

@@ -341,7 +341,11 @@ test('o3d-4kfh r5: the refusal names real exits and says terminal orders do not 
   )
 
   assert.match(message, /deallocate, dispatch or cancel those orders/i)
-  assert.match(message, /dispatching it or cancelling its order/i)
+  // o3d-2k5: the picking/packed exit now names THREE routes, and the reopen is the one that clears
+  // the blocker without either shipping the goods or losing the order.
+  assert.match(message, /cleared by dispatching it/i)
+  assert.match(message, /"Reopen for repack"/i)
+  assert.match(message, /or by cancelling its order/i)
   assert.match(
     message,
     /already shipped, completed or delivered do NOT block/i,
@@ -390,7 +394,8 @@ test('o3d-4kfh r6 (finding 4): a mixed set gets BOTH exits, each attached to the
     await findComponentGraphEditBlockers(client(edges, lines), 'comp', KIT_RECIPE_EDIT),
   )
 
-  assert.match(message, /dispatching it or cancelling its order/i, 'the live order keeps the dispatch exit')
+  assert.match(message, /cleared by dispatching it/i, 'the live order keeps the dispatch exit')
+  assert.match(message, /"Reopen for repack"/i, 'and gains the reopen exit (o3d-2k5)')
   assert.match(message, /Discard shipments/i, 'and the cancelled one gets the repair')
   assert.match(message, /order\(s\) SO-dead/, 'named specifically, so dispatch advice is never read onto it')
   assert.doesNotMatch(message, /order\(s\) SO-live/, 'the live order is not listed under the discard advice')

@@ -1,3 +1,4 @@
+import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
@@ -83,6 +84,15 @@ export type WmsOrderPushSweepResult = {
   released: number
   failed: number
   deadLettered: number
+  /**
+   * o3d-92fu: orders parked VALIDATION_FAILED this sweep — the payload could not be
+   * BUILT from local data, so no remote call was made. Deliberately NOT folded into
+   * `failed`: `failed` means "we talked to the WMS and it did not work", and a sweep
+   * reporting a remote failure that never happened sends an operator to the connector.
+   */
+  validationFailed: number
+  /** o3d-92fu: VALIDATION_FAILED links whose payload builds again — returned to the create queue. */
+  revalidated: number
 }
 
 type OrderForPush = {
@@ -278,7 +288,7 @@ function refundedQtyByLine(order: { refunds?: Array<{ lines: Array<{ salesOrderL
 // tested with an in-memory fake (see tests/wms-order-push-sweep-state.test.ts),
 // mirroring the repository pattern used by the shopping webhook inbox.
 
-type PushState = 'PENDING_CREATE' | 'PENDING_VERIFY' | 'SYNCED' | 'PENDING_CANCEL' | 'CANCELLED' | 'DEAD_LETTER' | 'HELD'
+type PushState = 'PENDING_CREATE' | 'PENDING_VERIFY' | 'SYNCED' | 'PENDING_CANCEL' | 'CANCELLED' | 'DEAD_LETTER' | 'HELD' | 'VALIDATION_FAILED'
 type LinkWrite = {
   connector?: string
   externalOrderId?: string | null
@@ -322,6 +332,19 @@ const RESET_DISPATCH_FAILURES = {
 
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
 export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
+/**
+ * o3d-92fu: a VALIDATION_FAILED link plus the order data the payload is rebuilt from.
+ * `lastError` is carried so a re-run that fails for the SAME reason can re-stamp the
+ * rotation without re-auditing — the issue asks for the disposition to be recorded once,
+ * not once per sweep forever.
+ */
+export type WmsPushRevalidateLink = {
+  id: string
+  orderId: string
+  lastError: string | null
+  attempts: number
+  order: OrderForPush & { shipFromWarehouseId: string | null }
+}
 export type WmsPushLinkRef = { id: string; orderId: string; externalOrderId: string | null }
 /**
  * o3d-bjc.8: a PENDING_VERIFY link, carrying OUR identifiers.
@@ -366,6 +389,26 @@ export interface WmsOrderPushPort {
    * without calling the WMS.
    */
   claimForCreate(orderId: string, connector: string, attemptedAt: Date): Promise<boolean>
+  /**
+   * o3d-92fu — record a PRE-CALL payload-validation failure, under the order's row lock.
+   *
+   * Deliberately NOT a plain upsert. The candidate list was read before this, so another worker
+   * (or this sweep's own earlier pass) can have claimed the order and pushed it in between. An
+   * unconditional write would then stamp VALIDATION_FAILED over a SYNCED link — keeping its
+   * externalOrderId while dropping the order out of the update, hold, cancel and dispatch passes,
+   * with a live warehouse order behind it. So the write happens under the same lock
+   * claimForCreate and deleteSalesOrder take, and applies ONLY while the link is still absent or
+   * PENDING_CREATE.
+   *
+   * Returns false when the order no longer exists or the link has moved on; the caller then simply
+   * skips it, exactly as it does for a refused claim.
+   */
+  recordValidationFailure(
+    orderId: string,
+    connector: string,
+    error: string,
+    attemptedAt: Date,
+  ): Promise<boolean>
   /** SYNCED links for ready orders changed since the last push (updatedAt > pushedAt). */
   /**
    * o3d-bjc.8: links whose WMS order was created but never proved ours. They are
@@ -375,6 +418,26 @@ export interface WmsOrderPushPort {
    */
   verifiableLinks?(connector: string, limit: number): Promise<WmsPushVerifyLink[]>
   updatableLinks(connector: string, limit: number): Promise<WmsPushUpdateLink[]>
+  /**
+   * o3d-92fu — VALIDATION_FAILED links whose order is STILL create-eligible, so the
+   * sweep can re-run the (purely local, zero-API-cost) payload build and put the order
+   * back in the create queue once someone fixes the data.
+   *
+   * Without this the disposition is a one-way door: the order leaves createCandidates —
+   * which is the whole point, it is what stops batchSize malformed orders starving every
+   * later valid order — and nothing would ever bring it back after the SKU is filled in.
+   *
+   * Eligibility is deliberately the SAME predicate as createCandidates. An order that is
+   * no longer ready+paid must NOT be promoted to PENDING_CREATE: PENDING_CREATE blocks the
+   * hard-delete guard and VALIDATION_FAILED (at attempts 0) does not, so promoting a
+   * cancelled order would silently re-lock the very door this issue opened.
+   *
+   * Returns the batch AND the true total, because a bounded sweep that reports only what it
+   * processed reads as "covered everything" — the overflow is logged from `total`.
+   *
+   * Optional so existing test ports keep compiling; when absent, the pass does not run.
+   */
+  revalidatableLinks?(connector: string, boundWarehouseIds: string[], limit: number): Promise<{ links: WmsPushRevalidateLink[]; total: number }>
   /** SYNCED links whose order is ON_HOLD. */
   holdableLinks(connector: string, limit: number): Promise<WmsPushLinkRef[]>
   /** SYNCED links whose order is CANCELLED in IMS. */
@@ -436,7 +499,7 @@ export async function runWmsOrderPushSweepCore(
   port: WmsOrderPushPort,
   options?: { batchSize?: number; now?: () => Date },
 ): Promise<WmsOrderPushSweepResult> {
-  const result: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0 }
+  const result: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0 }
   if (!connector.pushOrder) return { ...result, skipped: 'Active WMS connector has no order-push support' }
 
   const batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE
@@ -495,6 +558,73 @@ export async function runWmsOrderPushSweepCore(
     })
   }
 
+  // --- Revalidation pass (o3d-92fu) ---
+  //
+  // VALIDATION_FAILED is a persisted disposition, not a grave. The whole reason it exists is
+  // to take a malformed order OUT of createCandidates so it stops starving the queue — which
+  // means something has to put it back once the data is fixed, or the order stays unpushable
+  // forever after someone fills in the missing SKU.
+  //
+  // Rebuilding the payload is PURELY LOCAL: no connector call, no API budget, no claim. So
+  // this pass is safe to run every sweep and deliberately runs BEFORE the create pass, so an
+  // order fixed since the last sweep is pushed on this tick rather than the next.
+  //
+  // It rotates least-recently-checked first and reports its own overflow: a bounded sweep
+  // that only reports what it processed reads as "covered everything".
+  if (externalWarehouseByWarehouse.size > 0 && port.revalidatableLinks) {
+    const { links, total } = await port.revalidatableLinks(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize)
+    if (total > links.length) {
+      console.warn(
+        `[wms-order-push] ${total} orders are parked VALIDATION_FAILED and eligible for revalidation; `
+        + `this sweep re-checked the ${links.length} least-recently-checked. The remaining ${total - links.length} `
+        + 'rotate in on following sweeps — they are NOT dropped.',
+      )
+    }
+    for (const link of links) {
+      const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
+      if (!externalWarehouseId) continue
+      const ts = now()
+      try {
+        buildPushInput(link.order, externalWarehouseId)
+      } catch (error) {
+        const message = scrubWmsError(error, 'WMS order payload could not be built')
+        // Re-stamp so the rotation moves on. Audited only when the REASON changed — a new
+        // reason is new information for the operator; the same one repeated every sweep is
+        // the noise the persisted disposition exists to remove.
+        await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts }).catch((e) => {
+          console.error('[wms-order-push] failed to re-stamp validation disposition', link.id, e)
+        })
+        if (message !== link.lastError) {
+          await audit({
+            action: 'order_validate', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: null,
+            summary: `Order ${link.order.orderNumber ?? link.orderId} still cannot be pushed to the WMS, for a new reason: ${message}`,
+            before: { state: 'VALIDATION_FAILED', lastError: link.lastError },
+            after: { state: 'VALIDATION_FAILED', attempts: link.attempts, remoteCallMade: false },
+            error: message,
+          })
+        }
+        continue
+      }
+      // Builds again — back into the create queue. attempts is carried over untouched: if the
+      // link had already spent remote attempts before it stopped building, those still count
+      // against MAX_ATTEMPTS, so a genuinely broken order cannot loop the retry ladder by
+      // failing validation in between.
+      try {
+        await port.updateLink(link.id, { state: 'PENDING_CREATE', lastError: null, lastAttemptAt: null })
+      } catch (error) {
+        console.error('[wms-order-push] failed to re-queue a revalidated order', link.id, error)
+        continue
+      }
+      result.revalidated += 1
+      await audit({
+        action: 'order_validate', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: null,
+        summary: `Order ${link.order.orderNumber ?? link.orderId} builds a valid WMS payload again — re-queued for create`,
+        before: { state: 'VALIDATION_FAILED', lastError: link.lastError },
+        after: { state: 'PENDING_CREATE', attempts: link.attempts },
+      })
+    }
+  }
+
   // --- Create pass ---
   if (externalWarehouseByWarehouse.size > 0) {
     const candidates = await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize)
@@ -528,6 +658,62 @@ export async function runWmsOrderPushSweepCore(
       if (!externalWarehouseId) continue
 
       const ts = now()
+
+      // o3d-92fu: BUILD THE PAYLOAD BEFORE ANYTHING IS CLAIMED OR PERSISTED.
+      //
+      // buildPushInput used to run inside the same try as pushOrder, AFTER the claim. A
+      // purely LOCAL failure — a line with no SKU — therefore left a PENDING_CREATE claim
+      // that aged into DEAD_LETTER, even though pushOrder was never invoked and no remote
+      // side effect was possible. The delete guard blocks on EVERY link, so the order became
+      // permanently impossible to hard-delete because of a local data error.
+      //
+      // Persisting NOTHING here was tried and reverted (e5b57e1a): createCandidates selects
+      // `no link OR PENDING_CREATE` ordered by updatedAt ASC and takes batchSize, so an order
+      // that leaves no trace is re-selected and re-rejected every sweep, and batchSize
+      // malformed orders starve every later VALID order out of the warehouse queue. That is
+      // worse than the bug. The failure gets a PERSISTED disposition instead: it leaves the
+      // candidate set like a dead letter, and — unlike a dead letter — records that no remote
+      // call was ever made, which is what lets the delete guard let it go.
+      let input: WmsOrderPushInput
+      try {
+        input = buildPushInput(order, externalWarehouseId)
+      } catch (error) {
+        const message = scrubWmsError(error, 'WMS order payload could not be built')
+        const before = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
+        // Under the ORDER LOCK, and only while the link is still absent or PENDING_CREATE — the
+        // candidate list was read before this, so a concurrent worker may already have pushed the
+        // order, and stamping this over a SYNCED link would strand a live warehouse order outside
+        // every other pass. `attempts` is preserved rather than incremented: it counts REMOTE
+        // attempts, this failure made none, and it is what the delete guard reads to tell a link
+        // that only ever failed locally (attempts 0 — provably never reached the WMS) from one that
+        // failed REMOTELY first and only later stopped building (attempts > 0 — still ambiguous).
+        let recorded = false
+        try {
+          recorded = await port.recordValidationFailure(order.id, connectorId, message, ts)
+        } catch (persistError) {
+          // The disposition did not stick, so the order is still a candidate and is retried next
+          // sweep. Nothing remote happened either way, so this is not a push failure.
+          console.error('[wms-order-push] failed to persist validation disposition', order.id, persistError)
+          result.failed += 1
+          continue
+        }
+        // The order was deleted, or another worker owns the link now. Either way this pass has
+        // nothing to say about it.
+        if (!recorded) continue
+        result.validationFailed += 1
+        // Recorded ONCE, on entry. The old behaviour audited FAILED and incremented `failed`
+        // on every single sweep for the same unpushable order; the revalidation pass below
+        // re-audits only when the REASON changes or the payload starts building again.
+        await audit({
+          action: 'order_validate', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: order.id, externalId: null,
+          summary: `Order ${order.orderNumber ?? order.id} cannot be pushed to the WMS: ${message}`,
+          before,
+          after: { state: 'VALIDATION_FAILED', attempts: order.pushAttempts, remoteCallMade: false },
+          error: message,
+        })
+        continue
+      }
+
       // o3d-5r8: claim before the remote call. A claim failure means the order was
       // deleted or another worker owns it — skip WITHOUT touching the WMS. A claim
       // error is not the order's fault either, so it is logged and retried next sweep
@@ -557,13 +743,13 @@ export async function runWmsOrderPushSweepCore(
       if (!claimed) continue
 
       const beforeCreate = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
-      // Hoisted so the catch can tell "remote create failed" from "remote
+      // `push` is hoisted so the catch can tell "remote create failed" from "remote
       // create SUCCEEDED but recording the link failed" (Codex r1) — the audit
-      // outcome must mirror the remote mutation, not the local bookkeeping.
-      let input: WmsOrderPushInput | null = null
+      // outcome must mirror the remote mutation, not the local bookkeeping. `input`
+      // is no longer hoisted: it is built above, before the claim (o3d-92fu), so by
+      // here it always exists and a build failure never reaches this handler.
       let push: Awaited<ReturnType<NonNullable<PushConnector['pushOrder']>>> | null = null
       try {
-        input = buildPushInput(order, externalWarehouseId)
         push = await connector.pushOrder!(input)
         const courierPending = push.courierFallback ?? false
         // o3d-bjc.8: an id the connector MINTED but has not proved is ours is
@@ -755,7 +941,7 @@ export async function runWmsOrderPushSweepCore(
             : `WMS create failed for order ${order.orderNumber ?? order.id}${dead ? ' — dead-lettered' : ''}`,
           before: beforeCreate,
           after: push
-            ? { state: 'SYNCED', externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, linkPersistFailed: true, ...(input ? { intent: pushIntentSummary(input) } : {}) }
+            ? { state: 'SYNCED', externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, linkPersistFailed: true, intent: pushIntentSummary(input) }
             : { state, attempts },
           error: message,
         })
@@ -1252,6 +1438,27 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         return true
       })
     },
+    async recordValidationFailure(orderId, connector, error, attemptedAt) {
+      return db.$transaction(async (tx) => {
+        // The same row lock deleteSalesOrder and claimForCreate take — this is what makes the
+        // disposition and the delete (or a concurrent claim) serialise rather than merely race.
+        const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+        if (locked.length === 0) return false
+        const existing = await tx.wmsOrderPushLink.findUnique({
+          where: { orderId },
+          select: { state: true, attempts: true },
+        })
+        // Absent or PENDING_CREATE only. Any other state belongs to a worker that has already
+        // talked to the WMS, and this failure has no standing to overwrite it.
+        if (existing && existing.state !== 'PENDING_CREATE') return false
+        await tx.wmsOrderPushLink.upsert({
+          where: { orderId },
+          create: { orderId, connector, state: 'VALIDATION_FAILED', attempts: 0, lastError: error, lastAttemptAt: attemptedAt },
+          update: { state: 'VALIDATION_FAILED', lastError: error, lastAttemptAt: attemptedAt },
+        })
+        return true
+      })
+    },
     async verifiableLinks(connector, limit) {
       const rows = await db.wmsOrderPushLink.findMany({
         where: { connector, state: 'PENDING_VERIFY', externalOrderId: { not: null } },
@@ -1300,6 +1507,42 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         where: { id: { in: dueIds } },
         select: { id: true, externalOrderId: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true } } },
       })
+    },
+    async revalidatableLinks(connector, boundWarehouseIds, limit) {
+      // o3d-92fu. The order predicate is deliberately IDENTICAL to createCandidates', because
+      // this pass's only outcome is "put it back in that queue": promoting an order that
+      // createCandidates would not accept would park it in PENDING_CREATE, which the
+      // hard-delete guard blocks on — silently re-closing the door this issue opened, for an
+      // order that provably never reached the WMS.
+      const where = {
+        connector,
+        state: 'VALIDATION_FAILED',
+        order: {
+          status: { in: [...READY_STATUSES] },
+          paidAt: { not: null },
+          refundStatus: { not: 'FULL' },
+          withdrawalHoldAt: null,
+          withdrawalApprovedAt: null,
+          shipFromWarehouseId: { in: boundWarehouseIds },
+        },
+      } satisfies Prisma.WmsOrderPushLinkWhereInput
+      const [rows, total] = await Promise.all([
+        db.wmsOrderPushLink.findMany({
+          where,
+          select: {
+            id: true, orderId: true, lastError: true, attempts: true,
+            order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true } },
+          },
+          take: limit,
+          // Least-recently-CHECKED first, so a backlog larger than batchSize rotates through
+          // instead of the same head batch being re-checked every sweep while the tail is
+          // never revisited (the same failure verifiableLinks documents).
+          orderBy: [{ lastAttemptAt: { sort: 'asc', nulls: 'first' } }, { updatedAt: 'asc' }],
+        }),
+        // The TRUE total, so the sweep can say what it did not get to this tick.
+        db.wmsOrderPushLink.count({ where }),
+      ])
+      return { links: rows, total }
     },
     // o3d-bjc.8: PENDING_VERIFY is deliberately NOT cancellable or holdable.
     // The tempting argument is urgency — a cancelled order must not ship — but
@@ -1373,7 +1616,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
 export async function runWmsOrderPushSweep(
   options?: { batchSize?: number },
 ): Promise<WmsOrderPushSweepResult> {
-  const empty: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0 }
+  const empty: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0 }
 
   const state = await getIntegrationPluginState()
   const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])

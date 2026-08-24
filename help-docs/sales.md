@@ -151,6 +151,29 @@ the order and use **Discard shipments**. That deletes the remaining non-dispatch
 any already-dispatched one (reverse those with a refund), records what it removed — including
 tracking numbers — in the activity log, and is safe to repeat.
 
+#### Reopening a picked or packed shipment
+
+A shipment can only move forward, but a **picking or packed** one can be sent back to a pending draft
+with **Reopen for repack**, next to it in the Shipments panel. Use it when a shipment can no longer go
+out as packed — most often when a **partial refund lands after packing**, which IMS refuses to
+dispatch because it would ship goods the customer has been refunded for.
+
+Reopening:
+
+- turns the shipment back into a **pending draft** and keeps its tracking number and carrier, so a
+  label you already bought is not thrown away;
+- **re-allocates the order**, which nets the refund into the reservations, releases the refunded
+  units' reserved stock, and retires the draft when it no longer matches what the order owes;
+- records a **warning in the activity log** — the goods are physically in a box in the warehouse, and
+  reopening the record does not unpack them.
+
+**Unpack the parcel first, then press "Create Shipments"** in the Stock Allocation panel to rebuild
+the shipment to what actually remains. If every unit was refunded there is nothing left to build and
+IMS says so rather than creating an empty shipment.
+
+A **dispatched** shipment cannot be reopened — the goods have gone, and the way back is a refund or a
+return. A **cancelled** order uses **Discard shipments** above instead.
+
 ### Shipment Features
 
 - Each shipment gets an **independent tracking number**

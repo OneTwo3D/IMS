@@ -1,0 +1,15 @@
+-- o3d-92fu: a purely LOCAL payload-validation failure needs a disposition of its own.
+--
+-- Before this, a payload that could not be BUILT (a line with no SKU) was caught by the
+-- same handler as a remote failure: the claim stayed PENDING_CREATE, aged to DEAD_LETTER,
+-- and the hard-delete guard — which blocks on EVERY link — then refused forever, for an
+-- error that never touched the WMS.
+--
+-- It cannot be derived from the existing columns: a DEAD_LETTER caused by repeated REMOTE
+-- failures also has externalOrderId = NULL and pushedAt = NULL, and those attempts DID make
+-- calls that may have partially succeeded. So the fact "no remote call was ever made" has to
+-- be recorded explicitly, which is what this value is.
+--
+-- Added at the end of the enum: ALTER TYPE ... ADD VALUE takes an exclusive lock on the type
+-- for the length of the statement only, and no existing row changes.
+ALTER TYPE "WmsOrderPushState" ADD VALUE IF NOT EXISTS 'VALIDATION_FAILED';

@@ -7,6 +7,7 @@ import {
   type WmsPushCandidate,
   type WmsPushLinkRef,
   type WmsPushUpdateLink,
+  type WmsPushRevalidateLink,
   type WmsPushVerifyLink,
 } from '../lib/domain/wms/order-push-sweep.ts'
 import type { WmsOrderCancelResult, WmsOrderPushResult, WmsOrderUpdateResult } from '../lib/connectors/wms/types.ts'
@@ -51,10 +52,15 @@ type Seed = {
   verifiable?: WmsPushVerifyLink[]
   /** o3d-5r8: false simulates "order deleted / already owned" — the push must be skipped. */
   claimForCreate?: (orderId: string) => Promise<boolean>
+  /** o3d-92fu: VALIDATION_FAILED links the revalidation pass re-checks, plus the TRUE total. */
+  revalidatable?: { links: WmsPushRevalidateLink[]; total: number }
+  /** o3d-92fu: false simulates "order deleted / another worker owns the link" under the lock. */
+  recordValidationFailure?: (orderId: string) => Promise<boolean>
 }
 
 function makePort(seed: Seed) {
   const upserts: Array<{ orderId: string; create: Record<string, unknown>; update: Record<string, unknown> }> = []
+  const validationFailures: Array<{ orderId: string; connector: string; error: string; attemptedAt: Date }> = []
   const updates: Array<{ id: string; data: Record<string, unknown> }> = []
   const events: WmsMutationEventInput[] = []
   const claims: string[] = []
@@ -62,6 +68,11 @@ function makePort(seed: Seed) {
     activeBindings: async () => seed.bindings ?? BINDINGS,
     releasableHeldOrders: async () => seed.releasable ?? [],
     createCandidates: async () => seed.createCandidates ?? [],
+    revalidatableLinks: async () => seed.revalidatable ?? { links: [], total: 0 },
+    recordValidationFailure: async (orderId, connector, error, attemptedAt) => {
+      validationFailures.push({ orderId, connector, error, attemptedAt })
+      return seed.recordValidationFailure ? seed.recordValidationFailure(orderId) : true
+    },
     claimForCreate: async (orderId) => {
       claims.push(orderId)
       return seed.claimForCreate ? seed.claimForCreate(orderId) : true
@@ -74,7 +85,7 @@ function makePort(seed: Seed) {
     updateLink: async (id, data) => { updates.push({ id, data }) },
     recordEvent: async (event) => { events.push(event) },
   }
-  return { port, upserts, updates, events, claims }
+  return { port, upserts, updates, events, claims, validationFailures }
 }
 
 const okPush = async (): Promise<WmsOrderPushResult> => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' })
@@ -223,13 +234,211 @@ test('create: the 5th consecutive failure dead-letters', async () => {
   assert.equal(upserts[0].update.attempts, 5)
 })
 
-test('create: a line with no SKU dead-paths the order (caught, not silently pushed)', async () => {
-  const { port, upserts } = makePort({
+test('o3d-92fu create: a line with no SKU parks VALIDATION_FAILED — no claim, no remote call, no dead letter', async () => {
+  // This test used to assert the order was DEAD_LETTERED. That was the bug: buildPushInput ran
+  // after the claim, so a purely LOCAL failure left a PENDING_CREATE claim that aged into
+  // DEAD_LETTER — and the delete guard blocks on every link, so the order became permanently
+  // undeletable for an error that never touched the WMS.
+  let pushed = 0
+  const { port, upserts, claims, events, validationFailures } = makePort({
+    createCandidates: [candidate({ lines: [{ sku: null, qty: 1, taxForeign: 0, totalForeign: 10, description: 'x' }] })],
+  })
+  const r = await runWmsOrderPushSweepCore(
+    connector({ pushOrder: async () => { pushed += 1; return okPush() } }),
+    'mintsoft', port, { now: NOW },
+  )
+  assert.equal(r.validationFailed, 1)
+  assert.equal(r.deadLettered, 0)
+  // NOT counted as a push failure: `failed` means "we talked to the WMS and it did not work",
+  // and reporting one that never happened sends an operator to the connector.
+  assert.equal(r.failed, 0)
+  assert.equal(pushed, 0, 'the connector must never be called for a payload that could not be built')
+  assert.deepEqual(claims, [], 'no claim may be taken before the payload is known to build')
+  assert.equal(validationFailures.length, 1)
+  assert.equal(validationFailures[0].orderId, 'so-1')
+  assert.match(validationFailures[0].error, /no SKU/i)
+  // The disposition goes through the LOCK-GUARDED write, never the plain upsert: the candidate
+  // list was read earlier, so an unconditional write could stamp this over a link another worker
+  // has already pushed and SYNCED.
+  assert.deepEqual(upserts, [])
+  const audited = events.filter((e) => e.action === 'order_validate')
+  assert.equal(audited.length, 1)
+  assert.equal(audited[0].outcome, 'FAILED')
+  assert.deepEqual((audited[0].after as { remoteCallMade: boolean }).remoteCallMade, false)
+})
+
+test('o3d-92fu create: a disposition REFUSED under the lock is skipped, not audited', async () => {
+  // recordValidationFailure returns false when the order was deleted or the link has moved on
+  // (another worker claimed and pushed it between the candidate read and here). Recording an
+  // outcome for an order this pass no longer owns would be a fabricated timeline entry.
+  const { port, events, upserts } = makePort({
+    createCandidates: [candidate({ lines: [{ sku: null, qty: 1, taxForeign: 0, totalForeign: 10, description: 'x' }] })],
+    recordValidationFailure: async () => false,
+  })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.validationFailed, 0)
+  assert.equal(r.failed, 0)
+  assert.equal(r.deadLettered, 0)
+  assert.deepEqual(upserts, [])
+  assert.deepEqual(events.filter((e) => e.action === 'order_validate'), [])
+})
+
+test('o3d-92fu create: a validation failure spends NO push attempt and never dead-letters', async () => {
+  // `attempts` is the delete guard's evidence: 0 means "provably never reached the WMS", and
+  // anything above it means earlier calls happened and may have partially succeeded. Counting this
+  // failure against the retry ladder would forge remote history — and at 4 attempts it dead-letters
+  // the order on this very sweep, which is exactly what the old shared catch did.
+  //
+  // The value itself is preserved by the lock-guarded write (which re-reads it under the lock
+  // rather than trusting the candidate snapshot), so what is pinned here is that the SWEEP writes
+  // no attempt bookkeeping of its own on this path.
+  const { port, upserts, validationFailures } = makePort({
     createCandidates: [candidate({ pushAttempts: 4, lines: [{ sku: null, qty: 1, taxForeign: 0, totalForeign: 10, description: 'x' }] })],
   })
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
-  assert.equal(r.deadLettered, 1)
-  assert.match(String(upserts[0].update.lastError), /no SKU/i)
+  assert.equal(r.validationFailed, 1)
+  assert.equal(r.deadLettered, 0)
+  assert.equal(r.failed, 0)
+  assert.equal(validationFailures.length, 1)
+  assert.deepEqual(upserts, [], 'no attempts/state bookkeeping may be written outside the lock')
+})
+
+test('o3d-92fu create: a whole batch of malformed orders does NOT starve the valid one behind them', async () => {
+  // The regression test for the fix that was TRIED AND REVERTED (e5b57e1a). Persisting nothing
+  // for a local validation failure made the order deletable again but left it eligible forever:
+  // createCandidates selects `no link OR PENDING_CREATE` ordered by updatedAt ASC, take
+  // batchSize — so batchSize malformed orders are re-selected every sweep and no later VALID
+  // order is ever pushed to the warehouse.
+  //
+  // The port below applies that REAL selection rule against a tiny in-memory catalogue, so the
+  // starvation can actually arise rather than being assumed away by a fixed candidate list.
+  const BATCH = 3
+  const links = new Map<string, { state: string; attempts: number }>()
+  const orders = [
+    ...Array.from({ length: BATCH }, (_, i) => candidate({
+      id: `bad-${i}`, orderNumber: `SO-BAD-${i}`,
+      lines: [{ sku: null, qty: 1, taxForeign: 0, totalForeign: 10, description: 'x' }],
+    })),
+    candidate({ id: 'good-1', orderNumber: 'SO-GOOD' }),
+  ]
+  const pushedOrders: string[] = []
+  const port: WmsOrderPushPort = {
+    activeBindings: async () => BINDINGS,
+    releasableHeldOrders: async () => [],
+    createCandidates: async (_c, _w, limit) => orders
+      .filter((o) => { const link = links.get(o.id); return !link || link.state === 'PENDING_CREATE' })
+      .slice(0, limit)
+      .map((o) => ({ ...o, pushAttempts: links.get(o.id)?.attempts ?? 0 })),
+    // Deliberately absent: this test is about the CREATE queue, and a revalidation pass that
+    // re-queued the bad orders would mask the very starvation being pinned.
+    claimForCreate: async () => true,
+    // Models the production write: refuses unless the link is still absent or PENDING_CREATE.
+    recordValidationFailure: async (orderId) => {
+      const existing = links.get(orderId)
+      if (existing && existing.state !== 'PENDING_CREATE') return false
+      links.set(orderId, { state: 'VALIDATION_FAILED', attempts: existing?.attempts ?? 0 })
+      return true
+    },
+    verifiableLinks: async () => [],
+    updatableLinks: async () => [],
+    holdableLinks: async () => [],
+    cancellableLinks: async () => [],
+    upsertByOrder: async (orderId, _create, update) => {
+      const existing = links.get(orderId) ?? { state: 'PENDING_CREATE', attempts: 0 }
+      links.set(orderId, {
+        state: (update.state as string) ?? existing.state,
+        attempts: (update.attempts as number) ?? existing.attempts,
+      })
+    },
+    updateLink: async () => {},
+    recordEvent: async () => {},
+  }
+  const conn = connector({ pushOrder: async () => { pushedOrders.push('push'); return okPush() } })
+
+  const first = await runWmsOrderPushSweepCore(conn, 'mintsoft', port, { batchSize: BATCH, now: NOW })
+  assert.equal(first.validationFailed, BATCH)
+  assert.equal(first.created, 0, 'the valid order is behind the batch boundary on the first sweep')
+
+  const second = await runWmsOrderPushSweepCore(conn, 'mintsoft', port, { batchSize: BATCH, now: NOW })
+  assert.equal(second.created, 1, 'the valid order must be reachable once the malformed ones leave the queue')
+  assert.equal(second.validationFailed, 0)
+  assert.equal(links.get('good-1')?.state, 'SYNCED')
+})
+
+test('o3d-92fu revalidate: a link whose payload builds again is re-queued for create, attempts intact', async () => {
+  const link: WmsPushRevalidateLink = {
+    id: 'link-1', orderId: 'so-1', lastError: 'Sales order has a line with no SKU; cannot push to WMS', attempts: 2,
+    order: { ...candidate(), shipFromWarehouseId: 'wh-1' },
+  }
+  const { port, updates, events } = makePort({ revalidatable: { links: [link], total: 1 } })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.revalidated, 1)
+  assert.equal(updates.length, 1)
+  assert.equal(updates[0].id, 'link-1')
+  assert.equal(updates[0].data.state, 'PENDING_CREATE')
+  assert.equal(updates[0].data.lastError, null)
+  // Cleared so the create claim's lease does not refuse the re-queued order for five minutes.
+  assert.equal(updates[0].data.lastAttemptAt, null)
+  // attempts is NOT reset: remote attempts already spent still count against MAX_ATTEMPTS, or a
+  // broken order could ride the retry ladder forever by failing validation in between.
+  assert.equal(updates[0].data.attempts, undefined)
+  const audited = events.filter((e) => e.action === 'order_validate')
+  assert.equal(audited.length, 1)
+  assert.equal(audited[0].outcome, 'SUCCEEDED')
+})
+
+test('o3d-92fu revalidate: still-failing for the SAME reason re-stamps the rotation and audits NOTHING', async () => {
+  // The issue is explicit that the disposition must be recorded ONCE. The old behaviour audited
+  // FAILED and incremented `failed` on every single sweep for the same unpushable order.
+  const message = 'Sales order has a line with no SKU; cannot push to WMS'
+  const link: WmsPushRevalidateLink = {
+    id: 'link-1', orderId: 'so-1', lastError: message, attempts: 0,
+    order: { ...candidate({ lines: [{ sku: null, qty: 1, taxForeign: 0, totalForeign: 10, description: 'x' }] }), shipFromWarehouseId: 'wh-1' },
+  }
+  const { port, updates, events } = makePort({ revalidatable: { links: [link], total: 1 } })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.revalidated, 0)
+  assert.equal(r.validationFailed, 0)
+  assert.equal(r.failed, 0)
+  assert.equal(updates.length, 1)
+  assert.equal(updates[0].data.state, undefined, 'it stays VALIDATION_FAILED')
+  assert.deepEqual(updates[0].data.lastAttemptAt, NOW(), 'restamped so the rotation moves on')
+  assert.deepEqual(events.filter((e) => e.action === 'order_validate'), [])
+})
+
+test('o3d-92fu revalidate: a CHANGED reason is audited, because it is new information', async () => {
+  const link: WmsPushRevalidateLink = {
+    id: 'link-1', orderId: 'so-1', lastError: 'some older reason', attempts: 0,
+    order: { ...candidate({ lines: [{ sku: null, qty: 1, taxForeign: 0, totalForeign: 10, description: 'x' }] }), shipFromWarehouseId: 'wh-1' },
+  }
+  const { port, events } = makePort({ revalidatable: { links: [link], total: 1 } })
+  await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  const audited = events.filter((e) => e.action === 'order_validate')
+  assert.equal(audited.length, 1)
+  assert.equal(audited[0].outcome, 'FAILED')
+  assert.match(String(audited[0].error), /no SKU/i)
+})
+
+test('o3d-92fu revalidate: the bounded pass SAYS what it did not get to', async () => {
+  // A bounded sweep that reports only what it processed reads as "covered everything".
+  const link: WmsPushRevalidateLink = {
+    id: 'link-1', orderId: 'so-1', lastError: null, attempts: 0,
+    order: { ...candidate(), shipFromWarehouseId: 'wh-1' },
+  }
+  const warnings: string[] = []
+  const originalWarn = console.warn
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }
+  try {
+    const { port } = makePort({ revalidatable: { links: [link], total: 40 } })
+    await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { batchSize: 1, now: NOW })
+  } finally {
+    console.warn = originalWarn
+  }
+  const notice = warnings.find((line) => line.includes('VALIDATION_FAILED'))
+  assert.ok(notice, 'the overflow must be logged')
+  assert.match(notice!, /40 orders are parked/)
+  assert.match(notice!, /remaining 39/)
+  assert.match(notice!, /NOT dropped/)
 })
 
 test('release: a HELD link is reset to PENDING_CREATE (external id cleared)', async () => {

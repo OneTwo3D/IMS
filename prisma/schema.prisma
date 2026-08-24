@@ -3024,6 +3024,21 @@ enum WmsOrderPushState {
   DEAD_LETTER
   HELD
   MERGED
+  /// o3d-92fu: the push payload could not be BUILT from local data (a line with
+  /// no SKU, say), so pushOrder was never invoked and no remote side effect is
+  /// possible. Distinct from DEAD_LETTER, which spans repeated REMOTE failures
+  /// whose outcome is unknown — both have externalOrderId = null and pushedAt =
+  /// null, so nothing else on this row could tell them apart, and the hard-delete
+  /// guard has to. It is NOT a create candidate (that is what stops batchSize
+  /// malformed orders starving the create queue every sweep) and the revalidation
+  /// pass returns it to PENDING_CREATE for free — no remote call — the moment the
+  /// payload builds again.
+  ///
+  /// SAFE-TO-DELETE ONLY WITH attempts = 0. A link that already spent remote
+  /// attempts and only THEN failed to build keeps this state to stay out of the
+  /// queue, but its earlier calls may have partially succeeded, so the guard
+  /// still refuses on it.
+  VALIDATION_FAILED
 }
 
 model WmsOrderPushLink {

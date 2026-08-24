@@ -3794,6 +3794,12 @@ test('o3d-4kfh: user deallocation is REFUSED while a PACKED shipment exists', as
     () => releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1'),
     /Cannot deallocate this order while it has committed shipments \(1 packed\)/,
   )
+  // o3d-2k5: the refusal names a route that exists. Reopening reverts the shipment to a PENDING
+  // draft, and a PENDING draft is not a commitment and never reaches this refusal.
+  await assert.rejects(
+    () => releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1'),
+    /"Reopen for repack"/,
+  )
   assert.equal(ownAllocation(state), 10)
   assert.equal(state.stockLevels[0].reservedQty, 13)
 })

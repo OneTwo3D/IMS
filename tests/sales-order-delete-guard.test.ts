@@ -67,7 +67,14 @@ function matches(row: SyncLogRow, where: WhereNode): boolean {
 }
 
 function makeTx(seed: {
-  pushLink?: { state: string; externalOrderId: string | null; externalOrderNumber: string | null } | null
+  pushLink?: {
+    state: string
+    externalOrderId: string | null
+    externalOrderNumber: string | null
+    /** o3d-92fu: REMOTE attempts. Defaults to 0/null so every pre-existing case is unchanged. */
+    attempts?: number
+    pushedAt?: Date | null
+  } | null
   /**
    * Shipment ids, or full rows when the test cares about Group B staging (o3d-0qoo) or about the
    * committed-shipment blocker (o3d-2y1c). A bare id means "a never-journalled PENDING draft",
@@ -102,7 +109,9 @@ function makeTx(seed: {
         invoicedAt: seed.order?.invoicedAt ?? null,
       }),
     },
-    wmsOrderPushLink: { findUnique: async () => seed.pushLink ?? null },
+    wmsOrderPushLink: {
+      findUnique: async () => (seed.pushLink ? { attempts: 0, pushedAt: null, ...seed.pushLink } : null),
+    },
     shipment: {
       // `status` is served because the guard now SELECTS it (o3d-2y1c). It defaults to PENDING —
       // the schema default, and the status at which a shipment is still only a draft — so a
@@ -195,6 +204,45 @@ test('a WMS push link — even a pre-push PENDING_CREATE claim — blocks the de
   )
   assert.equal(blocker?.code, 'wms_order_push_link')
   assert.match(blocker!.message, /warehouse management system/i)
+})
+
+test('o3d-92fu: a VALIDATION_FAILED link with NO remote attempts does NOT block the delete', async () => {
+  // The push sweep writes this disposition BEFORE it claims anything and BEFORE it calls the
+  // connector — buildPushInput threw on local data, so pushOrder was never invoked and no
+  // remote side effect is possible. Blocking on it made a purely local data error (a line with
+  // no SKU) an unrecoverable, permanently undeletable order.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ pushLink: { state: 'VALIDATION_FAILED', externalOrderId: null, externalOrderNumber: null, attempts: 0, pushedAt: null } }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker, null)
+})
+
+test('o3d-92fu: a VALIDATION_FAILED link that ALREADY spent remote attempts still blocks', async () => {
+  // The state alone is not the licence. A link can reach VALIDATION_FAILED having pushed and
+  // failed remotely first and only later stopped building; those calls are exactly as ambiguous
+  // as any other dead letter, and the refusal must say so rather than citing the state.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ pushLink: { state: 'VALIDATION_FAILED', externalOrderId: null, externalOrderNumber: null, attempts: 3, pushedAt: null } }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'wms_order_push_link')
+  assert.match(blocker!.message, /3 push attempt\(s\) were made before its payload became invalid/)
+})
+
+test('o3d-92fu: a VALIDATION_FAILED link carrying an external id still blocks', async () => {
+  // Zero attempts but a remote id is a contradiction that can only mean the row was written by
+  // something other than the pre-call path. Fail closed: an id is positive evidence the
+  // warehouse holds this order.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ pushLink: { state: 'VALIDATION_FAILED', externalOrderId: 'wms-77', externalOrderNumber: 'WN-77', attempts: 0, pushedAt: null } }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'wms_order_push_link')
+  assert.match(blocker!.message, /WN-77/)
 })
 
 test('a SYNCED WMS link names the external order in the refusal', async () => {
@@ -877,6 +925,9 @@ test('o3d-2y1c: a PICKING shipment is refused with a reason instead of hitting t
   // ...and what the operator can actually do about it. Cancellation is a real remedy here:
   // cancelSalesOrderFulfillmentState deletes PICKING/PACKED shipments with the allocation release.
   assert.match(blocker!.message, /Cancel the order instead/)
+  // o3d-2k5: and the remedy that KEEPS the order — reopening reverts the shipment to a PENDING
+  // draft, and PENDING is deliberately not a blocker here, so this genuinely clears it.
+  assert.match(blocker!.message, /"Reopen for repack"/)
 })
 
 test('o3d-2y1c: a PACKED shipment blocks too, and several are summarised by status', async () => {

@@ -1907,14 +1907,14 @@ export async function clearDormantFulfillmentPinsInTx(
  * drawn from (o3d-4kfh r3, see `releaseOrderAllocationsInTx`), because a draft that outlives its
  * allocation is exactly what later becomes a committed shipment with nothing behind it.
  *
- * BUT NOTE WHAT THE OPERATOR IS ACTUALLY LEFT WITH, because it is narrower than it looks:
- * IMS has NO per-shipment cancel or rollback at all. `SHIPMENT_TRANSITIONS` is forward-only
- * (PENDING -> PICKING -> PACKED -> SHIPPED) and no action deletes a non-PENDING shipment. So the
- * only two ways out of this refusal are to DISPATCH the shipment, or to cancel the WHOLE order —
- * `cancelSalesOrderFulfillmentState` deletes the PENDING/PICKING/PACKED shipments in the same
- * transaction as the release, which is exactly the atomicity this path lacks. The refusal message
- * must therefore not tell the operator to "cancel the shipment": that button does not exist.
- * Filling that gap (o3d-q8r6) is a product decision, not part of this fix.
+ * WHAT THE OPERATOR IS LEFT WITH. `SHIPMENT_TRANSITIONS` is still forward-only (PENDING -> PICKING
+ * -> PACKED -> SHIPPED) and there is still no per-shipment DELETE, so the refusal message must not
+ * tell the operator to "cancel the shipment": that button does not exist. There are now three ways
+ * out: DISPATCH the shipment; cancel the WHOLE order (`cancelSalesOrderFulfillmentState` deletes the
+ * PENDING/PICKING/PACKED shipments in the same transaction as the release, which is exactly the
+ * atomicity this path lacks); or REOPEN the shipment (`reopenShipmentForRepack`, o3d-2k5), which
+ * reverts a PICKING/PACKED shipment to a PENDING draft — and a PENDING draft is not a commitment
+ * and never reaches this refusal.
  *
  * The caller MUST already hold the order's row lock (lockSalesOrder).
  */
@@ -1942,7 +1942,8 @@ export async function releaseOrderAllocationsForDeallocationInTx(
       + 'A picked or packed shipment is stock the warehouse is already holding against this order, and a '
       + 'shipped one is the cost evidence the accounting sub-ledger reverses through its allocation row — '
       + 'releasing either would leave the shipment dispatchable against another order\'s reservation. '
-      + 'Dispatch those shipments, or cancel the whole order.',
+      + 'Dispatch those shipments, cancel the whole order, or — for a picked/packed one you want to '
+      + 'rebuild rather than send — use "Reopen for repack" on it, which returns it to a pending draft.',
     )
   }
   return releaseOrderAllocationsInTx(tx, orderId, {

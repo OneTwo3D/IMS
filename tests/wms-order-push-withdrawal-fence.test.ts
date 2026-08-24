@@ -84,6 +84,10 @@ function makePort(seed: Seed) {
     releasableHeldOrders: async () => [],
     createCandidates: async () => seed.createCandidates ?? [],
     claimForCreate: async (orderId) => { claims.push(orderId); return true },
+    // o3d-92fu: this suite's orders all build a valid payload, so this is never reached;
+    // it throws rather than returning a value so a future seed that DOES fail to build
+    // cannot silently pass through it unnoticed.
+    recordValidationFailure: async () => { throw new Error('recordValidationFailure not expected in the withdrawal-fence suite') },
     verifiableLinks: async () => seed.verifiable ?? [],
     updatableLinks: async () => [],
     holdableLinks: async () => [],
