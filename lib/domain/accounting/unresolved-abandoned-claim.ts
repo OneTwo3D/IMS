@@ -72,10 +72,14 @@ import {
 // Everything else is unresolved.
 //
 // WHY THIS CANNOT LOOSEN THE DAILY-BATCH RECREATE VERDICT, the one reader here that moves money.
-// `settleableSettlementOutcomes` refuses DAILY_BATCH_* at every attempt and every status, so no
-// batch row can ever carry an operator settlement and the new arm cannot fire for one. That
-// invariant is load-bearing rather than incidental, so it is asserted in
-// tests/accounting/unresolved-abandoned-claim.test.ts rather than left to be noticed.
+// The arm below fires only on a CANCELLED row carrying an operator assertion AND NO document id,
+// and the only settlement producing that shape is a NOT_POSTED one. `settleableSettlementOutcomes`
+// admits POSTED and nothing else for DAILY_BATCH_*, so no batch row can reach it — and a POSTED
+// settlement writes the document id the operator supplied, which the external-id clause vetoes in
+// any case. Stated as that NARROWING rather than as a blanket "batch rows are never settleable",
+// which is no longer true: the type dimension is a per-outcome answer. The invariant is load-bearing
+// rather than incidental, so it is asserted in tests/accounting/unresolved-abandoned-claim.test.ts
+// rather than left to be noticed.
 //
 // A row that NAMES A DOCUMENT outranks the flag whichever way the flag points: an
 // externalTransactionId exists only because a remote call returned, so it is the ledger's own

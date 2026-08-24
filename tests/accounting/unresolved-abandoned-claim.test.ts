@@ -9,7 +9,7 @@ import {
 } from '@/lib/domain/accounting/unresolved-abandoned-claim'
 import {
   OPERATOR_ASSERTION_SETTLEMENT_BASIS,
-  isSettleableAccountingSyncType,
+  settleableSettlementOutcomes,
 } from '@/lib/domain/accounting/sync-row-settlement'
 
 /**
@@ -141,11 +141,23 @@ test('[o3d-nepa] the retention predicate and the recreate verdict are the SAME r
 })
 
 test('[o3d-nepa round 4] the new arm cannot reach the daily-batch recreate verdict', async () => {
-  // The one reader here that MOVES MONEY. It is safe from the operator-assertion arm only because a
-  // DAILY_BATCH row can never carry an operator settlement — so that invariant is asserted rather
-  // than assumed, and this fails the day the settlement action starts accepting batch rows.
+  // The one reader here that MOVES MONEY. `cancelledClaimIsResolved` fires only on a CANCELLED row
+  // that carries an operator assertion AND NO document id, and the only settlement that produces
+  // that shape is a NOT_POSTED one. A DAILY_BATCH type admits POSTED and nothing else — a POSTED
+  // settlement writes SYNCED with the id the operator supplied, which this rule's external-id clause
+  // vetoes anyway — so the arm cannot fire for a batch row.
+  //
+  // ASSERTED AS THE NARROWING IT IS, not as a blanket refusal. Earlier rounds of this branch wrote
+  // "a DAILY_BATCH row can never carry an operator settlement", which stopped being true when the
+  // type dimension became a per-outcome answer (`settleableSettlementOutcomes`): the control was
+  // NARROWED to POSTED rather than removed. Asserting the absolute here would fail on a rule that is
+  // sound, and — worse — would go on claiming an invariant the code no longer has.
   for (const type of ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B']) {
-    assert.equal(isSettleableAccountingSyncType(type), false, `${type} must stay unsettleable by hand`)
+    assert.deepEqual(
+      [...settleableSettlementOutcomes(type)],
+      ['POSTED'],
+      `${type} must admit no NOT_POSTED assertion — that is the one outcome that leaves a CANCELLED row carrying an operator settlement and no document id`,
+    )
   }
   // And the verdict must actually SELECT the column the shared rule now reads: handing a shared
   // predicate a row with the field missing turns `undefined` into a verdict.

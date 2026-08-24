@@ -365,20 +365,31 @@ test('[o3d-anu8] a LEDGER refusal after the plan leaves no record claiming a pay
   assert.ok(activity.some((entry) => entry.action === 'xero_followup_enqueue_refused'))
 })
 
-test('[o3d-anu8] an UNFENCEABLE reuse target leaves no record either', async () => {
-  // The other refusal that used to run after the record was already written. The revision-0 row is
-  // the reuse candidate; the asserted row is what cleared the ambiguity that would otherwise refuse.
+test('[o3d-anu8 × round 4] a REVISION-0 money reuse target is revived, and the record still lands after the outcome', async () => {
+  // WHAT THIS TEST USED TO BE, AND WHY IT IS NOT THAT ANY MORE. On o3d-anu8 this scenario REFUSED —
+  // `unfenced_reuse_target` — and the assertion was that a refusal writes no reliance record.
+  // o3d-batch-ret round 4 deleted that blanket refusal for MONEY-MOVING types with a reviewed
+  // argument: the CAS carries `attemptRevision: 0`, which is strictly stronger than the `(id, FAILED)`
+  // ABA it replaced, and `ledgerClearsFollowUpRevival` now asks for every money reuse whether the
+  // attempt already committed. (Round 5 restored it for the types that have no ledger to ask —
+  // see `unprobed_unfenced_reuse` below.) So a revision-0 INVOICE_PAYMENT is revived here.
+  //
+  // THE o3d-anu8 GUARD IS UNCHANGED AND IS WHAT THIS STILL ASSERTS: the reliance record is written
+  // on the DURABLE channel and never on the best-effort one. What moved is which outcome this
+  // scenario reaches. The refusal half of the guard — no record for an enqueue that did not happen —
+  // is still covered by the ledger refusal above and by `an unwritable record ABORTS the enqueue`
+  // below; the ordering half by `a REVIVAL cleared by an assertion is recorded too`.
   reset([assertedNotPostedRow(), failedPaymentRow({ attemptRevision: 0 })])
 
   await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
-  assert.equal(store.get('log-pay')?.status, 'FAILED', 'the unfenceable row is left exactly as it was')
-  assert.deepEqual(scheduled, [], 'and nothing was queued')
-  assert.deepEqual(durableActivity.filter((entry) => entry.action === RELIANCE_ACTION), [],
-    'so the reliance record must not exist: it would describe an enqueue that was refused')
+  assert.equal(store.get('log-pay')?.status, 'PENDING', 'round 4: the revision-0 money row IS revived')
+  assert.equal(store.get('log-pay')?.attemptRevision, 0, 'and the revival mints no attempt — only a claim does')
+  const record = durableActivity.find((entry) => entry.action === RELIANCE_ACTION)
+  assert.ok(record, 'a post cleared by that assertion is recorded, and on the DURABLE channel')
+  assert.equal((record.metadata as { planAction?: string }).planAction, 'reuse')
   assert.deepEqual(activity.filter((entry) => entry.action === RELIANCE_ACTION), [],
-    'and it must not exist on the best-effort channel either — that is where it used to be written')
-  assert.ok(activity.some((entry) => entry.metadata?.reason === 'unfenced_reuse_target'))
+    'and never on the best-effort channel — that is where it used to be written')
 })
 
 test('[o3d-anu8] a REVIVAL cleared by an assertion is recorded too, and after the revival', async () => {
@@ -487,7 +498,7 @@ test('[round 5] a revision-0 INVOICE_EMAIL is REFUSED, not revived — nothing e
   ledgerVerdict = { clear: true }
 
   const outcome = await (await loadEnqueue())(
-    'INVOICE_EMAIL', 'SalesOrder', 'order-1', { referenceId: 'order-1' }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD },
+    'INVOICE_EMAIL', 'SalesOrder', 'order-1', { referenceId: 'order-1' }, POSTED_ROW_ORIGIN,
   )
 
   assert.equal(outcome.enqueued, false, 'the caller must be able to see the follow-up is still owed')
@@ -511,7 +522,7 @@ test('[round 5] the SAME row at a real attempt revision is revived — the refus
   reset([failedEmailRow({ attemptRevision: 4 })])
 
   const outcome = await (await loadEnqueue())(
-    'INVOICE_EMAIL', 'SalesOrder', 'order-1', { referenceId: 'order-1' }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD },
+    'INVOICE_EMAIL', 'SalesOrder', 'order-1', { referenceId: 'order-1' }, POSTED_ROW_ORIGIN,
   )
 
   assert.equal(outcome.enqueued, true)
@@ -526,7 +537,7 @@ test('[round 5] and a revision-0 MONEY row is still revived — round 4’s fix 
   ledgerVerdict = { clear: true }
 
   const outcome = await (await loadEnqueue())(
-    'INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD },
+    'INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN,
   )
 
   assert.equal(outcome.enqueued, true, 'refusing a revision-0 money row was the dead end round 4 removed')
@@ -540,7 +551,7 @@ test('[round 5] a CREATE is untouched — the refusal is about reviving a row, n
   reset([])
 
   const outcome = await (await loadEnqueue())(
-    'INVOICE_EMAIL', 'SalesOrder', 'order-1', { referenceId: 'order-1' }, { from: 'postedRow', payload: POSTED_ROW_PAYLOAD },
+    'INVOICE_EMAIL', 'SalesOrder', 'order-1', { referenceId: 'order-1' }, POSTED_ROW_ORIGIN,
   )
 
   assert.equal(outcome.enqueued, true)

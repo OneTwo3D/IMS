@@ -635,12 +635,34 @@ test('[o3d-bqw7 r3] the re-asserted predicate REFUSES a row a concurrent writer 
 
   assert.equal(matches(row({ id: 'log-1', backReferenceCheckedAt: NOW }), perRowWhere), false)
   assert.equal(matches(row({ id: 'log-1', status: 'PENDING' }), perRowWhere), false)
-  assert.equal(matches(row({ id: 'log-1', status: 'CANCELLED' }), perRowWhere), false)
   assert.equal(matches(row({ id: 'log-1', externalTransactionId: null }), perRowWhere), false)
   assert.equal(matches(row({ id: 'log-1', type: 'INVOICE_PAYMENT' }), perRowWhere), false)
   assert.equal(matches(row({ id: 'log-1', backReferenceEvidenceCompactedAt: NOW }), perRowWhere), false)
   // …and a different row is never written by this statement at all.
   assert.equal(matches(row({ id: 'log-2' }), perRowWhere), false)
+
+  // CANCELLED IS NOT ON THAT LIST ANY MORE, AND THAT IS THE POINT OF THE SECOND POPULATION
+  // (o3d-nepa). `decideSaleRelease` retiring the row mid-pass moves it from the back-reference
+  // evidence arm INTO the unresolved-abandoned-claim arm; it has not left the predicate, so the
+  // write proceeds — and it should, because both arms compact to the same tombstone.
+  assert.equal(
+    matches(row({ id: 'log-1', status: 'CANCELLED' }), perRowWhere),
+    true,
+    'a retired row is still compactable — by the other arm',
+  )
+  // What DOES take it out is the same thing that takes it out of the delete's exemption: a
+  // cancellation that RESOLVED the claim. Asserted here so the re-assertion is shown to bite on the
+  // new arm too, rather than only on the one it was written for.
+  assert.equal(
+    matches(row({
+      id: 'log-1',
+      status: 'CANCELLED',
+      externalTransactionId: null,
+      abandonedBeforeRemoteCall: true,
+    }), perRowWhere),
+    false,
+    'a resolved abandonment leaves the predicate, and the re-asserted write must refuse it',
+  )
 })
 
 // ---------------------------------------------------------------------------
