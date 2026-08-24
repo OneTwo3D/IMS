@@ -2,7 +2,7 @@ import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { notify } from '@/lib/notifications'
-import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeUnendedWcPageWalk } from './api'
+import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeUnendedWcPageWalk, describeUnreadWcPage } from './api'
 import {
   HISTORICAL_IMPORT_UNIT_COST,
   buildStockMovementValueFields,
@@ -117,6 +117,9 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
     // readable page count reports 1, and this import would then treat the first 100 orders of the
     // window as the whole window and finish 'done' — a silent partial backfill.
     let endedOnEmptyPage = false
+    // Pages whose fetch failed after every attempt (round 3, Codex CRITICAL/HIGH). Separate from
+    // endedOnEmptyPage, which is a statement about the TAIL and cannot see a hole in the middle.
+    let unreadPages = 0
 
     while (page <= MAX_WC_PAGE_WALK_PAGES) {
       const processed = progress.ordersProcessed + progress.ordersSkipped
@@ -148,9 +151,16 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
       }
 
       if (!result || result.error) {
-        progress.errors.push(`Page ${page}: ${result?.error ?? 'unknown error'}`)
-        page++
-        continue
+        // STOP, do not skip (round 3, Codex CRITICAL/HIGH). `page++; continue` left a hole of up to
+        // 100 orders in the middle of the window that reaching an empty page later would not
+        // reveal, and — with the walk now bounded by the 1000-page ceiling rather than by
+        // `totalPages` — an unreachable store spent up to 1000 x (3 attempts x the request timeout
+        // + backoff) working through pages it could not read, writing a progress row per page and
+        // re-serialising a growing error array into one settings row each time. It exits on the
+        // first unread page instead, which is what it did before the ceiling replaced the header.
+        unreadPages++
+        progress.errors.push(describeUnreadWcPage('historical order', page, result?.error ?? 'unknown error'))
+        break
       }
 
       totalPages = result.totalPages
@@ -211,11 +221,14 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
     }
 
     // A walk that never reached an empty page read only part of the window, and this job has no
-    // cursor to hold — so the incompleteness is recorded as a page error, which the summary line
-    // below already counts and reports (o3d-xnwu).
-    if (!endedOnEmptyPage) {
+    // cursor to hold — so the incompleteness is recorded as a page error (o3d-xnwu). Only when the
+    // walk RAN OUT: a walk stopped by an unread page has already said why.
+    if (!endedOnEmptyPage && unreadPages === 0) {
       progress.errors.push(describeUnendedWcPageWalk('historical order', page - 1))
     }
+
+    // DID THIS READ THE WHOLE WINDOW? Either cause says no (round 3, Codex CRITICAL/MEDIUM).
+    const incompleteRead = !endedOnEmptyPage || unreadPages > 0
 
     progress.status = 'done'
     const parts: string[] = []
@@ -229,14 +242,25 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
 
     await logActivity({
       entityType: 'IMPORT', tag: 'import', action: 'imported',
-      description: `Imported ${progress.ordersProcessed} historical WC orders, ${progress.movementsCreated} demand records`,
+      level: incompleteRead ? 'WARNING' : undefined,
+      description: incompleteRead
+        ? `Historical WC order import INCOMPLETE: ${progress.message}`
+        : `Imported ${progress.ordersProcessed} historical WC orders, ${progress.movementsCreated} demand records`,
       resolveUser: false,
     })
 
+    // THE NOTIFICATION IS THE ONLY THING MOST OPERATORS SEE, AND IT SAID "COMPLETE" EITHER WAY
+    // (round 3, Codex MEDIUM). It rebuilt its own sentence from ordersProcessed/movementsCreated,
+    // so the "N page errors." clause `progress.message` carries — the ONLY place either
+    // incompleteness surfaced — never reached it, and neither did the activity log line. A
+    // truncated backfill announced "Historical Import Complete — Imported 100 orders", and the
+    // forecasting this feeds then reads a partial window as the real demand history.
     notify({
-      type: 'success',
-      title: 'Historical Import Complete',
-      message: `Imported ${progress.ordersProcessed} orders, created ${progress.movementsCreated} demand records.`,
+      type: incompleteRead ? 'warning' : 'success',
+      title: incompleteRead ? 'Historical Import Incomplete' : 'Historical Import Complete',
+      message: incompleteRead
+        ? `${progress.message} The window was NOT fully read \u2014 re-run this import for the same dates.`
+        : progress.message,
       actionUrl: '/analytics/reorder',
     })
   } catch (e) {

@@ -378,13 +378,32 @@ either would silently import the first page of a list and report it as the lot. 
 page ceiling so that a store ignoring the `page` parameter is not asked for ever; reaching that
 ceiling is reported as an incomplete read, not treated as the end of the collection.
 
+**A page that could not be read is the other kind of incomplete.** Ending on an empty page answers a
+question about the *tail*. A page whose fetch fails after its retries is a hole in the *middle*, and
+reaching an empty page later says nothing about it — so the two order backfills stop on the first
+unread page rather than skipping past it, and record which page it was. Stopping is also what keeps a
+store outage cheap: a walk that skipped would work its way through the whole page ceiling, three
+attempts and a two-minute timeout at a time, to reach a conclusion the first unread page had already
+settled.
+
 The four bulk walks are the ones with something to lose from getting this wrong, because three of
-them **move a cursor**. A truncated read that looked clean would advance the product or order sync
-cursor past everything it never asked for, and nothing re-reads behind a cursor — so an incomplete
-walk is recorded as an **error**, which is exactly the condition those cursors already refuse to
-advance on. The initial import goes further: a truncated read **fails the pass outright**, because
-that pass is what unlocks ongoing live order sync, and a backfill cut short at its first page has
-still "imported at least one order".
+them **move a cursor**. A read that did not cover the collection but looked clean would advance the
+product or order sync cursor past everything it never asked for, and nothing re-reads behind a cursor
+— so an incomplete walk is recorded as an **error**, which is exactly the condition those cursors
+already refuse to advance on. The initial import goes further: an incomplete read **fails the pass
+outright**, because that pass is what unlocks ongoing live order sync, and a backfill cut short at its
+first page has still "imported at least one order".
+
+**When a cursor walk runs out of ceiling, retrying cannot clear it.** The product sync and the order
+sweep read a window defined by their own cursor, and the incomplete read holds that cursor — so the
+next run rebuilds the same window, reads the same pages and stops in the same place, and the rows past
+the ceiling are never reached. That is not a transient failure waiting to clear, so it is raised as an
+ERROR in the activity log naming the stuck cursor, and the remedy is a human one: narrow the window so
+the cursor can advance, or raise the ceiling for that store.
+
+**A historical import that did not read its whole window says so.** That job has no cursor to hold, so
+the notification is the whole remedy — it reports as *incomplete* rather than complete, and tells you
+to re-run the same dates.
 
 ### What the connector will NOT change
 

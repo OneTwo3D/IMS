@@ -18,7 +18,7 @@ import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { notify } from '@/lib/notifications'
-import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeUnendedWcPageWalk } from '../api'
+import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeUnendedWcPageWalk, describeUnreadWcPage } from '../api'
 import { getWcPullStatuses, importWcOrder } from './order-import'
 import { WC_NO_STATUSES_SELECTED_MESSAGE } from '../order-status-filter'
 import type { WcFullOrder } from './types'
@@ -49,14 +49,27 @@ const JOB_KEY = 'initial_order_import_job'
  * active orders to import, is complete (per-order errors are surfaced but don't
  * block, since live sync of new orders can still proceed).
  *
- * A TRUNCATED READ IS THE ONE PER-PASS FAILURE THAT PROGRESS CANNOT OUTVOTE (o3d-xnwu). Every
- * other input here is per-ORDER: some orders failed, the rest are in, and live sync can carry the
- * rest. A walk that never reached an empty page is a statement about the COLLECTION — IMS does not
- * know how much of the store it has seen — and "imported at least one" is exactly the condition
- * that would be satisfied by a backfill truncated to its first page. Unlocking live sync on that
- * leaves every order beyond the truncation permanently unimported: the live sweeps are cursor-based
- * and the backfill is the only thing that ever reads the history. So it is passed in separately and
- * it fails the pass outright, which is what makes the retry happen.
+ * AN INCOMPLETE READ IS THE ONE PER-PASS FAILURE THAT PROGRESS CANNOT OUTVOTE (o3d-xnwu). The
+ * per-ORDER inputs are outvoted deliberately: some orders failed, the rest are in, and live sync can
+ * carry the rest. A read that did not cover the collection is a different kind of statement — IMS
+ * does not know how much of the store it has seen — and "imported at least one" is exactly the
+ * condition a backfill truncated to its first page satisfies. Unlocking live sync on that leaves
+ * every order it did not see permanently unimported: the live sweeps are cursor-based and the
+ * backfill is the only thing that ever reads the history. So it is passed in separately and it fails
+ * the pass outright, which is what makes the retry happen.
+ *
+ * AND "INCOMPLETE" HAS TWO CAUSES, NOT ONE (round 3, Codex CRITICAL). Round 2 gave this function
+ * `truncatedRead` — the walk never reached an empty page — and wrote that "every other input here is
+ * per-ORDER". That was false of an input the walk was already producing: a PAGE FETCH ERROR was
+ * pushed into `errors` and the walk did `page++; continue`, skipping up to 100 orders and then
+ * reaching an empty page perfectly normally. `truncatedRead` therefore read FALSE, `errorCount` was
+ * outvoted by the orders that did import, and the pass returned COMPLETE over a hole in the middle.
+ * The tail was checked and the middle was not — and a transient 500 or a timeout mid-walk is by far
+ * the likelier of the two.
+ *
+ * `unreadPages` is that second cause, and it is deliberately NOT folded into `truncatedRead`: they
+ * need different sentences in front of an operator (one says "we never saw the end", the other says
+ * "page 7 is missing"), and collapsing them is how the first came to stand for both.
  */
 export function decideInitialImportOutcome(input: {
   imported: number
@@ -64,8 +77,13 @@ export function decideInitialImportOutcome(input: {
   errorCount: number
   /** The order walk never reached an empty page, so how much of the store was read is unknown. */
   truncatedRead?: boolean
+  /**
+   * Pages whose fetch failed, so their rows were NEVER READ — a hole in the middle of the
+   * collection, which reaching an empty page later does not reveal.
+   */
+  unreadPages?: number
 }): 'complete' | 'failed' {
-  if (input.truncatedRead) return 'failed'
+  if (input.truncatedRead || (input.unreadPages ?? 0) > 0) return 'failed'
   const madeProgress = input.imported > 0 || input.skipped > 0
   return input.errorCount > 0 && !madeProgress ? 'failed' : 'complete'
 }
@@ -176,6 +194,9 @@ async function runInitialImport(progress: InitialImportProgress) {
     // GATES live order sync — an initial import truncated to 100 orders by a store that sends no
     // readable page count would unlock live sync over a store IMS has mostly never seen.
     let endedOnEmptyPage = false
+    // Pages whose fetch failed after every attempt. A hole in the MIDDLE, which endedOnEmptyPage —
+    // a statement about the TAIL — cannot see (round 3, Codex CRITICAL).
+    let unreadPages = 0
 
     while (page <= MAX_WC_PAGE_WALK_PAGES) {
       progress.currentPage = page
@@ -200,9 +221,21 @@ async function runInitialImport(progress: InitialImportProgress) {
       }
 
       if (!result || result.error) {
-        progress.errors.push(`Page ${page}: ${result?.error ?? 'unknown error'}`)
-        page++
-        continue
+        // A PAGE THAT WAS NEVER READ IS A HOLE, AND THE WALK STOPS ON IT (round 3, Codex CRITICAL).
+        //
+        // This used to `page++; continue`. The skipped page's orders were never imported, the walk
+        // went on to reach an empty page, and `endedOnEmptyPage` was therefore TRUE — so the read
+        // was recorded as complete, `wc_initial_import_completed` was written, live order sync was
+        // unlocked and `last_wc_order_sync_at` advanced past orders nothing else will ever read.
+        //
+        // BREAKING rather than skipping is also what stops the ceiling turning a store outage into a
+        // multi-day job (round 3, Codex HIGH). `unreadPages` already fails the pass, so the
+        // remaining pages cannot change the outcome; continuing would spend up to
+        // MAX_WC_PAGE_WALK_PAGES x (3 attempts x the request timeout + backoff) discovering that,
+        // writing a progress row per page as it went.
+        unreadPages++
+        progress.errors.push(describeUnreadWcPage('initial order import', page, result?.error ?? 'unknown error'))
+        break
       }
 
       totalPages = result.totalPages
@@ -268,7 +301,9 @@ async function runInitialImport(progress: InitialImportProgress) {
     // outvoting any error count, and a backfill truncated to its first page has made progress. It
     // is therefore passed in as its own input, which fails the pass and keeps live order sync
     // gated until a complete read succeeds.
-    if (!endedOnEmptyPage) {
+    // Only when the walk RAN OUT. A walk stopped by an unread page has already said why, and adding
+    // "it never reached an empty page" on top would describe our own break as the store's fault.
+    if (!endedOnEmptyPage && unreadPages === 0) {
       progress.errors.push(describeUnendedWcPageWalk('initial order import', page - 1))
     }
 
@@ -279,7 +314,8 @@ async function runInitialImport(progress: InitialImportProgress) {
       imported: progress.activeOrdersImported,
       skipped: progress.activeOrdersSkipped,
       errorCount: progress.errors.length,
-      truncatedRead: !endedOnEmptyPage,
+      truncatedRead: !endedOnEmptyPage && unreadPages === 0,
+      unreadPages,
     })
 
     if (outcome === 'failed') {
@@ -289,13 +325,15 @@ async function runInitialImport(progress: InitialImportProgress) {
       // retry. Surface it as an error so the UI shows Retry and live order sync
       // stays gated off until a real import succeeds.
       progress.status = 'error'
-      // TWO REASONS REACH HERE AND THEY NEED DIFFERENT SENTENCES (o3d-xnwu). "0 of N imported" is
-      // false for a truncated read, which imported everything it managed to see \u2014 the problem is
-      // that nobody knows what it did not see, and saying "0 imported" would send an operator
-      // looking for a systemic import failure that is not there.
-      progress.message = !endedOnEmptyPage
-        ? `Import incomplete \u2014 ${progress.activeOrdersImported} order${progress.activeOrdersImported === 1 ? '' : 's'} imported, but WooCommerce never returned an empty page, so how much of the store was read is unknown. Retry; live order sync stays off until a complete read succeeds.`
-        : `Import failed \u2014 0 of ${progress.totalOrders} order${progress.totalOrders === 1 ? '' : 's'} imported (${progress.errors.length} error${progress.errors.length === 1 ? '' : 's'}). Resolve the cause and retry; live order sync stays off until the initial import succeeds.`
+      // THREE REASONS REACH HERE NOW AND THEY NEED THREE SENTENCES (round 3, Codex CRITICAL).
+      // "0 of N imported" is false for either incomplete read, which imported everything it managed
+      // to see \u2014 the problem is that nobody knows what it did not see. And an unread page is not
+      // "we never saw the end": it is "page N is missing", a different thing to go and look at.
+      progress.message = unreadPages > 0
+        ? `Import incomplete \u2014 ${progress.activeOrdersImported} order${progress.activeOrdersImported === 1 ? '' : 's'} imported, but page ${progress.currentPage} could not be read, so up to 100 orders in the MIDDLE of the store were never seen. Retry; live order sync stays off until a complete read succeeds.`
+        : !endedOnEmptyPage
+          ? `Import incomplete \u2014 ${progress.activeOrdersImported} order${progress.activeOrdersImported === 1 ? '' : 's'} imported, but WooCommerce never returned an empty page, so how much of the store was read is unknown. Retry; live order sync stays off until a complete read succeeds.`
+          : `Import failed \u2014 0 of ${progress.totalOrders} order${progress.totalOrders === 1 ? '' : 's'} imported (${progress.errors.length} error${progress.errors.length === 1 ? '' : 's'}). Resolve the cause and retry; live order sync stays off until the initial import succeeds.`
       await saveProgress(progress)
 
       await logActivity({

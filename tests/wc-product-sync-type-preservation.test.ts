@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import type { WcFullProduct } from '../lib/connectors/woocommerce/sync/types.ts'
+import { describeWcPageWalkCeilingStall } from '@/lib/connectors/woocommerce/api'
 
 // o3d-y89x: the WooCommerce product sync is the THIRD writer of Product.type (after the
 // editor and the CSV import) and was the only unguarded one. It computed
@@ -196,8 +197,9 @@ mock.module('@/lib/connectors/woocommerce/api', {
     // o3d-xnwu: the walks now end on an EMPTY PAGE and bound themselves with the shared ceiling, so
     // a module double that omits these leaves `page <= undefined` and the loop never runs at all.
     MAX_WC_PAGE_WALK_PAGES: 1000,
-    describeUnendedWcPageWalk: (collection: string, pagesRead: number) =>
-      `The WooCommerce ${collection} walk did not reach an empty page within ${pagesRead} page(s).`,
+    // round 3: the REAL describer, so the operator-facing sentence the stall tests read is the one
+    // that ships rather than a stand-in this file wrote for itself.
+    describeWcPageWalkCeilingStall,
   },
 })
 
@@ -3134,4 +3136,77 @@ test('o3d-y89x r5: a blocker the DECISION saw and the itemisation missed still r
   assert.match(String(result.error), /rolled back/)
   assert.notEqual(result.permanent, true, 'a blocker that clears itself must stay retryable')
   assert.equal(findProductBySku('PARENT-SKU')?.type, 'SIMPLE', 'the transform is not committed')
+})
+
+// --- the page walk itself ---------------------------------------------------
+//
+// o3d-batch-wcsync ROUND 3 (Codex HIGH + MEDIUM) — "THE CURSOR IS HELD" HAD NO BEHAVIOURAL COVER.
+//
+// The round that made this walk end on an empty page pinned its central claim — a read that did not
+// cover the collection must not advance `last_wc_product_*` — with WHITESPACE-NORMALISED SOURCE
+// GREPS. Wrapping the very push those greps asserted in `if (false && …)` left the source text
+// intact and the whole suite green, and so did flipping the truncation flag to a constant `false`.
+// The pure functions were tested; the wiring that makes them matter was not.
+//
+// These drive the real `syncAllWcProducts` against a store that never ends, and assert on the
+// SETTING KEYS IT UPSERTED. The cursor is the only thing that decides whether the products past the
+// truncation are ever read again, so it is what the assertion is about.
+
+/** A product the walk counts and moves past cheaply: no SKU means "skipped", with no writes. */
+function skulessProduct(id: number): Row {
+  return { id, sku: '', name: `No SKU ${id}`, type: 'simple' } as unknown as Row
+}
+
+/** A store that answers every page with one product — it never returns an empty page. */
+function neverEndingStore(): Record<string, Row[]> {
+  let id = 1
+  return new Proxy({}, { get: () => [skulessProduct(id++)] }) as Record<string, Row[]>
+}
+
+test('[round 3] a walk that never reaches an empty page does NOT advance the cursor', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  productPages = neverEndingStore()
+
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(
+    state.settingUpserts.includes('last_wc_product_reconcile_at'),
+    false,
+    'advancing here skips every product past the truncation for ever — nothing re-reads behind a cursor',
+  )
+  assert.equal(result.errors.length, 1, 'and the incomplete read is RECORDED rather than merely implied')
+  assert.deepEqual(result.permanentErrors, [], 'nothing about the catalogue was established, so nothing is buried')
+})
+
+test('[round 3] running out of ceiling is escalated as a STALL, not left as one sync error line', async () => {
+  // The MEDIUM. This walk reads `modified_after = <cursor>`, and the error above HOLDS that cursor —
+  // so the next run rebuilds the identical window, reads the identical 1000 pages and stops in the
+  // identical place, for ever, never reaching what is past it. The round-2 wording said "it will be
+  // retried" and blamed an unreadable page-count header; both are the wrong diagnosis here.
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  productPages = neverEndingStore()
+
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  const stall = state.activity.filter((entry) => entry.action === 'wc_product_sync_ceiling_stall')
+  assert.equal(stall.length, 1, 'an operator has to be told this run makes no progress at all')
+  assert.equal(stall[0].level, 'ERROR')
+  assert.match(String(stall[0].description), /RETRYING CANNOT CLEAR IT/)
+  assert.match(String(stall[0].description), /last_wc_product_reconcile_at/, 'and it names the cursor that is stuck')
+  assert.equal(result.errors[0], stall[0].description, 'the sync error and the escalation are one sentence, not two')
+})
+
+test('[round 3] a walk that DOES reach an empty page advances the cursor and escalates nothing', async () => {
+  // The control that makes the two above mean something: without it, a change that simply never
+  // upserted the cursor, or one that escalated on every run, would pass them both.
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  productPages = { '1': [skulessProduct(1)] }
+
+  await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.ok(state.settingUpserts.includes('last_wc_product_reconcile_at'))
+  assert.deepEqual(state.activity.filter((entry) => entry.action === 'wc_product_sync_ceiling_stall'), [])
 })

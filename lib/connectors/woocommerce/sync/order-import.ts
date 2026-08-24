@@ -4,7 +4,7 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeUnendedWcPageWalk } from '../api'
+import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
@@ -2740,9 +2740,24 @@ export async function syncNewWcOrders(
 
   // A truncated read is a fetch error by another name, so it goes in `errors` and the cursor below
   // is held (o3d-xnwu). The `break` on a fetch error above pushed its own, so this only fires on a
-  // clean walk that ran out of ceiling without ever being told the collection had ended.
-  if (!endedOnEmptyPage && result.errors.length === 0) {
-    result.errors.push(describeUnendedWcPageWalk('order', page - 1))
+  // clean walk that RAN OUT OF CEILING.
+  //
+  // Which is a STALL, and the same one product-sync has (round 3, Codex MEDIUM): this error holds
+  // `cursorKey`, so the next sweep rebuilds the identical `modified_after` window and stops in the
+  // identical place. Retrying is the failure, not the recovery, so the message says that and the
+  // run escalates instead of leaving one line that reads as transient.
+  const ranOutOfCeiling = !endedOnEmptyPage && result.errors.length === 0
+  if (ranOutOfCeiling) {
+    result.errors.push(describeWcPageWalkCeilingStall('order', cursorKey))
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_order_sync_ceiling_stall',
+      tag: 'sync',
+      level: 'ERROR',
+      description: result.errors[result.errors.length - 1],
+      metadata: { mode, cursorKey, modifiedAfter: lastSync, pagesRead: page - 1, ceiling: MAX_WC_PAGE_WALK_PAGES },
+      resolveUser: false,
+    })
   }
 
   // Only advance the cursor after a fully clean run. Advancing after a fetch

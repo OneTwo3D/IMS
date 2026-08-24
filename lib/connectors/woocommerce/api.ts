@@ -112,9 +112,13 @@ export const MAX_WC_PAGE_WALK_PAGES = 1000
 /**
  * The message a walk that never reached an empty page reports.
  *
- * ONE WORDING for all four walks, because the thing being said is the same fact and the response is
- * the same: this was a TRUNCATED READ, nothing about the collection has been established, and the
- * cursor must not move past what was read.
+ * ONE WORDING for the walks that have no cursor to pin, because the thing being said is the same
+ * fact and the response is the same: this was a TRUNCATED READ, nothing about the collection has
+ * been established, and nothing may be treated as the end of it.
+ *
+ * A CURSOR WALK USES describeWcPageWalkCeilingStall INSTEAD (round 3, Codex MEDIUM). "It will be
+ * retried" is a promise, and for a walk whose cursor is held by this very error the retry is
+ * identical to the run that produced it — see below.
  */
 export function describeUnendedWcPageWalk(collection: string, pagesRead: number): string {
   return `The WooCommerce ${collection} walk did not reach an empty page within ${pagesRead} page(s) `
@@ -122,6 +126,64 @@ export function describeUnendedWcPageWalk(collection: string, pagesRead: number)
     + 'empty page can be truncated by a store that sends no readable x-wp-totalpages, so this is reported '
     + 'as an INCOMPLETE READ: nothing is treated as the end of the collection and the sync cursor is not '
     + 'advanced past it. It will be retried.'
+}
+
+/**
+ * o3d-batch-wcsync round 3 (Codex MEDIUM) — WHEN A CURSOR WALK RUNS OUT OF CEILING, THE RETRY IS
+ * THE FAILURE.
+ *
+ * Both cursor walks read a window defined by their own cursor (`modified_after = <cursor>`) and
+ * hold that cursor whenever anything landed in `errors`. Running out of ceiling lands in `errors`.
+ * So the next run rebuilds the SAME window, walks the SAME first {ceiling} pages, imports the same
+ * rows again, hits the ceiling again and holds the cursor again — for ever, and the rows past the
+ * ceiling are never reached at all. Nothing narrows the window, pages from a different offset, or
+ * advances the cursor partially.
+ *
+ * `describeUnendedWcPageWalk` said "It will be retried", and blamed a store that sends no readable
+ * `x-wp-totalpages`. That diagnosis fits the OTHER cause of an unended walk and not this one: here
+ * the header was fine, the store is fine, and the retry is the thing that cannot help. An operator
+ * reading it would wait for a transient problem to clear.
+ *
+ * Not fixed by advancing the cursor part-way: neither walk asks for a deterministic order over the
+ * field its cursor is expressed in, so "everything up to the newest row seen" is not a fact either
+ * of them can establish. Both remedies below are things a human does; the run states them and
+ * escalates rather than pretending it can recover.
+ */
+export function describeWcPageWalkCeilingStall(collection: string, cursorKey: string): string {
+  return `The WooCommerce ${collection} walk reached its ${MAX_WC_PAGE_WALK_PAGES}-page ceiling `
+    + `(${MAX_WC_PAGE_WALK_PAGES * 100} rows) without the store ever returning an empty page, so the window `
+    + `this run reads is WIDER THAN THE WALK CAN COVER. This is NOT transient and RETRYING CANNOT CLEAR IT: `
+    + `the cursor "${cursorKey}" is held by this error, so the next run rebuilds the identical window, reads `
+    + 'the identical pages and stops in the identical place — and nothing past the ceiling is ever reached. '
+    + 'Narrow the window (import or reconcile a smaller catalogue first, so the cursor can advance) or raise '
+    + 'MAX_WC_PAGE_WALK_PAGES for this store. Until one of those happens this sync makes no progress at all.'
+}
+
+/**
+ * The message a walk reports when a PAGE FETCH FAILED — a hole in the middle, not a short tail.
+ *
+ * o3d-batch-wcsync round 3 (Codex CRITICAL). Two walks handled a page error with
+ * `errors.push(...); page++; continue`, which SKIPS the page and keeps going. The walk then reaches
+ * an empty page perfectly normally, so the end-on-empty flag is TRUE and the truncation check —
+ * which only ever asked whether the walk reached an empty page — reads FALSE. An initial import
+ * that lost a page to one transient 500 therefore passed as COMPLETE, wrote
+ * `wc_initial_import_completed`, unlocked live order sync and advanced `last_wc_order_sync_at`
+ * past a hundred orders that nothing will ever read again: the live sweeps are cursor-based and
+ * the backfill is the only thing that reads the history.
+ *
+ * "Ended on an empty page" answers a question about the TAIL. This answers the other one — was
+ * every page in between actually read — and it is the likelier failure, because a transient 500 or
+ * a timeout is far more common than a store that never returns an empty page.
+ *
+ * ONE WORDING, for the same reason describeUnendedWcPageWalk has one.
+ */
+export function describeUnreadWcPage(collection: string, page: number, error: string): string {
+  return `The WooCommerce ${collection} walk could not read page ${page} after 3 attempts: ${error}. `
+    + 'That page was NEVER READ, so up to 100 rows in the MIDDLE of the collection are missing — which '
+    + 'reaching an empty page later would not reveal. The walk stops here rather than skipping past the '
+    + 'hole: the pass has already failed, so the remaining pages cannot change the outcome and walking '
+    + `them costs up to ${MAX_WC_PAGE_WALK_PAGES} more fetches. This is reported as an INCOMPLETE READ: `
+    + 'nothing is marked complete and the sync cursor is not advanced. It will be retried.'
 }
 
 /** Exported for test: the NaN this replaced is the silent truncation itself (o3d-jcx). */

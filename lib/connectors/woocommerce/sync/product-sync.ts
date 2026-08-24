@@ -6,7 +6,7 @@ import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { getSettingValue } from '@/lib/settings-store'
-import { wcFetch, wcPut, WC_PAGINATION_UNKNOWN, MAX_WC_PAGE_WALK_PAGES, describeUnendedWcPageWalk } from '../api'
+import { wcFetch, wcPut, WC_PAGINATION_UNKNOWN, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
 import { isPermanentProductSyncConflict, WcVariationLimitExceededError } from './product-sync-errors'
 import {
@@ -2249,7 +2249,7 @@ export async function syncAllWcProducts(
   let totalPages = 1
   /**
    * o3d-xnwu: the walk ends on an EMPTY PAGE, not on `totalPages`. Until this is true the run is an
-   * incomplete read and the cursor below must not move — see describeUnendedWcPageWalk.
+   * incomplete read and the cursor below must not move — see describeWcPageWalkCeilingStall.
    */
   let endedOnEmptyPage = false
 
@@ -2394,11 +2394,29 @@ export async function syncAllWcProducts(
   // not a reason to keep the cursor pinned, because a pinned cursor re-reads the WHOLE catalogue
   // every cycle for ever and still never imports the conflicted product.
   // A WALK THAT NEVER ENDED IS AN ERROR, AND IT LANDS IN `errors` SO THE CURSOR IS HELD (o3d-xnwu).
-  // Not in `permanentErrors`: nothing about the catalogue is established by a truncated read, and a
-  // retry against a store that starts sending the header again succeeds. `break` on a fetch error
-  // above already pushed its own error, so this only fires on a clean walk that ran out of ceiling.
-  if (!endedOnEmptyPage && result.errors.length === 0) {
-    result.errors.push(describeUnendedWcPageWalk('product', page - 1))
+  // Not in `permanentErrors`: nothing about the catalogue is established by a truncated read, so
+  // nothing may be buried. `break` on a fetch error above already pushed its own error, so this
+  // only fires on a clean walk that RAN OUT OF CEILING.
+  //
+  // AND THAT IS A STALL, NOT A TRUNCATION TO RETRY (round 3, Codex MEDIUM). Round 2 wrote here that
+  // "a retry against a store that starts sending the header again succeeds". That reasoning covers
+  // the OTHER cause of an unended walk. This one is the catalogue in the window being wider than
+  // 1000 pages: the header is fine, the store is fine, and because this error holds `cursorKey` the
+  // next run rebuilds the identical `modified_after` window, re-reads the identical 100,000
+  // products and stops in the identical place — for ever, never reaching what is past it. So it
+  // says so, and it escalates, rather than logging one line that reads as "wait and it will clear".
+  const ranOutOfCeiling = !endedOnEmptyPage && result.errors.length === 0
+  if (ranOutOfCeiling) {
+    result.errors.push(describeWcPageWalkCeilingStall('product', cursorKey))
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_product_sync_ceiling_stall',
+      tag: 'sync',
+      level: 'ERROR',
+      description: result.errors[result.errors.length - 1],
+      metadata: { mode, cursorKey, modifiedAfter, pagesRead: page - 1, ceiling: MAX_WC_PAGE_WALK_PAGES },
+      resolveUser: false,
+    })
   }
 
   if (result.errors.length === 0) {
