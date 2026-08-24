@@ -68,18 +68,69 @@ const dbStub = {
   // `lockSalesOrder` issues `SELECT id FROM "sales_orders" WHERE id = $1 FOR UPDATE`. Making THIS
   // throw — rather than the whole delegate — is the only faithful way to produce the third state:
   // the row is there, nobody can currently speak for it.
-  $queryRaw: async () => {
-    if (lockFailures > 0) {
-      lockFailures -= 1
-      throw new Error('could not lock the sales order row')
-    }
-    const landed = onSaleLock
-    onSaleLock = null
-    landed?.()
-    return []
-  },
+  $queryRaw: rowLockQuery,
   $executeRaw: async () => 1,
-  $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(dbStub),
+  /**
+   * o3d-psvi r3 (Codex HIGH) — THE DOUBLE HAS POSTGRES ABORT SEMANTICS.
+   *
+   * The previous double handed the transaction body the bare `dbStub`, so a statement that threw
+   * left every LATER statement working normally. Real Postgres does the opposite: the first failed
+   * statement ABORTS the transaction, and everything after it raises 25P02 until the block ends,
+   * whatever the application code does with the first error.
+   *
+   * That difference is not cosmetic — it is the entire finding. Under the old double, catching the
+   * lock failure INSIDE the transaction and carrying on looked like it produced the UNREADABLE
+   * refusal; in production the very next statement raised 25P02 and a raw Prisma error reached the
+   * operator instead. The test asserted a shape production did not have, and it could not fail.
+   */
+  $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(abortingTransactionScope()),
+}
+
+/** The lock's raw statement, shared by the top-level stub and the transaction scope. */
+async function rowLockQuery(): Promise<unknown[]> {
+  if (lockFailures > 0) {
+    lockFailures -= 1
+    throw new Error('could not lock the sales order row')
+  }
+  const landed = onSaleLock
+  onSaleLock = null
+  landed?.()
+  return []
+}
+
+/** What Postgres says to every statement issued after one has failed inside a transaction. */
+const TRANSACTION_ABORTED = 'current transaction is aborted, commands ignored until end of transaction block'
+
+function abortingTransactionScope(): unknown {
+  let aborted = false
+  const guard = (call: (...args: never[]) => Promise<unknown>) => async (...args: never[]): Promise<unknown> => {
+    if (aborted) {
+      const error = new Error(TRANSACTION_ABORTED) as Error & { code?: string }
+      error.code = '25P02'
+      throw error
+    }
+    try {
+      return await call(...args)
+    } catch (error) {
+      aborted = true
+      throw error
+    }
+  }
+  const guardedDelegate = (delegate: Record<string, unknown>) => new Proxy({}, {
+    get: (_target, prop: string) => guard(
+      (...args: never[]) => (delegate[prop] as (...a: never[]) => Promise<unknown>)(...args),
+    ),
+  })
+  return {
+    accountingSyncLog: guardedDelegate(accountingSyncLog as unknown as Record<string, unknown>),
+    salesOrder: guardedDelegate(dbStub.salesOrder as unknown as Record<string, unknown>),
+    salesOrderRefund: guardedDelegate(dbStub.salesOrderRefund as unknown as Record<string, unknown>),
+    purchaseInvoice: guardedDelegate(dbStub.purchaseInvoice as unknown as Record<string, unknown>),
+    supplierCreditNote: guardedDelegate(dbStub.supplierCreditNote as unknown as Record<string, unknown>),
+    setting: guardedDelegate(dbStub.setting as unknown as Record<string, unknown>),
+    $queryRaw: guard(rowLockQuery),
+    $executeRaw: guard(async () => 1),
+  }
 }
 
 mock.module('@/lib/db', { namedExports: { db: dbStub } })
@@ -204,6 +255,7 @@ test('[o3d-psvi] a retired row whose sale is LIVE again is released, and the swe
   assert.equal(row?.backReferenceCheckedAt, null, 'and unstamped, which is the other half of being a candidate')
   assert.equal(row?.externalTransactionId, 'XERO-INV-1', 'the document is untouched — nothing was posted by the release')
   assert.match(String(row?.errorMessage), /back-reference repair sweep/, 'the row says why it came back')
+  assert.equal(row?.settlementBasis, 'OPERATOR_RELEASE', 'and the column says an OPERATOR reached this status')
 
   // THE PART THAT MAKES IT A REMEDY. Everything above is a status change; this is the work.
   const result = await (await loadSweep())()
@@ -401,4 +453,69 @@ test('[o3d-psvi r2] a row STAMPED between the operator\'s read and the write is 
   assert.match(String(result.error), /already reached a verdict/)
   assert.match(String(result.error), /external-id release command/, 'and it names a remedy that IS performable')
   assert.equal(store.get('log-1')?.status, 'CANCELLED', 'nothing was written')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psvi ROUND 3 (Codex MEDIUM) — AN OPERATOR'S STATUS WRITE MUST NOT READ AS THE CONNECTOR'S.
+//
+// The retirement this control undoes is reachable from EITHER SYNCED or FAILED and preserves
+// neither, so the SYNCED written by the release is not a restatement of anything the connector said
+// — it is an operator's write, and an UNMARKED SYNCED is the strongest claim this table can make.
+// `settlementBasis` is the column that exists so a status a human reached is never read as one the
+// connector reached, and this branch's own refusal already reads that column rather than the note.
+//
+// The stamp is OPERATOR_RELEASE and not OPERATOR_ASSERTION on purpose: the DOCUMENT ID on a
+// released row is the connector's own (an asserted row is refused outright), so the readers that
+// fail closed on an unverified id must not fire — folding the two together would make the sweep
+// refuse the very row the release exists to hand it.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psvi r3] the release stamps its OWN basis, and the sweep still finishes the job', async () => {
+  const { isOperatorAssertedSettlement, isOperatorReleasedSettlement, OPERATOR_RELEASE_SETTLEMENT_BASIS } =
+    await import('@/lib/domain/accounting/sync-row-settlement')
+
+  reset({ status: 'CANCELLED', accountingInvoiceId: null })
+  await retireBySweep()
+  salesOrders.set('order-1', { status: 'PROCESSING', accountingInvoiceId: null })
+
+  assert.deepEqual(await (await loadRelease())('log-1', 5), { success: true })
+
+  const released = store.get('log-1')
+  assert.equal(released?.settlementBasis, OPERATOR_RELEASE_SETTLEMENT_BASIS)
+  assert.equal(
+    isOperatorReleasedSettlement(released?.settlementBasis ?? null),
+    true,
+    'a reader asking "did an operator reach this status?" must be able to see that it did',
+  )
+  // ...and it is NOT the assertion basis, because the id was never asserted. This is the half that
+  // keeps the remedy performable: the sweep refuses to write a back-reference or build follow-ups
+  // from an ASSERTED row, so a released row marked that way would be a remedy nothing performs.
+  assert.equal(isOperatorAssertedSettlement(released?.settlementBasis ?? null), false)
+
+  const result = await (await loadSweep())()
+  assert.equal(salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1', 'the link is still written')
+  assert.deepEqual(followUpTypes(), ['INVOICE_PAYMENT', 'INVOICE_PDF'], 'and the follow-ups are still enqueued')
+  assert.equal(result.repaired, 1)
+})
+
+test('[o3d-psvi r3] a lock failure REFUSES rather than escaping as a raw database error', async () => {
+  // THE THIRD STATE, ASSERTED AGAINST ABORT SEMANTICS. `$transaction` here aborts on the first
+  // failed statement exactly as Postgres does, so a `try` placed INSIDE the transaction cannot
+  // produce this refusal: the row re-read that follows it raises 25P02 and escapes. What the
+  // operator must never see is that error, or any word of it.
+  reset({ status: 'CANCELLED', accountingInvoiceId: null })
+  const retired = await retireBySweep()
+  salesOrders.set('order-1', { status: 'PROCESSING', accountingInvoiceId: null })
+  lockFailures = 1
+
+  const result = await (await loadRelease())('log-1', 5)
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /could not be read/)
+  assert.equal(
+    /aborted|25P02|commands ignored/i.test(String(result.error)),
+    false,
+    'a raw database error is not a refusal an operator can act on',
+  )
+  assert.deepEqual(store.get('log-1'), retired, 'and the rollback is what makes "nothing was changed" true')
 })

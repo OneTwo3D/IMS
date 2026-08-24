@@ -17,6 +17,13 @@ import test, { mock } from 'node:test'
 // stopped applying it, or applied it with the wrong polarity, fails here.
 // ---------------------------------------------------------------------------
 
+/**
+ * How many eligible rows the harness will serve before it gives up, in `compactUnbounded` mode.
+ * An order of magnitude above the production cap, so an uncapped loop is measured rather than
+ * merely hanging.
+ */
+const COMPACT_UNBOUNDED_CEILING = 50_000
+
 type DeleteArgs = { where: Record<string, unknown> }
 type UpdateArgs = { where: Record<string, unknown>; data: Record<string, unknown> }
 
@@ -31,12 +38,24 @@ const capture: {
    */
   accountingCompactSelect?: { where: Record<string, unknown> }
   compactPagesServed: number
+  /**
+   * o3d-bqw7 r3: when true the harness NEVER runs out of eligible rows, so the loop's own bound is
+   * the only thing that can stop it. Used to prove the per-row loop is capped rather than running
+   * until the table is empty.
+   */
+  compactUnbounded: boolean
+  /** Rows served by the select, and per-row writes issued — the two the bound is measured in. */
+  compactRowsServed: number
+  compactWrites: number
 } = {
   settingRows: [],
   accountingDelete: undefined,
   accountingCompact: undefined,
   accountingCompactSelect: undefined,
   compactPagesServed: 0,
+  compactUnbounded: false,
+  compactRowsServed: 0,
+  compactWrites: 0,
 }
 
 function noopDelegate() {
@@ -61,21 +80,40 @@ mock.module('@/lib/db', {
         },
         updateMany: async (args: UpdateArgs) => {
           capture.accountingCompact = args
+          capture.compactWrites++
           return { count: 1 }
         },
         // One page, then exhaustion — enough to drive the loop through exactly one row so the
-        // tombstone write can be captured.
-        findMany: async (args: { where: Record<string, unknown> }) => {
+        // tombstone write can be captured. In `compactUnbounded` mode it instead serves a full page
+        // for ever, so the only thing that can end the loop is the loop's own cap.
+        findMany: async (args: { where: Record<string, unknown>; take?: number }) => {
           capture.accountingCompactSelect = { where: args.where }
-          if (capture.compactPagesServed > 0) return []
-          capture.compactPagesServed++
-          return [{
-            id: 'log-1',
+          const compactedRow = (index: number) => ({
+            id: `log-${index}`,
             type: 'SALES_INVOICE',
             referenceType: 'SalesOrder',
-            externalTransactionId: 'XINV-1',
+            externalTransactionId: `XINV-${index}`,
             payload: { _registerPayment: true },
-          }]
+          })
+          if (capture.compactUnbounded) {
+            const take = args.take ?? 0
+            // A `take` of 0 or less would make this an infinite loop rather than a test, so the
+            // harness refuses it: the production loop must never ask for a non-positive page.
+            assert.ok(take > 0, 'the compaction must never ask for a non-positive page')
+            // The harness has a ceiling of its own, an order of magnitude above the production cap.
+            // Without it a loop with no bound would HANG rather than fail, and a test that hangs
+            // reports nothing; with it, an unbounded loop runs to the ceiling and the assertion
+            // below fails with the number it reached.
+            if (capture.compactRowsServed >= COMPACT_UNBOUNDED_CEILING) return []
+            capture.compactPagesServed++
+            const page = Array.from({ length: take }, (_, i) => compactedRow(capture.compactRowsServed + i))
+            capture.compactRowsServed += take
+            return page
+          }
+          if (capture.compactPagesServed > 0) return []
+          capture.compactPagesServed++
+          capture.compactRowsServed += 1
+          return [compactedRow(1)]
         },
       },
       stockMovement: noopDelegate(),
@@ -103,6 +141,14 @@ function matches(row: Row, where: Record<string, unknown>): boolean {
   for (const [key, condition] of Object.entries(where)) {
     if (key === 'NOT') {
       if (matches(row, condition as Record<string, unknown>)) return false
+      continue
+    }
+    // o3d-psvi: the compaction's age test is `createdAt < cutoff AND (syncedAt IS NULL OR
+    // syncedAt < cutoff)`, so this evaluator has to understand a disjunction or it would throw on
+    // the branch rather than checking it.
+    if (key === 'OR') {
+      const branches = condition as Array<Record<string, unknown>>
+      if (!branches.some((branch) => matches(row, branch))) return false
       continue
     }
     const value = row[key] ?? null
@@ -154,9 +200,12 @@ function resetCaptures(): void {
   capture.accountingCompact = undefined
   capture.accountingCompactSelect = undefined
   capture.compactPagesServed = 0
+  capture.compactUnbounded = false
+  capture.compactRowsServed = 0
+  capture.compactWrites = 0
 }
 
-async function runRetention(): Promise<{
+async function runRetention(options: { unbounded?: boolean } = {}): Promise<{
   deleteWhere: Record<string, unknown>
   compact: UpdateArgs
   perRowWhere: Record<string, unknown>
@@ -164,6 +213,7 @@ async function runRetention(): Promise<{
   const { purgeExpiredData } = await import('@/lib/data-retention')
   capture.settingRows = [{ key: 'retention_sync_logs_months', value: '6' }]
   resetCaptures()
+  capture.compactUnbounded = options.unbounded === true
   await purgeExpiredData()
   assert.ok(capture.accountingDelete, 'retention must still delete expired accounting sync logs')
   assert.ok(capture.accountingCompactSelect, 'retention must SELECT the rows it compacts — the per-row record is derived from the payload it erases')
@@ -471,13 +521,90 @@ test('[o3d-bqw7 r2] the record is KEYS, never a copy of the payload', async () =
   }
 })
 
-test('[o3d-bqw7 r2] each row is written on its own, re-asserting that it is not already compacted', async () => {
-  const { perRowWhere } = await runRetention()
+test('[o3d-bqw7 r2] each row is written on its own, re-asserting the WHOLE selection predicate', async () => {
+  const { compact, perRowWhere } = await runRetention()
 
   // A bulk UPDATE cannot compute a different value per row without moving the enqueue's gate
-  // conditions into SQL, where they would drift from the branches they mirror. Writing per row means
-  // a concurrent run — or the sweep settling the row between the select and this write — must not have
-  // its work overwritten by a tombstone computed from state it has moved on from.
+  // conditions into SQL, where they would drift from the branches they mirror. So the write is per
+  // row — and because the read and the write are then SEPARATE STATEMENTS, the write has to re-ask
+  // the whole question. r2 asked only `{ id, backReferenceEvidenceCompactedAt: null }`, which
+  // compacted a row a concurrent writer had moved out of the predicate in between: payload emptied,
+  // error message cleared, and an obligation record derived from a payload the row had moved past.
   assert.equal(perRowWhere.id, 'log-1')
-  assert.equal(perRowWhere.backReferenceEvidenceCompactedAt, null)
+  assert.deepEqual(
+    Object.keys(perRowWhere).sort(),
+    [...Object.keys(compact.where), 'id'].sort(),
+    'the write must ask exactly what the select asked, plus the row id',
+  )
+  for (const [key, condition] of Object.entries(compact.where)) {
+    assert.deepEqual(perRowWhere[key], condition, `the write dropped the selection's "${key}" clause`)
+  }
+})
+
+test('[o3d-bqw7 r3] the re-asserted predicate REFUSES a row a concurrent writer moved after the select', async () => {
+  // Stated behaviourally, against the write's own predicate, because that is the thing that was
+  // missing. Each of these is a real writer on this table between the select and the write:
+  //   • the sweep stamping a verdict or repairing the row (backReferenceCheckedAt);
+  //   • an operator retry taking FAILED back to PENDING (status);
+  //   • `decideSaleRelease` retiring the row to CANCELLED (status);
+  //   • the connector's fence-loss evidence write clearing the shape (externalTransactionId).
+  const { perRowWhere } = await runRetention()
+
+  const selected = row({ id: 'log-1' })
+  assert.equal(matches(selected, perRowWhere), true, 'the row as selected is still written')
+
+  assert.equal(matches(row({ id: 'log-1', backReferenceCheckedAt: NOW }), perRowWhere), false)
+  assert.equal(matches(row({ id: 'log-1', status: 'PENDING' }), perRowWhere), false)
+  assert.equal(matches(row({ id: 'log-1', status: 'CANCELLED' }), perRowWhere), false)
+  assert.equal(matches(row({ id: 'log-1', externalTransactionId: null }), perRowWhere), false)
+  assert.equal(matches(row({ id: 'log-1', type: 'INVOICE_PAYMENT' }), perRowWhere), false)
+  assert.equal(matches(row({ id: 'log-1', backReferenceEvidenceCompactedAt: NOW }), perRowWhere), false)
+  // …and a different row is never written by this statement at all.
+  assert.equal(matches(row({ id: 'log-2' }), perRowWhere), false)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psvi (Codex MEDIUM) — A ROW AN OPERATOR HAS JUST RE-OPENED IS NOT EXPIRED.
+//
+// `releaseRetiredAccountingSyncRowForLiveSale` writes SYNCED with `backReferenceCheckedAt` still
+// null and the document id kept, which IS the compaction predicate, and a released row is OLD by
+// construction. Compacting it before the repair sweep reaches it destroys the payload the PAYMENT
+// registration is rebuilt from — so the sweep would rebuild only the PDF and warn that the payment
+// is gone, having just told the operator it would enqueue the outstanding follow-ups.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psvi] a row RELEASED inside the retention window is not compacted out from under the sweep', async () => {
+  const { compact } = await runRetention()
+
+  // The release stamps `syncedAt` at the moment of the release, so a released row's last completion
+  // is recent however old its `createdAt` is.
+  assert.equal(
+    matches(row({ createdAt: OLD, syncedAt: NOW }), compact.where),
+    false,
+    'a released row must survive long enough for the sweep to read its payload',
+  )
+  // A DEFERRAL, not an exemption: the same row a full retention period later is compacted, so the
+  // bound this pass exists to impose still holds for a release nothing ever finishes.
+  assert.equal(matches(row({ createdAt: OLD, syncedAt: OLD }), compact.where), true)
+  // And the ordinary population — a row that never completed — is untouched by the new clause.
+  assert.equal(matches(row({ createdAt: OLD, syncedAt: null }), compact.where), true)
+})
+
+test('[o3d-bqw7 r3] the per-row loop is BOUNDED — it is the only one in the purge that is not a bulk statement', async () => {
+  // Every sibling compaction in purgeExpiredData is a single UPDATE whose cost the database bounds.
+  // This one issues a statement per row and reads from the head until the predicate empties, which
+  // is fine in the steady state and unbounded on a first run, a reconnected connector or a
+  // shortened retention period. The harness never runs out of eligible rows, so if the loop had no
+  // cap this test would not finish.
+  const { compact } = await runRetention({ unbounded: true })
+
+  assert.ok(capture.compactWrites > 0, 'it must actually compact')
+  assert.ok(
+    capture.compactWrites <= 5_000,
+    `the compaction issued ${capture.compactWrites} per-row writes in one run — it is not bounded`,
+  )
+  assert.equal(capture.compactRowsServed, capture.compactWrites, 'every row it read, it wrote')
+  // The remainder is not lost: a compacted row leaves the predicate for good, so the next run
+  // continues rather than repeating. The predicate is what makes that true, so assert it is intact.
+  assert.equal(compact.where.backReferenceEvidenceCompactedAt, null)
 })

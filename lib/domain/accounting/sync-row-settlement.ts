@@ -210,7 +210,38 @@ export function settleableSettlementOutcomes(type: string): readonly SettlementO
  */
 export const OPERATOR_ASSERTION_SETTLEMENT_BASIS = 'OPERATOR_ASSERTION'
 
-export type SettlementBasis = 'CONNECTOR_CONFIRMED' | 'OPERATOR_ASSERTION'
+/**
+ * o3d-psvi r3 (Codex MEDIUM) — THE OTHER OPERATOR-DRIVEN STATUS WRITE ON THIS TABLE.
+ *
+ * `releaseRetiredAccountingSyncRowForLiveSale` moves a row the sweep retired back to SYNCED so the
+ * repair sweep can finish it. That write is made BY AN OPERATOR, and the retirement it undoes is
+ * reachable from EITHER SYNCED or FAILED without recording which — so the released row's SYNCED is
+ * not, and cannot be, a restatement of what the connector said. Left unmarked it is
+ * indistinguishable from a connector writeback, and this column exists precisely so that a status
+ * an operator reached is never read as one the connector reached.
+ *
+ * IT IS NOT `OPERATOR_ASSERTION`, and the difference is what the two words mean rather than who
+ * pressed the button:
+ *
+ *   • OPERATOR_ASSERTION means the DOCUMENT EVIDENCE came from a human — a document id typed in
+ *     after looking at a screen, with no call made and no figure compared. Every reader that fails
+ *     closed on this basis does so about the ID: `settlementStatus` will not call a monetary-only
+ *     comparison settled, the back-reference sweep will not stamp the id onto a sale or build a
+ *     PDF/PAYMENT from it, the delete guard will not claim the document exists.
+ *   • OPERATOR_RELEASE means the row's STATUS was reached by an operator while the document id on
+ *     it is the CONNECTOR's own. The release refuses an asserted row outright
+ *     (`describeCancelledSaleRelease`), so this basis can only ever sit on connector-issued
+ *     evidence.
+ *
+ * Folding the second into the first would therefore be a bug, not extra caution: it would make the
+ * sweep refuse to repair the very row the release exists to hand it, which is the "remedy nothing
+ * performs" failure this issue is named for. `isOperatorAssertedSettlement` is consequently FALSE
+ * for it, and every existing reader behaves exactly as it did for NULL — what changes is that the
+ * fact is now RECORDED and a reader that wants it can ask for it.
+ */
+export const OPERATOR_RELEASE_SETTLEMENT_BASIS = 'OPERATOR_RELEASE'
+
+export type SettlementBasis = 'CONNECTOR_CONFIRMED' | 'OPERATOR_ASSERTION' | 'OPERATOR_RELEASE'
 
 /**
  * The basis a row's recorded outcome rests on. Reads the column rather than the errorMessage text:
@@ -218,11 +249,18 @@ export type SettlementBasis = 'CONNECTOR_CONFIRMED' | 'OPERATOR_ASSERTION'
  * the remote system's own words — so a settlement note is not something a reader may key on.
  */
 export function settlementBasisOf(settlementBasis: string | null | undefined): SettlementBasis {
-  return settlementBasis === OPERATOR_ASSERTION_SETTLEMENT_BASIS ? 'OPERATOR_ASSERTION' : 'CONNECTOR_CONFIRMED'
+  if (settlementBasis === OPERATOR_ASSERTION_SETTLEMENT_BASIS) return 'OPERATOR_ASSERTION'
+  if (settlementBasis === OPERATOR_RELEASE_SETTLEMENT_BASIS) return 'OPERATOR_RELEASE'
+  return 'CONNECTOR_CONFIRMED'
 }
 
 export function isOperatorAssertedSettlement(settlementBasis: string | null | undefined): boolean {
   return settlementBasisOf(settlementBasis) === 'OPERATOR_ASSERTION'
+}
+
+/** Whether this row's STATUS was reached by an operator release rather than by the connector. */
+export function isOperatorReleasedSettlement(settlementBasis: string | null | undefined): boolean {
+  return settlementBasisOf(settlementBasis) === 'OPERATOR_RELEASE'
 }
 
 export type SettlementOutcome = 'POSTED' | 'NOT_POSTED'

@@ -2332,6 +2332,12 @@ model AccountingSyncLog {
   /// outcome (app/actions/accounting-settlement.ts) and IMS verified NOTHING about it — no call was
   /// made, no figure was compared, only a document id was typed in.
   ///
+  /// o3d-psvi r3: 'OPERATOR_RELEASE' is the third value — a row the sweep retired to CANCELLED that
+  /// an operator put back in front of it (releaseRetiredAccountingSyncRowForLiveSale). The STATUS
+  /// was reached by a human, so it must not read as a connector writeback; the DOCUMENT ID was not,
+  /// because that control refuses an asserted row outright, so the readers that fail closed on an
+  /// unverified id must not fire for it. See lib/domain/accounting/sync-row-settlement.ts.
+  ///
   /// It exists because a verdict has to carry its basis. Without this column a settled row is
   /// byte-identical to a connector-confirmed one, and every reader that asks "did this post?" —
   /// most importantly lib/domain/accounting/settlement-status.ts, which then compares the amount
