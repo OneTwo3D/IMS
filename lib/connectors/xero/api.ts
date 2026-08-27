@@ -23,6 +23,63 @@ const XERO_CONNECTOR = 'xero'
 const XERO_NOT_SENT_STATUS = 0
 
 /**
+ * WHICH PRE-EGRESS REFUSAL THIS WAS — ENUMERATED AT THE SITE THAT MADE IT (o3d-gvzu).
+ *
+ * `status: 0` and a 429 both already say "this call produced no reply". Neither says WHY, and the
+ * difference matters to exactly one caller: the manual-journal poster, which holds a durable dispatch
+ * marker it may release only on PROOF THAT NOTHING LEFT THIS PROCESS. "We got no answer" is not that
+ * proof — a timeout, a socket reset mid-write and a 5xx are all cases where the request may have
+ * arrived — so the marker may not be released on the absence of a reply, only on the presence of a
+ * refusal that is provably above the socket.
+ *
+ * SO IT IS A NAMED SET, NOT A PREDICATE OVER ERROR SHAPES. Each member is written by the one
+ * statement that performs that refusal, and each is provable by WHERE THAT STATEMENT SITS rather than
+ * by what it says:
+ *
+ *  • `no-connection`          `getAccessToken()` returned null, so no token, no tenant header and no
+ *                             request object were ever built. `performRequest` is not reached at all;
+ *                             there is nothing to send and nothing that could have been sent.
+ *  • `posting-intent-refused` `accountingPostingIntentRefusal` refuses ABOVE the retry loop, before
+ *                             the first `waitForBudget`. It returns straight out of `performRequest`
+ *                             with no `connectorFetch` between it and the caller.
+ *  • `egress-unauthorised`    `accountingEgressRefusal` is the last statement before `noteRequest`,
+ *                             and nothing between it and `connectorFetch` awaits. On the attempt it
+ *                             refuses, `connectorFetch` is never called.
+ *  • `rate-budget-refused`    every budget refusal — the minute wait, the rolling-day cap, and both
+ *                             idempotency-window bounds — returns BEFORE `noteRequest`, which is why
+ *                             a refusal consumes no Xero budget.
+ *
+ * AND EVERY ONE OF THEM IS ADDITIONALLY GATED ON `firstCallAt === null`, per call. Three of these can
+ * be reached on a LATER pass of the retry loop, after an earlier attempt has already gone out — an
+ * egress authorisation re-evaluated per attempt, a budget bound checked after a 429 sleep. Such a
+ * refusal is pre-egress for its own attempt and says nothing whatever about the request that already
+ * left, so it is NOT tagged. `firstCallAt` is set on the statement after `noteRequest` and before
+ * `connectorFetch`, so "still null" is the machine-checked form of "this call has sent nothing".
+ *
+ * WHAT IS DELIBERATELY ABSENT. There is no member for a timeout, a reset, a 5xx, an unparseable body
+ * or a `connectorFetch` throw. Those are ANSWERS THAT DID NOT ARRIVE, not refusals that did not send,
+ * and the whole value of this type is that it cannot be widened to cover them without someone adding
+ * a member and writing down where the statement sits.
+ */
+export type XeroNotSentReason =
+  | 'no-connection'
+  | 'posting-intent-refused'
+  | 'egress-unauthorised'
+  | 'rate-budget-refused'
+
+/**
+ * How the reason travels from `performRequest` (which returns a `Response`) to `xeroFetchWithAuth`
+ * (which builds the `XeroResponse`). A symbol rather than a field so it cannot collide with anything
+ * on a real `Response`, and so a genuine Xero reply can never carry one.
+ */
+const XERO_NOT_SENT_REASON = Symbol('xero.notSentReason')
+
+/** Read the tag off a refusal built by {@link markNotSent}. Undefined on every real reply. */
+function xeroNotSentReason(res: Response): XeroNotSentReason | undefined {
+  return (res as Response & { [XERO_NOT_SENT_REASON]?: XeroNotSentReason })[XERO_NOT_SENT_REASON]
+}
+
+/**
  * In-request 429 retries. Exported because it is half of the only retry Xero's six-minute
  * Idempotency-Key window actually covers — see lib/domain/accounting/idempotency-retention.ts.
  */
@@ -92,6 +149,16 @@ export type XeroResponse<T = unknown> = {
   status: number
   data?: T
   error?: string
+  /**
+   * PRESENT ONLY WHEN THIS PROCESS PROVED IT SENT NOTHING (o3d-gvzu). See {@link XeroNotSentReason}
+   * for the enumeration and for why each member is provable from where its statement sits.
+   *
+   * `undefined` is not "we sent it". It is "nothing here proves we did not" — which covers a real
+   * reply, a timeout, a reset mid-write, a 5xx, and a per-attempt refusal that followed an attempt
+   * which had already gone out. Callers that hold a durable record of a dispatch must treat
+   * `undefined` as SENT.
+   */
+  notSent?: XeroNotSentReason
   /**
    * The Xero organisation this request was actually ADDRESSED TO — the tenantId that went out in the
    * `Xero-Tenant-Id` header, resolved BEFORE the request was made (o3d-gfh, o3d-s36z).
@@ -293,7 +360,22 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
   /** What is left of XERO_IN_REQUEST_RETRY_BUDGET_MS, from the first call. */
   const budgetRemainingMs = () =>
     firstCallAt === null ? Number.POSITIVE_INFINITY : XERO_IN_REQUEST_RETRY_BUDGET_MS - (Date.now() - firstCallAt)
-  const outOfBudgetResponse = (waitMs: number, elapsedMs: number) => ({
+  /**
+   * TAG A REFUSAL AS PROVABLY PRE-EGRESS — and refuse to tag it once anything has gone out (o3d-gvzu).
+   *
+   * `firstCallAt` is assigned on the statement AFTER `noteRequest` and BEFORE `connectorFetch`, and it
+   * is the only thing in this function that records "a request has left". So `firstCallAt === null` is
+   * a mechanical proof that no `connectorFetch` has been entered on this call, and it is checked HERE,
+   * at the moment of return, rather than at the site that decided to refuse — several of these
+   * refusals are re-evaluated per retry attempt, and the same refusal is pre-egress on attempt 0 and
+   * says nothing at all about attempt 1.
+   *
+   * IT ERRS ONLY TOWARDS "SENT". Losing a tag costs a marker that is not released and a refusal an
+   * operator resolves; adding one that is not true costs a duplicate document in a live ledger.
+   */
+  const markNotSent = <T extends object>(reason: XeroNotSentReason, res: T): T =>
+    firstCallAt === null ? Object.assign(res, { [XERO_NOT_SENT_REASON]: reason }) : res
+  const outOfBudgetResponse = (waitMs: number, elapsedMs: number) => markNotSent('rate-budget-refused', {
     ok: false,
     status: 429,
     text: async () =>
@@ -311,7 +393,7 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
    * by an exact-boundary sleep or by a timer that woke late. Its own message, so a test can tell which
    * of the two refused and an operator can tell which bound was hit.
    */
-  const budgetSpentResponse = (elapsedMs: number) => ({
+  const budgetSpentResponse = (elapsedMs: number) => markNotSent('rate-budget-refused', {
     ok: false,
     status: 429,
     text: async () =>
@@ -336,7 +418,9 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
   // across the retry loop, and re-asking would be a second evaluation of a settled permission.
   const intentRefusal = accountingPostingIntentRefusal(XERO_CONNECTOR, auth.tenantId)
   if (intentRefusal) {
-    return { ok: false, status: XERO_NOT_SENT_STATUS, text: async () => intentRefusal } as Response
+    return markNotSent('posting-intent-refused', {
+      ok: false, status: XERO_NOT_SENT_STATUS, text: async () => intentRefusal,
+    }) as Response
   }
 
   for (let attempt = 0; attempt <= XERO_MAX_RETRIES; attempt++) {
@@ -344,14 +428,14 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     const budget = await waitForBudget(auth.tenantId, remainingBeforeCall)
     if (!budget.ok) {
       if (budget.reason === 'budget') return outOfBudgetResponse(budget.waitMs, XERO_IN_REQUEST_RETRY_BUDGET_MS - remainingBeforeCall)
-      return {
+      return markNotSent('rate-budget-refused', {
         ok: false,
         status: 429,
         text: async () =>
           `Xero day budget exhausted for this tenant: ${XERO_DAY_LIMIT} calls used within the rolling ` +
           `24h window, oldest falls out in ${Math.round(budget.waitMs / 60_000)} min. Not waiting — ` +
           `the work must be deferred. (Xero's real cap is 1,000/org/rolling-24h since 2026-03-02.)`,
-      } as Response
+      } as Response)
     }
 
     // THE LAST STATEMENT BEFORE THE SOCKET, AND THE ONE PLACE ANY PRE-EGRESS PERMISSION IS SPENT
@@ -376,7 +460,9 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     // any other point, so it was not made at all.
     const egressRefusal = await accountingEgressRefusal(XERO_CONNECTOR, { tenantId: auth.tenantId })
     if (egressRefusal) {
-      return { ok: false, status: XERO_NOT_SENT_STATUS, text: async () => egressRefusal } as Response
+      return markNotSent('egress-unauthorised', {
+        ok: false, status: XERO_NOT_SENT_STATUS, text: async () => egressRefusal,
+      }) as Response
     }
 
     /**
@@ -467,7 +553,11 @@ export function formatIfModifiedSince(value: Date | string): string {
  */
 async function notConnectedResponse<T = unknown>(): Promise<XeroResponse<T>> {
   const blocked = await getStoredTenantBlockReason().catch(() => null)
-  return { ok: false, status: 0, error: blocked ?? 'Not connected to Xero' }
+  // PROVABLY PRE-EGRESS BY CONSTRUCTION, and the strongest of the four: `getAccessToken()` answered
+  // null, so there is no access token, no `Xero-Tenant-Id` and no request object. `performRequest` is
+  // never entered. This is the "Not connected to Xero" blip o3d-gvzu names — one of which used to
+  // wedge a manual-journal row for good.
+  return { ok: false, status: 0, error: blocked ?? 'Not connected to Xero', notSent: 'no-connection' }
 }
 
 async function xeroFetch<T = unknown>(
@@ -520,10 +610,19 @@ async function xeroFetchWithAuth<T = unknown>(
   // Refused before sending. Reported verbatim rather than falling through to the `!res.ok` branch,
   // which would prefix it with "HTTP 0:" and so describe a reply Xero never made.
   if (res.status === XERO_NOT_SENT_STATUS) {
-    return { ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text(), tenantId: auth.tenantId }
+    return {
+      ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text(), tenantId: auth.tenantId,
+      notSent: xeroNotSentReason(res),
+    }
   }
   if (res.status === 429) {
-    return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited'), tenantId: auth.tenantId }
+    // A 429 is the one status that appears on BOTH sides of the socket — the budget refusals below
+    // the fence report it without sending, and Xero itself answers it after a real send. So the tag
+    // is what separates them, never the status (o3d-gvzu).
+    return {
+      ok: false, status: 429, error: await res.text().catch(() => 'Rate limited'), tenantId: auth.tenantId,
+      notSent: xeroNotSentReason(res),
+    }
   }
 
   if (!res.ok) {

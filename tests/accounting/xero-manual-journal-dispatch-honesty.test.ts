@@ -347,7 +347,7 @@ test('o3d-jit6 r3: the refusal names BOTH producers of the state, not just the c
   const decision = decideCreateDispatch({
     type: 'COGS_JOURNAL',
     idempotencyKey: 'ims-manual-journal-log-1',
-    recorded: { dispatchedAt, idempotencyKey: 'ims-manual-journal-log-1' },
+    recorded: { dispatchedAt, idempotencyKey: 'ims-manual-journal-log-1', releasedAt: null },
     now: new Date(dispatchedAt.getTime() + XERO_IDEMPOTENCY_KEY_RETENTION_MS + 60_000),
     label: 'COGS_JOURNAL for PurchaseOrder po-1',
   })
@@ -376,15 +376,22 @@ test('o3d-jit6 r3: the not-sent message says the marker STANDS, rather than impl
   const message = describeCreateDispatchNotSent({
     label: 'COGS_JOURNAL for PurchaseOrder po-1',
     error: 'Xero day budget exhausted for this tenant',
+    // o3d-gvzu: the case where NO release is recorded — the transport gave no named proof, which is
+    // what a timeout, a reset mid-write and a 5xx all look like. The marker stands, and the message
+    // must still say so.
+    releasing: false,
   })
 
   assert.match(message, /NOTHING WAS SENT/)
   assert.match(message, /Xero day budget exhausted/, 'the transport\'s own reason travels')
-  // THE RESIDUAL, SAID OUT LOUD. o3d-gvzu is the column that would let the marker be released; until
-  // it exists, a message that implied recovery had happened would be the laundering this branch is
-  // about, pointing the other way.
-  assert.match(message, /dispatch record STANDS/)
-  assert.match(message, /never cleared/)
+  // THE RESIDUAL, SAID OUT LOUD. o3d-gvzu added the column that CAN release the marker — but only on
+  // a named, provably pre-egress refusal. This message is built with `releasing: false`, which is the
+  // case where no such proof exists (a timeout, a reset mid-write, a 5xx), and there the marker stands
+  // exactly as it did before. A message that implied recovery had happened would be the laundering
+  // this branch is about, pointing the other way.
+  assert.match(message, /NO RELEASE IS RECORDED/)
+  assert.match(message, /dispatch record therefore STANDS/)
+  assert.match(message, /may have reached Xero/)
   assert.ok(CREATE_DISPATCH_UNSETTLED_MEANING.includes('xero_sync_transport_refused_before_post'))
 })
 
@@ -407,7 +414,7 @@ test('o3d-jit6 r3: the journal branch classifies an unsent post as notPosted, an
     /if \(!posted\.success && !posted\.reachedTheWire\) \{/,
     'the branch must classify on what the transport did, not on the error text',
   )
-  assert.match(branch, /notPosted: \{ reason: 'transport-refused', operation: 'manual-journal', message \}/)
+  assert.match(branch, /reason: 'transport-refused',\n\s+operation: 'manual-journal',\n\s+message,/)
   // No status code and no error-string test anywhere in the branch — a shape test is not evidence.
   assert.ok(!/status === 0|res\.status|\.error\?\.includes|match\(/.test(branch),
     'the branch must not infer "nothing was sent" from a status code or from prose')

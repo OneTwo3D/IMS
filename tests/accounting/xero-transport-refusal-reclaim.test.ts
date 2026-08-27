@@ -214,7 +214,7 @@ function markerVerdict(now: Date) {
   return decideCreateDispatch({
     type: 'COGS_JOURNAL',
     idempotencyKey: KEY,
-    recorded: { dispatchedAt: T_DISPATCH, idempotencyKey: KEY },
+    recorded: { dispatchedAt: T_DISPATCH, idempotencyKey: KEY, releasedAt: null },
     now,
     label: 'COGS_JOURNAL for PurchaseOrder po-1',
   })
@@ -1271,7 +1271,11 @@ function makeSampledDatabase(options: { dispatchedAt: Date; startElapsedMs: numb
         // THE SLOW SECOND QUERY. Under load this is where the time goes, and under r8 every
         // millisecond of it fell outside the elapsed figure.
         dbNowMs += options.secondQueryMs
-        return { createDispatchedAt: options.dispatchedAt, createDispatchIdempotencyKey: KEY }
+        return {
+          createDispatchedAt: options.dispatchedAt,
+          createDispatchIdempotencyKey: KEY,
+          createDispatchReleasedAt: null,
+        }
       },
     },
   }

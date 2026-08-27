@@ -36,7 +36,7 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
-import { CREATE_DISPATCH_REPLAY_MARGIN_MS, describeCreateDispatchNotSent, planCreateDispatch, readCreateDispatchAge, type CreateDispatchAge, type CreateDispatchMint } from '@/lib/domain/accounting/create-dispatch-record'
+import { CREATE_DISPATCH_REPLAY_MARGIN_MS, describeCreateDispatchNotSent, mayReleaseCreateDispatch, planCreateDispatch, readCreateDispatchAge, type CreateDispatchAge, type CreateDispatchFenceWrite } from '@/lib/domain/accounting/create-dispatch-record'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
@@ -2015,7 +2015,7 @@ export async function renewClaimForRemoteWrite(
    *
    * Absent for every other remote mutation, which mint nothing.
    */
-  mint?: CreateDispatchMint,
+  write?: CreateDispatchFenceWrite,
 ): Promise<Date | null> {
   const renewedAt = new Date()
   const renewed = await db.accountingSyncLog.updateMany({
@@ -2027,7 +2027,11 @@ export async function renewClaimForRemoteWrite(
     // `planCreateDispatch` one statement ago. They are deliberately not the same instant: the claim is
     // only ever compared against itself, while the dispatch instant is aged against `clock_timestamp()`
     // by the next attempt, and mixing the two clocks there is the o3d-clxw defect.
-    data: mint ? { processingStartedAt: renewedAt, ...mint } : { processingStartedAt: renewedAt },
+    // o3d-gvzu: `write` is the MINT on a first dispatch and the release CONSUMPTION on an attempt
+    // proceeding under a release. Both belong in this statement for the same reason — the fact and the
+    // claim proof must land together, or not at all — and the union means the fence can never be
+    // handed both at once.
+    data: write ? { processingStartedAt: renewedAt, ...write } : { processingStartedAt: renewedAt },
   })
   return renewed.count === 1 ? renewedAt : null
 }
@@ -2093,7 +2097,7 @@ export type RemoteWriteLease = HeldClaim & {
    * written only on the path that actually reaches the socket, and it is written before it — see
    * {@link renewClaimForRemoteWrite}.
    */
-  fenceBeforeRemoteWrite: (operation: string, mintCreateDispatch?: CreateDispatchMint) => Promise<RemoteWriteFence>
+  fenceBeforeRemoteWrite: (operation: string, createDispatchWrite?: CreateDispatchFenceWrite) => Promise<RemoteWriteFence>
 }
 
 /**
@@ -2151,7 +2155,7 @@ export async function openRemoteWriteLease(
     entryId,
     heldFrom: () => heldFrom,
     deadlineAt,
-    async fenceBeforeRemoteWrite(operation: string, mintCreateDispatch?: CreateDispatchMint): Promise<RemoteWriteFence> {
+    async fenceBeforeRemoteWrite(operation: string, createDispatchWrite?: CreateDispatchFenceWrite): Promise<RemoteWriteFence> {
       // The deadline is checked BEFORE the renewal, so an entry that has run out of lease does not
       // extend its own claim on the way to refusing. Nothing is sent either way.
       if (now() >= deadlineAt) {
@@ -2177,13 +2181,17 @@ export async function openRemoteWriteLease(
       // is committed, send" and "it does not, nothing was written, nothing is sent".
       let again: Date | null
       try {
-        again = await renewClaimForRemoteWrite(entryId, claim, mintCreateDispatch)
+        again = await renewClaimForRemoteWrite(entryId, claim, createDispatchWrite)
       } catch (error) {
         // A create whose local record cannot be written is a create whose OUTCOME cannot be recorded
         // either (o3d-k26m.5), so it is refused rather than sent unrecorded. Only the minting fence
         // catches: without a record to write, a failed renewal is an ordinary error and belongs to the
         // per-entry catch exactly as it did before.
-        if (!mintCreateDispatch) throw error
+        // o3d-gvzu: the release CONSUMPTION fails closed for the same reason the mint does, and the
+        // reason is if anything sharper. A send that leaves without having spent the release leaves a
+        // permission standing over a request that may have landed — so the next attempt would post
+        // again on top of it. Both kinds of write are therefore covered by this branch.
+        if (!createDispatchWrite) throw error
         const message = `Xero sync log ${entryId} was not posted: IMS could not record that a create `
           + `(${operation}) was about to be dispatched — ${String(error)}. NOTHING WAS SENT, because a `
           + 'create whose dispatch cannot be written down is one whose outcome cannot be written down '
@@ -2627,6 +2635,62 @@ export function unsentHandBackCommitProvesRelease(metadata: unknown): boolean {
  * refusal points at, and rolling it back would delete the record of a real refusal on the grounds
  * that somebody else now owns the row. The caller gets the flag so it can say so.
  */
+/**
+ * RELEASE THE DISPATCH MARKER ON PROOF THAT NOTHING LEFT THE PROCESS (o3d-gvzu).
+ *
+ * The marker itself is untouched — it is write-once by database trigger, and it must stay that way,
+ * because it is a PROHIBITION and one that tampering clears hands the tamperer what they wanted. What
+ * this writes is the separate column beside it, which says the request the marker records never left.
+ *
+ * WHAT LICENSED IT IS DECIDED ELSEWHERE, and deliberately: the two facts that make a release provable
+ * — the transport's NAMED pre-egress refusal and the basis this attempt's dispatch was planned on —
+ * are only both in scope in the branch that made the post. By the time the hand-back runs, all that
+ * survives is the verdict it reached. This function does not re-derive it and could not: an error
+ * string is not evidence, and re-deciding from one here is the shape-matching this whole change exists
+ * to replace.
+ *
+ * FENCED LIKE EVERY OTHER NON-TERMINAL WRITE, and it must run BEFORE the claim is released: the fence
+ * requires the row to still be PROCESSING at this worker's claim instant, and the release flips it to
+ * PENDING in the same transaction.
+ *
+ *  • the held claim + the attempt revision — a displaced owner, or an attempt an operator has since
+ *    decided about, releases nothing;
+ *  • `createDispatchedAt: { not: null }` — a release with no marker to be about is meaningless, and
+ *    the database refuses one anyway;
+ *  • `createDispatchReleasedAt: null` — write-once per proof. A release already standing is not
+ *    re-stamped, so the instant on the row is the one belonging to the proof that first established
+ *    it.
+ *
+ * ZERO ROWS IS NOT AN ERROR: it is the fence doing its job, and the caller reports it. FAILING is —
+ * see the caller, where this shares the hand-back's all-or-nothing transaction.
+ *
+ * THE INSTANT IS THIS HOST'S CLOCK, AND THAT IS SAFE HERE ONLY BECAUSE OF WHAT READS IT. Unlike
+ * `createDispatchedAt`, which is aged against `clock_timestamp()` and therefore has to come from the
+ * database (o3d-clxw), this column is read by exactly one predicate — `releasedAt !== null` — and is
+ * never compared to another instant, never subtracted from one, and never ordered against anything. A
+ * future reader that wants to age it must take it from the database instead; there is no correct way
+ * to age this value.
+ */
+async function releaseCreateDispatchMarker(
+  client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  entryId: string,
+  held: HeldClaim,
+  attempt: AttemptRef,
+  now: Date = new Date(),
+): Promise<boolean> {
+  const released = await client.accountingSyncLog.updateMany({
+    where: {
+      ...heldClaimWhere(entryId, held),
+      connector: XERO_CONNECTOR,
+      attemptRevision: attempt.attemptRevision,
+      createDispatchedAt: { not: null },
+      createDispatchReleasedAt: null,
+    },
+    data: { createDispatchReleasedAt: now },
+  })
+  return released.count > 0
+}
+
 export async function recordAndReleaseUnsentTransportRefusal(
   tx: UnsentRefusalTransactionClient,
   args: {
@@ -2657,6 +2721,18 @@ export async function recordAndReleaseUnsentTransportRefusal(
     // best-effort helper's way of saying this, and this one takes the answer directly.
     userId: null,
   })
+  // o3d-gvzu — AND THE MARKER'S RELEASE, WHEN THE POST PROVED NOTHING LEFT, BEFORE the claim goes
+  // back: the fence below flips the row to PENDING, and this one requires it to still be PROCESSING.
+  //
+  // IT SHARES THIS TRANSACTION, WHICH IS WHAT MAKES IT FAIL CLOSED. A release that cannot be written
+  // takes the whole hand-back with it: no evidence row, no claim release, no requeue, and
+  // `retryUnsentHandBack` retries and then reports the abort. The row is left exactly as the marker
+  // alone leaves it — refusing past the window, with a remedy — which is the state this change exists
+  // to escape but is emphatically the safe end to fail towards. The alternative, handing the row back
+  // while quietly failing to release it, would be a row that looks recovered and is not.
+  const markerReleased = args.notPosted.releaseCreateDispatch
+    ? await releaseCreateDispatchMarker(tx, args.entry.id, args.lease, args.attempt)
+    : null
   const released = await releaseUnsentTransportRefusal(
     tx, args.entry.id, args.lease, args.attempt, args.notPosted.message,
   )
@@ -2676,6 +2752,12 @@ export async function recordAndReleaseUnsentTransportRefusal(
     description: `[xero-sync] sync log ${args.entry.id}: the unsent-refusal hand-back committed — `
       + `evidence written, fenced release matched ${released ? 'the row' : 'NOTHING (displaced owner '
         + 'or a moved attempt; the refusal is still recorded)'}`
+      + `${markerReleased === null
+        ? ', no dispatch-marker release (the refusal did not prove the request failed to leave, or the '
+          + 'marker was not this attempt\'s)'
+        : markerReleased
+          ? ', DISPATCH MARKER RELEASED — a later attempt may send'
+          : ', dispatch-marker release matched nothing'}`
       + `${args.job ? ', job requeued' : ''}.`,
     metadata: {
       syncLogId: args.entry.id,
@@ -2685,6 +2767,12 @@ export async function recordAndReleaseUnsentTransportRefusal(
       reason: args.notPosted.reason,
       handBackId,
       released,
+      // o3d-gvzu: null when this refusal licensed no release at all (the ordinary case — a timeout, a
+      // reset, a 5xx, or a replay of somebody else's marker), true/false when it did and the fence
+      // did or did not match. Three distinguishable answers, because "no release was attempted" and
+      // "a release was attempted and matched nothing" are different things to read afterwards.
+      createDispatchReleased: markerReleased,
+      ...(args.notPosted.releaseCreateDispatch ?? {}),
     },
     userId: null,
   })
@@ -4518,6 +4606,16 @@ type EntryResult = {
     reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused'
     operation: string
     message: string
+    /**
+     * o3d-gvzu — PRESENT ONLY WHEN THE HAND-BACK MUST ALSO RELEASE THE DISPATCH MARKER, and carrying
+     * the two facts that licensed it so the evidence row can name them.
+     *
+     * Set by the branch that made the post, because that is the only place both facts are in scope:
+     * the transport's NAMED pre-egress refusal, and the basis this attempt's dispatch was planned on.
+     * Absent is the normal case and the safe one — a timeout, a reset mid-write, a 5xx, or a replay of
+     * somebody else's marker all leave it absent, and the marker then stands exactly as before.
+     */
+    releaseCreateDispatch?: { notSent: string; basis: string }
   }
 }
 
@@ -5998,7 +6096,7 @@ async function processClaimedEntry(
         label: `${type} for ${referenceType} ${referenceId}`,
       })
       if (!dispatch.dispatch) return { success: false, error: dispatch.error }
-      const fence = await lease.fenceBeforeRemoteWrite('manual-journal', dispatch.mint ?? undefined)
+      const fence = await lease.fenceBeforeRemoteWrite('manual-journal', dispatch.write ?? undefined)
       if (!fence.ok) return fence.result
       const posted = await postPreparedManualJournal(prepared.prepared, { idempotencyKey: journalIdempotencyKey })
       if (!posted.success && !posted.reachedTheWire) {
@@ -6008,14 +6106,40 @@ async function processClaimedEntry(
         // budget — none of which the row can do anything about. `notPosted` is the channel that
         // already exists for "provably nothing was sent", and it is what writes the durable,
         // named activity row the later refusal tells an operator to look for.
+        //
+        // o3d-gvzu — AND WHETHER THE MARKER IS RELEASED IS DECIDED HERE, FROM TWO INDEPENDENT FACTS,
+        // BOTH OF WHICH MUST HOLD.
+        //
+        //  1. `posted.notSent` is present. That is a NAMED member of an enumeration written by the one
+        //     statement that performed the refusal, each provable from where that statement sits (see
+        //     XeroNotSentReason). It is not a status code, not an error shape and not a string match.
+        //     It is absent for a timeout, a socket reset mid-write, a 5xx and a client that threw —
+        //     every case where the request MAY HAVE ARRIVED — and those therefore keep the marker.
+        //  2. `mayReleaseCreateDispatch(dispatch.basis)`. The proof covers THIS attempt's request. It
+        //     may only be turned into a release when the marker on the row is one this attempt can
+        //     speak for: it minted it, or it spent a release that already said nothing had been sent.
+        //     A replay of an earlier dispatch's key may not, because that earlier request might have
+        //     reached Xero.
+        //
+        // The conjunction is the conservative direction: each half can only WITHHOLD a release the
+        // other would have granted, and a withheld release costs a refusal an operator resolves while
+        // a wrong one costs a duplicate journal in a live ledger.
+        const releasing = posted.notSent !== undefined && mayReleaseCreateDispatch(dispatch.basis)
         const message = describeCreateDispatchNotSent({
           label: `${type} for ${referenceType} ${referenceId}`,
           error: posted.error ?? 'the transport gave no reason',
+          notSent: posted.notSent,
+          releasing,
         })
         return {
           success: false,
           error: message,
-          notPosted: { reason: 'transport-refused', operation: 'manual-journal', message },
+          notPosted: {
+            reason: 'transport-refused',
+            operation: 'manual-journal',
+            message,
+            ...(releasing ? { releaseCreateDispatch: { notSent: posted.notSent as string, basis: dispatch.basis } } : {}),
+          },
         }
       }
       return { success: posted.success, externalId: posted.journalId, error: posted.error }
