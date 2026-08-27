@@ -23,7 +23,19 @@ import test, { mock } from 'node:test'
 // company the sweep could write a retired realm's id onto a live document — and the global unique
 // index does not stop it, because when no local row holds the orphaned id the write succeeds.
 // Re-adding it is a one-line change that no other test would notice, so the absence is asserted
-// here. Precondition for re-adding: o3d-s36z.
+// here.
+//
+// THE PRECONDITION IT NAMED HAS BEEN MET AND WAS THE WRONG ONE (o3d-0bfh r5, Codex HIGH). This said
+// "Precondition for re-adding: o3d-s36z". o3d-s36z CLOSED on 2026-08-21, and a row's realm is now
+// durably recorded (`AccountingSyncLog.connectionProvenance`, o3d-dzip) — so the CANDIDATE FENCE is
+// derivable today. The SELECT side was never the whole problem: QuickBooks does not enforce the
+// connection verdict at POST time (o3d-8prh, open — `accounting-posting-intent` and
+// `accounting-egress-authorization` are imported by the Xero connector and by nothing under
+// lib/connectors/quickbooks/), and this connector's own `enqueueFollowUpSyncLog` mints no
+// `connectionProvenance`, so every row a sweep created would be born `no-origin-recorded` and posted
+// unchecked. A stale precondition on a money path is an invitation: whoever read the old line would
+// find it satisfied and wire the binding. The real order of work is in the block at the end of
+// lib/connectors/quickbooks/sync-processor.ts.
 // ---------------------------------------------------------------------------
 
 const CURSOR_STORE = { load: async () => null, save: async () => {} }
@@ -201,8 +213,10 @@ test('[o3d-9kek r6] QuickBooks exports NO back-reference sweep binding, and neve
       sweepExports,
       [],
       `${label} must not export a back-reference repair sweep for QuickBooks: the sweep is scoped by connector `
-      + 'alone and a QuickBooks id is realm-local, so it can stamp a previous realm\'s id onto a live document. '
-      + 'Close o3d-s36z before re-adding it.',
+      + 'alone and a QuickBooks id is realm-local, so it can stamp a previous realm\'s id onto a live document, '
+      + 'and this connector checks no connection verdict at post time. o3d-s36z has closed and is NOT the '
+      + 'remaining blocker — o3d-8prh is; read the block at the end of the QuickBooks sync-processor for the '
+      + 'order of work before re-adding it.',
     )
   }
 

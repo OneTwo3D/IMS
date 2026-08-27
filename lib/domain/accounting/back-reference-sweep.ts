@@ -160,8 +160,16 @@ import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-s
 // So there is no QuickBooks binding, on purpose — failing to repair is acceptable, repairing onto
 // the wrong document is not. Namespacing the id per connection was tried and reverted: it lets both
 // bills exist, which moves the problem to ~190 call sites that read a naked external id, on models
-// that have no provenance column at all. o3d-gt8r carries that design and its findings; o3d-s36z is
-// the realm-isolation work that a QuickBooks binding is waiting on.
+// that have no provenance column at all. o3d-gt8r carries that design and its findings.
+//
+// WHAT A QUICKBOOKS BINDING IS WAITING ON HAS CHANGED (o3d-0bfh r5, Codex HIGH). It was o3d-s36z,
+// the realm-isolation work; that CLOSED on 2026-08-21 and a row's realm is now durably recorded, so
+// this module's candidate query COULD be fenced on it. The remaining blocker is on the other side of
+// the enqueue: QuickBooks does not check the connection verdict at post time (o3d-8prh), so a row
+// this sweep correctly selected would still be posted against whatever is connected when the
+// processor gets to it. The full order of work is at the end of
+// lib/connectors/quickbooks/sync-processor.ts; do not infer from "o3d-s36z is closed" that a binding
+// is now safe.
 //
 // The sweep must keep refusing to guess: failing to repair is acceptable, repairing onto
 // the wrong bill is not.

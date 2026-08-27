@@ -1014,12 +1014,14 @@ test('[o3d-9kek r10 f1] a fresh post whose follow-ups fail keeps the obligation,
 // is not a feature, and leaving it open on one side while closing it on the other would be a
 // difference nobody chose.
 //
-// What is genuinely different, and stays different: the QuickBooks repair SWEEP is still unwired
-// (o3d-s36z, realm isolation, is its precondition — see the block at the end of its sync-processor).
-// Recording the obligation and repairing it are separate acts, and only the second is what that
-// issue gates: the marker is a timestamp on the sync row and crosses no realm boundary. It has to
-// be written at the moment it is true, because afterwards the state is unrecoverable — which is the
-// same reason there is no backfill for rows written before the column existed.
+// What is genuinely different, and stays different: the QuickBooks repair SWEEP is unwired, so on
+// this connector NOTHING EVER READS THE MARKER BACK (o3d-0bfh r5, Codex HIGH — the last two tests in
+// this file pin that). Recording the obligation and repairing it are separate acts, and only the
+// second is blocked: the marker is a timestamp on the sync row and crosses no realm boundary. It has
+// to be written at the moment it is true, because afterwards the state is unrecoverable — which is
+// the same reason there is no backfill for rows written before the column existed. What that
+// justifies is WRITING it; it does not make anything read it. See the block at the end of the
+// QuickBooks sync-processor for what the actual blocker is (o3d-8prh, not the closed o3d-s36z).
 // ---------------------------------------------------------------------------
 
 async function runQuickBooks() {
@@ -1217,4 +1219,94 @@ test('[o3d-0bfh r4] and a QuickBooks row nobody touched is still released', asyn
 
   assert.equal(result.succeeded, 1)
   assert.equal(subject().backReferenceFollowUpsPendingAt, null)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r5 (Codex HIGH) — THE QUICKBOOKS MARKER HAS NO CONSUMER, PINNED AS A FACT.
+//
+// Codex asked for "a test that terminates execution after the SYNCED/marker transaction and proves a
+// later production run enqueues the outstanding money work". On QuickBooks that test CANNOT PASS,
+// and that is the finding rather than an obstacle to it: there is no sweep binding and no cron
+// invocation, so nothing re-reads the marker. The honest test is therefore the inverse — the same
+// crash, the same later production run, and an assertion of exactly how far it gets — which turns a
+// silent hole into a named one that fails the day somebody closes it without reading the plan.
+//
+// THE CRASH STATE IS PRODUCED BY THE REAL PROCESSOR, NOT SEEDED. A hand-built row would drift from
+// whatever the connector actually leaves behind, and then the gap this pins would be a gap in the
+// test's imagination. Run one is the existing fresh-post-with-failing-follow-ups path: it commits
+// SYNCED with the external id, claims the obligation in that same transaction, fails the enqueue,
+// swallows it and counts the entry succeeded. That is byte-for-byte the state a process death one
+// instruction after the commit leaves.
+//
+// AND THE CONTROL BELOW IS THE POINT OF THE WHOLE BLOCK AT THE END OF THE QUICKBOOKS PROCESSOR: the
+// recovery logic EXISTS and works perfectly. The idempotency branch re-claims and re-enqueues the
+// outstanding work exactly as it should. It is simply unreachable, because no candidate query on
+// this connector will ever select the row again. Without that control, "run two enqueued nothing"
+// would be equally satisfied by a harness that cannot observe an enqueue at all.
+// ---------------------------------------------------------------------------
+
+/** Drive the connector to the state a crash immediately after the SYNCED/marker commit leaves. */
+async function crashAfterTheSyncedCommit() {
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.failFollowUpsFor.add('log-1')
+  const posted = await runQuickBooks()
+
+  // THE PRECONDITION. Every assertion after this is about a row in this exact state, and a run that
+  // ended anywhere else would make the "nothing happened" below true for the wrong reason.
+  assert.equal(posted.succeeded, 1, 'the post itself landed — this is a crash after success, not a failure')
+  assert.equal(subject().status, 'SYNCED', 'the SYNCED transition COMMITTED')
+  assert.equal(subject().externalTransactionId, 'XBILL-1', 'and it carries the id QuickBooks issued')
+  assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date, 'and the obligation was claimed with it')
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 0,
+    'while the money work never ran — which is the whole reason the marker is set',
+  )
+  return subject().backReferenceFollowUpsPendingAt as Date
+}
+
+test('[o3d-0bfh r5] a QuickBooks crash after the SYNCED/marker commit is re-driven by NOTHING', async () => {
+  const owed = await crashAfterTheSyncedCommit()
+
+  // A later production run. The follow-up injection is gone, so if anything selected this row its
+  // work would succeed — the enqueue is not what stops it.
+  state.failFollowUpsFor.clear()
+  state.journal = []
+  const later = await runQuickBooks()
+
+  assert.equal(later.processed, 0, 'the row is SYNCED, and the processor selects PENDING and stale PROCESSING only')
+  assert.deepEqual(state.journal, [], 'nothing wrote to the row at all')
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 0,
+    'so the outstanding payment/PDF/email/attachment is still not enqueued — EVIDENCE IS PRESERVED, THE WORK IS NOT LIVE',
+  )
+  assert.deepEqual(
+    subject().backReferenceFollowUpsPendingAt, owed,
+    'and the obligation is still recorded, unread, by the same generation that recorded it',
+  )
+  // If this test ever fails, a consumer has been wired. Read the block at the end of
+  // lib/connectors/quickbooks/sync-processor.ts BEFORE deleting it: closing o3d-s36z was not enough,
+  // and a consumer that enqueues a payment before o3d-8prh lands can post it to the wrong company.
+})
+
+test('[o3d-0bfh r5] CONTROL: the recovery logic works perfectly — it is only unreachable', async () => {
+  const owed = await crashAfterTheSyncedCommit()
+
+  // The ONE thing that changes: the row is returned to the candidate population, exactly as an
+  // operator retry does. Nothing else about the row or the harness is touched.
+  subject().status = 'PENDING'
+  subject().processingStartedAt = null
+  state.failFollowUpsFor.clear()
+  const later = await runQuickBooks()
+
+  assert.equal(later.processed, 1, 'now it is selected')
+  assert.equal(later.succeeded, 1)
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 1,
+    'and the idempotency branch re-drives the outstanding money work correctly, without re-posting the bill',
+  )
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'and only then is the obligation discharged')
+  assert.notEqual(owed, null, 'the obligation this discharged is the one the crash recorded')
+  // So the marker protocol is complete and correct on this connector in every respect but one: no
+  // candidate query selects a SYNCED row by its marker. That single missing binding is the finding.
 })

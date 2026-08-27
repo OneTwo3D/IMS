@@ -83,7 +83,10 @@ export { pushPurchaseBill } from './bills'
 export { pushCreditMemo } from './credit-notes'
 export { pushJournalEntry } from './journals'
 // No repairQuickBooksBackReferences: the back-reference repair sweep is deliberately NOT bound for
-// QuickBooks until o3d-s36z delivers realm isolation. See the note at the end of ./sync-processor.
+// QuickBooks, so nothing on this connector consumes the follow-up obligation marker its processor
+// writes (o3d-0bfh r5). o3d-s36z, which this line used to name as the precondition, has CLOSED — it
+// delivered the durable realm record but not the post-time enforcement a consumer needs (o3d-8prh).
+// Read the block at the end of ./sync-processor before binding one; the order of work is in it.
 export { processPendingQuickBooksSync } from './sync-processor'
 export { pollQuickBooksPayments } from './payment-poller'
 export { downloadQuickBooksInvoicePdf, saveInvoicePdf } from './invoice-pdf'
