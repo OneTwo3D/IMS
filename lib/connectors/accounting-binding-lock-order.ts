@@ -26,11 +26,51 @@
  * has touched anything else. So the pin is first because the binding's correctness already required it
  * to be first; the other writers align with the arbiter rather than the arbiter with them.
  *
- * WHAT THIS DOES NOT DO. It orders the rows of ONE binding. It says nothing about the wholesale
- * table wipes (`resetDatabase`), which take whole tables rather than named rows — those have their own
- * argument and their own test — and nothing about the contact/supplier/product clears that follow a
- * disconnect, which every writer already performs in the same relative order after the binding rows.
+ * WHAT THIS DOES NOT DO. It orders the rows of ONE binding. It says nothing about the
+ * contact/supplier/product clears that follow a disconnect, which every writer already performs in the
+ * same relative order after the binding rows.
+ *
+ * IT DOES NOW COVER THE WHOLESALE WIPE, AND THE REASON THE FIRST ROUND EXCLUDED IT WAS WRONG
+ * (o3d-2w2j r2, Codex MEDIUM). `resetDatabase` was left out on the ground that it "takes whole tables
+ * rather than named rows, so there is nothing for the helper to key on". A whole-table `DELETE` is not
+ * an absence of acquisitions — it is EVERY acquisition, taken in scan order, which is the one order
+ * nothing can align with. An UNFILTERED delete over `settings` therefore locks the pin AND the
+ * witness, and the
+ * `xero_pin_write_consumes_release` trigger (20260819210000) acquires them in the opposite relation to
+ * the token: a concurrent consent's pin INSERT fires it, it locks the token row and then waits to
+ * delete the witness the wipe already holds, while the wipe moves on to `accountingToken.deleteMany`
+ * and waits on that token. Witness-before-token against token-before-witness — a cycle, which
+ * PostgreSQL settles by killing one of them, on the incident-recovery path both of them live on.
+ *
+ * So the wipe now takes the three binding rows through this helper FIRST, by name, and excludes them
+ * from the bulk delete that follows — see {@link ACCOUNTING_BINDING_SETTING_KEYS}. The exclusion is
+ * not tidiness: without it the bulk delete would still be free to block on a binding row held by an
+ * uncommitted consent while the wipe already held the token, which is the same cycle one statement
+ * later.
  */
+
+/**
+ * THE `settings` ROWS THAT ARE BINDING ROWS, so a writer that deletes settings wholesale can take
+ * them by name first and then exclude them (o3d-2w2j r2).
+ *
+ * Literals rather than imports, because the modules that define them import THIS one — a cycle is
+ * what re-exporting from here would cost. `tests/connectors/accounting-binding-lock-order.test.ts`
+ * asserts these against the constants each module actually uses, so the duplication is checked rather
+ * than trusted.
+ */
+export const ACCOUNTING_BINDING_PIN_SETTING_KEYS = [
+  'xero_expected_tenant_id',
+  'quickbooks_expected_realm_id',
+] as const
+
+/** The Xero release witness. QuickBooks has no release receipt, so it has no witness row. */
+export const ACCOUNTING_BINDING_WITNESS_SETTING_KEYS = ['xero_pin_release_witness'] as const
+
+/** Every binding row that lives in `settings`, for a bulk delete's exclusion list. */
+export const ACCOUNTING_BINDING_SETTING_KEYS: readonly string[] = [
+  ...ACCOUNTING_BINDING_PIN_SETTING_KEYS,
+  ...ACCOUNTING_BINDING_WITNESS_SETTING_KEYS,
+]
 
 /**
  * The rows of one accounting binding, in the ONLY order any writer may acquire them.

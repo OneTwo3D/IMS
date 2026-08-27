@@ -149,23 +149,54 @@ test('o3d-2w2j: the raw-SQL pin establishment really emits pin, token, witness',
   assert.match(statements[2].text, /delete from settings/, 'then the witness')
 })
 
-test('o3d-2w2j: the two writers that are DELIBERATELY not routed through it, and why', () => {
-  // Said out loud so the next reader does not "fix" them into inconsistency.
+test('o3d-2w2j r2: the wholesale reset is routed through it after all, and why the first reason was wrong', () => {
+  // ROUND 1 EXCLUDED IT, on the ground that `resetDatabase` "deletes whole TABLES, not the named rows
+  // of one binding, so there is nothing for the helper to key on". Codex refuted that (r2, MEDIUM): a
+  // whole-table DELETE is not an absence of row acquisitions, it is EVERY row acquisition in scan
+  // order, so `setting.deleteMany({})` locks the pin AND the witness — and the
+  // `xero_pin_write_consumes_release` trigger takes the token and THEN the witness, which is the
+  // inverted pair.
   //
-  // `resetDatabase` deletes whole TABLES, not the named rows of one binding, so there is nothing for
-  // the helper to key on; it keeps its hand-written settings-before-tokens order and its own test.
+  // The behaviour — the acquisition ORDER, and the exclusion that keeps the bulk delete out of it —
+  // is pinned in tests/accounting/reset-binding-lock-order.test.ts, which drives the real action. What
+  // is checked here is only that the writer goes through the one helper, because that is this file's
+  // subject.
   const reset = readFileSync('app/actions/reset.ts', 'utf8')
     .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
   const wipe = reset.slice(reset.indexOf('lockIntegrationPluginSelection(tx)'))
-  assert.ok(wipe.indexOf('tx.setting.deleteMany') < wipe.indexOf('tx.accountingToken.deleteMany'),
-    'it still deletes the settings (the pin among them) before the token row')
+  assert.match(wipe, /runOrderedAccountingBindingWrites\(\{/,
+    'the wipe takes the binding rows through the one order like every other writer')
+  assert.ok(!/tx\.setting\.deleteMany\(\{\}\)/.test(wipe),
+    'and no bare whole-table settings delete is left to acquire them in scan order')
+  assert.match(wipe, /notIn: \[\.\.\.ACCOUNTING_BINDING_SETTING_KEYS\]/,
+    'the bulk delete that follows excludes them, so it cannot re-enter the cycle one statement later')
+})
 
-  // The provisioner's `clearTenantPin` acquires in the canonical order too, but its sequence is
-  // forced by data dependence — the pin DELETE's `RETURNING` feeds the token UPDATE, whose own
-  // `RETURNING` feeds the witness INSERT — so there is no order left for a helper to choose.
+test('o3d-2w2j r2: the ONE writer still not routed through it, re-checked rather than restated', () => {
+  // The provisioner's `clearTenantPin` was the other stated exclusion, and after one exclusion proved
+  // wrong the remaining one is worth no benefit of the doubt. It survives, and the reason is
+  // verifiable rather than asserted: the sequence is FORCED BY DATA DEPENDENCE, and the order it is
+  // forced into is the canonical one.
+  //
+  //   1. the pin DELETE's `returning value` feeds `cleared`,
+  //   2. `cleared` is the parameter of the token UPDATE, whose own `returning` feeds `stamped.rows`,
+  //   3. and `row.pinReleasedGeneration` from those rows is what the witness INSERT is built from.
+  //
+  // There is no order left for a helper to choose, and the thunks the helper takes cannot carry a
+  // value from one step to the next in any case. All three positions are checked, not just the first
+  // two: an unchecked third is exactly how the reset's exclusion went unexamined.
   const provision = readFileSync('scripts/provision-xero-demo.ts', 'utf8')
   const clear = provision.slice(provision.indexOf('async function clearTenantPin('))
   const del = clear.indexOf("delete from settings where key = 'xero_expected_tenant_id'")
   const upd = clear.indexOf('update accounting_tokens')
+  const ins = clear.indexOf("insert into settings (key, value, \"updatedAt\") values ('xero_pin_release_witness'")
   assert.ok(del > -1 && upd > del, 'the pin is deleted before the token row is stamped')
+  assert.ok(ins > upd, 'and the witness is written after it — pin, token, witness, the canonical order')
+
+  // THE DEPENDENCE ITSELF, which is the whole of the exclusion's argument.
+  assert.match(clear.slice(del, upd), /returning value/, 'the pin DELETE returns what the UPDATE needs')
+  assert.match(clear.slice(upd, ins), /returning "tenantId", "pinReleasedTenantId", "pinReleasedGeneration"/,
+    'and the UPDATE returns what the witness INSERT is built from')
+  assert.match(clear.slice(ins), /row\.pinReleasedGeneration/,
+    'which it really does use, so the third step depends on the second')
 })

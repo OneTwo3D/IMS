@@ -23,7 +23,8 @@ const QBO_CONNECTOR = 'quickbooks'
 const QBO_OAUTH_STATE_PREFIX = 'qbo_oauth_state:'
 const QBO_OAUTH_STATE_TTL_MS = 10 * 60 * 1000 // 10 minutes
 const QBO_SCOPES = 'com.intuit.quickbooks.accounting openid profile email'
-const QBO_EXPECTED_REALM_KEY = 'quickbooks_expected_realm_id'
+/** Exported so the binding-lock-order test can check it against that module's own list (o3d-2w2j r2). */
+export const QBO_EXPECTED_REALM_KEY = 'quickbooks_expected_realm_id'
 const REFRESH_EARLY_MS = 2 * 60 * 1000
 
 type TokenResponse = {
