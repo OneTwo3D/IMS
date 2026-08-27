@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
-import { decideCreateClaim } from '../lib/domain/wms/order-push-sweep.ts'
+/**
+ * o3d-2k5r r6: order-push-sweep is loaded LAZILY, after `mock.module('@/lib/db')` has run.
+ *
+ * A static import here is evaluated before any mock is registered, so the copy of the sweep module
+ * this file would hold binds the REAL Prisma client — and the action now reaches into that module
+ * for the shared create predicate, which would then try to open a Postgres connection from a unit
+ * test. The lazy accessor is what keeps the mocked db the only one in play.
+ */
+const decideCreateClaim = async (...args: Parameters<
+  typeof import('../lib/domain/wms/order-push-sweep.ts')['decideCreateClaim']
+>) => (await import('../lib/domain/wms/order-push-sweep.ts')).decideCreateClaim(...args)
 
 /**
  * o3d-2k5r r5 — `repushMissingWmsOrder` IS THE FIFTH WRITER THAT RE-OPENS A WMS CREATE, and it was
@@ -34,6 +44,53 @@ const state = {
   activity: [] as Row[],
   /** Runs once, after the action's reads and before its write — how a test moves the world. */
   mutateBeforeWrite: null as (() => void) | null,
+  /**
+   * o3d-2k5r r6: runs once when the WRITE TRANSACTION opens — after every read the action made
+   * while deciding, before the eligibility it re-proves under the row lock. This is the window the
+   * in-transaction check exists for: a binding deactivated between the page and the click.
+   */
+  mutateInTransaction: null as (() => void) | null,
+  /** The sales order the shared create predicate is evaluated against. */
+  order: null as Row | null,
+  /** Warehouses the ACTIVE connector currently has an active binding for. */
+  bindings: [] as Array<{ warehouseId: string }>,
+}
+
+/**
+ * o3d-2k5r r6 — a strict evaluator for the SHARED create predicate.
+ *
+ * Deliberately generic over whatever `wmsCreateEligibleOrderWhere` produces, and it THROWS on an
+ * operator it does not implement. A fence added to create-eligibility.ts therefore either works
+ * here or fails this suite loudly; a double that silently ignored unknown keys would report every
+ * new fence as satisfied, which is the failure mode this whole finding is about.
+ */
+function matchesOrderWhere(row: Row, where: Row): boolean {
+  for (const [key, cond] of Object.entries(where)) {
+    const actual = row[key]
+    if (cond === null) {
+      if (actual !== null && actual !== undefined) return false
+      continue
+    }
+    if (cond instanceof Date || typeof cond !== 'object') {
+      if (actual !== cond) return false
+      continue
+    }
+    const c = cond as Row
+    if ('in' in c) {
+      if (!(c.in as unknown[]).includes(actual)) return false
+      continue
+    }
+    if ('not' in c) {
+      if (c.not === null) {
+        if (actual === null || actual === undefined) return false
+        continue
+      }
+      if (actual === c.not) return false
+      continue
+    }
+    throw new Error(`the create predicate grew an operator this double does not implement: ${key} ${JSON.stringify(cond)}`)
+  }
+  return true
 }
 
 function matches(row: Row, where: Row): boolean {
@@ -99,6 +156,24 @@ const client = {
       return { count: 1 }
     },
   },
+  salesOrder: {
+    findMany: async ({ where }: { where: Row }) => {
+      const { id, ...fences } = where
+      const ids = id && typeof id === 'object' && 'in' in (id as Row) ? ((id as Row).in as string[]) : [id as string]
+      if (!state.order || !ids.includes(state.order.id as string)) return []
+      return matchesOrderWhere(state.order, fences) ? [{ id: state.order.id }] : []
+    },
+    findFirst: async ({ where }: { where: Row }) => {
+      const { id, ...fences } = where
+      if (!state.order || state.order.id !== id) return null
+      return matchesOrderWhere(state.order, fences) ? { id: state.order.id } : null
+    },
+  },
+  externalWmsBinding: {
+    findMany: async () => state.bindings,
+  },
+  // The `SELECT ... FOR UPDATE` the in-transaction eligibility check takes on the sales order.
+  $queryRaw: async () => (state.order ? [{ id: state.order.id }] : []),
   wmsOrderPushLink: {
     findUnique: async () => state.link,
     updateMany: async ({ where, data }: { where: Row; data: Row }) => {
@@ -116,6 +191,8 @@ mock.module('@/lib/db', {
     db: {
       ...client,
       $transaction: async (fn: (tx: typeof client) => Promise<unknown>) => {
+        state.mutateInTransaction?.()
+        state.mutateInTransaction = null
         journal.length = 0
         journalling = true
         try {
@@ -149,6 +226,17 @@ function reset(over: Row = {}, connector = 'mintsoft') {
   state.probed = []
   state.activity = []
   state.mutateBeforeWrite = null
+  state.mutateInTransaction = null
+  state.bindings = [{ warehouseId: 'wh-1' }]
+  state.order = {
+    id: 'so-1',
+    status: 'PROCESSING',
+    paidAt: PUSHED,
+    refundStatus: 'NONE',
+    withdrawalHoldAt: null,
+    withdrawalApprovedAt: null,
+    shipFromWarehouseId: 'wh-1',
+  }
   state.finding = { orderId: 'so-1', category: 'MISSING_IN_WMS', status: 'OPEN', connector }
   state.link = {
     id: 'link-1',
@@ -160,7 +248,7 @@ function reset(over: Row = {}, connector = 'mintsoft') {
     externalOrderNumber: 'SO-1',
     pushedAt: PUSHED,
     lastAttemptAt: STAMP,
-    order: { id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'PROCESSING', paidAt: PUSHED, refundStatus: 'NONE' },
+    order: { id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null },
     ...over,
   }
 }
@@ -189,7 +277,7 @@ test('o3d-2k5r r5 repush: a NULL-STAMP ShipHero link is refused too — the bypa
   // so the sweep re-dispatched the create on the presence probe ALONE — the two-key rule skipped.
   // The refusal is a property of the CONNECTOR, so the stamp cannot route around it.
   reset({ lastAttemptAt: null }, 'shiphero')
-  assert.equal(decideCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: null }, new Date()), 'CLAIM',
+  assert.equal(await decideCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: null }, new Date()), 'CLAIM',
     'precondition: a null stamp is exactly what the sweep would have granted a create on')
 
   const result = await (await repush())('so-1')
@@ -219,7 +307,7 @@ test('o3d-2k5r r5 repush: a replay-safe connector re-queues, and CLEARS the stam
   // parks the link that was just re-queued.
   assert.equal(link.lastAttemptAt, null)
   assert.equal(
-    decideCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: link.lastAttemptAt as Date | null }, new Date()),
+    await decideCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: link.lastAttemptAt as Date | null }, new Date()),
     'CLAIM',
     'the re-queued link must be claimable — a stamp left on would make this PARK_AMBIGUOUS',
   )
@@ -295,14 +383,99 @@ test('o3d-2k5r r5 repush: a link that is not a settled push has no missing wareh
   assert.deepEqual(state.probed, [])
 })
 
+// --- o3d-2k5r r6: the COMPLETE create predicate, not three of its six fences ---------------
+
 test('o3d-2k5r r5 repush: an order the create pass would not select is refused, finding kept', async () => {
   // Codex r30 P1: resetting the link for a PICKING order resolves the finding while the order is
   // never re-created — it silently never fulfils.
+  //
+  // Route: wmsCreateEligibleOrderIds evaluates the SHARED where-clause against the order (status
+  // fails `in [PROCESSING, ALLOCATED]`) -> decideWmsMissingRepush answers `not-create-eligible`.
+  //
+  // Mutation: drop `status` from WMS_CREATE_ELIGIBLE_ORDER_FENCES and this fails — which is the
+  // point of routing it through the shared constant rather than an inline check: the assertion now
+  // guards the predicate every reader uses, not a copy of it living in this action.
   reset()
-  ;(state.link!.order as Row).status = 'PICKING'
+  state.order!.status = 'PICKING'
   const result = await (await repush())('so-1')
 
   assert.equal(result.success, false)
-  assert.match(result.error!, /paid, ready \(Processing\/Allocated\) orders/)
+  assert.match(result.error!, /paid and ready \(Processing\/Allocated\)/)
   assert.equal(state.finding!.status, 'OPEN')
+  assert.deepEqual(state.probed, [], 'and no connector call is spent on a decision already made')
+})
+
+test('o3d-2k5r r6 repush: an order whose warehouse binding was DISABLED is refused, not silently stranded', async () => {
+  // THE FINDING. The action checked status, paidAt and refundStatus by hand and stopped there, so
+  // an order whose binding had been deactivated since the discrepancy was raised probed clean, had
+  // its link reset, had the finding RESOLVED, and returned success — while `createCandidates`
+  // (which filters `shipFromWarehouseId in boundWarehouseIds`) never selected it again. Nothing
+  // could raise it either: MISSING_IN_WMS scans settled links, NOT_PUSHED scans actively bound
+  // warehouses. The order simply disappeared.
+  //
+  // Route: activeBoundWarehouseIds returns nothing -> the shared predicate matches nothing ->
+  // refused before the probe.
+  //
+  // Mutation: restore the hand-written status/paidAt/refundStatus check in place of
+  // `wmsCreateEligibleOrderIds` and this fails on all three assertions — the order is reset and the
+  // finding resolved, exactly as before.
+  reset()
+  state.bindings = []
+  const result = await (await repush())('so-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.error!, /ACTIVE binding/)
+  assert.equal(state.finding!.status, 'OPEN', 'the finding is the only trace of this order — it stays')
+  assert.equal(state.link!.state, 'SYNCED', 'and the link is untouched')
+})
+
+test('o3d-2k5r r6 repush: an order moved to an UNBOUND warehouse is refused', async () => {
+  // Route: the binding list is non-empty but does not contain the order's ship-from warehouse, so
+  // `shipFromWarehouseId: { in: [...] }` fails.
+  //
+  // Mutation: drop `shipFromWarehouseId` from wmsCreateEligibleOrderWhere and this fails — the
+  // fence that distinguishes "this connector fulfils from that warehouse" from "any warehouse".
+  reset()
+  state.order!.shipFromWarehouseId = 'wh-OTHER'
+  const result = await (await repush())('so-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.error!, /ACTIVE binding/)
+  assert.equal(state.finding!.status, 'OPEN')
+})
+
+test('o3d-2k5r r6 repush: a customer WITHDRAWAL fence refuses the re-push', async () => {
+  // Route: `withdrawalHoldAt: null` fails. o3d-e1yb — an order the customer has asked to withdraw
+  // must never re-enter fulfilment, and the re-push is a fulfilment path like any other.
+  //
+  // Mutation: drop either withdrawal fence from WMS_CREATE_ELIGIBLE_ORDER_FENCES and one of these
+  // two halves fails. The approval half is separate on purpose: a DIRECT approval records only the
+  // approval fact until its cancellation finishes, so the hold alone leaves a window.
+  reset()
+  state.order!.withdrawalHoldAt = new Date('2026-08-25T09:00:00.000Z')
+  assert.equal((await (await repush())('so-1')).success, false)
+
+  reset()
+  state.order!.withdrawalApprovedAt = new Date('2026-08-25T09:00:00.000Z')
+  assert.equal((await (await repush())('so-1')).success, false)
+  assert.equal(state.finding!.status, 'OPEN')
+})
+
+test('o3d-2k5r r6 repush: eligibility lost between the read and the write rolls the whole thing back', async () => {
+  // A render-time answer is a statement about the past. Route: every read passes, the transaction
+  // opens, the binding is deactivated inside that window, `isWmsCreateEligibleForUpdate` (under the
+  // sales order's row lock) answers false -> throw -> the finding resolution rolls back with it.
+  //
+  // Mutation: move the in-transaction check outside `db.$transaction`, or delete it, and this fails
+  // on the finding's status: it would be RESOLVED while the link reset was never going to help. The
+  // finding vanishing from the inbox is the whole harm — the order becomes invisible to every
+  // sweep that could have raised it again.
+  reset()
+  state.mutateInTransaction = () => { state.bindings = [] }
+  const result = await (await repush())('so-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.error!, /ACTIVE binding/)
+  assert.equal(state.finding!.status, 'OPEN', 'rolled back with the refusal')
+  assert.equal(state.link!.state, 'SYNCED')
 })

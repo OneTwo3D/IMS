@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+
+/**
+ * o3d-1izw — DEPLOYMENT FAILS CLOSED WHEN THE DATABASE HAS NOT HEARD OF A STATE THIS BUILD WRITES.
+ *
+ * `scripts/deploy.sh` normally applies migrations and then runs check-prisma-drift, so an ordinary
+ * deploy cannot leave the code ahead of the schema. `deploy.sh --skip-migrate` skips both, and so
+ * does any environment served straight from a working tree by `next dev`. Those are the two ways
+ * this branch reaches an environment ahead of its own schema, and this check is what makes the
+ * first of them refuse instead of shipping a build whose first lapsed create claim fails at the
+ * database and keeps failing on every later sweep.
+ *
+ * Deliberately narrow and cheap: one query against pg_enum, no Prisma engine, no migration state.
+ * It answers the single question "can this build write what it is about to write?".
+ */
+
+import { config as loadDotenv } from 'dotenv'
+
+loadDotenv({ path: '.env.local', override: false, quiet: true })
+loadDotenv({ path: '.env', override: false, quiet: true })
+
+const ENUM = 'WmsOrderPushState'
+const MIGRATION = '20260827090000_wms_push_ambiguous_create'
+const REQUIRED = ['AMBIGUOUS_CREATE']
+
+const databaseUrl = process.env.DATABASE_URL
+if (!databaseUrl) {
+  console.error(`FAIL ${ENUM}: DATABASE_URL is not set, so the database's enum vocabulary cannot be read.`)
+  console.error('Refusing rather than assuming it is fine — see o3d-1izw.')
+  process.exit(1)
+}
+
+const { Client } = await import('pg')
+const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 10_000 })
+
+let labels
+try {
+  await client.connect()
+  const result = await client.query(
+    'SELECT e.enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = $1',
+    [ENUM],
+  )
+  labels = result.rows.map((row) => row.enumlabel)
+} catch (error) {
+  console.error(`FAIL ${ENUM}: could not read the enum (${error instanceof Error ? error.message : String(error)}).`)
+  console.error('An unreadable catalogue is not a clean one — see o3d-1izw.')
+  process.exit(1)
+} finally {
+  await client.end().catch(() => undefined)
+}
+
+const missing = REQUIRED.filter((value) => !labels.includes(value))
+if (missing.length > 0) {
+  console.error(`FAIL ${ENUM}: this database is missing ${missing.join(', ')}.`)
+  console.error(`Migration ${MIGRATION} has not been applied here. The WMS order-push sweep will refuse to run`)
+  console.error('until it is. Apply it with:')
+  console.error('  npx prisma migrate deploy --schema prisma/schema.prisma')
+  console.error('  node scripts/check-prisma-drift.mjs')
+  console.error('Release gate: o3d-1izw.')
+  process.exit(1)
+}
+
+console.log(`PASS ${ENUM}: ${REQUIRED.join(', ')} present.`)

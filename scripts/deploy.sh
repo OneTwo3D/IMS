@@ -87,6 +87,18 @@ if ! $SKIP_MIGRATE; then
   info "Validating database schema..."
   node scripts/check-prisma-drift.mjs
   ok "Database schema matches prisma/schema.prisma."
+elif ! $RESTART_ONLY; then
+  # o3d-1izw: --skip-migrate applies nothing and validates nothing, which is how a build reaches an
+  # environment whose database does not have the push states it writes. The narrow check below is
+  # cheap enough to run on every such deploy and refuses rather than shipping code whose first
+  # lapsed create claim fails at the database and keeps failing on every sweep after.
+  #
+  # --restart-only is deliberately exempt: it delivers no new code, so it cannot introduce this
+  # mismatch, and an emergency bounce must not be blocked by a database read. The running build is
+  # covered by the sweep's own preflight gate, which refuses before it writes anything.
+  info "Skipping migrations — verifying the database can hold what this build writes..."
+  node scripts/check-wms-push-state-enum.mjs
+  ok "WMS push-state vocabulary present."
 fi
 
 # ---------------------------------------------------------------------------

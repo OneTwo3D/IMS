@@ -156,3 +156,59 @@ test('o3d-2k5r r5 row: a MISSING_IN_WMS drift row carries the re-push affordance
     assert.equal(row.repushRefusal, null, category)
   }
 })
+
+// --- o3d-2k5r r6: the control cannot render for an order the sweep would not select --------
+
+test('o3d-2k5r r6 row: an INELIGIBLE order gets no Re-push control, even on a replay-safe connector', async () => {
+  // The affordance and the action have to refuse for the SAME reasons, or the operator gets a
+  // button that always fails. `createEligible` is the shared create predicate's own verdict — the
+  // where-clause `createCandidates` selects on, evaluated by the database — so a disabled warehouse
+  // binding takes the button away instead of producing a click that resets the link, resolves the
+  // finding and strands the order.
+  //
+  // Route: decideWmsMissingRepush -> connector policy passes (mintsoft) -> createEligible false ->
+  // `not-create-eligible`.
+  //
+  // Mutation: default `createEligible` to true in decideWmsMissingRepush (or drop the branch) and
+  // this fails on `repushable` — the row renders the control for an order nothing will ever push.
+  const { buildOrderReconcileDriftRow, decideWmsMissingRepush } = await import('../lib/domain/wms/push-recovery-affordance.ts')
+  const row = buildOrderReconcileDriftRow({
+    orderId: 'so-1',
+    connector: 'mintsoft',
+    category: 'MISSING_IN_WMS',
+    detail: null,
+    externalOrderNumber: 'WMS-1',
+    lastSeenAt: new Date('2026-08-20T09:00:00.000Z'),
+    order: { id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null },
+    createEligible: false,
+  })
+  assert.equal(row.repushable, false)
+  assert.match(row.repushRefusal!, /ACTIVE binding/)
+  assert.match(row.repushRefusal!, /SO-1/, 'and it names the order the operator has to go and fix')
+
+  // The connector contract is still asked FIRST, so a ShipHero row says the duplicate thing rather
+  // than the eligibility thing — the two refusals have different remedies.
+  const shiphero = decideWmsMissingRepush({ connector: 'shiphero', reference: 'SO-1', createEligible: false })
+  assert.equal(shiphero.repushable, false)
+  assert.equal(shiphero.repushable === false ? shiphero.reason : '', 'create-not-repeatable')
+})
+
+test('o3d-2k5r r6 wiring: the inbox feeds the row the DATABASE\'s eligibility verdict, not a default', async () => {
+  // A shared rule nobody passes real evidence to is a shared rule that always says yes. This
+  // asserts the one thing the pure test above cannot: that `loadOrderReconcileDrift` computes
+  // eligibility with the shared query and hands it to the row builder.
+  //
+  // Route: loadOrderReconcileDrift -> wmsCreateEligibleOrderIds(activeConnector, missing ids) ->
+  // buildOrderReconcileDriftRow({ ...row, createEligible }).
+  //
+  // Mutation: pass `createEligible: true` (or drop the query and default it) and this fails —
+  // which is exactly how the previous round's fix looked complete while the affordance still
+  // rendered for orders the sweep would never select.
+  const { readFile } = await import('node:fs/promises')
+  const source = await readFile(new URL('../app/actions/sync-exceptions.ts', import.meta.url), 'utf8')
+  const start = source.indexOf('async function loadOrderReconcileDrift(')
+  assert.notEqual(start, -1)
+  const body = source.slice(start, source.indexOf('\n}\n', start))
+  assert.match(body, /await wmsCreateEligibleOrderIds\(/)
+  assert.match(body, /createEligible: eligible\.has\(row\.orderId\)/)
+})
