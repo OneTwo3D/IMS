@@ -1916,7 +1916,12 @@ fi
 if $NEW_BUILD_SERVING || $DEV_RESPONDER_PROVEN || $DRY_RUN; then
   PAST_POINT_OF_NO_RETURN=true
 fi
+# BOTH phase flags come down together. Leaving CUTOVER_ARMING raised here would send a
+# failure in the cleanup below — on the one path that reaches it without arming the point of
+# no return — into the PRE-STOP branch of the trap, which would report a predecessor that was
+# never stopped and unwind a fence that is already gone.
 FENCE_ARMED=false
+CUTOVER_ARMING=false
 
 CURRENT_STEP="unfence-cron"
 step "Restore the cron writers"

@@ -2329,7 +2329,11 @@ fi
 # is spliced in — splicing into a fenced crontab would preserve the commented-out lines
 # and leave the queue workers silently off.
 unfence_cron
+# Both phase flags come down together: leaving CUTOVER_ARMING raised would send a failure in
+# the rest of the installer into the PRE-STOP branch of the trap, which would report a
+# service that was never stopped and unwind a fence that is already gone.
 FENCE_ARMED=false
+CUTOVER_ARMING=false
 if ${UPGRADE_EXISTING}; then
   success "Upgrade cutover complete: every fence is down."
 fi

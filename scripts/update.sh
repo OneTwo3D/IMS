@@ -1371,7 +1371,11 @@ fi
 if $NEW_BUILD_SERVING || $DRY_RUN; then
   PAST_POINT_OF_NO_RETURN=true
 fi
+# Both phase flags come down together: leaving CUTOVER_ARMING raised would send a failure in
+# the cleanup below into the PRE-STOP branch of the trap, which would report an old version
+# that was never stopped and unwind a fence that is already gone.
 FENCE_ARMED=false
+CUTOVER_ARMING=false
 
 CURRENT_STEP="unfence-cron"
 # Cron goes back last, and only once the new version has answered: restoring the

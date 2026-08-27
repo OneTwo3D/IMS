@@ -1802,6 +1802,16 @@ for (const entry of ARMING_ORDER) {
       'fence_cron must run INSIDE the reversible phase: every way it can fail used to be reported as a post-stop failure, and answered by stopping a healthy service',
     )
     assert.ok(armed < stop, 'and FENCE_ARMED must be raised before anything is actually stopped')
+
+    // And the phase is CLOSED where the cutover ends. A CUTOVER_ARMING left raised past that
+    // point sends a cleanup failure into the pre-stop branch, which would report a
+    // predecessor that was never stopped and unwind a fence that is already gone.
+    const disarmed = requireCodeLine(lines, /^\s*CUTOVER_ARMING=false\s*$/, stop, 'the arming phase must be closed when the cutover ends')
+    const fenceDown = requireCodeLine(lines, /^\s*FENCE_ARMED=false\s*$/, stop, 'as must the stopping phase')
+    assert.ok(
+      Math.abs(disarmed - fenceDown) <= 2,
+      'the two phase flags must come down together, or there is a window in which both branches of the trap are wrong',
+    )
   })
 }
 
@@ -1837,6 +1847,7 @@ CRON_BACKUP="\${STATE_DIR}/crontab.bak"
 FENCE_DROPIN_DIR="\${STATE_DIR}/dropin"
 FENCE_DROPIN_FILE="\${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
 FENCE_DROPINS_CREATED=("\${FENCE_DROPIN_FILE}")
+FENCE_DROPIN_NAME=zz-deploy-fence.conf
 FENCE_MARKER_PREEXISTED=false
 SERVICE_UNITS=(app.service)
 DB_FENCE_STATE="\${STATE_DIR}/db.json"
@@ -1942,8 +1953,12 @@ function runTrapHarness(
       shellFunction(entry.source, entry.trap),
       state,
       // `(exit 7) || trap` gives the trap the $? a real failure would, and the subshell
-      // absorbs its own `exit` so the harness can still read the files afterwards.
-      `( (exit 7) || ${entry.trap} ) || true`,
+      // absorbs its own `exit` so the harness can still read the files afterwards. The
+      // status is echoed because a trap that dies early — an unbound variable under
+      // `set -u`, say — otherwise looks exactly like a trap that deliberately did nothing.
+      'TRAP_STATUS=0',
+      `( (exit 7) || ${entry.trap} ) || TRAP_STATUS=$?`,
+      'echo "TRAP_EXIT=${TRAP_STATUS}"',
     ].join('\n')
     const stdout = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
     return {
@@ -1980,6 +1995,7 @@ for (const entry of ARMING_TRAP_CASES) {
     assert.equal(result.markerExists, false, 'the reboot-fence marker this run wrote must be removed, or the next boot is refused')
     assert.equal(result.dropinExists, false, 'and so must the drop-in')
     assert.match(result.stdout, /BEFORE THE STOP/, 'and the operator must be told which kind of failure this was')
+    assert.match(result.stdout, /TRAP_EXIT=7/, 'the trap must run to its end and preserve the failure status')
   })
 
   test(`${entry.name}'s trap still tears down a POST-stop failure — the pre-stop branch is not a hole`, () => {
@@ -1997,6 +2013,7 @@ for (const entry of ARMING_TRAP_CASES) {
     )
     assert.equal(result.markerExists, true, 'the marker stays: the next run adopts it')
     assert.match(result.stdout, /AFTER THE STOP/, 'and the banner says so')
+    assert.match(result.stdout, /TRAP_EXIT=7/, 'the trap must run to its end and preserve the failure status')
   })
 }
 
@@ -2166,7 +2183,11 @@ test('docs/installation.md describes the build-id policy deploy.sh actually impl
   // The escape hatch the runbook names must be one the script reads.
   const documentedHatch = /IMS_ALLOW_UNIDENTIFIED_DEV_RESPONDER/.test(doc)
   assert.equal(documentedHatch, true, 'the dev path is fatal, so the runbook must document the one deliberate way past it')
-  assert.match(source, /IMS_ALLOW_UNIDENTIFIED_DEV_RESPONDER/, 'and the script must actually read it')
+  assert.match(
+    source,
+    /\$\{IMS_ALLOW_UNIDENTIFIED_DEV_RESPONDER:-/,
+    'and the script must actually READ it from the environment, not merely name it in a message',
+  )
 
   // And the phase model the trap implements must be the one the runbook describes.
   assert.match(doc, /CUTOVER_ARMING/, 'the runbook must describe the reversible pre-stop phase')
