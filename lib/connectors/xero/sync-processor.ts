@@ -6314,12 +6314,24 @@ export async function repairXeroBackReferences(limit = DEFAULT_BACK_REFERENCE_SW
     // stamped the row checked and cleared `backReferenceFollowUpsPendingAt` over unqueued money.
     // Permanently: a stamped row is never a candidate again.
     //
-    // `FollowUpOutcome` and `BackReferenceFollowUpOutcome` are structurally identical, so this is a
-    // direct return rather than a translation. They are two declarations on purpose — the sweep is
-    // connector-agnostic and must state its own contract — and if they ever diverge, this line is
-    // where the compiler says so.
-    enqueueFollowUps: (entryId, type, referenceType, referenceId, payload, syncResult, origin) =>
-      enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult, origin),
+    // IT IS NOW PASSED BY REFERENCE, WITH NO ADAPTER AT ALL — that is the point, not a tidy-up.
+    // Widening the type does not close this on its own: an `async` wrapper that awaits the call and
+    // returns a hardcoded `{ deferredReceiptsSettled: true }` satisfies the new signature exactly as
+    // happily as the old `void` one did, and it is the SAME line of code that was wrong before.
+    // (Verified: that mutation type-checks clean.) Handing over the function itself leaves nothing in
+    // between that could drop, fabricate or narrow the answer, and lets the binding seam assert it by
+    // IDENTITY — see tests/connectors/backreference-sweep-bindings.test.ts.
+    //
+    // It also removes the last place the ORIGIN record (o3d-bqw7 r2) could be dropped on its way to
+    // the enqueue: there is no longer a parameter list here to forget to forward it through.
+    //
+    // The wrapper only ever existed for a `payload as SyncPayload` cast, and `SyncPayload` IS
+    // `Record<string, unknown>` — the sweep's own parameter type — so the cast was doing nothing.
+    // `FollowUpOutcome` and `BackReferenceFollowUpOutcome` are likewise structurally identical, as are
+    // `AccountingOriginRecord` and the sweep's own origin parameter; they are separate declarations on
+    // purpose, because the sweep is connector-agnostic and must state its own contract, and if they
+    // ever diverge this line is where the compiler says so.
+    enqueueFollowUps,
   }, { limit })
 }
 

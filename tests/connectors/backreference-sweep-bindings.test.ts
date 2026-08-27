@@ -69,6 +69,38 @@ test('[o3d-9kek] the Xero sweep binding passes a persisted cursor store and the 
   assert.equal(deps.logActivity, logActivityPersisted, 'the deferral needs a CONFIRMED warning')
 })
 
+test('[o3d-0bfh] the Xero sweep binding hands over enqueueFollowUps ITSELF, not an adapter around it', async () => {
+  // The sweep releases the follow-up obligation on this dependency's answer. It used to be
+  // `Promise<void>`, and the binding was an `async` arrow that awaited the real call and dropped its
+  // `FollowUpOutcome` — so a deferred receipt that could not be registered (which NEVER throws, by
+  // design) came back as success and the sweep stamped the row checked with the money unqueued.
+  //
+  // WIDENING THE TYPE DOES NOT CLOSE THAT ON ITS OWN, which is why this test exists rather than
+  // resting on the compiler: an adapter that awaits the call and returns a hardcoded
+  // `{ deferredReceiptsSettled: true }` satisfies the new signature exactly as well, and it is the
+  // same line of code that was wrong before. Nothing in between is the only version with no room for
+  // it. The sweep's own tests inject their own dep, so they cannot see this.
+  //
+  // Asserted by IDENTITY ACROSS TWO INVOCATIONS: a module-level function is the same object every
+  // time, whereas an arrow written inline in the binding is a fresh closure per call. A residual,
+  // stated rather than implied — an adapter hoisted to a module-level const would pass this — but it
+  // catches the shape that was actually there and the natural way it would come back.
+  captured.length = 0
+  const mod = await import('@/lib/connectors/xero/sync-processor')
+  await mod.repairXeroBackReferences()
+  await mod.repairXeroBackReferences()
+
+  assert.equal(captured.length, 2)
+  const [first, second] = captured
+  assert.equal(typeof first.deps.enqueueFollowUps, 'function')
+  assert.equal(
+    first.deps.enqueueFollowUps,
+    second.deps.enqueueFollowUps,
+    'a per-call closure here is an adapter, and an adapter is where the outcome went missing',
+  )
+  assert.equal((first.deps.enqueueFollowUps as { name: string }).name, 'enqueueFollowUps')
+})
+
 test('[o3d-9kek r6] QuickBooks exports NO back-reference sweep binding, and never runs the sweep', async () => {
   captured.length = 0
   cursorStoreConnectors.length = 0
