@@ -433,3 +433,83 @@ test('o3d-1izw: the out-of-process gates align their search path with Prisma\'s'
     assert.match(source, /\.\.\.pgSearchPathOptions\(databaseUrl\)/, `${relative} aligns its search path`)
   }
 })
+
+test('o3d-1izw: on a non-public `?schema=` URL the RUNTIME resolves what the two external gates resolve', async () => {
+  // THE R7 FINDING, AS A TEST. Round 7 aligned the deploy check and the production preflight to the
+  // URL's schema — with each other. The application was left out: `new PrismaPg(dbPoolConfig())`
+  // passed no `{ schema }`, so `getConnectionInfo()` reported no `schemaName`; and the pool carried
+  // no startup `options`, so its connections ran on the server-default `search_path` — which is
+  // exactly what `to_regclass($1)` in the shared statement resolves through. Both release gates
+  // could therefore inspect and PASS `ims_app.wms_order_push_links` while the runtime looked
+  // elsewhere, and the runtime gate would refuse after deployment: a WMS fulfilment outage with two
+  // green gates. A gate has to be aligned to the thing it checks, not to the other gates.
+  //
+  // Route: DATABASE_URL=...?schema=ims_app -> lib/db/database-url-schema.mjs `databaseUrlSchema`
+  // -> (a) `pgSearchPathOptions` -> `dbPoolConfig().options` -> the pg Pool's startup search_path,
+  //    which the runtime gate's `$queryRawUnsafe` resolves through;
+  //    (b) `prismaAdapterSchemaOptions` -> `createDbAdapter()`'s second argument -> PrismaPg
+  //    `getConnectionInfo().schemaName`, which qualifies Prisma's generated queries;
+  //    compared against the value the two external clients spread in, read here through the WMS
+  //    module those two gates import it from.
+  //
+  // Mutation, either half: drop the second argument from `createDbAdapter()` and `schemaName` is
+  // `undefined`; drop the `...pgSearchPathOptions(...)` spread from `dbPoolConfig()` and both pool
+  // assertions fail. In BOTH cases the external gates still pass unchanged — which is the finding.
+  const before = process.env.DATABASE_URL
+  const url = 'postgresql://u:p@localhost:5432/ims?schema=ims_app'
+  process.env.DATABASE_URL = url
+  try {
+    const { createDbAdapter, dbPoolConfig } = await import('@/lib/db')
+    // Deliberately imported from the WMS module the deploy check and the preflight import it from,
+    // so this compares the runtime against THEIR source of truth rather than against a third copy.
+    const { pgSearchPathOptions } = await import('../lib/domain/wms/push-state-enum-query.mjs')
+
+    const external = pgSearchPathOptions(url)
+    assert.equal(
+      external.options, '-c search_path="ims_app"',
+      'the external gates put the URL\'s schema on their own connection',
+    )
+
+    // 1. THE RAW-QUERY SEARCH PATH. This is the one the o3d-1izw runtime gate actually resolves
+    //    through, and `PrismaPg`'s `{ schema }` option does NOT cover it — it qualifies generated
+    //    queries only, never `$queryRaw*`.
+    assert.equal(
+      dbPoolConfig().options, external.options,
+      'the runtime pool starts every connection on the same search_path the external gates use',
+    )
+
+    // 2. THE ADAPTER'S SCHEMA. Built through the exact factory production uses — not re-described
+    //    here — and connected, which for `pg` is lazy and opens no socket.
+    const adapter = await createDbAdapter().connect()
+    try {
+      assert.equal(
+        adapter.getConnectionInfo().schemaName, 'ims_app',
+        'the runtime adapter reports the URL\'s schema, so generated queries are qualified with it',
+      )
+      const pool = adapter.underlyingDriver() as unknown as { options?: { options?: string } }
+      assert.equal(
+        pool.options?.options, external.options,
+        'and the pool the adapter built for itself carries that startup search_path',
+      )
+    } finally {
+      await adapter.dispose()
+    }
+
+    // NON-VACUITY / no behaviour change where there is nothing to align. A URL naming no schema
+    // leaves all three exactly as they were: Prisma and pg both use the server default, so they
+    // already agree, and guessing `public` here would be a change dressed up as a fix. Without
+    // this, a `pgSearchPathOptions` that returned the ims_app options unconditionally would satisfy
+    // everything above.
+    process.env.DATABASE_URL = 'postgresql://u:p@localhost:5432/ims'
+    assert.equal(dbPoolConfig().options, undefined)
+    const plain = await createDbAdapter().connect()
+    try {
+      assert.equal(plain.getConnectionInfo().schemaName, undefined)
+    } finally {
+      await plain.dispose()
+    }
+  } finally {
+    if (before === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = before
+  }
+})
