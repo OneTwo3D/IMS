@@ -20,6 +20,12 @@ import {
 } from '@/lib/maintenance-mode'
 import { runPostMaintenanceRecheckForActiveConnector } from '@/lib/domain/wms/post-maintenance-recheck'
 import { eligibleCohortDigest, isolatableLinkWhere, loadUnresolvedDriftIncidents, readRawDriftState, unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
+import {
+  decideWmsMissingRepush,
+  decideWmsPushReplay,
+  describeBlockedWmsPush,
+} from '@/lib/domain/wms/push-recovery-affordance'
+import { wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugins'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity } from '@/lib/activity-log'
@@ -180,11 +186,24 @@ export type WmsPushDeadLetterRow = {
   orderId: string
   orderNumber: string | null
   connector: string
-  /** o3d-92fu: DEAD_LETTER or VALIDATION_FAILED — the remedies are different, so the row says which. */
+  /** o3d-92fu: DEAD_LETTER, VALIDATION_FAILED or AMBIGUOUS_CREATE — the remedies are different. */
   state: string
   attempts: number
   lastError: string | null
   lastAttemptAt: string | null
+  /**
+   * o3d-2k5r r5 — the affordance, DERIVED ON THE SERVER from `decideWmsPushReplay`: the same call
+   * `replayWmsOrderPush` refuses on. The table used to render Replay for every state except
+   * VALIDATION_FAILED, so a ShipHero AMBIGUOUS_CREATE row got a button the action refuses every
+   * time — and the docs already promised there was no button. A client that decides this for itself
+   * is a second reader of a server-side question, which is the whole defect class.
+   */
+  replayable: boolean
+  /** What to do instead, when `replayable` is false. Rendered in place of the button. */
+  replayRefusal: string | null
+  /** What this row IS — derived from the evidence, not from the state name (an AMBIGUOUS_CREATE
+   *  row was labelled "Push failed", which is the one thing it is not). */
+  why: string
 }
 
 /**
@@ -345,6 +364,16 @@ export type OrderReconcileDriftRow = {
   category: string
   detail: string | null
   foundAt: string | null
+  /** The connector the finding belongs to — the thing its replay policy is a property of. */
+  connector: string
+  /**
+   * o3d-2k5r r5 — MISSING_IN_WMS only, and derived on the server from `decideWmsMissingRepush`,
+   * the same call `repushMissingWmsOrder` refuses on. `false` for every other category, which
+   * has no Re-push control at all.
+   */
+  repushable: boolean
+  /** The manual reconciliation to do instead, when `repushable` is false on a MISSING_IN_WMS row. */
+  repushRefusal: string | null
 }
 
 /**
@@ -605,20 +634,32 @@ async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
     select: {
       orderId: true,
       category: true,
+      connector: true,
       detail: true,
       externalOrderNumber: true,
       lastSeenAt: true,
-      order: { select: { orderNumber: true } },
+      order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
     },
   })
-  return rows.map((row) => ({
-    orderId: row.orderId,
-    orderNumber: row.order.orderNumber,
-    externalOrderNumber: row.externalOrderNumber,
-    category: row.category,
-    detail: row.detail,
-    foundAt: row.lastSeenAt.toISOString(),
-  }))
+  return rows.map((row) => {
+    // o3d-2k5r r5: only MISSING_IN_WMS has a control, and only on a connector whose create refuses
+    // a duplicate. The other categories are resolved in the WMS or at the order and never carried
+    // a button, so they are not asked.
+    const decision = row.category === 'MISSING_IN_WMS'
+      ? decideWmsMissingRepush({ connector: row.connector, reference: wmsPushOrderReference(row.order) })
+      : null
+    return {
+      orderId: row.orderId,
+      orderNumber: row.order.orderNumber,
+      externalOrderNumber: row.externalOrderNumber,
+      category: row.category,
+      detail: row.detail,
+      foundAt: row.lastSeenAt.toISOString(),
+      connector: row.connector,
+      repushable: decision?.repushable === true,
+      repushRefusal: decision && !decision.repushable ? decision.guidance : null,
+    }
+  })
 }
 
 /**
@@ -743,9 +784,13 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         connector: true,
         state: true,
         attempts: true,
+        // o3d-2k5r r5: every column `decideWmsPushReplay` reads, so the row's affordance is the
+        // action's own answer rather than a re-derivation from `state`.
+        externalOrderId: true,
+        pushedAt: true,
         lastError: true,
         lastAttemptAt: true,
-        order: { select: { orderNumber: true } },
+        order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
       },
     }),
     // The admin list filter takes a single status, so query each failure status
@@ -1037,15 +1082,21 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   }
 
   const data: Omit<ExceptionInboxData, 'summary' | 'maintenanceRecovery'> = {
-    wmsPushDeadLetters: pushLinks.map((link) => ({
-      orderId: link.orderId,
-      orderNumber: link.order.orderNumber,
-      connector: link.connector,
-      state: link.state,
-      attempts: link.attempts,
-      lastError: link.lastError,
-      lastAttemptAt: link.lastAttemptAt?.toISOString() ?? null,
-    })),
+    wmsPushDeadLetters: pushLinks.map((link) => {
+      const decision = decideWmsPushReplay(link, wmsPushOrderReference(link.order))
+      return {
+        orderId: link.orderId,
+        orderNumber: link.order.orderNumber,
+        connector: link.connector,
+        state: link.state,
+        attempts: link.attempts,
+        lastError: link.lastError,
+        lastAttemptAt: link.lastAttemptAt?.toISOString() ?? null,
+        replayable: decision.replayable,
+        replayRefusal: decision.replayable ? null : decision.guidance,
+        why: describeBlockedWmsPush(link),
+      }
+    }),
     outboxFailures: outbox.map((row) => ({
       id: row.id,
       connector: row.connector,
@@ -2737,10 +2788,37 @@ export async function dismissWithdrawnDispatch(orderId: string): Promise<Mutatio
 }
 
 /**
- * Re-create a WMS order the WMS no longer knows (MISSING_IN_WMS reconcile
- * finding): compare-and-set the SYNCED/MERGED link back to PENDING_CREATE so
- * the next push sweep re-pushes it. The sweep's own eligibility still applies,
- * so a no-longer-eligible order simply won't re-push.
+ * Re-create a WMS order the WMS no longer knows (MISSING_IN_WMS reconcile finding): compare-and-set
+ * the SYNCED/MERGED link back to PENDING_CREATE so the next push sweep re-pushes it.
+ *
+ * o3d-2k5r r5 — THE FIFTH WRITER THAT RE-OPENS A CREATE, and the one that was reviewed as "already
+ * correct" because it probes the warehouse. It was not, and it failed in BOTH directions.
+ *
+ *   IT PARKED THE ORDER IT CLAIMED TO HAVE RE-QUEUED. The reset left `lastAttemptAt` — the dispatch
+ *   stamp — in place. `decideCreateClaim` reads a PENDING_CREATE link carrying a stamp older than
+ *   the lease as PARK_AMBIGUOUS, so the very next sweep parked the "re-queued" order as
+ *   AMBIGUOUS_CREATE. Meanwhile this action had already RESOLVED the discrepancy and reported
+ *   success, so the finding left the inbox and the order left the create queue in the same click.
+ *   On ShipHero that park has no automatic exit at all.
+ *
+ *   AND WHERE THERE WAS NO STAMP IT BYPASSED THE TWO-KEY RULE. A link with a null `lastAttemptAt`
+ *   (a legacy row, a restore) reads as CLAIM, so the sweep re-dispatched the create on the strength
+ *   of the presence probe ALONE — the exact reasoning create-replay-policy.ts exists to refuse,
+ *   and on ShipHero the exact way two warehouse orders get picked under one reference.
+ *
+ * So it now takes BOTH KEYS, from the same rule the sweep and the dead-letter replay take:
+ *
+ *   1. THE CONNECTOR'S OWN CREATE MUST REFUSE A DUPLICATE (`decideWmsMissingRepush`). A lookup that
+ *      came back empty is not proof the order is gone — it is the same lookup whose answer is in
+ *      doubt. Only the remote's contract covers the case where it is wrong.
+ *   2. THE WAREHOUSE MUST SAY IT HOLDS NO SUCH ORDER, under every reference this order could be
+ *      found by: the one a re-create would use, and the one IMS recorded.
+ *
+ * And the write is bound to ALL of it: the compare-and-set names every column the decision was read
+ * from, the dispatch stamp is cleared (so the re-queue is a real one, not a park in waiting) — and
+ * the stamp is cleared only on the path where both keys turned, because refusing before the write
+ * is the only place that is decided. The finding resolution and the link reset are one transaction,
+ * so the discrepancy is resolved only if the safe requeue commits.
  */
 export async function repushMissingWmsOrder(orderId: string): Promise<MutationResult> {
   try {
@@ -2761,6 +2839,42 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
     if (!activeConnectorId || openFinding.connector !== activeConnectorId) {
       return { success: false, error: 'This finding belongs to a connector that is no longer active — the next reconcile run retires it.' }
     }
+    // Read the link BEFORE any decision, and read every column the decision rests on — the write
+    // below has to require all of them back.
+    const link = await db.wmsOrderPushLink.findUnique({
+      where: { orderId },
+      select: {
+        id: true,
+        connector: true,
+        state: true,
+        attempts: true,
+        externalOrderId: true,
+        externalOrderNumber: true,
+        pushedAt: true,
+        lastAttemptAt: true,
+        order: { select: { id: true, orderNumber: true, externalOrderNumber: true, status: true, paidAt: true, refundStatus: true } },
+      },
+    })
+    if (!link) {
+      return { success: false, error: 'There is no WMS push link for this order, so there is nothing to re-push. The push sweep creates one on its own once the order is eligible.' }
+    }
+    // The finding's connector is the active one; the LINK's connector is what the replay policy is
+    // a property of, and a link can outlive the connector that wrote it. All three must agree
+    // before a warehouse is asked anything.
+    if (link.connector !== activeConnectorId) {
+      return { success: false, error: `This order's push link belongs to ${link.connector}, which is not the active WMS connector — its warehouse cannot be asked whether the order exists. Resolve it by hand.` }
+    }
+    if (link.state !== 'SYNCED' && link.state !== 'MERGED') {
+      return { success: false, error: `This order's push link is ${link.state}, not a settled push — there is no missing warehouse order to re-create. Check the order's push state.` }
+    }
+    const reference = wmsPushOrderReference(link.order)
+    // THE FIRST KEY, and the one no probe can supply — see create-replay-policy.ts. Asked before
+    // the probe because no answer the warehouse could give would change it, so spending a lookup
+    // would be spending a connector call on a decision already made.
+    const repush = decideWmsMissingRepush({ connector: link.connector, reference })
+    if (!repush.repushable) {
+      return { success: false, error: repush.guidance }
+    }
     const connector = getWmsConnector(activeConnectorId)
     if (!connector.probeOrderPresence) {
       return { success: false, error: 'The active WMS connector cannot verify order absence, so a safe re-push is not possible.' }
@@ -2770,33 +2884,41 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
     // link for e.g. a PICKING/PACKING order would resolve the finding while the
     // order is never re-created and silently never fulfils. Refuse; the
     // operator must return the order to a ready status first.
-    const order = await db.salesOrder.findUnique({
-      where: { id: orderId },
-      select: { status: true, paidAt: true, refundStatus: true },
-    })
-    if (!order || !['PROCESSING', 'ALLOCATED'].includes(order.status) || !order.paidAt || order.refundStatus === 'FULL') {
+    const order = link.order
+    if (!['PROCESSING', 'ALLOCATED'].includes(order.status) || !order.paidAt || order.refundStatus === 'FULL') {
       return {
         success: false,
-        error: `The push sweep only re-creates paid, ready (Processing/Allocated) orders — this order is ${order?.status ?? 'missing'}. Return it to a ready status (or resolve it manually in the WMS); the finding stays open meanwhile.`,
+        error: `The push sweep only re-creates paid, ready (Processing/Allocated) orders — this order is ${order.status}. Return it to a ready status (or resolve it manually in the WMS); the finding stays open meanwhile.`,
       }
     }
-    const link = await db.wmsOrderPushLink.findUnique({
-      where: { orderId },
-      select: { externalOrderNumber: true },
-    })
-    const presence = link?.externalOrderNumber
-      ? await connector.probeOrderPresence(link.externalOrderNumber)
-      : 'MISSING'
-    if (presence === 'FOUND') {
-      // The WMS knows the order again — the finding is stale; resolve it instead.
-      await db.wmsOrderDiscrepancy.updateMany({
-        where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
-        data: { status: 'RESOLVED', resolvedAt: new Date() },
-      })
-      return { success: false, error: 'The WMS knows this order again — the finding was stale and has been resolved. No re-push needed.' }
-    }
-    if (presence === 'AMBIGUOUS') {
-      return { success: false, error: 'The WMS returned an ambiguous match for this order — re-pushing could create a duplicate. Resolve the ambiguity in the WMS first.' }
+    // THE SECOND KEY. Both references are asked, and both must come back MISSING: the one a
+    // re-create would push under (the duplicate risk) and the one IMS recorded (the finding's own
+    // subject). They are usually the same string, and when they are not, "absent under one of them"
+    // is not absence.
+    const references = [...new Set([reference, link.externalOrderNumber].filter((r): r is string => !!r))]
+    for (const probeReference of references) {
+      let presence: 'FOUND' | 'MISSING' | 'AMBIGUOUS'
+      try {
+        presence = await connector.probeOrderPresence(probeReference)
+      } catch (error) {
+        return {
+          success: false,
+          error: `The WMS could not be asked whether order ${probeReference} still exists (${
+            error instanceof Error ? error.message : String(error)
+          }), so nothing was re-pushed. Try again once the WMS is reachable.`,
+        }
+      }
+      if (presence === 'FOUND') {
+        // The WMS knows the order again — the finding is stale; resolve it instead.
+        await db.wmsOrderDiscrepancy.updateMany({
+          where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN', connector: activeConnectorId },
+          data: { status: 'RESOLVED', resolvedAt: new Date() },
+        })
+        return { success: false, error: `The WMS knows order ${probeReference} again — the finding was stale and has been resolved. No re-push needed.` }
+      }
+      if (presence === 'AMBIGUOUS') {
+        return { success: false, error: `The WMS returned an ambiguous match for ${probeReference} — re-pushing could create a duplicate. Resolve the ambiguity in the WMS first.` }
+      }
     }
 
     // Codex: an OPEN finding is the AUTHORIZATION for this reset, and the two
@@ -2804,24 +2926,52 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
     // stays OPEN (it must not vanish from the inbox with the order unfixed).
     const outcome = await db.$transaction(async (tx) => {
       const finding = await tx.wmsOrderDiscrepancy.updateMany({
-        where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
+        where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN', connector: activeConnectorId },
         data: { status: 'RESOLVED', resolvedAt: new Date() },
       })
       if (finding.count === 0) {
         return { ok: false as const, error: 'No open missing-in-WMS finding for this order (already resolved or re-verified).' }
       }
       const updated = await tx.wmsOrderPushLink.updateMany({
-        // CAS on the exact WMS reference that was probed absent (Codex r20): a
-        // concurrent merge repoint changes externalOrderNumber, and clearing
-        // the NEW survivor reference off a stale probe would let the push
-        // sweep duplicate it.
-        where: { orderId, state: { in: ['SYNCED', 'MERGED'] }, externalOrderNumber: link?.externalOrderNumber ?? null },
+        // o3d-2k5r r5 — THE CAS NAMES EVERY COLUMN THE DECISION WAS READ FROM, not just the
+        // reference that was probed. `connector` decided the replay policy; `state` decided that
+        // this is a settled push; `externalOrderId`/`externalOrderNumber` are what the probe was
+        // about; `pushedAt`/`lastAttemptAt` are what the reset CLEARS, and clearing a column whose
+        // value has changed since it was read is how a dispatch stamp written by a concurrent sweep
+        // gets wiped. Anything that moved and this matches nothing — reported as stale rather than
+        // silently winning.
+        where: {
+          id: link.id,
+          connector: link.connector,
+          state: link.state,
+          attempts: link.attempts,
+          externalOrderId: link.externalOrderId,
+          externalOrderNumber: link.externalOrderNumber,
+          pushedAt: link.pushedAt,
+          lastAttemptAt: link.lastAttemptAt,
+        },
         data: {
           state: 'PENDING_CREATE',
           externalOrderId: null,
           externalOrderNumber: null,
           attempts: 0,
           lastError: null,
+          // THE DISPATCH STAMP, cleared — and reached only after both keys turned.
+          //
+          // `decideCreateClaim` reads a PENDING_CREATE link carrying a stamp as "a create left this
+          // system and we may never have learned the outcome", and parks it. Leaving the stamp on
+          // meant this action re-queued nothing: the next sweep parked the order AMBIGUOUS_CREATE
+          // while the finding was already resolved and the operator had been told it worked.
+          //
+          // Clearing it is this action's positive statement that the evidence was obtained — which
+          // is why it is safe here and would not have been on the probe alone. The claim rule grants
+          // on a CLEARED stamp, so whoever clears one is asserting the two-key rule was satisfied.
+          lastAttemptAt: null,
+          // The push that produced the now-missing warehouse order. Left in place it would make
+          // `wmsOrderMayExist` true for a link that carries no warehouse order at all, which is the
+          // first gate of the revalidation and ambiguous-create passes — the re-queued link would be
+          // permanently unre-queueable the moment it ever failed validation.
+          pushedAt: null,
           dispatchFailureCount: 0,
           dispatchLastError: null,
           dispatchDeadLetteredAt: null,
@@ -2837,7 +2987,7 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
       return { ok: true as const }
     }).catch((error) => {
       if (error instanceof Error && error.message === 'REPUSH_LINK_NOT_RESETTABLE') {
-        return { ok: false as const, error: 'The push link is no longer in a re-pushable state.' }
+        return { ok: false as const, error: 'This push link changed while you were looking at it — it is no longer the settled link that was inspected. Reload the inbox and check the order\'s current push state.' }
       }
       throw error
     })

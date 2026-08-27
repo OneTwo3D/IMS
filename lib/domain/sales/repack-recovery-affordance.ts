@@ -29,8 +29,7 @@
  * still PENDING/RETRYABLE_FAILED precisely while the release has not happened. It is true in both
  * cases the recovery exists for:
  *
- *   - the partial commit (reopen A, refused because B was committed; B is then DISPATCHED rather
- *     than reopened, so no later reopen will ever net the order), and
+ *   - the partial commit (reopen A, refused because B was committed), and
  *   - an order stranded by the earlier non-transactional shape, where the reopen committed and the
  *     allocation never ran.
  *
@@ -40,6 +39,26 @@
  * Ordinary "Create Shipments" is NOT this control and cannot stand in for it: it rebuilds the draft
  * from the netted quantity without ever performing the allocation-and-backstop transaction, so the
  * stale reservation release stays outstanding.
+ *
+ * AND EVIDENCE ALONE IS STILL NOT THE ACTION'S PREDICATE (o3d-2k5r r5). The evidence says the ORDER
+ * still owes the recovery. It does not say the recovery can RUN. `reopenShipmentForRepackAction`
+ * calls `allocateSalesOrder` with `refuseIfCommittedShipmentsExist`, which refuses while ANY
+ * shipment on the order is not a draft — so on the very state this control was added for (A
+ * reopened, B still PACKED) the action re-allocates nothing, resolves no backstop row, and returns
+ * `success: true` with a warning. A button that reports success for doing nothing is worse than one
+ * that errors, and the r4 test asserted that state as the control's correct behaviour.
+ *
+ * So the control now carries the ORDER-LEVEL prerequisite the action enforces: no committed
+ * shipment anywhere on the order. Until then the prerequisite ACTION is what renders — Reopen, on
+ * the sibling shipment that is blocking it — and that is a control the operator can actually press.
+ *
+ * DISPATCHING THE SIBLING DOES NOT CLEAR IT, and the operator message that said it would was wrong.
+ * `refuseIfCommittedShipmentsExist` matches every status that is not PENDING, and SHIPPED is one of
+ * them; `reopenShipmentForRepack` refuses SHIPPED outright because the goods have gone and the cost
+ * has been relieved. So an order whose blocking sibling is dispatched can no longer complete this
+ * recovery by any click, and the honest answer is to offer no button rather than one that reports a
+ * success it did not achieve. That order needs the shipment reconciliation of o3d-339; the backstop
+ * row stays visible in the integration outbox until it is done.
  */
 
 /** The status a shipment holds while nothing has been committed to it. */
@@ -56,6 +75,16 @@ export type RepackControlInput = {
    * backstop, and either can be finished from any draft on the order.
    */
   recoveryOutstanding: boolean
+  /**
+   * Does ANY shipment on this order hold a commitment — that is, sit at a status other than PENDING
+   * (o3d-2k5r r5)?
+   *
+   * The exact shape of `allocateSalesOrder`'s `refuseIfCommittedShipmentsExist` predicate
+   * (`shipment.findFirst({ orderId, status: { not: 'PENDING' } })`), and order-scoped for the same
+   * reason: the refusal is about the ORDER, so a per-shipment reading of it would be a different
+   * question. While this is true the recovery cannot complete, whichever draft it is invoked from.
+   */
+  orderHasCommittedShipment: boolean
 }
 
 /** A cancelled order takes the discard path instead: reopening would leave a draft on an order that
@@ -74,6 +103,10 @@ export function repackRecoveryControlIsAvailable(input: RepackControlInput): boo
   // ONLY a draft. On a committed shipment the reopen control is the right one, and offering both
   // would put two buttons that call the same action side by side with different promises.
   if (input.shipmentStatus !== UNCOMMITTED_SHIPMENT_STATUS) return false
+  // THE ACTION'S OWN PREREQUISITE. The re-allocation this control exists to run is refused while
+  // the order holds any commitment, and a refused re-allocation still reports success — so without
+  // this the control renders exactly where pressing it achieves nothing and says it worked.
+  if (input.orderHasCommittedShipment) return false
   return input.recoveryOutstanding
 }
 

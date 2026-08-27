@@ -7,7 +7,7 @@ import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
-import { wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal } from '@/lib/domain/wms/create-replay-policy'
+import { decideWmsPushReplay } from '@/lib/domain/wms/push-recovery-affordance'
 import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
 
 /**
@@ -25,29 +25,50 @@ export type WmsOrderPushStateView = {
   /**
    * Can an operator re-queue this push from here?
    *
-   * o3d-2k5r r4 — this is deliberately NOT "is the state one the action accepts". A parked
-   * AMBIGUOUS_CREATE on a connector whose create cannot be repeated safely is refused by the action
-   * every single time, so rendering a button for it would advertise a remedy that cannot be
-   * performed. The control appears only where pressing it can actually do something.
+   * o3d-2k5r r5 — DERIVED FROM `decideWmsPushReplay`, the same call `replayWmsOrderPush` refuses
+   * on. It used to be a hand-written `state === 'DEAD_LETTER' || (AMBIGUOUS_CREATE && replayable)`,
+   * which agreed with the action on the case it was written for and disagreed on another: a dead
+   * letter carrying an externalOrderId is refused by the action every time and was offered the
+   * button by this chip. A control and an action that answer the same question separately are the
+   * defect, not the wording of either answer.
    */
   canRetry: boolean
+  /**
+   * Why not, when `canRetry` is false and the push is a blocked one — the manual reconciliation the
+   * operator has instead. `null` for a link with nothing to say (a live queue, a settled push).
+   */
+  retryRefusal: string | null
 }
 
 export async function getWmsOrderPushStateForSalesOrder(salesOrderId: string): Promise<WmsOrderPushStateView | null> {
   await requireInternalUser()
   const link = await db.wmsOrderPushLink.findUnique({
     where: { orderId: salesOrderId },
-    select: { state: true, connector: true, externalOrderNumber: true, attempts: true, lastError: true, pushedAt: true },
+    // Every column `decideWmsPushReplay` reads — the read is written against the evidence type so a
+    // new refusal cannot be added to the rule and silently evaluated here against `undefined`.
+    select: {
+      state: true,
+      connector: true,
+      externalOrderId: true,
+      externalOrderNumber: true,
+      attempts: true,
+      lastError: true,
+      pushedAt: true,
+      order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
+    },
   })
   if (!link) return null
+  const decision = decideWmsPushReplay(link, wmsPushOrderReference(link.order))
   return {
     state: link.state,
     externalOrderNumber: link.externalOrderNumber,
     attempts: link.attempts,
     lastError: link.lastError,
     pushedAt: link.pushedAt?.toISOString() ?? null,
-    canRetry: link.state === 'DEAD_LETTER'
-      || (link.state === 'AMBIGUOUS_CREATE' && wmsAmbiguousCreateMayBeReplayed(link.connector)),
+    canRetry: decision.replayable,
+    // 'not-a-blocked-push' is not a refusal an operator needs to read: there is no control on the
+    // chip for a live queue or a settled push in the first place.
+    retryRefusal: decision.replayable || decision.reason === 'not-a-blocked-push' ? null : decision.guidance,
   }
 }
 
@@ -69,38 +90,18 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
     },
   })
   if (!link) return { success: false, error: 'No WMS push record for this order.' }
-  // o3d-92fu: a payload-invalid push has nothing to re-queue. Re-queueing would set
-  // PENDING_CREATE, the next sweep would fail to build the payload again and park it straight
-  // back — and in between the order would be undeletable again, because PENDING_CREATE blocks
-  // the hard-delete guard and VALIDATION_FAILED (at zero remote attempts) deliberately does
-  // not. The sweep's revalidation pass re-queues it automatically once the data is fixed.
-  if (link.state === 'VALIDATION_FAILED') {
-    return {
-      success: false,
-      error: 'This order could not be turned into a WMS payload at all (see the error on the push chip) — '
-        + 'nothing was sent, so there is nothing to replay. Fix the order data and the push sweep re-queues it by itself.',
-    }
-  }
-  // o3d-2k5r r4: AMBIGUOUS_CREATE joins DEAD_LETTER as a re-queueable state — it is the park a
-  // crashed create claim lands in, and without it the only IMS-side door out of that park would be
-  // the sweep's own reconciliation pass.
-  if (link.state !== 'DEAD_LETTER' && link.state !== 'AMBIGUOUS_CREATE') {
-    return { success: false, error: 'Only dead-lettered or outcome-unknown pushes can be re-queued.' }
-  }
-  // o3d-bjc.8: a dead letter that still carries an external id is not a failed
-  // create — it is an order that EXISTS in the WMS and could not be verified as
-  // ours (or was found to be someone else's). Re-queueing it means creating a
-  // SECOND warehouse order, which is exactly the duplicate fulfilment the
-  // PENDING_VERIFY state exists to prevent. That call needs a human who has
-  // looked at the WMS.
-  if (link.externalOrderId) {
-    return {
-      success: false,
-      error: `This order is already linked to WMS order ${link.externalOrderId}, which could not be verified. `
-        + 'Re-queueing would create a second warehouse order. Check the WMS first: if that order is ours, '
-        + 'the link is already correct; if it is not, clear the link before re-pushing.',
-    }
-  }
+  const reference = wmsPushOrderReference(link.order)
+  // o3d-2k5r r5 — EVERY REFUSAL DECIDABLE FROM THE LINK'S OWN COLUMNS, TAKEN FROM THE ONE RULE.
+  //
+  // Payload-invalid (o3d-92fu: nothing was sent, and the sweep re-queues it for free once the data
+  // is fixed), not-a-blocked-push, already-linked (o3d-bjc.8: the link names a warehouse order, so
+  // a re-queue is a SECOND one), and the connector's create-replay policy (o3d-2k5r r4). They were
+  // four inline conditions here, and the surfaces that offer this button re-derived them by hand
+  // and got them wrong. `decideWmsPushReplay` is now the only place they are written, and the
+  // chip's `canRetry` and the exception inbox's Replay affordance are the SAME call — so a control
+  // cannot render where this refuses.
+  const decision = decideWmsPushReplay(link, reference)
+  if (!decision.replayable) return { success: false, error: decision.guidance }
 
   // o3d-2k5r r3 — AUTHORITATIVE ABSENCE, on the same rule the sweep now applies.
   //
@@ -124,10 +125,8 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
     // REFUSES a duplicate refuses the loser of any race, whoever it is. A connector without that
     // property is never re-dispatched from here, and the refusal names WMS-side actions a person
     // can actually perform rather than an IMS control that does not exist.
-    const reference = wmsPushOrderReference(link.order)
-    if (!wmsAmbiguousCreateMayBeReplayed(link.connector)) {
-      return { success: false, error: wmsAmbiguousCreateRefusal(link.connector, reference) }
-    }
+    // The connector's replay policy has already been applied by `decideWmsPushReplay` above — this
+    // branch is only ever reached on a connector whose create refuses a duplicate.
     const pluginState = await getIntegrationPluginState()
     const activeConnectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
     if (!activeConnectorId || activeConnectorId !== link.connector) {

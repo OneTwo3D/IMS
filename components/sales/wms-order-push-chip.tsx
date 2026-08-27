@@ -57,6 +57,9 @@ export function WmsOrderPushChip({ orderId, push }: { orderId: string; push: Wms
     push.externalOrderNumber ? `WMS order ${push.externalOrderNumber}` : null,
     push.attempts ? `Attempts: ${push.attempts}` : null,
     push.lastError ? `Error: ${push.lastError}` : null,
+    // o3d-2k5r r5: the server's own reason for withholding Retry, so a chip with no button still
+    // says what to do instead rather than looking like an oversight.
+    push.retryRefusal,
   ].filter(Boolean).join(' · ')
 
   return (

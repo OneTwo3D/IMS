@@ -46,10 +46,16 @@ export function describeRepackReallocation(
 ): string | null {
   const opened = realloc.resumed ? 'The shipment was already a draft' : 'Shipment reopened'
   if (realloc.refused) {
+    // o3d-2k5r r5: "or dispatch it" was WRONG and it was the same defect as the control that
+    // rendered here — a remedy named by a surface that the predicate does not honour.
+    // `refuseIfCommittedShipmentsExist` matches every status that is not PENDING, SHIPPED included,
+    // and a dispatched shipment cannot be reopened afterwards. Dispatching the sibling does not
+    // release the reservation; it closes the only door that would have.
     return `${opened}, but stock could not be re-allocated because order ${orderRef} still has `
-      + 'another committed (picking or packed) shipment. Reopen that one too — or dispatch it — and the '
-      + 'refunded units’ reservation will be released then. Re-running this recovery on the draft also '
-      + 'finishes it once nothing committed is left.'
+      + 'another committed (picking or packed) shipment. REOPEN that one too — every shipment on the order '
+      + 'has to be back to a draft before the refunded units’ reservation can be released, and dispatching '
+      + 'it instead makes that impossible, because a dispatched shipment cannot be reopened. Once nothing '
+      + 'committed is left, "Finish repack recovery" on the draft completes it.'
   }
   if (realloc.success) return null
   if (realloc.committed) {

@@ -106,5 +106,32 @@ export function wmsAmbiguousCreateRefusal(connectorId: string, reference: string
   )
 }
 
+/**
+ * o3d-2k5r r5 — why a MISSING_IN_WMS finding is NOT being re-pushed automatically.
+ *
+ * A different situation from the one above and the same rule. Here a create DID succeed and IMS
+ * holds the warehouse id; the reconcile then found the warehouse no longer reports that order. Only
+ * one of the two readings makes a re-push safe. "The order was deleted/purged and nothing is there"
+ * makes it a clean re-create. "The order is there and the lookup missed it" — a renumbering, a
+ * client-scope change, an eventually-consistent index, a create still settling — makes the re-push a
+ * SECOND warehouse order under the same reference. A presence probe cannot separate them, because
+ * it is the very lookup whose answer is in doubt.
+ *
+ * On a connector whose own create refuses a duplicate, that does not matter: the second create is
+ * refused by the party that owns the data and the connector binds the order that already exists. On
+ * one whose only dedupe is a client-side preflight, nothing stands between the re-push and a double
+ * pick — so IMS does not offer it, and the finding stays OPEN where a person can see it.
+ */
+export function wmsMissingOrderRepushRefusal(connectorId: string, reference: string): string {
+  return (
+    `${connectorId}'s create does not refuse a duplicate, so IMS will not re-push order ${reference} on the `
+    + 'strength of a lookup that came back empty: if that order is in fact still in the warehouse, a re-push is a '
+    + 'second order under the same reference and the goods are picked twice. Open the WMS and search for '
+    + `${reference}. If it is genuinely gone, re-create it there and the dispatch sweep will reconcile it; if it `
+    + 'is there, the finding is a lookup fault and the next reconcile run resolves it by itself. This finding '
+    + 'stays open meanwhile.'
+  )
+}
+
 /** Every connector id this policy covers — exported so a test can assert the table is exhaustive. */
 export const WMS_CREATE_REPLAY_POLICY_IDS = WMS_CONNECTOR_IDS

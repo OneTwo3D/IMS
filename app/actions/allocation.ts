@@ -62,6 +62,7 @@ import {
   loadCommittedAllocationLines,
   residualAllocationQty,
   sumDispatchedQtyByAllocationScope,
+  UNCOMMITTED_SHIPMENT_STATUS,
 } from '@/lib/domain/inventory/reservation-residual'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -198,6 +199,17 @@ export type ShipmentRow = {
    * moves the shipment.
    */
   repackRecoveryOutstanding: boolean
+  /**
+   * o3d-2k5r r5 — the other half of the same ORDER-level question, and carried the same way and for
+   * the same reason.
+   *
+   * `reopenShipmentForRepackAction` runs its re-allocation with `refuseIfCommittedShipmentsExist`,
+   * which refuses while any shipment on the order is not a draft. The Finish-recovery control was
+   * gated on the outstanding-work evidence alone, so it rendered on a draft whose sibling was still
+   * PACKED — where the action re-allocates nothing, resolves no backstop row and reports success.
+   * The affordance has to know what the action knows.
+   */
+  orderHasCommittedShipment: boolean
   warehouseId: string
   warehouseCode: string
   warehouseName: string
@@ -277,9 +289,14 @@ export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]>
     },
     orderBy: { createdAt: 'asc' },
   })
+  // The same predicate `allocateSalesOrder` applies (`status: { not: 'PENDING' }`), read off the
+  // rows already in hand rather than as a second query — the page must not be able to disagree with
+  // itself about which shipments the order holds.
+  const orderHasCommittedShipment = rows.some((s) => s.status !== UNCOMMITTED_SHIPMENT_STATUS)
   return rows.map((s) => ({
     id: s.id,
     repackRecoveryOutstanding: outstandingReleases > 0,
+    orderHasCommittedShipment,
     warehouseId: s.warehouseId,
     warehouseCode: s.warehouse.code,
     warehouseName: s.warehouse.name,
