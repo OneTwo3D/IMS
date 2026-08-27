@@ -62,6 +62,7 @@ import {
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import {
   describeUnrecordablePostedDocument,
+  ledgerTargetIdFromPayload,
   PostedDocumentEvidenceUnwritten,
   UNRECORDED_POSTED_DOCUMENT_ACTION,
   type LedgerPostingMode,
@@ -491,7 +492,12 @@ export async function recordPostedSyncResult(
       // o3d-batch-ret r10 (Codex HIGH): the record is written with WHAT THIS ATTEMPT DID, not only
       // with which enum member it was. The mode comes off the row's own payload, which is what the
       // request status was resolved from; the remote-effect answer comes from the handler.
-      { postingMode: xeroPostingMode(payload), externalEffect: params.externalEffect },
+      // r12: and WHICH remote document it wrote to, off the same payload the mode comes from.
+      {
+        postingMode: xeroPostingMode(payload),
+        externalEffect: params.externalEffect,
+        ledgerTargetId: ledgerTargetIdFromPayload(payload),
+      },
       params.onConflictObserved,
     )
     return refusal.reason === 'ROW_MISSING'
@@ -633,6 +639,11 @@ function unrecordedPostedDocumentRecord(incident: UnrecordablePostedDocument, de
       // as "not recorded" rather than as a live posting.
       postingMode: incident.outcome?.postingMode ?? null,
       externalEffect: incident.outcome?.externalEffect ?? null,
+      // o3d-batch-ret r12 (Codex MEDIUM): WHICH REMOTE DOCUMENT THE OPERATION ACTED ON. Without it
+      // the BILL_ATTACHMENT remedy said "open that bill" about a bill nothing here named, and a
+      // factory reset deletes the PurchaseOrder and the sync row that were the only other route to
+      // it — so the operator was guessing which bill to strip an attachment off.
+      ledgerTargetId: incident.outcome?.ledgerTargetId ?? null,
     }))),
   }
 }

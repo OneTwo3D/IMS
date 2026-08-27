@@ -42,6 +42,7 @@ import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import {
   QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
   describeUnpersistedQboPost,
+  ledgerTargetIdFromPayload,
   type PostedOperationOutcome,
   type RemoteEffectOutcome,
   type UnpersistedQboPost,
@@ -378,6 +379,9 @@ function unpersistedQboPostRecord(incident: UnpersistedQboPost, description: str
       // builder for why an absent key must read as "not recorded" and never as a live posting.
       postingMode: incident.outcome?.postingMode ?? null,
       externalEffect: incident.outcome?.externalEffect ?? null,
+      // o3d-batch-ret r12 (Codex MEDIUM): the ledger document this operation acted ON. See the Xero
+      // builder — a remedy that says "open that bill" has to be able to say WHICH bill.
+      ledgerTargetId: incident.outcome?.ledgerTargetId ?? null,
     }))),
   }
 }
@@ -467,7 +471,12 @@ async function persistFreshQboPostOrEscalate(
   // FACT about this connector, not as a default, and a test holds the connector to it: the day a
   // draft path appears here, resolving LIVE unconditionally would be the same falsehood the Xero
   // side was corrected for.
-  const outcome: PostedOperationOutcome = { postingMode: 'LIVE', externalEffect }
+  const outcome: PostedOperationOutcome = {
+    postingMode: 'LIVE',
+    externalEffect,
+    // r12: the ledger document this operation acted on, read off the row's own payload.
+    ledgerTargetId: ledgerTargetIdFromPayload(payload),
+  }
   const incident: UnpersistedQboPost = { entry, postedExternalId: externalId, outcome }
   const description = describeUnpersistedQboPost(incident, lastError)
   // The console line FIRST, because it cannot fail and cannot be swept: at this instant it is the

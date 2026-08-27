@@ -44,16 +44,29 @@ export type UnrecordablePostedDocumentReason = 'ROW_MISSING' | 'ANOTHER_DOCUMENT
  *     `'false'`, so one operation type covers "an attachment now exists on that bill" and "nothing
  *     left this process".
  *
- * BOTH ARE OPTIONAL, AND AN ABSENT ONE IS NOT A DEFAULT. A record that does not carry the fact says
- * so and tells the operator to escalate. Guessing LIVE is how this record came to prescribe voiding
- * a document that was already there; guessing an upload is how it came to send someone to remove an
- * attachment this attempt never created.
+ *   • `ledgerTargetId` — WHICH REMOTE DOCUMENT THE OPERATION ACTED ON (round 12, Codex MEDIUM). An
+ *     operation that CREATES something is named by the id it returns; an operation that acts ON
+ *     something already in the ledger returns nothing that names it, and the row's `accountingInvoiceId`
+ *     is the only handle either connector ever had. `BILL_ATTACHMENT` shipped a remedy that told an
+ *     operator to "open that bill" and remove an attachment WITHOUT THAT HANDLE — and after a factory
+ *     reset the PurchaseOrder and the sync row are both gone, so the operator had to GUESS WHICH
+ *     LEDGER BILL TO OPEN. It is the id the handler itself passed to the upload
+ *     (`qboUploadAttachment('Bill', accountingInvoiceId, …)`, `xeroUploadAttachment('Invoices', …)`),
+ *     read off the same payload, so it names the bill the PDF actually went onto.
+ *
+ * ALL THREE ARE OPTIONAL, AND AN ABSENT ONE IS NOT A DEFAULT. A record that does not carry the fact
+ * says so and tells the operator to escalate. Guessing LIVE is how this record came to prescribe
+ * voiding a document that was already there; guessing an upload is how it came to send someone to
+ * remove an attachment this attempt never created; and having no target id at all is how it came to
+ * send someone to a bill it could not name.
  */
 export type LedgerPostingMode = 'LIVE' | 'DRAFT'
 export type RemoteEffectOutcome = 'MADE' | 'NONE'
 export type PostedOperationOutcome = {
   postingMode?: LedgerPostingMode
   externalEffect?: RemoteEffectOutcome
+  /** The ledger id of the document this operation acted ON, never one it created. */
+  ledgerTargetId?: string | null
 }
 
 export type UnrecordablePostedDocument = {
@@ -97,13 +110,14 @@ export function describeUnrecordablePostedDocument(incident: UnrecordablePostedD
       outcome: incident.outcome,
       rowState: reason === 'ROW_MISSING'
         ? `Its sync row ${entry.id} no longer exists, so nothing in IMS references it. `
-        : `Sync row ${entry.id} already names a different external id (${named ?? 'unknown'}) and was `
+        : `Sync row ${entry.id} already named a different external id (${named ?? 'unknown'}) and was `
           + 'left naming that one. ',
     })
   }
   const w = documentIncidentWording(entry.type, kind)
   const slots: WordingSlots = {
     ledger: 'Xero', postedExternalId: posted, lookup: w.lookup, lookupNoun: w.noun,
+    ledgerTargetId: nonEmpty(incident.outcome?.ledgerTargetId),
   }
   const did = render(posted ? w.didWithId : w.didWithoutId, slots)
   const head = `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} ${did}, `
@@ -117,7 +131,7 @@ export function describeUnrecordablePostedDocument(incident: UnrecordablePostedD
       + 'nothing further will be retried for this row. '
       + INCIDENT_IDENTIFICATION_TAIL
     : head
-      + `but sync row ${entry.id} already names a DIFFERENT ${render(w.conflictNoun, slots)} `
+      + `but sync row ${entry.id} already named a DIFFERENT ${render(w.conflictNoun, slots)} `
       + `(${named ?? 'unknown'}) — a newer claim posted while this attempt was on the wire. `
       + `${render(w.bothExist, slots)} The row was left naming the first one. `
       + (posted && named
@@ -445,11 +459,26 @@ export type UnpersistedQboPost = {
  * top of it. It is also a blunt lever, stopping every QuickBooks row, and the message says so.
  *
  * The `check` is what the operator does about the effect; the `effect` is what the replay costs.
+ *
+ * ROUND 12 (Codex MEDIUM): AND THESE TWO STRINGS ARE RENDERED, NOT PASTED. They are shipped remedies
+ * like any other, so they take the same declaration machinery: `{placeholder}` is the only way one of
+ * them may name a record value, `{lookup}` the only way one may send an operator to go and find
+ * something, and `needs`/`lookup` are checked against what the record builders actually write. Round
+ * 11 left this table outside the fence and named that as a hole; the hole had a live instance in it.
  */
-type ReplayWording = { effect: string; check: string }
+type ReplayWording = {
+  effect: string
+  check: string
+  /** Every record field these two templates name. Checked against the builders by the test. */
+  needs?: readonly RecordLookupField[]
+  /** What `{lookup}` searches by — the only route to a search criterion. */
+  lookup?: readonly RecordLookupField[]
+  /** What the generated lookup clause calls the thing being looked for. */
+  lookupNoun?: string
+}
 const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
   AccountingSyncType,
-  ReplayWording | Readonly<Record<RemoteEffectKnowledge, ReplayWording>>
+  ReplayWording | Readonly<Record<OutcomeWordingVariant, ReplayWording>>
 >> = {
   // ROUND 10 (Codex MEDIUM): THE ONLY ONE OF THE FOUR WITH A KILL SWITCH IN FRONT OF IT, AND THE
   // RECORD NOW SAYS WHICH SIDE OF IT THIS ATTEMPT FELL. The handler reads
@@ -460,26 +489,49 @@ const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
   // them OFF reads that a PDF is being uploaded. The handler's actual outcome is recorded now, so
   // each case gets a sentence that is simply true, and the hedge survives ONLY where the record
   // genuinely does not know.
+  // ROUND 12 (Codex HIGH): AND A RECORDED SETTING VALUE IS A HISTORICAL FACT, NOT A CURRENT ONE.
+  // `externalEffect: NONE` proves that `quickbooks_sync_attach_pdf` read "false" WHEN THIS ATTEMPT
+  // RAN. The record is permanent; the setting is not, and nothing rereads it. So the NONE wording
+  // below no longer says the replay IS a no-op — it says what was read, says the setting can have
+  // moved since, and sends the operator to read it as it is now.
   BILL_ATTACHMENT: {
     MADE: {
-      effect: 'the supplier invoice PDF is uploaded to the QuickBooks bill AGAIN, once per sweep',
-      check: 'open the bill in QuickBooks and delete any duplicate attachment',
+      effect: 'the supplier invoice PDF is uploaded to QuickBooks bill {ledgerTargetId} AGAIN, once '
+        + 'per sweep',
+      check: '{Lookup} and remove any duplicate attachment',
+      needs: ['ledgerTargetId'],
+      lookup: ['ledgerTargetId'],
+      lookupNoun: 'that bill',
+    },
+    MADE_TARGET_UNRECORDED: {
+      effect: 'the supplier invoice PDF is uploaded to that bill in QuickBooks AGAIN, once per sweep',
+      check: 'THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO, so it cannot send you to the '
+        + 'duplicates and nothing kept here derives the bill. Escalate this record to whoever '
+        + 'administers this installation',
     },
     NONE: {
-      effect: 'NOTHING AT ALL — attachment upload is turned off for this connector, so every sweep '
-        + 're-runs a handler that returns success without contacting QuickBooks and without '
-        + 'uploading anything',
-      check: 'nothing needs undoing for the attachment: this attempt created none, and no replay '
-        + 'creates one while that setting stays off',
+      effect: 'NOTHING — PROVIDED ATTACHMENT UPLOAD IS STILL OFF WHEN THE SWEEP RUNS. What this '
+        + 'record knows is that quickbooks_sync_attach_pdf read "false" AT THE MOMENT THIS ATTEMPT '
+        + 'RAN, which is the only reading it ever took. If that setting is on by the time the row is '
+        + 'reclaimed, every sweep uploads the supplier invoice PDF to the bill instead',
+      check: 'nothing this attempt did needs undoing — it created no attachment. THEN GO AND READ '
+        + 'quickbooks_sync_attach_pdf AS IT STANDS NOW, because this record cannot: if it is off, the '
+        + 'replay above stays a no-op and there is nothing to change; if it is ON, the replay uploads '
+        + 'to the bill, and you are choosing between turning it off — which stops attachment uploads '
+        + 'for EVERY bill on this connector, not this one — and letting the uploads happen and '
+        + 'clearing the duplicates afterwards. TURNING IT OFF IS NOT A FENCE EITHER: the handler '
+        + 'reads that setting and then uploads, so a run already past the read still uploads, and '
+        + 'nothing in IMS reports whether one is. Only closing the row stops the replay, and IMS '
+        + 'cannot close it (o3d-4b5p)',
     },
     UNRECORDED: {
-      effect: 'the supplier invoice PDF is uploaded to the QuickBooks bill AGAIN, once per sweep — '
-        + 'unless attachment upload is turned off for this connector, in which case every sweep does '
-        + 'nothing at all',
-      check: 'IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING, so do not delete an '
-        + 'attachment on the strength of this record — it may never have created one. Read the '
-        + 'setting quickbooks_sync_attach_pdf, then open the bill in QuickBooks and compare what is '
-        + 'attached against what should be there',
+      effect: 'either the supplier invoice PDF is uploaded to that bill in QuickBooks AGAIN once per '
+        + 'sweep, or nothing happens at all — which of the two depends on quickbooks_sync_attach_pdf '
+        + 'as it stands when the sweep runs, and this record carries no reading of it',
+      check: 'IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING, and it does not name the '
+        + 'bill either. READ quickbooks_sync_attach_pdf AS IT STANDS NOW to learn what a replay would '
+        + 'do, and escalate this record to whoever administers this installation rather than clearing '
+        + 'an attachment off a bill picked out any other way',
     },
   },
   INVOICE_PDF: {
@@ -548,9 +600,16 @@ const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
       + 'COUNT OF DUPLICATES, OF PENDING DELIVERIES OR OF COPIES THAT DID NOT ARRIVE FROM THIS QUERY: '
       + 'it cannot establish any of them (o3d-il7a)',
   },
+  // ROUND 12 (Codex MEDIUM), THE SAME DEFECT ONE ROW DOWN: "open the order in WooCommerce" named an
+  // object this record cannot identify. It holds the IMS reference above and no WooCommerce order
+  // number, and the IMS record that maps one to the other is deleted by a database reset — the same
+  // reset that preserves this record. So the instruction is gone rather than softened.
   WC_INVOICE_NOTE: {
     effect: 'a second invoice note is written onto the WooCommerce order, once per sweep',
-    check: 'open the order in WooCommerce and remove any duplicate note',
+    check: 'THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER — it holds the IMS reference above and '
+      + 'nothing else, and the IMS record that maps that reference to a WooCommerce order is deleted '
+      + 'by a database reset. Escalate this record to whoever administers this installation rather '
+      + 'than clearing notes off an order picked out any other way',
   },
 }
 
@@ -614,9 +673,47 @@ function remoteEffectKnowledge(outcome: PostedOperationOutcome | undefined): Rem
   return outcome?.externalEffect ?? 'UNRECORDED'
 }
 
+/**
+ * THE KEY A PER-OUTCOME WORDING TABLE IS READ WITH — TWO QUESTIONS, NOT ONE (round 12, Codex MEDIUM).
+ *
+ * "Did the handler act?" was the whole key, and it is not enough for an operation that acts ON an
+ * existing remote object. `MADE` earned a remedy — "open that bill and remove the duplicate
+ * attachment" — that needs a SECOND fact the record was not keeping: WHICH bill. So `MADE` splits on
+ * whether the target id is carried, and the two halves say opposite things: one sends the operator to
+ * a named bill through the lookup mechanism, the other refuses to send them anywhere.
+ *
+ * A record written before IMS kept the id lands in `MADE_TARGET_UNRECORDED`, which is the honest
+ * answer for it. Going forward it is unreachable for `BILL_ATTACHMENT`: the handler refuses to run
+ * without `accountingInvoiceId`, so a MADE outcome always has one.
+ */
+type OutcomeWordingVariant = RemoteEffectKnowledge | 'MADE_TARGET_UNRECORDED'
+function outcomeWordingVariant(outcome: PostedOperationOutcome | undefined): OutcomeWordingVariant {
+  const knowledge = remoteEffectKnowledge(outcome)
+  if (knowledge !== 'MADE') return knowledge
+  return nonEmpty(outcome?.ledgerTargetId) ? 'MADE' : 'MADE_TARGET_UNRECORDED'
+}
+
 /** '' and null are the same answer here, and both of them are "no id". */
 function nonEmpty(value: string | null | undefined): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+/**
+ * THE ID OF THE LEDGER DOCUMENT AN OPERATION ACTED ON, READ OFF THE ROW'S OWN PAYLOAD (round 12,
+ * Codex MEDIUM).
+ *
+ * ONE definition for both connectors, because the remedy that spends it is shared and a second
+ * spelling would be a silent drift the day either processor changed. `accountingInvoiceId` is a
+ * LEDGER id everywhere either processor touches it — it is what goes to `updateSalesInvoice` and
+ * `updatePurchaseBill`, to a payment's `Invoice.InvoiceID` / `LinkedTxn.TxnId`, and to
+ * `qboUploadAttachment('Bill', …)` / `xeroUploadAttachment('Invoices', …)` — so it names the remote
+ * document the attempt WROTE TO, never one it created. Absent is `null`, and `null` is what makes
+ * the record say it cannot name the thing rather than sending an operator to guess it.
+ */
+export function ledgerTargetIdFromPayload(payload: unknown): string | null {
+  if (typeof payload !== 'object' || payload === null) return null
+  const value = (payload as { accountingInvoiceId?: unknown }).accountingInvoiceId
+  return typeof value === 'string' ? nonEmpty(value) : null
 }
 
 /**
@@ -765,7 +862,9 @@ type NonDocumentOperationType = {
  * tests/accounting/record-names-only-what-it-holds.test.ts, and read there what the invariant now
  * provably covers and what it provably does not.
  */
-export const RECORD_LOOKUP_FIELDS = ['syncLogId', 'type', 'referenceType', 'referenceId', 'postedExternalId'] as const
+export const RECORD_LOOKUP_FIELDS = [
+  'syncLogId', 'type', 'referenceType', 'referenceId', 'postedExternalId', 'ledgerTargetId',
+] as const
 export type RecordLookupField = (typeof RECORD_LOOKUP_FIELDS)[number]
 
 /**
@@ -804,6 +903,7 @@ const LOOKUP_FIELD_PHRASE: Readonly<Record<RecordLookupField, string>> = Object.
   referenceType: 'the kind of IMS record named above',
   referenceId: 'the IMS reference above',
   postedExternalId: 'the id above',
+  ledgerTargetId: 'the ledger document id above',
 })
 
 /**
@@ -1249,6 +1349,8 @@ export type NonDocumentIncidentWording = {
   needs: readonly RecordLookupField[]
   /** As {@link DocumentIncidentWording.lookup}: the only route to a search criterion. */
   lookup?: readonly RecordLookupField[]
+  /** What the generated lookup clause calls the thing being looked for. */
+  lookupNoun?: string
 }
 
 const NOT_A_DOCUMENT_STANDS =
@@ -1259,7 +1361,7 @@ const NOTHING_CREATED_STANDS =
 
 export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
   NonDocumentOperationType,
-  NonDocumentIncidentWording | Readonly<Record<RemoteEffectKnowledge, NonDocumentIncidentWording>>
+  NonDocumentIncidentWording | Readonly<Record<OutcomeWordingVariant, NonDocumentIncidentWording>>
 >> = Object.freeze({
     PURCHASE_CREDIT_NOTE_ALLOCATION: {
       stands: NOT_A_DOCUMENT_STANDS,
@@ -1277,9 +1379,14 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
       stands: NOT_A_DOCUMENT_STANDS,
       did: 'it wrote a TAX RATE into the {ledger} organisation. A tax rate is a setting on the '
         + 'organisation rather than a document, and the value the write returns is a tax TYPE code',
+      // ROUND 12 (Codex MEDIUM), FOUND BY THE SAME SWEEP: "correct or archive that rate there if this
+      // write was wrong" is an instruction to act on a specific object, and deciding whether the
+      // write WAS wrong needs the rate as it stood BEFORE it, which nothing here keeps. The
+      // instruction is deleted; the escalation is what remains.
       remedy: 'REMEDY: THERE IS NOTHING TO VOID OR CREDIT — nothing was posted to a customer or a '
-        + 'supplier account. Review the tax rates in {ledger}, and correct or archive that rate there '
-        + 'if this write was wrong.',
+        + 'supplier account. THIS RECORD DOES NOT SAY WHAT THE RATE WAS BEFORE THE WRITE, so it '
+        + 'cannot tell you what correcting it would restore. Escalate this record to whoever '
+        + 'administers this installation.',
       needs: [],
     },
     // ROUND 10 (Codex MEDIUM): THE ONE OPERATION WHOSE OWN OUTCOME DECIDES THE SENTENCE. The handler
@@ -1287,20 +1394,44 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
     // round-9 wording — "it uploaded a supplier-invoice PDF", under a headline reading "NOTHING WAS
     // CREATED AT ALL" — was two claims that could not both hold, and on a disabled install BOTH were
     // false. It could send an operator to remove a duplicate attachment this attempt never created.
+    // ROUND 12 (Codex MEDIUM): AND THE MADE REMEDY NAMES THE BILL, OR IT SENDS NOBODY ANYWHERE. It
+    // said "open that bill … and remove the duplicate attachment" while declaring no lookup field at
+    // all, and the record did not retain the bill id: after a factory reset the PurchaseOrder and the
+    // sync row are both deleted, so "that bill" was a bill the operator had to GUESS — with removal
+    // from the wrong one as the cost of guessing wrong. The id is now kept (`ledgerTargetId`, the
+    // handle the handler itself uploaded against), and the remedy reaches it through `{lookup}` like
+    // every other search criterion in this module. A record written before it was kept takes the
+    // second cell, which refuses to send the operator to a bill rather than implying one.
     BILL_ATTACHMENT: {
       MADE: {
-        stands: 'AN ATTACHMENT NOW EXISTS ON THAT BILL IN {LEDGER}, and no standalone accounting '
-          + 'document was created. ',
+        stands: 'AN ATTACHMENT NOW EXISTS ON {LEDGER} BILL {ledgerTargetId}, and no standalone '
+          + 'accounting document was created. ',
+        did: 'it uploaded a supplier-invoice PDF onto {ledger} bill {ledgerTargetId}, which already '
+          + 'existed. THE UPLOAD HAPPENED. No id came back for the attachment itself, because an '
+          + 'attachment is not a document',
+        remedy: 'REMEDY: {Lookup} and remove the duplicate attachment. There is no document to void, '
+          + 'and the bill itself was not created by this attempt.',
+        needs: ['ledgerTargetId'],
+        lookup: ['ledgerTargetId'],
+        lookupNoun: 'that bill',
+      },
+      MADE_TARGET_UNRECORDED: {
+        stands: 'AN ATTACHMENT NOW EXISTS ON A BILL IN {LEDGER}, AND THIS RECORD DOES NOT NAME THAT '
+          + 'BILL. ',
         did: 'it uploaded a supplier-invoice PDF onto a bill that already existed in {ledger}. THE '
-          + 'UPLOAD HAPPENED. No id came back because an attachment is not a document',
-        remedy: 'REMEDY: open that bill in {ledger} and remove the duplicate attachment. There is no '
-          + 'document to void, and the bill itself was not created by this attempt.',
+          + 'UPLOAD HAPPENED. No id came back because an attachment is not a document, and this '
+          + 'record does not carry the id of the bill it went onto either',
+        remedy: 'REMEDY: DO NOT REMOVE AN ATTACHMENT FROM A BILL THIS RECORD CANNOT NAME. The upload '
+          + 'happened, so a duplicate may exist, but nothing kept here says which bill it is on and '
+          + 'nothing kept here derives it. Escalate this record to whoever administers this '
+          + 'installation.',
         needs: [],
       },
       NONE: {
         stands: 'NOTHING LEFT THIS PROCESS AND NOTHING IN {LEDGER} CHANGED. ',
-        did: 'it did nothing at all. Attachment upload is turned off for this connector, so the '
-          + 'handler returned success without contacting {ledger} and without uploading anything',
+        did: 'it did nothing at all. Attachment upload READ AS OFF FOR THIS CONNECTOR AT THE MOMENT '
+          + 'THIS ATTEMPT RAN, so the handler returned success without contacting {ledger} and '
+          + 'without uploading anything',
         remedy: 'REMEDY: THERE IS NOTHING TO UNDO. No attachment was created, no document was '
           + 'created, and nothing in {ledger} was touched by this attempt.',
         needs: [],
@@ -1308,12 +1439,12 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
       UNRECORDED: {
         stands: 'IMS DID NOT RECORD WHETHER THE UPLOAD HAPPENED. ',
         did: 'it either uploaded a supplier-invoice PDF onto a bill that already existed in {ledger} '
-          + 'or did nothing at all — the handler skips the upload and STILL RETURNS SUCCESS when '
-          + 'attachment upload is turned off for this connector, and this record does not say which '
-          + 'of the two this attempt was',
+          + 'or did nothing at all — the handler skips the upload and STILL RETURNS SUCCESS when the '
+          + 'attachment-upload setting reads as off, and this record does not say which of the two '
+          + 'this attempt was',
         remedy: 'REMEDY: DO NOT REMOVE AN ATTACHMENT ON THE STRENGTH OF THIS RECORD — this attempt '
-          + 'may never have created one. Open that bill in {ledger}, compare what is attached against '
-          + 'what should be there, and escalate this record to whoever administers this installation.',
+          + 'may never have created one, and this record does not name the bill one would be on. '
+          + 'Escalate this record to whoever administers this installation.',
         needs: [],
       },
     },
@@ -1340,8 +1471,15 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
     WC_INVOICE_NOTE: {
       stands: NOTHING_CREATED_STANDS,
       did: 'it wrote an invoice note onto the WooCommerce order',
-      remedy: 'REMEDY: open that order in WooCommerce and remove any duplicate note. There is nothing '
-        + 'to void in {ledger}.',
+      // ROUND 12 (Codex MEDIUM), THE THIRD INSTANCE: "open that order in WooCommerce" is an
+      // instruction to act on an object this record cannot identify. It keeps the IMS reference and
+      // no WooCommerce order number, and the IMS record that maps one to the other is deleted by the
+      // same reset that preserves this record.
+      remedy: 'REMEDY: THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER. It holds the IMS reference '
+        + 'above and nothing else, and the IMS record that maps that reference to a WooCommerce order '
+        + 'is deleted by a database reset. Escalate this record to whoever administers this '
+        + 'installation rather than clearing notes off an order picked out any other way. There is '
+        + 'nothing to void in {ledger}.',
       needs: [],
     },
   })
@@ -1352,9 +1490,9 @@ function nonDocumentWordingFor(
   outcome: PostedOperationOutcome | undefined,
 ): NonDocumentIncidentWording | undefined {
   const entry = (NON_DOCUMENT_INCIDENT_WORDING as Partial<Record<string, NonDocumentIncidentWording
-    | Readonly<Record<RemoteEffectKnowledge, NonDocumentIncidentWording>>>>)[type]
+    | Readonly<Record<OutcomeWordingVariant, NonDocumentIncidentWording>>>>)[type]
   if (!entry) return undefined
-  return 'did' in entry ? entry : entry[remoteEffectKnowledge(outcome)]
+  return 'did' in entry ? entry : entry[outcomeWordingVariant(outcome)]
 }
 
 /**
@@ -1374,7 +1512,7 @@ function nonDocumentWordingFor(
 type EffectClaim = 'MADE' | 'NONE' | 'UNKNOWN'
 function nonDocumentEffectClaim(type: string, outcome: PostedOperationOutcome | undefined): EffectClaim {
   const entry = (NON_DOCUMENT_INCIDENT_WORDING as Partial<Record<string, NonDocumentIncidentWording
-    | Readonly<Record<RemoteEffectKnowledge, NonDocumentIncidentWording>>>>)[type]
+    | Readonly<Record<OutcomeWordingVariant, NonDocumentIncidentWording>>>>)[type]
   // No entry at all, or one wording for the whole operation: the handler has no success path that
   // skips the work, so the effect happened.
   if (!entry || 'did' in entry) return 'MADE'
@@ -1419,7 +1557,13 @@ function describeNonDocumentIncident(params: {
 }): string {
   const { ledger, entry, kind, postedExternalId, rowState } = params
   const wording = nonDocumentWordingFor(entry.type, params.outcome)
-  const slots: WordingSlots = { ledger, postedExternalId, lookup: wording?.lookup }
+  const slots: WordingSlots = {
+    ledger,
+    postedExternalId,
+    ledgerTargetId: nonEmpty(params.outcome?.ledgerTargetId),
+    lookup: wording?.lookup,
+    lookupNoun: wording?.lookupNoun,
+  }
   const head = nonDocumentHead(ledger, entry, nonDocumentEffectClaim(entry.type, params.outcome))
   if (kind === 'UNCLASSIFIED' || !wording) {
     return head + rowState
@@ -1527,12 +1671,15 @@ export function classifyUnrecordedIncident(metadata: unknown): UnrecordedInciden
   // a live posting; it is a blob that does not say, and `incidentKindForOperation` treats it so.
   const postingMode = (metadata as { postingMode?: unknown }).postingMode
   const externalEffect = (metadata as { externalEffect?: unknown }).externalEffect
+  // ROUND 12: and the third fact, so a blob read back produces the SAME outcome the formatter held.
+  const ledgerTargetId = (metadata as { ledgerTargetId?: unknown }).ledgerTargetId
   return incidentKindForOperation(
     typeof type === 'string' ? type : null,
     typeof postedExternalId === 'string' ? postedExternalId : null,
     {
       postingMode: postingMode === 'LIVE' || postingMode === 'DRAFT' ? postingMode : undefined,
       externalEffect: externalEffect === 'MADE' || externalEffect === 'NONE' ? externalEffect : undefined,
+      ledgerTargetId: typeof ledgerTargetId === 'string' ? ledgerTargetId : null,
     },
   )
 }
@@ -1670,16 +1817,32 @@ export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentC
  * The wording round 10 added was correct and is still here, in `effect` and `check`. What was wrong
  * was everything around it, and a paragraph cannot correct its own frame — so the frame is separate.
  *
- * WHAT THIS ONE SAYS INSTEAD. It states that nothing happened; it says what a replay costs, which is
- * nothing while the setting stays as it is; it REFUSES the connector-wide shutdown, and says why —
- * there is no effect to contain, and the switch stops work that has nothing to do with this row; it
- * names the one setting that is actually load-bearing here and says to leave it as it is until the
- * write failure is fixed; and it points at the failure that IS real, which is that IMS could not
- * record the attempt and the row is now stuck.
+ * WHAT THIS ONE SAYS INSTEAD. It states that nothing happened; it says what a replay costs; it
+ * REFUSES the connector-wide shutdown, and says why — there is no effect to contain, and the switch
+ * stops work that has nothing to do with this row; and it points at the failure that IS real, which
+ * is that IMS could not record the attempt and the row is now stuck.
+ *
+ * ROUND 12 (Codex HIGH): AND IT NO LONGER TELLS THE OPERATOR THE SETTING IS OFF. Round 11 closed
+ * with "IF YOU WANT THE REPLAY TO STAY A NO-OP, LEAVE ATTACHMENT UPLOAD DISABLED … Leave it as it
+ * is" — a remedy built on a RECORDED value read as a CURRENT one. `externalEffect: NONE` proves only
+ * that `quickbooks_sync_attach_pdf` read "false" WHEN THIS ATTEMPT RAN; nothing rereads it, this
+ * record is permanent and exempt from both retention and the reset, and the setting is not. On an
+ * install where somebody enabled uploads in between, "leave it as it is" left them ON, and the
+ * stale-claim replay then uploaded an attachment on every sweep — the exact outcome the paragraph
+ * claimed to prevent.
+ *
+ * THAT PARAGRAPH IS DELETED RATHER THAN QUALIFIED. What replaces it is in the wording table, where
+ * the outcome is known: the `effect` says what was READ and when, and makes the no-op conditional on
+ * the setting AS IT STANDS WHEN THE SWEEP RUNS; the `check` sends the operator to read it now, gives
+ * them the choice if it is on, and says plainly that turning it off is not a fence either — the
+ * handler reads it and then uploads, so a run already past the read still uploads. Genuinely
+ * stopping an already-admitted replay needs the per-row or quiescence fence filed as o3d-4b5p; no
+ * wording here can substitute for it, and this record no longer implies one does.
  */
 function describeQboNoEffectIncident(
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
   wording: ReplayWording,
+  slots: WordingSlots,
   cause: unknown,
 ): string {
   return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} MADE NO EXTERNAL `
@@ -1687,18 +1850,15 @@ function describeQboNoEffectIncident(
     + 'created, changed, uploaded or emailed, and nothing in QuickBooks or anywhere else is '
     + 'different because this attempt ran. WHAT COULD NOT BE RECORDED IS THAT IT RAN AT ALL: '
     + `${String(cause)}. `
-    + `WHAT A REPLAY WOULD COST: sync row ${entry.id} still holds this worker's claim and no `
-    + 'mirrored accounting event was written, so once that claim goes stale the sweep will reclaim '
-    + `the row and run the operation again. Running it again does ${wording.effect}. `
-    + `WHAT TO DO ABOUT THE EFFECT: ${wording.check}. `
+    + `WHAT A REPLAY WOULD COST: sync row ${entry.id} was left holding this worker's claim, with no `
+    + 'mirrored accounting event written, so once that claim goes stale the sweep will reclaim '
+    + `the row and run the operation again. Running it again does ${render(wording.effect, slots)}. `
+    + `WHAT TO DO ABOUT THE EFFECT: ${render(wording.check, slots)}. `
     + 'DO NOT TURN QUICKBOOKS SYNC OFF FOR THIS ONE. That switch is the containment lever for an '
     + 'incident where something DID reach QuickBooks. There is nothing here to contain, and turning '
     + 'it off stops EVERY QuickBooks row on this installation — invoices, bills, payments and '
     + 'journals with nothing to do with this row — for as long as it stays off. '
-    + 'IF YOU WANT THE REPLAY TO STAY A NO-OP, LEAVE ATTACHMENT UPLOAD DISABLED: the setting is '
-    + 'quickbooks_sync_attach_pdf, and enabling it is the single change that would make the next '
-    + 'sweep act for real. Leave it as it is until the write failure above is fixed. '
-    + `WHAT IS ACTUALLY WRONG IS THE WRITE, NOT THE OPERATION: sync row ${entry.id} is left `
+    + `WHAT IS ACTUALLY WRONG IS THE WRITE, NOT THE OPERATION: sync row ${entry.id} was left `
     + 'PROCESSING at attempt revision 0 with no mirrored event, and nothing in IMS will settle it. '
     + `Fix the failure named above, and ESCALATE sync row ${entry.id}, with this record, to whoever `
     + 'administers this installation: closing it safely needs someone who can read the database '
@@ -1735,7 +1895,21 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
   // table: the handler returns success without uploading when attachment upload is off.
   const noRequestId = replayEntry && ('effect' in replayEntry
     ? replayEntry
-    : replayEntry[remoteEffectKnowledge(incident.outcome)])
+    : replayEntry[outcomeWordingVariant(incident.outcome)])
+  // ROUND 12 (Codex MEDIUM): the replay wording is RENDERED, like every other shipped remedy — so it
+  // can name the bill it uploaded to through `{ledgerTargetId}` and send the operator there through
+  // `{lookup}`, instead of saying "open the bill" about a bill nothing here identifies.
+  const replaySlots: WordingSlots = {
+    ledger: 'QuickBooks',
+    postedExternalId: nonEmpty(postedExternalId),
+    ledgerTargetId: nonEmpty(incident.outcome?.ledgerTargetId),
+    referenceId: entry.referenceId,
+    referenceType: entry.referenceType,
+    syncLogId: entry.id,
+    type: entry.type,
+    lookup: noRequestId?.lookup,
+    lookupNoun: noRequestId?.lookupNoun,
+  }
   // ROUND 11 (Codex HIGH): AND AN ATTEMPT THAT DID NOTHING GETS ITS OWN WHOLE MESSAGE, NOT ITS OWN
   // PARAGRAPH INSIDE THIS ONE. See `describeQboNoEffectIncident`. The test for it asserts the ENTIRE
   // generated string, because round 10's tests asserted the outcome-specific fragments, passed, and
@@ -1748,18 +1922,19 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
   const noExternalEffect = replayEntry !== undefined && !('effect' in replayEntry)
     && remoteEffectKnowledge(incident.outcome) === 'NONE'
   if (noRequestId && noExternalEffect) {
-    return describeQboNoEffectIncident(entry, noRequestId, cause)
+    return describeQboNoEffectIncident(entry, noRequestId, replaySlots, cause)
   }
   if (noRequestId) {
     return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} SUCCEEDED — the `
       + 'external effect has happened — but IMS could not record that it did: '
       + `${String(cause)}. THIS OPERATION RETURNS NO IDENTIFIER AND NO REQUEST ID PROTECTS IT: unlike a `
       + 'document post it is not sent under a derived Intuit Request-Id, so there is nothing for '
-      + `QuickBooks or WooCommerce or a mail server to deduplicate it against. Sync row ${entry.id} still `
-      + 'holds this worker\'s claim and no mirrored accounting event was written, so once that claim goes '
-      + `stale THE SWEEP WILL RECLAIM THE ROW AND RUN THE OPERATION AGAIN OUTRIGHT — ${noRequestId.effect}, `
+      + `QuickBooks or WooCommerce or a mail server to deduplicate it against. Sync row ${entry.id} was `
+      + 'left holding this worker\'s claim, with no mirrored accounting event written, so once that claim '
+      + 'goes stale THE SWEEP WILL RECLAIM THE ROW AND RUN THE OPERATION AGAIN OUTRIGHT — '
+      + `${render(noRequestId.effect, replaySlots)}, `
       + 'unbounded, because no retry is consumed while the row never leaves PROCESSING. '
-      + `WHAT TO DO ABOUT THE EFFECT: ${noRequestId.check}. `
+      + `WHAT TO DO ABOUT THE EFFECT: ${render(noRequestId.check, replaySlots)}. `
       + 'HOW TO STOP MORE OF IT: turn QuickBooks sync OFF. The control is the checkbox at the top of '
       + 'the SYNC tab of the QuickBooks connector panel, and it writes the setting '
       + 'quickbooks_sync_enabled. IT IS LABELLED "Enable Xero Sync" EVEN THERE, and its helper text '
@@ -1816,21 +1991,22 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
       postedExternalId: posted,
       outcome: incident.outcome,
       rowState: `The failure that stopped it being recorded: ${String(cause)}. Sync row ${entry.id} `
-        + 'still holds this worker\'s claim and names no document. ',
+        + 'was left holding this worker\'s claim and naming no document. ',
     })
   }
   const w = documentIncidentWording(entry.type, kind)
   const slots: WordingSlots = {
     ledger: 'QuickBooks', postedExternalId: posted, lookup: w.lookup, lookupNoun: w.noun,
+    ledgerTargetId: nonEmpty(incident.outcome?.ledgerTargetId),
   }
   const did = render(posted ? w.didWithId : w.didWithoutId, slots)
   return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} ${did}, but IMS `
     + `could not record the post: ${String(cause)}. `
-    + `Sync row ${entry.id} still names no document, so nothing in IMS points at this one and no `
+    + `Sync row ${entry.id} was left naming no document, so nothing in IMS pointed at this one and no `
     + 'mirrored accounting event was written for it — deliberately, because a FAILED one would deny a '
-    + 'document that exists. The row keeps its claim and will be re-attempted once the claim goes '
-    + 'stale; that attempt re-posts under the SAME Intuit Request-Id, so it should be deduplicated '
-    + 'rather than duplicated. '
+    + 'document that exists. The row was left holding its claim and will be re-attempted once that '
+    + 'claim goes stale; that attempt re-posts under the SAME Intuit Request-Id, so it should be '
+    + 'deduplicated rather than duplicated. '
     + (posted
       ? render(w.remedyIdUnrecorded, slots)
       : 'AND THE RESPONSE CARRIED NO ID EITHER, so there is nothing to open — do not go looking for '
