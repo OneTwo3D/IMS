@@ -1742,7 +1742,7 @@ async function enqueueFollowUps(
 // never less of it.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
-// WHAT TO DO, IN ORDER, WHENEVER SOMEONE PICKS THIS UP (o3d-9v3k tracks it):
+// WHAT TO DO, IN ORDER, WHENEVER SOMEONE PICKS THIS UP (o3d-s4q2 tracks it, blocked on o3d-8prh):
 //
 //   1. Land o3d-8prh: the connection verdict reached as the last statement before the QuickBooks
 //      socket, the same shape Xero has. Nothing below is safe before this.

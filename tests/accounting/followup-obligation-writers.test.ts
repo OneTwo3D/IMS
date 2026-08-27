@@ -1287,6 +1287,7 @@ test('[o3d-0bfh r5] a QuickBooks crash after the SYNCED/marker commit is re-driv
   // If this test ever fails, a consumer has been wired. Read the block at the end of
   // lib/connectors/quickbooks/sync-processor.ts BEFORE deleting it: closing o3d-s36z was not enough,
   // and a consumer that enqueues a payment before o3d-8prh lands can post it to the wrong company.
+  // o3d-s4q2 carries the gap and the order of work; it is blocked on o3d-8prh.
 })
 
 test('[o3d-0bfh r5] CONTROL: the recovery logic works perfectly — it is only unreachable', async () => {
