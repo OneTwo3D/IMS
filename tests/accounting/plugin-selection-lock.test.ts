@@ -997,6 +997,19 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // comments. Rewording that sentence to dodge this scan would delete the lesson to satisfy the
   // detector, so it is classified instead.
   'scripts/check-documented-env-vars.mjs': 'names-the-tools-only',
+  // o3d-2k5r r6 / o3d-1izw. Found for the same reason: its REFUSAL TEXT names `prisma migrate
+  // deploy`, because a refusal whose remedy is "apply the migration" is one nobody can act on. The
+  // module executes nothing — it takes a reader function and compares enum labels — and the one
+  // production reader is a parameterised `SELECT` over `pg_enum` living in order-push-sweep.ts,
+  // through the app's own client. Rewording the remedy to dodge this scan would delete the only
+  // useful part of the message.
+  'lib/domain/wms/push-state-schema-gate.ts': 'names-the-tools-only',
+  // o3d-1izw. A read-only deploy gate: it opens its own `pg` client (deploy.sh runs it before the
+  // app is up, so there is no app client to borrow) and issues ONE parameterised SELECT over
+  // pg_enum. It writes nothing anywhere, and it names `prisma migrate deploy` for the same reason
+  // the module above does. Runs only on `deploy.sh --skip-migrate`, the delivery path that applies
+  // and validates nothing.
+  'scripts/check-wms-push-state-enum.mjs': 'names-the-tools-only',
   'scripts/deploy.sh': 'migration-runner',
   'scripts/install.sh': 'migration-runner',
   'scripts/prisma-dev-db.sh': 'migration-runner',

@@ -67,13 +67,18 @@ test('o3d-1izw gate: a REFUSAL is re-probed, so applying the migration heals the
   // the thrown error) and this fails on the second call — the process would have to be restarted
   // after a migration, and an environment served by `next dev` is exactly the one nobody restarts.
   let migrated = false
+  let reads = 0
   const gate = createWmsPushStateSchemaGate(
-    async () => (migrated ? ['SYNCED', 'AMBIGUOUS_CREATE'] : ['SYNCED']),
+    async () => { reads += 1; return migrated ? ['SYNCED', 'AMBIGUOUS_CREATE'] : ['SYNCED'] },
     { onRefusal: () => {} },
   )
   await assert.rejects(gate(), isWmsPushStateSchemaError)
   migrated = true
   await gate()
+  // The READ COUNT is the assertion, not merely that the second call resolved: a gate that latched
+  // on the refusal would also resolve here, by never asking again and never having anything to
+  // refuse with. Two reads is what "re-probed" means.
+  assert.equal(reads, 2)
 })
 
 test('o3d-1izw gate: the refusal is announced ONCE per process, not once per sweep', async () => {
@@ -137,4 +142,63 @@ test('o3d-1izw gate: the sweep asks it BEFORE it reads a candidate, and the clai
   assert.notEqual(claim, -1)
   const claimBody = source.slice(claim, source.indexOf('return db.$transaction', claim))
   assert.match(claimBody, /await assertWmsPushStateSchemaReady\(\)/, 'the write site guards itself before opening the transaction')
+})
+
+// --- the DEPLOYMENT half ------------------------------------------------------------------
+
+test('o3d-1izw preflight: production preflight FAILS when the database lacks a state this build writes', async () => {
+  // Route: runProductionPreflight -> checkWmsPushStateSchema (PREFLIGHT_DB_CONNECT on) ->
+  // missingWmsPushStates -> a `fail` check carrying the same refusal the runtime gate raises.
+  //
+  // Mutation: report `warn` instead of `fail` (or skip the check when the value is absent) and
+  // this fails on `result.ok` — a deploy would proceed onto a database where the order-push sweep
+  // refuses to run at all, which is a fulfilment outage rather than a nit.
+  const { runProductionPreflight } = await import('../lib/ops/production-preflight.ts')
+  const env = { PREFLIGHT_DB_CONNECT: '1', DATABASE_URL: 'postgresql://u:p@localhost:5432/ims' }
+
+  const absent = await runProductionPreflight({
+    env,
+    dbConnect: async () => {},
+    readWmsPushStates: async () => ['PENDING_CREATE', 'SYNCED'],
+  })
+  const failed = absent.checks.find((check) => check.id === 'wms-push-state-schema')!
+  assert.equal(failed.status, 'fail')
+  assert.equal(absent.ok, false)
+  assert.match(failed.message, /o3d-1izw/)
+
+  const present = await runProductionPreflight({
+    env,
+    dbConnect: async () => {},
+    readWmsPushStates: async () => [...REQUIRED_WMS_PUSH_STATES],
+  })
+  assert.equal(present.checks.find((check) => check.id === 'wms-push-state-schema')!.status, 'pass')
+})
+
+test('o3d-1izw preflight: an UNREADABLE enum is a failed check, not a skipped one', async () => {
+  // Route: the reader throws -> `fail`.
+  //
+  // Mutation: swallow the error and return without adding a check, and this fails — "we could not
+  // ask" would pass the deploy gate, which is the same absence-as-an-answer shape the runtime gate
+  // refuses.
+  const { runProductionPreflight } = await import('../lib/ops/production-preflight.ts')
+  const result = await runProductionPreflight({
+    env: { PREFLIGHT_DB_CONNECT: '1', DATABASE_URL: 'postgresql://u:p@localhost:5432/ims' },
+    dbConnect: async () => {},
+    readWmsPushStates: async () => { throw new Error('connection refused') },
+  })
+  const check = result.checks.find((entry) => entry.id === 'wms-push-state-schema')!
+  assert.equal(check.status, 'fail')
+  assert.match(check.message, /o3d-1izw/)
+})
+
+test('o3d-1izw deploy: --skip-migrate runs the enum check, --restart-only does not', async () => {
+  // The one delivery path that applies and validates nothing has to verify this itself. Route:
+  // scripts/deploy.sh, the `elif ! $RESTART_ONLY` arm of the migration block.
+  //
+  // Mutation: delete the arm (or fold the check into the migrating branch, where it is redundant)
+  // and this fails — --skip-migrate is exactly how a build reaches an environment ahead of its own
+  // schema, which is what o3d-1izw is open against.
+  const { readFile } = await import('node:fs/promises')
+  const deploy = await readFile(new URL('../scripts/deploy.sh', import.meta.url), 'utf8')
+  assert.match(deploy, /elif ! \$RESTART_ONLY; then[\s\S]*node scripts\/check-wms-push-state-enum\.mjs/)
 })

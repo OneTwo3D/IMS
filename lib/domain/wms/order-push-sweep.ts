@@ -22,7 +22,6 @@ import { createWmsPushStateSchemaGate, WMS_PUSH_STATE_ENUM } from './push-state-
  * applyExternalFulfillmentUpdate once the WMS reports the order despatched.
  */
 
-const READY_STATUSES = ['PROCESSING', 'ALLOCATED'] as const
 /** Lifecycle statuses where the WMS order is already dispatched. A (full) refund on a
  *  dispatched order is a returns/financial matter — never a WMS cancellation. Under the
  *  orthogonal refund model a fully-refunded order keeps its lifecycle status, so this set

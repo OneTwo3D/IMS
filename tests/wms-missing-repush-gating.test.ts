@@ -427,6 +427,11 @@ test('o3d-2k5r r6 repush: an order whose warehouse binding was DISABLED is refus
   assert.match(result.error!, /ACTIVE binding/)
   assert.equal(state.finding!.status, 'OPEN', 'the finding is the only trace of this order — it stays')
   assert.equal(state.link!.state, 'SYNCED', 'and the link is untouched')
+  // Refused BEFORE the warehouse is asked anything. This is what distinguishes the up-front
+  // eligibility read from the in-transaction re-proof that backs it up: an order that can never be
+  // re-pushed must not spend a connector call finding that out, and if the up-front check went
+  // missing the probe would run before the transaction refused.
+  assert.deepEqual(state.probed, [])
 })
 
 test('o3d-2k5r r6 repush: an order moved to an UNBOUND warehouse is refused', async () => {
