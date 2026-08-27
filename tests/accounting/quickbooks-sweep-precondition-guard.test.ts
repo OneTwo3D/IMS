@@ -191,20 +191,31 @@ test('[o3d-0bfh r6] operator documentation does not blame the company boundary f
   )
 })
 
+/**
+ * RULE 3'S ACTUAL DECISION, as one function, so the control at the end of this file exercises the
+ * rule rather than its ingredients. A control that asserts on the regexes alone stays green if the
+ * rule around them is loosened — which is how the ±4-line exemption survived a round that claimed
+ * proximity had been removed.
+ */
+function bindingPreconditionOffence(lines: string[], index: number): boolean {
+  const line = lines[index]
+  if (!PRECONDITION.test(line) || HISTORICAL.test(line)) return false
+  const near = window(lines, index, 6)
+  if (!QUICKBOOKS.test(near) || !SWEEP_BINDING.test(near)) return false
+  // r7 (Codex MEDIUM): THE ±4-LINE EXEMPTION IS GONE. It was the last proximity rule in this file,
+  // kept after both of the others were found vacuous, and it fails the same way: a stale
+  // "Precondition for binding it: <anything>" written beside the corrected paragraph inherits that
+  // paragraph's o3d-8prh and passes — which is precisely where a maintainer puts one, and precisely
+  // the adjacency failure the header claimed was removed. The claim and its real prerequisite must
+  // be in the SAME CLAUSE, which is a property of the sentence and not of its neighbours.
+  return !REAL_PREREQUISITE.test(line)
+}
+
 test('[o3d-0bfh r6] any passage stating what a QuickBooks sweep binding awaits names the REAL prerequisite', () => {
   const offences: string[] = []
   for (const { rel, lines } of FILES) {
     lines.forEach((line, index) => {
-      if (!PRECONDITION.test(line) || HISTORICAL.test(line)) return
-      const near = window(lines, index, 6)
-      if (!QUICKBOOKS.test(near) || !SWEEP_BINDING.test(near)) return
-      // r7 (Codex MEDIUM): THE ±4-LINE EXEMPTION IS GONE. It was the last proximity rule in this
-      // file, kept after both of the others were found vacuous, and it fails the same way: a stale
-      // "Precondition for binding it: <anything>" written beside the corrected paragraph inherits
-      // that paragraph's o3d-8prh and passes — which is precisely where a maintainer puts one, and
-      // precisely the adjacency failure the header claims was removed. The claim and its real
-      // prerequisite must be in the SAME CLAUSE, which is a grammar rule and not a distance.
-      if (REAL_PREREQUISITE.test(line)) return
+      if (!bindingPreconditionOffence(lines, index)) return
       offences.push(`${rel}:${index + 1}: ${line.trim()}`)
     })
   }
@@ -300,18 +311,27 @@ test('[o3d-0bfh r7] CONTROL: the constructions that defeated the previous rules 
     '// rows a consumer would create.',
   ]
   const index = passage.indexOf(staleLine)
-  assert.ok(PRECONDITION.test(staleLine) && !HISTORICAL.test(staleLine), 'the stale line is a live claim')
-  assert.ok(QUICKBOOKS.test(window(passage, index, 6)) && SWEEP_BINDING.test(window(passage, index, 6)))
   assert.ok(
     REAL_PREREQUISITE.test(window(passage, index, 4)),
-    'the ±4 window DOES contain o3d-8prh — this is the escape, and the reason a proximity rule passes it',
+    'the ±4 window DOES contain o3d-8prh — this is the escape, and the reason a proximity rule passes this line',
   )
   assert.equal(
     REAL_PREREQUISITE.test(staleLine), false,
-    'but the claim itself names nothing real, so the same-clause rule flags it',
+    'while the claim itself names nothing real',
+  )
+  assert.equal(
+    bindingPreconditionOffence(passage, index), true,
+    'RULE 3 ITSELF must flag it. This assertion, not the regexes above, is what fails if the proximity '
+      + 'exemption is ever restored.',
   )
 
   // 2. THE after/once CONSTRUCTION, which matched no rule at all in r6.
+  // Each construction is run through RULE 3 in a passage that looks like the ones in the tree, so
+  // what is asserted is the rule's verdict and not a regex's.
+  const inQuickBooksPassage = (claim: string) => {
+    const lines = ['// NO back-reference repair sweep for QuickBooks yet.', claim, '// (nothing else on this passage)']
+    return bindingPreconditionOffence(lines, 1)
+  }
   for (const deferred of [
     'Bind the QuickBooks repair sweep only after o3d-s36z closes.',
     '// Do not re-add the sweep until o3d-s36z lands.',
@@ -319,6 +339,7 @@ test('[o3d-0bfh r7] CONTROL: the constructions that defeated the previous rules 
   ]) {
     assert.ok(PRECONDITION.test(deferred), `rule 3 must see a deferral instruction: ${deferred}`)
     assert.equal(REAL_PREREQUISITE.test(deferred), false, 'and none of them names the real prerequisite')
+    assert.equal(inQuickBooksPassage(deferred), true, `and rule 3 must flag it: ${deferred}`)
   }
   assert.ok(
     CURRENT_PRECONDITION_CLAIM.test('Bind the QuickBooks repair sweep only after o3d-s36z closes.'),
@@ -334,6 +355,7 @@ test('[o3d-0bfh r7] CONTROL: the constructions that defeated the previous rules 
     assert.ok(CURRENT_PRECONDITION_CLAIM.test(reversed), `rule 1 must see the reversed clause: ${reversed}`)
     assert.equal(HISTORICAL.test(reversed), false, 'and nothing on it reads as history')
     assert.ok(PRECONDITION.test(reversed), `rule 3 must see it too: ${reversed}`)
+    assert.equal(inQuickBooksPassage(reversed), true, `and flag it: ${reversed}`)
   }
 
   // 4. LINE WRAPPING — the claim split so that no precondition WORD survives on the line rule 3
@@ -341,6 +363,7 @@ test('[o3d-0bfh r7] CONTROL: the constructions that defeated the previous rules 
   const wrapped = '// The QuickBooks repair sweep must not be bound until the realm-provenance'
   assert.ok(PRECONDITION.test(wrapped), 'a wrapped deferral is still a deferral')
   assert.equal(REAL_PREREQUISITE.test(wrapped), false)
+  assert.equal(inQuickBooksPassage(wrapped), true, 'and rule 3 flags it with no precondition word on the line')
 
   // AND THE NEGATIVE SIDE, or the broadened rules are answered by deleting honest prose. Each of
   // these is a real line from the tree or its shape: a deferral that is not about binding a sweep, a
@@ -351,4 +374,9 @@ test('[o3d-0bfh r7] CONTROL: the constructions that defeated the previous rules 
   assert.ok(!CURRENT_PRECONDITION_CLAIM.test(historical) || HISTORICAL.test(historical))
   const corrected = '// Read the block at the end of ./sync-processor before binding one: it is ordered on o3d-8prh.'
   assert.ok(PRECONDITION.test(corrected) && REAL_PREREQUISITE.test(corrected), 'the fix has to be expressible')
+  assert.equal(
+    inQuickBooksPassage(corrected), false,
+    'and rule 3 must NOT flag the corrected line, or the rule forbids its own remedy and is answered by '
+      + 'deleting the comment',
+  )
 })
