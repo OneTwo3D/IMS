@@ -66,7 +66,7 @@ function qbo(type: AccountingSyncType, opts: { posted?: string | null; outcome?:
  * nobody moved, when it reaches a reader it was not written for.
  */
 const DESTRUCTIVE = [
-  /keep it \(re-enter the reference by hand\) or void it/,
+  /keep it \(re-enter the reference manually\) or void it/,
   /void or credit the duplicate/,
   /void any duplicate/,
   /POST A REVERSING JOURNAL against it/,
@@ -79,7 +79,7 @@ const DESTRUCTIVE = [
 // CASE 1 — XERO UPDATE
 // ---------------------------------------------------------------------------------------------
 // MUTATION THAT KILLS THIS (run): in OPERATION_SEMANTIC_BY_TYPE, set SALES_INVOICE_UPDATE back to
-// 'CREATE_DOCUMENT' — the wording reverts to "keep it (re-enter the reference by hand) or void it",
+// 'CREATE_DOCUMENT' — the wording reverts to "keep it (re-enter the reference manually) or void it",
 // and every doesNotMatch below fails on the first message.
 //
 // ROUTE: the exported Xero formatter, over both refusal reasons and both id combinations. Nothing
@@ -103,9 +103,12 @@ test('ROUND 10 (Codex HIGH): a Xero *_UPDATE incident never tells an operator to
     // …and the classification itself, so the wording cannot be right by accident.
     assert.equal(incidentKindForOperation(type, 'EXT-1', LIVE), 'LEDGER_DOCUMENT')
     assert.equal(incidentKindForOperation(type, null, LIVE), 'LEDGER_DOCUMENT_NO_IDENTIFIER')
-    // An UPDATE has no draft form to be unsure about: the mode cannot turn a change to a standing
-    // document into no change, so its absence is not an unknown here.
-    assert.equal(incidentKindForOperation(type, 'EXT-1'), 'LEDGER_DOCUMENT')
+    // ROUND 11 (Codex MEDIUM) CORRECTS THE LINE THAT STOOD HERE. Round 10 wrote that "an UPDATE has
+    // no draft form to be unsure about" and pinned the no-outcome case to LEDGER_DOCUMENT. Both
+    // update handlers send `resolveInvoiceStatus(payload._postingMode)` exactly as the creates do,
+    // so an update HAS a draft form and an unrecorded mode is an unknown here like anywhere else.
+    assert.equal(incidentKindForOperation(type, 'EXT-1'), 'LEDGER_OUTCOME_UNRECORDED')
+    assert.equal(incidentKindForOperation(type, 'EXT-1', DRAFT), 'LEDGER_DRAFT')
   }
 
   // A PAYMENT is the same class of mistake one door along: it applies to a document nobody created.
@@ -142,7 +145,7 @@ test('ROUND 10 (Codex HIGH): a DRAFT posting says no balances moved, and prescri
   assert.match(invoice, /created a DRAFT document in Xero as EXT-1/)
   assert.match(invoice, /DELETE it if it should not exist/)
   assert.match(invoice, /DO NOT void it, credit-note it or reverse it/)
-  assert.doesNotMatch(invoice, /keep it \(re-enter the reference by hand\) or void it/)
+  assert.doesNotMatch(invoice, /keep it \(re-enter the reference manually\) or void it/)
 
   // The conflict door and the no-id door take the same answer.
   const both = xero('SALES_INVOICE', { outcome: DRAFT, reason: 'ANOTHER_DOCUMENT_NAMED', named: 'EXT-2' })
@@ -163,10 +166,13 @@ test('ROUND 10 (Codex HIGH): a DRAFT posting says no balances moved, and prescri
     LEDGER_OUTCOME_UNRECORDED: 0, LEDGER_NON_DOCUMENT: 0, NO_IDENTIFIER_SIDE_EFFECT: 0, UNCLASSIFIED: 0,
   }
   const drafts = describePreservedUnrecordedIncidents({ ...zero, LEDGER_DRAFT: 2 })
-  assert.match(drafts, /2 were created as DRAFTS and MOVED NO BALANCES/)
-  assert.match(drafts, /DELETE one if it should not exist/)
-  assert.match(drafts, /DO NOT void, credit-note or reverse it/)
+  assert.match(drafts, /2 MOVED NO BALANCES/)
+  assert.match(drafts, /DO NOT void, credit-note or reverse any of them/)
   assert.doesNotMatch(drafts, /real money in somebody else's books/)
+  // ROUND 11 (Codex MEDIUM): and it no longer says every one of them was CREATED as a draft, nor
+  // prescribes deleting them, because a draft UPDATE modified one that stood there before.
+  assert.match(drafts, /THEY WERE NOT ALL CREATED AS DRAFTS/)
+  assert.doesNotMatch(drafts, /DELETE one if it should not exist/)
 })
 
 // ---------------------------------------------------------------------------------------------

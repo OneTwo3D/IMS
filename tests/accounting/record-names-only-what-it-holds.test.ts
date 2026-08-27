@@ -137,34 +137,122 @@ async function retainedMetadataKeys(): Promise<{ perBuilder: Map<string, Set<str
   return { perBuilder, common }
 }
 
+type WordingEntryView = {
+  label: string
+  templates: string[]
+  needs: readonly string[]
+  lookup: readonly string[]
+}
+
 /** Every wording entry in the module, flattened, with the strings it can render. */
-function everyWordingEntry(): { label: string; templates: string[]; needs: readonly string[] }[] {
-  const out: { label: string; templates: string[]; needs: readonly string[] }[] = []
+function everyWordingEntry(): WordingEntryView[] {
+  const out: WordingEntryView[] = []
   for (const [key, w] of Object.entries(DOCUMENT_INCIDENT_WORDING)) {
-    const { needs, ...rest } = w
-    out.push({ label: `DOCUMENT_INCIDENT_WORDING.${key}`, templates: Object.values(rest), needs })
+    const { needs, lookup, ...rest } = w
+    out.push({
+      label: `DOCUMENT_INCIDENT_WORDING.${key}`,
+      templates: Object.values(rest),
+      needs,
+      lookup: lookup ?? [],
+    })
   }
   for (const [type, entry] of Object.entries(NON_DOCUMENT_INCIDENT_WORDING)) {
     const variants = 'did' in entry ? { '': entry } : entry
     for (const [variant, w] of Object.entries(variants)) {
-      const { needs, ...rest } = w
+      const { needs, lookup, ...rest } = w
       out.push({
         label: `NON_DOCUMENT_INCIDENT_WORDING.${type}${variant ? `.${variant}` : ''}`,
         templates: Object.values(rest),
         needs,
+        lookup: lookup ?? [],
       })
     }
   }
   return out
 }
 
+// ---------------------------------------------------------------------------------------------
+// ROUND 11 (Codex MEDIUM) — THE THIRD GENERATION OF THIS INVARIANT, AND THE HONEST ACCOUNT OF IT.
+//
+// WHY THERE IS A THIRD. Round 9 scanned generated messages for a hand-written table of English
+// FIELD PHRASES ("its amount", "its date") and was bypassable by writing different words. Round 10
+// inverted it into a DECLARATION (`needs`) checked against what the two record builders write — and
+// was bypassable by not declaring anything: adding "search by gross total and posting day" to a
+// remedy introduces no placeholder, leaves `needs` truthful, compiles, and passes. Both generations
+// enumerated an OPEN class (the ways to name a datum) and called it closed.
+//
+// WHAT IS DIFFERENT NOW. The lookup clause is not prose. `lookupInstruction` in the module owns the
+// WHOLE clause — the verb, the ledger and the criterion — and builds it from the entry's declared
+// `lookup: RecordLookupField[]` against the values THIS incident carries. So:
+//
+//   • a criterion that is not a `RecordLookupField` does not compile;
+//   • a `RecordLookupField` the two builders do not BOTH write fails the declaration test below;
+//   • a field whose value is absent on this incident THROWS while rendering, and the test that
+//     generates every message for every combination turns that into a red build;
+//   • and the fence below refuses any template that contains a LOOKUP VERB in its own words, which
+//     leaves `{lookup}` as the only way a remedy can send an operator to go and find something.
+//
+// THE VERB LIST IS A CLOSED GRAMMATICAL CLASS, not an open list of data names. That is the whole
+// improvement: you cannot instruct a search without instructing a search, and the instruction is
+// what is enumerated, rather than the thing searched on.
+//
+// WHAT THIS PROVABLY DOES NOT COVER. Said plainly, because shipping a third version that implies
+// closure it does not have is the defect, not the wording:
+//
+//   1. A LOOKUP EXPRESSED WITHOUT ANY OF THESE VERBS still passes. "Go to the invoice whose gross
+//      total is the one on the order" names a criterion and contains no listed verb. English has no
+//      closed set of ways to name a datum, and these remedies are hand-written operator prose that
+//      could not be generated from a grammar without losing what ten rounds of review put into them.
+//      What is enforced is that the DIRECT forms — find / search / locate / look up / query /
+//      filter / retrieve / trace / identify — cannot be written at all.
+//   2. PROSE MAY STILL NAME A VALUE THIS MESSAGE HAS ALREADY PRINTED. "open both ids", "the
+//      reference above", "the id above" are deliberate and permitted: they point at text the reader
+//      already has, not at data they must go and find. A field the record does NOT print cannot be
+//      named this way and still be usable, but nothing here stops the sentence being written.
+//   3. IT COVERS THE TWO INCIDENT WORDING TABLES, NOT EVERY STRING IN THE MODULE. The formatter
+//      frames and `QBO_OPERATIONS_WITHOUT_REQUEST_ID`'s `check` are outside it. That is deliberate
+//      for the `check`: it instructs a query of the LOCAL EmailOutbox table by that table's own
+//      columns, which is a different act from looking this incident's effect up in a ledger, and
+//      every column it names was walked into the schema in rounds 6 through 9. It is a hole all the
+//      same, and it is named here rather than left to be found.
+//
+// The mutation Codex asked for is a REQUIRED FAILING CASE below, run against the shipped checker,
+// so the bypass this round closes cannot quietly reopen.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The direct ways English instructs a lookup. Closed by grammar rather than by data vocabulary —
+ * see the block above for exactly what that does and does not buy.
+ */
+const LOOKUP_VERB =
+  /\b(?:find|finds|finding|search|searches|searching|locate|locates|locating|look|looks|looking|query|queries|querying|filter|filters|filtering|retrieve|retrieves|retrieving|trace|traces|tracing|identify|identifies|identifying)\b/gi
+
+/** Every lookup verb a set of templates writes in its own words. `{lookup}` carries none. */
+function lookupVerbsWrittenInProse(templates: readonly string[]): string[] {
+  const found: string[] = []
+  for (const template of templates) {
+    // The generated clause is the permitted route, so its own placeholder is not prose. Everything
+    // else in the template is.
+    const prose = template.replace(/\{Lookup\}|\{lookup\}/g, ' ')
+    for (const [verb] of prose.matchAll(LOOKUP_VERB)) found.push(verb)
+  }
+  return found
+}
+
 const PLACEHOLDER = /\{([A-Za-z]+)\}/g
 
-// MUTATION THAT KILLS THIS (run): add `'grossTotal'` to any entry's `needs` — it is not a
-// `RecordLookupField`, so the BUILD fails before the test does; declare an existing field the
+// MUTATION THAT KILLS THIS (run): add `'grossTotal'` to any entry's `needs` or `lookup` — it is not
+// a `RecordLookupField`, so the BUILD fails before the test does; declare an existing field the
 // builders do not both write (e.g. `'rowNamesExternalId'`, which only the Xero builder writes) and
-// this test fails naming the entry. Deleting `postedExternalId` from either builder's metadata
-// object kills it the other way.
+// this test fails naming the entry. Deleting `postedExternalId` from the QuickBooks builder's
+// metadata object kills it the other way, and was RUN: it fails here with
+// 'DOCUMENT_INCIDENT_WORDING.CREATE_LIVE declares "postedExternalId", which is not a key both
+// record builders write'.
+//
+// ROUND 11, THE OTHER HALF: declaring a `lookup` field the INCIDENT does not carry — e.g. adding
+// `'syncLogId'` to CREATE_LIVE's lookup, which both builders do write but which no formatter puts
+// in the slots — is caught one test along instead, because `lookupInstruction` throws while
+// rendering. RUN: it fails 'ROUND 10: no message this module can produce leaks an unresolved slot'.
 //
 // ROUTE: the declarations come from the SHIPPED wording tables, and the retained keys are PARSED
 // OUT OF THE TWO CONNECTOR SOURCE FILES. Neither side of the comparison is written down here, so it
@@ -183,14 +271,21 @@ test('ROUND 10 (Codex MEDIUM): every field a wording DECLARES is one every recor
 
   const entries = everyWordingEntry()
   assert.ok(entries.length >= 12, `sanity: ${entries.length} wording entries were found`)
-  for (const { label, needs } of entries) {
-    for (const field of needs) {
+  for (const { label, needs, lookup } of entries) {
+    // ROUND 11: `lookup` is held to the same rule as `needs`, and for the same reason — the clause
+    // it generates is rendered on BOTH connectors' doors, so a key only one builder writes would
+    // produce a lookup instruction that cannot be followed on the other.
+    for (const field of [...needs, ...lookup]) {
       assert.ok(
         retained.has(field),
         `${label} declares "${field}", which is not a key both record builders write`,
       )
     }
   }
+  assert.ok(
+    entries.some((entry) => entry.lookup.length > 0),
+    'no entry declares a lookup at all, so this half of the check proves nothing',
+  )
 })
 
 // MUTATION THAT KILLS THIS (run): put a bare `{amount}` (or any undeclared slot) into any remedy
@@ -201,13 +296,24 @@ test('ROUND 10 (Codex MEDIUM): every field a wording DECLARES is one every recor
 // ROUTE: the templates are read out of the SHIPPED wording tables, and the slot vocabulary out of
 // the SHIPPED `RECORD_LOOKUP_FIELDS`.
 test('ROUND 10: a wording names a record value only through a slot it declared, and only a real one', () => {
-  const known = new Set<string>([...RECORD_LOOKUP_FIELDS, 'ledger', 'LEDGER'])
+  const known = new Set<string>([...RECORD_LOOKUP_FIELDS, 'ledger', 'LEDGER', 'lookup', 'Lookup'])
   let sawOne = false
-  for (const { label, templates, needs } of everyWordingEntry()) {
+  let sawLookup = false
+  for (const { label, templates, needs, lookup } of everyWordingEntry()) {
     for (const template of templates) {
       for (const [, slot] of template.matchAll(PLACEHOLDER)) {
         assert.ok(known.has(slot), `${label} names the slot "${slot}", which is not a thing this record holds`)
         if (slot === 'ledger' || slot === 'LEDGER') continue
+        // ROUND 11: the generated lookup clause is declared through `lookup`, not `needs` — it names
+        // no record value directly, it names the FIELDS the renderer may build a criterion from.
+        if (slot === 'lookup' || slot === 'Lookup') {
+          sawLookup = true
+          assert.ok(
+            lookup.length > 0,
+            `${label} renders "{${slot}}" without declaring a lookup field for it`,
+          )
+          continue
+        }
         sawOne = true
         assert.ok(
           needs.includes(slot),
@@ -217,6 +323,72 @@ test('ROUND 10: a wording names a record value only through a slot it declared, 
     }
   }
   assert.ok(sawOne, 'the check must actually have seen a record slot, or it proves nothing')
+  assert.ok(sawLookup, 'and a generated lookup clause, or the round-11 half proves nothing')
+
+  // The other direction: a declaration nobody renders is a declaration nobody checks.
+  for (const { label, templates, lookup } of everyWordingEntry()) {
+    if (lookup.length === 0) continue
+    assert.ok(
+      templates.some((template) => /\{Lookup\}|\{lookup\}/.test(template)),
+      `${label} declares a lookup no template renders`,
+    )
+  }
+})
+
+// MUTATION THAT KILLS THIS (run): write a lookup instruction into any remedy in either wording
+// table — e.g. append "search by gross total and posting day" to
+// DOCUMENT_INCIDENT_WORDING.CREATE_LIVE.remedyRowGone. The first assertion fails naming the entry
+// and the verb. That mutation is ALSO run inline below against the shipped checker, so this test
+// cannot become vacuous by the checker being weakened rather than the corpus being cleaned.
+//
+// ROUTE: the templates are read out of the SHIPPED wording tables. The verb list is the only thing
+// written down here, and it is a grammatical class rather than a list of data names — read the
+// block above this file's helpers for exactly what that does and does not cover.
+test('ROUND 11 (Codex MEDIUM): only the renderer may instruct a lookup, never a remedy in its own words', () => {
+  const entries = everyWordingEntry()
+  assert.ok(entries.length >= 12, `sanity: ${entries.length} wording entries were scanned`)
+  for (const { label, templates } of entries) {
+    const verbs = lookupVerbsWrittenInProse(templates)
+    assert.deepEqual(
+      verbs, [],
+      `${label} instructs a lookup in its own words (${verbs.join(', ')}). `
+      + 'A remedy may only send an operator looking through {lookup}, which is generated from the '
+      + 'fields this record is declared to hold.',
+    )
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // THE REQUIRED FAILING CASE (Codex, round 11). This is the exact bypass round 10 claimed to have
+  // eliminated and had not: it introduces no placeholder, leaves `needs` and `lookup` truthful, and
+  // compiles. It is run here against the SHIPPED checker so that weakening the checker fails this
+  // test rather than quietly reopening the hole.
+  // ---------------------------------------------------------------------------------------------
+  const shipped = DOCUMENT_INCIDENT_WORDING.CREATE_LIVE.remedyRowGone
+  assert.deepEqual(lookupVerbsWrittenInProse([shipped]), [], 'the entry being mutated must start clean')
+
+  const grossTotalBypass = `${shipped} If that fails, search by gross total and posting day.`
+  assert.deepEqual(
+    lookupVerbsWrittenInProse([grossTotalBypass]), ['search'],
+    'the gross-total/posting-day remedy is the round-10 bypass and it must be refused',
+  )
+
+  // …and the paraphrases of it, so the case is not passing on one word.
+  for (const [prose, expected] of [
+    ['Look it up using the gross total and the posting day.', ['Look']],
+    ['Locate the bill by its supplier reference.', ['Locate']],
+    ['Query the ledger for a document with that net amount.', ['Query']],
+    ['Filter the invoice list on the posting day.', ['Filter']],
+  ] as [string, string[]][]) {
+    assert.deepEqual(lookupVerbsWrittenInProse([prose]), expected, prose)
+  }
+
+  // AND THE HOLE, ASSERTED RATHER THAN IMPLIED. This one gets through, and a reader of this file is
+  // entitled to know that before trusting the invariant. It is item 1 of the block above.
+  assert.deepEqual(
+    lookupVerbsWrittenInProse(['Go to the invoice whose gross total matches the order.']), [],
+    'a lookup phrased without any of the direct verbs is NOT caught — the fence closes the verb, '
+    + 'not the language, and this assertion exists so that claim is documented rather than assumed',
+  )
 })
 
 // MUTATION THAT KILLS THIS (run): drop the `render(...)` call from around `w.bothExist` in the Xero
@@ -289,7 +461,7 @@ test('ROUND 9 (Codex HIGH): a Xero non-document incident with no identifier gets
     })
 
     // THE DEFECT: every one of these directs an operator at a document that was never created.
-    assert.doesNotMatch(message, /keep it \(re-enter the reference by hand\) or void it/, reason)
+    assert.doesNotMatch(message, /keep it \(re-enter the reference manually\) or void it/, reason)
     assert.doesNotMatch(message, /find it in Xero/, reason)
     assert.doesNotMatch(message, /open both ids in Xero/, reason)
     assert.doesNotMatch(message, /BOTH documents exist in Xero/, reason)
@@ -341,7 +513,7 @@ test('ROUND 9: every operation the map calls a non-document has its own remedy, 
       for (const [connector, message] of [['xero', xero], ['quickbooks', qbo]] as const) {
         assert.doesNotMatch(message, /void any duplicate\./, `${connector} ${type}`)
         assert.doesNotMatch(message, /confirm exactly one document exists/, `${connector} ${type}`)
-        assert.doesNotMatch(message, /keep it \(re-enter the reference by hand\)/, `${connector} ${type}`)
+        assert.doesNotMatch(message, /keep it \(re-enter the reference manually\)/, `${connector} ${type}`)
       }
       // The QuickBooks four keep the o3d-qn21 replay wording they already had; the rest take the
       // shared non-document message. Either way, no document instruction.

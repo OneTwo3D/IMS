@@ -256,8 +256,14 @@ test('Codex MEDIUM (round 3): the breadcrumb describes the WHOLE preserved set, 
   )
   assert.match(breadcrumb.description, /THEY ARE NOT ALL THE SAME KIND OF THING/)
 
-  // What IS true of the whole set: each one names an effect, and the record says which.
-  assert.match(breadcrumb.description, /Each record says what the effect was/)
+  // ROUND 11 (Codex MEDIUM): AND NOT "Each record says what the effect was", WHICH IS WHAT STOOD
+  // HERE. It is not true of the whole set. An unclassified operation type, an attachment written
+  // before IMS captured the handler's outcome, and a posting mode that was never recorded all
+  // produce records that say the opposite — that IMS does not know what happened. The breadcrumb is
+  // exempt from retention AND from the reset, so a universal it cannot support outlives every other
+  // statement in the system.
+  assert.doesNotMatch(breadcrumb.description, /Each record says what the effect was/)
+  assert.match(breadcrumb.description, /where IMS could not establish what the effect was, it says that/)
 
   // Unchanged: the ledger half is still stated, because BOTH fixtures here are ledger documents.
   assert.match(breadcrumb.description, /Xero or QuickBooks accepted and still holds/)
