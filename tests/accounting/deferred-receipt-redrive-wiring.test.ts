@@ -233,17 +233,32 @@ test('a receipt that already has its OWN sync row is never re-driven', async () 
   assert.equal(state.queued.length, 0)
 })
 
-test('nothing is re-driven while the invoice has not posted', async () => {
+test('an order carrying NO invoice id is the back-reference having failed, and is reported', async () => {
+  // THIS TEST CHANGED MEANING WITH THE PIN (o3d-ekn8 r5, Codex HIGH), so its old name and its old
+  // assertion are both gone rather than quietly adjusted.
+  //
+  // It used to read "nothing is re-driven while the invoice has not posted", and asserted SILENCE on
+  // the grounds that DOCUMENT_NOT_POSTED had already warned once when the receipt was recorded, so
+  // warning again on every invoice sync would be noise. That was true while the callee re-read the
+  // order's own column to find the document: a null column then genuinely meant "no invoice yet".
+  //
+  // Since r2 the caller PINS the id the post just returned, and the only caller is a connector that
+  // has just posted a SALES_INVOICE. "The invoice has not posted" is no longer expressible here at
+  // all. What a null column now means is the opposite: the invoice IS in the ledger and the local
+  // back-reference write did not land — the exact state QuickBooks reaches by catching that failure.
+  // Staying silent there is what let the receipts stay unregistered while the connector cleared the
+  // row's follow-up obligation, so silence is now the bug and the report is the fix.
   state.order.accountingInvoiceId = null
   state.payments = [{ id: 'pay-1', amount: 100, currency: 'GBP', method: 'card', reference: null, paidAt: new Date('2026-08-01') }]
 
-  await redrive()
+  const result = await redrive()
 
-  assert.equal(state.queued.length, 0)
-  // The re-drive exists precisely BECAUSE DOCUMENT_NOT_POSTED already warned once at the moment the
-  // receipt was recorded; returning early is what stops it warning again on every invoice sync. A bare
-  // "nothing queued" assertion would also be satisfied by falling through to a NO_BANK_ACCOUNT refusal.
-  assert.deepEqual(state.activity, [])
+  assert.equal(state.queued.length, 0, 'a receipt cannot be attached to a document the order has no record of')
+  assert.equal(result.settled, false, 'and the caller must NOT read that as work completed')
+  assert.equal(state.activity.length, 1, 'the early return is reported exactly once, not per receipt')
+  assert.equal(state.activity[0].action, 'deferred_invoice_payment_registration_unlinked')
+  assert.equal(state.activity[0].level, 'ERROR', 'money nothing will retry')
+  assert.match(String(state.activity[0].description), /INV-1/, 'naming the document that DID post')
 })
 
 // ---------------------------------------------------------------------------

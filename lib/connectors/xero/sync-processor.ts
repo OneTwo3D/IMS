@@ -3766,13 +3766,16 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           // catch below returns the row to PENDING still carrying `backReferenceFollowUpsPendingAt`,
           // and the next pass announces. Re-running the enqueue on that pass is a no-op — it is
           // idempotent through `hasExistingSyncLog` and the partial unique index (audit-42co).
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId },
+          const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId },
             // o3d-bqw7 r2: the row's COMPLETE origin record. This is the tombstone path — `payload` here
             // is `{}` — so the durable column is the only half that still names an organisation, and
             // without it the invoice PDF this enqueue raises could never post.
             { payload, ...origin })
           await announceCompactedFollowUpLoss(entry)
-          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
+          // o3d-ekn8 r5: and the release is gated on what the enqueue LEFT OWED as well as on the
+          // announcement, for the same reason — the marker must never be discharged on the strength
+          // of work that silently did nothing.
+          await settleFollowUpObligation(entry, followUps)
         } catch (followUpError) {
           // NOT released: the follow-ups did not run. The row goes back to PENDING (or FAILED at
           // MAX_RETRIES) still carrying the obligation, so whichever gets there first — this
@@ -3895,10 +3898,13 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
+          const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
             // The record this post was made under, read in the same statement as the payload.
             { payload, ...origin })
-          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
+          // o3d-ekn8 r5: released only if the receipts recorded before this invoice reached the
+          // ledger. The re-drive never throws, so that failure was arriving here as success. This
+          // supersedes the bare releaseFollowUpObligation: an unsettled receipt now retains the marker.
+          await settleFollowUpObligation(entry, followUps)
         } catch (followUpError) {
           await markSyncLogForFollowUpRetry(attempt, entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
@@ -4316,13 +4322,16 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           // catch below returns the row to PENDING still carrying `backReferenceFollowUpsPendingAt`,
           // and the next pass announces. Re-running the enqueue on that pass is a no-op — it is
           // idempotent through `hasExistingSyncLog` and the partial unique index (audit-42co).
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId },
+          const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId },
             // o3d-bqw7 r2: the row's COMPLETE origin record. This is the tombstone path — `payload` here
             // is `{}` — so the durable column is the only half that still names an organisation, and
             // without it the invoice PDF this enqueue raises could never post.
             { payload, ...origin })
           await announceCompactedFollowUpLoss(entry)
-          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
+          // o3d-ekn8 r5: and the release is gated on what the enqueue LEFT OWED as well as on the
+          // announcement, for the same reason — the marker must never be discharged on the strength
+          // of work that silently did nothing.
+          await settleFollowUpObligation(entry, followUps)
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
             const nextRetry = await markSyncLogForFollowUpRetry(attempt, entry, followUpError, tx)
@@ -4468,10 +4477,13 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
+          const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
             // The record this post was made under, read in the same statement as the payload.
             { payload, ...origin })
-          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
+          // o3d-ekn8 r5: released only if the receipts recorded before this invoice reached the
+          // ledger. The re-drive never throws, so that failure was arriving here as success. This
+          // supersedes the bare releaseFollowUpObligation: an unsettled receipt now retains the marker.
+          await settleFollowUpObligation(entry, followUps)
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
             const nextRetry = await markSyncLogForFollowUpRetry(attempt, entry, followUpError, tx)
@@ -6291,8 +6303,16 @@ export async function repairXeroBackReferences(limit = DEFAULT_BACK_REFERENCE_SW
     // o3d-bqw7 r2: the sweep now hands over the row's COMPLETE durable origin record, not just its
     // payload — a tombstone's payload is `{}` and its `connectionProvenance` column is the only half
     // left speaking, so without it every follow-up the sweep rebuilds is born unable to post.
-    enqueueFollowUps: (entryId, type, referenceType, referenceId, payload, syncResult, origin) =>
-      enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult, origin),
+    //
+    // RESIDUAL, NAMED RATHER THAN HIDDEN (o3d-ekn8 r5). The sweep's dep is `Promise<void>` and it
+    // discharges the obligation in the SAME write as the repair, so the outcome is dropped here: a
+    // sweep pass whose re-drive again leaves a receipt unregistered still clears the marker. Closing
+    // it means widening BackReferenceSweepDeps and splitting that write in the connector-agnostic
+    // module, which is a change of its own — the connectors' own post paths, which is where the
+    // finding was raised and where every first attempt runs, no longer do this.
+    enqueueFollowUps: async (entryId, type, referenceType, referenceId, payload, syncResult, origin) => {
+      await enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult, origin)
+    },
   }, { limit })
 }
 
@@ -6644,6 +6664,60 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
   return result
 }
 
+/**
+ * WHAT THE FOLLOW-UP WORK LEFT OUTSTANDING (o3d-ekn8 r5, Codex HIGH — CROSS-PORTED FROM THE
+ * QUICKBOOKS PATH, where the finding was raised).
+ *
+ * `enqueueFollowUps` returned `void`, so "it did not throw" was the only signal the four release
+ * sites below had — and the deferred-receipt re-drive is built NEVER to throw, because a receipt
+ * that cannot be registered must not fail a sync entry whose invoice HAS posted. Every way it can
+ * leave money unregistered therefore arrived at `releaseFollowUpObligation` as success, and the
+ * marker that says this row still owes work was cleared over a receipt still sitting unsettled.
+ *
+ * The back-reference half of the QuickBooks finding does NOT apply here and is deliberately not
+ * ported: this connector's `updateBackReference` propagates its failure (audit-H3), so a link that
+ * did not land reaches the catch, the row goes back to PENDING and the obligation is never released
+ * in the first place. Only the receipt half was open on this side.
+ */
+type FollowUpOutcome = {
+  /** False when a receipt recorded before this invoice is still waiting to reach the ledger. */
+  deferredReceiptsSettled: boolean
+}
+
+/**
+ * Discharge the obligation only when the follow-ups left nothing owed (o3d-ekn8 r5).
+ *
+ * The asymmetry is the one followUpObligationClaim was designed around: a marker left set costs one
+ * idempotent re-enqueue on a later sweep, a marker cleared early costs the payment.
+ */
+async function settleFollowUpObligation(
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  followUps: FollowUpOutcome,
+): Promise<void> {
+  if (followUps.deferredReceiptsSettled) {
+    await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
+    return
+  }
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'xero_followup_obligation_retained',
+    tag: 'sync',
+    level: 'ERROR',
+    description: `Xero sync entry ${entry.id} posted to the ledger, but a receipt recorded before this invoice `
+      + 'is still not registered against it. The row is deliberately left marked as owing follow-ups, because '
+      + 'nothing else about it records that: it is SYNCED and carries its external id exactly like a row that '
+      + 'completed. Re-run the invoice sync for this reference, or register the receipt in Xero by hand.',
+    metadata: {
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+    },
+    // Retaining the marker is ALREADY the safe state, so failing to describe it must not turn a
+    // posted invoice into a failed sync entry.
+  }).catch(() => { /* the state is on the row; the log is the notification */ })
+}
+
 async function enqueueSalesInvoiceFollowUps(
   entryId: string,
   referenceType: string,
@@ -6651,8 +6725,8 @@ async function enqueueSalesInvoiceFollowUps(
   payload: SyncPayload,
   syncResult: { externalId?: string; invoiceNumber?: string },
   origin: AccountingOriginRecord,
-): Promise<void> {
-  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return
+): Promise<FollowUpOutcome> {
+  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return { deferredReceiptsSettled: true }
   // Captured once, so the id handed to the deferred re-drive below is provably the one THIS post
   // returned rather than a re-read of a narrowed property.
   const postedInvoiceId: string = syncResult.externalId
@@ -6729,10 +6803,15 @@ async function enqueueSalesInvoiceFollowUps(
   // this processor made the call, and `syncResult.externalId` is the id the call returned. A connector
   // swap or a delete-and-re-post between the post and the re-drive silently redirected it. Re-resolving
   // after a pin is the race being closed, not a check of it, so the evidence goes IN.
-  await registerDeferredOrderReceipts(referenceId, {
+  //
+  // AND THE ANSWER IS CARRIED BACK (o3d-ekn8 r5, Codex HIGH). It is awaited but never allowed to
+  // throw, which meant "it returned" was indistinguishable from "the receipts reached the ledger" —
+  // and the caller discharges a durable obligation on that answer.
+  const redrive = await registerDeferredOrderReceipts(referenceId, {
     connector: 'xero',
     accountingInvoiceId: postedInvoiceId,
   })
+  return { deferredReceiptsSettled: redrive.settled }
 }
 
 async function enqueuePurchaseInvoiceFollowUps(
@@ -6817,20 +6896,19 @@ async function enqueueFollowUps(
    * honour.
    */
   origin: AccountingOriginRecord,
-): Promise<void> {
+): Promise<FollowUpOutcome> {
   if (type === 'SALES_INVOICE') {
-    await enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin)
-    return
+    return enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin)
   }
 
   if (type === 'PURCHASE_INVOICE') {
     await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin)
-    return
+    return { deferredReceiptsSettled: true }
   }
 
   if (type === 'PURCHASE_CREDIT_NOTE') {
     await enqueuePurchaseCreditNoteFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin)
-    return
+    return { deferredReceiptsSettled: true }
   }
 
   if (type === 'INVOICE_PDF' && referenceType === 'SalesOrder') {
@@ -6854,4 +6932,7 @@ async function enqueueFollowUps(
       )
     }
   }
+  // Every remaining type enqueues rows that carry their own document id in the payload; none of them
+  // has a deferred receipt waiting on it.
+  return { deferredReceiptsSettled: true }
 }

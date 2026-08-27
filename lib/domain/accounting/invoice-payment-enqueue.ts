@@ -717,13 +717,16 @@ export async function registerDeferredOrderReceipts(
   posted: PostedInvoiceEvidence,
 ): Promise<DeferredReceiptRedriveResult> {
   try {
-    // Does the PINNED connector post payments at all? A THROW is not the same answer as "off"
-    // (o3d-ekn8 r5): one says nothing is expected of this order, the other says we could not find
-    // out — and only the first discharges the caller's follow-up obligation. `.catch(() => false)`
-    // collapsed the two into the one that lets the marker be cleared.
+    // Does the PINNED connector post payments at all?
+    //
+    // FALSE is a complete answer — nothing is expected of this order — so it ends the call and the
+    // caller's obligation with it, without reading the order at all. A THROW is not an answer
+    // (o3d-ekn8 r5): it says we could not find out, and `.catch(() => false)` used to collapse the
+    // two into the one that lets the follow-up marker be cleared. So it does NOT end the call on its
+    // own; it falls through, and the cheap certain facts below — no order, no receipts — still get
+    // to say that nothing was owed either way.
     const paymentsPost = await isAccountingSyncTypeEnabledFor(posted.connector, 'INVOICE_PAYMENT').catch(() => null)
-    if (paymentsPost === null) return { settled: false, reason: 'posting-context-unknown' }
-    if (!paymentsPost) return { settled: true, reason: 'sync-disabled' }
+    if (paymentsPost === false) return { settled: true, reason: 'sync-disabled' }
     const order = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: {
@@ -744,6 +747,9 @@ export async function registerDeferredOrderReceipts(
     // genuinely discharged. Asked BEFORE the link check on purpose: an order with no receipts must
     // not hold an obligation open over a back-reference that has nothing to do with money.
     if (order.payments.length === 0) return { settled: true, reason: 'no-receipts' }
+    // Receipts exist and we could not find out whether they are meant to post. That is the one state
+    // where nothing has been decided about them, so nothing may be discharged on their behalf.
+    if (paymentsPost === null) return { settled: false, reason: 'posting-context-unknown' }
 
     // THE LINK NEVER LANDED (o3d-ekn8 r5, Codex HIGH). QuickBooks' `updateBackReference` catches its
     // own failure, so the invoice can post while the order is left with no accountingInvoiceId at
