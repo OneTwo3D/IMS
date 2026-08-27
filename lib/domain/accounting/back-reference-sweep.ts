@@ -6,6 +6,7 @@ import {
   backReferenceIsMissing,
   followUpObligationClaim,
   isExternalDocumentIdConflict,
+  nextFollowUpObligationGeneration,
   recoverPostedBusinessDate,
   resolvePurchaseOrderBackReference,
   syncTypeWritesBackReference,
@@ -1016,9 +1017,11 @@ export async function repairAccountingBackReferences(
    * A monotonic generation is also the honest reading of the column: it stops meaning "the instant
    * the obligation was first recorded" and starts meaning "the instant it was last claimed", which
    * is what every reader of it already uses it for. No reader compares it to a wall clock; the
-   * connectors' own `followUpObligationClaim` writes `new Date()` into it from the SYNCED
-   * transaction, which is a NEWER value than anything a sweep can be holding and therefore refuses
-   * the sweep exactly as intended.
+   * connectors claim from inside the SYNCED transaction through the SAME mint
+   * (`nextFollowUpObligationGeneration`, o3d-0bfh r4), so their generation is strictly later than
+   * anything a sweep can be holding and refuses the sweep exactly as intended — and, since r4, their
+   * RELEASE is fenced on the generation they minted, so a paused connector can no longer clear a
+   * generation the sweep has taken since.
    *
    * Three outcomes, and the caller must tell them apart:
    *   • `claimed`      — this run owns the generation returned; nobody else can be holding it.
@@ -1030,13 +1033,10 @@ export async function repairAccountingBackReferences(
     row: BackReferenceSweepRow,
   ): Promise<{ claimed: boolean; contended: boolean; pendingAt: Date | null }> => {
     const observed = row.backReferenceFollowUpsPendingAt
-    const minted = now()
-    // Strictly later than what was observed — see above. `Math.max` rather than a branch on
-    // equality, so a clock that has gone BACKWARDS (an NTP step, a second host) cannot mint a
-    // generation an earlier run could already be holding either.
-    const generation = observed === null
-      ? minted
-      : new Date(Math.max(minted.getTime(), observed.getTime() + 1))
+    // Strictly later than what was observed — see above. THE SAME MINT THE CONNECTORS USE
+    // (o3d-0bfh r4): one definition of the generation rule, because a restated copy is exactly how a
+    // writer falls out of a protocol, and this one had already been restated once.
+    const generation = nextFollowUpObligationGeneration(observed, now())
     // The SAME fragment the connectors merge into their SYNCED write (r10 finding 1). They can
     // claim it for free because they have a transaction to ride; the sweep has none, so it pays
     // for a write of its own — but the value written is one definition, not two.

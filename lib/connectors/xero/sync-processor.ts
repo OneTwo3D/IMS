@@ -46,7 +46,7 @@ import {
   BACK_REFERENCE_REPAIRABLE_STATUSES,
   applyBackReference,
   backReferenceIsMissing,
-  followUpObligationClaim,
+  claimFollowUpObligation,
   releaseFollowUpObligation,
   syncTypeWritesBackReference,
 } from '@/lib/domain/accounting/back-reference'
@@ -358,7 +358,14 @@ export { claimHeldFrom, heldClaimWhere, type HeldClaim } from '@/lib/domain/acco
  * instead — in the same transaction, which is what `evidence` on the refusal variants is proof of.
  */
 export type PostedSyncRecord =
-  | { recorded: true }
+  /**
+   * `followUpObligation` is the marker GENERATION this write took (o3d-0bfh r4, Codex HIGH), and it
+   * is carried all the way down to the release. `null` means the claim did not land — a peer holds
+   * the obligation, or the database refused the claim statement — and a caller holding `null`
+   * releases NOTHING, which is the safe direction: the marker stays set and the next sweep
+   * re-enqueues idempotently.
+   */
+  | { recorded: true; followUpObligation: Date | null }
   | { recorded: false; reason: 'ANOTHER_DOCUMENT_NAMED'; namedExternalId: string | null; evidence: string }
   | { recorded: false; reason: 'ROW_MISSING'; evidence: string }
 
@@ -426,9 +433,11 @@ export async function recordPostedSyncResult(
       syncedAt: new Date(),
       errorMessage: null,
       processingStartedAt: null,
-      // Claimed IN this transaction, so the row can never be SYNCED-with-an-id and silent about the
-      // follow-ups it still owes (r10 finding 1).
-      ...followUpObligationClaim(),
+      // NO obligation claim in this statement any more (o3d-0bfh r4). It is claimed a few lines
+      // below, in THIS transaction — so the row still can never be SYNCED-with-an-id and silent
+      // about the follow-ups it owes (r10 finding 1) — but as a compare-and-set that READS the
+      // generation it is replacing and hands back the one it minted. A `data` fragment cannot read,
+      // and a claim that cannot read cannot be released exclusively: that was the whole defect.
     },
   })
   if (written.count === 0) {
@@ -456,6 +465,17 @@ export async function recordPostedSyncResult(
   // the provenance marker, so it trips the trigger that clears the marker; this statement then mints
   // the new pair. Swapped, the transaction would erase its own stamp.
   await stampSyncedAtFromDatabaseClock(tx, entry.id)
+  /**
+   * AND THE OBLIGATION IS CLAIMED HERE (o3d-0bfh r4, Codex HIGH), in this transaction and after the
+   * write above has taken the row's exclusive lock — which is what makes the read-then-CAS inside it
+   * unlosable and the generation it mints exclusive. See {@link claimFollowUpObligation}.
+   *
+   * AFTER the database-clock stamp as well, and that ordering is free rather than lucky: this
+   * statement touches only `backReferenceFollowUpsPendingAt`, and the provenance trigger fires on
+   * `status` / `syncedAt` / `externalTransactionId` / `processingStartedAt`. It cannot clear the
+   * stamp the line above just minted.
+   */
+  const obligation = await claimFollowUpObligation(tx, { syncLogId: entry.id, connector: XERO_CONNECTOR })
   await updateMirroredEventForSyncLog(tx, {
     syncLogId: entry.id,
     type: entry.type,
@@ -469,7 +489,7 @@ export async function recordPostedSyncResult(
     // an earlier write established alone rather than wiping it.
     ...(params.externalRevisionAt !== undefined ? { externalRevisionAt: params.externalRevisionAt } : {}),
   })
-  return { recorded: true }
+  return { recorded: true, followUpObligation: obligation.claimed ? obligation.generation : null }
 }
 
 /**
@@ -2211,7 +2231,8 @@ export async function openRemoteWriteLease(
 // Exported for tests/accounting/xero-unrecorded-remote-write.test.ts: the give-up path is the one
 // that runs when the database is unreachable, so it has to be drivable without one.
 export type PostedDocumentPersistOutcome =
-  | { persisted: true }
+  /** o3d-0bfh r4: the obligation generation the persist took, carried down to the release that clears it. */
+  | { persisted: true; followUpObligation: Date | null }
   /**
    * THE POOL refused this attempt for the whole deadline (o3d-xl63 r3). The identifier has already
    * been reported on a channel that does not need a connection, and the caller must NOT touch the
@@ -2282,7 +2303,7 @@ export async function persistPostedXeroDocument(input: {
     // Not a pool problem and not this branch's to report: a newer claim posted its own document while
     // this attempt was on the wire, and o3d-550x has already made both identifiers durable.
     if (!record.recorded) return { persisted: false, reason: 'not-recorded', evidence: record.evidence }
-    return { persisted: true }
+    return { persisted: true, followUpObligation: record.followUpObligation }
   } catch (error) {
     // Only the pool's own give-up is handled here. Everything else — including the unwritten-evidence
     // throw o3d-550x raises when it cannot file a conflict — is left to the runner, untouched.
@@ -3774,8 +3795,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           await announceCompactedFollowUpLoss(entry)
           // o3d-ekn8 r5: and the release is gated on what the enqueue LEFT OWED as well as on the
           // announcement, for the same reason — the marker must never be discharged on the strength
-          // of work that silently did nothing.
-          await settleFollowUpObligation(entry, followUps)
+          // of work that silently did nothing. o3d-0bfh r4: and on the generation THIS pass claimed,
+          // so a sweep that has taken the obligation since keeps it.
+          await settleFollowUpObligation(entry, followUps, record.followUpObligation)
         } catch (followUpError) {
           // NOT released: the follow-ups did not run. The row goes back to PENDING (or FAILED at
           // MAX_RETRIES) still carrying the obligation, so whichever gets there first — this
@@ -3904,7 +3926,8 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           // o3d-ekn8 r5: released only if the receipts recorded before this invoice reached the
           // ledger. The re-drive never throws, so that failure was arriving here as success. This
           // supersedes the bare releaseFollowUpObligation: an unsettled receipt now retains the marker.
-          await settleFollowUpObligation(entry, followUps)
+          // o3d-0bfh r4: and only the generation this pass claimed in the SYNCED transaction.
+          await settleFollowUpObligation(entry, followUps, persisted.followUpObligation)
         } catch (followUpError) {
           await markSyncLogForFollowUpRetry(attempt, entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
@@ -4330,8 +4353,9 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           await announceCompactedFollowUpLoss(entry)
           // o3d-ekn8 r5: and the release is gated on what the enqueue LEFT OWED as well as on the
           // announcement, for the same reason — the marker must never be discharged on the strength
-          // of work that silently did nothing.
-          await settleFollowUpObligation(entry, followUps)
+          // of work that silently did nothing. o3d-0bfh r4: and on the generation THIS pass claimed,
+          // so a sweep that has taken the obligation since keeps it.
+          await settleFollowUpObligation(entry, followUps, record.followUpObligation)
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
             const nextRetry = await markSyncLogForFollowUpRetry(attempt, entry, followUpError, tx)
@@ -4483,7 +4507,8 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           // o3d-ekn8 r5: released only if the receipts recorded before this invoice reached the
           // ledger. The re-drive never throws, so that failure was arriving here as success. This
           // supersedes the bare releaseFollowUpObligation: an unsettled receipt now retains the marker.
-          await settleFollowUpObligation(entry, followUps)
+          // o3d-0bfh r4: and only the generation this pass claimed in the SYNCED transaction.
+          await settleFollowUpObligation(entry, followUps, persisted.followUpObligation)
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
             const nextRetry = await markSyncLogForFollowUpRetry(attempt, entry, followUpError, tx)
@@ -6712,9 +6737,19 @@ type FollowUpOutcome = {
 async function settleFollowUpObligation(
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
   followUps: FollowUpOutcome,
+  /**
+   * THE GENERATION THIS PASS TOOK IN THE SYNCED TRANSACTION (o3d-0bfh r4, Codex HIGH) — not a value
+   * re-read here, which is the race one layer down. `null` means the claim did not land, and then
+   * the release clears nothing: a pass that owns no generation has no standing to say the work is
+   * done, and the marker it would have cleared belongs to whoever does.
+   */
+  obligation: Date | null,
 ): Promise<void> {
   if (followUps.deferredReceiptsSettled) {
-    await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
+    // The release is fenced on `obligation`; a `superseded` answer means a sweep (or a later post)
+    // has claimed a NEWER generation since, so its obligation stands and this pass writes nothing.
+    // Not an error for this entry — its own follow-ups did run — and the helper says so on the log.
+    await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR, generation: obligation })
     return
   }
   await logActivity({

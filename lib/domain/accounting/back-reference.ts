@@ -601,38 +601,174 @@ export function syncTypeWritesBackReference(type: AccountingSyncType, referenceT
 //   1. CLAIMED AS AN INTENT, BEFORE THE LINK IS WRITTEN — never recorded in a catch afterwards. A
 //      marker written only when the enqueue fails is itself a database write that can fail
 //      transiently, and if it does, the row is linked again with nothing recording what it owes.
-//      That is the same hole one layer down. On the connector paths the claim is FREE: it merges
-//      into the update that flips the row to SYNCED, so there is no window at all between "SYNCED
-//      with an id" and "recorded as owing follow-ups", and no extra call that can fail on its own.
+//      That is the same hole one layer down. On the connector paths the claim rides IN THE SAME
+//      TRANSACTION as the update that flips the row to SYNCED, so there is no window at all between
+//      "SYNCED with an id" and "recorded as owing follow-ups", and no separate transaction that can
+//      fail on its own. (r4 made it a second STATEMENT in that transaction rather than a fragment of
+//      the first — see rule 3 for why a claim has to read before it writes.)
 //   2. RELEASED ONLY ONCE THE FOLLOW-UPS ACTUALLY RAN. The failure is asymmetric on purpose: a
 //      marker left behind on a row whose follow-ups succeeded costs ONE idempotent re-enqueue on a
 //      later sweep, while a marker cleared too early costs the payment.
+//
+// AND RULE 3, WHICH IS WHAT r4 ADDED (o3d-0bfh r4, Codex HIGH). EVERY WRITER AND EVERY RELEASER OF
+// THIS COLUMN PARTICIPATES IN ONE GENERATION PROTOCOL. r3 made the SWEEP's claim a strictly-later
+// compare-and-set, which is genuinely exclusive between sweeps — and left the connector release
+// clearing the marker BY ID ALONE, which is a second discharge path standing outside the rule. That
+// is enough to lose the money the rule exists to protect:
+//
+//   connector: claim generation C in the SYNCED transaction → enqueue → `deferredReceiptsSettled:
+//              true` … pauses here
+//   sweep:     read the row (marker C) → claim S = C+1 → enqueue → a receipt recorded since has NOT
+//              reached the ledger → `false` → DELIBERATELY RETAINS S, writing nothing
+//   connector: release by id → S is cleared anyway
+//
+// The row is now SYNCED, linked, and marker-null. The next sweep computes `owesFollowUps = false`,
+// calls it reconciled and stamps `backReferenceCheckedAt` — which the candidate query filters on —
+// so the row leaves the population for ever with the receipt unregistered. Nothing anywhere says so.
+//
+// So the protocol is stated once, here, and it has exactly three obligations:
+//
+//   • A CLAIM MINTS A GENERATION STRICTLY LATER THAN THE ONE IT OBSERVED
+//     ({@link nextFollowUpObligationGeneration}). The column is TIMESTAMP(3), so "write now()" is
+//     not a mint: two writers inside one millisecond write the value the other observed, and every
+//     fence built on it then proves nothing. This is the property the whole thing rests on.
+//   • A CLAIM IS EXCLUSIVE — it takes the generation, it does not merely observe one. The sweep pays
+//     for that with a compare-and-set on the row it read ({@link followUpObligationClaim} merged into
+//     `claimFollowUpObligation` there); a connector gets it for free, because it claims inside the
+//     transaction that has already row-locked the row to mark it SYNCED (see
+//     {@link claimFollowUpObligation} below).
+//   • A RELEASE CLEARS ONLY THE GENERATION IT MINTED, and a zero-row release is SUPERSEDED — not a
+//     failure and not a retry. Somebody else's obligation is on the row; leaving it there is the
+//     safe direction, and the next sweep discharges it.
 // ---------------------------------------------------------------------------
 
-/** The minimal Prisma surface the obligation release touches. Structural, so a test double fits. */
+/**
+ * The minimal Prisma surface the obligation protocol touches. Structural, so a test double fits.
+ *
+ * `updateMany`, not `update`, on BOTH sides: the claim and the release are compare-and-sets, and
+ * `update` has no predicate beyond the id — which is precisely the defect r4 removed.
+ */
 export type FollowUpObligationClient = {
   accountingSyncLog: {
-    update(args: { where: { id: string }; data: Record<string, unknown> }): Promise<unknown>
+    findUnique(args: {
+      where: { id: string }
+      select: { backReferenceFollowUpsPendingAt: true }
+    }): Promise<{ backReferenceFollowUpsPendingAt: Date | null } | null>
+    updateMany(args: {
+      where: Record<string, unknown>
+      data: Record<string, unknown>
+    }): Promise<{ count: number }>
   }
 }
 
 /**
- * The claim, as a data fragment to MERGE INTO the write that marks the row SYNCED — not as a call
- * of its own. Rule 1 above: made atomic with the SYNCED transition it is describing, so no ordering
- * and no failure of this marker can leave a posted row unrecorded.
+ * THE MINT (o3d-0bfh r3, generalised to every writer in r4).
+ *
+ * One definition, because a restated copy is how a writer falls out of a protocol. Strictly later
+ * than the generation observed, and `Math.max` rather than a branch on equality so that a clock
+ * which has gone BACKWARDS — an NTP step, a second host, a sweep and a connector on different
+ * machines — still cannot mint a generation somebody else could already be holding.
+ *
+ * No reader ever compares this column to a wall clock, so moving it forward costs nothing: it stops
+ * meaning "when the obligation was first recorded" and starts meaning "when it was last claimed",
+ * which is what every reader already uses it for.
+ */
+export function nextFollowUpObligationGeneration(observed: Date | null, now: Date = new Date()): Date {
+  return observed === null ? now : new Date(Math.max(now.getTime(), observed.getTime() + 1))
+}
+
+/**
+ * The claim, as a data fragment. Rule 1 above: written in the same TRANSACTION as the SYNCED
+ * transition it is describing, so no ordering and no failure of this marker can leave a posted row
+ * unrecorded.
  */
 export function followUpObligationClaim(now: Date = new Date()): { backReferenceFollowUpsPendingAt: Date } {
   return { backReferenceFollowUpsPendingAt: now }
 }
 
+/** What a connector's claim ended up owning. `contended` is a peer winning; `unwritable` is a database that did not answer. */
+export type FollowUpObligationClaimOutcome =
+  | { claimed: true; generation: Date }
+  | { claimed: false; reason: 'contended' | 'unwritable' }
+
+/**
+ * TAKE THE GENERATION A CONNECTOR IS GOING TO DISCHARGE (o3d-0bfh r4, Codex HIGH).
+ *
+ * MUST be called inside the transaction that marks the row SYNCED, and AFTER that write. Both halves
+ * are load-bearing:
+ *
+ *   • INSIDE, because rule 1 says the row can never be SYNCED-with-an-id and silent about the
+ *     follow-ups it owes. Two statements in one transaction are as atomic as one; two transactions
+ *     are the window the column exists to close.
+ *   • AFTER, because the SYNCED write has by then taken this row's exclusive lock and holds it to
+ *     COMMIT. So the value read here cannot change under us, the compare-and-set below cannot lose,
+ *     and the generation minted from it is exclusive without a retry loop. `contended` is therefore
+ *     unreachable from the connectors as they are wired today — it is kept, and it fails CLOSED
+ *     (owning nothing, releasing nothing), because a future caller that claims outside a lock would
+ *     otherwise silently inherit an exclusivity it does not have.
+ *
+ * It is deliberately NOT merged into the SYNCED write's `data` any more. It was, and that is what
+ * made it a plain `now()` overwrite with nothing to report back: the caller could not know WHICH
+ * generation it owned, so its release could only clear by id — the defect. The claim has to read
+ * before it writes, and a `data` fragment cannot read.
+ *
+ * Losing the claim is SAFE in the only direction that matters. Whatever the outcome, the marker on
+ * the row is non-null — either the generation this call wrote, or the newer one a peer wrote — so
+ * the row still says its follow-ups are owed. All that changes is who is allowed to say they are
+ * done, and a caller that owns nothing says nothing.
+ */
+export async function claimFollowUpObligation(
+  client: FollowUpObligationClient,
+  params: { syncLogId: string; connector: string; now?: Date },
+): Promise<FollowUpObligationClaimOutcome> {
+  try {
+    const current = await client.accountingSyncLog.findUnique({
+      where: { id: params.syncLogId },
+      select: { backReferenceFollowUpsPendingAt: true },
+    })
+    // The row vanished between the SYNCED write and this read — impossible under that write's own
+    // lock, and if it ever happens there is nothing to claim and nothing to release.
+    if (current === null) return { claimed: false, reason: 'contended' }
+    const observed = current.backReferenceFollowUpsPendingAt
+    const claim = followUpObligationClaim(nextFollowUpObligationGeneration(observed, params.now ?? new Date()))
+    const won = await client.accountingSyncLog.updateMany({
+      where: { id: params.syncLogId, backReferenceFollowUpsPendingAt: observed },
+      data: claim,
+    })
+    if (won.count === 0) return { claimed: false, reason: 'contended' }
+    return { claimed: true, generation: claim.backReferenceFollowUpsPendingAt }
+  } catch (error) {
+    console.error(
+      `${params.connector}: could not record that follow-ups are owed on the SYNCED write; the row keeps whatever obligation it had`,
+      params.syncLogId,
+      error,
+    )
+    return { claimed: false, reason: 'unwritable' }
+  }
+}
+
+/** What a release did. Only `released` means the marker this caller minted is gone. */
+export type FollowUpObligationReleaseOutcome = 'released' | 'superseded' | 'unwritable'
+
 /**
  * Discharge the obligation: the back-reference is written and the follow-ups are enqueued.
  *
- * SWALLOWS its failure and reports it as a boolean, and never throws. The follow-ups have already
- * run by the time this is called, so a failure here is not a reason to retry them — driving the
- * caller's follow-up-failure path would re-post work that succeeded. Leaving the marker set is the
- * safe direction: the next sweep finds a linked row that still says it owes follow-ups and
- * re-enqueues them idempotently. Noise, not loss.
+ * FENCED ON THE GENERATION THIS CALLER MINTED (o3d-0bfh r4, Codex HIGH). It used to clear by id
+ * alone, which made it the one discharge path outside the generation protocol — see rule 3 above for
+ * the interleaving that costs a payment. `generation` is the value {@link claimFollowUpObligation}
+ * returned, carried down unchanged; `null` means this caller never owned one, and then nothing is
+ * written at all.
+ *
+ * A ZERO-ROW RELEASE IS `superseded`, and it is the same deferral the sweep's settlement already has:
+ * another writer's obligation is on the row, nothing went wrong, nothing is written, and the next
+ * sweep discharges it after re-reading state that is current. It is NOT a failure, and it must not be
+ * silent — a refusal counted nowhere is indistinguishable from a settlement.
+ *
+ * SWALLOWS its failure and reports it, and never throws. The follow-ups have already run by the time
+ * this is called, so a failure here is not a reason to retry them — driving the caller's
+ * follow-up-failure path would re-post work that succeeded. Leaving the marker set is the safe
+ * direction: the next sweep finds a linked row that still says it owes follow-ups and re-enqueues
+ * them idempotently. Noise, not loss.
  *
  * It is a separate write because it has to be: the SYNCED transition commits BEFORE the follow-ups
  * run (that ordering is the connectors' idempotency guard against double-posting), so there is no
@@ -640,21 +776,35 @@ export function followUpObligationClaim(now: Date = new Date()): { backReference
  */
 export async function releaseFollowUpObligation(
   client: FollowUpObligationClient,
-  params: { syncLogId: string; connector: string },
-): Promise<boolean> {
+  params: { syncLogId: string; connector: string; generation: Date | null },
+): Promise<FollowUpObligationReleaseOutcome> {
+  if (params.generation === null) {
+    console.error(
+      `${params.connector}: follow-ups ran but this pass never took the obligation generation, so it is not the one to clear it; `
+      + 'a later sweep will re-enqueue them',
+      params.syncLogId,
+    )
+    return 'superseded'
+  }
   try {
-    await client.accountingSyncLog.update({
-      where: { id: params.syncLogId },
+    const cleared = await client.accountingSyncLog.updateMany({
+      where: { id: params.syncLogId, backReferenceFollowUpsPendingAt: params.generation },
       data: { backReferenceFollowUpsPendingAt: null },
     })
-    return true
+    if (cleared.count > 0) return 'released'
+    console.error(
+      `${params.connector}: follow-ups ran but the obligation marker has been re-claimed since, so this pass is not the one to `
+      + 'clear it; the newer obligation stands and a later sweep will discharge it',
+      params.syncLogId,
+    )
+    return 'superseded'
   } catch (error) {
     console.error(
       `${params.connector}: follow-ups ran but the obligation marker could not be cleared; a later sweep will re-enqueue them`,
       params.syncLogId,
       error,
     )
-    return false
+    return 'unwritable'
   }
 }
 

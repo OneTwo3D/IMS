@@ -41,7 +41,7 @@ import {
   applyBackReference,
   backReferenceHolder,
   findExternalDocumentIdClaim,
-  followUpObligationClaim,
+  claimFollowUpObligation,
   isExternalDocumentIdConflict,
   releaseFollowUpObligation,
 } from '@/lib/domain/accounting/back-reference'
@@ -528,7 +528,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
       // Idempotency guard: if a previous run already posted to QBO but failed
       // during follow-up work, don't re-post. Skip straight to follow-ups.
       if (entry.externalTransactionId) {
-        await db.$transaction(async (tx) => {
+        const obligation = await db.$transaction(async (tx) => {
           await tx.accountingSyncLog.update({
             where: { id: entry.id },
             data: {
@@ -536,12 +536,15 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
-              // Claimed in the SYNCED transaction, exactly as Xero does (r10 finding 1). See the
-              // block above enqueueFollowUps at the end of this file for why the marker is set here
-              // even though the QuickBooks sweep is still unwired.
-              ...followUpObligationClaim(),
             },
           })
+          // Claimed in the SYNCED TRANSACTION, exactly as Xero does (r10 finding 1) — and since
+          // o3d-0bfh r4 as a second statement inside it rather than a fragment of the first, so the
+          // claim can READ the generation it replaces and hand back the one it minted. The update
+          // above already holds this row's exclusive lock, which is what makes that read-then-CAS
+          // unlosable. See the block above enqueueFollowUps at the end of this file for why the
+          // marker is set here even though the QuickBooks sweep is still unwired.
+          const claim = await claimFollowUpObligation(tx, { syncLogId: entry.id, connector: QBO_CONNECTOR })
           await updateMirroredEventForSyncLog(tx, {
             syncLogId: entry.id,
             type: entry.type,
@@ -551,6 +554,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             status: 'POSTED',
             externalId: entry.externalTransactionId,
           })
+          return claim.claimed ? claim.generation : null
         })
         const link = await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
         const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
@@ -561,7 +565,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // AND NOT THROWING IS NOT THE SAME AS NOTHING BEING OWED (o3d-ekn8 r5): the back-reference
         // write swallows its failure and the deferred-receipt re-drive is built never to throw, so
         // the discharge asks both of them instead of inferring it from the absence of an exception.
-        await settleFollowUpObligation(entry, link, followUps)
+        await settleFollowUpObligation(entry, link, followUps, obligation)
         result.succeeded++
         continue
       }
@@ -578,7 +582,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // Persist external ID and SYNCED status BEFORE any follow-up work.
         // If follow-ups fail, the next retry will see externalTransactionId
         // and skip the QBO write (idempotency guard above).
-        await db.$transaction(async (tx) => {
+        const obligation = await db.$transaction(async (tx) => {
           await tx.accountingSyncLog.update({
             where: { id: entry.id },
             data: {
@@ -587,12 +591,14 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
-              // The external id and the record that follow-ups are owed become durable in ONE
-              // write (r10 finding 1) — the comment above is exactly why they have to: everything
-              // after this transaction can die without the row ever being re-posted.
-              ...followUpObligationClaim(),
             },
           })
+          // The external id and the record that follow-ups are owed become durable in ONE
+          // TRANSACTION (r10 finding 1) — the comment above is exactly why they have to: everything
+          // after it can die without the row ever being re-posted. o3d-0bfh r4 moved the claim out
+          // of the statement above and into this one so it can read the generation it replaces and
+          // report the one it minted; both statements commit together, so the window is still zero.
+          const claim = await claimFollowUpObligation(tx, { syncLogId: entry.id, connector: QBO_CONNECTOR })
           await updateMirroredEventForSyncLog(tx, {
             syncLogId: entry.id,
             type: entry.type,
@@ -602,6 +608,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             status: 'POSTED',
             externalId: syncResult.externalId ?? null,
           })
+          return claim.claimed ? claim.generation : null
         })
 
         // Follow-up work (back-references, enqueue PDF/email/payment).
@@ -613,7 +620,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           // o3d-ekn8 r5, Codex HIGH: released only if the link landed AND the receipts recorded
           // before this invoice reached the ledger. Neither of those failures throws, so both had
           // been arriving here as success and clearing the row's last record of the work.
-          await settleFollowUpObligation(entry, link, followUps)
+          await settleFollowUpObligation(entry, link, followUps, obligation)
         } catch (followUpError) {
           // ERROR, not WARNING: the external post is committed and this entry is about to be
           // marked succeeded, so nothing will drive these follow-ups again. A payment or PDF
@@ -1294,10 +1301,19 @@ async function settleFollowUpObligation(
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
   link: BackReferenceLink,
   followUps: FollowUpOutcome,
+  /**
+   * THE GENERATION THIS PASS TOOK IN THE SYNCED TRANSACTION (o3d-0bfh r4, Codex HIGH). Carried down
+   * rather than re-read: a re-read is the same race one layer lower. `null` means the claim did not
+   * land, and then nothing is cleared — a pass that owns no generation has no standing to say the
+   * work is done.
+   */
+  obligation: Date | null,
 ): Promise<void> {
   const linked = backReferenceLeavesNothingOwed(link)
   if (linked && followUps.deferredReceiptsSettled) {
-    await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
+    // Fenced on `obligation`. A `superseded` answer means a newer generation is on the row — a
+    // sweep's, once o3d-s36z wires one here, or a later post's — and it stands.
+    await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR, generation: obligation })
     return
   }
   const outstanding: string[] = []
