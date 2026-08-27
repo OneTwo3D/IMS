@@ -17,6 +17,43 @@ export const UNRECORDED_POSTED_DOCUMENT_ACTION = 'xero_posted_document_unrecorde
 
 export type UnrecordablePostedDocumentReason = 'ROW_MISSING' | 'ANOTHER_DOCUMENT_NAMED'
 
+/**
+ * WHAT THIS ATTEMPT ACTUALLY DID, WHERE THE OPERATION TYPE CANNOT SAY (round 10, Codex HIGH).
+ *
+ * THE DEFECT THIS EXISTS FOR. Round 9 made the classifier and the formatter share one decision and
+ * keyed it on the OPERATION TYPE — a map that is exhaustive over every member of
+ * `AccountingSyncType`, which reads as total and is not. `SALES_INVOICE_UPDATE` and
+ * `PURCHASE_INVOICE_UPDATE` MODIFY a document that already existed, so a persistence conflict does
+ * not imply a duplicate and "void it" can VOID A VALID PRE-EXISTING INVOICE OR BILL. And the same
+ * type that posts a live journal posts an unposted DRAFT when the row's `_postingMode` is `draft`:
+ * no balance has moved, "post a reversing journal" would move them for real, and the reset
+ * breadcrumb described every such incident as real money in the books.
+ *
+ * So the enum member is not the thing that decides the remedy. Two facts decide it and neither is
+ * derivable from the type:
+ *
+ *   • `postingMode` — whether the document reached the ledger or was created as a DRAFT. On Xero it
+ *     is `resolveInvoiceStatus`/`resolveJournalStatus` reading `payload._postingMode`; on
+ *     QuickBooks there is no draft form of any document at all (quickbooks/invoices.ts says so in as
+ *     many words: "No DRAFT/AUTHORISED status distinction on creation"), so that connector resolves
+ *     LIVE and a test holds it to that.
+ *   • `externalEffect` — whether the handler touched the remote system at all. `BILL_ATTACHMENT`
+ *     returns `{ success: true }` WITHOUT uploading when its connector's attach-PDF setting is
+ *     `'false'`, so one operation type covers "an attachment now exists on that bill" and "nothing
+ *     left this process".
+ *
+ * BOTH ARE OPTIONAL, AND AN ABSENT ONE IS NOT A DEFAULT. A record that does not carry the fact says
+ * so and tells the operator to escalate. Guessing LIVE is how this record came to prescribe voiding
+ * a document that was already there; guessing an upload is how it came to send someone to remove an
+ * attachment this attempt never created.
+ */
+export type LedgerPostingMode = 'LIVE' | 'DRAFT'
+export type RemoteEffectOutcome = 'MADE' | 'NONE'
+export type PostedOperationOutcome = {
+  postingMode?: LedgerPostingMode
+  externalEffect?: RemoteEffectOutcome
+}
+
 export type UnrecordablePostedDocument = {
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
   /** What THIS worker posted and cannot record. */
@@ -24,6 +61,8 @@ export type UnrecordablePostedDocument = {
   reason: UnrecordablePostedDocumentReason
   /** What the row keeps instead (null when the row is gone). */
   namedExternalId: string | null
+  /** What the attempt DID — see {@link PostedOperationOutcome}. Absent means "not recorded". */
+  outcome?: PostedOperationOutcome
 }
 
 /**
@@ -41,50 +80,48 @@ export function describeUnrecordablePostedDocument(incident: UnrecordablePostedD
   // are nullable, and "(no id returned)" is what this line already printed when one was — so
   // "find it by the id above" and "open both ids" were instructions to open a string that says
   // there is no string. An id that is absent gets a remedy that does not need one instead.
-  const posted = typeof postedExternalId === 'string' && postedExternalId.length > 0 ? postedExternalId : null
-  const named = typeof namedExternalId === 'string' && namedExternalId.length > 0 ? namedExternalId : null
-  const postedText = posted ?? '(no id returned)'
-  // ROUND 9 (Codex HIGH): AND WHETHER THERE IS A DOCUMENT AT ALL IS A QUESTION ABOUT THE OPERATION,
-  // NOT ABOUT THE ID. Round 8 taught the CLASSIFIER to ask both and left this formatter asking only
-  // whether an id was recorded, so every branch below still ended in "keep it or void it" — for a
-  // `PURCHASE_CREDIT_NOTE_ALLOCATION`, which creates no document, that directs an operator to alter
-  // the bill or the credit note the allocation was applied BETWEEN instead of undoing the
-  // allocation. Two readers of one question, one of them fixed, is how this record has been wrong
-  // before. They now share `incidentKindForOperation`, and only a genuine document post reaches a
-  // document remedy.
-  const kind = incidentKindForOperation(entry.type, posted)
-  if (kind !== 'LEDGER_DOCUMENT' && kind !== 'LEDGER_DOCUMENT_NO_IDENTIFIER') {
+  const posted = nonEmpty(postedExternalId)
+  const named = nonEmpty(namedExternalId)
+  // ROUND 10 (Codex HIGH): AND THE KIND IS DECIDED BY WHAT THE ATTEMPT DID, NOT BY WHICH ENUM
+  // MEMBER IT WAS. See `PostedOperationOutcome`: an UPDATE creates nothing, a DRAFT moves nothing,
+  // and an unrecorded posting mode is not a live posting.
+  const kind = incidentKindForOperation(entry.type, posted, incident.outcome)
+  if (!isDocumentKind(kind)) {
     return describeNonDocumentIncident({
       ledger: 'Xero',
       entry,
       kind,
       postedExternalId: posted,
+      outcome: incident.outcome,
       rowState: reason === 'ROW_MISSING'
         ? `Its sync row ${entry.id} no longer exists, so nothing in IMS references it. `
         : `Sync row ${entry.id} already names a different external id (${named ?? 'unknown'}) and was `
           + 'left naming that one. ',
     })
   }
+  const w = documentIncidentWording(entry.type, kind)
+  const slots = { ledger: 'Xero' as const, postedExternalId: posted }
+  const did = render(posted ? w.didWithId : w.didWithoutId, slots)
+  const head = `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} ${did}, `
   return reason === 'ROW_MISSING'
-    ? `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as ${postedText}, `
-      + `but its sync row ${entry.id} no longer exists, so nothing in IMS references the document. `
+    ? head
+      + `but its sync row ${entry.id} no longer exists, so nothing in IMS references ${render(w.noun, slots)}. `
       + (posted
-        ? 'REMEDY: find it in Xero by the id above and either keep it (re-enter the reference by hand) or void it; '
-        : 'NO ID WAS RETURNED, so there is nothing to open — do not go looking for one. The document is in '
-          + 'Xero all the same. REMEDY: escalate this record to whoever administers this installation, and '
-          + 'note that ')
-      + 'nothing further will be retried for this row.'
-      + (posted ? '' : ` ${INCIDENT_IDENTIFICATION_TAIL}`)
-    : `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as ${postedText}, `
-      + `but sync row ${entry.id} already names a DIFFERENT document (${named ?? 'unknown'}) — a newer `
-      + 'claim posted while this attempt was on the wire. BOTH documents exist in Xero. The row was left naming the '
-      + 'first one. '
+        ? render(w.remedyRowGone, slots)
+        : 'NO ID WAS RETURNED, so there is nothing to open — do not go looking for one. '
+          + `${render(w.absent, slots)} ${ESCALATE_REMEDY}, and note that `)
+      + 'nothing further will be retried for this row. '
+      + INCIDENT_IDENTIFICATION_TAIL
+    : head
+      + `but sync row ${entry.id} already names a DIFFERENT ${render(w.conflictNoun, slots)} `
+      + `(${named ?? 'unknown'}) — a newer claim posted while this attempt was on the wire. `
+      + `${render(w.bothExist, slots)} The row was left naming the first one. `
       + (posted && named
-        ? 'REMEDY: open both ids in Xero, keep the one the row names, and void or credit the duplicate; '
-        : 'ONE OF THE TWO IDS IS NOT RECORDED HERE, so they cannot both be opened. REMEDY: escalate this record '
-          + 'to whoever administers this installation, and note that ')
-      + 'no further sync attempt will touch either.'
-      + (posted && named ? '' : ` ${INCIDENT_IDENTIFICATION_TAIL}`)
+        ? render(w.remedyDuplicate, slots)
+        : 'ONE OF THE TWO IDS IS NOT RECORDED HERE, so they cannot both be opened. '
+          + `${ESCALATE_REMEDY}, and note that `)
+      + 'no further sync attempt will touch either. '
+      + INCIDENT_IDENTIFICATION_TAIL
 }
 
 /**
@@ -189,6 +226,8 @@ export type UnpersistedQboPost = {
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
   /** What QuickBooks accepted, and what this process could not write down. */
   postedExternalId: string | null
+  /** What the attempt DID — see {@link PostedOperationOutcome}. Absent means "not recorded". */
+  outcome?: PostedOperationOutcome
 }
 
 /**
@@ -403,17 +442,41 @@ export type UnpersistedQboPost = {
  *
  * The `check` is what the operator does about the effect; the `effect` is what the replay costs.
  */
-const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<AccountingSyncType, { effect: string; check: string }>> = {
+type ReplayWording = { effect: string; check: string }
+const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
+  AccountingSyncType,
+  ReplayWording | Readonly<Record<RemoteEffectKnowledge, ReplayWording>>
+>> = {
+  // ROUND 10 (Codex MEDIUM): THE ONLY ONE OF THE FOUR WITH A KILL SWITCH IN FRONT OF IT, AND THE
+  // RECORD NOW SAYS WHICH SIDE OF IT THIS ATTEMPT FELL. The handler reads
+  // `quickbooks_sync_attach_pdf` and returns success WITHOUT uploading when it is 'false'. Round 6
+  // wrote that as a HEDGE inside one sentence — "…unless the setting is false, in which case…" —
+  // which is a wording that is never true, only never quite false: an operator on an install with
+  // uploads ON reads a conditional about a setting they must go and check, and an operator with
+  // them OFF reads that a PDF is being uploaded. The handler's actual outcome is recorded now, so
+  // each case gets a sentence that is simply true, and the hedge survives ONLY where the record
+  // genuinely does not know.
   BILL_ATTACHMENT: {
-    // THE ONLY ONE OF THE FOUR WITH A KILL SWITCH IN FRONT OF IT (round 6). The handler reads
-    // `quickbooks_sync_attach_pdf` and returns success WITHOUT uploading when it is 'false', so on
-    // an install that has turned attachments off the replay costs nothing. Stating the repeat
-    // unconditionally would send that operator hunting a duplicate that cannot exist.
-    effect: 'the supplier invoice PDF is uploaded to the QuickBooks bill AGAIN, once per sweep — '
-      + 'unless the setting quickbooks_sync_attach_pdf is "false", in which case the operation '
-      + 'succeeds without uploading anything and the replay attaches nothing',
-    check: 'check that setting first; if attachments are on, open the bill in QuickBooks and delete '
-      + 'any duplicate attachment',
+    MADE: {
+      effect: 'the supplier invoice PDF is uploaded to the QuickBooks bill AGAIN, once per sweep',
+      check: 'open the bill in QuickBooks and delete any duplicate attachment',
+    },
+    NONE: {
+      effect: 'NOTHING AT ALL — attachment upload is turned off for this connector, so every sweep '
+        + 're-runs a handler that returns success without contacting QuickBooks and without '
+        + 'uploading anything',
+      check: 'nothing needs undoing for the attachment: this attempt created none, and no replay '
+        + 'creates one while that setting stays off',
+    },
+    UNRECORDED: {
+      effect: 'the supplier invoice PDF is uploaded to the QuickBooks bill AGAIN, once per sweep — '
+        + 'unless attachment upload is turned off for this connector, in which case every sweep does '
+        + 'nothing at all',
+      check: 'IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING, so do not delete an '
+        + 'attachment on the strength of this record — it may never have created one. Read the '
+        + 'setting quickbooks_sync_attach_pdf, then open the bill in QuickBooks and compare what is '
+        + 'attached against what should be there',
+    },
   },
   INVOICE_PDF: {
     effect: 'the invoice PDF is re-downloaded and written over the stored copy AGAIN, once per sweep',
@@ -500,18 +563,26 @@ export const QBO_NO_IDENTIFIER_OPERATION_TYPES: readonly string[] =
 /**
  * WHAT ONE PRESERVED INCIDENT ACTUALLY IS.
  *
- * `LEDGER_DOCUMENT` — a standalone document Xero or QuickBooks accepted and still holds, with an id
- * that opens it. Real money in somebody else's books; no reset of ours voids it.
- * `LEDGER_DOCUMENT_NO_IDENTIFIER` — the same class of write, from an operation whose handler DOES
- * return a document id, on a record that carries NO id (round 8, Codex MEDIUM). The document is
- * exactly as real; what is missing is the way to reach it. It gets its own sentence because the
- * `LEDGER_DOCUMENT` one ends "Open the id in that system", and there is no id to open.
+ * `LEDGER_DOCUMENT` — a LIVE effect stands in Xero or QuickBooks, with an id that opens it: a
+ * document created, a document modified, a payment applied, or a journal posted. Real money is
+ * involved and no reset of ours undoes it. WHICH of those four it was decides the remedy and is a
+ * separate question — see {@link OPERATION_SEMANTIC_BY_TYPE}.
+ * `LEDGER_DOCUMENT_NO_IDENTIFIER` — the same class of write, on a record that carries NO id (round
+ * 8, Codex MEDIUM). The effect is exactly as real; what is missing is the way to reach it.
+ * `LEDGER_DRAFT` — a document or manual journal CREATED UNPOSTED (round 10, Codex HIGH). It sits in
+ * the ledger's drafts and NO BALANCE HAS MOVED. Its remedy is DELETION: a reversal or a credit note
+ * posts for real, so following the live remedy moves the accounts by exactly the amount the draft
+ * never moved, and leaves the draft sitting there as well.
+ * `LEDGER_OUTCOME_UNRECORDED` — an operation that is live on one posting-mode setting and a draft on
+ * the other, on a record that does not carry which was used. IMS cannot say whether a balance moved,
+ * so it says that, and nothing else.
  * `LEDGER_NON_DOCUMENT` — a write the ledger accepted that is NOT a standalone document and returns
  * no id to open: a credit note APPLIED to a bill, a tax rate written into the organisation. The
  * write stands, and the allocation moves money — but there is nothing to go and look up by id.
- * `NO_IDENTIFIER_SIDE_EFFECT` — one of the four operations above. Nothing was created in the ledger
- * at all: a file was attached, a PDF was written over, an email was QUEUED, a note was pushed to
- * WooCommerce. `INVOICE_EMAIL` in particular creates only a LOCAL outbox row.
+ * `NO_IDENTIFIER_SIDE_EFFECT` — an operation that creates no accounting document anywhere: a file
+ * attached to an existing bill, a PDF written over, an email QUEUED, a note pushed to WooCommerce.
+ * `INVOICE_EMAIL` in particular creates only a LOCAL outbox row, and `BILL_ATTACHMENT` may create
+ * nothing at all.
  * `UNCLASSIFIED` — the record carries no type this codebase has classified. Counted separately and
  * NEVER folded into any of the others: the whole point is to stop asserting a remote document, and
  * guessing one is how the assertion got made in the first place.
@@ -519,116 +590,399 @@ export const QBO_NO_IDENTIFIER_OPERATION_TYPES: readonly string[] =
 export type UnrecordedIncidentKind =
   | 'LEDGER_DOCUMENT'
   | 'LEDGER_DOCUMENT_NO_IDENTIFIER'
+  | 'LEDGER_DRAFT'
+  | 'LEDGER_OUTCOME_UNRECORDED'
   | 'LEDGER_NON_DOCUMENT'
   | 'NO_IDENTIFIER_SIDE_EFFECT'
   | 'UNCLASSIFIED'
 
+/** The kinds whose wording is a DOCUMENT wording. Everything else takes the non-document message. */
+const DOCUMENT_KINDS = new Set<UnrecordedIncidentKind>([
+  'LEDGER_DOCUMENT', 'LEDGER_DOCUMENT_NO_IDENTIFIER', 'LEDGER_DRAFT', 'LEDGER_OUTCOME_UNRECORDED',
+])
+function isDocumentKind(kind: UnrecordedIncidentKind): boolean {
+  return DOCUMENT_KINDS.has(kind)
+}
+
+/** How much this record knows about whether the handler touched the remote system at all. */
+type RemoteEffectKnowledge = 'MADE' | 'NONE' | 'UNRECORDED'
+function remoteEffectKnowledge(outcome: PostedOperationOutcome | undefined): RemoteEffectKnowledge {
+  return outcome?.externalEffect ?? 'UNRECORDED'
+}
+
+/** '' and null are the same answer here, and both of them are "no id". */
+function nonEmpty(value: string | null | undefined): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
 /**
- * EVERY OPERATION TYPE, CLASSIFIED ONCE, SHARED BY BOTH CONNECTORS (round 7, Codex MEDIUM).
+ * WHAT EACH OPERATION SEMANTICALLY DOES — CREATE, UPDATE, PAY, JOURNAL (round 10, Codex HIGH).
  *
- * THE DEFECT THIS REPLACES. Round 6 classified by asking one question — "is this one of the four
- * no-identifier operations?" — and sent every other readable type to `LEDGER_DOCUMENT` by fallback.
- * That is the round-6 defect pointing the other way: an unknown was resolved to the CONFIDENT
- * answer. `PURCHASE_CREDIT_NOTE_ALLOCATION` is the proof. Xero processes it successfully and
- * deliberately returns NO external id — "the allocation is a sub-resource of the credit note, not a
- * standalone document" (xero/sync-processor.ts) — so a preserved incident for one was being counted
- * as a document that exists in Xero, carrying real money, openable by id. All three false, in the
- * one record in this system that outlives a factory reset. `TAX_RATE_SYNC` is the second: it returns
- * a tax TYPE code, which is neither money nor a document.
+ * THE DEFECT THIS REPLACES. Round 9's map answered ONE question — "is there a document at this
+ * id?" — and answered it `LEDGER_DOCUMENT` for every type whose handler returns a document id. That
+ * map is exhaustive over the enum and it LOOKS total, which is exactly why it went unquestioned for
+ * two rounds: `SALES_INVOICE_UPDATE` and `PURCHASE_INVOICE_UPDATE` return the id of a document they
+ * MODIFIED and did not create, so a persistence conflict on one implies no duplicate at all, and the
+ * remedy "keep it or void it" could VOID A VALID PRE-EXISTING INVOICE OR BILL. `INVOICE_PAYMENT` and
+ * `BILL_PAYMENT` return a PAYMENT id, and voiding or credit-noting the invoice a payment was applied
+ * to is the wrong document entirely. The kinds were exhaustive over enum NAMES and not over
+ * OUTCOMES.
  *
- * SO THE MAP IS EXHAUSTIVE AND THE COMPILER ENFORCES IT. `Record<AccountingSyncType, …>` fails to
- * build the day a type is added to the enum, which is the only mechanism that reliably survives a
- * schema change; `tests/accounting/reset-preserves-unrecorded-posted-documents.ts` re-derives the
- * enum from prisma/schema.prisma and checks the same thing from the outside.
+ * SO THE AXIS IS THE OPERATION, and the compiler enforces it the same way: `satisfies
+ * Readonly<Record<AccountingSyncType, …>>` fails the build the day a member is added to the enum.
+ * The literals are preserved with `as const` rather than erased by an annotation, because
+ * {@link NonDocumentOperationType} is derived from them.
  *
- * KEYED ON THE TYPE, NOT THE CONNECTOR, deliberately — `AccountingSyncType` is shared, and the four
- * no-identifier operations return `{ success: true }` with no id on BOTH connectors (verified in
- * xero/sync-processor.ts and quickbooks/sync-processor.ts). A type QuickBooks has no branch for at
- * all (the allocation is one) is classified by what it IS, not by who could have posted it.
+ * HOW EACH ROW WAS DECIDED: by walking the connector handler. `CREATE_DOCUMENT` reaches a create
+ * call and returns the new document's id; `UPDATE_DOCUMENT` reaches an update call against an id the
+ * row already knew; `APPLY_PAYMENT` returns a payment id and creates no invoice or bill;
+ * `POST_JOURNAL` goes through `pushManualJournal`; `LEDGER_NON_DOCUMENT` reaches the ledger and
+ * returns nothing openable; `NO_LEDGER_EFFECT` never reaches an accounting ledger at all.
  *
- * HOW EACH ROW WAS DECIDED: by what the connector's handler RETURNS. A handler that returns an
- * `externalId` naming a document you can open is `LEDGER_DOCUMENT` — including the two *_UPDATE
- * types, which return the id of the document they wrote to; the kind asserts that a document stands
- * at that id, not that this operation created it. A handler that reaches the ledger and returns no
- * openable document id is `LEDGER_NON_DOCUMENT`. The four that reach no ledger at all are
- * `NO_IDENTIFIER_SIDE_EFFECT`.
+ * KEYED ON THE TYPE, NOT THE CONNECTOR, deliberately — `AccountingSyncType` is shared, the same four
+ * no-identifier operations exist on both, and a type QuickBooks has no branch for at all (the
+ * allocation is one) is classified by what it IS rather than by who could have posted it.
  */
-export const INCIDENT_KIND_BY_OPERATION_TYPE =
+export type PostedOperationSemantic =
+  | 'CREATE_DOCUMENT'
+  | 'UPDATE_DOCUMENT'
+  | 'APPLY_PAYMENT'
+  | 'POST_JOURNAL'
+  | 'LEDGER_NON_DOCUMENT'
+  | 'NO_LEDGER_EFFECT'
+
+export const OPERATION_SEMANTIC_BY_TYPE =
   Object.freeze({
-    // Documents: the handler returns an invoice/bill/credit-note/payment/journal id.
-    SALES_INVOICE: 'LEDGER_DOCUMENT',
-    SALES_INVOICE_UPDATE: 'LEDGER_DOCUMENT',
-    PURCHASE_INVOICE: 'LEDGER_DOCUMENT',
-    PURCHASE_INVOICE_UPDATE: 'LEDGER_DOCUMENT',
-    INVOICE_PAYMENT: 'LEDGER_DOCUMENT',
-    BILL_PAYMENT: 'LEDGER_DOCUMENT',
-    CREDIT_NOTE: 'LEDGER_DOCUMENT',
-    PURCHASE_CREDIT_NOTE: 'LEDGER_DOCUMENT',
-    // Manual journals — one shared branch on both connectors, returning `journalId`.
-    COGS_JOURNAL: 'LEDGER_DOCUMENT',
-    INVENTORY_ADJUSTMENT: 'LEDGER_DOCUMENT',
-    STOCK_IN_TRANSIT: 'LEDGER_DOCUMENT',
-    STOCK_RECEIPT: 'LEDGER_DOCUMENT',
-    COGS_REVERSAL: 'LEDGER_DOCUMENT',
-    STOCK_ALLOCATION: 'LEDGER_DOCUMENT',
-    DAILY_BATCH_REVENUE_DEFERRAL: 'LEDGER_DOCUMENT',
-    DAILY_BATCH_INVENTORY_ALLOC: 'LEDGER_DOCUMENT',
-    DAILY_BATCH_GROUP_B: 'LEDGER_DOCUMENT',
-    DAILY_BATCH_INVENTORY_RECONCILIATION: 'LEDGER_DOCUMENT',
-    DAILY_BATCH_COGS_RECONCILIATION: 'LEDGER_DOCUMENT',
-    DAILY_BATCH_TRANSIT_RECONCILIATION: 'LEDGER_DOCUMENT',
-    UNEARNED_REV_REVERSAL: 'LEDGER_DOCUMENT',
-    ALLOCATION_REVERSAL: 'LEDGER_DOCUMENT',
-    REALISED_FX_JOURNAL: 'LEDGER_DOCUMENT',
-    UNREALISED_FX_JOURNAL: 'LEDGER_DOCUMENT',
-    MANUFACTURING_JOURNAL: 'LEDGER_DOCUMENT',
-    MANUFACTURING_RECLASS: 'LEDGER_DOCUMENT',
+    // Created here: the handler posts a NEW invoice, bill or credit note and returns its id.
+    SALES_INVOICE: 'CREATE_DOCUMENT',
+    PURCHASE_INVOICE: 'CREATE_DOCUMENT',
+    CREDIT_NOTE: 'CREATE_DOCUMENT',
+    PURCHASE_CREDIT_NOTE: 'CREATE_DOCUMENT',
+    // NOT created here: the handler writes to a document that already stood in the ledger, and
+    // returns the id OF THAT DOCUMENT. There is no duplicate and nothing to void.
+    SALES_INVOICE_UPDATE: 'UPDATE_DOCUMENT',
+    PURCHASE_INVOICE_UPDATE: 'UPDATE_DOCUMENT',
+    // A PAYMENT id, applied against a document nobody created here.
+    INVOICE_PAYMENT: 'APPLY_PAYMENT',
+    BILL_PAYMENT: 'APPLY_PAYMENT',
+    // Manual journals — one shared branch on both connectors, returning `journalId`. A journal is
+    // not voidable or credit-notable; it is reversed, unless it is a DRAFT, when it is deleted.
+    COGS_JOURNAL: 'POST_JOURNAL',
+    INVENTORY_ADJUSTMENT: 'POST_JOURNAL',
+    STOCK_IN_TRANSIT: 'POST_JOURNAL',
+    STOCK_RECEIPT: 'POST_JOURNAL',
+    COGS_REVERSAL: 'POST_JOURNAL',
+    STOCK_ALLOCATION: 'POST_JOURNAL',
+    DAILY_BATCH_REVENUE_DEFERRAL: 'POST_JOURNAL',
+    DAILY_BATCH_INVENTORY_ALLOC: 'POST_JOURNAL',
+    DAILY_BATCH_GROUP_B: 'POST_JOURNAL',
+    DAILY_BATCH_INVENTORY_RECONCILIATION: 'POST_JOURNAL',
+    DAILY_BATCH_COGS_RECONCILIATION: 'POST_JOURNAL',
+    DAILY_BATCH_TRANSIT_RECONCILIATION: 'POST_JOURNAL',
+    UNEARNED_REV_REVERSAL: 'POST_JOURNAL',
+    ALLOCATION_REVERSAL: 'POST_JOURNAL',
+    REALISED_FX_JOURNAL: 'POST_JOURNAL',
+    UNREALISED_FX_JOURNAL: 'POST_JOURNAL',
+    MANUFACTURING_JOURNAL: 'POST_JOURNAL',
+    MANUFACTURING_RECLASS: 'POST_JOURNAL',
     // Accepted by the ledger, but not a document and no id to open.
     PURCHASE_CREDIT_NOTE_ALLOCATION: 'LEDGER_NON_DOCUMENT',
     TAX_RATE_SYNC: 'LEDGER_NON_DOCUMENT',
-    // The four the table above is written for: nothing reaches the ledger.
-    BILL_ATTACHMENT: 'NO_IDENTIFIER_SIDE_EFFECT',
-    INVOICE_PDF: 'NO_IDENTIFIER_SIDE_EFFECT',
-    INVOICE_EMAIL: 'NO_IDENTIFIER_SIDE_EFFECT',
-    WC_INVOICE_NOTE: 'NO_IDENTIFIER_SIDE_EFFECT',
-    // `as const` + `satisfies` rather than a `Record<>` ANNOTATION (round 9): the annotation still
-    // fails the build when a member is added to the enum, and it additionally erased every literal,
-    // so nothing downstream could be typed BY the classification. The non-document wording table
-    // below is keyed on exactly the types this map calls non-documents, and that is only possible
-    // while these values stay literal.
-  } as const) satisfies Readonly<Record<AccountingSyncType, UnrecordedIncidentKind>>
+    // Nothing reaches an accounting ledger.
+    BILL_ATTACHMENT: 'NO_LEDGER_EFFECT',
+    INVOICE_PDF: 'NO_LEDGER_EFFECT',
+    INVOICE_EMAIL: 'NO_LEDGER_EFFECT',
+    WC_INVOICE_NOTE: 'NO_LEDGER_EFFECT',
+  } as const) satisfies Readonly<Record<AccountingSyncType, PostedOperationSemantic>>
+
+/**
+ * THE POSTING MODE ONLY CHANGES THE ANSWER FOR THESE TWO.
+ *
+ * A document CREATE and a manual JOURNAL are sent with a status resolved from `_postingMode`
+ * (`resolveInvoiceStatus` / `resolveJournalStatus` in the Xero processor), so on `draft` they land
+ * unposted and move nothing. An UPDATE writes to a document that already existed and a PAYMENT has
+ * no draft form, so for those two the mode cannot turn a real effect into no effect and its absence
+ * is not an unknown.
+ */
+const DRAFT_CAPABLE_SEMANTICS = new Set<PostedOperationSemantic>(['CREATE_DOCUMENT', 'POST_JOURNAL'])
 
 /** The operation types this map classifies as reaching no ledger document — derived, never re-listed. */
 type NonDocumentOperationType = {
-  [K in keyof typeof INCIDENT_KIND_BY_OPERATION_TYPE]:
-    (typeof INCIDENT_KIND_BY_OPERATION_TYPE)[K] extends 'LEDGER_NON_DOCUMENT' | 'NO_IDENTIFIER_SIDE_EFFECT'
+  [K in keyof typeof OPERATION_SEMANTIC_BY_TYPE]:
+    (typeof OPERATION_SEMANTIC_BY_TYPE)[K] extends 'LEDGER_NON_DOCUMENT' | 'NO_LEDGER_EFFECT'
       ? K
       : never
-}[keyof typeof INCIDENT_KIND_BY_OPERATION_TYPE]
+}[keyof typeof OPERATION_SEMANTIC_BY_TYPE]
 
 /**
- * WHAT THE RECORD CAN STILL BE USED TO FIND THE THING BY (round 9, Codex MEDIUM).
+ * WHAT A WORDING IS ALLOWED TO SEND AN OPERATOR TO USE — DECLARED, NOT DETECTED (round 10, Codex
+ * MEDIUM).
  *
  * THE DEFECT. Three remedies told an operator to find the write in the ledger "by the reference
- * above, its amount and its date". Neither record builder stores an amount or a date —
- * `unrecordedPostedDocumentRecord` and `unpersistedQboPostRecord` write syncLogId, type,
- * referenceType, referenceId and the external identifiers, and nothing else. A factory reset then
- * deletes the sync row, the order and the accounting event, so the permanent record was prescribing
- * a search by the two fields that discriminate between same-reference documents and are the two it
- * does not hold — worst exactly when there is more than one of them.
+ * above, its amount and its date". Neither record builder stores an amount or a date. Round 9
+ * removed those words and then guarded them with a DETECTOR: a hand-written table of English
+ * phrases, scanned over every generated message. That guard is bypassable by writing different
+ * words. A new remedy saying "search by gross total and posting day" names two fields the record
+ * does not hold, produces an EMPTY detected-field set, and passes. Generating every formatter branch
+ * does not make an open-ended phrase allowlist exhaustive, and a permanent record is the last place
+ * to rely on one.
  *
- * THE CHOICE MADE: the instruction was REMOVED rather than the fields persisted. Persisting them
- * means carrying an amount, a currency and a ledger date into `UnrecordablePostedDocument` and
- * `UnpersistedQboPost` from every call site in both processors, for a value neither incident type
- * has today; a record that sometimes has them would put the reader back where they started. So the
- * record now says what it holds and stops there, and `tests/accounting/record-names-only-what-it-
- * holds.test.ts` re-derives the retained keys from the two builders and fails if any wording names
- * a lookup field outside them.
+ * SO THE DESIGN IS INVERTED. The renderer no longer has its prose inspected; it DECLARES what it
+ * needs, and the declaration is checked against what the builders actually write:
+ *
+ *   • a wording names a record value ONLY through a `{placeholder}`, and the placeholder set is this
+ *     union — so `needs: ['grossTotal']` does not compile;
+ *   • every wording entry carries `needs`, and `tests/accounting/record-names-only-what-it-holds.
+ *     test.ts` parses the two record builders and fails if a declared key is one either builder does
+ *     not write;
+ *   • {@link render} throws on a placeholder that is not a slot, or on one whose value is absent —
+ *     so a remedy selected in a state where its id is null cannot silently print "null", and the
+ *     test that generates every message is what catches it before it ships.
+ *
+ * A remedy that needs a field this record does not hold therefore fails to compile or fails the
+ * test, whatever words it is written in.
+ */
+export const RECORD_LOOKUP_FIELDS = ['syncLogId', 'type', 'referenceType', 'referenceId', 'postedExternalId'] as const
+export type RecordLookupField = (typeof RECORD_LOOKUP_FIELDS)[number]
+
+/** The slots a wording template may substitute: the ledger's name, and the declared record fields. */
+type WordingSlots = { ledger: 'Xero' | 'QuickBooks' } & Partial<Record<RecordLookupField, string | null>>
+
+/**
+ * Substitute `{ledger}`, `{LEDGER}` and any {@link RecordLookupField} the caller supplies.
+ *
+ * THROWS on an unknown placeholder and on a declared one whose value is absent. Both are programming
+ * errors in a constant table, and the test that renders every message for every combination is what
+ * turns them into a red build rather than a record that tells an operator to open "null".
+ */
+function render(template: string, slots: WordingSlots): string {
+  return template.replace(/\{([A-Za-z]+)\}/g, (_whole, slot: string) => {
+    if (slot === 'ledger') return slots.ledger
+    if (slot === 'LEDGER') return slots.ledger.toUpperCase()
+    if (!(RECORD_LOOKUP_FIELDS as readonly string[]).includes(slot)) {
+      throw new Error(`incident wording named "${slot}", which is not a field this record holds`)
+    }
+    const value = slots[slot as RecordLookupField]
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new Error(`incident wording named "${slot}", which this record does not carry`)
+    }
+    return value
+  })
+}
+
+/** The one escalation instruction, so the seven places that end in it cannot each word it slightly differently. */
+const ESCALATE_REMEDY = 'REMEDY: escalate this record to whoever administers this installation'
+
+/**
+ * WHAT THE RECORD HOLDS, SAID ONCE. Every message ends in it, so no remedy has to imply the record
+ * carries more than this, and an escalation names what the person it escalates to will be given.
  */
 export const INCIDENT_IDENTIFICATION_TAIL =
   'WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the '
   + 'time this record was written — the write it describes was made in the same sync attempt. That '
   + 'is all of it.'
+
+/**
+ * THE ANSWER WHEN THE OUTCOME WAS NOT RECORDED, and it is deliberately the same in all three frames.
+ * A record that cannot say whether a balance moved has one honest instruction, and every variation
+ * on it would be a hint about which way to guess.
+ */
+const OUTCOME_UNRECORDED_REMEDY: string =
+  'REMEDY: THIS RECORD DOES NOT SAY WHETHER THAT WAS A LIVE POSTING OR A DRAFT. This operation '
+  + 'creates a live ledger document on one posting-mode setting and an UNPOSTED DRAFT on the other, '
+  + 'and IMS did not record which was used for this attempt — so it cannot say whether any balance '
+  + 'moved. DO NOT void, credit-note, reverse or delete anything on the strength of this record: the '
+  + 'remedy for a live posting is the one that does the most damage to a draft, and the other way '
+  + 'round. Escalate this record to whoever administers this installation'
+
+/**
+ * THE DOCUMENT REMEDY, PER OPERATION SEMANTIC AND PER POSTING MODE (round 10, Codex HIGH).
+ *
+ * ONE TABLE FOR BOTH CONNECTORS AND BOTH FRAMES. The Xero formatter reaches a document incident by
+ * two doors (the row is gone; the row names another id) and the QuickBooks one by a third (the id
+ * could not be written at all), and until now each door wrote its own remedy. Three authors of one
+ * instruction is how "keep it or void it" came to be said about an UPDATE, and about a DRAFT, on
+ * every one of them at once. The frames now contribute only the sentence about the ROW; every word
+ * about the DOCUMENT comes from here.
+ *
+ * WHY THE KEY IS NOT THE OPERATION TYPE. It is the semantic AND the posting mode, because those are
+ * the two things that decide what an operator must do:
+ *
+ *   CREATE_LIVE        a new document is in the ledger        → keep it or void it
+ *   CREATE_DRAFT       a document exists, UNPOSTED            → DELETE it; a reversal would post
+ *   JOURNAL_LIVE       a manual journal is in the ledger      → reverse it (journals do not void)
+ *   JOURNAL_DRAFT      a journal exists, UNPOSTED             → DELETE it; a reversal would post
+ *   UPDATE             a document that was already there was changed → inspect and correct it
+ *   PAYMENT            a payment was applied to a document nobody created here → remove the PAYMENT
+ *   OUTCOME_UNRECORDED live or draft, and this record does not say → touch nothing, escalate
+ */
+type DocumentWordingKey =
+  | 'CREATE_LIVE' | 'CREATE_DRAFT' | 'JOURNAL_LIVE' | 'JOURNAL_DRAFT'
+  | 'UPDATE' | 'PAYMENT' | 'OUTCOME_UNRECORDED'
+
+export type DocumentIncidentWording = {
+  /** Completes "Xero SALES_INVOICE for SalesOrder order-1 …, but …". */
+  didWithId: string
+  didWithoutId: string
+  /** What the rest of the sentence calls the thing, e.g. "the document". */
+  noun: string
+  /** What the row names a DIFFERENT one OF, e.g. "document". */
+  conflictNoun: string
+  /** The sentence about both of them existing, for the conflict frame. */
+  bothExist: string
+  /** What still stands when this record carries no id at all. */
+  absent: string
+  /** Xero, the row is gone, and the id is in hand. */
+  remedyRowGone: string
+  /** Xero, the row names another document, and both ids are in hand. */
+  remedyDuplicate: string
+  /** QuickBooks, the id is in hand and the row never learned it. */
+  remedyIdUnrecorded: string
+  /** Every record field the templates above name. Checked against the builders by the test. */
+  needs: readonly RecordLookupField[]
+}
+
+export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, DocumentIncidentWording>> = Object.freeze({
+  CREATE_LIVE: {
+    didWithId: 'POSTED as {postedExternalId}',
+    didWithoutId: 'POSTED as (no id returned)',
+    noun: 'the document',
+    conflictNoun: 'document',
+    bothExist: 'BOTH documents exist in {ledger}.',
+    absent: 'The document is in {ledger} all the same.',
+    remedyRowGone: 'REMEDY: find it in {ledger} by the id above and either keep it (re-enter the '
+      + 'reference by hand) or void it; ',
+    remedyDuplicate: 'REMEDY: open both ids in {ledger}, keep the one the row names, and void or '
+      + 'credit the duplicate; ',
+    remedyIdUnrecorded: 'REMEDY: open the id above in {ledger}, confirm exactly one document exists '
+      + 'for this reference, and void any duplicate.',
+    needs: ['postedExternalId'],
+  },
+  CREATE_DRAFT: {
+    didWithId: 'created a DRAFT document in {ledger} as {postedExternalId} — nothing was posted to the ledger',
+    didWithoutId: 'created a DRAFT document in {ledger} (no id returned) — nothing was posted to the ledger',
+    noun: 'the draft',
+    conflictNoun: 'draft',
+    bothExist: 'BOTH drafts exist in {ledger}, and neither has moved a balance.',
+    absent: 'The draft is in {ledger} all the same, and it moved no balances.',
+    remedyRowGone: 'REMEDY: THE DRAFT MOVED NO BALANCES — it was created unposted, so nothing has '
+      + 'reached the ledger. Find it in {ledger} by the id above and DELETE it if it should not '
+      + 'exist. DO NOT void it, credit-note it or reverse it: a reversal POSTS FOR REAL, so it would '
+      + 'move the accounts by exactly the amount this draft never moved, and leave the draft sitting '
+      + 'there as well; ',
+    remedyDuplicate: 'REMEDY: NEITHER DRAFT HAS MOVED A BALANCE. Open both ids in {ledger}, keep the '
+      + 'one the row names, and DELETE the duplicate. DO NOT void, credit-note or reverse either: a '
+      + 'reversal POSTS FOR REAL, and would move accounts these drafts never moved; ',
+    remedyIdUnrecorded: 'REMEDY: THE DRAFT MOVED NO BALANCES — it was created unposted. Open the id '
+      + 'above in {ledger}, confirm exactly one draft exists for this reference, and DELETE any '
+      + 'duplicate. DO NOT void, credit-note or reverse one: a reversal POSTS FOR REAL.',
+    needs: ['postedExternalId'],
+  },
+  JOURNAL_LIVE: {
+    didWithId: 'POSTED a manual journal to the {ledger} ledger as {postedExternalId}',
+    didWithoutId: 'POSTED a manual journal to the {ledger} ledger (no id returned)',
+    noun: 'the journal',
+    conflictNoun: 'journal',
+    bothExist: 'BOTH journals are in the {ledger} ledger.',
+    absent: 'The journal is in the {ledger} ledger all the same.',
+    remedyRowGone: 'REMEDY: find the journal in {ledger} by the id above and either keep it '
+      + '(re-enter the reference by hand) or POST A REVERSING JOURNAL against it — a manual journal '
+      + 'is not voided or credit-noted; ',
+    remedyDuplicate: 'REMEDY: open both ids in {ledger}, keep the one the row names, and REVERSE the '
+      + 'duplicate with a reversing journal — a manual journal is not voided or credit-noted; ',
+    remedyIdUnrecorded: 'REMEDY: open the id above in {ledger}, confirm exactly one journal exists '
+      + 'for this reference, and REVERSE any duplicate with a reversing journal. A manual journal is '
+      + 'not voided or credit-noted.',
+    needs: ['postedExternalId'],
+  },
+  JOURNAL_DRAFT: {
+    didWithId: 'created a DRAFT manual journal in {ledger} as {postedExternalId} — nothing was posted to the ledger',
+    didWithoutId: 'created a DRAFT manual journal in {ledger} (no id returned) — nothing was posted to the ledger',
+    noun: 'the draft journal',
+    conflictNoun: 'draft journal',
+    bothExist: 'BOTH draft journals exist in {ledger}, and neither has moved a balance.',
+    absent: 'The draft journal is in {ledger} all the same, and it moved no balances.',
+    remedyRowGone: 'REMEDY: THE DRAFT MOVED NO BALANCES — it was created unposted, so no account has '
+      + 'been touched. Find it in {ledger} by the id above and DELETE it if it should not exist. DO '
+      + 'NOT post a reversing journal: the reversal POSTS FOR REAL, so it would move the accounts by '
+      + 'exactly the amount this draft never moved, and leave the draft sitting there as well; ',
+    remedyDuplicate: 'REMEDY: NEITHER DRAFT HAS MOVED A BALANCE. Open both ids in {ledger}, keep the '
+      + 'one the row names, and DELETE the duplicate. DO NOT post a reversing journal for either: a '
+      + 'reversal POSTS FOR REAL; ',
+    remedyIdUnrecorded: 'REMEDY: THE DRAFT MOVED NO BALANCES — it was created unposted. Open the id '
+      + 'above in {ledger}, confirm exactly one draft journal exists for this reference, and DELETE '
+      + 'any duplicate. DO NOT post a reversing journal: a reversal POSTS FOR REAL.',
+    needs: ['postedExternalId'],
+  },
+  UPDATE: {
+    didWithId: 'MODIFIED the existing {ledger} document {postedExternalId}',
+    didWithoutId: 'MODIFIED an existing {ledger} document (no id returned)',
+    noun: 'the document it changed',
+    conflictNoun: 'document',
+    bothExist: 'BOTH documents exist in {ledger}, and NEITHER was created by this attempt — it '
+      + 'changed the one it names.',
+    absent: 'The document it changed is in {ledger} all the same, and it stood there before this '
+      + 'attempt ran.',
+    remedyRowGone: 'REMEDY: NO DOCUMENT WAS CREATED — this operation changed one that already '
+      + 'existed, so there is no duplicate here and nothing that this attempt brought into being. DO '
+      + 'NOT VOID OR CREDIT-NOTE IT: doing so would void a document that was valid before this '
+      + 'attempt ran. Open it in {ledger} by the id above, compare it against the reference above in '
+      + 'IMS, and correct it in {ledger} if the change should not stand; ',
+    remedyDuplicate: 'REMEDY: NO DOCUMENT WAS CREATED BY THIS ATTEMPT — it changed one that already '
+      + 'existed, and the row names a different one. DO NOT VOID OR CREDIT-NOTE EITHER. Open both '
+      + 'ids in {ledger}, compare each against the reference above in IMS, and correct whichever is '
+      + 'wrong; ',
+    remedyIdUnrecorded: 'REMEDY: NO DOCUMENT WAS CREATED — this operation changed one that already '
+      + 'existed. DO NOT VOID OR CREDIT-NOTE IT, and do not go looking for a duplicate. Open the id '
+      + 'above in {ledger}, compare it against the reference above in IMS, and correct it there if '
+      + 'the change should not stand.',
+    needs: ['postedExternalId'],
+  },
+  PAYMENT: {
+    didWithId: 'APPLIED a payment in {ledger}, recorded as {postedExternalId}',
+    didWithoutId: 'APPLIED a payment in {ledger} (no id returned)',
+    noun: 'the payment',
+    conflictNoun: 'payment',
+    bothExist: 'BOTH payments are in {ledger}.',
+    absent: 'The payment is in {ledger} all the same.',
+    remedyRowGone: 'REMEDY: A PAYMENT WAS APPLIED TO A DOCUMENT THAT ALREADY EXISTED — no invoice, '
+      + 'bill or credit note was created here. Open the payment in {ledger} by the id above and '
+      + 'either keep it (re-enter the reference by hand) or REMOVE OR REVERSE THAT PAYMENT. DO NOT '
+      + 'void or credit-note the document it was applied to; ',
+    remedyDuplicate: 'REMEDY: open both payment ids in {ledger}, keep the one the row names, and '
+      + 'remove or reverse the duplicate PAYMENT. DO NOT void or credit-note the invoice or bill '
+      + 'either payment was applied to — neither of them was created here; ',
+    remedyIdUnrecorded: 'REMEDY: open the id above in {ledger}, confirm exactly one payment exists '
+      + 'for this reference, and remove or reverse any duplicate PAYMENT. DO NOT void or credit-note '
+      + 'the document it was applied to — that document was not created here.',
+    needs: ['postedExternalId'],
+  },
+  OUTCOME_UNRECORDED: {
+    didWithId: 'reached {ledger} as {postedExternalId}',
+    didWithoutId: 'reached {ledger} (no id returned)',
+    noun: 'what it created',
+    conflictNoun: 'external id',
+    bothExist: 'BOTH ids were accepted by {ledger}.',
+    absent: 'Something was created in {ledger} all the same.',
+    remedyRowGone: OUTCOME_UNRECORDED_REMEDY + '; ',
+    remedyDuplicate: OUTCOME_UNRECORDED_REMEDY + '; ',
+    remedyIdUnrecorded: OUTCOME_UNRECORDED_REMEDY + '.',
+    needs: ['postedExternalId'],
+  },
+})
+
+
+/** Which wording a document incident earns — the semantic decides the shape, the kind decides the mode. */
+function documentIncidentWording(type: string, kind: UnrecordedIncidentKind): DocumentIncidentWording {
+  if (kind === 'LEDGER_OUTCOME_UNRECORDED') return DOCUMENT_INCIDENT_WORDING.OUTCOME_UNRECORDED
+  const semantic = operationSemanticFor(type)
+  if (semantic === 'POST_JOURNAL') {
+    return kind === 'LEDGER_DRAFT' ? DOCUMENT_INCIDENT_WORDING.JOURNAL_DRAFT : DOCUMENT_INCIDENT_WORDING.JOURNAL_LIVE
+  }
+  if (semantic === 'UPDATE_DOCUMENT') return DOCUMENT_INCIDENT_WORDING.UPDATE
+  if (semantic === 'APPLY_PAYMENT') return DOCUMENT_INCIDENT_WORDING.PAYMENT
+  return kind === 'LEDGER_DRAFT' ? DOCUMENT_INCIDENT_WORDING.CREATE_DRAFT : DOCUMENT_INCIDENT_WORDING.CREATE_LIVE
+}
 
 /**
  * THE REMEDY FOR A WRITE THAT IS NOT A DOCUMENT, PER OPERATION (round 9, Codex HIGH).
@@ -637,10 +991,34 @@ export const INCIDENT_IDENTIFICATION_TAIL =
  * type non-document and nobody writes it a remedy — the same mechanism, one level down, that stops
  * an operation type going unclassified. `{ledger}` is substituted at render time because these
  * operations are identical on both connectors and the incident is not.
+ *
+ * `stands` IS PER ENTRY RATHER THAN PER KIND (round 10, Codex MEDIUM). It used to be one of two
+ * sentences chosen by the kind, and one of them — "NOTHING WAS CREATED IN XERO AT ALL" — is not
+ * true of every operation it covered. `BILL_ATTACHMENT` with uploads enabled CREATES AN ATTACHMENT
+ * ON THE REMOTE BILL; with them disabled it makes no request at all. One sentence could not be true
+ * of both, so the sentence moved to where the difference is known.
  */
-export const NON_DOCUMENT_INCIDENT_WORDING:
-  Readonly<Record<NonDocumentOperationType, { did: string; remedy: string }>> = Object.freeze({
+export type NonDocumentIncidentWording = {
+  /** What now stands (or does not) in the ledger. */
+  stands: string
+  /** Completes "WHAT THE OPERATION DID: …". */
+  did: string
+  remedy: string
+  needs: readonly RecordLookupField[]
+}
+
+const NOT_A_DOCUMENT_STANDS =
+  'THIS IS NOT A DOCUMENT. {ledger} accepted the write and no reset of ours undoes it, but nothing '
+  + 'stands at an id, so there is nothing here to open, keep or void as one. '
+const NOTHING_CREATED_STANDS =
+  'NOTHING WAS CREATED IN {LEDGER} AT ALL, so do not go looking there for a document. '
+
+export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
+  NonDocumentOperationType,
+  NonDocumentIncidentWording | Readonly<Record<RemoteEffectKnowledge, NonDocumentIncidentWording>>
+>> = Object.freeze({
     PURCHASE_CREDIT_NOTE_ALLOCATION: {
+      stands: NOT_A_DOCUMENT_STANDS,
       did: 'it APPLIED an already-posted supplier credit note to an already-posted bill. An allocation '
         + 'is a sub-resource of the credit note, not a standalone document, and {ledger} returns no id '
         + 'for one',
@@ -649,27 +1027,62 @@ export const NON_DOCUMENT_INCIDENT_WORDING:
         + 'happened is that one was applied to the other, and the only thing that undoes it is removing '
         + 'that allocation from the credit note in {ledger}. Escalate this record to whoever '
         + 'administers this installation.',
+      needs: [],
     },
     TAX_RATE_SYNC: {
+      stands: NOT_A_DOCUMENT_STANDS,
       did: 'it wrote a TAX RATE into the {ledger} organisation. A tax rate is a setting on the '
         + 'organisation rather than a document, and the value the write returns is a tax TYPE code',
       remedy: 'REMEDY: THERE IS NOTHING TO VOID OR CREDIT — nothing was posted to a customer or a '
         + 'supplier account. Review the tax rates in {ledger}, and correct or archive that rate there '
         + 'if this write was wrong.',
+      needs: [],
     },
+    // ROUND 10 (Codex MEDIUM): THE ONE OPERATION WHOSE OWN OUTCOME DECIDES THE SENTENCE. The handler
+    // returns success WITHOUT uploading when its connector's attach-PDF setting is 'false', so the
+    // round-9 wording — "it uploaded a supplier-invoice PDF", under a headline reading "NOTHING WAS
+    // CREATED AT ALL" — was two claims that could not both hold, and on a disabled install BOTH were
+    // false. It could send an operator to remove a duplicate attachment this attempt never created.
     BILL_ATTACHMENT: {
-      did: 'it uploaded a supplier-invoice PDF onto a bill that already existed. No document was '
-        + 'created and no id was returned',
-      remedy: 'REMEDY: open that bill in {ledger} and remove any duplicate attachment. There is no '
-        + 'document to void.',
+      MADE: {
+        stands: 'AN ATTACHMENT NOW EXISTS ON THAT BILL IN {LEDGER}, and no standalone accounting '
+          + 'document was created. ',
+        did: 'it uploaded a supplier-invoice PDF onto a bill that already existed in {ledger}. THE '
+          + 'UPLOAD HAPPENED. No id came back because an attachment is not a document',
+        remedy: 'REMEDY: open that bill in {ledger} and remove the duplicate attachment. There is no '
+          + 'document to void, and the bill itself was not created by this attempt.',
+        needs: [],
+      },
+      NONE: {
+        stands: 'NOTHING LEFT THIS PROCESS AND NOTHING IN {LEDGER} CHANGED. ',
+        did: 'it did nothing at all. Attachment upload is turned off for this connector, so the '
+          + 'handler returned success without contacting {ledger} and without uploading anything',
+        remedy: 'REMEDY: THERE IS NOTHING TO UNDO. No attachment was created, no document was '
+          + 'created, and nothing in {ledger} was touched by this attempt.',
+        needs: [],
+      },
+      UNRECORDED: {
+        stands: 'IMS DID NOT RECORD WHETHER THE UPLOAD HAPPENED. ',
+        did: 'it either uploaded a supplier-invoice PDF onto a bill that already existed in {ledger} '
+          + 'or did nothing at all — the handler skips the upload and STILL RETURNS SUCCESS when '
+          + 'attachment upload is turned off for this connector, and this record does not say which '
+          + 'of the two this attempt was',
+        remedy: 'REMEDY: DO NOT REMOVE AN ATTACHMENT ON THE STRENGTH OF THIS RECORD — this attempt '
+          + 'may never have created one. Open that bill in {ledger}, compare what is attached against '
+          + 'what should be there, and escalate this record to whoever administers this installation.',
+        needs: [],
+      },
     },
     INVOICE_PDF: {
+      stands: NOTHING_CREATED_STANDS,
       did: 'it re-downloaded the invoice PDF and wrote it over the copy IMS had stored, so the effect '
         + 'landed inside IMS',
       remedy: 'REMEDY: confirm the invoice PDF stored against the order is the document you expect. '
         + 'There is nothing to void in {ledger}.',
+      needs: [],
     },
     INVOICE_EMAIL: {
+      stands: NOTHING_CREATED_STANDS,
       did: 'it QUEUED an invoice email to the customer — one PENDING row in the local email outbox. It '
         + 'succeeds by QUEUEING, not by sending',
       remedy: 'REMEDY: IMS CANNOT CANCEL A QUEUED COPY — EmailOutbox has four states (PENDING, '
@@ -678,13 +1091,27 @@ export const NON_DOCUMENT_INCIDENT_WORDING:
         + 'row\'s status, attempts, lastError and sentAt. A FAILED ROW IS NOT PROOF THAT NOTHING WENT, '
         + 'whatever its lastError says: IMS keeps no per-attempt outcome, so a row\'s final error '
         + 'cannot be read backwards into its history (o3d-ch0h).',
+      needs: [],
     },
     WC_INVOICE_NOTE: {
+      stands: NOTHING_CREATED_STANDS,
       did: 'it wrote an invoice note onto the WooCommerce order',
       remedy: 'REMEDY: open that order in WooCommerce and remove any duplicate note. There is nothing '
         + 'to void in {ledger}.',
+      needs: [],
     },
   })
+
+/** The wording for one non-document operation, after its own outcome has been asked for. */
+function nonDocumentWordingFor(
+  type: string,
+  outcome: PostedOperationOutcome | undefined,
+): NonDocumentIncidentWording | undefined {
+  const entry = (NON_DOCUMENT_INCIDENT_WORDING as Partial<Record<string, NonDocumentIncidentWording
+    | Readonly<Record<RemoteEffectKnowledge, NonDocumentIncidentWording>>>>)[type]
+  if (!entry) return undefined
+  return 'did' in entry ? entry : entry[remoteEffectKnowledge(outcome)]
+}
 
 /**
  * THE WHOLE MESSAGE FOR AN INCIDENT WHOSE OPERATION IS NOT A DOCUMENT POST (round 9, Codex HIGH).
@@ -696,33 +1123,31 @@ export const NON_DOCUMENT_INCIDENT_WORDING:
 function describeNonDocumentIncident(params: {
   ledger: 'Xero' | 'QuickBooks'
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
-  kind: Exclude<UnrecordedIncidentKind, 'LEDGER_DOCUMENT' | 'LEDGER_DOCUMENT_NO_IDENTIFIER'>
+  kind: UnrecordedIncidentKind
   postedExternalId: string | null
+  outcome: PostedOperationOutcome | undefined
   rowState: string
 }): string {
   const { ledger, entry, kind, postedExternalId, rowState } = params
-  const wording = (NON_DOCUMENT_INCIDENT_WORDING as Partial<Record<string, { did: string; remedy: string }>>)[entry.type]
-  const render = (text: string) => text.split('{ledger}').join(ledger)
+  const wording = nonDocumentWordingFor(entry.type, params.outcome)
+  const slots: WordingSlots = { ledger, postedExternalId }
   const head = `${ledger} ${entry.type} for ${entry.referenceType} ${entry.referenceId} SUCCEEDED — the `
     + 'external effect has happened — but IMS could not record that it did. '
   if (kind === 'UNCLASSIFIED' || !wording) {
     return head + rowState
       + 'THIS VERSION OF IMS DOES NOT CLASSIFY THAT OPERATION TYPE, so it cannot say what, if '
       + `anything, now stands in ${ledger}. REMEDY: DO NOT ASSUME A DOCUMENT. This record will not tell `
-      + 'you to open, keep or void one, because it cannot establish that there is one. Escalate this '
-      + `record to whoever administers this installation. ${INCIDENT_IDENTIFICATION_TAIL}`
+      + `you to open, keep or void one, because it cannot establish that there is one. ${ESCALATE_REMEDY}. `
+      + INCIDENT_IDENTIFICATION_TAIL
   }
   return head
-    + `WHAT THE OPERATION DID: ${render(wording.did)}. `
+    + `WHAT THE OPERATION DID: ${render(wording.did, slots)}. `
     + rowState
-    + (kind === 'LEDGER_NON_DOCUMENT'
-      ? `THIS IS NOT A DOCUMENT. ${ledger} accepted the write and no reset of ours undoes it, but `
-        + 'nothing stands at an id, so there is nothing here to open, keep or void as one. '
-      : `NOTHING WAS CREATED IN ${ledger.toUpperCase()} AT ALL, so do not go looking there for a document. `)
+    + render(wording.stands, slots)
     + (postedExternalId
       ? `The value recorded against this incident (${postedExternalId}) is not a document id. `
       : '')
-    + `${render(wording.remedy)} `
+    + `${render(wording.remedy, slots)} `
     + INCIDENT_IDENTIFICATION_TAIL
 }
 
@@ -735,18 +1160,30 @@ function describeNonDocumentIncident(params: {
  * two disagreed about `PURCHASE_CREDIT_NOTE_ALLOCATION`, and the formatter was the one an operator
  * reads. There is now one implementation and two entry points into it.
  */
+export function operationSemanticFor(type: string | null | undefined): PostedOperationSemantic | undefined {
+  if (typeof type !== 'string' || type.length === 0) return undefined
+  return (OPERATION_SEMANTIC_BY_TYPE as Record<string, PostedOperationSemantic | undefined>)[type]
+}
+
 export function incidentKindForOperation(
   type: string | null | undefined,
   postedExternalId: string | null | undefined,
+  outcome?: PostedOperationOutcome,
 ): UnrecordedIncidentKind {
-  if (typeof type !== 'string' || type.length === 0) return 'UNCLASSIFIED'
-  const kind = (INCIDENT_KIND_BY_OPERATION_TYPE as Record<string, UnrecordedIncidentKind | undefined>)[type]
-    ?? 'UNCLASSIFIED'
+  const semantic = operationSemanticFor(type)
+  if (!semantic) return 'UNCLASSIFIED'
+  if (semantic === 'NO_LEDGER_EFFECT') return 'NO_IDENTIFIER_SIDE_EFFECT'
+  if (semantic === 'LEDGER_NON_DOCUMENT') return 'LEDGER_NON_DOCUMENT'
+  // ROUND 10 (Codex HIGH): THE POSTING MODE DECIDES WHETHER A BALANCE MOVED, AND ITS ABSENCE IS NOT
+  // A LIVE POSTING. Only a CREATE and a JOURNAL have a draft form (see DRAFT_CAPABLE_SEMANTICS), so
+  // only for those two is a missing mode an unknown rather than an irrelevance — an UPDATE changed a
+  // document that was already standing whatever mode it was sent with, and a payment has no draft.
+  if (DRAFT_CAPABLE_SEMANTICS.has(semantic)) {
+    if (outcome?.postingMode === 'DRAFT') return 'LEDGER_DRAFT'
+    if (outcome?.postingMode !== 'LIVE') return 'LEDGER_OUTCOME_UNRECORDED'
+  }
   // THE OPERATION SAYS A DOCUMENT ID EXISTS; THE RECORD SAYS WHETHER ONE WAS WRITTEN DOWN.
-  if (kind !== 'LEDGER_DOCUMENT') return kind
-  return typeof postedExternalId === 'string' && postedExternalId.length > 0
-    ? 'LEDGER_DOCUMENT'
-    : 'LEDGER_DOCUMENT_NO_IDENTIFIER'
+  return nonEmpty(postedExternalId) ? 'LEDGER_DOCUMENT' : 'LEDGER_DOCUMENT_NO_IDENTIFIER'
 }
 
 /**
@@ -796,9 +1233,17 @@ export function classifyUnrecordedIncident(metadata: unknown): UnrecordedInciden
   const postedExternalId = (metadata as { postedExternalId?: unknown }).postedExternalId
   // ROUND 9: the decision itself lives in `incidentKindForOperation`, which the two formatters call
   // too. This function is the part that is only about reading a stored blob.
+  // ROUND 10: the two facts the TYPE cannot supply. A blob that carries neither is not a blob about
+  // a live posting; it is a blob that does not say, and `incidentKindForOperation` treats it so.
+  const postingMode = (metadata as { postingMode?: unknown }).postingMode
+  const externalEffect = (metadata as { externalEffect?: unknown }).externalEffect
   return incidentKindForOperation(
     typeof type === 'string' ? type : null,
     typeof postedExternalId === 'string' ? postedExternalId : null,
+    {
+      postingMode: postingMode === 'LIVE' || postingMode === 'DRAFT' ? postingMode : undefined,
+      externalEffect: externalEffect === 'MADE' || externalEffect === 'NONE' ? externalEffect : undefined,
+    },
   )
 }
 
@@ -809,6 +1254,8 @@ export function countUnrecordedIncidents(rows: readonly { metadata: unknown }[])
   const counts: UnrecordedIncidentCounts = {
     LEDGER_DOCUMENT: 0,
     LEDGER_DOCUMENT_NO_IDENTIFIER: 0,
+    LEDGER_DRAFT: 0,
+    LEDGER_OUTCOME_UNRECORDED: 0,
     LEDGER_NON_DOCUMENT: 0,
     NO_IDENTIFIER_SIDE_EFFECT: 0,
     UNCLASSIFIED: 0,
@@ -826,16 +1273,37 @@ export function countUnrecordedIncidents(rows: readonly { metadata: unknown }[])
  * here, next to the classifier that decides which sentence a row earns, so the two cannot drift.
  */
 export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentCounts): string {
-  const total = counts.LEDGER_DOCUMENT + counts.LEDGER_DOCUMENT_NO_IDENTIFIER
-    + counts.LEDGER_NON_DOCUMENT + counts.NO_IDENTIFIER_SIDE_EFFECT + counts.UNCLASSIFIED
+  const total = counts.LEDGER_DOCUMENT + counts.LEDGER_DOCUMENT_NO_IDENTIFIER + counts.LEDGER_DRAFT
+    + counts.LEDGER_OUTCOME_UNRECORDED + counts.LEDGER_NON_DOCUMENT + counts.NO_IDENTIFIER_SIDE_EFFECT
+    + counts.UNCLASSIFIED
   const parts: string[] = [
     `Database reset kept ${total} record(s) of things IMS did against an accounting connector and `
     + 'could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately.',
   ]
   if (counts.LEDGER_DOCUMENT > 0) {
     parts.push(
-      `${counts.LEDGER_DOCUMENT} name a DOCUMENT Xero or QuickBooks accepted and still holds — real `
-      + 'money in somebody else\'s books, which no reset of ours voids. Open the id in that system.',
+      `${counts.LEDGER_DOCUMENT} name a LIVE effect Xero or QuickBooks accepted and still holds — `
+      + 'real money in somebody else\'s books, which no reset of ours undoes. THEY ARE NOT ALL NEW '
+      + 'DOCUMENTS: this count also holds documents that were MODIFIED rather than created, and '
+      + 'payments applied to documents nobody created here. Open the id in that system, and read the '
+      + 'record itself for what the operation actually did before you void, credit or reverse '
+      + 'anything.',
+    )
+  }
+  if (counts.LEDGER_DRAFT > 0) {
+    parts.push(
+      `${counts.LEDGER_DRAFT} were created as DRAFTS and MOVED NO BALANCES — the posting mode for `
+      + 'those rows was `draft`, so the document or journal sits unposted in Xero. DELETE one if it '
+      + 'should not exist. DO NOT void, credit-note or reverse it: a reversal POSTS FOR REAL, and '
+      + 'would move the accounts by exactly the amount the draft never moved.',
+    )
+  }
+  if (counts.LEDGER_OUTCOME_UNRECORDED > 0) {
+    parts.push(
+      `${counts.LEDGER_OUTCOME_UNRECORDED} are from operations that create a LIVE ledger document on `
+      + 'one posting-mode setting and an UNPOSTED DRAFT on the other, ON RECORDS THAT DO NOT SAY '
+      + 'WHICH. IMS cannot tell you whether those balances moved. Do not void, credit, reverse or '
+      + 'delete anything on the strength of these. Escalate them.',
     )
   }
   if (counts.LEDGER_DOCUMENT_NO_IDENTIFIER > 0) {
@@ -857,9 +1325,11 @@ export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentC
   }
   if (counts.NO_IDENTIFIER_SIDE_EFFECT > 0) {
     parts.push(
-      `${counts.NO_IDENTIFIER_SIDE_EFFECT} are NOT ledger documents and created nothing in Xero or `
-      + 'QuickBooks to go and look for. They record an effect that landed somewhere else and can '
-      + 'repeat: a file attached to a QuickBooks bill, an invoice PDF written over the stored copy, an '
+      `${counts.NO_IDENTIFIER_SIDE_EFFECT} are NOT accounting documents — no invoice, bill, credit `
+      + 'note, payment or journal was created in Xero or QuickBooks for any of them. They record an '
+      + 'effect that landed somewhere else and can repeat: a file attached to an EXISTING bill (or, '
+      + 'where attachment upload is off, nothing at all — each record says which), an invoice PDF '
+      + 'written over the stored copy, an '
       + 'invoice email QUEUED to a customer, a note written onto a WooCommerce order. The queued-email '
       + 'one never had a remote document at all — only a local email-outbox row, WHICH THIS RESET HAS '
       + 'JUST DELETED: the outbox rows that record tells you to inspect are gone with it, so their '
@@ -899,7 +1369,12 @@ export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentC
  */
 export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: unknown): string {
   const { entry, postedExternalId } = incident
-  const noRequestId = QBO_OPERATIONS_WITHOUT_REQUEST_ID[entry.type]
+  const replayEntry = QBO_OPERATIONS_WITHOUT_REQUEST_ID[entry.type]
+  // ROUND 10 (Codex MEDIUM): `BILL_ATTACHMENT` has one wording per OUTCOME, not one wording. See the
+  // table: the handler returns success without uploading when attachment upload is off.
+  const noRequestId = replayEntry && ('effect' in replayEntry
+    ? replayEntry
+    : replayEntry[remoteEffectKnowledge(incident.outcome)])
   if (noRequestId) {
     return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} SUCCEEDED — the `
       + 'external effect has happened — but IMS could not record that it did: '
@@ -947,33 +1422,41 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
   // return `res.data?.Payment?.Id` / `?.BillPayment?.Id` without checking presence, and the caller
   // passes `syncResult.externalId ?? null` straight through — so the remedy is written from whether
   // an id is here, not from the fact that this operation type usually has one.
-  const posted = typeof postedExternalId === 'string' && postedExternalId.length > 0 ? postedExternalId : null
+  const posted = nonEmpty(postedExternalId)
   // ROUND 9 (Codex HIGH): AND EVERYTHING BELOW IS WRITTEN FOR A DOCUMENT POST. The four
   // no-identifier operations are taken by the branch above; every OTHER non-document operation —
   // an allocation, a tax rate, a type this binary does not know — fell through to it and was told
   // to open, confirm and void a document. Same defect as the Xero formatter, same shared answer.
-  const kind = incidentKindForOperation(entry.type, posted)
-  if (kind !== 'LEDGER_DOCUMENT' && kind !== 'LEDGER_DOCUMENT_NO_IDENTIFIER') {
+  // ROUND 10 (Codex HIGH): and a document incident is no longer one wording either — an UPDATE, a
+  // PAYMENT, a DRAFT and a live CREATE need four different things done, and the enum member does not
+  // say which. QuickBooks has no draft form of any document (quickbooks/invoices.ts: "No
+  // DRAFT/AUTHORISED status distinction on creation"), so its caller resolves LIVE and the DRAFT
+  // wordings below are unreachable from this connector — by fact, not by assumption.
+  const kind = incidentKindForOperation(entry.type, posted, incident.outcome)
+  if (!isDocumentKind(kind)) {
     return describeNonDocumentIncident({
       ledger: 'QuickBooks',
       entry,
       kind,
       postedExternalId: posted,
+      outcome: incident.outcome,
       rowState: `The failure that stopped it being recorded: ${String(cause)}. Sync row ${entry.id} `
         + 'still holds this worker\'s claim and names no document. ',
     })
   }
-  return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as `
-    + `${posted ?? '(no id returned)'}, but IMS could not record the post: ${String(cause)}. `
+  const w = documentIncidentWording(entry.type, kind)
+  const slots = { ledger: 'QuickBooks' as const, postedExternalId: posted }
+  const did = render(posted ? w.didWithId : w.didWithoutId, slots)
+  return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} ${did}, but IMS `
+    + `could not record the post: ${String(cause)}. `
     + `Sync row ${entry.id} still names no document, so nothing in IMS points at this one and no `
     + 'mirrored accounting event was written for it — deliberately, because a FAILED one would deny a '
     + 'document that exists. The row keeps its claim and will be re-attempted once the claim goes '
     + 'stale; that attempt re-posts under the SAME Intuit Request-Id, so it should be deduplicated '
     + 'rather than duplicated. '
     + (posted
-      ? 'REMEDY: open the id above in QuickBooks, confirm exactly one document exists for this '
-        + 'reference, and void any duplicate.'
+      ? render(w.remedyIdUnrecorded, slots)
       : 'AND THE RESPONSE CARRIED NO ID EITHER, so there is nothing to open — do not go looking for '
-        + 'one. The document is in QuickBooks all the same. REMEDY: escalate this record to whoever '
-        + `administers this installation. ${INCIDENT_IDENTIFICATION_TAIL}`)
+        + `one. ${render(w.absent, slots)} ${ESCALATE_REMEDY}.`)
+    + ` ${INCIDENT_IDENTIFICATION_TAIL}`
 }
