@@ -25,6 +25,14 @@ let store: SyncLogStore = createSyncLogStore([])
 const activity: Array<{ action: string; level?: string; description?: string }> = []
 /** Everything the receipt-registration path queued, in order. */
 const queued: Array<{ type: string; payload: Record<string, unknown>; idempotencyKey?: string }> = []
+/**
+ * Every sync row whose follow-up obligation was DISCHARGED (o3d-ekn8 r5).
+ *
+ * The marker is the only thing that distinguishes a row whose follow-ups ran from one whose did not:
+ * both end SYNCED carrying the external id. So "was it released?" is the question that separates a
+ * receipt still recoverable from one lost behind a row that looks finished.
+ */
+const released: string[] = []
 
 /**
  * o3d-ekn8 r2 — THE THREE FACTS THE RE-DRIVE USED TO RE-DERIVE, now controlled independently so a
@@ -43,6 +51,12 @@ const live = {
   typeEnabledFor: (connector: string) => connector === 'quickbooks',
   enqueueConnector: 'quickbooks' as 'xero' | 'quickbooks',
   reinvoiceTo: null as string | null,
+  /**
+   * o3d-ekn8 r5 — THE BACK-REFERENCE WRITE FAILS. QuickBooks' `updateBackReference` catches this, so
+   * the invoice really is in the ledger while the order is left carrying no invoice id at all. With
+   * the old code that state was indistinguishable from "this order has nothing to register".
+   */
+  backReferenceFails: null as Error | null,
 }
 
 /** Every connector the INVOICE_PAYMENT sync-row read was scoped to, in order. */
@@ -94,10 +108,15 @@ const dbStub = {
   // kept the push would pass with the fence removed.
   $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
     const mark = queued.length
+    // The ROWS are rolled back too (o3d-ekn8 r5): the re-drive now reads back what actually reached
+    // the queue to decide whether anything is still owed, so a fake that kept a row the fence had
+    // just thrown out would report the receipt as registered — the exact blindness under test.
+    const rowMark = store.rows.length
     try {
       return await fn(dbStub)
     } catch (error) {
       queued.length = mark
+      store.rows.length = rowMark
       throw error
     }
   },
@@ -127,9 +146,30 @@ mock.module('@/lib/accounting', {
     lookupPaymentAccount: () => 'QBO-BANK-1',
     queueAccountingSyncTxWithOutcome: async (
       _tx: unknown,
-      params: { type: string; payload: Record<string, unknown>; idempotencyKey?: string },
+      params: {
+        type: string
+        referenceType: string
+        referenceId: string
+        payload: Record<string, unknown>
+        idempotencyKey?: string
+      },
     ) => {
       queued.push({ type: params.type, payload: params.payload, idempotencyKey: params.idempotencyKey })
+      // AND THE ROW ITSELF (o3d-ekn8 r5). The re-drive decides whether the obligation is discharged
+      // by re-reading the rows that now exist under the PINNED connector and document — so a fake
+      // that recorded the call but wrote nothing would report every receipt as still unregistered
+      // and make the retention assertions below pass for a reason that has nothing to do with the
+      // fix. Written under `enqueueConnector`, because which ledger the row landed in is the whole
+      // question a connector switch mid-flight asks.
+      store.rows.push(syncLogRow({
+        id: `log-payment-${store.rows.length + 1}`,
+        connector: live.enqueueConnector,
+        type: params.type,
+        status: 'PENDING',
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+        payload: params.payload,
+      }))
       // The enqueue resolves the active connector for ITSELF, so it — not the caller — is the only
       // thing that can say which ledger the row landed in (o3d-2sm1 r8).
       return { queued: true, connector: live.enqueueConnector }
@@ -145,6 +185,10 @@ mock.module('@/lib/domain/accounting/back-reference', {
     // re-drive re-READS the order, and it is this write landing BEFORE the follow-ups that makes the
     // DOCUMENT_NOT_POSTED refusal stop applying. Setting it here reproduces that ordering exactly.
     applyBackReference: async (_db: unknown, params: { externalId: string }) => {
+      // o3d-ekn8 r5: and it can REFUSE. The unique index on accounting_invoice_id turns a document
+      // already claimed locally into a throw, which this connector swallows — leaving the order with
+      // no link while the invoice sits in QuickBooks.
+      if (live.backReferenceFails) throw live.backReferenceFails
       // `reinvoiceTo` models a delete-and-re-post whose back-reference landed FIRST: the order ends up
       // pointing at a document this post did not create, while `syncResult.externalId` is still the id
       // this post returned. That divergence is the whole of o3d-ekn8 r2.
@@ -155,7 +199,10 @@ mock.module('@/lib/domain/accounting/back-reference', {
     findExternalDocumentIdClaim: async () => null,
     followUpObligationClaim: () => ({}),
     isExternalDocumentIdConflict: () => false,
-    releaseFollowUpObligation: async () => {},
+    releaseFollowUpObligation: async (_client: unknown, params: { syncLogId: string }) => {
+      released.push(params.syncLogId)
+      return true
+    },
   },
 })
 mock.module('@/lib/connectors/accounting-settlement-probe', {
@@ -198,12 +245,14 @@ test.beforeEach(() => {
   store = createSyncLogStore([pendingSalesInvoice()])
   activity.length = 0
   queued.length = 0
+  released.length = 0
   paymentRowScopes.length = 0
   live.activeConnector = 'quickbooks'
   live.activeTypeEnabled = true
   live.typeEnabledFor = (connector: string) => connector === 'quickbooks'
   live.enqueueConnector = 'quickbooks'
   live.reinvoiceTo = null
+  live.backReferenceFails = null
   order.totalForeign = 100
   // The state the defect lives in: the receipt exists, the invoice does NOT yet.
   order.accountingInvoiceId = null
@@ -228,6 +277,10 @@ test('[o3d-ekn8] a receipt recorded before the QuickBooks invoice posted IS regi
     'invoice-payment:payment:pay-1:invoice:QBINV-9',
     'keyed to the RECEIPT AND THE DOCUMENT, so a re-drive is a no-op while a re-POST is not (o3d-ekn8 r3)',
   )
+  // o3d-ekn8 r5. Stated HERE so the two retention tests below are not vacuous: on the path where the
+  // receipt really does reach the ledger the obligation IS discharged, so an empty `released` in
+  // those tests is a difference this harness can actually express.
+  assert.deepEqual(released, ['entry-invoice'], 'and the row stops saying it owes follow-ups')
 })
 
 test('[o3d-ekn8] the re-drive runs the real guard — a receipt that cannot fit the invoice is NOT registered', async () => {
@@ -348,4 +401,73 @@ test('[o3d-ekn8 r2] a row the enqueue wrote for another connector is ROLLED BACK
   const refusals = activity.filter((entry) => entry.action === 'invoice_payment_not_registered')
   assert.equal(refusals.length, 1, 'and the operator is told, with a remedy')
   assert.match(String(refusals[0].description), /register the payment in the accounting connector by hand/i)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-ekn8 ROUND 5 (Codex HIGH) — THE OBLIGATION IS NOT DISCHARGED OVER WORK THAT DID NOT HAPPEN.
+//
+// r2-r4 pinned the re-drive to the post, scoped it to the posted document and rolled back a row
+// written for another ledger. All of that is on the path where the LOCAL half worked. When it did
+// not, none of it was reached: `updateBackReference` catches its own failure and returned void, the
+// re-drive's first line treated an order with no invoice id exactly like an order with no receipts
+// and returned in silence, and the loop then released the follow-up obligation regardless.
+//
+// That marker is the ONLY thing separating this row from one whose follow-ups completed — SYNCED,
+// external id, no error either way. Clearing it early is not a lost warning; it is a recorded
+// receipt left permanently unsettled behind a row that looks finished.
+//
+// Both tests below drive the REAL processor and assert on the marker, because the marker is the
+// state that decides whether the money is still recoverable.
+// ---------------------------------------------------------------------------
+
+test('[o3d-ekn8 r5] a back-reference that never landed KEEPS the follow-up obligation', async () => {
+  // The invoice posts; the local link write is refused (the unique index already holds this id).
+  // QuickBooks swallows that, so the order is left with no invoice id at all.
+  live.backReferenceFails = new Error('accounting_invoice_id is already held by another sales order')
+
+  await runQuickBooks()
+
+  assert.equal(order.accountingInvoiceId, null, 'precondition: the local link really did not land')
+  assert.deepEqual(
+    queued.filter((row) => row.type === 'INVOICE_PAYMENT'),
+    [],
+    'precondition: with no link there is nothing the receipt could be registered against',
+  )
+  assert.deepEqual(
+    released,
+    [],
+    'so the row must go on saying it owes follow-ups — it is the only record left that the receipt is unregistered',
+  )
+  const unlinked = activity.filter((entry) => entry.action === 'deferred_invoice_payment_registration_unlinked')
+  assert.equal(unlinked.length, 1, 'and the silent early return is now a reported one')
+  assert.equal(unlinked[0].level, 'ERROR', 'money nothing will retry is not a WARNING')
+  assert.match(String(unlinked[0].description), /QBINV-9/, 'the message names the document that DID post')
+  const retained = activity.filter((entry) => entry.action === 'quickbooks_followup_obligation_retained')
+  assert.equal(retained.length, 1, 'and the retained obligation is stated, not left to be inferred from a missing log line')
+})
+
+test('[o3d-ekn8 r5] a connector switch mid-re-drive KEEPS the follow-up obligation', async () => {
+  // The pin holds and the fence works: the enqueue resolved the other connector for itself, so the
+  // row it wrote was rolled back rather than posted to a ledger nobody measured it against (r4).
+  // Nothing therefore reached QuickBooks — and the receipt is STILL owed. Reporting the rollback and
+  // then clearing the marker in the same breath is how that debt was being dropped.
+  live.enqueueConnector = 'xero'
+
+  await runQuickBooks()
+
+  assert.equal(order.accountingInvoiceId, 'QBINV-9', 'precondition: the invoice really did post')
+  assert.deepEqual(
+    queued.filter((row) => row.type === 'INVOICE_PAYMENT'),
+    [],
+    'precondition: the registration was unwritten, so no receipt reached the pinned ledger',
+  )
+  assert.deepEqual(released, [], 'the obligation stays claimed while the receipt is still owed')
+  const retained = activity.filter((entry) => entry.action === 'quickbooks_followup_obligation_retained')
+  assert.equal(retained.length, 1)
+  assert.equal(retained[0].level, 'ERROR', 'what is outstanding here is money, not merely a local link')
+  assert.match(
+    String(retained[0].description),
+    /still not registered in the ledger/,
+    'and it says which of the two halves is outstanding',
+  )
 })
