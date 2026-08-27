@@ -419,13 +419,41 @@ test('o3d-1izw: the out-of-process gates align their search path with Prisma\'s'
   // Mutation: return `{}` unconditionally and the first assertion fails; drop the spread from
   // either script and the source assertions below fail.
   const { pgSearchPathOptions } = await import('../lib/domain/wms/push-state-enum-query.mjs')
+  const { PRISMA_DEFAULT_SCHEMA, resolveDatabaseUrlSchema } = await import('../lib/db/database-url-schema.mjs')
   assert.deepEqual(
     pgSearchPathOptions('postgresql://u:p@localhost:5432/ims?schema=ims_app'),
     { options: '-c search_path="ims_app"' },
   )
-  // No schema named: leave the client alone rather than guessing a default.
-  assert.deepEqual(pgSearchPathOptions('postgresql://u:p@localhost:5432/ims'), {})
+  // NO SCHEMA NAMED IS NOT "NOTHING TO ALIGN" (r9). Round 8 returned `{}` here, on the reasoning
+  // that Prisma and pg both fall back to the server default and so already agree. Prisma does not
+  // fall back to the server default at all — see the compiled-SQL test below — so leaving the raw
+  // client on `"$user", public` is the same split, running the other way. The default is therefore
+  // stated, not left implicit.
+  assert.deepEqual(
+    pgSearchPathOptions('postgresql://u:p@localhost:5432/ims'),
+    { options: `-c search_path="${PRISMA_DEFAULT_SCHEMA}"` },
+  )
+  // PARSE FAILURE STAYS DISTINCT FROM SCHEMA ABSENCE. It is the only input that still yields no
+  // schema, and it means the opposite thing: not "align me to the default" but "there is no
+  // connection here to align". Collapsing the two back into one `null` is what let the default case
+  // hide inside the "nothing to do" branch for a whole round.
+  //
+  // Mutation: make `resolveDatabaseUrlSchema` return `PRISMA_DEFAULT_SCHEMA` on the catch path (or
+  // `null` for a valid URL with no `?schema=`) and the two `parsed`/`explicit` assertions below
+  // fail even though the options above are unchanged.
   assert.deepEqual(pgSearchPathOptions('not a url'), {})
+  assert.deepEqual(
+    resolveDatabaseUrlSchema('not a url'),
+    { parsed: false, explicit: false, schema: null },
+  )
+  assert.deepEqual(
+    resolveDatabaseUrlSchema('postgresql://u:p@localhost:5432/ims'),
+    { parsed: true, explicit: false, schema: PRISMA_DEFAULT_SCHEMA },
+  )
+  assert.deepEqual(
+    resolveDatabaseUrlSchema('postgresql://u:p@localhost:5432/ims?schema=ims_app'),
+    { parsed: true, explicit: true, schema: 'ims_app' },
+  )
 
   const { readFile } = await import('node:fs/promises')
   for (const relative of ['../scripts/check-wms-push-state-enum.mjs', '../lib/ops/production-preflight.ts']) {
@@ -495,19 +523,167 @@ test('o3d-1izw: on a non-public `?schema=` URL the RUNTIME resolves what the two
       await adapter.dispose()
     }
 
-    // NON-VACUITY / no behaviour change where there is nothing to align. A URL naming no schema
-    // leaves all three exactly as they were: Prisma and pg both use the server default, so they
-    // already agree, and guessing `public` here would be a change dressed up as a fix. Without
-    // this, a `pgSearchPathOptions` that returned the ims_app options unconditionally would satisfy
-    // everything above.
+    // NON-VACUITY. Without this, a `pgSearchPathOptions`/`prismaAdapterSchemaOptions` pair that
+    // returned the ims_app values unconditionally would satisfy everything above. A URL naming no
+    // schema must produce Prisma's OWN default on both halves — not `ims_app`, and (since r9) not
+    // nothing.
+    const { PRISMA_DEFAULT_SCHEMA } = await import('../lib/db/database-url-schema.mjs')
     process.env.DATABASE_URL = 'postgresql://u:p@localhost:5432/ims'
-    assert.equal(dbPoolConfig().options, undefined)
+    assert.equal(dbPoolConfig().options, `-c search_path="${PRISMA_DEFAULT_SCHEMA}"`)
     const plain = await createDbAdapter().connect()
     try {
-      assert.equal(plain.getConnectionInfo().schemaName, undefined)
+      assert.equal(plain.getConnectionInfo().schemaName, PRISMA_DEFAULT_SCHEMA)
     } finally {
       await plain.dispose()
     }
+  } finally {
+    if (before === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = before
+  }
+})
+
+/**
+ * Compile one GENERATED query for the WMS push-link model through the REAL generated Prisma client
+ * and return the SQL it produced — without a database.
+ *
+ * This is the only way to answer the question the r9 finding turns on, which is not "what does the
+ * adapter report?" but "what schema does Prisma actually WRITE to?". The two are not the same: the
+ * adapter's `schemaName` is an input to the query compiler, and what the compiler does when that
+ * input is absent is a property of the installed client that no amount of config inspection
+ * reveals. So the client is built for real, the query is compiled for real, and the SQL is
+ * intercepted at the driver boundary — the adapter's own `queryRaw`, wrapped in a Proxy so the
+ * factory this repository ships is the one under test rather than a stand-in — and refused before
+ * it can reach a socket. `pg`'s pool is lazy, so nothing connects.
+ */
+async function compileWmsPushLinkSql(adapterFactory: unknown): Promise<string> {
+  const { PrismaClient } = await import('@/app/generated/prisma/client')
+  const compiled: string[] = []
+  class InterceptedBeforeExecution extends Error {}
+  const recording = new Proxy(adapterFactory as Record<string, unknown>, {
+    get(target, prop, receiver) {
+      if (prop === 'connect') {
+        return async () => {
+          const connection = await (target as { connect: () => Promise<object> }).connect()
+          return new Proxy(connection as Record<string, unknown>, {
+            get(conn, key, innerReceiver) {
+              if (key === 'queryRaw' || key === 'executeRaw') {
+                return async (query: { sql: string }) => {
+                  compiled.push(query.sql)
+                  throw new InterceptedBeforeExecution('captured')
+                }
+              }
+              const value = Reflect.get(conn, key, innerReceiver)
+              return typeof value === 'function' ? value.bind(conn) : value
+            },
+          })
+        }
+      }
+      const value = Reflect.get(target, prop, receiver)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+  const client = new PrismaClient({ adapter: recording as never })
+  try {
+    await client.wmsOrderPushLink.findFirst({ where: { orderId: 'o3d-1izw-compile-probe' } })
+  } catch {
+    // The interception above is the expected outcome; a real failure shows up as no captured SQL.
+  } finally {
+    try {
+      await client.$disconnect()
+    } catch {
+      // nothing was ever connected
+    }
+  }
+  assert.equal(compiled.length > 0, true, 'the generated client compiled and dispatched a query')
+  return compiled[0]!
+}
+
+/** The schema a compiled statement qualifies the WMS push-link table with. */
+function qualifiedSchemaOf(sql: string): string | undefined {
+  return /FROM "([^"]+)"\."wms_order_push_links"/.exec(sql)?.[1]
+}
+
+/** The schema a `-c search_path="..."` startup option puts `to_regclass()` on. */
+function searchPathSchemaOf(options: string | undefined): string | undefined {
+  return options === undefined ? undefined : /^-c search_path="(.*)"$/.exec(options)?.[1]?.replace(/""/g, '"')
+}
+
+test('o3d-1izw r9: the SQL the generated client compiles is qualified to the schema `to_regclass` resolves — including on a URL that names none', async () => {
+  // THE R9 FINDING, AS A TEST, AND THE ONE THE PREVIOUS ROUNDS COULD NOT STATE. Every earlier
+  // assertion here compared CONFIGURATION — `getConnectionInfo().schemaName` against a pg `options`
+  // string — which can only show that two settings match. It cannot show what Prisma does with the
+  // setting, and the finding is precisely about the case where the setting is ABSENT: an adapter
+  // reporting no `schemaName` does not fall back to the connection's `search_path`, it qualifies
+  // generated queries against a hardcoded `"public"`. Configuration inspection reads that as "both
+  // sides on the default, therefore aligned"; the compiled SQL says otherwise.
+  //
+  // So this compiles a real WMS query through the real generated client and compares the schema in
+  // the SQL against the schema `to_regclass($1)` — the shared catalogue statement the runtime gate,
+  // the deploy check and the production preflight all run — resolves through. That is the actual
+  // property at stake: the gate and the write must name the same table.
+  //
+  // Route: DATABASE_URL -> lib/db/database-url-schema.mjs -> (a) prismaAdapterSchemaOptions ->
+  // createDbAdapter()'s `{ schema }` -> the query compiler's qualification of every generated
+  // statement, captured here at the driver boundary; (b) pgSearchPathOptions -> dbPoolConfig()
+  // `options` -> the pool's startup search_path, which is what `to_regclass($1)` resolves through
+  // for the runtime gate and what the two out-of-process gates spread into their own pg Client.
+  //
+  // Mutation, no-schema URL: revert `resolveDatabaseUrlSchema` to return `null` for a valid URL
+  // with no `?schema=` (the r8 behaviour). `prismaAdapterSchemaOptions` goes back to `undefined`,
+  // the compiled SQL still says `public` — and `dbPoolConfig().options` becomes `undefined`, so
+  // `searchPathSchemaOf` returns `undefined` and the equality below fails. That is the finding:
+  // the write is pinned to `public` while the three gates are left on the server default.
+  //
+  // Mutation, ?schema= URL: drop the second argument from `createDbAdapter()` and the compiled SQL
+  // reverts to `"public"."wms_order_push_links"` while the search path still says `ims_app` — the
+  // r8 finding, now visible in the SQL rather than in a reported setting.
+  //
+  // Mutation, the constant: change `PRISMA_DEFAULT_SCHEMA` to anything else and the control below
+  // fails, because it is checked against what Prisma actually compiles rather than trusted.
+  const before = process.env.DATABASE_URL
+  try {
+    const { createDbAdapter, dbPoolConfig } = await import('@/lib/db')
+    const { PRISMA_DEFAULT_SCHEMA } = await import('../lib/db/database-url-schema.mjs')
+
+    // 1. A URL THAT NAMES NO SCHEMA — the case r8 left split, and the shape most URLs have.
+    process.env.DATABASE_URL = 'postgresql://u:p@127.0.0.1:5432/ims'
+    const plainSql = await compileWmsPushLinkSql(createDbAdapter())
+    const plainWritten = qualifiedSchemaOf(plainSql)
+    const plainResolved = searchPathSchemaOf(dbPoolConfig().options)
+    assert.equal(
+      plainWritten, PRISMA_DEFAULT_SCHEMA,
+      'the generated WMS write is qualified to Prisma\'s default',
+    )
+    assert.equal(
+      plainWritten, plainResolved,
+      'and `to_regclass` resolves that same schema, so all three gates inspect the table the write targets',
+    )
+
+    // 2. A URL THAT NAMES ONE — the r8 case, re-proved against compiled SQL rather than settings.
+    process.env.DATABASE_URL = 'postgresql://u:p@127.0.0.1:5432/ims?schema=ims_app'
+    const namedSql = await compileWmsPushLinkSql(createDbAdapter())
+    const namedWritten = qualifiedSchemaOf(namedSql)
+    assert.equal(namedWritten, 'ims_app', 'the generated WMS write follows the URL\'s schema')
+    assert.equal(
+      namedWritten, searchPathSchemaOf(dbPoolConfig().options),
+      'and so does the search path the gates resolve `to_regclass` through',
+    )
+    // NON-VACUITY for the pair above: the two cases must not be the same string, or an
+    // unconditional `public` on both halves would satisfy everything.
+    assert.notEqual(namedWritten, plainWritten)
+
+    // 3. THE CONTROL THAT MAKES `PRISMA_DEFAULT_SCHEMA` A MEASUREMENT AND NOT A GUESS, and that
+    //    demonstrates the defect this fix removes. An adapter built with NO schema option at all —
+    //    `new PrismaPg(config)`, exactly what `createDbAdapter()` did before r8 — still compiles
+    //    against a hardcoded schema, on a URL whose search path is free to point somewhere else.
+    const { PrismaPg } = await import('@prisma/adapter-pg')
+    const unqualifiedSql = await compileWmsPushLinkSql(
+      new PrismaPg({ connectionString: 'postgresql://u:p@127.0.0.1:5432/ims', max: 2 }),
+    )
+    assert.equal(
+      qualifiedSchemaOf(unqualifiedSql), PRISMA_DEFAULT_SCHEMA,
+      'an adapter reporting no schemaName qualifies generated queries with PRISMA_DEFAULT_SCHEMA — which is why the default is stated rather than left implicit',
+    )
   } finally {
     if (before === undefined) delete process.env.DATABASE_URL
     else process.env.DATABASE_URL = before
