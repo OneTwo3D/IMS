@@ -79,29 +79,25 @@ UPDATE "shopping_sync_logs"
 -- The steady-state discriminator is sound. This block is entirely about the WINDOW in which two
 -- binaries could both be writing this table, because the OLD one still selects held sales invoices
 -- by payload->>'reason' = 'missing_wc_invoice_number' — an OPERATOR-CONTROLLED string typed into
--- WooCommerce's refund dialog. That is the exact collision "recordKind" exists to remove, and the
--- old binary can recreate it AFTER the backfill has run.
+-- WooCommerce's refund dialog — and still selects refund parks with a predicate that has no
+-- recordKind clause at all. That is the exact collision "recordKind" exists to remove, and the old
+-- binary can recreate it AFTER the backfill has run.
 --
--- THE REQUIRED ORDER. Every step is mandatory. There is no variant of this that runs the old binary
--- against the migrated schema.
+-- THE REQUIRED ORDER. Every step is mandatory, and every step is now EXECUTED rather than described
+-- (see "THE ORDER IS AN ANCESTOR" below). There is no supported variant of this that runs the old
+-- binary against the migrated schema.
 --
 --   1. STOP AND DRAIN THE OLD BINARY FIRST. Nothing may be writing shopping_sync_logs: the
---      WooCommerce refund sweep, the order import/poll, the webhook handler and the held-invoice
---      release sweep all write it. "Quiesce" here means the process is stopped, not merely idle —
---      an idle sweep is one webhook away from writing.
+--      WooCommerce refund sweep, the order import/poll, the webhook handler, the refund-park
+--      recovery action and the held-invoice release sweep all write it. "Quiesce" here means the
+--      process is stopped, not merely idle — an idle sweep is one webhook away from writing.
 --   2. APPLY THIS MIGRATION. Additive and nullable, so it is metadata-only.
 --   3. RUN THE TWO UPDATE STATEMENTS ABOVE (they are part of this file and run with it). They only
 --      ever write a NULL cell, so they are idempotent and safe to re-run at any time.
---   4. RUN THE VERIFICATION CHECKS. They are declared beside this file as `verify.sql`: three
+--   4. RUN THE VERIFICATION CHECKS. They are declared beside this file as `verify.sql`: five
 --      statements, each returning one row of (check_name, violations), every count required to be
---      zero.
---
---      *** ON THIS BRANCH YOU RUN THEM BY HAND. *** The runner they are written for,
---      `scripts/run-migration-verifications.mjs`, DOES NOT EXIST HERE. It is on the sibling branch
---      o3d-batch-deployseq (o3d-2sm1.1), which is not an ancestor of this one, and until that
---      branch merges nothing in this tree executes verify.sql. Feed it to psql against the
---      migrated database yourself, read all three counts, and do not start the new build unless
---      every one is 0.
+--      zero. `scripts/run-migration-verifications.mjs` runs them after the schema has moved and
+--      before anything is started, and a non-zero count stops the cutover.
 --
 --      A non-zero answer means something wrote this table after step 1, i.e. the predecessor was
 --      still live. The response is to stop it, establish what the rows are (see check 2's caveat in
@@ -109,7 +105,7 @@ UPDATE "shopping_sync_logs"
 --   5. START THE NEW BUILD. From this moment every park and every hold is stamped as it is written,
 --      and both predicates require the stamp.
 --
--- WHAT HAPPENS IF STEP 1 IS SKIPPED — two failures, and only one of them is repairable:
+-- WHAT HAPPENS IF STEP 1 IS SKIPPED — three failures, and only one of them is repairable:
 --
 --   (a) THE OLD BINARY CREATES UNSTAMPED ROWS. A hold or a park written between the backfill and
 --       the new build carries a NULL recordKind and is invisible to BOTH new predicates: the hold
@@ -141,48 +137,79 @@ UPDATE "shopping_sync_logs"
 --       full held-invoice shape" selects exactly the rows (b) creates, and nothing else: a genuine
 --       hold carries the hold stamp, and a genuine park carries a refund body.
 --
---       That is check 3 in verify.sql, and it is mandatory like the other two: the cutover fails and
---       the new build is not started if it returns anything but zero. On this branch "fails" means
---       YOU stop, because nothing here runs the file — see the branch note below. Saying this
---       failure mode was invisible was worse than leaving it unchecked; saying a script enforces it
---       when no such script exists is the same mistake in the other direction.
+--       That is check 3 in verify.sql, and it is mandatory like the others: the cutover fails and
+--       the new build is not started if it returns anything but zero. Saying this failure mode was
+--       invisible was worse than leaving it unchecked; saying a script enforces it when no such
+--       script exists is the same mistake in the other direction, and both are now behind us.
+--
+--       AND CHECK 3 NO LONGER READS `status` (Codex MEDIUM). It used to require PENDING, which is
+--       the status the overwrite lands on — so the predecessor's OWN release sweep, flipping the
+--       same row to SYNCED or FAILED, switched the check off while the corruption stood untouched.
+--       The contradiction is between the stamp and the payload. The status is not part of it.
+--
+--   (c) THE OLD BINARY RETIRES A HELD SALES INVOICE THROUGH THE REFUND-PARK RECOVERY ACTION, AND
+--       THIS IS NOT REPAIRABLE EITHER. This is (b) in the opposite direction and it was missing
+--       from every earlier revision of this block, including the "what is still not covered"
+--       paragraph that claimed to bound what was left (Codex MEDIUM). The recovery action
+--       (lib/domain/sales/refund-park-recovery.ts, o3d-54p) selects actionable parks — and the OLD
+--       version of activeRefundParkWhere has no recordKind clause, which is the r8 defect itself.
+--       So the recovery inbox lists a HELD SALES INVOICE and offers an operator two acts on it:
+--
+--         * DISMISS  — writes status = 'SYNCED', syncedAt = now, errorMessage = a note beginning
+--                      'Recovered by operator:'. The hold leaves heldSalesInvoiceQueueWhere's
+--                      PENDING selector permanently: the invoice is never posted, and nothing
+--                      anywhere says the order is still waiting for one. The payload is untouched
+--                      and the stamp, if any, is untouched, so checks 1, 2 AND 3 all return zero.
+--         * REASSIGN — writes a new entityId and leaves the payload deliberately alone, so the
+--                      hold now sits on one order while naming another. It also breaks check 3's
+--                      identity clause (payload->>'salesOrderId' = "entityId") on any row check 3
+--                      was catching, which is a second way for (b) to go quiet after the fact.
+--
+--       CHECKS 4 AND 5 ARE THOSE TWO SIGNATURES. The recovery note prefix is written by exactly one
+--       code path, and the CURRENT version of that path requires recordKind = 'WC_REFUND_PARK', so
+--       it can never land on a held invoice; and buildHeldSalesInvoicePayload always writes
+--       salesOrderId equal to the row's own entityId, so a hold-shaped payload naming a different
+--       order has no legitimate producer. Neither check reads recordKind, on purpose: the same act
+--       against an UNSTAMPED hold from case (a) has no stamp to test.
 --
 --       WHAT IS STILL NOT COVERED, stated so the correction does not overclaim: the old release
---       sweep can also flip a mis-selected park to FAILED or SYNCED and replace its errorMessage
---       WITHOUT touching the payload. That row keeps a refund body, so it has no contradictory
---       shape to query for. It is a lesser corruption — the refund evidence survives — but it is
---       real, and stopping the writer first remains the defence for it. Which is why step 1 is a
---       step and not a note: check 3 is the second line, not a licence to skip the first.
+--       sweep can also flip a mis-selected PARK to FAILED or SYNCED and replace its errorMessage
+--       with a sweep message, WITHOUT touching the payload. That row keeps a refund body and a park
+--       stamp, so it has no contradictory shape to query for. It is a lesser corruption — the
+--       refund evidence survives — but it is real, and stopping the writer first remains the
+--       defence for it. Which is why step 1 is a step and not a note: the checks are the second
+--       line, not a licence to skip the first.
 --
 -- ---------------------------------------------------------------------------------------------
--- WHAT THIS BRANCH DOES AND DOES NOT GIVE YOU. READ THIS BEFORE TRUSTING ANY SENTENCE ABOVE.
+-- THE ORDER IS AN ANCESTOR, NOT A REQUEST. READ THIS BEFORE TRUSTING ANY SENTENCE ABOVE.
 --
--- NEITHER STEP 1 NOR STEP 4 IS AUTOMATED ON THIS BRANCH. Both are MANUAL, and this file used to say
--- otherwise — four times over — which was worse than saying nothing, because an operator who
--- believes the deploy enforces quiescence has no reason to enforce it themselves.
+-- An earlier revision of this file said, correctly at the time, that neither step 1 nor step 4 was
+-- automated here and that both were MANUAL. It also asked a reader to honour a MERGE DEPENDENCY on
+-- a sibling branch. A comment is not a merge dependency: nothing stopped this migration shipping
+-- first, and shipping first is exactly failure modes (b) and (c).
 --
---   * `scripts/run-migration-verifications.mjs` DOES NOT EXIST IN THIS TREE. verify.sql is written
---     in the form that runner expects, and nothing here executes it.
---   * `scripts/deploy.sh` IN THIS TREE RUNS migrate -> build -> stop -> start. So on this branch
---     the PREDECESSOR SERVES THROUGH THE ALTER, THROUGH BOTH BACKFILL STATEMENTS AND THROUGH THE
---     WHOLE BUILD — which is precisely failure mode (b) below, the one this file calls not
---     repairable. Applying this migration with `bash scripts/deploy.sh` and nothing else is the
---     unsafe cutover, not the safe one.
+-- SO THE DEPENDENCY IS NOW A COMMIT ORDER. This branch is REBASED ONTO o3d-batch-deployseq
+-- (o3d-2sm1.x). Every commit that reorders the deploy is an ancestor of the commit that adds this
+-- migration, so there is no history in which this migration is applied by a tree that does not
+-- already contain the stop, the fence and the runner. Git enforces it; no reviewer has to.
 --
--- THE MERGE DEPENDENCY, STATED AS A DEPENDENCY: this migration must not be applied by an automated
--- deploy until o3d-batch-deployseq (o3d-2sm1.1) is merged. That branch reorders every supported
--- entrypoint to build -> validate -> stop and drain -> migrate -> verify -> start, fences the
--- predecessor off on any post-stop failure, and adds the runner that executes verify.sql. This
--- migration is recorded on it as one that needs quiescence. Until it lands, the ONLY safe way to
--- apply this is by hand, in the order above: stop the app, `prisma migrate deploy`, run verify.sql
--- through psql, then build and start.
+-- WHAT THOSE ANCESTORS GIVE THIS MIGRATION:
 --
--- WHY THE SPLIT IS STILL THE RIGHT ONE: deploy.sh is deliberately NOT edited here, because two
--- branches rewriting the same script would conflict and one would silently win. That branch owns
--- the ORDER (step 1, the only defence against (b) and against the errorMessage rewrite) and this
--- migration owns the CHECKS. The split is defensible only because this paragraph exists — a
--- migration that declares checks nothing runs, while claiming they are enforced, is worse than one
--- that asks a human to run them.
+--   * `scripts/deploy.sh`, `scripts/update.sh` AND `scripts/install.sh` all run
+--     build -> validate -> stop and drain every writer -> fence the database -> migrate -> verify
+--     -> start. install.sh matters as much as the other two: it explicitly supports being re-run
+--     over an existing installation, and in that case it detects the existing install, installs a
+--     reboot fence, stops the service, fences the crontab, stops legacy PM2 and app-directory
+--     processes, proves with the database that nothing else is connected, and only then migrates.
+--     A rerun no longer migrates underneath a live predecessor, which is the one entrypoint most
+--     likely to be used by somebody who does not know the deploy order.
+--   * `scripts/run-migration-verifications.mjs` EXECUTES verify.sql on all three paths, after the
+--     schema has moved and before anything is started, and a non-zero count stops the cutover.
+--   * `prisma/migrations/verification-required.txt` NAMES this migration, so a future edit that
+--     deletes verify.sql is a coverage gap CI fails on rather than a silent loss of the checks.
+--
+-- WHAT THIS BRANCH STILL DOES NOT DO: it does not edit deploy.sh, update.sh or install.sh. It does
+-- not need to — it inherits them. This migration owns the CHECKS; the ancestors own the ORDER.
 -- ---------------------------------------------------------------------------------------------
 --
 -- A LEGACY PARK THAT ESCAPES ANYWAY STILL FAILS LOUDLY: an unstamped park is not found by
@@ -191,9 +218,8 @@ UPDATE "shopping_sync_logs"
 -- changed by this migration — it stays keyed on (connector, "externalId") over the wider predicate,
 -- so the failure mode is a unique violation somebody sees rather than two live parks for one refund.
 --
--- VERIFICATION QUERIES — ALL THREE MUST RETURN 0. They live in `verify.sql` beside this file, NOT
--- in this comment: a second copy is a check that can drift from the one that is actually run. On a
--- branch where nothing runs it, run it yourself.
+-- VERIFICATION QUERIES — ALL FIVE MUST RETURN 0. They live in `verify.sql` beside this file, NOT
+-- in this comment: a second copy is a check that can drift from the one that is actually run.
 --
 --   1. shopping_sync_logs unstamped held sales invoice   — an old binary CREATED a hold after the
 --                                                          backfill; it would never be released.
@@ -204,11 +230,24 @@ UPDATE "shopping_sync_logs"
 --                                                          check 2's own comment before acting.
 --   3. shopping_sync_logs park stamp over a held-invoice payload
 --                                                        — an old binary OVERWROTE a stamped park
---                                                          with an invoice hold; case (b) above.
+--                                                          with an invoice hold; case (b) above. In
+--                                                          ANY status, so settling the row does not
+--                                                          hide it.
+--   4. shopping_sync_logs operator recovery note on a held-invoice payload
+--                                                        — an old binary's recovery inbox let an
+--                                                          operator DISMISS or REASSIGN a held
+--                                                          sales invoice; case (c) above. A
+--                                                          dismissed hold is never invoiced.
+--   5. shopping_sync_logs held-invoice payload naming another order
+--                                                        — the REASSIGN half of case (c), and the
+--                                                          state check 3 loses when a row it was
+--                                                          catching is moved.
 --
 -- 1 is repairable by re-running the two UPDATE statements above. 2 is repairable ONLY once the rows
 -- have been confirmed to be refund parks: statement 2 stamps whatever it matches as
 -- 'WC_REFUND_PARK', which puts the row in the recovery inbox with "Wrong order" / "Dismiss" refund
--- actions on it — the r8 defect, recreated by the remedy. 3 is not repairable, and is an incident:
--- the refund evidence on those rows has been replaced.
+-- actions on it — the r8 defect, recreated by the remedy. 3, 4 and 5 are not repairable, and are an
+-- incident: on 3 the refund evidence on those rows has been replaced; on 4 and 5 a held invoice has
+-- been retired or moved by an operator who was shown the wrong row, and the orders behind them have
+-- to be re-derived by hand.
 -- ---------------------------------------------------------------------------------------------

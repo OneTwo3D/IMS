@@ -24,3 +24,14 @@
 # left undecidable. It returns zero for ever after, and the day it does not,
 # something served across a migration.
 20260822090000_refund_reversal_staging_state
+
+# Adds shopping_sync_logs.recordKind, the discriminator that tells a WooCommerce
+# refund park apart from a held sales invoice. Its whole safety argument is about
+# WHICH BINARY was serving: the predecessor selects held invoices by an
+# OPERATOR-TYPED payload string with no recordKind clause, so while it is live it
+# can both CREATE unstamped rows and OVERWRITE an already-stamped park with an
+# invoice hold — the second of which destroys the only copy IMS has of a refund
+# WooCommerce already paid out. Its verify.sql is therefore the second line behind
+# the stop: five checks, each a shape no legitimate writer produces, each zero for
+# ever after. The day one is not, a predecessor was writing this table.
+20260822120000_shopping_sync_log_record_kind
