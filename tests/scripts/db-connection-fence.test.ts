@@ -1156,21 +1156,49 @@ test('the fence revokes nothing when the admin connection is not the application
   })()
 })
 
-test('a release over an unbound connection refuses instead of reporting the application free', () => {
-  // The CRITICAL exactly: no record, and has_database_privilege() over the ADMIN connection says
-  // imsapp can connect — to 'imsdb'. The application uses onetwo3d_ims, which this run has not
-  // asked about and cannot ask about.
+test('a release over an unbound connection restores nothing, however good its record looks', async () => {
+  // The record is PRESENT and valid, so nothing downstream would ever question this release: it
+  // would GRANT CONNECT on 'imsdb' — the admin URL's target, where imsapp already connects —
+  // report "released", and let the caller start an application whose own database, onetwo3d_ims,
+  // this run has never asked about and cannot ask about.
   //
   // MUTATION ROUTE: remove the requireBoundDatabaseIdentity() call from doRelease() and this
-  // returns EXIT_FENCE_UNPROVEN (4), which every caller treats as "carry on".
-  return (async () => {
-    const client = new FakeAdminClient({ stillConnectsBefore: true })
-    const code = await withMismatchedUrls(() => doRelease(client as never, { stateFile: '', appRole: '', timeoutSeconds: 1 }))
+  // returns EXIT_OK with two GRANTs on the wire.
+  const dir = stateDir()
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    publishState(stateFile, SAMPLE_STATE)
+    const client = new FakeAdminClient({ stateFile, releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' })
+    const code = await withMismatchedUrls(() => doRelease(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
 
-    assert.equal(code, EXIT_ERROR, 'an unidentified database is a refusal, not an unproven release')
-    assert.notEqual(code, EXIT_FENCE_UNPROVEN, 'and specifically not the code that lets a caller continue')
+    assert.equal(code, EXIT_ERROR, 'an unidentified database is a refusal, not a release')
+    assert.notEqual(code, EXIT_OK, 'and above all not a success')
     assert.deepEqual(client.grants, [], 'and nothing may be granted on it')
-  })()
+    assert.equal(existsSync(stateFile), true, 'the record survives: this fence has not been released by anyone')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a release refuses when the record it holds was written for another database', async () => {
+  // The other half of the same question: the URLs agree, and the RECORD is from somewhere else —
+  // a state file left by a run against a different database. Releasing from here would restore
+  // grants recorded elsewhere, named by a database this connection is not attached to.
+  //
+  // MUTATION ROUTE: delete the `state.database !== connectedDatabase` arm from doRelease() and
+  // this returns EXIT_OK, having granted on "elsewhere".
+  const dir = stateDir()
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    publishState(stateFile, { ...SAMPLE_STATE, database: 'elsewhere' })
+    const client = new FakeAdminClient({ stateFile, connectedDatabase: 'imsdb' })
+    const code = await withAdminUrl(() => doRelease(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+
+    assert.equal(code, EXIT_ERROR)
+    assert.deepEqual(client.grants, [], 'nothing recorded somewhere else may be restored from here')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('an unrecorded release proves "the application can connect" by connecting as the application', () => {

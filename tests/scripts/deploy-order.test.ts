@@ -4221,3 +4221,109 @@ test('no entrypoint writes its reboot-fence drop-in with a bare redirection', ()
     )
   }
 })
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r13, HIGH) — "THE FENCE DID NOT EXIT 0" WAS READ AS "NO FENCE WAS RAISED".
+//
+// fence-db-connections.mjs COMMITS its REVOKEs and then asks whether the door is actually shut.
+// When the application keeps CONNECT through role membership, or the room will not go quiet, it
+// DELIBERATELY LEAVES THEM STANDING so nothing is half-applied — PUBLIC, monitoring, backup, BI
+// and any second application are locked out at that moment. That used to arrive as the same exit
+// 1 a failure which revoked NOTHING produces, and DB_FENCE_RAISED was set only on exit 0. So the
+// run recorded itself as having raised no fence; a record lost during cleanup then met the
+// exit-4 arm with the flag false, took the warning-success branch, lowered DB_FENCE_UP and let
+// the marker claim a release nobody performed, over grantees still revoked and now unrecorded.
+//
+// An exit code is not evidence about what was committed, so the script now has one that IS:
+// exit 5, EXIT_FENCE_STANDING. These run the shipped functions in a shell whose EXIT trap
+// releases, exactly as the real ones do, and watch what the release decides.
+// ---------------------------------------------------------------------------
+
+/** A fence stub that answers each mode with its own exit code, and logs what it was asked. */
+function fenceStubByMode(dir: string, codes: { fence: number; release: number }): void {
+  writeFileSync(
+    join(dir, 'fence.mjs'),
+    [
+      "import { appendFileSync } from 'node:fs'",
+      `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+      `if (process.argv.includes('--release')) process.exit(${codes.release})`,
+      `process.exit(${codes.fence})`,
+      '',
+    ].join('\n'),
+  )
+}
+
+for (const entry of FENCE_HARNESS) {
+  test(`${entry.name} treats a lost record as fatal after a fence that COMMITTED its revokes and could not be called good`, () => {
+    // The whole sequence, in one shell: --fence exits 5 (revokes committed, fence ineffective),
+    // the entrypoint aborts, and the EXIT trap's release finds no record and can prove only the
+    // application role's own CONNECT (exit 4).
+    const dir = mkdtempSync(join(tmpdir(), 'ims-fence5-'))
+    try {
+      fenceStubByMode(dir, { fence: 5, release: 4 })
+      const program = [
+        'set -uo pipefail',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+        shellFunction(entry.source, 'fence_db_connections'),
+        shellFunction(entry.source, 'release_db_connections'),
+        'on_exit() { if release_db_connections; then echo "TRAP RELEASE SAID OK"; else echo "TRAP RELEASE REFUSED"; fi; }',
+        'trap on_exit EXIT',
+        'fence_db_connections',
+        'echo "REACHED THE MIGRATION"',
+      ].join('\n')
+      const result = runShell(program)
+
+      // MUTATION ROUTE: delete the `5)` arm from fence_db_connections() so exit 5 falls through
+      // to the catch-all `*)`. DB_FENCE_RAISED stays false, the exit-4 arm takes its
+      // warning-success branch and 'TRAP RELEASE SAID OK' is printed instead.
+      assert.match(calls(dir), /--fence/, 'precondition: the fence was attempted')
+      assert.match(calls(dir), /--release/, 'and the cleanup asked the database')
+      assert.ok(!result.output.includes('REACHED THE MIGRATION'), 'exit 5 must abort like exit 3 does')
+      assert.match(result.output, /FENCE IS STANDING/, 'and say the revokes are committed, not that nothing happened')
+      assert.match(result.output, /TRAP RELEASE REFUSED/, 'a record lost under a committed fence is not releasable')
+      assert.ok(!result.output.includes('TRAP RELEASE SAID OK'), 'and must never be walked past')
+      assert.match(result.output, /RECORD IS GONE/, 'with the grantees it can no longer name')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${entry.name} raises the sticky flag when the exit trap's re-fence commits revokes it cannot prove`, () => {
+    // The same defect on the recovery path. refence_db_connections() collapsed every non-zero
+    // into `return 1`, so a re-fence that committed its revokes and could not call them a fence
+    // left DB_FENCE_RAISED false — and the release that follows in the same trap read its own
+    // "unproven" verdict as permission to continue.
+    //
+    // `set -e` is deliberately off: install.sh's re-fence opens with `${DB_FENCE_UP} && return 0`,
+    // which is a failing AND-list, and the harness must not exit on it before reaching the code
+    // under test.
+    const dir = mkdtempSync(join(tmpdir(), 'ims-refence5-'))
+    try {
+      fenceStubByMode(dir, { fence: 5, release: 4 })
+      const program = [
+        'set -uo pipefail',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        shellFunction(entry.source, 'refence_db_connections'),
+        shellFunction(entry.source, 'release_db_connections'),
+        'refence_db_connections || echo "REFENCE REPORTED FAILURE"',
+        'if release_db_connections; then echo "RELEASE SAID OK"; else echo "RELEASE REFUSED"; fi',
+      ].join('\n')
+      const result = runShell(program)
+
+      // MUTATION ROUTE: remove the `-eq 5` block from refence_db_connections() so it falls back
+      // to `[[ "$rc" -eq 0 ]] || return 1`. DB_FENCE_RAISED stays false and 'RELEASE SAID OK'
+      // is printed.
+      assert.match(result.output, /REFENCE REPORTED FAILURE/, 'a fence it cannot prove is still not a success')
+      assert.match(result.output, /COMMITTED ITS REVOKES/, 'and it must say what it did leave behind')
+      assert.match(result.output, /RELEASE REFUSED/, 'so the release that follows cannot be walked past')
+      assert.ok(!result.output.includes('RELEASE SAID OK'), 'which is the branch the flag exists to prevent')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
