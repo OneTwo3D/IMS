@@ -353,7 +353,11 @@ export type UnpersistedQboPost = {
  * proof of no effect). Rebuilding it inside a wording fix is the same mistake with a deadline.
  *
  * SO THE MESSAGE NOW SAYS ONLY WHAT CAN BE DONE, NAMES WHAT CANNOT, AND POINTS AT THE FILED WORK
- * (o3d-3lhp, o3d-4b5p). The one lever it names was verified the same way as the refusals: turning
+ * (o3d-3lhp, o3d-4b5p). The one lever it names was verified the same way as the refusals — including
+ * WHAT THE OPERATOR SEES: the checkbox that writes it is labelled "Enable Xero Sync" on the
+ * QuickBooks panel too, because `ACCOUNTING_CONNECTOR_UI` maps both connectors to `XeroClient` and
+ * that label is a literal while the KEY comes from `settingKeyFor(connectorId, 'sync_enabled')`. The
+ * message says so rather than naming a "Sync Enabled" control nobody can find (o3d-m9wm). Turning
  * `quickbooks_sync_enabled` off stops a NEW cron pass and a NEW press of the manual Sync button,
  * because both READ that setting before they call the processor. What it does not do is stop a run
  * already past that read — see ROUND 7 below, which is why the message no longer builds a remedy on
@@ -639,8 +643,12 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
       + `stale THE SWEEP WILL RECLAIM THE ROW AND RUN THE OPERATION AGAIN OUTRIGHT — ${noRequestId.effect}, `
       + 'unbounded, because no retry is consumed while the row never leaves PROCESSING. '
       + `WHAT TO DO ABOUT THE EFFECT: ${noRequestId.check}. `
-      + 'HOW TO STOP MORE OF IT: turn QuickBooks sync OFF (Sync settings, the Sync Enabled toggle, '
-      + 'i.e. quickbooks_sync_enabled). The stale-claim sweep and the manual Sync button both READ '
+      + 'HOW TO STOP MORE OF IT: turn QuickBooks sync OFF. The control is the checkbox at the top of '
+      + 'the SYNC tab of the QuickBooks connector panel, and it writes the setting '
+      + 'quickbooks_sync_enabled. IT IS LABELLED "Enable Xero Sync" EVEN THERE, and its helper text '
+      + 'says Xero too: the QuickBooks panel renders the Xero client and those two strings are '
+      + 'hardcoded. The words are wrong; the checkbox is the right one. (Filed as o3d-m9wm.) '
+      + 'The stale-claim sweep and the manual Sync button both READ '
       + 'that setting before they call the QuickBooks processor, so while it is off neither one '
       + 'STARTS another run. It stops EVERY QuickBooks row, not this one, and it recalls nothing '
       + 'already queued or already done. '

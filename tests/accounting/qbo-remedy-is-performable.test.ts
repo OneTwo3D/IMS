@@ -809,3 +809,46 @@ test('STEP 7: BILL_ATTACHMENT no longer promises a re-upload the attach setting 
     assert.doesNotMatch(await incidentMessage(type), /quickbooks_sync_attach_pdf/, type)
   }
 })
+
+// ---------------------------------------------------------------------------
+// ROUND 7 (verification pass): THE RECORD NAMED A TOGGLE LABEL THAT DOES NOT EXIST.
+//
+// Rounds 3-6 all said "Sync settings, the Sync Enabled toggle". No control is labelled that. The
+// QuickBooks panel renders `XeroClient` (ACCOUNTING_CONNECTOR_UI maps both connectors to it), and
+// that component's sync-enabled checkbox carries the LITERAL label "Enable Xero Sync" while its
+// KEY comes from `settingKeyFor(connectorId, 'sync_enabled')` — so on the QuickBooks panel it says
+// Xero and writes quickbooks_sync_enabled. An operator told to find a "Sync Enabled" toggle would
+// not find one, and an operator who found this one would reasonably leave it alone.
+//
+// The record now names the checkbox by what it WRITES and warns about the label. The UI bug is
+// filed as o3d-m9wm; when it is fixed, this test fails and the record's warning comes out with it.
+//
+// REVERT EVIDENCE (verified by making that one change and re-running this file):
+//   * changing the label in xero-client.tsx to {`Enable ${connectorLabel} Sync`} fails this test,
+//     which is exactly the signal that the record's warning is now stale.
+//   * deleting the label warning from the record fails it too.
+// ---------------------------------------------------------------------------
+
+test('ROUND 7: the record names the sync checkbox by what it writes, and warns about its label', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+
+  const panel = await readFile(path.join(process.cwd(), 'app/(dashboard)/sync/accounting-connector-panel.tsx'), 'utf8')
+  assert.match(panel, /quickbooks:\s*\{[\s\S]*?Client: XeroClient/, 'the QuickBooks panel is the Xero client')
+
+  const client = await readFile(path.join(process.cwd(), 'app/(dashboard)/sync/xero-client.tsx'), 'utf8')
+  // The key is connector-derived...
+  assert.match(client, /const syncEnabledKey = settingKey\('sync_enabled'\)/)
+  assert.match(client, /const settingKey = \(suffix: string\) => settingKeyFor\(connectorId, suffix\)/)
+  // ...and the label is not.
+  assert.match(client, /<span className="text-sm font-medium">Enable Xero Sync<\/span>/,
+    'if this label became connector-aware, the record must stop warning about it (o3d-m9wm)')
+  // And it lives on the Sync tab.
+  assert.match(client, /\{ id: 'sync', label: 'Sync' \}/)
+
+  const description = await incidentMessage()
+  assert.doesNotMatch(description, /the Sync Enabled toggle/, 'no control is labelled that')
+  assert.match(description, /the SYNC tab of the QuickBooks connector panel/)
+  assert.match(description, /IT IS LABELLED "Enable Xero Sync" EVEN THERE/)
+  assert.match(description, /o3d-m9wm/)
+})
