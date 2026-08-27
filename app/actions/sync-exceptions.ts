@@ -850,6 +850,9 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         referenceId: true,
         externalTransactionId: true,
         backReferenceFollowUpsPendingAt: true,
+        // r7: the AGE columns. `owedSince` is syncedAt ?? createdAt — the marker is a generation,
+        // not a time, and must never be rendered as one.
+        syncedAt: true,
         createdAt: true,
       },
     }),

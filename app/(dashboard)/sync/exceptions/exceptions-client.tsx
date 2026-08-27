@@ -824,7 +824,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`Accounting follow-ups owed, with nothing to re-drive them (${data.summary.accountingFollowUpObligations})`}
-            detail="These documents reached the accounting package, but the follow-up work behind them — the payment, the PDF, the email, the attachment — was never enqueued, and this connector has no repair sweep to come back for it. The sync row still looks successful, so this list is the only thing that says otherwise. Re-drive each one by hand in the accounting package, checking there first for work already present."
+            detail="These documents reached the accounting package still owing follow-up work — the payment, the PDF, the email, the attachment — and this connector has no repair sweep, so NOTHING will ever come back for them. That much is certain. What is NOT known is whether that work was enqueued before the pass stopped: the same marker survives a pass whose follow-ups all ran and whose last write failed. Treat every row as an UNRESOLVED outcome, not as work known to be undone. Open the document in the accounting package and record what is actually present, which is safe to repeat as often as you like; create only what is verifiably absent, and escalate to accounting instead of re-driving anything you cannot account for — a duplicate payment is not undoable."
             shown={data.accountingFollowUpObligations.length}
             total={data.summary.accountingFollowUpObligations}
           />

@@ -677,9 +677,15 @@ export type FollowUpObligationClient = {
  * which has gone BACKWARDS — an NTP step, a second host, a sweep and a connector on different
  * machines — still cannot mint a generation somebody else could already be holding.
  *
- * No reader ever compares this column to a wall clock, so moving it forward costs nothing: it stops
- * meaning "when the obligation was first recorded" and starts meaning "when it was last claimed",
- * which is what every reader already uses it for.
+ * MOVING IT FORWARD IS THE POINT, AND IT IS WHY THE VALUE IS NOT A TIME. It stops meaning "when the
+ * obligation was first recorded" and means only "which claim is current" — under contention it is a
+ * value that has not happened yet. r6 shipped a backlog query that compared it to a wall clock and
+ * hid genuinely stranded obligations for as long as the mint had run ahead (o3d-0bfh r7, Codex
+ * HIGH). NO READER OUTSIDE THIS PROTOCOL MAY COMPARE IT TO A CLOCK, render it as an age, or subtract
+ * it from anything; the only question it answers elsewhere is whether it is NULL. See the "WHAT
+ * `backReferenceFollowUpsPendingAt` IS, AND WHAT IT IS NOT" block in
+ * lib/domain/accounting/follow-up-obligation-registry.ts, and the scan in
+ * tests/accounting/follow-up-recovery-registry.test.ts that enforces it.
  */
 export function nextFollowUpObligationGeneration(observed: Date | null, now: Date = new Date()): Date {
   return observed === null ? now : new Date(Math.max(now.getTime(), observed.getTime() + 1))

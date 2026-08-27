@@ -164,8 +164,8 @@ import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-s
 //
 // WHAT A QUICKBOOKS BINDING IS WAITING ON HAS CHANGED (o3d-0bfh r5, Codex HIGH). It was o3d-s36z,
 // the realm-isolation work; that CLOSED on 2026-08-21 and a row's realm is now durably recorded, so
-// this module's candidate query COULD be fenced on it. The remaining blocker is on the other side of
-// the enqueue: QuickBooks does not check the connection verdict at post time (o3d-8prh), so a row
+// this module's candidate query COULD be fenced on it. The remaining blocker is o3d-8prh, post-time
+// authorization, on the other side of the enqueue: QuickBooks checks no connection verdict there, so a row
 // this sweep correctly selected would still be posted against whatever is connected when the
 // processor gets to it. The full order of work is at the end of
 // lib/connectors/quickbooks/sync-processor.ts; do not infer from "o3d-s36z is closed" that a binding

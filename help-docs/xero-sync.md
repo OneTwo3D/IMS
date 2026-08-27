@@ -1432,7 +1432,7 @@ does not yet check **at post time** — as the last thing it does before sending
 connected at that moment is the company the row was raised against, and the follow-up rows a repair
 would create carry no record of their own origin for such a check to read. A correctly selected row
 could therefore still be posted against whatever company happens to be connected when the sync
-processor reaches it. Both of those have to land before a QuickBooks sweep is safe to bind.
+processor reaches it. Both of those — the **post time** check and the origin record — have to land before a QuickBooks sweep is safe to bind.
 
 On QuickBooks, a back-reference that fails to write is therefore **not retried by anything**: the
 warning in the activity log (`quickbooks_backreference_failed` or

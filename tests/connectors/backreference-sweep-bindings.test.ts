@@ -216,7 +216,7 @@ test('[o3d-9kek r6] QuickBooks exports NO back-reference sweep binding, and neve
       + 'alone and a QuickBooks id is realm-local, so it can stamp a previous realm\'s id onto a live document, '
       + 'and this connector checks no connection verdict at post time. o3d-s36z has closed and is NOT the '
       + 'remaining blocker — o3d-8prh is; read the block at the end of the QuickBooks sync-processor for the '
-      + 'order of work before re-adding it.',
+      + 'order of work before re-adding it (o3d-8prh).',
     )
   }
 

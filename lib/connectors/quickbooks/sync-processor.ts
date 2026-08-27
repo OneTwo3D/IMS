@@ -1473,8 +1473,8 @@ async function updateBackReference(
         level: 'WARNING',
         description: `Did not write the QuickBooks back-reference for PO ${referenceId}: its bill cannot be identified `
           + `(${applied.attribution.reason}). Link the bill manually — the external id is on the sync row. `
-          + 'NOTHING re-checks this automatically: QuickBooks has no back-reference repair sweep (blocked on '
-          + 'o3d-8prh, post-time realm enforcement), so resolving the ambiguity on its own will not link the bill.',
+          + 'NOTHING re-checks this automatically: no QuickBooks back-reference repair sweep (blocked on o3d-8prh, '
+          + 'post-time realm enforcement), so resolving the ambiguity on its own will not link the bill.',
         metadata: { referenceType, referenceId, externalId, reason: applied.attribution.reason },
       })
       return { linked: false, reason: 'ambiguous' }

@@ -45,9 +45,13 @@ const QUICKBOOKS_RECOVERY: FollowUpObligationRecovery = {
   blockedBy: 'the QuickBooks back-reference repair sweep is not bound and no cron invokes it (o3d-8prh: '
     + 'this connector does not enforce the connection/realm verdict at post time, and its follow-up rows '
     + 'record no origin, so a re-enqueued payment could post to a different company)',
-  operatorRemedy: 'the row is listed in the exception inbox under "Accounting follow-ups owed, with nothing to '
-    + 're-drive them" (/sync/exceptions) — re-drive its payment, PDF, email or attachment by hand from there, '
-    + 'checking QuickBooks first for one already present',
+  operatorRemedy: 'NOTHING will come back for this row — but that does NOT establish that its follow-ups never '
+    + 'ran, so treat the outcome as UNKNOWN rather than as undone (see FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN). '
+    + 'The row is listed in the exception inbox under "Accounting follow-ups owed, with nothing to re-drive them" '
+    + '(/sync/exceptions): open the document in QuickBooks and record what is actually there — payment, PDF, '
+    + 'email, attachment — then create ONLY what is verifiably absent. If QuickBooks cannot be read, or what you '
+    + 'find is ambiguous, escalate to accounting instead of re-driving anything: a second payment against an '
+    + 'invoice is not undoable, and re-reading the document is safe to repeat as often as you like',
 }
 
 /**
@@ -77,8 +81,9 @@ export function followUpObligationRecoveryFor(connector: string): FollowUpObliga
     consumer: 'none',
     blockedBy: `no entry for connector "${connector}" in ACCOUNTING_FOLLOW_UP_RECOVERY, so nothing is known to `
       + 'read its retained markers back',
-    operatorRemedy: 'declare the connector in lib/domain/accounting/follow-up-obligation-registry.ts, and until '
-      + 'then re-drive its outstanding follow-ups by hand',
+    operatorRemedy: 'declare the connector in lib/domain/accounting/follow-up-obligation-registry.ts. Until then '
+      + 'treat any listed row as an UNKNOWN outcome, not an undone one: read the document in the accounting '
+      + 'package, record what is already present, and create only what is verifiably absent — or escalate',
   }
 }
 
@@ -98,19 +103,62 @@ export const CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER: readonly string[] = Object.e
  */
 export const STRANDED_FOLLOW_UP_OBLIGATION_STATUSES = ['SYNCED', 'FAILED'] as const
 
+// -------------------------------------------------------------------------
+// WHAT `backReferenceFollowUpsPendingAt` IS, AND WHAT IT IS NOT (o3d-0bfh r7, Codex HIGH).
+//
+// IT IS A MONOTONIC GENERATION TOKEN. `nextFollowUpObligationGeneration` mints it as
+// `max(now, observed + 1ms)` — deliberately AHEAD of the minting host's clock whenever a generation
+// is already on the row, precisely so that two writers inside one TIMESTAMP(3) millisecond, or two
+// hosts whose clocks disagree, still cannot mint a value the other could be holding. Its whole job
+// is ORDERING and OWNERSHIP: a release clears only the exact generation it minted.
+//
+// IT IS NOT A TIMESTAMP. It does not answer "when did this row start owing follow-ups", and under
+// contention (or after a backward clock correction on the minting host) it is a value that has not
+// happened yet. So:
+//
+//   • never compare it to a clock — `lt`/`gt`/`gte`/`lte` against `new Date()` is exactly the bug
+//     this comment exists to stop. r6 excluded backlog rows with `marker < now - grace`, which hid a
+//     genuinely stranded obligation until the FUTURE marker plus the grace, by an amount that grows
+//     with contention. The hidden row is a stalled payment nobody is told about;
+//   • never render it to an operator as an age or an "owed since";
+//   • never subtract it from anything.
+//
+// THE ONLY QUESTION A READER OUTSIDE THE CLAIM/RELEASE PROTOCOL MAY ASK OF IT IS WHETHER IT IS NULL.
+// Non-null means "some pass took this obligation and no pass has discharged it". That is a fact
+// about STATE, needs no interpretation, and is all the backlog below uses it for.
+// tests/accounting/follow-up-recovery-registry.test.ts enforces the rule by scanning for a range
+// comparison on the column, so the next reader cannot re-introduce it quietly.
+// -------------------------------------------------------------------------
+
 /**
- * How long after the marker was minted a row is still assumed to be MID-PASS rather than stranded.
+ * How long after the row REACHED ITS TERMINAL STATE it is still assumed to be mid-pass.
  *
  * The connector claims the obligation in the SYNCED transaction and releases it a few statements
  * later, so a marked SYNCED row exists for a moment on every healthy post. Without this window the
  * backlog would flicker with rows that are perfectly fine, and an operator surface that cries wolf
- * every few seconds is not a surface. Five minutes is far longer than the claim→release interval and
- * far shorter than "someone will notice tomorrow".
+ * every few seconds is not a surface.
+ *
+ * IT IS A NOISE FILTER OVER A REAL AGE, NOT AN OWNERSHIP FENCE. Ownership is the generation's job
+ * and the generation is never read here (see above). Five minutes is far longer than the
+ * claim→release interval and far shorter than "someone will notice tomorrow"; a pass that genuinely
+ * runs longer than this is listed while still active, which is why the remedy this backlog carries
+ * treats every row as an UNKNOWN outcome to be reconciled rather than as work known to be undone.
  */
 export const FOLLOW_UP_OBLIGATION_SETTLING_GRACE_MS = 5 * 60 * 1000
 
 /**
- * THE OPERATIONAL BACKLOG (o3d-0bfh r6, Codex HIGH).
+ * The columns the grace is measured from — genuine wall-clock times, in preference order.
+ *
+ * `syncedAt` is written by the same transaction that mints the claim (rule 1 of the protocol: the
+ * claim is a second statement in the SYNCED write), so on a SYNCED row it IS the instant the
+ * obligation was taken. `createdAt` is the fallback for a FAILED row that never reached SYNCED, and
+ * is a database `now()` default. Neither is ever advanced by the fencing protocol, neither is ever
+ * pushed ahead of the clock, and no writer here mints either of them.
+ */
+export const FOLLOW_UP_OBLIGATION_AGE_COLUMNS = ['syncedAt', 'createdAt'] as const
+
+/**
+ * THE OPERATIONAL BACKLOG (o3d-0bfh r6 Codex HIGH; the grace corrected in r7).
  *
  * Rows carrying a follow-up obligation on a connector that has no consumer for it. This is the whole
  * point of the finding: the previous design made an ACTIVITY-LOG LINE the only notice an operator
@@ -118,6 +166,9 @@ export const FOLLOW_UP_OBLIGATION_SETTLING_GRACE_MS = 5 * 60 * 1000
  * that one insert left a payment, PDF, email or attachment permanently stalled with nothing anywhere
  * saying so. A row carrying a marker with no consumer is ALREADY a queryable state — this view over
  * it depends on no second write landing at the worst possible moment.
+ *
+ * THE MARKER IS TESTED FOR EXISTENCE ONLY. The age comes from `syncedAt` (else `createdAt`), which
+ * are times; the marker is a generation and is not one. See the block above.
  *
  * Backed by @@index([connector, status, createdAt]) on AccountingSyncLog for the connector+status
  * half; the marker predicate narrows a population that is empty in the healthy case.
@@ -130,20 +181,58 @@ export function buildFollowUpObligationBacklogWhere(options?: {
   const now = options?.now ?? new Date()
   const grace = options?.settlingGraceMs ?? FOLLOW_UP_OBLIGATION_SETTLING_GRACE_MS
   const connectors = options?.connectors ?? CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER
+  const settledBefore = new Date(now.getTime() - grace)
   return {
     connector: { in: [...connectors] },
     status: { in: [...STRANDED_FOLLOW_UP_OBLIGATION_STATUSES] },
-    backReferenceFollowUpsPendingAt: { not: null, lt: new Date(now.getTime() - grace) },
+    // Existence, and nothing else. A range comparison here is the r7 defect.
+    backReferenceFollowUpsPendingAt: { not: null },
+    OR: [
+      // `not: null` is redundant in SQL (a comparison with NULL is never true) and is stated anyway,
+      // so the predicate says which rows it means without the reader having to know that.
+      { syncedAt: { not: null, lt: settledBefore } },
+      // A FAILED row that never reached SYNCED has no completion stamp; its creation is the only
+      // real time it carries. Explicitly `syncedAt: null` so the two branches cannot both match and
+      // so a row with a syncedAt inside the grace is not readmitted by an ancient createdAt.
+      { syncedAt: null, createdAt: { lt: settledBefore } },
+    ],
   }
 }
 
 /**
  * Oldest obligation first, tie-broken on `id` so a truncated page is deterministic across renders —
  * the same reason buildStrandedSyncRowOrderBy does it.
+ *
+ * On `createdAt`, NOT on the marker: sorting by the generation would order the page by who last
+ * contended for a row rather than by how long the work has been owed, and would put a
+ * contention-inflated marker at the wrong end of the list. `createdAt` is always present, is a real
+ * time, and is the trailing column of @@index([connector, status, createdAt]).
  */
 export function buildFollowUpObligationBacklogOrderBy(): Prisma.AccountingSyncLogOrderByWithRelationInput[] {
-  return [{ backReferenceFollowUpsPendingAt: 'asc' }, { id: 'asc' }]
+  return [{ createdAt: 'asc' }, { id: 'asc' }]
 }
+
+/**
+ * WHAT A RETAINED MARKER DOES AND DOES NOT ESTABLISH (o3d-0bfh r7, Codex HIGH).
+ *
+ * Carried to the operator surface verbatim, because the r6 wording said the follow-up work "was
+ * never enqueued" and told an operator to re-drive it. That is not established by the marker.
+ * `settleFollowUpObligation` retains it when the enqueue SUCCEEDED and only the back-reference write
+ * failed afterwards, and `releaseFollowUpObligation` retains it when every follow-up succeeded and
+ * only the clearing write failed. On a money path, "redo it" against work that may already be queued
+ * is worse than the stall being reported: a payment registered twice is not undoable.
+ *
+ * What IS established is the thing the backlog exists for: nothing on this connector will ever
+ * re-read the marker, so no automatic route out exists. That is a statement about the SYSTEM and it
+ * is true unconditionally. What happened to the work itself is a statement about the PAST, and the
+ * marker does not carry it.
+ */
+export const FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN =
+  'What is known: nothing on this connector will re-read this marker, so no automatic route out exists. What is '
+  + 'NOT known: whether the payment, PDF, email or attachment was enqueued before the pass stopped — the same '
+  + 'marker survives a pass whose follow-ups all ran and whose LAST write failed. Reconcile against the '
+  + 'accounting package before creating anything, and escalate rather than re-drive if you cannot establish what '
+  + 'is already there.'
 
 /** The columns the loader selects — the row as it comes off the database. */
 export type FollowUpObligationBacklogSource = {
@@ -154,7 +243,10 @@ export type FollowUpObligationBacklogSource = {
   referenceType: string
   referenceId: string
   externalTransactionId: string | null
+  /** Read for its NULL-ness only — it is a generation, not a time. */
   backReferenceFollowUpsPendingAt: Date | null
+  /** The real times. `owedSince` below is one of these, never the marker. */
+  syncedAt: Date | null
   createdAt: Date
 }
 
@@ -167,6 +259,10 @@ export type FollowUpObligationBacklogRow = {
   referenceType: string
   referenceId: string
   externalTransactionId: string | null
+  /**
+   * When the row reached the state it is stranded in — `syncedAt`, else `createdAt`. NOT the
+   * obligation marker: that is a generation and displaying it as a time is the r7 defect.
+   */
   owedSince: Date | null
   /** Why nothing re-drives it, straight from the connector's own declaration. */
   blockedBy: string
@@ -192,7 +288,7 @@ export function describeFollowUpObligationBacklogRow(row: FollowUpObligationBack
     referenceType: row.referenceType,
     referenceId: row.referenceId,
     externalTransactionId: row.externalTransactionId,
-    owedSince: row.backReferenceFollowUpsPendingAt,
+    owedSince: row.syncedAt ?? row.createdAt,
     blockedBy: recovery.consumer === 'none'
       ? recovery.blockedBy
       : `connector "${row.connector}" declares a sweep consumer, so this row should not be in the backlog at all`,

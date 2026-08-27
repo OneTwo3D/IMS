@@ -116,6 +116,11 @@ function matches(row: Record<string, unknown>, where: Record<string, unknown>): 
         const right = operand instanceof Date ? operand.getTime() : operand
         if (op === 'in') { if (!(operand as unknown[]).includes(value)) return false; continue }
         if (op === 'not') { if (operand === null ? value === null : left === right) return false; continue }
+        // SQL: a range comparison against NULL is UNKNOWN, never true. JavaScript coerces null to 0
+        // and would answer `null < anyDate` = true, which would have made a NULL `syncedAt` satisfy
+        // the backlog's age predicate — the double disagreeing with the database on exactly the
+        // column the o3d-0bfh r7 grace is measured on.
+        if (value === null && (op === 'lt' || op === 'lte' || op === 'gt' || op === 'gte')) return false
         if (op === 'lt') { if (!((left as number) < (right as number))) return false; continue }
         if (op === 'lte') { if (!((left as number) <= (right as number))) return false; continue }
         if (op === 'gt') { if (!((left as number) > (right as number))) return false; continue }
@@ -1486,5 +1491,87 @@ test('[o3d-0bfh r6] CONTROL: a marked row inside the settling grace, and a XERO 
   assert.equal(
     inTheOperatorBacklog(asXero, 30), false,
     'a connector WITH a sweep consumer is never listed as needing a human',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r7 (Codex HIGH) — THE SETTLING GRACE READ THE FENCING GENERATION AS WALL-CLOCK TIME.
+//
+// r6 excluded a row from the backlog with `backReferenceFollowUpsPendingAt < now - grace`. That
+// column is NOT a timestamp: `nextFollowUpObligationGeneration` mints it as `max(now, observed +
+// 1ms)`, deliberately AHEAD of the minting host's clock, so that two writers inside one TIMESTAMP(3)
+// millisecond cannot mint the same value. The value therefore carried two meanings — an ordering
+// token, and roughly-a-time — and only the first is true under load.
+//
+// Consequence: a contended row's marker sits in the FUTURE, `marker < now - grace` is false for
+// longer than the grace, and the amount grows with contention. The row hidden that way is a stalled
+// payment, PDF, email or attachment on a connector with no sweep — the exact thing the backlog
+// exists to show. The grace now measures on `syncedAt` (else `createdAt`), which are real times
+// nothing mints, and the marker is asked only whether it is null.
+// ---------------------------------------------------------------------------
+
+test('[o3d-0bfh r7] a generation pushed AHEAD of real time by contention still appears in the backlog', async () => {
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.failFollowUpsFor.add('log-1')
+  await runQuickBooks()
+
+  const row = subject()
+  const claimed = row.backReferenceFollowUpsPendingAt
+  assert.ok(claimed instanceof Date, 'the obligation is retained — there is something to be hidden')
+  assert.ok(row.syncedAt instanceof Date, 'and the row carries the real completion time the grace measures on')
+
+  // CONTENTION, minted by the production mint rather than by hand: a peer observed a generation an
+  // hour ahead (a second host whose clock had run fast, or a burst of re-claims on this row), so the
+  // next mint is an hour and a millisecond ahead of ANY clock that will read it.
+  const contended = nextFollowUpObligationGeneration(
+    new Date(Date.now() + 60 * 60_000),
+    new Date(),
+  )
+  assert.ok(
+    contended.getTime() > Date.now() + 30 * 60_000,
+    'the mint really does push the generation past the clock — that is the premise of this test',
+  )
+  row.backReferenceFollowUpsPendingAt = contended
+
+  // Thirty minutes on: the document posted half an hour ago and nothing has come back for it. Under
+  // the r6 predicate the marker (now + 60m) is not less than (now + 30m - 5m), so the row was
+  // invisible — and would stay invisible for an hour and five minutes after the money work stalled.
+  assert.equal(
+    inTheOperatorBacklog(row, 30), true,
+    'a stranded obligation must be listed on the age of the ROW, not on a fencing token that contention pushed '
+      + 'into the future',
+  )
+
+  // The same row an hour and a half on, when even the inflated marker has fallen behind the clock:
+  // still listed. Nothing about this depends on the marker's value, which is the point.
+  assert.equal(inTheOperatorBacklog(row, 90), true, 'and it does not appear only once the future marker matures')
+
+  // CONTROL, so this is not satisfied by a predicate that ignores the grace entirely: the same
+  // contention-inflated marker on a row that posted seconds ago is still mid-pass and NOT listed.
+  assert.equal(
+    inTheOperatorBacklog(row, 0), false,
+    'the grace still holds a freshly-posted row back — it is a noise filter on a real age, not a no-op',
+  )
+})
+
+test('[o3d-0bfh r7] a FAILED row that never reached SYNCED is aged on createdAt, not on the marker', async () => {
+  // The other branch of the where-clause. A row whose retries exhausted before it ever posted has no
+  // `syncedAt`; without the createdAt branch it could never be listed at all, and FAILED is one of
+  // the two statuses this backlog exists for.
+  reset('quickbooks')
+  const row: SyncRow = {
+    ...blankRow(),
+    status: 'FAILED',
+    syncedAt: null,
+    createdAt: new Date(Date.now() - 60 * 60_000),
+    backReferenceFollowUpsPendingAt: nextFollowUpObligationGeneration(new Date(Date.now() + 60 * 60_000), new Date()),
+  }
+  assert.equal(inTheOperatorBacklog(row, 0), true, 'an hour-old FAILED row owing follow-ups is stranded, and listed')
+
+  const fresh: SyncRow = { ...row, createdAt: new Date() }
+  assert.equal(
+    inTheOperatorBacklog(fresh, 0), false,
+    'and one created seconds ago is not — the createdAt branch is a real age too, not an unconditional pass',
   )
 })
