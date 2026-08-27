@@ -1420,7 +1420,9 @@ ok "Artefact validated."
 # ---------------------------------------------------------------------------
 # @deploy-phase: fence-writers
 #
-# From here on the fence is armed: nothing below restarts what we stop.
+# Two phases in one block. `arming` first: the reboot fence and the cron fence go in, and
+# every failure there is REVERSED by the trap with nothing stopped. Then `stopping`, from
+# FENCE_ARMED=true onwards: nothing below restarts what we stop.
 # ---------------------------------------------------------------------------
 CURRENT_STEP="fence-writers"
 step "Stop and drain every writer"
