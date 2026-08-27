@@ -281,8 +281,11 @@ test('ROUND 7: the record says why the query cannot be narrowed', async () => {
 })
 
 test('ROUND 7: the outbox really does terminalise a row FAILED for a suppressed recipient', async () => {
-  // ROUND 8: this is the one FAILED path the record still calls conclusive, and it is conclusive
-  // because it runs BEFORE the send. The other FAILED paths are read from the same file below.
+  // ROUND 9: this branch is still real and still runs before the send — what changed is that the
+  // record no longer calls it CONCLUSIVE, because it runs before THIS retry's send and reads
+  // nothing about the attempts before it. See
+  // tests/accounting/outbox-failed-is-not-non-delivery.test.ts, which drives a delivered copy into
+  // this very branch. The other FAILED paths are read from the same file below.
   const { readFile } = await import('node:fs/promises')
   const path = await import('node:path')
   const sender = await readFile(path.join(process.cwd(), 'lib/email-outbox.ts'), 'utf8')

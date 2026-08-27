@@ -390,8 +390,15 @@ test('ROUND 6: an INVOICE_EMAIL incident is NOT described as a document standing
   assert.match(
     breadcrumb.description,
     /only a local email-outbox row, WHICH THIS RESET HAS JUST DELETED/,
-    'and it says the count that record asks for can no longer be made',
+    'and it says what can no longer be done as a result',
   )
+  // ROUND 9 (Codex MEDIUM): the breadcrumb described a COUNT instruction round 7 had already
+  // deleted from the incident wording, and it survives the reset that deletes the rows which would
+  // settle the contradiction. It now states the remaining fact and names no count.
+  assert.doesNotMatch(breadcrumb.description, /tells you to count/i)
+  assert.doesNotMatch(breadcrumb.description, /the count cannot be made/i)
+  assert.match(breadcrumb.description, /that record tells you to inspect are gone with it/)
+  assert.match(breadcrumb.description, /statuses can no longer be inspected/)
 
   const metadata = (breadcrumb as unknown as { metadata?: Record<string, unknown> }).metadata
   assert.equal(metadata?.ledgerDocuments, 0, 'the count that would have been asserted is zero, and is stated as zero')
@@ -710,7 +717,13 @@ test('ROUND 8: the per-incident record stops promising an id it does not carry',
   )
   assert.doesNotMatch(withoutId, /open the id above in QuickBooks/)
   assert.match(withoutId, /THE RESPONSE CARRIED NO ID EITHER/)
-  assert.match(withoutId, /find the document in QuickBooks by the reference above, its amount and its date/)
+  // ROUND 9 (Codex MEDIUM): NOT "by the reference above, its amount and its date". Neither record
+  // builder stores an amount or a date, and a reset deletes the rows that did — see
+  // tests/accounting/record-names-only-what-it-holds.test.ts, which derives the retained keys from
+  // the two builders and scans every message this module can produce.
+  assert.doesNotMatch(withoutId, /its amount and its date/)
+  assert.match(withoutId, /escalate this record to whoever administers this installation/)
+  assert.match(withoutId, /WHAT THIS RECORD HOLDS/)
 
   // With an id, the remedy that WAS performable is unchanged.
   const withId = describeUnpersistedQboPost(
