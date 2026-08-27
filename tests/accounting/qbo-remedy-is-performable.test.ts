@@ -344,7 +344,7 @@ test('STEP 3: a settlement that DOES succeed can only produce SYNCED or CANCELLE
 test('STEP 3: the message does not offer FAILED as a settlement outcome (o3d-peh1 round 3)', async () => {
   const description = await incidentMessage()
   assert.doesNotMatch(description, /mark it SYNCED, or FAILED/)
-  assert.match(description, /its only two outcomes are SYNCED and CANCELLED/)
+  assert.match(description, /settlement has only two outcomes, SYNCED and CANCELLED/)
 })
 
 // ---------------------------------------------------------------------------
@@ -409,9 +409,13 @@ test('STEP 5: and it points at the stranded-rows banner, by name, as the per-row
   assert.match(description, /THE PER-ROW REMEDY DOES EXIST/)
   assert.match(description, /STRANDED SYNC ROWS/, 'the operator has to be told WHERE the control is')
   assert.match(description, /BY ADOPTION/, 'and why a revision-0 row is settleable there')
-  // Xero-first resolution, so this can become true without a deliberate retirement.
+  // Xero-first resolution is what makes the refusal conditional rather than permanent.
   assert.match(description, /XERO-FIRST/)
-  assert.match(description, /both connectors enabled is a guarded state/)
+  // Round 6 removed the claim that stood here — "both connectors enabled is a guarded state, not an
+  // impossible one … no deliberate retirement is needed". The plugin save refuses that state, so it
+  // must not come back; STEP 7 below pins the sentence that replaced it against the shipped guard.
+  assert.doesNotMatch(description, /both connectors enabled is a guarded state/)
+  assert.doesNotMatch(description, /no deliberate\s+retirement is needed/)
 })
 
 test('STEP 5: the stranded read model DOES mark this exact row settleable, by adoption (round 4)', async () => {
@@ -602,7 +606,7 @@ test('STEP 6: the record names BOTH conditions and no longer says the replay sto
     assert.match(description, /TURN quickbooks_sync_enabled OFF AS WELL/, type)
     // And the order that keeps it a PER-ROW remedy rather than a permanent shutdown, since the
     // toggle it now requires is the same blunt lever that stops every other QuickBooks row.
-    assert.match(description, /then turn quickbooks_sync_enabled back\s+on/, type)
+    assert.match(description, /turn quickbooks_sync_enabled back\s+on/, type)
     assert.doesNotMatch(description, /without stopping every other QuickBooks row/, type)
   }
 })
@@ -641,4 +645,145 @@ test('STEP 6: and that claim about the list is true of the shipped read model (r
     false,
     'the newest row — the one a fresh incident would be — is the one that falls off the page',
   )
+})
+
+// ---------------------------------------------------------------------------
+// STEP 7 — ROUND 6 (Codex HIGH): THE TWO SENTENCES ROUNDS 3-5 NEVER RE-CHECKED.
+//
+// Rounds 3, 4 and 5 each corrected the settleability claim and each left the clauses BESIDE it
+// alone. Two of those were false:
+//
+//   1. "the settle control is not rendered on any QuickBooks LOG view". QuickBooks has no client of
+//      its own — `ACCOUNTING_CONNECTOR_UI` maps it to `XeroClient` — and that component mounts
+//      `<SettleSyncRowControl>` for every FAILED or PROCESSING row. The control IS rendered; it
+//      resolves to a "not settleable" label whose tooltip is the GENERIC refusal, which tells the
+//      operator to retry the row until it shows an attempt. On this connector that never happens,
+//      and every retry is another replay of the effect.
+//   2. "both connectors enabled is a guarded state, not an impossible one … no deliberate retirement
+//      is needed". `saveIntegrationPluginState` refuses that resulting state outright.
+//
+// Both are checked against the SHIPPED artefact that decides them — the settleability helper called
+// exactly as the log view calls it, the component registry, and the guard's own literal message —
+// rather than wording against wording.
+//
+// REVERT EVIDENCE (each verified by putting that one thing back and re-running this file):
+//   * restoring "and the settle control is not rendered on any QuickBooks LOG view" fails
+//     "the record no longer denies that the log view renders anything".
+//   * deleting the "DO NOT FOLLOW THAT TOOLTIP" sentence fails "the record contradicts the tooltip
+//     the log view actually shows".
+//   * restoring "(both connectors enabled is a guarded state, not an impossible one) and no
+//     deliberate retirement is needed" fails STEP 5's doesNotMatch pair AND "the record quotes the
+//     guard that refuses it".
+//   * changing the refusal string in app/actions/settings.ts fails "the record quotes the guard
+//     that refuses it" — the two are coupled deliberately.
+// ---------------------------------------------------------------------------
+
+test('STEP 7: the QuickBooks log view is XeroClient, and it mounts the settle control for a PROCESSING row (round 6)', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+
+  const registry = await readFile(path.join(process.cwd(), 'app/(dashboard)/sync/accounting-connector-panel.tsx'), 'utf8')
+  const quickbooksPanel = /quickbooks:\s*\{[^}]*\}/.exec(registry)?.[0] ?? ''
+  assert.match(quickbooksPanel, /Client:\s*XeroClient/, 'QuickBooks has no client of its own — it reuses this one')
+
+  const client = await readFile(path.join(process.cwd(), 'app/(dashboard)/sync/xero-client.tsx'), 'utf8')
+  assert.match(
+    client,
+    /const settlementApplies = log\.status === 'FAILED' \|\| log\.status === 'PROCESSING'/,
+    'and it decides whether to mount the control on the status alone',
+  )
+  assert.match(client, /\{settlementApplies && \(\s*<SettleSyncRowControl/, 'which is what mounts it')
+
+  // The row the incident describes is PROCESSING, so `settlementApplies` is TRUE for it.
+  assert.equal(incidentRow().status, 'PROCESSING')
+})
+
+test('STEP 7: and what it renders is a refusal whose reason sends the operator into a retry loop (round 6)', async () => {
+  const { describeSyncRowSettleability } = await import('@/lib/domain/accounting/sync-row-settlement')
+
+  // EXACTLY the arguments xero-client.tsx passes — no `connector`, no `unclaimableRefusalReason` —
+  // which is what drops this row into the generic branch.
+  const row = incidentRow()
+  const settlement = describeSyncRowSettleability({
+    status: row.status,
+    type: row.type,
+    attemptRevision: row.attemptRevision,
+  })
+  assert.equal(settlement.settleable, false, 'so no button — but the control is still mounted')
+  assert.equal(typeof settlement.notSettleableReason, 'string')
+  assert.match(
+    settlement.notSettleableReason ?? '',
+    /retry the row, and settle it once it shows an attempt/,
+    'the tooltip an operator on the QuickBooks log view is actually given',
+  )
+
+  const description = await incidentMessage()
+  assert.doesNotMatch(
+    description,
+    /not rendered on any QuickBooks LOG view/,
+    'the record no longer denies that the log view renders anything',
+  )
+  assert.match(description, /THE LOG VIEW DOES SHOW YOU SOMETHING, AND IT IS NOT A BUTTON/)
+  assert.match(description, /not settleable/, 'and names the words the operator will see')
+  assert.match(
+    description,
+    /DO NOT FOLLOW THAT TOOLTIP[\s\S]*never stamps one, so no number of retries will ever make an attempt appear/,
+    'the record contradicts the tooltip the log view actually shows',
+  )
+})
+
+test('STEP 7: and retrying really does not stamp an attempt — the row is still at 0 after a refusal (round 6)', async () => {
+  const { settleAccountingSyncRow } = await import('@/app/actions/accounting-settlement')
+
+  // QuickBooks active, exactly as STEP 2. The point here is the state AFTER the refusal: nothing in
+  // this path stamps a revision, so "retry until it shows an attempt" can never terminate.
+  assert.equal(state.activeConnector, 'quickbooks')
+  const refused = await settleAccountingSyncRow('log-1', {
+    observedStatus: 'PROCESSING', observedAttemptRevision: 0, outcome: 'NOT_POSTED',
+  })
+  assert.equal(refused.success, false)
+  assert.equal(state.rows[0].attemptRevision, 0, 'still unfenced — the retry the tooltip asks for changes nothing')
+  assert.equal(state.rows[0].status, 'PROCESSING')
+})
+
+test('STEP 7: enabling Xero BESIDE QuickBooks is refused by the shipped guard, and the record quotes it (round 6)', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+
+  const settings = await readFile(path.join(process.cwd(), 'app/actions/settings.ts'), 'utf8')
+  const guard = /if \(resulting\.xero && resulting\.quickbooks\) \{\s*return \{ conflict: '([^']+)' \}/.exec(settings)
+  assert.ok(guard, 'the resulting-state exclusivity guard must still be the thing that decides this')
+  const refusal = guard![1]
+
+  const description = await incidentMessage()
+  // COUPLED to the product's own words: if either side is reworded without the other, this fails.
+  assert.ok(
+    description.includes(refusal),
+    `the record must quote the refusal an operator will actually be shown, verbatim: ${refusal}`,
+  )
+  assert.match(description, /BUT YOU CANNOT ENABLE XERO BESIDE QUICKBOOKS/)
+  assert.match(description, /SO THIS STEP IS A DELIBERATE RETIREMENT OF QUICKBOOKS/)
+  assert.match(description, /it must be ONE save/, 'because two saves cannot reach the target state')
+})
+
+test('STEP 7: the INVOICE_EMAIL count is ordered AFTER the lever that freezes it (round 6)', async () => {
+  const description = await incidentMessage('INVOICE_EMAIL')
+  assert.match(description, /BUT STOP THE REPLAY FIRST/, 'a count taken while the sweep runs is stale by one per sweep')
+  // And the ordered remedy repeats it, so the two halves of the message cannot drift apart.
+  assert.match(
+    description,
+    /turn quickbooks_sync_enabled off FIRST[\s\S]*count the queued copies, settle this row/,
+    'the ordered remedy must put the count inside the frozen window',
+  )
+})
+
+test('STEP 7: BILL_ATTACHMENT no longer promises a re-upload the attach setting can prevent (round 6)', async () => {
+  const bill = await incidentMessage('BILL_ATTACHMENT')
+  assert.match(bill, /quickbooks_sync_attach_pdf/, 'the setting that makes the handler a no-op must be named')
+  assert.match(bill, /succeeds without uploading anything and the replay attaches nothing/)
+
+  // And it is scoped to that operation only — the other three have no such gate.
+  for (const type of ['INVOICE_PDF', 'INVOICE_EMAIL', 'WC_INVOICE_NOTE']) {
+    assert.doesNotMatch(await incidentMessage(type), /quickbooks_sync_attach_pdf/, type)
+  }
 })

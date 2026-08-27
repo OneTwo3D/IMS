@@ -426,7 +426,10 @@ function unpersistedQboPostRecord(incident: UnpersistedQboPost, description: str
  *
  * IT DOES NOT SAY "SETTLE THE ROW" (round 3), AND IT DOES NOT SAY "YOU NEVER CAN" EITHER (round 4).
  * The settlement action refuses this row WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR — no attempt
- * revision, so UNFENCED_ATTEMPT — and no QuickBooks log view renders the control. Once QuickBooks is
+ * revision, so UNFENCED_ATTEMPT. (An earlier wording added "and no QuickBooks log view renders the
+ * control". That was false: QuickBooks reuses `XeroClient`, which mounts `SettleSyncRowControl` for
+ * every FAILED/PROCESSING row, where it resolves to a "not settleable" label. See ROUND 6 in
+ * unrecorded-posted-document.ts.) Once QuickBooks is
  * not the active connector the same row is settleable BY ADOPTION from the stranded-sync-rows banner,
  * which is the one per-row way to stop this replay. Do not re-add a bare "settle the row" here, and
  * do not restate the refusal as an absolute: both wordings have now been wrong, in opposite

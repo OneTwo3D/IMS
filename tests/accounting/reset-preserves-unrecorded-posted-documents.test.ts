@@ -36,7 +36,7 @@ import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-r
 // the same three resets the Xero one does.
 // ---------------------------------------------------------------------------
 
-type ActivityRow = { action: string; description: string; level?: string }
+type ActivityRow = { action: string; description: string; level?: string; metadata?: unknown }
 
 const state = {
   activity: [] as ActivityRow[],
@@ -82,6 +82,14 @@ const activityLog = {
   count: async (args?: { where?: unknown }) => {
     const filter = actionOf(args?.where)
     return state.activity.filter((row) => (filter.select ? filter.select.includes(row.action) : true)).length
+  },
+  // Round 6: the breadcrumb can no longer be written from an integer — which sentence each row
+  // earns is decided by its own metadata, so the reset reads the rows.
+  findMany: async (args?: { where?: unknown; select?: Record<string, boolean> }) => {
+    const filter = actionOf(args?.where)
+    return state.activity
+      .filter((row) => (filter.select ? filter.select.includes(row.action) : true))
+      .map((row) => (args?.select ? { metadata: row.metadata ?? null } : { ...row }))
   },
   create: async ({ data }: { data: ActivityRow }) => {
     state.activity.push(data)
@@ -134,6 +142,8 @@ mock.module('@/lib/activity-log', {
 const INCIDENT: ActivityRow = {
   action: UNRECORDED_POSTED_DOCUMENT_ACTION,
   level: 'ERROR',
+  // `unrecordedPostedDocumentRecord` writes metadata.type from entry.type. Round 6 classifies on it.
+  metadata: { type: 'SALES_INVOICE', syncLogId: 'log-1' },
   description: 'Xero SALES_INVOICE for SalesOrder order-1 POSTED as INV-XERO-SECOND, but sync row log-1 '
     + 'already names a DIFFERENT document (INV-XERO-FIRST). REMEDY: open both ids in Xero.',
 }
@@ -141,6 +151,8 @@ const INCIDENT: ActivityRow = {
 const QBO_INCIDENT: ActivityRow = {
   action: QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
   level: 'ERROR',
+  // `unpersistedQboPostRecord` writes the same field. A SALES_INVOICE is a real ledger document.
+  metadata: { type: 'SALES_INVOICE', syncLogId: 'log-2' },
   description: 'QuickBooks SALES_INVOICE for SalesOrder order-2 POSTED as QBO-INV-9, but IMS could not '
     + 'record that id. REMEDY: open the id above in QuickBooks.',
 }
@@ -235,20 +247,23 @@ test('Codex MEDIUM (round 3): the breadcrumb describes the WHOLE preserved set, 
     /Those documents still exist in Xero or QuickBooks/,
     'that is true of the Xero records and of a QuickBooks document post — and of nothing else preserved here',
   )
-  assert.match(breadcrumb.description, /NOT ALL LEDGER DOCUMENTS/)
+  assert.match(breadcrumb.description, /THEY ARE NOT ALL THE SAME KIND OF THING/)
 
   // What IS true of the whole set: each one names an effect, and the record says which.
-  assert.match(breadcrumb.description, /Each record says which/)
-  for (const effect of ['attached to a QuickBooks bill', 'invoice PDF', 'email queued to a customer', 'WooCommerce order']) {
-    assert.ok(breadcrumb.description.includes(effect), `the non-document effects are named: ${effect}`)
-  }
+  assert.match(breadcrumb.description, /Each record says what the effect was/)
 
-  // And the half-truth this same reset creates: the queued copies a record tells the reader to count
-  // were deleted by `emailOutbox.deleteMany({})` a few lines above the exemption.
-  assert.match(breadcrumb.description, /emptied the email outbox/)
-
-  // Unchanged: the ledger half is still stated, because it is still true of part of the set.
+  // Unchanged: the ledger half is still stated, because BOTH fixtures here are ledger documents.
   assert.match(breadcrumb.description, /Xero or QuickBooks accepted and still holds/)
+  assert.match(breadcrumb.description, /^Database reset kept 2 record/)
+
+  // ROUND 6 (Codex MEDIUM): and because both of them ARE ledger documents, the side-effect sentence
+  // must not appear at all. Round 3's hedge emitted it unconditionally over a single count, so this
+  // very reset asserted that some preserved record was a queued email, a WooCommerce note or a bill
+  // attachment when none of them was.
+  assert.doesNotMatch(breadcrumb.description, /are NOT ledger documents/)
+  for (const effect of ['attached to a QuickBooks bill', 'WooCommerce order', 'email-outbox row']) {
+    assert.ok(!breadcrumb.description.includes(effect), `nothing here is one of those: ${effect}`)
+  }
 })
 
 test('Codex r3 medium + HIGH: the exemption is in the DELETE, and it names the whole pair', async () => {
@@ -309,4 +324,134 @@ test('Codex r3 medium: a reset with nothing to preserve says nothing', async () 
     !state.activity.some((row) => row.action === 'database_reset_preserved_unrecorded_documents'),
     'a breadcrumb on every reset would be noise, and would stop meaning anything when it mattered',
   )
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 6 (Codex MEDIUM): THE BREADCRUMB WAS STILL ASSERTING A REMOTE DOCUMENT THAT NEVER EXISTED.
+//
+// Round 3 replaced one false sentence with a hedge — "THEY ARE NOT ALL LEDGER DOCUMENTS. Some name a
+// document … The rest name an effect …" — over a SINGLE count. True of the set, useless about any
+// member of it, and on an install whose only preserved incident is an `INVOICE_EMAIL` it is worse
+// than useless: it asserts that some of them are documents standing in a ledger when none of them
+// is. `INVOICE_EMAIL` creates only a local `EmailOutbox` row — which this same reset deleted a few
+// statements earlier — and no QuickBooks document at all. This breadcrumb is exempt from retention
+// and from the reset, so that assertion is permanent.
+//
+// The counts are now classified from each record's own `metadata.type`, and a kind with nothing in
+// it emits NO sentence.
+//
+// REVERT EVIDENCE (each verified by putting that one thing back and re-running this file):
+//   * restoring the single `activityLog.count` + the round-3 hedge fails "an INVOICE_EMAIL incident
+//     is NOT described as a document standing in a ledger" on the ledger sentence.
+//   * making `classifyUnrecordedIncident` return 'LEDGER_DOCUMENT' for an unreadable metadata fails
+//     "a record with no readable type is counted apart rather than guessed".
+//   * dropping INVOICE_EMAIL from QBO_OPERATIONS_WITHOUT_REQUEST_ID fails the same first test.
+// ---------------------------------------------------------------------------
+
+const QBO_EMAIL_INCIDENT: ActivityRow = {
+  action: QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+  level: 'ERROR',
+  metadata: { type: 'INVOICE_EMAIL', syncLogId: 'log-3' },
+  description: 'QuickBooks INVOICE_EMAIL for SalesOrder order-3 SUCCEEDED — the external effect has '
+    + 'happened — but IMS could not record that it did.',
+}
+
+const QBO_UNTYPED_INCIDENT: ActivityRow = {
+  action: QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+  level: 'ERROR',
+  metadata: null,
+  description: 'QuickBooks incident whose metadata did not survive.',
+}
+
+test('ROUND 6: an INVOICE_EMAIL incident is NOT described as a document standing in a ledger', async () => {
+  reset([QBO_EMAIL_INCIDENT])
+
+  await runReset('full')
+
+  const kept = state.activity.filter((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION)
+  assert.equal(kept.length, 1, 'it is still preserved — it is the only thing saying the effect repeated')
+
+  const breadcrumb = state.activity.find((row) => row.action === 'database_reset_preserved_unrecorded_documents')
+  assert.ok(breadcrumb)
+
+  // THE DEFECT: not one word claiming a document exists somewhere to go and look for.
+  assert.doesNotMatch(
+    breadcrumb.description,
+    /Xero or QuickBooks accepted and still holds/,
+    'no ledger document was ever created for this incident',
+  )
+  assert.doesNotMatch(breadcrumb.description, /real money in somebody else's books/)
+
+  // What it says instead.
+  assert.match(breadcrumb.description, /1 are NOT ledger documents and created nothing in Xero or QuickBooks/)
+  assert.match(
+    breadcrumb.description,
+    /only a local email-outbox row, WHICH THIS RESET HAS JUST DELETED/,
+    'and it says the count that record asks for can no longer be made',
+  )
+
+  const metadata = (breadcrumb as unknown as { metadata?: Record<string, unknown> }).metadata
+  assert.equal(metadata?.ledgerDocuments, 0, 'the count that would have been asserted is zero, and is stated as zero')
+  assert.equal(metadata?.noIdentifierSideEffects, 1)
+  assert.equal(metadata?.unclassified, 0)
+  assert.equal(metadata?.preserved, 1, 'the total still reconciles with the parts')
+})
+
+test('ROUND 6: a mixed set gets one truthful count per kind, not one number and a hedge', async () => {
+  reset([INCIDENT, QBO_INCIDENT, QBO_EMAIL_INCIDENT])
+
+  await runReset('full')
+
+  const breadcrumb = state.activity.find((row) => row.action === 'database_reset_preserved_unrecorded_documents')
+  assert.ok(breadcrumb)
+  assert.match(breadcrumb.description, /^Database reset kept 3 record/)
+  assert.match(breadcrumb.description, /2 name a DOCUMENT Xero or QuickBooks accepted and still holds/)
+  assert.match(breadcrumb.description, /1 are NOT ledger documents/)
+
+  const metadata = (breadcrumb as unknown as { metadata?: Record<string, unknown> }).metadata
+  assert.equal(metadata?.ledgerDocuments, 2)
+  assert.equal(metadata?.noIdentifierSideEffects, 1)
+  assert.equal(metadata?.unclassified, 0)
+})
+
+test('ROUND 6: a record with no readable type is counted apart rather than guessed', async () => {
+  // Guessing is exactly how the false assertion was made in the first place. An unreadable record
+  // gets its own sentence and its own number, and neither of the other two sentences appears.
+  reset([QBO_UNTYPED_INCIDENT])
+
+  await runReset('full')
+
+  const breadcrumb = state.activity.find((row) => row.action === 'database_reset_preserved_unrecorded_documents')
+  assert.ok(breadcrumb)
+  assert.doesNotMatch(breadcrumb.description, /Xero or QuickBooks accepted and still holds/)
+  assert.doesNotMatch(breadcrumb.description, /are NOT ledger documents/)
+  assert.match(breadcrumb.description, /1 carry no readable operation type/)
+
+  const metadata = (breadcrumb as unknown as { metadata?: Record<string, unknown> }).metadata
+  assert.equal(metadata?.unclassified, 1)
+  assert.equal(metadata?.ledgerDocuments, 0)
+  assert.equal(metadata?.noIdentifierSideEffects, 0)
+})
+
+test('ROUND 6: the classifier keys on the OPERATION TYPE, not on the connector that wrote it', async () => {
+  const { classifyUnrecordedIncident, QBO_NO_IDENTIFIER_OPERATION_TYPES } =
+    await import('@/lib/domain/accounting/unrecorded-posted-document')
+
+  // The four are no-identifier operations wherever they run — an `AccountingSyncType` is shared, so
+  // keying on the ACTION would reproduce the original mistake with the connectors swapped.
+  for (const type of QBO_NO_IDENTIFIER_OPERATION_TYPES) {
+    assert.equal(classifyUnrecordedIncident({ type }), 'NO_IDENTIFIER_SIDE_EFFECT', type)
+  }
+  assert.deepEqual(
+    [...QBO_NO_IDENTIFIER_OPERATION_TYPES].sort(),
+    ['BILL_ATTACHMENT', 'INVOICE_EMAIL', 'INVOICE_PDF', 'WC_INVOICE_NOTE'],
+    'derived from the wording table, so a fifth operation moves both readers at once',
+  )
+
+  assert.equal(classifyUnrecordedIncident({ type: 'SALES_INVOICE' }), 'LEDGER_DOCUMENT')
+  assert.equal(classifyUnrecordedIncident({ type: 'PURCHASE_INVOICE' }), 'LEDGER_DOCUMENT')
+
+  for (const unreadable of [null, undefined, 'INVOICE_EMAIL', 42, [], {}, { type: '' }, { type: 7 }]) {
+    assert.equal(classifyUnrecordedIncident(unreadable), 'UNCLASSIFIED', JSON.stringify(unreadable) ?? 'undefined')
+  }
 })

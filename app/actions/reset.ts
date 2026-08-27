@@ -6,7 +6,11 @@ import { logActivity } from '@/lib/activity-log'
 import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
 import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
-import { UNRECORDED_POSTED_DOCUMENT_ACTIONS } from '@/lib/domain/accounting/unrecorded-posted-document'
+import {
+  countUnrecordedIncidents,
+  describePreservedUnrecordedIncidents,
+  UNRECORDED_POSTED_DOCUMENT_ACTIONS,
+} from '@/lib/domain/accounting/unrecorded-posted-document'
 
 export type ResetLevel = 'transactions' | 'products' | 'full'
 
@@ -113,10 +117,18 @@ async function clearTransactionScope() {
   // only that. The same name covers the four no-identifier operations in
   // lib/domain/accounting/unrecorded-posted-document.ts — a bill attachment, a stored invoice PDF, an
   // invoice email QUEUED to a customer, a WooCommerce note — none of which is a ledger document and
-  // one of which is not even finished. Preserving them is still right, because the record is the only
-  // thing that says the effect repeated; describing them all as ledger documents sends the reader to
-  // the wrong system. The breadcrumb below says what is true of the WHOLE set and lets each record
-  // speak for itself.
+  // one of which is not even finished.
+  //
+  // AND ROUND 3'S ANSWER TO THAT WAS A HEDGE, NOT A FIX (round 6, Codex MEDIUM). It replaced the one
+  // false sentence with "THEY ARE NOT ALL LEDGER DOCUMENTS. Some name a document … The rest name an
+  // effect …" over a SINGLE count. That is true of the set and useless about any member of it: an
+  // install whose only preserved incident is a queued INVOICE_EMAIL still got a paragraph asserting
+  // that some of them are documents standing in a ledger, when none of them is — and this breadcrumb
+  // is exempt from retention and from the reset, so it is permanent evidence for a document that
+  // never existed. The record's own `metadata.type` is what settles it, and BOTH connectors write
+  // that field, so the counts below are classified rather than aggregated: a kind with nothing in it
+  // now emits no sentence at all. A row whose type cannot be read is counted as UNCLASSIFIED and
+  // never guessed into either bucket.
   //
   // BOTH ACTIONS, FROM THE ONE PLACE THE PAIR IS NAMED. This exemption originally spelled out a single
   // constant — the Xero one — and read as complete: it compiled, its test passed, and the sentence
@@ -144,25 +156,28 @@ async function clearTransactionScope() {
   // The breadcrumb below puts the count in the same list so nobody has to know to look, and it names
   // BOTH actions because a breadcrumb that names one is the same defect as an exemption that does.
   await db.activityLog.deleteMany({ where: { action: { notIn: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS] } } })
-  const preserved = await db.activityLog.count({ where: { action: { in: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS] } } })
-  if (preserved > 0) {
+  // findMany, not count: the breadcrumb can no longer be written from an integer, because which
+  // sentence each row earns is decided by its own metadata. The population is bounded by what
+  // survived the delete above — incidents this rare are units, not pages.
+  const preservedRows = await db.activityLog.findMany({
+    where: { action: { in: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS] } },
+    select: { metadata: true },
+  })
+  if (preservedRows.length > 0) {
+    const counts = countUnrecordedIncidents(preservedRows)
     await logActivity({
       entityType: 'SYSTEM',
       tag: 'sync',
       action: 'database_reset_preserved_unrecorded_documents',
       level: 'WARNING',
-      description: `Database reset kept ${preserved} record(s) of things IMS did against an accounting `
-        + 'connector and could never record. THEY ARE NOT ALL LEDGER DOCUMENTS. Some name a document '
-        + 'Xero or QuickBooks accepted and still holds — real money in somebody else\'s books, which no '
-        + 'reset of ours voids. The rest name an effect that landed somewhere else and can repeat: a '
-        + 'file attached to a QuickBooks bill, an invoice PDF written over the stored copy, an invoice '
-        + 'email queued to a customer, a note written onto a WooCommerce order. Each record says which '
-        + 'it is, what the effect was and what can be done about it. Nothing else in IMS references any '
-        + 'of them any more — and for a queued-email one, this reset has just emptied the email outbox '
-        + 'too, so the copies that record tells you to count are gone with it and the count cannot be '
-        + 'made after the fact. Search this log for '
-        + `${UNRECORDED_POSTED_DOCUMENT_ACTIONS.map((action) => `"${action}"`).join(' or ')}.`,
-      metadata: { preserved, actions: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS] },
+      description: describePreservedUnrecordedIncidents(counts),
+      metadata: {
+        preserved: preservedRows.length,
+        ledgerDocuments: counts.LEDGER_DOCUMENT,
+        noIdentifierSideEffects: counts.NO_IDENTIFIER_SIDE_EFFECT,
+        unclassified: counts.UNCLASSIFIED,
+        actions: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS],
+      },
     })
   }
 
