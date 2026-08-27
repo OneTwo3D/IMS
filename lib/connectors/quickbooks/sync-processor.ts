@@ -42,10 +42,11 @@ import {
   backReferenceHolder,
   findExternalDocumentIdClaim,
   claimFollowUpObligation,
+  followUpObligationRecoveryNote,
   isExternalDocumentIdConflict,
   releaseFollowUpObligation,
 } from '@/lib/domain/accounting/back-reference'
-import { followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
+import { FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN, followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
@@ -644,10 +645,18 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           await reportRetainedObligation({
             action: 'quickbooks_followup_error',
             level: 'ERROR',
-            description: `QuickBooks sync entry ${entry.id} posted successfully but its follow-up work was NOT `
-              + `enqueued: ${String(followUpError)}. The document is in QuickBooks; its payment, PDF or email `
-              + 'follow-ups need to be re-driven manually — the row is listed in the exception inbox at '
-              + '/sync/exceptions under "Accounting follow-ups owed, with nothing to re-drive them".',
+            // o3d-0bfh r8 (Codex HIGH): this used to say the follow-up work "was NOT enqueued" and
+            // that it "needs to be re-driven manually". BOTH are unestablished, and the second is
+            // dangerous. `enqueueFollowUps` writes each follow-up as its own local row and enqueues
+            // INVOICE_PAYMENT BEFORE INVOICE_PDF, so the ordinary way this branch is reached leaves
+            // a payment already PENDING in the queue; telling an operator to re-drive it by hand is
+            // telling them to create a second, undeduplicable payment against one invoice.
+            description: `QuickBooks sync entry ${entry.id} posted successfully but its follow-up pass stopped `
+              + `partway: ${String(followUpError)}. HOW FAR IT GOT IS NOT KNOWN FROM HERE — the follow-ups are `
+              + 'enqueued one at a time as separate local rows, so some may already be queued and due to execute. '
+              + 'The document is in QuickBooks and the row is listed in the exception inbox at /sync/exceptions '
+              + 'under "Accounting follow-ups owed, with nothing to re-drive them". '
+              + FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN,
             metadata: { syncLogId: entry.id, type: entry.type, referenceType: entry.referenceType, referenceId: entry.referenceId },
             syncLogId: entry.id,
           })
@@ -1370,8 +1379,13 @@ async function settleFollowUpObligation(
       + 'it is SYNCED and carries its external id exactly like a row that completed. NOTHING WILL RE-DRIVE '
       + 'THIS AUTOMATICALLY — QuickBooks has no back-reference repair sweep bound (o3d-8prh), so the marker is '
       + 'evidence rather than scheduled work. It is listed in the exception inbox at /sync/exceptions under '
-      + '"Accounting follow-ups owed, with nothing to re-drive them". Link the document and re-run the invoice '
-      + 'sync for this reference, or register the receipt in QuickBooks by hand.',
+      + '"Accounting follow-ups owed, with nothing to re-drive them". '
+      // o3d-0bfh r8 (Codex HIGH): "re-run the invoice sync, or register the receipt by hand" was a
+      // direct re-drive instruction on the money path. Nothing here establishes that the receipt is
+      // unregistered — only that THIS pass could not confirm it — and a hand-registered payment
+      // cannot be deduplicated against one the local queue is still holding. The remedy comes from
+      // the connector's own registry entry, which says read and escalate.
+      + followUpObligationRecoveryNote(QBO_FOLLOW_UP_RECOVERY) + '.',
     metadata: {
       syncLogId: entry.id,
       type: entry.type,

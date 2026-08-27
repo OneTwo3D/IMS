@@ -25,6 +25,7 @@ import {
   buildFollowUpObligationBacklogOrderBy,
   buildFollowUpObligationBacklogWhere,
   describeFollowUpObligationBacklogRow,
+  readFollowUpObligationDatabaseNow,
 } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity } from '@/lib/activity-log'
@@ -645,6 +646,10 @@ async function loadMaintenanceRecoveryState(): Promise<MaintenanceRecoveryState>
 
 /** True per-source totals — never capped by the display limit (Codex r3/r5). */
 async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
+  // o3d-0bfh r8 (Codex HIGH): the settling grace is aged against the DATABASE's clock, never this
+  // host's. Read before the batch because the predicate is built from it; `null` (unreadable clock)
+  // means no grace at all, which lists every marked row — noise in the safe direction.
+  const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
   const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations] = await Promise.all([
     db.wmsOrderPushLink.count({ where: { state: 'DEAD_LETTER' } }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
@@ -662,7 +667,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // o3d-0bfh r6 (Codex HIGH). NOT scoped to the active connector: a QuickBooks row that owes a
     // payment owes it whether or not QuickBooks is the connector enabled today, and the whole reason
     // the row is here is that nothing will ever come back to it on its own.
-    db.accountingSyncLog.count({ where: buildFollowUpObligationBacklogWhere() }),
+    db.accountingSyncLog.count({ where: buildFollowUpObligationBacklogWhere({ databaseNow: followUpDatabaseNow }) }),
   ])
 
   const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
@@ -748,6 +753,10 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   await requirePermission('sync')
 
   const counts = await loadExceptionCounts()
+  // The same database-clock reading rule as the counts above (o3d-0bfh r8). Taken again rather than
+  // threaded through, because the two loads are independent reads and a cutoff a few milliseconds
+  // apart cannot change which side of a five-minute grace a row falls on.
+  const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
   const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: { state: 'DEAD_LETTER' },
@@ -838,7 +847,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     // o3d-0bfh r6 (Codex HIGH) — the rows behind the count above. Capped like every other section;
     // the count is the real total, so the client renders "showing N of M".
     db.accountingSyncLog.findMany({
-      where: buildFollowUpObligationBacklogWhere(),
+      where: buildFollowUpObligationBacklogWhere({ databaseNow: followUpDatabaseNow }),
       orderBy: buildFollowUpObligationBacklogOrderBy(),
       take: SECTION_LIMIT,
       select: {
@@ -850,9 +859,10 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         referenceId: true,
         externalTransactionId: true,
         backReferenceFollowUpsPendingAt: true,
-        // r7: the AGE columns. `owedSince` is syncedAt ?? createdAt — the marker is a generation,
-        // not a time, and must never be rendered as one.
-        syncedAt: true,
+        // r8: the AGE columns, and both are stamped by the DATABASE. `owedSince` is the claim's own
+        // clock_timestamp() stamp, else createdAt (a database now() default). NOT the marker, which
+        // is a generation; and NOT syncedAt, which an application host writes with new Date().
+        backReferenceFollowUpsClaimedAtDatabaseClock: true,
         createdAt: true,
       },
     }),

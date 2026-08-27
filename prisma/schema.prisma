@@ -2421,6 +2421,36 @@ model AccountingSyncLog {
   // Not a candidate-query predicate: an unstamped row is a candidate already. It only widens the
   // "back-reference done, follow-ups outstanding" pass that used to be FAILED-only.
   backReferenceFollowUpsPendingAt DateTime?
+  // o3d-0bfh r8 (Codex HIGH): WHEN THE CURRENT OBLIGATION WAS CLAIMED, STAMPED BY THE DATABASE.
+  //
+  // `backReferenceFollowUpsPendingAt` above is a GENERATION, not a time — minted as
+  // max(now, observed + 1ms), so under contention it is deliberately ahead of every clock and no
+  // reader outside the claim/release protocol may compare it to one. The backlog in the exception
+  // inbox still needs an AGE, and r7 measured it on `syncedAt`, which the connectors write with the
+  // application host's `new Date()`. Both ends of that comparison were then application clocks from
+  // possibly different hosts: if the minting host ran ahead, or its clock was corrected backwards
+  // afterwards, a genuinely stranded payment stayed BELOW the cutoff and was hidden from the only
+  // surface that reports it — the same host-clock disagreement `syncedAtDatabaseClock` above exists
+  // because this codebase already anticipates.
+  //
+  // This column is written by the DATABASE, not by any writer: a trigger on the marker column
+  // (migration 20260827120000) stamps `clock_timestamp()` in the same statement that mints a new
+  // generation, clears it when the marker is cleared, and carries the old value over otherwise — so
+  // no application host can supply a value for it and no claim site can forget it. The backlog ages
+  // it against a `clock_timestamp()` read from the SAME database, so both ends of the comparison are
+  // readings of one clock and no application host's `new Date()` is involved at all. Triggers are
+  // invisible to this schema; the migration is where the rule lives.
+  //
+  // NOT stamped by the application also because the connectors' claim rides inside the transaction
+  // that records the invoice's external id: an extra statement there is an extra way to abort it,
+  // and a rolled-back SYNCED write means the invoice is posted to QuickBooks a second time.
+  //
+  // NULL is a real state, not a missing value: a marker minted by a build that predates this column,
+  // or one whose stamp statement failed after the CAS committed. Such a row CANNOT be aged against
+  // database time, so the backlog falls back to `createdAt` — which is a database `now()` DEFAULT,
+  // and therefore still not an application clock. That fallback is the fail-safe direction: it lists
+  // sooner, and the failure this whole column addresses is a row being HIDDEN.
+  backReferenceFollowUpsClaimedAtDatabaseClock DateTime?
   // o3d-0m56: when this row first made a REMOTE money call. Set once, immediately BEFORE the
   // call, and NEVER cleared — not by the manual retry, not by an automatic revival, both of
   // which reset retryCount to 0 and so cannot be used to answer "has this been sent before?".
