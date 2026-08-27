@@ -21,7 +21,6 @@ import {
 import { buildStockMovementValueFieldsFromConsumed } from '@/lib/domain/inventory/stock-movement-value'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirementQuantities } from '@/lib/products/fulfillment-requirement-snapshot'
-import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { withSavepoint } from '@/lib/db/savepoint'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -337,15 +336,10 @@ async function validateActiveShipmentTotalsWithinOrder(
     if (shippableQty.lt(0)) shippableQty = new Prisma.Decimal(0)
     if (plannedQty.gt(shippableQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
       if (refundedQty.gt(0)) {
-        // o3d-2k5: the remedy is now a control that exists, and the message names the three steps in
-        // the order they must happen. Before this it said "unpack or cancel this shipment" and neither
-        // was buildable: confirmSalesOrderShipments only replaces PENDING shipments, the transition map
-        // is forward-only, and a per-shipment delete demanded a CANCELLED order. `reopenShipmentForRepack`
-        // is the way back; the physical un-pack is the operator's own step in between, which is why it is
-        // stated rather than implied.
-        return `Shipment for line ${label} would ship more than remains after refunds — it was packed before the refund landed. `
-          + 'Use "Reopen for repack" on this shipment (Sales → the order → Shipments), physically remove the refunded units from the parcel, '
-          + 'then "Create Shipments" in the Stock Allocation panel to rebuild it to what remains.'
+        // A PACKED shipment can't be rebuilt via confirmSalesOrderShipments (it only replaces PENDING
+        // shipments) — this was packed before the refund, so it needs an operator to unpack/cancel and
+        // rebuild it to the reduced quantity (tracked as the o3d-339 recovery follow-up).
+        return `Shipment for line ${label} would ship more than remains after refunds — it was packed before the refund landed. Unpack or cancel this shipment and rebuild it to exclude the refunded units.`
       }
       return `Shipment quantity for line ${label} exceeds ordered quantity. Reload and retry.`
     }
@@ -757,180 +751,6 @@ export async function discardCancelledOrderShipmentsInTx(
   })
   await tx.shipment.deleteMany({ where: { id: { in: discarded.map((row) => row.id) } } })
   return { discarded }
-}
-
-export type ReopenShipmentForRepackResult =
-  | {
-      success: false
-      error: string
-      /**
-       * o3d-2k5r r3: WHICH refusal, for the one caller that can act on the distinction.
-       *
-       * `ALREADY_PENDING` is not really a refusal of the recovery — it is "the reverting half is
-       * already done". The action treats it as a RESUME point (re-net the order and resolve the
-       * refund backstop against the existing draft) rather than a dead end, which is what makes
-       * the recovery re-runnable after an allocation refusal left it half-open. It carries the
-       * order identifiers because the caller needs them and cannot get them from an error string.
-       */
-      code?: 'ALREADY_PENDING'
-      orderId?: string
-      orderRef?: string
-    }
-  | {
-      success: true
-      orderId: string
-      orderRef: string
-      previousStatus: string
-      trackingNumber: string | null
-      shippingService: string | null
-      lineCount: number
-    }
-
-/**
- * o3d-2k5 — THE WAY BACK FROM A COMMITTED SHIPMENT THAT MAY NO LONGER SHIP.
- *
- * `validateActiveShipmentTotalsWithinOrder` refuses to dispatch a PACKED shipment that would ship
- * more than remains after a refund (o3d-339). That refusal is the money fix and is not weakened
- * here. What it did not have was an exit: `confirmSalesOrderShipments` only ever REPLACES PENDING
- * shipments, `SHIPMENT_TRANSITIONS` is forward-only, and the only deletes of a non-PENDING shipment
- * demand a CANCELLED order (`discardCancelledOrderShipmentsInTx`) or take the whole order down
- * (`cancelSalesOrderFulfillmentState`). So the refusal named "unpack or cancel this shipment" and
- * neither control existed. This is that control.
- *
- * WHY REVERT RATHER THAN DELETE. `confirmSalesOrderShipments` already knows how to replace a
- * PENDING draft, and `reconcilePendingShipments` already knows how to retire one the allocation
- * rows no longer back, reporting the tracking number it was carrying. Reverting therefore reuses
- * the entire rebuild path with no new write protocol, and PRESERVES `trackingNumber` /
- * `shippingService` — a purchased label with a real carrier record behind it — which a delete
- * destroys. The hard sub-question, what happens to a JOURNALLED shipment, does not arise: the
- * daily Group B batch stages `status: 'SHIPPED'` (lib/connectors/xero/daily-sync.ts), so a PICKING
- * or PACKED shipment can never carry a journal date, and nothing in scope has been posted.
- *
- * WHY NOTHING IS RE-RESERVED HERE. `reservedQty` is decremented EXCLUSIVELY on the transition to
- * SHIPPED, and the OrderAllocation row is RETAINED through pick and pack — so a PACKED shipment has
- * released nothing and there is nothing to put back. What the revert moves is the DEMAND NETTING:
- * `allocateSalesOrder` nets non-PENDING shipments out of demand and re-adds them to the persisted
- * row, so the reverted quantity simply moves from the committed half of that claim to the
- * outstanding half and the row total is unchanged by construction. Any version of this that touched
- * `reservedQty` would double-count. That is also why the reallocation is the CALLER's step
- * (app/actions/allocation.ts) rather than this function's: `allocateSalesOrder` takes the same
- * order lock, so it cannot run inside this transaction.
- *
- * WHY NOT A REVERSE EDGE IN `SHIPMENT_TRANSITIONS`. A PACKED -> PENDING edge in that map is
- * reachable from `updateShipmentStatus`, which would let a caller revert a shipment WITHOUT the
- * reallocation and outbox resolution that make the revert mean anything — leaving the order with a
- * draft nothing has re-netted and a refund backstop row still deferred. The map stays forward-only
- * and this is the only door, so the three steps cannot be performed one-third of the way. It also
- * leaves `state-machines.test.ts`'s key-set assertion and the generated workflow docs describing a
- * lifecycle that is still, for every generic caller, forward-only.
- *
- * PHYSICAL, NOT ONLY DATA. A PACKED shipment has been picked and packed in the warehouse. This
- * reverts the RECORD; the units still have to come out of the box. The activity-log row below is
- * deliberately WARNING level and says so, because it is the only durable trace that a human owes
- * the warehouse an action.
- */
-export async function reopenShipmentForRepack(
-  client: ShipmentServiceClient,
-  shipmentId: string,
-  audit: { userId?: string | null } = {},
-): Promise<ReopenShipmentForRepackResult> {
-  // The order id is needed to take the lock, and it can only come from an unlocked read. Everything
-  // decided on is re-read INSIDE the lock below; this read decides nothing.
-  const located = await client.shipment.findUnique({
-    where: { id: shipmentId },
-    select: { orderId: true },
-  })
-  if (!located) return { success: false, error: 'Shipment not found' }
-
-  return runInTransaction(client, async (tx) => {
-    await lockSalesOrder(tx, located.orderId)
-    const shipment = await tx.shipment.findUnique({
-      where: { id: shipmentId },
-      select: {
-        id: true,
-        orderId: true,
-        status: true,
-        trackingNumber: true,
-        shippingService: true,
-        lines: { select: { id: true } },
-        order: { select: { status: true, orderNumber: true, externalOrderNumber: true } },
-      },
-    })
-    if (!shipment) return { success: false as const, error: 'Shipment not found' }
-    // The shipment moved to a different order between the two reads — the lock we hold is the wrong
-    // one, so decide nothing.
-    if (shipment.orderId !== located.orderId) {
-      return { success: false as const, error: 'This shipment moved to another order. Reload and retry.' }
-    }
-    // SHIPPED is terminal, and deliberately so: the goods have gone, stock movements and COGS have
-    // been written against them, and a dispatch is reversed by a refund or a return — which relieve
-    // cost basis through the very rows a rollback would delete.
-    if (shipment.status === 'SHIPPED') {
-      return {
-        success: false as const,
-        error: 'This shipment has already been dispatched, so it cannot be reopened. '
-          + 'Reverse a dispatch with a refund or a return, which relieve the cost of the goods that actually left.',
-      }
-    }
-    if (shipment.status === UNCOMMITTED_SHIPMENT_STATUS) {
-      return {
-        success: false as const,
-        code: 'ALREADY_PENDING' as const,
-        orderId: shipment.orderId,
-        orderRef: shipment.order.orderNumber ?? shipment.order.externalOrderNumber ?? shipment.orderId.slice(0, 8),
-        error: 'This shipment is already a pending draft — nothing has been committed to it. '
-          + 'Use "Create Shipments" in the Stock Allocation panel to rebuild it against what remains on the order.',
-      }
-    }
-    // A cancelled order has its own repair, which DELETES rather than reopens: reopening would leave
-    // a draft on an order that will never be invoiced, and confirmSalesOrderShipments refuses to
-    // build shipments for a cancelled order anyway — so the rebuild step would dead-end.
-    if (SHIPMENT_TRANSITION_REFUSING_ORDER_STATUSES.has(String(shipment.order.status))) {
-      return { success: false as const, error: terminalOrderTransitionError(String(shipment.order.status)) }
-    }
-
-    const previousStatus = String(shipment.status)
-    const orderRef = shipment.order.orderNumber ?? shipment.order.externalOrderNumber ?? shipment.orderId.slice(0, 8)
-    await tx.shipment.update({
-      where: { id: shipmentId },
-      // Status ONLY. trackingNumber and shippingService are deliberately untouched — see the note
-      // above on why a revert beats a delete — and shippedAt is null on any non-SHIPPED shipment,
-      // so there is nothing to clear.
-      data: { status: UNCOMMITTED_SHIPMENT_STATUS },
-    })
-    await tx.activityLog.create({
-      data: {
-        userId: audit.userId ?? null,
-        entityType: 'SALES_ORDER',
-        entityId: shipment.orderId,
-        action: 'shipment_reopened_for_repack',
-        tag: 'sales',
-        level: 'WARNING',
-        description: `Reopened a ${previousStatus} shipment on order ${orderRef} so it can be rebuilt to what remains`
-          + ` — the goods for this shipment are physically picked/packed and must be unpacked in the warehouse`
-          + (shipment.trackingNumber
-            ? `. It carries tracking number ${shipment.trackingNumber}, which is kept on the draft; cancel the label with the carrier if the rebuild does not use it`
-            : ''),
-        metadata: {
-          shipmentId,
-          orderRef,
-          previousStatus,
-          trackingNumber: shipment.trackingNumber ?? null,
-          shippingService: shipment.shippingService ?? null,
-          lineCount: shipment.lines.length,
-        },
-      },
-    })
-    return {
-      success: true as const,
-      orderId: shipment.orderId,
-      orderRef,
-      previousStatus,
-      trackingNumber: shipment.trackingNumber ?? null,
-      shippingService: shipment.shippingService ?? null,
-      lineCount: shipment.lines.length,
-    }
-  })
 }
 
 export async function transitionShipmentStatus(

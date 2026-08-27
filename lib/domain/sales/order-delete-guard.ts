@@ -354,9 +354,8 @@ export async function findSalesOrderDeleteBlocker(
           // shipments in the same transaction as the allocation release.
           : 'A picked or packed shipment is stock the warehouse is already holding against this '
             + 'order. Cancel the order instead — cancelling deletes its picked and packed shipments '
-            + 'and releases the reservations in one step. To keep the order and clear this blocker '
-            + 'instead, use "Reopen for repack" on each picked/packed shipment (o3d-2k5): that reverts '
-            + 'it to a PENDING draft, and a PENDING draft is deliberately not a blocker here.'),
+            + 'and releases the reservations in one step. A single shipment cannot be cancelled on '
+            + 'its own (o3d-q8r6), so the whole order is the unit of undo here.'),
     })
   }
   const orderKeyed: Prisma.AccountingSyncLogWhereInput[] = [

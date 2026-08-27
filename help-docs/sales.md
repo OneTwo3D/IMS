@@ -151,59 +151,6 @@ the order and use **Discard shipments**. That deletes the remaining non-dispatch
 any already-dispatched one (reverse those with a refund), records what it removed — including
 tracking numbers — in the activity log, and is safe to repeat.
 
-#### Reopening a picked or packed shipment
-
-A shipment can only move forward, but a **picking or packed** one can be sent back to a pending draft
-with **Reopen for repack**, next to it in the Shipments panel. Use it when a shipment can no longer go
-out as packed — most often when a **partial refund lands after packing**, which IMS refuses to
-dispatch because it would ship goods the customer has been refunded for.
-
-Reopening:
-
-- turns the shipment back into a **pending draft** and keeps its tracking number and carrier, so a
-  label you already bought is not thrown away;
-- **re-allocates the order**, which nets the refund into the reservations, releases the refunded
-  units' reserved stock, and retires the draft when it no longer matches what the order owes;
-- records a **warning in the activity log** — the goods are physically in a box in the warehouse, and
-  reopening the record does not unpack them.
-
-Those steps are **all or nothing**: they share one database transaction, so an interrupted recovery
-leaves the shipment exactly as it was rather than a draft whose stock has not been re-netted. If the
-re-allocation cannot run at all — no warehouse is available for sale, say — the reopen is rolled back
-and IMS tells you nothing changed.
-
-There is **one deliberate exception**. If the order carries *another* picking or packed shipment, the
-re-allocation is refused (IMS will not re-net an order that still has committed stock elsewhere) and
-the reopen is kept. It has to be: with two packed shipments, rolling back would refuse each one
-because of the other and neither could ever be reopened. **Reopen the second shipment too** — every
-shipment on the order has to be back to a draft before the refunded units' reservation can be
-released.
-
-Once nothing committed is left, the draft shows a **Finish repack recovery** button, which runs the
-missing re-netting and releases the refunded units' reservation. It is a different button from
-*Reopen for repack* on purpose — nothing is unpacked and no shipment is changed by it.
-
-That button appears **only where there is something to finish and finishing it can work**: the order
-still has an unresolved refund-reservation release recorded against it (the durable trace the
-recovery leaves behind) **and** no shipment on the order is still committed. It disappears once the
-recovery has run. It is also the way to repair an order left part-way through a recovery by an older
-version of IMS. **"Create Shipments" is not a substitute** — it rebuilds the draft from the
-already-netted quantity without releasing the stale reservation.
-
-**Do not dispatch the second shipment instead of reopening it.** A dispatched shipment still counts
-as committed for this check *and* can never be reopened afterwards, so dispatching it closes the only
-door: the order can then no longer complete the recovery by any click, and the outstanding refund
-reservation has to be reconciled by hand (it stays visible as a failed `refund.reservation-release`
-row in the integration outbox on the Sync Exceptions page). The Finish repack recovery button is
-deliberately **not** shown in that state rather than being shown and doing nothing.
-
-**Unpack the parcel first, then press "Create Shipments"** in the Stock Allocation panel to rebuild
-the shipment to what actually remains. If every unit was refunded there is nothing left to build and
-IMS says so rather than creating an empty shipment.
-
-A **dispatched** shipment cannot be reopened — the goods have gone, and the way back is a refund or a
-return. A **cancelled** order uses **Discard shipments** above instead.
-
 ### Shipment Features
 
 - Each shipment gets an **independent tracking number**
