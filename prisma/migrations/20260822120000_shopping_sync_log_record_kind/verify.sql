@@ -28,12 +28,29 @@
 -- this header claimed all of them had the narrow meaning; they do not.
 --
 -- WHY THERE ARE SEVEN AND NOT SIX (Codex HIGH, round 13). Checks 1-6 all read THE ROW AS IT IS NOW,
--- and three of them rest on an assumption about which write was the LAST one: check 5 assumes a
--- REASSIGN is the last payload-relevant mutation, and checks 3, 4 and 6 key on an `errorMessage` or a
--- `payload` that a later write replaces. A reassigned hold that the predecessor then RE-HOLDS onto
--- its new order has its payload, externalId and error message overwritten wholesale — the identity
--- equality is restored, the operator's note is gone, and the backfill stamps what looks exactly like
--- a legitimate hold. All six return zero over a destroyed accounting payload.
+-- and two of them rest on an assumption about WHICH WRITE WAS THE LAST ONE. A reassigned hold that
+-- the predecessor then RE-HOLDS onto its new order has its payload, externalId and error message
+-- overwritten wholesale — the identity equality is restored, the operator's note is gone, and the
+-- backfill stamps what looks exactly like a legitimate hold. All six return zero over a destroyed
+-- accounting payload.
+--
+-- THE AUDIT, check by check, because "does a later write switch this off?" is the question this
+-- round asks of the whole file:
+--
+--   * CHECK 5 assumes a REASSIGN is the last payload-relevant mutation. It is not — the rewrite
+--     above restores exactly the equality this check needs broken. THE DEFECT.
+--   * CHECK 4 keys on the operator's note in `errorMessage`, and the same rewrite replaces it. A
+--     DISMISS moves no entityId, so the predecessor re-holding the SAME order onto a dismissed row
+--     does it there too, without any reassign being involved. THE DEFECT, second door.
+--   * CHECK 3 needs the park STAMP as well as the shape, and the stamp is written by backfill
+--     statement 2 — which never stamps a hold-shaped row. So it holds for a park the backfill had
+--     already stamped and the predecessor then overwrote (a REASSIGN moves that row to check 5 and a
+--     re-hold moves it back), and it is blind by construction to a row recovered BEFORE the
+--     migration: the backfill sees the rewritten row and stamps it a HOLD.
+--   * CHECK 6's rows are settled to SYNCED or FAILED, and both predecessor writers select PENDING
+--     only, so nothing rewrites them afterwards. Stable.
+--   * CHECKS 1 AND 2 want a NULL stamp, and the only writer of that column runs once, before these
+--     checks do. Stable.
 --
 -- WHEN THE CURRENT STATE CAN BE MADE TO LOOK INNOCENT, THE EVIDENCE HAS TO COME FROM HISTORY. Check
 -- 7 joins the `wc_refund_park_recovered` activity entries — written by `recoverParkedWcRefund`,
