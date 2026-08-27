@@ -408,7 +408,15 @@ test('o3d-92fu revalidate: a link whose payload builds again is re-queued for cr
   assert.equal(updates[0].id, 'link-1')
   assert.equal(updates[0].data.state, 'PENDING_CREATE')
   assert.equal(updates[0].data.lastError, null)
-  // Cleared so the create claim's lease does not refuse the re-queued order for five minutes.
+  // o3d-2k5r r2. The lease clear is STILL intended — without it the rotation stamp written a
+  // moment ago makes claimForCreate refuse the re-queued order for a full five minutes — but it
+  // is only safe because the write is a COMPARE-AND-SET on VALIDATION_FAILED. That predicate is
+  // the load-bearing half of this assertion, not an implementation detail: it is what proves
+  // the column being cleared is this pass's own rotation stamp and never another worker's LIVE
+  // create lease (a claim can only be granted from PENDING_CREATE, so no claim can exist while
+  // the CAS matches). Assert the two together, or the next reader deletes the guard and keeps
+  // the wipe.
+  assert.equal(updates[0].ifState, 'VALIDATION_FAILED', 'the promote must be state-guarded')
   assert.equal(updates[0].data.lastAttemptAt, null)
   // attempts is NOT reset: remote attempts already spent still count against MAX_ATTEMPTS, or a
   // broken order could ride the retry ladder forever by failing validation in between.
@@ -467,6 +475,132 @@ test('o3d-92fu revalidate: the bounded pass SAYS what it did not get to', async 
   assert.match(notice!, /40 orders are parked/)
   assert.match(notice!, /remaining 39/)
   assert.match(notice!, /NOT dropped/)
+})
+
+test('o3d-2k5r r2 revalidate: a link that LEFT VALIDATION_FAILED before the write is not re-queued', async () => {
+  // The hazard this closes. Two sweeps read the same VALIDATION_FAILED link. A promotes it,
+  // claims it under the order row lock and is inside pushOrder; B then reaches this write. The
+  // old bare `update({ where: { id } })` had no predicate, so B stamped PENDING_CREATE back over
+  // A's claim AND nulled A's live lease — and B's own claim check hits
+  // `if (!existing.lastAttemptAt) return true`, so B pushed the same order again. Two warehouse
+  // orders, goods shipped twice.
+  const link = revalidateLink({ lastError: 'Sales order has a line with no SKU; cannot push to WMS', attempts: 2 })
+  const warnings: string[] = []
+  const originalWarn = console.warn
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }
+  let r
+  let guardMisses
+  try {
+    const port = makePort({
+      revalidatable: { links: [link], total: 1 },
+      // Worker A got there first: by the time this write lands the link is A's live claim.
+      stateAtWrite: () => 'PENDING_CREATE',
+    })
+    guardMisses = port.guardMisses
+    r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port.port, { now: NOW })
+    assert.deepEqual(port.updates, [], 'nothing may be written over the other worker')
+    assert.deepEqual(port.events.filter((e) => e.action === 'order_validate'), [], 'and nothing audited')
+  } finally {
+    console.warn = originalWarn
+  }
+  assert.equal(r.revalidated, 0, 'a write that did not apply is not a revalidation')
+  assert.deepEqual(guardMisses, [{ id: 'link-1', fromState: 'VALIDATION_FAILED', actual: 'PENDING_CREATE' }])
+  assert.ok(warnings.some((w) => w.includes('left VALIDATION_FAILED')), 'and the operator is told')
+})
+
+test('o3d-2k5r r2 revalidate: the RE-STAMP is state-guarded too, and a lost race audits nothing', async () => {
+  // The same read-then-write window on the still-failing branch. Unguarded, this moved the
+  // winning worker's lease clock forward and stamped a stale lastError onto a link that had
+  // left this pass's jurisdiction.
+  const link = revalidateLink({
+    lastError: 'some older reason',
+    order: { ...candidate({ lines: [{ sku: null, qty: 1, taxForeign: 0, totalForeign: 10, description: 'x' }] }), shipFromWarehouseId: 'wh-1' },
+  })
+  const { port, updates, events } = makePort({
+    revalidatable: { links: [link], total: 1 },
+    stateAtWrite: () => 'PENDING_CREATE',
+  })
+  await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.deepEqual(updates, [])
+  // The reason CHANGED, so the un-guarded version would have audited FAILED here.
+  assert.deepEqual(events.filter((e) => e.action === 'order_validate'), [])
+})
+
+test('o3d-2k5r r2 revalidate: a link carrying a WMS ORDER ID is NOT re-queued — the re-queue reads the delete guard\'s rule', async () => {
+  // The MEDIUM. `revalidatableLinks` filtered on state and order eligibility only, so a link the
+  // hard-delete guard REFUSES to let go of ("a call may have been dispatched") was promoted
+  // straight back into createCandidates — which selects on state alone — and re-pushed with no
+  // verification. The comment on the guard says such a link can carry a REAL external id, so
+  // that re-push mints a second warehouse order and overwrites the first id.
+  const link = revalidateLink({ attempts: 1, externalOrderId: 'wms-77' })
+  const warnings: string[] = []
+  const originalWarn = console.warn
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }
+  let r
+  try {
+    const { port, updates, events } = makePort({ revalidatable: { links: [link], total: 1 } })
+    r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+    assert.deepEqual(updates, [], 'not promoted, and not re-stamped either')
+    assert.deepEqual(events.filter((e) => e.action === 'order_validate'), [])
+  } finally {
+    console.warn = originalWarn
+  }
+  assert.equal(r.revalidated, 0)
+  const notice = warnings.find((w) => w.includes('NOT re-queued'))
+  assert.ok(notice, 'an unpromotable parked link must be surfaced, not silently skipped')
+  assert.match(notice!, /wms-77/)
+})
+
+test('o3d-2k5r r2 revalidate: a PUSH STAMP with no id blocks the re-queue as well', async () => {
+  // The other half of the same rule. A released HELD link keeps its pushedAt, and can then be
+  // converted to VALIDATION_FAILED — so this shape is reachable, unlike the attempts-0 variant
+  // the old predicate comment claimed to catch.
+  const link = revalidateLink({ attempts: 1, pushedAt: new Date('2026-06-01T00:00:00.000Z') })
+  const originalWarn = console.warn
+  console.warn = () => {}
+  let r
+  try {
+    const { port, updates } = makePort({ revalidatable: { links: [link], total: 1 } })
+    r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+    assert.deepEqual(updates, [])
+  } finally {
+    console.warn = originalWarn
+  }
+  assert.equal(r.revalidated, 0)
+})
+
+test('o3d-2k5r r2 release: the HELD reset is state-guarded — a link that moved on keeps its new id', async () => {
+  // The THIRD write in this sweep that re-opens a create, and the same hazard: this one nulls
+  // externalOrderId. A releases the link, claims it and pushes it to SYNCED under a FRESH WMS
+  // id; B's unguarded release then stamped PENDING_CREATE back over that and DISCARDED the new
+  // id, so the next sweep created a second warehouse order and IMS no longer held a reference
+  // to the first.
+  const originalWarn = console.warn
+  const warnings: string[] = []
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }
+  let r
+  try {
+    const { port, updates, events } = makePort({
+      releasable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-old' }],
+      stateAtWrite: () => 'SYNCED',
+    })
+    r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+    assert.deepEqual(updates, [])
+    assert.deepEqual(events.filter((e) => e.action === 'order_release'), [])
+  } finally {
+    console.warn = originalWarn
+  }
+  assert.equal(r.released, 0)
+  assert.ok(warnings.some((w) => w.includes('left HELD')))
+})
+
+test('o3d-2k5r r2 release: the winning worker DOES release, guarded on HELD', async () => {
+  // The negative above is only worth anything if the guarded write applies in the normal case.
+  const { port, updates } = makePort({ releasable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-old' }] })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.released, 1)
+  assert.equal(updates[0].ifState, 'HELD')
+  assert.equal(updates[0].data.externalOrderId, null)
 })
 
 test('release: a HELD link is reset to PENDING_CREATE (external id cleared)', async () => {
@@ -669,7 +803,8 @@ test('audit: remote create succeeds but the link write fails → event stays SUC
 
 test('audit: a failed release records no event and does not count (Codex r1)', async () => {
   const { port, events } = makePort({ releasable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-old' }] })
-  port.updateLink = async () => { throw new Error('db down') }
+  // o3d-2k5r r2: the release write is the STATE-GUARDED one now, so that is the write to break.
+  port.updateLinkIfState = async () => { throw new Error('db down') }
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
   assert.equal(r.released, 0)
   assert.equal(events.filter((entry) => entry.action === 'order_release').length, 0)

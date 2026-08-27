@@ -23,6 +23,8 @@ const state = {
   findManyArgs: [] as Row[],
   countArgs: [] as Row[],
   salesOrderFindManyArgs: [] as Row[],
+  updateManyArgs: [] as Row[],
+  updateManyCount: 1,
 }
 
 function reset() {
@@ -33,6 +35,8 @@ function reset() {
   state.findManyArgs = []
   state.countArgs = []
   state.salesOrderFindManyArgs = []
+  state.updateManyArgs = []
+  state.updateManyCount = 1
 }
 
 const tx = {
@@ -56,6 +60,10 @@ mock.module('@/lib/db', {
       wmsOrderPushLink: {
         findMany: async (args: Row) => { state.findManyArgs.push(args); return [] },
         count: async (args: Row) => { state.countArgs.push(args); return 0 },
+        updateMany: async (args: Row) => {
+          state.updateManyArgs.push(args)
+          return { count: state.updateManyCount }
+        },
       },
       salesOrder: {
         findMany: async (args: Row) => { state.salesOrderFindManyArgs.push(args); return [] },
@@ -175,4 +183,57 @@ test('o3d-2k5r port: revalidatableLinks uses the SAME order eligibility as creat
     assert.deepEqual(revalidateWhere[key], candidateWhere[key], key)
   }
   assert.equal((state.findManyArgs[0].where as Row).state, 'VALIDATION_FAILED')
+})
+
+test('o3d-2k5r r2 port: updateLinkIfState is a COMPARE-AND-SET on the state, not a bare update', async () => {
+  reset()
+  const ok = await (await port()).updateLinkIfState('link-1', 'VALIDATION_FAILED', {
+    state: 'PENDING_CREATE', lastError: null, lastAttemptAt: null,
+  })
+
+  assert.equal(ok, true)
+  assert.equal(state.updateManyArgs.length, 1)
+  // The predicate is the whole point. `update({ where: { id } })` cannot express it, which is
+  // why this goes through the many-form: without `state` in the where, an overlapping sweep
+  // stamps a pre-push state over a link another worker has already claimed and pushed, and the
+  // create pass — whose candidate query selects on state alone — pushes the SAME order again.
+  assert.deepEqual(state.updateManyArgs[0].where, { id: 'link-1', state: 'VALIDATION_FAILED' })
+  assert.deepEqual(state.updateManyArgs[0].data, { state: 'PENDING_CREATE', lastError: null, lastAttemptAt: null })
+})
+
+test('o3d-2k5r r2 port: a CAS that matched no row reports false — the caller must not count it', async () => {
+  reset()
+  state.updateManyCount = 0
+  assert.equal(
+    await (await port()).updateLinkIfState('link-1', 'VALIDATION_FAILED', { state: 'PENDING_CREATE' }),
+    false,
+  )
+})
+
+test('o3d-2k5r r2 port: revalidatableLinks filters on the SHARED no-WMS-order columns, and selects them', async () => {
+  reset()
+  const { NO_WMS_ORDER_COLUMNS } = await import('../lib/domain/wms/order-push-sweep.ts')
+  await (await port()).revalidatableLinks!('mintsoft', ['wh-1'], 25)
+
+  const args = state.findManyArgs[0]
+  const where = args.where as Row
+  // Not "pushedAt: null, externalOrderId: null" restated here — the SAME object the re-queue
+  // guard reads, so a column added to the rule is added to the query by construction. A link
+  // the hard-delete guard refuses to let go of must never occupy a slot in this bounded batch:
+  // nothing in the pass re-stamps a skipped link, and the ordering is lastAttemptAt-nulls-first,
+  // so a handful of them would sit at the head of the queue and starve the promotable tail.
+  for (const [column, value] of Object.entries(NO_WMS_ORDER_COLUMNS)) {
+    assert.deepEqual(where[column], value, column)
+  }
+  // And the COUNT must apply the same filter, or the overflow notice reports a backlog that
+  // includes rows this pass can never act on.
+  for (const [column, value] of Object.entries(NO_WMS_ORDER_COLUMNS)) {
+    assert.deepEqual((state.countArgs[0].where as Row)[column], value, `count: ${column}`)
+  }
+  // Selected as well as filtered, so the core decides with the shared predicate rather than
+  // trusting this port to have filtered.
+  const select = args.select as Row
+  for (const column of Object.keys(NO_WMS_ORDER_COLUMNS)) {
+    assert.equal(select[column], true, `select: ${column}`)
+  }
 })

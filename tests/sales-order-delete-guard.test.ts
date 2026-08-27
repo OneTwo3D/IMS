@@ -279,18 +279,61 @@ test('o3d-2k5r: provesNoRemoteWmsCall — an ABSENT link is the ONLY uncondition
   assert.equal(provesNoRemoteWmsCall({ ...clean, state: 'PENDING_CREATE' }), false)
   // Nor is a dead letter, which has exactly the same three columns as the clean case.
   assert.equal(provesNoRemoteWmsCall({ ...clean, state: 'DEAD_LETTER' }), false)
-  // Each of the three columns is load-bearing on its own.
+  // ATTEMPTS is the conjunct that decides real rows: every conversion of a pre-existing link
+  // raises it to at least AMBIGUOUS_ATTEMPTS, which is the whole mechanism by which "a claim was
+  // taken and we never learned the outcome" stops reading as proof.
   assert.equal(provesNoRemoteWmsCall({ ...clean, attempts: 1 }), false)
+
+  // o3d-2k5r r2. The other two are NOT "load-bearing on their own" for THIS reader, and the
+  // comment that said so was wrong. No writer in order-push-sweep.ts can produce a
+  // VALIDATION_FAILED link carrying a pushedAt or an externalOrderId AT ATTEMPTS 0: the create
+  // branch of recordValidationFailure mints all three columns together from
+  // NO_REMOTE_WMS_CALL_COLUMNS, and every conversion path raises attempts first. So these two
+  // assertions pin FAIL-CLOSED behaviour against a shape this file cannot currently produce —
+  // a row written by a future path, a migration, or a hand-edit — and they are kept for exactly
+  // that. They are not the justification for the conjuncts existing.
   assert.equal(provesNoRemoteWmsCall({ ...clean, pushedAt: new Date() }), false)
   assert.equal(provesNoRemoteWmsCall({ ...clean, externalOrderId: 'wms-1' }), false)
 })
 
-test('o3d-92fu: a VALIDATION_FAILED link carrying an external id still blocks', async () => {
-  // Zero attempts but a remote id is a contradiction that can only mean the row was written by
-  // something other than the pre-call path. Fail closed: an id is positive evidence the
-  // warehouse holds this order.
+test('o3d-2k5r r2: wmsOrderMayExist — the re-queue reads the SAME columns and reaches a WEAKER answer', async () => {
+  // The pushedAt / externalOrderId conjuncts ARE reachable and decisive here, which is what
+  // makes them worth keeping: this reader's caller (the revalidation re-queue) sees links at
+  // attempts >= 1, because a VALIDATION_FAILED link converted from a claim has already been
+  // raised to AMBIGUOUS_ATTEMPTS, and a released HELD link keeps its pushedAt.
+  const { wmsOrderMayExist, provesNoRemoteWmsCall } = await import('@/lib/domain/wms/order-push-sweep')
+
+  const spent = { state: 'VALIDATION_FAILED', attempts: 1, pushedAt: null, externalOrderId: null }
+  const withId = { ...spent, externalOrderId: 'wms-1' }
+  const withStamp = { ...spent, pushedAt: new Date() }
+
+  // WHERE THEY AGREE: an id or a push stamp means a warehouse order may exist. Both readers
+  // refuse — the delete guard will not erase the last local record of it, and the re-queue will
+  // not push over it. This is the finding: reading the same evidence and reaching OPPOSITE
+  // conclusions is what let a link the guard blocked a delete on be re-pushed unverified.
+  assert.equal(wmsOrderMayExist(withId), true)
+  assert.equal(provesNoRemoteWmsCall(withId), false)
+  assert.equal(wmsOrderMayExist(withStamp), true)
+  assert.equal(provesNoRemoteWmsCall(withStamp), false)
+
+  // WHERE THEY DELIBERATELY DIFFER, and the whole of the difference: spent attempts alone do
+  // NOT block a re-queue. Re-queueing hands the link back to the create ladder, which already
+  // retries a PENDING_CREATE link at attempts > 0 under the same MAX_ATTEMPTS bound and the
+  // same claim lease — bounded and reversible. Deleting is neither.
+  assert.equal(wmsOrderMayExist(spent), false)
+  assert.equal(provesNoRemoteWmsCall(spent), false)
+})
+
+test('o3d-92fu: a VALIDATION_FAILED link carrying an external id blocks, and the REFUSAL NAMES THE ORDER', async () => {
+  // o3d-2k5r r2: attempts 1, not 0. The attempts-0 variant this used to assert is a row no
+  // writer in order-push-sweep.ts can produce (every conversion raises attempts first), so the
+  // test proved the guard held for a shape it will never meet. At attempts 1 the row is the one
+  // production actually makes — a converted claim whose payload later stopped building — and
+  // the assertion that still bites is the EVIDENCE the message cites: naming the count instead
+  // of the id printed "0 push attempt(s) may already have been dispatched" for a link carrying
+  // a real warehouse order, a refusal whose own stated reason argued for the delete.
   const blocker = await findSalesOrderDeleteBlocker(
-    makeTx({ pushLink: { state: 'VALIDATION_FAILED', externalOrderId: 'wms-77', externalOrderNumber: 'WN-77', attempts: 0, pushedAt: null } }),
+    makeTx({ pushLink: { state: 'VALIDATION_FAILED', externalOrderId: 'wms-77', externalOrderNumber: 'WN-77', attempts: 1, pushedAt: null } }),
     'order-1',
     STAMPS,
   )

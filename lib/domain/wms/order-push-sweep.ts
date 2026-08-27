@@ -729,6 +729,14 @@ export async function runWmsOrderPushSweepCore(
       // id. `wmsOrderMayExist` is the same function the hard-delete guard's rule is built from,
       // so the two readers cannot reach opposite conclusions from the same columns.
       //
+      // The Prisma port ALSO filters on these columns, spread from the same constant, so
+      // against THAT port this branch is unreachable. The two are not redundant: the query
+      // filter is what keeps an unpromotable link out of the BOUNDED batch it would otherwise
+      // sit at the head of forever (nothing here re-stamps a skipped link, and the ordering is
+      // lastAttemptAt-nulls-first), and this check is what makes the DECISION the shared
+      // rule's, for any port. So the skipped link is surfaced by the sync-exceptions inbox
+      // rather than by the warning below, which only fires for a port that did not filter.
+      //
       // Deliberately WEAKER than provesNoRemoteWmsCall, and this is the whole of the
       // difference: `attempts > 0` does NOT block a re-queue. Re-queueing hands the link back
       // to the create ladder, which already retries a PENDING_CREATE link at attempts > 0 under
@@ -1744,9 +1752,11 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       // all. Nothing in this pass re-stamps a skipped link, and the ordering is
       // `lastAttemptAt asc nulls first`, so a handful of permanently-unpromotable links would
       // sit at the head of the queue every sweep and starve the promotable tail behind them.
-      // Such a link stays parked as VALIDATION_FAILED with its lastError, visible to an
-      // operator, and is not silently dropped: `total` counts only what this pass can act on,
-      // which is what the overflow notice claims it counts.
+      // Such a link is not silently dropped. It stays parked as VALIDATION_FAILED and is listed
+      // by the sync-exceptions inbox, whose BLOCKED_WMS_PUSH_STATES includes VALIDATION_FAILED
+      // precisely so a state nothing retries on its own cannot become an invisible
+      // non-delivery. And `total` then counts only what this pass can act on, which is what the
+      // overflow notice claims it counts.
       const where = {
         connector,
         state: 'VALIDATION_FAILED',
