@@ -517,12 +517,12 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
       check: 'nothing this attempt did needs undoing — it created no attachment. THEN GO AND READ '
         + 'quickbooks_sync_attach_pdf AS IT STANDS NOW, because this record cannot: if it is off, the '
         + 'replay above stays a no-op and there is nothing to change; if it is ON, the replay uploads '
-        + 'to the bill, and you are choosing between turning it off — which stops attachment uploads '
-        + 'for EVERY bill on this connector, not this one — and letting the uploads happen and '
-        + 'clearing the duplicates afterwards. TURNING IT OFF IS NOT A FENCE EITHER: the handler '
+        + 'to a bill THIS RECORD DOES NOT NAME, so there is no duplicate this record can send you to. '
+        + 'The one lever here is that setting, and it stops attachment uploads for EVERY bill on this '
+        + 'connector rather than for this one. TURNING IT OFF IS NOT A FENCE EITHER: the handler '
         + 'reads that setting and then uploads, so a run already past the read still uploads, and '
         + 'nothing in IMS reports whether one is. Only closing the row stops the replay, and IMS '
-        + 'cannot close it (o3d-4b5p)',
+        + 'cannot close it (o3d-4b5p). Escalate this record to whoever administers this installation',
     },
     UNRECORDED: {
       effect: 'either the supplier invoice PDF is uploaded to that bill in QuickBooks AGAIN once per '
@@ -1370,8 +1370,7 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
         + 'for one',
       remedy: 'REMEDY: DO NOT OPEN, KEEP OR VOID EITHER THE BILL OR THE CREDIT NOTE ON THE STRENGTH OF '
         + 'THIS RECORD. Both of them existed before this operation and neither was created by it; what '
-        + 'happened is that one was applied to the other, and the only thing that undoes it is removing '
-        + 'that allocation from the credit note in {ledger}. Escalate this record to whoever '
+        + 'happened is that one was applied to the other. Escalate this record to whoever '
         + 'administers this installation.',
       needs: [],
     },
@@ -1404,8 +1403,8 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
     // second cell, which refuses to send the operator to a bill rather than implying one.
     BILL_ATTACHMENT: {
       MADE: {
-        stands: 'AN ATTACHMENT NOW EXISTS ON {LEDGER} BILL {ledgerTargetId}, and no standalone '
-          + 'accounting document was created. ',
+        stands: 'THIS ATTEMPT UPLOADED AN ATTACHMENT ONTO {LEDGER} BILL {ledgerTargetId}, and no '
+          + 'standalone accounting document was created. ',
         did: 'it uploaded a supplier-invoice PDF onto {ledger} bill {ledgerTargetId}, which already '
           + 'existed. THE UPLOAD HAPPENED. No id came back for the attachment itself, because an '
           + 'attachment is not a document',
@@ -1416,8 +1415,8 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
         lookupNoun: 'that bill',
       },
       MADE_TARGET_UNRECORDED: {
-        stands: 'AN ATTACHMENT NOW EXISTS ON A BILL IN {LEDGER}, AND THIS RECORD DOES NOT NAME THAT '
-          + 'BILL. ',
+        stands: 'THIS ATTEMPT UPLOADED AN ATTACHMENT ONTO A BILL IN {LEDGER}, AND THIS RECORD DOES '
+          + 'NOT NAME THAT BILL. ',
         did: 'it uploaded a supplier-invoice PDF onto a bill that already existed in {ledger}. THE '
           + 'UPLOAD HAPPENED. No id came back because an attachment is not a document, and this '
           + 'record does not carry the id of the bill it went onto either',
@@ -1661,6 +1660,28 @@ export function incidentKindForOperation(
  * `LEDGER_DOCUMENT` is downgraded; the other kinds are the ones whose id is EXPECTED to be absent,
  * and their wording never promised one.
  */
+/**
+ * WHAT A STORED BLOB SAYS THIS ATTEMPT DID — ONE READER, USED BY EVERYTHING THAT READS ONE
+ * (round 13, Codex HIGH).
+ *
+ * EVERY KEY IS OPTIONAL AND EVERY ABSENT KEY READS AS "NOT RECORDED". That is not defensive
+ * coding: rows written by older binaries of this same module genuinely do not carry these keys —
+ * `postingMode` and `externalEffect` arrived in round 10, `ledgerTargetId` in round 12 — and the
+ * whole point of the outcome variants is that a record which cannot say something must say so
+ * rather than let a wording assume it. `ledgerTargetId` absent is `null`, `null` selects
+ * `MADE_TARGET_UNRECORDED`, and that cell refuses to send an operator to a bill.
+ */
+function outcomeFromStoredMetadata(metadata: object): PostedOperationOutcome {
+  const postingMode = (metadata as { postingMode?: unknown }).postingMode
+  const externalEffect = (metadata as { externalEffect?: unknown }).externalEffect
+  const ledgerTargetId = (metadata as { ledgerTargetId?: unknown }).ledgerTargetId
+  return {
+    postingMode: postingMode === 'LIVE' || postingMode === 'DRAFT' ? postingMode : undefined,
+    externalEffect: externalEffect === 'MADE' || externalEffect === 'NONE' ? externalEffect : undefined,
+    ledgerTargetId: typeof ledgerTargetId === 'string' ? nonEmpty(ledgerTargetId) : null,
+  }
+}
+
 export function classifyUnrecordedIncident(metadata: unknown): UnrecordedIncidentKind {
   if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) return 'UNCLASSIFIED'
   const type = (metadata as { type?: unknown }).type
@@ -1669,19 +1690,85 @@ export function classifyUnrecordedIncident(metadata: unknown): UnrecordedInciden
   // too. This function is the part that is only about reading a stored blob.
   // ROUND 10: the two facts the TYPE cannot supply. A blob that carries neither is not a blob about
   // a live posting; it is a blob that does not say, and `incidentKindForOperation` treats it so.
-  const postingMode = (metadata as { postingMode?: unknown }).postingMode
-  const externalEffect = (metadata as { externalEffect?: unknown }).externalEffect
   // ROUND 12: and the third fact, so a blob read back produces the SAME outcome the formatter held.
-  const ledgerTargetId = (metadata as { ledgerTargetId?: unknown }).ledgerTargetId
+  // ROUND 13: read by `outcomeFromStoredMetadata`, which is now the single reader of a stored blob.
   return incidentKindForOperation(
     typeof type === 'string' ? type : null,
     typeof postedExternalId === 'string' ? postedExternalId : null,
-    {
-      postingMode: postingMode === 'LIVE' || postingMode === 'DRAFT' ? postingMode : undefined,
-      externalEffect: externalEffect === 'MADE' || externalEffect === 'NONE' ? externalEffect : undefined,
-      ledgerTargetId: typeof ledgerTargetId === 'string' ? ledgerTargetId : null,
-    },
+    outcomeFromStoredMetadata(metadata),
   )
+}
+
+/** Which ledger an incident record is about, decided by the action name that made it. */
+function ledgerForIncidentAction(action: string): 'Xero' | 'QuickBooks' | undefined {
+  if (action === UNRECORDED_POSTED_DOCUMENT_ACTION) return 'Xero'
+  if (action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION) return 'QuickBooks'
+  return undefined
+}
+
+/**
+ * THE REMEDY THIS VERSION OF IMS WOULD WRITE FOR AN ALREADY-STORED RECORD (round 13, Codex HIGH).
+ *
+ * THE DEFECT. Round 12 split `MADE` into "the bill id is retained" and "it is not", and the second
+ * cell refuses to send an operator to a bill the record cannot name. Every path that BUILDS one of
+ * these records routes a missing id into it — there are three, and they all read the id off the
+ * sync row's own payload — but that fixed only records written from now on. The description is
+ * RENDERED ONCE and stored in `ActivityLog.description`; nothing re-renders it; the record is
+ * exempt from retention AND from the factory reset. So a record written before round 12 keeps the
+ * round-11 sentence "open that bill … and remove the duplicate attachment" for ever, about a bill
+ * that after a reset nothing in this installation can identify — and the new cell it should have
+ * landed in was, for those records, unreachable. A cell no record can reach is not a fix.
+ *
+ * SO THERE IS NOW A ROUTE. This rebuilds the remedy from the record's own METADATA, which is
+ * structured and is read by the same `outcomeFromStoredMetadata` the classifier uses, so a stored
+ * blob selects exactly the wording cell the formatter would select today. A blob with no
+ * `ledgerTargetId` selects `MADE_TARGET_UNRECORDED`; a blob with no `externalEffect` selects
+ * `UNRECORDED`; both refuse to name a bill. It is ADDITIVE — nothing rewrites the stored sentence,
+ * because the stored sentence also carries this incident's cause and its ids, and a permanent
+ * record of a live remote effect is the last thing to overwrite on a best guess. The stored text
+ * being wrong in its own right is filed as o3d-hh3n (a backfill, which needs a write this branch
+ * may not make).
+ *
+ * WHAT IT ANSWERS FOR. The NON-DOCUMENT operations — the ones whose remedy can name a remote object
+ * this record may or may not hold, which is the whole class this finding is about. For a document
+ * incident it returns `undefined` and says nothing: those remedies are chosen by the ROW's state at
+ * the moment of the conflict (which document the row named instead), and the metadata does not
+ * carry enough to re-decide that without guessing — which is the mistake, not the fix.
+ */
+export function remedyForStoredIncident(action: string, metadata: unknown): string | undefined {
+  const ledger = ledgerForIncidentAction(action)
+  if (!ledger) return undefined
+  if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) return undefined
+  const type = (metadata as { type?: unknown }).type
+  if (typeof type !== 'string') return undefined
+  const outcome = outcomeFromStoredMetadata(metadata)
+  const wording = nonDocumentWordingFor(type, outcome)
+  if (!wording) return undefined
+  const postedExternalId = (metadata as { postedExternalId?: unknown }).postedExternalId
+  return render(wording.remedy, {
+    ledger,
+    postedExternalId: typeof postedExternalId === 'string' ? nonEmpty(postedExternalId) : null,
+    ledgerTargetId: outcome.ledgerTargetId ?? null,
+    lookup: wording.lookup,
+    lookupNoun: wording.lookupNoun,
+  })
+}
+
+/**
+ * THE REMEDY TO SHOW BESIDE A STORED RECORD, OR NOTHING (round 13, Codex HIGH).
+ *
+ * The only thing that decides it is whether the stored sentence ALREADY CONTAINS what this version
+ * would write. A record written by this version does, and gets nothing added; a record written
+ * before round 12 does not, and gets the current remedy printed next to the one it was given. No
+ * version stamp is consulted, because there is not one on these rows and inventing a cut-off date
+ * would be a guess about which binary wrote a row — the text either agrees or it does not.
+ */
+export function supersedingRemedyForStoredIncident(
+  row: { action: string; description: string; metadata: unknown },
+): string | undefined {
+  const remedy = remedyForStoredIncident(row.action, row.metadata)
+  if (!remedy) return undefined
+  return row.description.includes(remedy) ? undefined : remedy
 }
 
 /** One tally per kind, so a caller cannot report a total it has not broken down. */
