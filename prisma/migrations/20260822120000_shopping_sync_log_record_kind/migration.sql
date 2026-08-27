@@ -324,20 +324,61 @@ UPDATE "shopping_sync_logs"
 --                                                          ANY status, so settling the row does not
 --                                                          hide it.
 --   4. shopping_sync_logs operator recovery note on a held-invoice payload
---                                                        — an old binary's recovery inbox let an
---                                                          operator DISMISS or REASSIGN a held
---                                                          sales invoice; case (c) above. A
---                                                          dismissed hold is never invoiced.
+--                                                        — the DISMISS half of case (c): an old
+--                                                          binary's recovery inbox let an operator
+--                                                          dismiss a held sales invoice, which is
+--                                                          never invoiced afterwards. A DISMISS
+--                                                          moves neither entityId nor the payload,
+--                                                          so this one requires
+--                                                          salesOrderId = entityId.
 --   5. shopping_sync_logs held-invoice payload naming another order
---                                                        — the REASSIGN half of case (c), and the
---                                                          state check 3 loses when a row it was
---                                                          catching is moved.
+--                                                        — the REASSIGN half of case (c), the state
+--                                                          check 3 loses when a row it was catching
+--                                                          is moved, and where reassign-then-dismiss
+--                                                          lands (it reads neither status nor
+--                                                          message). It requires a STRING
+--                                                          salesOrderId that differs from entityId.
 --   6. shopping_sync_logs held-release outcome on a row that is not a hold
 --                                                        — case (d): the old release sweep settled a
 --                                                          mis-selected refund park. On the
 --                                                          'Superseded' outcome the park is SYNCED
 --                                                          and gone from the recovery inbox with an
 --                                                          unrefunded amount on it.
+--
+-- ---------------------------------------------------------------------------------------------
+-- A HOLD-SHAPED PAYLOAD WITH NO ORDER ID — MANUAL, AND DELIBERATELY NOT A VERIFY CHECK (Codex r12).
+--
+-- Checks 4 and 5 used to spell their identity clause `IS DISTINCT FROM`, so that a hold payload
+-- which had LOST its salesOrderId counted as the same contradiction. That is not free: an ABSENT
+-- member SATISFIES `IS DISTINCT FROM`, and every raw WooCommerce refund body is a payload with no
+-- salesOrderId — so a genuine refund park decorated with the other members was selected as damage,
+-- on a healthy database, by a hook that runs with the application and the database fenced.
+--
+-- The missing member cannot be told apart from external decoration by any clause available here, so
+-- it is diagnosed by HAND rather than by a check that stops a cutover over it. Run this when
+-- something else has already given you reason to look — it returns rows, it does not fail anything:
+--
+--   SELECT id, "recordKind", status, "entityId", "externalId", "errorMessage"
+--     FROM "shopping_sync_logs"
+--    WHERE connector = 'woocommerce'
+--      AND direction = 'FROM_CONNECTOR'
+--      AND "entityType" = 'SalesOrder'
+--      AND jsonb_typeof(payload) = 'object'
+--      AND payload->'id' IS NULL
+--      AND payload->>'reason' = 'missing_wc_invoice_number'
+--      AND payload->>'connector' = 'woocommerce'
+--      AND jsonb_typeof(payload->'externalOrderId') = 'string'
+--      AND jsonb_typeof(payload->'externalOrderNumber') = 'string'
+--      AND jsonb_typeof(payload->'orderNumber') = 'string'
+--      AND jsonb_typeof(payload->'metaKey') = 'string'
+--      AND jsonb_typeof(payload->'accountingPayload') = 'object'
+--      AND "externalId" = payload->>'externalOrderId'
+--      AND payload->'salesOrderId' IS NULL;
+--
+-- A row it returns is a hold whose payload no longer names any order. `payload->'id' IS NULL` and
+-- the externalId equality are what keep a decorated refund body out of the ANSWER as well as out of
+-- the checks — a diagnostic nobody trusts is not a diagnostic.
+-- ---------------------------------------------------------------------------------------------
 --
 -- 1 is repairable by re-running the two UPDATE statements above. 2 is repairable ONLY once the rows
 -- have been confirmed to be refund parks: statement 2 stamps whatever it matches as
