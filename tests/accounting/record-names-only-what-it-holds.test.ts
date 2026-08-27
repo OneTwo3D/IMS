@@ -8,6 +8,7 @@ import {
   DOCUMENT_INCIDENT_WORDING,
   NON_DOCUMENT_INCIDENT_WORDING,
   OPERATION_SEMANTIC_BY_TYPE,
+  QBO_OPERATIONS_WITHOUT_REQUEST_ID,
   RECORD_LOOKUP_FIELDS,
   describePreservedUnrecordedIncidents,
   describeUnpersistedQboPost,
@@ -54,6 +55,16 @@ const OUTCOMES: (PostedOperationOutcome | undefined)[] = [
   { externalEffect: 'NONE' as RemoteEffectOutcome },
   { postingMode: 'LIVE' as LedgerPostingMode, externalEffect: 'MADE' as RemoteEffectOutcome },
   { postingMode: 'DRAFT' as LedgerPostingMode, externalEffect: 'NONE' as RemoteEffectOutcome },
+  // ROUND 12: with and without the id of the document the operation acted ON. Without these the
+  // `{ledgerTargetId}` slot and the lookup clause built from it are never rendered here, and the
+  // unresolved-slot check below would pass by never reaching them.
+  { ledgerTargetId: 'LEDGER-BILL-1' },
+  { externalEffect: 'MADE' as RemoteEffectOutcome, ledgerTargetId: 'LEDGER-BILL-1' },
+  {
+    postingMode: 'LIVE' as LedgerPostingMode,
+    externalEffect: 'MADE' as RemoteEffectOutcome,
+    ledgerTargetId: 'LEDGER-BILL-1',
+  },
 ]
 
 /** Every message the module can produce, for every type, every id combination and every outcome. */
@@ -171,6 +182,33 @@ function everyWordingEntry(): WordingEntryView[] {
   return out
 }
 
+/**
+ * THE THIRD WORDING TABLE, WHICH ROUND 11 NAMED AS A HOLE AND ROUND 12 PUT INSIDE THE FENCE.
+ *
+ * `QBO_OPERATIONS_WITHOUT_REQUEST_ID` is shipped operator prose exactly like the other two — it is
+ * what the QuickBooks frames print under "WHAT A REPLAY WOULD COST" and "WHAT TO DO ABOUT THE
+ * EFFECT" — and round 11 left it outside every check here, writing that the hole was "named rather
+ * than left to be found". It had a live instance in it: `BILL_ATTACHMENT.MADE.check` said "open the
+ * bill in QuickBooks and delete any duplicate attachment" about a bill nothing in the record named.
+ */
+function everyReplayWordingEntry(): WordingEntryView[] {
+  const out: WordingEntryView[] = []
+  for (const [type, entry] of Object.entries(QBO_OPERATIONS_WITHOUT_REQUEST_ID)) {
+    if (!entry) continue
+    const variants = 'effect' in entry ? { '': entry } : entry
+    for (const [variant, w] of Object.entries(variants)) {
+      const { needs, lookup, ...rest } = w
+      out.push({
+        label: `QBO_OPERATIONS_WITHOUT_REQUEST_ID.${type}${variant ? `.${variant}` : ''}`,
+        templates: Object.values(rest),
+        needs: needs ?? [],
+        lookup: lookup ?? [],
+      })
+    }
+  }
+  return out
+}
+
 // ---------------------------------------------------------------------------------------------
 // ROUND 11 (Codex MEDIUM) — THE THIRD GENERATION OF THIS INVARIANT, AND THE HONEST ACCOUNT OF IT.
 //
@@ -269,8 +307,11 @@ test('ROUND 10 (Codex MEDIUM): every field a wording DECLARES is one every recor
   )
   assert.ok(!retained.has('rowNamesExternalId'), 'and it is NOT common to both, so a declaration of it must fail')
 
-  const entries = everyWordingEntry()
-  assert.ok(entries.length >= 12, `sanity: ${entries.length} wording entries were found`)
+  // ROUND 12: the replay table is in here now. Its `BILL_ATTACHMENT.MADE` entry is what declares
+  // `ledgerTargetId`, so this assertion is what proves BOTH record builders retain the bill id the
+  // remedy sends an operator to — parsed out of the two connector sources, not written down here.
+  const entries = [...everyWordingEntry(), ...everyReplayWordingEntry()]
+  assert.ok(entries.length >= 16, `sanity: ${entries.length} wording entries were found`)
   for (const { label, needs, lookup } of entries) {
     // ROUND 11: `lookup` is held to the same rule as `needs`, and for the same reason — the clause
     // it generates is rendered on BOTH connectors' doors, so a key only one builder writes would
@@ -299,7 +340,7 @@ test('ROUND 10: a wording names a record value only through a slot it declared, 
   const known = new Set<string>([...RECORD_LOOKUP_FIELDS, 'ledger', 'LEDGER', 'lookup', 'Lookup'])
   let sawOne = false
   let sawLookup = false
-  for (const { label, templates, needs, lookup } of everyWordingEntry()) {
+  for (const { label, templates, needs, lookup } of [...everyWordingEntry(), ...everyReplayWordingEntry()]) {
     for (const template of templates) {
       for (const [, slot] of template.matchAll(PLACEHOLDER)) {
         assert.ok(known.has(slot), `${label} names the slot "${slot}", which is not a thing this record holds`)
@@ -326,7 +367,7 @@ test('ROUND 10: a wording names a record value only through a slot it declared, 
   assert.ok(sawLookup, 'and a generated lookup clause, or the round-11 half proves nothing')
 
   // The other direction: a declaration nobody renders is a declaration nobody checks.
-  for (const { label, templates, lookup } of everyWordingEntry()) {
+  for (const { label, templates, lookup } of [...everyWordingEntry(), ...everyReplayWordingEntry()]) {
     if (lookup.length === 0) continue
     assert.ok(
       templates.some((template) => /\{Lookup\}|\{lookup\}/.test(template)),
@@ -345,8 +386,22 @@ test('ROUND 10: a wording names a record value only through a slot it declared, 
 // written down here, and it is a grammatical class rather than a list of data names — read the
 // block above this file's helpers for exactly what that does and does not cover.
 test('ROUND 11 (Codex MEDIUM): only the renderer may instruct a lookup, never a remedy in its own words', () => {
-  const entries = everyWordingEntry()
-  assert.ok(entries.length >= 12, `sanity: ${entries.length} wording entries were scanned`)
+  // ROUND 12: the replay table is scanned too, minus ONE named string. Round 11 exempted the WHOLE
+  // table on the strength of `INVOICE_EMAIL.check` instructing a query of the LOCAL EmailOutbox by
+  // its own columns — a different act from looking this incident's effect up in a ledger. That
+  // reasoning covers exactly that one string, and covering the table with it is how
+  // `BILL_ATTACHMENT.MADE.check` came to say "open the bill" unchecked.
+  const EXEMPT = 'QBO_OPERATIONS_WITHOUT_REQUEST_ID.INVOICE_EMAIL'
+  const replay = everyReplayWordingEntry()
+  const exempt = replay.find((entry) => entry.label === EXEMPT)
+  assert.ok(exempt, 'the exemption must name an entry that exists')
+  assert.notDeepEqual(
+    lookupVerbsWrittenInProse(exempt!.templates), [],
+    'and it must still NEED the exemption — if it no longer writes a lookup verb, delete the '
+    + 'exemption rather than keeping a hole nothing is standing in',
+  )
+  const entries = [...everyWordingEntry(), ...replay.filter((entry) => entry.label !== EXEMPT)]
+  assert.ok(entries.length >= 15, `sanity: ${entries.length} wording entries were scanned`)
   for (const { label, templates } of entries) {
     const verbs = lookupVerbsWrittenInProse(templates)
     assert.deepEqual(
@@ -388,6 +443,146 @@ test('ROUND 11 (Codex MEDIUM): only the renderer may instruct a lookup, never a 
     lookupVerbsWrittenInProse(['Go to the invoice whose gross total matches the order.']), [],
     'a lookup phrased without any of the direct verbs is NOT caught — the fence closes the verb, '
     + 'not the language, and this assertion exists so that claim is documented rather than assumed',
+  )
+})
+
+// ---------------------------------------------------------------------------------------------
+// ROUND 12 (Codex MEDIUM) — THE QUESTION THE LOOKUP-VERB LIST WAS A PROXY FOR.
+//
+// The lookup fence asks "does this remedy send an operator SEARCHING in its own words?". The thing
+// that actually goes wrong is one step further out: DOES THIS REMEDY TELL AN OPERATOR TO ACT ON A
+// SPECIFIC OBJECT THE RECORD CANNOT IDENTIFY? `open` is not a lookup verb, so
+// `BILL_ATTACHMENT.MADE` shipped "open that bill in {ledger} and remove the duplicate attachment"
+// with no lookup field declared and no bill id retained — and after a factory reset the
+// PurchaseOrder and the sync row are both deleted, so the operator had to guess which ledger bill
+// to strip an attachment off. The sweep found two more of the same shape: `WC_INVOICE_NOTE` ("open
+// that order in WooCommerce") and `TAX_RATE_SYNC` ("correct or archive that rate").
+//
+// SO THE FENCE ASKS THE ACTUAL QUESTION. An IMPERATIVE ACT VERB — a verb that changes something in
+// somebody else's system — may appear in a remedy only if that entry DECLARES a lookup, i.e. only
+// if the record can name what is being acted on. Prohibitions are stripped first, because "DO NOT
+// void it" needs no identifier: refusing to act on a thing does not require finding it.
+//
+// THE CLASS IS CLOSED BY GRAMMAR, like the lookup verbs: an imperative is a verb in a clause's
+// first position, and the act verbs are enumerated. What it does NOT cover, stated rather than
+// implied:
+//
+//   1. IT CHECKS THAT THE ENTRY CAN NAME SOMETHING, NOT THAT THE NAMED THING IS THE THING ACTED
+//      ON. `PAYMENT` declares a lookup on the payment id and instructs removing the payment, which
+//      is right; an entry that declared a lookup on one object and instructed action on another
+//      would pass.
+//   2. A GERUND OR A NOMINALISATION IS NOT AN IMPERATIVE, and is not caught.
+//      `PURCHASE_CREDIT_NOTE_ALLOCATION` says "the only thing that undoes it is removing that
+//      allocation from the credit note" — descriptive, and followed by an escalation rather than
+//      an instruction, which is why it is left as it stands.
+//   3. AN INSTRUCTION PHRASED WITHOUT ANY OF THESE VERBS still passes, for the same reason item 1
+//      of the round-11 block gives: English has no closed set of ways to tell someone to do
+//      something.
+// ---------------------------------------------------------------------------------------------
+
+/** Verbs that CHANGE something in somebody else's system. Closed, and enumerated. */
+const ACT_VERB = /^(open|remove|delete|void|reverse|correct|archive|cancel|credit-note|amend|edit|detach)\b/i
+
+/**
+ * A clause boundary, for deciding what is in IMPERATIVE position. Deliberately NOT `, ` or ` or `:
+ * "there is nothing here to open, keep or void as one" is a description, and splitting on those
+ * turns its tail into a false imperative.
+ */
+const CLAUSE_BOUNDARY = /(?:\.\s|;\s|:\s|—\s|\band\s)/
+
+/** Every act this set of templates INSTRUCTS. A prohibition instructs nothing and is stripped. */
+function actsInstructed(templates: readonly string[]): string[] {
+  const found: string[] = []
+  for (const template of templates) {
+    const prose = template
+      .replace(/\{Lookup\}|\{lookup\}/g, ' ')
+      .replace(/\bdo not\b[^.;:]*/gi, ' ')
+    for (const clause of prose.split(CLAUSE_BOUNDARY)) {
+      const match = ACT_VERB.exec(clause.trim())
+      if (match) found.push(match[1].toLowerCase())
+    }
+  }
+  return found
+}
+
+// MUTATION THAT KILLS THIS (run): restore the shipped round-11 wording — put
+// `remedy: 'REMEDY: open that bill in {ledger} and remove the duplicate attachment. …'` back on
+// NON_DOCUMENT_INCIDENT_WORDING.BILL_ATTACHMENT.MADE_TARGET_UNRECORDED (the cell that cannot name a
+// bill) and this test fails naming that entry and the verbs `open, remove`. Restoring
+// WC_INVOICE_NOTE's "open that order in WooCommerce and remove any duplicate note" or
+// TAX_RATE_SYNC's "correct or archive that rate there" kills it the same way. Both mutations are
+// ALSO run inline below against the shipped checker, so weakening the checker fails this test
+// rather than quietly reopening the hole.
+//
+// ROUTE: the templates come from the SHIPPED wording tables — all three of them — and the
+// declaration each entry is judged against is the entry's own `lookup`. Only the verb list and the
+// clause grammar are written down here.
+test('ROUND 12 (Codex MEDIUM): a remedy may only instruct an act on an object the record can name', () => {
+  const entries = [...everyWordingEntry(), ...everyReplayWordingEntry()]
+  assert.ok(entries.length >= 16, `sanity: ${entries.length} wording entries were scanned`)
+
+  let sawPermitted = false
+  for (const { label, templates, lookup } of entries) {
+    const acts = actsInstructed(templates)
+    if (lookup.length > 0) {
+      if (acts.length > 0) sawPermitted = true
+      continue
+    }
+    assert.deepEqual(
+      acts, [],
+      `${label} instructs an operator to ${acts.join(', ')} — but it declares no lookup, so this `
+      + 'record cannot name the thing being acted on. Either retain and declare an identifier for '
+      + 'it, or replace the instruction with an escalation.',
+    )
+  }
+  assert.ok(
+    sawPermitted,
+    'no entry that CAN name its object instructs an act on it, so the permitted half proves nothing',
+  )
+
+  // ---------------------------------------------------------------------------------------------
+  // THE REQUIRED FAILING CASES. These are the three shipped wordings this round removed, run
+  // against the shipped checker.
+  // ---------------------------------------------------------------------------------------------
+  assert.deepEqual(
+    actsInstructed(['REMEDY: open that bill in {ledger} and remove the duplicate attachment. There '
+      + 'is no document to void, and the bill itself was not created by this attempt.']),
+    ['open', 'remove'],
+    'the round-11 attachment remedy is the finding, and it must be refused',
+  )
+  assert.deepEqual(
+    actsInstructed(['REMEDY: open that order in WooCommerce and remove any duplicate note. There is '
+      + 'nothing to void in {ledger}.']),
+    ['open', 'remove'],
+    'the WooCommerce note remedy is the same defect and must be refused',
+  )
+  assert.deepEqual(
+    actsInstructed(['REMEDY: THERE IS NOTHING TO VOID OR CREDIT — nothing was posted to a customer '
+      + 'or a supplier account. Review the tax rates in {ledger}, and correct or archive that rate '
+      + 'there if this write was wrong.']),
+    ['correct'],
+    'the tax-rate remedy is the same defect and must be refused',
+  )
+
+  // A PROHIBITION IS NOT AN INSTRUCTION, and must not be caught — refusing to act on a thing needs
+  // no identifier for it. This is the shipped UPDATE_DRAFT sentence.
+  assert.deepEqual(
+    actsInstructed(['DO NOT VOID OR CREDIT-NOTE IT — that would act on a document that was valid '
+      + 'before this attempt ran. DO NOT REVERSE IT — a reversal POSTS FOR REAL.']),
+    [],
+    'a prohibition names an act it forbids, and forbidding needs no lookup',
+  )
+
+  // AND THE HOLES, ASSERTED RATHER THAN IMPLIED — items 2 and 3 of the block above.
+  assert.deepEqual(
+    actsInstructed(['The only thing that undoes it is removing that allocation from the credit note.']),
+    [],
+    'a gerund is not an imperative and is NOT caught — this assertion exists so that is documented',
+  )
+  assert.deepEqual(
+    actsInstructed(['Go to that bill and take the second PDF off it.']), [],
+    'an instruction phrased without a listed verb is NOT caught — the fence closes the verb, not '
+    + 'the language',
   )
 })
 

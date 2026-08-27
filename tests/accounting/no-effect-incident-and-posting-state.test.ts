@@ -49,46 +49,52 @@ const LIVE: PostedOperationOutcome = { postingMode: 'LIVE' }
 // ---------------------------------------------------------------------------------------------
 
 const QBO_NO_EFFECT =
-  'QuickBooks BILL_ATTACHMENT for PurchaseOrder po-1 MADE NO EXTERNAL EFFECT. The handler returned '
-  + 'success WITHOUT ACTING: no request was sent, nothing was created, changed, uploaded or emailed, '
-  + 'and nothing in QuickBooks or anywhere else is different because this attempt ran. WHAT COULD NOT '
-  + 'BE RECORDED IS THAT IT RAN AT ALL: Error: write conflict. WHAT A REPLAY WOULD COST: sync row '
-  + 'log-1 still holds this worker\'s claim and no mirrored accounting event was written, so once that '
-  + 'claim goes stale the sweep will reclaim the row and run the operation again. Running it again '
-  + 'does NOTHING AT ALL — attachment upload is turned off for this connector, so every sweep re-runs '
-  + 'a handler that returns success without contacting QuickBooks and without uploading anything. '
-  + 'WHAT TO DO ABOUT THE EFFECT: nothing needs undoing for the attachment: this attempt created '
-  + 'none, and no replay creates one while that setting stays off. DO NOT TURN QUICKBOOKS SYNC OFF '
-  + 'FOR THIS ONE. That switch is the containment lever for an incident where something DID reach '
-  + 'QuickBooks. There is nothing here to contain, and turning it off stops EVERY QuickBooks row on '
-  + 'this installation — invoices, bills, payments and journals with nothing to do with this row — '
-  + 'for as long as it stays off. IF YOU WANT THE REPLAY TO STAY A NO-OP, LEAVE ATTACHMENT UPLOAD '
-  + 'DISABLED: the setting is quickbooks_sync_attach_pdf, and enabling it is the single change that '
-  + 'would make the next sweep act for real. Leave it as it is until the write failure above is '
-  + 'fixed. WHAT IS ACTUALLY WRONG IS THE WRITE, NOT THE OPERATION: sync row log-1 is left PROCESSING '
-  + 'at attempt revision 0 with no mirrored event, and nothing in IMS will settle it. Fix the failure '
-  + 'named above, and ESCALATE sync row log-1, with this record, to whoever administers this '
-  + 'installation: closing it safely needs someone who can read the database directly (o3d-4b5p, '
-  + 'o3d-3lhp). ONE THING ON SCREEN IS ACTIVELY WRONG AND YOU WILL SEE IT: the accounting log renders '
-  + 'a settle control for every FAILED or PROCESSING row, and on this one it resolves to the words '
-  + '"not settleable" with its reason as the tooltip. DO NOT FOLLOW THAT TOOLTIP. It tells you to '
-  + 'retry the row until it shows an attempt revision, and the QuickBooks claim never stamps one, so '
-  + 'no number of retries will ever make an attempt appear. This is the known hole o3d-qn21. WHAT '
-  + 'THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time '
-  + 'this record was written — the write it describes was made in the same sync attempt. That is all '
-  + 'of it.'
+  'QuickBooks BILL_ATTACHMENT for PurchaseOrder po-1 MADE NO EXTERNAL EFFECT. The handler '
+  + 'returned success WITHOUT ACTING: no request was sent, nothing was created, changed, uploaded '
+  + 'or emailed, and nothing in QuickBooks or anywhere else is different because this attempt '
+  + 'ran. WHAT COULD NOT BE RECORDED IS THAT IT RAN AT ALL: Error: write conflict. WHAT A REPLAY '
+  + 'WOULD COST: sync row log-1 was left holding this worker\'s claim, with no mirrored accounting '
+  + 'event written, so once that claim goes stale the sweep will reclaim the row and run the '
+  + 'operation again. Running it again does NOTHING — PROVIDED ATTACHMENT UPLOAD IS STILL OFF '
+  + 'WHEN THE SWEEP RUNS. What this record knows is that quickbooks_sync_attach_pdf read "false" '
+  + 'AT THE MOMENT THIS ATTEMPT RAN, which is the only reading it ever took. If that setting is '
+  + 'on by the time the row is reclaimed, every sweep uploads the supplier invoice PDF to the '
+  + 'bill instead. WHAT TO DO ABOUT THE EFFECT: nothing this attempt did needs undoing — it '
+  + 'created no attachment. THEN GO AND READ quickbooks_sync_attach_pdf AS IT STANDS NOW, because '
+  + 'this record cannot: if it is off, the replay above stays a no-op and there is nothing to '
+  + 'change; if it is ON, the replay uploads to the bill, and you are choosing between turning it '
+  + 'off — which stops attachment uploads for EVERY bill on this connector, not this one — and '
+  + 'letting the uploads happen and clearing the duplicates afterwards. TURNING IT OFF IS NOT A '
+  + 'FENCE EITHER: the handler reads that setting and then uploads, so a run already past the '
+  + 'read still uploads, and nothing in IMS reports whether one is. Only closing the row stops '
+  + 'the replay, and IMS cannot close it (o3d-4b5p). DO NOT TURN QUICKBOOKS SYNC OFF FOR THIS '
+  + 'ONE. That switch is the containment lever for an incident where something DID reach '
+  + 'QuickBooks. There is nothing here to contain, and turning it off stops EVERY QuickBooks row '
+  + 'on this installation — invoices, bills, payments and journals with nothing to do with this '
+  + 'row — for as long as it stays off. WHAT IS ACTUALLY WRONG IS THE WRITE, NOT THE OPERATION: '
+  + 'sync row log-1 was left PROCESSING at attempt revision 0 with no mirrored event, and nothing '
+  + 'in IMS will settle it. Fix the failure named above, and ESCALATE sync row log-1, with this '
+  + 'record, to whoever administers this installation: closing it safely needs someone who can '
+  + 'read the database directly (o3d-4b5p, o3d-3lhp). ONE THING ON SCREEN IS ACTIVELY WRONG AND '
+  + 'YOU WILL SEE IT: the accounting log renders a settle control for every FAILED or PROCESSING '
+  + 'row, and on this one it resolves to the words "not settleable" with its reason as the '
+  + 'tooltip. DO NOT FOLLOW THAT TOOLTIP. It tells you to retry the row until it shows an attempt '
+  + 'revision, and the QuickBooks claim never stamps one, so no number of retries will ever make '
+  + 'an attempt appear. This is the known hole o3d-qn21. WHAT THIS RECORD HOLDS: the operation '
+  + 'type, the IMS reference above, the sync row id, and the time this record was written — the '
+  + 'write it describes was made in the same sync attempt. That is all of it.'
 
 const XERO_NO_EFFECT =
   'Xero BILL_ATTACHMENT for PurchaseOrder po-1 SUCCEEDED WITHOUT MAKING ANY EXTERNAL EFFECT — '
-  + 'nothing left this process and nothing in Xero changed — and IMS could not record that it ran. '
-  + 'WHAT THE OPERATION DID: it did nothing at all. Attachment upload is turned off for this '
-  + 'connector, so the handler returned success without contacting Xero and without uploading '
-  + 'anything. Its sync row log-1 no longer exists, so nothing in IMS references it. NOTHING LEFT '
-  + 'THIS PROCESS AND NOTHING IN XERO CHANGED. REMEDY: THERE IS NOTHING TO UNDO. No attachment was '
-  + 'created, no document was created, and nothing in Xero was touched by this attempt. WHAT THIS '
-  + 'RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this '
-  + 'record was written — the write it describes was made in the same sync attempt. That is all of '
-  + 'it.'
+  + 'nothing left this process and nothing in Xero changed — and IMS could not record that it '
+  + 'ran. WHAT THE OPERATION DID: it did nothing at all. Attachment upload READ AS OFF FOR THIS '
+  + 'CONNECTOR AT THE MOMENT THIS ATTEMPT RAN, so the handler returned success without contacting '
+  + 'Xero and without uploading anything. Its sync row log-1 no longer exists, so nothing in IMS '
+  + 'references it. NOTHING LEFT THIS PROCESS AND NOTHING IN XERO CHANGED. REMEDY: THERE IS '
+  + 'NOTHING TO UNDO. No attachment was created, no document was created, and nothing in Xero was '
+  + 'touched by this attempt. WHAT THIS RECORD HOLDS: the operation type, the IMS reference '
+  + 'above, the sync row id, and the time this record was written — the write it describes was '
+  + 'made in the same sync attempt. That is all of it.'
 
 const XERO_UPDATE_DRAFT =
   'Xero SALES_INVOICE_UPDATE for SalesOrder order-2 MODIFIED the existing Xero DRAFT document INV-1 '
@@ -147,9 +153,15 @@ test('ROUND 11 (Codex HIGH): an attempt that did nothing gets a whole message th
     'nor order it left off indefinitely')
   assert.match(message, /DO NOT TURN QUICKBOOKS SYNC OFF FOR THIS ONE/,
     'it refuses that instruction explicitly, because the operator has seen it on sibling records')
-  assert.match(message, /LEAVE ATTACHMENT UPLOAD DISABLED/,
+  // ROUND 12 (Codex HIGH): and it no longer TELLS the operator the setting is off. It names the
+  // setting, says what was read and WHEN, and sends them to read it as it stands — see
+  // tests/accounting/record-reads-settings-as-history.test.ts for the whole of that replacement.
+  assert.match(message, /quickbooks_sync_attach_pdf/,
     'the one setting that is actually load-bearing here')
-  assert.match(message, /quickbooks_sync_attach_pdf/)
+  assert.doesNotMatch(message, /LEAVE ATTACHMENT UPLOAD DISABLED/,
+    'a recorded reading of a mutable setting may not be given as an instruction about its current value')
+  assert.doesNotMatch(message, /Leave it as it is/,
+    'nor may the record tell an operator to leave a setting it has not read')
 })
 
 // MUTATION THAT KILLS THIS (run): make `nonDocumentEffectClaim` return 'MADE' unconditionally — the

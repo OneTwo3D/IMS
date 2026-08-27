@@ -476,7 +476,7 @@ type ReplayWording = {
   /** What the generated lookup clause calls the thing being looked for. */
   lookupNoun?: string
 }
-const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
+export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
   AccountingSyncType,
   ReplayWording | Readonly<Record<OutcomeWordingVariant, ReplayWording>>
 >> = {
