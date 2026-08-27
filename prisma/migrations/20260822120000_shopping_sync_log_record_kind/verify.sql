@@ -219,20 +219,33 @@ SELECT 'shopping_sync_logs park stamp over a held-invoice payload' AS check_name
 --    its payload is unchanged — so checks 1, 2 and 3 ALL return zero over it. Only the note gives it
 --    away.
 --
---    AND THE NOTE IS UNFORGEABLE HERE. The prefix is written by exactly one code path, and the
---    CURRENT version of that path requires recordKind = 'WC_REFUND_PARK', so it can never put a note
---    on a held invoice. `accountingPayload` (an OBJECT) and `metaKey` are the two members only
---    buildHeldSalesInvoicePayload writes, and it is the PAIR that is unforgeable, not either member:
---    a decorating extension can put a stray top-level `metaKey` on a refund body (that is the r10
---    HIGH, and it is why check 6 and backfill statement 2 no longer test one field), but
---    `accountingPayload` is an IMS-internal name a store has no reason to emit, and an operator
---    typing into WooCommerce's refund dialog controls neither. This check is DELIBERATELY a PARTIAL
---    shape rather than the complete one: the identity clause is out because a REASSIGN that broke it
---    and a DISMISS that followed must still be caught, and the reason clause is out for the same
---    conservatism. A genuine refund park dismissed by an operator carries the note over a RAW
---    REFUND BODY and is not selected. The stamp is deliberately NOT in this check: an UNSTAMPED hold
---    (case (a)) that the same action then dismissed must be caught too, and it carries no stamp to
---    test.
+--    THE SHAPE IS THE TEST, AND TWO FIELDS ARE NOT A SHAPE (Codex r11 HIGH). This check used to
+--    require an `accountingPayload` OBJECT and a non-null `metaKey` and call the PAIR unforgeable.
+--    Calling a pair of fields unforgeable does not create a trust boundary: a refund payload is cast
+--    from the store's response and stored UNCHANGED, so a decorating extension controls every
+--    top-level member of it. The r10 HIGH one check over is exactly that — a forged `metaKey` on a
+--    genuine refund body — and this check, which reads BOTH of the fields that HIGH said could not
+--    be trusted individually, kept the pair. A genuine refund park whose raw WooCommerce payload
+--    happens to carry an `accountingPayload` object and any non-null `metaKey`, dismissed by an
+--    operator through the recovery inbox, would be counted here.
+--
+--    AND BEING CAUGHT HERE IS NOT A SAFE DEGRADATION. verify.sql runs as the post-migration
+--    verification hook, AFTER the schema has moved and while the application and the database are
+--    both still fenced. A non-zero count is a failed deploy in that window, every retry fails
+--    identically over the same untouched row, and the way out is a hand-edit of a customer's refund
+--    evidence. A false positive here costs an outage; there is no "it will be looked at" reading.
+--
+--    SO IT REQUIRES EVERY MEMBER buildHeldSalesInvoicePayload WRITES THAT NEITHER RECOVERY ACTION
+--    TOUCHES. buildRefundParkDismissData writes only status, errorMessage and syncedAt;
+--    buildRefundParkReassignData adds entityId. Neither writes `payload`, `connector`, `direction`
+--    or `entityType` — so every field below is exactly what the WRITER put there, whatever the
+--    recovery did afterwards. The ONE omission is the identity equality
+--    payload->>'salesOrderId' = "entityId", and only because REASSIGN moves the column it compares:
+--    a REASSIGN that broke it and a DISMISS that followed must still be caught, which is the whole
+--    reason this check exists alongside check 3.
+--
+--    The stamp is still deliberately NOT in this check: an UNSTAMPED hold (case (a)) that the same
+--    action then dismissed must be caught too, and it carries no stamp to test.
 SELECT 'shopping_sync_logs operator recovery note on a held-invoice payload' AS check_name,
        count(*)                                                              AS violations
   FROM "shopping_sync_logs"
@@ -241,8 +254,13 @@ SELECT 'shopping_sync_logs operator recovery note on a held-invoice payload' AS 
    AND "entityType" = 'SalesOrder'
    AND "errorMessage" LIKE 'Recovered by operator:%'
    AND jsonb_typeof(payload) = 'object'
-   AND jsonb_typeof(payload->'accountingPayload') = 'object'
-   AND payload->>'metaKey' IS NOT NULL;
+   AND payload->>'reason' = 'missing_wc_invoice_number'
+   AND payload->>'connector' = 'woocommerce'
+   AND jsonb_typeof(payload->'externalOrderId') = 'string'
+   AND jsonb_typeof(payload->'externalOrderNumber') = 'string'
+   AND jsonb_typeof(payload->'orderNumber') = 'string'
+   AND jsonb_typeof(payload->'metaKey') = 'string'
+   AND jsonb_typeof(payload->'accountingPayload') = 'object';
 
 -- 5. NO HELD-INVOICE PAYLOAD THAT NAMES A DIFFERENT ORDER FROM THE ROW IT SITS ON — the REASSIGN
 --    half of the same act, and the reason check 3 alone is not enough even without its status bug.
@@ -261,6 +279,22 @@ SELECT 'shopping_sync_logs operator recovery note on a held-invoice payload' AS 
 --    IS DISTINCT FROM, not <>: a hold-shaped payload that has LOST its salesOrderId is a
 --    contradiction of the same kind, and `<>` against a missing member is UNKNOWN and selects
 --    nothing. The stamp is out of this one for the same reason it is out of check 4.
+--
+--    AND THAT NULL-SAFETY IS EXACTLY WHY THE SHAPE HAD TO BE COMPLETE (Codex r11 HIGH).
+--    `IS DISTINCT FROM` is correct one check over, where an ABSENT member must still count — and
+--    HERE it makes an absent member SATISFY the clause. So while this check read only an
+--    `accountingPayload` OBJECT and a non-null `metaKey`, any refund body carrying those two
+--    decorations and no `salesOrderId` at all — which no raw WooCommerce refund body has — was
+--    selected, on a healthy database, as a held invoice naming another order. verify.sql runs after
+--    the migration with both the application and the database fenced, so that is a deployment
+--    outage with an identical failure on every retry.
+--
+--    It now requires every member buildHeldSalesInvoicePayload writes that neither recovery action
+--    touches — the exact reason, the connector, both external-order fields, the order number, and
+--    the TYPES of metaKey and accountingPayload — and omits exactly one thing: the identity
+--    equality, which is the contradiction this check is looking for. `salesOrderId` is the one
+--    payload member whose TYPE is deliberately not asserted, because "it is gone" is one of the two
+--    states being caught.
 SELECT 'shopping_sync_logs held-invoice payload naming another order' AS check_name,
        count(*)                                                       AS violations
   FROM "shopping_sync_logs"
@@ -269,8 +303,13 @@ SELECT 'shopping_sync_logs held-invoice payload naming another order' AS check_n
    AND "entityType" = 'SalesOrder'
    AND "entityId" IS NOT NULL
    AND jsonb_typeof(payload) = 'object'
+   AND payload->>'reason' = 'missing_wc_invoice_number'
+   AND payload->>'connector' = 'woocommerce'
+   AND jsonb_typeof(payload->'externalOrderId') = 'string'
+   AND jsonb_typeof(payload->'externalOrderNumber') = 'string'
+   AND jsonb_typeof(payload->'orderNumber') = 'string'
+   AND jsonb_typeof(payload->'metaKey') = 'string'
    AND jsonb_typeof(payload->'accountingPayload') = 'object'
-   AND payload->>'metaKey' IS NOT NULL
    AND payload->>'salesOrderId' IS DISTINCT FROM "entityId";
 
 -- 6. NO HELD-RELEASE OUTCOME ON A ROW THAT IS NOT A HELD SALES INVOICE — the transition every

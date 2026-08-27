@@ -1215,3 +1215,205 @@ test('deploy.sh carries the hook, which is the whole reason verify.sql is execut
   )
   assert.equal(existsSync('scripts/run-migration-verifications.mjs'), true, 'and it resolves to a file')
 })
+
+/* ================================================================================================
+ * o3d-xnwu r11 (Codex HIGH) — CHECKS 4 AND 5 TRUSTED TWO FIELDS AND CALLED IT A SHAPE.
+ *
+ * Both read only `jsonb_typeof(payload->'accountingPayload') = 'object'` and
+ * `payload->>'metaKey' IS NOT NULL`, on the argument that the PAIR is unforgeable. The r10 HIGH one
+ * check over had already established the opposite: a refund payload is cast from the store's
+ * response and stored UNCHANGED, so a decorating extension controls every top-level member of it —
+ * which is exactly why check 6 and backfill statement 2 stopped testing one field. Calling a pair
+ * of them unforgeable does not create a trust boundary.
+ *
+ * AND CHECK 5 CARRIED THE NULL-SAFETY TRAP ONE CHECK OVER. `IS DISTINCT FROM` was chosen so that a
+ * hold payload which has LOST its salesOrderId still counts — correct there. Here it means an
+ * ABSENT `salesOrderId` SATISFIES the identity clause, so a decorated refund body with no
+ * salesOrderId at all — which is every raw WooCommerce refund body — was selected.
+ *
+ * BEING CAUGHT BY THESE CHECKS IS NOT A SAFE DEGRADATION. verify.sql is the post-migration
+ * verification hook: it runs after the schema has moved, with the application and the database both
+ * still fenced. A non-zero count there is a deployment outage, every retry fails identically over
+ * the same untouched row, and the only way out is hand-editing a customer's refund evidence.
+ *
+ * The fix is the maximal immutable shape: every member buildHeldSalesInvoicePayload writes that
+ * NEITHER recovery action touches. buildRefundParkDismissData writes status, errorMessage and
+ * syncedAt; buildRefundParkReassignData adds entityId. Neither writes `payload`, so every payload
+ * member is recovery-proof — and the one omission is the identity equality, which is the
+ * contradiction these two checks exist to find.
+ * ============================================================================================== */
+
+/** Every payload member the two checks may rely on, with the value the writer puts there. */
+const RECOVERY_PROOF_MEMBERS = {
+  reason: 'missing_wc_invoice_number',
+  connector: 'woocommerce',
+  externalOrderId: '4021',
+  externalOrderNumber: '4021',
+  orderNumber: 'SO-1',
+  metaKey: '_wcpdf_invoice_number',
+  accountingPayload: { salesOrderId: 'order-1', currency: 'GBP' },
+} as const
+
+/**
+ * THE HOSTILE ROW Codex named: a genuine refund park an extension decorated with BOTH of the fields
+ * checks 4 and 5 used to trust, and — like every raw WooCommerce refund body — carrying no
+ * `salesOrderId` at all, which is what made `IS DISTINCT FROM` select it.
+ */
+const decoratedRefundPayload = {
+  ...refundPayloadWithTypedReason,
+  metaKey: 'wc_some_extension_meta',
+  accountingPayload: { plugin: 'some-extension', total: '12.00' },
+}
+
+const decoratedPark: Row = { ...base, recordKind: null, payload: decoratedRefundPayload }
+const dismissedDecoratedPark: Row = { ...decoratedPark, status: 'SYNCED', errorMessage: RECOVERY_NOTE }
+const reassignedDecoratedPark: Row = {
+  ...decoratedPark, entityId: 'order-2', status: 'PENDING', errorMessage: REASSIGN_NOTE,
+}
+
+test('checks 4 and 5 stay ZERO on a genuine park decorated with both fields they used to trust', () => {
+  // ROUTE: the shipped verify.sql, parsed and evaluated over the row. Not a text assertion — the
+  // point is what the SQL SELECTS.
+  //
+  // MUTATION THAT KILLS THIS TEST: drop any one of the six added conjuncts from check 4 or check 5
+  // (the reason, the connector, either external-order field, the order number, the metaKey TYPE, or
+  // the accountingPayload type). Each removal readmits this row, because a decorated refund body
+  // satisfies everything that is left.
+  assert.equal(
+    selects(3, dismissedDecoratedPark),
+    false,
+    'a dismissed refund park whose store payload carries an accountingPayload and a metaKey is not a dismissed hold',
+  )
+  assert.equal(
+    selects(4, decoratedPark),
+    false,
+    'and a decorated refund body with NO salesOrderId must not satisfy IS DISTINCT FROM as a "hold naming another order"',
+  )
+  assert.equal(selects(4, reassignedDecoratedPark), false, 'not even once an operator has reassigned it')
+
+  // The whole point of the finding: the SAME row is a healthy-database row. Every other check must
+  // be quiet over it too, or the deploy fails from somewhere else for the same wrong reason.
+  for (const index of [0, 1, 2, 3, 4, 5]) {
+    assert.equal(
+      selects(index, decoratedPark),
+      index === 1,
+      `only check 2 (an unstamped actionable park) may see this row, not check ${index + 1}`,
+    )
+  }
+})
+
+test('checks 4 and 5 require EVERY payload member neither recovery action can touch', () => {
+  // ROUTE: for each member in turn, remove it from the genuine hold payload and re-evaluate. A
+  // check that still fires without a member is a check that is not reading it, so this is what
+  // proves each added conjunct is load-bearing rather than decorative.
+  //
+  // MUTATION THAT KILLS THIS TEST: delete any one conjunct from either check. The corresponding
+  // iteration below then still selects, and the assertion fails naming the member.
+  for (const member of Object.keys(RECOVERY_PROOF_MEMBERS)) {
+    const { [member as keyof typeof heldPayload]: _dropped, ...without } = heldPayload
+    assert.equal(
+      selects(3, { ...dismissedStampedHold, payload: without }),
+      false,
+      `check 4 must read payload.${member} — without it the check fires on a payload that is not the writer's`,
+    )
+    assert.equal(
+      selects(4, { ...reassignedStampedHold, payload: without }),
+      false,
+      `check 5 must read payload.${member} — without it the check fires on a payload that is not the writer's`,
+    )
+  }
+
+  // ...and the members must be read by TYPE where the writer's type is what identifies them: a
+  // metaKey that is a number, or an accountingPayload that is an array, is not what the writer put
+  // there. (`payload->>'metaKey' IS NOT NULL` — the clause that used to be here — is satisfied by
+  // both.)
+  assert.equal(selects(3, { ...dismissedStampedHold, payload: { ...heldPayload, metaKey: 7 } }), false)
+  assert.equal(selects(4, { ...reassignedStampedHold, payload: { ...heldPayload, accountingPayload: [] } }), false)
+
+  // AND THE POSITIVE HALF, or "require everything" would pass by selecting nothing at all.
+  assert.equal(selects(3, dismissedStampedHold), true, 'the genuine DISMISS of a hold is still caught')
+  assert.equal(selects(3, dismissedUnstampedHold), true, 'including on a hold that was never stamped')
+  assert.equal(selects(4, reassignedStampedHold), true, 'the genuine REASSIGN of a hold is still caught')
+  assert.equal(selects(4, reassignedOverwrittenPark), true, 'and the case-(b) row a REASSIGN moved')
+  assert.equal(
+    selects(4, { ...genuineHold, payload: heldPayloadWithoutOrderId }),
+    true,
+    'and a hold-shaped payload that has LOST its order id — the one member whose type is deliberately not asserted',
+  )
+})
+
+test('checks 4 and 5 carry the complete held-invoice shape MINUS exactly the identity clause', () => {
+  // ROUTE: pure text out of the shipped verify.sql, so the two cannot drift apart or drift away
+  // from the one thing they are allowed to omit.
+  //
+  // MUTATION THAT KILLS THIS TEST: add the identity clause back to either (they would then go quiet
+  // on the REASSIGN they exist to catch), or drop a shape clause from one and not the other.
+  const verifyStatements = statements(readFileSync(VERIFY, 'utf8'))
+  const IDENTITY = 'payload->>\'salesOrderId\' = "entityId"'
+
+  const complete = heldShapeOf(whereClauseOf(verifyStatements[0]))
+  assert.ok(complete.includes(IDENTITY), 'precondition: check 1 carries the identity clause')
+
+  const shapeOf = (index: number) =>
+    heldShapeOf(whereClauseOf(verifyStatements[index])).filter(
+      (clause) => clause !== 'payload->>\'salesOrderId\' IS DISTINCT FROM "entityId"',
+    )
+
+  const expected = [
+    "jsonb_typeof(payload) = 'object'",
+    "payload->>'reason' = 'missing_wc_invoice_number'",
+    "payload->>'connector' = 'woocommerce'",
+    "jsonb_typeof(payload->'externalOrderId') = 'string'",
+    "jsonb_typeof(payload->'externalOrderNumber') = 'string'",
+    "jsonb_typeof(payload->'orderNumber') = 'string'",
+    "jsonb_typeof(payload->'metaKey') = 'string'",
+    "jsonb_typeof(payload->'accountingPayload') = 'object'",
+  ].sort()
+
+  assert.deepEqual(shapeOf(3), expected, 'check 4 must read the maximal recovery-proof shape')
+  assert.deepEqual(shapeOf(4), expected, 'check 5 must read the same one')
+
+  // The identity equality is the ONE omission, and it must be omitted from both: it is the clause a
+  // REASSIGN breaks, which is the damage these two exist to catch.
+  for (const index of [3, 4]) {
+    assert.ok(
+      !heldShapeOf(whereClauseOf(verifyStatements[index])).includes(IDENTITY),
+      `check ${index + 1} must NOT require salesOrderId = entityId — a REASSIGN moves that column`,
+    )
+  }
+  // ...and check 5 keeps the null-safe spelling of its contradiction, which is what makes a payload
+  // that has LOST its order id count.
+  assert.ok(
+    heldShapeOf(whereClauseOf(verifyStatements[4])).includes(
+      'payload->>\'salesOrderId\' IS DISTINCT FROM "entityId"',
+    ),
+    'check 5 must compare the identity with IS DISTINCT FROM, not <>',
+  )
+})
+
+test('every member checks 4 and 5 rely on is one no recovery action can write', () => {
+  // ROUTE: read the two recovery patches out of the shipped module and assert what they set. A
+  // check may only trust a payload member if the act it is detecting cannot have produced it.
+  //
+  // MUTATION THAT KILLS THIS TEST: make either builder write `payload` (or connector/direction/
+  // entityType). The union below stops being the four columns named here.
+  const source = readFileSync(`${process.cwd()}/lib/domain/sales/refund-park-recovery.ts`, 'utf8')
+  const bodyOf = (fn: string) => {
+    const start = source.indexOf(`export function ${fn}(`)
+    assert.notEqual(start, -1, `${fn} must exist`)
+    const open = source.indexOf('{', start)
+    return source.slice(open, source.indexOf('\n}', open))
+  }
+  const written = new Set<string>()
+  for (const fn of ['buildRefundParkReassignData', 'buildRefundParkDismissData']) {
+    for (const match of bodyOf(fn).matchAll(/^\s{4}(\w+):/gm)) written.add(match[1])
+  }
+  assert.deepEqual(
+    [...written].sort(),
+    ['entityId', 'errorMessage', 'status', 'syncedAt'].sort(),
+    'a recovery action that wrote anything else would invalidate the shape checks 4 and 5 rely on',
+  )
+  for (const column of ['payload', 'connector', 'direction', 'entityType', 'externalId']) {
+    assert.ok(!written.has(column), `neither recovery action may write ${column}`)
+  }
+})
