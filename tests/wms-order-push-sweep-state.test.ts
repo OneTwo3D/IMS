@@ -41,6 +41,24 @@ function candidate(overrides: Partial<WmsPushCandidate> = {}): WmsPushCandidate 
   }
 }
 
+/**
+ * o3d-2k5r r2. A revalidation candidate defaults to the columns that say NO WMS ORDER EXISTS,
+ * because that is the only shape the production port's where-clause can return — a test that
+ * wants the other shape has to ask for it, and then it is testing the re-queue guard.
+ */
+function revalidateLink(overrides: Partial<WmsPushRevalidateLink> = {}): WmsPushRevalidateLink {
+  return {
+    id: 'link-1',
+    orderId: 'so-1',
+    lastError: null,
+    attempts: 0,
+    pushedAt: null,
+    externalOrderId: null,
+    order: { ...candidate(), shipFromWarehouseId: 'wh-1' },
+    ...overrides,
+  }
+}
+
 type Seed = {
   bindings?: Array<{ warehouseId: string; externalWarehouseId: string }>
   releasable?: WmsPushLinkRef[]
@@ -56,12 +74,18 @@ type Seed = {
   revalidatable?: { links: WmsPushRevalidateLink[]; total: number }
   /** o3d-92fu: false simulates "order deleted / another worker owns the link" under the lock. */
   recordValidationFailure?: (orderId: string) => Promise<boolean>
+  /**
+   * o3d-2k5r r2: what an OVERLAPPING worker has left the link in by the time a state-guarded
+   * write lands. Default: still the state this pass read, so the compare-and-set matches.
+   */
+  stateAtWrite?: (id: string) => string
 }
 
 function makePort(seed: Seed) {
   const upserts: Array<{ orderId: string; create: Record<string, unknown>; update: Record<string, unknown> }> = []
   const validationFailures: Array<{ orderId: string; connector: string; error: string; attemptedAt: Date }> = []
-  const updates: Array<{ id: string; data: Record<string, unknown> }> = []
+  const updates: Array<{ id: string; data: Record<string, unknown>; ifState?: string }> = []
+  const guardMisses: Array<{ id: string; fromState: string; actual: string }> = []
   const events: WmsMutationEventInput[] = []
   const claims: string[] = []
   const port: WmsOrderPushPort = {
@@ -83,9 +107,18 @@ function makePort(seed: Seed) {
     cancellableLinks: async () => seed.cancellable ?? [],
     upsertByOrder: async (orderId, create, update) => { upserts.push({ orderId, create, update }) },
     updateLink: async (id, data) => { updates.push({ id, data }) },
+    updateLinkIfState: async (id, fromState, data) => {
+      // The CAS, modelled the way the Prisma port implements it: the write applies only if the
+      // link is STILL in `fromState` at the moment it lands. `stateAtWrite` is how a test says
+      // "another worker moved this link in between".
+      const actual = seed.stateAtWrite ? seed.stateAtWrite(id) : fromState
+      if (actual !== fromState) { guardMisses.push({ id, fromState, actual }); return false }
+      updates.push({ id, data, ifState: fromState })
+      return true
+    },
     recordEvent: async (event) => { events.push(event) },
   }
-  return { port, upserts, updates, events, claims, validationFailures }
+  return { port, upserts, updates, events, claims, validationFailures, guardMisses }
 }
 
 const okPush = async (): Promise<WmsOrderPushResult> => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' })
@@ -351,6 +384,7 @@ test('o3d-92fu create: a whole batch of malformed orders does NOT starve the val
       })
     },
     updateLink: async () => {},
+    updateLinkIfState: async () => true,
     recordEvent: async () => {},
   }
   const conn = connector({ pushOrder: async () => { pushedOrders.push('push'); return okPush() } })
@@ -366,10 +400,7 @@ test('o3d-92fu create: a whole batch of malformed orders does NOT starve the val
 })
 
 test('o3d-92fu revalidate: a link whose payload builds again is re-queued for create, attempts intact', async () => {
-  const link: WmsPushRevalidateLink = {
-    id: 'link-1', orderId: 'so-1', lastError: 'Sales order has a line with no SKU; cannot push to WMS', attempts: 2,
-    order: { ...candidate(), shipFromWarehouseId: 'wh-1' },
-  }
+  const link = revalidateLink({ lastError: 'Sales order has a line with no SKU; cannot push to WMS', attempts: 2 })
   const { port, updates, events } = makePort({ revalidatable: { links: [link], total: 1 } })
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
   assert.equal(r.revalidated, 1)
@@ -391,10 +422,10 @@ test('o3d-92fu revalidate: still-failing for the SAME reason re-stamps the rotat
   // The issue is explicit that the disposition must be recorded ONCE. The old behaviour audited
   // FAILED and incremented `failed` on every single sweep for the same unpushable order.
   const message = 'Sales order has a line with no SKU; cannot push to WMS'
-  const link: WmsPushRevalidateLink = {
-    id: 'link-1', orderId: 'so-1', lastError: message, attempts: 0,
+  const link = revalidateLink({
+    lastError: message,
     order: { ...candidate({ lines: [{ sku: null, qty: 1, taxForeign: 0, totalForeign: 10, description: 'x' }] }), shipFromWarehouseId: 'wh-1' },
-  }
+  })
   const { port, updates, events } = makePort({ revalidatable: { links: [link], total: 1 } })
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
   assert.equal(r.revalidated, 0)
@@ -407,10 +438,10 @@ test('o3d-92fu revalidate: still-failing for the SAME reason re-stamps the rotat
 })
 
 test('o3d-92fu revalidate: a CHANGED reason is audited, because it is new information', async () => {
-  const link: WmsPushRevalidateLink = {
-    id: 'link-1', orderId: 'so-1', lastError: 'some older reason', attempts: 0,
+  const link = revalidateLink({
+    lastError: 'some older reason',
     order: { ...candidate({ lines: [{ sku: null, qty: 1, taxForeign: 0, totalForeign: 10, description: 'x' }] }), shipFromWarehouseId: 'wh-1' },
-  }
+  })
   const { port, events } = makePort({ revalidatable: { links: [link], total: 1 } })
   await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
   const audited = events.filter((e) => e.action === 'order_validate')
@@ -421,10 +452,7 @@ test('o3d-92fu revalidate: a CHANGED reason is audited, because it is new inform
 
 test('o3d-92fu revalidate: the bounded pass SAYS what it did not get to', async () => {
   // A bounded sweep that reports only what it processed reads as "covered everything".
-  const link: WmsPushRevalidateLink = {
-    id: 'link-1', orderId: 'so-1', lastError: null, attempts: 0,
-    order: { ...candidate(), shipFromWarehouseId: 'wh-1' },
-  }
+  const link = revalidateLink()
   const warnings: string[] = []
   const originalWarn = console.warn
   console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }

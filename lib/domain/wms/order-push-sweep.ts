@@ -1737,9 +1737,20 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       // createCandidates would not accept would park it in PENDING_CREATE, which the
       // hard-delete guard blocks on — silently re-closing the door this issue opened, for an
       // order that provably never reached the WMS.
+      //
+      // o3d-2k5r r2: AND the same columns the core's re-queue guard reads, spread from the
+      // SHARED CONSTANT rather than restated — a link carrying a WMS id or a push stamp must
+      // not merely be skipped in the core, it must not occupy a slot in the bounded batch at
+      // all. Nothing in this pass re-stamps a skipped link, and the ordering is
+      // `lastAttemptAt asc nulls first`, so a handful of permanently-unpromotable links would
+      // sit at the head of the queue every sweep and starve the promotable tail behind them.
+      // Such a link stays parked as VALIDATION_FAILED with its lastError, visible to an
+      // operator, and is not silently dropped: `total` counts only what this pass can act on,
+      // which is what the overflow notice claims it counts.
       const where = {
         connector,
         state: 'VALIDATION_FAILED',
+        ...NO_WMS_ORDER_COLUMNS,
         order: {
           status: { in: [...READY_STATUSES] },
           paidAt: { not: null },
@@ -1754,6 +1765,9 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           where,
           select: {
             id: true, orderId: true, lastError: true, attempts: true,
+            // Carried even though the where-clause already filters on them, so the core decides
+            // with the shared predicate instead of trusting THIS port to have filtered.
+            pushedAt: true, externalOrderId: true,
             order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true } },
           },
           take: limit,
@@ -1831,6 +1845,18 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     },
     async updateLink(id, data) {
       await db.wmsOrderPushLink.update({ where: { id }, data })
+    },
+    async updateLinkIfState(id, fromState, data) {
+      // updateMany, not update: `update` has no way to express a predicate beyond the unique
+      // key, so the compare-and-set has to go through the many-form. Postgres takes the row
+      // lock for the duration of the matching scan, so two workers racing this cannot both
+      // match — the loser sees count 0 and is told the link moved on. Same shape as the
+      // per-attempt CAS in order-reconcile-sweep.
+      const { count } = await db.wmsOrderPushLink.updateMany({
+        where: { id, state: fromState as never },
+        data,
+      })
+      return count > 0
     },
     recordEvent: (event) => recordWmsMutationEvent(event),
   }

@@ -94,6 +94,10 @@ function makePort(seed: Seed) {
     cancellableLinks: async () => [],
     upsertByOrder: async (orderId, create, update) => { upserts.push({ orderId, create, update }) },
     updateLink: async (id, data) => { updates.push({ id, data }) },
+    // o3d-2k5r r2: this suite seeds no releasable or revalidatable links, so the only two
+    // callers of the guarded write are unreachable here; it throws rather than recording, so a
+    // future seed that DOES reach it cannot pass unnoticed with an unasserted write.
+    updateLinkIfState: async () => { throw new Error('updateLinkIfState not expected in the withdrawal-fence suite') },
     updateLinkByOrder: async (orderId, data) => { updatesByOrder.push({ orderId, data }) },
     readWithdrawalState: seed.readWithdrawalState
       ?? (async () => ({ withdrawalHoldAt: null, withdrawalApprovedAt: null })),
