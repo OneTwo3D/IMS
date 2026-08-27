@@ -92,24 +92,71 @@ export function shouldGrantCreateClaim(
  * known to have failed. That is the reading the hard-delete guard needs, and it is the only
  * reading that is safe when the answer is used to erase the last local record of a
  * warehouse order.
+ *
+ * WRITER AND READER SHARE THE COLUMNS THEMSELVES (o3d-2k5r r2). The constants below are what
+ * `recordValidationFailure`'s create branch WRITES and what the predicates READ, so a change to
+ * one is a change to the other by construction — the previous version restated the invariant by
+ * hand in the writer and tied the two together with nothing but a pair of test assertions.
+ */
+
+/** The columns that say NO WMS ORDER EXISTS for this link. */
+export const NO_WMS_ORDER_COLUMNS = { pushedAt: null, externalOrderId: null } as const
+
+/** ...and, with attempts, that no remote call was ever DISPATCHED for it. */
+export const NO_REMOTE_WMS_CALL_COLUMNS = { attempts: 0, ...NO_WMS_ORDER_COLUMNS } as const
+
+/**
+ * The number `recordValidationFailure` raises a CONVERTED claim to, so the columns stop reading
+ * as proof.
+ *
+ * KNOWN COST, accepted deliberately: `attempts` is also the create pass's retry ladder, so a
+ * converted claim that in fact made no call dead-letters after MAX_ATTEMPTS - AMBIGUOUS_ATTEMPTS
+ * further real attempts rather than MAX_ATTEMPTS. Separating "calls that may have been
+ * dispatched" from "retries spent" needs a second column and therefore a migration; until then
+ * one spent retry is the price of not hard-deleting an order the warehouse may be picking, and
+ * the delete guard's message says "may have been dispatched" rather than reporting the count as
+ * a record of attempts made.
  */
 export const AMBIGUOUS_ATTEMPTS = 1
 
 /**
+ * Does this link carry positive evidence that a WMS ORDER EXISTS for its order?
+ *
+ * A WEAKER question than provesNoRemoteWmsCall, and deliberately so — it is what the
+ * revalidation re-queue needs (see the revalidation pass). Re-queueing puts a link back into
+ * createCandidates, which selects on state alone; pushing over an id or a push stamp mints a
+ * SECOND warehouse order for the same sales order.
+ */
+export function wmsOrderMayExist(
+  link: { pushedAt: Date | null; externalOrderId: string | null },
+): boolean {
+  return link.pushedAt !== NO_WMS_ORDER_COLUMNS.pushedAt
+    || link.externalOrderId !== NO_WMS_ORDER_COLUMNS.externalOrderId
+}
+
+/**
  * Does this WmsOrderPushLink prove that nothing was ever sent to the WMS for its order?
  *
- * Pure, exported, and shared by the writer's tests and the hard-delete guard so the two
- * cannot drift. `null` (no link at all) is the only unconditional yes.
+ * Pure, exported, and shared by the writer (through NO_REMOTE_WMS_CALL_COLUMNS), the hard-delete
+ * guard and the revalidation re-queue, so the three cannot drift. `null` (no link at all) is the
+ * only unconditional yes.
+ *
+ * On the pushedAt / externalOrderId conjuncts: NO writer in this file can currently produce a
+ * VALIDATION_FAILED link that carries either one AT attempts 0 — every conversion of a
+ * pre-existing link raises attempts to AMBIGUOUS_ATTEMPTS, and the create branch mints all three
+ * columns together from NO_REMOTE_WMS_CALL_COLUMNS. So for THIS reader they are unreachable
+ * belt-and-braces, and the earlier comment claiming they catch a real shape ("it pushed, then its
+ * payload stopped building") was wrong. They are not decoration: they are reachable and load-
+ * bearing for `wmsOrderMayExist`, whose caller reads links at attempts >= 1 — a HELD link that is
+ * released keeps its pushedAt, and can then be converted to VALIDATION_FAILED.
  */
 export function provesNoRemoteWmsCall(
   link: { state: string; attempts: number; pushedAt: Date | null; externalOrderId: string | null } | null,
 ): boolean {
   if (!link) return true
   if (link.state !== 'VALIDATION_FAILED') return false
-  // All three, and not as belt-and-braces: a VALIDATION_FAILED link can carry a real external
-  // id or a pushedAt stamp (it pushed, then its payload stopped building), and either is
-  // positive evidence the warehouse holds the order.
-  return link.attempts === 0 && link.pushedAt === null && link.externalOrderId === null
+  if (wmsOrderMayExist(link)) return false
+  return link.attempts === NO_REMOTE_WMS_CALL_COLUMNS.attempts
 }
 const DEFAULT_BATCH_SIZE = 25
 /** o3d-rbyg: shared empty result for the live withdrawal screen — "nothing withdrawn", not "unknown". */
@@ -392,6 +439,10 @@ export type WmsPushRevalidateLink = {
   orderId: string
   lastError: string | null
   attempts: number
+  /** o3d-2k5r r2: the columns `wmsOrderMayExist` reads. Carried so the RE-QUEUE decision is made
+   *  by the shared rule rather than by trusting the port's where-clause to have filtered. */
+  pushedAt: Date | null
+  externalOrderId: string | null
   order: OrderForPush & { shipFromWarehouseId: string | null }
 }
 export type WmsPushLinkRef = { id: string; orderId: string; externalOrderId: string | null }
@@ -522,6 +573,25 @@ export interface WmsOrderPushPort {
   readWithdrawalTombstone?(orderId: string): Promise<{ standing: boolean } | null>
   updateLinkByOrder?(orderId: string, data: LinkWrite): Promise<void>
   updateLink(id: string, data: LinkWrite): Promise<void>
+  /**
+   * o3d-2k5r r2 — apply `data` ONLY while the link is still in `fromState`; false when it has
+   * moved on. The convention already exists in order-reconcile-sweep (its per-attempt CAS), and
+   * it exists for this reason.
+   *
+   * `updateLink` is a bare `update({ where: { id } })`: no row lock, no predicate. Every pass in
+   * this sweep reads its batch and then writes it back some milliseconds later, and the cron
+   * rate-limits sweeps without serialising them — so between the read and the write another
+   * worker can have claimed the link, pushed it, and settled it. An unguarded write then stamps
+   * a pre-push state over a settled one, and the create pass — whose candidate query selects on
+   * state alone — pushes the SAME order a second time. Two warehouse orders, goods shipped
+   * twice, which is the exact failure the claim lease exists to prevent.
+   *
+   * The state predicate is also what makes clearing `lastAttemptAt` here safe: at the instant
+   * the write applies the link is provably NOT PENDING_CREATE, so the column being cleared is a
+   * rotation stamp and never a live create lease. A claim can only be taken after this write has
+   * committed, and it is taken under the order's row lock.
+   */
+  updateLinkIfState(id: string, fromState: PushState, data: LinkWrite): Promise<boolean>
   /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
   recordEvent(event: WmsMutationEventInput): Promise<void>
 }
@@ -599,10 +669,22 @@ export async function runWmsOrderPushSweepCore(
   for (const link of await port.releasableHeldOrders(connectorId, batchSize)) {
     // Only a release that actually PERSISTED counts and is audited (Codex r1:
     // swallowing the write error while recording SUCCEEDED forged the timeline).
+    //
+    // o3d-2k5r r2: GUARDED ON 'HELD', for the same reason the revalidation promote below is
+    // guarded. This write nulls externalOrderId so the order re-creates. Two overlapping sweeps
+    // both read the link while it is HELD; A releases it, claims it and pushes it to SYNCED with
+    // a fresh WMS id — and B's unguarded release then stamped PENDING_CREATE back over that,
+    // DISCARDING the new id, so the next sweep created a second warehouse order and IMS no
+    // longer held a reference to the first.
+    let released = false
     try {
-      await port.updateLink(link.id, { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, cancelledAt: null, ...RESET_DISPATCH_FAILURES })
+      released = await port.updateLinkIfState(link.id, 'HELD', { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, cancelledAt: null, ...RESET_DISPATCH_FAILURES })
     } catch (error) {
       console.error('[wms-order-push] release link update failed', link.id, error)
+      continue
+    }
+    if (!released) {
+      console.warn(`[wms-order-push] link ${link.id} left HELD before its release was written — another worker owns it now; not released`)
       continue
     }
     result.released += 1
@@ -639,6 +721,30 @@ export async function runWmsOrderPushSweepCore(
     for (const link of links) {
       const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId) continue
+      // o3d-2k5r r2: THE RE-QUEUE READS THE SHARED RULE, not its own re-derivation of it.
+      //
+      // This pass's only outcome is "put the order back in createCandidates", and that query
+      // selects on state alone — so promoting a link that already carries a WMS id or a push
+      // stamp mints a SECOND warehouse order for the same sales order and overwrites the first
+      // id. `wmsOrderMayExist` is the same function the hard-delete guard's rule is built from,
+      // so the two readers cannot reach opposite conclusions from the same columns.
+      //
+      // Deliberately WEAKER than provesNoRemoteWmsCall, and this is the whole of the
+      // difference: `attempts > 0` does NOT block a re-queue. Re-queueing hands the link back
+      // to the create ladder, which already retries a PENDING_CREATE link at attempts > 0 under
+      // the same MAX_ATTEMPTS bound and the same claim lease — the risk is the create pass's
+      // existing one, unchanged, and it is bounded and reversible. Deleting is neither: it
+      // erases the last local record of an order the warehouse may be picking. So the delete
+      // guard needs "no call was EVER dispatched" and this pass needs only "no WMS order
+      // exists".
+      if (wmsOrderMayExist(link)) {
+        console.warn(
+          `[wms-order-push] link ${link.id} is parked VALIDATION_FAILED but carries `
+          + `${link.externalOrderId ? `WMS order ${link.externalOrderId}` : 'a recorded push'} — NOT re-queued; `
+          + 'a create would duplicate a warehouse order. Resolve it by hand.',
+        )
+        continue
+      }
       const ts = now()
       try {
         buildPushInput(link.order, externalWarehouseId)
@@ -647,10 +753,17 @@ export async function runWmsOrderPushSweepCore(
         // Re-stamp so the rotation moves on. Audited only when the REASON changed — a new
         // reason is new information for the operator; the same one repeated every sweep is
         // the noise the persisted disposition exists to remove.
-        await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts }).catch((e) => {
-          console.error('[wms-order-push] failed to re-stamp validation disposition', link.id, e)
-        })
-        if (message !== link.lastError) {
+        // Guarded on VALIDATION_FAILED like the promote below: if the link was promoted and
+        // claimed by an overlapping sweep between the read and here, this write would move that
+        // worker's lease clock and stamp a stale lastError onto a link that has left this pass's
+        // jurisdiction. Nothing to re-stamp then, and nothing to audit either.
+        const restamped = await port
+          .updateLinkIfState(link.id, 'VALIDATION_FAILED', { lastError: message, lastAttemptAt: ts })
+          .catch((e) => {
+            console.error('[wms-order-push] failed to re-stamp validation disposition', link.id, e)
+            return false
+          })
+        if (restamped && message !== link.lastError) {
           await audit({
             action: 'order_validate', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: null,
             summary: `Order ${link.order.orderNumber ?? link.orderId} still cannot be pushed to the WMS, for a new reason: ${message}`,
@@ -665,10 +778,31 @@ export async function runWmsOrderPushSweepCore(
       // link had already spent remote attempts before it stopped building, those still count
       // against MAX_ATTEMPTS, so a genuinely broken order cannot loop the retry ladder by
       // failing validation in between.
+      //
+      // o3d-2k5r r2: STATE-GUARDED, and this is the hazard the guard closes.
+      //
+      // Two overlapping sweeps both read this link while it is VALIDATION_FAILED. A promotes it,
+      // claims it under the order row lock and is inside pushOrder. B then reached this write —
+      // an unguarded `update({ where: { id } })` that also NULLED lastAttemptAt — and so wiped
+      // A's live claim lease. B's own claim check then hit `if (!existing.lastAttemptAt) return
+      // true` and pushed the same order again: two warehouse orders, goods shipped twice. If A's
+      // push had already landed, the same write reverted a SYNCED/PENDING_VERIFY link to
+      // PENDING_CREATE while KEEPING its externalOrderId, which the create pass re-pushes.
+      //
+      // The predicate is what makes the lease clear safe rather than merely narrower: it applies
+      // only while the link is still VALIDATION_FAILED, and a VALIDATION_FAILED link's
+      // lastAttemptAt is this pass's own rotation stamp, never a live create lease. The lease
+      // must be cleared, or the rotation stamp written a moment ago would make claimForCreate
+      // refuse the re-queued order for a full CREATE_CLAIM_LEASE_MS.
+      let promoted = false
       try {
-        await port.updateLink(link.id, { state: 'PENDING_CREATE', lastError: null, lastAttemptAt: null })
+        promoted = await port.updateLinkIfState(link.id, 'VALIDATION_FAILED', { state: 'PENDING_CREATE', lastError: null, lastAttemptAt: null })
       } catch (error) {
         console.error('[wms-order-push] failed to re-queue a revalidated order', link.id, error)
+        continue
+      }
+      if (!promoted) {
+        console.warn(`[wms-order-push] link ${link.id} left VALIDATION_FAILED before its re-queue was written — another worker owns it now; not re-queued`)
         continue
       }
       result.revalidated += 1
