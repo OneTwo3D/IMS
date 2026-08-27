@@ -628,7 +628,7 @@ test('readState tells a missing record apart from one that exists and cannot be 
     writeFileSync(sentinelless, JSON.stringify(SAMPLE_STATE))
     const read = readState(sentinelless)
     assert.equal(read.status, STATE_CORRUPT, 'a record with no completeness sentinel is CORRUPT')
-    assert.match(read.detail, /sentinel/, 'and says why')
+    assert.match(read.detail ?? '', /sentinel/, 'and says why')
 
     const unreadable = join(dir, 'unreadable.json')
     writeFileSync(unreadable, JSON.stringify({ ...SAMPLE_STATE, state_complete: 1 }))
