@@ -9,7 +9,7 @@ import {
   decideCreateDispatch,
   planCreateDispatch,
   type CreateDispatchClient,
-  type CreateDispatchMint,
+  type CreateDispatchFenceWrite,
 } from '@/lib/domain/accounting/create-dispatch-record'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 
@@ -45,6 +45,7 @@ type Row = {
   processingStartedAt: Date | null
   createDispatchedAt: Date | null
   createDispatchIdempotencyKey: string | null
+  createDispatchReleasedAt: Date | null
 }
 
 function harness() {
@@ -56,6 +57,8 @@ function harness() {
     processingStartedAt: new Date('2026-08-22T08:59:00.000Z'),
     createDispatchedAt: null,
     createDispatchIdempotencyKey: null,
+    // o3d-gvzu: the release column. Null on every row until a transport refusal proves nothing left.
+    createDispatchReleasedAt: null,
   }
   /** Documents that actually exist in the ledger. The number that must never reach 2. */
   const xeroCreates: string[] = []
@@ -66,7 +69,11 @@ function harness() {
     $queryRaw: (async () => [{ now: new Date(now) }]) as CreateDispatchClient['$queryRaw'],
     accountingSyncLog: {
       findUnique: async ({ where }) => (where.id === row.id
-        ? { createDispatchedAt: row.createDispatchedAt, createDispatchIdempotencyKey: row.createDispatchIdempotencyKey }
+        ? {
+          createDispatchedAt: row.createDispatchedAt,
+          createDispatchIdempotencyKey: row.createDispatchIdempotencyKey,
+          createDispatchReleasedAt: row.createDispatchReleasedAt,
+        }
         : null),
     },
   }
@@ -80,12 +87,17 @@ function harness() {
    *
    * The trigger's job is modelled too: the pair may be minted, never moved.
    */
-  function fenceBeforeRemoteWrite(mint: CreateDispatchMint | undefined, claimHeld: boolean): boolean {
+  function fenceBeforeRemoteWrite(write: CreateDispatchFenceWrite | undefined, claimHeld: boolean): boolean {
     if (!claimHeld) return false
     row.processingStartedAt = new Date(now)
-    if (mint && row.createDispatchedAt === null) {
-      row.createDispatchedAt = mint.createDispatchedAt
-      row.createDispatchIdempotencyKey = mint.createDispatchIdempotencyKey
+    if (write && 'createDispatchedAt' in write && row.createDispatchedAt === null) {
+      row.createDispatchedAt = write.createDispatchedAt
+      row.createDispatchIdempotencyKey = write.createDispatchIdempotencyKey
+    }
+    // o3d-gvzu: and the release is SPENT by the same statement, exactly as production spends it —
+    // the permission cannot outlive the request it permitted.
+    if (write && 'createDispatchReleasedAt' in write) {
+      row.createDispatchReleasedAt = write.createDispatchReleasedAt
     }
     return true
   }
@@ -137,7 +149,7 @@ function harness() {
     })
     if (!plan.dispatch) return plan.error
 
-    if (!fenceBeforeRemoteWrite(plan.mint ?? undefined, opts.claimHeld ?? true)) {
+    if (!fenceBeforeRemoteWrite(plan.write ?? undefined, opts.claimHeld ?? true)) {
       return 'claim lost before the remote write; nothing was sent'
     }
 
@@ -245,7 +257,7 @@ test('o3d-jit6 r1#2: planning writes NOTHING, whatever it answers', async () => 
     entryId: ENTRY_ID, type: 'COGS_JOURNAL', idempotencyKey: KEY, label: LABEL,
   })
   assert.equal(plan.dispatch, true)
-  assert.ok(plan.dispatch === true && plan.mint, 'it hands the fence what to record')
+  assert.ok(plan.dispatch === true && plan.write, 'it hands the fence what to record')
   assert.equal(h.row.createDispatchedAt, null, 'but has recorded nothing itself')
 })
 
@@ -304,7 +316,7 @@ test('o3d-jit6: the margin is subtracted, so a decision taken at 5m59s does not 
   const dispatchedAt = new Date('2026-08-22T09:00:00.000Z')
   const justInside = new Date(dispatchedAt.getTime() + XERO_IDEMPOTENCY_KEY_RETENTION_MS - CREATE_DISPATCH_REPLAY_MARGIN_MS - 1)
   const justOutside = new Date(dispatchedAt.getTime() + XERO_IDEMPOTENCY_KEY_RETENTION_MS - CREATE_DISPATCH_REPLAY_MARGIN_MS)
-  const recorded = { dispatchedAt, idempotencyKey: KEY }
+  const recorded = { dispatchedAt, idempotencyKey: KEY, releasedAt: null }
 
   const inside = decideCreateDispatch({ type: 'COGS_JOURNAL', idempotencyKey: KEY, recorded, now: justInside, label: LABEL })
   assert.equal(inside.dispatch, true)
@@ -330,7 +342,7 @@ test('o3d-jit6: a type whose create UPSERTS on a number IMS mints may still re-p
   const decision = decideCreateDispatch({
     type: 'CREDIT_NOTE',
     idempotencyKey: KEY,
-    recorded: { dispatchedAt: new Date('2026-08-22T09:00:00.000Z'), idempotencyKey: KEY },
+    recorded: { dispatchedAt: new Date('2026-08-22T09:00:00.000Z'), idempotencyKey: KEY, releasedAt: null },
     now: new Date('2026-08-22T10:00:00.000Z'),
     label: 'CREDIT_NOTE for SalesOrderRefund r-1',
   })
@@ -419,8 +431,8 @@ test('o3d-jit6 r1#2: the journal branch PLANS before the fence and RECORDS in it
   // proves the claim rather than by one that runs whether or not the post is going to happen.
   assert.match(
     branch,
-    /lease\.fenceBeforeRemoteWrite\('manual-journal', dispatch\.mint \?\? undefined\)/,
-    'the mint must be handed to the fence — a record written outside it can outlive a post that never left',
+    /lease\.fenceBeforeRemoteWrite\('manual-journal', dispatch\.write \?\? undefined\)/,
+    'the fence write must be handed to the fence — a record written outside it can outlive a post that never left',
   )
   assert.ok(!/takeCreateDispatchSlot|accountingSyncLog\.update/.test(branch),
     'and the branch must not write the record for itself')
@@ -442,7 +454,7 @@ test('o3d-jit6 r1#2: the fence writes the claim renewal and the dispatch record 
     source.indexOf('function lostClaimMessage('),
   )
   assert.equal((renew.match(/await db\.accountingSyncLog\./g) ?? []).length, 1, 'exactly one write')
-  assert.match(renew, /data: mint \? \{ processingStartedAt: renewedAt, \.\.\.mint \} : \{ processingStartedAt: renewedAt \}/)
+  assert.match(renew, /data: write \? \{ processingStartedAt: renewedAt, \.\.\.write \} : \{ processingStartedAt: renewedAt \}/)
   assert.match(renew, /where: \{ \.\.\.heldClaimWhere\(entryId, held\), connector: XERO_CONNECTOR \}/,
     'and the mint is scoped to the claim, so only the worker that owns the row can record a dispatch for it')
 })
@@ -465,7 +477,7 @@ test('o3d-jit6 r1#3: every no-remedy type prescribes a remedy the settlement act
     const decision = decideCreateDispatch({
       type,
       idempotencyKey: KEY,
-      recorded: { dispatchedAt: new Date('2026-08-22T09:00:00.000Z'), idempotencyKey: KEY },
+      recorded: { dispatchedAt: new Date('2026-08-22T09:00:00.000Z'), idempotencyKey: KEY, releasedAt: null },
       now: new Date('2026-08-22T10:00:00.000Z'),
       label: `${type} for DailyBatch b-1`,
     })
