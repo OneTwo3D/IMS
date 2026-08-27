@@ -64,6 +64,9 @@ import {
   describeUnrecordablePostedDocument,
   PostedDocumentEvidenceUnwritten,
   UNRECORDED_POSTED_DOCUMENT_ACTION,
+  type LedgerPostingMode,
+  type PostedOperationOutcome,
+  type RemoteEffectOutcome,
   type UnrecordablePostedDocument,
   type UnrecordablePostedDocumentReason,
 } from '@/lib/domain/accounting/unrecorded-posted-document'
@@ -441,6 +444,12 @@ export async function recordPostedSyncResult(
      * leave the callback by a route a rollback cannot take with it.
      */
     onConflictObserved?: (incident: UnrecordablePostedDocument) => void
+    /**
+     * o3d-batch-ret r10: whether the handler touched Xero at all, for the operations that can
+     * succeed without doing so. Omitted by every caller whose operation always makes a remote call,
+     * and by the short-circuit paths that called nothing this attempt.
+     */
+    externalEffect?: RemoteEffectOutcome
   },
 ): Promise<PostedSyncRecord> {
   const { entry, externalId, payload } = params
@@ -474,7 +483,17 @@ export async function recordPostedSyncResult(
     const refusal = current === null
       ? { reason: 'ROW_MISSING' as const, namedExternalId: null }
       : { reason: 'ANOTHER_DOCUMENT_NAMED' as const, namedExternalId: current.externalTransactionId }
-    const evidence = await recordUnrecordablePostedDocument(tx, entry, externalId, refusal, params.onConflictObserved)
+    const evidence = await recordUnrecordablePostedDocument(
+      tx,
+      entry,
+      externalId,
+      refusal,
+      // o3d-batch-ret r10 (Codex HIGH): the record is written with WHAT THIS ATTEMPT DID, not only
+      // with which enum member it was. The mode comes off the row's own payload, which is what the
+      // request status was resolved from; the remote-effect answer comes from the handler.
+      { postingMode: xeroPostingMode(payload), externalEffect: params.externalEffect },
+      params.onConflictObserved,
+    )
     return refusal.reason === 'ROW_MISSING'
       ? { recorded: false, reason: 'ROW_MISSING', evidence }
       : { recorded: false, reason: 'ANOTHER_DOCUMENT_NAMED', namedExternalId: refusal.namedExternalId, evidence }
@@ -559,6 +578,7 @@ async function recordUnrecordablePostedDocument(
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
   externalId: string | null,
   refusal: { reason: UnrecordablePostedDocumentReason; namedExternalId: string | null },
+  outcome: PostedOperationOutcome,
   onConflictObserved?: (incident: UnrecordablePostedDocument) => void,
 ): Promise<string> {
   const incident: UnrecordablePostedDocument = {
@@ -566,6 +586,7 @@ async function recordUnrecordablePostedDocument(
     postedExternalId: externalId,
     reason: refusal.reason,
     namedExternalId: refusal.namedExternalId,
+    outcome,
   }
   // BEFORE the write, not after it. What this hands upward is the OBSERVATION, and the observation is
   // already complete: the row was read in this transaction and it names another document. Announcing it
@@ -607,6 +628,11 @@ function unrecordedPostedDocumentRecord(incident: UnrecordablePostedDocument, de
       postedExternalId: incident.postedExternalId,
       rowNamesExternalId: incident.reason === 'ANOTHER_DOCUMENT_NAMED' ? incident.namedExternalId : null,
       reason: incident.reason,
+      // o3d-batch-ret r10: WITHOUT THESE, A ROW READ BACK IS A ROW THAT CANNOT SAY WHETHER A BALANCE
+      // MOVED. The reset breadcrumb classifies from this metadata alone, and a missing key is read
+      // as "not recorded" rather than as a live posting.
+      postingMode: incident.outcome?.postingMode ?? null,
+      externalEffect: incident.outcome?.externalEffect ?? null,
     }))),
   }
 }
@@ -665,6 +691,8 @@ export async function recordPostedDocumentDurably(
    * `POST_REMOTE_PERSIST_TX_OPTIONS`; everyone else keeps Prisma's defaults.
    */
   txOptions?: { maxWait?: number; timeout?: number },
+  /** o3d-batch-ret r10: the handler's own answer to "did anything leave this process". */
+  externalEffect?: RemoteEffectOutcome,
 ): Promise<PostedSyncRecord> {
   const revision = externalRevisionAt !== undefined ? { externalRevisionAt } : {}
   let unwritten: PostedDocumentEvidenceUnwritten | undefined
@@ -699,6 +727,7 @@ export async function recordPostedDocumentDurably(
         externalId,
         payload,
         ...revision,
+        externalEffect,
         onConflictObserved: (incident) => { observed = incident },
       }), txOptions)
     } catch (error) {
@@ -2364,6 +2393,8 @@ export async function persistPostedXeroDocument(input: {
    * rule decides such a path on.
    */
   externalRevisionAt?: Date | null
+  /** o3d-batch-ret r10: the handler's remote-effect answer, for the operations that can make none. */
+  externalEffect?: RemoteEffectOutcome
 }): Promise<PostedDocumentPersistOutcome> {
   const { entry, payload, claim } = input
   const externalId = input.externalId ?? null
@@ -2391,6 +2422,7 @@ export async function persistPostedXeroDocument(input: {
         payload,
         input.externalRevisionAt,
         POST_REMOTE_PERSIST_TX_OPTIONS,
+        input.externalEffect,
       ),
       // o3d-xl63 r6/r7: the deadline is derived from the claim THIS worker holds, read here as the
       // call is built rather than carried down from the top of the sweep. A renewal that moved the
@@ -3924,6 +3956,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it
           // made is recorded and orders the document against other writers.
           externalRevisionAt: syncResult.externalRevisionAt ?? null,
+          // o3d-batch-ret r10 (Codex MEDIUM): BILL_ATTACHMENT is the one operation that can succeed
+          // having sent nothing, and only the handler knows which it did.
+          externalEffect: syncResult.externalEffect,
         })
         if (!persisted.persisted) {
           // Both reasons end the same way on THIS path, and for the same reason they end differently
@@ -4497,6 +4532,9 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it
           // made is recorded and orders the document against other writers.
           externalRevisionAt: syncResult.externalRevisionAt ?? null,
+          // o3d-batch-ret r10 (Codex MEDIUM): BILL_ATTACHMENT is the one operation that can succeed
+          // having sent nothing, and only the handler knows which it did.
+          externalEffect: syncResult.externalEffect,
         })
         if (!persisted.persisted) {
           // THE TWO FAILURES ARE NOT THE SAME JOB OUTCOME, and collapsing them would be wrong in
@@ -4631,6 +4669,21 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
   return result
 }
 
+/**
+ * WHAT THE ROW'S POSTING MODE MEANS FOR THE UNRECORDED-POST RECORD (o3d-batch-ret r10, Codex HIGH).
+ *
+ * The same predicate the two resolvers below use, and deliberately not a second reading of the
+ * setting: `_postingMode` is a per-sync-type OPERATOR SETTING carried on the row's own payload, so
+ * every attempt on this row sends the same status, and a record written on any of them can state it.
+ * `resolveInvoiceStatus` covers the invoice, bill and credit-note creates AND the two *_UPDATE
+ * types; `resolveJournalStatus` covers every manual journal. Both answer DRAFT on exactly this
+ * value, and `tests/accounting/unrecorded-outcome-decides-the-remedy.test.ts` holds the three to one
+ * another so the record cannot drift from the status the request was actually sent with.
+ */
+function xeroPostingMode(payload: SyncPayload): LedgerPostingMode {
+  return payload._postingMode === 'draft' ? 'DRAFT' : 'LIVE'
+}
+
 /** Resolve _postingMode to Xero API status values */
 function resolveInvoiceStatus(mode: unknown): string {
   return mode === 'draft' ? 'DRAFT' : 'AUTHORISED'
@@ -4643,6 +4696,17 @@ type EntryResult = {
   success: boolean
   externalId?: string
   invoiceNumber?: string
+  /**
+   * o3d-batch-ret r10 (Codex MEDIUM): DID THIS HANDLER TOUCH XERO AT ALL?
+   *
+   * Set only by the handlers that can succeed WITHOUT making a remote call — `BILL_ATTACHMENT`
+   * returns `{ success: true }` and uploads nothing when `xero_sync_attach_pdf` is 'false'. The
+   * unrecorded-post record is the reader: without this it said both that a PDF was uploaded and that
+   * nothing was created at all, and on a disabled install it sent an operator to remove a duplicate
+   * attachment the attempt never made. Absent means "not recorded", which the record says out loud
+   * rather than resolving to either answer.
+   */
+  externalEffect?: RemoteEffectOutcome
   /** o3d-cvj9 r3: the external system's revision stamp for the document this write just changed. */
   externalRevisionAt?: Date | null
   error?: string
@@ -5783,7 +5847,8 @@ async function processClaimedEntry(
       }
       const attachEnabled = await db.setting.findUnique({ where: { key: 'xero_sync_attach_pdf' } })
       if (attachEnabled?.value === 'false') {
-        return { success: true }
+        // NOTHING LEAVES THIS PROCESS, and the record has to be able to say so (r10, Codex MEDIUM).
+        return { success: true, externalEffect: 'NONE' }
       }
       try {
         const relPath = supplierInvoicePath.replace(/^\/+/, '')
@@ -5800,7 +5865,8 @@ async function processClaimedEntry(
         if (!uploadRes.ok) {
           return { success: false, error: uploadRes.error ?? 'Failed to attach supplier invoice PDF' }
         }
-        return { success: true }
+        // An attachment now exists on that bill — no accounting document, but not nothing either.
+        return { success: true, externalEffect: 'MADE' }
       } catch (e) {
         return { success: false, error: String(e) }
       }

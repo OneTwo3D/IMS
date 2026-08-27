@@ -175,6 +175,11 @@ async function clearTransactionScope() {
         preserved: preservedRows.length,
         ledgerDocuments: counts.LEDGER_DOCUMENT,
         ledgerDocumentsWithoutIdentifier: counts.LEDGER_DOCUMENT_NO_IDENTIFIER,
+        // o3d-batch-ret r10: a DRAFT moved no balances and an unrecorded posting mode cannot say
+        // whether one did. Folding either into `ledgerDocuments` is the falsehood this round removed
+        // from the sentence, so it must not survive in the number beside it.
+        ledgerDrafts: counts.LEDGER_DRAFT,
+        ledgerOutcomeUnrecorded: counts.LEDGER_OUTCOME_UNRECORDED,
         ledgerNonDocuments: counts.LEDGER_NON_DOCUMENT,
         noIdentifierSideEffects: counts.NO_IDENTIFIER_SIDE_EFFECT,
         unclassified: counts.UNCLASSIFIED,

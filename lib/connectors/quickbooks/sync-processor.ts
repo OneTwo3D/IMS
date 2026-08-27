@@ -42,6 +42,8 @@ import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import {
   QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
   describeUnpersistedQboPost,
+  type PostedOperationOutcome,
+  type RemoteEffectOutcome,
   type UnpersistedQboPost,
 } from '@/lib/domain/accounting/unrecorded-posted-document'
 import { redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
@@ -372,6 +374,10 @@ function unpersistedQboPostRecord(incident: UnpersistedQboPost, description: str
       referenceType: entry.referenceType,
       referenceId: entry.referenceId,
       postedExternalId: incident.postedExternalId,
+      // o3d-batch-ret r10: what the ATTEMPT did, which the operation type cannot say. See the Xero
+      // builder for why an absent key must read as "not recorded" and never as a live posting.
+      postingMode: incident.outcome?.postingMode ?? null,
+      externalEffect: incident.outcome?.externalEffect ?? null,
     }))),
   }
 }
@@ -442,6 +448,8 @@ async function persistFreshQboPostOrEscalate(
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
   payload: SyncPayload,
   externalId: string | null,
+  /** o3d-batch-ret r10: the handler's own answer to "did anything leave this process". */
+  externalEffect?: RemoteEffectOutcome,
 ): Promise<boolean> {
   let lastError: unknown
   for (let attempt = 0; attempt < POST_EVIDENCE_TRANSACTION_ATTEMPTS; attempt += 1) {
@@ -453,7 +461,14 @@ async function persistFreshQboPostOrEscalate(
     }
   }
 
-  const incident: UnpersistedQboPost = { entry, postedExternalId: externalId }
+  // o3d-batch-ret r10 (Codex HIGH): THIS CONNECTOR HAS NO DRAFT FORM OF ANY DOCUMENT. Its invoice
+  // module says so in as many words — "No DRAFT/AUTHORISED status distinction on creation" — and no
+  // QuickBooks handler reads `_postingMode` or sends a status of any kind. So the mode is LIVE as a
+  // FACT about this connector, not as a default, and a test holds the connector to it: the day a
+  // draft path appears here, resolving LIVE unconditionally would be the same falsehood the Xero
+  // side was corrected for.
+  const outcome: PostedOperationOutcome = { postingMode: 'LIVE', externalEffect }
+  const incident: UnpersistedQboPost = { entry, postedExternalId: externalId, outcome }
   const description = describeUnpersistedQboPost(incident, lastError)
   // The console line FIRST, because it cannot fail and cannot be swept: at this instant it is the
   // only place the identifier is written down, and a crash inside the durable write below must still
@@ -935,7 +950,9 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // evidence fence there cannot stop it because the database has no evidence yet. See
         // persistFreshQboPostOrEscalate: the write is re-driven, and an id that still cannot be
         // recorded is escalated rather than denied.
-        if (!await persistFreshQboPostOrEscalate(entry, payload, syncResult.externalId ?? null)) {
+        if (!await persistFreshQboPostOrEscalate(
+          entry, payload, syncResult.externalId ?? null, syncResult.externalEffect,
+        )) {
           result.failed++
           continue
         }
@@ -1128,7 +1145,19 @@ async function processEntry(
   // o3d-550x: the instant this worker claimed the row. Still needed after o3d-e2mz — this connector
   // mints no attempt revision, so the claim is the ONLY fence its cancelled-order retirement has.
   claimedAt: Date,
-): Promise<{ success: boolean; externalId?: string; invoiceNumber?: string; error?: string; skipped?: boolean }> {
+): Promise<{
+  success: boolean
+  externalId?: string
+  invoiceNumber?: string
+  error?: string
+  skipped?: boolean
+  /**
+   * o3d-batch-ret r10 (Codex MEDIUM): DID THIS HANDLER TOUCH QUICKBOOKS AT ALL? Set only by the
+   * handlers that can succeed WITHOUT a remote call — `BILL_ATTACHMENT` returns success and uploads
+   * nothing when `quickbooks_sync_attach_pdf` is 'false'. Absent means "not recorded".
+   */
+  externalEffect?: RemoteEffectOutcome
+}> {
   const requestId = buildQboRequestId(getIdempotencySource(entryId, type, referenceId, payload))
 
   switch (type) {
@@ -1465,7 +1494,8 @@ async function processEntry(
       }
       const attachEnabled = await db.setting.findUnique({ where: { key: 'quickbooks_sync_attach_pdf' } })
       if (attachEnabled?.value === 'false') {
-        return { success: true }
+        // NOTHING LEAVES THIS PROCESS, and the record has to be able to say so (r10, Codex MEDIUM).
+        return { success: true, externalEffect: 'NONE' }
       }
       try {
         const relPath = supplierInvoicePath.replace(/^\/+/, '')
@@ -1479,7 +1509,8 @@ async function processEntry(
         if (!uploadRes.ok) {
           return { success: false, error: uploadRes.error ?? 'Failed to attach supplier invoice PDF' }
         }
-        return { success: true }
+        // An attachment now exists on that bill — no accounting document, but not nothing either.
+        return { success: true, externalEffect: 'MADE' }
       } catch (e) {
         return { success: false, error: String(e) }
       }
