@@ -6300,19 +6300,26 @@ export async function repairXeroBackReferences(limit = DEFAULT_BACK_REFERENCE_SW
     // What the connector supplies is only the part the connector-agnostic module cannot hold: the
     // locked read and the retirement, in one transaction on the Xero database handle.
     decideSaleRelease,
-    // o3d-bqw7 r2: the sweep now hands over the row's COMPLETE durable origin record, not just its
+    // o3d-bqw7 r2: the sweep hands over the row's COMPLETE durable origin record, not just its
     // payload — a tombstone's payload is `{}` and its `connectionProvenance` column is the only half
     // left speaking, so without it every follow-up the sweep rebuilds is born unable to post.
     //
-    // RESIDUAL, NAMED RATHER THAN HIDDEN (o3d-ekn8 r5). The sweep's dep is `Promise<void>` and it
-    // discharges the obligation in the SAME write as the repair, so the outcome is dropped here: a
-    // sweep pass whose re-drive again leaves a receipt unregistered still clears the marker. Closing
-    // it means widening BackReferenceSweepDeps and splitting that write in the connector-agnostic
-    // module, which is a change of its own — the connectors' own post paths, which is where the
-    // finding was raised and where every first attempt runs, no longer do this.
-    enqueueFollowUps: async (entryId, type, referenceType, referenceId, payload, syncResult, origin) => {
-      await enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult, origin)
-    },
+    // THE SETTLEMENT OUTCOME IS RETURNED, NOT DISCARDED (o3d-0bfh, closing the residual r5 named).
+    //
+    // This adapter used to `await` the enqueue and drop its `FollowUpOutcome` to satisfy a
+    // `Promise<void>` dep. That made the sweep an ALTERNATE OBLIGATION-RELEASE PATH around the four
+    // gates r5 had just installed on this connector's own post sites: the re-drive never throws for
+    // a receipt it could not register — capacity refusals and connector-switch rollbacks return
+    // `settled: false` deliberately — so every one of them reached the sweep as success, and it
+    // stamped the row checked and cleared `backReferenceFollowUpsPendingAt` over unqueued money.
+    // Permanently: a stamped row is never a candidate again.
+    //
+    // `FollowUpOutcome` and `BackReferenceFollowUpOutcome` are structurally identical, so this is a
+    // direct return rather than a translation. They are two declarations on purpose — the sweep is
+    // connector-agnostic and must state its own contract — and if they ever diverge, this line is
+    // where the compiler says so.
+    enqueueFollowUps: (entryId, type, referenceType, referenceId, payload, syncResult, origin) =>
+      enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult, origin),
   }, { limit })
 }
 

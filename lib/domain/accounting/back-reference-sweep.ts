@@ -505,6 +505,20 @@ export type BackReferenceSweepActivity = {
   metadata: Record<string, unknown>
 }
 
+/**
+ * WHAT A FOLLOW-UP ENQUEUE LEFT OUTSTANDING (o3d-0bfh).
+ *
+ * Structurally identical to the connectors' own `FollowUpOutcome`, and deliberately NOT imported
+ * from either of them: this module is connector-agnostic, and the point of stating the shape here
+ * is that BOTH connectors must satisfy it. A connector whose enqueue cannot leave money outstanding
+ * answers `{ deferredReceiptsSettled: true }` unconditionally, which is a claim it makes rather
+ * than a default this module assumes on its behalf.
+ */
+export type BackReferenceFollowUpOutcome = {
+  /** False when a receipt recorded before this document is still waiting to reach the ledger. */
+  deferredReceiptsSettled: boolean
+}
+
 export type BackReferenceSweepDeps = {
   db: BackReferenceSweepClient
   /** AccountingSyncLog.connector value this sweep owns, e.g. 'xero'. */
@@ -529,6 +543,22 @@ export type BackReferenceSweepDeps = {
    * this to logActivityPersisted, whose return value is the confirmation.
    */
   logActivity: (entry: BackReferenceSweepActivity) => Promise<boolean>
+  /**
+   * MUST REPORT WHAT IT LEFT OUTSTANDING (o3d-0bfh, Codex HIGH) — the same contract, and for the
+   * same reason, as `logActivity` directly above.
+   *
+   * This was `Promise<void>`, and that was the whole defect. The connectors' deferred-receipt
+   * re-drive is built NEVER TO THROW — a receipt that cannot be registered must not fail a sync
+   * entry whose invoice HAS posted — so capacity refusals, connector-switch rollbacks and every
+   * other registration failure return `settled: false` and resolve normally. Awaiting a `void`
+   * left "it did not throw" as the only signal, so all of them arrived here as success, and the
+   * sweep stamped the row checked and cleared `backReferenceFollowUpsPendingAt` over money that
+   * had not reached the ledger.
+   *
+   * o3d-ekn8 r5 closed exactly this at the connectors' own four post-path release sites. The sweep
+   * is the OTHER release path — the one that runs for every row those sites left unsettled — so a
+   * discard here is not a lesser copy of that finding, it is the way around the gate it installed.
+   */
   enqueueFollowUps: (
     entryId: string,
     type: AccountingSyncType,
@@ -551,7 +581,7 @@ export type BackReferenceSweepDeps = {
       connectionProvenance: string | null | undefined
       backReferenceEvidenceCompactedAt?: Date | null
     },
-  ) => Promise<void>
+  ) => Promise<BackReferenceFollowUpOutcome>
   now?: () => Date
   /**
    * IS THE SALE THIS ROW BELONGS TO STILL LIVE — and if not, retire the row (o3d-e2mz r8).
@@ -620,6 +650,17 @@ export type BackReferenceRepairResult = {
    * to go and undo in the ledger.
    */
   retiredCancelledSale: number
+  /**
+   * Rows whose follow-up enqueue RETURNED NORMALLY but reported a deferred receipt still not
+   * registered in the ledger (o3d-0bfh). Left unstamped and still marked as owing follow-ups.
+   *
+   * Its own number, and not folded into `failed`, because it is not a failure of this sweep: the
+   * enqueue ran and answered truthfully. It is money the ledger has not seen, and the population it
+   * counts is the one that must not be allowed to shrink silently — which is exactly what happened
+   * while this outcome was discarded, since every one of these rows was previously counted as
+   * `repaired` or as a recovered follow-up and then stamped out of the candidate set for good.
+   */
+  followUpsUnsettled: number
 }
 
 /**
@@ -788,7 +829,7 @@ export async function repairAccountingBackReferences(
 
   const result: BackReferenceRepairResult = {
     scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, followUpsDiscarded: 0, skippedUnverified: 0,
-    retiredCancelledSale: 0,
+    retiredCancelledSale: 0, followUpsUnsettled: 0,
   }
   // One cutoff for the whole run, so every page of the scan agrees on which deferred rows
   // are due — a per-page `new Date()` would let a row fall on both sides of the boundary.
@@ -1067,6 +1108,46 @@ export async function repairAccountingBackReferences(
   }
 
   /**
+   * THE ENQUEUE RAN AND LEFT MONEY OUTSTANDING (o3d-0bfh). Count it, name it, keep the marker.
+   *
+   * NOT the same act as `reportDiscardedFollowUps` above, and the difference decides the policy.
+   * A discard is TERMINAL — the payload is gone, no future sweep can rebuild it — so it settles the
+   * row and the warning is the only remaining artefact, which is why it settles only once the
+   * warning is confirmed persisted. This is the opposite: the work is still rebuildable, the next
+   * sweep can and should retry it, and the row is being LEFT IN the candidate set. Retaining the
+   * marker is therefore ALREADY the safe state, so `logActivity`'s answer is deliberately not read —
+   * failing to describe an outstanding receipt must not be able to make the sweep settle it. That is
+   * the same reasoning, and the same asymmetry, as the connectors' `settleFollowUpObligation`.
+   *
+   * ERROR, not WARNING: a receipt that never reached the ledger is a customer's payment missing from
+   * the accounts, and the row it is owed against is SYNCED and carries its external id exactly like
+   * a row that completed. Nothing else about it says anything is wrong.
+   */
+  const reportUnsettledReceipts = async (row: BackReferenceSweepRow, phase: 'repaired' | 'already-applied') => {
+    result.followUpsUnsettled++
+    await deps.logActivity({
+      entityType: 'SYSTEM',
+      action: `${prefix}_backreference_followups_retained`,
+      tag: 'sync',
+      level: 'ERROR',
+      description: `Enqueued the outstanding ${connectorLabel} follow-ups recorded against ${row.type} for `
+        + `${row.referenceType} ${row.referenceId}, but a receipt recorded before this document is STILL NOT `
+        + `registered against it in ${connectorLabel}. The row is deliberately left unsettled and still marked as `
+        + 'owing follow-ups, so the next sweep retries them — it is SYNCED and carries its external id exactly '
+        + `like a row that completed, so nothing else about it records this. Register the receipt in ${connectorLabel} `
+        + 'by hand if it does not clear.',
+      metadata: {
+        syncLogId: row.id,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        externalId: row.externalTransactionId,
+        phase,
+      },
+    }).catch(() => { /* the state is on the row; the log is the notification */ })
+  }
+
+  /**
    * MAY THIS REPAIR BE SETTLED, GIVEN WHAT IT COULD RECOVER ABOUT THE INVOICE DATE? (o3d-r5pj.)
    *
    * Only the SALES_INVOICE / SalesOrder pair writes `invoicedAt` at all, so every other pair
@@ -1188,8 +1269,9 @@ export async function repairAccountingBackReferences(
     // which a tombstone keeps. The processor short-circuit already had this order for the reason
     // o3d-nepa r4 gives: the announcement gates the RELEASE, it must never gate the enqueue.
     const discarded = compactionDiscardedFollowUps(row)
+    let outcome: BackReferenceFollowUpOutcome
     try {
-      await deps.enqueueFollowUps(
+      outcome = await deps.enqueueFollowUps(
         row.id,
         row.type,
         row.referenceType,
@@ -1213,8 +1295,22 @@ export async function repairAccountingBackReferences(
       })
       return false
     }
-    // AND ONLY NOW THE TERMINAL DISCARD. The rebuildable half has gone out; what is left is work this
-    // tombstone can never recover, and the marker may be consumed only once that is on record.
+    // IT RETURNED — THAT IS NOT THE SAME AS IT SETTLED (o3d-0bfh). The enqueue is built never to
+    // throw for a receipt it could not register, so the refusal arrives here as a normal return and
+    // the row must NOT be stamped on it. Answering false keeps the marker and leaves the row in the
+    // candidate set, which is the identical treatment the throwing case gets immediately above —
+    // the only thing that ever distinguished them was that one of the two was observable.
+    //
+    // THIS IS ASKED BEFORE THE TERMINAL DISCARD BELOW, because that discard CONSUMES the marker:
+    // announcing a permanent loss and settling the row on a pass that also failed to register a
+    // receipt would retire the only record that the receipt is still owed.
+    if (!outcome.deferredReceiptsSettled) {
+      await reportUnsettledReceipts(row, 'already-applied')
+      return false
+    }
+    // AND ONLY NOW THE TERMINAL DISCARD. The rebuildable half has gone out and settled; what is left
+    // is work this tombstone can never recover, and the marker may be consumed only once that is on
+    // record.
     if (discarded.length > 0) return reportDiscardedFollowUps(row, 'already-applied')
     await deps.logActivity({
       entityType: 'SYSTEM',
@@ -1576,10 +1672,20 @@ export async function repairAccountingBackReferences(
           let followUpsEnqueued = true
           {
             try {
-              await deps.enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, {
+              // AND ITS ANSWER IS READ (o3d-0bfh). `followUpsEnqueued` was set from control flow
+              // alone — assigned false only in the catch — so a non-throwing refusal left it true
+              // and the row was stamped CHECKED, its marker cleared and (for a FAILED row) its
+              // status flipped to SYNCED, with the receipt still unregistered. The re-drive behind
+              // this call cannot throw by design, so control flow was never able to see the case
+              // this variable exists to gate.
+              const outcome = await deps.enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, {
                 externalId: row.externalTransactionId,
                 invoiceNumber,
               }, sweepRowOriginRecord(row))
+              if (!outcome.deferredReceiptsSettled) {
+                followUpsEnqueued = false
+                await reportUnsettledReceipts(row, followUpsOnly ? 'already-applied' : 'repaired')
+              }
             } catch (followUpError) {
               followUpsEnqueued = false
               console.error(`${prefix}: back-reference follow-up enqueue failed`, row.id, followUpError)

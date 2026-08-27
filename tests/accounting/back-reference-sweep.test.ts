@@ -190,6 +190,14 @@ type Harness = {
     rawStatements: Array<{ sql: string; values: unknown[] }>
   }
   failFollowUpsFor: Set<string>
+  /**
+   * Sync rows whose follow-up enqueue RETURNS NORMALLY but reports a deferred receipt still not
+   * registered (o3d-0bfh). Deliberately separate from `failFollowUpsFor`: the production re-drive is
+   * built never to throw for exactly this case, so a double that could only throw modelled the one
+   * failure mode the sweep already handled and none of the ones that actually occur — capacity
+   * refusals and connector-switch rollbacks.
+   */
+  unsettledFollowUpsFor: Set<string>
   failProbeFor: Set<string>
   /**
    * Activity-log persistence failures, by action. The PRODUCTION logActivity swallows its write
@@ -225,13 +233,14 @@ function makeHarness(store: Store): Harness {
   const followUps: Harness['followUps'] = []
   const calls = { candidateQueries: 0, syncRowsRead: 0, probes: 0, billUpdates: 0, transactions: 0, rawStatements: [] as Array<{ sql: string; values: unknown[] }> }
   const failFollowUpsFor = new Set<string>()
+  const unsettledFollowUpsFor = new Set<string>()
   const failProbeFor = new Set<string>()
   const failActivityFor = new Set<string>()
   const failPendingMarkerFor = new Set<string>()
   const failInvoiceDateReadFor = new Set<string>()
   const harness = {
-    store, activities, followUps, calls, failFollowUpsFor, failProbeFor, failActivityFor, failPendingMarkerFor,
-    failInvoiceDateReadFor, raceAfterBillRead: null,
+    store, activities, followUps, calls, failFollowUpsFor, unsettledFollowUpsFor, failProbeFor, failActivityFor,
+    failPendingMarkerFor, failInvoiceDateReadFor, raceAfterBillRead: null,
   } as Harness
 
   const client = {
@@ -421,6 +430,11 @@ function sweepDeps(harness: Harness, now?: () => Date, overrides: { cursorStore?
       harness.activities.push(entry)
       return true
     },
+    // Models the PRODUCTION contract on BOTH of its axes (o3d-0bfh). It can throw, and — separately —
+    // it can RETURN NORMALLY while reporting that a deferred receipt never reached the ledger. The
+    // second is the one the connectors actually produce: the re-drive is built never to throw,
+    // because a receipt it cannot register must not fail a sync entry whose invoice HAS posted.
+    // It also records the ORIGIN it was handed (o3d-bqw7 r2), which is what the tombstone tests read.
     enqueueFollowUps: async (
       entryId: string,
       _type: string,
@@ -432,6 +446,7 @@ function sweepDeps(harness: Harness, now?: () => Date, overrides: { cursorStore?
     ) => {
       if (harness.failFollowUpsFor.has(entryId)) throw new Error('follow-up enqueue failed')
       harness.followUps.push({ entryId, referenceType, referenceId, origin })
+      return { deferredReceiptsSettled: !harness.unsettledFollowUpsFor.has(entryId) }
     },
   } as Parameters<typeof repairAccountingBackReferences>[0]
 }
@@ -1879,6 +1894,98 @@ test('[o3d-p5j3] discharging a FALSE obligation never flips a genuinely FAILED r
   assert.equal(harness.store.syncRows[0].status, 'FAILED', 'the row keeps its own verdict')
   assert.equal(harness.store.syncRows[0].backReferenceFollowUpsPendingAt, null, 'but the false obligation drains')
   assert.ok(harness.store.syncRows[0].backReferenceCheckedAt)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh — the sweep discarded the follow-up enqueue's settlement outcome.
+//
+// o3d-ekn8 r5 gated the four release sites on the connectors' own post paths, so a post that left a
+// receipt unregistered kept its obligation marker. This sweep is the OTHER release path — the one
+// that runs for every row those sites left unsettled — and it awaited `enqueueFollowUps` for its
+// exception and nothing else. Since the deferred-receipt re-drive is built NEVER TO THROW (a receipt
+// that cannot be registered must not fail a sync entry whose invoice HAS posted), every capacity
+// refusal and connector-switch rollback arrived as success. The sweep stamped the row checked and
+// cleared the marker, permanently: a stamped row is never a candidate again.
+//
+// Both tests below drive a NON-THROWING `settled: false`, which is the only shape production
+// produces. Each dies if the outcome is discarded again — see the mutation noted on each.
+// ---------------------------------------------------------------------------
+
+test('[o3d-0bfh] a repaired row whose receipt is still unregistered keeps its marker and is NOT stamped', async () => {
+  // MUTATION THAT KILLS THIS: drop the `if (!outcome.deferredReceiptsSettled)` branch in the repair
+  // path (or restore the `await deps.enqueueFollowUps(...)` discard). `followUpsEnqueued` then stays
+  // true, markChecked runs, and the three assertions below all flip at once — stamped, marker gone,
+  // and FAILED silently promoted to SYNCED.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED', payload: { date: '2026-01-05', invoiceNumber: 'INV-1' } })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  harness.unsettledFollowUpsFor.add('log-0001')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  // The LINK half genuinely succeeded and is reported as such — the finding is about what is
+  // released on the strength of it, not about refusing the repair.
+  assert.equal(run.repaired, 1)
+  assert.equal(harness.store.orders[0].accountingInvoiceId, 'XINV-1')
+
+  assert.equal(run.followUpsUnsettled, 1, 'the outstanding receipt is counted, not absorbed into `repaired`')
+  assert.equal(run.failed, 0, 'and it is not a failure of the sweep: the enqueue ran and answered truthfully')
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null,
+    'a stamped row is never a candidate again, so stamping this one loses the receipt for good')
+  assert.ok(harness.store.syncRows[0].backReferenceFollowUpsPendingAt,
+    'the marker is the only thing that records the money is still owed')
+  assert.equal(harness.store.syncRows[0].status, 'FAILED',
+    'and the row must not be promoted to SYNCED on work that did not complete')
+
+  const retained = harness.activities.find((entry) => entry.action === 'xero_backreference_followups_retained')
+  assert.ok(retained, 'the outstanding receipt is announced')
+  assert.equal(retained.level, 'ERROR')
+  assert.equal(retained.metadata.phase, 'repaired')
+  assert.equal(retained.metadata.externalId, 'XINV-1')
+
+  // The next sweep must still find it — the whole point of not stamping it.
+  harness.unsettledFollowUpsFor.clear()
+  const second = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.equal(second.followUpsUnsettled, 0)
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'and it settles once the receipt lands')
+  assert.equal(harness.store.syncRows[0].backReferenceFollowUpsPendingAt, null)
+})
+
+test('[o3d-0bfh] a follow-ups-only row whose receipt is still unregistered keeps its marker and is NOT stamped', async () => {
+  // The path with no back-reference of its own (settleOutstandingFollowUpsOnly) — reached by rows
+  // carrying no external id, where the enqueue IS the entire outstanding work.
+  //
+  // MUTATION THAT KILLS THIS: drop the `if (!outcome.deferredReceiptsSettled)` branch in
+  // settleOutstandingFollowUpsOnly (or discard the outcome again). It then returns true, the caller
+  // runs markChecked, and the row is stamped with its marker cleared.
+  const harness = makeHarness({
+    syncRows: [invoicePdfRow(1)],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: 'XINV-1' }],
+  })
+  harness.unsettledFollowUpsFor.add('log-0001')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-0001'], 'the enqueue did run')
+  assert.equal(run.followUpsUnsettled, 1, 'and reported that it left a receipt outstanding')
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null,
+    'which is not a settlement, however normally the call returned')
+  assert.ok(harness.store.syncRows[0].backReferenceFollowUpsPendingAt, 'the obligation survives for the next sweep')
+
+  const retained = harness.activities.find((entry) => entry.action === 'xero_backreference_followups_retained')
+  assert.ok(retained)
+  assert.equal(retained.level, 'ERROR')
+  assert.equal(retained.metadata.phase, 'already-applied')
+  // The success log belongs to a settled pass only; announcing "recovered" here would contradict the
+  // ERROR sitting beside it.
+  assert.equal(harness.activities.find((entry) => entry.action === 'xero_backreference_followups_recovered'), undefined)
+
+  harness.unsettledFollowUpsFor.clear()
+  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'and it settles once the receipt lands')
 })
 
 // ---------------------------------------------------------------------------

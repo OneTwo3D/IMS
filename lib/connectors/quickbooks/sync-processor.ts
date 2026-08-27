@@ -1634,6 +1634,15 @@ async function enqueueFollowUps(
 // the binding here — the connector-agnostic sweep module needs no changes for it, only a trustworthy
 // realm boundary underneath.
 //
+// WHEN IT IS RE-ADDED, ITS `enqueueFollowUps` MUST RETURN THIS FILE'S `FollowUpOutcome` (o3d-0bfh).
+// The Xero binding wrapped the call in an `async` adapter that awaited it and dropped the outcome to
+// satisfy a `Promise<void>` dep, which made the sweep a second release path around the very gate
+// `settleFollowUpObligation` installs above: `deferredReceiptsSettled: false` never throws, so it
+// arrived as success and the sweep cleared the obligation marker over an unregistered receipt. The
+// dep is now `Promise<BackReferenceFollowUpOutcome>`, so the compiler refuses a binding that
+// discards it — but only if the outcome is RETURNED rather than awaited-and-swallowed inside an
+// adapter, which type-checks just as happily. Return it directly.
+//
 // THE FOLLOW-UP OBLIGATION MARKER IS STILL CLAIMED HERE, AND THAT IS NOT A CONTRADICTION (r10
 // finding 1). Recording that work is owed and repairing it are two different acts, and only the
 // second one is what o3d-s36z gates. The marker writes nothing to any accounting document and
