@@ -1153,3 +1153,30 @@ test('[o3d-anu8] a connector-confirmed posted document outranks an asserted one'
   assert.equal(blocker?.code, 'accounting_sync_live')
   assert.match(blocker!.message, /is already POSTED as INV-REAL/)
 })
+
+test('o3d-2k5r r4: an AMBIGUOUS_CREATE park blocks the delete, and does not prescribe a cancel it cannot perform', async () => {
+  // The park is the state whose whole content is "a create left and we never learned the outcome".
+  // provesNoRemoteWmsCall must refuse it — the ONLY state that proves anything is a
+  // recordValidationFailure-CREATED disposition — and the refusal must not tell the operator to
+  // cancel the order "so the WMS order is withdrawn", because there is no id to withdraw.
+  const { provesNoRemoteWmsCall } = await import('@/lib/domain/wms/order-push-sweep')
+  assert.equal(
+    provesNoRemoteWmsCall({ state: 'AMBIGUOUS_CREATE', attempts: 1, pushedAt: null, externalOrderId: null }),
+    false,
+  )
+  // ...and at attempts 0 as well: the state alone is disqualifying, so a park written by a future
+  // writer that forgot the attempts floor still cannot be read as proof.
+  assert.equal(
+    provesNoRemoteWmsCall({ state: 'AMBIGUOUS_CREATE', attempts: 0, pushedAt: null, externalOrderId: null }),
+    false,
+  )
+
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ pushLink: { state: 'AMBIGUOUS_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 1, pushedAt: null } }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'wms_order_push_link', 'the delete is refused')
+  assert.match(blocker!.message, /no recorded outcome/i)
+  assert.doesNotMatch(blocker!.message, /so the WMS order is withdrawn/)
+})

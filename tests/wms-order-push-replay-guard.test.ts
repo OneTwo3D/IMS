@@ -26,6 +26,10 @@ type LinkRow = {
   attempts: number
   externalOrderId: string | null
   pushedAt: Date | null
+  /** o3d-2k5r r4: the dispatch stamp. A re-queue that leaves it set is parked straight back. */
+  lastAttemptAt?: Date | null
+  externalOrderNumber?: string | null
+  lastError?: string | null
 }
 
 const state = {
@@ -126,8 +130,16 @@ function deadLetter(over: Partial<LinkRow> = {}): LinkRow {
     attempts: 5,
     externalOrderId: null,
     pushedAt: null,
+    lastAttemptAt: new Date('2026-08-01T00:00:00.000Z'),
+    externalOrderNumber: null,
+    lastError: null,
     ...over,
   }
+}
+
+/** o3d-2k5r r4: the park a crashed create claim lands in. Same columns, different state. */
+function ambiguousCreate(over: Partial<LinkRow> = {}): LinkRow {
+  return deadLetter({ state: 'AMBIGUOUS_CREATE', attempts: 1, ...over })
 }
 
 function reset(links: LinkRow[]) {
@@ -237,4 +249,75 @@ test('o3d-2k5r r4 replay: a connector whose create cannot be repeated safely is 
   assert.match(result.error!, /second warehouse order/i)
   assert.deepEqual(state.probedReferences, [], 'a probe could not have changed the answer, so none was spent')
   assert.equal(state.links[0].state, 'DEAD_LETTER', 'nothing written')
+})
+
+// --- o3d-2k5r r4: the park, and the control that must not be offered for it -------------
+
+async function loadReadAction() {
+  const mod = await import('@/app/actions/wms-order-push')
+  return mod.getWmsOrderPushStateForSalesOrder
+}
+
+test('o3d-2k5r r4 chip: canRetry is FALSE for a park the action would refuse every time', async () => {
+  // The "remedy that cannot be performed" class, caught at the point it would be advertised. A
+  // ShipHero park can never be re-queued by this action, so offering the button would be a lie —
+  // and the operator would press it, be refused, and learn nothing they could act on.
+  reset([ambiguousCreate({ connector: 'shiphero' })])
+  const view = await (await loadReadAction())('so-1')
+  assert.equal(view!.state, 'AMBIGUOUS_CREATE')
+  assert.equal(view!.canRetry, false)
+})
+
+test('o3d-2k5r r4 chip: canRetry is TRUE for a park the action can actually resolve', async () => {
+  // The other half, or the rule above would pass for a chip that simply never offers the button.
+  reset([ambiguousCreate({ connector: 'mintsoft' })])
+  const view = await (await loadReadAction())('so-1')
+  assert.equal(view!.canRetry, true)
+})
+
+test('o3d-2k5r r4 chip: a dead letter still offers the button, and a live queue does not', async () => {
+  reset([deadLetter()])
+  assert.equal((await (await loadReadAction())('so-1'))!.canRetry, true)
+  reset([deadLetter({ state: 'PENDING_CREATE', attempts: 0 })])
+  assert.equal((await (await loadReadAction())('so-1'))!.canRetry, false)
+})
+
+test('o3d-2k5r r4 replay: an AMBIGUOUS_CREATE park is re-queued once BOTH keys turn', async () => {
+  // Route: state AMBIGUOUS_CREATE -> the ambiguity branch -> the replay policy (mintsoft passes)
+  // -> the presence probe (MISSING) -> the compare-and-set on the state that was inspected.
+  reset([ambiguousCreate()])
+  state.presence = 'MISSING'
+  const result = await (await loadAction())('so-1')
+
+  assert.equal(result.success, true)
+  assert.deepEqual(state.probedReferences, ['SO-1'], 'the warehouse WAS asked')
+  assert.equal(state.links[0].state, 'PENDING_CREATE')
+  assert.equal(state.links[0].attempts, 0)
+  // Without this the very next sweep reads the stamp as "a create left and we never learned the
+  // outcome" and parks the link straight back — a re-queue that silently does nothing.
+  assert.equal(state.links[0].lastAttemptAt, null)
+})
+
+test('o3d-2k5r r4 replay: an AMBIGUOUS_CREATE park is refused while the warehouse still holds the order', async () => {
+  reset([ambiguousCreate()])
+  state.presence = 'FOUND'
+  const result = await (await loadAction())('so-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.error!, /already holds an order under reference SO-1/i)
+  assert.equal(state.links[0].state, 'AMBIGUOUS_CREATE', 'nothing written')
+})
+
+test('o3d-2k5r r4 replay: a stale AMBIGUOUS_CREATE replay matches nothing and says so', async () => {
+  // The compare-and-set is on the state that was INSPECTED. A park that another worker resolved
+  // between the read and the write must not be converted by a decision taken about a different row.
+  reset([ambiguousCreate()])
+  state.presence = 'MISSING'
+  state.mutateAfterRead = () => { state.links[0].state = 'SYNCED'; state.links[0].externalOrderId = 'wms-9' }
+  const result = await (await loadAction())('so-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.error!, /changed while you were looking at it/i)
+  assert.equal(state.links[0].state, 'SYNCED')
+  assert.equal(state.links[0].externalOrderId, 'wms-9', 'the settled id survives')
 })

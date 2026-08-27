@@ -272,7 +272,17 @@ export async function findSalesOrderDeleteBlocker(
         : `${pushLink.attempts} push attempt(s) may already have been dispatched`
     blockers.push({
       code: 'wms_order_push_link',
-      message: pushLink.state === 'VALIDATION_FAILED'
+      message: pushLink.state === 'AMBIGUOUS_CREATE'
+        // o3d-2k5r r4: its own message, because the generic one prescribes a remedy that cannot be
+        // performed here. "Cancel the order so the WMS order is withdrawn" needs an external id to
+        // withdraw, and the defining feature of this state is that IMS never learned one — a cancel
+        // would report success having withdrawn nothing.
+        ? 'Cannot delete an order whose WMS create was dispatched with no recorded outcome '
+          + `(push state ${pushLink.state}). The warehouse may be holding an order for it under a `
+          + 'reference IMS never learned, so a cancel here would withdraw nothing. Resolve it in the '
+          + 'WMS first — the push chip carries the reference to search for and what to do with what '
+          + 'you find.'
+        : pushLink.state === 'VALIDATION_FAILED'
         ? `Cannot delete an order that may already have reached the warehouse management system `
           + `(${evidence}, and its payload only became invalid afterwards). A failed or unfinished push `
           + 'does not prove nothing was created — cancel the order instead so the WMS order is withdrawn.'

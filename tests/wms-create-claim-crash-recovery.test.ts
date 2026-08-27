@@ -85,7 +85,7 @@ type LinkRow = {
  * at all. `claimForCreate` delegates to the PRODUCTION decision rather than re-stating it, so this
  * harness cannot quietly diverge from the rule it is supposed to be exercising.
  */
-function makeLinkStore(options: { connectorId: string; failLinkWrites?: boolean }) {
+function makeLinkStore(options: { connectorId: string; failLinkWrites?: boolean; releasable?: boolean }) {
   const links = new Map<string, LinkRow>()
   const events: WmsMutationEventInput[] = []
   const claimCalls: Array<{ orderId: string; at: Date }> = []
@@ -100,7 +100,11 @@ function makeLinkStore(options: { connectorId: string; failLinkWrites?: boolean 
 
   const port: WmsOrderPushPort = {
     activeBindings: async () => BINDINGS,
-    releasableHeldOrders: async () => [],
+    releasableHeldOrders: async () => {
+      const link = links.get('so-1')
+      if (!options.releasable || !link || link.state !== 'HELD') return []
+      return [{ id: link.id, orderId: link.orderId, externalOrderId: link.externalOrderId }]
+    },
     createCandidates: async () => {
       const link = links.get('so-1')
       if (link && link.state !== 'PENDING_CREATE') return []
@@ -206,9 +210,11 @@ function makeLinkStore(options: { connectorId: string; failLinkWrites?: boolean 
 function shipheroWarehouse() {
   const created: string[] = []
   const inFlight: string[] = []
+  const probes: string[] = []
   return {
     created,
     inFlight,
+    probes,
     dispatchInFlight(externalReference: string) { inFlight.push(externalReference) },
     land() { created.push(...inFlight.splice(0)) },
     pushOrder: async (input: WmsOrderPushInput): Promise<WmsOrderPushResult> => {
@@ -219,10 +225,12 @@ function shipheroWarehouse() {
       created.push(input.externalReference)
       return { externalOrderId: `sh-${created.length}`, externalOrderNumber: `SH-${created.length}`, status: 'pending' }
     },
-    probeOrderPresence: async (orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> =>
+    probeOrderPresence: async (orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> => {
       // Answers from what the warehouse HOLDS. An in-flight create is neither present nor proof of
       // absence — which is the whole point.
-      (created.length > 0 && orderNumber === 'SO-1' ? 'FOUND' : 'MISSING'),
+      probes.push(orderNumber)
+      return created.length > 0 && orderNumber === 'SO-1' ? 'FOUND' : 'MISSING'
+    },
   }
 }
 
@@ -235,10 +243,14 @@ function shipheroWarehouse() {
 function mintsoftWarehouse() {
   const created: string[] = []
   const inFlight: string[] = []
+  const probes: string[] = []
   return {
     created,
+    probes,
     dispatchInFlight(orderNumber: string) { inFlight.push(orderNumber) },
-    land() { created.push(...inFlight.splice(0)) },
+    /** The remote's OWN uniqueness rule, applied to the request that was on the wire: a create for
+     *  an order number Mintsoft already holds is refused, whoever sent it and whenever it arrives. */
+    land() { for (const n of inFlight.splice(0)) if (!created.includes(n)) created.push(n) },
     pushOrder: async (input: WmsOrderPushInput): Promise<WmsOrderPushResult> => {
       const hit = created.indexOf(input.orderNumber)
       if (hit >= 0) {
@@ -247,8 +259,10 @@ function mintsoftWarehouse() {
       created.push(input.orderNumber)
       return { externalOrderId: `ms-${created.length}`, externalOrderNumber: `MS-${created.length}`, status: 'NEW' }
     },
-    probeOrderPresence: async (orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> =>
-      (created.includes(orderNumber) ? 'FOUND' : 'MISSING'),
+    probeOrderPresence: async (orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> => {
+      probes.push(orderNumber)
+      return created.includes(orderNumber) ? 'FOUND' : 'MISSING'
+    },
   }
 }
 
@@ -311,4 +325,151 @@ test('o3d-2k5r r4 create: a crashed create is NOT re-dispatched when the lease e
   assert.equal(parked.state, 'AMBIGUOUS_CREATE')
   assert.ok(parked.attempts >= AMBIGUOUS_ATTEMPTS, 'and it no longer reads as "no call was dispatched"')
   assert.match(String(parked.lastError), /outcome/i)
+})
+
+/**
+ * The three tests below are one experiment with one variable changed at a time. All of them start
+ * from the SAME crash — same order, same valid payload, same claim left behind — and differ only in
+ * what the warehouse says and which connector holds the link. A guard that simply never re-queued
+ * anything would pass the first test in this file and fail all three of these.
+ */
+
+/** Run the crash (sweep 1) and the park (sweep 2), and hand back the parked link store. */
+async function crashThenPark(connectorId: string, wms: ReturnType<typeof shipheroWarehouse> | ReturnType<typeof mintsoftWarehouse>) {
+  const conn = connectorFor(wms)
+  const dying = makeLinkStore({ connectorId, failLinkWrites: true })
+  await quiet(() => runWmsOrderPushSweepCore(
+    {
+      ...conn,
+      pushOrder: async (input: WmsOrderPushInput) => {
+        wms.dispatchInFlight('externalReference' in input && connectorId === 'shiphero' ? input.externalReference : input.orderNumber)
+        return { externalOrderId: 'inflight', externalOrderNumber: 'INFLIGHT', status: 'NEW' }
+      },
+    },
+    connectorId, dying.port, { now: () => T0 },
+  ))
+  const parking = makeLinkStore({ connectorId })
+  parking.links.set('so-1', { ...dying.links.get('so-1')! })
+  await quiet(() => runWmsOrderPushSweepCore(conn, connectorId, parking.port, { now: () => T1 }))
+  assert.equal(parking.links.get('so-1')!.state, 'AMBIGUOUS_CREATE', 'precondition: the claim was parked')
+  return parking.links.get('so-1')!
+}
+
+test('o3d-2k5r r4 reconcile: the park RE-OPENS when the connector refuses duplicates AND the warehouse says the order never arrived', async () => {
+  // The guard has to be able to let go, or every test above passes for a rule that simply never
+  // re-queues anything. Mintsoft: PUT /api/Order refuses an order number it already holds, so the
+  // request still on the wire cannot become a second order however this race falls.
+  const wms = mintsoftWarehouse()
+  const parked = await crashThenPark('mintsoft', wms)
+
+  const third = makeLinkStore({ connectorId: 'mintsoft' })
+  third.links.set('so-1', { ...parked })
+  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'mintsoft', third.port, { now: () => T2 }))
+
+  // ROUTE: the reconciliation pass re-queued it and the CREATE pass then pushed it, in one sweep.
+  assert.deepEqual(third.validationFailureCalls, [], 'not the validation-failure route')
+  assert.deepEqual(wms.probes, ['SO-1'], 'the warehouse was asked, exactly once')
+  assert.equal(r.ambiguousCreateRequeued, 1)
+  assert.equal(r.created, 1)
+
+  // And the crashed worker's request finally lands on top of it. ONE order, either way.
+  wms.land()
+  assert.deepEqual(wms.created, ['SO-1'])
+  assert.equal(third.links.get('so-1')!.externalOrderId, 'ms-1')
+})
+
+test('o3d-2k5r r4 reconcile: the park STAYS SHUT while the warehouse still holds the order', async () => {
+  const wms = mintsoftWarehouse()
+  const parked = await crashThenPark('mintsoft', wms)
+  // The crashed worker's create landed before this sweep, so the warehouse can now say so.
+  wms.land()
+
+  const third = makeLinkStore({ connectorId: 'mintsoft' })
+  third.links.set('so-1', { ...parked })
+  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'mintsoft', third.port, { now: () => T2 }))
+
+  assert.equal(r.ambiguousCreateRequeued, 0)
+  assert.equal(r.created, 0)
+  assert.deepEqual(wms.created, ['SO-1'], 'still one order')
+  const still = third.links.get('so-1')!
+  assert.equal(still.state, 'AMBIGUOUS_CREATE')
+  assert.match(String(still.lastError), /ALREADY holds an order/i)
+  // Not wedged at the head of the rotation either: the stamp moves so other parked links get a turn.
+  assert.deepEqual(still.lastAttemptAt, T2)
+})
+
+test('o3d-2k5r r4 reconcile: a ShipHero park is NEVER re-opened, even when the warehouse says MISSING', async () => {
+  // THE FINDING'S OWN SENTENCE, as a test. ShipHero's create key is not unique, so "absent right
+  // now" cannot licence a replay — the crashed worker's request is still on the wire, and a second
+  // create would be a second warehouse order. Same crash, same MISSING probe, opposite outcome to
+  // the Mintsoft test above, and the ONLY difference is the connector.
+  const wms = shipheroWarehouse()
+  const parked = await crashThenPark('shiphero', wms)
+  assert.deepEqual(wms.created, [], 'precondition: the warehouse has nothing yet, so a probe would say MISSING')
+
+  const third = makeLinkStore({ connectorId: 'shiphero' })
+  third.links.set('so-1', { ...parked })
+  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'shiphero', third.port, { now: () => T2 }))
+
+  assert.equal(r.ambiguousCreateRequeued, 0)
+  assert.equal(r.created, 0)
+  assert.deepEqual(wms.probes, [], 'no answer could have licensed the replay, so no probe was spent')
+  const still = third.links.get('so-1')!
+  assert.equal(still.state, 'AMBIGUOUS_CREATE')
+  assert.match(String(still.lastError), /not safe to repeat/i)
+  // The remedy named is one a person can actually perform: it is WMS-side, and needs no IMS control.
+  assert.match(String(still.lastError), /Open the WMS and look for SO-1/)
+
+  wms.land()
+  assert.deepEqual(wms.created, ['so-1'], 'and the one create that did happen is the only one')
+})
+
+test('o3d-2k5r r4 release: a HELD order re-opened for create is CLAIMED, not parked', async () => {
+  // The regression the new rule could most easily have caused. The release writes PENDING_CREATE
+  // over a link whose lastAttemptAt belongs to the create that was later CANCELLED when the order
+  // was held — nothing is outstanding — so if the release did not clear the stamp, the very next
+  // create pass would read it as an expired claim and park the order it had just re-opened. That
+  // failure would be invisible from the release pass's own result counters.
+  const wms = mintsoftWarehouse()
+  const store = makeLinkStore({ connectorId: 'mintsoft', releasable: true })
+  store.links.set('so-1', {
+    id: 'link-1', orderId: 'so-1', connector: 'mintsoft', state: 'HELD', attempts: 0,
+    lastError: null, lastAttemptAt: T0, pushedAt: null, externalOrderId: null, externalOrderNumber: null,
+  })
+  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'mintsoft', store.port, { now: () => T1 }))
+
+  assert.equal(r.released, 1)
+  assert.equal(r.createClaimParked, 0, 'the release must not be swallowed by the park')
+  assert.equal(r.created, 1)
+  assert.deepEqual(wms.created, ['SO-1'])
+})
+
+test('o3d-2k5r r4: a claim that is still LIVE is left alone — the park is for a LAPSED one only', async () => {
+  // The park must not become a way for an overlapping sweep to steal a link from a worker that is
+  // still inside pushOrder. Thirty seconds after the claim, nothing may touch it at all.
+  const wms = mintsoftWarehouse()
+  const store = makeLinkStore({ connectorId: 'mintsoft' })
+  store.links.set('so-1', {
+    id: 'link-1', orderId: 'so-1', connector: 'mintsoft', state: 'PENDING_CREATE', attempts: 0,
+    lastError: null, lastAttemptAt: new Date(T0.getTime() + 30_000), pushedAt: null,
+    externalOrderId: null, externalOrderNumber: null,
+  })
+  const r = await quiet(() => runWmsOrderPushSweepCore(connectorFor(wms), 'mintsoft', store.port, { now: () => new Date(T0.getTime() + 60_000) }))
+
+  assert.equal(r.createClaimParked, 0)
+  assert.equal(r.created, 0)
+  assert.deepEqual(wms.created, [], 'nothing was pushed')
+  assert.equal(store.links.get('so-1')!.state, 'PENDING_CREATE', 'and the live claim is untouched')
+})
+
+test('o3d-2k5r r4: shouldGrantCreateClaim grants ONLY on a cleared dispatch stamp', () => {
+  // The pure rule, stated where a reader can see all of it at once. `shouldGrantCreateClaim` is
+  // still what the create path asks; what changed is that a stamped PENDING_CREATE never answers
+  // yes again, however old the stamp is.
+  const at = new Date('2026-07-20T12:00:00Z')
+  assert.equal(shouldGrantCreateClaim(null, at), true, 'no link at all')
+  assert.equal(shouldGrantCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: null }, at), true, 'queued, never dispatched')
+  assert.equal(shouldGrantCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: new Date(at.getTime() - 1) }, at), false, 'live claim')
+  assert.equal(shouldGrantCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: new Date(at.getTime() - 86_400_000) }, at), false, 'a day-old claim is still not evidence')
+  assert.equal(decideCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: new Date(at.getTime() - 86_400_000) }, at), 'PARK_AMBIGUOUS')
 })
