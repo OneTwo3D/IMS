@@ -307,6 +307,12 @@ export type BackReferenceSweepRow = {
   status: string
   payload: unknown
   createdAt: Date
+  /**
+   * The attempt this row is AT (o3d-e2mz). Read so the settlement write can be fenced on it: a
+   * concurrent retry that revives the row bumps this, and a verdict reached before that bump is a
+   * verdict about a different attempt.
+   */
+  attemptRevision: number
   /** When this row's PO ambiguity was last reported. NULL = never. */
   backReferenceAmbiguousLoggedAt: Date | null
   /**
@@ -388,6 +394,10 @@ export const BACK_REFERENCE_CANDIDATE_SELECT = {
   // obligation record is what tells a tombstone that lost a payment from one that lost nothing.
   connectionProvenance: true,
   followUpObligations: true,
+  // o3d-0bfh r2 (Codex HIGH): the identity of the attempt this run's decision was taken about, so
+  // the settlement write can compare-and-swap on it. Without it in the SELECT the fence below
+  // cannot be built at all, and the sweep's verdict lands on whatever the row has become.
+  attemptRevision: true,
 } as const
 
 /**
@@ -477,6 +487,13 @@ export type BackReferenceSweepClient = BackReferenceDeps & {
   accountingSyncLog: {
     findMany(args: BackReferenceCandidateQuery): Promise<BackReferenceSweepRow[]>
     update(args: { where: { id: string }; data: Record<string, unknown> }): Promise<unknown>
+    /**
+     * The settlement write's compare-and-set (o3d-0bfh r2). `update` cannot express it: it matches
+     * on the primary key alone and there is no unmatched outcome to observe — it either writes or
+     * throws. `updateMany` reports the rows it actually touched, and a count of zero is the answer
+     * this sweep needs.
+     */
+    updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
   }
   /**
    * The sweep asks the SalesOrder one question `BackReferenceDeps` does not (o3d-r5pj, Codex r10 #3):
@@ -661,6 +678,17 @@ export type BackReferenceRepairResult = {
    * `repaired` or as a recovered follow-up and then stamped out of the candidate set for good.
    */
   followUpsUnsettled: number
+  /**
+   * Rows whose SETTLEMENT WRITE was refused because the row had moved since the decision was taken
+   * (o3d-0bfh r2, Codex HIGH). The compare-and-set matched nothing, so nothing was written and the
+   * row is left eligible for the next sweep.
+   *
+   * Its own number, and not folded into `failed`, because nothing went wrong here either: another
+   * writer legitimately advanced the row, and this sweep's verdict was simply about an older state
+   * of it. What it must never be is silent — a refusal counted nowhere is indistinguishable from a
+   * settlement, and the whole point of the fence is that this outcome is observable.
+   */
+  settlementDeferred: number
 }
 
 /**
@@ -829,7 +857,7 @@ export async function repairAccountingBackReferences(
 
   const result: BackReferenceRepairResult = {
     scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, followUpsDiscarded: 0, skippedUnverified: 0,
-    retiredCancelledSale: 0, followUpsUnsettled: 0,
+    retiredCancelledSale: 0, followUpsUnsettled: 0, settlementDeferred: 0,
   }
   // One cutoff for the whole run, so every page of the scan agrees on which deferred rows
   // are due — a per-page `new Date()` would let a row fall on both sides of the boundary.
@@ -845,12 +873,70 @@ export async function repairAccountingBackReferences(
    * leaving the marker behind would make the two columns contradict each other on every settled row,
    * and any future reader of "which rows still owe follow-ups" would have to know to also check
    * whether the row had been stamped. One write, one consistent state.
+   *
+   * FENCED ON THE STATE THE VERDICT WAS REACHED FROM (o3d-0bfh r2, Codex HIGH). It used to update BY
+   * ID ALONE, and that made it the last unfenced writer in a path full of fences. The interleaving
+   * it lost work to is real and needs no exotic timing, because concurrent cron and manual runs
+   * reach it: this sweep reads a FAILED row and its follow-up enqueue answers
+   * `deferredReceiptsSettled: true`; meanwhile `retryFailedXeroSync` returns that same row to the
+   * processor, which BUMPS `attemptRevision`, claims the follow-up marker afresh and discovers a
+   * newly recorded — or still unregistered — receipt. The sweep then arrived here and wrote
+   * unconditionally: it cleared the NEWER marker, stamped `backReferenceCheckedAt` (which removes
+   * the row from the candidate set PERMANENTLY, since the query filters on that column being null),
+   * and — reading a status snapshot that was already stale — could promote the row to SYNCED with
+   * the obligation the other path was truthfully retaining now erased.
+   *
+   * So the write is a COMPARE-AND-SET over four columns, and each one is there for a reason:
+   *
+   *   • `backReferenceCheckedAt: null` — nobody has settled it since; a stamp is terminal and must
+   *     never be written twice with different data.
+   *   • `attemptRevision` — the identity of the attempt this verdict is ABOUT. Status cannot serve:
+   *     every retry path returns the row to a status it already held (see the column's own note in
+   *     prisma/schema.prisma), so only this is a per-attempt identity.
+   *   • `status` — because the `extra` this is called with can carry `status: 'SYNCED'`, and that
+   *     promotion is only sound about the status that was read.
+   *   • `backReferenceFollowUpsPendingAt` — the obligation MARKER GENERATION. Clearing it is the
+   *     part that loses money, and a marker re-claimed by a concurrent post carries a different
+   *     timestamp, so equality on it is what distinguishes "the obligation I discharged" from "an
+   *     obligation somebody else has just recorded".
+   *
+   * A zero-row result is a DEFERRAL, never a failure and never a retry: the row is left exactly as
+   * the other writer made it, still unstamped, so it is a candidate for the next sweep — which will
+   * re-read it and reach its own verdict from state that is actually current. Counted, so the
+   * refusal cannot be silent.
    */
-  const markChecked = async (id: string, extra?: Record<string, unknown>) => {
-    await deps.db.accountingSyncLog.update({
-      where: { id },
+  const settlementFence = (
+    row: BackReferenceSweepRow,
+    followUpsPendingAt: Date | null = row.backReferenceFollowUpsPendingAt,
+  ) => ({
+    id: row.id,
+    status: row.status,
+    attemptRevision: row.attemptRevision,
+    followUpsPendingAt,
+  })
+
+  const markChecked = async (
+    fence: ReturnType<typeof settlementFence>,
+    extra?: Record<string, unknown>,
+  ): Promise<boolean> => {
+    const settled = await deps.db.accountingSyncLog.updateMany({
+      where: {
+        id: fence.id,
+        backReferenceCheckedAt: null,
+        status: fence.status,
+        attemptRevision: fence.attemptRevision,
+        backReferenceFollowUpsPendingAt: fence.followUpsPendingAt,
+      },
       data: { backReferenceCheckedAt: now(), backReferenceFollowUpsPendingAt: null, ...extra },
     })
+    if (settled.count > 0) return true
+    result.settlementDeferred++
+    console.error(
+      `${prefix}: back-reference settlement refused — the row moved since this run's verdict was reached; `
+      + 'leaving it eligible',
+      fence.id,
+    )
+    return false
   }
 
   /**
@@ -864,24 +950,34 @@ export async function repairAccountingBackReferences(
    * follow-ups are outstanding, and the worst case is a marker on a row whose follow-ups then
    * succeed, which costs one extra idempotent re-enqueue on a later sweep.
    *
-   * Returns false if the marker could not be persisted, and the caller then does NOTHING ELSE to the
-   * row: nothing has been written yet, `missing` is still true, and the next sweep retries the whole
-   * repair from scratch.
+   * Returns `claimed: false` if the marker could not be persisted, and the caller then does NOTHING
+   * ELSE to the row: nothing has been written yet, `missing` is still true, and the next sweep
+   * retries the whole repair from scratch.
+   *
+   * AND IT REPORTS THE VALUE IT WROTE (o3d-0bfh r2). The settlement write is fenced on the marker
+   * generation, so the caller has to know WHICH marker its own verdict is about — the one already on
+   * the row, or the one this call has just claimed. Re-reading the row for it would reintroduce the
+   * race one layer down: the value returned here is the value written here.
    */
-  const claimFollowUpObligation = async (row: BackReferenceSweepRow): Promise<boolean> => {
-    if (row.backReferenceFollowUpsPendingAt !== null) return true
+  const claimFollowUpObligation = async (
+    row: BackReferenceSweepRow,
+  ): Promise<{ claimed: boolean; pendingAt: Date | null }> => {
+    if (row.backReferenceFollowUpsPendingAt !== null) {
+      return { claimed: true, pendingAt: row.backReferenceFollowUpsPendingAt }
+    }
+    // The SAME fragment the connectors merge into their SYNCED write (r10 finding 1). They can
+    // claim it for free because they have a transaction to ride; the sweep has none, so it pays
+    // for a write of its own — but the value written is one definition, not two.
+    const claim = followUpObligationClaim(now())
     try {
-      // The SAME fragment the connectors merge into their SYNCED write (r10 finding 1). They can
-      // claim it for free because they have a transaction to ride; the sweep has none, so it pays
-      // for a write of its own — but the value written is one definition, not two.
       await deps.db.accountingSyncLog.update({
         where: { id: row.id },
-        data: followUpObligationClaim(now()),
+        data: claim,
       })
-      return true
+      return { claimed: true, pendingAt: claim.backReferenceFollowUpsPendingAt }
     } catch (pendingError) {
       console.error(`${prefix}: could not record that follow-ups are owed; leaving the repair for the next sweep`, row.id, pendingError)
-      return false
+      return { claimed: false, pendingAt: row.backReferenceFollowUpsPendingAt }
     }
   }
 
@@ -1379,7 +1475,7 @@ export async function repairAccountingBackReferences(
           // INVOICE_PDF row is the case that costs real work: no external id, not a back-reference
           // type, and a nested INVOICE_EMAIL + WC_INVOICE_NOTE pair that only the enqueue rebuilds.
           if (!(await settleOutstandingFollowUpsOnly(row))) continue
-          await markChecked(row.id)
+          await markChecked(settlementFence(row))
           continue
         }
 
@@ -1601,8 +1697,10 @@ export async function repairAccountingBackReferences(
             }
             if (discardsFollowUps && !(await reportDiscardedFollowUps(row, 'already-applied'))) continue
           }
-          // Linked, nothing outstanding: reconciled. Stamped, so it never occupies a slot again.
-          await markChecked(row.id)
+          // Linked, nothing outstanding: reconciled. Stamped, so it never occupies a slot again —
+          // unless the row moved under this verdict, in which case the fence refuses and the next
+          // sweep decides again.
+          await markChecked(settlementFence(row))
           continue
         }
         // Counted as CHECKED either way, but a follow-ups-only pass is not a repair: nothing was
@@ -1615,9 +1713,17 @@ export async function repairAccountingBackReferences(
         // persisted, nothing else is done to the row: the link is still missing, so the next sweep
         // repeats this pass from the top rather than linking a document whose outstanding work
         // nothing records.
-        if (!evidenceOnly && !(await claimFollowUpObligation(row))) {
-          result.failed++
-          continue
+        // The marker generation this run's settlement will be fenced on: the one already on the row
+        // when a claim was unnecessary, the one just written when it was, and (for a tombstone,
+        // which claims nothing) whatever the row was read with.
+        let settlementMarker: Date | null = row.backReferenceFollowUpsPendingAt
+        if (!evidenceOnly) {
+          const obligation = await claimFollowUpObligation(row)
+          if (!obligation.claimed) {
+            result.failed++
+            continue
+          }
+          settlementMarker = obligation.pendingAt
         }
 
         // Where the write actually landed. For a PO-keyed row that is the bill the FENCED
@@ -1737,7 +1843,10 @@ export async function repairAccountingBackReferences(
           // terminal policy as the discarded follow-ups, because the remedy (a human reading the
           // date off the ledger) is not something this sweep can observe.
           if (followUpsEnqueued && await businessDateSettled(row, businessDate)) {
-            await markChecked(row.id, row.status === 'FAILED' && !evidenceOnly ? { status: 'SYNCED', errorMessage: null } : undefined)
+            await markChecked(
+              settlementFence(row, settlementMarker),
+              row.status === 'FAILED' && !evidenceOnly ? { status: 'SYNCED', errorMessage: null } : undefined,
+            )
           }
 
           if (followUpsOnly) {
