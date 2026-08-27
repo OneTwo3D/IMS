@@ -42,7 +42,6 @@ import {
   backReferenceHolder,
   findExternalDocumentIdClaim,
   claimFollowUpObligation,
-  followUpObligationRecoveryNote,
   isExternalDocumentIdConflict,
   releaseFollowUpObligation,
 } from '@/lib/domain/accounting/back-reference'
@@ -1315,6 +1314,16 @@ function backReferenceLeavesNothingOwed(link: BackReferenceLink): boolean {
 const QBO_FOLLOW_UP_RECOVERY = followUpObligationRecoveryFor(QBO_CONNECTOR)
 
 /**
+ * The remedy an operator reads, taken from that same registry entry rather than restated here
+ * (o3d-0bfh r8). Narrowed rather than reached through a helper so this file takes no extra import:
+ * the branch is the type saying that only a connector with NO consumer has a remedy at all, and if
+ * QuickBooks ever gains a sweep the message correctly stops telling anyone to do anything by hand.
+ */
+const QBO_FOLLOW_UP_REMEDY = QBO_FOLLOW_UP_RECOVERY.consumer === 'none'
+  ? QBO_FOLLOW_UP_RECOVERY.operatorRemedy
+  : 'a later sweep re-reads the marker and re-enqueues the work, so there is nothing to do by hand'
+
+/**
  * DISCHARGE THE FOLLOW-UP OBLIGATION ONLY WHEN NOTHING IS STILL OWED (o3d-ekn8 r5, Codex HIGH).
  *
  * The release used to be unconditional on both post-success paths: `updateBackReference` swallows
@@ -1385,7 +1394,7 @@ async function settleFollowUpObligation(
       // unregistered — only that THIS pass could not confirm it — and a hand-registered payment
       // cannot be deduplicated against one the local queue is still holding. The remedy comes from
       // the connector's own registry entry, which says read and escalate.
-      + followUpObligationRecoveryNote(QBO_FOLLOW_UP_RECOVERY) + '.',
+      + QBO_FOLLOW_UP_REMEDY + '.',
     metadata: {
       syncLogId: entry.id,
       type: entry.type,
