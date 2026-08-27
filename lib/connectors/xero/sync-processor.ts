@@ -454,6 +454,16 @@ export async function recordPostedSyncResult(
   },
 ): Promise<PostedSyncRecord> {
   const { entry, externalId, payload } = params
+  // WHAT THIS ATTEMPT DID, IN ONE PLACE. The mode comes off the row's own payload, which is what the
+  // request status was resolved from; the remote-effect answer comes from the handler; and
+  // `ledgerTargetId` (o3d-batch-ret r12, Codex MEDIUM) is WHICH remote document it wrote to, off the
+  // same payload — without it the attachment remedy said "open that bill" about a bill nothing in
+  // the record named.
+  const outcome: PostedOperationOutcome = {
+    postingMode: xeroPostingMode(payload),
+    externalEffect: params.externalEffect,
+    ledgerTargetId: ledgerTargetIdFromPayload(payload),
+  }
   const written = await tx.accountingSyncLog.updateMany({
     where: {
       id: entry.id,
@@ -489,15 +499,10 @@ export async function recordPostedSyncResult(
       entry,
       externalId,
       refusal,
-      // o3d-batch-ret r10 (Codex HIGH): the record is written with WHAT THIS ATTEMPT DID, not only
-      // with which enum member it was. The mode comes off the row's own payload, which is what the
-      // request status was resolved from; the remote-effect answer comes from the handler.
-      // r12: and WHICH remote document it wrote to, off the same payload the mode comes from.
-      {
-        postingMode: xeroPostingMode(payload),
-        externalEffect: params.externalEffect,
-        ledgerTargetId: ledgerTargetIdFromPayload(payload),
-      },
+      // o3d-batch-ret r10 (Codex HIGH): WHAT THIS ATTEMPT DID, not only which enum member it was.
+      // Assembled above the SYNCED write, not here: everything between that write and the stamp is
+      // inside the window tests/connectors/xero-synced-at-clock.test.ts holds the ordering with.
+      outcome,
       params.onConflictObserved,
     )
     return refusal.reason === 'ROW_MISSING'

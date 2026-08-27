@@ -205,7 +205,12 @@ function incidentRow(over: Partial<SyncRow> = {}): SyncRow {
   }
 }
 
-async function incidentMessage(type = 'INVOICE_EMAIL', externalEffect?: 'MADE' | 'NONE') {
+async function incidentMessage(
+  type = 'INVOICE_EMAIL',
+  externalEffect?: 'MADE' | 'NONE',
+  // ROUND 12: and WHICH bill it uploaded to, when the record kept it.
+  ledgerTargetId?: string,
+) {
   const { describeUnpersistedQboPost } = await import('@/lib/domain/accounting/unrecorded-posted-document')
   return describeUnpersistedQboPost(
     {
@@ -213,7 +218,7 @@ async function incidentMessage(type = 'INVOICE_EMAIL', externalEffect?: 'MADE' |
       postedExternalId: null,
       // ROUND 10: `BILL_ATTACHMENT` is the one of the four whose handler decides whether anything
       // left the process, so its record has one wording per outcome. The others have none to record.
-      outcome: { postingMode: 'LIVE', externalEffect },
+      outcome: { postingMode: 'LIVE', externalEffect, ledgerTargetId },
     },
     new Error('write conflict'),
   )
@@ -841,22 +846,30 @@ test('STEP 7 (round 8): the INVOICE_EMAIL inspection claims no quiescence, becau
 // saying nothing happens. Returning MADE unconditionally fails the disabled case the other way. Both
 // were run.
 test('STEP 7 (round 10): the BILL_ATTACHMENT replay wording states which of the two the handler did', async () => {
-  const uploaded = await incidentMessage('BILL_ATTACHMENT', 'MADE')
-  assert.match(uploaded, /uploaded to the QuickBooks bill AGAIN, once per sweep/)
-  assert.match(uploaded, /delete any duplicate attachment/)
+  const uploaded = await incidentMessage('BILL_ATTACHMENT', 'MADE', 'QBO-BILL-7')
+  assert.match(uploaded, /uploaded to QuickBooks bill QBO-BILL-7 AGAIN, once per sweep/)
+  assert.match(uploaded, /remove any duplicate attachment/)
   assert.doesNotMatch(uploaded, /unless/i, 'nothing is conditional once the outcome is known')
   assert.doesNotMatch(uploaded, /quickbooks_sync_attach_pdf/, 'and no setting needs checking')
 
-  const disabled = await incidentMessage('BILL_ATTACHMENT', 'NONE')
-  assert.match(disabled, /NOTHING AT ALL — attachment upload is turned off/)
-  assert.match(disabled, /this attempt created none/)
-  assert.doesNotMatch(disabled, /delete any duplicate attachment/)
+  // ROUND 12 (Codex MEDIUM): an upload whose BILL the record cannot name sends nobody anywhere.
+  const uploadedUnnamed = await incidentMessage('BILL_ATTACHMENT', 'MADE')
+  assert.match(uploadedUnnamed, /THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO/)
+  assert.doesNotMatch(uploadedUnnamed, /remove any duplicate attachment/)
 
-  // Only where IMS did not record it does the record name the setting and refuse to prescribe.
+  // ROUND 12 (Codex HIGH): the no-op is stated as what the setting READ when the attempt ran, and
+  // the operator is sent to read it as it stands rather than told what it is.
+  const disabled = await incidentMessage('BILL_ATTACHMENT', 'NONE')
+  assert.match(disabled, /NOTHING — PROVIDED ATTACHMENT UPLOAD IS STILL OFF WHEN THE SWEEP RUNS/)
+  assert.match(disabled, /it created no attachment/)
+  assert.match(disabled, /THEN GO AND READ quickbooks_sync_attach_pdf AS IT STANDS NOW/)
+  assert.doesNotMatch(disabled, /remove any duplicate attachment/)
+
+  // Where IMS did not record it, the record names the setting and refuses to prescribe.
   const unknown = await incidentMessage('BILL_ATTACHMENT')
   assert.match(unknown, /quickbooks_sync_attach_pdf/, 'the setting that makes the handler a no-op must be named')
   assert.match(unknown, /IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING/)
-  assert.match(unknown, /do not delete an attachment on the strength of this record/)
+  assert.match(unknown, /and it does not name the bill either/)
 
   // And it is scoped to that operation only — the other three have no such gate.
   for (const type of ['INVOICE_PDF', 'INVOICE_EMAIL', 'WC_INVOICE_NOTE']) {

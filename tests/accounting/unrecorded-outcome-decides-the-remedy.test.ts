@@ -215,9 +215,14 @@ test('ROUND 10: an attempt whose posting mode was not recorded says so, and pres
 //
 // ROUTE: the exported formatters, both connectors, with the handler's own recorded answer.
 test('ROUND 10 (Codex MEDIUM): the attachment record states the handler outcome, including the disabled no-op', () => {
-  const uploaded = xero('BILL_ATTACHMENT', { posted: null, outcome: { externalEffect: 'MADE' } })
+  // ROUND 12: an upload that happened is now told apart from an upload whose BILL the record can
+  // name — see tests/accounting/record-reads-settings-as-history.test.ts. The round-10 property is
+  // unchanged and is asserted on the named cell.
+  const uploaded = xero('BILL_ATTACHMENT', {
+    posted: null, outcome: { externalEffect: 'MADE', ledgerTargetId: 'XERO-BILL-7' },
+  })
   assert.match(uploaded, /THE UPLOAD HAPPENED/)
-  assert.match(uploaded, /AN ATTACHMENT NOW EXISTS ON THAT BILL IN XERO/)
+  assert.match(uploaded, /AN ATTACHMENT NOW EXISTS ON XERO BILL XERO-BILL-7/)
   assert.match(uploaded, /no standalone accounting document was created/)
   assert.match(uploaded, /remove the duplicate attachment/)
   // THE DEFECT: it said an upload happened AND that nothing was created at all.
@@ -237,15 +242,19 @@ test('ROUND 10 (Codex MEDIUM): the attachment record states the handler outcome,
   assert.match(unknown, /escalate this record/i)
 
   // The QuickBooks door is the o3d-qn21 replay wording, and it splits the same three ways.
-  const qboUploaded = qbo('BILL_ATTACHMENT', { posted: null, outcome: { externalEffect: 'MADE' } })
-  assert.match(qboUploaded, /uploaded to the QuickBooks bill AGAIN, once per sweep/)
-  assert.match(qboUploaded, /delete any duplicate attachment/)
+  const qboUploaded = qbo('BILL_ATTACHMENT', {
+    posted: null, outcome: { externalEffect: 'MADE', ledgerTargetId: 'QBO-BILL-7' },
+  })
+  assert.match(qboUploaded, /uploaded to QuickBooks bill QBO-BILL-7 AGAIN, once per sweep/)
+  assert.match(qboUploaded, /remove any duplicate attachment/)
   assert.doesNotMatch(qboUploaded, /unless/i)
 
   const qboDisabled = qbo('BILL_ATTACHMENT', { posted: null, outcome: { externalEffect: 'NONE' } })
-  assert.match(qboDisabled, /NOTHING AT ALL — attachment upload is turned off/)
-  assert.match(qboDisabled, /this attempt created none/)
-  assert.doesNotMatch(qboDisabled, /delete any duplicate attachment/)
+  // ROUND 12 (Codex HIGH): the no-op claim is CONDITIONAL now — `externalEffect: NONE` says what the
+  // setting read when the attempt ran, and this record outlives the setting.
+  assert.match(qboDisabled, /NOTHING — PROVIDED ATTACHMENT UPLOAD IS STILL OFF WHEN THE SWEEP RUNS/)
+  assert.match(qboDisabled, /it created no attachment/)
+  assert.doesNotMatch(qboDisabled, /remove any duplicate attachment/)
 
   const qboUnknown = qbo('BILL_ATTACHMENT', { posted: null })
   assert.match(qboUnknown, /IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING/)
