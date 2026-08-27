@@ -1275,10 +1275,10 @@ test('checks 4 and 5 stay ZERO on a genuine park decorated with both fields they
   // ROUTE: the shipped verify.sql, parsed and evaluated over the row. Not a text assertion — the
   // point is what the SQL SELECTS.
   //
-  // MUTATION THAT KILLS THIS TEST: drop any one of the six added conjuncts from check 4 or check 5
-  // (the reason, the connector, either external-order field, the order number, the metaKey TYPE, or
-  // the accountingPayload type). Each removal readmits this row, because a decorated refund body
-  // satisfies everything that is left.
+  // MUTATION THAT KILLS THIS TEST: revert either check to its pre-r11 pair — an accountingPayload
+  // OBJECT and a non-null metaKey — and this row is admitted by both. (Dropping ONE of the added
+  // conjuncts is not enough to readmit it, because the remaining ones still reject a refund body;
+  // that each individual conjunct is load-bearing is what the next test proves, member by member.)
   assert.equal(
     selects(3, dismissedDecoratedPark),
     false,
