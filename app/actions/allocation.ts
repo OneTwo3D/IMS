@@ -49,9 +49,11 @@ import {
   confirmSalesOrderShipments,
   discardCancelledOrderShipmentsInTx,
   reconcileOrderAfterShipment,
+  reopenShipmentForRepack,
   transitionShipmentStatus,
   type OrderCompletionAuthority,
 } from '@/lib/domain/sales/shipment-service'
+import { resolveRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import {
   allocationScopeKey,
   dispatchedAllocationLines,
@@ -1221,6 +1223,101 @@ export async function discardCancelledOrderShipments(
 
     revalidateSalesAllocationPaths(orderId)
     return { success: true, discardedCount: result.discarded.length }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    return { success: false, error: message }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reopen a committed (PICKING/PACKED) shipment so it can be rebuilt (o3d-2k5)
+// ---------------------------------------------------------------------------
+
+/**
+ * The exit the o3d-339 dispatch refusal names, and the reason it can name one at all.
+ *
+ * A partial refund landing AFTER a shipment was packed leaves the shipment shipping more than
+ * remains. `validateActiveShipmentTotalsWithinOrder` refuses that dispatch — correctly; it is the
+ * money fix — but `confirmSalesOrderShipments` only replaces PENDING shipments, so nothing could
+ * rebuild the packed one, and `releaseReservationsAfterRefund` refuses the reservation release while
+ * a shipment exists, so the unrefunded remainder stayed unshippable with its backstop row deferred.
+ *
+ * THE THREE STEPS, in this order, because each depends on the one before:
+ *
+ *  1. `reopenShipmentForRepack` reverts the shipment to PENDING under the order lock. Preserves the
+ *     tracking number, touches no reservation (see its doc comment for why re-reserving would
+ *     double-count), and records the physical un-pack the warehouse now owes as a WARNING.
+ *  2. re-allocation with `refuseIfCommittedShipmentsExist` — the NARROW refusal. It is only passable
+ *     BECAUSE step 1 turned the last committed shipment into a draft; the strict
+ *     `refuseIfShipmentsExist` the refund backstop uses would still decline, which is exactly why
+ *     the backstop cron could never heal this on its own. The rebuild nets the refund into
+ *     `OrderAllocation`, releases the refunded units' reservation, and `reconcilePendingShipments`
+ *     retires the now-unbacked draft, reporting the label it carried.
+ *  3. resolving the deferred refund-reservation-release backstop rows INSIDE that allocation
+ *     transaction (`onReconciledInTx`, committed path only) — so a crash between commit and resolve
+ *     cannot leave a redundant re-allocation queued.
+ *
+ * The operator then presses "Create Shipments" (the Stock Allocation panel's own button, which
+ * calls `confirmAllocations` below), and it builds a fresh shipment at the reduced quantity. That step is deliberately NOT done here: rebuilding is a decision about what goes in
+ * the box, and the box has to be physically unpacked first.
+ *
+ * PERMISSION. `sales.process` — the same permission that already moves a shipment PENDING → PICKING
+ * → PACKED and dispatches it. Reopening is strictly less consequential than the dispatch that
+ * permission already allows (a dispatch writes stock movements and COGS and is reversed only by a
+ * refund or a return), so refusing the undo to the person trusted with the do is not a defensible
+ * line. Recorded as a decision, not an inference: if this should be manager-gated instead, it is one
+ * `requirePermission` call here, because the reverse edge was deliberately kept out of
+ * `SHIPMENT_TRANSITIONS` and there is no other door.
+ */
+export async function reopenShipmentForRepackAction(
+  shipmentId: string,
+): Promise<{ success: boolean; error?: string; warning?: string; orderId?: string }> {
+  try {
+    const session = await requirePermission('sales.process')
+
+    const reopened = await reopenShipmentForRepack(db, shipmentId, { userId: session.user.id })
+    if (!reopened.success) return { success: false, error: reopened.error }
+
+    const orderId = reopened.orderId
+    // Read BEFORE the allocation call: the resolve runs inside that transaction, and taking a second
+    // trip to the database from inside it would widen the window the order lock is held for.
+    const refunds = await db.salesOrderRefund.findMany({ where: { orderId }, select: { id: true } })
+
+    const realloc = await autoAllocateOrder(orderId, {
+      internalBypassToken: INTERNAL_ACTION_BYPASS,
+      refuseIfCommittedShipmentsExist: true,
+      onReconciledInTx: async (tx) => {
+        for (const refund of refunds) {
+          await resolveRefundReservationReleaseOutbox(refund.id, { client: tx })
+        }
+      },
+    })
+
+    revalidateSalesAllocationPaths(orderId)
+
+    // The revert COMMITTED whatever happens next — it is its own transaction — so this reports
+    // honestly rather than pretending the whole recovery ran. Each of these leaves the order in a
+    // state an operator can still work: the shipment is a draft, and "Create Shipments" rebuilds
+    // it. What has NOT happened is the reservation netting, and saying so is the point.
+    if (realloc.refused) {
+      return {
+        success: true,
+        orderId,
+        warning: `Shipment reopened, but stock could not be re-allocated because order ${reopened.orderRef} still has `
+          + 'another committed (picking or packed) shipment. Reopen that one too — or dispatch it — and the '
+          + 'refunded units\u2019 reservation will be released then.',
+      }
+    }
+    if (!realloc.success) {
+      return {
+        success: true,
+        orderId,
+        warning: `Shipment reopened, but re-allocating order ${reopened.orderRef} did not complete`
+          + `${realloc.error ? ` (${realloc.error})` : ''}. The refunded units may still be reserved; `
+          + 'run allocation on this order again before rebuilding the shipment.',
+      }
+    }
+    return { success: true, orderId }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
     return { success: false, error: message }

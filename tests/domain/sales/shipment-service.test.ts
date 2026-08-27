@@ -6,6 +6,7 @@ import {
   confirmSalesOrderShipments,
   discardCancelledOrderShipmentsInTx,
   reconcileOrderAfterShipment,
+  reopenShipmentForRepack,
   transitionShipmentStatus,
   type ShipmentServiceClient,
 } from '@/lib/domain/sales/shipment-service'
@@ -324,9 +325,36 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
         // Projects exactly the keys asked for. Returning only `status` when the caller also asked
         // for `orderId` handed the commitment check an undefined order id, which would have made it
         // silently validate nothing (o3d-4kfh r3).
+        // o3d-2k5: `reopenShipmentForRepack` asks for the shipment, its lines AND its parent order in
+        // one projection. Checked BEFORE the narrow `select.status` branch below, which would
+        // otherwise answer it with a two-key object and hand the reopen an undefined order status —
+        // silently skipping the cancelled-order refusal.
+        if (select?.lines && select?.order) {
+          const parent = state.orders.find((row) => row.id === shipment.orderId)
+          return {
+            id: shipment.id,
+            orderId: shipment.orderId,
+            status: shipment.status,
+            trackingNumber: shipment.trackingNumber,
+            shippingService: shipment.shippingService,
+            lines: state.shipmentLines
+              .filter((line) => line.shipmentId === shipment.id)
+              .map((line) => ({ id: line.id })),
+            order: parent
+              ? {
+                status: parent.status,
+                orderNumber: parent.orderNumber,
+                externalOrderNumber: parent.externalOrderNumber,
+              }
+              : null,
+          }
+        }
         if (select?.status) {
           return select.orderId ? { status: shipment.status, orderId: shipment.orderId } : { status: shipment.status }
         }
+        // o3d-2k5: the unlocked `{ orderId: true }` pre-read. Projected rather than returning the
+        // whole row, so a test cannot pass by reading a field the production select never asked for.
+        if (select?.orderId) return { orderId: shipment.orderId }
         if (!include) return shipment
         const order = state.orders.find((row) => row.id === shipment.orderId)!
         return {
@@ -2264,4 +2292,182 @@ test('o3d-kouj: the same shipment WITHOUT a pin is still measured against the ca
   )
   assert.equal(state.shipments[0].status, 'PACKED')
   assert.equal(state.stockLevels[0].quantity, 4, 'nothing moved')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2k5 — THE WAY BACK FROM A PACKED SHIPMENT THE REFUND GUARD REFUSES.
+//
+// o3d-339 refuses to dispatch a PACKED shipment that would ship more than remains after a refund.
+// That refusal stays exactly as it was; what these tests cover is the exit it now names, and that
+// the exit actually reaches a dispatchable order rather than merely being a button.
+// ---------------------------------------------------------------------------
+
+function packedBeforeRefundState(overrides: Partial<State> = {}): State {
+  return baseState({
+    // 5 ordered, 5 packed, then 2 refunded — the shipment now exceeds what remains.
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 5, sku: 'SKU-1', description: 'Product 1' }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 5 }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: 'TRACK-1', shippingService: 'DPD' }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 5 }],
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-1', productId: 'product-1', qty: 2 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 5 }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 5, unitCostBase: 5 }],
+    ...overrides,
+  })
+}
+
+test('o3d-2k5: reopening a PACKED shipment returns it to a PENDING draft and KEEPS its purchased label', async () => {
+  const state = packedBeforeRefundState()
+
+  const result = await reopenShipmentForRepack(createClient(state), 'shipment-1', { userId: 'user-1' })
+
+  assert.equal(result.success, true, result.success ? undefined : result.error)
+  assert.equal(state.shipments[0].status, 'PENDING', 'the row itself is a draft again — that is what makes it rebuildable')
+  assert.equal(state.shipments[0].trackingNumber, 'TRACK-1', 'a purchased label is a real carrier record; a delete would have destroyed it')
+  assert.equal(state.shipments[0].shippingService, 'DPD')
+  assert.deepEqual(state.shipmentLines.map((line) => line.id), ['shipment-line-1'], 'the lines are kept — the rebuild replaces them, this does not delete them')
+  assert.equal(state.stockLevels[0].reservedQty, 5, 'reservedQty is UNTOUCHED: a PACKED shipment released nothing, so there is nothing to put back')
+  assert.equal(state.activityLogs?.length, 1)
+  const entry = state.activityLogs![0] as { action: string; level: string; description: string; metadata: { previousStatus: string; trackingNumber: string | null } }
+  assert.equal(entry.action, 'shipment_reopened_for_repack')
+  assert.equal(entry.level, 'WARNING', 'a human owes the warehouse a physical un-pack; that is not an INFO')
+  assert.equal(entry.metadata.previousStatus, 'PACKED')
+  assert.equal(entry.metadata.trackingNumber, 'TRACK-1')
+  assert.match(entry.description, /unpacked in the warehouse/)
+})
+
+test('o3d-2k5: a DISPATCHED shipment cannot be reopened — a dispatch is reversed by a refund or a return', async () => {
+  const state = packedBeforeRefundState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: 'DPD' }],
+  })
+
+  const result = await reopenShipmentForRepack(createClient(state), 'shipment-1')
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /already been dispatched/)
+  assert.equal(state.shipments[0].status, 'SHIPPED', 'nothing was written')
+  assert.equal(state.activityLogs?.length, 0)
+})
+
+test('o3d-2k5: a PENDING draft is refused, and is sent to the rebuild control instead', async () => {
+  const state = packedBeforeRefundState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null }],
+  })
+
+  const result = await reopenShipmentForRepack(createClient(state), 'shipment-1')
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /"Create Shipments"/)
+  assert.equal(state.activityLogs?.length, 0, 'refusing must not leave an audit row claiming a reopen happened')
+})
+
+test('o3d-2k5: a CANCELLED order takes the discard repair, not the reopen', async () => {
+  // Reopening would leave a draft on an order confirmSalesOrderShipments refuses to build for, so
+  // the rebuild step would dead-end — the refusal has to send the operator to the path that works.
+  const state = packedBeforeRefundState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'CANCELLED' }],
+  })
+
+  const result = await reopenShipmentForRepack(createClient(state), 'shipment-1')
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /Discard shipments/)
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.activityLogs?.length, 0)
+})
+
+test('o3d-2k5: the WHOLE recovery — a refund lands after packing, and the order ends up dispatched at the reduced quantity', async () => {
+  const state = packedBeforeRefundState()
+
+  // 1. Today's dead end: the o3d-339 guard refuses the dispatch, and names the exit.
+  const blocked = await transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-1', targetStatus: 'SHIPPED' })
+  assert.equal(blocked.success, false)
+  assert.match((blocked as { error: string }).error, /Reopen for repack/)
+  assert.equal(state.shipments[0].status, 'PACKED')
+
+  // 2. The exit.
+  const reopened = await reopenShipmentForRepack(createClient(state), 'shipment-1', { userId: 'user-1' })
+  assert.equal(reopened.success, true, reopened.success ? undefined : reopened.error)
+
+  // 3. The rebuild — the path that only ever replaces PENDING shipments, which is why the revert
+  //    had to be a revert. It nets the refund at build time: 5 allocated − 2 refunded = 3.
+  const rebuilt = await confirmSalesOrderShipments(createClient(state), 'order-1')
+  assert.equal(rebuilt.deletedPendingCount, 1, 'the reopened draft is the one it replaced')
+  assert.equal(rebuilt.shipmentCount, 1)
+  assert.equal(state.shipments.length, 1)
+  const fresh = state.shipments[0]
+  assert.equal(fresh.status, 'PENDING')
+  assert.deepEqual(
+    state.shipmentLines.filter((line) => line.shipmentId === fresh.id).map((line) => line.qty),
+    [3],
+    'rebuilt to what actually remains — this is the number the guard was defending',
+  )
+
+  // 4. And it now dispatches, which is the whole point: the remainder is shippable again.
+  const picking = await transitionShipmentStatus(createClient(state), { shipmentId: fresh.id, targetStatus: 'PICKING' })
+  assert.equal(picking.success, true, picking.success ? undefined : picking.error)
+  const packed = await transitionShipmentStatus(createClient(state), { shipmentId: fresh.id, targetStatus: 'PACKED' })
+  assert.equal(packed.success, true, packed.success ? undefined : packed.error)
+  const shipped = await transitionShipmentStatus(createClient(state), { shipmentId: fresh.id, targetStatus: 'SHIPPED' })
+  assert.equal(shipped.success, true, shipped.success ? undefined : shipped.error)
+  assert.equal(state.shipments[0].status, 'SHIPPED')
+  assert.equal(state.stockLevels[0].quantity, 2, '3 of the 5 units left the building')
+})
+
+test('o3d-2k5: the same recovery on a KIT nets the refund at LEAF level when the shipment is rebuilt', async () => {
+  // 4 kits ordered and packed as 0.4 of a fractional component; 1 kit refunded. The rebuild must
+  // produce 0.3 of the component, not "3 kits" — the leaf is the only unit the dispatch cap and the
+  // builder can agree in.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 4, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 0.1, sku: 'COMP-1' }] },
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'comp-1', warehouseId: 'warehouse-1', qty: 0.4 }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 0.4 }],
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-1', productId: 'kit-1', qty: 1 }],
+    stockLevels: [{ productId: 'comp-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 0.4 }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  const blocked = await transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-1', targetStatus: 'SHIPPED' })
+  assert.equal(blocked.success, false)
+  assert.match((blocked as { error: string }).error, /Reopen for repack/)
+
+  const reopened = await reopenShipmentForRepack(createClient(state), 'shipment-1')
+  assert.equal(reopened.success, true, reopened.success ? undefined : reopened.error)
+
+  await confirmSalesOrderShipments(createClient(state), 'order-1')
+  const fresh = state.shipments[0]
+  const rebuiltQtys = state.shipmentLines.filter((line) => line.shipmentId === fresh.id).map((line) => line.qty)
+  assert.equal(rebuiltQtys.length, 1)
+  // Compared with a tolerance, not for equality: this double stores raw JS numbers, so 0.4 − 0.1
+  // shows its float dust here where the real column (Decimal(12,4)) would persist 0.3000. The
+  // tolerance is far tighter than one unit of that scale, so it still fails on a wrong quantity.
+  assert.ok(
+    Math.abs(rebuiltQtys[0] - 0.3) < 1e-9,
+    `three kits worth of the component, netted through the kit recipe — got ${rebuiltQtys[0]}`,
+  )
+
+  const shipped = await transitionShipmentStatus(createClient(state), { shipmentId: fresh.id, targetStatus: 'PICKING' })
+  assert.equal(shipped.success, true, shipped.success ? undefined : shipped.error)
+})
+
+test('o3d-2k5: after a FULL refund the rebuild has nothing to build, and says so instead of shipping', async () => {
+  const state = packedBeforeRefundState({
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-1', productId: 'product-1', qty: 5 }],
+  })
+
+  const blocked = await transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-1', targetStatus: 'SHIPPED' })
+  assert.equal(blocked.success, false)
+  assert.match((blocked as { error: string }).error, /Reopen for repack/)
+
+  const reopened = await reopenShipmentForRepack(createClient(state), 'shipment-1')
+  assert.equal(reopened.success, true, reopened.success ? undefined : reopened.error)
+
+  await assert.rejects(
+    () => confirmSalesOrderShipments(createClient(state), 'order-1'),
+    /already covered by active shipments or refunds/,
+    'every unit was refunded — the correct outcome is no shipment at all, not a smaller one',
+  )
+  assert.equal(state.shipments[0].status, 'PENDING', 'and the draft is left as a draft, which blocks nothing')
 })

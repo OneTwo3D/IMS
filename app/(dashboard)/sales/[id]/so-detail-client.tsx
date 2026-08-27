@@ -25,7 +25,7 @@ import { sendSalesOrderEmail, sendInvoiceEmail } from '@/app/actions/email'
 import {
   autoAllocateOrder, getOrderAllocations, getOrderShipments,
   deallocateOrder, confirmAllocations, updateAllocation, addAllocation,
-  discardCancelledOrderShipments,
+  discardCancelledOrderShipments, reopenShipmentForRepackAction,
   updateShipmentStatus, updateShipmentTracking,
   type AllocationRow, type FulfillmentRequirementRow, type ShipmentRow,
 } from '@/app/actions/allocation'
@@ -683,6 +683,9 @@ function ShipmentsPanel({
   const [tracking, setTracking] = useState('')
   const [service, setService] = useState('')
   const [error, setError] = useState('')
+  // o3d-2k5: the reopen can SUCCEED and still leave work outstanding (the re-allocation refused, or
+  // did not complete). That is not an error and must not be shown as one — but it must be shown.
+  const [warning, setWarning] = useState('')
 
   function handleAdvance(shipmentId: string, target: string) {
     if (target === 'SHIPPED') {
@@ -717,6 +720,29 @@ function ShipmentsPanel({
     })
   }
 
+  // o3d-2k5: the exit the packed-before-refund dispatch refusal names. Reverts the shipment to a
+  // PENDING draft and re-nets the order's allocations, so the Stock Allocation panel's "Create
+  // Shipments" button can rebuild it to what actually remains. That panel reappears because a
+  // PENDING shipment is excluded from `committedByLine`, so the order reads as unfulfilled again. The units still have to come out of the box in the warehouse — the
+  // confirmation says so, because nothing in the data can do that part.
+  function handleReopenForRepack(shipmentId: string, status: string) {
+    if (!window.confirm(
+      `This shipment is ${SHIPMENT_STATUS_LABELS[status] ?? status.toLowerCase()} — the goods have been picked`
+      + `${status === 'PACKED' ? ' and packed' : ''} in the warehouse.\n\n`
+      + 'Reopening turns it back into a pending draft and re-nets the order against refunds, so it can be '
+      + 'rebuilt to what remains. Any tracking number is kept on the draft.\n\n'
+      + 'Physically unpack the parcel before rebuilding. Continue?',
+    )) return
+    setError('')
+    setWarning('')
+    startTransition(async () => {
+      const result = await reopenShipmentForRepackAction(shipmentId)
+      if (!result.success) { setError(result.error ?? 'Failed'); return }
+      if (result.warning) setWarning(result.warning)
+      onRefresh()
+    })
+  }
+
   // o3d-4kfh r6 (finding 4): the exit the component-graph refusal names. Dispatching a cancelled
   // order's shipment is refused (it would ship goods for a cancelled sale) and CANCELLED has no
   // transition to CANCELLED, so before this there was no way to clear the blocker at all.
@@ -745,6 +771,11 @@ function ShipmentsPanel({
   return (
     <div className="space-y-3">
       {error && <p className="text-sm text-destructive">{error}</p>}
+      {warning && (
+        <p className="text-sm text-amber-700 dark:text-amber-400 rounded-md border border-amber-300 dark:border-amber-800 px-3 py-2">
+          {warning}
+        </p>
+      )}
       {discardableCount > 0 && (
         <div className="rounded-md border border-destructive/40 px-4 py-2 flex items-center justify-between gap-3">
           <p className="text-sm text-muted-foreground">
@@ -793,6 +824,21 @@ function ShipmentsPanel({
                   <Button size="sm" className="h-7 text-xs" onClick={() => handleAdvance(s.id, nextAction.target)} disabled={isPending}>
                     {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
                     {nextAction.label}
+                  </Button>
+                )}
+                {/* o3d-2k5: only a COMMITTED, non-dispatched shipment can be reopened. A PENDING draft
+                    has nothing committed to undo ("Create Shipments" already replaces it), SHIPPED is
+                    terminal, and a cancelled order takes the discard path above instead. */}
+                {!isCancelledOrder && (s.status === 'PICKING' || s.status === 'PACKED') && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs"
+                    onClick={() => handleReopenForRepack(s.id, s.status)}
+                    disabled={isPending}
+                  >
+                    {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
+                    Reopen for repack
                   </Button>
                 )}
                 {s.status === 'SHIPPED' && (
