@@ -33,7 +33,12 @@
 //                          missing import. This mode runs the same imports, opens the same
 //                          connection and asks the same questions.
 //   --fence                revoke CONNECT, drain the existing backends, prove it is quiet
-//   --release              restore EXACTLY the grants that were revoked, and verify they are back
+//   --release              restore EXACTLY the grants that were revoked, and verify they are back.
+//                          When there is no usable record to restore FROM, it does not report
+//                          "nothing to release" — a record that was never written and one a
+//                          power cut ate look identical from here. It asks the database, and
+//                          only a database that says the application role holds CONNECT is a
+//                          proof that no fence is standing (o3d-2sm1.5, Codex r11 HIGH).
 //   --print-migration-url  the admin URL with `options=-c role=<app role>` merged in — the
 //                          connection the migration must run through. See "WHO THE
 //                          MIGRATION RUNS AS" below. No database connection is opened.
@@ -116,7 +121,8 @@
 // than the fenced snapshot.
 // =============================================================================
 
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -448,17 +454,129 @@ function parseArgs(argv) {
   return options
 }
 
-function readState(stateFile) {
-  try {
-    return JSON.parse(readFileSync(stateFile, 'utf8'))
-  } catch {
-    return null
+// ---------------------------------------------------------------------------
+// THE FENCE RECORD (o3d-2sm1.5, Codex r11 HIGH).
+//
+// THE ASYMMETRY IS THE WHOLE FINDING. The REVOKE is a committed PostgreSQL transaction: it
+// is on the medium before COMMIT returns and it survives anything. The file that undoes it
+// was a plain writeFileSync — no atomic replacement, no flush — and its return was allowed
+// to permit that transaction. A power cut between the two preserves the revocations and
+// loses or truncates the record, and `--release` then read `null`, reported "nothing to
+// release" and exited 0 while the application and every other recorded grantee stayed
+// locked out of the database.
+//
+// Two halves, and both are needed:
+//
+//   1. The record is PUBLISHED DURABLY BEFORE BEGIN — same-directory temporary, file fsync,
+//      atomic rename, directory fsync — and a failure aborts WITHOUT revoking anything.
+//   2. `--release` no longer reads absence as a negative. A record that was never written
+//      and a record a power cut ate are indistinguishable from here, so a missing or
+//      unusable record is not an answer at all: the database is asked instead, and only a
+//      database that says the application role holds CONNECT proves there is no fence.
+// ---------------------------------------------------------------------------
+
+/** The record is there and usable: released from it, exactly what was revoked comes back. */
+export const STATE_PRESENT = 'present'
+/**
+ * Nothing at the path. THE AMBIGUOUS ONE, and the reason this enum exists: "no fence was
+ * ever taken" and "the fence record was lost" look identical here. Never a proof of absence.
+ */
+export const STATE_ABSENT = 'absent'
+/** Something is at the path but it could not be read at all (permissions, a directory, EIO). */
+export const STATE_UNREADABLE = 'unreadable'
+/** Something is at the path, it was read, and it is not a usable record of what to restore. */
+export const STATE_CORRUPT = 'corrupt'
+
+/**
+ * Written LAST, so a record that parses without it was torn rather than finished.
+ *
+ * publish_durable_file()'s `marker_complete=1` in the deploy scripts is the same device for
+ * the same reason. The atomic rename below should make a torn record unobservable at the
+ * authoritative path; this is what catches the case where it is observable anyway — and a
+ * record from a build that predates the sentinel is CORRUPT rather than present, which is
+ * loud, recoverable, and much safer than releasing from a grantee list that may be short.
+ */
+export const STATE_COMPLETE_SENTINEL = 1
+
+/** Pure: is this parsed object a record a release can actually be driven from? */
+export function classifyStateShape(parsed) {
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return 'the record is not a JSON object'
+  if (parsed.state_complete !== STATE_COMPLETE_SENTINEL) {
+    return 'the record does not end with the completeness sentinel, so it was truncated or predates it'
   }
+  if (typeof parsed.database !== 'string' || parsed.database.length === 0) return 'the record names no database'
+  if (!Array.isArray(parsed.revoked) || parsed.revoked.some((grantee) => typeof grantee !== 'string')) {
+    return 'the record carries no usable list of revoked grantees'
+  }
+  return ''
 }
 
-function writeState(stateFile, state) {
-  mkdirSync(dirname(stateFile), { recursive: true })
-  writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 })
+/**
+ * Read the fence record, saying WHICH kind of nothing it found when it finds nothing.
+ *
+ * The old version returned `null` for "no file", "unreadable file" and "unparseable file"
+ * alike, and every caller read that single null as "no fence is recorded".
+ */
+export function readState(stateFile) {
+  let raw
+  try {
+    raw = readFileSync(stateFile, 'utf8')
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return { status: STATE_ABSENT, detail: 'no file at that path' }
+    return { status: STATE_UNREADABLE, detail: error instanceof Error ? error.message : String(error) }
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    return { status: STATE_CORRUPT, detail: `the record is not valid JSON (${error instanceof Error ? error.message : String(error)})` }
+  }
+  const problem = classifyStateShape(parsed)
+  if (problem) return { status: STATE_CORRUPT, detail: problem }
+  return { status: STATE_PRESENT, state: parsed }
+}
+
+/**
+ * Publish the fence record so that a power cut leaves either the previous record or the
+ * complete new one, and so that the bytes are on the medium before the caller is allowed to
+ * revoke anything.
+ *
+ * Throws on any failure — including the directory flush AFTER the rename, where the new
+ * record is already visible and its NAME is not yet proven. The caller must abort there
+ * rather than read the file back: a read-back is satisfied by the page cache, which is the
+ * exact state a power cut undoes.
+ */
+export function publishState(stateFile, state) {
+  const dir = dirname(stateFile)
+  mkdirSync(dir, { recursive: true })
+  const tmp = `${stateFile}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
+  const body = `${JSON.stringify({ ...state, state_complete: STATE_COMPLETE_SENTINEL }, null, 2)}\n`
+  try {
+    const fd = openSync(tmp, 'wx', 0o600)
+    try {
+      writeFileSync(fd, body)
+      // BARRIER 1: the data, before any name points at it.
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    renameSync(tmp, stateFile)
+  } catch (error) {
+    try {
+      unlinkSync(tmp)
+    } catch {
+      /* the temporary may never have been created; the failure being reported is the one above */
+    }
+    throw error
+  }
+  // BARRIER 2: the directory entry the rename created. Without it the reboot can find the
+  // previous record, or neither, however well the data was written.
+  const dirFd = openSync(dir, 'r')
+  try {
+    fsyncSync(dirFd)
+  } finally {
+    closeSync(dirFd)
+  }
 }
 
 async function readFacts(client, appRole) {
@@ -599,7 +717,24 @@ async function doPreflight(client, options) {
   return EXIT_OK
 }
 
-async function doFence(client, options) {
+/**
+ * The refusal that keeps the asymmetry from opening: the record could not be made durable, so
+ * nothing is revoked. Nothing has changed in the database and nothing needs releasing.
+ */
+function refuseUnrecordedFence(stateFile, error, appeared = []) {
+  const message = error instanceof Error ? error.message : String(error)
+  console.error(`NOT FENCED: the fence record ${stateFile} could not be published durably (${message}).`)
+  console.error('Refusing to revoke CONNECT. A REVOKE is a committed transaction that survives a power cut;')
+  console.error('this file is the only thing that undoes it, and a revoke whose undo record may not survive')
+  console.error('locks the application out of its database with nothing left to say how to let it back in.')
+  if (appeared.length > 0) {
+    console.error(`The fence already recorded stays exactly as it is; ${appeared.join(', ')} was NOT revoked.`)
+  }
+  console.error('Nothing has been revoked by this run. Fix the filesystem (space, permissions, mount) and re-run.')
+  return EXIT_NOT_FENCEABLE
+}
+
+export async function doFence(client, options) {
   // The fence is only ever established through an EXPLICIT admin URL. Falling back to
   // DIRECT_URL here would let a fence engage while the caller has no idea which
   // connection survived it — and the caller has to run the migration through exactly
@@ -626,7 +761,20 @@ async function doFence(client, options) {
     return EXIT_NOT_FENCEABLE
   }
 
-  const existing = options.stateFile ? readState(options.stateFile) : null
+  // A RECORD THAT EXISTS AND CANNOT BE USED IS NOT "NO RECORD" (o3d-2sm1.5, Codex r11 HIGH).
+  // The old read collapsed absent, unreadable and unparseable into one null, and this line
+  // then took the "no existing fence" branch — which would publish a FRESH record over the
+  // only surviving trace of what an earlier run revoked, and release would afterwards
+  // restore the wrong set. Only a genuinely absent record starts a fresh fence.
+  const read = options.stateFile ? readState(options.stateFile) : { status: STATE_ABSENT, detail: 'no --state-file was given' }
+  if (read.status === STATE_UNREADABLE || read.status === STATE_CORRUPT) {
+    console.error(`NOT FENCED: ${options.stateFile} holds a fence record this run cannot use (${read.status}: ${read.detail}).`)
+    console.error('Refusing to revoke CONNECT over it: that record may be the only account of what an earlier')
+    console.error('fence took away, and overwriting it would leave those grantees with nothing to restore them.')
+    console.error(`Inspect ${options.stateFile}, restore the grants it describes by hand if it describes any, remove it, and re-run.`)
+    return EXIT_NOT_FENCEABLE
+  }
+  const existing = read.status === STATE_PRESENT ? read.state : null
   const plan = existing ? { fenceable: true, reason: '', revoke: existing.revoked } : freshPlan
 
   if (!plan.fenceable) {
@@ -639,29 +787,44 @@ async function doFence(client, options) {
   const revokes = buildRevokeStatements(facts.database, plan.revoke)
   const grants = buildGrantStatements(facts.database, plan.revoke)
 
+  // PUBLISHED DURABLY, AND BEFORE THE TRANSACTION THAT MAKES IT NECESSARY.
+  //
+  // The comment below used to say "written BEFORE the revoke", which was true of the CALL and
+  // not of the BYTES: writeFileSync returns as soon as the kernel has the page, and the
+  // REVOKE that follows is a committed transaction that survives a power cut the file does
+  // not. So the ordering has to be a durability ordering, and a publication that cannot be
+  // proven aborts the fence rather than permitting a revoke nothing records.
   if (options.stateFile && !existing) {
-    // Written BEFORE the revoke: a crash between the two must leave a record of what
-    // to restore, not a fence nobody can undo.
-    writeState(options.stateFile, {
-      database: facts.database,
-      owner_role: facts.owner_role,
-      app_role: appRole,
-      admin_role: facts.admin_role,
-      revoked: plan.revoke,
-      datacl_before: facts.datacl ?? null,
-      fenced_at: new Date().toISOString(),
-      undo_sql: grants,
-    })
+    try {
+      publishState(options.stateFile, {
+        database: facts.database,
+        owner_role: facts.owner_role,
+        app_role: appRole,
+        admin_role: facts.admin_role,
+        revoked: plan.revoke,
+        datacl_before: facts.datacl ?? null,
+        fenced_at: new Date().toISOString(),
+        undo_sql: grants,
+      })
+    } catch (error) {
+      return refuseUnrecordedFence(options.stateFile, error)
+    }
   } else if (existing) {
     console.log(`Re-applying the fence recorded at ${existing.fenced_at} (grantees: ${existing.revoked.join(', ')}).`)
     // A grantee that appeared SINCE the fence was recorded would otherwise be revoked by
     // nothing: the state file is the authority on what to restore, not on what holds CONNECT
-    // now. Anything new is revoked too and appended, so the release still puts it back.
+    // now. Anything new is revoked too and appended, so the release still puts it back —
+    // and the appended record is published durably before those extra revokes run, for the
+    // same reason the first one is.
     const appeared = freshPlan.revoke.filter((grantee) => !plan.revoke.includes(grantee))
     if (appeared.length > 0) {
       console.log(`  and revoking from ${appeared.join(', ')}, which has acquired CONNECT since the fence was recorded.`)
       plan.revoke.push(...appeared)
-      writeState(options.stateFile, { ...existing, revoked: plan.revoke, undo_sql: buildGrantStatements(facts.database, plan.revoke) })
+      try {
+        publishState(options.stateFile, { ...existing, revoked: plan.revoke, undo_sql: buildGrantStatements(facts.database, plan.revoke) })
+      } catch (error) {
+        return refuseUnrecordedFence(options.stateFile, error, appeared)
+      }
       revokes.push(...buildRevokeStatements(facts.database, appeared))
       grants.push(...buildGrantStatements(facts.database, appeared))
     }
@@ -742,12 +905,81 @@ async function doFence(client, options) {
   return EXIT_OK
 }
 
-async function doRelease(client, options) {
-  const state = options.stateFile ? readState(options.stateFile) : null
-  if (!state) {
-    console.log('No connection fence is recorded; nothing to release.')
-    return EXIT_OK
+/**
+ * Pure: what `--release` may conclude when the record cannot answer.
+ *
+ * "NOTHING TO RELEASE" IS A CLAIM ABOUT THE DATABASE, NOT ABOUT A FILE (o3d-2sm1.5, Codex r11
+ * HIGH). A missing record is the shape a lost record takes, so it proves nothing on its own.
+ * The only proof that no fence is standing is the database saying the application role holds
+ * CONNECT — and if it does not, a fence IS standing with no record of it, which is a refusal
+ * with instructions, never a success.
+ */
+export function assessUnrecordedRelease({ status, detail = '', appRole, stateFile, appStillConnects }) {
+  const where = stateFile || '<no --state-file was given>'
+  const what = `${status}${detail ? `: ${detail}` : ''}`
+  if (!appRole) {
+    return {
+      exitCode: EXIT_ERROR,
+      fenceProvenAbsent: false,
+      lines: [
+        `No usable connection-fence record (${what}) at ${where}, and no application role to ask about:`,
+        'DATABASE_URL carries no role name and --app-role was not given.',
+        'Refusing to report "nothing to release": absence of a record is not absence of a fence, and',
+        'without a role there is nothing to prove the database is open to. Pass --app-role=<role> and re-run.',
+      ],
+    }
   }
+  if (appStillConnects) {
+    return {
+      exitCode: EXIT_OK,
+      fenceProvenAbsent: true,
+      lines: [
+        `No usable connection-fence record (${what}) at ${where}.`,
+        `Nothing to release, and PROVEN so: ${appRole} holds CONNECT on this database, so no fence is standing.`,
+        ...(status === STATE_ABSENT ? [] : [`The unusable record was left at ${where} for inspection.`]),
+      ],
+    }
+  }
+  return {
+    exitCode: EXIT_ERROR,
+    fenceProvenAbsent: false,
+    lines: [
+      `A CONNECTION FENCE IS STANDING AND ITS RECORD IS GONE (${what}) at ${where}.`,
+      `${appRole} does NOT hold CONNECT on this database, so something revoked it — but the file that says`,
+      'what was revoked, and from whom, is missing or unusable. This is the state a power cut between the',
+      'REVOKE and the record produces: the transaction survives, the undo does not.',
+      'Refusing to report "nothing to release". Restore CONNECT by hand as a superuser or the database owner:',
+      `  GRANT CONNECT ON DATABASE <this database> TO ${appRole};`,
+      'and check pg_database.datacl for any OTHER grantee the same fence took CONNECT from — a role that',
+      'held it before the deploy and does not hold it now was revoked by this fence and is not in any record.',
+    ],
+  }
+}
+
+/**
+ * The branch taken when the record cannot answer. Asks the database, which is where the
+ * durable half of the fence lives, and reports what it can actually prove.
+ */
+async function releaseWithoutRecord(client, options, read) {
+  const appRole = options.appRole || parseRoleFromConnectionString(process.env.DATABASE_URL)
+  const effective = appRole ? await readEffectiveConnect(client, appRole) : { stillConnects: false }
+  const verdict = assessUnrecordedRelease({
+    status: read.status,
+    detail: read.detail,
+    appRole,
+    stateFile: options.stateFile,
+    appStillConnects: effective.stillConnects,
+  })
+  for (const line of verdict.lines) (verdict.exitCode === EXIT_OK ? console.log : console.error)(line)
+  return verdict.exitCode
+}
+
+export async function doRelease(client, options) {
+  const read = options.stateFile ? readState(options.stateFile) : { status: STATE_ABSENT, detail: 'no --state-file was given' }
+  if (read.status !== STATE_PRESENT) {
+    return releaseWithoutRecord(client, options, read)
+  }
+  const state = read.state
 
   const grants = buildGrantStatements(state.database, state.revoked)
   for (const statement of grants) {

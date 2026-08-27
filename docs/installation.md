@@ -520,6 +520,19 @@ left by a version of these scripts that predates the sentinel) is read the conse
 the schema **may** have moved, so the connection fence is held and the run re-migrates, checks
 drift and re-verifies before anything gets `CONNECT` back.
 
+**The reboot-fence drop-in is published the same way** (o3d-2sm1.5). The marker is only the
+condition; the `zz-deploy-fence.conf` drop-in carrying `AssertPathExists=!<marker>` is what makes
+systemd honour it, so both have to be equally durable. It used to be written with a plain
+redirection into a `mkdir -p`'d `<unit>.d`, then `daemon-reload`ed and verified — which proves
+systemd can read it *now* and flushes nothing. Nothing between that write and the first
+`systemctl stop` is a write barrier, so a power cut after `schema_touched` became durable and
+before the drop-in reached the medium rebooted **without** the fence, and the old enabled unit
+started against a partially migrated schema. It now goes through the same discipline as the
+marker, plus one barrier the marker does not need: where the run creates the `<unit>.d`
+directory, that directory's own entry is flushed before anything is written into it. A
+publication that cannot be proven **fails the install**, which is before the phase becomes
+`stopping` and before anything is stopped.
+
 **The stop is recorded before it is asked for.** The marker says `phase=stopping` on disk
 before the first `systemctl stop`, so a run killed across the stop is adopted as a run that
 stopped something. Without that, adoption falls back to asking whether anything is still
@@ -575,6 +588,23 @@ application role, PUBLIC (the default database ACL grants it to PUBLIC, so revok
 alone changes nothing) and any other role with a direct grant — for the length of the window
 (`scripts/fence-db-connections.mjs --fence`), drain what is already attached, and only then take
 the snapshot.
+
+**The fence record is published before the `REVOKE`, and durably** (o3d-2sm1.5). The revoke is a
+committed PostgreSQL transaction: it survives a power cut. `db-connect-fence.json` — the only
+account of what was revoked and from whom — used to be a plain write whose return permitted that
+transaction, so a power cut in between preserved the lock-out and lost the key. It is now written
+to a temporary in the same directory, `fsync`ed, renamed and the directory `fsync`ed, all before
+`BEGIN`; if any of that cannot be proven, **nothing is revoked** and the run aborts with exit 3.
+The last field of a complete record is `"state_complete": 1`.
+
+**And `--release` never reads a missing record as "no fence".** A record that was never written
+and one a power cut ate are indistinguishable from the file system, so absence is not an answer:
+`--release` asks the database instead, and only `has_database_privilege(<app role>, …, 'CONNECT')`
+coming back true proves that no fence is standing. If the application role cannot connect and
+there is no usable record, it refuses with exit 1 and prints the `GRANT` to run by hand, rather
+than reporting "nothing to release" over a database the application is still locked out of. A
+record that exists but cannot be parsed is left in place for inspection, and `--fence` refuses to
+overwrite one rather than starting a fresh record over the only account of an earlier fence.
 
 **Every grantee, not two of them** (o3d-2sm1.5). It used to revoke from PUBLIC and the application
 role and call the database held closed. A third role with a direct `CONNECT` grant — monitoring,
