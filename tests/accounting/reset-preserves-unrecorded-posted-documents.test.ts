@@ -425,7 +425,7 @@ test('ROUND 6: a record with no readable type is counted apart rather than guess
   assert.ok(breadcrumb)
   assert.doesNotMatch(breadcrumb.description, /Xero or QuickBooks accepted and still holds/)
   assert.doesNotMatch(breadcrumb.description, /are NOT ledger documents/)
-  assert.match(breadcrumb.description, /1 carry no readable operation type/)
+  assert.match(breadcrumb.description, /1 carry no operation type this version of IMS has classified/)
 
   const metadata = (breadcrumb as unknown as { metadata?: Record<string, unknown> }).metadata
   assert.equal(metadata?.unclassified, 1)
@@ -454,4 +454,146 @@ test('ROUND 6: the classifier keys on the OPERATION TYPE, not on the connector t
   for (const unreadable of [null, undefined, 'INVOICE_EMAIL', 42, [], {}, { type: '' }, { type: 7 }]) {
     assert.equal(classifyUnrecordedIncident(unreadable), 'UNCLASSIFIED', JSON.stringify(unreadable) ?? 'undefined')
   }
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 7 (Codex MEDIUM): THE FALLBACK POINTED THE WRONG WAY, AND A REAL XERO OPERATION PROVED IT.
+//
+// Round 6 asked one question — "is this one of the four no-identifier operations?" — and sent every
+// other readable type to LEDGER_DOCUMENT. `PURCHASE_CREDIT_NOTE_ALLOCATION` is a type Xero
+// processes SUCCESSFULLY and deliberately returns no external id for: "the allocation is a
+// sub-resource of the credit note, not a standalone document" (xero/sync-processor.ts). Its
+// preserved incident was therefore being counted as a document standing in Xero, carrying real
+// money, openable by id — three false statements in the one record that outlives a factory reset.
+//
+// The classification is now an EXHAUSTIVE map over AccountingSyncType, and an unknown type is
+// UNCLASSIFIED. That is the same defect round 6 fixed pointing the other way: default to the humble
+// answer, not the confident one.
+//
+// REVERT EVIDENCE (each verified by making that one change and re-running this file):
+//   * restoring the `QBO_NO_IDENTIFIER_OPERATION_TYPES.includes(type) ? … : 'LEDGER_DOCUMENT'`
+//     fallback fails "a Xero credit-note ALLOCATION is not described as a document standing in a
+//     ledger" and "an unknown type is UNCLASSIFIED, not a document".
+//   * moving PURCHASE_CREDIT_NOTE_ALLOCATION to LEDGER_DOCUMENT in the map fails the first of those.
+//   * deleting a member from the map fails "the map classifies every AccountingSyncType" (and the
+//     build, which is the point of the Record<> type).
+// ---------------------------------------------------------------------------
+
+const XERO_ALLOCATION_INCIDENT: ActivityRow = {
+  action: UNRECORDED_POSTED_DOCUMENT_ACTION,
+  level: 'ERROR',
+  metadata: { type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', syncLogId: 'log-9' },
+  description: 'Xero PURCHASE_CREDIT_NOTE_ALLOCATION for SupplierCreditNote scn-9 POSTED, but IMS '
+    + 'could not record it.',
+}
+
+test('ROUND 7: a Xero credit-note ALLOCATION is not described as a document standing in a ledger', async () => {
+  reset([XERO_ALLOCATION_INCIDENT])
+
+  await runReset('full')
+
+  const kept = state.activity.filter((row) => row.action === UNRECORDED_POSTED_DOCUMENT_ACTION)
+  assert.equal(kept.length, 1, 'still preserved — the allocation moved money and no reset undoes it')
+
+  const breadcrumb = state.activity.find((row) => row.action === 'database_reset_preserved_unrecorded_documents')
+  assert.ok(breadcrumb)
+
+  // THE DEFECT: an allocation has no document id, so none of this may be said about it.
+  assert.doesNotMatch(breadcrumb.description, /Xero or QuickBooks accepted and still holds/)
+  assert.doesNotMatch(breadcrumb.description, /Open the id in that system/)
+  assert.doesNotMatch(breadcrumb.description, /real money in somebody else's books/)
+  // Nor is it one of the four: something DID reach the ledger.
+  assert.doesNotMatch(breadcrumb.description, /created nothing in Xero or QuickBooks/)
+
+  assert.match(breadcrumb.description, /1 record a write Xero or QuickBooks ACCEPTED that is NOT a standalone document/)
+  assert.match(breadcrumb.description, /has NO id to open/)
+
+  const metadata = (breadcrumb as unknown as { metadata?: Record<string, unknown> }).metadata
+  assert.equal(metadata?.ledgerDocuments, 0, 'the count that would have been asserted is zero, and is stated as zero')
+  assert.equal(metadata?.ledgerNonDocuments, 1)
+  assert.equal(metadata?.noIdentifierSideEffects, 0)
+  assert.equal(metadata?.unclassified, 0)
+  assert.equal(metadata?.preserved, 1)
+})
+
+test('ROUND 7: an unknown type is UNCLASSIFIED, not a document', async () => {
+  const { classifyUnrecordedIncident } = await import('@/lib/domain/accounting/unrecorded-posted-document')
+
+  // A type from a schema newer than this binary, a truncated string, a renamed member.
+  for (const type of ['FUTURE_LEDGER_THING', 'SALES_INVOICE_V2', 'PURCHASE_INVOIC', 'sales_invoice']) {
+    assert.equal(classifyUnrecordedIncident({ type }), 'UNCLASSIFIED', type)
+  }
+  // And the one that made the point.
+  assert.equal(classifyUnrecordedIncident({ type: 'PURCHASE_CREDIT_NOTE_ALLOCATION' }), 'LEDGER_NON_DOCUMENT')
+  assert.equal(classifyUnrecordedIncident({ type: 'TAX_RATE_SYNC' }), 'LEDGER_NON_DOCUMENT')
+})
+
+test('ROUND 7: the map classifies every AccountingSyncType, read from the schema itself', async () => {
+  // The compiler already enforces this through Record<AccountingSyncType, …>. This reads the enum
+  // from prisma/schema.prisma so the guarantee does not depend on the generated client being in
+  // step with the schema, and so a member added to the schema fails a TEST as well as the build.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const { INCIDENT_KIND_BY_OPERATION_TYPE } = await import('@/lib/domain/accounting/unrecorded-posted-document')
+
+  const schema = await readFile(path.join(process.cwd(), 'prisma/schema.prisma'), 'utf8')
+  const block = /enum AccountingSyncType \{([\s\S]*?)\n\}/.exec(schema)
+  assert.ok(block, 'the enum must still be in the schema')
+  const members = block![1]
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^[A-Z][A-Z0-9_]*$/.test(line))
+
+  assert.ok(members.length > 25, `sanity: the enum parsed to ${members.length} members`)
+  assert.deepEqual(
+    members.filter((member) => !(member in INCIDENT_KIND_BY_OPERATION_TYPE)),
+    [],
+    'every operation type must have a classification — an unmapped one silently becomes UNCLASSIFIED',
+  )
+  assert.deepEqual(
+    Object.keys(INCIDENT_KIND_BY_OPERATION_TYPE).filter((key) => !members.includes(key)),
+    [],
+    'and the map must not carry a type the schema no longer has',
+  )
+})
+
+test('ROUND 7: the two non-document types are exactly the ones the breadcrumb sentence names', async () => {
+  // The LEDGER_NON_DOCUMENT sentence enumerates its members ("a credit note APPLIED to a bill, a
+  // tax rate written into the organisation"). That is exact today and would quietly stop being
+  // exact if a third member were added, so the drift is caught here rather than in a reset.
+  const { INCIDENT_KIND_BY_OPERATION_TYPE } = await import('@/lib/domain/accounting/unrecorded-posted-document')
+  const nonDocuments = Object.entries(INCIDENT_KIND_BY_OPERATION_TYPE)
+    .filter(([, kind]) => kind === 'LEDGER_NON_DOCUMENT')
+    .map(([type]) => type)
+    .sort()
+  assert.deepEqual(nonDocuments, ['PURCHASE_CREDIT_NOTE_ALLOCATION', 'TAX_RATE_SYNC'])
+})
+
+test('ROUND 7: the four no-identifier types in the map are the four in the wording table', async () => {
+  // Two derivations of the same set — the wording table and the semantic map — must not drift, or
+  // the record would describe an operation one way and count it another.
+  const { INCIDENT_KIND_BY_OPERATION_TYPE, QBO_NO_IDENTIFIER_OPERATION_TYPES } =
+    await import('@/lib/domain/accounting/unrecorded-posted-document')
+  const fromMap = Object.entries(INCIDENT_KIND_BY_OPERATION_TYPE)
+    .filter(([, kind]) => kind === 'NO_IDENTIFIER_SIDE_EFFECT')
+    .map(([type]) => type)
+    .sort()
+  assert.deepEqual(fromMap, [...QBO_NO_IDENTIFIER_OPERATION_TYPES].sort())
+})
+
+test('ROUND 7: a mixed set counts all four kinds apart', async () => {
+  reset([INCIDENT, QBO_EMAIL_INCIDENT, XERO_ALLOCATION_INCIDENT, QBO_UNTYPED_INCIDENT])
+
+  await runReset('full')
+
+  const breadcrumb = state.activity.find((row) => row.action === 'database_reset_preserved_unrecorded_documents')
+  assert.ok(breadcrumb)
+  assert.match(breadcrumb.description, /^Database reset kept 4 record/)
+
+  const metadata = (breadcrumb as unknown as { metadata?: Record<string, unknown> }).metadata
+  assert.equal(metadata?.ledgerDocuments, 1)
+  assert.equal(metadata?.ledgerNonDocuments, 1)
+  assert.equal(metadata?.noIdentifierSideEffects, 1)
+  assert.equal(metadata?.unclassified, 1)
+  assert.equal(metadata?.preserved, 4, 'the total still reconciles with the parts')
 })

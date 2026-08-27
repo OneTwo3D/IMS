@@ -53,6 +53,11 @@ mock.module('@/lib/db', {
 
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
 
+// Round 7: the OTHER writer of this row shape is an authenticated server action, so it is driven
+// here rather than described.
+mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'op-1' } }) } })
+mock.module('@/lib/auth', { namedExports: { auth: async () => ({ user: { id: 'op-1' } }) } })
+
 // The real sender, so that "nothing was sent" is an observation rather than an assumption.
 mock.module('@/lib/mailer', {
   namedExports: {
@@ -125,20 +130,19 @@ test('Codex MEDIUM (round 3): the escalation names the queued copies and the fac
   // Round 3 replaced this sentence rather than keeping it: "settling cancels nothing that is already
   // queued" still implied a settlement the operator could go and perform, and they cannot.
   assert.doesNotMatch(description, /SETTLING THE ROW CANCELS NOTHING THAT IS ALREADY QUEUED/)
-  assert.match(
-    description,
-    /WHAT YOU CANNOT DO WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR: settle sync row log-1 by hand/,
-    'the step the reader would otherwise trust to end it is named as unavailable, not merely as insufficient',
-  )
-  // Round 4: unavailable WHILE QUICKBOOKS IS ACTIVE, which is not the same as unavailable. The
-  // unqualified sentence hid the only per-row remedy there is.
+  // ROUND 7: the settlement is not named as a step at all — not as available, and not as
+  // unavailable-for-now. Naming it either way is what made three rounds of wording wrong; the
+  // reader is told to escalate the row instead.
+  assert.doesNotMatch(description, /settle sync row log-1/)
   assert.doesNotMatch(description, /refuses EVERY QuickBooks row/)
-  // Round 5: the condition is a CONJUNCTION — not the active connector AND its sync toggle off,
-  // because the manual Sync button gates on the toggle alone. See STEP 6 in
-  // tests/accounting/qbo-remedy-is-performable.test.ts, which drives both halves.
-  assert.match(description, /THE PER-ROW REMEDY DOES EXIST, BUT IT NEEDS BOTH OF TWO THINGS/)
-  assert.match(description, /TURN quickbooks_sync_enabled OFF AS WELL/)
-  assert.match(description, /STRANDED SYNC ROWS/)
+  // ROUND 7 (Codex HIGH): the conjunction round 5 added was the PRECONDITION of a remedy that could
+  // always be raced — the toggle admits, it does not quiesce. The remedy is gone with it, and the
+  // record says to leave the connector off and escalate. See
+  // tests/accounting/qbo-disable-is-not-quiescence.ts, which drives the race.
+  assert.doesNotMatch(description, /THE PER-ROW REMEDY DOES EXIST/)
+  assert.doesNotMatch(description, /STRANDED SYNC ROWS/)
+  assert.match(description, /THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE/)
+  assert.match(description, /ESCALATE sync row log-1/)
 
   // ROUND 3 (Codex HIGH). The instruction this test used to pin — "keep at most the one copy the
   // customer should receive, and cancel the rest", then settle — WAS NOT PERFORMABLE. The outbox has
@@ -147,17 +151,23 @@ test('Codex MEDIUM (round 3): the escalation names the queued copies and the fac
   // names the impossibility instead of instructing past it.
   assert.doesNotMatch(description, /cancel the rest/, 'there is no operation that cancels a queued copy')
   assert.match(description, /IMS CANNOT CANCEL A QUEUED COPY/)
-  assert.match(description, /every copy already queued WILL be delivered/)
+
+  // ROUND 7 (Codex MEDIUM): NOT "every copy WILL be delivered", and NOT a count to give a customer.
+  // The outbox terminalises a row FAILED for a suppressed recipient, a permanent send failure or
+  // five exhausted attempts; the rows carry no sync-log id; and the authenticated
+  // accounting-invoice action writes the identical shape. See the two tests at the end of this file.
+  assert.doesNotMatch(description, /every copy already queued WILL be delivered/)
+  assert.doesNotMatch(description, /how many copies are on their way/)
 
   // What survives is the part that IS runnable: the query still has to select the rows the first two
-  // tests produced, because counting them and warning the customer is the whole of what can be done.
+  // tests produced, because inspecting them is the whole of what can be done.
   for (const fragment of ['kind ACCOUNTING_INVOICE', 'referenceType SalesOrder', 'referenceId = the order id']) {
     assert.ok(
       description.includes(fragment),
       `the query the operator is told to run must name ${fragment}, which is what queueEmail actually writes`,
     )
   }
-  assert.match(description, /tell the customer how many copies are on their way/)
+  assert.match(description, /WHAT COMES BACK IS CANDIDATES, AND IMS CANNOT NARROW THEM/)
 
   // tests/accounting/qbo-remedy-is-performable.test.ts walks every step of this message against the
   // shipped code — the outbox enum, the settlement action, and the sync toggle it does name.
@@ -180,4 +190,97 @@ test('Codex MEDIUM: the outbox caveat stays on the email operation only', async 
     assert.match(description, /NO REQUEST ID PROTECTS IT/, `${type} keeps the o3d-qn21 replay warning`)
     assert.doesNotMatch(description, /email-outbox row/, `${type} has no queued copies to cancel`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 7 (Codex MEDIUM): THE COUNT THE RECORD PRESCRIBED COULD NOT BE MADE FROM THIS DATA.
+//
+// The record told an operator to query the outbox by kind/reference and report that number to the
+// customer as copies on their way. Two shipped facts make that impossible, and both are exercised
+// below rather than asserted about:
+//
+//   1. THE SAME SHAPE HAS ANOTHER, LEGITIMATE WRITER. `sendAccountingInvoiceEmail` in
+//      app/actions/email.ts is an authenticated operator action behind `sales.process`, and it
+//      calls the very function the replay calls. Its rows are in the same result set.
+//   2. NO ROW CARRIES ITS ORIGIN. The model has no column naming the sync log, attempt or incident
+//      that queued it, so nothing can attribute a copy to this incident — and a row can already be
+//      SENT, or FAILED and never delivered at all.
+//
+// Durable provenance is filed as o3d-il7a.
+//
+// REVERT EVIDENCE (each verified by making that one change and re-running this file):
+//   * restoring "every one of which the outbox sender will deliver" to the INVOICE_EMAIL `effect`
+//     fails "the record does not promise the queued rows are delivered".
+//   * restoring "tell the customer how many copies are on their way" to the `check` fails the same
+//     test.
+//   * deleting the "no outbox row records the sync attempt that queued it" clause fails "the record
+//     says why the query cannot be narrowed".
+// ---------------------------------------------------------------------------
+
+test('ROUND 7: the manual send writes the identical row shape, so the query cannot separate them', async () => {
+  state.outbox = []
+  state.sends = 0
+
+  // The replay's write, through the path the sync processor takes.
+  const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
+  await sendAccountingInvoiceEmailInternal('order-1')
+  const replayed = { ...state.outbox[0] }
+
+  // The operator's own send, through the SHIPPED authenticated action.
+  const { sendAccountingInvoiceEmail } = await import('@/app/actions/email')
+  const manualResult = await sendAccountingInvoiceEmail('order-1')
+  assert.equal(manualResult.success, true, 'the operator action is reachable and writes a row')
+  assert.equal(state.outbox.length, 2)
+  const manual = { ...state.outbox[1] }
+
+  assert.deepEqual(
+    { kind: replayed.kind, referenceType: replayed.referenceType, referenceId: replayed.referenceId },
+    { kind: manual.kind, referenceType: manual.referenceType, referenceId: manual.referenceId },
+    'the query the record names selects both, and nothing on the row tells them apart',
+  )
+  for (const row of [replayed, manual]) {
+    for (const provenance of ['syncLogId', 'sourceSyncLogId', 'accountingSyncLogId', 'attempt', 'attemptRevision']) {
+      assert.ok(!(provenance in row), `no outbox row carries ${provenance}, so attribution is impossible`)
+    }
+  }
+})
+
+test('ROUND 7: the record does not promise the queued rows are delivered, and does not ask for a count', async () => {
+  const { describeUnpersistedQboPost } = await import('@/lib/domain/accounting/unrecorded-posted-document')
+  const description = describeUnpersistedQboPost(
+    { entry: { id: 'log-1', type: 'INVOICE_EMAIL', referenceType: 'SalesOrder', referenceId: 'order-1' }, postedExternalId: null },
+    new Error('write conflict'),
+  )
+
+  assert.doesNotMatch(description, /will deliver/)
+  assert.doesNotMatch(description, /WILL be delivered/)
+  assert.doesNotMatch(description, /how many copies/)
+  assert.doesNotMatch(description, /tell the customer/)
+
+  // The three reasons the rows are only candidates, each of which is a shipped fact.
+  assert.match(description, /the authenticated accounting-invoice email action writes the identical shape/)
+  assert.match(description, /a SENT row has already gone/)
+  assert.match(description, /a FAILED row never went at all/)
+  assert.match(description, /o3d-il7a/, 'and the work that would make an exact answer possible')
+})
+
+test('ROUND 7: the record says why the query cannot be narrowed', async () => {
+  const { describeUnpersistedQboPost } = await import('@/lib/domain/accounting/unrecorded-posted-document')
+  const description = describeUnpersistedQboPost(
+    { entry: { id: 'log-1', type: 'INVOICE_EMAIL', referenceType: 'SalesOrder', referenceId: 'order-1' }, postedExternalId: null },
+    new Error('write conflict'),
+  )
+  assert.match(description, /no outbox row records the sync attempt that queued it/)
+})
+
+test('ROUND 7: the outbox really does terminalise a row FAILED for a suppressed recipient', async () => {
+  // The record says a FAILED row never went at all. This is that path in the shipped sender, so the
+  // sentence is an observation rather than a reading of the enum.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const sender = await readFile(path.join(process.cwd(), 'lib/email-outbox.ts'), 'utf8')
+  assert.match(sender, /emailSuppression\.findUnique/, 'the suppression lookup')
+  assert.match(sender, /status: 'FAILED',\s*\n\s*lastError: `Suppressed recipient/, 'which terminalises the row FAILED')
+  assert.match(sender, /const permanentFailure = !!sendResult\.permanent \|\| attempts >= EMAIL_MAX_ATTEMPTS/)
+  assert.match(sender, /status: permanentFailure \? 'FAILED' : 'PENDING'/)
 })

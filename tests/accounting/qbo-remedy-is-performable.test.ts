@@ -27,6 +27,15 @@ import test, { mock } from 'node:test'
  *     "the message does not offer FAILED as a settlement outcome".
  *   * deleting the `quickbooks_sync_enabled` sentence from the tail fails
  *     "the ONE lever the message names is the one that actually stops the sweep".
+ *
+ * ROUND 7 (Codex HIGH) REMOVED THE REMEDY THESE STEPS WERE WRITTEN AROUND. The steps below still
+ * exercise the shipped code they always did — the outbox enum, the settlement action, the plugin
+ * guard, the stranded read model — because those facts are unchanged and worth keeping pinned. What
+ * changed is what the RECORD is allowed to say about them: the toggle it names is an admission
+ * check, not a quiescence fence, so an operator following a count/settle/re-enable procedure can be
+ * raced by a worker admitted before the disable. See tests/accounting/qbo-disable-is-not-quiescence.ts,
+ * which drives that race end to end. Every wording assertion here is now the NEGATIVE of the
+ * instruction it used to require.
  */
 
 // ---------------------------------------------------------------------------
@@ -252,13 +261,20 @@ test('STEP 1: the message does not tell an operator to cancel a queued copy (o3d
   assert.doesNotMatch(description, /keep at most the one copy/)
   // What it says instead — the impossibility, named.
   assert.match(description, /IMS CANNOT CANCEL A QUEUED COPY/)
-  assert.match(description, /every copy already queued WILL be delivered/)
 
-  // And it still says what CAN be done, with the query that selects the rows queueEmail writes.
+  // ROUND 7 (Codex MEDIUM): and it no longer promises the queued rows are all on their way. The
+  // outbox terminalises a row FAILED for a suppressed recipient, a permanent send failure or five
+  // exhausted attempts, so "WILL be delivered" was an absolute the data cannot carry.
+  assert.doesNotMatch(description, /every copy already queued WILL be delivered/)
+  assert.doesNotMatch(description, /how many copies are on their way/)
+
+  // And it still says what CAN be done, with the query that selects the rows queueEmail writes —
+  // now described as CANDIDATES rather than as a count.
   for (const fragment of ['kind ACCOUNTING_INVOICE', 'referenceType SalesOrder', 'referenceId = the order id']) {
-    assert.ok(description.includes(fragment), `counting them is still performable, and needs ${fragment}`)
+    assert.ok(description.includes(fragment), `inspecting them is still performable, and needs ${fragment}`)
   }
-  assert.match(description, /tell the customer how many copies are on their way/)
+  assert.match(description, /WHAT COMES BACK IS CANDIDATES, AND IMS CANNOT NARROW THEM/)
+  assert.match(description, /DO NOT REPORT A COUNT OF DUPLICATES OR OF PENDING DELIVERIES FROM THIS QUERY/)
 })
 
 // ---------------------------------------------------------------------------
@@ -307,12 +323,11 @@ test('STEP 2: the message does not tell an operator to settle a QuickBooks row (
   for (const type of ['INVOICE_EMAIL', 'BILL_ATTACHMENT', 'INVOICE_PDF', 'WC_INVOICE_NOTE']) {
     const description = await incidentMessage(type)
     assert.doesNotMatch(description, /then settle sync row log-1 by hand/, `${type} still names an unperformable step`)
-    assert.match(
-      description,
-      /WHAT YOU CANNOT DO WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR: settle sync row log-1 by hand/,
-      type,
-    )
-    assert.match(description, /UNFENCED_ATTEMPT/, type)
+    // ROUND 7: the record does not name settling as a step at all any more — not as available, not
+    // as unavailable-for-now. The refusal above is still the shipped behaviour (this file drives
+    // it), but an operator is told to escalate the row rather than to reason about the fence.
+    assert.doesNotMatch(description, /settle sync row log-1/, type)
+    assert.match(description, /ESCALATE sync row log-1/, type)
   }
 })
 
@@ -344,7 +359,10 @@ test('STEP 3: a settlement that DOES succeed can only produce SYNCED or CANCELLE
 test('STEP 3: the message does not offer FAILED as a settlement outcome (o3d-peh1 round 3)', async () => {
   const description = await incidentMessage()
   assert.doesNotMatch(description, /mark it SYNCED, or FAILED/)
-  assert.match(description, /settlement has only two outcomes, SYNCED and CANCELLED/)
+  // ROUND 7: the record no longer describes settlement outcomes, because it no longer sends anyone
+  // to settle. The two outcomes above are still the only ones the action can produce — that is what
+  // the test before this one drives — but stating them invited the step this record now withholds.
+  assert.doesNotMatch(description, /settlement has only two outcomes/)
 })
 
 // ---------------------------------------------------------------------------
@@ -395,27 +413,30 @@ test('STEP 5: the record no longer states the refusal as an absolute (round 4)',
     assert.doesNotMatch(description, /refuses EVERY QuickBooks row/, `${type} still claims a universal refusal`)
     assert.doesNotMatch(description, /not rendered on any QuickBooks view/, `${type} still claims no view has the control`)
     assert.doesNotMatch(description, /THE ONE LEVER THAT STOPS THE REPEAT/, `${type} still calls the blunt lever the only one`)
-    // What it says instead: the refusal, scoped; and the blunt lever, named as blunt rather than only.
-    assert.match(description, /WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR/, type)
-    assert.match(description, /THE BLUNT LEVER, AVAILABLE NOW/, type)
+    // ROUND 7: what it says instead is what the lever DOES — stop a new run starting — and what it
+    // does not do. The scoped refusal wording went with the remedy that needed it.
+    assert.match(description, /neither one STARTS another run/, type)
+    assert.match(description, /stops EVERY QuickBooks row, not this one/, type)
+    assert.match(description, /TURNING IT OFF IS NOT A FENCE/, type)
   }
 })
 
-test('STEP 5: and it points at the stranded-rows banner, by name, as the per-row remedy (round 4)', async () => {
+test('STEP 5 (round 7): the per-row remedy those sentences pointed at is GONE from the record', async () => {
   const description = await incidentMessage()
-  // Round 5 corrected the CONDITION this sentence states — it is now a conjunction, and STEP 6
-  // pins both halves — but the claim it makes is still the one round 4 was raised to add: the
-  // per-row remedy is not impossible, it is conditional.
-  assert.match(description, /THE PER-ROW REMEDY DOES EXIST/)
-  assert.match(description, /STRANDED SYNC ROWS/, 'the operator has to be told WHERE the control is')
-  assert.match(description, /BY ADOPTION/, 'and why a revision-0 row is settleable there')
-  // Xero-first resolution is what makes the refusal conditional rather than permanent.
-  assert.match(description, /XERO-FIRST/)
-  // Round 6 removed the claim that stood here — "both connectors enabled is a guarded state, not an
-  // impossible one … no deliberate retirement is needed". The plugin save refuses that state, so it
-  // must not come back; STEP 7 below pins the sentence that replaced it against the shipped guard.
+  // ROUND 7 (Codex HIGH). Rounds 4-6 wrote and re-wrote a per-row remedy whose precondition was the
+  // sync toggle. The toggle is an admission check, so the remedy could always be raced — see
+  // tests/accounting/qbo-disable-is-not-quiescence.ts. It is deleted rather than softened: a
+  // qualified version of an unsafe procedure is still an unsafe procedure.
+  assert.doesNotMatch(description, /THE PER-ROW REMEDY DOES EXIST/)
+  assert.doesNotMatch(description, /STRANDED SYNC ROWS/)
+  assert.doesNotMatch(description, /BY ADOPTION/)
+  assert.doesNotMatch(description, /XERO-FIRST/)
+  // Nor either of the wordings earlier rounds removed, which must not return with it.
   assert.doesNotMatch(description, /both connectors enabled is a guarded state/)
   assert.doesNotMatch(description, /no deliberate\s+retirement is needed/)
+  // What stands in its place.
+  assert.match(description, /ESCALATE sync row log-1/)
+  assert.match(description, /o3d-4b5p/, 'and names the work that would make a remedy sound')
 })
 
 test('STEP 5: the stranded read model DOES mark this exact row settleable, by adoption (round 4)', async () => {
@@ -594,28 +615,31 @@ test('STEP 6: an ABSENT toggle row counts as off, exactly as the Sync action rea
   assert.equal(state.rows[0].status, 'CANCELLED')
 })
 
-test('STEP 6: the record names BOTH conditions and no longer says the replay stops on Xero alone (round 5)', async () => {
+test('STEP 6 (round 7): the record names the two call sites the lever gates, not a two-part precondition', async () => {
   for (const type of ['INVOICE_EMAIL', 'BILL_ATTACHMENT', 'INVOICE_PDF', 'WC_INVOICE_NOTE']) {
     const description = await incidentMessage(type)
     // The sentence that was true of the cron and false of the button.
     assert.doesNotMatch(description, /so the replay stops there too/, `${type} still says Xero alone stops the replay`)
     assert.doesNotMatch(description, /enabling Xero is enough on its own/, type)
-    // What it says instead: both conditions, the button named, and the toggle named.
-    assert.match(description, /NEEDS BOTH OF TWO THINGS/, type)
-    assert.match(description, /IT DOES NOT STOP THE MANUAL SYNC/, type)
-    assert.match(description, /TURN quickbooks_sync_enabled OFF AS WELL/, type)
-    // And the order that keeps it a PER-ROW remedy rather than a permanent shutdown, since the
-    // toggle it now requires is the same blunt lever that stops every other QuickBooks row.
-    assert.match(description, /turn quickbooks_sync_enabled back\s+on/, type)
-    assert.doesNotMatch(description, /without stopping every other QuickBooks row/, type)
+    // ROUND 7: and the conjunction that replaced it is gone too, because it was a precondition for
+    // the remedy rather than a fact about the row. Both call sites are still named — as the two
+    // things the toggle stops STARTING.
+    assert.doesNotMatch(description, /NEEDS BOTH OF TWO THINGS/, type)
+    assert.doesNotMatch(description, /turn quickbooks_sync_enabled back\s+on/, type)
+    assert.match(description, /The stale-claim sweep and the manual Sync button both READ/, type)
+    assert.match(description, /THEN LEAVE IT OFF/, type)
   }
 })
 
-test('STEP 6: the record states the stranded list’s limit rather than promising the row will appear (round 5)', async () => {
+test('STEP 6 (round 7): the record no longer sends the operator to the stranded list at all', async () => {
+  // Round 5 added the list's limit because the record promised the row would appear there. Round 7
+  // withdrew the instruction to go there, so the limit is no longer a claim this record makes —
+  // and a truthful sentence about a screen nobody is being sent to is still surface to keep correct.
+  // The facts themselves stay pinned by the test below, which reads the shipped read model.
   const description = await incidentMessage()
-  assert.match(description, /IT IS NOT A COMPLETE LIST/)
-  assert.match(description, /50 OLDEST/, 'the limit the Sync page actually passes')
-  assert.match(description, /sorts LAST/, 'a fresh incident is at the bottom, which is what makes the limit bite')
+  assert.doesNotMatch(description, /IT IS NOT A COMPLETE LIST/)
+  assert.doesNotMatch(description, /50 OLDEST/)
+  assert.doesNotMatch(description, /sorts LAST/)
 })
 
 test('STEP 6: and that claim about the list is true of the shipped read model (round 5)', async () => {
@@ -723,7 +747,7 @@ test('STEP 7: and what it renders is a refusal whose reason sends the operator i
     /not rendered on any QuickBooks LOG view/,
     'the record no longer denies that the log view renders anything',
   )
-  assert.match(description, /THE LOG VIEW DOES SHOW YOU SOMETHING, AND IT IS NOT A BUTTON/)
+  assert.match(description, /ONE THING ON SCREEN IS ACTIVELY WRONG AND YOU WILL SEE IT/)
   assert.match(description, /not settleable/, 'and names the words the operator will see')
   assert.match(
     description,
@@ -746,7 +770,7 @@ test('STEP 7: and retrying really does not stamp an attempt — the row is still
   assert.equal(state.rows[0].status, 'PROCESSING')
 })
 
-test('STEP 7: enabling Xero BESIDE QuickBooks is refused by the shipped guard, and the record quotes it (round 6)', async () => {
+test('STEP 7 (round 7): the plugin guard still refuses both connectors — and the record no longer walks anyone into that save', async () => {
   const { readFile } = await import('node:fs/promises')
   const path = await import('node:path')
 
@@ -755,26 +779,24 @@ test('STEP 7: enabling Xero BESIDE QuickBooks is refused by the shipped guard, a
   assert.ok(guard, 'the resulting-state exclusivity guard must still be the thing that decides this')
   const refusal = guard![1]
 
+  // ROUND 7: the guard is unchanged and still refuses that state — which is why the assertion above
+  // stays. What went is the record's INSTRUCTION to perform that save: retiring QuickBooks was step
+  // one of the per-row remedy, and the remedy is gone, so the record must not send anyone into a
+  // connector switch to fix one row.
   const description = await incidentMessage()
-  // COUPLED to the product's own words: if either side is reworded without the other, this fails.
-  assert.ok(
-    description.includes(refusal),
-    `the record must quote the refusal an operator will actually be shown, verbatim: ${refusal}`,
-  )
-  assert.match(description, /BUT YOU CANNOT ENABLE XERO BESIDE QUICKBOOKS/)
-  assert.match(description, /SO THIS STEP IS A DELIBERATE RETIREMENT OF QUICKBOOKS/)
-  assert.match(description, /it must be ONE save/, 'because two saves cannot reach the target state')
+  assert.ok(!description.includes(refusal), 'the record no longer walks an operator into the plugin save')
+  assert.doesNotMatch(description, /BUT YOU CANNOT ENABLE XERO BESIDE QUICKBOOKS/)
+  assert.doesNotMatch(description, /SO THIS STEP IS A DELIBERATE RETIREMENT OF QUICKBOOKS/)
+  assert.doesNotMatch(description, /it must be ONE save/)
 })
 
-test('STEP 7: the INVOICE_EMAIL count is ordered AFTER the lever that freezes it (round 6)', async () => {
+test('STEP 7 (round 7): the INVOICE_EMAIL INSPECTION is ordered after the lever that stops new copies', async () => {
   const description = await incidentMessage('INVOICE_EMAIL')
-  assert.match(description, /BUT STOP THE REPLAY FIRST/, 'a count taken while the sweep runs is stale by one per sweep')
-  // And the ordered remedy repeats it, so the two halves of the message cannot drift apart.
-  assert.match(
-    description,
-    /turn quickbooks_sync_enabled off FIRST[\s\S]*count the queued copies, settle this row/,
-    'the ordered remedy must put the count inside the frozen window',
-  )
+  assert.match(description, /STOP THE REPLAY FIRST/, 'an inspection taken while the sweep runs grows by one per sweep')
+  // ROUND 7: the ordered remedy that used to repeat this is gone, so the ordering now lives in one
+  // place only — and the thing being ordered is an INSPECTION, not a count reported to a customer.
+  assert.doesNotMatch(description, /count the queued copies, settle this row/)
+  assert.match(description, /Then INSPECT the outbox/)
 })
 
 test('STEP 7: BILL_ATTACHMENT no longer promises a re-upload the attach setting can prevent (round 6)', async () => {

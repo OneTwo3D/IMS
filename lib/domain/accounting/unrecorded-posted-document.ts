@@ -296,6 +296,47 @@ export type UnpersistedQboPost = {
  * that stops new ones being queued. A count taken first is stale by one copy per sweep, and it is
  * the number they were about to give a customer. The `check` now names the order.
  *
+ * ----------------------------------------------------------------------------------------------
+ * ROUND 7 (Codex HIGH): THE WHOLE REMEDY RESTED ON A FENCE THAT DOES NOT EXIST, SO THE REMEDY IS
+ * GONE — THIS RECORD NOW REQUIRES THE CONNECTOR TO STAY OFF AND THE ROW TO BE ESCALATED.
+ * ----------------------------------------------------------------------------------------------
+ * Rounds 5 and 6 built a per-row remedy on one sentence: turn `quickbooks_sync_enabled` off and
+ * "nothing further can be queued while you work", then count, settle, and turn it back on. THAT
+ * SENTENCE IS FALSE, and every step after it inherited the falsehood. Walked into the tree:
+ *
+ *   • BOTH claim paths READ the setting and THEN call the processor with nothing in between —
+ *     app/api/cron/accounting-sync/route.ts and `triggerQuickBooksSync` in
+ *     app/actions/quickbooks-sync.ts. The toggle is an ADMISSION CHECK. A run that passed the read
+ *     a moment before the operator flipped it is still running, and still claims rows.
+ *   • That run's claim is indistinguishable from the abandoned one. `stampingCustodyOnClaim` writes
+ *     status and custody and NEVER `attemptRevision`, so the freshly claimed row is PROCESSING at
+ *     revision 0 — exactly what adoption's compare-and-swap on (id, revision 0, status) matches.
+ *   • And the writeback has no fence at all. `persistFreshQboPost` issues
+ *     `accountingSyncLog.update({ where: { id } })` with SYNCED and the external id: no claim token,
+ *     no attempt revision, no status predicate. It lands on whatever the row says by then —
+ *     including a settlement made in between.
+ *
+ * So an admitted worker can queue ANOTHER customer email after the operator's count, win a race
+ * against a successful settlement, and overwrite the CANCELLED row with a SYNCED one. Nothing in
+ * IMS reports an in-flight run, so there is no moment an operator can point at and call the row
+ * quiet.
+ *
+ * THE CHOICE, MADE DELIBERATELY. The alternative was to build the missing quiescence — a shared
+ * execution or generation fence honoured by the cron branch, the manual sync, the claim AND the
+ * writeback. That is not a wording fix: it is the attempt fence this branch has already built and
+ * reverted TWICE (o3d-peh1 rounds 6 and 7) because this connector lacks the primitives, and the
+ * branch is under a no-migration rule. Writing a third one to justify a paragraph would be the same
+ * mistake with a deadline. So the record stops prescribing the unsafe procedure instead: it names
+ * the lever, says plainly what the lever does NOT do, tells the operator to LEAVE IT OFF, and
+ * escalates the row for manual recovery. The missing fence is filed as o3d-4b5p.
+ *
+ * WHAT WAS DELETED RATHER THAN SOFTENED: the instruction to retire QuickBooks in favour of Xero,
+ * the instruction to count the queued copies and report that number, the instruction to settle the
+ * row, and the instruction to turn the toggle back on. A softer version of an unsafe procedure is
+ * still an unsafe procedure. What was KEPT is the warning about the settle control's tooltip,
+ * because the operator sees that control whether this record mentions it or not, and following it
+ * replays the effect.
+ *
  * WHY GETTING THIS WRONG COSTS MORE HERE THAN ANYWHERE ELSE. This record is exempt from BOTH
  * retention (the ERROR-level exemption below) and the factory reset. It is the permanent
  * operator-facing account of a live remote effect, so a wrong ABSOLUTE in it outlives every other
@@ -312,10 +353,11 @@ export type UnpersistedQboPost = {
  * proof of no effect). Rebuilding it inside a wording fix is the same mistake with a deadline.
  *
  * SO THE MESSAGE NOW SAYS ONLY WHAT CAN BE DONE, NAMES WHAT CANNOT, AND POINTS AT THE FILED WORK
- * (o3d-3lhp). The one real lever it names was verified the same way as the refusals: turning
- * `quickbooks_sync_enabled` off stops the stale-claim sweep AND the manual sync, because both gate
- * on it before the processor is reached. It is a blunt lever — it stops every QuickBooks row — and
- * the message says that too, rather than implying a per-row control that does not exist.
+ * (o3d-3lhp, o3d-4b5p). The one lever it names was verified the same way as the refusals: turning
+ * `quickbooks_sync_enabled` off stops a NEW cron pass and a NEW press of the manual Sync button,
+ * because both READ that setting before they call the processor. What it does not do is stop a run
+ * already past that read — see ROUND 7 below, which is why the message no longer builds a remedy on
+ * top of it. It is also a blunt lever, stopping every QuickBooks row, and the message says so.
  *
  * The `check` is what the operator does about the effect; the `effect` is what the replay costs.
  */
@@ -336,18 +378,26 @@ const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<AccountingSyncType, { ef
     check: 'confirm the invoice PDF stored against the order is the document you expect',
   },
   INVOICE_EMAIL: {
+    // NO DELIVERY CLAIM (round 7, Codex MEDIUM). The previous wording said every queued copy "will
+    // be delivered". The outbox sender terminalises a row FAILED for a suppressed recipient, for a
+    // permanent send failure, and when EMAIL_MAX_ATTEMPTS is exhausted (lib/email-outbox.ts), so
+    // that was an absolute the data cannot carry. What IS true is the row.
     effect: 'ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — one more PENDING '
-      + 'accounting-invoice row in the email outbox per sweep, every one of which the outbox sender '
-      + 'will deliver',
+      + 'accounting-invoice row in the email outbox per sweep',
     check: 'this operation succeeds by QUEUEING, not by sending, and IMS CANNOT CANCEL A QUEUED COPY. '
       + 'EmailOutbox has four states — PENDING, PROCESSING, SENT, FAILED — none of which means '
-      + '"deliberately not delivered", and no action, route or screen removes an unsent row, so every '
-      + 'copy already queued WILL be delivered and there is nothing to press. What you CAN do is COUNT '
-      + 'them — BUT STOP THE REPLAY FIRST (the blunt lever below), because until it is stopped the '
-      + 'count grows by one every sweep and the number you give the customer is already wrong. Then '
-      + 'query the email outbox directly for kind ACCOUNTING_INVOICE, referenceType SalesOrder, '
-      + 'referenceId = the order id (no page in IMS lists them), and tell the customer how many copies '
-      + 'are on their way',
+      + '"deliberately not delivered", and no action, route or screen removes an unsent row, so there '
+      + 'is nothing to press. STOP THE REPLAY FIRST (the lever below), because until it is stopped '
+      + 'another row is queued every sweep. Then INSPECT the outbox: query it for kind '
+      + 'ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order id (no page in IMS '
+      + 'lists them) and read each row\'s status, attempts, createdAt and sentAt. WHAT COMES BACK IS '
+      + 'CANDIDATES, AND IMS CANNOT NARROW THEM: no outbox row records the sync attempt that queued '
+      + 'it, so nothing attributes a copy to this incident; the authenticated accounting-invoice '
+      + 'email action writes the identical shape, so ordinary operator sends are in the same result; '
+      + 'a SENT row has already gone; and a FAILED row never went at all — the outbox marks one '
+      + 'FAILED for a suppressed recipient, for a permanent send failure, and when five attempts are '
+      + 'exhausted. Read them by status and time, and DO NOT REPORT A COUNT OF DUPLICATES OR OF '
+      + 'PENDING DELIVERIES FROM THIS QUERY: it cannot establish either (o3d-il7a)',
   },
   WC_INVOICE_NOTE: {
     effect: 'a second invoice note is written onto the WooCommerce order, once per sweep',
@@ -368,16 +418,93 @@ export const QBO_NO_IDENTIFIER_OPERATION_TYPES: readonly string[] =
 /**
  * WHAT ONE PRESERVED INCIDENT ACTUALLY IS.
  *
- * `LEDGER_DOCUMENT` — a document Xero or QuickBooks accepted and still holds. Real money in somebody
- * else's books; no reset of ours voids it.
- * `NO_IDENTIFIER_SIDE_EFFECT` — one of the four operations above. No ledger document was created at
- * all: a file was attached, a PDF was written over, an email was QUEUED, a note was pushed to
+ * `LEDGER_DOCUMENT` — a standalone document Xero or QuickBooks accepted and still holds, with an id
+ * that opens it. Real money in somebody else's books; no reset of ours voids it.
+ * `LEDGER_NON_DOCUMENT` — a write the ledger accepted that is NOT a standalone document and returns
+ * no id to open: a credit note APPLIED to a bill, a tax rate written into the organisation. The
+ * write stands, and the allocation moves money — but there is nothing to go and look up by id.
+ * `NO_IDENTIFIER_SIDE_EFFECT` — one of the four operations above. Nothing was created in the ledger
+ * at all: a file was attached, a PDF was written over, an email was QUEUED, a note was pushed to
  * WooCommerce. `INVOICE_EMAIL` in particular creates only a LOCAL outbox row.
- * `UNCLASSIFIED` — the record does not carry a usable type. Counted separately and NEVER folded into
- * either: the whole point is to stop asserting a remote document, and guessing one is how the
- * assertion got made in the first place.
+ * `UNCLASSIFIED` — the record carries no type this codebase has classified. Counted separately and
+ * NEVER folded into any of the others: the whole point is to stop asserting a remote document, and
+ * guessing one is how the assertion got made in the first place.
  */
-export type UnrecordedIncidentKind = 'LEDGER_DOCUMENT' | 'NO_IDENTIFIER_SIDE_EFFECT' | 'UNCLASSIFIED'
+export type UnrecordedIncidentKind =
+  | 'LEDGER_DOCUMENT'
+  | 'LEDGER_NON_DOCUMENT'
+  | 'NO_IDENTIFIER_SIDE_EFFECT'
+  | 'UNCLASSIFIED'
+
+/**
+ * EVERY OPERATION TYPE, CLASSIFIED ONCE, SHARED BY BOTH CONNECTORS (round 7, Codex MEDIUM).
+ *
+ * THE DEFECT THIS REPLACES. Round 6 classified by asking one question — "is this one of the four
+ * no-identifier operations?" — and sent every other readable type to `LEDGER_DOCUMENT` by fallback.
+ * That is the round-6 defect pointing the other way: an unknown was resolved to the CONFIDENT
+ * answer. `PURCHASE_CREDIT_NOTE_ALLOCATION` is the proof. Xero processes it successfully and
+ * deliberately returns NO external id — "the allocation is a sub-resource of the credit note, not a
+ * standalone document" (xero/sync-processor.ts) — so a preserved incident for one was being counted
+ * as a document that exists in Xero, carrying real money, openable by id. All three false, in the
+ * one record in this system that outlives a factory reset. `TAX_RATE_SYNC` is the second: it returns
+ * a tax TYPE code, which is neither money nor a document.
+ *
+ * SO THE MAP IS EXHAUSTIVE AND THE COMPILER ENFORCES IT. `Record<AccountingSyncType, …>` fails to
+ * build the day a type is added to the enum, which is the only mechanism that reliably survives a
+ * schema change; `tests/accounting/reset-preserves-unrecorded-posted-documents.ts` re-derives the
+ * enum from prisma/schema.prisma and checks the same thing from the outside.
+ *
+ * KEYED ON THE TYPE, NOT THE CONNECTOR, deliberately — `AccountingSyncType` is shared, and the four
+ * no-identifier operations return `{ success: true }` with no id on BOTH connectors (verified in
+ * xero/sync-processor.ts and quickbooks/sync-processor.ts). A type QuickBooks has no branch for at
+ * all (the allocation is one) is classified by what it IS, not by who could have posted it.
+ *
+ * HOW EACH ROW WAS DECIDED: by what the connector's handler RETURNS. A handler that returns an
+ * `externalId` naming a document you can open is `LEDGER_DOCUMENT` — including the two *_UPDATE
+ * types, which return the id of the document they wrote to; the kind asserts that a document stands
+ * at that id, not that this operation created it. A handler that reaches the ledger and returns no
+ * openable document id is `LEDGER_NON_DOCUMENT`. The four that reach no ledger at all are
+ * `NO_IDENTIFIER_SIDE_EFFECT`.
+ */
+export const INCIDENT_KIND_BY_OPERATION_TYPE: Readonly<Record<AccountingSyncType, UnrecordedIncidentKind>> =
+  Object.freeze({
+    // Documents: the handler returns an invoice/bill/credit-note/payment/journal id.
+    SALES_INVOICE: 'LEDGER_DOCUMENT',
+    SALES_INVOICE_UPDATE: 'LEDGER_DOCUMENT',
+    PURCHASE_INVOICE: 'LEDGER_DOCUMENT',
+    PURCHASE_INVOICE_UPDATE: 'LEDGER_DOCUMENT',
+    INVOICE_PAYMENT: 'LEDGER_DOCUMENT',
+    BILL_PAYMENT: 'LEDGER_DOCUMENT',
+    CREDIT_NOTE: 'LEDGER_DOCUMENT',
+    PURCHASE_CREDIT_NOTE: 'LEDGER_DOCUMENT',
+    // Manual journals — one shared branch on both connectors, returning `journalId`.
+    COGS_JOURNAL: 'LEDGER_DOCUMENT',
+    INVENTORY_ADJUSTMENT: 'LEDGER_DOCUMENT',
+    STOCK_IN_TRANSIT: 'LEDGER_DOCUMENT',
+    STOCK_RECEIPT: 'LEDGER_DOCUMENT',
+    COGS_REVERSAL: 'LEDGER_DOCUMENT',
+    STOCK_ALLOCATION: 'LEDGER_DOCUMENT',
+    DAILY_BATCH_REVENUE_DEFERRAL: 'LEDGER_DOCUMENT',
+    DAILY_BATCH_INVENTORY_ALLOC: 'LEDGER_DOCUMENT',
+    DAILY_BATCH_GROUP_B: 'LEDGER_DOCUMENT',
+    DAILY_BATCH_INVENTORY_RECONCILIATION: 'LEDGER_DOCUMENT',
+    DAILY_BATCH_COGS_RECONCILIATION: 'LEDGER_DOCUMENT',
+    DAILY_BATCH_TRANSIT_RECONCILIATION: 'LEDGER_DOCUMENT',
+    UNEARNED_REV_REVERSAL: 'LEDGER_DOCUMENT',
+    ALLOCATION_REVERSAL: 'LEDGER_DOCUMENT',
+    REALISED_FX_JOURNAL: 'LEDGER_DOCUMENT',
+    UNREALISED_FX_JOURNAL: 'LEDGER_DOCUMENT',
+    MANUFACTURING_JOURNAL: 'LEDGER_DOCUMENT',
+    MANUFACTURING_RECLASS: 'LEDGER_DOCUMENT',
+    // Accepted by the ledger, but not a document and no id to open.
+    PURCHASE_CREDIT_NOTE_ALLOCATION: 'LEDGER_NON_DOCUMENT',
+    TAX_RATE_SYNC: 'LEDGER_NON_DOCUMENT',
+    // The four the table above is written for: nothing reaches the ledger.
+    BILL_ATTACHMENT: 'NO_IDENTIFIER_SIDE_EFFECT',
+    INVOICE_PDF: 'NO_IDENTIFIER_SIDE_EFFECT',
+    INVOICE_EMAIL: 'NO_IDENTIFIER_SIDE_EFFECT',
+    WC_INVOICE_NOTE: 'NO_IDENTIFIER_SIDE_EFFECT',
+  })
 
 /**
  * CLASSIFY BY THE OPERATION TYPE, NOT BY THE ACTION NAME (Codex MEDIUM).
@@ -394,6 +521,13 @@ export type UnrecordedIncidentKind = 'LEDGER_DOCUMENT' | 'NO_IDENTIFIER_SIDE_EFF
  * as much "not a ledger document" as a QuickBooks one. Keying on the ACTION would reproduce the
  * original mistake with the connectors swapped.
  *
+ * ROUND 7 (Codex MEDIUM): AND THE LOOKUP HAS NO FALLBACK DIRECTION ANY MORE. It reads
+ * {@link INCIDENT_KIND_BY_OPERATION_TYPE}, which classifies every member of the enum; anything not
+ * in it — a type from a future schema, a truncated string, a row written by a newer binary — is
+ * UNCLASSIFIED. That is the humble answer rather than the confident one, and it is the correction
+ * this module has now had to make in both directions: round 6 stopped an unknown being called a
+ * side effect, and round 7 stops it being called a document.
+ *
  * Both record builders write `metadata.type` from `entry.type`
  * (xero/sync-processor.ts `unrecordedPostedDocumentRecord`, quickbooks/sync-processor.ts
  * `unpersistedQboPostRecord`), so the field this reads is written on every row either connector
@@ -403,7 +537,8 @@ export function classifyUnrecordedIncident(metadata: unknown): UnrecordedInciden
   if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) return 'UNCLASSIFIED'
   const type = (metadata as { type?: unknown }).type
   if (typeof type !== 'string' || type.length === 0) return 'UNCLASSIFIED'
-  return QBO_NO_IDENTIFIER_OPERATION_TYPES.includes(type) ? 'NO_IDENTIFIER_SIDE_EFFECT' : 'LEDGER_DOCUMENT'
+  return (INCIDENT_KIND_BY_OPERATION_TYPE as Record<string, UnrecordedIncidentKind | undefined>)[type]
+    ?? 'UNCLASSIFIED'
 }
 
 /** One tally per kind, so a caller cannot report a total it has not broken down. */
@@ -412,6 +547,7 @@ export type UnrecordedIncidentCounts = Record<UnrecordedIncidentKind, number>
 export function countUnrecordedIncidents(rows: readonly { metadata: unknown }[]): UnrecordedIncidentCounts {
   const counts: UnrecordedIncidentCounts = {
     LEDGER_DOCUMENT: 0,
+    LEDGER_NON_DOCUMENT: 0,
     NO_IDENTIFIER_SIDE_EFFECT: 0,
     UNCLASSIFIED: 0,
   }
@@ -428,7 +564,8 @@ export function countUnrecordedIncidents(rows: readonly { metadata: unknown }[])
  * here, next to the classifier that decides which sentence a row earns, so the two cannot drift.
  */
 export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentCounts): string {
-  const total = counts.LEDGER_DOCUMENT + counts.NO_IDENTIFIER_SIDE_EFFECT + counts.UNCLASSIFIED
+  const total = counts.LEDGER_DOCUMENT + counts.LEDGER_NON_DOCUMENT
+    + counts.NO_IDENTIFIER_SIDE_EFFECT + counts.UNCLASSIFIED
   const parts: string[] = [
     `Database reset kept ${total} record(s) of things IMS did against an accounting connector and `
     + 'could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately.',
@@ -437,6 +574,14 @@ export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentC
     parts.push(
       `${counts.LEDGER_DOCUMENT} name a DOCUMENT Xero or QuickBooks accepted and still holds — real `
       + 'money in somebody else\'s books, which no reset of ours voids. Open the id in that system.',
+    )
+  }
+  if (counts.LEDGER_NON_DOCUMENT > 0) {
+    parts.push(
+      `${counts.LEDGER_NON_DOCUMENT} record a write Xero or QuickBooks ACCEPTED that is NOT a `
+      + 'standalone document and has NO id to open — a credit note APPLIED to a bill, a tax rate '
+      + 'written into the organisation. The write stands and no reset of ours undoes it, and the '
+      + 'allocation moved money. Read those records themselves; do not go looking for a document.',
     )
   }
   if (counts.NO_IDENTIFIER_SIDE_EFFECT > 0) {
@@ -452,8 +597,8 @@ export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentC
   }
   if (counts.UNCLASSIFIED > 0) {
     parts.push(
-      `${counts.UNCLASSIFIED} carry no readable operation type, so IMS cannot say which of the two `
-      + 'they are. Read those records themselves before assuming either.',
+      `${counts.UNCLASSIFIED} carry no operation type this version of IMS has classified, so it `
+      + 'cannot say which kind they are. Read those records themselves before assuming any of them.',
     )
   }
   parts.push(
@@ -477,8 +622,9 @@ export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentC
  *   • ONE OF THE FOUR NO-IDENTIFIER OPERATIONS above. No id came back and no Request-Id was ever
  *     sent, so nothing deduplicates the re-attempt: stale-claim recovery REPLAYS THE EFFECT
  *     OUTRIGHT, and goes on replaying it every sweep for as long as the row stays claimed. That
- *     reader has to be told to go and look at the effect — and told, in the same breath, that the
- *     per-row stop they would reach for does not exist and what the blunt one is (round 3).
+ *     reader is told to go and look at the effect, told the one lever that stops new runs starting,
+ *     told what that lever does NOT do (round 7), and told to escalate the row rather than settle
+ *     it — because IMS cannot show them that the row is quiet (o3d-4b5p).
  */
 export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: unknown): string {
   const { entry, postedExternalId } = incident
@@ -493,61 +639,34 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
       + `stale THE SWEEP WILL RECLAIM THE ROW AND RUN THE OPERATION AGAIN OUTRIGHT — ${noRequestId.effect}, `
       + 'unbounded, because no retry is consumed while the row never leaves PROCESSING. '
       + `WHAT TO DO ABOUT THE EFFECT: ${noRequestId.check}. `
-      + `WHAT YOU CANNOT DO WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR: settle sync row ${entry.id} by `
-      + 'hand. The settlement action refuses it — this connector stamps no attempt revision, so its rows '
-      + 'stay at revision 0 and the attempt fence answers UNFENCED_ATTEMPT. THE LOG VIEW DOES SHOW YOU '
-      + 'SOMETHING, AND IT IS NOT A BUTTON: the accounting log renders the settle control for every '
-      + 'FAILED or PROCESSING row, and on this one it resolves to the words "not settleable", with its '
-      + 'reason as the tooltip. DO NOT FOLLOW THAT TOOLTIP. It is the generic reason, written for a '
-      + 'connector that stamps attempts, and it tells you to retry the row until it shows one: '
-      + 'QuickBooks never stamps one, so no number of retries will ever make an attempt appear — and '
-      + 'every retry is another replay of the effect above. It could not mark a row FAILED in any case: '
-      + 'settlement has only two outcomes, SYNCED and CANCELLED. '
-      + 'THE BLUNT LEVER, AVAILABLE NOW, is turning QuickBooks sync OFF (Sync settings, the Sync '
-      + 'Enabled toggle, i.e. quickbooks_sync_enabled). The stale-claim sweep and the manual sync both '
-      + 'gate on it and both stop. It stops EVERY QuickBooks row, not this one, and it recalls nothing '
-      + 'already queued or already done; until it is off, the effect above repeats every sweep. '
-      + `AND THE PER-ROW REMEDY DOES EXIST, BUT IT NEEDS BOTH OF TWO THINGS, NOT ONE — the refusal above `
-      + 'is a fact about the INSTALLATION, not about this row for ever. '
-      + 'FIRST, QUICKBOOKS MUST STOP BEING THE ACTIVE CONNECTOR. That is resolved XERO-FIRST from the '
-      + 'integration PLUGIN switches, so enabling the Xero plugin is what does it — BUT YOU CANNOT ENABLE '
-      + 'XERO BESIDE QUICKBOOKS. The plugin save validates the RESULTING selection and refuses that state '
-      + 'outright: "Enable either Xero or QuickBooks, not both — accounting dispatch is single-connector." '
-      + 'SO THIS STEP IS A DELIBERATE RETIREMENT OF QUICKBOOKS, and it must be ONE save: on Settings > '
-      + 'Integrations, turn the QuickBooks switch OFF and the Xero switch ON before saving, because that '
-      + 'screen posts every switch together and a resulting state with both on is rejected. THAT STOPS THE '
-      + 'CRON AND ONLY THE CRON — the accounting-sync route takes the Xero branch and never reaches the '
-      + 'QuickBooks processor. '
-      + 'IT DOES NOT STOP THE MANUAL SYNC, AND THAT IS THE SECOND THING. The QuickBooks Sync button gates '
-      + 'on quickbooks_sync_enabled and NOTHING ELSE — it never asks which connector is active — so while '
-      + 'that toggle is on, anyone holding the sync permission can press it and the stale-claim sweep '
-      + `reclaims row ${entry.id} again. SO TURN quickbooks_sync_enabled OFF AS WELL. Until both hold, the `
-      + 'STRANDED SYNC ROWS list withholds the Settle control from this row and gives its reason there, '
-      + 'naming this toggle. '
-      + 'THE ORDER THAT MAKES IT A PER-ROW REMEDY RATHER THAN A PERMANENT SHUTDOWN, AND IT IS ALSO WHAT '
-      + 'MAKES THE COUNT ABOVE HOLD STILL: turn quickbooks_sync_enabled off FIRST — that alone stops both '
-      + 'the sweep and the button, so nothing further can be queued while you work — then retire '
-      + 'QuickBooks in favour of Xero as above, count the queued copies, settle this row, and turn '
-      + 'quickbooks_sync_enabled back on. The row is terminal by then, so the sweep has nothing to '
-      + 'reclaim — every OTHER QuickBooks row resumes and this one does not. '
-      + `WHERE THE CONTROL IS. Sync row ${entry.id} appears in the STRANDED SYNC ROWS list in the `
-      + 'connector-orphan banner on the Sync screen — that list selects unresolved rows on a NON-ACTIVE '
-      + 'connector, PROCESSING included, and once QuickBooks is retired it is the only view this row still '
-      + 'appears in at all — every accounting LOG view is scoped to the ACTIVE connector, so the row '
-      + 'leaves the log the moment Xero takes over. IT IS NOT A COMPLETE LIST: it shows the 50 OLDEST '
-      + 'stranded rows, with no paging, filter or search, ordered by the SYNC ROW\'s creation time — so a '
-      + 'row queued today sorts LAST, while one that has been replaying for weeks sorts near the front. '
-      + 'The banner states the total and says when it is cut short; if this row is not on the page, clear '
-      + 'or settle older ones until it is. '
-      + 'IT IS SETTLED THERE BY ADOPTION: with both conditions above holding, nothing — not the cron, not '
-      + 'the manual sync — can claim a QuickBooks row, so the abandoned attempt in front of you is the '
-      + 'only one this row can have had, and the adoption is itself compare-and-swapped on (row, '
-      + 'revision 0, status). Settling it NOT_POSTED terminalises it CANCELLED and releases the claim. '
-      + '(Settling is an assertion about the OUTSIDE world and does not undo anything already done or '
-      + 'already queued — the copies above still arrive.) '
-      + 'This is the known hole o3d-qn21, and the missing operations — an outbox cancel, and a per-row '
-      + 'remediation that works WITHOUT retiring the connector — are filed as o3d-3lhp. Until those '
-      + 'land this record is the only thing that says the effect repeated.'
+      + 'HOW TO STOP MORE OF IT: turn QuickBooks sync OFF (Sync settings, the Sync Enabled toggle, '
+      + 'i.e. quickbooks_sync_enabled). The stale-claim sweep and the manual Sync button both READ '
+      + 'that setting before they call the QuickBooks processor, so while it is off neither one '
+      + 'STARTS another run. It stops EVERY QuickBooks row, not this one, and it recalls nothing '
+      + 'already queued or already done. '
+      + 'THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE. Both of those call sites read the '
+      + 'setting and then call the processor with nothing in between, so a run admitted a moment '
+      + 'before you flipped it keeps going: it can claim THIS row afterwards, run the operation '
+      + 'again, and then write over the row — the write that records a QuickBooks post updates the '
+      + 'row BY ID ALONE, with no claim token, no attempt revision and no status check, so it lands '
+      + 'on whatever the row says by then. That claim also leaves the row at attempt revision 0, '
+      + 'which is indistinguishable from the abandoned attempt in front of you. Nothing in IMS '
+      + 'reports whether such a run is still going, so there is no moment you can point at and call '
+      + 'this row quiet. '
+      + `SO DO NOT CLOSE THIS ROW YOURSELF, AND DO NOT TURN QUICKBOOKS SYNC BACK ON TO FINISH THE `
+      + `JOB. Leave the toggle off and ESCALATE sync row ${entry.id}, with this record, to whoever `
+      + 'administers this installation: closing it safely needs someone who can read the database '
+      + 'directly, and the machinery that would make an operator remedy sound is filed as o3d-4b5p '
+      + '(a quiescence fence the cron, the manual sync, the claim and the writeback all honour) and '
+      + 'o3d-3lhp (a per-row remediation, and a way to cancel a queued email). '
+      + 'ONE THING ON SCREEN IS ACTIVELY WRONG AND YOU WILL SEE IT: the accounting log renders a '
+      + 'settle control for every FAILED or PROCESSING row, and on this one it resolves to the words '
+      + '"not settleable" with its reason as the tooltip. DO NOT FOLLOW THAT TOOLTIP. It is the '
+      + 'generic reason, written for a connector that stamps attempt revisions, and it tells you to '
+      + 'retry the row until it shows one: QuickBooks never stamps one, so no number of retries will '
+      + 'ever make an attempt appear — and every retry is another replay of the effect above. '
+      + 'This is the known hole o3d-qn21. Until the work above lands, this record is the only thing '
+      + 'that says the effect repeated.'
   }
   return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as `
     + `${postedExternalId ?? '(no id returned)'}, but IMS could not record that id: ${String(cause)}. `

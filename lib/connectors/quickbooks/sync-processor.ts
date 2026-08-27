@@ -424,16 +424,16 @@ function unpersistedQboPostRecord(incident: UnpersistedQboPost, description: str
  * `describeUnpersistedQboPost` does is refuse to describe a protection these four do not have — it
  * tells the operator the effect will repeat, what the effect is, and WHAT CAN AND CANNOT BE PRESSED.
  *
- * IT DOES NOT SAY "SETTLE THE ROW" (round 3), AND IT DOES NOT SAY "YOU NEVER CAN" EITHER (round 4).
- * The settlement action refuses this row WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR — no attempt
- * revision, so UNFENCED_ATTEMPT. (An earlier wording added "and no QuickBooks log view renders the
- * control". That was false: QuickBooks reuses `XeroClient`, which mounts `SettleSyncRowControl` for
- * every FAILED/PROCESSING row, where it resolves to a "not settleable" label. See ROUND 6 in
- * unrecorded-posted-document.ts.) Once QuickBooks is
- * not the active connector the same row is settleable BY ADOPTION from the stranded-sync-rows banner,
- * which is the one per-row way to stop this replay. Do not re-add a bare "settle the row" here, and
- * do not restate the refusal as an absolute: both wordings have now been wrong, in opposite
- * directions. The single authority on the wording is `describeUnpersistedQboPost`.
+ * IT DOES NOT PRESCRIBE SETTLING THE ROW AT ALL (round 7), AND THAT IS A REVERSAL. Rounds 4 to 6
+ * built a per-row remedy — retire QuickBooks in favour of Xero, turn `quickbooks_sync_enabled` off,
+ * count, settle by adoption, turn it back on — on the premise that the toggle quiesces the
+ * connector. It does not: both claim paths READ that setting and then call this processor, so a run
+ * admitted before the flip still claims; its claim leaves the row at attempt revision 0, which is
+ * what adoption's compare-and-swap matches; and `persistFreshQboPost` above updates the row BY ID
+ * with no claim or attempt fence, so its write lands on top of a settlement. The record now says
+ * turn the toggle off, LEAVE it off, and escalate the row. Do not re-add a settle instruction here
+ * or there until o3d-4b5p gives this connector a real quiescence fence. The single authority on the
+ * wording is `describeUnpersistedQboPost`.
  *
  * Returns whether the id is now durable. `false` means the caller must NOT continue into the
  * follow-ups and must NOT let the outer handler see this iteration.

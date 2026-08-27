@@ -28,9 +28,21 @@
 // A row adopted and settled CANCELLED in that state can be reclaimed by the very next press: the
 // customer email replays, and the worker's later write lands on top of the settlement.
 //
-// THE PREMISE THAT IS ACTUALLY TRUE is the sync toggle. It is the ONE gate BOTH claim paths pass
-// through, so `<connector>_sync_enabled !== 'true'` is necessary and sufficient for "no claim path
-// for this connector exists". This module is that predicate, kept pure so the rule is unit-testable
+// THE BEST PREMISE AVAILABLE is the sync toggle. It is the ONE gate BOTH claim paths pass through,
+// so `<connector>_sync_enabled !== 'true'` is NECESSARY for "no claim path for this connector
+// exists".
+//
+// IT IS NOT SUFFICIENT, AND AN EARLIER VERSION OF THIS COMMENT CLAIMED IT WAS (round 7, Codex
+// HIGH). Both gates READ the setting and then call the processor with nothing in between, so a run
+// admitted a moment before the toggle was turned off keeps running and still claims rows; its claim
+// leaves the row PROCESSING at attempt revision 0, which is exactly what the adoption
+// compare-and-swap matches; and `persistFreshQboPost` updates the row by id with no claim or
+// attempt fence, so its write can land on top of a settlement made in between. Nothing in IMS
+// reports an in-flight run. This predicate therefore establishes that no NEW claim will be
+// ADMITTED — not that the row is quiet — and the QuickBooks unrecorded-post record no longer builds
+// a count/settle/re-enable remedy on it. The missing fence is filed as o3d-4b5p.
+//
+// This module is that predicate, kept pure so the rule is unit-testable
 // without a database and shared verbatim by the read model (which decides whether the control is
 // OFFERED) and the settlement action (which decides whether the adoption is ALLOWED). Two copies of
 // this rule drifting apart is a control the UI offers and the action refuses, or worse.
