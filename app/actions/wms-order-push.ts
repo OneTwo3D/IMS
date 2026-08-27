@@ -4,6 +4,10 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
+import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
 
 /**
  * Read + recovery surface for the outbound WMS order push (Phase 8). Reads the
@@ -40,9 +44,20 @@ export async function getWmsOrderPushStateForSalesOrder(salesOrderId: string): P
 
 export async function replayWmsOrderPush(salesOrderId: string): Promise<{ success: boolean; error?: string }> {
   await requirePermission('sync')
+  // o3d-2k5r r3: read the EXACT evidence the decision rests on, because the write below has to
+  // require it back. `state`, `attempts`, `externalOrderId` and `pushedAt` are the four columns
+  // every refusal here is derived from, and they are the four the compare-and-set names.
   const link = await db.wmsOrderPushLink.findUnique({
     where: { orderId: salesOrderId },
-    select: { id: true, state: true, externalOrderId: true },
+    select: {
+      id: true,
+      connector: true,
+      state: true,
+      attempts: true,
+      externalOrderId: true,
+      pushedAt: true,
+      order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
+    },
   })
   if (!link) return { success: false, error: 'No WMS push record for this order.' }
   // o3d-92fu: a payload-invalid push has nothing to re-queue. Re-queueing would set
@@ -73,10 +88,87 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
     }
   }
 
+  // o3d-2k5r r3 — AUTHORITATIVE ABSENCE, on the same rule the sweep now applies.
+  //
+  // A dead letter with no external id is not "a create that demonstrably never happened". It is
+  // MAX_ATTEMPTS creates that all THREW, and a throw is as consistent with a timeout on a request
+  // the WMS went on to honour as with a rejection. `wmsCreateOutcomeIsAmbiguous` is the shared
+  // predicate that says so, and every dead letter that reaches here satisfies it (attempts is at
+  // MAX_ATTEMPTS by construction) — the call is written against the predicate rather than against
+  // that arithmetic so the two cannot drift apart later.
+  //
+  // Re-queueing without an answer is what makes the warehouse pick the same order twice, so the
+  // replay asks the WMS itself and refuses on anything short of a verifiable MISSING. This is
+  // deliberately NOT an operator override: the person pressing the button is looking at the same
+  // screen we are, and an operator assertion must not be promoted into system evidence (o3d-anu8).
+  if (wmsCreateOutcomeIsAmbiguous(link)) {
+    const pluginState = await getIntegrationPluginState()
+    const activeConnectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
+    if (!activeConnectorId || activeConnectorId !== link.connector) {
+      return {
+        success: false,
+        error: 'This push belongs to a WMS connector that is not the active one, so its warehouse cannot be asked '
+          + 'whether the order already exists. Re-enable that connector, or resolve the order in the WMS by hand.',
+      }
+    }
+    const connector = getWmsConnector(activeConnectorId)
+    if (!connector.probeOrderPresence) {
+      return {
+        success: false,
+        error: 'A create was already dispatched for this order and its outcome was never recorded, and the active WMS '
+          + 'connector cannot check whether that order exists. Re-queueing could create a second warehouse order — '
+          + 'check the WMS and resolve it by hand.',
+      }
+    }
+    const reference = wmsPushOrderReference(link.order)
+    let presence: 'FOUND' | 'MISSING' | 'AMBIGUOUS'
+    try {
+      presence = await connector.probeOrderPresence(reference)
+    } catch (error) {
+      return {
+        success: false,
+        error: `The WMS could not be asked whether order ${reference} already exists (${
+          error instanceof Error ? error.message : String(error)
+        }), so this push was not re-queued. Try again once the WMS is reachable.`,
+      }
+    }
+    if (presence === 'FOUND') {
+      return {
+        success: false,
+        error: `The WMS already holds an order under reference ${reference}. A create was dispatched before and its `
+          + 'outcome was never recorded — re-queueing would create a second warehouse order. Link that order to this '
+          + 'one, or cancel it in the WMS, before re-pushing.',
+      }
+    }
+    if (presence === 'AMBIGUOUS') {
+      return {
+        success: false,
+        error: `The WMS returned an ambiguous match for reference ${reference}, so it cannot confirm the order is `
+          + 'absent. Resolve the ambiguity in the WMS before re-pushing.',
+      }
+    }
+  }
+
   // Re-queue for the next sweep. The sweep's eligibility (ready + paid + bound)
   // still applies, so a no-longer-eligible order simply won't re-push.
-  await db.wmsOrderPushLink.update({
-    where: { id: link.id },
+  //
+  // o3d-2k5r r3 — COMPARE-AND-SET ON THE EVIDENCE THAT WAS INSPECTED, not a bare update by id.
+  //
+  // This is the fourth writer that re-opens a create, and it was the only unguarded one. Between
+  // the read above and this write, another replay can have re-queued the link and a sweep can have
+  // settled it as SYNCED with a fresh external id and push stamp. A bare `update({ where: { id } })`
+  // then reverted that settled link to PENDING_CREATE while KEEPING the new id — and
+  // createCandidates selects on state alone, so the order was created in the warehouse a second
+  // time. Requiring the four columns back means a stale replay matches nothing and is REPORTED as
+  // stale rather than silently winning.
+  const requeued = await db.wmsOrderPushLink.updateMany({
+    where: {
+      id: link.id,
+      state: 'DEAD_LETTER',
+      attempts: link.attempts,
+      externalOrderId: null,
+      pushedAt: link.pushedAt,
+    },
     // The replay re-creates the WMS order, so any dispatch dead-letter state
     // from the previous order must not carry over (6oyu.2).
     data: {
@@ -93,6 +185,14 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
       dispatchUnresolvedAt: null,
     },
   })
+  if (requeued.count === 0) {
+    return {
+      success: false,
+      error: 'This push changed while you were looking at it — it is no longer the dead letter that was inspected. '
+        + 'Reload the order and check its current push state before replaying.',
+    }
+  }
+
   await logActivity({
     entityType: 'SALES_ORDER',
     entityId: salesOrderId,

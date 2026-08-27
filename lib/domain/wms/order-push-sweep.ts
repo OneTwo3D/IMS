@@ -28,6 +28,20 @@ const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED'] as const
 const MAX_ATTEMPTS = 5
 
 /**
+ * o3d-2k5r r3 — how many warehouse-presence probes ONE sweep may spend resolving ambiguous
+ * revalidation candidates.
+ *
+ * The revalidation pass is otherwise purely local (no connector call, no API budget), and both
+ * connectors implement the probe as a real search — Mintsoft an Order/Search, ShipHero a
+ * credit-consuming GraphQL query. Bounding it keeps a backlog of ambiguous claims from turning
+ * a local pass into a per-sweep quota drain.
+ *
+ * Running out is a DELAY, never a decision: an unprobed link is re-stamped and rotates back in on
+ * a later sweep, and nothing is re-queued without an answer.
+ */
+const PRESENCE_PROBE_BUDGET = 5
+
+/**
  * How long a create claim is exclusive (o3d-38gl).
  *
  * PENDING_CREATE is a STATE, not a claim: it cannot distinguish "I just took this" from
@@ -122,16 +136,40 @@ export const AMBIGUOUS_ATTEMPTS = 1
 /**
  * Does this link carry positive evidence that a WMS ORDER EXISTS for its order?
  *
- * A WEAKER question than provesNoRemoteWmsCall, and deliberately so — it is what the
- * revalidation re-queue needs (see the revalidation pass). Re-queueing puts a link back into
- * createCandidates, which selects on state alone; pushing over an id or a push stamp mints a
- * SECOND warehouse order for the same sales order.
+ * The strongest of the three answers, and the cheapest: an id or a push stamp is a RECORD that
+ * a warehouse order was minted. Nothing may re-open a create for such a link — createCandidates
+ * selects on state alone, so a promote here mints a SECOND warehouse order for the same sales
+ * order and overwrites the first id.
  */
 export function wmsOrderMayExist(
   link: { pushedAt: Date | null; externalOrderId: string | null },
 ): boolean {
   return link.pushedAt !== NO_WMS_ORDER_COLUMNS.pushedAt
     || link.externalOrderId !== NO_WMS_ORDER_COLUMNS.externalOrderId
+}
+
+/**
+ * o3d-2k5r r3 — the middle answer, and the one the branch previously did not have.
+ *
+ * NO record of a warehouse order, but spent attempts: a create MAY have been dispatched and its
+ * outcome was never written back. This is exactly the shape `recordValidationFailure` mints when
+ * it CONVERTS an expired PENDING_CREATE claim (attempts raised to AMBIGUOUS_ATTEMPTS, id and
+ * stamp still null), and it is also every failed create on the retry ladder — a throw from
+ * pushOrder can be a timeout on a request the WMS went on to honour.
+ *
+ * "Ambiguous" is NOT "safe to retry". A re-queue is bounded by MAX_ATTEMPTS, but the thing it
+ * risks — a second physical fulfilment under an id IMS never learned — is not reversible and
+ * cannot be cancelled automatically. So every writer that re-opens a create for such a link must
+ * first obtain the WAREHOUSE'S OWN WORD that no such order exists (probeOrderPresence ===
+ * 'MISSING'), or leave it to an operator.
+ */
+export function wmsCreateOutcomeIsAmbiguous(
+  link: { attempts: number; pushedAt: Date | null; externalOrderId: string | null },
+): boolean {
+  // An order that positively may EXIST is not merely ambiguous — a stronger refusal already
+  // covers it, and reporting it as ambiguous would invite a probe whose answer changes nothing.
+  if (wmsOrderMayExist(link)) return false
+  return link.attempts !== NO_REMOTE_WMS_CALL_COLUMNS.attempts
 }
 
 /**
@@ -156,7 +194,9 @@ export function provesNoRemoteWmsCall(
   if (!link) return true
   if (link.state !== 'VALIDATION_FAILED') return false
   if (wmsOrderMayExist(link)) return false
-  return link.attempts === NO_REMOTE_WMS_CALL_COLUMNS.attempts
+  // The three answers are ONE ladder, so a reader cannot pick up "no order exists" without also
+  // picking up "…and none may have been dispatched" (o3d-2k5r r3).
+  return !wmsCreateOutcomeIsAmbiguous(link)
 }
 const DEFAULT_BATCH_SIZE = 25
 /** o3d-rbyg: shared empty result for the live withdrawal screen — "nothing withdrawn", not "unknown". */
@@ -186,6 +226,14 @@ export type WmsOrderPushSweepResult = {
   validationFailed: number
   /** o3d-92fu: VALIDATION_FAILED links whose payload builds again — returned to the create queue. */
   revalidated: number
+  /**
+   * o3d-2k5r r3: VALIDATION_FAILED links whose payload builds again but which were NOT re-queued,
+   * because a create may already have been dispatched and the warehouse could not confirm the
+   * order is absent. Counted separately from `revalidated` because they are the opposite outcome,
+   * and separately from `failed` because nothing was sent — they are waiting on a warehouse answer
+   * or on an operator.
+   */
+  revalidateAmbiguous: number
 }
 
 type OrderForPush = {
@@ -346,9 +394,23 @@ const ORDER_PUSH_SELECT = {
   refunds: { select: { lines: { select: { salesOrderLineId: true, qty: true } } } },
 } as const
 
+/**
+ * The reference IMS puts on the WMS order — and therefore the ONLY string a presence probe can
+ * meaningfully ask the warehouse about (o3d-2k5r r3).
+ *
+ * Exported so the manual dead-letter replay probes the SAME reference a create would have used.
+ * A probe against a different string is not weaker evidence, it is evidence about a different
+ * question, and "MISSING" from it would license the duplicate it was supposed to prevent.
+ */
+export function wmsPushOrderReference(
+  order: { id: string; orderNumber: string | null; externalOrderNumber: string | null },
+): string {
+  return order.orderNumber ?? order.externalOrderNumber ?? order.id
+}
+
 function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOrderPushInput {
   return {
-    orderNumber: order.orderNumber ?? order.externalOrderNumber ?? order.id,
+    orderNumber: wmsPushOrderReference(order),
     externalReference: order.id,
     externalWarehouseId,
     currency: order.currency,
@@ -613,7 +675,14 @@ function pushIntentSummary(input: WmsOrderPushInput) {
   }
 }
 
-type PushConnector = Pick<WmsConnector, 'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment' | 'verifyPushedOrder'>
+type PushConnector = Pick<
+  WmsConnector,
+  // o3d-2k5r r3: `probeOrderPresence` is the connector-AUTHORITATIVE absence check the
+  // revalidation pass needs before it may re-open a create whose outcome is unknown. Tri-state on
+  // purpose: only MISSING means "verifiably no such order", and a merged/ambiguous match must
+  // never be reported as MISSING.
+  'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment' | 'verifyPushedOrder' | 'probeOrderPresence'
+>
 
 /**
  * Testable core of the order-push sweep — operates purely on the injected
@@ -626,7 +695,7 @@ export async function runWmsOrderPushSweepCore(
   port: WmsOrderPushPort,
   options?: { batchSize?: number; now?: () => Date },
 ): Promise<WmsOrderPushSweepResult> {
-  const result: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0 }
+  const result: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0 }
   if (!connector.pushOrder) return { ...result, skipped: 'Active WMS connector has no order-push support' }
 
   const batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE
@@ -659,6 +728,39 @@ export async function runWmsOrderPushSweepCore(
         action: 'order_comment', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: orderId ?? null, externalId: externalOrderId,
         summary: 'Failed to post warehouse-visible note on WMS order', after: { comment }, error: scrubWmsError(error, 'WMS comment failed'),
       })
+    }
+  }
+
+  /**
+   * o3d-2k5r r3 — does the WAREHOUSE ITSELF say there is no order under this reference?
+   *
+   * The only evidence that licenses re-opening a create for a link whose remote outcome is
+   * unknown. Deliberately tri-state-derived and fail-closed: `absent` is true ONLY for a
+   * connector that answered MISSING, which its own contract defines as "verifiably no trace".
+   * FOUND, AMBIGUOUS, a throw, a connector with no probe and an exhausted budget are all the same
+   * answer here — NOT PROVED — and differ only in what the operator is told.
+   *
+   * The reason text is carried on the link's `lastError`, so the sync-exceptions inbox (which
+   * lists VALIDATION_FAILED in BLOCKED_WMS_PUSH_STATES) shows why an order is sitting still.
+   */
+  let presenceProbeBudget = PRESENCE_PROBE_BUDGET
+  const probeWarehouseAbsence = async (reference: string): Promise<{ absent: boolean; reason: string }> => {
+    if (!connector.probeOrderPresence) {
+      return { absent: false, reason: 'the active WMS connector cannot check whether such an order exists, so it cannot be re-queued automatically — check the WMS and resolve it by hand' }
+    }
+    if (presenceProbeBudget <= 0) {
+      return { absent: false, reason: `this sweep's warehouse-presence check budget (${PRESENCE_PROBE_BUDGET}) is spent — it is re-checked on a later sweep` }
+    }
+    presenceProbeBudget -= 1
+    try {
+      const presence = await connector.probeOrderPresence(reference)
+      if (presence === 'MISSING') return { absent: true, reason: `the WMS confirms it holds no order under reference ${reference}` }
+      if (presence === 'FOUND') {
+        return { absent: false, reason: `the WMS ALREADY holds an order under reference ${reference} — re-queueing would create a second one. Link it or cancel it in the WMS by hand` }
+      }
+      return { absent: false, reason: `the WMS returned an ambiguous match for reference ${reference}, so absence is not proved — resolve it in the WMS by hand` }
+    } catch (error) {
+      return { absent: false, reason: `the WMS presence check failed: ${scrubWmsError(error, 'presence probe failed')}` }
     }
   }
 
@@ -708,6 +810,12 @@ export async function runWmsOrderPushSweepCore(
   // this pass is safe to run every sweep and deliberately runs BEFORE the create pass, so an
   // order fixed since the last sweep is pushed on this tick rather than the next.
   //
+  // o3d-2k5r r3: ONE exception, and it is budgeted. A candidate whose remote outcome is ambiguous
+  // — a converted create claim — cannot be re-queued without the warehouse's own word that no such
+  // order exists, so it costs one presence probe (PRESENCE_PROBE_BUDGET per sweep, spent only on
+  // candidates that would otherwise be re-queued this tick). The common case, a disposition that
+  // proves no call was ever dispatched, still costs nothing.
+  //
   // It rotates least-recently-checked first and reports its own overflow: a bounded sweep
   // that only reports what it processed reads as "covered everything".
   if (externalWarehouseByWarehouse.size > 0 && port.revalidatableLinks) {
@@ -722,7 +830,7 @@ export async function runWmsOrderPushSweepCore(
     for (const link of links) {
       const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId) continue
-      // o3d-2k5r r2: THE RE-QUEUE READS THE SHARED RULE, not its own re-derivation of it.
+      // o3d-2k5r r2/r3: THE RE-QUEUE READS THE SHARED RULE, not its own re-derivation of it.
       //
       // This pass's only outcome is "put the order back in createCandidates", and that query
       // selects on state alone — so promoting a link that already carries a WMS id or a push
@@ -733,19 +841,15 @@ export async function runWmsOrderPushSweepCore(
       // The Prisma port ALSO filters on these columns, spread from the same constant, so
       // against THAT port this branch is unreachable. The two are not redundant: the query
       // filter is what keeps an unpromotable link out of the BOUNDED batch it would otherwise
-      // sit at the head of forever (nothing here re-stamps a skipped link, and the ordering is
-      // lastAttemptAt-nulls-first), and this check is what makes the DECISION the shared
-      // rule's, for any port. So the skipped link is surfaced by the sync-exceptions inbox
-      // rather than by the warning below, which only fires for a port that did not filter.
+      // sit at the head of forever, and this check is what makes the DECISION the shared rule's,
+      // for any port. So the skipped link is surfaced by the sync-exceptions inbox rather than by
+      // the warning below, which only fires for a port that did not filter.
       //
-      // Deliberately WEAKER than provesNoRemoteWmsCall, and this is the whole of the
-      // difference: `attempts > 0` does NOT block a re-queue. Re-queueing hands the link back
-      // to the create ladder, which already retries a PENDING_CREATE link at attempts > 0 under
-      // the same MAX_ATTEMPTS bound and the same claim lease — the risk is the create pass's
-      // existing one, unchanged, and it is bounded and reversible. Deleting is neither: it
-      // erases the last local record of an order the warehouse may be picking. So the delete
-      // guard needs "no call was EVER dispatched" and this pass needs only "no WMS order
-      // exists".
+      // This is the FIRST of two gates. It refuses a link that positively records a warehouse
+      // order. The second, below the payload rebuild, refuses one whose remote outcome is merely
+      // UNKNOWN — see wmsCreateOutcomeIsAmbiguous. Between them the rule is exactly the hard-delete
+      // guard's: only a disposition that proves no call was ever dispatched is re-queued on this
+      // sweep's own authority.
       if (wmsOrderMayExist(link)) {
         console.warn(
           `[wms-order-push] link ${link.id} is parked VALIDATION_FAILED but carries `
@@ -783,6 +887,62 @@ export async function runWmsOrderPushSweepCore(
         }
         continue
       }
+      // o3d-2k5r r3 — SECOND GATE: AN AMBIGUOUS CLAIM IS NOT RE-QUEUED ON THIS SWEEP'S WORD.
+      //
+      // The rule here used to be the opposite, and it was wrong. It held that spent attempts block
+      // a hard DELETE but not a re-queue, on the argument that "a re-queue is bounded and
+      // reversible where a delete is not". A re-queue is bounded — MAX_ATTEMPTS caps how many
+      // times it repeats — but what it risks is not reversible: `attempts >= 1` with no id and no
+      // push stamp is exactly what recordValidationFailure mints when it converts an EXPIRED
+      // create claim, and a claim exists only because a worker was about to call pushOrder. If
+      // that create landed before the worker died, the warehouse is holding an order whose id IMS
+      // never learned; the next sweep creates a SECOND one and records only the second id. Goods
+      // ship twice, and the unknown first id cannot be cancelled automatically.
+      //
+      // So the only disposition re-queued automatically is the one that PROVES no call was ever
+      // dispatched — attempts 0, minted by recordValidationFailure's create branch from an ABSENT
+      // link. For anything else this pass needs the warehouse's own word, and takes nothing else:
+      // an operator assertion is not evidence (o3d-anu8), and neither is our own silence.
+      //
+      // A refusal here is NOT a dead end. The link stays VALIDATION_FAILED with the reason on
+      // `lastError` (the sync-exceptions inbox lists it), the rotation stamp moves so it does not
+      // sit at the head of the batch, and the next sweep probes again — so an order the WMS
+      // genuinely never received re-queues itself as soon as the connector can say so.
+      let warehouseAbsenceProved = false
+      if (wmsCreateOutcomeIsAmbiguous(link)) {
+        const absence = await probeWarehouseAbsence(wmsPushOrderReference(link.order))
+        if (!absence.absent) {
+          const message = 'A WMS create may already have been dispatched for this order and its outcome was never '
+            + `recorded, so it will not be re-queued automatically: ${absence.reason}.`
+          console.warn(`[wms-order-push] link ${link.id} builds a valid payload again but is NOT re-queued — ${absence.reason}`)
+          // Guarded on VALIDATION_FAILED for the same reason every other write in this pass is: an
+          // overlapping sweep may have promoted and claimed the link since it was read, and this
+          // write moves the rotation stamp, which doubles as that worker's claim lease.
+          const restamped = await port
+            .updateLinkIfState(link.id, 'VALIDATION_FAILED', { lastError: message, lastAttemptAt: ts })
+            .catch((e) => {
+              console.error('[wms-order-push] failed to re-stamp an ambiguous revalidation candidate', link.id, e)
+              return false
+            })
+          if (!restamped) continue
+          result.revalidateAmbiguous += 1
+          // Audited on the same discipline as the build-failure branch: a NEW reason is new
+          // information, the same reason every sweep is the noise the persisted disposition exists
+          // to remove.
+          if (message !== link.lastError) {
+            await audit({
+              action: 'order_validate', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: null,
+              summary: `Order ${link.order.orderNumber ?? link.orderId} can be pushed again, but a previous create may already have reached the WMS — held back for reconciliation`,
+              before: { state: 'VALIDATION_FAILED', lastError: link.lastError },
+              after: { state: 'VALIDATION_FAILED', attempts: link.attempts, remoteOutcomeAmbiguous: true },
+              error: message,
+            })
+          }
+          continue
+        }
+        warehouseAbsenceProved = true
+      }
+
       // Builds again — back into the create queue. attempts is carried over untouched: if the
       // link had already spent remote attempts before it stopped building, those still count
       // against MAX_ATTEMPTS, so a genuinely broken order cannot loop the retry ladder by
@@ -820,9 +980,13 @@ export async function runWmsOrderPushSweepCore(
       result.revalidated += 1
       await audit({
         action: 'order_validate', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: null,
-        summary: `Order ${link.order.orderNumber ?? link.orderId} builds a valid WMS payload again — re-queued for create`,
+        summary: `Order ${link.order.orderNumber ?? link.orderId} builds a valid WMS payload again — re-queued for create`
+          + (warehouseAbsenceProved ? ', after the WMS confirmed it holds no such order' : ''),
         before: { state: 'VALIDATION_FAILED', lastError: link.lastError },
-        after: { state: 'PENDING_CREATE', attempts: link.attempts },
+        // `warehouseAbsenceProved` distinguishes the two licences this promote can rest on: a
+        // disposition that proved no call was ever dispatched, or a connector-authoritative
+        // absence check. An auditor should never have to guess which one was relied on.
+        after: { state: 'PENDING_CREATE', attempts: link.attempts, warehouseAbsenceProved },
       })
     }
   }
@@ -1879,7 +2043,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
 export async function runWmsOrderPushSweep(
   options?: { batchSize?: number },
 ): Promise<WmsOrderPushSweepResult> {
-  const empty: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0 }
+  const empty: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0 }
 
   const state = await getIntegrationPluginState()
   const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
