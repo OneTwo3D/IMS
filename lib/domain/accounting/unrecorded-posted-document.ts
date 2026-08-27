@@ -1726,7 +1726,7 @@ function ledgerForIncidentAction(action: string): 'Xero' | 'QuickBooks' | undefi
  * `UNRECORDED`; both refuse to name a bill. It is ADDITIVE — nothing rewrites the stored sentence,
  * because the stored sentence also carries this incident's cause and its ids, and a permanent
  * record of a live remote effect is the last thing to overwrite on a best guess. The stored text
- * being wrong in its own right is filed as o3d-hh3n (a backfill, which needs a write this branch
+ * being wrong in its own right is filed as o3d-xaun (a backfill, which needs a write this branch
  * may not make).
  *
  * WHAT IT ANSWERS FOR. The NON-DOCUMENT operations — the ones whose remedy can name a remote object
@@ -1734,6 +1734,12 @@ function ledgerForIncidentAction(action: string): 'Xero' | 'QuickBooks' | undefi
  * incident it returns `undefined` and says nothing: those remedies are chosen by the ROW's state at
  * the moment of the conflict (which document the row named instead), and the metadata does not
  * carry enough to re-decide that without guessing — which is the mistake, not the fix.
+ *
+ * AND IT READS THE TABLE THE RECORD'S OWN FRAME READS. A QuickBooks no-Request-Id incident does not
+ * print `NON_DOCUMENT_INCIDENT_WORDING.remedy` at all — its "WHAT TO DO ABOUT THE EFFECT" sentence
+ * is the `check` from {@link QBO_OPERATIONS_WITHOUT_REQUEST_ID}, because on that connector the
+ * effect REPEATS. Handing a QuickBooks record the Xero sentence would be a fourth wording for the
+ * same incident, which is the drift the whole module is arranged to prevent.
  */
 export function remedyForStoredIncident(action: string, metadata: unknown): string | undefined {
   const ledger = ledgerForIncidentAction(action)
@@ -1741,17 +1747,31 @@ export function remedyForStoredIncident(action: string, metadata: unknown): stri
   if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) return undefined
   const type = (metadata as { type?: unknown }).type
   if (typeof type !== 'string') return undefined
-  const outcome = outcomeFromStoredMetadata(metadata)
-  const wording = nonDocumentWordingFor(type, outcome)
-  if (!wording) return undefined
+  const referenceType = (metadata as { referenceType?: unknown }).referenceType
+  const referenceId = (metadata as { referenceId?: unknown }).referenceId
+  const syncLogId = (metadata as { syncLogId?: unknown }).syncLogId
   const postedExternalId = (metadata as { postedExternalId?: unknown }).postedExternalId
-  return render(wording.remedy, {
+  const outcome = outcomeFromStoredMetadata(metadata)
+
+  const replayEntry = ledger === 'QuickBooks' ? QBO_OPERATIONS_WITHOUT_REQUEST_ID[type as AccountingSyncType] : undefined
+  const replay = replayEntry && ('effect' in replayEntry ? replayEntry : replayEntry[outcomeWordingVariant(outcome)])
+  const wording = replay ?? nonDocumentWordingFor(type, outcome)
+  if (!wording) return undefined
+
+  const slots: WordingSlots = {
     ledger,
     postedExternalId: typeof postedExternalId === 'string' ? nonEmpty(postedExternalId) : null,
     ledgerTargetId: outcome.ledgerTargetId ?? null,
+    referenceId: typeof referenceId === 'string' ? nonEmpty(referenceId) : null,
+    referenceType: typeof referenceType === 'string' ? nonEmpty(referenceType) : null,
+    syncLogId: typeof syncLogId === 'string' ? nonEmpty(syncLogId) : null,
+    type,
     lookup: wording.lookup,
     lookupNoun: wording.lookupNoun,
-  })
+  }
+  return 'check' in wording
+    ? `WHAT TO DO ABOUT THE EFFECT: ${render(wording.check, slots)}.`
+    : render(wording.remedy, slots)
 }
 
 /**

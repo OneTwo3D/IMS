@@ -6,10 +6,14 @@ import path from 'node:path'
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import {
   OPERATION_SEMANTIC_BY_TYPE,
+  QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+  UNRECORDED_POSTED_DOCUMENT_ACTION,
   classifyUnrecordedIncident,
   describeUnpersistedQboPost,
   describeUnrecordablePostedDocument,
   ledgerTargetIdFromPayload,
+  remedyForStoredIncident,
+  supersedingRemedyForStoredIncident,
   type LedgerPostingMode,
   type PostedOperationOutcome,
   type RemoteEffectOutcome,
@@ -513,4 +517,253 @@ test('ROUND 12 (Codex MEDIUM): the two other remedies that acted on an object th
   )
   assert.match(XERO_TAX_RATE, /THIS RECORD DOES NOT SAY WHAT THE RATE WAS BEFORE THE WRITE/)
   assert.doesNotMatch(XERO_TAX_RATE, /correct or archive that rate/)
+})
+
+// ---------------------------------------------------------------------------------------------
+// ROUND 13 (Codex HIGH) — THE CELL A LEGACY RECORD COULD NOT REACH.
+//
+// Round 12 built `MADE_TARGET_UNRECORDED` for "a record written before IMS kept the bill id", and
+// the test above proves the FORMATTERS route into it. That is only half an answer, and the missing
+// half is the one that matters: the description is rendered ONCE and stored in
+// `ActivityLog.description`, nothing re-renders it, and the row is exempt from BOTH retention and
+// the factory reset. Records that predate the retained id therefore never went near the new cell —
+// they keep the round-11 sentence "open that bill in {ledger} and remove the duplicate attachment"
+// for ever, about a bill that after a reset nothing in this installation can identify. A cell no
+// existing record can reach is not a fix for existing records.
+//
+// SO THERE ARE TWO PROPERTIES HERE, AND THEY ARE DIFFERENT PROPERTIES.
+//
+//   1. EVERY PATH THAT BUILDS ONE ROUTES A MISSING ID INTO THE SAFE CELL. There are three — the
+//      QuickBooks escalation, the Xero conflict transaction, and the Xero standalone re-attempt
+//      after that transaction could not commit — and they resolve to TWO constructions of a
+//      `PostedOperationOutcome`, because the third re-renders the incident the second built. Both
+//      read the id off the sync row's own PAYLOAD, so a row written before this branch existed
+//      (no `accountingInvoiceId` in its payload) yields `null` and lands in the safe cell from
+//      either one. That is asserted against the shipped sources, so a fourth path that forgets is
+//      a red build rather than a silent old remedy.
+//   2. A RECORD ALREADY IN THE DATABASE REACHES IT WHEN IT IS READ. `remedyForStoredIncident`
+//      rebuilds the remedy from the record's own metadata through the same reader the classifier
+//      uses, so a stored blob selects the cell the formatter would select today: no
+//      `ledgerTargetId` key selects `MADE_TARGET_UNRECORDED`, no `externalEffect` key selects
+//      `UNRECORDED`, and both refuse to name a bill. /activity prints it beside the stored sentence
+//      when the stored sentence is not it.
+//
+// WHAT IS NOT CLOSED, SAID PLAINLY: the stored text ITSELF is still wrong, and correcting it needs
+// a write to a permanent record — filed as o3d-xaun, with the reason it was not made here (the
+// stored sentence also carries this incident's cause, which the metadata does not).
+// ---------------------------------------------------------------------------------------------
+
+/** The metadata a record written BEFORE round 12 carries: no `ledgerTargetId` key at all. */
+const PRE_ROUND_12_METADATA = Object.freeze({
+  syncLogId: 'log-1',
+  type: 'BILL_ATTACHMENT',
+  referenceType: 'PurchaseOrder',
+  referenceId: 'po-1',
+  postedExternalId: null,
+  postingMode: 'LIVE',
+  externalEffect: 'MADE',
+})
+
+/** The remedy that record was GIVEN, which is the thing the operator is reading today. */
+const ROUND_11_STORED_REMEDY =
+  'QuickBooks BILL_ATTACHMENT for PurchaseOrder po-1 SUCCEEDED — the external effect has happened '
+  + '— but IMS could not record that it did. WHAT TO DO ABOUT THE EFFECT: open that bill in '
+  + 'QuickBooks and remove any duplicate attachment.'
+
+/**
+ * The safe cell as each connector's own frame prints it. They are different sentences because the
+ * frames are: on QuickBooks the effect REPEATS once per sweep, so its "what to do" lives in the
+ * replay table, and handing a QuickBooks record the Xero sentence would be a fourth wording for one
+ * incident. Both refuse to send anybody to a bill.
+ */
+const QBO_SAFE_CELL_REMEDY =
+  'WHAT TO DO ABOUT THE EFFECT: THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO, so it cannot '
+  + 'send you to the duplicates and nothing kept here derives the bill. Escalate this record to '
+  + 'whoever administers this installation.'
+const XERO_SAFE_CELL_REMEDY =
+  'REMEDY: DO NOT REMOVE AN ATTACHMENT FROM A BILL THIS RECORD CANNOT NAME. The upload happened, '
+  + 'so a duplicate may exist, but nothing kept here says which bill it is on and nothing kept here '
+  + 'derives it. Escalate this record to whoever administers this installation.'
+
+// MUTATION THAT KILLS THIS (run): in `outcomeFromStoredMetadata`, fall back to the record's other
+// id — `ledgerTargetId: typeof ledgerTargetId === 'string' ? nonEmpty(ledgerTargetId) : nonEmpty(...)`
+// — or simply have `outcomeWordingVariant` answer 'MADE' whenever the effect was MADE, and the
+// pre-round-12 blob renders the NAMED remedy: the first equality fails on the whole string, and the
+// `{ledgerTargetId}` slot throws while rendering because the blob carries no id to put in it. RUN.
+//
+// ROUTE: the metadata is the shape the pre-round-12 builder wrote (its keys are parsed out of the
+// SHIPPED builder below, so it cannot drift into a shape no record ever had); the remedy is
+// produced by the shipped `remedyForStoredIncident`; the wording is the shipped table.
+test('ROUND 13 (Codex HIGH): a record written before the bill id was retained reaches the safe cell when it is READ', async () => {
+  // THE LOAD-BEARING CASE. A record built the way a pre-round-12 record was built — MADE, with no
+  // `ledgerTargetId` key in its metadata at all — read back today.
+  assert.equal(
+    remedyForStoredIncident(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, PRE_ROUND_12_METADATA),
+    QBO_SAFE_CELL_REMEDY,
+  )
+  assert.equal(
+    remedyForStoredIncident(UNRECORDED_POSTED_DOCUMENT_ACTION, PRE_ROUND_12_METADATA),
+    XERO_SAFE_CELL_REMEDY,
+    'the same record on the other connector reaches the safe cell through its OWN frame',
+  )
+  for (const safe of [QBO_SAFE_CELL_REMEDY, XERO_SAFE_CELL_REMEDY]) {
+    assert.doesNotMatch(safe, /open that bill|remove the duplicate|remove any duplicate/i)
+    assert.match(safe, /Escalate this record to whoever administers this installation/)
+  }
+
+  // AND THE BLOB IS A SHAPE A RECORD REALLY HAD. Every key above except `ledgerTargetId` is one the
+  // shipped builder still writes; `ledgerTargetId` is the one round 12 added, and its ABSENCE is
+  // the whole case. A test whose fixture drifted into a shape no record ever carried would prove
+  // nothing about the records in the database.
+  const source = await readFile(
+    path.join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8',
+  )
+  const metadataAt = source.indexOf('sanitizeActivityLogMetadata({')
+  const builderKeys = source.slice(metadataAt, source.indexOf('}))', metadataAt))
+  for (const key of Object.keys(PRE_ROUND_12_METADATA)) {
+    assert.match(builderKeys, new RegExp(`^\\s+${key}:`, 'm'), `the builder still writes ${key}`)
+  }
+  assert.match(builderKeys, /^\s+ledgerTargetId:/m, 'and it writes the key this fixture omits')
+
+  // A RECORD WITH NO RECORDED OUTCOME AT ALL — written before round 10 — is safe by the same rule:
+  // an absent key reads as "not recorded", never as a live upload.
+  const { postingMode, externalEffect, ...preRound10 } = PRE_ROUND_12_METADATA
+  assert.equal(
+    remedyForStoredIncident(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, preRound10),
+    'WHAT TO DO ABOUT THE EFFECT: IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING, and it '
+    + 'does not name the bill either. READ quickbooks_sync_attach_pdf AS IT STANDS NOW to learn what '
+    + 'a replay would do, and escalate this record to whoever administers this installation rather '
+    + 'than clearing an attachment off a bill picked out any other way.',
+  )
+  assert.equal(
+    remedyForStoredIncident(UNRECORDED_POSTED_DOCUMENT_ACTION, preRound10),
+    'REMEDY: DO NOT REMOVE AN ATTACHMENT ON THE STRENGTH OF THIS RECORD — this attempt may never '
+    + 'have created one, and this record does not name the bill one would be on. Escalate this '
+    + 'record to whoever administers this installation.',
+  )
+
+  // A record that DOES carry the id still gets the remedy that spends it, so this is not "always
+  // refuse".
+  assert.equal(
+    remedyForStoredIncident(
+      QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+      { ...PRE_ROUND_12_METADATA, ledgerTargetId: 'QBO-BILL-77' },
+    ),
+    'WHAT TO DO ABOUT THE EFFECT: Find that bill in QuickBooks by the ledger document id above and '
+    + 'remove any duplicate attachment.',
+  )
+
+  // WHAT IT REFUSES TO ANSWER FOR, rather than guessing: a document incident, whose remedy is
+  // chosen by which OTHER document the row named at the moment of the conflict — a fact the
+  // metadata does not carry.
+  assert.equal(
+    remedyForStoredIncident(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, {
+      ...PRE_ROUND_12_METADATA, type: 'PURCHASE_INVOICE', postedExternalId: 'QBO-BILL-9',
+    }),
+    undefined,
+  )
+  assert.equal(remedyForStoredIncident('some_other_action', PRE_ROUND_12_METADATA), undefined)
+  assert.equal(remedyForStoredIncident(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, null), undefined)
+})
+
+// MUTATION THAT KILLS THIS (run): make `supersedingRemedyForStoredIncident` return the remedy
+// unconditionally (drop the `description.includes` check) and the second assertion fails — every
+// current record would be told it was written by an earlier version. Making it return `undefined`
+// unconditionally fails the first.
+//
+// ROUTE: the shipped reader, against a stored description that really is the round-11 sentence and
+// against one this version generates.
+test('ROUND 13 (Codex HIGH): the current remedy is shown only where the stored one is not it', () => {
+  assert.equal(
+    supersedingRemedyForStoredIncident({
+      action: QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+      description: ROUND_11_STORED_REMEDY,
+      metadata: PRE_ROUND_12_METADATA,
+    }),
+    QBO_SAFE_CELL_REMEDY,
+    'the stored sentence sends an operator to a bill nothing names — the current one must be shown',
+  )
+  assert.match(ROUND_11_STORED_REMEDY, /open that bill in QuickBooks and remove any duplicate/,
+    'not vacuous: the stored text really is the instruction this round refuses')
+
+  // A record written by THIS version already contains it, and gets nothing added.
+  const current = describeUnpersistedQboPost(
+    { entry: ATTACH, postedExternalId: null, outcome: { externalEffect: 'MADE' } },
+    new Error('write conflict'),
+  )
+  assert.match(current, /THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO/)
+  assert.equal(
+    supersedingRemedyForStoredIncident({
+      action: QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+      description: current,
+      metadata: { ...PRE_ROUND_12_METADATA },
+    }),
+    undefined,
+  )
+})
+
+// MUTATION THAT KILLS THIS (run): drop `ledgerTargetId: ledgerTargetIdFromPayload(payload)` from
+// either connector's `PostedOperationOutcome` construction — or replace it with the row's external
+// id — and the assertion fails naming that file. RUN on both.
+//
+// ROUTE: the SHIPPED connector sources. Every construction of a `PostedOperationOutcome` in either
+// processor is found by the type annotation the compiler already requires, so a fourth path cannot
+// be added without appearing here.
+test('ROUND 13 (Codex HIGH): every path that builds one of these records reads the bill id off the payload', async () => {
+  let constructions = 0
+  for (const file of [
+    'lib/connectors/quickbooks/sync-processor.ts',
+    'lib/connectors/xero/sync-processor.ts',
+  ]) {
+    const source = await readFile(path.join(process.cwd(), file), 'utf8')
+    const matches = [...source.matchAll(/const \w+: PostedOperationOutcome = \{([\s\S]*?)\n {2}\}/g)]
+    assert.ok(matches.length > 0, `${file} must still build the outcome these records are written from`)
+    for (const match of matches) {
+      constructions += 1
+      assert.match(
+        match[1], /ledgerTargetId: ledgerTargetIdFromPayload\(payload\)/,
+        `${file} builds an outcome that does not read the ledger target off the row's payload, so a `
+        + 'record built from it would claim a bill it cannot name',
+      )
+    }
+  }
+  assert.equal(constructions, 2, 'both processors build exactly one, and both were checked')
+
+  // A payload written before this branch existed carries no `accountingInvoiceId`, and that is what
+  // makes both of those constructions land in the safe cell.
+  assert.equal(ledgerTargetIdFromPayload({ supplierInvoicePath: 'uploads/bill-1.pdf' }), null)
+})
+
+// MUTATION THAT KILLS THIS (run): restore `stands: 'AN ATTACHMENT NOW EXISTS ON {LEDGER} BILL
+// {ledgerTargetId}, …'` to NON_DOCUMENT_INCIDENT_WORDING.BILL_ATTACHMENT.MADE and the scan finds
+// it, naming the message. RUN.
+//
+// ROUTE: the messages are generated by the shipped formatters over both connectors and every
+// outcome; the phrase is the one the round-12 code actually wrote.
+test('ROUND 13 (Codex MEDIUM): the record says what the attempt DID to a remote object, not what stands on one now', () => {
+  // Attachment or bill existence is MUTABLE and this record is not: an operator may remove the
+  // duplicate, an administrator may change the bill, the bill may be deleted — and this record
+  // survives retention AND the factory reset, so a current-state claim in it outlives its own truth.
+  const PRESENT_REMOTE_CLAIM = /\b(?:AN?|THE) [A-Z]+ (?:NOW |STILL )?EXISTS\b/
+  for (const { label, text } of everyIncidentMessage()) {
+    assert.doesNotMatch(
+      text, PRESENT_REMOTE_CLAIM,
+      `${label} asserts that a remote object exists NOW. This record cannot know that: it outlives `
+      + 'every change anybody makes to the ledger. Say what this attempt DID instead.',
+    )
+  }
+
+  // NOT VACUOUS: the scan matches the wording this round replaced.
+  assert.match('AN ATTACHMENT NOW EXISTS ON XERO BILL XERO-BILL-77', PRESENT_REMOTE_CLAIM)
+  assert.match('AN ATTACHMENT NOW EXISTS ON A BILL IN XERO', PRESENT_REMOTE_CLAIM)
+
+  // AND WHAT IT SAYS INSTEAD, on both cells.
+  assert.match(XERO_MADE_NAMED_BILL, /THIS ATTEMPT UPLOADED AN ATTACHMENT ONTO XERO BILL XERO-BILL-77/)
+  assert.match(XERO_MADE_UNNAMED_BILL, /THIS ATTEMPT UPLOADED AN ATTACHMENT ONTO A BILL IN XERO/)
+
+  // WHAT THIS SCAN DOES NOT COVER, said rather than implied: the DOCUMENT wordings make the same
+  // kind of claim in other words — "BOTH documents exist in {ledger}", "it is still unposted", "no
+  // duplicate of it exists to open" — and correcting those is not a wording change, because the
+  // whole "keep it or void it" remedy is built on the document being there to keep or void. It is a
+  // wider class than this finding, and it is filed as o3d-ps83 rather than half-done here.
 })
