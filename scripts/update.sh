@@ -235,7 +235,27 @@ DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL:-}"
 START_TIME=$(date +%s)
 
 # ---------------------------------------------------------------------------
-# Fence bookkeeping (o3d-2sm1.1).
+# THE FENCE STATE MACHINE (o3d-2sm1.1, phases added o3d-2sm1.5 Codex r7 HIGH).
+#
+# Four phases, one direction only, and the exit trap does something different in each:
+#
+#   none      Nothing this run created needs undoing; the trap just exits.
+#   arming    CUTOVER_ARMING=true. Reversible cutover state exists — the reboot-fence
+#             drop-in and marker, the cron fence — and NOTHING has been asked to stop. The
+#             old version is up and healthy. A failure here is UNDONE: the crontab goes
+#             back verbatim, the drop-in and marker THIS run wrote are removed, and nothing
+#             is stopped. See unwind_arming().
+#   stopping  FENCE_ARMED=true. A stop has been ATTEMPTED, or a previous run's fence was
+#             adopted and its stop already happened.
+#   serving   PAST_POINT_OF_NO_RETURN=true. The new version proved it is the process on the
+#             port; nothing below may take that away.
+#
+# THE ARMING PHASE EXISTS BECAUSE IT WAS MISSING. FENCE_ARMED used to be raised before
+# `fence_cron`, so a crontab backup that could not be written, a failed chmod, a broken
+# pipeline or a `crontab` returning non-zero reached the trap looking exactly like a failed
+# migration — and the trap STOPPED a service nobody had touched, kept the reboot fence and
+# demanded a recovery, over a schema that had not moved. A failure in the cheap, reversible
+# step ran the expensive, outage-causing machinery.
 #
 # FENCE_ARMED means: from here on, nothing in this script restarts what it stopped.
 # A "rollback" that brings the old version back up against a MIGRATED schema is the
@@ -244,6 +264,8 @@ START_TIME=$(date +%s)
 # migration started, so a power cut does not quietly undo it. Fix the cause and re-run:
 # every step below is idempotent, and a re-run adopts all three fences before it builds.
 # ---------------------------------------------------------------------------
+# Phase `arming`: reversible cutover state exists and nothing has been stopped yet.
+CUTOVER_ARMING=false
 FENCE_ARMED=false
 FENCE_MASK=false
 # `prisma migrate deploy` HAS BEEN INVOKED: the schema may have moved, or half-moved.
@@ -262,6 +284,9 @@ SCHEMA_TOUCHED=false
 DB_FENCE_UP=false
 DEPLOY_OK=false
 CRON_FENCED=false
+# Did THIS run write the crontab backup? The arming unwind restores from it; an ADOPTED
+# backup belongs to a previous run's still-standing fence and must not be touched.
+CRON_BACKUP_CREATED=false
 CURRENT_STEP="startup"
 BACKUP_FILE=""
 FENCE_FILE="${DATA_DIR}/DEPLOY-FENCED"
@@ -681,6 +706,45 @@ adopt_db_connections() {
   success "Connection fence adopted; the recovery runs through DEPLOY_ADMIN_DATABASE_URL."
 }
 
+# Put the crontab back from the backup THIS run took, whatever fence_cron managed to do with
+# it. The authority is the backup file rather than CRON_FENCED: that flag is raised only once
+# `crontab` has returned 0, so a run that rewrote the crontab and then failed — or failed
+# halfway through rewriting it — would otherwise restore nothing. An ADOPTED backup is left
+# alone: it belongs to a previous run's fence, which is still standing.
+restore_cron_from_backup() {
+  command -v crontab >/dev/null 2>&1 || return 0
+  $CRON_BACKUP_CREATED || return 0
+  [[ -f "${CRON_BACKUP}" ]] || return 1
+  crontab -u "${APP_USER}" "${CRON_BACKUP}" || return 1
+  rm -f "${CRON_BACKUP}"
+  CRON_FENCED=false
+  CRON_BACKUP_CREATED=false
+  success "The ${APP_USER} crontab is back exactly as it was."
+  return 0
+}
+
+# UNDO THE ARMING PHASE. Called only from the pre-stop branch of the exit trap, where the old
+# version is still up and the schema has not moved: the correct outcome is that the box looks
+# exactly as it did before this run started. It stops nothing and touches only state THIS run
+# created — rollback_reboot_fence_install() removes the drop-in this process wrote and,
+# because FENCE_ARMED is false here, the marker too, unless it was already there.
+unwind_arming() {
+  local unwound=true
+  if ! restore_cron_from_backup; then
+    unwound=false
+    error "The ${APP_USER} crontab could NOT be restored from ${CRON_BACKUP}."
+    error "Put it back by hand:  crontab -u ${APP_USER} ${CRON_BACKUP}"
+  fi
+  rollback_reboot_fence_install
+  if [[ -f "${FENCE_FILE}" ]] && ! ${FENCE_MARKER_PREEXISTED}; then
+    unwound=false
+    error "${FENCE_FILE} is still there and would refuse the next boot. Remove it: rm -f ${FENCE_FILE}"
+  fi
+  if $unwound; then
+    success "Every change this run had made has been undone; nothing was stopped."
+  fi
+}
+
 on_exit() {
   local status=$?
   $DEPLOY_OK && exit 0
@@ -711,6 +775,31 @@ on_exit() {
       echo -e "  marker      : ${FENCE_FILE} still exists and would refuse the next boot."
       echo -e "                Remove it once you are happy: rm -f ${FENCE_FILE}"
     fi
+    exit "${status}"
+  fi
+
+  # A FAILURE BEFORE THE STOP IS NOT AN OUTAGE, AND MUST NOT BE TURNED INTO ONE
+  # (o3d-2sm1.5, Codex r7 HIGH). FENCE_ARMED used to be raised before `fence_cron`, so every
+  # way cron management can fail reached the branch below — which stops the service, keeps
+  # the reboot fence and demands a recovery, on a host whose schema had not moved and whose
+  # old version was still serving. Nothing has been asked to stop yet, so the only correct
+  # action is to put back what this run changed and leave the service alone.
+  if ! $FENCE_ARMED && $CUTOVER_ARMING; then
+    echo ""
+    echo -e "${YELLOW}${BOLD}=======================================================================${RESET}"
+    echo -e "${YELLOW}${BOLD} UPDATE FAILED BEFORE THE STOP — THE OLD VERSION IS STILL SERVING${RESET}"
+    echo -e "${YELLOW}${BOLD}=======================================================================${RESET}"
+    echo -e "  failed step : ${CURRENT_STEP}"
+    echo -e "  exit status : ${status}"
+    echo -e "  service     : UNTOUCHED. Nothing was stopped, so nothing needs starting."
+    echo -e "  schema      : untouched — the migration was never invoked."
+    echo -e "  database    : never fenced; the application still has CONNECT."
+    echo ""
+    if ! $DRY_RUN; then
+      unwind_arming
+    fi
+    echo ""
+    echo -e "  Fix the cause and re-run. Nothing has to be recovered first."
     exit "${status}"
   fi
 
@@ -837,6 +926,8 @@ fence_cron() {
   if [[ ! -f "${CRON_BACKUP}" ]]; then
     printf '%s\n' "$current" > "${CRON_BACKUP}"
     chmod 600 "${CRON_BACKUP}"
+    # THIS run's backup, so the arming unwind may restore from it and delete it.
+    CRON_BACKUP_CREATED=true
   fi
   printf '%s\n' "$current" \
     | awk '{ if ($0 ~ /^[[:space:]]*[^#[:space:]]/) print "#DEPLOY-FENCE# " $0; else print $0 }' \
@@ -1067,12 +1158,21 @@ header "Stopping and draining every writer"
 # schema has not moved, and FENCE_ARMED is still false, so the failure banner does not
 # claim an outage that has not happened.
 FENCE_MASK=true
+
+# PHASE `arming`. Everything between here and the stop is reversible, and the exit trap
+# reverses it: it restores the crontab and removes the drop-in and marker this run wrote,
+# WITHOUT stopping anything.
+CUTOVER_ARMING=true
+
 install_reboot_fence "cutover started $(date -Iseconds)" \
   || die "Refusing to stop the old version without a verified reboot fence: a reboot mid-migration would start it again against a migrated schema."
 
-FENCE_ARMED=true
-
 fence_cron
+
+# PHASE `stopping`. THIS is where the fence is armed, and not one line earlier: from the next
+# statement on, something has been asked to stop and nothing may start it again. Every failure
+# before this point takes the reversible branch in the trap (o3d-2sm1.5, Codex r7 HIGH).
+FENCE_ARMED=true
 
 info "Stopping ${SERVICE_UNIT}"
 run systemctl stop "${SERVICE_UNIT}"

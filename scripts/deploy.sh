@@ -303,9 +303,34 @@ as_app_user() {
 }
 
 # ---------------------------------------------------------------------------
-# Fence bookkeeping. Three flags, and they mean three different things:
+# THE FENCE STATE MACHINE (o3d-2sm1.5, Codex r7 HIGH).
 #
-#   FENCE_ARMED     from here on, never restart the thing we stopped.
+# Four phases, one direction only, and the exit trap does something different in each:
+#
+#   none      This run has created nothing that needs undoing, so the trap just exits.
+#   arming    CUTOVER_ARMING=true. This run has installed REVERSIBLE cutover state — the
+#             reboot-fence drop-in and marker, the cron fence — and has NOT yet asked
+#             anything to stop. The predecessor is up, healthy, and serving the schema it
+#             was built against. A failure here is UNDONE: the crontab goes back verbatim,
+#             the drop-in and the marker THIS run created are removed, and NOTHING is
+#             stopped. See unwind_arming().
+#   stopping  FENCE_ARMED=true. A stop has been ATTEMPTED — or a previous run's fence was
+#             adopted, which means its stop already happened. From here nothing restarts
+#             what was stopped: the trap re-stops, re-fences and reports.
+#   serving   PAST_POINT_OF_NO_RETURN=true. The new build PROVED it is the process
+#             answering the port. Nothing below may take that away.
+#
+# THE ARMING PHASE EXISTS BECAUSE IT WAS MISSING. FENCE_ARMED used to be raised BEFORE
+# `fence_cron` and before any stop, so a crontab backup that could not be written, a chmod
+# that failed, a broken pipeline or a `crontab` that returned non-zero arrived at the trap
+# looking exactly like a failed migration. The trap then STOPPED a service nobody had
+# touched, installed the reboot fence, kept it, and told the operator not to start the
+# predecessor — over a schema that had not moved and a service that was still healthy. A
+# failure in the cheap, reversible step ran the expensive, outage-causing machinery.
+#
+# The remaining flags say what is TRUE, not where we are:
+#
+#   FENCE_ARMED     a stop has been attempted; never restart the thing we stopped.
 #   FENCE_MASK      this run INTENDS to migrate, so the fence must survive a reboot.
 #                   Armed before the stop, because a fence installed later does not
 #                   exist for a run that is killed rather than exiting.
@@ -326,12 +351,19 @@ as_app_user() {
 #                   failed health check must then not report a fence that is no longer
 #                   there (o3d-2sm1.4, Codex r3 HIGH). The trap re-establishes it.
 # ---------------------------------------------------------------------------
+# Phase `arming`: reversible cutover state exists and NOTHING has been stopped yet.
+CUTOVER_ARMING=false
+# Phase `stopping`: a stop has been ATTEMPTED. Raised immediately before the first
+# `systemctl stop`, and by the adoption path, whose predecessor already stopped.
 FENCE_ARMED=false
 FENCE_MASK=false
 SCHEMA_TOUCHED=false
 DB_FENCE_UP=false
 DEPLOY_OK=false
 CRON_FENCED=false
+# Did THIS run write the crontab backup? The unwind restores from it, and an ADOPTED
+# backup belongs to the previous run's still-standing fence and must not be touched.
+CRON_BACKUP_CREATED=false
 CURRENT_STEP="startup"
 SERVICE_UNITS=()
 # Is the reboot fence ACTUALLY loaded by systemd right now? Distinct from FENCE_MASK, which
@@ -351,6 +383,27 @@ PAST_POINT_OF_NO_RETURN=false
 # build id and the build-id proof below can never be established from it. That is "cannot
 # prove", not "proven wrong" (o3d-2sm1.5, r6 CRITICAL).
 DEV_SERVER_UNIT=false
+# The dev-server equivalent of NEW_BUILD_SERVING: the process that answered was shown to
+# be the unit this run restarted, running from this working tree (o3d-2sm1.5, Codex r7
+# HIGH). A dev server has no production build id to serve, so the asset channel can never
+# arm; this is the evidence that replaces it, and without it the deploy fails.
+DEV_RESPONDER_PROVEN=false
+# Which unit the process on the port turned out to belong to, filled in by the proof.
+RESPONDER_UNIT=""
+# When this run issued `systemctl start`. The responder must post-date it, or it survived
+# the stop and is not ours.
+SERVICE_START_EPOCH=0
+# Clock slack for that comparison, in seconds.
+DEV_RESPONDER_CLOCK_SLACK=5
+# THE ESCAPE HATCH, AND WHY IT IS NARROW. Making the dev path fatal is correct only while
+# the identity check itself works; a bug in it would fail every deploy on this host AFTER
+# the migration with the fence up, which is exactly the outage r6 fixed. This env var
+# completes such a run WITHOUT arming the point of no return — it buys back the old
+# behaviour deliberately, per run, and never silently.
+ALLOW_UNIDENTIFIED_DEV_RESPONDER=false
+if [[ "${IMS_ALLOW_UNIDENTIFIED_DEV_RESPONDER:-0}" == "1" ]]; then
+  ALLOW_UNIDENTIFIED_DEV_RESPONDER=true
+fi
 
 CRON_BACKUP="${STATE_DIR}/crontab-${APP_USER}.bak"
 DB_FENCE_SCRIPT="${APP_DIR_REAL}/scripts/fence-db-connections.mjs"
@@ -842,6 +895,8 @@ fence_cron() {
   if [[ ! -f "$CRON_BACKUP" ]]; then
     printf '%s\n' "$current" > "$CRON_BACKUP"
     chmod 600 "$CRON_BACKUP"
+    # THIS run's backup, so the arming unwind is allowed to restore from it and delete it.
+    CRON_BACKUP_CREATED=true
     info "Crontab backed up verbatim: ${CRON_BACKUP}"
   else
     info "Reusing the crontab backup from the previous run: ${CRON_BACKUP}"
@@ -883,6 +938,49 @@ as_app_user_db() {
   fi
 }
 
+# Put the crontab back from the backup THIS run took, whatever fence_cron managed to do
+# with it. The authority is the backup file rather than CRON_FENCED: fence_cron raises that
+# flag only once `crontab` has returned 0, so a run that rewrote the crontab and then failed
+# — or failed halfway through rewriting it — would otherwise never restore anything.
+#
+# An ADOPTED backup is left alone: it belongs to a previous run's fence, which is still
+# standing, and that run's crontab fence must stay up.
+restore_cron_from_backup() {
+  command -v crontab >/dev/null 2>&1 || return 0
+  $CRON_BACKUP_CREATED || return 0
+  [[ -f "$CRON_BACKUP" ]] || return 1
+  crontab -u "$APP_USER" "$CRON_BACKUP" || return 1
+  rm -f "$CRON_BACKUP"
+  CRON_FENCED=false
+  CRON_BACKUP_CREATED=false
+  ok "The ${APP_USER} crontab is back exactly as it was."
+  return 0
+}
+
+# UNDO THE ARMING PHASE. Called only from the pre-stop branch of the exit trap, where the
+# predecessor is still up and the schema has not moved: the correct outcome is that the box
+# looks exactly as it did before this run started. It stops nothing, starts nothing, and
+# touches only state THIS run created — rollback_reboot_fence_install() removes the
+# drop-ins this process wrote and, because FENCE_ARMED is false here, the marker too,
+# unless the marker was already there when it was called.
+unwind_arming() {
+  local unwound=true
+  if ! restore_cron_from_backup; then
+    unwound=false
+    echo -e "${RED}[ERROR]${RESET} The ${APP_USER} crontab could NOT be restored from ${CRON_BACKUP}." >&2
+    echo -e "${RED}[ERROR]${RESET} Put it back by hand:  crontab -u ${APP_USER} ${CRON_BACKUP}" >&2
+  fi
+  rollback_reboot_fence_install
+  if [[ -f "$FENCE_FILE" ]] && ! $FENCE_MARKER_PREEXISTED; then
+    unwound=false
+    echo -e "${RED}[ERROR]${RESET} ${FENCE_FILE} is still there and would refuse the next boot." >&2
+    echo -e "${RED}[ERROR]${RESET} Remove it by hand:  rm -f ${FENCE_FILE}" >&2
+  fi
+  if $unwound; then
+    ok "Every change this run had made has been undone; nothing was stopped."
+  fi
+}
+
 on_exit() {
   local status=$?
   $DEPLOY_OK && exit 0
@@ -916,6 +1014,37 @@ on_exit() {
       echo -e "  marker      : ${FENCE_FILE} still exists and would refuse the next boot."
       echo -e "                Remove it once you are happy: rm -f ${FENCE_FILE}"
     fi
+    exit "$status"
+  fi
+
+  # A FAILURE BEFORE THE STOP IS NOT AN OUTAGE, AND MUST NOT BE TURNED INTO ONE
+  # (o3d-2sm1.5, Codex r7 HIGH).
+  #
+  # FENCE_ARMED used to be raised before `fence_cron`, so every way that cron management can
+  # fail — an unwritable backup, a failed chmod, a broken pipeline, a `crontab` that returns
+  # non-zero — reached the branch below. That branch STOPS the service, keeps the reboot
+  # fence and demands a recovery, and it was doing all of it to a host whose schema had not
+  # moved and whose predecessor was still serving. The expensive machinery ran for the
+  # cheapest, most reversible step there is.
+  #
+  # Nothing has been asked to stop yet, so the only correct action is to put back what this
+  # run changed and leave the service alone.
+  if ! $FENCE_ARMED && $CUTOVER_ARMING; then
+    echo ""
+    echo -e "${YELLOW}${BOLD}=========================================================================${RESET}"
+    echo -e "${YELLOW}${BOLD} DEPLOY FAILED BEFORE THE STOP — THE PREDECESSOR IS STILL SERVING${RESET}"
+    echo -e "${YELLOW}${BOLD}=========================================================================${RESET}"
+    echo -e "  failed step : ${CURRENT_STEP}"
+    echo -e "  exit status : ${status}"
+    echo -e "  service     : UNTOUCHED. Nothing was stopped, so nothing needs starting."
+    echo -e "  schema      : untouched — the migration was never invoked."
+    echo -e "  database    : never fenced; the application still has CONNECT."
+    echo ""
+    if ! $DRY_RUN; then
+      unwind_arming
+    fi
+    echo ""
+    echo -e "  Fix the cause and re-run. Nothing has to be recovered first."
     exit "$status"
   fi
 
@@ -1301,6 +1430,13 @@ step "Stop and drain every writer"
 # costs nothing: the predecessor is still up, the schema has not moved, and FENCE_ARMED
 # is still false, so the failure banner does not claim an outage that has not happened.
 $SKIP_MIGRATE || FENCE_MASK=true
+
+# PHASE `arming`. Everything between here and the stop is reversible, and the exit trap
+# reverses it: it restores the crontab and removes the drop-in and marker this run wrote,
+# WITHOUT stopping anything. Raised before install_reboot_fence, so that even a partial
+# install is unwound by the trap as well as by its own rollback.
+CUTOVER_ARMING=true
+
 if $FENCE_MASK; then
   install_reboot_fence "cutover started $(date -Iseconds)" \
     || die "Refusing to stop the predecessor without a verified reboot fence: a reboot mid-migration would start it again against a migrated schema."
@@ -1308,9 +1444,12 @@ else
   info "--skip-migrate: no migration will be applied, so no reboot fence is installed."
 fi
 
-FENCE_ARMED=true
-
 fence_cron
+
+# PHASE `stopping`. THIS is where the fence is armed, and not one line earlier: from the
+# next statement on, something has been asked to stop and nothing may start it again. Every
+# failure before this point took the reversible branch above (o3d-2sm1.5, Codex r7 HIGH).
+FENCE_ARMED=true
 
 # --- the web server --------------------------------------------------------
 if [[ "${#SERVICE_UNITS[@]}" -gt 0 ]]; then
@@ -1347,6 +1486,132 @@ app_pids() {
 port_pid() {
   ss -ltnp 2>/dev/null | awk -v p=":${PORT}\$" '$4 ~ p {print $NF}' \
     | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true
+}
+
+# ---------------------------------------------------------------------------
+# WHO ACTUALLY ANSWERED, WHEN A BUILD ID CANNOT SAY (o3d-2sm1.5, Codex r7 HIGH).
+#
+# DEV_SERVER_UNIT describes the launcher this run INTENDED to start. It says nothing about
+# the process that answered the port, and the two are not the same thing: a stale listener,
+# an operator's `next dev` in another worktree, or anything else that wins the race for
+# :$PORT passes the health poll just as well — and was then left serving the migrated schema
+# with the deploy reporting success. "A dev server cannot prove a build id" is a reason to
+# look for different evidence, not a reason to stop looking.
+#
+# So the dev path asks the same question the asset channel asks — is the thing on the port
+# the thing this run started? — of the listener itself, and it needs all three answers:
+#
+#   1. the pid LISTENING on :$PORT belongs to a unit this run just restarted. systemd tears
+#      the cgroup down on stop, so a process that survived cannot be inside the new one, and
+#      it cannot be a descendant of the new MainPID either;
+#   2. its working directory is $APP_DIR_REAL — the tree `next dev` compiles from, which is
+#      what "the new code" means for a dev server; and
+#   3. it started AFTER this run issued `systemctl start`.
+#
+# VERIFIED AGAINST THIS HOST'S REAL DEV UNIT before it was made fatal, because the last
+# attempt at a fatal dev path (r6) was a deterministic post-migration outage. On
+# ims-stage-dev.service the listener is the `next-server` grandchild of the npm MainPID, its
+# cgroup is `/system.slice/ims-stage-dev.service` — exactly what `systemctl show -p
+# ControlGroup` reports for the unit — its cwd is the app directory, and the start epoch
+# computed below equals the unit's ActiveEnterTimestamp to the second. All three answer yes
+# for the real dev server and no for anything else holding the port.
+# ---------------------------------------------------------------------------
+
+# Wall-clock second at which a process started, from /proc alone. The comm field is
+# parenthesised and this box's own listener is literally `(next-server (v16.2.10))`, so
+# everything up to the LAST ')' is dropped rather than the first.
+proc_start_epoch() {
+  local pid="$1" stat rest ticks btime clk
+  stat="$(cat "/proc/${pid}/stat" 2>/dev/null)" || return 1
+  rest="${stat##*)}"
+  ticks="$(awk '{print $20}' <<<"$rest")"
+  [[ "$ticks" =~ ^[0-9]+$ ]] || return 1
+  btime="$(awk '/^btime /{print $2}' /proc/stat 2>/dev/null)"
+  [[ "$btime" =~ ^[0-9]+$ ]] || return 1
+  clk="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+  [[ "$clk" =~ ^[0-9]+$ && "$clk" -gt 0 ]] || clk=100
+  echo "$(( btime + ticks / clk ))"
+}
+
+# Is this pid inside the cgroup of one of the units this run restarted?
+pid_in_unit_cgroup() {
+  local pid="$1" unit unit_cg pid_cg
+  pid_cg="$(sed -n 's#^0::##p' "/proc/${pid}/cgroup" 2>/dev/null | head -1)"
+  [[ -n "$pid_cg" ]] || pid_cg="$(head -1 "/proc/${pid}/cgroup" 2>/dev/null | cut -d: -f3- || true)"
+  [[ -n "$pid_cg" ]] || return 1
+  for unit in "${SERVICE_UNITS[@]:-}"; do
+    [[ -n "$unit" ]] || continue
+    unit_cg="$(systemctl show -p ControlGroup --value "$unit" 2>/dev/null || true)"
+    [[ -n "$unit_cg" ]] || continue
+    if [[ "$pid_cg" == "$unit_cg" || "$pid_cg" == "${unit_cg}/"* ]]; then
+      RESPONDER_UNIT="$unit"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The same question by a second route, for a host whose /proc/<pid>/cgroup this cannot read
+# (cgroup v1, a container): is the pid a descendant of a restarted unit's MainPID? A process
+# that survived the stop is not, because the MainPID is the one this run started.
+pid_in_unit_process_tree() {
+  local pid="$1" unit main cur hops
+  for unit in "${SERVICE_UNITS[@]:-}"; do
+    [[ -n "$unit" ]] || continue
+    main="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
+    [[ "$main" =~ ^[0-9]+$ && "$main" -gt 1 ]] || continue
+    cur="$pid"
+    hops=0
+    while [[ "$cur" =~ ^[0-9]+$ && "$cur" -gt 1 && "$hops" -lt 32 ]]; do
+      if [[ "$cur" == "$main" ]]; then
+        RESPONDER_UNIT="$unit"
+        return 0
+      fi
+      cur="$(awk '/^PPid:/{print $2}' "/proc/${cur}/status" 2>/dev/null || true)"
+      hops=$(( hops + 1 ))
+    done
+  done
+  return 1
+}
+
+# All three answers, for every pid holding the port. Any listener that cannot be attributed
+# fails the whole proof: "one of them is ours" is not an answer when the question is which
+# process the health check reached.
+prove_dev_responder() {
+  local pids pid cwd started proven=false
+  RESPONDER_UNIT=""
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemctl is unavailable, so nothing here can attribute :${PORT} to a unit this run restarted."
+    return 1
+  fi
+  pids="$(port_pid | grep -E '^[0-9]+$' || true)"
+  if [[ -z "$pids" ]]; then
+    warn "Nothing listening on :${PORT} can be attributed to a pid (ss -ltnp returned none), so the responder cannot be identified."
+    return 1
+  fi
+  for pid in $pids; do
+    cwd="$(readlink -f "/proc/${pid}/cwd" 2>/dev/null || true)"
+    if [[ "$cwd" != "$APP_DIR_REAL" ]]; then
+      warn "pid ${pid} holds :${PORT} but runs from ${cwd:-an unreadable working directory}, not ${APP_DIR_REAL}."
+      return 1
+    fi
+    if ! pid_in_unit_cgroup "$pid" && ! pid_in_unit_process_tree "$pid"; then
+      warn "pid ${pid} holds :${PORT} but belongs to no unit this run restarted (${SERVICE_UNITS[*]:-none})."
+      return 1
+    fi
+    started="$(proc_start_epoch "$pid" || true)"
+    if [[ ! "$started" =~ ^[0-9]+$ ]]; then
+      warn "The start time of pid ${pid} could not be read, so nothing shows it post-dates the restart."
+      return 1
+    fi
+    if (( started + DEV_RESPONDER_CLOCK_SLACK < SERVICE_START_EPOCH )); then
+      warn "pid ${pid} started $(( SERVICE_START_EPOCH - started ))s BEFORE this run issued systemctl start: it survived the stop and is not what this run started."
+      return 1
+    fi
+    ok "pid ${pid} holds :${PORT}, runs from ${APP_DIR_REAL}, belongs to ${RESPONDER_UNIT} and started after the restart."
+    proven=true
+  done
+  $proven
 }
 
 STRAY_PIDS="$( { app_pids; port_pid; } | grep -E '^[0-9]+$' | sort -u || true)"
@@ -1500,6 +1765,10 @@ release_db_connections \
   || die "Refusing to start the application while it has no CONNECT on its own database."
 remove_reboot_fence
 
+# The instant the restart was issued. The responder proof below requires the process on the
+# port to post-date it: anything older survived the stop and is not what this run started.
+SERVICE_START_EPOCH=$(date +%s)
+
 if [[ "${#SERVICE_UNITS[@]}" -gt 0 ]]; then
   for unit in "${SERVICE_UNITS[@]}"; do
     # Lifts a mask left by an older revision of this script, which masked from its exit
@@ -1600,12 +1869,25 @@ else
 
   if ! $NEW_BUILD_SERVING; then
     if $DEV_SERVER_UNIT; then
-      # Not a teardown. The unit this run stopped, migrated behind and restarted is a dev
-      # server; it is serving THIS working tree, which is the new code, and it simply has no
-      # production build id to offer. Nothing is proven, so the point of no return stays
-      # false and the trap keeps its teardown for a later failure — but the absence of proof
-      # here is a property of the launcher, not evidence of a stale predecessor.
-      warn "Cannot prove which build is answering ${HEALTH_URL}: a development server holds port ${PORT}, and /_next/static/${NEW_BUILD_ID}/ is a production artefact it does not serve. The service is up; the release is NOT being declared irreversible."
+      # A DEV UNIT IS A DIFFERENT PROOF, NOT AN EXEMPTION (o3d-2sm1.5, Codex r7 HIGH).
+      #
+      # This used to be a bare `warn`, after which the script cleared the fence, restored
+      # cron and reported a complete deploy with NOTHING having identified the process on
+      # the port. DEV_SERVER_UNIT is a property of the unit this run selected; the thing
+      # that answered may be anything that won the race for :${PORT}, and it would have been
+      # left serving the migrated schema over a green deploy. So the dev path proves the
+      # responder's identity directly — see prove_dev_responder() — and fails while the
+      # fences are still up if it cannot.
+      if prove_dev_responder; then
+        DEV_RESPONDER_PROVEN=true
+        ok "${HEALTH_URL} is answered by the development server this run restarted, running from ${APP_DIR_REAL}. A dev server compiles from that tree, so the code answering IS the code this run deployed."
+      elif $ALLOW_UNIDENTIFIED_DEV_RESPONDER; then
+        warn "IMS_ALLOW_UNIDENTIFIED_DEV_RESPONDER=1: finishing WITHOUT having identified the process on :${PORT}."
+        warn "Nothing here has shown that what answers ${HEALTH_URL} is this working tree, so the release"
+        warn "is NOT declared irreversible and a later failure can still be torn down. Check it by hand."
+      else
+        die "A development server was expected on :${PORT}, but nothing identified the process that answered ${HEALTH_URL} as a unit this run restarted, running from ${APP_DIR_REAL} and started after the restart — the reason is printed above. The schema has already moved, so this fails with the fences still up rather than reporting success over whatever holds the port. If the identity check itself is what is broken on this host, re-run with IMS_ALLOW_UNIDENTIFIED_DEV_RESPONDER=1, which finishes without declaring the release irreversible."
+      fi
     else
       die "Something answered ${HEALTH_URL}, but nothing proved it was BUILD_ID ${NEW_BUILD_ID}. A predecessor still holding port ${PORT} answers that path too, and the schema has already moved. Refusing to declare the release irreversible on the strength of an open port."
     fi
@@ -1628,7 +1910,10 @@ fi
 # ARMED ONLY BY THE PROOF ABOVE. `$NEW_BUILD_SERVING` stays false unless the health phase
 # established that the BUILD_ID on disk is the one answering — an open port is not that, and
 # the trap's refusal to stop the service is only defensible once it is.
-if $NEW_BUILD_SERVING || $DRY_RUN; then
+# `$DEV_RESPONDER_PROVEN` is the same standard for a launcher that has no production build id
+# to serve: the pid on the port was shown to belong to a unit this run restarted, to run from
+# this working tree, and to post-date the restart. Neither is set by an open port.
+if $NEW_BUILD_SERVING || $DEV_RESPONDER_PROVEN || $DRY_RUN; then
   PAST_POINT_OF_NO_RETURN=true
 fi
 FENCE_ARMED=false

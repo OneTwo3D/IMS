@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -1738,3 +1738,437 @@ for (const [name, lines] of [
     )
   })
 }
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r7, HIGH) — A CRON-FENCING ERROR STOPPED A STILL-HEALTHY SERVICE.
+//
+// FENCE_ARMED was raised BEFORE `fence_cron` and before any stop, so every way cron
+// management can fail — a crontab backup that cannot be written, a failed chmod, a broken
+// pipeline, a `crontab` that returns non-zero — arrived at the exit trap looking exactly
+// like a failed migration. The trap then STOPPED a service nobody had touched, kept the
+// reboot fence and demanded a recovery, on a host whose schema had not moved and whose
+// predecessor was still serving. A failure in the cheapest, most reversible step ran the
+// expensive, outage-causing machinery, in all three entrypoints.
+//
+// The fix is the phase model, not another guard: `arming` (reversible state exists, nothing
+// stopped) is a different phase from `stopping` (a stop has been attempted), and the trap
+// unwinds the first and defends the second.
+// ---------------------------------------------------------------------------
+
+/** The line index of the first code line matching `pattern`, at or after `from`. */
+function requireCodeLine(lines: string[], pattern: RegExp, from: number, what: string): number {
+  const index = codeLine(lines, pattern, from)
+  assert.notEqual(index, -1, what)
+  return index
+}
+
+const ARMING_ORDER = [
+  {
+    name: 'deploy.sh',
+    lines: DEPLOY_LINES,
+    // deploy.sh and update.sh carry phase markers; install.sh's cutover is a plain block.
+    anchor: (lines: string[]) => phaseLine(lines, 'fence-writers'),
+  },
+  {
+    name: 'update.sh',
+    lines: UPDATE_LINES,
+    anchor: (lines: string[]) => phaseLine(lines, 'fence-writers'),
+  },
+  {
+    name: 'install.sh',
+    lines: INSTALL_LINES,
+    anchor: (lines: string[]) =>
+      requireCodeLine(lines, /install_reboot_fence "install\.sh cutover started/, 0, 'install.sh must have a cutover fence-writers block'),
+  },
+] as const
+
+for (const entry of ARMING_ORDER) {
+  test(`${entry.name} arms the fence at the stop, so a cron-fencing failure is not a post-stop failure`, () => {
+    const { lines } = entry
+    // The anchor is the reboot-fence install, so start looking a little before it: the
+    // arming flag has to be raised BEFORE the first thing that creates cutover state.
+    const anchor = entry.anchor(lines)
+    const from = Math.max(0, anchor - 40)
+
+    const arming = requireCodeLine(lines, /^\s*CUTOVER_ARMING=true\s*$/, from, 'the reversible phase must be entered explicitly')
+    const install = requireCodeLine(lines, /install_reboot_fence "/, arming, 'the reboot fence is installed inside the arming phase')
+    const cron = requireCodeLine(lines, /^\s*fence_cron\s*$/, arming, 'the cron writers are fenced inside the arming phase')
+    const armed = requireCodeLine(lines, /^\s*FENCE_ARMED=true\s*$/, arming, 'and the fence is armed after it')
+    const stop = requireCodeLine(lines, /systemctl stop/, armed, 'the stop must follow the arming')
+
+    assert.ok(arming < install, 'the arming phase must be entered before the reboot fence is written')
+    assert.ok(
+      cron < armed,
+      'fence_cron must run INSIDE the reversible phase: every way it can fail used to be reported as a post-stop failure, and answered by stopping a healthy service',
+    )
+    assert.ok(armed < stop, 'and FENCE_ARMED must be raised before anything is actually stopped')
+  })
+}
+
+/**
+ * The exit trap, run for real, in the state a failed `fence_cron` leaves behind.
+ *
+ * The scenario is the exact one that used to cost an outage: this run wrote the crontab
+ * backup and then the `crontab` install failed, so CRON_FENCED is false while a backup and
+ * a freshly written reboot fence are both on disk — and NOTHING has been stopped.
+ */
+const ARMING_TRAP_CASES = [
+  {
+    name: 'deploy.sh',
+    source: DEPLOY_LINES.join('\n'),
+    trap: 'on_exit',
+    marker: 'FENCED',
+    preamble: (dir: string) => `
+DRY_RUN=false
+BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+STATE_DIR='${dir}'
+APP_USER=appuser
+APP_DIR_REAL=/opt/app
+PORT=3000
+CURRENT_STEP=fence-writers
+DEPLOY_OK=false
+PAST_POINT_OF_NO_RETURN=false
+SCHEMA_TOUCHED=false
+FENCE_MASK=true
+DB_FENCE_UP=false
+REBOOT_FENCE_INSTALLED=true
+FENCE_FILE="\${STATE_DIR}/FENCED"
+CRON_BACKUP="\${STATE_DIR}/crontab.bak"
+FENCE_DROPIN_DIR="\${STATE_DIR}/dropin"
+FENCE_DROPIN_FILE="\${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
+FENCE_DROPINS_CREATED=("\${FENCE_DROPIN_FILE}")
+FENCE_MARKER_PREEXISTED=false
+SERVICE_UNITS=(app.service)
+DB_FENCE_STATE="\${STATE_DIR}/db.json"
+DB_FENCE_SCRIPT=/opt/app/scripts/fence-db-connections.mjs
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
+`,
+  },
+  {
+    name: 'update.sh',
+    source: UPDATE_LINES.join('\n'),
+    trap: 'on_exit',
+    marker: 'FENCED',
+    preamble: (dir: string) => `
+DRY_RUN=false
+BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+DATA_DIR='${dir}'
+APP_USER=appuser
+SERVICE_UNIT=app.service
+CURRENT_STEP=fence-writers
+DEPLOY_OK=false
+PAST_POINT_OF_NO_RETURN=false
+SCHEMA_TOUCHED=false
+DB_FENCE_UP=false
+REBOOT_FENCE_INSTALLED=true
+BACKUP_FILE=''
+BACKUP_DIR="\${DATA_DIR}/backups"
+FENCE_FILE="\${DATA_DIR}/FENCED"
+CRON_BACKUP="\${DATA_DIR}/crontab.bak"
+FENCE_DROPIN_DIR="\${DATA_DIR}/dropin"
+FENCE_DROPIN_FILE="\${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
+FENCE_DROPIN_CREATED=true
+FENCE_MARKER_PREEXISTED=false
+DB_FENCE_STATE="\${DATA_DIR}/db.json"
+DB_FENCE_SCRIPT=/opt/app/scripts/fence-db-connections.mjs
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
+`,
+  },
+  {
+    name: 'install.sh',
+    source: INSTALL_SOURCE,
+    trap: 'on_cutover_exit',
+    marker: 'FENCED',
+    preamble: (dir: string) => `
+DATA_DIR='${dir}'
+APP_USER=appuser
+APP_NAME=one-two-inventory
+CUTOVER_STEP=fence-writers
+PAST_POINT_OF_NO_RETURN=false
+SCHEMA_TOUCHED=false
+DB_FENCE_UP=false
+REBOOT_FENCE_INSTALLED=true
+FENCE_FILE="\${DATA_DIR}/FENCED"
+CRON_BACKUP="\${DATA_DIR}/crontab.bak"
+FENCE_DROPIN_DIR="\${DATA_DIR}/dropin"
+FENCE_DROPIN_FILE="\${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
+FENCE_DROPIN_CREATED=true
+FENCE_MARKER_PREEXISTED=false
+DB_FENCE_STATE="\${DATA_DIR}/db.json"
+DB_FENCE_SCRIPT=/opt/app/scripts/fence-db-connections.mjs
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
+`,
+  },
+] as const
+
+/** Everything the trap calls that is NOT the subject: recorded, never performed. */
+const TRAP_STUBS = `
+LOG="\${STATE_DIR:-\${DATA_DIR}}/calls.log"
+: > "\${LOG}"
+info(){ :; }
+warn(){ echo "$*"; }
+error(){ echo "$*"; }
+ok(){ echo "$*"; }
+success(){ echo "$*"; }
+systemctl(){ echo "systemctl $*" >> "\${LOG}"; return 0; }
+crontab(){ echo "crontab $*" >> "\${LOG}"; return 0; }
+install_reboot_fence(){ echo "install_reboot_fence $*" >> "\${LOG}"; return 0; }
+release_db_connections(){ echo "release_db_connections" >> "\${LOG}"; return 0; }
+refence_db_connections(){ echo "refence_db_connections" >> "\${LOG}"; return 0; }
+write_fence_marker(){ echo "write_fence_marker $*" >> "\${LOG}"; return 0; }
+write_cutover_marker(){ echo "write_cutover_marker $*" >> "\${LOG}"; return 0; }
+`
+
+function runTrapHarness(
+  entry: (typeof ARMING_TRAP_CASES)[number],
+  state: string,
+): { log: string; stdout: string; markerExists: boolean; dropinExists: boolean } {
+  const dir = mkdtempSync(join(tmpdir(), 'ims-arming-'))
+  try {
+    const dropinDir = join(dir, 'dropin')
+    execFileSync('mkdir', ['-p', dropinDir])
+    // What the arming phase had put on disk when the failure hit.
+    writeFileSync(join(dir, 'FENCED'), 'migration_attempted=false\nschema_touched=false\n')
+    writeFileSync(join(dropinDir, 'zz-deploy-fence.conf'), '[Unit]\n')
+    writeFileSync(join(dir, 'crontab.bak'), '*/5 * * * * /usr/bin/true\n')
+
+    const program = [
+      'set -euo pipefail',
+      entry.preamble(dir),
+      TRAP_STUBS,
+      shellFunction(entry.source, 'restore_cron_from_backup'),
+      shellFunction(entry.source, 'rollback_reboot_fence_install'),
+      shellFunction(entry.source, 'unwind_arming'),
+      shellFunction(entry.source, entry.trap),
+      state,
+      // `(exit 7) || trap` gives the trap the $? a real failure would, and the subshell
+      // absorbs its own `exit` so the harness can still read the files afterwards.
+      `( (exit 7) || ${entry.trap} ) || true`,
+    ].join('\n')
+    const stdout = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    return {
+      log: readFileSync(join(dir, 'calls.log'), 'utf8'),
+      stdout,
+      markerExists: existsSync(join(dir, 'FENCED')),
+      dropinExists: existsSync(join(dropinDir, 'zz-deploy-fence.conf')),
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+for (const entry of ARMING_TRAP_CASES) {
+  test(`${entry.name}'s trap does not stop a service it never stopped when the cron fence fails`, () => {
+    // fence_cron wrote the backup and then `crontab` failed: CRON_FENCED is false, the
+    // backup exists, the reboot fence is installed, and nothing has been stopped.
+    const result = runTrapHarness(
+      entry,
+      ['CUTOVER_ARMING=true', 'FENCE_ARMED=false', 'CRON_FENCED=false', 'CRON_BACKUP_CREATED=true'].join('\n'),
+    )
+
+    assert.ok(
+      !/systemctl stop/.test(result.log),
+      `a pre-stop failure must not stop the service — the trap ran: ${result.log}`,
+    )
+    assert.ok(!/install_reboot_fence/.test(result.log), 'nor re-install the reboot fence it is about to remove')
+    assert.ok(!/refence_db_connections/.test(result.log), 'nor revoke CONNECT on a database that was never fenced')
+    assert.match(
+      result.log,
+      /crontab -u appuser \S*crontab\.bak/,
+      'the crontab must be restored from the backup this run took, whatever fence_cron managed to do with it',
+    )
+    assert.equal(result.markerExists, false, 'the reboot-fence marker this run wrote must be removed, or the next boot is refused')
+    assert.equal(result.dropinExists, false, 'and so must the drop-in')
+    assert.match(result.stdout, /BEFORE THE STOP/, 'and the operator must be told which kind of failure this was')
+  })
+
+  test(`${entry.name}'s trap still tears down a POST-stop failure — the pre-stop branch is not a hole`, () => {
+    // The control. Without it, a trap that did nothing at all would pass the test above.
+    const result = runTrapHarness(
+      entry,
+      ['CUTOVER_ARMING=true', 'FENCE_ARMED=true', 'CRON_FENCED=true', 'CRON_BACKUP_CREATED=true'].join('\n'),
+    )
+
+    assert.match(result.log, /systemctl stop/, 'a failure after the stop must re-stop what may have come back')
+    assert.match(result.log, /install_reboot_fence/, 'and re-establish the reboot fence')
+    assert.ok(
+      !/crontab -u appuser \S*crontab\.bak/.test(result.log),
+      'and it must NOT hand the cron writers back to a host with nothing serving',
+    )
+    assert.equal(result.markerExists, true, 'the marker stays: the next run adopts it')
+    assert.match(result.stdout, /AFTER THE STOP/, 'and the banner says so')
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r7, HIGH) — THE DEV-SERVER EXCEPTION REPORTED SUCCESS WITHOUT
+// IDENTIFYING THE RESPONDER.
+//
+// When DEV_SERVER_UNIT was inferred from a selected unit, failing to serve the new
+// BUILD_ID asset only WARNED: the script then cleared the fence, restored cron, set
+// DEPLOY_OK and reported a complete deploy with NEW_BUILD_SERVING still false. But
+// DEV_SERVER_UNIT describes the launcher the run intended to start, not the process that
+// answered the port — so a stale or unrelated listener that won the post-release race
+// passed the health check and was left serving the migrated schema.
+//
+// r6's lesson stands: the dev path may only be made fatal on evidence that actually
+// distinguishes this host's real dev server from a stale listener, which a build id cannot.
+// The evidence is the listener itself — its unit, its working tree, and its age.
+// ---------------------------------------------------------------------------
+
+test('deploy.sh does not finish a dev-server deploy over an unidentified responder', () => {
+  const source = DEPLOY_LINES.filter(isCode).join('\n')
+
+  assert.ok(
+    !/warn "Cannot prove which build is answering/.test(source),
+    'the bare warning that completed the deploy without identifying anything must be gone',
+  )
+  assert.match(source, /^prove_dev_responder\(\) \{$/m, 'the dev path must have a proof of its own')
+
+  // The proof flag is set by the proof and by nothing else.
+  const lines = DEPLOY_LINES
+  const armed = lines
+    .map((line, index) => ({ line, index }))
+    .filter((entry) => isCode(entry.line) && /^\s*DEV_RESPONDER_PROVEN=true\s*$/.test(entry.line))
+  assert.equal(armed.length, 1, 'exactly one place may establish the dev-server proof')
+  let previous = armed[0].index - 1
+  while (previous >= 0 && !isCode(lines[previous])) previous -= 1
+  assert.match(
+    lines[previous],
+    /^\s*if prove_dev_responder; then\s*$/,
+    'and it must be the branch where prove_dev_responder returned zero',
+  )
+
+  // Unproven is fatal, and the fences are still armed when it fires: the die is before
+  // FENCE_ARMED=false, which is the line that ends the teardown window.
+  const die = lines.findIndex((line) => isCode(line) && /die "A development server was expected/.test(line))
+  assert.notEqual(die, -1, 'an unidentified responder on the dev path must be fatal')
+  const disarm = lines.findIndex((line, index) => index > die && isCode(line) && /^FENCE_ARMED=false$/.test(line))
+  assert.notEqual(disarm, -1, 'the teardown window must still be open when it fires')
+
+  // And the point of no return is armed by that proof, not by the unit's kind.
+  const arm = lines.findIndex((line) => isCode(line) && /^\s*PAST_POINT_OF_NO_RETURN=true\s*$/.test(line))
+  previous = arm - 1
+  while (previous >= 0 && !isCode(lines[previous])) previous -= 1
+  assert.match(lines[previous], /\$DEV_RESPONDER_PROVEN/, 'the dev proof is what arms it on that path')
+  assert.ok(
+    !/\$DEV_SERVER_UNIT[^\n]*\|\|[^\n]*PAST_POINT_OF_NO_RETURN|PAST_POINT_OF_NO_RETURN=true[^\n]*DEV_SERVER_UNIT/.test(source),
+    'and being a dev unit must never arm it on its own',
+  )
+})
+
+/**
+ * prove_dev_responder(), run for real against real processes and real /proc data.
+ *
+ * `port_pid` is stubbed — the point is not whether `ss` works — and `systemctl` answers
+ * ControlGroup/MainPID from the fixture. Everything that decides is the shipped code
+ * reading /proc for a process this test actually started.
+ */
+function runResponderProof(options: {
+  appDir: string
+  pid: number
+  cgroup: string
+  mainPid: number
+  startEpoch: number
+}): boolean {
+  const source = DEPLOY_LINES.join('\n')
+  const program = [
+    'set -uo pipefail',
+    "YELLOW=''; RED=''; GREEN=''; BOLD=''; RESET=''",
+    'warn(){ :; }',
+    'ok(){ :; }',
+    'PORT=3000',
+    `APP_DIR_REAL='${options.appDir}'`,
+    'SERVICE_UNITS=(app.service)',
+    `SERVICE_START_EPOCH=${options.startEpoch}`,
+    'DEV_RESPONDER_CLOCK_SLACK=5',
+    'RESPONDER_UNIT=""',
+    `STUB_CGROUP='${options.cgroup}'`,
+    `STUB_MAINPID=${options.mainPid}`,
+    'systemctl(){ case "$*" in *ControlGroup*) echo "$STUB_CGROUP" ;; *MainPID*) echo "$STUB_MAINPID" ;; esac; return 0; }',
+    `port_pid(){ echo ${options.pid}; }`,
+    shellFunction(source, 'proc_start_epoch'),
+    shellFunction(source, 'pid_in_unit_cgroup'),
+    shellFunction(source, 'pid_in_unit_process_tree'),
+    shellFunction(source, 'prove_dev_responder'),
+    'if prove_dev_responder; then echo PROVEN; else echo UNPROVEN; fi',
+  ].join('\n')
+  const out = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  return out.trim().endsWith('PROVEN') && !out.trim().endsWith('UNPROVEN')
+}
+
+test('prove_dev_responder identifies the process on the port, and rejects the ways it can be the wrong one', () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'ims-responder-')))
+  const listener = spawn('sleep', ['30'], { cwd: dir, stdio: 'ignore' })
+  const other = spawn('sleep', ['30'], { cwd: dir, stdio: 'ignore' })
+  try {
+    const pid = listener.pid as number
+    const cgroup = (readFileSync(`/proc/${pid}/cgroup`, 'utf8').split('\n')[0] ?? '').replace(/^\d+::/, '')
+    const now = Math.floor(Date.now() / 1000)
+
+    // The positive control, and it has to pass: a check that can only ever fail would make
+    // every negative below vacuous — and a dev unit that can never complete is the r6 outage.
+    assert.equal(
+      runResponderProof({ appDir: dir, pid, cgroup, mainPid: other.pid as number, startEpoch: now - 3600 }),
+      true,
+      'a listener in the restarted unit, in the app directory, younger than the restart, is the responder',
+    )
+
+    assert.equal(
+      runResponderProof({ appDir: '/opt/some-other-tree', pid, cgroup, mainPid: other.pid as number, startEpoch: now - 3600 }),
+      false,
+      'a listener serving a DIFFERENT working tree is not this deploy (a dev server compiles from its cwd)',
+    )
+
+    assert.equal(
+      runResponderProof({
+        appDir: dir,
+        pid,
+        cgroup: '/system.slice/something-else.service',
+        mainPid: other.pid as number,
+        startEpoch: now - 3600,
+      }),
+      false,
+      'a listener that belongs to no unit this run restarted is not this deploy',
+    )
+
+    assert.equal(
+      runResponderProof({ appDir: dir, pid, cgroup, mainPid: other.pid as number, startEpoch: now + 3600 }),
+      false,
+      'a listener that predates the restart survived the stop, whatever else is true of it',
+    )
+  } finally {
+    listener.kill('SIGKILL')
+    other.kill('SIGKILL')
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r7, HIGH) — AND THE RUNBOOK ASSERTED A GUARANTEE THE CODE DID NOT
+// DELIVER. docs/installation.md said all three scripts require positive proof, that a
+// build-id mismatch is FATAL and that absence of proof fails the deploy. None of it was
+// true on deploy.sh's dev path, and the "mismatch is fatal" line had been wrong about the
+// code since r6 reverted it. A document is not a guarantee; this test ties the two.
+// ---------------------------------------------------------------------------
+
+test('docs/installation.md describes the build-id policy deploy.sh actually implements', () => {
+  const doc = readFileSync(join(process.cwd(), 'docs/installation.md'), 'utf8')
+  const source = DEPLOY_LINES.filter(isCode).join('\n')
+
+  // The code's actual policy: a scraped mismatch warns.
+  assert.ok(!/die "Served BUILD_ID/.test(source) && !/die "The build id scraped/.test(source), 'precondition: a scraped mismatch is not fatal')
+  assert.ok(
+    !/mismatch is\s+\*\*fatal\*\*/.test(doc),
+    'the runbook must not promise a fatal build-id mismatch that deploy.sh warns about',
+  )
+
+  // The escape hatch the runbook names must be one the script reads.
+  const documentedHatch = /IMS_ALLOW_UNIDENTIFIED_DEV_RESPONDER/.test(doc)
+  assert.equal(documentedHatch, true, 'the dev path is fatal, so the runbook must document the one deliberate way past it')
+  assert.match(source, /IMS_ALLOW_UNIDENTIFIED_DEV_RESPONDER/, 'and the script must actually read it')
+
+  // And the phase model the trap implements must be the one the runbook describes.
+  assert.match(doc, /CUTOVER_ARMING/, 'the runbook must describe the reversible pre-stop phase')
+  assert.match(DEPLOY_LINES.join('\n'), /^CUTOVER_ARMING=false$/m, 'which the script must have')
+})

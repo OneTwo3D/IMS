@@ -665,16 +665,42 @@ exit trap deliberately stops tearing the deploy down: the new build is serving, 
 restore must not become an outage plus a database lockout. That is only defensible if the new build
 really *is* the one serving. A health poll proves a socket accepted a request — `deploy.sh`'s
 `HEALTH_PATH` defaults to `/login` and `update.sh`/`install.sh` poll `/api/health`, all of which a
-**stale predecessor still holding the port** answers just as happily. So all three scripts now arm
-the flag only on positive proof:
+**stale predecessor still holding the port** answers just as happily. So the flag is armed only on
+positive proof that the process on the port is the one this run started — and the three scripts do
+not all have the same evidence available, so this is what each of them actually does:
 
-* the `BUILD_ID` in what the health URL served equals the `BUILD_ID` on disk — and a **mismatch is
-  fatal**, not the warning it used to be; or
-* an asset under `/_next/static/<BUILD_ID>/` answers `200`, which only the process whose own build
-  id is that one can do.
+* **The production channel, all three scripts.** An asset under `/_next/static/<BUILD_ID>/` answers
+  `200`. Next matches that prefix against a directory snapshot taken at start-up, so only a process
+  whose own build id is that one can serve it — a `200` is the new code identifying itself. If it
+  does not answer, `update.sh` and `install.sh` fail outright, and so does `deploy.sh` on every
+  launcher except the one below.
+* **The build id scraped from the health page is evidence, not a verdict** — `deploy.sh` only, and
+  it is **not** fatal. It is a regex over whatever HTML that path returns, so a page that embeds no
+  build id, a different one, or one behind a CDN is not proof of a stale predecessor. A mismatch
+  **warns**, arms nothing and fails nothing. Making it fatal was a deterministic post-migration
+  outage on this host: a `next dev` unit answers with the literal build id `development` — eleven
+  characters, so it cleared the scrape's length filter — and the mismatch branch fired on every
+  single run, leaving a migrated schema with nothing serving and the app role locked out
+  (o3d-2sm1.5 r6). If you are reading this expecting "mismatch is fatal", that sentence was wrong
+  about the code for two rounds; this is what the code does.
+* **The development-server channel, `deploy.sh` only.** `detect_service_units` selects any unit
+  whose `WorkingDirectory` resolves to the app directory, and on a stage box that is a `next dev`
+  unit. It is still stopped and drained — it is a live writer into the same database — but it
+  compiles from source and has no production build id to serve, so the asset channel can never arm
+  for it. That is not an exemption: `DEV_SERVER_UNIT` describes the launcher the run *intended*,
+  not the process that answered, and a bare warning there used to complete the deploy with nothing
+  having identified the responder at all. So `deploy.sh` proves the responder's identity directly,
+  and needs **all three** of: the pid listening on the port belongs to a unit this run restarted
+  (its cgroup matches `systemctl show -p ControlGroup`, or it descends from the unit's `MainPID`);
+  its `/proc/<pid>/cwd` is the app directory, which is the tree a dev server compiles from; and it
+  started **after** this run issued `systemctl start`, so it did not survive the stop.
 
-If neither is established the deploy **fails while the trap can still stop the predecessor**, rather
-than reporting success over an old build serving a migrated schema.
+If nothing identifies the responder the deploy **fails while the trap can still stop the
+predecessor**, rather than reporting success over an old build serving a migrated schema. The one
+deliberate way past that is `IMS_ALLOW_UNIDENTIFIED_DEV_RESPONDER=1`, for the case where the
+identity check itself is what is broken on a host: it finishes the run, but it does **not** arm the
+point of no return — so a later failure can still be torn down — and it says so on every line it
+prints.
 
 **The fence is mandatory for an existing database** (o3d-2sm1.4). Earlier revisions treated exit 3
 from `scripts/fence-db-connections.mjs` — "CONNECT was **not** revoked" — as a warning and carried on
@@ -718,6 +744,25 @@ existed — invisible until the next reboot, when the unit failed its assertion 
 box connecting that to a deploy that had "changed nothing". The install now removes exactly what
 **that call** created, and never a fence that was already standing (an adoption, or the exit
 trap's own re-install).
+
+**A failure before the stop is not an outage, and is no longer treated as one** (o3d-2sm1.5). The
+cutover is a four-phase state machine in all three scripts, and the exit trap does something
+different in each:
+
+| Phase | Flag | What the exit trap does |
+| --- | --- | --- |
+| `none` | — | Nothing this run created needs undoing; it just exits. |
+| `arming` | `CUTOVER_ARMING` | Reversible state exists — the reboot-fence drop-in and marker, the fenced crontab — and **nothing has been asked to stop**. The trap **undoes it**: the crontab goes back verbatim from the backup this run took, the drop-in and marker this run wrote are removed, and the service is **not touched**. |
+| `stopping` | `FENCE_ARMED` | A stop has been **attempted** (or a previous run's fence was adopted, which means its stop already happened). The trap re-stops, re-fences, holds the connection fence if the schema moved, and refuses to restart anything. |
+| `serving` | `PAST_POINT_OF_NO_RETURN` | The new build was proven to be the process on the port. Nothing may stop it; a failed cleanup is a note for a human. |
+
+`FENCE_ARMED` used to be raised *before* `fence_cron` and before any stop, so every way cron
+management can fail — an unwritable backup, a failed `chmod`, a broken pipeline, a `crontab` that
+returns non-zero — arrived at the trap looking exactly like a failed migration. The trap then
+**stopped a service nobody had touched**, kept the reboot fence and demanded a recovery, over a
+schema that had not moved and a predecessor that was still healthy: a failure in the cheapest,
+most reversible step running the expensive, outage-causing machinery. The flag is now raised on the
+line before the first `systemctl stop`, and the arming phase is what covers everything earlier.
 
 **A migration needs a unit to fence** (o3d-2sm1.5). With no systemd unit serving the tree the
 install used to warn and return success, so the `|| die` at every call site never fired: the
