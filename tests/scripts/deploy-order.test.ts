@@ -2040,12 +2040,23 @@ function runTrapHarness(
       shellFunction(entry.source, 'unwind_arming'),
       shellFunction(entry.source, entry.trap),
       state,
-      // `(exit 7) || trap` gives the trap the $? a real failure would, and the subshell
-      // absorbs its own `exit` so the harness can still read the files afterwards. The
-      // status is echoed because a trap that dies early — an unbound variable under
+      // PRODUCTION SEMANTICS, WHICH `||` TAKES AWAY (o3d-2sm1.5, Codex r9 MEDIUM).
+      //
+      // This was `( (exit 7) || TRAP ) || TRAP_STATUS=$?`. Bash suppresses errexit for every
+      // command of an AND-OR list except the last, and that suppression is INHERITED by the
+      // whole subshell — so the trap and every helper it called ran with `set -e` disabled,
+      // and a failing cleanup step inside them could not abort the way it does in a real
+      // run. The tests proved the trap's happy path and nothing else.
+      //
+      // So: errexit off in the OUTER harness only, a standalone subshell that turns it back
+      // on and installs the trap the way the script does, `$?` read afterwards, `set -e`
+      // restored. The subshell still absorbs the trap's own `exit` so the files can be read.
+      // The status is echoed because a trap that dies early — an unbound variable under
       // `set -u`, say — otherwise looks exactly like a trap that deliberately did nothing.
-      'TRAP_STATUS=0',
-      `( (exit 7) || ${entry.trap} ) || TRAP_STATUS=$?`,
+      'set +e',
+      `( trap ${entry.trap} EXIT; set -e; exit 7 )`,
+      'TRAP_STATUS=$?',
+      'set -e',
       'echo "TRAP_EXIT=${TRAP_STATUS}"',
     ].join('\n')
     const stdout = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
@@ -2907,3 +2918,628 @@ test('deploy.sh finishes the escape path cleanly when its cleanup succeeds', () 
   assert.ok(!/AFTER THE STOP/.test(result.stdout), 'and print no failure banner')
   assert.match(result.log, /unfence_cron/, 'the cleanup it was covering must actually have run')
 })
+
+// ===========================================================================
+// o3d-2sm1.5, Codex r9 — ATOMIC IN MEMORY IS NOT DURABLE ACROSS A CRASH.
+//
+// r8 made the marker and the crontab backup atomic: a reader never sees a half-written
+// file. That is a different property from durable. `> "$FENCE_FILE"` truncated the
+// authoritative marker before filling it, and the cron backup was renamed with neither its
+// data nor its containing directory flushed — so a power cut published an empty file over
+// the only evidence the next run has, while publication had returned success.
+//
+// Everything below runs the shipped implementations. Where the property is an ORDERING,
+// the order is observed by shimming `sync`, `mv` and `crontab` into one log, because no
+// amount of reading the file back can distinguish "flushed" from "in the page cache".
+// ===========================================================================
+
+const R9_SCRIPTS = [
+  { name: 'deploy.sh', source: DEPLOY_LINES.join('\n'), writer: 'write_fence_marker' },
+  { name: 'update.sh', source: UPDATE_LINES.join('\n'), writer: 'write_fence_marker' },
+  { name: 'install.sh', source: INSTALL_SOURCE, writer: 'write_cutover_marker' },
+] as const
+
+// ---------------------------------------------------------------------------
+// FINDING 5 — the AND-OR harness defect, and the proof that this file no longer has it.
+// ---------------------------------------------------------------------------
+
+/** Run one trap-shaped program and report whether the body after a failure still ran. */
+function errexitReaches(shape: (trap: string) => string): boolean {
+  const program = [
+    'set -euo pipefail',
+    'demo_trap(){ false; echo REACHED_PAST_FAILURE; }',
+    'set +e',
+    shape('demo_trap'),
+    'set -e',
+    'true',
+  ].join('\n')
+  const out = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  return !/REACHED_PAST_FAILURE/.test(out)
+}
+
+test('the trap harnesses in this file run with production errexit semantics', () => {
+  // THE DEFECT, DEMONSTRATED. As the LEFT operand of an AND-OR list, bash suppresses
+  // errexit for the whole subshell — so `false` inside the trap does not abort it and every
+  // assertion about a failing cleanup step is made against semantics no real run has.
+  assert.equal(
+    errexitReaches((trap) => `( (exit 7) || ${trap} ) || TRAP_STATUS=$?`), // errexit-shape-demo
+    false,
+    'the old shape must be shown to suppress errexit, or this test is proving nothing',
+  )
+
+  // THE SHAPE NOW USED, at both sites: a standalone subshell that turns errexit back on and
+  // installs the trap the way the script does, with `$?` read afterwards.
+  assert.equal(
+    errexitReaches((trap) => `( trap ${trap} EXIT; set -e; exit 7 )\nTRAP_STATUS=$?`),
+    true,
+    'the shape the harnesses use must let a failure inside the trap abort it',
+  )
+})
+
+test('no harness in this file makes a trap the left operand of an AND-OR list', () => {
+  // The sweep. r8 corrected this shape at one site and left it at another; the only way it
+  // does not come back a third time is for the file to refuse to contain it.
+  const self = readFileSync(join(process.cwd(), 'tests/scripts/deploy-order.test.ts'), 'utf8')
+  const offenders = self
+    .split(/\r?\n/)
+    .map((line, index) => ({ line, index }))
+    .filter(
+      ({ line }) =>
+        /\(\s*\(\s*exit\s+\d+\s*\)\s*\|\|/.test(line) &&
+        !line.trimStart().startsWith('//') &&
+        // The one legitimate occurrence: the test above BUILDS the defective shape in order
+        // to demonstrate that it suppresses errexit. It is never used to test the scripts.
+        !line.includes('errexit-shape-demo'),
+    )
+  assert.deepEqual(
+    offenders.map(({ index }) => index + 1),
+    [],
+    `an errexit-suppressing trap harness survives at: ${offenders.map((o) => `${o.index + 1}: ${o.line.trim()}`).join('\n')}`,
+  )
+})
+
+// ---------------------------------------------------------------------------
+// FINDING 1 — the marker is published durably, and the last durable one is never truncated.
+// ---------------------------------------------------------------------------
+
+const R9_MARKER_PREAMBLE = (dir: string) => `
+DRY_RUN=false
+BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+CUTOVER_STATE_DIR='${dir}'
+STATE_DIR='${dir}'
+DATA_DIR='${dir}'
+FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
+CRON_BACKUP="\${CUTOVER_STATE_DIR}/crontab-appuser.bak"
+CURRENT_STEP=fence-writers
+CUTOVER_STEP=fence-writers
+APP_USER=appuser
+APP_DIR=/opt/app
+APP_DIR_REAL=/opt/app
+APP_NAME=one-two-inventory
+PORT=3000
+FENCE_MASK=true
+FENCE_ARMED=false
+CUTOVER_ARMING=true
+SCHEMA_TOUCHED=false
+REBOOT_FENCE_INSTALLED=false
+DB_FENCE_UP=false
+BACKUP_FILE=''
+SERVICE_UNITS=(app.service)
+CRON_BACKUP_CREATED=false
+CRON_FENCED=false
+DB_FENCE_STATE="\${CUTOVER_STATE_DIR}/deploy/db-connect-fence.json"
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
+info(){ :; }
+ok(){ :; }
+success(){ :; }
+warn(){ echo "WARN $*"; }
+error(){ echo "ERR $*"; }
+die(){ echo "DIE: $*" >&2; exit 1; }
+`
+
+/** The barrier log: every sync, rename and crontab call, in the order the script made them. */
+const R9_BARRIER_SHIMS = `
+BARRIERS="\${CUTOVER_STATE_DIR}/barriers.log"
+: > "\${BARRIERS}"
+sync(){ echo "sync \$*" >> "\${BARRIERS}"; command sync "\$@"; }
+mv(){ echo "mv \$*" >> "\${BARRIERS}"; command mv "\$@"; }
+crontab(){
+  echo "crontab \$*" >> "\${BARRIERS}"
+  if [[ " \$* " == *" -l "* ]]; then echo "*/5 * * * * /usr/bin/true"; return 0; fi
+  # Drain stdin: the scripts pipe the fenced crontab in, and a shim that does not read it
+  # kills the producing awk with SIGPIPE and fails the pipeline for a reason of our making.
+  cat >/dev/null 2>&1 || true
+  return 0
+}
+`
+
+function runR9(
+  entry: (typeof R9_SCRIPTS)[number],
+  functions: string[],
+  body: string,
+  extra = '',
+): { stdout: string; status: number; dir: string; files: string[]; marker: string | null; barriers: string[] } {
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r9-'))
+  try {
+    const program = [
+      'set -euo pipefail',
+      R9_MARKER_PREAMBLE(dir),
+      extra,
+      ...functions.map((name) => shellFunction(entry.source, name)),
+      body,
+    ].join('\n')
+    let stdout = ''
+    let status = 0
+    try {
+      stdout = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) {
+      const err = error as { status?: number; stdout?: string; stderr?: string }
+      status = err.status ?? -1
+      stdout = `${err.stdout ?? ''}${err.stderr ?? ''}`
+    }
+    const markerPath = join(dir, 'DEPLOY-FENCED')
+    const barrierPath = join(dir, 'barriers.log')
+    return {
+      stdout,
+      status,
+      dir,
+      files: execFileSync('bash', ['-c', `ls -A "${dir}"`], { encoding: 'utf8' }).split('\n').filter(Boolean),
+      marker: existsSync(markerPath) ? readFileSync(markerPath, 'utf8') : null,
+      barriers: existsSync(barrierPath) ? readFileSync(barrierPath, 'utf8').split('\n').filter(Boolean) : [],
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+for (const entry of R9_SCRIPTS) {
+  test(`${entry.name} fsyncs the marker data before the rename and the directory after it`, () => {
+    // THE ORDERING IS THE PROPERTY. Data flushed after the rename can publish a name whose
+    // content is not on the medium; a directory never flushed can lose the name itself,
+    // however well the data was written. Observed, not asserted from the source.
+    const result = runR9(entry, ['fsync_path', 'publish_durable_file', entry.writer], `${entry.writer} "under test"`, R9_BARRIER_SHIMS)
+    assert.equal(result.status, 0, `the writer must succeed:\n${result.stdout}`)
+
+    const dataBarrier = result.barriers.findIndex((line) => /^sync .*DEPLOY-FENCED\.\w+$/.test(line))
+    const rename = result.barriers.findIndex((line) => /^mv -f .*DEPLOY-FENCED\.\w+ .*DEPLOY-FENCED$/.test(line))
+    const dirBarrier = result.barriers.findIndex((line) => new RegExp(`^sync ${result.dir}$`).test(line))
+
+    assert.notEqual(dataBarrier, -1, `the temporary must be fsynced: ${result.barriers.join(' | ')}`)
+    assert.notEqual(rename, -1, `and published by rename: ${result.barriers.join(' | ')}`)
+    assert.notEqual(dirBarrier, -1, `and the directory fsynced: ${result.barriers.join(' | ')}`)
+    assert.ok(dataBarrier < rename, `the data barrier must precede the rename: ${result.barriers.join(' | ')}`)
+    assert.ok(rename < dirBarrier, `and the directory barrier must follow it: ${result.barriers.join(' | ')}`)
+  })
+
+  test(`${entry.name} leaves the last durable marker untouched when a publish fails`, () => {
+    // THE WHOLE POINT OF NOT TRUNCATING IN PLACE. The first publish succeeds; the second is
+    // broken at the chmod, which is after the temporary has content and before anything is
+    // renamed. What must survive is the FIRST marker, byte for byte — the old writer would
+    // have left an empty file at exactly this instant.
+    const result = runR9(
+      entry,
+      ['fsync_path', 'publish_durable_file', entry.writer],
+      [
+        `${entry.writer} "the durable one"`,
+        'cp "${FENCE_FILE}" "${CUTOVER_STATE_DIR}/expected"',
+        'chmod(){ return 1; }',
+        'RC=0',
+        `${entry.writer} "the one that fails" || RC=$?`,
+        'echo "RC=${RC}"',
+        'cmp -s "${FENCE_FILE}" "${CUTOVER_STATE_DIR}/expected" && echo MARKER_INTACT || echo MARKER_LOST',
+      ].join('\n'),
+    )
+
+    assert.match(result.stdout, /RC=1/, `a publish that cannot complete must report failure:\n${result.stdout}`)
+    assert.match(result.stdout, /MARKER_INTACT/, `and the last durable marker must survive it:\n${result.stdout}`)
+    assert.ok(
+      result.marker !== null && /^marker_complete=1$/m.test(result.marker),
+      'and it is still a complete marker, not a truncated one',
+    )
+    assert.deepEqual(
+      result.files.filter((name) => name.startsWith('DEPLOY-FENCED.')),
+      [],
+      `and no temporary may be left behind: ${result.files.join(', ')}`,
+    )
+  })
+
+  test(`${entry.name} ends every published marker with the completeness sentinel`, () => {
+    const result = runR9(entry, ['fsync_path', 'publish_durable_file', entry.writer], `${entry.writer} "under test"`)
+    assert.ok(result.marker !== null, 'the marker must be published')
+    const lines = (result.marker ?? '').split('\n').filter(Boolean)
+    assert.equal(
+      lines[lines.length - 1],
+      'marker_complete=1',
+      `the sentinel must be the LAST line, or it proves nothing about the lines above it:\n${result.marker}`,
+    )
+  })
+
+  test(`${entry.name} fsyncs the crontab backup and its directory BEFORE it touches the crontab`, () => {
+    // The r8 verification read the backup back and called that proof. Read-back is satisfied
+    // by the page cache: a power loss after the crontab has been fenced can reboot with the
+    // backup missing while publication returned success, and the resume then restores an
+    // empty crontab or leaves cron commented out for ever.
+    const result = runR9(
+      entry,
+      ['fsync_path', 'publish_cron_backup', 'fence_cron'],
+      'fence_cron',
+      [R9_BARRIER_SHIMS, 'DRY_RUN=false', 'step(){ :; }', 'header(){ :; }'].join('\n'),
+    )
+    assert.equal(result.status, 0, `fence_cron must succeed:\n${result.stdout}`)
+
+    const dataBarrier = result.barriers.findIndex((line) => /^sync .*crontab-appuser\.bak\.\w+$/.test(line))
+    const rename = result.barriers.findIndex((line) => /^mv -f .*crontab-appuser\.bak\.\w+ .*crontab-appuser\.bak$/.test(line))
+    const dirBarrier = result.barriers.findIndex((line) => new RegExp(`^sync ${result.dir}$`).test(line))
+    const install = result.barriers.findIndex((line) => /^crontab -u appuser (?!-l)/.test(line))
+
+    assert.notEqual(dataBarrier, -1, `the temporary backup must be fsynced: ${result.barriers.join(' | ')}`)
+    assert.notEqual(rename, -1, `and published by rename: ${result.barriers.join(' | ')}`)
+    assert.notEqual(dirBarrier, -1, `and the directory fsynced: ${result.barriers.join(' | ')}`)
+    assert.notEqual(install, -1, `and the fenced crontab actually installed: ${result.barriers.join(' | ')}`)
+    assert.ok(dataBarrier < rename, `data barrier before the rename: ${result.barriers.join(' | ')}`)
+    assert.ok(rename < dirBarrier, `directory barrier after it: ${result.barriers.join(' | ')}`)
+    assert.ok(
+      dirBarrier < install,
+      `and BOTH barriers before the crontab is written — otherwise the fence outlives its backup: ${result.barriers.join(' | ')}`,
+    )
+  })
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 1 (adoption half) — a marker with no completeness sentinel is UNKNOWN, not false.
+// ---------------------------------------------------------------------------
+
+for (const entry of R8_CASES) {
+  test(`${entry.name} adopts a truncated marker as a possible migration, not as a clean stop`, () => {
+    // Exactly what the pre-r9 in-place writer left behind when it was killed between the
+    // truncation and the last line: a phase it cannot read, and a schema flag that is simply
+    // absent. Adoption used to default that flag to false and RELEASE the connection fence.
+    const result = runAdoption(entry, 'phase=stopping\nmigration_attempted=true\n', 'PREDECESSOR_ACTIVE=true')
+
+    assert.equal(result.status, 0, `adoption must succeed:\n${result.stdout}`)
+    assert.ok(
+      !/release_db_connections/.test(result.log),
+      `the connection fence must never be released on the strength of a line that was never written: ${result.log}`,
+    )
+    if (entry.name !== 'install.sh') {
+      // install.sh re-fences through fence_db_connections and only when a fence state file
+      // is present; the other two carry a dedicated adoption path.
+      assert.match(result.log, /adopt_db_connections/, `the fence must be HELD over a schema that may have moved:\n${result.log}`)
+    }
+    assert.match(result.stdout, /AFTER_SCHEMA_TOUCHED=true/, 'and the unknown must be carried forward as "it may have moved"')
+    assert.match(result.stdout, /marker_complete=1/, 'and the operator must be told why this marker was read the expensive way')
+  })
+
+  test(`${entry.name} still releases the fence for a COMPLETE marker that says nothing moved`, () => {
+    // THE CONTROL, and the reason this is not just "always hold": a revoke nobody undoes is
+    // an application that cannot reach its database at all. The only difference from the
+    // test above is the sentinel.
+    const result = runAdoption(
+      entry,
+      completeMarker('phase=stopping\nmigration_attempted=true\nschema_touched=false\n'),
+      'PREDECESSOR_ACTIVE=true',
+    )
+
+    assert.equal(result.status, 0, `adoption must succeed:\n${result.stdout}`)
+    assert.match(result.log, /release_db_connections/, `a complete marker saying nothing moved must release:\n${result.log}`)
+    assert.ok(!/adopt_db_connections/.test(result.log), 'and must not hold a fence over a schema that never moved')
+    assert.match(result.stdout, /AFTER_SCHEMA_TOUCHED=false/, 'and carry the fact forward as written')
+  })
+
+  test(`${entry.name} does not resume an interrupted arming it cannot read in full`, () => {
+    // The arming resume is the one path that leaves a predecessor running, and it is gated
+    // on schema_touched=false. A truncated marker cannot supply that, so it must fall
+    // through to the ordinary adoption — which stops and re-fences.
+    const result = runAdoption(entry, 'phase=arming\nmigration_attempted=true\n', 'PREDECESSOR_ACTIVE=true')
+
+    assert.match(result.log, /systemctl stop/, `an unreadable arming must be adopted conservatively:\n${result.log}`)
+    assert.match(result.log, /install_reboot_fence/, 'and the reboot fence re-established')
+    assert.equal(result.markerExists, true, 'and the marker kept')
+  })
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 4 — the `stopping` transition is written down BEFORE the stop is asked for.
+// ---------------------------------------------------------------------------
+
+for (const [name, lines] of [
+  ['deploy.sh', DEPLOY_LINES],
+  ['update.sh', UPDATE_LINES],
+  ['install.sh', INSTALL_LINES],
+] as const) {
+  test(`${name} persists phase=stopping before it asks anything to stop`, () => {
+    // Anchored on the CALL, because `FENCE_ARMED=true` also appears in adoption — where the
+    // stop has already happened and there is nothing to persist ahead of.
+    const persist = lines.findIndex((line) => isCode(line) && /^\s*persist_stop_requested$/.test(line))
+    assert.notEqual(persist, -1, 'the stop phase must persist the transition it has just entered')
+
+    let arm = -1
+    for (let index = persist; index >= 0; index -= 1) {
+      if (isCode(lines[index]) && /^\s*FENCE_ARMED=true$/.test(lines[index])) {
+        arm = index
+        break
+      }
+    }
+    assert.notEqual(arm, -1, 'and it must sit under the flag it is recording')
+    assert.ok(persist - arm <= 6, `the transition must be persisted immediately after the flag, not ${persist - arm} lines later`)
+
+    const stopBetween = codeLine(lines, /systemctl stop/, arm)
+    assert.ok(
+      stopBetween === -1 || stopBetween > persist,
+      'nothing may be stopped between raising the flag in memory and writing it to disk',
+    )
+    const stopAfter = codeLine(lines, /systemctl stop/, persist)
+    assert.notEqual(stopAfter, -1, 'and the stop must actually follow it')
+  })
+}
+
+for (const entry of R9_SCRIPTS) {
+  test(`${entry.name} records phase=stopping durably, and refuses to stop if it cannot`, () => {
+    // THE TRANSITION, WRITTEN. It used to live in shell memory until some later rewrite —
+    // usually the exit trap, which a SIGKILL never reaches.
+    const written = runR9(
+      entry,
+      ['fsync_path', 'publish_durable_file', entry.writer, 'persist_stop_requested'],
+      ['FENCE_ARMED=true', 'persist_stop_requested', 'echo OK'].join('\n'),
+    )
+    assert.match(written.stdout, /OK/, `persisting the transition must succeed:\n${written.stdout}`)
+    assert.match(written.marker ?? '', /^phase=stopping$/m, `and the marker on disk must say so:\n${written.marker}`)
+    assert.match(written.marker ?? '', /^marker_complete=1$/m, 'as a complete marker')
+
+    // AND THE REFUSAL. If the transition cannot be recorded, nothing may be stopped: a stop
+    // whose interruption leaves no evidence is adopted as an arming and UNWOUND.
+    const refused = runR9(
+      entry,
+      ['fsync_path', 'publish_durable_file', entry.writer, 'persist_stop_requested'],
+      ['FENCE_ARMED=true', 'chmod(){ return 1; }', 'persist_stop_requested', 'echo REACHED_THE_STOP'].join('\n'),
+    )
+    assert.notEqual(refused.status, 0, `an unrecordable transition must abort:\n${refused.stdout}`)
+    assert.ok(!/REACHED_THE_STOP/.test(refused.stdout), `and nothing after it may run: ${refused.stdout}`)
+    assert.match(refused.stdout, /DIE:.*phase=stopping/, 'and it must say what it refused and why')
+  })
+}
+
+for (const entry of R8_CASES) {
+  test(`${entry.name} adopts a persisted stop as a stop even with an unrelated listener on the port`, () => {
+    // THE HARM THE MEMORY-ONLY FLAG CAUSED. With the marker still saying `arming`, adoption
+    // fell through to the liveness heuristic — where ANY listener counts as the predecessor
+    // — and UNWOUND the fences over a service that had already been asked to stop. Here the
+    // unit is down, something else holds the port, and the marker is the only thing that
+    // knows a stop was requested.
+    // PORT (deploy.sh) and APP_PORT (update.sh, install.sh) are the same port under the two
+    // names the scripts use; both are set so the listener is visible to whichever is read.
+    const listener = [
+      'PREDECESSOR_ACTIVE=false',
+      'PORT=3000',
+      'APP_PORT=3000',
+      'ss(){ echo "LISTEN 0 511 0.0.0.0:3000 0.0.0.0:*"; return 0; }',
+    ].join('\n')
+    const result = runAdoption(entry, completeMarker('phase=stopping\nmigration_attempted=true\nschema_touched=false\n'), listener)
+
+    assert.match(result.log, /systemctl stop/, `a persisted stop must be adopted by re-stopping:\n${result.log}`)
+    assert.match(result.log, /install_reboot_fence/, 'and by re-establishing the reboot fence')
+    assert.equal(result.markerExists, true, 'and the marker kept — this run owns the fence now')
+    assert.equal(result.backupExists, true, 'and the crontab NOT handed back while nothing is serving')
+    assert.match(result.stdout, /AFTER_FENCE_ARMED=true/, 'the stopping phase is entered')
+    assert.ok(!/INTERRUPTED ARMING/.test(result.stdout), 'and it is never mistaken for an arming')
+  })
+
+  test(`${entry.name} would unwind the same listener if the marker still said arming`, () => {
+    // THE CONTROL THAT MAKES THE TEST ABOVE MEAN SOMETHING. Identical state, identical
+    // unrelated listener; only the persisted phase differs — and it flips the outcome from
+    // "re-stop and re-fence" to "unwind and leave it running". That is exactly what a run
+    // interrupted across the stop used to get.
+    // PORT (deploy.sh) and APP_PORT (update.sh, install.sh) are the same port under the two
+    // names the scripts use; both are set so the listener is visible to whichever is read.
+    const listener = [
+      'PREDECESSOR_ACTIVE=false',
+      'PORT=3000',
+      'APP_PORT=3000',
+      'ss(){ echo "LISTEN 0 511 0.0.0.0:3000 0.0.0.0:*"; return 0; }',
+    ].join('\n')
+    const result = runAdoption(entry, completeMarker('phase=arming\nmigration_attempted=true\nschema_touched=false\n'), listener)
+
+    assert.match(result.stdout, /INTERRUPTED ARMING/, `an arming with a live listener resumes:\n${result.stdout}`)
+    assert.ok(!/systemctl stop/.test(result.log), 'and stops nothing')
+    assert.equal(result.markerExists, false, 'and takes the reversible fence down')
+  })
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 3 — one cutover namespace, and the runbook that says so is now true.
+//
+// deploy.sh kept its marker, cron backup, connection-fence state and lock under
+// /var/lib/ims-deploy while install.sh and update.sh kept theirs under the application data
+// directory — and install.sh's failure banner told the operator that deploy.sh "adopts this
+// fence". Following that instruction after a failed install ran deploy.sh against a
+// namespace holding none of it.
+// ---------------------------------------------------------------------------
+
+/** The right-hand side of one top-level assignment, as the script actually writes it. */
+function assignment(source: string, name: string): string {
+  const match = new RegExp(`^${name}=(.*)$`, 'm').exec(source)
+  assert.notEqual(match, null, `the script must define ${name}`)
+  return (match as RegExpExecArray)[1]
+}
+
+test('all three entrypoints resolve the cutover namespace from the same expression', () => {
+  const resolved = R9_SCRIPTS.map((entry) => assignment(entry.source, 'CUTOVER_STATE_DIR'))
+  assert.equal(
+    new Set(resolved).size,
+    1,
+    `a namespace resolved differently per entrypoint is the defect itself:\n${R9_SCRIPTS.map((e, i) => `${e.name}: ${resolved[i]}`).join('\n')}`,
+  )
+
+  // And every path that decides recovery hangs off it, in the same shape everywhere.
+  for (const key of ['FENCE_FILE', 'CRON_BACKUP', 'DB_FENCE_DIR', 'LOCK_FILE'] as const) {
+    const values = R9_SCRIPTS.map((entry) => assignment(entry.source, key))
+    assert.equal(
+      new Set(values).size,
+      1,
+      `${key} must be the same path in all three:\n${R9_SCRIPTS.map((e, i) => `${e.name}: ${values[i]}`).join('\n')}`,
+    )
+    assert.match(values[0], /\$\{CUTOVER_STATE_DIR\}/, `${key} must derive from the shared namespace, not a private directory`)
+  }
+
+  // The connection-fence state is one level down, and also shared.
+  const fenceStates = R9_SCRIPTS.map((entry) => assignment(entry.source, 'DB_FENCE_STATE'))
+  assert.equal(new Set(fenceStates).size, 1, `DB_FENCE_STATE must be the same path in all three: ${fenceStates.join(' | ')}`)
+
+  // No entrypoint may quietly keep its own.
+  for (const entry of R9_SCRIPTS) {
+    const privatePaths = entry.source
+      .split(/\r?\n/)
+      .filter((line) => /^(FENCE_FILE|CRON_BACKUP|DB_FENCE_STATE|DB_FENCE_DIR|LOCK_FILE)=/.test(line))
+      .filter((line) => !line.includes('${CUTOVER_STATE_DIR}') && !line.includes('${DB_FENCE_DIR}'))
+    assert.deepEqual(privatePaths, [], `${entry.name} still resolves cutover state outside the shared namespace: ${privatePaths}`)
+  }
+})
+
+test('all three entrypoints carry the same durability and namespace primitives, byte for byte', () => {
+  // A fix applied to one script and not the others is how both the AND-OR harness defect and
+  // this namespace split survived a round. Shared text cannot drift silently.
+  for (const name of [
+    'fsync_path',
+    'publish_durable_file',
+    'ensure_cutover_state_dirs',
+    'acquire_cutover_lock',
+    'marker_is_complete',
+    'import_legacy_file',
+    'import_legacy_cutover_state',
+  ]) {
+    const bodies = R9_SCRIPTS.map((entry) => shellFunction(entry.source, name))
+    assert.equal(
+      new Set(bodies).size,
+      1,
+      `${name}() has drifted between the entrypoints:\n${R9_SCRIPTS.map((e, i) => `--- ${e.name} ---\n${bodies[i]}`).join('\n')}`,
+    )
+  }
+
+  // persist_stop_requested differs in exactly one thing: install.sh's writer is named
+  // write_cutover_marker. Normalise that and the rest must be identical too.
+  const stops = R9_SCRIPTS.map((entry) =>
+    shellFunction(entry.source, 'persist_stop_requested').replaceAll('write_cutover_marker', 'write_fence_marker'),
+  )
+  assert.equal(new Set(stops).size, 1, `persist_stop_requested() has drifted:\n${stops.join('\n---\n')}`)
+})
+
+test('install.sh tells the operator to re-run the other two, and they read the marker it names', () => {
+  const banner = INSTALL_LINES.filter((line) => /adopts? this fence|all three read this fence/.test(line)).join('\n')
+  assert.match(banner, /deploy\.sh/, 'the banner must still name the other entrypoints')
+  assert.match(
+    INSTALL_SOURCE,
+    /all three read this fence"\n\s*error\s+"\s*from the same place \(\$\{FENCE_FILE\}\) and adopt it\."/,
+    'and it must name the file they actually read, rather than asserting an interoperability it did not have',
+  )
+  // The claim is only true because ${FENCE_FILE} resolves identically in all three, which the
+  // namespace test above asserts. Named here so the two are not read as independent.
+  assert.equal(
+    new Set(R9_SCRIPTS.map((entry) => assignment(entry.source, 'FENCE_FILE'))).size,
+    1,
+    'and that sentence is a lie unless FENCE_FILE is one path everywhere',
+  )
+})
+
+// Every ordered pair: a marker written by one entrypoint, adopted by another.
+const CROSS_STOPPING_STATE = ['CUTOVER_ARMING=true', 'FENCE_ARMED=true', 'FENCE_MASK=true', 'SCHEMA_TOUCHED=true'].join('\n')
+
+for (const writerEntry of R8_CASES) {
+  for (const adopterEntry of R8_CASES) {
+    test(`a fence left by ${writerEntry.name} is adopted by ${adopterEntry.name}`, () => {
+      // THE RUNBOOK, EXECUTED. The marker is produced by the first script's own writer and
+      // consumed by the second script's own adoption — no fixture text in between, so a
+      // divergence in either would show up here.
+      const marker = runMarkerWriter(writerEntry, CROSS_STOPPING_STATE)
+      assert.match(marker, /^phase=stopping$/m, `${writerEntry.name} must record the stop it made`)
+      assert.match(marker, /^marker_complete=1$/m, 'and publish it complete')
+
+      const result = runAdoption(adopterEntry, marker, 'PREDECESSOR_ACTIVE=true')
+      assert.equal(result.status, 0, `${adopterEntry.name} must adopt it cleanly:\n${result.stdout}`)
+      assert.match(result.log, /systemctl stop/, `${adopterEntry.name} must re-stop what ${writerEntry.name} stopped`)
+      assert.match(result.log, /install_reboot_fence/, 'and re-establish the reboot fence')
+      assert.ok(
+        !/release_db_connections/.test(result.log),
+        `and must NOT release a fence ${writerEntry.name} was right to leave standing: ${result.log}`,
+      )
+      assert.match(result.stdout, /AFTER_SCHEMA_TOUCHED=true/, 'the migration attempt must survive the hand-off')
+      assert.equal(result.markerExists, true, 'and the marker stays: the adopter owns the fence now')
+    })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The legacy namespace: state left by a checkout that predates the shared one.
+// ---------------------------------------------------------------------------
+
+const R9_LEGACY_STATE = `
+LEGACY_CUTOVER_STATE_DIR="\${CUTOVER_STATE_DIR}/legacy"
+LEGACY_FENCE_FILE="\${LEGACY_CUTOVER_STATE_DIR}/FENCED"
+LEGACY_CRON_BACKUP="\${LEGACY_CUTOVER_STATE_DIR}/crontab-appuser.bak"
+LEGACY_DB_FENCE_STATE="\${LEGACY_CUTOVER_STATE_DIR}/db-connect-fence.json"
+DB_FENCE_DIR="\${CUTOVER_STATE_DIR}/deploy"
+mkdir -p "\${LEGACY_CUTOVER_STATE_DIR}"
+printf 'phase=stopping\\nmigration_attempted=true\\nschema_touched=true\\n' > "\${LEGACY_FENCE_FILE}"
+printf '*/5 * * * * /usr/bin/true\\n' > "\${LEGACY_CRON_BACKUP}"
+printf '{"grants":[]}\\n' > "\${LEGACY_DB_FENCE_STATE}"
+chown(){ :; }
+`
+
+for (const entry of R9_SCRIPTS) {
+  test(`${entry.name} imports a fence left at deploy.sh's pre-r9 paths before it adopts anything`, () => {
+    const result = runR9(
+      entry,
+      ['fsync_path', 'publish_durable_file', 'ensure_cutover_state_dirs', 'import_legacy_file', 'import_legacy_cutover_state'],
+      [
+        'import_legacy_cutover_state',
+        'echo "MARKER=$(cat "${FENCE_FILE}" 2>/dev/null | tr "\\n" ";")"',
+        'echo "CRON=$(cat "${CRON_BACKUP}" 2>/dev/null)"',
+        'echo "DBSTATE=$(cat "${DB_FENCE_STATE}" 2>/dev/null)"',
+        '[[ -e "${LEGACY_FENCE_FILE}" ]] && echo LEGACY_MARKER_REMAINS || echo LEGACY_MARKER_MOVED',
+      ].join('\n'),
+      R9_LEGACY_STATE,
+    )
+
+    assert.equal(result.status, 0, `the import must succeed:\n${result.stdout}`)
+    assert.match(result.stdout, /MARKER=phase=stopping;/, `the marker must arrive at the shared path:\n${result.stdout}`)
+    assert.match(result.stdout, /CRON=\*\/5 \* \* \* \* \/usr\/bin\/true/, 'and the crontab backup with it')
+    assert.match(result.stdout, /DBSTATE=\{"grants":\[\]\}/, 'and the recorded grants, or the fence can never be released')
+    assert.match(result.stdout, /LEGACY_MARKER_MOVED/, 'and nothing may be left at the old path for a later run to adopt twice')
+  })
+
+  test(`${entry.name} refuses to guess when both namespaces hold a fence`, () => {
+    // Two interrupted runs, one in each namespace. Choosing between them would silently
+    // discard a crontab backup or a set of recorded grants nothing else can reconstruct.
+    const result = runR9(
+      entry,
+      ['fsync_path', 'publish_durable_file', 'ensure_cutover_state_dirs', 'import_legacy_file', 'import_legacy_cutover_state'],
+      ['printf "phase=stopping\\n" > "${FENCE_FILE}"', 'import_legacy_cutover_state', 'echo REACHED_ADOPTION'].join('\n'),
+      R9_LEGACY_STATE,
+    )
+
+    assert.notEqual(result.status, 0, `a run that cannot tell which fence is standing must stop:\n${result.stdout}`)
+    assert.ok(!/REACHED_ADOPTION/.test(result.stdout), `and adopt nothing: ${result.stdout}`)
+    assert.match(result.stdout, /DIE:.*Refusing to guess/, 'and say exactly what it refused')
+    assert.match(result.stdout, /Nothing has been stopped/, 'and that nothing has happened yet')
+  })
+
+  test(`${entry.name} does nothing at all when there is no legacy namespace`, () => {
+    // The overwhelmingly common case, and it must be silent and free.
+    const result = runR9(
+      entry,
+      ['fsync_path', 'publish_durable_file', 'ensure_cutover_state_dirs', 'import_legacy_file', 'import_legacy_cutover_state'],
+      ['import_legacy_cutover_state', 'echo DONE'].join('\n'),
+      [
+        'LEGACY_CUTOVER_STATE_DIR="${CUTOVER_STATE_DIR}/legacy"',
+        'LEGACY_FENCE_FILE="${LEGACY_CUTOVER_STATE_DIR}/FENCED"',
+        'LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-appuser.bak"',
+        'LEGACY_DB_FENCE_STATE="${LEGACY_CUTOVER_STATE_DIR}/db-connect-fence.json"',
+        'DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"',
+      ].join('\n'),
+    )
+
+    assert.equal(result.status, 0, `it must succeed:\n${result.stdout}`)
+    assert.match(result.stdout, /DONE/, 'and return')
+    assert.ok(!/Imported/.test(result.stdout), `and claim no import: ${result.stdout}`)
+    assert.equal(result.marker, null, 'and create no marker out of nothing')
+  })
+}
