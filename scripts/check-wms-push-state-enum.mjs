@@ -10,11 +10,23 @@
  * first of them refuse instead of shipping a build whose first lapsed create claim fails at the
  * database and keeps failing on every later sweep.
  *
- * Deliberately narrow and cheap: one query against pg_enum, no Prisma engine, no migration state.
- * It answers the single question "can this build write what it is about to write?".
+ * Deliberately narrow and cheap: one catalogue query, no Prisma engine, no migration state. It
+ * answers the single question "can this build write what it is about to write?".
+ *
+ * The query is the SHARED, COLUMN-ANCHORED one — it starts at `wms_order_push_links.state` and
+ * reads the labels of the type that column is actually declared as, never matching a type by name.
+ * A name-keyed check is satisfied by any same-named enum anywhere in the database, and since all
+ * three gates asked the same question, one wrong query was a common-mode bypass of all of them.
  */
 
 import { config as loadDotenv } from 'dotenv'
+
+import {
+  pgSearchPathOptions,
+  WMS_PUSH_STATE_COLUMN,
+  WMS_PUSH_STATE_ENUM_LABELS_SQL,
+  WMS_PUSH_STATE_TABLE,
+} from '../lib/domain/wms/push-state-enum-query.mjs'
 
 loadDotenv({ path: '.env.local', override: false, quiet: true })
 loadDotenv({ path: '.env', override: false, quiet: true })
@@ -31,18 +43,22 @@ if (!databaseUrl) {
 }
 
 const { Client } = await import('pg')
-const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 10_000 })
+// Prisma reads `?schema=` from the URL and sets search_path from it; `pg` does not. The shared
+// statement resolves the table through the asking connection's search path on purpose, so this
+// out-of-process check aligns itself with the process it is vouching for.
+const client = new Client({
+  connectionString: databaseUrl,
+  connectionTimeoutMillis: 10_000,
+  ...pgSearchPathOptions(databaseUrl),
+})
 
 let labels
 try {
   await client.connect()
-  const result = await client.query(
-    'SELECT e.enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = $1',
-    [ENUM],
-  )
+  const result = await client.query(WMS_PUSH_STATE_ENUM_LABELS_SQL, [WMS_PUSH_STATE_TABLE, WMS_PUSH_STATE_COLUMN])
   labels = result.rows.map((row) => row.enumlabel)
 } catch (error) {
-  console.error(`FAIL ${ENUM}: could not read the enum (${error instanceof Error ? error.message : String(error)}).`)
+  console.error(`FAIL ${ENUM}: could not read the enum ${WMS_PUSH_STATE_TABLE}.${WMS_PUSH_STATE_COLUMN} is declared as (${error instanceof Error ? error.message : String(error)}).`)
   console.error('An unreadable catalogue is not a clean one — see o3d-1izw.')
   process.exit(1)
 } finally {
@@ -51,7 +67,8 @@ try {
 
 const missing = REQUIRED.filter((value) => !labels.includes(value))
 if (missing.length > 0) {
-  console.error(`FAIL ${ENUM}: this database is missing ${missing.join(', ')}.`)
+  console.error(`FAIL ${ENUM}: the type ${WMS_PUSH_STATE_TABLE}.${WMS_PUSH_STATE_COLUMN} is declared as is missing ${missing.join(', ')}.`)
+  console.error('(Read from that column\'s own catalogue entry — a same-named enum elsewhere in the database does not count.)')
   console.error(`Migration ${MIGRATION} has not been applied here. The WMS order-push sweep will refuse to run`)
   console.error('until it is. Apply it with:')
   console.error('  npx prisma migrate deploy --schema prisma/schema.prisma')
@@ -60,4 +77,4 @@ if (missing.length > 0) {
   process.exit(1)
 }
 
-console.log(`PASS ${ENUM}: ${REQUIRED.join(', ')} present.`)
+console.log(`PASS ${ENUM}: ${REQUIRED.join(', ')} present on the type ${WMS_PUSH_STATE_TABLE}.${WMS_PUSH_STATE_COLUMN} is declared as.`)

@@ -8,7 +8,12 @@ import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCrea
 import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere } from './create-eligibility'
 import { scrubWmsError } from './error-scrub'
 import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
-import { createWmsPushStateSchemaGate, WMS_PUSH_STATE_ENUM } from './push-state-schema-gate'
+import {
+  createWmsPushStateSchemaGate,
+  WMS_PUSH_STATE_COLUMN,
+  WMS_PUSH_STATE_ENUM_LABELS_SQL,
+  WMS_PUSH_STATE_TABLE,
+} from './push-state-schema-gate'
 
 /**
  * Connector-agnostic outbound order-push sweep (Phase 8). Pushes IMS sales
@@ -2122,20 +2127,26 @@ export async function runWmsOrderPushSweepCore(
 }
 
 /**
- * The database's OWN vocabulary for the push-state enum — read from `pg_enum`, not from the
+ * The database's OWN vocabulary for the push-state enum — read from the catalogue, not from the
  * generated client, because it is precisely the disagreement between the two that this answers.
  *
- * A type that does not exist yields no rows, which the gate treats as "every required value is
- * missing" — the same refusal, which is right: a database with no `WmsOrderPushState` at all is
- * further behind, not closer.
+ * ASKED OF THE COLUMN, NOT OF A TYPE NAME. The statement is the shared, column-anchored one: it
+ * starts at `wms_order_push_links.state` and reads the labels of whatever type `pg_attribute` says
+ * that column is declared as. An earlier version matched the type BY NAME instead, which unions the
+ * labels of every same-named type in the database and so could be satisfied by an enum in a schema
+ * nothing writes to. This runs on the Prisma pool — the same connection the create claim's
+ * INSERT runs on — so `to_regclass` resolves the table through the writer's own search path.
+ *
+ * No such table, no such column, or a column whose type is not an enum all yield no rows, which the
+ * gate treats as "every required value is missing". That is the right refusal: a database that
+ * cannot even be asked is further behind than one that answers no.
  */
 async function readWmsPushStateEnumValues(): Promise<string[]> {
-  const rows = await db.$queryRaw<Array<{ enumlabel: string }>>`
-    SELECT e.enumlabel AS "enumlabel"
-    FROM pg_enum e
-    JOIN pg_type t ON t.oid = e.enumtypid
-    WHERE t.typname = ${WMS_PUSH_STATE_ENUM}
-  `
+  const rows = await db.$queryRawUnsafe<Array<{ enumlabel: string }>>(
+    WMS_PUSH_STATE_ENUM_LABELS_SQL,
+    WMS_PUSH_STATE_TABLE,
+    WMS_PUSH_STATE_COLUMN,
+  )
   return rows.map((row) => row.enumlabel)
 }
 

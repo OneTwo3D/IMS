@@ -16,8 +16,11 @@
  * because the runtime never reads it.
  *
  * WHAT IT LOOKS LIKE NOW. The gate below is asked BEFORE the sweep touches anything, and again at
- * the write site that mints the value. It answers from one query against `pg_enum`, and its
- * refusal is a named error carrying the issue id and the exact remedy. So the incompatibility is
+ * the write site that mints the value. It answers from one catalogue query — the shared, COLUMN-
+ * ANCHORED statement in ./push-state-enum-query.mjs, which starts at `wms_order_push_links.state`
+ * and reads the labels of whatever type that column is actually declared as, so a same-named enum
+ * in another schema cannot vouch for it — and its refusal is a named error carrying the issue id
+ * and the exact remedy. So the incompatibility is
  * LOUD (a distinct error class, not a driver message), EARLY (before a claim, a connector call or
  * any write — the sweep does no work at all on an unmigrated database rather than corrupting a
  * link half way through) and ONCE (one refusal per sweep instead of one per lapsed claim, and one
@@ -35,7 +38,24 @@
  * heal, with no restart.
  */
 
-/** The enum whose values this gate is about. */
+/**
+ * The ONE query every gate asks, and the table/column it is anchored at. Re-exported here so the
+ * three callers reach the rule and the statement through a single import, and so a reader of the
+ * gate can see that the question is asked of a column rather than of a type name.
+ */
+export {
+  pgSearchPathOptions,
+  WMS_PUSH_STATE_COLUMN,
+  WMS_PUSH_STATE_ENUM_LABELS_SQL,
+  WMS_PUSH_STATE_TABLE,
+} from './push-state-enum-query.mjs'
+
+/**
+ * The enum whose values this gate is about — for the REFUSAL TEXT only.
+ *
+ * Deliberately not used to find the type: identifying an enum by name is exactly the bypass the
+ * column-anchored query above exists to close. It names the thing a person has to go and look at.
+ */
 export const WMS_PUSH_STATE_ENUM = 'WmsOrderPushState'
 
 /** The migration that adds them, named in the refusal so the remedy is copy-pasteable. */

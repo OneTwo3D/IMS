@@ -14,7 +14,11 @@ import { checkFileScanHealth, type FileScanResult } from '@/lib/security/file-sc
 import { RETIRED_ENV_VARS } from '@/lib/ops/retired-env-vars'
 import {
   missingWmsPushStates,
+  pgSearchPathOptions,
+  WMS_PUSH_STATE_COLUMN,
   WMS_PUSH_STATE_ENUM,
+  WMS_PUSH_STATE_ENUM_LABELS_SQL,
+  WMS_PUSH_STATE_TABLE,
   wmsPushStateSchemaRefusal,
 } from '@/lib/domain/wms/push-state-schema-gate'
 
@@ -39,9 +43,9 @@ type PreflightOptions = {
   scanHealth?: (env: Env) => Promise<FileScanResult>
   dbConnect?: (databaseUrl: string) => Promise<void>
   /**
-   * o3d-1izw: the database's OWN labels for the WMS push-state enum. Injected so the check is
-   * testable without a server; the default reads `pg_enum` over the same connection string the
-   * connectivity check uses.
+   * o3d-1izw: the database's OWN labels for the type `wms_order_push_links.state` is declared as.
+   * Injected so the check is testable without a server; the default asks the SHARED, column-
+   * anchored statement over the same connection string the connectivity check uses.
    */
   readWmsPushStates?: (databaseUrl: string) => Promise<readonly string[]>
 }
@@ -220,6 +224,10 @@ async function checkDatabaseConnectivity(
 /**
  * o3d-1izw — CAN THIS BUILD WRITE WHAT IT IS ABOUT TO WRITE?
  *
+ * Asked of the COLUMN the value would be written to, via the one statement the runtime gate and the
+ * deploy check also use. Identifying the enum by name would let a same-named type in an unrelated
+ * schema pass all three at once — the gates are only independent if the question is right.
+ *
  * A deploy that applied its migrations cannot fail this. A deploy that skipped them can, and so can
  * an environment served straight from a working tree — the two ways this branch reaches a database
  * that has never heard of `AMBIGUOUS_CREATE`. Without it the discovery is made by Postgres, inside
@@ -244,12 +252,20 @@ async function checkWmsPushStateSchema(
       labels = await readWmsPushStates(databaseUrl)
     } else {
       const { Client } = await import('pg')
-      const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 })
+      // The search path is aligned with Prisma's deliberately: this check opens its OWN connection,
+      // and the shared statement resolves the table through whatever search path the asking
+      // connection has. A preflight that resolved `wms_order_push_links` to a different table from
+      // the application it is vouching for would be answering about the wrong object.
+      const client = new Client({
+        connectionString: databaseUrl,
+        connectionTimeoutMillis: 5_000,
+        ...pgSearchPathOptions(databaseUrl),
+      })
       try {
         await client.connect()
         const result = await client.query<{ enumlabel: string }>(
-          'SELECT e.enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = $1',
-          [WMS_PUSH_STATE_ENUM],
+          WMS_PUSH_STATE_ENUM_LABELS_SQL,
+          [WMS_PUSH_STATE_TABLE, WMS_PUSH_STATE_COLUMN],
         )
         labels = result.rows.map((row) => row.enumlabel)
       } finally {
@@ -258,7 +274,7 @@ async function checkWmsPushStateSchema(
     }
   } catch {
     // An unreadable catalogue is not a clean one.
-    add(checks, 'fail', 'wms-push-state-schema', WMS_PUSH_STATE_ENUM, `Could not read the ${WMS_PUSH_STATE_ENUM} enum, so it cannot be confirmed present. Release gate: o3d-1izw.`)
+    add(checks, 'fail', 'wms-push-state-schema', WMS_PUSH_STATE_ENUM, `Could not read the enum ${WMS_PUSH_STATE_TABLE}.${WMS_PUSH_STATE_COLUMN} is declared as, so ${WMS_PUSH_STATE_ENUM} cannot be confirmed to carry what this build writes. Release gate: o3d-1izw.`)
     return
   }
 
@@ -267,7 +283,7 @@ async function checkWmsPushStateSchema(
     add(checks, 'fail', 'wms-push-state-schema', WMS_PUSH_STATE_ENUM, wmsPushStateSchemaRefusal(missing))
     return
   }
-  add(checks, 'pass', 'wms-push-state-schema', WMS_PUSH_STATE_ENUM, `${WMS_PUSH_STATE_ENUM} carries every value this build writes.`)
+  add(checks, 'pass', 'wms-push-state-schema', WMS_PUSH_STATE_ENUM, `The enum ${WMS_PUSH_STATE_TABLE}.${WMS_PUSH_STATE_COLUMN} is declared as carries every value this build writes.`)
 }
 
 async function checkWritableDirectory(checks: PreflightCheck[], label: string, directory: string): Promise<void> {
