@@ -1249,9 +1249,8 @@ export function assessUnrecordedRelease({
       appRoleConnects: true,
       lines: [
         `No usable connection-fence record (${what}) at ${where}.`,
-        `${appRole} holds CONNECT, and DATABASE_URL itself connected to "${appConnection.database || connectedDatabase}"`,
-        'to prove it rather than a privilege read taken over another connection. THAT IS THE ONLY THING',
-        'THIS RUN CAN PROVE.',
+        `${appRole} holds CONNECT — proven by CONNECTING AS IT over DATABASE_URL to "${appConnection.database || connectedDatabase}",`,
+        'not by a privilege read taken over another connection. THAT IS THE ONLY THING THIS RUN CAN PROVE.',
         'IT IS NOT PROOF THAT NO FENCE IS STANDING (o3d-2sm1.5, Codex r12 HIGH). A fence revokes CONNECT',
         'from EVERY grantee that held it directly — PUBLIC, monitoring, backup, BI, a second application —',
         `and ${appRole} can hold CONNECT through PUBLIC, through role membership or through a manual grant`,

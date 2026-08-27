@@ -7,6 +7,7 @@ import { test } from 'node:test'
 
 import {
   EXIT_ERROR,
+  EXIT_FENCE_STANDING,
   EXIT_FENCE_UNPROVEN,
   EXIT_NOT_FENCEABLE,
   EXIT_OK,
@@ -15,6 +16,7 @@ import {
   STATE_CORRUPT,
   STATE_PRESENT,
   STATE_UNREADABLE,
+  assessDatabaseIdentity,
   assessUnrecordedRelease,
   classifyStateShape,
   doFence,
@@ -23,6 +25,7 @@ import {
   readState,
   assessEffectiveFence,
   assessMigrationRole,
+  parseConnectionIdentity,
   buildMigrationConnectionString,
   listDirectConnectGrantees,
   buildGrantStatements,
@@ -457,7 +460,10 @@ test('the fence refuses to call a database drained while anything is still attac
   const source = readFileSync(join(process.cwd(), 'scripts/fence-db-connections.mjs'), 'utf8')
   const doFence = source.slice(source.indexOf('async function doFence('), source.indexOf('async function doRelease('))
   assert.match(doFence, /Refusing to call the database drained/)
-  assert.match(doFence, /return EXIT_ERROR/)
+  // EXIT_FENCE_STANDING, not EXIT_ERROR: the revokes are committed by the time this is reached,
+  // and the callers' sticky flag has to be able to tell that from a fence that revoked nothing
+  // (o3d-2sm1.5, Codex r13 HIGH).
+  assert.match(doFence, /return EXIT_FENCE_STANDING/)
 })
 
 // ---------------------------------------------------------------------------
@@ -522,6 +528,9 @@ class FakeAdminClient {
       stillConnectsAfter?: boolean
       datacl?: string | null
       releasedDatacl?: string | null
+      connectedDatabase?: string
+      attached?: { pid: number; application_name: string; usename: string }[]
+      throwAfterCommit?: string
     } = {},
   ) {}
 
@@ -551,15 +560,21 @@ class FakeAdminClient {
         ],
       }
     }
+    if (sql.includes('AS connected_database')) {
+      return { rows: [{ connected_database: this.options.connectedDatabase ?? 'imsdb' }] }
+    }
     if (sql.includes('AS still_connects')) {
       this.connectAsks += 1
+      // The second ask is the post-COMMIT one, which is where a failure has to be reported as a
+      // fence that is STANDING rather than as one that never happened.
+      if (this.connectAsks === 2 && this.options.throwAfterCommit) throw new Error(this.options.throwAfterCommit)
       const answer =
         this.connectAsks === 1 ? (this.options.stillConnectsBefore ?? true) : (this.options.stillConnectsAfter ?? false)
       return { rows: [{ still_connects: answer }] }
     }
     if (sql.includes('FROM pg_roles r')) return { rows: [] }
     if (sql.includes('pg_terminate_backend')) return { rows: [] }
-    if (sql.includes('FROM pg_stat_activity')) return { rows: [] }
+    if (sql.includes('FROM pg_stat_activity')) return { rows: this.options.attached ?? [] }
     if (sql.includes('FROM pg_database d WHERE d.datname = $1')) {
       return { rows: [{ datacl: this.options.releasedDatacl ?? null, owner_role: 'owner' }] }
     }
@@ -580,7 +595,10 @@ async function withAdminUrl<T>(run: () => Promise<T>): Promise<T> {
   const previous = process.env.DEPLOY_ADMIN_DATABASE_URL
   const previousApp = process.env.DATABASE_URL
   process.env.DEPLOY_ADMIN_DATABASE_URL = 'postgres://deployadmin@localhost/imsdb'
-  delete process.env.DATABASE_URL
+  // THE APPLICATION'S OWN URL, naming the same database (o3d-2sm1.5, Codex r13 CRITICAL). Every
+  // mode now refuses unless the connection it opened can be SHOWN to be the application's
+  // database, and the admin URL alone cannot show that. It used to be deleted here.
+  process.env.DATABASE_URL = 'postgres://imsapp@localhost/imsdb'
   try {
     return await run()
   } finally {
@@ -857,6 +875,10 @@ test('an application role that connects is not proof that the fence is gone, onl
     appRole: 'imsapp',
     stateFile: '/var/lib/one-two-inventory/deploy/db-connect-fence.json',
     appStillConnects: true,
+    // The application's own connection, observed rather than inferred (r13). Without it there is
+    // no "the application connects" to be bounded, and the verdict is a different refusal.
+    connectedDatabase: 'imsdb',
+    appConnection: { attempted: true, connected: true, database: 'imsdb', error: '' },
   })
   // MUTATION ROUTE: put `exitCode: EXIT_OK, fenceProvenAbsent: true` back into the
   // appStillConnects branch of assessUnrecordedRelease() and both assertions below fail.
@@ -881,6 +903,8 @@ test('an unusable record is left in place, and is still not a released fence', (
     appRole: 'imsapp',
     stateFile: '/var/lib/one-two-inventory/deploy/db-connect-fence.json',
     appStillConnects: true,
+    connectedDatabase: 'imsdb',
+    appConnection: { attempted: true, connected: true, database: 'imsdb', error: '' },
   })
   // MUTATION ROUTE: as above — EXIT_OK in that branch fails the first assertion.
   assert.equal(verdict.exitCode, EXIT_FENCE_UNPROVEN)
@@ -935,7 +959,15 @@ test('--release over a lost record refuses even when the application connects, b
       datacl: '{owner=CTc/owner,=T/owner,imsapp=c/owner}',
       releasedDatacl: '{owner=CTc/owner,=T/owner,imsapp=c/owner}',
     })
-    const code = await withAdminUrl(() => doRelease(client as never, { stateFile, appRole: 'imsapp' }))
+    const code = await withAdminUrl(() =>
+      doRelease(client as never, {
+        stateFile,
+        appRole: 'imsapp',
+        // The application's own connection succeeds — this is the state where BOTH halves agree
+        // that imsapp is back inside, and it is STILL not a released fence (r13 kept r12 whole).
+        probeApplication: async () => ({ attempted: true, connected: true, database: 'imsdb', error: '' }),
+      } as never),
+    )
 
     // MUTATION ROUTE: restore `exitCode: EXIT_OK` in the appStillConnects branch of
     // assessUnrecordedRelease() and the first two assertions fail together.
@@ -968,6 +1000,313 @@ test('--release restores exactly the recorded grantees when the record survived'
       'GRANT CONNECT ON DATABASE "imsdb" TO "imsapp";',
     ])
     assert.equal(existsSync(stateFile), false, 'and the record goes only once the grants are verified back')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r13, CRITICAL) — THE ANSWER WAS NEVER BOUND TO THE APPLICATION'S DATABASE.
+//
+// Every mode but --print-migration-url connects through DEPLOY_ADMIN_DATABASE_URL when it is
+// set, and then asks its questions of current_database() ON THAT CONNECTION while taking the
+// ROLE from DATABASE_URL. Nothing checked that the two were the same place. Point the admin URL
+// at another database on which the application role happens to hold CONNECT — a copy, a
+// `postgres` maintenance database, a staging URL left in the environment — and `--release`
+// answers "the application can connect" about a database the application never uses, exits 4,
+// and the caller permits startup while the real database still denies CONNECT. The health route
+// does not touch the database, so the deploy reports success with the application locked out.
+//
+// Same class as asking the right question of the wrong object. The binding is proven from two
+// directions, and each of these tests isolates ONE of them so that removing it fails one test.
+// ---------------------------------------------------------------------------
+
+test('an admin URL naming a different database from DATABASE_URL is refused even when this connection landed correctly', () => {
+  // MUTATION ROUTE: delete the `admin.database !== app.database` arm from
+  // assessDatabaseIdentity() and this returns bound. The live check below cannot cover it: the
+  // migration runs through a SEPARATE connection composed from the admin URL, so two URLs that
+  // disagree are a refusal on their own merits, whatever this particular connection reached.
+  const verdict = assessDatabaseIdentity({
+    adminUrl: 'postgres://deployadmin@localhost:5432/onetwo3d_ims_copy',
+    appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims',
+    connectedDatabase: 'onetwo3d_ims',
+  })
+
+  assert.equal(verdict.bound, false, 'two URLs naming different databases are not one database')
+  assert.match(verdict.reason, /onetwo3d_ims_copy/, 'and the refusal must name both')
+  assert.match(verdict.reason, /onetwo3d_ims"/)
+})
+
+test('an admin URL on a different server is refused rather than assumed to be the same host renamed', () => {
+  // MUTATION ROUTE: delete the `admin.server !== app.server` arm and this returns bound. A
+  // privilege read on one server says nothing whatever about another.
+  const verdict = assessDatabaseIdentity({
+    adminUrl: 'postgres://deployadmin@db-old.internal:5432/onetwo3d_ims',
+    appUrl: 'postgres://imsapp@db-new.internal:5432/onetwo3d_ims',
+    connectedDatabase: 'onetwo3d_ims',
+  })
+
+  assert.equal(verdict.bound, false, 'the same database name on two servers is two databases')
+  assert.match(verdict.reason, /db-old\.internal/)
+  assert.match(verdict.reason, /db-new\.internal/)
+})
+
+test('a connection attached to a database neither URL asked for is refused', () => {
+  // The admin URL with NO database in its path — it connects to the login role's own default
+  // database, and both URLs look fine while the connection is somewhere else entirely. This is
+  // the case a URL comparison cannot see at all.
+  //
+  // MUTATION ROUTE: delete the `connectedDatabase !== app.database` arm and this returns bound.
+  const verdict = assessDatabaseIdentity({
+    adminUrl: 'postgres://deployadmin@localhost:5432/',
+    appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims',
+    connectedDatabase: 'deployadmin',
+  })
+
+  assert.equal(verdict.bound, false, 'the live attachment is the half a URL cannot prove')
+  assert.match(verdict.reason, /deployadmin/)
+})
+
+test('a loopback address, localhost and a unix socket are the same machine, and are not refused', () => {
+  // The control on the control: a check that refuses every legitimate configuration gets turned
+  // off, and then it protects nothing.
+  //
+  // MUTATION ROUTE: compare the host strings as written — drop the LOCAL_HOSTS/socket family in
+  // parseConnectionIdentity() — and both of these are refused.
+  assert.equal(
+    assessDatabaseIdentity({
+      adminUrl: 'postgres://deployadmin@127.0.0.1:5432/onetwo3d_ims',
+      appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims',
+      connectedDatabase: 'onetwo3d_ims',
+    }).bound,
+    true,
+  )
+  assert.equal(
+    assessDatabaseIdentity({
+      adminUrl: 'postgresql:///onetwo3d_ims?host=/var/run/postgresql',
+      appUrl: 'postgres://imsapp@localhost/onetwo3d_ims',
+      connectedDatabase: 'onetwo3d_ims',
+    }).bound,
+    true,
+    'a socket directory and localhost are the same server on the same default port',
+  )
+  // And the port still separates two clusters on that one machine.
+  assert.equal(
+    assessDatabaseIdentity({
+      adminUrl: 'postgres://deployadmin@localhost:5433/onetwo3d_ims',
+      appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims',
+      connectedDatabase: 'onetwo3d_ims',
+    }).bound,
+    false,
+  )
+})
+
+test('nothing to bind to is not a pass: an unset or database-less DATABASE_URL is refused', () => {
+  // MUTATION ROUTE: return { bound: true } when appUrl is missing — the "there is nothing to
+  // check, so it must be fine" reading — and both of these fail.
+  assert.equal(assessDatabaseIdentity({ adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: '', connectedDatabase: 'imsdb' }).bound, false)
+  assert.equal(
+    assessDatabaseIdentity({ adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: 'postgres://imsapp@localhost/', connectedDatabase: 'imsdb' }).bound,
+    false,
+    'a URL with no database in its path identifies no database',
+  )
+  assert.equal(parseConnectionIdentity('not a url at all').ok, false)
+})
+
+/** Admin and application URLs that do NOT agree — the two-database configuration, at the wire. */
+async function withMismatchedUrls<T>(run: () => Promise<T>): Promise<T> {
+  const previous = process.env.DEPLOY_ADMIN_DATABASE_URL
+  const previousApp = process.env.DATABASE_URL
+  // The fake answers current_database() = 'imsdb', i.e. the admin URL's target — the database on
+  // which imsapp holds CONNECT. The application itself uses onetwo3d_ims, and nothing here can
+  // say anything at all about that one.
+  process.env.DEPLOY_ADMIN_DATABASE_URL = 'postgres://deployadmin@localhost/imsdb'
+  process.env.DATABASE_URL = 'postgres://imsapp@localhost/onetwo3d_ims'
+  try {
+    return await run()
+  } finally {
+    if (previous === undefined) delete process.env.DEPLOY_ADMIN_DATABASE_URL
+    else process.env.DEPLOY_ADMIN_DATABASE_URL = previous
+    if (previousApp === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = previousApp
+  }
+}
+
+test('the fence revokes nothing when the admin connection is not the application\'s database', () => {
+  // TWO DATABASES, and the role connects only to the admin URL's target. Fencing here would lock
+  // other people's clients out of somewhere else while the application went on writing across
+  // the migration, and every verification would be a truthful report about the wrong database.
+  //
+  // MUTATION ROUTE: remove the requireBoundDatabaseIdentity() call from doFence() and this
+  // fences 'imsdb' and returns EXIT_OK with three REVOKEs on the wire.
+  const dir = stateDir()
+  return (async () => {
+    try {
+      const stateFile = join(dir, 'db-connect-fence.json')
+      const client = new FakeAdminClient({ stateFile })
+      const code = await withMismatchedUrls(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+
+      assert.equal(code, EXIT_NOT_FENCEABLE, 'a database that cannot be shown to be the right one is not fenceable')
+      assert.deepEqual(client.revokes, [], 'and NOTHING may be revoked on it')
+      assert.ok(!client.log.includes('BEGIN'), 'the transaction must never be opened')
+      assert.equal(existsSync(stateFile), false, 'and no record may claim a fence over it')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })()
+})
+
+test('a release over an unbound connection refuses instead of reporting the application free', () => {
+  // The CRITICAL exactly: no record, and has_database_privilege() over the ADMIN connection says
+  // imsapp can connect — to 'imsdb'. The application uses onetwo3d_ims, which this run has not
+  // asked about and cannot ask about.
+  //
+  // MUTATION ROUTE: remove the requireBoundDatabaseIdentity() call from doRelease() and this
+  // returns EXIT_FENCE_UNPROVEN (4), which every caller treats as "carry on".
+  return (async () => {
+    const client = new FakeAdminClient({ stillConnectsBefore: true })
+    const code = await withMismatchedUrls(() => doRelease(client as never, { stateFile: '', appRole: '', timeoutSeconds: 1 }))
+
+    assert.equal(code, EXIT_ERROR, 'an unidentified database is a refusal, not an unproven release')
+    assert.notEqual(code, EXIT_FENCE_UNPROVEN, 'and specifically not the code that lets a caller continue')
+    assert.deepEqual(client.grants, [], 'and nothing may be granted on it')
+  })()
+})
+
+test('an unrecorded release proves "the application can connect" by connecting as the application', () => {
+  // The privilege read is taken over the admin connection and answers about the admin
+  // connection's database. The application uses DATABASE_URL. When the two disagree — the read
+  // says CONNECT, the application's own URL is refused — the disagreement IS the finding, and it
+  // must be fatal: the caller is otherwise about to start an application on the weaker answer.
+  //
+  // MUTATION ROUTE: drop the `!appConnection.connected` arm from assessUnrecordedRelease() (or
+  // stop passing the probe from releaseWithoutRecord) and this returns 4.
+  return (async () => {
+    const client = new FakeAdminClient({ stillConnectsBefore: true })
+    let probed = ''
+    const code = await withAdminUrl(() =>
+      doRelease(client as never, {
+        stateFile: '',
+        appRole: '',
+        timeoutSeconds: 1,
+        probeApplication: async (connectionString: string) => {
+          probed = connectionString
+          return { attempted: true, connected: false, database: '', error: 'FATAL: permission denied for database "imsdb"' }
+        },
+      } as never),
+    )
+
+    assert.equal(probed, 'postgres://imsapp@localhost/imsdb', 'the probe must use DATABASE_URL, not the admin URL')
+    assert.equal(code, EXIT_ERROR, 'a privilege read the application itself contradicts is fatal')
+    assert.deepEqual(client.grants, [], 'and nothing is restored on the strength of it')
+  })()
+})
+
+test('an unrecorded release refuses when the application lands on a different database from this run', () => {
+  // MUTATION ROUTE: drop the `appConnection.database !== connectedDatabase` arm and this returns
+  // 4 — "the application can connect", about a database it never uses.
+  return (async () => {
+    const client = new FakeAdminClient({ stillConnectsBefore: true, connectedDatabase: 'imsdb' })
+    const code = await withAdminUrl(() =>
+      doRelease(client as never, {
+        stateFile: '',
+        appRole: '',
+        timeoutSeconds: 1,
+        probeApplication: async () => ({ attempted: true, connected: true, database: 'onetwo3d_ims', error: '' }),
+      } as never),
+    )
+
+    assert.equal(code, EXIT_ERROR, 'two connections on two databases cannot speak for each other')
+  })()
+})
+
+test('an unrecorded release still refuses to call a fence released when the application does connect', () => {
+  // THE CONTROL THAT MUST SURVIVE (r12): even with both halves agreeing, "the application can
+  // connect" is never promoted to "no fence is standing" — PUBLIC, monitoring, backup, BI and a
+  // second application may still be revoked by the same fence, and no record names them.
+  //
+  // MUTATION ROUTE: return EXIT_OK (or EXIT_ERROR) from that branch and this fails.
+  return (async () => {
+    const client = new FakeAdminClient({ stillConnectsBefore: true, connectedDatabase: 'imsdb' })
+    const code = await withAdminUrl(() =>
+      doRelease(client as never, {
+        stateFile: '',
+        appRole: '',
+        timeoutSeconds: 1,
+        probeApplication: async () => ({ attempted: true, connected: true, database: 'imsdb', error: '' }),
+      } as never),
+    )
+
+    assert.equal(code, EXIT_FENCE_UNPROVEN, 'proven connectivity is still not proof that no fence stands')
+    assert.deepEqual(client.grants, [], 'and it grants nothing')
+  })()
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r13, HIGH) — AN EXIT CODE IS NOT EVIDENCE ABOUT WHAT WAS COMMITTED.
+//
+// doFence() COMMITS its REVOKEs and then asks whether the door is actually shut. When the
+// application keeps CONNECT through role membership, or the room will not go quiet, it
+// deliberately LEAVES THEM STANDING so nothing is half-applied — and reported that with the same
+// EXIT_ERROR a failure that revoked nothing returns. The callers raise their sticky "this run
+// raised a fence" flag only on exit 0, so a run holding PUBLIC, monitoring and BI out was
+// recorded as one with no fence to its name.
+//
+// EXIT_FENCE_STANDING means one thing: the revokes are committed and in force.
+// ---------------------------------------------------------------------------
+
+test('a fence that committed its revokes and could not shut the application out says the fence is STANDING', async () => {
+  // MUTATION ROUTE: return EXIT_ERROR from the ineffective-fence branch of completeFence() and
+  // this fails — which is the state the entrypoints could not distinguish.
+  const dir = stateDir()
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    const client = new FakeAdminClient({ stateFile, stillConnectsAfter: true })
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+
+    assert.equal(code, EXIT_FENCE_STANDING, 'the revokes are committed, so this is not "the fence failed"')
+    assert.notEqual(code, EXIT_ERROR, 'and not the code a fence that revoked nothing returns')
+    // Precondition: this really is the post-commit side.
+    assert.ok(client.log.includes('COMMIT'), 'the transaction must have committed for this to be about a standing fence')
+    assert.equal(client.revokes.length, 3, 'and the revokes must be on the wire')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a fence whose room will not go quiet says the fence is STANDING', async () => {
+  // MUTATION ROUTE: return EXIT_ERROR from the drain refusal and this fails.
+  const dir = stateDir()
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    const client = new FakeAdminClient({
+      stateFile,
+      attached: [{ pid: 4242, application_name: 'psql', usename: 'someone' }],
+    })
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+
+    assert.equal(code, EXIT_FENCE_STANDING, 'CONNECT is revoked and standing; the drain is what failed')
+    assert.ok(client.log.includes('COMMIT'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('an error thrown AFTER the commit is a standing fence, not an exception the caller must classify', async () => {
+  // A throw from any post-commit read used to escape doFence() entirely and reach main()'s
+  // catch, which exits 1 — indistinguishable from a fence that revoked nothing, over a database
+  // whose CONNECT had just been taken away.
+  //
+  // MUTATION ROUTE: remove the try/catch around completeFence() and this rejects instead of
+  // returning, failing the test.
+  const dir = stateDir()
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    const client = new FakeAdminClient({ stateFile, throwAfterCommit: 'server closed the connection unexpectedly' })
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+
+    assert.equal(code, EXIT_FENCE_STANDING, 'a throw after COMMIT is still a database with a fence on it')
+    assert.ok(client.log.includes('COMMIT'), 'precondition: the revokes committed before the failure')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
