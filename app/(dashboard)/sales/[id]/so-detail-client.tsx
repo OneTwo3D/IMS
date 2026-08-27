@@ -864,6 +864,7 @@ function ShipmentsPanel({
                     orderStatus: orderStatus,
                     recoveryOutstanding: s.repackRecoveryOutstanding,
                     orderHasCommittedShipment: s.orderHasCommittedShipment,
+                    orderHasUnreopenableCommitment: s.orderHasUnreopenableCommitment,
                   })
                   return (
                     <>

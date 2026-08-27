@@ -187,29 +187,57 @@ export async function scheduleRefundUnmatchedWarningOutbox(
  * Re-running allocation is not side-effect-idempotent (it deletes/recreates
  * OrderAllocation rows and resets staged allocation accounting), so once the
  * immediate attempt has released, the durable backstop's work is done (Codex review
- * r2). Only resolves a still-open (PENDING / RETRYABLE_FAILED) row — a row the drain
- * has already claimed (PROCESSING) or finished is left untouched. Best-effort: if this
- * fails, the drain re-runs the (numerically idempotent) release on the next tick.
+ * r2). Only resolves an UNRESOLVED row (`UNRESOLVED_RELEASE_STATUSES` — including a
+ * dead-lettered PERMANENT_FAILED one, which is the whole point of o3d-2k5r r6: the
+ * in-transaction recovery is now the only thing that can ever clear it) — a row the
+ * drain has already claimed (PROCESSING) or finished is left untouched. Best-effort: if
+ * this fails, the drain re-runs the (numerically idempotent) release on the next tick.
  */
+/**
+ * THE STATUSES THAT MEAN "THIS RELEASE HAS NOT HAPPENED" (o3d-2k5r r4, widened in r6).
+ *
+ * One set, used by BOTH the evidence read that offers the recovery control and the write that
+ * resolves the row when the recovery runs — because a status the reader counts as outstanding but
+ * the resolver refuses to clear is a control that can be pressed and can never go away.
+ *
+ * PENDING / RETRYABLE_FAILED — the drain still owns them; the release is owed.
+ *
+ * PERMANENT_FAILED — the drain has GIVEN UP on them, and that is the strongest evidence of all
+ * (o3d-2k5r r6). The drain refuses while any shipment exists and burns an attempt each time, so an
+ * order stranded long enough dead-letters here; `claimIntegrationOutboxWork` never claims a
+ * PERMANENT_FAILED row again, so nothing else in the system will ever release that reservation.
+ * Excluding it inverted the design's own promise: the orders the resume path was BUILT for — the
+ * ones stranded by the earlier non-transactional shape, which have had the longest to exhaust their
+ * retries — were the exact orders it withheld the control from, leaving stock reserved indefinitely.
+ *
+ * PROCESSING is deliberately NOT here. The drain holds the row and is running the same repair right
+ * now; offering the operator the button then is inviting them to race a worker that already has it,
+ * and a resolver that cleared a claimed row would let the recovery and the drain both believe they
+ * finished it. If the drain fails it returns the row to RETRYABLE_FAILED and the control comes back
+ * on the next read.
+ *
+ * SUCCEEDED is the recovery already done.
+ */
+const UNRESOLVED_RELEASE_STATUSES: string[] = [
+  INTEGRATION_OUTBOX_STATUS.PENDING,
+  INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
+  INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
+]
+
 /**
  * o3d-2k5r r4 — THE DURABLE EVIDENCE THAT A REPACK RECOVERY IS STILL OUTSTANDING.
  *
- * The recovery's third step resolves these rows. So a row still sitting PENDING or
- * RETRYABLE_FAILED for one of this order's refunds is exactly "the refunded units' reservation has
- * not been released for this order yet", committed inside the refund's own transaction and
- * therefore surviving every crash the recovery can suffer. It is what gates the "Finish repack
- * recovery" control, so that control appears only where there is something to finish — and
- * disappears once there is not.
+ * The recovery's third step resolves these rows. So a row still sitting at one of the statuses
+ * above for one of this order's refunds is exactly "the refunded units' reservation has not been
+ * released for this order yet", committed inside the refund's own transaction and therefore
+ * surviving every crash the recovery can suffer. It is what gates the "Finish repack recovery"
+ * control, so that control appears only where there is something to finish — and disappears once
+ * there is not.
  *
  * Deliberately NOT "the order has a PENDING shipment": every order with a draft has one, and
  * offering the control on all of them would be an invitation to re-run a repair that is already
  * done. Nor "an activity-log row exists": logActivity swallows write failures, so its absence
  * proves nothing.
- *
- * A CLAIMED (PROCESSING) row is deliberately NOT counted. The drain holds it, and the drain is
- * running the same repair; the operator offering to do it by hand at that moment would be racing a
- * worker that already has it. If the drain fails it returns the row to RETRYABLE_FAILED and the
- * control comes back on the next read.
  */
 export async function countOutstandingRefundReservationReleases(
   orderId: string,
@@ -228,7 +256,7 @@ export async function countOutstandingRefundReservationReleases(
       connector: REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
       operation: REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
       idempotencyKey: { in: idempotencyKeys },
-      status: { in: [INTEGRATION_OUTBOX_STATUS.PENDING, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED] },
+      status: { in: UNRESOLVED_RELEASE_STATUSES },
     },
   })
 }
@@ -248,9 +276,16 @@ export async function resolveRefundReservationReleaseOutbox(
       connector: REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
       operation: REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
       idempotencyKey,
-      status: { in: [INTEGRATION_OUTBOX_STATUS.PENDING, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED] },
+      status: { in: UNRESOLVED_RELEASE_STATUSES },
     },
-    data: { status: INTEGRATION_OUTBOX_STATUS.SUCCEEDED, lockedAt: null, lockedBy: null },
+    // `nextAttemptAt` is cleared with the rest: a PERMANENT_FAILED row carries null already, and a
+    // RETRYABLE_FAILED one must not keep a due time on a row nothing will drain again.
+    data: {
+      status: INTEGRATION_OUTBOX_STATUS.SUCCEEDED,
+      lockedAt: null,
+      lockedBy: null,
+      nextAttemptAt: null,
+    },
   })
   return count
 }

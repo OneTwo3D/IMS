@@ -289,16 +289,21 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       // o3d-4kfh r6: the `{ status: { in: [...] } }` shape is real — `discardCancelledOrderShipmentsInTx`
       // asks for exactly PENDING/PICKING/PACKED, and a double that ignored it (or answered it with
       // every shipment) could not tell a repair that spares SHIPPED from one that deletes it.
+      // o3d-2k5r r6: `reopenShipmentForRepack` asks for the order's OTHER shipments under the lock
+      // (`id: { not: shipmentId }`). A double that ignored that exclusion would answer with the
+      // shipment being reopened as well — and since a PACKED shipment is not unreopenable, the
+      // sibling check would still pass and the test would prove nothing.
       findMany: async ({ where, select }: {
-        where: { orderId: string; status?: string | { in: string[] } }
+        where: { orderId: string; status?: string | { in: string[] } | { not: string }; id?: { not: string } }
         select?: Record<string, unknown>
       }) => state.shipments
         .filter((shipment) => shipment.orderId === where.orderId)
+        .filter((shipment) => where.id?.not === undefined || shipment.id !== where.id.not)
         .filter((shipment) => {
           if (where.status == null) return true
-          return typeof where.status === 'string'
-            ? shipment.status === where.status
-            : where.status.in.includes(shipment.status)
+          if (typeof where.status === 'string') return shipment.status === where.status
+          if ('not' in where.status) return shipment.status !== where.status.not
+          return where.status.in.includes(shipment.status)
         })
         .map((shipment) => {
           if (select?.lines) return {
@@ -2374,6 +2379,46 @@ test('o3d-2k5: a CANCELLED order takes the discard repair, not the reopen', asyn
   assert.match((result as { error: string }).error, /Discard shipments/)
   assert.equal(state.shipments[0].status, 'PACKED')
   assert.equal(state.activityLogs?.length, 0)
+})
+
+test('o3d-2k5r r6: a DISPATCHED sibling refuses the reopen under the lock, BEFORE the revert is written', async () => {
+  // THE ENTRY TO THE DEAD END, closed at the write path rather than only in the UI. The order has a
+  // packed shipment and an already-dispatched one. Reverting the packed one leaves a draft that
+  // `allocateSalesOrder` will refuse to re-net for as long as the order exists — the dispatched
+  // sibling is not PENDING and can never be reopened — so the revert buys nothing and costs the
+  // order the last state it could still have been dispatched from.
+  const state = packedBeforeRefundState({
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: 'TRACK-1', shippingService: 'DPD' },
+      { id: 'shipment-2', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-2', shippingService: 'DPD' },
+    ],
+  })
+
+  const result = await reopenShipmentForRepack(createClient(state), 'shipment-1', { userId: 'user-1' })
+
+  assert.equal(result.success, false)
+  assert.equal((result as { code?: string }).code, 'UNREOPENABLE_SIBLING')
+  assert.match((result as { error: string }).error, /1 dispatched shipment/)
+  assert.equal(state.shipments[0].status, 'PACKED', 'the refusal is BEFORE the write, not after it')
+  assert.equal(state.activityLogs?.length, 0, 'and nothing tells the warehouse to unpack a box that was never reopened')
+})
+
+test('o3d-2k5r r6: a PACKED sibling does NOT refuse it — that deadlock is what the partial commit exists to break', async () => {
+  // The limit of the guard above, asserted so it cannot quietly widen into "any sibling". Two
+  // packed shipments refuse each other's re-allocation; if the reopen refused here too, neither
+  // could ever go first and the recovery this branch exists for would be unreachable.
+  const state = packedBeforeRefundState({
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: 'TRACK-1', shippingService: 'DPD' },
+      { id: 'shipment-2', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: 'TRACK-2', shippingService: 'DPD' },
+    ],
+  })
+
+  const result = await reopenShipmentForRepack(createClient(state), 'shipment-1', { userId: 'user-1' })
+
+  assert.equal(result.success, true, result.success ? undefined : result.error)
+  assert.equal(state.shipments[0].status, 'PENDING')
+  assert.equal(state.shipments[1].status, 'PACKED', 'and only the one asked for moved')
 })
 
 test('o3d-2k5: the WHOLE recovery — a refund lands after packing, and the order ends up dispatched at the reduced quantity', async () => {

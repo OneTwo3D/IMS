@@ -62,6 +62,13 @@ function makeClient(store: Store) {
     __store: store,
     shipment: {
       findUnique: async ({ where }: { where: { id: string } }) => store.shipments.get(where.id) ?? null,
+      // o3d-2k5r r6: the action re-reads the order's blockers under the lock after a refusal, so
+      // the double has to answer the same query the real client does — including the
+      // `status: { not: 'PENDING' }` filter, or the test would pass on a read that found nothing.
+      findMany: async ({ where }: { where: { orderId: string; status?: { not: string } } }) =>
+        [...store.shipments.values()].filter((row) =>
+          row.orderId === where.orderId
+          && (where.status?.not === undefined || row.status !== where.status.not)),
       update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
         const row = store.shipments.get(where.id)
         if (!row) throw new Error(`no shipment ${where.id}`)
@@ -217,9 +224,13 @@ function allocationRan(over: Record<string, unknown> = {}) {
   }
 }
 
-function reset(shipmentStatus: string) {
+function reset(shipmentStatus: string, siblingStatuses: string[] = []) {
   committed = emptyStore()
   committed.shipments.set('ship-1', { id: 'ship-1', orderId: 'so-1', status: shipmentStatus })
+  siblingStatuses.forEach((status, i) => {
+    const id = `ship-sib-${i + 1}`
+    committed.shipments.set(id, { id, orderId: 'so-1', status })
+  })
   committed.refunds.push({ id: 'refund-1', orderId: 'so-1' })
   state.reopenClient = null
   state.allocClient = null
@@ -287,7 +298,9 @@ test('o3d-2k5r r3: a REFUSED re-allocation KEEPS the reopen — otherwise two pa
   // shipments A and B both packed, `refuseIfCommittedShipmentsExist` refuses A because B is
   // committed and refuses B because A is; rolling back on refusal would make the order permanently
   // unrecoverable. The operator reopens the other one and THAT transaction nets the whole order.
-  reset('PACKED')
+  // o3d-2k5r r6: the blocker is seeded, and it is PACKED — the partial commit is justified by the
+  // deadlock two reopenable shipments create, so the test has to be in that state to claim it.
+  reset('PACKED', ['PACKED'])
   state.allocResult = { success: false, refused: true, syncProductIds: [], allocationCount: 0, unallocatedLines: [], unallocatedQty: 0, backorderLineCount: 0 }
   const result = await (await loadAction())('ship-1')
 
@@ -328,4 +341,40 @@ test('o3d-2k5r r3: a shipment that does not exist is still a plain refusal, not 
   assert.equal(result.success, false)
   assert.equal(result.error, 'Shipment not found')
   assert.equal(state.allocCalls, 0, 'nothing may be allocated for a shipment we could not read')
+})
+
+test('o3d-2k5r r6: a refusal caused by a DISPATCHED sibling rolls the reopen back instead of committing it', async () => {
+  // THE FINDING, on the write path. Pre-fix, `refused` alone kept the reopen — whatever caused it.
+  // With a SHIPPED sibling the refusal is permanent (`refuseIfCommittedShipmentsExist` matches
+  // every non-PENDING status, and a dispatched shipment can never be reopened), so keeping the
+  // revert converted a shipment that could still go out into a draft no control can finish. There
+  // is no deadlock to break here: the blocker will never move.
+  reset('PACKED', ['SHIPPED'])
+  state.allocResult = { success: false, refused: true, syncProductIds: [], allocationCount: 0, unallocatedLines: [], unallocatedQty: 0, backorderLineCount: 0 }
+  const result = await (await loadAction())('ship-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.error!, /cannot be completed/)
+  assert.match(result.error!, /1 dispatched shipment/)
+  assert.equal(committed.shipments.get('ship-1')!.status, 'PACKED', 'the revert must not survive a refusal that leads nowhere')
+  assert.deepEqual(
+    committed.activity.filter((a) => a.action === 'shipment_reopened_for_repack'),
+    [],
+    'and the warehouse must not be told to unpack a box for a revert that was rolled back',
+  )
+  assert.deepEqual(committed.resolved, [], 'nothing was netted, so no backstop row may be consumed')
+})
+
+test('o3d-2k5r r6: the same guard covers the RESUME path, where no reopen ran to check anything', async () => {
+  // The draft is already open (the state an older IMS could strand, or a refused earlier run left)
+  // and a sibling has since been dispatched. `reopenShipmentForRepack` returns ALREADY_PENDING and
+  // never reaches its own lock-time sibling check, so without the action's re-read this returned
+  // `success: true` with a warning for a run that netted nothing and resolved nothing.
+  reset('PENDING', ['SHIPPED'])
+  state.allocResult = { success: false, refused: true, syncProductIds: [], allocationCount: 0, unallocatedLines: [], unallocatedQty: 0, backorderLineCount: 0 }
+  const result = await (await loadAction())('ship-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.error!, /cannot be completed/)
+  assert.deepEqual(committed.resolved, [], 'and it must not report a recovery it did not perform')
 })

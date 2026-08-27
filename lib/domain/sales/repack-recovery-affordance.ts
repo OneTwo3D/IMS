@@ -59,12 +59,69 @@
  * recovery by any click, and the honest answer is to offer no button rather than one that reports a
  * success it did not achieve. That order needs the shipment reconciliation of o3d-339; the backstop
  * row stays visible in the integration outbox until it is done.
+ *
+ * AND HIDING *THAT* CONTROL WAS THE GUARD IN THE WRONG PLACE (o3d-2k5r r6, o3d-flxt).
+ *
+ * Withholding "Finish repack recovery" from a PENDING draft whose sibling is SHIPPED describes the
+ * dead end AFTER the order is already in it. It is not how the order GETS there. The entry is one
+ * step earlier and it is the OTHER button: with A=PACKED and B=SHIPPED, the reopen predicate looked
+ * only at A's own status, so A rendered "Reopen for repack"; pressing it reverts A, the
+ * re-allocation is refused because B is not PENDING, and that refusal DELIBERATELY COMMITS the
+ * revert. One click later A is a draft that no control can finish and B is a dispatch that cannot
+ * be reopened — a state the operator could not have been in before they pressed a button IMS
+ * offered them.
+ *
+ * So the reopen carries the ORDER-LEVEL question too, and it is a DIFFERENT question from the
+ * finish control's: not "does the order hold a commitment" (two packed shipments do, and that case
+ * is recoverable — reopen the other one) but "does the order hold a commitment that can never be
+ * reopened". While that is true, reverting anything is a one-way trip into the dead end, so no
+ * reopen is offered on that order at all.
+ *
+ * THE PARTIAL COMMIT SURVIVES ONLY FOR REOPENABLE BLOCKERS. The refusal keeps the reopen because
+ * with A and B both PACKED, rolling back would refuse A because of B and B because of A and neither
+ * could ever go first — a real deadlock that only a partial commit breaks. That argument requires
+ * the blocker to be reopenable. A SHIPPED blocker is not a deadlock, it is a wall: keeping the
+ * revert buys no future step and costs the order its last recoverable state. The action therefore
+ * re-checks this under the order lock and ABORTS instead (app/actions/allocation.ts), so the UI
+ * predicate below and the write path refuse the same thing.
  */
 
 /** The status a shipment holds while nothing has been committed to it. */
 const UNCOMMITTED_SHIPMENT_STATUS = 'PENDING'
 /** Committed but not dispatched — the states the ordinary reopen acts on. */
 const REOPENABLE_SHIPMENT_STATUSES: ReadonlySet<string> = new Set(['PICKING', 'PACKED'])
+
+/**
+ * Is this shipment a commitment that can NEVER be turned back into a draft (o3d-2k5r r6)?
+ *
+ * Today that is exactly SHIPPED — `reopenShipmentForRepack` refuses it because the goods have gone
+ * and the cost has been relieved. It is written as "committed and not reopenable" rather than
+ * `=== 'SHIPPED'` so that any status added to `ShipmentStatus` later is treated as a wall until
+ * someone decides otherwise: the failure mode of guessing wrong in the other direction is an
+ * operator being handed a button that strands their order.
+ */
+export function shipmentIsUnreopenableCommitment(status: string): boolean {
+  return status !== UNCOMMITTED_SHIPMENT_STATUS && !REOPENABLE_SHIPMENT_STATUSES.has(status)
+}
+
+/**
+ * The two ORDER-LEVEL facts both controls need, derived from one pass over the order's shipment
+ * statuses. Exported so the page (`getOrderShipments`), the write path (`reopenShipmentForRepack`
+ * and `reopenShipmentForRepackAction`) and the tests all ask the question the same way — the
+ * defect this fixes was two surfaces answering the same question differently.
+ */
+export function summariseRepackBlockers(statuses: Iterable<string>): {
+  orderHasCommittedShipment: boolean
+  orderHasUnreopenableCommitment: boolean
+} {
+  let orderHasCommittedShipment = false
+  let orderHasUnreopenableCommitment = false
+  for (const status of statuses) {
+    if (status !== UNCOMMITTED_SHIPMENT_STATUS) orderHasCommittedShipment = true
+    if (shipmentIsUnreopenableCommitment(status)) orderHasUnreopenableCommitment = true
+  }
+  return { orderHasCommittedShipment, orderHasUnreopenableCommitment }
+}
 
 export type RepackControlInput = {
   shipmentStatus: string
@@ -85,6 +142,17 @@ export type RepackControlInput = {
    * question. While this is true the recovery cannot complete, whichever draft it is invoked from.
    */
   orderHasCommittedShipment: boolean
+  /**
+   * Does ANY shipment on this order hold a commitment that can never be reopened — in practice, a
+   * DISPATCHED sibling (o3d-2k5r r6, o3d-flxt)?
+   *
+   * Order-scoped, and deliberately not "sibling-scoped": a SHIPPED shipment fails the reopenable
+   * test on its own status anyway, so excluding self would only add a way for the two readings to
+   * disagree. While this is true the order's recovery cannot be completed by any click, and — the
+   * part that was missing — reverting one more shipment cannot help either, it can only convert a
+   * still-committed shipment into a draft nothing will ever finish.
+   */
+  orderHasUnreopenableCommitment: boolean
 }
 
 /** A cancelled order takes the discard path instead: reopening would leave a draft on an order that
@@ -95,6 +163,13 @@ function orderTakesTheDiscardPath(orderStatus: string): boolean {
 
 export function repackReopenControlIsAvailable(input: RepackControlInput): boolean {
   if (orderTakesTheDiscardPath(input.orderStatus)) return false
+  // THE GUARD BEFORE THE ACTION IT GUARDS (o3d-2k5r r6). Reverting this shipment while the order
+  // holds a commitment nobody can ever reopen does not advance the recovery by one step — the
+  // re-allocation is refused for the same reason it will be refused every time afterwards — and it
+  // consumes the last state from which the order could still be dispatched as packed. Withholding
+  // the FINISH control in that state describes the dead end; withholding this one is what keeps the
+  // order out of it.
+  if (input.orderHasUnreopenableCommitment) return false
   return REOPENABLE_SHIPMENT_STATUSES.has(input.shipmentStatus)
 }
 

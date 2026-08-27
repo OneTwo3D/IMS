@@ -21,6 +21,7 @@ import {
 import { buildStockMovementValueFieldsFromConsumed } from '@/lib/domain/inventory/stock-movement-value'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirementQuantities } from '@/lib/products/fulfillment-requirement-snapshot'
+import { shipmentIsUnreopenableCommitment } from '@/lib/domain/sales/repack-recovery-affordance'
 import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { withSavepoint } from '@/lib/db/savepoint'
 
@@ -772,7 +773,7 @@ export type ReopenShipmentForRepackResult =
        * the recovery re-runnable after an allocation refusal left it half-open. It carries the
        * order identifiers because the caller needs them and cannot get them from an error string.
        */
-      code?: 'ALREADY_PENDING'
+      code?: 'ALREADY_PENDING' | 'UNREOPENABLE_SIBLING'
       orderId?: string
       orderRef?: string
     }
@@ -889,8 +890,44 @@ export async function reopenShipmentForRepack(
       return { success: false as const, error: terminalOrderTransitionError(String(shipment.order.status)) }
     }
 
-    const previousStatus = String(shipment.status)
     const orderRef = shipment.order.orderNumber ?? shipment.order.externalOrderNumber ?? shipment.orderId.slice(0, 8)
+
+    // o3d-2k5r r6 / o3d-flxt — THE RECHECK UNDER THE LOCK, BEFORE THE REVERT.
+    //
+    // The order's OTHER shipments decide whether reverting this one can lead anywhere. The caller's
+    // re-allocation is refused while ANY of them is non-PENDING; that refusal deliberately KEEPS
+    // this revert, and it may, because two PICKING/PACKED shipments refuse each other and only a
+    // partial commit breaks that deadlock — the operator reopens the other one and THAT call nets
+    // the order.
+    //
+    // A DISPATCHED sibling is not a deadlock. It can never be reopened, so the refusal will stand
+    // forever; reverting here would turn a shipment that can still go out into a draft no control
+    // can finish, on an order whose stale reservation then has to be reconciled by hand. Refusing
+    // is the only outcome that leaves the order somewhere it can still be worked from.
+    //
+    // Read INSIDE the lock, after the read that decided this shipment's own status, because the
+    // affordance that hides the button reads outside it — a sibling can be dispatched between the
+    // page render and the click, and that race is exactly how an order reaches the dead end without
+    // anyone pressing a button they should not have.
+    const siblings = await tx.shipment.findMany({
+      where: { orderId: shipment.orderId, id: { not: shipmentId } },
+      select: { id: true, status: true },
+    })
+    const unreopenable = siblings.filter((sibling) => shipmentIsUnreopenableCommitment(String(sibling.status)))
+    if (unreopenable.length > 0) {
+      return {
+        success: false as const,
+        code: 'UNREOPENABLE_SIBLING' as const,
+        orderId: shipment.orderId,
+        orderRef,
+        error: `Order ${orderRef} has ${unreopenable.length} dispatched shipment(s), which cannot be reopened. `
+          + 'Reopening this one would leave it a draft that stock could never be re-allocated to — the '
+          + 're-allocation is refused while any shipment on the order is not a draft. Nothing was changed. '
+          + 'Reconcile the outstanding refund reservation against the dispatched shipment instead (o3d-339).',
+      }
+    }
+
+    const previousStatus = String(shipment.status)
     await tx.shipment.update({
       where: { id: shipmentId },
       // Status ONLY. trackingNumber and shippingService are deliberately untouched — see the note

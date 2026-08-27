@@ -179,6 +179,13 @@ because of the other and neither could ever be reopened. **Reopen the second shi
 shipment on the order has to be back to a draft before the refunded units' reservation can be
 released.
 
+That exception applies **only to a picking or packed sibling**, because only those can be reopened
+afterwards. If the order carries a **dispatched** shipment, **Reopen for repack** is not offered at
+all, on any shipment on that order — and if you invoke it another way IMS refuses and changes
+nothing. Reopening there would turn a shipment that can still go out into a draft that stock could
+never be re-allocated to: the re-allocation is refused while any shipment on the order is not a
+draft, and a dispatched shipment can never go back to being one. See the warning below.
+
 Once nothing committed is left, the draft shows a **Finish repack recovery** button, which runs the
 missing re-netting and releases the refunded units' reservation. It is a different button from
 *Reopen for repack* on purpose — nothing is unpacked and no shipment is changed by it.
@@ -187,15 +194,19 @@ That button appears **only where there is something to finish and finishing it c
 still has an unresolved refund-reservation release recorded against it (the durable trace the
 recovery leaves behind) **and** no shipment on the order is still committed. It disappears once the
 recovery has run. It is also the way to repair an order left part-way through a recovery by an older
-version of IMS. **"Create Shipments" is not a substitute** — it rebuilds the draft from the
+version of IMS — **including one whose release has been retrying for so long that IMS gave up on it**
+and marked it permanently failed on the Sync Exceptions page. Nothing else will ever retry such a
+row, so this button is the only thing that can release that stock; pressing it clears the failed row
+along with the reservation. **"Create Shipments" is not a substitute** — it rebuilds the draft from the
 already-netted quantity without releasing the stale reservation.
 
 **Do not dispatch the second shipment instead of reopening it.** A dispatched shipment still counts
 as committed for this check *and* can never be reopened afterwards, so dispatching it closes the only
 door: the order can then no longer complete the recovery by any click, and the outstanding refund
 reservation has to be reconciled by hand (it stays visible as a failed `refund.reservation-release`
-row in the integration outbox on the Sync Exceptions page). The Finish repack recovery button is
-deliberately **not** shown in that state rather than being shown and doing nothing.
+row in the integration outbox on the Sync Exceptions page). Neither button is shown in that state,
+rather than one being shown and doing nothing — and IMS will not let you reopen anything else on that
+order either, so an order that is already in that position cannot be made worse by a click.
 
 **Unpack the parcel first, then press "Create Shipments"** in the Stock Allocation panel to rebuild
 the shipment to what actually remains. If every unit was refunded there is nothing left to build and

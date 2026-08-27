@@ -54,8 +54,9 @@ export function describeRepackReallocation(
     return `${opened}, but stock could not be re-allocated because order ${orderRef} still has `
       + 'another committed (picking or packed) shipment. REOPEN that one too — every shipment on the order '
       + 'has to be back to a draft before the refunded units’ reservation can be released, and dispatching '
-      + 'it instead makes that impossible, because a dispatched shipment cannot be reopened. Once nothing '
-      + 'committed is left, "Finish repack recovery" on the draft completes it.'
+      + 'it instead makes that impossible, because a dispatched shipment cannot be reopened — IMS will then '
+      + 'refuse to reopen anything on this order at all (o3d-2k5r r6), and the release has to be reconciled '
+      + 'by hand. Once nothing committed is left, "Finish repack recovery" on the draft completes it.'
   }
   if (realloc.success) return null
   if (realloc.committed) {

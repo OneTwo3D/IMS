@@ -4,6 +4,7 @@ import {
   repackControlsFor,
   repackRecoveryControlIsAvailable,
   repackReopenControlIsAvailable,
+  summariseRepackBlockers,
 } from '../../../lib/domain/sales/repack-recovery-affordance.ts'
 import { countOutstandingRefundReservationReleases } from '../../../lib/domain/sales/refund-reservation-release-outbox.ts'
 
@@ -42,16 +43,17 @@ function controlsOnOrder(
   shipments: Array<{ name: string; status: string }>,
   order: { status: string; recoveryOutstanding: boolean },
 ): Record<string, Array<'reopen' | 'finish-recovery'>> {
-  // The same predicate `allocateSalesOrder` applies, and the same one `getOrderShipments` computes
-  // for the page: any shipment on the order that is not a draft.
-  const orderHasCommittedShipment = shipments.some((s) => s.status !== 'PENDING')
+  // Derived by the SAME helper `getOrderShipments` and `reopenShipmentForRepackAction` use, from
+  // the same input (the order's shipment statuses). A test that computed these two booleans by hand
+  // would be asserting its own arithmetic, not the page's.
+  const blockers = summariseRepackBlockers(shipments.map((s) => s.status))
   const out: Record<string, Array<'reopen' | 'finish-recovery'>> = {}
   for (const shipment of shipments) {
     out[shipment.name] = repackControlsFor({
       shipmentStatus: shipment.status,
       orderStatus: order.status,
       recoveryOutstanding: order.recoveryOutstanding,
-      orderHasCommittedShipment,
+      ...blockers,
     })
   }
   return out
@@ -93,16 +95,65 @@ test('o3d-2k5r r5 UI sequence: while another shipment is committed, the draft of
   )
 })
 
-test('o3d-2k5r r5 UI sequence: dispatching the sibling instead closes the door, and no button pretends otherwise', () => {
-  // The case the r4 doc block described as one the recovery "exists for". It is not: SHIPPED is not
-  // PENDING, so `refuseIfCommittedShipmentsExist` still refuses, and `reopenShipmentForRepack`
-  // refuses SHIPPED outright — no click completes this recovery ever again. Offering the button
-  // would be the "remedy that cannot be performed" shape one more time; the outstanding release is
-  // reconciled by hand (o3d-339) and stays visible as a failed outbox row meanwhile.
+test('o3d-2k5r r6 UI sequence: an order that ALREADY has a dispatched shipment offers no reopen to drive it into the dead end', () => {
+  // THE STATE BEFORE THE DAMAGE, which is the state the r5 version of this test skipped. It started
+  // at A=PENDING/B=SHIPPED and asserted "no control" — but that is the dead end itself, reached one
+  // click earlier from HERE. A is PACKED and B is already dispatched (a partial dispatch, then a
+  // refund lands on what is left). The r5 code rendered "Reopen for repack" on A: pressing it
+  // reverts A, the re-allocation is refused because B is not PENDING, and the refusal COMMITS the
+  // revert. The operator's own click is what created the unrecoverable state.
   const order = { status: PROCESSING, recoveryOutstanding: true }
-  const dispatchedSibling = controlsOnOrder([{ name: 'A', status: 'PENDING' }, { name: 'B', status: 'SHIPPED' }], order)
-  assert.deepEqual(dispatchedSibling.B, [], 'a dispatched shipment offers neither')
-  assert.deepEqual(dispatchedSibling.A, [], 'and the draft offers nothing it cannot deliver')
+  const beforeTheClick = controlsOnOrder([{ name: 'A', status: 'PACKED' }, { name: 'B', status: 'SHIPPED' }], order)
+  assert.deepEqual(beforeTheClick.A, [], 'the packed shipment must not offer a reopen that strands the order')
+  assert.deepEqual(beforeTheClick.B, [], 'and a dispatched shipment offers neither, as before')
+
+  // The same is true of a PICKING shipment, and of a third shipment on the same order: it is the
+  // ORDER that cannot be recovered, not one shipment's relationship to one sibling.
+  const threeUp = controlsOnOrder(
+    [{ name: 'A', status: 'PICKING' }, { name: 'B', status: 'PACKED' }, { name: 'C', status: 'SHIPPED' }],
+    order,
+  )
+  assert.deepEqual(threeUp, { A: [], B: [], C: [] })
+
+  // And the state one click later — the only one r5 tested — still offers nothing, which is now a
+  // state no control can produce rather than the one every control led to.
+  const theDeadEnd = controlsOnOrder([{ name: 'A', status: 'PENDING' }, { name: 'B', status: 'SHIPPED' }], order)
+  assert.deepEqual(theDeadEnd, { A: [], B: [] })
+})
+
+test('o3d-2k5r r6: a dispatched shipment withholds the reopen ONLY where it makes the order unrecoverable', () => {
+  // The rule stated directly, and its LIMIT — the same distinction the action's partial commit
+  // turns on. Two PICKING/PACKED shipments refuse each other, and that IS recoverable: reopen one,
+  // the refusal keeps it, reopen the other, and that transaction nets the order. So a committed
+  // sibling must NOT withhold the reopen; only an unreopenable one may.
+  const order = { status: PROCESSING, recoveryOutstanding: true }
+  const twoPacked = controlsOnOrder([{ name: 'A', status: 'PACKED' }, { name: 'B', status: 'PACKED' }], order)
+  assert.deepEqual(twoPacked, { A: ['reopen'], B: ['reopen'] }, 'a reopenable blocker is a deadlock, not a wall')
+
+  // A status nobody has taught this module about is treated as a wall, not as a draft: guessing the
+  // other way hands an operator a button that strands their order.
+  assert.equal(
+    repackReopenControlIsAvailable({
+      shipmentStatus: 'PACKED',
+      orderStatus: PROCESSING,
+      recoveryOutstanding: true,
+      orderHasCommittedShipment: true,
+      orderHasUnreopenableCommitment: true,
+    }),
+    false,
+  )
+  assert.deepEqual(
+    summariseRepackBlockers(['PENDING', 'SOMETHING_NEW']),
+    { orderHasCommittedShipment: true, orderHasUnreopenableCommitment: true },
+  )
+  assert.deepEqual(
+    summariseRepackBlockers(['PENDING', 'PACKED', 'PICKING']),
+    { orderHasCommittedShipment: true, orderHasUnreopenableCommitment: false },
+  )
+  assert.deepEqual(
+    summariseRepackBlockers(['PENDING', 'PENDING']),
+    { orderHasCommittedShipment: false, orderHasUnreopenableCommitment: false },
+  )
 })
 
 test('o3d-2k5r r4 UI sequence: an order stranded by the earlier non-transactional shape', () => {
@@ -110,7 +161,7 @@ test('o3d-2k5r r4 UI sequence: an order stranded by the earlier non-transactiona
   // PENDING draft, the pre-refund reservation, and an unresolved backstop row. Nothing about the
   // shipment distinguishes it from an ordinary draft — only the durable evidence does. And nothing
   // else on the order is committed, so the recovery can actually run.
-  const stranded = { shipmentStatus: 'PENDING', orderStatus: PROCESSING, recoveryOutstanding: true, orderHasCommittedShipment: false }
+  const stranded = { shipmentStatus: 'PENDING', orderStatus: PROCESSING, recoveryOutstanding: true, orderHasCommittedShipment: false, orderHasUnreopenableCommitment: false }
   assert.deepEqual(repackControlsFor(stranded), ['finish-recovery'])
 
   // And the control is NOT offered on every order that happens to have a draft, which is what
@@ -128,7 +179,7 @@ test('o3d-2k5r r5: the recovery control never renders where the action would ref
   for (const shipmentStatus of ['PENDING', 'PICKING', 'PACKED', 'SHIPPED', 'SOMETHING_NEW']) {
     for (const recoveryOutstanding of [true, false]) {
       assert.equal(
-        repackRecoveryControlIsAvailable({ shipmentStatus, orderStatus: PROCESSING, recoveryOutstanding, orderHasCommittedShipment: true }),
+        repackRecoveryControlIsAvailable({ shipmentStatus, orderStatus: PROCESSING, recoveryOutstanding, orderHasCommittedShipment: true, orderHasUnreopenableCommitment: false }),
         false,
         `${shipmentStatus}/${recoveryOutstanding} offered Finish recovery while the order held a commitment`,
       )
@@ -140,8 +191,10 @@ test('o3d-2k5r r4: the two controls are mutually exclusive in every state', () =
   for (const shipmentStatus of ['PENDING', 'PICKING', 'PACKED', 'SHIPPED', 'SOMETHING_NEW']) {
     for (const recoveryOutstanding of [true, false]) {
       for (const orderHasCommittedShipment of [true, false]) {
-        const controls = repackControlsFor({ shipmentStatus, orderStatus: PROCESSING, recoveryOutstanding, orderHasCommittedShipment })
-        assert.ok(controls.length <= 1, `${shipmentStatus}/${recoveryOutstanding}/${orderHasCommittedShipment} offered ${controls.join('+')}`)
+        for (const orderHasUnreopenableCommitment of [true, false]) {
+          const controls = repackControlsFor({ shipmentStatus, orderStatus: PROCESSING, recoveryOutstanding, orderHasCommittedShipment, orderHasUnreopenableCommitment })
+          assert.ok(controls.length <= 1, `${shipmentStatus}/${recoveryOutstanding}/${orderHasCommittedShipment}/${orderHasUnreopenableCommitment} offered ${controls.join('+')}`)
+        }
       }
     }
   }
@@ -151,10 +204,10 @@ test('o3d-2k5r r4: a cancelled order offers neither — it takes the discard pat
   // Reopening would leave a draft on an order that will never be invoiced, and the rebuild step
   // refuses a cancelled order anyway, so the recovery would dead-end.
   for (const shipmentStatus of ['PENDING', 'PICKING', 'PACKED']) {
-    assert.deepEqual(repackControlsFor({ shipmentStatus, orderStatus: 'CANCELLED', recoveryOutstanding: true, orderHasCommittedShipment: false }), [])
+    assert.deepEqual(repackControlsFor({ shipmentStatus, orderStatus: 'CANCELLED', recoveryOutstanding: true, orderHasCommittedShipment: false, orderHasUnreopenableCommitment: false }), [])
   }
-  assert.equal(repackReopenControlIsAvailable({ shipmentStatus: 'PACKED', orderStatus: 'CANCELLED', recoveryOutstanding: true, orderHasCommittedShipment: true }), false)
-  assert.equal(repackRecoveryControlIsAvailable({ shipmentStatus: 'PENDING', orderStatus: 'CANCELLED', recoveryOutstanding: true, orderHasCommittedShipment: false }), false)
+  assert.equal(repackReopenControlIsAvailable({ shipmentStatus: 'PACKED', orderStatus: 'CANCELLED', recoveryOutstanding: true, orderHasCommittedShipment: true, orderHasUnreopenableCommitment: false }), false)
+  assert.equal(repackRecoveryControlIsAvailable({ shipmentStatus: 'PENDING', orderStatus: 'CANCELLED', recoveryOutstanding: true, orderHasCommittedShipment: false, orderHasUnreopenableCommitment: false }), false)
 })
 
 // --- the durable evidence itself -------------------------------------------------------
@@ -198,6 +251,32 @@ test('o3d-2k5r r4 evidence: RETRYABLE_FAILED counts, SUCCEEDED and PROCESSING do
   // SUCCEEDED is the recovery already done. PROCESSING is the drain holding the row and running the
   // same repair right now — offering the operator the button there is inviting them to race it.
   assert.equal(await countOutstandingRefundReservationReleases('order-1', { client }), 1)
+})
+
+test('o3d-2k5r r6 evidence: a DEAD-LETTERED (PERMANENT_FAILED) row is outstanding — it is the oldest stranded order', async () => {
+  // THE ORDERS THE RESUME PATH WAS BUILT FOR. The drain refuses while any shipment exists and burns
+  // an attempt each time, so an order stranded long enough dead-letters. `claimIntegrationOutboxWork`
+  // never claims a PERMANENT_FAILED row again — so if the evidence read skips it too, the only
+  // control that could release that reservation is withheld from precisely the orders that need it,
+  // and the stock stays reserved forever.
+  const { client } = readClient(['r-dead'], [
+    { idempotencyKey: 'sales:refund.reservation-release:r-dead', status: 'PERMANENT_FAILED' },
+  ])
+  assert.equal(await countOutstandingRefundReservationReleases('order-1', { client }), 1)
+})
+
+test('o3d-2k5r r6: a PENDING draft whose only backstop row is PERMANENT_FAILED gets the Finish control', async () => {
+  // The finding end to end: the evidence read and the affordance together, on the state an
+  // exhausted-retry stranded order is actually in — one draft, nothing else committed, one
+  // dead-lettered release row.
+  const { client } = readClient(['r-dead'], [
+    { idempotencyKey: 'sales:refund.reservation-release:r-dead', status: 'PERMANENT_FAILED' },
+  ])
+  const outstanding = await countOutstandingRefundReservationReleases('order-1', { client })
+  assert.deepEqual(
+    controlsOnOrder([{ name: 'A', status: 'PENDING' }], { status: PROCESSING, recoveryOutstanding: outstanding > 0 }),
+    { A: ['finish-recovery'] },
+  )
 })
 
 test('o3d-2k5r r4 evidence: an order with no refunds asks the outbox nothing', async () => {
