@@ -33,6 +33,8 @@ const queued: Array<{ type: string; payload: Record<string, unknown>; idempotenc
  * receipt still recoverable from one lost behind a row that looks finished.
  */
 const released: string[] = []
+/** The generations the connector's claim minted, so the fenced release can be modelled honestly. */
+const claimed: Array<{ syncLogId: string; generation: Date }> = []
 
 /**
  * o3d-ekn8 r2 — THE THREE FACTS THE RE-DRIVE USED TO RE-DERIVE, now controlled independently so a
@@ -197,11 +199,27 @@ mock.module('@/lib/domain/accounting/back-reference', {
     },
     backReferenceHolder: () => ({}),
     findExternalDocumentIdClaim: async () => null,
-    followUpObligationClaim: () => ({}),
+    /**
+     * o3d-0bfh r4: the claim is a call now, not a `data` fragment, and it hands back the GENERATION
+     * it minted. Modelled rather than stubbed to `undefined`, because the release below is fenced on
+     * that value — a mock that returned nothing would make every release look superseded and the
+     * `released` assertions would pass while asserting the opposite of what they say.
+     */
+    claimFollowUpObligation: async (_client: unknown, params: { syncLogId: string }) => {
+      const generation = new Date(`2026-08-2${claimed.length + 1}T00:00:00.000Z`)
+      claimed.push({ syncLogId: params.syncLogId, generation })
+      return { claimed: true as const, generation }
+    },
     isExternalDocumentIdConflict: () => false,
-    releaseFollowUpObligation: async (_client: unknown, params: { syncLogId: string }) => {
+    releaseFollowUpObligation: async (_client: unknown, params: { syncLogId: string; generation: Date | null }) => {
+      // FENCED, so a release that carried no generation clears nothing — which is what makes
+      // `released` still able to tell a discharge from a refusal (o3d-0bfh r4).
+      const mine = claimed.find((entry) => entry.syncLogId === params.syncLogId)
+      if (params.generation === null || mine === undefined || mine.generation.getTime() !== params.generation.getTime()) {
+        return 'superseded' as const
+      }
       released.push(params.syncLogId)
-      return true
+      return 'released' as const
     },
   },
 })
@@ -246,6 +264,7 @@ test.beforeEach(() => {
   activity.length = 0
   queued.length = 0
   released.length = 0
+  claimed.length = 0
   paymentRowScopes.length = 0
   live.activeConnector = 'quickbooks'
   live.activeTypeEnabled = true
