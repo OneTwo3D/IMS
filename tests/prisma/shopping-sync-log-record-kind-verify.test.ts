@@ -653,5 +653,12 @@ test('deploy.sh carries the hook, which is the whole reason verify.sql is execut
   // and asserted deploy.sh did NOT mention it — true while the branches were separate, and a
   // guarantee that the unsafe order could never be fixed here without a red suite.
   const deploy = readFileSync('scripts/deploy.sh', 'utf8')
-  assert.match(deploy, /run-migration-verifications/, 'the hook this migration depends on is present')
+  // The whole invocation, not the stem: a name that no longer resolves to a file is the same
+  // absence with a green test over it.
+  assert.match(
+    deploy,
+    /node scripts\/run-migration-verifications\.mjs/,
+    'the hook this migration depends on is invoked, by the path that actually exists',
+  )
+  assert.equal(existsSync('scripts/run-migration-verifications.mjs'), true, 'and it resolves to a file')
 })
