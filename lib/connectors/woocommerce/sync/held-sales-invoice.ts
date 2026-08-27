@@ -55,6 +55,28 @@ export const MISSING_INVOICE_NUMBER_QUEUE_REASON = 'missing_wc_invoice_number'
  */
 export const HELD_SALES_INVOICE_RECORD_KIND = 'WC_HELD_SALES_INVOICE'
 
+/**
+ * THE THREE SENTENCES THE RELEASE SWEEP SETTLES A HOLD WITH (o3d-xnwu r9, Codex MEDIUM).
+ *
+ * Named here rather than typed inline at the three `update` calls, because verify.sql check 6
+ * MATCHES ON THEM: a row that is not a hold carrying one of these messages was settled by a
+ * predecessor whose queue predicate had no `recordKind` clause, and that has no legitimate
+ * producer. A check that keys on a string literal and a writer that types one are two copies of the
+ * same fact, and the copy in the migration cannot be recompiled — so the test asserts verify.sql
+ * against THESE, and drifting the writer's wording turns it red rather than turning the check off.
+ *
+ * Every one of them is written ONLY to a row selected by {@link heldSalesInvoiceQueueWhere}, which
+ * requires {@link HELD_SALES_INVOICE_RECORD_KIND}. That is the whole of check 6's forgery argument.
+ */
+export const HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE =
+  'The sales order this invoice was held for cannot be found, so it can never be released. Nothing was posted.'
+
+/** The prefix — the rest names the ledger document, so the check matches on this much. */
+export const HELD_SALES_INVOICE_SUPERSEDED_PREFIX = 'Superseded: this order already carries ledger document '
+
+export const HELD_SALES_INVOICE_UNREADABLE_MESSAGE =
+  'The held sales-invoice payload is unreadable, so the invoice cannot be released automatically — queue it from the order.'
+
 export type HeldSalesInvoicePayload = {
   reason: typeof MISSING_INVOICE_NUMBER_QUEUE_REASON
   connector: 'woocommerce'

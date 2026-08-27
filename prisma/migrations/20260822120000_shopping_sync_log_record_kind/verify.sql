@@ -27,6 +27,20 @@
 -- own comment says what else can trip it and why the repair is conditional. An earlier revision of
 -- this header claimed all of them had the narrow meaning; they do not.
 --
+-- WHY THERE ARE SIX AND NOT FIVE (Codex MEDIUM, round 5). Checks 1-5 model what the predecessor
+-- WRITES INTO A ROW. They do not model what it does to a row's STATUS AND MESSAGE while leaving the
+-- payload and the stamp alone — and that transition is not harmless, because the recovery inbox
+-- selects on status. The old held-invoice release sweep selects a hold by payload->>'reason', which
+-- is OPERATOR-CONTROLLED text, so it can pick up a genuine refund park; when the order behind it is
+-- already invoiced it writes status = 'SYNCED' and a 'Superseded:' message and stops. The park's
+-- payload is untouched and its stamp still says WC_REFUND_PARK, so all five earlier checks return
+-- zero — and activeRefundParkWhere lists only PENDING/FAILED/QUARANTINED, so the park is gone from
+-- the inbox for ever with a real, unrefunded amount on it. CHECK 6 IS THAT SIGNATURE, and it covers
+-- the sweep's other two outcomes for the same reason.
+--
+-- This file's own comments already ACKNOWLEDGED that transition ("WHAT IS STILL NOT COVERED") and
+-- enforced nothing about it. An honest note about a blind spot is still a blind spot.
+--
 -- WHY THERE ARE FIVE AND NOT THREE (Codex MEDIUM). The first three modelled ONE predecessor act —
 -- the held-invoice writer overwriting a park — and modelled it in ONE state. They stopped seeing it
 -- the moment anything moved afterwards, and they never looked at the act that goes the other way:
@@ -45,13 +59,29 @@
 -- Run again after any repair. Check 1 is repairable by re-running the two UPDATE statements in
 -- migration.sql, which only ever write a NULL cell. CHECK 2 IS REPAIRABLE ONLY AFTER THE ROWS HAVE
 -- BEEN IDENTIFIED — see its comment; blindly re-running statement 2 is itself a defect. A non-zero
--- answer on check 3, 4 or 5 is NOT repairable automatically and needs the incident handling in
--- migration.sql.
+-- answer on check 3, 4, 5 or 6 is NOT repairable automatically and needs the incident handling in
+-- migration.sql. On check 6 in particular the row still holds the store's refund body, so the amount
+-- is recoverable by hand — what has been lost is the row's place in the recovery inbox, and its own
+-- error text.
 -- =============================================================================
 
 -- 1. NO UNSTAMPED HOLD. Every held sales invoice must say so, or it is never released and the order
 --    is never invoiced. A row matching this shape with a NULL recordKind was created after the
 --    backfill ran, i.e. by a predecessor that was still serving.
+--
+--    NO STATUS CLAUSE, AND IT IS THE THIRD TIME THIS FILE HAS HAD TO REMOVE ONE (Codex HIGH, round
+--    5). This check used to require PENDING, which is the status a hold is WRITTEN in — not the
+--    status it is always FOUND in. The predecessor's own release sweep settles a hold to FAILED when
+--    its order cannot be found or its payload will not read, and its recovery inbox settles one to
+--    SYNCED; at that instant this check went quiet over an unstamped hold that still exists.
+--
+--    THIS CHECK IS THE EXACT MIRROR OF BACKFILL STATEMENT 1, and it has to stay that way: the
+--    prescribed repair is "re-run the two UPDATE statements", so anything this check reports must be
+--    something statement 1 will stamp. While this check read a status and statement 1 read the same
+--    status, they agreed and were both wrong together; a fix to one alone would have left the check
+--    reporting rows the repair could not touch — and the repair would then have fallen through to
+--    statement 2 and declared an invoice hold a refund park. Both now classify on the payload shape,
+--    which no status transition rewrites.
 SELECT 'shopping_sync_logs unstamped held sales invoice' AS check_name,
        count(*)                                          AS violations
   FROM "shopping_sync_logs"
@@ -59,7 +89,6 @@ SELECT 'shopping_sync_logs unstamped held sales invoice' AS check_name,
    AND connector = 'woocommerce'
    AND direction = 'FROM_CONNECTOR'
    AND "entityType" = 'SalesOrder'
-   AND status = 'PENDING'
    AND "entityId" IS NOT NULL
    AND jsonb_typeof(payload) = 'object'
    AND payload->>'reason' = 'missing_wc_invoice_number'
@@ -86,6 +115,14 @@ SELECT 'shopping_sync_logs unstamped held sales invoice' AS check_name,
 --    anything. If they are refund parks written by a predecessor, statement 2 is the repair. If
 --    they are a new family, the fix is in the WRITER — give it a recordKind — and this check should
 --    be narrowed to exclude it at the same time, never satisfied by stamping it as a park.
+--
+--    ITS STATUS LIST IS DELIBERATE, AND IT WAS RE-EXAMINED (Codex HIGH, round 5, after the same
+--    shape was found in check 1 and in backfill statement 1). This check DOES read status, and a
+--    predecessor settling an unstamped park to SYNCED does switch it off. That is kept, because the
+--    list is exactly activeRefundParkWhere's: an unstamped SYNCED row is invisible to the recovery
+--    inbox whether it is stamped or not, so there is nothing this check could report that stamping
+--    would fix. What makes that safe rather than merely arguable is CHECK 6, which reads neither the
+--    status nor the stamp and catches the act that produced the SYNCED row in the first place.
 --
 --    NARROWED as far as it can be without losing what it is for: `externalId IS NOT NULL` is a
 --    property every park has (upsertRefundPark always supplies it, and the partial unique index
@@ -210,3 +247,52 @@ SELECT 'shopping_sync_logs held-invoice payload naming another order' AS check_n
    AND jsonb_typeof(payload->'accountingPayload') = 'object'
    AND payload->>'metaKey' IS NOT NULL
    AND payload->>'salesOrderId' IS DISTINCT FROM "entityId";
+
+-- 6. NO HELD-RELEASE OUTCOME ON A ROW THAT IS NOT A HELD SALES INVOICE — the transition every
+--    earlier check watched past, and the one this file's own prose used to admit it could not see.
+--
+--    THE ACT. `retryHeldWcSalesInvoiceReleases` (lib/connectors/woocommerce/sync/order-import.ts)
+--    walks the held queue and settles the rows it cannot release. The PREDECESSOR'S version of
+--    `heldSalesInvoiceQueueWhere` has no recordKind clause, so it selects on payload->>'reason' —
+--    free text an operator types into WooCommerce's refund dialog — and therefore picks up genuine
+--    REFUND PARKS. It then writes ONE OF THREE OUTCOMES, and each writes only `status`, `syncedAt`
+--    and `errorMessage`:
+--
+--      * the order is already invoiced  -> status 'SYNCED', a 'Superseded: this order already
+--                                          carries ledger document …' message;
+--      * the order cannot be found      -> status 'FAILED', 'The sales order this invoice was held
+--                                          for cannot be found …';
+--      * the payload will not read      -> status 'FAILED', 'The held sales-invoice payload is
+--                                          unreadable …' — which is what a park's raw refund body
+--                                          looks like to the hold's own validator.
+--
+--    WHY THAT IS NOT COVERED BY CHECKS 1-5. The payload is untouched, so it is still a refund body:
+--    checks 3, 4 and 5 all key on the held-invoice payload shape and see nothing. The stamp is
+--    untouched, so it still says WC_REFUND_PARK: checks 1 and 2 want a NULL stamp. Every one of them
+--    returns zero. Meanwhile `activeRefundParkWhere` lists only PENDING, FAILED and QUARANTINED —
+--    so the SYNCED outcome removes a park carrying a real, unrefunded amount from the recovery inbox
+--    permanently, and the FAILED outcomes replace whatever the park itself said with a sentence about
+--    an invoice.
+--
+--    THE SIGNATURE, AND WHY IT CANNOT BE FORGED. These three sentences are written by exactly two
+--    code paths, both of which act only on a row selected by the CURRENT
+--    `heldSalesInvoiceQueueWhere` — and that predicate requires recordKind = 'WC_HELD_SALES_INVOICE'
+--    and a hold payload. So a row that is NOT a hold carrying one of these messages has no
+--    legitimate producer. `metaKey` is what says "not a hold": buildHeldSalesInvoicePayload writes it
+--    on every hold, and a WooCommerce refund body has no such member. A genuine hold settled by the
+--    sweep carries a metaKey and is not selected here, which is what keeps this check at zero on a
+--    healthy database for ever.
+--
+--    NO STATUS CLAUSE AND NO STAMP CLAUSE, for the same reasons checks 3, 4 and 5 have neither: the
+--    contradiction is between the MESSAGE and the PAYLOAD, and an unstamped park from case (a) that
+--    the same sweep then settled has no stamp to test.
+SELECT 'shopping_sync_logs held-release outcome on a row that is not a hold' AS check_name,
+       count(*)                                                              AS violations
+  FROM "shopping_sync_logs"
+ WHERE connector = 'woocommerce'
+   AND direction = 'FROM_CONNECTOR'
+   AND "entityType" = 'SalesOrder'
+   AND payload->>'metaKey' IS NULL
+   AND ("errorMessage" = 'The sales order this invoice was held for cannot be found, so it can never be released. Nothing was posted.'
+     OR "errorMessage" = 'The held sales-invoice payload is unreadable, so the invoice cannot be released automatically — queue it from the order.'
+     OR "errorMessage" LIKE 'Superseded: this order already carries ledger document %');

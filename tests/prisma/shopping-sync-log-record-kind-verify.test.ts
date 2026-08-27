@@ -2,6 +2,12 @@ import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import test from 'node:test'
 
+import {
+  HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE,
+  HELD_SALES_INVOICE_SUPERSEDED_PREFIX,
+  HELD_SALES_INVOICE_UNREADABLE_MESSAGE,
+} from '@/lib/connectors/woocommerce/sync/held-sales-invoice'
+
 // ---------------------------------------------------------------------------
 // o3d-xnwu r8 + Codex MEDIUM — THE CUTOVER CHECKS ARE A FILE THE DEPLOY RUNS, AND ONE OF THEM
 // CATCHES THE CASE THE MIGRATION CALLED UNDETECTABLE.
@@ -23,6 +29,7 @@ import test from 'node:test'
 
 const MIGRATION_DIR = 'prisma/migrations/20260822120000_shopping_sync_log_record_kind'
 const VERIFY = `${MIGRATION_DIR}/verify.sql`
+const MIGRATION = `${MIGRATION_DIR}/migration.sql`
 
 /** Strip `--` line comments; the checks themselves carry no block comments or quoted `--`. */
 function stripComments(sql: string): string {
@@ -76,8 +83,16 @@ function whereClauseOf(statement: string): string {
   return statement.slice(at + ' WHERE '.length)
 }
 
-/** Split on top-level AND, ignoring anything inside parentheses or string literals. */
-function conjuncts(clause: string): string[] {
+/**
+ * Split on a top-level operator, ignoring anything inside parentheses or string literals.
+ *
+ * o3d-xnwu r9: generalised from AND-only. Check 6 is a conjunction with one disjunctive term — the
+ * three sentences the predecessor's release sweep writes — so the evaluator has to understand OR and
+ * parentheses or it cannot be run against the shipped text at all. The quote tracking is what keeps
+ * an ' OR ' inside a message literal from being read as an operator.
+ */
+function splitTopLevel(clause: string, operator: 'AND' | 'OR'): string[] {
+  const needle = ` ${operator} `
   const parts: string[] = []
   let depth = 0
   let quoted = false
@@ -92,16 +107,31 @@ function conjuncts(clause: string): string[] {
     if (char === "'") { quoted = true; current += char; continue }
     if (char === '(') depth += 1
     if (char === ')') depth -= 1
-    if (depth === 0 && clause.slice(index, index + 5).toUpperCase() === ' AND ') {
+    if (depth === 0 && clause.slice(index, index + needle.length).toUpperCase() === needle) {
       parts.push(current.trim())
       current = ''
-      index += 4
+      index += needle.length - 1
       continue
     }
     current += char
   }
   if (current.trim()) parts.push(current.trim())
   return parts
+}
+
+/** Strip one pair of parentheses that encloses the WHOLE expression, and nothing else. */
+function unwrap(expression: string): string {
+  const trimmed = expression.trim()
+  if (!trimmed.startsWith('(')) return trimmed
+  let depth = 0
+  for (let index = 0; index < trimmed.length; index += 1) {
+    if (trimmed[index] === '(') depth += 1
+    else if (trimmed[index] === ')') {
+      depth -= 1
+      if (depth === 0) return index === trimmed.length - 1 ? unwrap(trimmed.slice(1, -1)) : trimmed
+    }
+  }
+  return trimmed
 }
 
 function jsonType(value: unknown): Value {
@@ -192,10 +222,51 @@ function matchesConjunct(condition: string, row: Row): boolean {
   return left === right
 }
 
+/** AND / OR / parentheses over the leaf comparisons above. */
+function matchesCondition(expression: string, row: Row): boolean {
+  const trimmed = unwrap(expression)
+  const ors = splitTopLevel(trimmed, 'OR')
+  if (ors.length > 1) return ors.some((part) => matchesCondition(part, row))
+  const ands = splitTopLevel(trimmed, 'AND')
+  if (ands.length > 1) return ands.every((part) => matchesCondition(part, row))
+  return matchesConjunct(trimmed, row)
+}
+
 /** Does the numbered check in verify.sql select this row? */
 function selects(checkIndex: number, row: Row): boolean {
   const statement = statements(readFileSync(VERIFY, 'utf8'))[checkIndex]
-  return conjuncts(whereClauseOf(statement)).every((condition) => matchesConjunct(condition, row))
+  return matchesCondition(whereClauseOf(statement), row)
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * ...AND THE SAME EVALUATOR OVER THE BACKFILL, WHICH NOTHING USED TO RUN (o3d-xnwu r9, Codex HIGH).
+ *
+ * The two UPDATE statements in migration.sql are a CLASSIFIER, and until this round no test applied
+ * them to a row. The HIGH was inside one of them: statement 1 recognised a hold only while PENDING,
+ * so a hold the predecessor's own release sweep had settled to FAILED fell through to statement 2 —
+ * the catch-all — and was stamped a refund park.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The two UPDATE statements, in file order. The ALTER carries no WHERE and is not one of them. */
+function backfillStatements(): string[] {
+  return statements(readFileSync(MIGRATION, 'utf8'))
+    .filter((statement) => /^UPDATE "shopping_sync_logs"/i.test(statement))
+}
+
+function backfillSelects(step: 0 | 1, row: Row): boolean {
+  return matchesCondition(whereClauseOf(backfillStatements()[step]), row)
+}
+
+/**
+ * What the backfill leaves in `recordKind`, running the statements IN ORDER.
+ *
+ * Statement 2 requires `recordKind IS NULL`, so a row statement 1 stamped is already out of its
+ * reach — which is modelled by returning at the first match rather than by mutating a copy.
+ */
+function backfillStamp(row: Row): string | null {
+  if (backfillSelects(0, row)) return 'WC_HELD_SALES_INVOICE'
+  if (backfillSelects(1, row)) return 'WC_REFUND_PARK'
+  return row.recordKind
 }
 
 // ---------------------------------------------------------------------------
@@ -250,15 +321,15 @@ const parkWithTypedReason: Row = { ...base, payload: refundPayloadWithTypedReaso
 const unstampedHold: Row = { ...base, recordKind: null, payload: heldPayload }
 const unstampedPark: Row = { ...base, recordKind: null, payload: refundPayloadWithTypedReason }
 
-test('verify.sql declares five checks in the shape the deploy hook executes', () => {
+test('verify.sql declares six checks in the shape the deploy hook executes', () => {
   const sql = readFileSync(VERIFY, 'utf8')
   const all = statements(sql)
 
   assert.equal(
     all.length,
-    5,
-    'five mandatory checks: unstamped hold, unstamped park, overwritten park, recovery note on a '
-    + 'hold, and a hold payload naming another order',
+    6,
+    'six mandatory checks: unstamped hold, unstamped park, overwritten park, recovery note on a '
+    + 'hold, a hold payload naming another order, and a held-release outcome on a row that is not a hold',
   )
   for (const [index, statement] of all.entries()) {
     // The contract in scripts/run-migration-verifications.mjs: exactly one row of
@@ -269,7 +340,7 @@ test('verify.sql declares five checks in the shape the deploy hook executes', ()
   }
 
   const names = all.map((statement) => statement.match(/^SELECT '([^']+)'/i)![1])
-  assert.equal(new Set(names).size, 5, 'each check names itself distinctly, so a failure says which one')
+  assert.equal(new Set(names).size, 6, 'each check names itself distinctly, so a failure says which one')
 })
 
 test('CASE (b) IS DETECTABLE: check 3 finds a stamped park overwritten with a held-invoice payload', () => {
@@ -396,7 +467,7 @@ test('check 4 catches a legacy DISMISS of a held sales invoice — an invoice no
   assert.equal(selects(3, dismissedStampedHold), true, 'the recovery note on a hold payload is the signature')
 
   // And it is invisible to every check that existed before it.
-  assert.equal(selects(0, dismissedStampedHold), false, 'check 1 wants a NULL stamp and PENDING')
+  assert.equal(selects(0, dismissedStampedHold), false, 'check 1 wants a NULL stamp')
   assert.equal(selects(1, dismissedStampedHold), false, 'check 2 wants a NULL stamp')
   assert.equal(selects(2, dismissedStampedHold), false, 'check 3 wants the PARK stamp')
   assert.equal(selects(4, dismissedStampedHold), false, 'a DISMISS does not move entityId — that is check 5')
@@ -495,11 +566,253 @@ test('the migration prose no longer tells an operator that case (b) is invisible
     /o3d-batch-deployseq/,
     'the sibling branch that owns the deploy ORDER is named, because check 3 is the second line not the first',
   )
+  // r9: the paragraph that used to END here now says why that admission was not enough. The claim
+  // it made — that a settled mis-selected park "has no contradictory shape to query for" — was
+  // wrong: the MESSAGE is the shape, and check 6 queries it.
   assert.match(
     migration,
     /WHAT IS STILL NOT COVERED/,
-    'and the correction does not overclaim: the errorMessage rewrite has no contradictory shape to query',
+    'the earlier admission is quoted rather than deleted, so the correction is legible',
   )
+  assert.match(
+    migration,
+    /IT HAS ONE, AND IT IS THE MESSAGE/,
+    'and it is answered rather than restated — an acknowledged blind spot is still a blind spot',
+  )
+})
+
+/* ================================================================================================
+ * o3d-xnwu r9 (Codex HIGH) — THE BACKFILL TURNED FAILED HOLDS INTO REFUND PARKS.
+ *
+ * Statement 1 recognised a hold only while PENDING. That is the status a hold is WRITTEN in, not the
+ * status it is always FOUND in: the predecessor's own release sweep settles a hold to FAILED when
+ * its order cannot be found or its payload will not read, and its recovery inbox settles one to
+ * SYNCED. Statement 1 skipped every one of those; statement 2 — the catch-all, which DOES read
+ * FAILED — then stamped them 'WC_REFUND_PARK'.
+ *
+ * A gate keyed on state the damage itself can change. It is the same defect the previous round
+ * removed from check 3, and check 1 in verify.sql had the third instance of it.
+ * ============================================================================================== */
+
+/** A legacy hold the release sweep already closed because its order was gone. */
+const failedPredecessorHold: Row = {
+  ...unstampedHold, status: 'FAILED', errorMessage: HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE,
+}
+/** ...and one it closed because the order was already invoiced by another route. */
+const syncedPredecessorHold: Row = {
+  ...unstampedHold,
+  status: 'SYNCED',
+  errorMessage: `${HELD_SALES_INVOICE_SUPERSEDED_PREFIX}INV-2026-0088, so the held sales invoice was not released.`,
+}
+
+test('the backfill classifies a held invoice by its SHAPE, in every status a hold can be found in', () => {
+  // ROUTE PROOF: these go through the two UPDATE statements read out of the shipped migration.sql,
+  // in file order, with statement 2 unreachable for anything statement 1 stamped — which is what
+  // makes "step 1 skipped it" and "step 2 caught it" a single measurable outcome.
+  assert.equal(backfillStatements().length, 2, 'the backfill is the two UPDATE statements')
+
+  for (const status of ['PENDING', 'FAILED', 'SYNCED', 'QUARANTINED']) {
+    // MUTATION THAT KILLS THIS TEST: put `AND status = 'PENDING'` back on statement 1. FAILED and
+    // QUARANTINED then fall through to statement 2 and come back 'WC_REFUND_PARK'; SYNCED comes back
+    // null. Three of the four rows change answer.
+    assert.equal(
+      backfillStamp({ ...unstampedHold, status }),
+      'WC_HELD_SALES_INVOICE',
+      `a held-invoice payload in ${status} is a held sales invoice`,
+    )
+  }
+})
+
+test('a hold the predecessor already settled is never stamped a refund park', () => {
+  // The two rows the HIGH is actually about — a hold carrying the release sweep's own closing
+  // message. Before the fix the FAILED one came back 'WC_REFUND_PARK': stamped a park over a
+  // held-invoice payload, which is precisely what check 3 exists to catch, so the CUTOVER FAILS
+  // after the service has been stopped and the schema has moved — an outage caused by the migration
+  // itself.
+  assert.equal(backfillStamp(failedPredecessorHold), 'WC_HELD_SALES_INVOICE')
+  assert.equal(backfillStamp(syncedPredecessorHold), 'WC_HELD_SALES_INVOICE')
+
+  // And the self-inflicted check-3 failure is gone with it: the row the backfill produces is not a
+  // park stamp over a held-invoice payload, because it is not stamped a park.
+  assert.equal(
+    selects(2, { ...failedPredecessorHold, recordKind: backfillStamp(failedPredecessorHold) }),
+    false,
+    'the backfill no longer manufactures the contradiction check 3 stops the deploy for',
+  )
+  assert.equal(
+    selects(2, { ...failedPredecessorHold, recordKind: 'WC_REFUND_PARK' }),
+    true,
+    '...and check 3 really would have stopped it — the assertion above is not vacuous',
+  )
+})
+
+test('statement 2 refuses the held shape ON ITS OWN, not merely because statement 1 ran first', () => {
+  // The catch-all declares everything it does not recognise a refund park. Its only protection used
+  // to be that some earlier statement had been broad enough — which is one narrowing away from
+  // mis-stamping an invoice hold.
+  //
+  // MUTATION THAT KILLS THIS TEST: drop `AND payload->>'metaKey' IS NULL` from statement 2.
+  for (const status of ['PENDING', 'FAILED', 'QUARANTINED']) {
+    assert.equal(
+      backfillSelects(1, { ...unstampedHold, status }),
+      false,
+      `the catch-all does not claim a held-invoice payload in ${status}`,
+    )
+  }
+
+  // ...while it still claims every park it is there for, which is what stops the clause being a
+  // narrowing that empties the recovery inbox.
+  for (const status of ['PENDING', 'FAILED', 'QUARANTINED']) {
+    assert.equal(backfillSelects(1, { ...unstampedPark, status }), true, `an unstamped ${status} park is a park`)
+  }
+  assert.equal(backfillSelects(1, { ...unstampedPark, status: 'SYNCED' }), false, 'a settled park is not actionable')
+})
+
+test('check 1 and backfill statement 1 are the SAME predicate — the repair must match the report', () => {
+  // THE THIRD INSTANCE of the status-gated defect, and the reason it had to move with the backfill.
+  // The prescribed repair for check 1 is "re-run the two UPDATE statements", so anything check 1
+  // reports must be something statement 1 will stamp. Fix one and not the other and the repair falls
+  // through to statement 2 — which stamps an invoice hold 'WC_REFUND_PARK'.
+  const check = whereClauseOf(statements(readFileSync(VERIFY, 'utf8'))[0])
+  const backfill = whereClauseOf(backfillStatements()[0])
+
+  const normalise = (clause: string) => splitTopLevel(clause, 'AND').map((part) => part.trim()).sort()
+  // MUTATION THAT KILLS THIS TEST: restore `status = 'PENDING'` to either one alone.
+  assert.deepEqual(normalise(check), normalise(backfill),
+    'check 1 is backfill statement 1 written as a SELECT — they may not drift')
+})
+
+test('check 1 keeps seeing an unstamped hold after the predecessor settles it', () => {
+  for (const row of [failedPredecessorHold, syncedPredecessorHold]) {
+    // MUTATION THAT KILLS THIS TEST: restore `AND status = 'PENDING'` to check 1.
+    assert.equal(selects(0, row), true, `an unstamped hold in ${row.status} is still an unstamped hold`)
+  }
+  // ...and it still says nothing about a correctly stamped one, in any status.
+  for (const status of ['PENDING', 'FAILED', 'SYNCED']) {
+    assert.equal(selects(0, { ...genuineHold, status }), false, `a stamped hold in ${status} is fine`)
+  }
+  // ...nor about a park, which is check 2's business.
+  assert.equal(selects(0, unstampedPark), false)
+})
+
+/* ================================================================================================
+ * o3d-xnwu r9 (Codex MEDIUM) — A LEGACY RELEASE THAT RETIRES A REFUND PARK.
+ *
+ * The predecessor's release sweep selects a hold by payload->>'reason' — operator-controlled text —
+ * so it picks up genuine refund parks. It then writes ONLY status, syncedAt and errorMessage. The
+ * payload and the stamp stay consistent, so all five earlier checks return zero; and the
+ * 'Superseded' outcome writes SYNCED, which activeRefundParkWhere does not list. The park, carrying
+ * a real unrefunded amount, is hidden for ever.
+ *
+ * The migration's own comments already ACKNOWLEDGED this transition and enforced nothing about it.
+ * ============================================================================================== */
+
+const SUPERSEDED_NOTE = `${HELD_SALES_INVOICE_SUPERSEDED_PREFIX}INV-2026-0088, so the held sales invoice was not released.`
+
+/** THE ONE THAT HIDES MONEY: a genuine park, settled SYNCED by a sweep with no business selecting it. */
+const supersededPark: Row = { ...parkWithTypedReason, status: 'SYNCED', errorMessage: SUPERSEDED_NOTE }
+const missingOrderPark: Row = {
+  ...parkWithTypedReason, status: 'FAILED', errorMessage: HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE,
+}
+const unreadablePark: Row = {
+  ...parkWithTypedReason, status: 'FAILED', errorMessage: HELD_SALES_INVOICE_UNREADABLE_MESSAGE,
+}
+
+test('check 6 catches all three held-release outcomes landing on a row that is not a hold', () => {
+  // MUTATION THAT KILLS THIS TEST: delete check 6 from verify.sql, or narrow its message list. Each
+  // row below is selected by exactly one of the three disjuncts, so dropping any one goes red.
+  assert.equal(selects(5, supersededPark), true, 'the SYNCED outcome — the one that hides the refund')
+  assert.equal(selects(5, missingOrderPark), true, 'the missing-order outcome')
+  assert.equal(selects(5, unreadablePark), true, 'the unreadable-payload outcome — what a refund body looks like to the hold validator')
+})
+
+test('and NONE of the five earlier checks sees the superseded park — which is why check 6 exists', () => {
+  // The payload is untouched, so 3, 4 and 5 (all keyed on the held-invoice shape) see nothing. The
+  // stamp is untouched, so 1 and 2 (both keyed on a NULL stamp) see nothing. Every count is zero
+  // while an unresolved monetary refund has left the inbox.
+  for (const check of [0, 1, 2, 3, 4]) {
+    assert.equal(selects(check, supersededPark), false, `check ${check + 1} returns zero over it`)
+  }
+})
+
+test('check 6 stays silent on a GENUINE hold settled by the very same sweep', () => {
+  // This is the legitimate, everyday act: the sweep closing a hold it really did select. It happens
+  // on healthy databases, so a check that fired here would fail every later deploy. `metaKey` is
+  // what separates them — every hold has one, no WooCommerce refund body does.
+  for (const note of [HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE, HELD_SALES_INVOICE_UNREADABLE_MESSAGE, SUPERSEDED_NOTE]) {
+    assert.equal(
+      selects(5, { ...genuineHold, status: 'FAILED', errorMessage: note }),
+      false,
+      'a hold settled by the hold sweep is not a contradiction',
+    )
+    assert.equal(
+      selects(5, { ...unstampedHold, status: 'FAILED', errorMessage: note }),
+      false,
+      'and neither is an UNSTAMPED hold settled by it — that is check 1',
+    )
+  }
+})
+
+test('check 6 covers the blind spot check 2 deliberately keeps', () => {
+  // THE SWEEP OF THE WHOLE FILE for gates keyed on state the damage can change. Check 2 still reads
+  // status, and that is kept on purpose: its list is exactly activeRefundParkWhere's, so an
+  // unstamped SYNCED row is invisible to the recovery inbox whether it is stamped or not and there
+  // is nothing stamping would fix. What makes that a decision rather than the same defect a third
+  // time is that check 6 reads NEITHER the status NOR the stamp, and catches the act that produced
+  // the SYNCED row.
+  const unstampedSupersededPark: Row = { ...unstampedPark, status: 'SYNCED', errorMessage: SUPERSEDED_NOTE }
+
+  assert.equal(selects(1, unstampedSupersededPark), false, 'check 2 does not see it, by design')
+  assert.equal(selects(1, { ...unstampedSupersededPark, status: 'PENDING' }), true,
+    '...and it is the STATUS that closes check 2, so the assertion above is about the right clause')
+  // MUTATION THAT KILLS THIS TEST: give check 6 a status or a recordKind clause.
+  assert.equal(selects(5, unstampedSupersededPark), true, 'check 6 has neither clause, and catches it')
+})
+
+test('check 6 stays silent on every ordinary park', () => {
+  assert.equal(selects(5, genuinePark), false, 'no message, no accusation')
+  assert.equal(selects(5, parkWithTypedReason), false, 'a typed reason is not a sweep outcome')
+  assert.equal(
+    selects(5, { ...parkWithTypedReason, status: 'SYNCED', errorMessage: RECOVERY_NOTE }),
+    false,
+    'an operator dismissal is check 4\'s business, and a legitimate act on a park besides',
+  )
+  assert.equal(
+    selects(5, { ...parkWithTypedReason, status: 'FAILED', errorMessage: 'Sync failed: connection reset' }),
+    false,
+    'an ordinary error is not one of the three sentences',
+  )
+  assert.equal(
+    selects(5, { ...parkWithTypedReason, status: 'SYNCED', errorMessage: 'Superseded: something else entirely' }),
+    false,
+    'and the LIKE is anchored on the sweep\'s own wording, not on the word "Superseded"',
+  )
+})
+
+test('check 6 keys on the message the CODE writes, so the writer cannot drift away from it', () => {
+  // A check that matches a string literal and a writer that types one are two copies of one fact,
+  // and the copy in the migration cannot be recompiled. So the three sentences are exported
+  // constants, and this is the link between them.
+  const verify = readFileSync(VERIFY, 'utf8')
+  for (const message of [
+    HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE,
+    HELD_SALES_INVOICE_UNREADABLE_MESSAGE,
+    HELD_SALES_INVOICE_SUPERSEDED_PREFIX,
+  ]) {
+    assert.ok(verify.includes(message), `verify.sql must carry the exact sentence the sweep writes: ${message}`)
+  }
+
+  // ...and the sweep really does write them, by the route check 6 assumes: the settle-and-close arms
+  // of retryHeldWcSalesInvoiceReleases and the unreadable arm of releaseHeldWcSalesInvoice.
+  const importer = readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
+  for (const name of [
+    'HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE',
+    'HELD_SALES_INVOICE_UNREADABLE_MESSAGE',
+    'HELD_SALES_INVOICE_SUPERSEDED_PREFIX',
+  ]) {
+    assert.ok(importer.includes(`errorMessage: ${name}`) || importer.includes(`\${${name}}`),
+      `${name} is what the importer writes, not a second copy of the sentence`)
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -545,7 +858,7 @@ test('the runner that executes these checks is IN this tree, and the migration s
 
   // What survives from every earlier round: the checks are declared, counted, and not copied inline.
   assert.match(migration, /run-migration-verifications\.mjs/, 'the runner is named as the thing that runs them')
-  assert.match(migration, /ALL FIVE MUST RETURN 0/)
+  assert.match(migration, /ALL SIX MUST RETURN 0/)
   assert.doesNotMatch(migration, /SELECT count\(\*\) FROM "shopping_sync_logs"/, 'no second copy of the checks')
 })
 

@@ -17,6 +17,9 @@ import {
   buildReleasedSalesInvoicePayload,
   HELD_SALES_INVOICE_RECORD_KIND,
   heldSalesInvoiceQueueWhere,
+  HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE,
+  HELD_SALES_INVOICE_SUPERSEDED_PREFIX,
+  HELD_SALES_INVOICE_UNREADABLE_MESSAGE,
   isHeldSalesInvoicePayload,
   releasedSalesInvoiceQueueWhere,
 } from './held-sales-invoice'
@@ -1092,7 +1095,7 @@ async function releaseHeldWcSalesInvoice(
       where: { id: row.id },
       data: {
         status: 'FAILED',
-        errorMessage: 'The held sales-invoice payload is unreadable, so the invoice cannot be released automatically — queue it from the order.',
+        errorMessage: HELD_SALES_INVOICE_UNREADABLE_MESSAGE,
         syncedAt: new Date(),
       },
     }).catch(() => {})
@@ -1315,8 +1318,7 @@ export async function retryHeldWcSalesInvoiceReleases(options?: {
         where: { id: row.id },
         data: {
           status: 'FAILED',
-          errorMessage:
-            'The sales order this invoice was held for cannot be found, so it can never be released. Nothing was posted.',
+          errorMessage: HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE,
           syncedAt: new Date(),
         },
       }).catch(() => {})
@@ -1331,7 +1333,7 @@ export async function retryHeldWcSalesInvoiceReleases(options?: {
         data: {
           status: 'SYNCED',
           errorMessage:
-            `Superseded: this order already carries ledger document ${order.accountingInvoiceId}, so the held sales `
+            `${HELD_SALES_INVOICE_SUPERSEDED_PREFIX}${order.accountingInvoiceId}, so the held sales `
             + 'invoice was not released.',
           syncedAt: new Date(),
         },
