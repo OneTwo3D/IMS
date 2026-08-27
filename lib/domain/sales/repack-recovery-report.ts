@@ -4,8 +4,13 @@
  * Pure and separate from the action because it is a decision, not plumbing, and because the
  * version that lived inline got it backwards on the commonest path.
  *
- * The reopen is its own committed transaction, so the recovery is always reported honestly rather
- * than as all-or-nothing. What matters is which of three genuinely different outcomes happened:
+ * o3d-2k5r r3: the recovery now commits the reopen, the netting and the backstop resolution as ONE
+ * transaction, so the third case below is no longer reachable from that action — it aborts and
+ * rolls the reopen back instead of reporting a two-thirds state. The branch stays because this is a
+ * total function over its own input type and a caller that does not roll back would otherwise fall
+ * through to silence, which is the failure this module exists to prevent.
+ *
+ * What matters is which of three genuinely different outcomes happened:
  *
  *  - REFUSED — another committed shipment blocked the rebuild. Nothing was re-allocated and no
  *    backstop row was consumed; the operator has a concrete next action.
@@ -26,6 +31,12 @@ export type RepackReallocationOutcome = {
   committed?: boolean
   error?: string
   unallocatedQty?: number
+  /**
+   * o3d-2k5r r3: true when the action RESUMED an already-reopened draft rather than reverting a
+   * committed shipment on this run. "Shipment reopened, but…" is simply false there, and an
+   * operator reading it looks for a revert that did not happen.
+   */
+  resumed?: boolean
 }
 
 /** The operator-facing warning, or null when the recovery completed with nothing to say. */
@@ -33,21 +44,23 @@ export function describeRepackReallocation(
   orderRef: string,
   realloc: RepackReallocationOutcome,
 ): string | null {
+  const opened = realloc.resumed ? 'The shipment was already a draft' : 'Shipment reopened'
   if (realloc.refused) {
-    return `Shipment reopened, but stock could not be re-allocated because order ${orderRef} still has `
+    return `${opened}, but stock could not be re-allocated because order ${orderRef} still has `
       + 'another committed (picking or packed) shipment. Reopen that one too — or dispatch it — and the '
-      + 'refunded units’ reservation will be released then.'
+      + 'refunded units’ reservation will be released then. Re-running this recovery on the draft also '
+      + 'finishes it once nothing committed is left.'
   }
   if (realloc.success) return null
   if (realloc.committed) {
-    return `Shipment reopened and the refunded units’ reservation was released, but order ${orderRef} `
+    return `${opened} and the refunded units’ reservation was released, but order ${orderRef} `
       + 'could not be fully re-allocated'
       + `${realloc.error ? ` (${realloc.error})` : ''}`
       + `${realloc.unallocatedQty ? ` — ${realloc.unallocatedQty} unit(s) are on backorder` : ''}. `
       + 'Rebuild the shipment for what is allocated, or wait for stock — the refund reconciliation itself '
       + 'is done, so re-running allocation will not change it.'
   }
-  return `Shipment reopened, but re-allocating order ${orderRef} did not complete`
+  return `${opened}, but re-allocating order ${orderRef} did not complete`
     + `${realloc.error ? ` (${realloc.error})` : ''}. The refunded units may still be reserved; `
     + 'run allocation on this order again before rebuilding the shipment.'
 }

@@ -296,32 +296,40 @@ test('o3d-2k5r: provesNoRemoteWmsCall — an ABSENT link is the ONLY uncondition
   assert.equal(provesNoRemoteWmsCall({ ...clean, externalOrderId: 'wms-1' }), false)
 })
 
-test('o3d-2k5r r2: wmsOrderMayExist — the re-queue reads the SAME columns and reaches a WEAKER answer', async () => {
-  // The pushedAt / externalOrderId conjuncts ARE reachable and decisive here, which is what
-  // makes them worth keeping: this reader's caller (the revalidation re-queue) sees links at
-  // attempts >= 1, because a VALIDATION_FAILED link converted from a claim has already been
-  // raised to AMBIGUOUS_ATTEMPTS, and a released HELD link keeps its pushedAt.
-  const { wmsOrderMayExist, provesNoRemoteWmsCall } = await import('@/lib/domain/wms/order-push-sweep')
+test('o3d-2k5r r3: the three predicates are ONE LADDER — an order exists, may exist, or provably never did', async () => {
+  // The r2 version of this test asserted the opposite of the middle rung: that spent attempts
+  // alone do NOT block a re-queue, because a re-queue is "bounded and reversible". It is bounded;
+  // a second physical fulfilment is not reversible. That is the finding, and this is the rule
+  // that replaced it.
+  const { wmsOrderMayExist, wmsCreateOutcomeIsAmbiguous, provesNoRemoteWmsCall } = await import('@/lib/domain/wms/order-push-sweep')
 
   const spent = { state: 'VALIDATION_FAILED', attempts: 1, pushedAt: null, externalOrderId: null }
+  const clean = { ...spent, attempts: 0 }
   const withId = { ...spent, externalOrderId: 'wms-1' }
   const withStamp = { ...spent, pushedAt: new Date() }
 
-  // WHERE THEY AGREE: an id or a push stamp means a warehouse order may exist. Both readers
-  // refuse — the delete guard will not erase the last local record of it, and the re-queue will
-  // not push over it. This is the finding: reading the same evidence and reaching OPPOSITE
-  // conclusions is what let a link the guard blocked a delete on be re-pushed unverified.
+  // TOP RUNG — an id or a push stamp RECORDS a warehouse order. Nothing may re-open a create, and
+  // the delete guard will not erase the last local reference to it.
   assert.equal(wmsOrderMayExist(withId), true)
   assert.equal(provesNoRemoteWmsCall(withId), false)
   assert.equal(wmsOrderMayExist(withStamp), true)
   assert.equal(provesNoRemoteWmsCall(withStamp), false)
+  // ...and such a link is NOT reported as merely ambiguous: a probe would change nothing, and
+  // offering one would invite a re-queue on a FOUND that was never in doubt.
+  assert.equal(wmsCreateOutcomeIsAmbiguous(withId), false)
+  assert.equal(wmsCreateOutcomeIsAmbiguous(withStamp), false)
 
-  // WHERE THEY DELIBERATELY DIFFER, and the whole of the difference: spent attempts alone do
-  // NOT block a re-queue. Re-queueing hands the link back to the create ladder, which already
-  // retries a PENDING_CREATE link at attempts > 0 under the same MAX_ATTEMPTS bound and the
-  // same claim lease — bounded and reversible. Deleting is neither.
+  // MIDDLE RUNG — no record of an order, but a call MAY have been dispatched. This is what
+  // recordValidationFailure mints when it converts an expired claim. A re-queue here needs the
+  // warehouse's own word (probeOrderPresence === 'MISSING'); it is not this rule's to grant.
   assert.equal(wmsOrderMayExist(spent), false)
+  assert.equal(wmsCreateOutcomeIsAmbiguous(spent), true)
   assert.equal(provesNoRemoteWmsCall(spent), false)
+
+  // BOTTOM RUNG — the disposition minted from an ABSENT link. The only shape re-queued on IMS's
+  // own authority, and the only one the hard delete may let go of.
+  assert.equal(wmsCreateOutcomeIsAmbiguous(clean), false)
+  assert.equal(provesNoRemoteWmsCall(clean), true)
 })
 
 test('o3d-92fu: a VALIDATION_FAILED link carrying an external id blocks, and the REFUSAL NAMES THE ORDER', async () => {

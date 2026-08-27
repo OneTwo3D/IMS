@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  AMBIGUOUS_ATTEMPTS,
   runWmsOrderPushSweepCore,
   shouldGrantCreateClaim,
   type WmsOrderPushPort,
@@ -10,7 +11,7 @@ import {
   type WmsPushRevalidateLink,
   type WmsPushVerifyLink,
 } from '../lib/domain/wms/order-push-sweep.ts'
-import type { WmsOrderCancelResult, WmsOrderPushResult, WmsOrderUpdateResult } from '../lib/connectors/wms/types.ts'
+import type { WmsOrderCancelResult, WmsOrderPushInput, WmsOrderPushResult, WmsOrderUpdateResult } from '../lib/connectors/wms/types.ts'
 import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
 
 const NOW = () => new Date('2026-06-26T00:00:00.000Z')
@@ -62,7 +63,12 @@ function revalidateLink(overrides: Partial<WmsPushRevalidateLink> = {}): WmsPush
 type Seed = {
   bindings?: Array<{ warehouseId: string; externalWarehouseId: string }>
   releasable?: WmsPushLinkRef[]
-  createCandidates?: WmsPushCandidate[]
+  /**
+   * o3d-2k5r r3: a FUNCTION is evaluated when the CREATE pass asks, i.e. AFTER the revalidation
+   * pass has written. That ordering is the whole point — it is the only way one sweep can show a
+   * re-queue turning into a second warehouse order, which is what the pre-fix rule did.
+   */
+  createCandidates?: WmsPushCandidate[] | (() => WmsPushCandidate[])
   updatable?: WmsPushUpdateLink[]
   holdable?: WmsPushLinkRef[]
   cancellable?: WmsPushLinkRef[]
@@ -74,6 +80,12 @@ type Seed = {
   revalidatable?: { links: WmsPushRevalidateLink[]; total: number }
   /** o3d-92fu: false simulates "order deleted / another worker owns the link" under the lock. */
   recordValidationFailure?: (orderId: string) => Promise<boolean>
+  /**
+   * o3d-2k5r r3: EVERY link write throws — which is what a killed worker looks like from the
+   * row's point of view. The create path's own failure write is `.catch(() => {})`-swallowed, so
+   * the claim written before the remote call is all that survives.
+   */
+  failLinkWrites?: boolean
   /**
    * o3d-2k5r r2: what an OVERLAPPING worker has left the link in by the time a state-guarded
    * write lands. Default: still the state this pass read, so the compare-and-set matches.
@@ -91,7 +103,7 @@ function makePort(seed: Seed) {
   const port: WmsOrderPushPort = {
     activeBindings: async () => seed.bindings ?? BINDINGS,
     releasableHeldOrders: async () => seed.releasable ?? [],
-    createCandidates: async () => seed.createCandidates ?? [],
+    createCandidates: async () => (typeof seed.createCandidates === 'function' ? seed.createCandidates() : seed.createCandidates ?? []),
     revalidatableLinks: async () => seed.revalidatable ?? { links: [], total: 0 },
     recordValidationFailure: async (orderId, connector, error, attemptedAt) => {
       validationFailures.push({ orderId, connector, error, attemptedAt })
@@ -105,7 +117,10 @@ function makePort(seed: Seed) {
     updatableLinks: async () => seed.updatable ?? [],
     holdableLinks: async () => seed.holdable ?? [],
     cancellableLinks: async () => seed.cancellable ?? [],
-    upsertByOrder: async (orderId, create, update) => { upserts.push({ orderId, create, update }) },
+    upsertByOrder: async (orderId, create, update) => {
+      upserts.push({ orderId, create, update })
+      if (seed.failLinkWrites) throw new Error('worker died before the writeback')
+    },
     updateLink: async (id, data) => { updates.push({ id, data }) },
     updateLinkIfState: async (id, fromState, data) => {
       // The CAS, modelled the way the Prisma port implements it: the write applies only if the
@@ -123,7 +138,9 @@ function makePort(seed: Seed) {
 
 const okPush = async (): Promise<WmsOrderPushResult> => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' })
 function connector(overrides: {
-  pushOrder?: () => Promise<WmsOrderPushResult>
+  // Takes the INPUT, so a double can answer a later presence probe from what it was actually
+  // asked to create rather than from a flag the test sets by hand (o3d-2k5r r3).
+  pushOrder?: (input: WmsOrderPushInput) => Promise<WmsOrderPushResult>
   updateOrder?: () => Promise<WmsOrderUpdateResult>
   cancelOrder?: () => Promise<WmsOrderCancelResult>
   comments?: Array<{ externalOrderId: string; comment: string }>
@@ -132,9 +149,13 @@ function connector(overrides: {
     externalOrderId: string,
     reference: { orderNumber: string | null; externalReference: string | null },
   ) => Promise<'ours' | 'foreign' | 'unknown'>
+  /** o3d-2k5r r3: the connector-AUTHORITATIVE absence check. Undefined models a connector that
+   *  cannot probe, which must never be read as "absent". */
+  probeOrderPresence?: (orderNumber: string) => Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'>
 } = {}) {
   return {
     verifyPushedOrder: overrides.verifyPushedOrder,
+    probeOrderPresence: overrides.probeOrderPresence,
     pushOrder: overrides.pushOrder ?? okPush,
     updateOrder: overrides.updateOrder ?? (async () => ({ updated: true, status: 'NEW' })),
     cancelOrder: overrides.cancelOrder ?? (async () => ({ cancelled: true, status: 'CANCELLED' })),
@@ -400,9 +421,13 @@ test('o3d-92fu create: a whole batch of malformed orders does NOT starve the val
 })
 
 test('o3d-92fu revalidate: a link whose payload builds again is re-queued for create, attempts intact', async () => {
+  // o3d-2k5r r3: attempts 2 makes this an AMBIGUOUS claim, so the re-queue now rests on the
+  // warehouse's own word rather than on IMS's. MISSING is the only answer that grants it.
   const link = revalidateLink({ lastError: 'Sales order has a line with no SKU; cannot push to WMS', attempts: 2 })
   const { port, updates, events } = makePort({ revalidatable: { links: [link], total: 1 } })
-  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  const r = await runWmsOrderPushSweepCore(
+    connector({ probeOrderPresence: async () => 'MISSING' }), 'mintsoft', port, { now: NOW },
+  )
   assert.equal(r.revalidated, 1)
   assert.equal(updates.length, 1)
   assert.equal(updates[0].id, 'link-1')
@@ -424,6 +449,27 @@ test('o3d-92fu revalidate: a link whose payload builds again is re-queued for cr
   const audited = events.filter((e) => e.action === 'order_validate')
   assert.equal(audited.length, 1)
   assert.equal(audited[0].outcome, 'SUCCEEDED')
+  // The audit must say WHICH licence the promote rested on. An auditor should never have to
+  // infer "we asked the warehouse" from the absence of anything saying we did not.
+  assert.equal((audited[0].after as Record<string, unknown>).warehouseAbsenceProved, true)
+})
+
+test('o3d-2k5r r3 revalidate: a disposition that PROVES no call was dispatched is re-queued with no probe at all', async () => {
+  // The bottom rung, and the only shape re-queued on IMS's own authority: attempts 0, minted by
+  // recordValidationFailure's create branch from an ABSENT link. It must not cost a remote call —
+  // this pass runs every sweep, and the whole design rests on it being local.
+  const probes: string[] = []
+  const link = revalidateLink({ lastError: 'Sales order has a line with no SKU; cannot push to WMS', attempts: 0 })
+  const { port, updates, events } = makePort({ revalidatable: { links: [link], total: 1 } })
+  const r = await runWmsOrderPushSweepCore(
+    connector({ probeOrderPresence: async (n) => { probes.push(n); return 'MISSING' } }), 'mintsoft', port, { now: NOW },
+  )
+  assert.equal(r.revalidated, 1)
+  assert.equal(r.revalidateAmbiguous, 0)
+  assert.deepEqual(probes, [], 'a provably pre-call disposition costs no WMS request')
+  assert.equal(updates[0].data.state, 'PENDING_CREATE')
+  const audited = events.filter((e) => e.action === 'order_validate')
+  assert.equal((audited[0].after as Record<string, unknown>).warehouseAbsenceProved, false)
 })
 
 test('o3d-92fu revalidate: still-failing for the SAME reason re-stamps the rotation and audits NOTHING', async () => {
@@ -484,7 +530,10 @@ test('o3d-2k5r r2 revalidate: a link that LEFT VALIDATION_FAILED before the writ
   // A's claim AND nulled A's live lease — and B's own claim check hits
   // `if (!existing.lastAttemptAt) return true`, so B pushed the same order again. Two warehouse
   // orders, goods shipped twice.
-  const link = revalidateLink({ lastError: 'Sales order has a line with no SKU; cannot push to WMS', attempts: 2 })
+  // attempts 0 deliberately: this test is about the COMPARE-AND-SET on the promote, and at
+  // attempts > 0 the ambiguity gate (o3d-2k5r r3) refuses before the write is ever attempted, so
+  // the CAS would never be exercised and the test would pass for the wrong reason.
+  const link = revalidateLink({ lastError: 'Sales order has a line with no SKU; cannot push to WMS', attempts: 0 })
   const warnings: string[] = []
   const originalWarn = console.warn
   console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }
@@ -567,6 +616,183 @@ test('o3d-2k5r r2 revalidate: a PUSH STAMP with no id blocks the re-queue as wel
     console.warn = originalWarn
   }
   assert.equal(r.revalidated, 0)
+})
+
+/**
+ * o3d-2k5r r3 — a WMS that REMEMBERS what it was asked to create.
+ *
+ * The point of the double: "would this re-queue put a second order in the warehouse?" is then
+ * answered BY THE WAREHOUSE, from what it was actually told, rather than asserted by the test. A
+ * double whose presence probe returned a value the test hard-coded would agree with whichever rule
+ * it was pointed at, and could not falsify either.
+ */
+function fakeWarehouse() {
+  const created: string[] = []
+  return {
+    created,
+    pushOrder: async (input: WmsOrderPushInput): Promise<WmsOrderPushResult> => {
+      created.push(input.orderNumber)
+      return { externalOrderId: `wms-${created.length}`, externalOrderNumber: `WN-${created.length}`, status: 'NEW' }
+    },
+    probeOrderPresence: async (orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> =>
+      (created.includes(orderNumber) ? 'FOUND' : 'MISSING'),
+  }
+}
+
+test('o3d-2k5r r3 revalidate: a create that LANDED before the worker died is NOT re-queued — the second create is a second warehouse order', async () => {
+  // THE SCENARIO, end to end, and the one the r2 rule got wrong.
+  //
+  // Sweep 1 — the create reaches the WMS and the worker dies before ANY writeback. Modelled by a
+  // port whose link writes all throw, because that is what a killed process looks like from the
+  // row's point of view: the create path's own failure write is `.catch(() => {})`-swallowed, so
+  // the only thing left on the link is the claim claimForCreate wrote BEFORE the remote call —
+  // PENDING_CREATE at attempts 0.
+  const wms = fakeWarehouse()
+  const conn = connector({ pushOrder: wms.pushOrder, probeOrderPresence: wms.probeOrderPresence })
+  const dying = makePort({ createCandidates: [candidate()], failLinkWrites: true })
+  const first = await runWmsOrderPushSweepCore(conn, 'mintsoft', dying.port, { now: NOW })
+  assert.equal(wms.created.length, 1, 'the create DID reach the warehouse')
+  assert.equal(first.created, 0, 'and IMS recorded nothing about it')
+
+  // The lease then expires and the order stops building a payload (someone clears a SKU), so
+  // recordValidationFailure CONVERTS the expired claim: attempts raised to AMBIGUOUS_ATTEMPTS,
+  // externalOrderId and pushedAt still null. That the real port writes exactly this shape is
+  // proved in tests/wms-order-push-validation-disposition-port.test.ts.
+  const converted = revalidateLink({
+    attempts: AMBIGUOUS_ATTEMPTS,
+    lastError: 'Sales order has a line with no SKU; cannot push to WMS',
+  })
+
+  // Sweep 2 — the data is fixed, so the payload builds again. `createCandidates` selects on STATE
+  // alone, exactly as the production query does, so a promote is picked up by the create pass on
+  // this same tick. Under the r2 rule that is precisely what happened.
+  let second: ReturnType<typeof makePort>
+  // eslint-disable-next-line prefer-const
+  second = makePort({
+    revalidatable: { links: [converted], total: 1 },
+    createCandidates: () => (second.updates.some((u) => u.data.state === 'PENDING_CREATE') ? [candidate()] : []),
+  })
+  const warnings: string[] = []
+  const originalWarn = console.warn
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }
+  let r
+  try {
+    r = await runWmsOrderPushSweepCore(conn, 'mintsoft', second.port, { now: NOW })
+  } finally {
+    console.warn = originalWarn
+  }
+
+  // THE ASSERTION THAT MATTERS: the warehouse was not told to fulfil the same sale twice.
+  assert.equal(wms.created.length, 1)
+  assert.equal(r.created, 0)
+  assert.equal(r.revalidated, 0)
+  assert.equal(r.revalidateAmbiguous, 1)
+  // Not silently dropped either: the rotation stamp moves so it does not wedge the head of the
+  // batch, and the reason is persisted where the sync-exceptions inbox reads it.
+  assert.equal(second.updates.length, 1)
+  assert.equal(second.updates[0].ifState, 'VALIDATION_FAILED')
+  assert.equal(second.updates[0].data.state, undefined, 'it stays VALIDATION_FAILED')
+  assert.deepEqual(second.updates[0].data.lastAttemptAt, NOW())
+  assert.match(String(second.updates[0].data.lastError), /may already have been dispatched/i)
+  assert.match(String(second.updates[0].data.lastError), /ALREADY holds an order/i)
+  const audited = second.events.filter((e) => e.action === 'order_validate')
+  assert.equal(audited.length, 1)
+  assert.equal(audited[0].outcome, 'FAILED')
+  assert.equal((audited[0].after as Record<string, unknown>).remoteOutcomeAmbiguous, true)
+  assert.ok(warnings.some((w) => w.includes('NOT re-queued')), 'and the operator is told')
+})
+
+test('o3d-2k5r r3 revalidate: the same ambiguous link IS re-queued once the warehouse says the order never arrived', async () => {
+  // The guard has to be able to LET GO, or the previous test passes for a rule that simply never
+  // re-queues anything. Identical link, identical connector — the only difference is that this
+  // warehouse was never told to create it, so its own probe answers MISSING.
+  const wms = fakeWarehouse()
+  const conn = connector({ pushOrder: wms.pushOrder, probeOrderPresence: wms.probeOrderPresence })
+  const converted = revalidateLink({ attempts: AMBIGUOUS_ATTEMPTS, lastError: 'Sales order has a line with no SKU; cannot push to WMS' })
+  let harness: ReturnType<typeof makePort>
+  // eslint-disable-next-line prefer-const
+  harness = makePort({
+    revalidatable: { links: [converted], total: 1 },
+    createCandidates: () => (harness.updates.some((u) => u.data.state === 'PENDING_CREATE') ? [candidate()] : []),
+  })
+  const r = await runWmsOrderPushSweepCore(conn, 'mintsoft', harness.port, { now: NOW })
+  assert.equal(r.revalidated, 1)
+  assert.equal(r.revalidateAmbiguous, 0)
+  assert.equal(r.created, 1)
+  assert.deepEqual(wms.created, ['SO-1'], 'and the order the warehouse never had is now there, once')
+  assert.equal(harness.updates[0].data.state, 'PENDING_CREATE')
+})
+
+test('o3d-2k5r r3 revalidate: a connector that CANNOT prove absence never gets the benefit of the doubt', async () => {
+  // No probe is not "no order". A connector without probeOrderPresence must leave the link parked
+  // for a human, not fall back to the r2 behaviour of promoting on spent attempts alone.
+  const wms = fakeWarehouse()
+  const converted = revalidateLink({ attempts: AMBIGUOUS_ATTEMPTS })
+  let harness: ReturnType<typeof makePort>
+  // eslint-disable-next-line prefer-const
+  harness = makePort({
+    revalidatable: { links: [converted], total: 1 },
+    createCandidates: () => (harness.updates.some((u) => u.data.state === 'PENDING_CREATE') ? [candidate()] : []),
+  })
+  const originalWarn = console.warn
+  console.warn = () => {}
+  let r
+  try {
+    r = await runWmsOrderPushSweepCore(connector({ pushOrder: wms.pushOrder }), 'mintsoft', harness.port, { now: NOW })
+  } finally {
+    console.warn = originalWarn
+  }
+  assert.equal(r.revalidated, 0)
+  assert.equal(r.revalidateAmbiguous, 1)
+  assert.deepEqual(wms.created, [])
+  assert.match(String(harness.updates[0].data.lastError), /cannot check whether such an order exists/i)
+})
+
+test('o3d-2k5r r3 revalidate: a THROWN presence probe is not absence either, and does not fail the sweep', async () => {
+  const converted = revalidateLink({ attempts: AMBIGUOUS_ATTEMPTS })
+  const { port, updates } = makePort({ revalidatable: { links: [converted], total: 1 } })
+  const originalWarn = console.warn
+  console.warn = () => {}
+  let r
+  try {
+    r = await runWmsOrderPushSweepCore(
+      connector({ probeOrderPresence: async () => { throw new Error('WMS unreachable') } }),
+      'mintsoft', port, { now: NOW },
+    )
+  } finally {
+    console.warn = originalWarn
+  }
+  assert.equal(r.revalidated, 0)
+  assert.equal(r.revalidateAmbiguous, 1)
+  assert.equal(r.failed, 0, 'nothing was sent, so this is not a push failure')
+  assert.match(String(updates[0].data.lastError), /presence check failed/i)
+})
+
+test('o3d-2k5r r3 revalidate: the probe budget DELAYS a decision, it never makes one', async () => {
+  // The pass is otherwise local, so the probe is bounded per sweep. Over budget must park the
+  // link with a reason that says "later", not re-queue it and not close it out.
+  const wms = fakeWarehouse()
+  const conn = connector({ pushOrder: wms.pushOrder, probeOrderPresence: wms.probeOrderPresence })
+  const links = Array.from({ length: 6 }, (_, i) => revalidateLink({
+    id: `link-${i}`,
+    orderId: `so-${i}`,
+    attempts: AMBIGUOUS_ATTEMPTS,
+    order: { ...candidate({ id: `so-${i}`, orderNumber: `SO-${i}` }), shipFromWarehouseId: 'wh-1' },
+  }))
+  const { port, updates } = makePort({ revalidatable: { links, total: 6 } })
+  const originalWarn = console.warn
+  console.warn = () => {}
+  let r
+  try {
+    r = await runWmsOrderPushSweepCore(conn, 'mintsoft', port, { batchSize: 6, now: NOW })
+  } finally {
+    console.warn = originalWarn
+  }
+  assert.equal(r.revalidated, 5, 'five probes were affordable')
+  assert.equal(r.revalidateAmbiguous, 1, 'and the sixth waits rather than being decided without one')
+  const parked = updates.find((u) => u.data.state === undefined)
+  assert.match(String(parked!.data.lastError), /budget \(5\) is spent/)
+  assert.match(String(parked!.data.lastError), /re-checked on a later sweep/)
 })
 
 test('o3d-2k5r r2 release: the HELD reset is state-guarded — a link that moved on keeps its new id', async () => {

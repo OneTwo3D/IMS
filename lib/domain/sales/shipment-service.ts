@@ -760,7 +760,22 @@ export async function discardCancelledOrderShipmentsInTx(
 }
 
 export type ReopenShipmentForRepackResult =
-  | { success: false; error: string }
+  | {
+      success: false
+      error: string
+      /**
+       * o3d-2k5r r3: WHICH refusal, for the one caller that can act on the distinction.
+       *
+       * `ALREADY_PENDING` is not really a refusal of the recovery — it is "the reverting half is
+       * already done". The action treats it as a RESUME point (re-net the order and resolve the
+       * refund backstop against the existing draft) rather than a dead end, which is what makes
+       * the recovery re-runnable after an allocation refusal left it half-open. It carries the
+       * order identifiers because the caller needs them and cannot get them from an error string.
+       */
+      code?: 'ALREADY_PENDING'
+      orderId?: string
+      orderRef?: string
+    }
   | {
       success: true
       orderId: string
@@ -860,6 +875,9 @@ export async function reopenShipmentForRepack(
     if (shipment.status === UNCOMMITTED_SHIPMENT_STATUS) {
       return {
         success: false as const,
+        code: 'ALREADY_PENDING' as const,
+        orderId: shipment.orderId,
+        orderRef: shipment.order.orderNumber ?? shipment.order.externalOrderNumber ?? shipment.orderId.slice(0, 8),
         error: 'This shipment is already a pending draft — nothing has been committed to it. '
           + 'Use "Create Shipments" in the Stock Allocation panel to rebuild it against what remains on the order.',
       }
