@@ -4,7 +4,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
-import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal } from './create-replay-policy'
+import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal, wmsCreateReplayPolicy } from './create-replay-policy'
 import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere } from './create-eligibility'
 import { scrubWmsError } from './error-scrub'
 import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
@@ -40,6 +40,11 @@ const MAX_ATTEMPTS = 5
  *
  * Running out is a DELAY, never a decision: an unprobed link is re-stamped and rotates back in on
  * a later sweep, and nothing is re-queued without an answer.
+ *
+ * o3d-2k5r r6: the HELD release pass shares this budget, on the same terms — it spends a probe only
+ * on a hold whose remote cancellation was never CONFIRMED and whose connector refuses a duplicate
+ * create, which is the one shape that would otherwise be re-created on no evidence at all. A
+ * confirmed cancellation, the ordinary case, costs nothing.
  */
 const PRESENCE_PROBE_BUDGET = 5
 
@@ -941,7 +946,7 @@ export async function runWmsOrderPushSweepCore(
         action: 'order_release', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
         summary: 'Held order NOT re-queued — no confirmed WMS cancellation and this connector does not refuse a duplicate create',
         before: { state: 'HELD', externalOrderId: link.externalOrderId },
-        after: { state: 'DEAD_LETTER', remoteCancellationConfirmed: false, createReplayPolicy: 'client-side-dedupe-only' },
+        after: { state: 'DEAD_LETTER', remoteCancellationConfirmed: false, createReplayPolicy: wmsCreateReplayPolicy(connectorId) },
         error: gate.guidance,
       })
       continue

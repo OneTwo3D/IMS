@@ -991,7 +991,14 @@ test('audit: release / hold / cancel each record their state transition', async 
   const release = events.find((entry) => entry.action === 'order_release')
   assert.ok(release)
   assert.deepEqual(release.before, { state: 'HELD', externalOrderId: 'wms-r' })
-  assert.deepEqual(release.after, { state: 'PENDING_CREATE', externalOrderId: null })
+  // o3d-2k5r r6: the row now also records WHICH evidence licensed the re-create, so "why was this
+  // order pushed again?" is answerable from the timeline rather than from the code of the day.
+  assert.deepEqual(release.after, {
+    state: 'PENDING_CREATE',
+    externalOrderId: null,
+    releaseEvidence: 'remote-cancellation-confirmed',
+    warehouseAbsenceProbed: false,
+  })
   const hold = events.find((entry) => entry.action === 'order_hold')
   assert.ok(hold)
   assert.equal(hold.outcome, 'SUCCEEDED')
