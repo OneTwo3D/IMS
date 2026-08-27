@@ -298,18 +298,23 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       // o3d-2k5r r7: BOTH `in` filters are honoured, because both are load-bearing. A double that
       // ignored `idempotencyKey.in` would count another order's row; one that ignored `status.in`
       // would count a SUCCEEDED row and report a recovery that is already finished as outstanding.
-      // Either way the fence would refuse dispatches it must let through, and the narrowness test
+      // Either way the fence would refuse dispatches it must let through, and the narrowness tests
       // below would pass without the narrowing existing.
+      //
+      // Each filter is OPTIONAL here, exactly as it is in Postgres: a `count` that omits one counts
+      // more rows, it does not fail. Requiring them would turn "the production read lost a filter"
+      // into a TypeError in the double, which fails every test at once and so proves nothing about
+      // which one the filter was actually holding up.
       count: async ({ where }: {
         where: {
           connector: string
           operation: string
-          idempotencyKey: { in: string[] }
-          status: { in: string[] }
+          idempotencyKey?: { in: string[] }
+          status?: { in: string[] }
         }
       }) => (state.releaseOutbox ?? []).filter((row) => (
-        where.idempotencyKey.in.includes(row.idempotencyKey)
-        && where.status.in.includes(row.status)
+        (where.idempotencyKey === undefined || where.idempotencyKey.in.includes(row.idempotencyKey))
+        && (where.status === undefined || where.status.in.includes(row.status))
       )).length,
     },
     salesOrderRefundLine: {
@@ -2710,16 +2715,26 @@ test('o3d-2k5r r7: a refund whose reservation release already happened does not 
 })
 
 test('o3d-2k5r r7: an unresolved row on ANOTHER order does not fence this one', async () => {
-  // `countOutstandingRefundReservationReleases` keys the count on THIS order's refund ids. A read
-  // that lost that filter would refuse every dispatch in the system while any order anywhere owed a
-  // recovery, and none of the tests above would notice.
+  // The count is keyed on the idempotency keys built from THIS order's refund ids. This order's own
+  // recovery is done (refund-1, SUCCEEDED); a different order still owes one (refund-2, PENDING).
+  //
+  // The fixture is built so the key filter is the ONLY thing separating them: order-1 does have a
+  // refund, so the "no refunds → 0" shortcut is passed and the count statement really runs. Drop
+  // `idempotencyKey: { in: idempotencyKeys }` from that count and this test fails — without a
+  // refund of its own, order-1 would never reach the statement and the loosening would go unseen.
   const state = partlyRefundedTwoShipmentOrder({
     shipments: [
       { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
       { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
     ],
-    refunds: [{ id: 'refund-1', orderId: 'order-OTHER' }],
-    releaseOutbox: [{ idempotencyKey: 'sales:refund.reservation-release:refund-1', status: 'PENDING' }],
+    refunds: [
+      { id: 'refund-1', orderId: 'order-1' },
+      { id: 'refund-2', orderId: 'order-OTHER' },
+    ],
+    releaseOutbox: [
+      { idempotencyKey: 'sales:refund.reservation-release:refund-1', status: 'SUCCEEDED' },
+      { idempotencyKey: 'sales:refund.reservation-release:refund-2', status: 'PENDING' },
+    ],
   })
 
   const result = await transitionShipmentStatus(createClient(state), {
