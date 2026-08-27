@@ -233,7 +233,14 @@ function shellFunction(source: string, name: string): string {
  * about what actually reaches the medium, so the shipped implementations are what run.
  */
 function durabilityFunctions(source: string): string {
-  return [shellFunction(source, 'fsync_path'), shellFunction(source, 'publish_durable_file')].join('\n')
+  return [
+    shellFunction(source, 'fsync_path'),
+    shellFunction(source, 'publish_durable_file'),
+    // The drop-in publisher is one of these too (o3d-2sm1.5, Codex r11): install_reboot_fence()
+    // routes the systemd fragment through it, so a harness without it fails the install with
+    // "command not found" and every "the install must fail" test passes for the wrong reason.
+    shellFunction(source, 'publish_durable_dropin'),
+  ].join('\n')
 }
 
 /** The one marker filename, in the one cutover namespace, for all three entrypoints. */
@@ -3412,6 +3419,7 @@ test('all three entrypoints carry the same durability and namespace primitives, 
   for (const name of [
     'fsync_path',
     'publish_durable_file',
+    'publish_durable_dropin',
     'ensure_cutover_state_dirs',
     'acquire_cutover_lock',
     'marker_is_complete',
@@ -3744,4 +3752,295 @@ test('docs/installation.md offers no hand-run cutover, only the shipped entrypoi
     /`scripts\/install\.sh`, `scripts\/update\.sh`, `scripts\/deploy\.sh`/,
     'and point at all three entrypoints, since a fence left by any of them is adopted by any other',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r11) — THE OTHER HALF OF THE FENCE WAS NEVER FLUSHED.
+//
+//   CRITICAL  install_reboot_fence() published the marker through publish_durable_file()
+//             and then wrote the systemd drop-in with a plain `cat > "$dropin"` into a
+//             `mkdir -p`'d directory, chmod 644, daemon-reload, verify. daemon-reload and
+//             `systemctl show -p DropInPaths` prove only that systemd can read the drop-in
+//             NOW. Execution then stops the services and migrates, with no write barrier
+//             anywhere in between — the deferral's claim that "the writeback window ends
+//             before anything is stopped" is not established by that ordering. A power cut
+//             after `schema_touched` is durable but before the drop-in reaches the medium
+//             reboots without the AssertPathExists=! fence: the durable marker names a
+//             condition no unit asserts on, and the old enabled service starts against a
+//             partially migrated schema.
+//
+// The fix is publish_durable_dropin(), which adds the barrier publish_durable_file() cannot
+// give — the NEW `<unit>.d` directory's own entry in /etc/systemd/system — to the two it
+// already has. The tests below run the shipped function and the shipped
+// install_reboot_fence(), and each states WHICH SIDE OF WHICH BARRIER it injects on.
+// ---------------------------------------------------------------------------
+
+const R11_FENCE_CASES = [
+  { name: 'deploy.sh', source: DEPLOY_LINES.join('\n') },
+  { name: 'update.sh', source: UPDATE_LINES.join('\n') },
+  { name: 'install.sh', source: INSTALL_SOURCE },
+] as const
+
+/**
+ * The reboot-fence installer, running for real, over a temporary /etc/systemd/system.
+ *
+ * Only the things that are NOT under test are stubbed: the marker writer (its durability has
+ * its own tests above), `systemctl`, and verify_reboot_fence() — whose appearance in the
+ * output is itself an assertion, because a refusal that reaches the verify has happened too
+ * late. publish_durable_dropin(), rollback_reboot_fence_install() and install_reboot_fence()
+ * are the shipped text.
+ *
+ * `rm` is shimmed to SNAPSHOT the drop-in the instant before the rollback deletes it. That
+ * is what makes the precondition observable: without it the rollback erases the evidence
+ * that the rename had already published a complete, systemd-readable drop-in at the
+ * authoritative path, and the test could then pass for a publication that failed EARLIER —
+ * the wrong side of the barrier, where a read-back would also have refused.
+ */
+function runR11(
+  entry: (typeof R11_FENCE_CASES)[number],
+  extra = '',
+): { stdout: string; status: number; dropinExists: boolean; snapshot: string | null; barriers: string[] } {
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r11-'))
+  const systemdRoot = join(dir, 'etc-systemd-system')
+  const dropin = join(systemdRoot, 'app.service.d', 'zz-deploy-fence.conf')
+  const snapshot = join(dir, 'dropin-at-refusal')
+  try {
+    const preamble = `
+set -euo pipefail
+DRY_RUN=false
+BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+STATE_DIR='${dir}'
+DATA_DIR='${dir}'
+CUTOVER_STATE_DIR='${dir}'
+FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
+BARRIERS="\${CUTOVER_STATE_DIR}/barriers.log"
+SNAPSHOT='${snapshot}'
+SYSTEMD_ROOT='${systemdRoot}'
+FENCE_DROPIN_NAME=zz-deploy-fence.conf
+FENCE_DROPIN_DIR="\${SYSTEMD_ROOT}/app.service.d"
+FENCE_DROPIN_FILE="\${FENCE_DROPIN_DIR}/\${FENCE_DROPIN_NAME}"
+DROPIN="\${FENCE_DROPIN_FILE}"
+DROPIN_DIR="\${FENCE_DROPIN_DIR}"
+SERVICE_UNIT=app.service
+SERVICE_UNITS=(app.service)
+APP_NAME=app
+APP_USER=appuser
+APP_DIR=/opt/app
+APP_DIR_REAL=/opt/app
+FENCE_ARMED=false
+FENCE_MARKER_PREEXISTED=false
+FENCE_DROPIN_CREATED=false
+FENCE_DROPINS_CREATED=()
+REBOOT_FENCE_INSTALLED=false
+command mkdir -p "\${SYSTEMD_ROOT}"
+: > "\${BARRIERS}"
+info(){ :; }
+ok(){ :; }
+success(){ :; }
+warn(){ echo "WARN $*"; }
+error(){ echo "ERR $*"; }
+die(){ echo "DIE: $*" >&2; exit 1; }
+systemctl(){ echo "systemctl $*" >> "\${BARRIERS}"; return 0; }
+fence_dropin_file(){ echo "\${SYSTEMD_ROOT}/\$1.d/\${FENCE_DROPIN_NAME}"; }
+write_fence_marker(){ printf 'reboot_fence=absent\\nmarker_complete=1\\n' > "\${FENCE_FILE}"; return 0; }
+write_cutover_marker(){ write_fence_marker "\$@"; }
+verify_reboot_fence(){ echo VERIFIED; return 0; }
+sync(){ echo "sync \$*" >> "\${BARRIERS}"; command sync "\$@"; }
+mv(){ echo "mv \$*" >> "\${BARRIERS}"; command mv "\$@"; }
+rm(){
+  local __a
+  for __a in "\$@"; do
+    if [[ "\${__a}" == "\${DROPIN}" && -f "\${__a}" ]]; then cp "\${__a}" "\${SNAPSHOT}"; fi
+  done
+  command rm "\$@"
+}
+`
+    const program = [
+      preamble,
+      extra,
+      ...['fsync_path', 'publish_durable_dropin', 'rollback_reboot_fence_install', 'install_reboot_fence'].map((name) =>
+        shellFunction(entry.source, name),
+      ),
+      'RC=0',
+      'install_reboot_fence "r11 under test" || RC=$?',
+      'echo "RC=${RC}"',
+      'echo "INSTALLED=${REBOOT_FENCE_INSTALLED}"',
+      'if [[ "${RC}" -eq 0 ]]; then echo REACHED_THE_STOP; fi',
+    ].join('\n')
+
+    let stdout = ''
+    let status = 0
+    try {
+      stdout = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) {
+      const err = error as { status?: number; stdout?: string; stderr?: string }
+      status = err.status ?? -1
+      stdout = `${err.stdout ?? ''}${err.stderr ?? ''}`
+    }
+    const barrierPath = join(dir, 'barriers.log')
+    return {
+      stdout,
+      status,
+      dropinExists: existsSync(dropin),
+      snapshot: existsSync(snapshot) ? readFileSync(snapshot, 'utf8') : null,
+      barriers: existsSync(barrierPath) ? readFileSync(barrierPath, 'utf8').split('\n').filter(Boolean) : [],
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+/**
+ * FAILURE INJECTED ON THE POST-RENAME SIDE OF BARRIER 2.
+ *
+ * The new drop-in directory's parent flush (BARRIER 0) succeeds, the temporary's own flush
+ * (BARRIER 1) succeeds, the rename succeeds. Only the flush of the drop-in DIRECTORY that
+ * publish_durable_dropin() performs AFTER the rename fails — together with the bare-`sync`
+ * fallback, without which fsync_path() would report success and there would be nothing to
+ * observe.
+ *
+ * So at the instant the installer must decide, the drop-in is complete and readable at
+ * /etc/systemd/system/<unit>.d/zz-deploy-fence.conf; a daemon-reload would load it and
+ * `systemctl show -p DropInPaths` would report it. Only the publisher's return value knows
+ * that the directory entry is not proven durable. That is the exact instant the CRITICAL
+ * names, and no read-back, reload or verify can reach it.
+ */
+const R11_POST_RENAME_DROPIN_SHIM = `
+sync(){
+  echo "sync \$*" >> "\${BARRIERS}"
+  if [[ \$# -eq 0 || "\${1}" == "\${DROPIN_DIR}" ]]; then return 1; fi
+  command sync "\$@"
+}
+`
+
+/**
+ * FAILURE INJECTED ON BARRIER 0 — BEFORE ANY DROP-IN EXISTS.
+ *
+ * /etc/systemd/system/<unit>.d does not exist yet, so publish_durable_dropin() creates it and
+ * must flush /etc/systemd/system to make that directory's own name durable. This shim fails
+ * that flush and the bare-`sync` fallback. Nothing has been renamed and no drop-in is
+ * visible: a file flushed into a directory whose entry was never flushed is published into
+ * nothing, which is the failure publish_durable_file() could not have caught because it
+ * assumes its directory already exists.
+ */
+const R11_NEW_DIRECTORY_SHIM = `
+sync(){
+  echo "sync \$*" >> "\${BARRIERS}"
+  if [[ \$# -eq 0 || "\${1}" == "\${SYSTEMD_ROOT}" ]]; then return 1; fi
+  command sync "\$@"
+}
+`
+
+for (const entry of R11_FENCE_CASES) {
+  test(`${entry.name} refuses the cutover when the drop-in's POST-RENAME barrier fails, though systemd could read it`, () => {
+    const result = runR11(entry, R11_POST_RENAME_DROPIN_SHIM)
+
+    // THE PRECONDITION, PROVED RATHER THAN ASSUMED. Without it this could pass for a
+    // publication that failed before the rename — the side where nothing is visible and the
+    // OLD code's daemon-reload/verify would have refused too.
+    assert.ok(
+      result.snapshot !== null,
+      `the rename must have published the drop-in before the refusal:\n${result.stdout}\n${result.barriers.join(' | ')}`,
+    )
+    assert.match(
+      result.snapshot ?? '',
+      /^AssertPathExists=!.*DEPLOY-FENCED$/m,
+      'and it must be the complete fence condition, so nothing about its CONTENT could have refused it',
+    )
+
+    // AND THE REFUSAL, which at this instant can only come from publish_durable_dropin()'s
+    // return value.
+    assert.match(result.stdout, /RC=1/, `an unprovable drop-in must fail the install:\n${result.stdout}`)
+    assert.match(result.stdout, /INSTALLED=false/, `and no fence may be claimed:\n${result.stdout}`)
+    assert.ok(!/REACHED_THE_STOP/.test(result.stdout), `and the caller's || die must fire:\n${result.stdout}`)
+
+    // THE ROUTE. verify_reboot_fence() is stubbed to succeed and to announce itself, so its
+    // absence proves the refusal happened at the publication and not at the verify — i.e.
+    // before daemon-reload, before FENCE_ARMED, before persist_stop_requested and before the
+    // first `systemctl stop`.
+    assert.ok(
+      !/VERIFIED/.test(result.stdout),
+      `the refusal must precede the reload and the verify, not follow them:\n${result.stdout}`,
+    )
+    assert.equal(
+      result.dropinExists,
+      false,
+      'and the rollback must remove the drop-in this call created, leaving no half-published fence',
+    )
+  })
+
+  test(`${entry.name} refuses the cutover when the NEW drop-in directory cannot be made durable`, () => {
+    const result = runR11(entry, R11_NEW_DIRECTORY_SHIM)
+
+    // Precondition: the barrier that failed is the one for the directory, and it was reached
+    // — the drop-in directory did not previously exist, so BARRIER 0 applies.
+    assert.ok(
+      result.barriers.some((line) => /^sync .*etc-systemd-system$/.test(line)),
+      `the parent of a newly created drop-in directory must be flushed: ${result.barriers.join(' | ')}`,
+    )
+    assert.ok(
+      !result.barriers.some((line) => /^mv /.test(line)),
+      `and nothing may be renamed once it fails: ${result.barriers.join(' | ')}`,
+    )
+
+    assert.match(result.stdout, /RC=1/, `an unprovable drop-in directory must fail the install:\n${result.stdout}`)
+    assert.match(result.stdout, /INSTALLED=false/, `and no fence may be claimed:\n${result.stdout}`)
+    assert.ok(!/VERIFIED/.test(result.stdout), `and the refusal must precede the verify:\n${result.stdout}`)
+    assert.equal(result.dropinExists, false, 'and no drop-in may be left at the authoritative path')
+  })
+
+  test(`${entry.name} publishes the drop-in with the same three barriers, in order, before it reloads systemd`, () => {
+    // THE ORDERING IS THE PROPERTY, observed rather than read out of the source. Data flushed
+    // after the rename publishes a name whose content is not on the medium; a directory never
+    // flushed loses the name; and a `<unit>.d` whose own entry was never flushed loses both.
+    const result = runR11(entry)
+    assert.match(result.stdout, /RC=0/, `the install must succeed on the happy path:\n${result.stdout}`)
+
+    const parentBarrier = result.barriers.findIndex((line) => /^sync .*etc-systemd-system$/.test(line))
+    const dataBarrier = result.barriers.findIndex((line) => /^sync .*zz-deploy-fence\.conf\.\w+$/.test(line))
+    const rename = result.barriers.findIndex((line) =>
+      /^mv -f .*zz-deploy-fence\.conf\.\w+ .*app\.service\.d\/zz-deploy-fence\.conf$/.test(line),
+    )
+    const dirBarrier = result.barriers.findIndex((line) => /^sync .*app\.service\.d$/.test(line))
+    const reload = result.barriers.findIndex((line) => /^systemctl daemon-reload$/.test(line))
+
+    assert.notEqual(parentBarrier, -1, `BARRIER 0 must flush the new directory's parent: ${result.barriers.join(' | ')}`)
+    assert.notEqual(dataBarrier, -1, `BARRIER 1 must flush the temporary: ${result.barriers.join(' | ')}`)
+    assert.notEqual(rename, -1, `the drop-in must be published by rename: ${result.barriers.join(' | ')}`)
+    assert.notEqual(dirBarrier, -1, `BARRIER 2 must flush the drop-in directory: ${result.barriers.join(' | ')}`)
+    assert.notEqual(reload, -1, `and systemd must then be reloaded: ${result.barriers.join(' | ')}`)
+
+    assert.ok(parentBarrier < dataBarrier, `the directory's own entry is flushed first: ${result.barriers.join(' | ')}`)
+    assert.ok(dataBarrier < rename, `the data barrier must precede the rename: ${result.barriers.join(' | ')}`)
+    assert.ok(rename < dirBarrier, `and the directory barrier must follow it: ${result.barriers.join(' | ')}`)
+    assert.ok(dirBarrier < reload, `and ALL of it must precede the reload: ${result.barriers.join(' | ')}`)
+  })
+}
+
+test('no entrypoint writes its reboot-fence drop-in with a bare redirection', () => {
+  // The behavioural tests above are the proof; this is the shape that made the defect
+  // possible, named so it cannot come back in a different spelling — including at the exit
+  // trap's re-install, which shares install_reboot_fence().
+  for (const entry of R11_FENCE_CASES) {
+    const body = shellFunction(entry.source, 'install_reboot_fence')
+    assert.ok(
+      !/cat\s*>\s*"?\$\{?(dropin|FENCE_DROPIN_FILE)/.test(body),
+      `${entry.name}: install_reboot_fence() truncates the drop-in in place instead of publishing it:\n${body}`,
+    )
+    assert.match(
+      body,
+      /publish_durable_dropin/,
+      `${entry.name}: install_reboot_fence() must publish the drop-in durably`,
+    )
+    // And the result must be acted on: a `|| true` here is exactly the r10 defect one file over.
+    assert.ok(
+      /if ! publish_durable_dropin/.test(body),
+      `${entry.name}: the publisher's return value must gate the install:\n${body}`,
+    )
+    assert.match(
+      body,
+      /rollback_reboot_fence_install\n?\s*return 1/,
+      `${entry.name}: a failed drop-in publication must roll back and refuse, not warn`,
+    )
+  }
 })

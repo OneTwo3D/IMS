@@ -806,6 +806,61 @@ publish_durable_file() {
   return 0
 }
 
+# PUBLISH A SYSTEMD DROP-IN DURABLY (o3d-2sm1.5, Codex r11 CRITICAL).
+#
+# The reboot fence had only the visible half. `cat > "$dropin"` + `chmod 644` +
+# `daemon-reload` + `systemctl show -p DropInPaths` proves that systemd can read the drop-in
+# NOW. It flushes nothing: not the file's data, not the rename that publishes it, and not the
+# `<unit>.d` directory the drop-in usually had to be created in. Execution then goes straight
+# on to stop the services and migrate, and NOTHING in between is a write barrier — so the
+# claim that "the writeback window ends before anything is stopped" is not established by the
+# ordering. A power cut after `schema_touched` is durable but before the drop-in reaches the
+# medium reboots WITHOUT the AssertPathExists=! fence: the durable marker then names a
+# condition no unit asserts on, and the old enabled service starts against a partially
+# migrated schema. The marker protects nothing on its own; the drop-in is what makes systemd
+# honour it, so the two must be equally durable.
+#
+# Three barriers, and the first is the one publish_durable_file() cannot give, because it
+# assumes its directory already exists:
+#
+#   BARRIER 0  the NEW drop-in directory's own entry in /etc/systemd/system. A file flushed
+#              into a directory whose name was never flushed is published into nothing.
+#   BARRIER 1  the drop-in's data, before any name points at it.
+#   BARRIER 2  the directory entry the rename created.
+#
+# The temporary carries the `.conf.XXXXXX` suffix, which systemd does not load — only `.conf`
+# files in a `.d` directory are drop-ins — so a daemon-reload racing this publication reads
+# either the previous drop-in or the complete new one, never a partial one.
+publish_durable_dropin() {
+  local target="$1" dir parent tmp created=false
+  dir="$(dirname "$target")"
+  parent="$(dirname "$dir")"
+  if [[ ! -d "$dir" ]]; then
+    mkdir -p "$dir" || return 1
+    created=true
+  fi
+  # BARRIER 0, and only where a directory was actually created: fsyncing the parent of a
+  # directory that already survived a boot proves nothing and costs a flush of /etc.
+  if $created; then fsync_path "$parent" || return 1; fi
+  tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
+  if ! cat > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  # 0644 and not publish_durable_file()'s 0600: this is a systemd unit fragment, and every
+  # other drop-in on the host is world-readable. The marker it points at is the secret-ish
+  # one; the fence itself is meant to be legible to an operator reading `systemctl cat`.
+  if ! chmod 644 "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  # BARRIER 1: the data, before the name exists. After this the rename can only publish
+  # bytes that are already on the medium.
+  if ! fsync_path "$tmp"; then rm -f "$tmp"; return 1; fi
+  if ! mv -f "$tmp" "$target" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  # BARRIER 2: the directory entry the rename created. As in publish_durable_file(), a
+  # failure HERE returns non-zero with the new drop-in ALREADY VISIBLE — daemon-reload will
+  # load it and `systemctl show -p DropInPaths` will report it, and a power loss can still
+  # restore the previous directory entry. So the caller must act on THIS RETURN VALUE;
+  # verify_reboot_fence() asks systemd a different question and cannot answer this one.
+  fsync_path "$dir" || return 1
+  return 0
+}
+
 # THE SHARED NAMESPACE IS THE APPLICATION'S OWN DATA DIRECTORY, so this creates what is
 # missing and changes the mode of nothing else. deploy.sh used to `chmod 700` its private
 # state directory; doing that to ${CUTOVER_STATE_DIR} now would take /var/lib/one-two-inventory
@@ -1024,16 +1079,26 @@ install_reboot_fence() {
     rollback_reboot_fence_install
     return 1
   }
-  mkdir -p "${FENCE_DROPIN_DIR}"
+  # A DROP-IN SYSTEMD CAN READ IS NOT A DROP-IN THE MEDIUM WILL KEEP (o3d-2sm1.5, Codex r11
+  # CRITICAL). Published through the same discipline as the marker it asserts on — file
+  # fsync, rename, directory fsync, and the drop-in directory's own entry where this call
+  # created it — and a failure is FATAL HERE, which is before CUTOVER_ARMING becomes
+  # `stopping` and before the first `systemctl stop`. Everything undone by
+  # rollback_reboot_fence_install() and by the pre-stop branch of the exit trap.
   [[ -f "${FENCE_DROPIN_FILE}" ]] || FENCE_DROPIN_CREATED=true
-  cat > "${FENCE_DROPIN_FILE}" <<FENCEEOF
+  if ! publish_durable_dropin "${FENCE_DROPIN_FILE}" <<FENCEEOF
 [Unit]
 # Installed by scripts/install.sh for the length of an upgrade cutover.
 # While the marker below exists this unit must not start — not by hand, and not on
 # boot. install.sh removes both once the migration has been verified.
 AssertPathExists=!${FENCE_FILE}
 FENCEEOF
-  chmod 644 "${FENCE_DROPIN_FILE}"
+  then
+    error "${FENCE_DROPIN_FILE} could not be published durably, so there is NO reboot fence:"
+    error "a reboot before it reached the medium would start ${APP_NAME}.service against a migrated schema."
+    rollback_reboot_fence_install
+    return 1
+  fi
   if ! systemctl daemon-reload; then
     error "systemctl daemon-reload failed; the reboot fence is NOT active."
     rollback_reboot_fence_install
