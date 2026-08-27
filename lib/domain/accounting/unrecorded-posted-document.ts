@@ -102,7 +102,9 @@ export function describeUnrecordablePostedDocument(incident: UnrecordablePostedD
     })
   }
   const w = documentIncidentWording(entry.type, kind)
-  const slots = { ledger: 'Xero' as const, postedExternalId: posted }
+  const slots: WordingSlots = {
+    ledger: 'Xero', postedExternalId: posted, lookup: w.lookup, lookupNoun: w.noun,
+  }
   const did = render(posted ? w.didWithId : w.didWithoutId, slots)
   const head = `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} ${did}, `
   return reason === 'ROW_MISSING'
@@ -698,15 +700,28 @@ export const OPERATION_SEMANTIC_BY_TYPE =
   } as const) satisfies Readonly<Record<AccountingSyncType, PostedOperationSemantic>>
 
 /**
- * THE POSTING MODE ONLY CHANGES THE ANSWER FOR THESE TWO.
+ * WHICH OPERATIONS ARE SENT WITH A POSTING MODE AT ALL — READ OFF THE HANDLERS (round 11, Codex
+ * MEDIUM).
  *
- * A document CREATE and a manual JOURNAL are sent with a status resolved from `_postingMode`
- * (`resolveInvoiceStatus` / `resolveJournalStatus` in the Xero processor), so on `draft` they land
- * unposted and move nothing. An UPDATE writes to a document that already existed and a PAYMENT has
- * no draft form, so for those two the mode cannot turn a real effect into no effect and its absence
- * is not an unknown.
+ * ROUND 10 GOT THE AXIS RIGHT AND THEN LET ONE SEMANTIC IGNORE HALF OF IT. It wrote that "an UPDATE
+ * writes to a document that already existed … so the mode cannot turn a real effect into no effect".
+ * THAT IS FALSE OF THIS CODEBASE. Both update handlers send `resolveInvoiceStatus(postingMode)`
+ * exactly as the creates do (`SALES_INVOICE_UPDATE` and `PURCHASE_INVOICE_UPDATE` in the Xero
+ * processor), and `_postingMode` is one per-sync-type operator setting shared by the create and the
+ * update of the same document. So an update issued while that setting is `draft` sends status DRAFT:
+ * the document it changed is an UNPOSTED DRAFT, no balance has moved, and round 10 counted it as a
+ * LIVE document — which made the reset breadcrumb call it "real money in somebody else's books".
+ *
+ * THE MODEL IS NOW TWO INDEPENDENT AXES, and this set is the whole of the second one. The SEMANTIC
+ * says what the operation did to the ledger (create / update / pay / journal); the POSTING STATE
+ * says whether what it did reached the ledger at all. Membership here is decided by ONE question —
+ * does the handler send a status resolved from `_postingMode`? — and not by whether the operation
+ * feels like it creates something. A payment is the only document operation that does not: Xero
+ * Payments have no draft form and no status is resolved for them.
  */
-const DRAFT_CAPABLE_SEMANTICS = new Set<PostedOperationSemantic>(['CREATE_DOCUMENT', 'POST_JOURNAL'])
+const DRAFT_CAPABLE_SEMANTICS = new Set<PostedOperationSemantic>([
+  'CREATE_DOCUMENT', 'UPDATE_DOCUMENT', 'POST_JOURNAL',
+])
 
 /** The operation types this map classifies as reaching no ledger document — derived, never re-listed. */
 type NonDocumentOperationType = {
@@ -741,17 +756,91 @@ type NonDocumentOperationType = {
  *     so a remedy selected in a state where its id is null cannot silently print "null", and the
  *     test that generates every message is what catches it before it ships.
  *
- * A remedy that needs a field this record does not hold therefore fails to compile or fails the
- * test, whatever words it is written in.
+ * ROUND 11 (Codex MEDIUM): AND THAT WAS STILL NOT AN ENFORCED DECLARATION — IT WAS AN AUTHOR
+ * CONVENTION WITH A TEST NEXT TO IT. Round 10 closed the sentence above with "whatever words it is
+ * written in", and that was the third version of this invariant to claim closure it did not have.
+ * The check reads `{placeholder}`s and trusts `needs`; a remedy that writes "search by gross total
+ * and posting day" IN PROSE introduces no placeholder, leaves `needs` truthful, and passes. So the
+ * LOOKUP CLAUSE ITSELF stopped being prose — see {@link LOOKUP_FIELD_PHRASE} and the fence in
+ * tests/accounting/record-names-only-what-it-holds.test.ts, and read there what the invariant now
+ * provably covers and what it provably does not.
  */
 export const RECORD_LOOKUP_FIELDS = ['syncLogId', 'type', 'referenceType', 'referenceId', 'postedExternalId'] as const
 export type RecordLookupField = (typeof RECORD_LOOKUP_FIELDS)[number]
 
-/** The slots a wording template may substitute: the ledger's name, and the declared record fields. */
-type WordingSlots = { ledger: 'Xero' | 'QuickBooks' } & Partial<Record<RecordLookupField, string | null>>
+/**
+ * THE ONE PRODUCER OF A LOOKUP INSTRUCTION (round 11, Codex MEDIUM).
+ *
+ * THE DEFECT IT REPLACES. Round 10 made a wording DECLARE the record values it names, and checked
+ * the declaration against what the two builders write. That check reads `{placeholder}`s and trusts
+ * each entry's `needs` array — so a remedy that adds "search by gross total and posting day" in
+ * ORDINARY PROSE introduces no placeholder, leaves `needs` truthful, compiles, and passes. `needs`
+ * was an author convention, not an enforced declaration, and the exact bypass round 10 claimed to
+ * eliminate survived it. Round 9's version was bypassable a different way, and round 8's a third.
+ *
+ * SO THE LOOKUP CLAUSE IS NOT PROSE ANY MORE. An entry declares `lookup: RecordLookupField[]`, and
+ * the sentence that tells an operator what to search by is GENERATED here from that declaration
+ * against the values this incident actually carries. A field that is not a `RecordLookupField` does
+ * not compile; a field the builders do not both write fails the declaration test; a field whose
+ * value is absent on THIS incident throws while rendering, and the test that generates every message
+ * for every combination is what turns that into a red build.
+ *
+ * WHAT IS RESERVED. The renderer owns the WHOLE lookup clause — the verb, the ledger and the
+ * criterion — so a template cannot supply half of one. The fence in
+ * tests/accounting/record-names-only-what-it-holds.test.ts then refuses any template containing a
+ * LOOKUP VERB at all, which leaves `{lookup}` as the only way a remedy can tell an operator to go
+ * and find something. What prose MAY still do is name a value THIS MESSAGE HAS ALREADY PRINTED —
+ * "open both ids", "the reference above" — because that is text the reader already has in front of
+ * them, not data they must go and search on.
+ *
+ * WHAT THIS PROVABLY DOES NOT COVER, said plainly rather than implied: see the fence's own comment
+ * in that test file, which is the honest half of this answer. English has no closed set of ways to
+ * name a datum, and these remedies are hand-written operator prose that could not survive being
+ * generated from a grammar without losing everything ten rounds of review put into them.
+ */
+const LOOKUP_FIELD_PHRASE: Readonly<Record<RecordLookupField, string>> = Object.freeze({
+  syncLogId: 'the sync row id above',
+  type: 'the operation type above',
+  referenceType: 'the kind of IMS record named above',
+  referenceId: 'the IMS reference above',
+  postedExternalId: 'the id above',
+})
 
 /**
- * Substitute `{ledger}`, `{LEDGER}` and any {@link RecordLookupField} the caller supplies.
+ * The slots a wording template may substitute: the ledger's name, the record fields, and — for
+ * `{lookup}` — the DECLARATION rather than a finished sentence. The clause is built only if a
+ * template actually reaches for it, because a wording that declares a lookup may also have branches
+ * that do not use one (the same entry answers both "the id is in hand" and "no id came back").
+ */
+type WordingSlots = {
+  ledger: 'Xero' | 'QuickBooks'
+  lookup?: readonly RecordLookupField[]
+  /** What the generated clause calls the thing being looked for — the entry's own `noun`. */
+  lookupNoun?: string
+} & Partial<Record<RecordLookupField, string | null>>
+
+/**
+ * Build the lookup clause for one incident, or throw if this incident cannot support it.
+ *
+ * The values come from the incident's own slots, so a remedy selected in a state where its lookup
+ * field is null cannot render at all — it does not degrade into "look it up by null".
+ */
+function lookupInstruction(fields: readonly RecordLookupField[], slots: WordingSlots): string {
+  if (fields.length === 0) {
+    throw new Error('a lookup instruction with no declared field is not an instruction')
+  }
+  const phrases = fields.map((field) => {
+    const value = slots[field]
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new Error(`incident wording sends an operator to look up by "${field}", which this record does not carry`)
+    }
+    return LOOKUP_FIELD_PHRASE[field]
+  })
+  return `find ${slots.lookupNoun ?? 'it'} in ${slots.ledger} by ${phrases.join(' and ')}`
+}
+
+/**
+ * Substitute `{ledger}`, `{LEDGER}`, `{lookup}` and any {@link RecordLookupField} the caller supplies.
  *
  * THROWS on an unknown placeholder and on a declared one whose value is absent. Both are programming
  * errors in a constant table, and the test that renders every message for every combination is what
@@ -761,6 +850,13 @@ function render(template: string, slots: WordingSlots): string {
   return template.replace(/\{([A-Za-z]+)\}/g, (_whole, slot: string) => {
     if (slot === 'ledger') return slots.ledger
     if (slot === 'LEDGER') return slots.ledger.toUpperCase()
+    if (slot === 'lookup' || slot === 'Lookup') {
+      if (!slots.lookup) {
+        throw new Error('incident wording named "{lookup}" without declaring a lookup field for it')
+      }
+      const clause = lookupInstruction(slots.lookup, slots)
+      return slot === 'Lookup' ? clause.charAt(0).toUpperCase() + clause.slice(1) : clause
+    }
     if (!(RECORD_LOOKUP_FIELDS as readonly string[]).includes(slot)) {
       throw new Error(`incident wording named "${slot}", which is not a field this record holds`)
     }
@@ -771,6 +867,7 @@ function render(template: string, slots: WordingSlots): string {
     return value
   })
 }
+
 
 /** The one escalation instruction, so the seven places that end in it cannot each word it slightly differently. */
 const ESCALATE_REMEDY = 'REMEDY: escalate this record to whoever administers this installation'
@@ -798,6 +895,23 @@ const OUTCOME_UNRECORDED_REMEDY: string =
   + 'round. Escalate this record to whoever administers this installation'
 
 /**
+ * THE SAME ANSWER FOR AN UPDATE, WHICH KNOWS ONE MORE THING (round 11, Codex MEDIUM).
+ *
+ * The posting state is unknown, so nothing may be acted on — but "this attempt created nothing" is
+ * known from the operation itself and does not depend on the mode. Losing that sentence is how a
+ * reader of an update incident ends up looking for a duplicate that cannot exist.
+ */
+const UPDATE_OUTCOME_UNRECORDED_REMEDY: string =
+  'REMEDY: NO DOCUMENT WAS CREATED — this operation changed one that already existed, so there is no '
+  + 'duplicate of it in existence and nothing this attempt brought into being. WHAT THIS RECORD '
+  + 'DOES NOT '
+  + 'SAY is whether the document it changed is LIVE or an UNPOSTED DRAFT: the update is sent with a '
+  + 'status resolved from the same posting-mode setting the create uses, and IMS did not record '
+  + 'which was in force for this attempt. So it cannot say whether any balance moved. DO NOT void, '
+  + 'credit-note, reverse or delete anything on the strength of this record. Escalate this record to '
+  + 'whoever administers this installation'
+
+/**
  * THE DOCUMENT REMEDY, PER OPERATION SEMANTIC AND PER POSTING MODE (round 10, Codex HIGH).
  *
  * ONE TABLE FOR BOTH CONNECTORS AND BOTH FRAMES. The Xero formatter reaches a document incident by
@@ -814,13 +928,22 @@ const OUTCOME_UNRECORDED_REMEDY: string =
  *   CREATE_DRAFT       a document exists, UNPOSTED            → DELETE it; a reversal would post
  *   JOURNAL_LIVE       a manual journal is in the ledger      → reverse it (journals do not void)
  *   JOURNAL_DRAFT      a journal exists, UNPOSTED             → DELETE it; a reversal would post
- *   UPDATE             a document that was already there was changed → inspect and correct it
+ *   UPDATE_LIVE        a live document that was already there was changed → inspect and correct it
+ *   UPDATE_DRAFT       an UNPOSTED document was changed       → correct it; do NOT delete it either
+ *   UPDATE_UNRECORDED  a document was changed, posted or not  → correct nothing, escalate
  *   PAYMENT            a payment was applied to a document nobody created here → remove the PAYMENT
  *   OUTCOME_UNRECORDED live or draft, and this record does not say → touch nothing, escalate
+ *
+ * ROUND 11 (Codex MEDIUM): THE UPDATE ROW IS NOW THREE ROWS, because the posting state is asked of
+ * an update like it is asked of anything else. Round 10 had ONE update wording and reached it
+ * without consulting the mode, so a draft update was described as a live document and counted as
+ * real money. Note that UPDATE_DRAFT is the one draft wording that must NOT say "delete it": the
+ * draft it changed stood there before this attempt ran, and deleting it destroys somebody's work.
  */
 type DocumentWordingKey =
   | 'CREATE_LIVE' | 'CREATE_DRAFT' | 'JOURNAL_LIVE' | 'JOURNAL_DRAFT'
-  | 'UPDATE' | 'PAYMENT' | 'OUTCOME_UNRECORDED'
+  | 'UPDATE_LIVE' | 'UPDATE_DRAFT' | 'UPDATE_UNRECORDED'
+  | 'PAYMENT' | 'OUTCOME_UNRECORDED'
 
 export type DocumentIncidentWording = {
   /** Completes "Xero SALES_INVOICE for SalesOrder order-1 …, but …". */
@@ -842,6 +965,11 @@ export type DocumentIncidentWording = {
   remedyIdUnrecorded: string
   /** Every record field the templates above name. Checked against the builders by the test. */
   needs: readonly RecordLookupField[]
+  /**
+   * What `{lookup}` searches by — the ONLY route by which a remedy may introduce a search criterion
+   * (round 11, Codex MEDIUM). Omitted where no template reaches for one.
+   */
+  lookup?: readonly RecordLookupField[]
 }
 
 export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, DocumentIncidentWording>> = Object.freeze({
@@ -852,13 +980,14 @@ export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, Docu
     conflictNoun: 'document',
     bothExist: 'BOTH documents exist in {ledger}.',
     absent: 'The document is in {ledger} all the same.',
-    remedyRowGone: 'REMEDY: find it in {ledger} by the id above and either keep it (re-enter the '
-      + 'reference by hand) or void it; ',
+    remedyRowGone: 'REMEDY: {lookup} and either keep it (re-enter the '
+      + 'reference manually) or void it; ',
     remedyDuplicate: 'REMEDY: open both ids in {ledger}, keep the one the row names, and void or '
       + 'credit the duplicate; ',
     remedyIdUnrecorded: 'REMEDY: open the id above in {ledger}, confirm exactly one document exists '
       + 'for this reference, and void any duplicate.',
     needs: ['postedExternalId'],
+    lookup: ['postedExternalId'],
   },
   CREATE_DRAFT: {
     didWithId: 'created a DRAFT document in {ledger} as {postedExternalId} — nothing was posted to the ledger',
@@ -868,7 +997,7 @@ export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, Docu
     bothExist: 'BOTH drafts exist in {ledger}, and neither has moved a balance.',
     absent: 'The draft is in {ledger} all the same, and it moved no balances.',
     remedyRowGone: 'REMEDY: THE DRAFT MOVED NO BALANCES — it was created unposted, so nothing has '
-      + 'reached the ledger. Find it in {ledger} by the id above and DELETE it if it should not '
+      + 'reached the ledger. {Lookup} and DELETE it if it should not '
       + 'exist. DO NOT void it, credit-note it or reverse it: a reversal POSTS FOR REAL, so it would '
       + 'move the accounts by exactly the amount this draft never moved, and leave the draft sitting '
       + 'there as well; ',
@@ -879,6 +1008,7 @@ export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, Docu
       + 'above in {ledger}, confirm exactly one draft exists for this reference, and DELETE any '
       + 'duplicate. DO NOT void, credit-note or reverse one: a reversal POSTS FOR REAL.',
     needs: ['postedExternalId'],
+    lookup: ['postedExternalId'],
   },
   JOURNAL_LIVE: {
     didWithId: 'POSTED a manual journal to the {ledger} ledger as {postedExternalId}',
@@ -887,8 +1017,8 @@ export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, Docu
     conflictNoun: 'journal',
     bothExist: 'BOTH journals are in the {ledger} ledger.',
     absent: 'The journal is in the {ledger} ledger all the same.',
-    remedyRowGone: 'REMEDY: find the journal in {ledger} by the id above and either keep it '
-      + '(re-enter the reference by hand) or POST A REVERSING JOURNAL against it — a manual journal '
+    remedyRowGone: 'REMEDY: {lookup} and either keep it '
+      + '(re-enter the reference manually) or POST A REVERSING JOURNAL against it — a manual journal '
       + 'is not voided or credit-noted; ',
     remedyDuplicate: 'REMEDY: open both ids in {ledger}, keep the one the row names, and REVERSE the '
       + 'duplicate with a reversing journal — a manual journal is not voided or credit-noted; ',
@@ -896,6 +1026,7 @@ export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, Docu
       + 'for this reference, and REVERSE any duplicate with a reversing journal. A manual journal is '
       + 'not voided or credit-noted.',
     needs: ['postedExternalId'],
+    lookup: ['postedExternalId'],
   },
   JOURNAL_DRAFT: {
     didWithId: 'created a DRAFT manual journal in {ledger} as {postedExternalId} — nothing was posted to the ledger',
@@ -905,7 +1036,7 @@ export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, Docu
     bothExist: 'BOTH draft journals exist in {ledger}, and neither has moved a balance.',
     absent: 'The draft journal is in {ledger} all the same, and it moved no balances.',
     remedyRowGone: 'REMEDY: THE DRAFT MOVED NO BALANCES — it was created unposted, so no account has '
-      + 'been touched. Find it in {ledger} by the id above and DELETE it if it should not exist. DO '
+      + 'been touched. {Lookup} and DELETE it if it should not exist. DO '
       + 'NOT post a reversing journal: the reversal POSTS FOR REAL, so it would move the accounts by '
       + 'exactly the amount this draft never moved, and leave the draft sitting there as well; ',
     remedyDuplicate: 'REMEDY: NEITHER DRAFT HAS MOVED A BALANCE. Open both ids in {ledger}, keep the '
@@ -915,8 +1046,9 @@ export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, Docu
       + 'above in {ledger}, confirm exactly one draft journal exists for this reference, and DELETE '
       + 'any duplicate. DO NOT post a reversing journal: a reversal POSTS FOR REAL.',
     needs: ['postedExternalId'],
+    lookup: ['postedExternalId'],
   },
-  UPDATE: {
+  UPDATE_LIVE: {
     didWithId: 'MODIFIED the existing {ledger} document {postedExternalId}',
     didWithoutId: 'MODIFIED an existing {ledger} document (no id returned)',
     noun: 'the document it changed',
@@ -928,16 +1060,69 @@ export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, Docu
     remedyRowGone: 'REMEDY: NO DOCUMENT WAS CREATED — this operation changed one that already '
       + 'existed, so there is no duplicate here and nothing that this attempt brought into being. DO '
       + 'NOT VOID OR CREDIT-NOTE IT: doing so would void a document that was valid before this '
-      + 'attempt ran. Open it in {ledger} by the id above, compare it against the reference above in '
+      + 'attempt ran. {Lookup}, compare it against the reference above in '
       + 'IMS, and correct it in {ledger} if the change should not stand; ',
     remedyDuplicate: 'REMEDY: NO DOCUMENT WAS CREATED BY THIS ATTEMPT — it changed one that already '
       + 'existed, and the row names a different one. DO NOT VOID OR CREDIT-NOTE EITHER. Open both '
       + 'ids in {ledger}, compare each against the reference above in IMS, and correct whichever is '
       + 'wrong; ',
     remedyIdUnrecorded: 'REMEDY: NO DOCUMENT WAS CREATED — this operation changed one that already '
-      + 'existed. DO NOT VOID OR CREDIT-NOTE IT, and do not go looking for a duplicate. Open the id '
+      + 'existed. DO NOT VOID OR CREDIT-NOTE IT, and no duplicate of it exists to open. Open the id '
       + 'above in {ledger}, compare it against the reference above in IMS, and correct it there if '
       + 'the change should not stand.',
+    needs: ['postedExternalId'],
+    lookup: ['postedExternalId'],
+  },
+  // ROUND 11 (Codex MEDIUM): AN UPDATE SENT ON `draft` CHANGED A DOCUMENT THAT IS UNPOSTED. Two
+  // facts hold at once and each one forbids a different remedy: nothing was CREATED, so voiding or
+  // credit-noting destroys a document that was valid before the attempt ran; and nothing has
+  // POSTED, so a reversal would move balances this draft never moved. Deletion is forbidden too,
+  // which is what makes this different from CREATE_DRAFT — the draft existed first.
+  UPDATE_DRAFT: {
+    didWithId: 'MODIFIED the existing {ledger} DRAFT document {postedExternalId} — it is still '
+      + 'unposted, and no balance moved',
+    didWithoutId: 'MODIFIED an existing {ledger} DRAFT document (no id returned) — it is still '
+      + 'unposted, and no balance moved',
+    noun: 'the draft it changed',
+    conflictNoun: 'draft document',
+    bothExist: 'BOTH drafts exist in {ledger}, NEITHER was created by this attempt, and neither has '
+      + 'moved a balance.',
+    absent: 'The draft it changed is in {ledger} all the same, it stood there before this attempt '
+      + 'ran, and it moved no balances.',
+    remedyRowGone: 'REMEDY: NOTHING WAS CREATED AND NOTHING WAS POSTED. This operation changed a '
+      + 'document that already existed, and it was sent unposted, so no balance moved. DO NOT VOID '
+      + 'OR CREDIT-NOTE IT — that would act on a document that was valid before this attempt ran. DO '
+      + 'NOT REVERSE IT — a reversal POSTS FOR REAL and would move accounts this draft never moved. '
+      + 'AND DO NOT DELETE IT — the draft was there before this attempt and deleting it destroys '
+      + 'work this attempt did not do. {Lookup}, compare it against the '
+      + 'reference above in IMS, and correct the draft in place if the change should not stand; ',
+    remedyDuplicate: 'REMEDY: NOTHING WAS CREATED, NOTHING WAS POSTED, and the row names a different '
+      + 'draft. DO NOT VOID, CREDIT-NOTE, REVERSE OR DELETE EITHER: neither was created by this '
+      + 'attempt and neither has moved a balance. Open both ids in {ledger}, compare each against '
+      + 'the reference above in IMS, and correct whichever draft is wrong in place; ',
+    remedyIdUnrecorded: 'REMEDY: NOTHING WAS CREATED AND NOTHING WAS POSTED — this operation changed '
+      + 'a document that already existed, unposted. DO NOT VOID, CREDIT-NOTE, REVERSE OR DELETE IT, '
+      + 'and no duplicate of it exists to open. Open the id above in {ledger}, compare it against '
+      + 'the reference above in IMS, and correct the draft in place if the change should not stand.',
+    needs: ['postedExternalId'],
+    lookup: ['postedExternalId'],
+  },
+  // The update whose posting mode was not recorded. The UPDATE facts still hold in full — this
+  // attempt created nothing — so the update-specific refusals are kept. What is unknown is only
+  // whether the document it changed is live or a draft, and that decides nothing an operator may
+  // safely do here, so it is told to change nothing.
+  UPDATE_UNRECORDED: {
+    didWithId: 'MODIFIED the existing {ledger} document {postedExternalId}',
+    didWithoutId: 'MODIFIED an existing {ledger} document (no id returned)',
+    noun: 'the document it changed',
+    conflictNoun: 'document',
+    bothExist: 'BOTH documents exist in {ledger}, and NEITHER was created by this attempt — it '
+      + 'changed the one it names.',
+    absent: 'The document it changed is in {ledger} all the same, and it stood there before this '
+      + 'attempt ran.',
+    remedyRowGone: UPDATE_OUTCOME_UNRECORDED_REMEDY + '; ',
+    remedyDuplicate: UPDATE_OUTCOME_UNRECORDED_REMEDY + '; ',
+    remedyIdUnrecorded: UPDATE_OUTCOME_UNRECORDED_REMEDY + '.',
     needs: ['postedExternalId'],
   },
   PAYMENT: {
@@ -948,8 +1133,8 @@ export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, Docu
     bothExist: 'BOTH payments are in {ledger}.',
     absent: 'The payment is in {ledger} all the same.',
     remedyRowGone: 'REMEDY: A PAYMENT WAS APPLIED TO A DOCUMENT THAT ALREADY EXISTED — no invoice, '
-      + 'bill or credit note was created here. Open the payment in {ledger} by the id above and '
-      + 'either keep it (re-enter the reference by hand) or REMOVE OR REVERSE THAT PAYMENT. DO NOT '
+      + 'bill or credit note was created here. {Lookup} and '
+      + 'either keep it (re-enter the reference manually) or REMOVE OR REVERSE THAT PAYMENT. DO NOT '
       + 'void or credit-note the document it was applied to; ',
     remedyDuplicate: 'REMEDY: open both payment ids in {ledger}, keep the one the row names, and '
       + 'remove or reverse the duplicate PAYMENT. DO NOT void or credit-note the invoice or bill '
@@ -958,6 +1143,7 @@ export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, Docu
       + 'for this reference, and remove or reverse any duplicate PAYMENT. DO NOT void or credit-note '
       + 'the document it was applied to — that document was not created here.',
     needs: ['postedExternalId'],
+    lookup: ['postedExternalId'],
   },
   OUTCOME_UNRECORDED: {
     didWithId: 'reached {ledger} as {postedExternalId}',
@@ -974,16 +1160,70 @@ export const DOCUMENT_INCIDENT_WORDING: Readonly<Record<DocumentWordingKey, Docu
 })
 
 
-/** Which wording a document incident earns — the semantic decides the shape, the kind decides the mode. */
+/**
+ * THE POSTING STATE OF THE ATTEMPT, AS A VALUE (round 11, Codex MEDIUM).
+ *
+ * Derived from the kind rather than from the operation, because that is the whole correction: what
+ * the operation MEANT and where its write ENDED UP are two questions, and round 10 answered the
+ * second one out of the first for updates.
+ */
+type PostingState = 'LIVE' | 'DRAFT' | 'UNRECORDED'
+function postingStateOf(kind: UnrecordedIncidentKind): PostingState {
+  if (kind === 'LEDGER_DRAFT') return 'DRAFT'
+  if (kind === 'LEDGER_OUTCOME_UNRECORDED') return 'UNRECORDED'
+  return 'LIVE'
+}
+
+/** The four document semantics — the ones `isDocumentKind` can be reached with. */
+type DocumentSemantic = 'CREATE_DOCUMENT' | 'UPDATE_DOCUMENT' | 'APPLY_PAYMENT' | 'POST_JOURNAL'
+
+/**
+ * THE TWO AXES, AS A TABLE RATHER THAN A LADDER OF `if`s (round 11, Codex MEDIUM).
+ *
+ * Round 10's selector asked the semantic first and the posting state second, and the UPDATE arm
+ * returned before the state was ever consulted — which is precisely how a draft update came to be
+ * described as a live document and counted as real money. A table cannot do that: every semantic
+ * has a cell for every state, and the compiler fails the build if one is missing.
+ *
+ * APPLY_PAYMENT's three cells are the same wording ON PURPOSE, and it is not a shrug. A payment is
+ * not in {@link DRAFT_CAPABLE_SEMANTICS} — no status is resolved for it and Xero Payments have no
+ * draft form — so `incidentKindForOperation` cannot produce DRAFT or UNRECORDED for one. The cells
+ * exist so that the day a payment DOES acquire a draft form, the change is made here where it is
+ * visible, rather than by an arm that silently never looked.
+ */
+const DOCUMENT_WORDING_BY_SEMANTIC: Readonly<Record<
+  DocumentSemantic,
+  Readonly<Record<PostingState, DocumentIncidentWording>>
+>> = Object.freeze({
+  CREATE_DOCUMENT: {
+    LIVE: DOCUMENT_INCIDENT_WORDING.CREATE_LIVE,
+    DRAFT: DOCUMENT_INCIDENT_WORDING.CREATE_DRAFT,
+    UNRECORDED: DOCUMENT_INCIDENT_WORDING.OUTCOME_UNRECORDED,
+  },
+  POST_JOURNAL: {
+    LIVE: DOCUMENT_INCIDENT_WORDING.JOURNAL_LIVE,
+    DRAFT: DOCUMENT_INCIDENT_WORDING.JOURNAL_DRAFT,
+    UNRECORDED: DOCUMENT_INCIDENT_WORDING.OUTCOME_UNRECORDED,
+  },
+  UPDATE_DOCUMENT: {
+    LIVE: DOCUMENT_INCIDENT_WORDING.UPDATE_LIVE,
+    DRAFT: DOCUMENT_INCIDENT_WORDING.UPDATE_DRAFT,
+    UNRECORDED: DOCUMENT_INCIDENT_WORDING.UPDATE_UNRECORDED,
+  },
+  APPLY_PAYMENT: {
+    LIVE: DOCUMENT_INCIDENT_WORDING.PAYMENT,
+    DRAFT: DOCUMENT_INCIDENT_WORDING.PAYMENT,
+    UNRECORDED: DOCUMENT_INCIDENT_WORDING.PAYMENT,
+  },
+})
+
+/** Which wording a document incident earns — one cell of {@link DOCUMENT_WORDING_BY_SEMANTIC}. */
 function documentIncidentWording(type: string, kind: UnrecordedIncidentKind): DocumentIncidentWording {
-  if (kind === 'LEDGER_OUTCOME_UNRECORDED') return DOCUMENT_INCIDENT_WORDING.OUTCOME_UNRECORDED
   const semantic = operationSemanticFor(type)
-  if (semantic === 'POST_JOURNAL') {
-    return kind === 'LEDGER_DRAFT' ? DOCUMENT_INCIDENT_WORDING.JOURNAL_DRAFT : DOCUMENT_INCIDENT_WORDING.JOURNAL_LIVE
-  }
-  if (semantic === 'UPDATE_DOCUMENT') return DOCUMENT_INCIDENT_WORDING.UPDATE
-  if (semantic === 'APPLY_PAYMENT') return DOCUMENT_INCIDENT_WORDING.PAYMENT
-  return kind === 'LEDGER_DRAFT' ? DOCUMENT_INCIDENT_WORDING.CREATE_DRAFT : DOCUMENT_INCIDENT_WORDING.CREATE_LIVE
+  const row = semantic && semantic in DOCUMENT_WORDING_BY_SEMANTIC
+    ? DOCUMENT_WORDING_BY_SEMANTIC[semantic as DocumentSemantic]
+    : DOCUMENT_WORDING_BY_SEMANTIC.CREATE_DOCUMENT
+  return row[postingStateOf(kind)]
 }
 
 /**
@@ -1007,13 +1247,15 @@ export type NonDocumentIncidentWording = {
   did: string
   remedy: string
   needs: readonly RecordLookupField[]
+  /** As {@link DocumentIncidentWording.lookup}: the only route to a search criterion. */
+  lookup?: readonly RecordLookupField[]
 }
 
 const NOT_A_DOCUMENT_STANDS =
   'THIS IS NOT A DOCUMENT. {ledger} accepted the write and no reset of ours undoes it, but nothing '
   + 'stands at an id, so there is nothing here to open, keep or void as one. '
 const NOTHING_CREATED_STANDS =
-  'NOTHING WAS CREATED IN {LEDGER} AT ALL, so do not go looking there for a document. '
+  'NOTHING WAS CREATED IN {LEDGER} AT ALL, so there is no document there to open. '
 
 export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
   NonDocumentOperationType,
@@ -1116,6 +1358,51 @@ function nonDocumentWordingFor(
 }
 
 /**
+ * WHAT THE FRAME MAY CLAIM ABOUT THE EFFECT (round 11, Codex HIGH).
+ *
+ * THE DEFECT. The shared head opened every non-document incident with "SUCCEEDED — the external
+ * effect has happened — but IMS could not record that it did", and round 10 then wrote
+ * `BILL_ATTACHMENT`'s no-op its own BODY while leaving it inside that head. The message therefore
+ * asserted an external effect in its first clause and denied one three sentences later, for an
+ * attempt that made no request at all.
+ *
+ * THE CLAIM IS NOW READ OFF THE SAME FACT THE BODY IS. An operation with no no-op form — a PDF
+ * write, an email queue, a WooCommerce note — always did its thing, and its head says so whatever
+ * the record carries. An operation that CAN return success without acting says only what this
+ * attempt's recorded outcome supports, and says "we do not know" when it carries none.
+ */
+type EffectClaim = 'MADE' | 'NONE' | 'UNKNOWN'
+function nonDocumentEffectClaim(type: string, outcome: PostedOperationOutcome | undefined): EffectClaim {
+  const entry = (NON_DOCUMENT_INCIDENT_WORDING as Partial<Record<string, NonDocumentIncidentWording
+    | Readonly<Record<RemoteEffectKnowledge, NonDocumentIncidentWording>>>>)[type]
+  // No entry at all, or one wording for the whole operation: the handler has no success path that
+  // skips the work, so the effect happened.
+  if (!entry || 'did' in entry) return 'MADE'
+  const knowledge = remoteEffectKnowledge(outcome)
+  return knowledge === 'UNRECORDED' ? 'UNKNOWN' : knowledge
+}
+
+/** The opening sentence, per {@link nonDocumentEffectClaim}. */
+function nonDocumentHead(
+  ledger: 'Xero' | 'QuickBooks',
+  entry: { type: AccountingSyncType; referenceType: string; referenceId: string },
+  claim: EffectClaim,
+): string {
+  const subject = `${ledger} ${entry.type} for ${entry.referenceType} ${entry.referenceId} `
+  if (claim === 'NONE') {
+    return subject + 'SUCCEEDED WITHOUT MAKING ANY EXTERNAL EFFECT — nothing left this process and '
+      + `nothing in ${ledger} changed — and IMS could not record that it ran. `
+  }
+  if (claim === 'UNKNOWN') {
+    return subject + 'SUCCEEDED, but IMS RECORDED NEITHER WHAT IT DID NOR THAT IT RAN — this '
+      + 'operation has a success path that acts and a success path that does nothing, and this '
+      + 'record does not say which one this attempt took. '
+  }
+  return subject + 'SUCCEEDED — the external effect has happened — but IMS could not record that it '
+    + 'did. '
+}
+
+/**
  * THE WHOLE MESSAGE FOR AN INCIDENT WHOSE OPERATION IS NOT A DOCUMENT POST (round 9, Codex HIGH).
  *
  * Shared by both connectors' formatters, because the reason a formatter may not emit "find it, keep
@@ -1132,9 +1419,8 @@ function describeNonDocumentIncident(params: {
 }): string {
   const { ledger, entry, kind, postedExternalId, rowState } = params
   const wording = nonDocumentWordingFor(entry.type, params.outcome)
-  const slots: WordingSlots = { ledger, postedExternalId }
-  const head = `${ledger} ${entry.type} for ${entry.referenceType} ${entry.referenceId} SUCCEEDED — the `
-    + 'external effect has happened — but IMS could not record that it did. '
+  const slots: WordingSlots = { ledger, postedExternalId, lookup: wording?.lookup }
+  const head = nonDocumentHead(ledger, entry, nonDocumentEffectClaim(entry.type, params.outcome))
   if (kind === 'UNCLASSIFIED' || !wording) {
     return head + rowState
       + 'THIS VERSION OF IMS DOES NOT CLASSIFY THAT OPERATION TYPE, so it cannot say what, if '
@@ -1177,9 +1463,11 @@ export function incidentKindForOperation(
   if (semantic === 'NO_LEDGER_EFFECT') return 'NO_IDENTIFIER_SIDE_EFFECT'
   if (semantic === 'LEDGER_NON_DOCUMENT') return 'LEDGER_NON_DOCUMENT'
   // ROUND 10 (Codex HIGH): THE POSTING MODE DECIDES WHETHER A BALANCE MOVED, AND ITS ABSENCE IS NOT
-  // A LIVE POSTING. Only a CREATE and a JOURNAL have a draft form (see DRAFT_CAPABLE_SEMANTICS), so
-  // only for those two is a missing mode an unknown rather than an irrelevance — an UPDATE changed a
-  // document that was already standing whatever mode it was sent with, and a payment has no draft.
+  // A LIVE POSTING.
+  // ROUND 11 (Codex MEDIUM): AND IT IS ASKED OF THE UPDATE TOO. See DRAFT_CAPABLE_SEMANTICS: the
+  // update handlers resolve their status from the same `_postingMode` the creates do, so an update
+  // sent on `draft` left an UNPOSTED DRAFT behind and moved nothing. The posting state is a fact
+  // about the ATTEMPT, asked independently of what the operation semantically did.
   if (DRAFT_CAPABLE_SEMANTICS.has(semantic)) {
     if (outcome?.postingMode === 'DRAFT') return 'LEDGER_DRAFT'
     if (outcome?.postingMode !== 'LIVE') return 'LEDGER_OUTCOME_UNRECORDED'
@@ -1294,10 +1582,12 @@ export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentC
   }
   if (counts.LEDGER_DRAFT > 0) {
     parts.push(
-      `${counts.LEDGER_DRAFT} were created as DRAFTS and MOVED NO BALANCES — the posting mode for `
-      + 'those rows was `draft`, so the document or journal sits unposted in Xero. DELETE one if it '
-      + 'should not exist. DO NOT void, credit-note or reverse it: a reversal POSTS FOR REAL, and '
-      + 'would move the accounts by exactly the amount the draft never moved.',
+      `${counts.LEDGER_DRAFT} MOVED NO BALANCES — the posting mode on those rows was \`draft\`, so `
+      + 'what they wrote sits UNPOSTED in Xero. DO NOT void, credit-note or reverse any of them: a '
+      + 'reversal POSTS FOR REAL, and would move the accounts by exactly the amount the draft never '
+      + 'moved. THEY WERE NOT ALL CREATED AS DRAFTS: this count also holds documents that were '
+      + 'MODIFIED while unposted, and deleting one of those destroys a draft that stood there before '
+      + 'the attempt ran. Read the record itself before deleting anything.',
     )
   }
   if (counts.LEDGER_OUTCOME_UNRECORDED > 0) {
@@ -1329,10 +1619,19 @@ export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentC
     parts.push(
       `${counts.NO_IDENTIFIER_SIDE_EFFECT} are NOT accounting documents — no invoice, bill, credit `
       + 'note, payment or journal was created in Xero or QuickBooks for any of them. They record an '
-      + 'effect that landed somewhere else and can repeat: a file attached to an EXISTING bill (or, '
-      + 'where attachment upload is off, nothing at all — each record says which), an invoice PDF '
-      + 'written over the stored copy, an '
-      + 'invoice email QUEUED to a customer, a note written onto a WooCommerce order. The queued-email '
+      + 'effect that landed somewhere else and can repeat: a file attached to an EXISTING bill, an '
+      + 'invoice PDF written over the stored copy, an '
+      + 'invoice email QUEUED to a customer, a note written onto a WooCommerce order. '
+      // ROUND 11 (Codex MEDIUM): THE UNKNOWN BUCKET IS NAMED RATHER THAN ASSUMED AWAY. This sentence
+      // used to read "(or, where attachment upload is off, nothing at all — each record says which)".
+      // A record written before IMS captured the handler's outcome says the opposite of "which": it
+      // says it does not know. This count does not separate the three, so the breadcrumb may not
+      // imply it does.
+      + 'AN ATTACHMENT RECORD IN HERE MAY BE A NO-OP: that handler returns success WITHOUT uploading '
+      + 'when attachment upload is off for its connector. Records written since IMS began capturing '
+      + 'that outcome say which of the two happened; OLDER ONES SAY THEY DO NOT KNOW, and this count '
+      + 'does not separate them, so it cannot tell you how many of either there are. '
+      + 'The queued-email '
       + 'one never had a remote document at all — only a local email-outbox row, WHICH THIS RESET HAS '
       + 'JUST DELETED: the outbox rows that record tells you to inspect are gone with it, so their '
       + 'statuses can no longer be inspected.',
@@ -1345,11 +1644,71 @@ export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentC
     )
   }
   parts.push(
-    'Each record says what the effect was and what can be done about it. Nothing else in IMS '
+    // ROUND 11 (Codex MEDIUM): NOT "each record says what the effect was". Some of them say the
+    // opposite — an unclassified operation type, an attachment written before the handler's outcome
+    // was captured, a posting mode that was never recorded — and this breadcrumb is exempt from
+    // retention and from the reset, so a universal it cannot support outlives everything else here.
+    'Read each record. It says what can be done about it, and where IMS could not establish what the '
+    + 'effect was, it says that instead of guessing. Nothing else in IMS '
     + 'references any of them any more. Search this log for '
     + `${UNRECORDED_POSTED_DOCUMENT_ACTIONS.map((action) => `"${action}"`).join(' or ')}.`,
   )
   return parts.join(' ')
+}
+
+/**
+ * THE WHOLE MESSAGE FOR AN ATTEMPT THAT MADE NO EXTERNAL EFFECT (round 11, Codex HIGH).
+ *
+ * THE DEFECT. Round 10 gave the disabled-upload case its own wording and left it inside the generic
+ * no-Request-Id frame. That frame opens by asserting an external effect has happened, and closes by
+ * instructing the operator to turn QuickBooks sync off, LEAVE it off, and escalate — while itself
+ * acknowledging that doing so "stops EVERY QuickBooks row, not this one". So an operation that made
+ * no request at all, changed nothing anywhere and cost nothing to repeat became the reason to halt
+ * unrelated invoice, bill, payment and journal processing across the whole installation, for as long
+ * as it took someone to come and look.
+ *
+ * The wording round 10 added was correct and is still here, in `effect` and `check`. What was wrong
+ * was everything around it, and a paragraph cannot correct its own frame — so the frame is separate.
+ *
+ * WHAT THIS ONE SAYS INSTEAD. It states that nothing happened; it says what a replay costs, which is
+ * nothing while the setting stays as it is; it REFUSES the connector-wide shutdown, and says why —
+ * there is no effect to contain, and the switch stops work that has nothing to do with this row; it
+ * names the one setting that is actually load-bearing here and says to leave it as it is until the
+ * write failure is fixed; and it points at the failure that IS real, which is that IMS could not
+ * record the attempt and the row is now stuck.
+ */
+function describeQboNoEffectIncident(
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  wording: ReplayWording,
+  cause: unknown,
+): string {
+  return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} MADE NO EXTERNAL `
+    + 'EFFECT. The handler returned success WITHOUT ACTING: no request was sent, nothing was '
+    + 'created, changed, uploaded or emailed, and nothing in QuickBooks or anywhere else is '
+    + 'different because this attempt ran. WHAT COULD NOT BE RECORDED IS THAT IT RAN AT ALL: '
+    + `${String(cause)}. `
+    + `WHAT A REPLAY WOULD COST: sync row ${entry.id} still holds this worker's claim and no `
+    + 'mirrored accounting event was written, so once that claim goes stale the sweep will reclaim '
+    + `the row and run the operation again. Running it again does ${wording.effect}. `
+    + `WHAT TO DO ABOUT THE EFFECT: ${wording.check}. `
+    + 'DO NOT TURN QUICKBOOKS SYNC OFF FOR THIS ONE. That switch is the containment lever for an '
+    + 'incident where something DID reach QuickBooks. There is nothing here to contain, and turning '
+    + 'it off stops EVERY QuickBooks row on this installation — invoices, bills, payments and '
+    + 'journals with nothing to do with this row — for as long as it stays off. '
+    + 'IF YOU WANT THE REPLAY TO STAY A NO-OP, LEAVE ATTACHMENT UPLOAD DISABLED: the setting is '
+    + 'quickbooks_sync_attach_pdf, and enabling it is the single change that would make the next '
+    + 'sweep act for real. Leave it as it is until the write failure above is fixed. '
+    + `WHAT IS ACTUALLY WRONG IS THE WRITE, NOT THE OPERATION: sync row ${entry.id} is left `
+    + 'PROCESSING at attempt revision 0 with no mirrored event, and nothing in IMS will settle it. '
+    + `Fix the failure named above, and ESCALATE sync row ${entry.id}, with this record, to whoever `
+    + 'administers this installation: closing it safely needs someone who can read the database '
+    + 'directly (o3d-4b5p, o3d-3lhp). '
+    + 'ONE THING ON SCREEN IS ACTIVELY WRONG AND YOU WILL SEE IT: the accounting log renders a '
+    + 'settle control for every FAILED or PROCESSING row, and on this one it resolves to the words '
+    + '"not settleable" with its reason as the tooltip. DO NOT FOLLOW THAT TOOLTIP. It tells you to '
+    + 'retry the row until it shows an attempt revision, and the QuickBooks claim never stamps one, '
+    + 'so no number of retries will ever make an attempt appear. This is the known hole o3d-qn21. '
+    + INCIDENT_IDENTIFICATION_TAIL
 }
 
 /**
@@ -1377,6 +1736,20 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
   const noRequestId = replayEntry && ('effect' in replayEntry
     ? replayEntry
     : replayEntry[remoteEffectKnowledge(incident.outcome)])
+  // ROUND 11 (Codex HIGH): AND AN ATTEMPT THAT DID NOTHING GETS ITS OWN WHOLE MESSAGE, NOT ITS OWN
+  // PARAGRAPH INSIDE THIS ONE. See `describeQboNoEffectIncident`. The test for it asserts the ENTIRE
+  // generated string, because round 10's tests asserted the outcome-specific fragments, passed, and
+  // left the fragments sitting inside a frame that contradicted every one of them.
+  //
+  // The gate is that the NONE VARIANT OF THE REPLAY WORDING WAS THE ONE SELECTED — not merely that
+  // the record says `externalEffect: 'NONE'`. Only an operation with a no-op success path has a
+  // variant to select; an `INVOICE_PDF` record carrying NONE would otherwise be handed a frame
+  // saying nothing happened, above a replay sentence describing the PDF being written again.
+  const noExternalEffect = replayEntry !== undefined && !('effect' in replayEntry)
+    && remoteEffectKnowledge(incident.outcome) === 'NONE'
+  if (noRequestId && noExternalEffect) {
+    return describeQboNoEffectIncident(entry, noRequestId, cause)
+  }
   if (noRequestId) {
     return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} SUCCEEDED — the `
       + 'external effect has happened — but IMS could not record that it did: '
@@ -1447,7 +1820,9 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
     })
   }
   const w = documentIncidentWording(entry.type, kind)
-  const slots = { ledger: 'QuickBooks' as const, postedExternalId: posted }
+  const slots: WordingSlots = {
+    ledger: 'QuickBooks', postedExternalId: posted, lookup: w.lookup, lookupNoun: w.noun,
+  }
   const did = render(posted ? w.didWithId : w.didWithoutId, slots)
   return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} ${did}, but IMS `
     + `could not record the post: ${String(cause)}. `
