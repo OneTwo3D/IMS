@@ -59,13 +59,23 @@ import {
 //      the call cannot be to a same-named local stub;
 //   4. that file is a real ENTRY POINT — a route module exporting GET/POST, or a 'use server'
 //      action module — so the call is not sitting in a helper nothing routes to;
-//   5. a named BEHAVIOURAL test exists for the connector, it drives the real entry point, and it
-//      names the binding. That test is what actually executes the path.
+//   5. a named BEHAVIOURAL test exists for the connector, it drives the real entry point, it names
+//      the binding, and (r8) it is DRIVEN BY THIS REGISTRY — it imports ACCOUNTING_FOLLOW_UP_RECOVERY
+//      and asserts, per entry, that invoking the real entry point calls that connector's sweep if
+//      and only if the entry says `consumer: 'sweep'`. That test is what actually executes the path,
+//      and being registry-driven is what makes it cover a connector nobody remembered to add.
+//
+// (2), (3) and (4) ARE ONE RESOLVED QUESTION SINCE r8, not three independent text matches. Codex was
+// right that three independent matches are answered together by a file that does none of it: an
+// unused aliased import beside a same-named local function, and a call in a helper nothing routes
+// to, satisfied all three at once. `reachableSweepInvocations` binds the CALLED identifier to the
+// module's export and walks outward from the real entry points, so neither forgery answers it.
 //
 // WHAT IT STILL DOES NOT PROVE: that the call is on a branch reached under production conditions.
 // Nothing short of running the entry point proves that, which is why (5) requires a test that does —
-// tests/cron/accounting-sync-backreference-sweep.test.ts imports the cron route's GET, invokes it,
-// and asserts the sweep ran. The registry check's job is to make sure a NEWLY declared connector
+// tests/cron/accounting-sync-backreference-sweep.test.ts imports the cron route's GET, invokes it
+// per registry entry, and asserts that connector's own sweep double was called exactly when the
+// entry says it should be. The registry check's job is to make sure a NEWLY declared connector
 // cannot reach `consumer: 'sweep'` without such a test existing at all; the test's job is to prove
 // reachability. Neither alone is the guarantee, and this comment is the honest statement of that.
 // ---------------------------------------------------------------------------
@@ -362,6 +372,18 @@ test('[o3d-0bfh r6] every connector that claims a follow-up obligation is declar
   assert.ok(INVOCATION_SOURCES.length > 0, 'the invocation scan must actually reach some sources')
 })
 
+/**
+ * Does this test file import the registry itself? The contract test's list of connectors must BE the
+ * registry, not a copy of it — a copy stops covering the registry the moment somebody adds an entry.
+ */
+function reachableRegistryImport(code: string, fileName: string): boolean {
+  const sourceFile = ts.createSourceFile(fileName, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  return importBindings(sourceFile).some((binding) => (
+    binding.module === '@/lib/domain/accounting/follow-up-obligation-registry'
+    && binding.imported === 'ACCOUNTING_FOLLOW_UP_RECOVERY'
+  ))
+}
+
 test("[o3d-0bfh r6] a consumer: 'sweep' declaration has a real binding AND a real invocation", async () => {
   const sweepConnectors = Object.entries(ACCOUNTING_FOLLOW_UP_RECOVERY)
     .filter(([, recovery]) => recovery.consumer === 'sweep')
@@ -417,6 +439,16 @@ test("[o3d-0bfh r6] a consumer: 'sweep' declaration has a real binding AND a rea
     assert.ok(
       bindings.some((name) => proof.executable.includes(name)),
       `${behavioural.test} must name ${bindings.join(', ')}, or it is not evidence about this binding.`,
+    )
+    // r8 (Codex MEDIUM): AND IT MUST BE DRIVEN BY THIS REGISTRY. A hand-written list of connectors
+    // in the contract test would leave a NEWLY declared connector checked by nothing while every
+    // assertion here stayed green — which is the same silence one file over. Resolved as an import
+    // symbol rather than matched as text, for the reason the invocation check is.
+    assert.ok(
+      reachableRegistryImport(proof.text, behavioural.test),
+      `${behavioural.test} must import ACCOUNTING_FOLLOW_UP_RECOVERY from `
+        + '@/lib/domain/accounting/follow-up-obligation-registry and drive its assertions from it. A contract test '
+        + 'with its own list of connectors stops covering the registry the moment a connector is added to it.',
     )
   }
 })
