@@ -176,9 +176,20 @@ There is **one deliberate exception**. If the order carries *another* picking or
 re-allocation is refused (IMS will not re-net an order that still has committed stock elsewhere) and
 the reopen is kept. It has to be: with two packed shipments, rolling back would refuse each one
 because of the other and neither could ever be reopened. Reopen the second shipment — or dispatch it
-— and that step re-nets the whole order. You can also press **Reopen for repack** again on the draft
-itself once nothing committed is left; on an already-pending draft the button finishes the
-re-allocation rather than refusing.
+— and that step re-nets the whole order.
+
+If the second shipment is **dispatched** rather than reopened, nothing will ever re-net the order on
+its own: a dispatched shipment is terminal and has no reopen. The draft left behind then shows a
+**Finish repack recovery** button, which runs the missing re-netting and releases the refunded
+units' reservation. It is a different button from *Reopen for repack* on purpose — nothing is
+unpacked and no shipment is changed by it.
+
+That button appears **only where there is something to finish**: IMS shows it when the order still
+has an unresolved refund-reservation release recorded against it, which is the durable trace the
+recovery leaves behind, and it disappears once the recovery has run. It is also the way to repair an
+order left part-way through a recovery by an older version of IMS. **"Create Shipments" is not a
+substitute** — it rebuilds the draft from the already-netted quantity without releasing the stale
+reservation.
 
 **Unpack the parcel first, then press "Create Shipments"** in the Stock Allocation panel to rebuild
 the shipment to what actually remains. If every unit was refunded there is nothing left to build and

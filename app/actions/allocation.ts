@@ -53,7 +53,7 @@ import {
   transitionShipmentStatus,
   type OrderCompletionAuthority,
 } from '@/lib/domain/sales/shipment-service'
-import { resolveRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
+import { countOutstandingRefundReservationReleases, resolveRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { describeRepackReallocation } from '@/lib/domain/sales/repack-recovery-report'
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
 import {
@@ -188,6 +188,16 @@ export type AllocationRow = {
 
 export type ShipmentRow = {
   id: string
+  /**
+   * o3d-2k5r r4 — an ORDER-level fact, carried on every row on purpose.
+   *
+   * The detail client refreshes shipments through `getOrderShipments` and has no other refresh
+   * channel, so a separate order-scoped fetch would go stale the moment a recovery ran and would
+   * leave the "Finish repack recovery" control on screen after there was nothing left to finish.
+   * Riding this payload means the control appears and disappears with the same round trip that
+   * moves the shipment.
+   */
+  repackRecoveryOutstanding: boolean
   warehouseId: string
   warehouseCode: string
   warehouseName: string
@@ -251,6 +261,9 @@ export async function getOrderAllocations(orderId: string): Promise<AllocationRo
 
 export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]> {
   await requireInternalUser()
+  // o3d-2k5r r4: the durable evidence that this order still owes the repack recovery's
+  // re-allocation and refund-backstop steps. One count for the order, not one per shipment.
+  const outstandingReleases = await countOutstandingRefundReservationReleases(orderId)
   const rows = await db.shipment.findMany({
     where: { orderId },
     include: {
@@ -266,6 +279,7 @@ export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]>
   })
   return rows.map((s) => ({
     id: s.id,
+    repackRecoveryOutstanding: outstandingReleases > 0,
     warehouseId: s.warehouseId,
     warehouseCode: s.warehouse.code,
     warehouseName: s.warehouse.name,
