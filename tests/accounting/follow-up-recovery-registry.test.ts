@@ -170,24 +170,184 @@ function invocationSources(): Source[] {
 
 const INVOCATION_SOURCES = invocationSources()
 
-/** Does this file import `binding` from `module` — statically, or as a dynamic `await import`? */
-function importsBindingFrom(code: string, binding: string, module: string): boolean {
-  const spec = module.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const name = binding.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const staticImport = new RegExp(`import\\s*(?:type\\s*)?\\{[^}]*\\b${name}\\b[^}]*\\}\\s*from\\s*['"\`]${spec}['"\`]`)
-  const dynamicImport = new RegExp(`\\{[^}]*\\b${name}\\b[^}]*\\}\\s*=\\s*await\\s+import\\(\\s*['"\`]${spec}['"\`]`)
-  return staticImport.test(code) || dynamicImport.test(code)
+
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r8 (Codex MEDIUM) — THE INVOCATION CHECK RESOLVES THE CALL TO AN IMPORTED SYMBOL, AND
+// PROVES THE CALL SITE IS REACHED FROM AN ENTRY POINT.
+//
+// r7's checks (2), (3) and (4) were three INDEPENDENT text matches over one file: "some `name(`
+// appears", "some import of `name` from that module appears", "the file exports GET/POST". Codex is
+// right that all three are satisfied together by a file that does none of what they claim:
+//
+//   import { repairXeroBackReferences as unused } from '@/lib/connectors/xero/sync-processor'
+//   function repairXeroBackReferences() { ... }        // a same-named LOCAL
+//   function neverCalled() { repairXeroBackReferences() }   // in a helper nothing routes to
+//   export async function GET() { return NextResponse.json({}) }
+//
+// The check below asks one question instead of three. It binds every imported name — static
+// `import { a as b } from 'mod'` AND the dynamic `const { a } = await import('mod')` form this
+// codebase's cron routes actually use — to its module and its ORIGINAL export name, then walks
+// outward from the module's real entry points (GET/POST on a route, every export on a 'use server'
+// module) through the calls those functions make, and asks whether any function it can reach calls
+// an identifier bound to that module's export. A same-named local is not bound to the module; a
+// helper nothing reaches is never walked into.
+// ---------------------------------------------------------------------------
+
+/** One imported name: what it is called here, what it is called there, and where it came from. */
+type ImportBinding = { local: string; imported: string; module: string }
+
+function importBindings(sourceFile: ts.SourceFile): ImportBinding[] {
+  const bindings: ImportBinding[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+      const named = node.importClause?.namedBindings
+      if (named && ts.isNamedImports(named)) {
+        for (const element of named.elements) {
+          bindings.push({
+            local: element.name.text,
+            imported: (element.propertyName ?? element.name).text,
+            module: (node.moduleSpecifier as ts.StringLiteral).text,
+          })
+        }
+      }
+    }
+    // `const { repairXeroBackReferences } = await import('@/lib/...')` — the form the cron route
+    // uses, and one a static-import matcher would have to be told about separately.
+    if (ts.isVariableDeclaration(node) && node.initializer && ts.isObjectBindingPattern(node.name)) {
+      let initializer: ts.Expression = node.initializer
+      if (ts.isAwaitExpression(initializer)) initializer = initializer.expression
+      if (
+        ts.isCallExpression(initializer)
+        && initializer.expression.kind === ts.SyntaxKind.ImportKeyword
+        && initializer.arguments[0]
+        && ts.isStringLiteral(initializer.arguments[0])
+      ) {
+        const module = (initializer.arguments[0] as ts.StringLiteral).text
+        for (const element of node.name.elements) {
+          if (!ts.isIdentifier(element.name)) continue
+          const imported = element.propertyName && ts.isIdentifier(element.propertyName)
+            ? element.propertyName.text
+            : element.name.text
+          bindings.push({ local: element.name.text, imported, module })
+        }
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return bindings
+}
+
+/** Top-level named functions, so a call from one can be followed into the next. */
+function topLevelFunctions(sourceFile: ts.SourceFile): Map<string, ts.Node> {
+  const functions = new Map<string, ts.Node>()
+  for (const statement of sourceFile.statements) {
+    if (ts.isFunctionDeclaration(statement) && statement.name) {
+      functions.set(statement.name.text, statement)
+      continue
+    }
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (!ts.isIdentifier(declaration.name) || !declaration.initializer) continue
+        if (ts.isArrowFunction(declaration.initializer) || ts.isFunctionExpression(declaration.initializer)) {
+          functions.set(declaration.name.text, declaration.initializer)
+        }
+      }
+    }
+  }
+  return functions
+}
+
+/** The names the framework can call into: GET/POST on a route, every export on a server action. */
+function entryPointNames(sourceFile: ts.SourceFile, isServerActionModule: boolean): string[] {
+  const names: string[] = []
+  for (const statement of sourceFile.statements) {
+    const modifiers = ts.canHaveModifiers(statement) ? ts.getModifiers(statement) : undefined
+    const exported = modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) ?? false
+    if (!exported) continue
+    if (ts.isFunctionDeclaration(statement) && statement.name) {
+      if (isServerActionModule || statement.name.text === 'GET' || statement.name.text === 'POST') {
+        names.push(statement.name.text)
+      }
+      continue
+    }
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (!ts.isIdentifier(declaration.name)) continue
+        if (isServerActionModule || declaration.name.text === 'GET' || declaration.name.text === 'POST') {
+          names.push(declaration.name.text)
+        }
+      }
+    }
+  }
+  return names
+}
+
+/** Every identifier called anywhere inside this subtree. */
+function calledNames(node: ts.Node): Set<string> {
+  const called = new Set<string>()
+  const visit = (current: ts.Node): void => {
+    if (ts.isCallExpression(current) && ts.isIdentifier(current.expression)) called.add(current.expression.text)
+    ts.forEachChild(current, visit)
+  }
+  visit(node)
+  return called
 }
 
 /**
- * Is this file something the framework can actually route to? A cron route module exports GET or
- * POST; a server-action module is marked 'use server'. A call in neither is a call in a helper.
+ * Which of `bindingNames` this file calls, as an import from `module`, from code the framework can
+ * actually reach. The answer is a list so a caller can say WHICH binding, and empty means "no
+ * reachable call to any of them", which is the state r7's three text checks could not tell apart
+ * from a real one.
  */
-function isEntryPoint(source: Source): boolean {
-  if (/^\s*['"]use server['"]/m.test(source.text)) return true
-  return /export\s+(?:async\s+)?function\s+(GET|POST)\b/.test(source.executable)
-    || /export\s+const\s+(GET|POST)\b/.test(source.executable)
+function reachableSweepInvocations(
+  code: string,
+  fileName: string,
+  module: string,
+  bindingNames: readonly string[],
+): string[] {
+  const sourceFile = ts.createSourceFile(fileName, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const isServerActionModule = sourceFile.statements.some((statement) => (
+    ts.isExpressionStatement(statement)
+    && ts.isStringLiteral(statement.expression)
+    && statement.expression.text === 'use server'
+  ))
+  const entries = entryPointNames(sourceFile, isServerActionModule)
+  if (entries.length === 0) return []
+
+  const functions = topLevelFunctions(sourceFile)
+  const bindings = importBindings(sourceFile)
+  // The LOCAL names that really are this module's exports — a same-named local function is not one.
+  const localForBinding = new Map<string, string>()
+  for (const binding of bindings) {
+    if (binding.module !== module) continue
+    if (!bindingNames.includes(binding.imported)) continue
+    // A local function declaration with the same name shadows the import for every call in the file,
+    // so the import cannot vouch for those calls.
+    if (functions.has(binding.local)) continue
+    localForBinding.set(binding.local, binding.imported)
+  }
+  if (localForBinding.size === 0) return []
+
+  const visited = new Set<string>()
+  const queue = [...entries]
+  const invoked = new Set<string>()
+  while (queue.length > 0) {
+    const name = queue.pop() as string
+    if (visited.has(name)) continue
+    visited.add(name)
+    const node = functions.get(name)
+    if (!node) continue
+    for (const called of calledNames(node)) {
+      const imported = localForBinding.get(called)
+      if (imported) invoked.add(imported)
+      if (functions.has(called) && !visited.has(called)) queue.push(called)
+    }
+  }
+  return [...invoked]
 }
+
 
 test('[o3d-0bfh r6] every connector that claims a follow-up obligation is declared in the registry', () => {
   // The map below is the test's own knowledge of where a connector lives. If it does not cover a
@@ -223,15 +383,17 @@ test("[o3d-0bfh r6] a consumer: 'sweep' declaration has a real binding AND a rea
     // (2) an invocation in EXECUTABLE source — comments and string contents removed first, so a
     // commented-out or quoted call no longer counts; (3) from a file that imports the binding from
     // THIS connector's module, so it cannot be a same-named local stub; (4) in a real entry point.
-    const callers = INVOCATION_SOURCES.filter((source) => bindings.some((name) => (
-      source.executable.includes(`${name}(`)
-      && importsBindingFrom(source.code, name, CONNECTOR_MODULES[connector])
-      && isEntryPoint(source)
-    )))
+    // r8 (Codex MEDIUM): ONE resolved question, not three independent text matches. The called
+    // identifier must be bound to THIS module's export (so a same-named local cannot answer for it),
+    // and the call site must be reached from a real entry point (so a helper nothing routes to
+    // cannot either).
+    const callers = INVOCATION_SOURCES.filter((source) => (
+      reachableSweepInvocations(source.text, source.rel, CONNECTOR_MODULES[connector], bindings).length > 0
+    ))
     assert.ok(
       callers.length > 0,
-      `${connector} exports ${bindings.join(', ')} but NOTHING under app/api/cron or app/actions calls it from `
-        + 'executable code, importing it from ' + CONNECTOR_MODULES[connector] + ', inside a routable entry point. '
+      `${connector} exports ${bindings.join(', ')} but NOTHING under app/api/cron or app/actions calls it as an `
+        + `import from ${CONNECTOR_MODULES[connector]}, from code reachable from an entry point. `
         + 'A binding nothing invokes is exactly as dead as no binding: the marker is retained, no candidate query '
         + 'ever selects it, and the operator is told a sweep will re-enqueue the work.',
     )
@@ -255,6 +417,96 @@ test("[o3d-0bfh r6] a consumer: 'sweep' declaration has a real binding AND a rea
     assert.ok(
       bindings.some((name) => proof.executable.includes(name)),
       `${behavioural.test} must name ${bindings.join(', ')}, or it is not evidence about this binding.`,
+    )
+  }
+})
+
+test('[o3d-0bfh r8] CONTROL: the invocation check resolves the SYMBOL, so the two forgeries Codex named fail it', () => {
+  // r7's checks were three independent text matches over one file. Codex named two files that
+  // satisfy all three while doing none of what they claim. Both are asserted here, along with the
+  // real shapes that must keep passing — a control that only rejects would be satisfied by a
+  // function that returns nothing.
+  const MODULE = '@/lib/connectors/xero/sync-processor'
+  const BINDINGS = ['repairXeroBackReferences']
+
+  const forgeries: Array<{ what: string; code: string }> = [
+    {
+      what: 'AN UNUSED ALIASED IMPORT plus a same-named local function',
+      code: [
+        `import { repairXeroBackReferences as unused } from '${MODULE}'`,
+        'function repairXeroBackReferences() { return {} }',
+        'export async function GET() { repairXeroBackReferences(); return new Response() }',
+      ].join('\n'),
+    },
+    {
+      what: 'A CALL IN A HELPER NOTHING ROUTES TO, in a file that does export GET',
+      code: [
+        `import { repairXeroBackReferences } from '${MODULE}'`,
+        'async function neverCalled() { await repairXeroBackReferences() }',
+        'export async function GET() { return new Response() }',
+      ].join('\n'),
+    },
+    {
+      what: 'a call in a file with no entry point at all',
+      code: [
+        `import { repairXeroBackReferences } from '${MODULE}'`,
+        'export async function helper() { await repairXeroBackReferences() }',
+      ].join('\n'),
+    },
+    {
+      what: 'an import of the binding from a DIFFERENT module',
+      code: [
+        "import { repairXeroBackReferences } from '@/lib/connectors/quickbooks/sync-processor'",
+        'export async function GET() { await repairXeroBackReferences(); return new Response() }',
+      ].join('\n'),
+    },
+  ]
+  for (const { what, code } of forgeries) {
+    assert.deepEqual(
+      reachableSweepInvocations(code, 'forgery.ts', MODULE, BINDINGS), [],
+      `the invocation check is satisfied by ${what}, which is the defect it exists to close`,
+    )
+  }
+
+  const genuine: Array<{ what: string; code: string }> = [
+    {
+      what: 'the dynamic-import form the cron route actually uses',
+      code: [
+        'export async function GET() {',
+        `  const { repairXeroBackReferences } = await import('${MODULE}')`,
+        '  await repairXeroBackReferences()',
+        '  return new Response()',
+        '}',
+      ].join('\n'),
+    },
+    {
+      what: 'a LEGITIMATELY aliased static import',
+      code: [
+        `import { repairXeroBackReferences as repair } from '${MODULE}'`,
+        'export async function GET() { await repair(); return new Response() }',
+      ].join('\n'),
+    },
+    {
+      what: 'a call one hop away, in a helper the entry point does reach',
+      code: [
+        `import { repairXeroBackReferences } from '${MODULE}'`,
+        'async function sweep() { await repairXeroBackReferences() }',
+        'export async function GET() { await sweep(); return new Response() }',
+      ].join('\n'),
+    },
+    {
+      what: 'a server action module, where every export is an entry point',
+      code: [
+        "'use server'",
+        `import { repairXeroBackReferences } from '${MODULE}'`,
+        'export async function runSync() { await repairXeroBackReferences() }',
+      ].join('\n'),
+    },
+  ]
+  for (const { what, code } of genuine) {
+    assert.deepEqual(
+      reachableSweepInvocations(code, 'genuine.ts', MODULE, BINDINGS), BINDINGS,
+      `the invocation check rejects ${what}, which is a real wiring — a check nothing can satisfy gets deleted`,
     )
   }
 })
