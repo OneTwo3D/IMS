@@ -12,7 +12,7 @@ import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/can
 import { readClaimedSyncLogPayload } from '@/lib/domain/accounting/claimed-sync-payload'
 import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityPersisted } from '@/lib/activity-log'
 import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
 import { pushCreditMemo } from './credit-notes'
@@ -45,7 +45,7 @@ import {
   isExternalDocumentIdConflict,
   releaseFollowUpObligation,
 } from '@/lib/domain/accounting/back-reference'
-import type { FollowUpObligationRecovery } from '@/lib/domain/accounting/back-reference'
+import { followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
@@ -631,17 +631,25 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           // The obligation is deliberately NOT released here (r10 finding 1). This branch marks the
           // entry succeeded regardless, so the row is about to look identical to one whose
           // follow-ups ran — the marker is the only thing left that says otherwise. It is EVIDENCE,
-          // not a work queue: no QuickBooks sweep reads it (o3d-8prh), so the ERROR below is the
-          // notification and a human is the recovery. See the block at the end of this file.
-          await logActivity({
-            entityType: 'SYSTEM',
+          // not a work queue: no QuickBooks sweep reads it (o3d-8prh). See the block at the end of
+          // this file.
+          //
+          // THE ERROR BELOW IS NO LONGER THE ONLY NOTICE (o3d-0bfh r6, Codex HIGH). It used to be —
+          // written with `logActivity`, which swallows a failed insert and resolves `void`, so a
+          // transient failure of that one write left this stalled payment/PDF/email invisible while
+          // the entry was counted successful. The retained marker is now surfaced as an operational
+          // backlog in the exception inbox, so the operator-visible record of the debt is the ROW,
+          // already committed; `reportRetainedObligation` additionally reports a lost notice to
+          // stderr instead of discarding it.
+          await reportRetainedObligation({
             action: 'quickbooks_followup_error',
-            tag: 'sync',
             level: 'ERROR',
             description: `QuickBooks sync entry ${entry.id} posted successfully but its follow-up work was NOT `
               + `enqueued: ${String(followUpError)}. The document is in QuickBooks; its payment, PDF or email `
-              + 'follow-ups need to be re-driven manually.',
+              + 'follow-ups need to be re-driven manually — the row is listed in the exception inbox at '
+              + '/sync/exceptions under "Accounting follow-ups owed, with nothing to re-drive them".',
             metadata: { syncLogId: entry.id, type: entry.type, referenceType: entry.referenceType, referenceId: entry.referenceId },
+            syncLogId: entry.id,
           })
         }
 
@@ -1283,19 +1291,19 @@ function backReferenceLeavesNothingOwed(link: BackReferenceLink): boolean {
 /**
  * WHAT RE-DRIVES A RETAINED OBLIGATION ON THIS CONNECTOR: NOTHING (o3d-0bfh r5, Codex HIGH).
  *
- * Named once, passed to every release, and deliberately not a comment: `releaseFollowUpObligation`
- * requires it, so a future QuickBooks caller cannot inherit Xero's "a later sweep will discharge it"
- * by omission. `blockedBy` is the CURRENT blocker and it is not the one this file named for three
- * rounds — see the block at the end of this file for why o3d-s36z closing did not unblock anything.
+ * Passed to every release, so a future QuickBooks caller cannot inherit Xero's "a later sweep will
+ * discharge it" by omission. `blockedBy` is the CURRENT blocker and it is not the one this file
+ * named for three rounds — see the block at the end of this file for why o3d-s36z closing did not
+ * unblock anything.
+ *
+ * READ FROM THE REGISTRY, NOT WRITTEN HERE (o3d-0bfh r6, Codex MEDIUM). r5 declared the recovery as
+ * a local literal, and a literal is copyable: a third connector could paste Xero's
+ * `{ consumer: 'sweep' }`, have no sweep at all, and compile. The declaration now lives in
+ * lib/domain/accounting/follow-up-obligation-registry.ts, where a test requires every `sweep` entry
+ * to have both an exported binding and an invocation — and where the backlog that makes THIS
+ * connector's retained markers visible to an operator reads the same entry.
  */
-const QBO_FOLLOW_UP_RECOVERY = {
-  consumer: 'none',
-  blockedBy: 'the QuickBooks back-reference repair sweep is not bound and no cron invokes it (o3d-8prh: '
-    + 'this connector does not enforce the connection/realm verdict at post time, so a re-enqueued '
-    + 'payment could post to a different company)',
-  operatorRemedy: 'find the row by its non-null backReferenceFollowUpsPendingAt and re-drive its payment, PDF, '
-    + 'email or attachment by hand, checking QuickBooks first for one already there',
-} as const satisfies FollowUpObligationRecovery
+const QBO_FOLLOW_UP_RECOVERY = followUpObligationRecoveryFor(QBO_CONNECTOR)
 
 /**
  * DISCHARGE THE FOLLOW-UP OBLIGATION ONLY WHEN NOTHING IS STILL OWED (o3d-ekn8 r5, Codex HIGH).
@@ -1351,10 +1359,8 @@ async function settleFollowUpObligation(
   const outstanding: string[] = []
   if (!linked) outstanding.push(`the local link to the QuickBooks document did not land (${link.linked ? 'linked' : link.reason})`)
   if (!followUps.deferredReceiptsSettled) outstanding.push('a receipt recorded before this invoice is still not registered in the ledger')
-  await logActivity({
-    entityType: 'SYSTEM',
+  await reportRetainedObligation({
     action: 'quickbooks_followup_obligation_retained',
-    tag: 'sync',
     // ERROR when money is the thing left outstanding, WARNING when it is only the local link — the
     // two need different people to do different things, and at one level the first reads as the
     // second and nobody acts on it.
@@ -1363,8 +1369,9 @@ async function settleFollowUpObligation(
       + 'The row is deliberately left marked as owing follow-ups, because nothing else about it records that: '
       + 'it is SYNCED and carries its external id exactly like a row that completed. NOTHING WILL RE-DRIVE '
       + 'THIS AUTOMATICALLY — QuickBooks has no back-reference repair sweep bound (o3d-8prh), so the marker is '
-      + 'evidence rather than scheduled work. Link the document and re-run the invoice sync for this '
-      + 'reference, or register the receipt in QuickBooks by hand.',
+      + 'evidence rather than scheduled work. It is listed in the exception inbox at /sync/exceptions under '
+      + '"Accounting follow-ups owed, with nothing to re-drive them". Link the document and re-run the invoice '
+      + 'sync for this reference, or register the receipt in QuickBooks by hand.',
     metadata: {
       syncLogId: entry.id,
       type: entry.type,
@@ -1373,9 +1380,67 @@ async function settleFollowUpObligation(
       backReference: link.linked ? 'linked' : link.reason,
       deferredReceiptsSettled: followUps.deferredReceiptsSettled,
     },
-    // Retaining the marker is ALREADY the safe state, so failing to describe it must not turn a
-    // posted invoice into a failed sync entry.
-  }).catch(() => { /* the state is on the row; the log is the notification */ })
+    syncLogId: entry.id,
+  })
+}
+
+/**
+ * ANNOUNCE A RETAINED OBLIGATION — AND SAY SO WHEN THE ANNOUNCEMENT ITSELF DID NOT LAND
+ * (o3d-0bfh r6, Codex HIGH).
+ *
+ * What stood here was `logActivity(...).catch(...)`, under a comment that called the log line the
+ * whole of the notification and a human the whole of the recovery. Those two facts do not fit
+ * together: `logActivity` swallows a persistence failure and resolves `void`, so the appended
+ * `.catch()` could never fire on the failure that matters, the entry was counted successful, the row
+ * stayed SYNCED and was never selected again — a payment, PDF, email or attachment permanently
+ * stalled with no operator-visible notice at all. A recovery that rests entirely on a human seeing
+ * something cannot rest on a write whose failure nobody can observe.
+ *
+ * TWO CHANGES, AND THE SECOND IS THE LOAD-BEARING ONE:
+ *
+ *   • `logActivityPersisted` REPORTS whether the row landed, so the failure is at least observable
+ *     here rather than silently swallowed, and a lost notice reaches stderr — the one channel that
+ *     does not depend on the database this row could not be written to;
+ *   • the obligation is no longer announced ONLY in the activity log. The marker left on the sync
+ *     row is now surfaced as an operational backlog
+ *     (lib/domain/accounting/follow-up-obligation-registry.ts, rendered in the exception inbox), so
+ *     the durable, operator-visible record of the debt is THE ROW ITSELF — a state that is already
+ *     committed by the time this function is reached, and a view over it that needs no second write
+ *     to succeed at the worst possible moment.
+ *
+ * So this function never throws and its return value is deliberately not a gate: retaining the
+ * marker is already the safe state, and failing to describe it must not turn a posted invoice into a
+ * failed sync entry.
+ */
+async function reportRetainedObligation(params: {
+  action: string
+  level: 'WARNING' | 'ERROR'
+  description: string
+  metadata: Record<string, unknown>
+  syncLogId: string
+}): Promise<void> {
+  let persisted = false
+  try {
+    persisted = await logActivityPersisted({
+      entityType: 'SYSTEM',
+      action: params.action,
+      tag: 'sync',
+      level: params.level,
+      description: params.description,
+      metadata: params.metadata,
+    })
+  } catch {
+    // logActivityPersisted is documented not to throw; if it does, it is still not a reason to fail
+    // a posted invoice, and the backlog below is unaffected either way.
+    persisted = false
+  }
+  if (persisted) return
+  console.error(
+    `[quickbooks] the activity-log notice for sync entry ${params.syncLogId} could NOT be written (${params.action}). `
+    + 'The obligation itself is NOT lost: the row still carries backReferenceFollowUpsPendingAt and appears in the '
+    + 'exception inbox at /sync/exceptions under "Accounting follow-ups owed, with nothing to re-drive them". '
+    + params.description,
+  )
 }
 
 async function updateBackReference(

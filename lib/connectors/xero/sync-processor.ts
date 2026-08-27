@@ -50,6 +50,7 @@ import {
   releaseFollowUpObligation,
   syncTypeWritesBackReference,
 } from '@/lib/domain/accounting/back-reference'
+import { followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { stampSyncedAtFromDatabaseClock } from './synced-at-clock'
 import { claimHeldFrom, heldClaimWhere, releaseClaimForRetry, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import {
@@ -6758,7 +6759,14 @@ async function settleFollowUpObligation(
       // invokes it, so a retained marker is re-read and its follow-ups re-enqueued idempotently.
       // Stated rather than defaulted, because the sibling connector's answer is the opposite one and
       // a default would have silently given QuickBooks this one.
-      recovery: { consumer: 'sweep' },
+      //
+      // AND IT IS READ FROM THE REGISTRY, NOT WRITTEN AS A LITERAL HERE (o3d-0bfh r6, Codex MEDIUM).
+      // `{ consumer: 'sweep' }` written inline is an ordinary copyable object with no relationship
+      // to the binding two functions below or to the cron that calls it; a new connector could paste
+      // it, have neither, and compile. The registry entry it now reads is the one
+      // tests/accounting/follow-up-recovery-registry.test.ts holds to having BOTH an exported
+      // binding and a scheduled or manual invocation.
+      recovery: followUpObligationRecoveryFor(XERO_CONNECTOR),
     })
     return
   }

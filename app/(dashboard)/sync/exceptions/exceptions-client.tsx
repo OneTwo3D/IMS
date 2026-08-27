@@ -820,6 +820,41 @@ export function ExceptionsClient({ data }: Props) {
         </Card>
       ) : null}
 
+      {data.accountingFollowUpObligations.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`Accounting follow-ups owed, with nothing to re-drive them (${data.summary.accountingFollowUpObligations})`}
+            detail="These documents reached the accounting package, but the follow-up work behind them — the payment, the PDF, the email, the attachment — was never enqueued, and this connector has no repair sweep to come back for it. The sync row still looks successful, so this list is the only thing that says otherwise. Re-drive each one by hand in the accounting package, checking there first for work already present."
+            shown={data.accountingFollowUpObligations.length}
+            total={data.summary.accountingFollowUpObligations}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Connector</TableHead>
+                <TableHead>Document</TableHead>
+                <TableHead>Reference</TableHead>
+                <TableHead>External id</TableHead>
+                <TableHead>Owed since</TableHead>
+                <TableHead>Why nothing re-drives it</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.accountingFollowUpObligations.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell className="text-xs">{row.connector}</TableCell>
+                  <TableCell className="text-xs">{row.type} <span className="text-muted-foreground">({row.status})</span></TableCell>
+                  <TableCell className="text-xs font-mono">{row.referenceType}/{row.referenceId}</TableCell>
+                  <TableCell className="text-xs font-mono">{row.externalTransactionId ?? '—'}</TableCell>
+                  <TableCell className="text-xs">{row.owedSince ? new Date(row.owedSince).toLocaleString() : '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{row.blockedBy} — {row.operatorRemedy}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
       {data.productStructureConflicts.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
