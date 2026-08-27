@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 import { nextFollowUpObligationGeneration } from '@/lib/domain/accounting/back-reference'
+import { buildFollowUpObligationBacklogWhere } from '@/lib/domain/accounting/follow-up-obligation-registry'
 
 // ---------------------------------------------------------------------------
 // o3d-9kek Codex r10 finding 1 — the NORMAL Xero writer must claim the follow-up obligation.
@@ -164,6 +165,12 @@ const state = {
    * of the "settle only if the announcement is on record" property.
    */
   unpersistableActivityActions: new Set<string>(),
+  /**
+   * o3d-0bfh r6: the back-reference WRITE fails (not a unique-id conflict — an ordinary transient
+   * error). QuickBooks swallows that, so the entry still succeeds while the link never landed, which
+   * is the path that reaches settleFollowUpObligation's RETAINED branch.
+   */
+  failBackReferenceWrite: false,
 }
 
 function marker(): Date | null {
@@ -244,6 +251,10 @@ const billClient = {
     return bill ? { accountingInvoiceId: bill.accountingInvoiceId } : null
   },
   async update(args: { where: { id: string }; data: Record<string, unknown> }) {
+    if (state.failBackReferenceWrite) {
+      record('backReference.attempted-and-failed')
+      throw new Error('transient: could not write the back-reference')
+    }
     const bill = state.bills.find((candidate) => candidate.id === args.where.id)
     if (!bill) throw new Error(`fake db: no bill ${args.where.id}`)
     Object.assign(bill, args.data)
@@ -402,6 +413,7 @@ function reset(connector = 'xero') {
   state.failReleaseFor.clear()
   state.raceBeforeRelease = null
   state.unpersistableActivityActions.clear()
+  state.failBackReferenceWrite = false
 }
 
 /** The single sync row under test (the follow-up rows the run creates are appended after it). */
@@ -1311,4 +1323,168 @@ test('[o3d-0bfh r5] CONTROL: the recovery logic works perfectly — it is only u
   assert.notEqual(owed, null, 'the obligation this discharged is the one the crash recorded')
   // So the marker protocol is complete and correct on this connector in every respect but one: no
   // candidate query selects a SYNCED row by its marker. That single missing binding is the finding.
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r6 (Codex HIGH) — THE ONLY HUMAN-RECOVERY NOTIFICATION COULD BE SILENTLY LOST.
+//
+// The two QuickBooks paths above said, in as many words, that the activity entry IS the notification
+// and human action is the entire recovery. Both wrote it with `logActivity`, which swallows a
+// persistence failure and resolves `void` — so the appended `.catch()` could never fire on the
+// failure that matters. The entry was then counted successful, the row stayed SYNCED, nothing
+// selected it again, and no sweep consumes its marker: one transient activity-log failure left a
+// payment, PDF, email or attachment permanently stalled with NO operator-visible notice at all.
+//
+// The fix is not a better log line. It is that the obligation is no longer announced only in the log:
+// the marker on the row — a state that is already committed by the time any of this runs — is
+// surfaced as an operational backlog (buildFollowUpObligationBacklogWhere, rendered in the exception
+// inbox). A row carrying a marker with no consumer is ALREADY a queryable state, and a view over it
+// depends on no second write landing at the worst possible moment.
+//
+// SO THESE TESTS FAIL THE ACTIVITY-LOG INSERT AND ASSERT THE OBLIGATION IS STILL VISIBLE, by
+// evaluating the PRODUCTION where-clause against the row the production processor left behind. The
+// where-interpreter throws on any predicate it cannot honour, so this cannot degrade into "some
+// query matched something".
+// ---------------------------------------------------------------------------
+
+/**
+ * Does the operational backlog select this row? The REAL predicate, evaluated by the same matcher
+ * every other assertion in this file uses. `now` is pushed past the settling grace, because a row
+ * that has just been claimed is deliberately not listed — the connector releases the marker a few
+ * statements after it takes it, and a backlog that flickered on every healthy post is not a surface.
+ */
+function inTheOperatorBacklog(row: SyncRow, atMinutesLater = 30): boolean {
+  const where = buildFollowUpObligationBacklogWhere({
+    now: new Date(Date.now() + atMinutesLater * 60_000),
+  }) as unknown as Record<string, unknown>
+  return matches(row as unknown as Record<string, unknown>, where)
+}
+
+/** console.error, captured — the last-resort channel for a notice the database could not take. */
+function captureStderr(): { lines: string[]; restore: () => void } {
+  const lines: string[] = []
+  const original = console.error
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+  return { lines, restore: () => { console.error = original } }
+}
+
+test('[o3d-0bfh r6] a follow-up failure whose ACTIVITY LOG could not be written is still visible to an operator', async () => {
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.failFollowUpsFor.add('log-1')
+  // THE INJECTION THIS TEST IS ABOUT: the notice cannot be persisted. Under the old code this was
+  // indistinguishable from success, because logActivity reports nothing.
+  state.unpersistableActivityActions.add('quickbooks_followup_error')
+  const stderr = captureStderr()
+
+  let result
+  try {
+    result = await runQuickBooks()
+  } finally {
+    stderr.restore()
+  }
+
+  // The entry is STILL counted succeeded and the row STILL ends SYNCED — that is deliberate (the
+  // document is in QuickBooks), and it is precisely what makes the row indistinguishable from a
+  // completed one and therefore what makes the notice load-bearing.
+  assert.equal(result.succeeded, 1)
+  assert.equal(subject().status, 'SYNCED')
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 0,
+    'the follow-up work really did not run — otherwise there is no obligation to be visible',
+  )
+
+  // 1. The notice was ATTEMPTED and reported as unwritable, rather than being awaited and assumed.
+  assert.ok(
+    state.activities.some((entry) => entry.action === 'quickbooks_followup_error'),
+    'the write must have been attempted through the PERSISTED logger',
+  )
+  assert.ok(
+    stderr.lines.some((line) => line.includes('could NOT be written') && line.includes('log-1')),
+    `a lost notice must reach the one channel the failed database write cannot swallow; saw ${JSON.stringify(stderr.lines)}`,
+  )
+
+  // 2. AND THE OBLIGATION IS STILL VISIBLE WITHOUT IT. This is the assertion the finding asked for:
+  // the debt survives on the row, and the production backlog query selects it.
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date,
+    'the marker — the durable record of the debt — is retained',
+  )
+  assert.ok(
+    inTheOperatorBacklog(subject()),
+    'and the operational backlog selects the row, so the operator sees the stalled payment/PDF/email even '
+      + 'though every activity-log write for it failed',
+  )
+})
+
+test('[o3d-0bfh r6] the same holds on the RETAINED-obligation path, where the log line WAS the whole notification', async () => {
+  // The other site Codex named by line (settleFollowUpObligation). Reached by failing the
+  // back-reference WRITE: QuickBooks swallows that, so the entry succeeds, the link never landed,
+  // and the obligation is deliberately retained with a log line as its only announcement.
+  reset('quickbooks')
+  state.failBackReferenceWrite = true
+  state.unpersistableActivityActions.add('quickbooks_followup_obligation_retained')
+  const stderr = captureStderr()
+
+  let result
+  try {
+    result = await runQuickBooks()
+  } finally {
+    stderr.restore()
+  }
+
+  assert.equal(result.succeeded, 1, 'the post landed; only the local link did not')
+  assert.ok(
+    state.journal.some((entry) => entry.op === 'backReference.attempted-and-failed'),
+    'the link write must actually have been attempted and failed, or this row owes nothing',
+  )
+  assert.ok(
+    state.activities.some((entry) => entry.action === 'quickbooks_followup_obligation_retained'),
+    'the retained-obligation notice was attempted',
+  )
+  assert.ok(
+    stderr.lines.some((line) => line.includes('could NOT be written')),
+    `and its failure was reported rather than swallowed; saw ${JSON.stringify(stderr.lines)}`,
+  )
+  assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date, 'the obligation is retained')
+  assert.ok(inTheOperatorBacklog(subject()), 'and it is listed for an operator with no dependence on that log write')
+})
+
+test('[o3d-0bfh r6] CONTROL: a row whose follow-ups RAN is not in the backlog', async () => {
+  // Without this, "the backlog selects the row" is satisfied by a predicate that selects every row —
+  // which would bury the real obligations in a list of healthy documents and be no surface at all.
+  reset('quickbooks')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.succeeded, 1)
+  assert.equal(state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 1, 'the follow-ups ran')
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'so the obligation was discharged')
+  assert.equal(inTheOperatorBacklog(subject()), false, 'and nothing about it is listed as owed')
+})
+
+test('[o3d-0bfh r6] CONTROL: a marked row inside the settling grace, and a XERO row, are not listed', async () => {
+  // Two ways the backlog could cry wolf, both asserted against the real predicate:
+  //
+  //   • a row claimed moments ago is MID-PASS — the connector releases the marker a few statements
+  //     after taking it, so listing it would flicker on every healthy post;
+  //   • a Xero row's marker HAS a consumer. Listing it would tell an operator to do by hand what the
+  //     sweep is about to do, which is how a duplicate payment gets recorded.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.failFollowUpsFor.add('log-1')
+  await runQuickBooks()
+  assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date)
+
+  assert.equal(
+    inTheOperatorBacklog(subject(), 0), false,
+    'a marker claimed seconds ago is still in flight, not stranded',
+  )
+  assert.equal(inTheOperatorBacklog(subject(), 30), true, 'and the same row IS listed once the grace has passed')
+
+  const asXero = { ...subject(), connector: 'xero' }
+  assert.equal(
+    inTheOperatorBacklog(asXero, 30), false,
+    'a connector WITH a sweep consumer is never listed as needing a human',
+  )
 })

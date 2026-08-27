@@ -1817,8 +1817,11 @@ async function enqueueFollowUps(
 //      live connection — the o3d-19gy rule. Otherwise step 3 manufactures unpostable rows.
 //   3. Bind the sweep, fencing its candidate query on the row's recorded origin against the realm
 //      connected now, refusing every decision but `match`.
-//   4. Change `QBO_FOLLOW_UP_RECOVERY` to `{ consumer: 'sweep' }` — the compiler will not remind
-//      you, but the tests in tests/accounting/followup-obligation-writers.test.ts will.
+//   4. Change the QUICKBOOKS ENTRY in lib/domain/accounting/follow-up-obligation-registry.ts to the
+//      sweep consumer — not a literal here; the registry is where the binding and the invocation are
+//      checked, and tests/accounting/follow-up-recovery-registry.test.ts refuses the entry until
+//      step 3 above is actually done. Changing it also empties this connector's exception-inbox
+//      backlog, because that view is derived from the same entry.
 //
 // WHEN IT IS RE-ADDED, ITS `enqueueFollowUps` MUST RETURN THIS FILE'S `FollowUpOutcome` (o3d-0bfh).
 // The Xero binding wrapped the call in an `async` adapter that awaited it and dropped the outcome to
