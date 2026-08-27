@@ -93,6 +93,15 @@ type State = {
   lines: OrderLine[]
   allocations: Allocation[]
   refundLines?: Array<{ orderId: string; salesOrderLineId: string | null; productId: string | null; qty: number }>
+  /**
+   * o3d-2k5r r7: the order's REFUNDS (not their lines), and the refund-reservation-release backstop
+   * rows keyed off them. These are what `countOutstandingRefundReservationReleases` reads, and they
+   * are a DIFFERENT fact from `refundLines`: the lines say how much the dispatch cap must net off,
+   * these say whether the reservation release behind that refund has actually happened yet.
+   * Absent means "no refunds", which is every fixture that predates the dispatch fence.
+   */
+  refunds?: Array<{ id: string; orderId: string }>
+  releaseOutbox?: Array<{ idempotencyKey: string; status: string }>
   // Kit/BOM graph: productId -> its component requirements. Absent products are treated as SIMPLE.
   kits?: Record<string, Array<{ componentId: string; qty: number; sku?: string }>>
   /**
@@ -279,6 +288,29 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
           && allocation.productId === key.productId
         )) ?? null
       },
+    },
+    salesOrderRefund: {
+      findMany: async ({ where }: { where: { orderId: string } }) => (state.refunds ?? [])
+        .filter((refund) => refund.orderId === where.orderId)
+        .map((refund) => ({ id: refund.id })),
+    },
+    integrationOutbox: {
+      // o3d-2k5r r7: BOTH `in` filters are honoured, because both are load-bearing. A double that
+      // ignored `idempotencyKey.in` would count another order's row; one that ignored `status.in`
+      // would count a SUCCEEDED row and report a recovery that is already finished as outstanding.
+      // Either way the fence would refuse dispatches it must let through, and the narrowness test
+      // below would pass without the narrowing existing.
+      count: async ({ where }: {
+        where: {
+          connector: string
+          operation: string
+          idempotencyKey: { in: string[] }
+          status: { in: string[] }
+        }
+      }) => (state.releaseOutbox ?? []).filter((row) => (
+        where.idempotencyKey.in.includes(row.idempotencyKey)
+        && where.status.in.includes(row.status)
+      )).length,
     },
     salesOrderRefundLine: {
       findMany: async ({ where }: { where: { refund: { orderId: string } } }) => (state.refundLines ?? [])
@@ -2515,4 +2547,186 @@ test('o3d-2k5: after a FULL refund the rebuild has nothing to build, and says so
     'every unit was refunded — the correct outcome is no shipment at all, not a smaller one',
   )
   assert.equal(state.shipments[0].status, 'PENDING', 'and the draft is left as a draft, which blocks nothing')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r7 — THE DISPATCH FENCE FOR AN OUTSTANDING REPACK RECOVERY
+//
+// r6 established that a repack recovery must not CREATE a dead end: the partial commit that keeps
+// a refused re-allocation's reopen survives only while every blocker is still reopenable, re-read
+// under the order lock at the moment that transaction commits.
+//
+// That check is an instant, not a rule. The state it permits — one shipment reopened to a draft,
+// its sibling still PACKED, the refund's reservation release still deferred — is one dispatch away
+// from the exact wall the check exists to avoid, and nothing stopped that dispatch: not the
+// shipment screen, not a label purchase, and least of all a WMS despatch feed, which never sees the
+// operator warning. These four fix the rule at the irreversible act instead, under the same order
+// lock, which is the single door every dispatch route goes through.
+//
+// Read them as a pair of opposites. The first two prove the fence REFUSES the dispatch that would
+// foreclose a recovery the order still owes; the last two prove it lets everything else through,
+// which is what stops it being a wedge.
+// ---------------------------------------------------------------------------
+
+/** The order's refunds and their still-unresolved backstop rows, as the fence reads them. */
+function outstandingRecovery() {
+  return {
+    refunds: [{ id: 'refund-1', orderId: 'order-1' }],
+    releaseOutbox: [{ idempotencyKey: 'sales:refund.reservation-release:refund-1', status: 'PENDING' }],
+  }
+}
+
+/** Two lines, one shipment each: line-a partly refunded, line-b untouched and fully packed. */
+function partlyRefundedTwoShipmentOrder(overrides: Partial<State> = {}): State {
+  return baseState({
+    lines: [
+      { id: 'line-a', orderId: 'order-1', productId: 'product-a', qty: 3, sku: 'SKU-A', description: 'Product A' },
+      { id: 'line-b', orderId: 'order-1', productId: 'product-b', qty: 1, sku: 'SKU-B', description: 'Product B' },
+    ],
+    allocations: [
+      { orderId: 'order-1', lineId: 'line-a', productId: 'product-a', warehouseId: 'warehouse-1', qty: 3 },
+      { orderId: 'order-1', lineId: 'line-b', productId: 'product-b', warehouseId: 'warehouse-1', qty: 1 },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-a', shipmentId: 'shipment-a', lineId: 'line-a', productId: 'product-a', qty: 2 },
+      { id: 'shipment-line-b', shipmentId: 'shipment-b', lineId: 'line-b', productId: 'product-b', qty: 1 },
+    ],
+    // One of line-a's three units was refunded after shipment-a was packed. Both shipments are
+    // still within ordered-minus-refunded, so `validateActiveShipmentTotalsWithinOrder` PASSES —
+    // which is what makes these tests about the fence and not about the dispatch cap.
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-a', productId: 'product-a', qty: 1 }],
+    stockLevels: [
+      { productId: 'product-a', warehouseId: 'warehouse-1', quantity: 3, reservedQty: 3 },
+      { productId: 'product-b', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 },
+    ],
+    costLayers: [
+      { id: 'layer-a', productId: 'product-a', warehouseId: 'warehouse-1', remainingQty: 3, unitCostBase: 5 },
+      { id: 'layer-b', productId: 'product-b', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 },
+    ],
+    ...overrides,
+  })
+}
+
+test('o3d-2k5r r7: a sibling cannot be dispatched out from under a repack recovery the partial commit left half-open', async () => {
+  // THE LOAD-BEARING CASE, and it is a sequence, not a state. The operator pressed "Reopen for
+  // repack" on shipment-a; the re-allocation was refused because shipment-b was PACKED; that
+  // refusal DELIBERATELY COMMITTED the reopen, having checked — correctly, under the order lock —
+  // that every blocker was still reopenable. shipment-b is that blocker, and this is the dispatch
+  // that would falsify the check a moment after it was made.
+  const state = partlyRefundedTwoShipmentOrder({
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    ...outstandingRecovery(),
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-b',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /repack recovery/)
+  // Refused, not thrown, and refused BEFORE anything irreversible: the WMS path returns this as a
+  // sync exception rather than an exception, and the order is left exactly where the recovery can
+  // still be finished from.
+  assert.equal(state.shipments[1].status, 'PACKED')
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.cogsEntries.length, 0)
+  assert.equal(state.stockLevels[1].quantity, 1)
+  assert.equal(state.stockLevels[1].reservedQty, 1)
+})
+
+test('o3d-2k5r r7: the same wall is refused with no reopen at all — pack two, refund, dispatch one', async () => {
+  // No recovery has been started here. Two shipments were packed, a refund landed behind them, and
+  // dispatching either one makes the deferred release unrecoverable just as surely as the sequence
+  // above. A fence that only covered the post-reopen state would let this through.
+  const state = partlyRefundedTwoShipmentOrder({
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    ...outstandingRecovery(),
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-b',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /repack recovery/)
+  assert.equal(state.shipments[1].status, 'PACKED')
+  assert.equal(state.movements.length, 0)
+})
+
+test('o3d-2k5r r7: the fence does NOT outlive the recovery it protects — an order already holding a dispatch still ships', async () => {
+  // shipment-a is SHIPPED, so the recovery is ALREADY foreclosed: reopening it is refused outright
+  // and the re-allocation will be declined for ever, outstanding backstop row or not. Refusing this
+  // dispatch too would buy nothing and would strand goods that must still go out, on an order that
+  // needs the o3d-339 reconciliation either way. Delete the `orderHasUnreopenableCommitment` arm of
+  // `dispatchForeclosesRepackRecovery` and this test fails — which is the point of having it.
+  const state = partlyRefundedTwoShipmentOrder({
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    ...outstandingRecovery(),
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-b',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.shipments[1].status, 'SHIPPED')
+  assert.equal(state.movements.length, 1)
+})
+
+test('o3d-2k5r r7: a refund whose reservation release already happened does not fence anything', async () => {
+  // The evidence is the UNRESOLVED row, not the refund. Once the recovery has run (or the backstop
+  // cron drained it) the row is SUCCEEDED, the order owes nothing, and dispatch is ordinary. Widen
+  // `UNRESOLVED_RELEASE_STATUSES` to include SUCCEEDED, or drop the `status` filter from the count,
+  // and this test fails — so "outstanding" cannot quietly become "has ever been refunded".
+  const state = partlyRefundedTwoShipmentOrder({
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    refunds: [{ id: 'refund-1', orderId: 'order-1' }],
+    releaseOutbox: [{ idempotencyKey: 'sales:refund.reservation-release:refund-1', status: 'SUCCEEDED' }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-b',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.shipments[1].status, 'SHIPPED')
+  assert.equal(state.movements.length, 1)
+})
+
+test('o3d-2k5r r7: an unresolved row on ANOTHER order does not fence this one', async () => {
+  // `countOutstandingRefundReservationReleases` keys the count on THIS order's refund ids. A read
+  // that lost that filter would refuse every dispatch in the system while any order anywhere owed a
+  // recovery, and none of the tests above would notice.
+  const state = partlyRefundedTwoShipmentOrder({
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    refunds: [{ id: 'refund-1', orderId: 'order-OTHER' }],
+    releaseOutbox: [{ idempotencyKey: 'sales:refund.reservation-release:refund-1', status: 'PENDING' }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-b',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.shipments[1].status, 'SHIPPED')
 })
