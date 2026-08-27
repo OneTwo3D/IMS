@@ -95,8 +95,11 @@ function createPrismaClient() {
  * The pool configuration handed to the adapter, exported so it can be asserted against rather than
  * re-described by a test — a duplicated literal is a bound nothing checks is still there.
  *
- * `options` is the startup `search_path` (absent when the URL names no schema). It is what makes
- * the RAW statements this application runs — the o3d-1izw push-state gate among them — resolve the
+ * `options` is the startup `search_path`. It is ALWAYS set on a parseable URL — the URL's own
+ * `?schema=` when it has one, and Prisma's own default when it has not, because an adapter with no
+ * `schemaName` compiles generated queries against a hardcoded `"public"` rather than against the
+ * connection's search path, so "no schema named" is a divergence and not an agreement. It is what
+ * makes the RAW statements this application runs — the o3d-1izw push-state gate among them — resolve the
  * same objects the two out-of-process release gates resolve. `PrismaPg`'s `{ schema }` option does
  * not cover them: it qualifies generated queries only.
  */
