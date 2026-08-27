@@ -593,12 +593,38 @@ CRON_FENCED=false
 # backup belongs to a previous run's still-standing fence and must not be touched.
 CRON_BACKUP_CREATED=false
 CUTOVER_STEP="startup"
-FENCE_FILE="${DATA_DIR}/DEPLOY-FENCED"
-CRON_BACKUP="${DATA_DIR}/crontab-${APP_USER}.bak"
+# ---------------------------------------------------------------------------
+# THE CUTOVER NAMESPACE, AND THERE IS EXACTLY ONE (o3d-2sm1.5, Codex r9 HIGH).
+#
+# deploy.sh used to keep its marker, cron backup, connection-fence state and lock under
+# /var/lib/ims-deploy while this script and update.sh kept theirs under the application data
+# directory. The failure banner below nevertheless tells the operator that scripts/deploy.sh
+# "adopts this fence", and following that instruction ran deploy.sh against a namespace
+# holding none of it: no marker to adopt, no cron backup to reuse, no connection-fence state
+# to hold — so it took a fresh backup of an ALREADY FENCED crontab, rewrote the shared
+# drop-in, and could finish reporting success with the scheduled writers still commented out
+# and this run's marker orphaned. A documented guarantee the code did not deliver.
+#
+# So all four paths are resolved by the SAME expression in all three scripts, defaulting to
+# the application data directory — what the installed unit's AssertPathExists= already names
+# and what docs/installation.md documents for a manual fence.
+CUTOVER_STATE_DIR="${IMS_CUTOVER_STATE_DIR:-${IMS_DEPLOY_STATE_DIR:-${IMS_DATA_DIR:-/var/lib/one-two-inventory}}}"
+FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
+CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 FENCE_DROPIN_DIR="/etc/systemd/system/${APP_NAME}.service.d"
 FENCE_DROPIN_FILE="${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
-DB_FENCE_DIR="${DATA_DIR}/deploy"
+DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"
 DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
+# ONE lock for all three entrypoints. deploy.sh and update.sh each held their own and this
+# script took none at all, so an install could run straight through another cutover.
+LOCK_FILE="${CUTOVER_STATE_DIR}/cutover.lock"
+# The namespace deploy.sh wrote to before this round. Nothing writes here any more, and a run
+# that finds state at these paths IMPORTS it into the canonical namespace before it changes a
+# unit or a crontab — see import_legacy_cutover_state().
+LEGACY_CUTOVER_STATE_DIR="${IMS_LEGACY_CUTOVER_STATE_DIR:-/var/lib/ims-deploy}"
+LEGACY_FENCE_FILE="${LEGACY_CUTOVER_STATE_DIR}/FENCED"
+LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
+LEGACY_DB_FENCE_STATE="${LEGACY_CUTOVER_STATE_DIR}/db-connect-fence.json"
 DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"
 DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE}"
@@ -720,9 +746,95 @@ stop_legacy_launchers() {
   success "Legacy launchers and stray app-directory processes stopped."
 }
 
+# ---------------------------------------------------------------------------
+# DURABILITY PRIMITIVES (o3d-2sm1.5, Codex r9 HIGH).
+#
+# The previous round made the marker and the cron backup ATOMIC — a reader never sees a
+# half-written file. That is a different property from DURABLE, and only the second one
+# survives a power cut: an atomic rename whose data was never flushed reboots as an empty
+# or missing file, and a read-back through the page cache proves the bytes are VISIBLE,
+# not that they are on the medium.
+#
+# So every published file gets two barriers: the file's own data before the rename, and
+# the containing directory after it. Without the second, the rename itself is not durable
+# and the reboot finds the OLD name — or no name at all.
+# ---------------------------------------------------------------------------
+
+# fsync one path. GNU coreutils `sync PATH` opens the path and calls fsync(2) on that
+# descriptor, which for a directory is exactly the barrier that makes a rename durable.
+# Where that is unavailable, fall back to a whole-filesystem sync, which is a superset.
+# It NEVER silently does nothing: a failure is returned so the caller can refuse to
+# publish rather than claim a durability it did not get.
+fsync_path() {
+  local target="$1"
+  sync "$target" 2>/dev/null && return 0
+  sync 2>/dev/null && return 0
+  return 1
+}
+
+# Publish stdin at "$1" so that a SIGKILL or a power loss at any instant leaves either the
+# PREVIOUS durable content or the complete new content, and never a truncated file.
+#
+# `> "$FENCE_FILE"` did the opposite: it truncated the authoritative marker first and filled
+# it afterwards, so a kill in between left an empty or partial marker at the one path the
+# next run reads. Adoption reads an unrecognised phase conservatively as `stopping`, but it
+# read the MISSING schema flag as `false` and released the connection fence — over a schema
+# that may have been half migrated.
+#
+# Same directory, so the rename is a rename and not a copy. Every failure path removes the
+# temporary file and returns non-zero, leaving the last durable marker untouched.
+publish_durable_file() {
+  local target="$1" dir tmp
+  dir="$(dirname "$target")"
+  mkdir -p "$dir" || return 1
+  tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
+  if ! cat > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  if ! chmod 600 "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  # BARRIER 1: the data, before the name exists. After this the rename can only publish
+  # bytes that are already on the medium.
+  if ! fsync_path "$tmp"; then rm -f "$tmp"; return 1; fi
+  if ! mv -f "$tmp" "$target" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  # BARRIER 2: the directory entry the rename created. Without it the reboot can find the
+  # old name, or neither name, however well the data was flushed.
+  fsync_path "$dir" || return 1
+  return 0
+}
+
+# THE SHARED NAMESPACE IS THE APPLICATION'S OWN DATA DIRECTORY, so this creates what is
+# missing and changes the mode of nothing else. deploy.sh used to `chmod 700` its private
+# state directory; doing that to ${CUTOVER_STATE_DIR} now would take /var/lib/one-two-inventory
+# — uploads, backups, the Xero store — away from the service that owns it. The two files
+# that need protecting carry their own 0600, and the connection-fence state lives in a 0700
+# subdirectory owned by ${APP_USER}, which is the identity that writes it: the fence script
+# runs as the app user, so a root-owned 0700 directory made that write impossible.
+ensure_cutover_state_dirs() {
+  mkdir -p "$CUTOVER_STATE_DIR" || return 1
+  mkdir -p "$DB_FENCE_DIR" || return 1
+  chown "${APP_USER}:${APP_USER}" "$DB_FENCE_DIR" 2>/dev/null || true
+  chmod 700 "$DB_FENCE_DIR" 2>/dev/null || true
+  return 0
+}
+
+# ONE LOCK FOR ALL THREE ENTRYPOINTS (o3d-2sm1.5, Codex r9 HIGH). deploy.sh held
+# ${STATE_DIR}/deploy.lock and update.sh held ${DATA_DIR}/update.lock, so "refusing to run
+# two cutovers at once" was true of two deploys and false of a deploy racing an update;
+# install.sh took no lock at all. One path, taken by all three.
+acquire_cutover_lock() {
+  ensure_cutover_state_dirs || die "Could not create ${CUTOVER_STATE_DIR}; the cutover namespace is unusable. Nothing has been stopped."
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "Another cutover (deploy.sh, update.sh or install.sh) holds ${LOCK_FILE}. Refusing to run two cutovers at once."
+  # AND the lock the previous version of deploy.sh took, so a cutover started from a checkout
+  # that predates the shared namespace is still excluded. Only when that directory already
+  # exists: creating it would be re-creating the namespace this round retired.
+  if [[ -d "$LEGACY_CUTOVER_STATE_DIR" ]]; then
+    exec 8>"${LEGACY_CUTOVER_STATE_DIR}/deploy.lock"
+    flock -n 8 || die "A cutover from a checkout that predates the shared namespace holds ${LEGACY_CUTOVER_STATE_DIR}/deploy.lock. Refusing to run two cutovers at once."
+  fi
+}
+
 write_cutover_marker() {
   local reason="$1" status="${2:-0}"
-  mkdir -p "${DATA_DIR}"
+  mkdir -p "${CUTOVER_STATE_DIR}"
   {
     echo "fenced_at=$(date -Iseconds)"
     echo "reason=${reason}"
@@ -753,12 +865,22 @@ write_cutover_marker() {
     # does not exist gets read as one (Codex r3 HIGH).
     echo "db_connect_fence=$(${DB_FENCE_UP} && echo held || echo released)"
     echo "release_db_connect_fence=${DB_FENCE_RELEASE_CMD}"
-  } > "${FENCE_FILE}"
-  chmod 600 "${FENCE_FILE}"
-  # DURABILITY. Everything above is a page-cache write until something flushes it, and the
-  # one caller that cannot afford that is mark_schema_touched(): the marker exists precisely
-  # for the run that is killed or loses power a moment later.
-  sync "${FENCE_FILE}" 2>/dev/null || sync || true
+    # THE LAST LINE, AND IT IS THE POINT OF IT (o3d-2sm1.5, Codex r9 HIGH). A marker that
+    # does not end here was never published by publish_durable_file(), so every fact above
+    # it is unproven — including `schema_touched=`, whose ABSENCE adoption used to read as
+    # `false` and release the connection fence over a possibly half-migrated schema. See
+    # marker_is_complete().
+    echo "marker_complete=1"
+  } | publish_durable_file "${FENCE_FILE}" || {
+    # NOT fatal here: this is also called from the exit trap, where dying loses the status
+    # and the banner. It is fatal in mark_schema_touched() and persist_stop_requested(),
+    # which check the file afterwards — the two callers whose whole purpose is the durable
+    # record. What matters is that the LAST DURABLE MARKER IS STILL THERE: a failed publish
+    # changed nothing.
+    warn "Could not publish ${FENCE_FILE} durably; the previous marker is unchanged."
+    return 1
+  }
+  return 0
 }
 
 # THE SCHEMA IS ABOUT TO MOVE — SAY SO ON DISK BEFORE IT DOES (o3d-2sm1.4, Codex r3 CRITICAL).
@@ -774,10 +896,44 @@ mark_schema_touched() {
   # A FIRST install has no predecessor, no fence and no marker to adopt: nothing was
   # stopped, so there is nothing for a later run to recover. Only a cutover writes one.
   ${FENCE_ARMED} || return 0
-  write_cutover_marker "migration about to be invoked at $(date -Iseconds)"
+  # `|| true` so the assertion below is what speaks. A failed publish leaves the LAST
+  # DURABLE marker in place, and if that one already says schema_touched=true the record
+  # this function exists to create is already on disk; if it does not, the grep fails and
+  # nothing is migrated.
+  write_cutover_marker "migration about to be invoked at $(date -Iseconds)" || true
   grep -qE '^schema_touched=true$' "${FENCE_FILE}" || die \
     "Could not record schema_touched=true in ${FENCE_FILE}. Refusing to migrate: a migration whose interruption cannot be recorded would be adopted as one that never started."
   success "Recorded schema_touched=true in ${FENCE_FILE} (flushed) — an interrupted migration is now recoverable."
+}
+
+# THE STOP IS ABOUT TO BE ASKED FOR — SAY SO ON DISK BEFORE ASKING (o3d-2sm1.5, Codex r9
+# MEDIUM).
+#
+# `FENCE_ARMED=true` was set in shell memory immediately before `systemctl stop`, and the
+# durable marker went on saying `phase=arming` until some LATER write refreshed it — the
+# exit trap, usually, which a SIGKILL, an OOM kill or a power cut never reaches. So a run
+# interrupted across the stop left a marker describing a phase it was no longer in, and the
+# next run's adoption fell through to the liveness heuristic, where ANY listener on the
+# port — an operator's `next dev` in another worktree, a stray process, a sibling app —
+# counts as "the predecessor is still serving" and the arming is UNWOUND: the crontab is
+# restored, the reboot fence taken down and the connection fence released, over a service
+# that had already been asked to stop.
+#
+# So the transition is persisted first, and conservatively: `stopping` means only "a stop
+# has been REQUESTED", never "the stop succeeded". Recovery semantics, which are the ones
+# already in place for this phase: marker_phase() returns `stopping`, adoption takes the
+# ordinary branch, and that branch re-stops the units, re-installs and re-verifies the
+# reboot fence, adopts the cron fence, and holds or releases the connection fence on
+# `schema_touched`. Nothing in that path is harmed by a stop that had not actually landed —
+# every step of it is idempotent — which is exactly why the conservative direction is the
+# one to persist.
+persist_stop_requested() {
+  # `|| true` so the assertion below is what speaks; a failed publish leaves the last
+  # durable marker untouched, and the grep then reports on THAT file.
+  write_cutover_marker "stop requested at $(date -Iseconds)" || true
+  grep -qE '^phase=stopping$' "${FENCE_FILE}" || die \
+    "Could not record phase=stopping in ${FENCE_FILE}. Refusing to stop: a stop whose interruption cannot be recorded would be adopted as an arming that never stopped anything, and unwound over a service that had already been asked to stop."
+  info "Recorded phase=stopping in ${FENCE_FILE} (flushed) — an interruption across the stop is now recoverable."
 }
 
 verify_reboot_fence() {
@@ -835,7 +991,14 @@ install_reboot_fence() {
     return 1
   fi
 
-  write_cutover_marker "${reason}"
+  # A FENCE WHOSE MARKER IS NOT DURABLE IS NOT A FENCE. The marker is the condition the
+  # drop-in asserts on, so a publish that could not be flushed must fail the install rather
+  # than install a drop-in pointing at a file a power cut can lose.
+  write_cutover_marker "${reason}" || {
+    error "${FENCE_FILE} could not be published durably, so there is NO reboot fence."
+    rollback_reboot_fence_install
+    return 1
+  }
   mkdir -p "${FENCE_DROPIN_DIR}"
   [[ -f "${FENCE_DROPIN_FILE}" ]] || FENCE_DROPIN_CREATED=true
   cat > "${FENCE_DROPIN_FILE}" <<FENCEEOF
@@ -859,7 +1022,8 @@ FENCEEOF
   # Re-written now that the answer is known. The marker is the file the NEXT run (and the
   # operator after a hard kill) reads, and it was written before the drop-in was verified —
   # so it said `reboot_fence=absent` about a fence that had just been installed.
-  write_cutover_marker "${reason}"
+  write_cutover_marker "${reason}" \
+    || warn "The fence is installed and verified, but ${FENCE_FILE} could not be refreshed; it still reads reboot_fence=absent."
   return 0
 }
 
@@ -901,7 +1065,17 @@ publish_cron_backup() {
   # lose their trailing newlines, so this compares every byte that matters.
   if [[ "$(cat "${tmp}" 2>/dev/null)" != "${content}" ]]; then rm -f "${tmp}"; return 1; fi
   if [[ "$(stat -c '%a' "${tmp}" 2>/dev/null)" != "600" ]]; then rm -f "${tmp}"; return 1; fi
+  # DURABLE, NOT MERELY VISIBLE (o3d-2sm1.5, Codex r9 HIGH). The read-back above proves the
+  # bytes can be SEEN, and the page cache will happily satisfy it from memory. A power loss
+  # after the crontab has been fenced would then reboot with this backup missing or
+  # zero-length while publication had returned success — and the resume either restores an
+  # empty crontab or leaves cron commented out for ever. Both barriers land BEFORE the
+  # crontab is touched, because the caller invokes `crontab` only once this returns 0.
+  if ! fsync_path "${tmp}"; then rm -f "${tmp}"; return 1; fi
   if ! mv -f "${tmp}" "${CRON_BACKUP}" 2>/dev/null; then rm -f "${tmp}"; return 1; fi
+  # BARRIER 2: the directory entry the rename created. Without it the reboot can find the
+  # temporary name, or no name at all, however well the data was flushed.
+  if ! fsync_path "$(dirname "${CRON_BACKUP}")"; then rm -f "${CRON_BACKUP}"; return 1; fi
   # IMMEDIATELY: from here the file is authoritative and must be owned by this run in the
   # same breath, or the unwind disowns a backup it is the only one able to restore.
   CRON_BACKUP_CREATED=true
@@ -953,6 +1127,19 @@ unfence_cron() {
 # left one behind after a stop; anything unrecognised therefore reads as `stopping`, which is
 # the direction that stops a service rather than leaving one running over a schema that may
 # have moved.
+# WAS THIS MARKER PUBLISHED IN ONE PIECE? (o3d-2sm1.5, Codex r9 HIGH)
+#
+# publish_durable_file() writes `marker_complete=1` last, so its presence is proof that
+# every line above it reached the medium together. Its ABSENCE means one of two things and
+# both are read the same way: a marker truncated by the pre-r9 in-place writer, or one
+# written by a version of this script older than the sentinel. Either way the facts in it
+# are unproven, and the only safe reading of an unproven `schema_touched` is "it may have
+# been touched" — the opposite of the `false` that adoption used to default to before it
+# released the connection fence.
+marker_is_complete() {
+  grep -qE '^marker_complete=1$' "$FENCE_FILE" 2>/dev/null
+}
+
 marker_phase() {
   local phase
   phase="$(sed -n 's/^phase=//p' "${FENCE_FILE}" 2>/dev/null | tail -1)"
@@ -1148,6 +1335,59 @@ refence_db_connections() {
 # reboot fence, confirm cron, and adopt or release the connection fence by the same rule
 # the trap uses. And refuse to go on if it says a migration was attempted and this run
 # would not re-run one — there is no such mode here, so this is an assertion, not a flag.
+# ---------------------------------------------------------------------------
+# IMPORTING THE LEGACY NAMESPACE (o3d-2sm1.5, Codex r9 HIGH).
+#
+# Before this round deploy.sh kept its cutover state under /var/lib/ims-deploy while
+# install.sh and update.sh kept theirs under the application data directory. A host part-way
+# through a cutover started by the OLD deploy.sh therefore has a standing fence at paths the
+# shared namespace does not name — and a run that simply ignored them would take a fresh
+# crontab backup over an already-fenced crontab, rewrite the shared drop-in and leave the
+# previous marker orphaned. Exactly the failure the shared namespace exists to end.
+#
+# So each legacy artefact is MOVED into the canonical namespace before anything is adopted
+# and long before any unit or crontab is touched, and it is moved durably: the content is
+# republished through publish_durable_file(), so a crash mid-import leaves either the legacy
+# copy or a complete canonical one.
+#
+# It never GUESSES. Both namespaces holding the same artefact means two runs were
+# interrupted, and choosing between them would silently discard a crontab backup or a set of
+# recorded grants nothing else can reconstruct.
+import_legacy_file() {
+  local legacy="$1" canonical="$2" what="$3" owner="${4:-}"
+  [[ -e "$legacy" ]] || return 1
+  if [[ -e "$canonical" ]]; then
+    die "Two cutover namespaces both hold a ${what}: ${legacy} (the namespace deploy.sh used before o3d-2sm1.5) and ${canonical} (the shared one). Refusing to guess which fence is standing. Nothing has been stopped: read both, keep the one that describes the interrupted run, delete the other, and re-run."
+  fi
+  publish_durable_file "$canonical" < "$legacy" || die \
+    "The ${what} at ${legacy} could not be published durably at ${canonical}, so this run cannot adopt the fence a previous run left standing. Nothing has been stopped and nothing has been migrated."
+  [[ -z "$owner" ]] || chown "${owner}:${owner}" "$canonical" 2>/dev/null || true
+  rm -f "$legacy"
+  warn "Imported the ${what} into the shared cutover namespace: ${legacy} -> ${canonical}"
+  return 0
+}
+
+import_legacy_cutover_state() {
+  [[ "$LEGACY_CUTOVER_STATE_DIR" != "$CUTOVER_STATE_DIR" ]] || return 0
+  [[ -d "$LEGACY_CUTOVER_STATE_DIR" ]] || return 0
+  ensure_cutover_state_dirs || die "Could not create ${CUTOVER_STATE_DIR}; the cutover namespace is unusable. Nothing has been stopped."
+  local imported=false
+  # The connection-fence state goes back to ${APP_USER}: the fence script runs as the app
+  # user, and a root-owned copy is one it cannot release.
+  if import_legacy_file "$LEGACY_DB_FENCE_STATE" "$DB_FENCE_STATE" "connection-fence state" "$APP_USER"; then imported=true; fi
+  if import_legacy_file "$LEGACY_CRON_BACKUP" "$CRON_BACKUP" "crontab backup"; then imported=true; fi
+  # LAST, because the marker is what adoption keys on: until it is at the canonical path
+  # nothing adopts anything, so a crash part-way through this import leaves a run that finds
+  # no marker and stops nothing.
+  if import_legacy_file "$LEGACY_FENCE_FILE" "$FENCE_FILE" "cutover marker"; then imported=true; fi
+  if $imported; then
+    warn "The state above was left by a checkout that predates the shared cutover namespace."
+    warn "It is adopted below exactly as if this run had written it."
+  fi
+  rmdir "$LEGACY_CUTOVER_STATE_DIR" 2>/dev/null || true
+  return 0
+}
+
 adopt_existing_fence() {
   [[ -f "${FENCE_FILE}" ]] || return 0
 
@@ -1169,6 +1409,20 @@ adopt_existing_fence() {
   if grep -qE '^schema_touched=true$' "${FENCE_FILE}" 2>/dev/null; then
     adopted_schema_touched=true
   fi
+  # AN INCOMPLETE MARKER IS NOT A MARKER SAYING `false` (o3d-2sm1.5, Codex r9 HIGH).
+  #
+  # An unrecognised `phase=` was already read conservatively as `stopping`, but the schema
+  # flag was read INDEPENDENTLY and defaulted to `false` when the line was missing — so a
+  # marker truncated by the old in-place writer was adopted as "stopped, migrated nothing",
+  # and the connection fence was RELEASED over a schema that may be half applied. Missing is
+  # not false. It is unknown, and unknown is read the expensive way.
+  if ! marker_is_complete; then
+    warn "${FENCE_FILE} does not end with marker_complete=1, so it was never published in one"
+    warn "piece: it is truncated, or was written by a version of this script older than the"
+    warn "sentinel. Reading it the SAFE way — the schema may have moved. This run re-migrates,"
+    warn "re-checks drift and re-verifies before anything gets CONNECT back."
+    adopted_schema_touched=true
+  fi
   if [[ "${adopted_phase}" == "arming" ]] && ! ${adopted_schema_touched} && predecessor_is_active; then
     warn "Adopting an INTERRUPTED ARMING — a previous run was killed before it stopped anything:"
     sed 's/^/         /' "${FENCE_FILE}"
@@ -1183,7 +1437,10 @@ adopt_existing_fence() {
   warn "Adopting an existing cutover fence — a previous run stopped here:"
   sed 's/^/         /' "${FENCE_FILE}"
   FENCE_ARMED=true
-  if grep -qE '^schema_touched=true$' "${FENCE_FILE}" 2>/dev/null; then
+  # Read ONCE, above, and read conservatively there: a second independent grep is how the
+  # missing-line-means-false defect got in. (`if`, not `&&`: under errexit a bare
+  # `$flag && VAR=true` exits the script the moment the flag is false.)
+  if ${adopted_schema_touched}; then
     SCHEMA_TOUCHED=true
   fi
   systemctl stop "${APP_NAME}.service" >/dev/null 2>&1 || true
@@ -1333,7 +1590,8 @@ on_cutover_exit() {
   fi
   error "  cron        : ${APP_USER} entries left FENCED (commented out)."
   error "  Do NOT start ${APP_NAME}.service by hand. Fix the cause and re-run this"
-  error "  installer, scripts/update.sh or scripts/deploy.sh — each adopts this fence."
+  error "  installer, scripts/update.sh or scripts/deploy.sh — all three read this fence"
+  error "  from the same place (${FENCE_FILE}) and adopt it."
 
   systemctl stop "${APP_NAME}.service" >/dev/null 2>&1 || true
   install_reboot_fence "install failed at ${CUTOVER_STEP}" >/dev/null 2>&1 \
@@ -1364,7 +1622,7 @@ on_cutover_exit() {
   fi
   # LAST, so the marker records the fence state that is true when this process exits rather
   # than the one that was true before the re-fence was attempted.
-  write_cutover_marker "install failed at ${CUTOVER_STEP}" "${status}"
+  write_cutover_marker "install failed at ${CUTOVER_STEP}" "${status}" || true
   exit "${status}"
 }
 
@@ -2157,6 +2415,8 @@ if upgrade_in_place; then
   CUTOVER_STEP="adopt"
   # A fence a previous run left standing is adopted here, so a rebuild that has to run
   # inside a HELD fence gets MIGRATION_DATABASE_URL before the build needs it.
+  acquire_cutover_lock
+  import_legacy_cutover_state
   adopt_existing_fence
 fi
 
@@ -2217,6 +2477,8 @@ if ${UPGRADE_EXISTING}; then
   # nothing may start it again. Every failure before this point takes the reversible branch
   # in the trap (o3d-2sm1.5, Codex r7 HIGH).
   FENCE_ARMED=true
+  # ...and the transition is on disk before `systemctl stop` runs, not after it.
+  persist_stop_requested
 
   info "systemctl stop ${APP_NAME}.service"
   systemctl stop "${APP_NAME}.service" >/dev/null 2>&1 || true

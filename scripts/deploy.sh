@@ -511,38 +511,6 @@ fence_dropin_file() { echo "/etc/systemd/system/$1.d/${FENCE_DROPIN_NAME}"; }
 # and the reboot finds the OLD name — or no name at all.
 # ---------------------------------------------------------------------------
 
-# THE SHARED NAMESPACE IS THE APPLICATION'S OWN DATA DIRECTORY, so this creates what is
-# missing and changes the mode of nothing else. deploy.sh used to `chmod 700` its private
-# state directory; doing that to ${CUTOVER_STATE_DIR} now would take /var/lib/one-two-inventory
-# — uploads, backups, the Xero store — away from the service that owns it. The two files
-# that need protecting carry their own 0600, and the connection-fence state lives in a 0700
-# subdirectory owned by ${APP_USER}, which is the identity that writes it: the fence script
-# runs as the app user, so a root-owned 0700 directory made that write impossible.
-ensure_cutover_state_dirs() {
-  mkdir -p "$CUTOVER_STATE_DIR" || return 1
-  mkdir -p "$DB_FENCE_DIR" || return 1
-  chown "${APP_USER}:${APP_USER}" "$DB_FENCE_DIR" 2>/dev/null || true
-  chmod 700 "$DB_FENCE_DIR" 2>/dev/null || true
-  return 0
-}
-
-# ONE LOCK FOR ALL THREE ENTRYPOINTS (o3d-2sm1.5, Codex r9 HIGH). deploy.sh held
-# ${STATE_DIR}/deploy.lock and update.sh held ${DATA_DIR}/update.lock, so "refusing to run
-# two cutovers at once" was true of two deploys and false of a deploy racing an update;
-# install.sh took no lock at all. One path, taken by all three.
-acquire_cutover_lock() {
-  ensure_cutover_state_dirs || die "Could not create ${CUTOVER_STATE_DIR}; the cutover namespace is unusable. Nothing has been stopped."
-  exec 9>"$LOCK_FILE"
-  flock -n 9 || die "Another cutover (deploy.sh, update.sh or install.sh) holds ${LOCK_FILE}. Refusing to run two cutovers at once."
-  # AND the lock the previous version of deploy.sh took, so a cutover started from a checkout
-  # that predates the shared namespace is still excluded. Only when that directory already
-  # exists: creating it would be re-creating the namespace this round retired.
-  if [[ -d "$LEGACY_CUTOVER_STATE_DIR" ]]; then
-    exec 8>"${LEGACY_CUTOVER_STATE_DIR}/deploy.lock"
-    flock -n 8 || die "A cutover from a checkout that predates the shared namespace holds ${LEGACY_CUTOVER_STATE_DIR}/deploy.lock. Refusing to run two cutovers at once."
-  fi
-}
-
 # fsync one path. GNU coreutils `sync PATH` opens the path and calls fsync(2) on that
 # descriptor, which for a directory is exactly the barrier that makes a rename durable.
 # Where that is unavailable, fall back to a whole-filesystem sync, which is a superset.
@@ -581,6 +549,38 @@ publish_durable_file() {
   # old name, or neither name, however well the data was flushed.
   fsync_path "$dir" || return 1
   return 0
+}
+
+# THE SHARED NAMESPACE IS THE APPLICATION'S OWN DATA DIRECTORY, so this creates what is
+# missing and changes the mode of nothing else. deploy.sh used to `chmod 700` its private
+# state directory; doing that to ${CUTOVER_STATE_DIR} now would take /var/lib/one-two-inventory
+# — uploads, backups, the Xero store — away from the service that owns it. The two files
+# that need protecting carry their own 0600, and the connection-fence state lives in a 0700
+# subdirectory owned by ${APP_USER}, which is the identity that writes it: the fence script
+# runs as the app user, so a root-owned 0700 directory made that write impossible.
+ensure_cutover_state_dirs() {
+  mkdir -p "$CUTOVER_STATE_DIR" || return 1
+  mkdir -p "$DB_FENCE_DIR" || return 1
+  chown "${APP_USER}:${APP_USER}" "$DB_FENCE_DIR" 2>/dev/null || true
+  chmod 700 "$DB_FENCE_DIR" 2>/dev/null || true
+  return 0
+}
+
+# ONE LOCK FOR ALL THREE ENTRYPOINTS (o3d-2sm1.5, Codex r9 HIGH). deploy.sh held
+# ${STATE_DIR}/deploy.lock and update.sh held ${DATA_DIR}/update.lock, so "refusing to run
+# two cutovers at once" was true of two deploys and false of a deploy racing an update;
+# install.sh took no lock at all. One path, taken by all three.
+acquire_cutover_lock() {
+  ensure_cutover_state_dirs || die "Could not create ${CUTOVER_STATE_DIR}; the cutover namespace is unusable. Nothing has been stopped."
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "Another cutover (deploy.sh, update.sh or install.sh) holds ${LOCK_FILE}. Refusing to run two cutovers at once."
+  # AND the lock the previous version of deploy.sh took, so a cutover started from a checkout
+  # that predates the shared namespace is still excluded. Only when that directory already
+  # exists: creating it would be re-creating the namespace this round retired.
+  if [[ -d "$LEGACY_CUTOVER_STATE_DIR" ]]; then
+    exec 8>"${LEGACY_CUTOVER_STATE_DIR}/deploy.lock"
+    flock -n 8 || die "A cutover from a checkout that predates the shared namespace holds ${LEGACY_CUTOVER_STATE_DIR}/deploy.lock. Refusing to run two cutovers at once."
+  fi
 }
 
 write_fence_marker() {
@@ -696,16 +696,12 @@ mark_schema_touched() {
 # every step of it is idempotent — which is exactly why the conservative direction is the
 # one to persist.
 persist_stop_requested() {
-  if $DRY_RUN; then
-    echo -e "${YELLOW}[DRY]${RESET}   would record phase=stopping in ${FENCE_FILE} and flush it BEFORE anything is stopped"
-    return 0
-  fi
   # `|| true` so the assertion below is what speaks; a failed publish leaves the last
   # durable marker untouched, and the grep then reports on THAT file.
   write_fence_marker "stop requested at $(date -Iseconds)" || true
-  grep -qE '^phase=stopping$' "$FENCE_FILE" || die \
-    "Could not record phase=stopping in ${FENCE_FILE}. Refusing to stop the predecessor: a stop whose interruption cannot be recorded would be adopted as an arming that never stopped anything, and unwound over a service that had already been asked to stop."
-  ok "Recorded phase=stopping in ${FENCE_FILE} (flushed) — an interruption across the stop is now recoverable."
+  grep -qE '^phase=stopping$' "${FENCE_FILE}" || die \
+    "Could not record phase=stopping in ${FENCE_FILE}. Refusing to stop: a stop whose interruption cannot be recorded would be adopted as an arming that never stopped anything, and unwound over a service that had already been asked to stop."
+  info "Recorded phase=stopping in ${FENCE_FILE} (flushed) — an interruption across the stop is now recoverable."
 }
 
 verify_reboot_fence() {
@@ -1169,11 +1165,6 @@ unfence_cron() {
 }
 
 # --- adopting somebody else's marker ---------------------------------------
-# What phase the run that wrote this marker had actually reached. A marker with no `phase=`
-# line was written by an older version of this script, which only ever left one behind after
-# a stop; the conservative reading of anything unrecognised is therefore `stopping`, because
-# that is the reading which stops a service rather than leaving one running over a schema
-# that may have moved.
 # WAS THIS MARKER PUBLISHED IN ONE PIECE? (o3d-2sm1.5, Codex r9 HIGH)
 #
 # publish_durable_file() writes `marker_complete=1` last, so its presence is proof that
@@ -1187,6 +1178,11 @@ marker_is_complete() {
   grep -qE '^marker_complete=1$' "$FENCE_FILE" 2>/dev/null
 }
 
+# What phase the run that wrote this marker had actually reached. A marker with no `phase=`
+# line was written by an older version of this script, which only ever left one behind after
+# a stop; the conservative reading of anything unrecognised is therefore `stopping`, because
+# that is the reading which stops a service rather than leaving one running over a schema
+# that may have moved.
 marker_phase() {
   local phase
   phase="$(sed -n 's/^phase=//p' "$FENCE_FILE" 2>/dev/null | tail -1)"
@@ -1896,7 +1892,11 @@ fence_cron
 # failure before this point took the reversible branch above (o3d-2sm1.5, Codex r7 HIGH).
 FENCE_ARMED=true
 # ...and the transition is on disk before the first `systemctl stop` runs, not after it.
-persist_stop_requested
+if $DRY_RUN; then
+  echo -e "${YELLOW}[DRY]${RESET}   would record phase=stopping in ${FENCE_FILE} and flush it BEFORE anything is stopped"
+else
+  persist_stop_requested
+fi
 
 # --- the web server --------------------------------------------------------
 if [[ "${#SERVICE_UNITS[@]}" -gt 0 ]]; then
