@@ -3288,6 +3288,13 @@ for (const entry of R9_SCRIPTS) {
 
     // AND THE REFUSAL. If the transition cannot be recorded, nothing may be stopped: a stop
     // whose interruption leaves no evidence is adopted as an arming and UNWOUND.
+    //
+    // FAILURE INJECTED ON THE PRE-RENAME SIDE OF THE BARRIER: the chmod runs before BARRIER 1
+    // and long before the rename, so nothing new is ever visible and the last durable marker
+    // is untouched. Since r10 it is the PUBLISHER'S RESULT that refuses here, so the message
+    // is the durability one and the content grep below it never runs. The post-rename half of
+    // this property — where the grep WOULD have passed — is asserted in the r10 block at the
+    // end of this file, and neither side covers the other.
     const refused = runR9(
       entry,
       ['fsync_path', 'publish_durable_file', entry.writer, 'persist_stop_requested'],
@@ -3295,7 +3302,11 @@ for (const entry of R9_SCRIPTS) {
     )
     assert.notEqual(refused.status, 0, `an unrecordable transition must abort:\n${refused.stdout}`)
     assert.ok(!/REACHED_THE_STOP/.test(refused.stdout), `and nothing after it may run: ${refused.stdout}`)
-    assert.match(refused.stdout, /DIE:.*phase=stopping/, 'and it must say what it refused and why')
+    assert.match(
+      refused.stdout,
+      /DIE: Could not (publish .* durably before stopping|record phase=stopping)/,
+      `and it must say what it refused and why:\n${refused.stdout}`,
+    )
   })
 }
 
@@ -3582,3 +3593,155 @@ for (const entry of R9_SCRIPTS) {
     assert.match(result.stdout, /NO_DBSTATE/, 'nor a set of recorded grants out of nothing')
   })
 }
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r10) — VISIBILITY IS STILL NOT DURABILITY, ON THE OTHER SIDE OF THE
+// BARRIER.
+//
+//   CRITICAL  docs/installation.md's "Manual equivalent" recreated the unsafe migration
+//             window it exists to close: it published a COMPLETE marker saying
+//             `schema_touched=false` and then invoked Prisma, and it fenced cron with a
+//             comment rather than a command. An operator following it step by step ended in
+//             exactly the state the scripts prevent. The recipe is gone; the test below is
+//             what stops it coming back.
+//   HIGH      publish_durable_file() renames BEFORE its last barrier, so a failed
+//             parent-directory fsync returns non-zero with the new bytes already visible at
+//             the authoritative path. mark_schema_touched() and persist_stop_requested()
+//             discarded that result with `|| true` and validated the visible replacement
+//             with grep — which the renamed bytes satisfy. Migration and stopping went
+//             ahead over a publication whose directory entry a power loss could undo,
+//             restoring the previous complete marker.
+//
+// AND THE ROUND-9 COVERAGE PROVED THE RIGHT PROPERTY ON THE WRONG SIDE OF THE BARRIER: it
+// injected a chmod failure, which happens BEFORE the rename, where nothing is visible and
+// the read-back correctly fails. Every test below states which side it injects on.
+// ---------------------------------------------------------------------------
+
+/**
+ * FAILURE INJECTED ON THE POST-RENAME SIDE OF THE BARRIER.
+ *
+ * BARRIER 1 (`fsync_path "$tmp"`, before the rename) succeeds. The rename succeeds. Only
+ * BARRIER 2 — the parent-directory flush that publish_durable_file() performs AFTER the
+ * rename — fails, together with the bare-`sync` fallback fsync_path tries next, without
+ * which fsync_path would report success and there would be no failure to observe.
+ *
+ * So at the instant the caller must decide, the NEW marker is fully visible at the
+ * authoritative path and its directory entry is not proven durable. Any caller that greps
+ * the file is satisfied; only the publisher's return value tells the truth. That is the
+ * exact instant Codex named, and it is the one the chmod shim could not reach.
+ */
+const R10_POST_RENAME_BARRIER_SHIM = `
+sync(){
+  if [[ $# -eq 0 || "\${1}" == "\${CUTOVER_STATE_DIR}" ]]; then return 1; fi
+  command sync "\$@"
+}
+`
+
+for (const entry of R9_SCRIPTS) {
+  test(`${entry.name} refuses to migrate when the POST-RENAME barrier fails, though the marker is visible`, () => {
+    const result = runR9(
+      entry,
+      ['fsync_path', 'publish_durable_file', entry.writer, 'mark_schema_touched'],
+      ['mark_schema_touched', 'echo REACHED_THE_MIGRATION'].join('\n'),
+      [R10_POST_RENAME_BARRIER_SHIM, 'FENCE_ARMED=true'].join('\n'),
+    )
+
+    // THE PRECONDITION, PROVED RATHER THAN ASSUMED. Without this the test could pass for the
+    // wrong reason — a publication that failed before the rename, where there is nothing to
+    // read back and the old `|| true` + grep would also have refused. The rename HAPPENED:
+    // the new marker is at the authoritative path, complete, and says the very thing the
+    // read-back looks for.
+    assert.ok(result.marker !== null, `the rename must have published the new marker: ${result.files.join(', ')}`)
+    assert.match(result.marker ?? '', /^schema_touched=true$/m, 'and it must say exactly what the grep looks for')
+    assert.match(result.marker ?? '', /^marker_complete=1$/m, 'as a complete marker, so nothing else could have refused it')
+
+    // AND THE REFUSAL, which at this instant can only come from the publisher's return value.
+    assert.notEqual(result.status, 0, `an unprovable publication must abort the migration:\n${result.stdout}`)
+    assert.ok(!/REACHED_THE_MIGRATION/.test(result.stdout), `and nothing after it may run:\n${result.stdout}`)
+    assert.match(result.stdout, /DIE:.*durably before migrating/, `and it must say what it refused and why:\n${result.stdout}`)
+  })
+
+  test(`${entry.name} refuses to stop when the POST-RENAME barrier fails, though the marker is visible`, () => {
+    const result = runR9(
+      entry,
+      ['fsync_path', 'publish_durable_file', entry.writer, 'persist_stop_requested'],
+      ['FENCE_ARMED=true', 'persist_stop_requested', 'echo REACHED_THE_STOP'].join('\n'),
+      R10_POST_RENAME_BARRIER_SHIM,
+    )
+
+    // Same precondition, same side of the barrier: the transition is VISIBLE on disk.
+    assert.ok(result.marker !== null, `the rename must have published the new marker: ${result.files.join(', ')}`)
+    assert.match(result.marker ?? '', /^phase=stopping$/m, 'and it must say exactly what the grep looks for')
+    assert.match(result.marker ?? '', /^marker_complete=1$/m, 'as a complete marker, so nothing else could have refused it')
+
+    assert.notEqual(result.status, 0, `an unprovable transition must abort the stop:\n${result.stdout}`)
+    assert.ok(!/REACHED_THE_STOP/.test(result.stdout), `and nothing after it may run:\n${result.stdout}`)
+    assert.match(result.stdout, /DIE:.*durably before stopping/, `and it must say what it refused and why:\n${result.stdout}`)
+  })
+}
+
+test('neither critical transition substitutes a read-back for the publisher’s durability result', () => {
+  // The behavioural tests above are the proof; this is the shape that made the defect
+  // possible, named so it cannot return in a different spelling. The grep must SURVIVE — it
+  // answers a real and separate question, "is this the marker we meant to write?" — but it
+  // may never be the only gate.
+  for (const entry of R9_SCRIPTS) {
+    for (const fn of ['mark_schema_touched', 'persist_stop_requested']) {
+      const body = shellFunction(entry.source, fn)
+      const publishCall = body.split('\n').find((line) => new RegExp(`^\\s*${entry.writer}\\s`).test(line))
+      assert.ok(publishCall, `${entry.name}: ${fn}() must publish the marker`)
+      assert.ok(
+        !/\|\|\s*true\s*$/.test(publishCall as string),
+        `${entry.name}: ${fn}() discards the publisher's result: ${publishCall}`,
+      )
+      assert.match(
+        publishCall as string,
+        /\|\|\s*die\b/,
+        `${entry.name}: ${fn}() must treat a failed publication as fatal: ${publishCall}`,
+      )
+      assert.match(body, /grep -qE/, `${entry.name}: ${fn}() must still confirm WHAT landed, as an additional gate`)
+    }
+  }
+})
+
+test('docs/installation.md offers no hand-run cutover, only the shipped entrypoints', () => {
+  // THE UNDER-IMPLEMENTED RUNBOOK IS THE DEFECT. Every earlier round found documentation
+  // that OVERCLAIMED; this one under-implemented, which is worse — an operator follows it
+  // and lands in the state the scripts exist to prevent. A copy-pasteable cutover cannot be
+  // made equivalent without reimplementing publish_durable_file(), the completeness
+  // sentinel, the arming/stopping transitions, the cron backup's ownership flag, the lock,
+  // adoption and the exit-trap unwind. So the doc no longer offers one, and this test is the
+  // thing that keeps it from being helpfully re-added.
+  const doc = readFileSync(join(process.cwd(), 'docs/installation.md'), 'utf8')
+  const blocks = [...doc.matchAll(/```[a-z]*\n([\s\S]*?)```/g)].map((match) => match[1])
+  assert.ok(blocks.length > 0, 'precondition: the runbook has fenced command blocks to inspect')
+
+  for (const block of blocks) {
+    assert.ok(
+      !/prisma migrate deploy/.test(block),
+      `no command block may invoke the migration by hand — it is the step whose ordering the cutover exists to enforce:\n${block}`,
+    )
+    assert.ok(
+      !/DEPLOY-FENCED/.test(block),
+      `nor hand-write the cutover marker: a shell redirection is neither atomic nor flushed, and publish_durable_file() is not expressible in a runbook:\n${block}`,
+    )
+    assert.ok(
+      !/zz-deploy-fence\.conf/.test(block),
+      `nor hand-install the reboot fence, whose drop-in must be verified as loaded before anything stops:\n${block}`,
+    )
+    assert.ok(
+      !/fence-db-connections\.mjs/.test(block),
+      `nor hand-drive the connection fence, whose release is gated on schema_touched:\n${block}`,
+    )
+  }
+
+  // AND THE POSITIVE HALF: it must still tell the operator what to run, or "no manual
+  // recipe" is just a gap. Without this, deleting the whole Updating section would pass.
+  assert.match(doc, /bash scripts\/update\.sh/, 'the runbook must name the supported update path')
+  assert.match(doc, /no manual equivalent/i, 'and say plainly that hand-rolling it is not supported')
+  assert.match(
+    doc,
+    /`scripts\/install\.sh`, `scripts\/update\.sh`, `scripts\/deploy\.sh`/,
+    'and point at all three entrypoints, since a fence left by any of them is adopted by any other',
+  )
+})

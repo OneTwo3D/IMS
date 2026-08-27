@@ -444,51 +444,39 @@ cd /opt/one-two-inventory
 bash scripts/update.sh
 ```
 
-Manual equivalent:
+**There is no manual equivalent, and this document deliberately no longer offers one.**
 
-```bash
-cd /opt/one-two-inventory
+Until o3d-2sm1.5 it did: a copy-pasteable block that fetched, built, wrote a `DEPLOY-FENCED`
+marker, stopped the service and invoked Prisma. It read like the scripts and it was not the
+scripts, and the three things it could not carry are each exactly the failure the cutover
+exists to prevent.
 
-# Replace <deployed-branch> with the branch this instance tracks
-git fetch origin
-git reset --hard origin/<deployed-branch>
+* **It published `schema_touched=false` and then migrated.** The marker was written once,
+  complete, *before* `prisma migrate deploy` — so a Prisma failure, an OOM kill or a power cut
+  mid-migration left a **complete** marker on disk asserting the schema had not moved. The
+  next entrypoint adopts that marker, believes it, and **releases the connection fence over a
+  half-migrated schema**. `mark_schema_touched()` exists to publish `schema_touched=true`
+  *before* Prisma is invoked, and to refuse the migration if that cannot be made durable.
+  No hand-typed sequence did either.
+* **Its cron fence was a comment.** `# then comment the jobs out` is not a command. An
+  operator following the block literally left every cron writer running across the migration,
+  which is the second half of "stop and drain every writer".
+* **Nothing it wrote was durable.** `printf > file` is neither atomic nor flushed. The scripts
+  publish through `publish_durable_file()`: a temporary in the same directory, an `fsync` of
+  the data, the `rename`, an `fsync` of the parent directory, and a `marker_complete=1`
+  sentinel written last so a reader can tell a whole marker from a torn one. A shell
+  redirection has none of that, and a reboot can find an empty marker, the previous one, or no
+  marker at all.
 
-# Install dependencies and BUILD FIRST, while the old version is still serving the
-# schema it was written against (see "Deploy order" below — this order matters)
-npm ci --omit=dev
-npx prisma generate --schema prisma/schema.prisma
-npm run build
+The three entrypoints — `scripts/install.sh`, `scripts/update.sh`, `scripts/deploy.sh` — share
+one cutover namespace, one lock and one state machine, so a fence left standing by any of them
+is adopted by any other. **If an update fails, re-run one of those scripts; do not hand-roll
+the sequence.** The failure banner names the marker, the fences that are standing and the
+command that releases each, and the next run adopts what the failed one left behind.
 
-# Stop and drain every writer BEFORE the schema moves
-crontab -u imsapp -l > /var/lib/one-two-inventory/crontab-imsapp.bak  # then comment the jobs out
-mkdir -p /etc/systemd/system/one-two-inventory.service.d        # reboot fence, BEFORE the migration
-printf '[Unit]\nAssertPathExists=!/var/lib/one-two-inventory/DEPLOY-FENCED\n' \
-  > /etc/systemd/system/one-two-inventory.service.d/zz-deploy-fence.conf
-# A marker, not a `touch`: the scripts read this file, and one that does not end with
-# marker_complete=1 is read the conservative way (see "One cutover namespace" below)
-printf 'phase=stopping\nmigration_attempted=true\nschema_touched=false\nmarker_complete=1\n' \
-  > /var/lib/one-two-inventory/DEPLOY-FENCED
-systemctl daemon-reload
-systemctl show -p DropInPaths --value one-two-inventory.service # VERIFY it took
-systemctl stop one-two-inventory.service
-node scripts/fence-db-connections.mjs --fence \
-  --state-file=/var/lib/one-two-inventory/deploy/db-connect-fence.json  # optional; see below
-node scripts/check-db-writers.mjs          # refuses if anything is still connected
-
-# Migrate with nothing serving, and run the migrations' own checks
-npx prisma migrate deploy --schema prisma/schema.prisma
-node scripts/check-prisma-drift.mjs
-node scripts/run-migration-verifications.mjs
-
-# Only now start the new version — and if any step above failed, leave it stopped
-node scripts/fence-db-connections.mjs --release \
-  --state-file=/var/lib/one-two-inventory/deploy/db-connect-fence.json
-rm -f /etc/systemd/system/one-two-inventory.service.d/zz-deploy-fence.conf
-rm -f /var/lib/one-two-inventory/DEPLOY-FENCED
-systemctl daemon-reload
-systemctl start one-two-inventory.service
-crontab -u imsapp /var/lib/one-two-inventory/crontab-imsapp.bak  # restore cron last
-```
+To see what a run would do without doing it, `bash scripts/update.sh --dry-run` prints the
+whole plan and changes nothing (and works unprivileged); `bash scripts/deploy.sh --dry-run`
+does the same for a deploy.
 
 ### Deploy order, and what happens on a rollback
 

@@ -796,6 +796,12 @@ publish_durable_file() {
   if ! mv -f "$tmp" "$target" 2>/dev/null; then rm -f "$tmp"; return 1; fi
   # BARRIER 2: the directory entry the rename created. Without it the reboot can find the
   # old name, or neither name, however well the data was flushed.
+  #
+  # A FAILURE HERE RETURNS NON-ZERO WITH THE NEW BYTES ALREADY AT $target (o3d-2sm1.5, Codex
+  # r10 HIGH). That is not a leak, it is the honest answer: the content is VISIBLE and its
+  # NAME is not proven, so a power loss can restore the previous directory entry and with it
+  # the previous marker. Callers must act on THIS RETURN VALUE. Anything that greps $target
+  # instead reads the new content and concludes a durability it was never given.
   fsync_path "$dir" || return 1
   return 0
 }
@@ -873,10 +879,12 @@ write_cutover_marker() {
     echo "marker_complete=1"
   } | publish_durable_file "${FENCE_FILE}" || {
     # NOT fatal here: this is also called from the exit trap, where dying loses the status
-    # and the banner. It is fatal in mark_schema_touched() and persist_stop_requested(),
-    # which check the file afterwards — the two callers whose whole purpose is the durable
-    # record. What matters is that the LAST DURABLE MARKER IS STILL THERE: a failed publish
-    # changed nothing.
+    # and the banner. It IS fatal in mark_schema_touched() and persist_stop_requested() —
+    # the two callers whose whole purpose is the durable record — and fatal on THIS RETURN
+    # VALUE, never on a read-back of the file afterwards (o3d-2sm1.5, Codex r10 HIGH): the
+    # rename lands before the last barrier, so the marker can be readable and undurable at
+    # the same instant. What matters here is that the LAST DURABLE MARKER IS STILL THERE:
+    # a failed publish changed nothing.
     warn "Could not publish ${FENCE_FILE} durably; the previous marker is unchanged."
     return 1
   }
@@ -896,11 +904,20 @@ mark_schema_touched() {
   # A FIRST install has no predecessor, no fence and no marker to adopt: nothing was
   # stopped, so there is nothing for a later run to recover. Only a cutover writes one.
   ${FENCE_ARMED} || return 0
-  # `|| true` so the assertion below is what speaks. A failed publish leaves the LAST
-  # DURABLE marker in place, and if that one already says schema_touched=true the record
-  # this function exists to create is already on disk; if it does not, the grep fails and
-  # nothing is migrated.
-  write_cutover_marker "migration about to be invoked at $(date -Iseconds)" || true
+  # THE PUBLISHER'S RESULT IS THE DURABILITY ANSWER, AND IT IS FATAL (o3d-2sm1.5, Codex r10
+  # HIGH). This was `|| true`, with the grep below left to speak for it. It cannot speak for
+  # it: publish_durable_file() RENAMES the new marker into place and only then flushes the
+  # parent directory, so a failed BARRIER 2 leaves bytes that are perfectly VISIBLE and not
+  # proven to be on the medium. The grep was satisfied, the migration went ahead, and a power
+  # loss could restore the previous directory entry — the older complete marker, saying
+  # `schema_touched=false` — over a half-migrated schema. A read-back answers "can this be
+  # seen?"; it never answers "will this survive?", and it does not substitute for the
+  # publisher's own result.
+  write_cutover_marker "migration about to be invoked at $(date -Iseconds)" || die \
+    "Could not publish ${FENCE_FILE} durably before migrating. Refusing to migrate: a migration whose interruption cannot be recorded would be adopted as one that never started."
+  # AND the content, which is a DIFFERENT question from durability: that what landed is the
+  # marker this function exists to write. An additional gate, never a replacement for the
+  # publisher's result above.
   grep -qE '^schema_touched=true$' "${FENCE_FILE}" || die \
     "Could not record schema_touched=true in ${FENCE_FILE}. Refusing to migrate: a migration whose interruption cannot be recorded would be adopted as one that never started."
   success "Recorded schema_touched=true in ${FENCE_FILE} (flushed) — an interrupted migration is now recoverable."
@@ -928,9 +945,17 @@ mark_schema_touched() {
 # every step of it is idempotent — which is exactly why the conservative direction is the
 # one to persist.
 persist_stop_requested() {
-  # `|| true` so the assertion below is what speaks; a failed publish leaves the last
-  # durable marker untouched, and the grep then reports on THAT file.
-  write_cutover_marker "stop requested at $(date -Iseconds)" || true
+  # THE PUBLISHER'S RESULT IS THE DURABILITY ANSWER, AND IT IS FATAL (o3d-2sm1.5, Codex r10
+  # HIGH). This was `|| true`, with the grep below left to speak for it. The grep only proves
+  # the bytes can be SEEN: publish_durable_file() renames before its last barrier, so a failed
+  # parent-directory fsync publishes a marker the grep is happy with and the medium may not
+  # keep. The reboot then finds the PREVIOUS directory entry — `phase=arming` — and adoption
+  # falls through to the liveness heuristic and UNWINDS the fences over a service that had
+  # already been asked to stop.
+  write_cutover_marker "stop requested at $(date -Iseconds)" || die \
+    "Could not publish ${FENCE_FILE} durably before stopping. Refusing to stop: a stop whose interruption cannot be recorded would be adopted as an arming that never stopped anything, and unwound over a service that had already been asked to stop."
+  # AND the content, a DIFFERENT question from durability. An additional gate, never a
+  # replacement for the publisher's result above.
   grep -qE '^phase=stopping$' "${FENCE_FILE}" || die \
     "Could not record phase=stopping in ${FENCE_FILE}. Refusing to stop: a stop whose interruption cannot be recorded would be adopted as an arming that never stopped anything, and unwound over a service that had already been asked to stop."
   info "Recorded phase=stopping in ${FENCE_FILE} (flushed) — an interruption across the stop is now recoverable."
