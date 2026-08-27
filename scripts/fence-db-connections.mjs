@@ -37,8 +37,13 @@
 //                          When there is no usable record to restore FROM, it does not report
 //                          "nothing to release" — a record that was never written and one a
 //                          power cut ate look identical from here. It asks the database, and
-//                          only a database that says the application role holds CONNECT is a
-//                          proof that no fence is standing (o3d-2sm1.5, Codex r11 HIGH).
+//                          NEITHER answer is a success (o3d-2sm1.5, Codex r11 and r12 HIGH):
+//                          an application role WITHOUT CONNECT means a fence is standing whose
+//                          record is gone (exit 1), and an application role WITH CONNECT proves
+//                          only that — the same fence may still hold PUBLIC, monitoring, BI or
+//                          a second application out, and doFence() leaves precisely that shape
+//                          standing on purpose (exit 4, EXIT_FENCE_UNPROVEN). Only a record can
+//                          license "released".
 //   --print-migration-url  the admin URL with `options=-c role=<app role>` merged in — the
 //                          connection the migration must run through. See "WHO THE
 //                          MIGRATION RUNS AS" below. No database connection is opened.
@@ -132,6 +137,16 @@ import pg from 'pg'
 export const EXIT_OK = 0
 export const EXIT_ERROR = 1
 export const EXIT_NOT_FENCEABLE = 3
+/**
+ * `--release` was asked to release a fence it has no record of, and the database says the
+ * APPLICATION ROLE can connect. That is the only thing it proves, and it is NOT proof that no
+ * fence is standing (o3d-2sm1.5, Codex r12 HIGH): a fence revokes CONNECT from every grantee
+ * that held it directly, and the application can keep CONNECT through PUBLIC, through role
+ * membership or through a manual grant while monitoring, backup, BI or a second application
+ * stays revoked by that same fence. Non-zero, deliberately: the caller decides what to do with
+ * "the application can connect and nothing else here is knowable", but nobody may read it as OK.
+ */
+export const EXIT_FENCE_UNPROVEN = 4
 
 export const PUBLIC_GRANTEE = 'PUBLIC'
 
@@ -471,8 +486,10 @@ function parseArgs(argv) {
 //      atomic rename, directory fsync — and a failure aborts WITHOUT revoking anything.
 //   2. `--release` no longer reads absence as a negative. A record that was never written
 //      and a record a power cut ate are indistinguishable from here, so a missing or
-//      unusable record is not an answer at all: the database is asked instead, and only a
-//      database that says the application role holds CONNECT proves there is no fence.
+//      unusable record is not an answer at all: the database is asked instead. And the
+//      answer it can give is bounded (r12) — has_database_privilege() speaks for ONE role,
+//      while the fence revoked from every direct grantee, so "the application connects" is
+//      never promoted to "no fence is standing". Both branches are non-zero.
 // ---------------------------------------------------------------------------
 
 /** The record is there and usable: released from it, exactly what was revoked comes back. */
@@ -910,9 +927,16 @@ export async function doFence(client, options) {
  *
  * "NOTHING TO RELEASE" IS A CLAIM ABOUT THE DATABASE, NOT ABOUT A FILE (o3d-2sm1.5, Codex r11
  * HIGH). A missing record is the shape a lost record takes, so it proves nothing on its own.
- * The only proof that no fence is standing is the database saying the application role holds
- * CONNECT — and if it does not, a fence IS standing with no record of it, which is a refusal
- * with instructions, never a success.
+ * So the database is asked — and then the answer is not over-read (o3d-2sm1.5, Codex r12 HIGH).
+ *
+ * `has_database_privilege(appRole, ...)` speaks for exactly ONE role. The fence revokes CONNECT
+ * from EVERY grantee that held it directly, so the application can be back inside — through
+ * PUBLIC, through membership, through a manual grant — while monitoring, backup, BI or a second
+ * application is still shut out by the same fence. doFence() produces that shape deliberately:
+ * it rejects a fence the application survives through membership and leaves the revokes standing.
+ * Without the record there is no baseline of the original grantees, and no ACL read reconstructs
+ * one, so this function NEVER returns EXIT_OK and NEVER sets fenceProvenAbsent. It returns a
+ * refusal with instructions in both directions; the only difference is which refusal.
  */
 export function assessUnrecordedRelease({ status, detail = '', appRole, stateFile, appStillConnects }) {
   const where = stateFile || '<no --state-file was given>'
@@ -931,11 +955,26 @@ export function assessUnrecordedRelease({ status, detail = '', appRole, stateFil
   }
   if (appStillConnects) {
     return {
-      exitCode: EXIT_OK,
-      fenceProvenAbsent: true,
+      exitCode: EXIT_FENCE_UNPROVEN,
+      fenceProvenAbsent: false,
+      appRoleConnects: true,
       lines: [
         `No usable connection-fence record (${what}) at ${where}.`,
-        `Nothing to release, and PROVEN so: ${appRole} holds CONNECT on this database, so no fence is standing.`,
+        `${appRole} holds CONNECT on this database. THAT IS THE ONLY THING THIS RUN CAN PROVE.`,
+        'IT IS NOT PROOF THAT NO FENCE IS STANDING (o3d-2sm1.5, Codex r12 HIGH). A fence revokes CONNECT',
+        'from EVERY grantee that held it directly — PUBLIC, monitoring, backup, BI, a second application —',
+        `and ${appRole} can hold CONNECT through PUBLIC, through role membership or through a manual grant`,
+        'while every one of those is still revoked by that same fence.',
+        '--fence PRODUCES EXACTLY THIS SHAPE ON PURPOSE: when the application keeps CONNECT through role',
+        'membership after the direct grantees have been revoked, doFence() rejects the fence as ineffective',
+        'and DELIBERATELY LEAVES IT STANDING so nothing is half-applied. Lose the record from that state and',
+        'this is what is left behind — an application that connects, and revocations nobody has undone.',
+        'Without the record there is no baseline of who held CONNECT beforehand, and no ACL read can',
+        'reconstruct one: a role that has no CONNECT now looks identical whether a fence took it or it never',
+        'had it. So this is a REFUSAL, not a release. Audit the ACL and restore by hand before treating this',
+        'database as open:',
+        '  SELECT datacl FROM pg_database WHERE datname = current_database();',
+        '  GRANT CONNECT ON DATABASE <this database> TO <every role that held it before and does not now>;',
         ...(status === STATE_ABSENT ? [] : [`The unusable record was left at ${where} for inspection.`]),
       ],
     }

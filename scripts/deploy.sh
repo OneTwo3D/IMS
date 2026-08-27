@@ -402,6 +402,12 @@ FENCE_ARMED=false
 FENCE_MASK=false
 SCHEMA_TOUCHED=false
 DB_FENCE_UP=false
+# DID THIS RUN EVER RAISE A CONNECTION FENCE (o3d-2sm1.5, Codex r12 HIGH). DB_FENCE_UP is
+# lowered again by every release, so it cannot answer "was there a fence to release at all".
+# This one is raised once and never lowered: if it is true and the release then reports that
+# it has no record to release FROM, the record this run wrote has been lost underneath it,
+# and that is a refusal rather than a warning.
+DB_FENCE_RAISED=false
 DEPLOY_OK=false
 CRON_FENCED=false
 # Did THIS run write the crontab backup? The unwind restores from it, and an ADOPTED
@@ -977,6 +983,7 @@ fence_db_connections() {
       [[ -n "$MIGRATION_DATABASE_URL" ]] || die \
         "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       DB_FENCE_UP=true
+      DB_FENCE_RAISED=true
       ok "Connection fence up: new application connections are refused for the window."
       ok "The migration will connect as the deploy admin and RUN AS the application role, so what it creates is owned by the application."
       ;;
@@ -1057,19 +1064,57 @@ release_db_connections() {
     echo -e "${YELLOW}[DRY]${RESET}   would run: ${DB_FENCE_RELEASE_CMD}  (as ${APP_USER})"
     return 0
   fi
-  [[ -f "$DB_FENCE_STATE" ]] || return 0
-  [[ -f "$DB_FENCE_SCRIPT" ]] || { echo -e "${RED}[ERROR]${RESET} Cannot release the connection fence: ${DB_FENCE_SCRIPT} is missing." >&2; return 1; }
+  # THE STATE FILE IS NOT ASKED WHETHER A FENCE STANDS (o3d-2sm1.5, Codex r12 HIGH).
+  # This used to begin `[[ -f "$DB_FENCE_STATE" ]] || return 0`, which is the same defect the
+  # database-backed release was added to fix, one layer up: an ABSENCE treated as an ANSWER.
+  # A durable revoke outlives a lost record, so on the exact failure the record-loss work
+  # exists for, this function reported success without asking anything, the start path took
+  # that for a released fence, removed the reboot fence and started an application with no
+  # CONNECT on its own database. So the script is ALWAYS run, and it is the DATABASE that says
+  # what is standing. Its exit codes: 0 released from a record and verified; 4 no record, and
+  # the application role's own CONNECT is all that could be proven; anything else, a refusal.
+  [[ -f "$DB_FENCE_SCRIPT" ]] || { echo -e "${RED}[ERROR]${RESET} Cannot release the connection fence: ${DB_FENCE_SCRIPT} is missing, so nothing here can ask the database whether one is standing." >&2; return 1; }
 
-  if as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "$DB_FENCE_SCRIPT" --release --state-file="$DB_FENCE_STATE"; then
+  local rc=0
+  as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+    node "$DB_FENCE_SCRIPT" --release --state-file="$DB_FENCE_STATE" || rc=$?
+
+  if [[ "$rc" -eq 0 ]]; then
     MIGRATION_DATABASE_URL=""
     DB_FENCE_UP=false
     ok "Connection fence released."
     return 0
   fi
 
-  echo -e "${RED}[ERROR]${RESET} THE CONNECTION FENCE COULD NOT BE RELEASED. The application role still" >&2
-  echo -e "${RED}[ERROR]${RESET} has no CONNECT on this database and cannot start until this is undone:" >&2
+  if [[ "$rc" -eq 4 ]]; then
+    # EXIT 4: there is no record, and the database says the application role holds CONNECT.
+    # That is the ONE thing it proves. The same fence revokes CONNECT from PUBLIC, monitoring,
+    # backup, BI and any second application, and the application can be back inside through
+    # PUBLIC or role membership while all of those are still shut out — the shape --fence
+    # itself leaves standing when it rejects an ineffective fence. So it is never "released".
+    DB_FENCE_UP=false
+    if ${DB_FENCE_RAISED:-false}; then
+      echo -e "${RED}[ERROR]${RESET} A CONNECTION FENCE WAS RAISED BY THIS RUN AND ITS RECORD IS GONE (exit 4)." >&2
+      echo -e "${RED}[ERROR]${RESET} ${DB_FENCE_STATE} no longer holds a usable record, so nothing can restore the" >&2
+      echo -e "${RED}[ERROR]${RESET} grants this run revoked. ${APP_USER}'s role can connect; PUBLIC and every other" >&2
+      echo -e "${RED}[ERROR]${RESET} grantee the fence took CONNECT from may still be locked out, with no record of" >&2
+      echo -e "${RED}[ERROR]${RESET} who they were. Audit the ACL by hand before this database is treated as open:" >&2
+      echo -e "${RED}[ERROR]${RESET}   SELECT datacl FROM pg_database WHERE datname = current_database();" >&2
+      return 1
+    fi
+    MIGRATION_DATABASE_URL=""
+    warn "NO CONNECTION-FENCE RECORD, AND NO PROOF THAT NO FENCE IS STANDING (exit 4)."
+    warn "The database says the application role can connect, and that is all it says. A fence"
+    warn "revokes CONNECT from every grantee that held it — PUBLIC, monitoring, backup, BI — and"
+    warn "the application can hold CONNECT through PUBLIC or role membership while those stay"
+    warn "revoked. This run raised no fence and moved no schema, so it continues; if this box has"
+    warn "ever had a deploy interrupted, audit the ACL before trusting it:"
+    warn "  SELECT datacl FROM pg_database WHERE datname = current_database();"
+    return 0
+  fi
+
+  echo -e "${RED}[ERROR]${RESET} THE CONNECTION FENCE COULD NOT BE RELEASED (exit ${rc}). The application role" >&2
+  echo -e "${RED}[ERROR]${RESET} still has no CONNECT on this database and cannot start until this is undone:" >&2
   echo -e "${RED}[ERROR]${RESET}   ${DB_FENCE_RELEASE_CMD}" >&2
   echo -e "${RED}[ERROR]${RESET} or, by hand as a superuser, the GRANTs recorded in ${DB_FENCE_STATE}." >&2
   return 1
@@ -1099,6 +1144,7 @@ refence_db_connections() {
     node "$DB_FENCE_SCRIPT" --fence --state-file="$DB_FENCE_STATE" || rc=$?
   [[ "$rc" -eq 0 ]] || return 1
   DB_FENCE_UP=true
+  DB_FENCE_RAISED=true
   # DO NOT SUBSTITUTE THE ADMIN URL WHEN THE COMPOSER REFUSES (o3d-2sm1.5, r6).
   # `--print-migration-url` throws precisely so that a migration can never run AS THE ADMIN
   # while the log announces the application role; catching that throw and assigning
@@ -1130,7 +1176,21 @@ adopt_db_connections() {
     return 0
   fi
   if [[ ! -f "$DB_FENCE_STATE" ]]; then
-    info "No connection fence was standing from the previous run (${DB_FENCE_STATE} is absent)."
+    # AN ABSENT FILE IS NOT PROOF THAT NO PREVIOUS FENCE STANDS (o3d-2sm1.5, Codex r12 HIGH).
+    # This used to say so out loud — "No connection fence was standing" — on the strength of a
+    # missing file, and then carry on adopting nothing. A durable revoke outlives its record,
+    # and this is the path taken when the previous run had ALREADY REACHED THE MIGRATION, so a
+    # fence certainly existed. Ask the database. With no record --release grants nothing and
+    # restores nothing; it only reads, and it refuses (exit 1) when the application role is
+    # locked out — which is exactly the recovery this must not walk past.
+    local absent_rc=0
+    release_db_connections || absent_rc=$?
+    [[ "$absent_rc" -eq 0 ]] || die \
+      "The previous run had already started migrating, so it had fenced the database — and the record of that fence at ${DB_FENCE_STATE} is gone while the database says the fence has NOT been undone: the application role has no CONNECT. Nothing here can reconstruct which grantees it revoked. Restore CONNECT by hand as a superuser, check pg_database.datacl for every other grantee that lost it, and re-run. Nothing has been migrated by this run."
+    warn "The previous run had reached the migration, so it had raised a connection fence — and no"
+    warn "record of it survives at ${DB_FENCE_STATE}. The database confirms only that the application"
+    warn "role can connect, so this recovery goes on through the application role. Audit"
+    warn "pg_database.datacl for any OTHER grantee that fence may still be holding out."
     return 0
   fi
   [[ -n "$DEPLOY_ADMIN_DATABASE_URL" ]] || die \
