@@ -1174,6 +1174,171 @@ for (const entry of FENCE_HARNESS) {
 }
 
 // ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r12, HIGH) — EVERY ENTRYPOINT SHORT-CIRCUITED THE RELEASE.
+//
+// Round 11 taught scripts/fence-db-connections.mjs --release to ASK PostgreSQL whether a
+// fence is standing when the record cannot answer, because a durable revoke outlives a lost
+// record. Every caller then opened with `[[ -f "$DB_FENCE_STATE" ]] || return 0` and never
+// invoked it — a file-existence answer in front of the database question, which is the same
+// defect the database question was added to fix. The start path took that false success,
+// removed the reboot fence and started an application with no CONNECT on its own database.
+//
+// These run the SHIPPED release function with NO state file against a stub that answers the
+// way a real database would, so a reinstated short-circuit fails them rather than reading
+// past them: the stub logs every invocation, and a short-circuit produces an empty log.
+// ---------------------------------------------------------------------------
+
+/** A stand-in for fence-db-connections.mjs that records its argv and exits how it is told. */
+function fenceStub(dir: string, exitCode: number): void {
+  writeFileSync(
+    join(dir, 'fence.mjs'),
+    [
+      "import { appendFileSync } from 'node:fs'",
+      `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+      `process.exit(${exitCode})`,
+      '',
+    ].join('\n'),
+  )
+}
+
+function runShell(program: string): { status: number; output: string } {
+  try {
+    return {
+      status: 0,
+      output: execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
+    }
+  } catch (error) {
+    const failure = error as { status?: number; stdout?: string; stderr?: string }
+    return { status: failure.status ?? -1, output: `${failure.stdout ?? ''}${failure.stderr ?? ''}` }
+  }
+}
+
+function calls(dir: string): string {
+  return existsSync(join(dir, 'calls.log')) ? readFileSync(join(dir, 'calls.log'), 'utf8') : ''
+}
+
+for (const entry of FENCE_HARNESS) {
+  const release = (dir: string, raised: boolean, extra: string[] = []) =>
+    [
+      'set -euo pipefail',
+      entry.preamble(dir),
+      // update.sh's release reports through error(); the shared preamble does not define it.
+      'error() { echo "ERROR: $*" >&2; }',
+      `DB_FENCE_RAISED=${raised}`,
+      shellFunction(entry.source, 'release_db_connections'),
+      ...extra,
+    ].join('\n')
+
+  test(`${entry.name} asks the DATABASE about a fence when no record exists, and refuses when the application has no CONNECT`, () => {
+    // The r11 failure exactly: the revoke survived, the record did not. The database says the
+    // application role cannot connect (--release exit 1), and the caller must not start it.
+    const dir = mkdtempSync(join(tmpdir(), 'ims-rel-nostate-'))
+    try {
+      fenceStub(dir, 1)
+      assert.equal(existsSync(join(dir, 'db-connect-fence.json')), false, 'the record must be absent for this to test anything')
+
+      const result = runShell(release(dir, false, ['release_db_connections', 'echo "RELEASE SAID IT WAS FINE"']))
+
+      // MUTATION ROUTE: put `[[ -f "$DB_FENCE_STATE" ]] || return 0` back at the top of
+      // release_db_connections() and BOTH of these fail — the log is empty and the status is 0.
+      assert.match(calls(dir), /--release/, 'the release must be RUN, not skipped because a file is missing')
+      assert.notEqual(result.status, 0, 'and a database that says the application is locked out must refuse')
+      assert.ok(!result.output.includes('RELEASE SAID IT WAS FINE'), 'nothing may treat that as a released fence')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${entry.name} never calls a fence released when only the application role's own CONNECT was proven`, () => {
+    // --release exit 4: no record, and the database confirms only that the application role
+    // holds CONNECT. PUBLIC, monitoring, backup, BI or a second application may still be
+    // revoked by the same fence, so this run continues but never says "released".
+    const dir = mkdtempSync(join(tmpdir(), 'ims-rel-unproven-'))
+    try {
+      fenceStub(dir, 4)
+      const result = runShell(release(dir, false, ['release_db_connections', 'echo "CONTINUED"']))
+
+      // MUTATION ROUTE: reinstate the `[[ -f ... ]] || return 0` short-circuit and the first
+      // two assertions fail (empty log, no warning). Delete the exit-4 arm so 4 falls through
+      // to the generic refusal and 'CONTINUED' disappears.
+      assert.match(calls(dir), /--release/, 'the database is asked even with no record on disk')
+      assert.match(result.output, /NO PROOF THAT NO FENCE IS STANDING/, 'and the bound on the claim is stated out loud')
+      assert.match(result.output, /SELECT datacl FROM pg_database/, 'with the ACL audit it is demanding')
+      assert.ok(!/Connection fence released/.test(result.output), 'and it is never reported as released')
+      assert.match(result.output, /CONTINUED/, 'a run that raised no fence of its own is not bricked by this')
+      assert.equal(result.status, 0)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`${entry.name} refuses when THIS run raised a fence and its record has since vanished`, () => {
+    // DB_FENCE_RAISED is the half of the question DB_FENCE_UP cannot answer: every release
+    // lowers DB_FENCE_UP, so it cannot say whether there was a fence to release at all. If
+    // this run put one up and the record is gone underneath it, the grants it revoked are
+    // unrecoverable and "the application can connect" is not good enough.
+    const dir = mkdtempSync(join(tmpdir(), 'ims-rel-raised-'))
+    try {
+      fenceStub(dir, 4)
+      const result = runShell(release(dir, true, ['release_db_connections', 'echo "CONTINUED"']))
+
+      // MUTATION ROUTE: drop the `if ${DB_FENCE_RAISED:-false}; then ... return 1; fi` arm and
+      // this returns 0 with 'CONTINUED' printed.
+      assert.notEqual(result.status, 0, 'a record lost underneath this run is a refusal')
+      assert.ok(!result.output.includes('CONTINUED'), 'and nothing after it may run')
+      assert.match(result.output, /RECORD IS GONE/, 'and it must say what it lost')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+for (const entry of FENCE_HARNESS.filter((candidate) => candidate.name !== 'install.sh')) {
+  test(`${entry.name} adoption asks the database instead of reading an absent record as "no fence stands"`, () => {
+    // The adoption path is only reached when the marker says the previous run had ALREADY
+    // REACHED THE MIGRATION — so it had fenced. It used to announce "No connection fence was
+    // standing from the previous run" on the strength of a missing file and adopt nothing.
+    const dir = mkdtempSync(join(tmpdir(), 'ims-adopt-nostate-'))
+    try {
+      fenceStub(dir, 1)
+      const program = [
+        'set -euo pipefail',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        shellFunction(entry.source, 'release_db_connections'),
+        shellFunction(entry.source, 'adopt_db_connections'),
+        'adopt_db_connections',
+        'echo "ADOPTED NOTHING AND CARRIED ON"',
+      ].join('\n')
+      const result = runShell(program)
+
+      // MUTATION ROUTE: restore `if [[ ! -f "$DB_FENCE_STATE" ]]; then info ...; return 0; fi`
+      // and all three fail — the stub is never invoked and the script carries on.
+      assert.match(calls(dir), /--release/, 'the database must be asked whether a fence is standing')
+      assert.notEqual(result.status, 0, 'and a fence with no record is not something to adopt past')
+      assert.ok(
+        !result.output.includes('ADOPTED NOTHING AND CARRIED ON'),
+        'the recovery must not continue over a fence it cannot account for',
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+test('install.sh adoption has a branch for a missing connection-fence record at all', () => {
+  // install.sh adopts inline rather than through adopt_db_connections(), and the missing-record
+  // case had NO else branch: a lost record silently meant "there was never a fence".
+  const adoptIf = codeLine(INSTALL_LINES, /if \[\[ -f "\$\{DB_FENCE_STATE\}" \]\]; then/)
+  assert.notEqual(adoptIf, -1, 'the inline adoption must still be recognisable')
+  const elseLine = codeLine(INSTALL_LINES, /^    else$/, adoptIf)
+  assert.notEqual(elseLine, -1, 'and it must have an else for the record that is not there')
+  const askedDatabase = codeLine(INSTALL_LINES, /release_db_connections \|\| absent_rc=\$\?/, elseLine)
+  assert.notEqual(askedDatabase, -1, 'which asks the database rather than assuming no fence stands')
+})
+
+// ---------------------------------------------------------------------------
 // o3d-2sm1.5 (Codex r4, CRITICAL) — install.sh BUILT INSIDE THE STOPPED WINDOW.
 //
 // Its order was stop -> drain -> migrate -> verify -> seed -> bootstrap -> BUILD -> start,
@@ -1945,6 +2110,8 @@ FENCE_MARKER_PREEXISTED=false
 SERVICE_UNITS=(app.service)
 DB_FENCE_STATE="\${STATE_DIR}/db.json"
 DB_FENCE_SCRIPT=/opt/app/scripts/fence-db-connections.mjs
+DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
+MIGRATION_DATABASE_URL=''
 DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
 `,
   },
@@ -1976,6 +2143,8 @@ FENCE_DROPIN_CREATED=true
 FENCE_MARKER_PREEXISTED=false
 DB_FENCE_STATE="\${DATA_DIR}/db.json"
 DB_FENCE_SCRIPT=/opt/app/scripts/fence-db-connections.mjs
+DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
+MIGRATION_DATABASE_URL=''
 DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
 `,
   },
@@ -2002,6 +2171,8 @@ FENCE_DROPIN_CREATED=true
 FENCE_MARKER_PREEXISTED=false
 DB_FENCE_STATE="\${DATA_DIR}/db.json"
 DB_FENCE_SCRIPT=/opt/app/scripts/fence-db-connections.mjs
+DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
+MIGRATION_DATABASE_URL=''
 DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
 `,
   },
@@ -2498,6 +2669,12 @@ function runAdoption(
     writeFileSync(join(dir, 'FENCED'), marker)
     writeFileSync(join(dropinDir, 'zz-deploy-fence.conf'), '[Unit]\n')
     writeFileSync(join(dir, 'crontab.bak'), '*/5 * * * * /usr/bin/true\n')
+    // AND THE CONNECTION-FENCE RECORD (o3d-2sm1.5, Codex r12). A fence that is STANDING has a
+    // record; the fixture used to omit it, so install.sh's inline adoption skipped its whole
+    // held-fence branch on a missing file and the "must NOT release" assertions below were
+    // satisfied by a branch that never ran. The missing-record case is now its own scenario,
+    // asserted separately, because it no longer means "there was never a fence".
+    writeFileSync(join(dir, 'db.json'), '{"database":"imsdb","revoked":["PUBLIC"]}\n')
 
     let stdout = ''
     let status = 0

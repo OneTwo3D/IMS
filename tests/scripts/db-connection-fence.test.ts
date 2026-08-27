@@ -7,6 +7,7 @@ import { test } from 'node:test'
 
 import {
   EXIT_ERROR,
+  EXIT_FENCE_UNPROVEN,
   EXIT_NOT_FENCEABLE,
   EXIT_OK,
   PUBLIC_GRANTEE,
@@ -837,19 +838,43 @@ test('a lost record is never "nothing to release" while the application is locke
   assert.match(text, /OTHER grantee/, 'and warn that other recorded grantees are locked out with no record either')
 })
 
-test('"nothing to release" is a claim about the database, and only the database can prove it', () => {
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r12, HIGH) — ONE ROLE'S CONNECT IS NOT EVERY GRANTEE'S.
+//
+// r11 made the unrecorded release ASK the database instead of reading a missing file as an
+// answer, and then over-read the answer it got: has_database_privilege(appRole, ...) speaks
+// for exactly ONE role, while the fence revokes CONNECT from EVERY grantee that held it
+// directly. The application can be back inside through PUBLIC, through role membership or
+// through a manual grant while monitoring, backup, BI or a second application is still shut
+// out by the same fence — and doFence() PRODUCES that shape on purpose, rejecting a fence the
+// application survives through membership and leaving the revokes standing. So the branch
+// contradicted a rule its own file enforces elsewhere.
+// ---------------------------------------------------------------------------
+
+test('an application role that connects is not proof that the fence is gone, only that it is back inside', () => {
   const verdict = assessUnrecordedRelease({
     status: STATE_ABSENT,
     appRole: 'imsapp',
     stateFile: '/var/lib/one-two-inventory/deploy/db-connect-fence.json',
     appStillConnects: true,
   })
-  assert.equal(verdict.exitCode, EXIT_OK, 'a database the application can reach has no fence to release')
-  assert.equal(verdict.fenceProvenAbsent, true)
-  assert.match(verdict.lines.join('\n'), /PROVEN/, 'and the proof must be stated, not assumed from the missing file')
+  // MUTATION ROUTE: put `exitCode: EXIT_OK, fenceProvenAbsent: true` back into the
+  // appStillConnects branch of assessUnrecordedRelease() and both assertions below fail.
+  assert.equal(
+    verdict.exitCode,
+    EXIT_FENCE_UNPROVEN,
+    'the application connecting says nothing about PUBLIC, monitoring, backup, BI or a second application',
+  )
+  assert.notEqual(verdict.exitCode, EXIT_OK, 'and it is never a success')
+  assert.equal(verdict.fenceProvenAbsent, false, 'nothing here proves a fence absent')
+  assert.equal(verdict.appRoleConnects, true, 'the one thing it may claim, it claims')
+  const text = verdict.lines.join('\n')
+  assert.match(text, /ONLY THING THIS RUN CAN PROVE/, 'the claim must be bounded out loud')
+  assert.match(text, /role membership/, 'and name the route by which the application gets back in')
+  assert.match(text, /SELECT datacl FROM pg_database/, 'and hand over the ACL audit it is demanding')
 })
 
-test('an unusable record is left in place even when no fence turns out to be standing', () => {
+test('an unusable record is left in place, and is still not a released fence', () => {
   const verdict = assessUnrecordedRelease({
     status: STATE_CORRUPT,
     detail: 'the record is not valid JSON',
@@ -857,7 +882,8 @@ test('an unusable record is left in place even when no fence turns out to be sta
     stateFile: '/var/lib/one-two-inventory/deploy/db-connect-fence.json',
     appStillConnects: true,
   })
-  assert.equal(verdict.exitCode, EXIT_OK)
+  // MUTATION ROUTE: as above — EXIT_OK in that branch fails the first assertion.
+  assert.equal(verdict.exitCode, EXIT_FENCE_UNPROVEN)
   assert.match(verdict.lines.join('\n'), /left at .* for inspection/, 'a corrupt record is evidence, not litter')
 })
 
@@ -893,14 +919,33 @@ test('--release over a lost record grants nothing and fails, rather than reporti
   }
 })
 
-test('--release over a lost record succeeds only once the database says the application can connect', async () => {
+test('--release over a lost record refuses even when the application connects, because another revoked grantee may still be out', async () => {
+  // THE SHAPE doFence() ITSELF LEAVES BEHIND (o3d-2sm1.5, Codex r12 HIGH). The fence revoked
+  // CONNECT from PUBLIC and from `monitoring`; the application kept it through role membership,
+  // so doFence() rejected the fence as ineffective and DELIBERATELY left the revokes standing.
+  // The datacl below is that state: imsapp connects, PUBLIC and monitoring do not. Then the
+  // record is lost. Reading has_database_privilege('imsapp') as "no fence is standing" reports
+  // success over two revocations nobody will ever undo.
   const dir = stateDir()
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
-    const client = new FakeAdminClient({ stateFile, stillConnectsBefore: true })
+    const client = new FakeAdminClient({
+      stateFile,
+      stillConnectsBefore: true,
+      datacl: '{owner=CTc/owner,=T/owner,imsapp=c/owner}',
+      releasedDatacl: '{owner=CTc/owner,=T/owner,imsapp=c/owner}',
+    })
     const code = await withAdminUrl(() => doRelease(client as never, { stateFile, appRole: 'imsapp' }))
-    assert.equal(code, EXIT_OK, 'a database the application can reach really has nothing to release')
-    assert.deepEqual(client.grants, [], 'and there is nothing to grant back')
+
+    // MUTATION ROUTE: restore `exitCode: EXIT_OK` in the appStillConnects branch of
+    // assessUnrecordedRelease() and the first two assertions fail together.
+    assert.equal(code, EXIT_FENCE_UNPROVEN, 'the application being back inside is not the fence being gone')
+    assert.notEqual(code, EXIT_OK, 'and nothing about this state may exit 0')
+    assert.deepEqual(client.grants, [], 'and with no record there is nothing it may grant back')
+    assert.ok(
+      client.log.some((sql) => sql.includes('AS still_connects')),
+      'it must still ASK the database rather than read the missing file as an answer',
+    )
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

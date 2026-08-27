@@ -599,12 +599,29 @@ The last field of a complete record is `"state_complete": 1`.
 
 **And `--release` never reads a missing record as "no fence".** A record that was never written
 and one a power cut ate are indistinguishable from the file system, so absence is not an answer:
-`--release` asks the database instead, and only `has_database_privilege(<app role>, …, 'CONNECT')`
-coming back true proves that no fence is standing. If the application role cannot connect and
-there is no usable record, it refuses with exit 1 and prints the `GRANT` to run by hand, rather
-than reporting "nothing to release" over a database the application is still locked out of. A
-record that exists but cannot be parsed is left in place for inspection, and `--fence` refuses to
-overwrite one rather than starting a fresh record over the only account of an earlier fence.
+`--release` asks the database instead. **Neither answer it can get is a success**, because
+`has_database_privilege(<app role>, …, 'CONNECT')` speaks for exactly one role while the fence
+revokes `CONNECT` from every grantee that held it:
+
+| what the database says | exit | what it means |
+| --- | --- | --- |
+| the application role has **no** `CONNECT` | `1` | a fence is standing and its record is gone. It prints the `GRANT` to run by hand and tells you to check `pg_database.datacl` for the other grantees it cannot name. |
+| the application role **has** `CONNECT` | `4` | that, and only that. The application can be back inside through `PUBLIC`, through role membership or through a manual grant while monitoring, backup, BI or a second application is still revoked by the same fence — the shape `--fence` itself leaves standing when it rejects an ineffective fence. Audit `SELECT datacl FROM pg_database WHERE datname = current_database();` before treating the database as open. |
+
+Only a usable record licenses "released" (exit 0), because only a record says who held `CONNECT`
+beforehand. A record that exists but cannot be parsed is left in place for inspection, and
+`--fence` refuses to overwrite one rather than starting a fresh record over the only account of an
+earlier fence.
+
+**The entrypoints always ask.** `deploy.sh`, `update.sh` and `install.sh` used to open their
+release with `[[ -f <state file> ]] || return 0`, which is the same defect one layer up — an
+absence treated as an answer — and it meant the check above was never reached on the exact failure
+it exists for. They now run `--release` unconditionally, on the start path and on both adoption
+paths, and act on the exit code: exit 1 is fatal everywhere (the application has no `CONNECT`, so
+nothing may start or adopt past it); exit 4 is fatal when *that* run had raised a fence of its own
+and the record has since vanished, and otherwise a loud warning carrying the ACL audit, so a
+`--skip-migrate` run or a resume over an untouched schema is not blocked by a state nothing can
+distinguish from health.
 
 **Every grantee, not two of them** (o3d-2sm1.5). It used to revoke from PUBLIC and the application
 role and call the database held closed. A third role with a direct `CONNECT` grant — monitoring,
