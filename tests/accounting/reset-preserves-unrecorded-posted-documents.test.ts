@@ -545,7 +545,7 @@ test('ROUND 7: the map classifies every AccountingSyncType, read from the schema
   // step with the schema, and so a member added to the schema fails a TEST as well as the build.
   const { readFile } = await import('node:fs/promises')
   const path = await import('node:path')
-  const { INCIDENT_KIND_BY_OPERATION_TYPE } = await import('@/lib/domain/accounting/unrecorded-posted-document')
+  const { OPERATION_SEMANTIC_BY_TYPE } = await import('@/lib/domain/accounting/unrecorded-posted-document')
 
   const schema = await readFile(path.join(process.cwd(), 'prisma/schema.prisma'), 'utf8')
   const block = /enum AccountingSyncType \{([\s\S]*?)\n\}/.exec(schema)
@@ -557,12 +557,12 @@ test('ROUND 7: the map classifies every AccountingSyncType, read from the schema
 
   assert.ok(members.length > 25, `sanity: the enum parsed to ${members.length} members`)
   assert.deepEqual(
-    members.filter((member) => !(member in INCIDENT_KIND_BY_OPERATION_TYPE)),
+    members.filter((member) => !(member in OPERATION_SEMANTIC_BY_TYPE)),
     [],
     'every operation type must have a classification — an unmapped one silently becomes UNCLASSIFIED',
   )
   assert.deepEqual(
-    Object.keys(INCIDENT_KIND_BY_OPERATION_TYPE).filter((key) => !members.includes(key)),
+    Object.keys(OPERATION_SEMANTIC_BY_TYPE).filter((key) => !members.includes(key)),
     [],
     'and the map must not carry a type the schema no longer has',
   )
@@ -572,9 +572,9 @@ test('ROUND 7: the two non-document types are exactly the ones the breadcrumb se
   // The LEDGER_NON_DOCUMENT sentence enumerates its members ("a credit note APPLIED to a bill, a
   // tax rate written into the organisation"). That is exact today and would quietly stop being
   // exact if a third member were added, so the drift is caught here rather than in a reset.
-  const { INCIDENT_KIND_BY_OPERATION_TYPE } = await import('@/lib/domain/accounting/unrecorded-posted-document')
-  const nonDocuments = Object.entries(INCIDENT_KIND_BY_OPERATION_TYPE)
-    .filter(([, kind]) => kind === 'LEDGER_NON_DOCUMENT')
+  const { OPERATION_SEMANTIC_BY_TYPE } = await import('@/lib/domain/accounting/unrecorded-posted-document')
+  const nonDocuments = Object.entries(OPERATION_SEMANTIC_BY_TYPE)
+    .filter(([, semantic]) => semantic === 'LEDGER_NON_DOCUMENT')
     .map(([type]) => type)
     .sort()
   assert.deepEqual(nonDocuments, ['PURCHASE_CREDIT_NOTE_ALLOCATION', 'TAX_RATE_SYNC'])
@@ -583,10 +583,10 @@ test('ROUND 7: the two non-document types are exactly the ones the breadcrumb se
 test('ROUND 7: the four no-identifier types in the map are the four in the wording table', async () => {
   // Two derivations of the same set — the wording table and the semantic map — must not drift, or
   // the record would describe an operation one way and count it another.
-  const { INCIDENT_KIND_BY_OPERATION_TYPE, QBO_NO_IDENTIFIER_OPERATION_TYPES } =
+  const { OPERATION_SEMANTIC_BY_TYPE, QBO_NO_IDENTIFIER_OPERATION_TYPES } =
     await import('@/lib/domain/accounting/unrecorded-posted-document')
-  const fromMap = Object.entries(INCIDENT_KIND_BY_OPERATION_TYPE)
-    .filter(([, kind]) => kind === 'NO_IDENTIFIER_SIDE_EFFECT')
+  const fromMap = Object.entries(OPERATION_SEMANTIC_BY_TYPE)
+    .filter(([, semantic]) => semantic === 'NO_LEDGER_EFFECT')
     .map(([type]) => type)
     .sort()
   assert.deepEqual(fromMap, [...QBO_NO_IDENTIFIER_OPERATION_TYPES].sort())

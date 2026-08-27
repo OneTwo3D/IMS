@@ -5,34 +5,39 @@ import path from 'node:path'
 
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import {
-  INCIDENT_KIND_BY_OPERATION_TYPE,
+  DOCUMENT_INCIDENT_WORDING,
   NON_DOCUMENT_INCIDENT_WORDING,
+  OPERATION_SEMANTIC_BY_TYPE,
+  RECORD_LOOKUP_FIELDS,
   describePreservedUnrecordedIncidents,
   describeUnpersistedQboPost,
   describeUnrecordablePostedDocument,
   incidentKindForOperation,
+  type LedgerPostingMode,
+  type PostedOperationOutcome,
+  type RemoteEffectOutcome,
   type UnrecordedIncidentCounts,
   type UnrecordedIncidentKind,
 } from '@/lib/domain/accounting/unrecorded-posted-document'
 
 // ---------------------------------------------------------------------------
-// ROUND 9 (Codex HIGH #1 + MEDIUM #1) — THE RECORD MAY ONLY TELL AN OPERATOR TO USE WHAT IT KEEPS,
-// AND MAY ONLY DESCRIBE WHAT THE OPERATION ACTUALLY DID.
+// THE RECORD MAY ONLY TELL AN OPERATOR TO USE WHAT IT KEEPS.
 //
-// Two defects with one shape. The formatters branched on whether an IDENTIFIER was present and
-// never on what the OPERATION was, so a `PURCHASE_CREDIT_NOTE_ALLOCATION` — which succeeds with no
-// external id precisely because it creates an allocation rather than a document — was told to be
-// found, kept or voided as a document; and the remedy for a document with no id told the operator
-// to search by "the reference, the amount and the date", two of which no record builder stores and
-// none of which survives a factory reset.
+// ROUND 9 wrote this as a DETECTOR: a hand-written table of English phrases ("its amount", "its
+// date"), scanned over every generated message. Codex's round-10 finding is that the detector is
+// bypassable by writing different words — a remedy saying "search by gross total and posting day"
+// names two fields no builder writes, produces an EMPTY detected-field set, and passes. Generating
+// every formatter branch does not make an open-ended phrase allowlist exhaustive.
 //
-// This file asserts the general rule rather than the two instances: EVERY message this module can
-// produce is generated, and any lookup attribute it names must be a key one of the two record
-// builders actually writes. The retained keys are PARSED FROM THE BUILDERS, so the rule cannot be
-// satisfied by editing a list in the test.
+// ROUND 10 INVERTS IT. The wording tables DECLARE what they need (`needs`), and name a record value
+// only through a `{placeholder}` the renderer resolves. This file validates the DECLARATION against
+// the metadata the two builders actually write, and validates that no template names anything it did
+// not declare. A remedy that needs a field the record does not hold therefore fails to compile
+// (`needs: ['grossTotal']` is not a `RecordLookupField`) or fails a test here, whatever words it is
+// written in.
 // ---------------------------------------------------------------------------
 
-const OPERATION_TYPES = Object.keys(INCIDENT_KIND_BY_OPERATION_TYPE) as AccountingSyncType[]
+const OPERATION_TYPES = Object.keys(OPERATION_SEMANTIC_BY_TYPE) as AccountingSyncType[]
 
 const ENTRY = (type: AccountingSyncType) => ({
   id: 'log-1',
@@ -41,34 +46,51 @@ const ENTRY = (type: AccountingSyncType) => ({
   referenceId: 'order-1',
 })
 
-/** Every message the module can produce, for every operation type and every id/row combination. */
+const OUTCOMES: (PostedOperationOutcome | undefined)[] = [
+  undefined,
+  { postingMode: 'LIVE' as LedgerPostingMode },
+  { postingMode: 'DRAFT' as LedgerPostingMode },
+  { externalEffect: 'MADE' as RemoteEffectOutcome },
+  { externalEffect: 'NONE' as RemoteEffectOutcome },
+  { postingMode: 'LIVE' as LedgerPostingMode, externalEffect: 'MADE' as RemoteEffectOutcome },
+  { postingMode: 'DRAFT' as LedgerPostingMode, externalEffect: 'NONE' as RemoteEffectOutcome },
+]
+
+/** Every message the module can produce, for every type, every id combination and every outcome. */
 function everyIncidentMessage(): { label: string; text: string }[] {
   const messages: { label: string; text: string }[] = []
   for (const type of OPERATION_TYPES) {
-    for (const posted of [null, 'EXT-1']) {
-      messages.push({
-        label: `qbo ${type} posted=${String(posted)}`,
-        text: describeUnpersistedQboPost({ entry: ENTRY(type), postedExternalId: posted }, new Error('write conflict')),
-      })
-      for (const named of [null, 'EXT-OTHER']) {
-        for (const reason of ['ROW_MISSING', 'ANOTHER_DOCUMENT_NAMED'] as const) {
-          messages.push({
-            label: `xero ${type} posted=${String(posted)} named=${String(named)} ${reason}`,
-            text: describeUnrecordablePostedDocument({
-              entry: ENTRY(type), postedExternalId: posted, namedExternalId: named, reason,
-            }),
-          })
+    for (const outcome of OUTCOMES) {
+      const o = JSON.stringify(outcome ?? null)
+      for (const posted of [null, 'EXT-1']) {
+        messages.push({
+          label: `qbo ${type} posted=${String(posted)} outcome=${o}`,
+          text: describeUnpersistedQboPost(
+            { entry: ENTRY(type), postedExternalId: posted, outcome },
+            new Error('write conflict'),
+          ),
+        })
+        for (const named of [null, 'EXT-OTHER']) {
+          for (const reason of ['ROW_MISSING', 'ANOTHER_DOCUMENT_NAMED'] as const) {
+            messages.push({
+              label: `xero ${type} posted=${String(posted)} named=${String(named)} ${reason} outcome=${o}`,
+              text: describeUnrecordablePostedDocument({
+                entry: ENTRY(type), postedExternalId: posted, namedExternalId: named, reason, outcome,
+              }),
+            })
+          }
         }
       }
     }
   }
   const kinds: UnrecordedIncidentKind[] = [
-    'LEDGER_DOCUMENT', 'LEDGER_DOCUMENT_NO_IDENTIFIER', 'LEDGER_NON_DOCUMENT',
-    'NO_IDENTIFIER_SIDE_EFFECT', 'UNCLASSIFIED',
+    'LEDGER_DOCUMENT', 'LEDGER_DOCUMENT_NO_IDENTIFIER', 'LEDGER_DRAFT', 'LEDGER_OUTCOME_UNRECORDED',
+    'LEDGER_NON_DOCUMENT', 'NO_IDENTIFIER_SIDE_EFFECT', 'UNCLASSIFIED',
   ]
   const zero: UnrecordedIncidentCounts = {
-    LEDGER_DOCUMENT: 0, LEDGER_DOCUMENT_NO_IDENTIFIER: 0, LEDGER_NON_DOCUMENT: 0,
-    NO_IDENTIFIER_SIDE_EFFECT: 0, UNCLASSIFIED: 0,
+    LEDGER_DOCUMENT: 0, LEDGER_DOCUMENT_NO_IDENTIFIER: 0, LEDGER_DRAFT: 0,
+    LEDGER_OUTCOME_UNRECORDED: 0, LEDGER_NON_DOCUMENT: 0, NO_IDENTIFIER_SIDE_EFFECT: 0,
+    UNCLASSIFIED: 0,
   }
   for (const kind of kinds) {
     messages.push({
@@ -76,49 +98,17 @@ function everyIncidentMessage(): { label: string; text: string }[] {
       text: describePreservedUnrecordedIncidents({ ...zero, [kind]: 1 }),
     })
   }
-  messages.push({ label: 'breadcrumb all kinds', text: describePreservedUnrecordedIncidents({
-    LEDGER_DOCUMENT: 1, LEDGER_DOCUMENT_NO_IDENTIFIER: 1, LEDGER_NON_DOCUMENT: 1,
-    NO_IDENTIFIER_SIDE_EFFECT: 1, UNCLASSIFIED: 1,
-  }) })
+  const allOnes = Object.fromEntries(kinds.map((k) => [k, 1])) as UnrecordedIncidentCounts
+  messages.push({ label: 'breadcrumb all kinds', text: describePreservedUnrecordedIncidents(allOnes) })
   return messages
 }
 
 /**
- * The attributes a wording can send an operator to look a write up BY, and the metadata key that
- * would have to be retained for the instruction to be performable. Phrase-based on purpose: the
- * defect was always a PHRASE ("its amount and its date"), never a field reference.
- */
-const LOOKUP_PHRASE_TO_FIELD: Readonly<Record<string, string>> = {
-  'its amount': 'amount',
-  'their amount': 'amount',
-  'the amount': 'amount',
-  'its date': 'date',
-  'their date': 'date',
-  'the date': 'date',
-  'ledger date': 'date',
-  'its currency': 'currency',
-  'the currency': 'currency',
-  'invoice number': 'invoiceNumber',
-  'the customer name': 'customerName',
-  'the supplier name': 'supplierName',
-  'the contact name': 'contactName',
-}
-
-function lookupFieldsNamedBy(message: string): string[] {
-  const lower = message.toLowerCase()
-  const found = new Set<string>()
-  for (const [phrase, field] of Object.entries(LOOKUP_PHRASE_TO_FIELD)) {
-    if (lower.includes(phrase)) found.add(field)
-  }
-  return [...found].sort()
-}
-
-/**
  * The metadata keys each record builder actually writes, read from its source — PER BUILDER, and
- * then intersected. The wording below is shared by both connectors, so a key only ONE of them
- * writes is not a key the wording may rely on: a QuickBooks incident would arrive without it.
- * (Asserting against the union was the first shape of this test, and dropping `referenceId` from
- * the QuickBooks builder passed it.)
+ * then intersected. The wording is shared by both connectors, so a key only ONE of them writes is
+ * not a key the wording may rely on: a QuickBooks incident would arrive without it. (Asserting
+ * against the UNION was the first shape of this test, and dropping `referenceId` from the
+ * QuickBooks builder passed it.)
  */
 async function retainedMetadataKeys(): Promise<{ perBuilder: Map<string, Set<string>>; common: Set<string> }> {
   const sources: [string, string][] = [
@@ -147,34 +137,99 @@ async function retainedMetadataKeys(): Promise<{ perBuilder: Map<string, Set<str
   return { perBuilder, common }
 }
 
-// MUTATION THAT KILLS THIS (run): put "its amount and its date" back into either no-identifier
-// remedy in lib/domain/accounting/unrecorded-posted-document.ts — the generated message names
-// `amount` and `date`, neither of which the builders write, and the assertion fails naming the
-// message. Deleting a key from `unrecordedPostedDocumentRecord`'s metadata kills it the other way.
+/** Every wording entry in the module, flattened, with the strings it can render. */
+function everyWordingEntry(): { label: string; templates: string[]; needs: readonly string[] }[] {
+  const out: { label: string; templates: string[]; needs: readonly string[] }[] = []
+  for (const [key, w] of Object.entries(DOCUMENT_INCIDENT_WORDING)) {
+    const { needs, ...rest } = w
+    out.push({ label: `DOCUMENT_INCIDENT_WORDING.${key}`, templates: Object.values(rest), needs })
+  }
+  for (const [type, entry] of Object.entries(NON_DOCUMENT_INCIDENT_WORDING)) {
+    const variants = 'did' in entry ? { '': entry } : entry
+    for (const [variant, w] of Object.entries(variants)) {
+      const { needs, ...rest } = w
+      out.push({
+        label: `NON_DOCUMENT_INCIDENT_WORDING.${type}${variant ? `.${variant}` : ''}`,
+        templates: Object.values(rest),
+        needs,
+      })
+    }
+  }
+  return out
+}
+
+const PLACEHOLDER = /\{([A-Za-z]+)\}/g
+
+// MUTATION THAT KILLS THIS (run): add `'grossTotal'` to any entry's `needs` — it is not a
+// `RecordLookupField`, so the BUILD fails before the test does; declare an existing field the
+// builders do not both write (e.g. `'rowNamesExternalId'`, which only the Xero builder writes) and
+// this test fails naming the entry. Deleting `postedExternalId` from either builder's metadata
+// object kills it the other way.
 //
-// ROUTE: the messages come from the exported formatters, and the retained keys are PARSED OUT OF
-// THE TWO CONNECTOR SOURCE FILES — neither side of the comparison is written down in this file, so
-// it cannot pass by agreeing with itself.
-test('ROUND 9 (Codex MEDIUM): no wording tells an operator to use a field the record does not retain', async () => {
+// ROUTE: the declarations come from the SHIPPED wording tables, and the retained keys are PARSED
+// OUT OF THE TWO CONNECTOR SOURCE FILES. Neither side of the comparison is written down here, so it
+// cannot pass by agreeing with itself.
+test('ROUND 10 (Codex MEDIUM): every field a wording DECLARES is one every record builder writes', async () => {
   const { common: retained } = await retainedMetadataKeys()
 
-  // NOT VACUOUS: the detector fires on the sentence that was actually shipped.
-  assert.deepEqual(
-    lookupFieldsNamedBy(
-      'REMEDY: find the document in QuickBooks by the reference above, its amount and its date, and void any duplicate.',
-    ),
-    ['amount', 'date'],
-    'the detector must catch the round-8 wording, or this whole test proves nothing',
+  // NOT VACUOUS: the comparison can fail. `rowNamesExternalId` is a real key of the Xero builder,
+  // and it is exactly the kind of field a shared wording must not lean on.
+  const { perBuilder } = await retainedMetadataKeys()
+  assert.ok(
+    perBuilder.get('unrecordedPostedDocumentRecord')!.has('rowNamesExternalId'),
+    'the Xero builder writes rowNamesExternalId',
   )
-  assert.ok(!retained.has('amount') && !retained.has('date'), 'and neither builder retains them')
+  assert.ok(!retained.has('rowNamesExternalId'), 'and it is NOT common to both, so a declaration of it must fail')
 
-  for (const { label, text } of everyIncidentMessage()) {
-    for (const field of lookupFieldsNamedBy(text)) {
+  const entries = everyWordingEntry()
+  assert.ok(entries.length >= 12, `sanity: ${entries.length} wording entries were found`)
+  for (const { label, needs } of entries) {
+    for (const field of needs) {
       assert.ok(
         retained.has(field),
-        `${label} tells the operator to use "${field}", which no record builder writes:\n${text}`,
+        `${label} declares "${field}", which is not a key both record builders write`,
       )
     }
+  }
+})
+
+// MUTATION THAT KILLS THIS (run): put a bare `{amount}` (or any undeclared slot) into any remedy
+// string — `render` throws while generating, and the assertion below fails naming the entry. Put
+// `{postedExternalId}` into a template of an entry whose `needs` omits it and the declaration
+// assertion fails instead.
+//
+// ROUTE: the templates are read out of the SHIPPED wording tables, and the slot vocabulary out of
+// the SHIPPED `RECORD_LOOKUP_FIELDS`.
+test('ROUND 10: a wording names a record value only through a slot it declared, and only a real one', () => {
+  const known = new Set<string>([...RECORD_LOOKUP_FIELDS, 'ledger', 'LEDGER'])
+  let sawOne = false
+  for (const { label, templates, needs } of everyWordingEntry()) {
+    for (const template of templates) {
+      for (const [, slot] of template.matchAll(PLACEHOLDER)) {
+        assert.ok(known.has(slot), `${label} names the slot "${slot}", which is not a thing this record holds`)
+        if (slot === 'ledger' || slot === 'LEDGER') continue
+        sawOne = true
+        assert.ok(
+          needs.includes(slot),
+          `${label} renders "{${slot}}" without declaring it in needs`,
+        )
+      }
+    }
+  }
+  assert.ok(sawOne, 'the check must actually have seen a record slot, or it proves nothing')
+})
+
+// MUTATION THAT KILLS THIS (run): change `render` to fall back to a literal instead of throwing on
+// an absent value, then select a `{postedExternalId}` remedy on a no-id incident — the leftover /
+// wrong text lands in a generated message and the scan below fails.
+//
+// ROUTE: every message is GENERATED from the shipped formatters, over every type, id combination
+// and outcome.
+test('ROUND 10: no message this module can produce leaks an unresolved slot', () => {
+  const messages = everyIncidentMessage()
+  assert.ok(messages.length > 500, `sanity: ${messages.length} messages were generated`)
+  for (const { label, text } of messages) {
+    assert.doesNotMatch(text, /\{[A-Za-z]+\}/, `${label} left a slot unresolved:\n${text}`)
   }
 })
 
@@ -262,9 +317,9 @@ test('ROUND 9 (Codex HIGH): a Xero non-document incident with no identifier gets
   assert.doesNotMatch(unknown, /find it in Xero/)
 })
 
-// MUTATION THAT KILLS THIS (run): move any type in INCIDENT_KIND_BY_OPERATION_TYPE to
-// LEDGER_NON_DOCUMENT without adding a wording entry — the build fails on the Record<> key set, and
-// deleting an entry from NON_DOCUMENT_INCIDENT_WORDING fails this test's first assertion.
+// MUTATION THAT KILLS THIS (run): move any type in OPERATION_SEMANTIC_BY_TYPE to
+// 'LEDGER_NON_DOCUMENT' without adding a wording entry — the build fails on the Record<> key set,
+// and deleting an entry from NON_DOCUMENT_INCIDENT_WORDING fails this test's first assertion.
 test('ROUND 9: every operation the map calls a non-document has its own remedy, on both connectors', () => {
   const nonDocuments = OPERATION_TYPES.filter(
     (type) => incidentKindForOperation(type, null) === 'LEDGER_NON_DOCUMENT'
@@ -288,7 +343,9 @@ test('ROUND 9: every operation the map calls a non-document has its own remedy, 
       // The QuickBooks four keep the o3d-qn21 replay wording they already had; the rest take the
       // shared non-document message. Either way, no document instruction.
       assert.ok(
-        /NOTHING WAS CREATED IN/.test(qbo) || /NO REQUEST ID PROTECTS IT/.test(qbo) || /THIS IS NOT A DOCUMENT/.test(qbo),
+        /NOTHING WAS CREATED IN/.test(qbo) || /NO REQUEST ID PROTECTS IT/.test(qbo)
+          || /THIS IS NOT A DOCUMENT/.test(qbo) || /NOTHING LEFT THIS PROCESS/.test(qbo)
+          || /IMS DID NOT RECORD WHETHER THE UPLOAD HAPPENED/.test(qbo),
         `${type} must say what it was instead of a document`,
       )
     }
@@ -304,8 +361,9 @@ test('ROUND 9: every operation the map calls a non-document has its own remedy, 
 // breadcrumb rather than written down here, so the two can only agree by actually agreeing.
 test('ROUND 9 (Codex MEDIUM): the reset breadcrumb attributes to the incident only what the incident says', () => {
   const breadcrumb = describePreservedUnrecordedIncidents({
-    LEDGER_DOCUMENT: 0, LEDGER_DOCUMENT_NO_IDENTIFIER: 0, LEDGER_NON_DOCUMENT: 0,
-    NO_IDENTIFIER_SIDE_EFFECT: 1, UNCLASSIFIED: 0,
+    LEDGER_DOCUMENT: 0, LEDGER_DOCUMENT_NO_IDENTIFIER: 0, LEDGER_DRAFT: 0,
+    LEDGER_OUTCOME_UNRECORDED: 0, LEDGER_NON_DOCUMENT: 0, NO_IDENTIFIER_SIDE_EFFECT: 1,
+    UNCLASSIFIED: 0,
   })
   const emailRecord = describeUnpersistedQboPost(
     { entry: ENTRY('INVOICE_EMAIL'), postedExternalId: null },
