@@ -226,6 +226,20 @@ function shellFunction(source: string, name: string): string {
 }
 
 /**
+ * The durability primitives every marker and cron-backup writer now goes through, taken
+ * from the script under test.
+ *
+ * A harness that stubbed these would prove the writer CALLS something; the finding was
+ * about what actually reaches the medium, so the shipped implementations are what run.
+ */
+function durabilityFunctions(source: string): string {
+  return [shellFunction(source, 'fsync_path'), shellFunction(source, 'publish_durable_file')].join('\n')
+}
+
+/** The one marker filename, in the one cutover namespace, for all three entrypoints. */
+const MARKER_NAME = 'DEPLOY-FENCED'
+
+/**
  * The regex the script's ADOPTION path greps the marker with, taken from the script itself.
  *
  * Every occurrence must be the SAME pattern: the writer confirms what it wrote with it and
@@ -611,7 +625,8 @@ const MARKER_CASES = [
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 STATE_DIR='${dir}'
-FENCE_FILE="\${STATE_DIR}/FENCED"
+CUTOVER_STATE_DIR='${dir}'
+FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
 CURRENT_STEP=migrate
 FENCE_MASK=true
 SCHEMA_TOUCHED=false
@@ -635,7 +650,8 @@ die() { echo "die: $*" >&2; exit 1; }
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 DATA_DIR='${dir}'
-FENCE_FILE="\${DATA_DIR}/DEPLOY-FENCED"
+CUTOVER_STATE_DIR='${dir}'
+FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
 CURRENT_STEP=migrate
 FENCE_MASK=true
 SCHEMA_TOUCHED=false
@@ -655,7 +671,8 @@ die() { echo "die: $*" >&2; exit 1; }
     markerCall: 'write_cutover_marker "cutover started"',
     preamble: (dir: string) => `
 DATA_DIR='${dir}'
-FENCE_FILE="\${DATA_DIR}/DEPLOY-FENCED"
+CUTOVER_STATE_DIR='${dir}'
+FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
 CUTOVER_STEP=migrate
 APP_DIR=/opt/app
 APP_NAME=one-two-inventory
@@ -678,12 +695,13 @@ function runMarkerHarness(entry: (typeof MARKER_CASES)[number], call: string): s
     const program = [
       'set -euo pipefail',
       entry.preamble(dir),
+      durabilityFunctions(entry.source),
       shellFunction(entry.source, entry.markerFn),
       shellFunction(entry.source, 'mark_schema_touched'),
       call,
     ].join('\n')
     execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
-    return readFileSync(join(dir, entry.name === 'deploy.sh' ? 'FENCED' : 'DEPLOY-FENCED'), 'utf8')
+    return readFileSync(join(dir, MARKER_NAME), 'utf8')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -758,7 +776,13 @@ for (const entry of MARKER_CASES) {
     const markerLines = new Set(marker.split(/\r?\n/))
     for (let index = 0; index < lines.length; index += 1) {
       if (!/^[ \t]*SCHEMA_TOUCHED=true$/.test(lines[index])) continue
-      const carriedForward = /grep -qE '\^schema_touched=true\$'/.test(lines[index - 1] ?? '')
+      // Carried forward EITHER by grepping the marker on the line above, or by testing the
+      // single variable adoption derived from that grep — which is the form the conservative
+      // incomplete-marker reading forced, since it must decide the answer in one place.
+      const previous = lines[index - 1] ?? ''
+      const carriedForward =
+        /grep -qE '\^schema_touched=true\$'/.test(previous) ||
+        /^\s*if \$\{?[a-zA-Z_]*[Aa][Dd][Oo][Pp][Tt][Ee][Dd]_SCHEMA_TOUCHED\}?; then$/i.test(previous)
       assert.ok(
         markerLines.has(lines[index]) || carriedForward,
         `SCHEMA_TOUCHED is raised at line ${index + 1} neither by mark_schema_touched() nor by reading the persisted marker`,
@@ -782,9 +806,30 @@ for (const entry of MARKER_CASES) {
 
   test(`${entry.name} flushes the marker instead of leaving it in the page cache`, () => {
     // A marker that only reached the page cache is not evidence a power cut leaves behind,
-    // and a power cut is half of what this flag is for.
+    // and a power cut is half of what this flag is for. Two barriers, not one: the file's
+    // own data BEFORE the rename, and the containing directory AFTER it — an atomic rename
+    // whose directory entry was never flushed reboots as the old name, or as no name.
     const writer = shellFunction(entry.source, entry.markerFn)
-    assert.match(writer, /\bsync\b/, 'the marker write must be flushed to disk')
+    assert.match(
+      writer,
+      /\| publish_durable_file "\$\{?FENCE_FILE\}?"/,
+      'the marker must be PUBLISHED, never written in place over the last durable one',
+    )
+    assert.ok(
+      !/^\s*\} > "\$\{?FENCE_FILE\}?"/m.test(writer),
+      'and it must not truncate the authoritative marker to fill it afterwards',
+    )
+
+    const publish = shellFunction(entry.source, 'publish_durable_file')
+    const fileBarrier = publish.indexOf('fsync_path "$tmp"')
+    const rename = publish.indexOf('mv -f "$tmp" "$target"')
+    const dirBarrier = publish.indexOf('fsync_path "$dir"')
+    assert.ok(fileBarrier !== -1, 'the data must be fsynced')
+    assert.ok(rename !== -1, 'and published by rename')
+    assert.ok(dirBarrier !== -1, 'and the parent directory fsynced')
+    assert.ok(fileBarrier < rename, 'the data barrier comes BEFORE the rename')
+    assert.ok(rename < dirBarrier, 'the directory barrier comes AFTER it')
+    assert.match(shellFunction(entry.source, 'fsync_path'), /\bsync\b/, 'and fsync_path must actually flush')
 
     const mark = shellFunction(entry.source, 'mark_schema_touched')
     assert.match(
@@ -938,6 +983,8 @@ DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
 STATE_DIR='${dir}'
+CUTOVER_STATE_DIR='${dir}'
+DB_FENCE_DIR='${dir}'
 DB_FENCE_SCRIPT='${dir}/fence.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
@@ -1009,7 +1056,9 @@ for (const entry of FENCE_HARNESS) {
       const program = [
         'set -euo pipefail',
         entry.preamble(dir),
-        shellFunction(entry.source, 'fence_db_connections'),
+        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+      shellFunction(entry.source, 'fence_db_connections'),
         'fence_db_connections',
         'echo "REACHED THE MIGRATION"',
       ].join('\n')
@@ -1051,7 +1100,9 @@ for (const entry of FENCE_HARNESS) {
       const program = [
         'set -euo pipefail',
         entry.preamble(dir),
-        shellFunction(entry.source, 'fence_db_connections'),
+        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+      shellFunction(entry.source, 'fence_db_connections'),
         'fence_db_connections',
         'echo "FENCE_UP=${DB_FENCE_UP} MIGRATION_URL=${MIGRATION_DATABASE_URL}"',
       ].join('\n')
@@ -1089,7 +1140,9 @@ for (const entry of FENCE_HARNESS) {
       const program = [
         'set -euo pipefail',
         entry.preamble(dir),
-        shellFunction(entry.source, 'fence_db_connections'),
+        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+        shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+      shellFunction(entry.source, 'fence_db_connections'),
         'fence_db_connections',
         'echo "REACHED THE MIGRATION"',
       ].join('\n')
@@ -1269,7 +1322,8 @@ const FENCE_INSTALL_CASES = [
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 STATE_DIR='${dir}'
-FENCE_FILE="\${STATE_DIR}/FENCED"
+CUTOVER_STATE_DIR='${dir}'
+FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
 FENCE_DROPIN_NAME='zz-deploy-fence.conf'
 CURRENT_STEP=fence-writers
 FENCE_MASK=true
@@ -1300,7 +1354,8 @@ systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 DATA_DIR='${dir}'
-FENCE_FILE="\${DATA_DIR}/DEPLOY-FENCED"
+CUTOVER_STATE_DIR='${dir}'
+FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
 SERVICE_UNIT=app.service
 FENCE_DROPIN_DIR="${dir}/dropins/app.service.d"
 FENCE_DROPIN_FILE="\${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
@@ -1329,7 +1384,8 @@ systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
     markerFn: 'write_cutover_marker',
     preamble: (dir: string) => `
 DATA_DIR='${dir}'
-FENCE_FILE="\${DATA_DIR}/DEPLOY-FENCED"
+CUTOVER_STATE_DIR='${dir}'
+FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
 FENCE_DROPIN_DIR="${dir}/dropins/app.service.d"
 FENCE_DROPIN_FILE="\${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
 CUTOVER_STEP=fence-writers
@@ -1360,6 +1416,7 @@ function runFenceInstallHarness(entry: (typeof FENCE_INSTALL_CASES)[number], pre
       'set -uo pipefail',
       entry.preamble(dir),
       prelude,
+      durabilityFunctions(entry.source),
       shellFunction(entry.source, entry.markerFn),
       shellFunction(entry.source, 'verify_reboot_fence'),
       shellFunction(entry.source, 'rollback_reboot_fence_install'),
@@ -1367,7 +1424,7 @@ function runFenceInstallHarness(entry: (typeof FENCE_INSTALL_CASES)[number], pre
       'install_reboot_fence "a cutover that is about to fail" && echo INSTALL_OK || echo INSTALL_FAILED',
     ].join('\n')
     const output = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
-    const markerName = entry.name === 'deploy.sh' ? 'FENCED' : 'DEPLOY-FENCED'
+    const markerName = MARKER_NAME
     return {
       output,
       markerExists: existsSync(join(dir, markerName)),
@@ -1427,6 +1484,7 @@ for (const entry of FENCE_INSTALL_CASES) {
       const program = [
         'set -uo pipefail',
         preamble,
+        durabilityFunctions(entry.source),
         shellFunction(entry.source, entry.markerFn),
         shellFunction(entry.source, 'verify_reboot_fence'),
         shellFunction(entry.source, 'rollback_reboot_fence_install'),
@@ -1436,7 +1494,7 @@ for (const entry of FENCE_INSTALL_CASES) {
       const output = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
       assert.match(output, /INSTALL_OK/, `the fence must install cleanly in this harness: ${output}`)
 
-      const markerName = entry.name === 'deploy.sh' ? 'FENCED' : 'DEPLOY-FENCED'
+      const markerName = MARKER_NAME
       const body = readFileSync(join(dir, markerName), 'utf8')
       assert.match(
         body,
@@ -1859,6 +1917,7 @@ const ARMING_TRAP_CASES = [
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 STATE_DIR='${dir}'
+CUTOVER_STATE_DIR='${dir}'
 APP_USER=appuser
 APP_DIR_REAL=/opt/app
 PORT=3000
@@ -1891,6 +1950,7 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 DATA_DIR='${dir}'
+CUTOVER_STATE_DIR='${dir}'
 APP_USER=appuser
 SERVICE_UNIT=app.service
 CURRENT_STEP=fence-writers
@@ -1919,6 +1979,7 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release'
     marker: 'FENCED',
     preamble: (dir: string) => `
 DATA_DIR='${dir}'
+CUTOVER_STATE_DIR='${dir}'
 APP_USER=appuser
 APP_NAME=one-two-inventory
 CUTOVER_STEP=fence-writers
@@ -2313,6 +2374,7 @@ function runMarkerWriter(entry: (typeof R8_CASES)[number], state: string): strin
       TRAP_STUBS,
       entry.extra,
       R8_STUBS,
+      durabilityFunctions(entry.source),
       shellFunction(entry.source, entry.writer),
       state,
       `${entry.writer} "under test"`,
@@ -2390,6 +2452,7 @@ function adoptionProgram(entry: (typeof R8_CASES)[number], dir: string, state: s
     parts.push('fence_dropin_file(){ echo "${FENCE_DROPIN_DIR}/${FENCE_DROPIN_NAME}"; }')
   }
   parts.push(
+    shellFunction(entry.source, 'marker_is_complete'),
     shellFunction(entry.source, 'marker_phase'),
     shellFunction(entry.source, 'predecessor_is_active'),
     shellFunction(entry.source, 'remove_reboot_fence'),
@@ -2443,8 +2506,19 @@ function runAdoption(
   }
 }
 
-const ARMING_MARKER = 'phase=arming\nmigration_attempted=true\nschema_touched=false\nreboot_fence=installed\n'
-const STOPPING_MARKER = 'phase=stopping\nmigration_attempted=true\nschema_touched=false\nreboot_fence=installed\n'
+/**
+ * A marker as publish_durable_file() leaves it: complete, and saying so on its last line.
+ *
+ * Adoption now treats the ABSENCE of that line as "the schema may have moved", so a fixture
+ * that omits it is testing the truncated-marker path, not the ordinary one. Every fixture
+ * below is explicit about which of the two it is.
+ */
+function completeMarker(body: string): string {
+  return `${body}marker_complete=1\n`
+}
+
+const ARMING_MARKER = completeMarker('phase=arming\nmigration_attempted=true\nschema_touched=false\nreboot_fence=installed\n')
+const STOPPING_MARKER = completeMarker('phase=stopping\nmigration_attempted=true\nschema_touched=false\nreboot_fence=installed\n')
 
 for (const entry of R8_CASES) {
   test(`${entry.name} resumes an interrupted arming instead of stopping a predecessor nobody stopped`, () => {
@@ -2489,7 +2563,7 @@ for (const entry of R8_CASES) {
   test(`${entry.name} does not resume an arming whose schema had already been touched`, () => {
     const result = runAdoption(
       entry,
-      'phase=arming\nmigration_attempted=true\nschema_touched=true\n',
+      completeMarker('phase=arming\nmigration_attempted=true\nschema_touched=true\n'),
       'PREDECESSOR_ACTIVE=true',
     )
 
@@ -2524,7 +2598,7 @@ for (const entry of R8_CASES) {
     // Every older version of these scripts only ever left a marker behind AFTER a stop, so
     // the absent-phase reading has to be the one that stops rather than the one that leaves
     // a service running over a schema that may have moved.
-    const result = runAdoption(entry, 'migration_attempted=true\nschema_touched=false\n', 'PREDECESSOR_ACTIVE=true')
+    const result = runAdoption(entry, completeMarker('migration_attempted=true\nschema_touched=false\n'), 'PREDECESSOR_ACTIVE=true')
 
     assert.match(result.log, /systemctl stop/, 'an unrecognised phase must be adopted conservatively')
     assert.equal(result.markerExists, true, 'and the fence kept')
@@ -2560,6 +2634,7 @@ function runPublishCronBackup(
       TRAP_STUBS,
       entry.extra,
       R8_STUBS,
+      durabilityFunctions(entry.source),
       shellFunction(entry.source, 'publish_cron_backup'),
       'CRON_BACKUP_CREATED=false',
       shim,
@@ -2672,6 +2747,7 @@ for (const entry of R8_CASES) {
         entry.extra,
         R8_STUBS,
         'crontab(){ if [[ "${3:-}" == "-l" ]]; then echo "*/5 * * * * /usr/bin/true"; else echo "crontab $*" >> "${LOG}"; fi; return 0; }',
+        durabilityFunctions(entry.source),
         shellFunction(entry.source, 'publish_cron_backup'),
         shellFunction(entry.source, 'fence_cron'),
         'CRON_FENCED=false',

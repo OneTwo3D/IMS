@@ -589,7 +589,7 @@ write_fence_marker() {
     echo -e "${YELLOW}[DRY]${RESET}   would write ${FENCE_FILE}"
     return 0
   fi
-  mkdir -p "$STATE_DIR"
+  mkdir -p "${CUTOVER_STATE_DIR}"
   {
     echo "fenced_at=$(date -Iseconds)"
     echo "reason=${reason}"
