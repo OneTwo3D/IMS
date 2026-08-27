@@ -168,6 +168,17 @@ function term(expression: string, row: Row): Value {
   const member = trimmed.match(/^payload\s*->>\s*'([^']+)'$/i)
   if (member) return row.payload === null ? NULL : jsonText(row.payload[member[1]])
 
+  // o3d-xnwu r12 — `payload->'x'`, the MEMBER rather than its text. `IS NULL` over it means "the
+  // key is absent", which is NOT the same question as `payload->>'x' IS NULL`: a json null member
+  // is SQL NULL through `->>` and a non-null jsonb through `->`. Checks 4 and 5 depend on exactly
+  // that difference — a refund body carrying `"id": null` must be EXCLUDED, not admitted.
+  const rawMember = trimmed.match(/^payload\s*->\s*'([^']+)'$/i)
+  if (rawMember) {
+    if (row.payload === null) return NULL
+    const value = row.payload[rawMember[1]]
+    return value === undefined ? NULL : JSON.stringify(value)
+  }
+
   const column = trimmed.replace(/^"(.*)"$/, '$1')
   assert.ok(column in row, `verify.sql refers to a column this test does not model: ${column}`)
   const value = row[column as keyof Row]
@@ -221,6 +232,17 @@ function matchesConjunct(condition: string, row: Row): boolean {
   // salesOrderId is the same contradiction and `<>` against a missing member is UNKNOWN.
   const distinct = condition.match(/^(.*?)\s+IS\s+DISTINCT\s+FROM\s+(.*)$/i)
   if (distinct) return term(distinct[1], row) !== term(distinct[2], row)
+
+  // o3d-xnwu r12 — `<>`, which check 5 now uses in place of IS DISTINCT FROM. The difference is the
+  // whole finding: `<>` against an ABSENT member is UNKNOWN and selects nothing, which is what keeps
+  // a decorated refund body with no salesOrderId out of a check that stops the cutover.
+  const notEqual = condition.match(/^(.*?)\s*<>\s*(.*)$/)
+  if (notEqual) {
+    const left = term(notEqual[1], row)
+    const right = term(notEqual[2], row)
+    if (left === NULL || right === NULL) return false
+    return left !== right
+  }
 
   const like = condition.match(/^(.*?)\s+LIKE\s+(.*)$/i)
   if (like) {
@@ -329,13 +351,27 @@ const RECOVERY_NOTE = 'Recovered by operator: dismissed as a stale cross-order p
   + 'order 4021 did NOT list refund 991 at 2026-08-22T09:00:00.000Z, so this park does not describe '
   + 'this order.'
 
-/** CASE (b): the old binary found this park by `reason` alone and overwrote it with an invoice hold. */
-const overwrittenStampedPark: Row = { ...base, recordKind: 'WC_REFUND_PARK', payload: heldPayload }
+/**
+ * CASE (b): the old binary found this park by `reason` alone and overwrote it with an invoice hold.
+ *
+ * o3d-xnwu r12 — AND THE OVERWRITE REPLACES THE WHOLE ROW, `externalId` INCLUDED.
+ * holdWcSalesInvoiceForMissingNumber builds one `data` object — connector, direction, status,
+ * entityType, entityId, externalId = String(wcOrder.id), recordKind, payload, errorMessage,
+ * syncedAt — and passes it to BOTH the update and the create. This fixture used to keep the park's
+ * externalId (the REFUND id) beside a hold payload naming order 4021, a row the predecessor cannot
+ * produce, and checks 4 and 5 now read that column.
+ */
+const overwrittenStampedPark: Row = {
+  ...base, recordKind: 'WC_REFUND_PARK', externalId: '4021', payload: heldPayload,
+}
 
-const genuineHold: Row = { ...base, recordKind: 'WC_HELD_SALES_INVOICE', payload: heldPayload }
+/** Every hold-shaped row carries the ORDER id, because that is what the hold writer writes. */
+const genuineHold: Row = {
+  ...base, recordKind: 'WC_HELD_SALES_INVOICE', externalId: '4021', payload: heldPayload,
+}
 const genuinePark: Row = { ...base, payload: { id: 992, amount: '5.00', reason: 'damaged in transit' } }
 const parkWithTypedReason: Row = { ...base, payload: refundPayloadWithTypedReason }
-const unstampedHold: Row = { ...base, recordKind: null, payload: heldPayload }
+const unstampedHold: Row = { ...base, recordKind: null, externalId: '4021', payload: heldPayload }
 const unstampedPark: Row = { ...base, recordKind: null, payload: refundPayloadWithTypedReason }
 
 test('verify.sql declares six checks in the shape the deploy hook executes', () => {
@@ -516,7 +552,23 @@ test('check 4 does not accuse the LEGITIMATE dismissal of a real refund park', (
 
 test('check 5 catches a legacy REASSIGN that moved a held invoice onto another order', () => {
   assert.equal(selects(4, reassignedStampedHold), true, 'a hold naming an order it does not sit on')
-  assert.equal(selects(3, reassignedStampedHold), true, 'and the note catches it independently')
+  // o3d-xnwu r12 — AND CHECK 4 NO LONGER DOUBLES UP ON IT. The identity clause is split by
+  // mutation: a DISMISS moves neither entityId nor the payload, so check 4 requires the equality,
+  // and a REASSIGN is check 5's alone. Nothing is lost, because check 5 reads neither the status nor
+  // the message — see the reassign-then-dismiss test below.
+  assert.equal(selects(3, reassignedStampedHold), false, 'a REASSIGN broke the equality check 4 requires')
+})
+
+test('reassign-THEN-dismiss is still caught, which is what makes the identity split safe', () => {
+  // ROUTE: the shipped check 5, over a row that has had BOTH recovery actions applied — entityId
+  // moved by the REASSIGN, then status/errorMessage rewritten by the DISMISS. Check 5 reads neither
+  // of the two columns a DISMISS writes, so the second act cannot hide the first.
+  //
+  // MUTATION THAT KILLS THIS TEST: add a status or errorMessage clause to check 5 (e.g. require
+  // PENDING, the status a REASSIGN leaves), and the dismissed row below stops being selected.
+  const reassignedThenDismissed: Row = { ...reassignedStampedHold, status: 'SYNCED', errorMessage: RECOVERY_NOTE }
+  assert.equal(selects(4, reassignedThenDismissed), true, 'the moved payload is still naming the first order')
+  assert.equal(selects(3, reassignedThenDismissed), false, 'and check 4 is right to be quiet — the identity is broken')
 })
 
 test('check 5 stays silent on every row whose hold payload still names its own row', () => {
@@ -534,13 +586,34 @@ test('a REASSIGN moves a case-(b) row OUT of check 3 and INTO check 5 — which 
   assert.equal(selects(4, reassignedOverwrittenPark), true, 'check 5 is where it lands')
 })
 
-test('check 5 treats a hold payload that has LOST its order id as the same contradiction', () => {
-  // IS DISTINCT FROM, not `<>`: a missing member compares UNKNOWN and would select nothing, so the
-  // one state that says "this payload no longer names anything" would be the one state ignored.
-  assert.equal(
-    selects(4, { ...genuineHold, payload: heldPayloadWithoutOrderId }),
-    true,
-    'a hold-shaped payload with no salesOrderId names no order at all',
+test('a hold payload that has LOST its order id no longer STOPS a cutover, and is diagnosed by hand', () => {
+  // o3d-xnwu r12 (Codex HIGH) — THE INVERSION, AND WHY IT IS THE SAFE DIRECTION.
+  //
+  // `IS DISTINCT FROM` was chosen so this state would count. What it actually bought was that an
+  // ABSENT member SATISFIES the clause — and EVERY raw WooCommerce refund body is a payload with no
+  // salesOrderId, so a decorated genuine refund was selected as damage by a hook that runs with the
+  // application and the database fenced. The missing member cannot be told apart from external
+  // decoration by any clause available here, so it stops being a blocking check.
+  //
+  // ROUTE: the shipped check 5 over the row, then the shipped migration.sql text for the manual
+  // query it moved to.
+  //
+  // MUTATION THAT KILLS THIS TEST: put `IS DISTINCT FROM` back into check 5 — the first assertion
+  // flips to true. Delete the manual query from migration.sql — the last two fail.
+  const lostOrderId: Row = { ...genuineHold, payload: heldPayloadWithoutOrderId }
+  assert.equal(selects(4, lostOrderId), false, 'check 5 now requires a STRING salesOrderId that differs')
+  assert.equal(selects(3, lostOrderId), false, 'and check 4 requires one equal to entityId')
+
+  const migration = readFileSync(MIGRATION, 'utf8')
+  assert.match(migration, /A HOLD-SHAPED PAYLOAD WITH NO ORDER ID/, 'the state must still be diagnosable')
+  assert.match(
+    migration,
+    /AND payload->'salesOrderId' IS NULL;/,
+    'by a manual query that asks for exactly it',
+  )
+  assert.ok(
+    !statements(migration).some((statement) => /payload->'salesOrderId' IS NULL/.test(statement)),
+    'and it must be a COMMENT, not an executed statement — a blocking check is what was just removed',
   )
 })
 
@@ -1252,6 +1325,10 @@ const RECOVERY_PROOF_MEMBERS = {
   orderNumber: 'SO-1',
   metaKey: '_wcpdf_invoice_number',
   accountingPayload: { salesOrderId: 'order-1', currency: 'GBP' },
+  // o3d-xnwu r12: `salesOrderId` joined the list when the identity clause was split by mutation.
+  // Check 4 requires it EQUAL to entityId, check 5 requires it a STRING that differs — so removing
+  // it must silence both, which is the property the loop below proves member by member.
+  salesOrderId: 'order-1',
 } as const
 
 /**
@@ -1272,13 +1349,15 @@ const reassignedDecoratedPark: Row = {
 }
 
 test('checks 4 and 5 stay ZERO on a genuine park decorated with both fields they used to trust', () => {
-  // ROUTE: the shipped verify.sql, parsed and evaluated over the row. Not a text assertion — the
-  // point is what the SQL SELECTS.
+  // THIS ROW IS THE r11 REGRESSION GUARD, AND IT IS NOT THE PROOF (o3d-xnwu r12). It decorates a
+  // refund body with exactly two members — metaKey and accountingPayload — so it leaves every clause
+  // added after r10 unsatisfied, and it would stay out of both checks even if every one of those
+  // clauses were deleted. The adversary that actually tests them is the next test down.
+  //
+  // ROUTE: the shipped verify.sql, parsed and evaluated over the row. Not a text assertion.
   //
   // MUTATION THAT KILLS THIS TEST: revert either check to its pre-r11 pair — an accountingPayload
-  // OBJECT and a non-null metaKey — and this row is admitted by both. (Dropping ONE of the added
-  // conjuncts is not enough to readmit it, because the remaining ones still reject a refund body;
-  // that each individual conjunct is load-bearing is what the next test proves, member by member.)
+  // OBJECT and a non-null metaKey — and this row is admitted by both.
   assert.equal(
     selects(3, dismissedDecoratedPark),
     false,
@@ -1287,7 +1366,7 @@ test('checks 4 and 5 stay ZERO on a genuine park decorated with both fields they
   assert.equal(
     selects(4, decoratedPark),
     false,
-    'and a decorated refund body with NO salesOrderId must not satisfy IS DISTINCT FROM as a "hold naming another order"',
+    'and a decorated refund body with NO salesOrderId must not satisfy the identity clause as a "hold naming another order"',
   )
   assert.equal(selects(4, reassignedDecoratedPark), false, 'not even once an operator has reassigned it')
 
@@ -1298,6 +1377,139 @@ test('checks 4 and 5 stay ZERO on a genuine park decorated with both fields they
       selects(index, decoratedPark),
       index === 1,
       `only check 2 (an unstamped actionable park) may see this row, not check ${index + 1}`,
+    )
+  }
+})
+
+/* ================================================================================================
+ * o3d-xnwu r12 (Codex HIGH) — THE ADVERSARY BUILT PROPERLY.
+ *
+ * r11's answer to "a store controls the payload" was to require MORE of the store's payload: eight
+ * top-level members instead of two. The row above does not disprove that, because it only ever
+ * carried two of them. THIS one carries EVERY member both checks require, with the writer's exact
+ * types, on a genuine WooCommerce refund body that still has its required numeric `id` — the shape
+ * an extension decorating the refund object produces, persisted unchanged by upsertRefundPark.
+ *
+ * Against check 5 it also carries a STRING salesOrderId naming another order; against check 4 a
+ * salesOrderId equal to the row's entityId. So for each check, exactly ONE clause stands between a
+ * healthy database and a failed cutover with a fenced application — and the second half of this
+ * test removes that clause's subject to prove which one it is.
+ * ============================================================================================== */
+
+/** Every member checks 4 and 5 require, with the writer's types, on a real refund body. */
+const decorationsOfAHold = {
+  connector: 'woocommerce',
+  // Equal to the row's own externalId — a park's externalId is the REFUND id, so a decorator that
+  // wanted past `"externalId" = payload->>'externalOrderId'` would have to write this.
+  externalOrderId: '991',
+  externalOrderNumber: '4021',
+  orderNumber: 'SO-1',
+  metaKey: '_wcpdf_invoice_number',
+  accountingPayload: { currency: 'GBP' },
+  // A STRING, because check 5 requires one — and a value the store invents, because `entityId` is an
+  // internal IMS id the storefront has never seen. That asymmetry is why the identity clause is the
+  // one member of the shape a decorator cannot aim: it can write salesOrderId, but not the RIGHT one.
+  salesOrderId: 'order-9',
+} as const
+
+/** `refundPayloadWithTypedReason` supplies the required numeric `id` and the typed reason. */
+const fullyDecoratedRefundPayload = { ...refundPayloadWithTypedReason, ...decorationsOfAHold }
+
+const dismissedFullyDecoratedPark: Row = {
+  ...base, recordKind: null, status: 'SYNCED', errorMessage: RECOVERY_NOTE, payload: fullyDecoratedRefundPayload,
+}
+const reassignedFullyDecoratedPark: Row = {
+  ...base, recordKind: null, status: 'PENDING', errorMessage: REASSIGN_NOTE, payload: fullyDecoratedRefundPayload,
+}
+
+/** Removing the one member a genuine refund body cannot be without. */
+function withoutRefundId(payload: Record<string, unknown>): Record<string, unknown> {
+  const { id: _refundId, ...rest } = payload
+  return rest
+}
+
+test('a FULLY decorated genuine refund — every required member, right types — still fails both checks', () => {
+  // ROUTE: the shipped verify.sql evaluated over two ordinary healthy-database rows that satisfy
+  // EVERY clause of checks 4 and 5 except the structural one.
+  //
+  // MUTATION THAT KILLS THIS TEST: delete `AND payload->'id' IS NULL` from check 5 (second half
+  // below flips), or from check 4 together with its identity equality.
+  assert.equal(selects(3, dismissedFullyDecoratedPark), false, 'a decorated refund body an operator dismissed is not a dismissed hold')
+  assert.equal(selects(4, reassignedFullyDecoratedPark), false, 'and one an operator reassigned is not a moved hold')
+
+  // WHICH CLAUSE IS DOING THE WORK, named by removing what it reads.
+  //
+  // CHECK 5 has exactly ONE objection to this row: the refund id. Everything else it asks for, a
+  // decorator can write — including a string salesOrderId that differs from an entityId it does not
+  // know. Take the id away and the check fires, so that clause is what is holding the cutover open.
+  assert.equal(
+    selects(4, { ...reassignedFullyDecoratedPark, payload: withoutRefundId(fullyDecoratedRefundPayload) }),
+    true,
+    "check 5's ONLY remaining objection is the refund id — so `payload->'id' IS NULL` is what holds it",
+  )
+
+  // CHECK 4 has TWO independent objections, and that is the point of the split: the id, and the
+  // identity EQUALITY. Removing the id alone is not enough, because a decorator still has not named
+  // this row's internal order id.
+  assert.equal(
+    selects(3, { ...dismissedFullyDecoratedPark, payload: withoutRefundId(fullyDecoratedRefundPayload) }),
+    false,
+    'check 4 still refuses it: salesOrderId does not equal entityId, and no store can guess that value',
+  )
+
+  // ...and with BOTH removed it fires, which is what proves neither clause is decoration. (Such a
+  // row is not producible by a decorating store — it requires the internal order id — and check 1
+  // would see it anyway, because the shared five-clause shape rests on the same identity.)
+  const aimedPayload = { ...withoutRefundId(fullyDecoratedRefundPayload), salesOrderId: 'order-1' }
+  assert.equal(
+    selects(3, { ...dismissedFullyDecoratedPark, payload: aimedPayload }),
+    true,
+    'check 4 fires only once BOTH the id and the identity objection are gone',
+  )
+  assert.equal(
+    selects(3, { ...dismissedFullyDecoratedPark, payload: { ...aimedPayload, id: 991 } }),
+    false,
+    "...and putting the refund id back alone is enough to stop it — `payload->'id' IS NULL` is load-bearing on check 4 too",
+  )
+
+  // AND THE SECOND STRUCTURAL DISCRIMINATOR, isolated the same way. Start from the row check 5 DOES
+  // select (the id removed) and break only the externalId agreement: a park's externalId is the
+  // REFUND id, so a decorator that has not also renamed externalOrderId to it is refused here even
+  // with no `id` at all.
+  const idRemoved = withoutRefundId(fullyDecoratedRefundPayload)
+  assert.equal(
+    selects(4, { ...reassignedFullyDecoratedPark, payload: { ...idRemoved, externalOrderId: '4021' } }),
+    false,
+    'check 5 also requires "externalId" = payload->>\'externalOrderId\', which a refund park cannot satisfy by accident',
+  )
+  assert.equal(
+    selects(3, { ...dismissedFullyDecoratedPark, payload: { ...aimedPayload, externalOrderId: '4021' } }),
+    false,
+    'and so does check 4, on the row that otherwise fires',
+  )
+
+  // A json null `id` is not an absent one, and must resolve AWAY from the outage: `->` returns the
+  // json null, which IS NOT NULL, so the check stays quiet. (`->>` would have returned SQL NULL and
+  // fired.) This is why the clause is spelled on the member rather than on its text.
+  assert.equal(
+    selects(4, { ...reassignedFullyDecoratedPark, payload: { ...fullyDecoratedRefundPayload, id: null } }),
+    false,
+    'a refund body carrying "id": null is excluded too',
+  )
+
+  // And the rest of the file is quiet over them, or the cutover fails from somewhere else for the
+  // same wrong reason. Check 2 sees the reassigned row: it is an unstamped actionable park, which it
+  // genuinely is, and check 2's own comment says it is a superset rather than an accusation.
+  for (const index of [0, 1, 2, 3, 4, 5]) {
+    assert.equal(
+      selects(index, dismissedFullyDecoratedPark),
+      false,
+      `check ${index + 1} must be quiet over the dismissed adversary`,
+    )
+    assert.equal(
+      selects(index, reassignedFullyDecoratedPark),
+      index === 1,
+      `only check 2 may see the reassigned adversary, not check ${index + 1}`,
     )
   }
 })
@@ -1335,31 +1547,27 @@ test('checks 4 and 5 require EVERY payload member neither recovery action can to
   assert.equal(selects(3, dismissedUnstampedHold), true, 'including on a hold that was never stamped')
   assert.equal(selects(4, reassignedStampedHold), true, 'the genuine REASSIGN of a hold is still caught')
   assert.equal(selects(4, reassignedOverwrittenPark), true, 'and the case-(b) row a REASSIGN moved')
-  assert.equal(
-    selects(4, { ...genuineHold, payload: heldPayloadWithoutOrderId }),
-    true,
-    'and a hold-shaped payload that has LOST its order id — the one member whose type is deliberately not asserted',
-  )
 })
 
-test('checks 4 and 5 carry the complete held-invoice shape MINUS exactly the identity clause', () => {
-  // ROUTE: pure text out of the shipped verify.sql, so the two cannot drift apart or drift away
-  // from the one thing they are allowed to omit.
+test('checks 4 and 5 carry the same recovery-proof shape, and SPLIT the identity clause by mutation', () => {
+  // ROUTE: pure text out of the shipped verify.sql, so the two cannot drift apart and neither can
+  // drift back to the r11 shape that omitted the identity from BOTH.
   //
-  // MUTATION THAT KILLS THIS TEST: add the identity clause back to either (they would then go quiet
-  // on the REASSIGN they exist to catch), or drop a shape clause from one and not the other.
+  // MUTATION THAT KILLS THIS TEST: drop `payload->'id' IS NULL` or the externalId equality from
+  // either check; give check 4 the inequality or check 5 the equality; or restore
+  // `IS DISTINCT FROM` anywhere. Each lands on a named assertion below.
   const verifyStatements = statements(readFileSync(VERIFY, 'utf8'))
-  const IDENTITY = 'payload->>\'salesOrderId\' = "entityId"'
+  const EQUALITY = 'payload->>\'salesOrderId\' = "entityId"'
+  const INEQUALITY = 'payload->>\'salesOrderId\' <> "entityId"'
+  const SALES_ORDER_ID_IS_A_STRING = "jsonb_typeof(payload->'salesOrderId') = 'string'"
 
-  const complete = heldShapeOf(whereClauseOf(verifyStatements[0]))
-  assert.ok(complete.includes(IDENTITY), 'precondition: check 1 carries the identity clause')
+  // THE STRUCTURAL DISCRIMINATOR, which is the whole r12 finding: every other clause below is a
+  // top-level member of a payload the store controls, and this one is a member the store's payload
+  // MUST have and the writer's never does.
+  const STRUCTURAL = ["payload->'id' IS NULL", '"externalId" = payload->>\'externalOrderId\'']
 
-  const shapeOf = (index: number) =>
-    heldShapeOf(whereClauseOf(verifyStatements[index])).filter(
-      (clause) => clause !== 'payload->>\'salesOrderId\' IS DISTINCT FROM "entityId"',
-    )
-
-  const expected = [
+  const COMMON = [
+    ...STRUCTURAL,
     "jsonb_typeof(payload) = 'object'",
     "payload->>'reason' = 'missing_wc_invoice_number'",
     "payload->>'connector' = 'woocommerce'",
@@ -1368,26 +1576,31 @@ test('checks 4 and 5 carry the complete held-invoice shape MINUS exactly the ide
     "jsonb_typeof(payload->'orderNumber') = 'string'",
     "jsonb_typeof(payload->'metaKey') = 'string'",
     "jsonb_typeof(payload->'accountingPayload') = 'object'",
-  ].sort()
+  ]
 
-  assert.deepEqual(shapeOf(3), expected, 'check 4 must read the maximal recovery-proof shape')
-  assert.deepEqual(shapeOf(4), expected, 'check 5 must read the same one')
+  assert.deepEqual(
+    heldShapeOf(whereClauseOf(verifyStatements[3])),
+    [...COMMON, EQUALITY].sort(),
+    'check 4 (DISMISS) reads the recovery-proof shape AND requires salesOrderId = entityId',
+  )
+  assert.deepEqual(
+    heldShapeOf(whereClauseOf(verifyStatements[4])),
+    [...COMMON, SALES_ORDER_ID_IS_A_STRING, INEQUALITY].sort(),
+    'check 5 (REASSIGN) reads the same shape AND requires a STRING salesOrderId that differs',
+  )
 
-  // The identity equality is the ONE omission, and it must be omitted from both: it is the clause a
-  // REASSIGN breaks, which is the damage these two exist to catch.
-  for (const index of [3, 4]) {
-    assert.ok(
-      !heldShapeOf(whereClauseOf(verifyStatements[index])).includes(IDENTITY),
-      `check ${index + 1} must NOT require salesOrderId = entityId — a REASSIGN moves that column`,
-    )
-  }
-  // ...and check 5 keeps the null-safe spelling of its contradiction, which is what makes a payload
-  // that has LOST its order id count.
+  // The two halves are exclusive, or the split is decoration.
+  const shape4 = heldShapeOf(whereClauseOf(verifyStatements[3]))
+  const shape5 = heldShapeOf(whereClauseOf(verifyStatements[4]))
+  assert.ok(!shape4.includes(INEQUALITY), 'a DISMISS moves neither side, so check 4 must not ask for a difference')
+  assert.ok(!shape5.includes(EQUALITY), 'a REASSIGN moves entityId, so check 5 must not ask for equality')
+
+  // AND `IS DISTINCT FROM` IS GONE FROM BOTH. It is what made an ABSENT salesOrderId — every raw
+  // refund body — satisfy the clause, which is the false positive this round removes.
+  const verifySql = readFileSync(VERIFY, 'utf8')
   assert.ok(
-    heldShapeOf(whereClauseOf(verifyStatements[4])).includes(
-      'payload->>\'salesOrderId\' IS DISTINCT FROM "entityId"',
-    ),
-    'check 5 must compare the identity with IS DISTINCT FROM, not <>',
+    !/salesOrderId'\s+IS\s+DISTINCT\s+FROM/i.test(stripComments(verifySql)),
+    'no check may compare the identity with IS DISTINCT FROM: an absent member satisfies it',
   )
 })
 
