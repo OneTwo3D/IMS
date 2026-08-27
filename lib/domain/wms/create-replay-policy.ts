@@ -168,6 +168,14 @@ export const WMS_CREATE_REPLAY_POLICY_IDS = WMS_CONNECTOR_IDS
  * happens at the HOLD, so the order never sits in a state whose only exit is a write nothing will
  * ever be allowed to make.
  *
+ * THE ONE RESIDUE, STATED RATHER THAN PAPERED OVER. A HELD link written BEFORE this revision
+ * carries `cancelledAt` whichever answer the WMS gave, so for those rows the stamp is not evidence
+ * and this rule cannot tell. Closing that would need a column to distinguish them, i.e. a
+ * migration, and none is applied on this branch. The exposure is bounded: it is only unsafe on a
+ * connector with no remote duplicate refusal, which today means ShipHero alone — and ShipHero has
+ * no live deployment (the repo is the deploy). On Mintsoft such a row releases, re-creates, and the
+ * remote refuses any duplicate, which is the outcome the rule would have chosen anyway.
+ *
  * WHAT THE PROBE IS FOR, AND WHAT IT IS NOT FOR. Where key 1 is absent and key 2 holds, the
  * release still asks the warehouse whether it holds the order (`probeOrderPresence`), because a
  * re-create against a LIVE order — even one a remote duplicate-refusal makes safe from a double
