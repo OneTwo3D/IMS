@@ -142,8 +142,10 @@ mock.module('@/lib/activity-log', {
 const INCIDENT: ActivityRow = {
   action: UNRECORDED_POSTED_DOCUMENT_ACTION,
   level: 'ERROR',
-  // `unrecordedPostedDocumentRecord` writes metadata.type from entry.type. Round 6 classifies on it.
-  metadata: { type: 'SALES_INVOICE', syncLogId: 'log-1' },
+  // `unrecordedPostedDocumentRecord` writes metadata.type from entry.type. Round 6 classifies on it,
+  // and round 8 also reads `postedExternalId` — which that builder writes too, and which this
+  // fixture's own description names, so the two halves of the record agree.
+  metadata: { type: 'SALES_INVOICE', syncLogId: 'log-1', postedExternalId: 'INV-XERO-SECOND' },
   description: 'Xero SALES_INVOICE for SalesOrder order-1 POSTED as INV-XERO-SECOND, but sync row log-1 '
     + 'already names a DIFFERENT document (INV-XERO-FIRST). REMEDY: open both ids in Xero.',
 }
@@ -151,8 +153,9 @@ const INCIDENT: ActivityRow = {
 const QBO_INCIDENT: ActivityRow = {
   action: QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
   level: 'ERROR',
-  // `unpersistedQboPostRecord` writes the same field. A SALES_INVOICE is a real ledger document.
-  metadata: { type: 'SALES_INVOICE', syncLogId: 'log-2' },
+  // `unpersistedQboPostRecord` writes the same fields. A SALES_INVOICE is a real ledger document,
+  // and this one came back with an id.
+  metadata: { type: 'SALES_INVOICE', syncLogId: 'log-2', postedExternalId: 'QBO-INV-9' },
   description: 'QuickBooks SALES_INVOICE for SalesOrder order-2 POSTED as QBO-INV-9, but IMS could not '
     + 'record that id. REMEDY: open the id above in QuickBooks.',
 }
@@ -448,8 +451,9 @@ test('ROUND 6: the classifier keys on the OPERATION TYPE, not on the connector t
     'derived from the wording table, so a fifth operation moves both readers at once',
   )
 
-  assert.equal(classifyUnrecordedIncident({ type: 'SALES_INVOICE' }), 'LEDGER_DOCUMENT')
-  assert.equal(classifyUnrecordedIncident({ type: 'PURCHASE_INVOICE' }), 'LEDGER_DOCUMENT')
+  // ROUND 8: a document kind needs the recorded id as well as the operation semantics.
+  assert.equal(classifyUnrecordedIncident({ type: 'SALES_INVOICE', postedExternalId: 'INV-1' }), 'LEDGER_DOCUMENT')
+  assert.equal(classifyUnrecordedIncident({ type: 'PURCHASE_INVOICE', postedExternalId: 'BILL-1' }), 'LEDGER_DOCUMENT')
 
   for (const unreadable of [null, undefined, 'INVOICE_EMAIL', 42, [], {}, { type: '' }, { type: 7 }]) {
     assert.equal(classifyUnrecordedIncident(unreadable), 'UNCLASSIFIED', JSON.stringify(unreadable) ?? 'undefined')
@@ -596,4 +600,150 @@ test('ROUND 7: a mixed set counts all four kinds apart', async () => {
   assert.equal(metadata?.noIdentifierSideEffects, 1)
   assert.equal(metadata?.unclassified, 1)
   assert.equal(metadata?.preserved, 4, 'the total still reconciles with the parts')
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 8 (Codex MEDIUM): CLASSIFIED AS OPENABLE WHEN NO IDENTIFIER WAS EVER RETURNED.
+//
+// The map answers "what does a successful handler for this type RETURN?", and for every document
+// type the answer is "an id". It was the ONLY question asked, so a record that carries no id was
+// still counted as a `LEDGER_DOCUMENT` and earned the breadcrumb sentence that ends "Open the id in
+// that system" — an instruction to open something the record does not contain, in the one record
+// that survives a factory reset.
+//
+// A record with no id is REACHABLE, not hypothetical. Both QuickBooks payment handlers return
+// `{ success: true, externalId: res.data?.Payment?.Id }` / `?.BillPayment?.Id` — a deeply-optional
+// read with no presence check — and `persistFreshQboPostOrEscalate` is called with
+// `syncResult.externalId ?? null`, so a successful post with no id escalates here as
+// `postedExternalId: null`. The Xero side reaches it from the other direction: `postedExternalId`
+// is nullable on `UnrecordablePostedDocument` and its wording already prints "(no id returned)".
+//
+// The classification now depends on the operation semantics AND the recorded result.
+// ---------------------------------------------------------------------------
+
+/** A QuickBooks INVOICE_PAYMENT that succeeded and returned no id — the shape the handler can produce. */
+const QBO_DOCUMENT_WITHOUT_ID_INCIDENT: ActivityRow = {
+  action: QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+  level: 'ERROR',
+  metadata: { type: 'INVOICE_PAYMENT', syncLogId: 'log-9', postedExternalId: null },
+  description: 'QuickBooks INVOICE_PAYMENT for SalesOrder order-9 POSTED as (no id returned).',
+}
+
+// MUTATION THAT KILLS THIS: delete the `postedExternalId` branch from `classifyUnrecordedIncident`
+// (return `kind` directly) — every assertion below the first pair fails with 'LEDGER_DOCUMENT'.
+// Narrowing the check to `postedExternalId !== undefined` fails the `null` and `''` cases, which are
+// the two the shipped writers actually produce. Both were run.
+test('ROUND 8: a document type with no recorded identifier is NOT classified as openable', async () => {
+  const { classifyUnrecordedIncident } = await import('@/lib/domain/accounting/unrecorded-posted-document')
+
+  // With an id, nothing changes.
+  assert.equal(
+    classifyUnrecordedIncident({ type: 'INVOICE_PAYMENT', postedExternalId: 'PAY-1' }),
+    'LEDGER_DOCUMENT',
+  )
+
+  // Without one — in each of the three shapes the writers can produce: the key absent (the JSON
+  // round-trip in `unpersistedQboPostRecord` drops an `undefined`), an explicit null (what
+  // `syncResult.externalId ?? null` writes), and an empty string.
+  for (const metadata of [
+    { type: 'INVOICE_PAYMENT' },
+    { type: 'INVOICE_PAYMENT', postedExternalId: null },
+    { type: 'INVOICE_PAYMENT', postedExternalId: '' },
+    { type: 'BILL_PAYMENT', postedExternalId: null },
+    { type: 'SALES_INVOICE', postedExternalId: null },
+  ]) {
+    assert.equal(
+      classifyUnrecordedIncident(metadata),
+      'LEDGER_DOCUMENT_NO_IDENTIFIER',
+      JSON.stringify(metadata),
+    )
+  }
+
+  // The downgrade applies ONLY to the document kinds. The others are the ones whose id is EXPECTED
+  // to be absent, and their sentences never promised one — moving them would be a fresh falsehood.
+  assert.equal(classifyUnrecordedIncident({ type: 'PURCHASE_CREDIT_NOTE_ALLOCATION' }), 'LEDGER_NON_DOCUMENT')
+  assert.equal(classifyUnrecordedIncident({ type: 'TAX_RATE_SYNC', postedExternalId: null }), 'LEDGER_NON_DOCUMENT')
+  assert.equal(classifyUnrecordedIncident({ type: 'INVOICE_EMAIL' }), 'NO_IDENTIFIER_SIDE_EFFECT')
+  assert.equal(classifyUnrecordedIncident({ type: 'FUTURE_THING', postedExternalId: 'X' }), 'UNCLASSIFIED')
+})
+
+// MUTATION THAT KILLS THIS: fold LEDGER_DOCUMENT_NO_IDENTIFIER back into LEDGER_DOCUMENT anywhere —
+// in the classifier, or by deleting the new `if (counts.LEDGER_DOCUMENT_NO_IDENTIFIER > 0)` block so
+// the row falls through uncounted. The first makes "Open the id in that system" reappear and fails
+// the doesNotMatch; the second breaks the `preserved` / per-kind reconciliation. Both were run.
+test('ROUND 8: the breadcrumb for such a record does not tell an operator to open an id', async () => {
+  reset([QBO_DOCUMENT_WITHOUT_ID_INCIDENT])
+
+  await runReset('full')
+
+  const breadcrumb = state.activity.find((row) => row.action === 'database_reset_preserved_unrecorded_documents')
+  assert.ok(breadcrumb)
+
+  // THE DEFECT: the openable-document sentence, earned by a record with nothing to open.
+  assert.doesNotMatch(breadcrumb.description, /Open the id in that system/)
+  assert.doesNotMatch(breadcrumb.description, /Xero or QuickBooks accepted and still holds/)
+
+  // What it says instead — the write is still real, and that is still stated.
+  assert.match(breadcrumb.description, /1 are the same kind of write/)
+  assert.match(breadcrumb.description, /ON A RECORD THAT CARRIES NO ID/)
+  assert.match(breadcrumb.description, /DO NOT GO LOOKING FOR AN ID/)
+  assert.match(breadcrumb.description, /^Database reset kept 1 record/)
+
+  const metadata = (breadcrumb as unknown as { metadata?: Record<string, unknown> }).metadata
+  assert.equal(metadata?.ledgerDocuments, 0, 'it is not counted among the ones that can be opened')
+  assert.equal(metadata?.ledgerDocumentsWithoutIdentifier, 1)
+  assert.equal(metadata?.ledgerNonDocuments, 0, 'nor demoted to a kind whose write is not a document')
+  assert.equal(metadata?.noIdentifierSideEffects, 0)
+  assert.equal(metadata?.unclassified, 0)
+  assert.equal(metadata?.preserved, 1)
+})
+
+// MUTATION THAT KILLS THIS: restore the unconditional 'REMEDY: open the id above in QuickBooks' tail
+// to `describeUnpersistedQboPost` — the doesNotMatch fails on the no-id incident. Run.
+test('ROUND 8: the per-incident record stops promising an id it does not carry', async () => {
+  const { describeUnpersistedQboPost, describeUnrecordablePostedDocument } =
+    await import('@/lib/domain/accounting/unrecorded-posted-document')
+
+  const withoutId = describeUnpersistedQboPost(
+    { entry: { id: 'log-9', type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: 'order-9' }, postedExternalId: null },
+    new Error('write conflict'),
+  )
+  assert.doesNotMatch(withoutId, /open the id above in QuickBooks/)
+  assert.match(withoutId, /THE RESPONSE CARRIED NO ID EITHER/)
+  assert.match(withoutId, /find the document in QuickBooks by the reference above, its amount and its date/)
+
+  // With an id, the remedy that WAS performable is unchanged.
+  const withId = describeUnpersistedQboPost(
+    { entry: { id: 'log-9', type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: 'order-9' }, postedExternalId: 'PAY-1' },
+    new Error('write conflict'),
+  )
+  assert.match(withId, /open the id above in QuickBooks/)
+  assert.doesNotMatch(withId, /THE RESPONSE CARRIED NO ID EITHER/)
+
+  // The Xero record has the same hole and the same fix.
+  const xeroNoId = describeUnrecordablePostedDocument({
+    entry: { id: 'log-8', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-8' },
+    postedExternalId: null,
+    reason: 'ROW_MISSING',
+    namedExternalId: null,
+  })
+  assert.doesNotMatch(xeroNoId, /find it in Xero by the id above/)
+  assert.match(xeroNoId, /NO ID WAS RETURNED, so there is nothing to open/)
+
+  const xeroBothIds = describeUnrecordablePostedDocument({
+    entry: { id: 'log-8', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-8' },
+    postedExternalId: 'INV-SECOND',
+    reason: 'ANOTHER_DOCUMENT_NAMED',
+    namedExternalId: 'INV-FIRST',
+  })
+  assert.match(xeroBothIds, /open both ids in Xero/)
+
+  const xeroOneId = describeUnrecordablePostedDocument({
+    entry: { id: 'log-8', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-8' },
+    postedExternalId: null,
+    reason: 'ANOTHER_DOCUMENT_NAMED',
+    namedExternalId: 'INV-FIRST',
+  })
+  assert.doesNotMatch(xeroOneId, /open both ids in Xero/)
+  assert.match(xeroOneId, /ONE OF THE TWO IDS IS NOT RECORDED HERE/)
 })

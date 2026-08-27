@@ -167,7 +167,10 @@ test('Codex MEDIUM (round 3): the escalation names the queued copies and the fac
       `the query the operator is told to run must name ${fragment}, which is what queueEmail actually writes`,
     )
   }
-  assert.match(description, /WHAT COMES BACK IS CANDIDATES, AND IMS CANNOT NARROW THEM/)
+  // ROUND 8 split this in two: what comes back is a NON-QUIESCENT SNAPSHOT (the replay may still
+  // be adding to it), and IMS cannot narrow what it does contain.
+  assert.match(description, /WHAT COMES BACK IS A NON-QUIESCENT SNAPSHOT/)
+  assert.match(description, /AND IMS CANNOT NARROW IT/)
 
   // tests/accounting/qbo-remedy-is-performable.test.ts walks every step of this message against the
   // shipped code — the outbox enum, the settlement action, and the sync toggle it does name.
@@ -260,7 +263,11 @@ test('ROUND 7: the record does not promise the queued rows are delivered, and do
   // The three reasons the rows are only candidates, each of which is a shipped fact.
   assert.match(description, /the authenticated accounting-invoice email action writes the identical shape/)
   assert.match(description, /a SENT row has already gone/)
-  assert.match(description, /a FAILED row never went at all/)
+  // ROUND 8 (Codex HIGH): the FAILED half of this sentence was itself an absolute the data cannot
+  // carry — see tests/accounting/outbox-failed-is-not-non-delivery.test.ts, which drives the
+  // shipped sender stamping FAILED on a copy the mail server accepted.
+  assert.doesNotMatch(description, /a FAILED row never went at all/)
+  assert.match(description, /A FAILED ROW IS NOT PROOF THAT NOTHING WENT/)
   assert.match(description, /o3d-il7a/, 'and the work that would make an exact answer possible')
 })
 
@@ -274,8 +281,8 @@ test('ROUND 7: the record says why the query cannot be narrowed', async () => {
 })
 
 test('ROUND 7: the outbox really does terminalise a row FAILED for a suppressed recipient', async () => {
-  // The record says a FAILED row never went at all. This is that path in the shipped sender, so the
-  // sentence is an observation rather than a reading of the enum.
+  // ROUND 8: this is the one FAILED path the record still calls conclusive, and it is conclusive
+  // because it runs BEFORE the send. The other FAILED paths are read from the same file below.
   const { readFile } = await import('node:fs/promises')
   const path = await import('node:path')
   const sender = await readFile(path.join(process.cwd(), 'lib/email-outbox.ts'), 'utf8')

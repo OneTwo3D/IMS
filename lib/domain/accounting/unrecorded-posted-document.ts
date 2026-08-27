@@ -36,16 +36,31 @@ export type UnrecordablePostedDocument = {
  */
 export function describeUnrecordablePostedDocument(incident: UnrecordablePostedDocument): string {
   const { entry, postedExternalId, namedExternalId, reason } = incident
-  const posted = postedExternalId ?? '(no id returned)'
+  // ROUND 8 (Codex MEDIUM): THE REMEDY MAY ONLY NAME AN ID THE RECORD ACTUALLY CARRIES. Both fields
+  // are nullable, and "(no id returned)" is what this line already printed when one was — so
+  // "find it by the id above" and "open both ids" were instructions to open a string that says
+  // there is no string. An id that is absent gets a remedy that does not need one instead.
+  const posted = typeof postedExternalId === 'string' && postedExternalId.length > 0 ? postedExternalId : null
+  const named = typeof namedExternalId === 'string' && namedExternalId.length > 0 ? namedExternalId : null
+  const postedText = posted ?? '(no id returned)'
   return reason === 'ROW_MISSING'
-    ? `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as ${posted}, `
+    ? `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as ${postedText}, `
       + `but its sync row ${entry.id} no longer exists, so nothing in IMS references the document. `
-      + 'REMEDY: find it in Xero by the id above and either keep it (re-enter the reference by hand) or void it; '
+      + (posted
+        ? 'REMEDY: find it in Xero by the id above and either keep it (re-enter the reference by hand) or void it; '
+        : 'NO ID WAS RETURNED, so there is nothing to open — do not go looking for one. REMEDY: find it in Xero '
+          + 'by the reference above, its amount and its date, and either keep it (re-enter the reference by hand) '
+          + 'or void it; ')
       + 'nothing further will be retried for this row.'
-    : `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as ${posted}, `
-      + `but sync row ${entry.id} already names a DIFFERENT document (${namedExternalId ?? 'unknown'}) — a newer `
+    : `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as ${postedText}, `
+      + `but sync row ${entry.id} already names a DIFFERENT document (${named ?? 'unknown'}) — a newer `
       + 'claim posted while this attempt was on the wire. BOTH documents exist in Xero. The row was left naming the '
-      + 'first one. REMEDY: open both ids in Xero, keep the one the row names, and void or credit the duplicate; '
+      + 'first one. '
+      + (posted && named
+        ? 'REMEDY: open both ids in Xero, keep the one the row names, and void or credit the duplicate; '
+        : 'ONE OF THE TWO IDS IS NOT RECORDED HERE, so they cannot both be opened. REMEDY: find the documents in '
+          + 'Xero by the reference above, their amount and their date, keep the one the row names, and void or '
+          + 'credit the duplicate; ')
       + 'no further sync attempt will touch either.'
 }
 
@@ -386,22 +401,50 @@ const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<AccountingSyncType, { ef
     // be delivered". The outbox sender terminalises a row FAILED for a suppressed recipient, for a
     // permanent send failure, and when EMAIL_MAX_ATTEMPTS is exhausted (lib/email-outbox.ts), so
     // that was an absolute the data cannot carry. What IS true is the row.
+    //
+    // AND NO NON-DELIVERY CLAIM EITHER (round 8, Codex HIGH). Round 7 then said a FAILED row "never
+    // went at all", which is the same mistake inverted: an ABSENCE OF CONFIRMATION read as a
+    // NEGATIVE ANSWER. `processPendingEmailOutbox` stamps SENT only AFTER `sendEmail` has returned,
+    // and that stamp is inside the try whose catch writes `status: permanentFailure ? 'FAILED' :
+    // 'PENDING'` — so a delivered copy whose stamp could not be written lands FAILED on the fifth
+    // attempt and lands PENDING (and is SENT AGAIN) before it. `sendEmail` itself decides
+    // success from the transport error's responseCode/code/message (lib/mailer.ts), which cannot
+    // distinguish "rejected" from "accepted, then the connection died". EXACTLY ONE FAILED PATH IS
+    // CONCLUSIVE and it is conclusive because it runs BEFORE the send: the `emailSuppression`
+    // lookup at the top of the loop, which writes `lastError: `Suppressed recipient: …``. That is
+    // the discriminator the wording now hands the operator, and it is a recorded field rather than
+    // an inference.
+    //
+    // AND THE INSPECTION IS NOT ORDERED BEHIND A STOP (round 8, Codex MEDIUM). The check used to
+    // say "STOP THE REPLAY FIRST", then inspect. The only lever is the sync toggle, which this same
+    // record already says is an admission check and not a fence, so that ordering cannot be
+    // established: the query is a snapshot that can still grow, and it says so.
     effect: 'ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — one more PENDING '
       + 'accounting-invoice row in the email outbox per sweep',
     check: 'this operation succeeds by QUEUEING, not by sending, and IMS CANNOT CANCEL A QUEUED COPY. '
       + 'EmailOutbox has four states — PENDING, PROCESSING, SENT, FAILED — none of which means '
       + '"deliberately not delivered", and no action, route or screen removes an unsent row, so there '
-      + 'is nothing to press. STOP THE REPLAY FIRST (the lever below), because until it is stopped '
-      + 'another row is queued every sweep. Then INSPECT the outbox: query it for kind '
-      + 'ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order id (no page in IMS '
-      + 'lists them) and read each row\'s status, attempts, createdAt and sentAt. WHAT COMES BACK IS '
-      + 'CANDIDATES, AND IMS CANNOT NARROW THEM: no outbox row records the sync attempt that queued '
+      + 'is nothing to press. TURN THE LEVER BELOW OFF FIRST, so that no NEW run is admitted — but '
+      + 'it is an ADMISSION CHECK, NOT A FENCE: a run admitted a moment before you flipped it can '
+      + 'queue another copy afterwards, and nothing in IMS reports whether one is doing so. Then '
+      + 'INSPECT the outbox: query it for kind ACCOUNTING_INVOICE, referenceType SalesOrder, '
+      + 'referenceId = the order id (no page in IMS lists them) and read each row\'s status, attempts, '
+      + 'lastError, createdAt and sentAt. WHAT COMES BACK IS A NON-QUIESCENT SNAPSHOT: the set can '
+      + 'still grow after you have read it, so re-run the query rather than treating one result as '
+      + 'the final list. AND IMS CANNOT NARROW IT: no outbox row records the sync attempt that queued '
       + 'it, so nothing attributes a copy to this incident; the authenticated accounting-invoice '
       + 'email action writes the identical shape, so ordinary operator sends are in the same result; '
-      + 'a SENT row has already gone; and a FAILED row never went at all — the outbox marks one '
-      + 'FAILED for a suppressed recipient, for a permanent send failure, and when five attempts are '
-      + 'exhausted. Read them by status and time, and DO NOT REPORT A COUNT OF DUPLICATES OR OF '
-      + 'PENDING DELIVERIES FROM THIS QUERY: it cannot establish either (o3d-il7a)',
+      + 'a SENT row has already gone; and A FAILED ROW IS NOT PROOF THAT NOTHING WENT — it means IMS '
+      + 'HOLDS NO DURABLE CONFIRMATION OF DELIVERY. ONE FAILED PATH IS CONCLUSIVE, because it runs '
+      + 'BEFORE anything is handed to a mail server: the suppression check, whose lastError begins '
+      + '"Suppressed recipient:" — that copy was never sent. EVERY OTHER FAILED ROW IS AMBIGUOUS. '
+      + 'The sender stamps SENT only after the transport call has returned, and that stamp is inside '
+      + 'the same try whose catch writes FAILED on the fifth attempt (and PENDING before it, which '
+      + 'sends the copy again), so a copy that WAS delivered and could not be stamped ends up FAILED; '
+      + 'and a send is judged from the transport error alone, which cannot say whether the server had '
+      + 'already accepted the message. Read them by status, lastError and time, and DO NOT REPORT A '
+      + 'COUNT OF DUPLICATES, OF PENDING DELIVERIES OR OF COPIES THAT DID NOT ARRIVE FROM THIS QUERY: '
+      + 'it cannot establish any of them (o3d-il7a)',
   },
   WC_INVOICE_NOTE: {
     effect: 'a second invoice note is written onto the WooCommerce order, once per sweep',
@@ -424,6 +467,10 @@ export const QBO_NO_IDENTIFIER_OPERATION_TYPES: readonly string[] =
  *
  * `LEDGER_DOCUMENT` — a standalone document Xero or QuickBooks accepted and still holds, with an id
  * that opens it. Real money in somebody else's books; no reset of ours voids it.
+ * `LEDGER_DOCUMENT_NO_IDENTIFIER` — the same class of write, from an operation whose handler DOES
+ * return a document id, on a record that carries NO id (round 8, Codex MEDIUM). The document is
+ * exactly as real; what is missing is the way to reach it. It gets its own sentence because the
+ * `LEDGER_DOCUMENT` one ends "Open the id in that system", and there is no id to open.
  * `LEDGER_NON_DOCUMENT` — a write the ledger accepted that is NOT a standalone document and returns
  * no id to open: a credit note APPLIED to a bill, a tax rate written into the organisation. The
  * write stands, and the allocation moves money — but there is nothing to go and look up by id.
@@ -436,6 +483,7 @@ export const QBO_NO_IDENTIFIER_OPERATION_TYPES: readonly string[] =
  */
 export type UnrecordedIncidentKind =
   | 'LEDGER_DOCUMENT'
+  | 'LEDGER_DOCUMENT_NO_IDENTIFIER'
   | 'LEDGER_NON_DOCUMENT'
   | 'NO_IDENTIFIER_SIDE_EFFECT'
   | 'UNCLASSIFIED'
@@ -536,13 +584,33 @@ export const INCIDENT_KIND_BY_OPERATION_TYPE: Readonly<Record<AccountingSyncType
  * (xero/sync-processor.ts `unrecordedPostedDocumentRecord`, quickbooks/sync-processor.ts
  * `unpersistedQboPostRecord`), so the field this reads is written on every row either connector
  * produces. A row without it is UNCLASSIFIED rather than assumed.
+ *
+ * ROUND 8 (Codex MEDIUM): AND THE OPERATION IS ONLY HALF THE ANSWER. The map says what a SUCCESSFUL
+ * handler for that type RETURNS; the record says what this incident actually GOT. Those come apart:
+ * both payment handlers return `{ success: true, externalId: res.data?.Payment?.Id }` (and
+ * `?.BillPayment?.Id`), a deeply-optional read with no presence check, and the caller passes
+ * `syncResult.externalId ?? null` on, so a QuickBooks post can succeed with NO id and still be
+ * recorded here. The Xero record has the same hole from the other side: `postedExternalId` is
+ * nullable on `UnrecordablePostedDocument` and its wording already prints "(no id returned)".
+ * Classifying such a row `LEDGER_DOCUMENT` earned it the breadcrumb sentence that ends "Open the id
+ * in that system" — an instruction to open something the record does not contain. So the classifier
+ * reads BOTH: the type decides the semantics, and `metadata.postedExternalId` decides whether the
+ * document-with-an-id sentence or the document-without-an-id sentence is true of this row. Only
+ * `LEDGER_DOCUMENT` is downgraded; the other kinds are the ones whose id is EXPECTED to be absent,
+ * and their wording never promised one.
  */
 export function classifyUnrecordedIncident(metadata: unknown): UnrecordedIncidentKind {
   if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) return 'UNCLASSIFIED'
   const type = (metadata as { type?: unknown }).type
   if (typeof type !== 'string' || type.length === 0) return 'UNCLASSIFIED'
-  return (INCIDENT_KIND_BY_OPERATION_TYPE as Record<string, UnrecordedIncidentKind | undefined>)[type]
+  const kind = (INCIDENT_KIND_BY_OPERATION_TYPE as Record<string, UnrecordedIncidentKind | undefined>)[type]
     ?? 'UNCLASSIFIED'
+  // THE OPERATION SAYS A DOCUMENT ID EXISTS; THE RECORD SAYS WHETHER ONE WAS WRITTEN DOWN.
+  if (kind !== 'LEDGER_DOCUMENT') return kind
+  const postedExternalId = (metadata as { postedExternalId?: unknown }).postedExternalId
+  return typeof postedExternalId === 'string' && postedExternalId.length > 0
+    ? 'LEDGER_DOCUMENT'
+    : 'LEDGER_DOCUMENT_NO_IDENTIFIER'
 }
 
 /** One tally per kind, so a caller cannot report a total it has not broken down. */
@@ -551,6 +619,7 @@ export type UnrecordedIncidentCounts = Record<UnrecordedIncidentKind, number>
 export function countUnrecordedIncidents(rows: readonly { metadata: unknown }[]): UnrecordedIncidentCounts {
   const counts: UnrecordedIncidentCounts = {
     LEDGER_DOCUMENT: 0,
+    LEDGER_DOCUMENT_NO_IDENTIFIER: 0,
     LEDGER_NON_DOCUMENT: 0,
     NO_IDENTIFIER_SIDE_EFFECT: 0,
     UNCLASSIFIED: 0,
@@ -568,8 +637,8 @@ export function countUnrecordedIncidents(rows: readonly { metadata: unknown }[])
  * here, next to the classifier that decides which sentence a row earns, so the two cannot drift.
  */
 export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentCounts): string {
-  const total = counts.LEDGER_DOCUMENT + counts.LEDGER_NON_DOCUMENT
-    + counts.NO_IDENTIFIER_SIDE_EFFECT + counts.UNCLASSIFIED
+  const total = counts.LEDGER_DOCUMENT + counts.LEDGER_DOCUMENT_NO_IDENTIFIER
+    + counts.LEDGER_NON_DOCUMENT + counts.NO_IDENTIFIER_SIDE_EFFECT + counts.UNCLASSIFIED
   const parts: string[] = [
     `Database reset kept ${total} record(s) of things IMS did against an accounting connector and `
     + 'could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately.',
@@ -578,6 +647,14 @@ export function describePreservedUnrecordedIncidents(counts: UnrecordedIncidentC
     parts.push(
       `${counts.LEDGER_DOCUMENT} name a DOCUMENT Xero or QuickBooks accepted and still holds — real `
       + 'money in somebody else\'s books, which no reset of ours voids. Open the id in that system.',
+    )
+  }
+  if (counts.LEDGER_DOCUMENT_NO_IDENTIFIER > 0) {
+    parts.push(
+      `${counts.LEDGER_DOCUMENT_NO_IDENTIFIER} are the same kind of write — a DOCUMENT Xero or `
+      + 'QuickBooks accepted, which no reset of ours voids — ON A RECORD THAT CARRIES NO ID. DO NOT '
+      + 'GO LOOKING FOR AN ID: there is none to open. Read those records themselves and find the '
+      + 'document in that system by the reference, the amount and the date they name.',
     )
   }
   if (counts.LEDGER_NON_DOCUMENT > 0) {
@@ -676,12 +753,22 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
       + 'This is the known hole o3d-qn21. Until the work above lands, this record is the only thing '
       + 'that says the effect repeated.'
   }
+  // ROUND 8 (Codex MEDIUM), as above: a post can succeed with no id at all — both payment handlers
+  // return `res.data?.Payment?.Id` / `?.BillPayment?.Id` without checking presence, and the caller
+  // passes `syncResult.externalId ?? null` straight through — so the remedy is written from whether
+  // an id is here, not from the fact that this operation type usually has one.
+  const posted = typeof postedExternalId === 'string' && postedExternalId.length > 0 ? postedExternalId : null
   return `QuickBooks ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as `
-    + `${postedExternalId ?? '(no id returned)'}, but IMS could not record that id: ${String(cause)}. `
+    + `${posted ?? '(no id returned)'}, but IMS could not record the post: ${String(cause)}. `
     + `Sync row ${entry.id} still names no document, so nothing in IMS points at this one and no `
     + 'mirrored accounting event was written for it — deliberately, because a FAILED one would deny a '
     + 'document that exists. The row keeps its claim and will be re-attempted once the claim goes '
     + 'stale; that attempt re-posts under the SAME Intuit Request-Id, so it should be deduplicated '
-    + 'rather than duplicated. REMEDY: open the id above in QuickBooks, confirm exactly one document '
-    + 'exists for this reference, and void any duplicate.'
+    + 'rather than duplicated. '
+    + (posted
+      ? 'REMEDY: open the id above in QuickBooks, confirm exactly one document exists for this '
+        + 'reference, and void any duplicate.'
+      : 'AND THE RESPONSE CARRIED NO ID EITHER, so there is nothing to open — do not go looking for '
+        + 'one. REMEDY: find the document in QuickBooks by the reference above, its amount and its '
+        + 'date, confirm exactly one exists for this reference, and void any duplicate.')
 }

@@ -273,8 +273,15 @@ test('STEP 1: the message does not tell an operator to cancel a queued copy (o3d
   for (const fragment of ['kind ACCOUNTING_INVOICE', 'referenceType SalesOrder', 'referenceId = the order id']) {
     assert.ok(description.includes(fragment), `inspecting them is still performable, and needs ${fragment}`)
   }
-  assert.match(description, /WHAT COMES BACK IS CANDIDATES, AND IMS CANNOT NARROW THEM/)
-  assert.match(description, /DO NOT REPORT A COUNT OF DUPLICATES OR OF PENDING DELIVERIES FROM THIS QUERY/)
+  // ROUND 8: the same two facts, now stated as a non-quiescent snapshot plus the narrowing it
+  // cannot do — and the prohibition covers copies that did NOT arrive as well, because a FAILED
+  // row is not proof of non-delivery either.
+  assert.match(description, /WHAT COMES BACK IS A NON-QUIESCENT SNAPSHOT/)
+  assert.match(description, /AND IMS CANNOT NARROW IT/)
+  assert.match(
+    description,
+    /DO NOT REPORT A COUNT OF DUPLICATES, OF PENDING DELIVERIES OR OF COPIES THAT DID NOT ARRIVE FROM THIS QUERY/,
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -790,11 +797,29 @@ test('STEP 7 (round 7): the plugin guard still refuses both connectors — and t
   assert.doesNotMatch(description, /it must be ONE save/)
 })
 
-test('STEP 7 (round 7): the INVOICE_EMAIL INSPECTION is ordered after the lever that stops new copies', async () => {
+// ROUND 8 (Codex MEDIUM): THE ORDERING THIS TEST PINNED COULD NOT BE ESTABLISHED.
+//
+// Round 7 said "STOP THE REPLAY FIRST", then inspect. The only lever is the sync toggle, and round
+// 7's own HIGH established that the toggle is an ADMISSION CHECK, not a fence — a run admitted
+// before the flip keeps going, and nothing in IMS reports whether one is. So "stop, then inspect"
+// promised a quiescence the same record had just denied, and the statuses read afterwards are a
+// racing snapshot. The wording is now admission-only and says the snapshot is non-quiescent.
+//
+// MUTATION THAT KILLS THIS: restore 'STOP THE REPLAY FIRST (the lever below), because until it is
+// stopped another row is queued every sweep.' to the INVOICE_EMAIL `check` — the first
+// doesNotMatch fails. Deleting the NON-QUIESCENT SNAPSHOT clause fails the third assertion. Both
+// were run.
+test('STEP 7 (round 8): the INVOICE_EMAIL inspection claims no quiescence, because the lever cannot give it one', async () => {
   const description = await incidentMessage('INVOICE_EMAIL')
-  assert.match(description, /STOP THE REPLAY FIRST/, 'an inspection taken while the sweep runs grows by one per sweep')
-  // ROUND 7: the ordered remedy that used to repeat this is gone, so the ordering now lives in one
-  // place only — and the thing being ordered is an INSPECTION, not a count reported to a customer.
+  assert.doesNotMatch(description, /STOP THE REPLAY FIRST/, 'there is no lever that stops a run already admitted')
+  assert.match(description, /TURN THE LEVER BELOW OFF FIRST, so that no NEW run is admitted/)
+  assert.match(description, /it is an ADMISSION CHECK, NOT A FENCE/)
+  assert.match(description, /WHAT COMES BACK IS A NON-QUIESCENT SNAPSHOT/)
+  assert.match(description, /re-run the query rather than treating one result as the final list/)
+  // The same record must go on saying WHY the lever cannot be trusted as a stop, one paragraph
+  // later — the two statements are the same fact and may not drift apart.
+  assert.match(description, /THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE/)
+  // ROUND 7, unchanged: what is being ordered is an INSPECTION, not a count reported to a customer.
   assert.doesNotMatch(description, /count the queued copies, settle this row/)
   assert.match(description, /Then INSPECT the outbox/)
 })

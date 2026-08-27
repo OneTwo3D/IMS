@@ -174,6 +174,7 @@ async function clearTransactionScope() {
       metadata: {
         preserved: preservedRows.length,
         ledgerDocuments: counts.LEDGER_DOCUMENT,
+        ledgerDocumentsWithoutIdentifier: counts.LEDGER_DOCUMENT_NO_IDENTIFIER,
         ledgerNonDocuments: counts.LEDGER_NON_DOCUMENT,
         noIdentifierSideEffects: counts.NO_IDENTIFIER_SIDE_EFFECT,
         unclassified: counts.UNCLASSIFIED,
