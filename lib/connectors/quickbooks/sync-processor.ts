@@ -552,12 +552,16 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             externalId: entry.externalTransactionId,
           })
         })
-        await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
-        await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+        const link = await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+        const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
         // Only reached when the enqueue did NOT throw. This branch has no catch of its own — an
         // exception propagates to the outer handler, which retries the row — so the obligation
         // simply stays claimed, which is the correct state for work that has not run.
-        await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
+        //
+        // AND NOT THROWING IS NOT THE SAME AS NOTHING BEING OWED (o3d-ekn8 r5): the back-reference
+        // write swallows its failure and the deferred-receipt re-drive is built never to throw, so
+        // the discharge asks both of them instead of inferring it from the absence of an exception.
+        await settleFollowUpObligation(entry, link, followUps)
         result.succeeded++
         continue
       }
@@ -604,9 +608,12 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // These are best-effort: if they fail, the external post is already
         // safely recorded and won't be replayed.
         try {
-          await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
-          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
+          const link = await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
+          const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
+          // o3d-ekn8 r5, Codex HIGH: released only if the link landed AND the receipts recorded
+          // before this invoice reached the ledger. Neither of those failures throws, so both had
+          // been arriving here as success and clearing the row's last record of the work.
+          await settleFollowUpObligation(entry, link, followUps)
         } catch (followUpError) {
           // ERROR, not WARNING: the external post is committed and this entry is about to be
           // marked succeeded, so nothing will drive these follow-ups again. A payment or PDF
@@ -1238,6 +1245,89 @@ async function quarantineRefusedBackReference(params: {
   }
 }
 
+/**
+ * WHETHER THE LOCAL LINK LANDED (o3d-ekn8 r5, Codex HIGH).
+ *
+ * `updateBackReference` swallows its failures on this connector (see the catch below — de-swallowing
+ * would change retry semantics for every type at once), and it used to return `void`, so the caller
+ * could not tell a written link from a failed one. That silence propagated: the deferred-receipt
+ * re-drive then found an order with no invoice id and returned quietly, and the processor released
+ * the follow-up obligation marker — the last record that this posted invoice still owed work.
+ *
+ * The failure is still swallowed. What is no longer swallowed is the FACT of it.
+ *
+ * `nothing-to-link` is kept apart from the failures on purpose: no external id means no link was
+ * ever owed, so it must not hold an obligation open. `ambiguous` and `contended` ARE failures for
+ * this purpose even though neither is an error — the link is not on the document, and on this
+ * connector nothing retries it.
+ */
+type BackReferenceLink =
+  | { linked: true }
+  | { linked: false; reason: 'nothing-to-link' }
+  | { linked: false; reason: 'ambiguous' | 'contended' | 'conflict' | 'failed' }
+
+/** Whether a link outcome leaves the row owing nothing further — see BackReferenceLink. */
+function backReferenceLeavesNothingOwed(link: BackReferenceLink): boolean {
+  return link.linked || link.reason === 'nothing-to-link'
+}
+
+/**
+ * DISCHARGE THE FOLLOW-UP OBLIGATION ONLY WHEN NOTHING IS STILL OWED (o3d-ekn8 r5, Codex HIGH).
+ *
+ * The release used to be unconditional on both post-success paths: `updateBackReference` swallows
+ * its failure and `enqueueFollowUps` returned `void`, so the loop cleared the marker whether or not
+ * the link had landed and whether or not the receipts recorded before the invoice ever reached the
+ * ledger. That marker is the ONLY thing distinguishing this row from one whose follow-ups completed
+ * — the row is SYNCED with an external id either way — so clearing it early is not a lost warning,
+ * it is a lost debt: a recorded receipt permanently unsettled behind a row that looks finished.
+ *
+ * The asymmetry is deliberate and is the one followUpObligationClaim was designed around: a marker
+ * left set costs one idempotent re-enqueue on a later sweep; a marker cleared early costs the
+ * payment. So it is released only when BOTH facts say nothing is outstanding.
+ *
+ * On this connector the retained marker drives nothing yet — the repair sweep is unwired until
+ * o3d-s36z (see the block at the end of this file). It is still the correct state to leave behind:
+ * the alternative is not "no marker", it is a row that has forgotten what it owes, and that fact
+ * cannot be recovered afterwards.
+ */
+async function settleFollowUpObligation(
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  link: BackReferenceLink,
+  followUps: FollowUpOutcome,
+): Promise<void> {
+  const linked = backReferenceLeavesNothingOwed(link)
+  if (linked && followUps.deferredReceiptsSettled) {
+    await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
+    return
+  }
+  const outstanding: string[] = []
+  if (!linked) outstanding.push(`the local link to the QuickBooks document did not land (${link.linked ? 'linked' : link.reason})`)
+  if (!followUps.deferredReceiptsSettled) outstanding.push('a receipt recorded before this invoice is still not registered in the ledger')
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'quickbooks_followup_obligation_retained',
+    tag: 'sync',
+    // ERROR when money is the thing left outstanding, WARNING when it is only the local link — the
+    // two need different people to do different things, and at one level the first reads as the
+    // second and nobody acts on it.
+    level: followUps.deferredReceiptsSettled ? 'WARNING' : 'ERROR',
+    description: `QuickBooks sync entry ${entry.id} posted to the ledger, but ${outstanding.join(', and ')}. `
+      + 'The row is deliberately left marked as owing follow-ups, because nothing else about it records that: '
+      + 'it is SYNCED and carries its external id exactly like a row that completed. Link the document and '
+      + 're-run the invoice sync for this reference, or register the receipt in QuickBooks by hand.',
+    metadata: {
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      backReference: link.linked ? 'linked' : link.reason,
+      deferredReceiptsSettled: followUps.deferredReceiptsSettled,
+    },
+    // Retaining the marker is ALREADY the safe state, so failing to describe it must not turn a
+    // posted invoice into a failed sync entry.
+  }).catch(() => { /* the state is on the row; the log is the notification */ })
+}
+
 async function updateBackReference(
   syncLogId: string,
   type: AccountingSyncType,
@@ -1245,8 +1335,8 @@ async function updateBackReference(
   referenceId: string,
   externalId?: string,
   invoiceNumber?: string,
-): Promise<void> {
-  if (!externalId) return
+): Promise<BackReferenceLink> {
+  if (!externalId) return { linked: false, reason: 'nothing-to-link' }
 
   try {
     // EVERY type goes through the shared writer, exactly as Xero's does (o3d-9kek). Hand-rolled
@@ -1272,13 +1362,19 @@ async function updateBackReference(
           + 'isolation, o3d-s36z), so resolving the ambiguity on its own will not link the bill.',
         metadata: { referenceType, referenceId, externalId, reason: applied.attribution.reason },
       })
+      return { linked: false, reason: 'ambiguous' }
     }
     // o3d-9kek finding 3: the resolved bill gained an external id between the resolve and
     // the compare-and-swap, so nothing was written and nothing was overwritten. Not an
     // error — the repair sweep re-resolves it from the state that actually won.
     if (applied.outcome === 'contended') {
       console.warn(`quickbooks: back-reference for PO ${referenceId} lost the race for bill ${applied.purchaseInvoiceId}; it must be linked by hand.`)
+      return { linked: false, reason: 'contended' }
     }
+    // `nothing-to-apply` is a type/reference pair that writes no back-reference at all (or a legacy
+    // PO row with no bill to attribute to) — nothing was owed, so nothing is outstanding.
+    if (applied.outcome === 'nothing-to-apply') return { linked: false, reason: 'nothing-to-link' }
+    return { linked: true }
   } catch (error) {
     // AN EXTERNAL-ID CONFLICT IS NOT A FAILURE TO REPORT AND FORGET (o3d-9kek r7 finding 1). The
     // document is already in the QuickBooks ledger; the index refused only the LOCAL record of it.
@@ -1288,7 +1384,7 @@ async function updateBackReference(
     // same index refuses a manual link too.
     if (isExternalDocumentIdConflict(error)) {
       await quarantineRefusedBackReference({ syncLogId, type, referenceType, referenceId, externalId, error })
-      return
+      return { linked: false, reason: 'conflict' }
     }
     // Pre-existing: QuickBooks swallows back-reference failures here (Xero does not — it
     // propagates so the caller retries). Still not changed, because de-swallowing alters QBO's
@@ -1316,7 +1412,22 @@ async function updateBackReference(
         + '(blocked on realm isolation, o3d-s36z). Link the document to that external id by hand.',
       metadata: { type, referenceType, referenceId, externalId },
     })
+    return { linked: false, reason: 'failed' }
   }
+}
+
+/**
+ * WHAT THE FOLLOW-UP WORK LEFT OUTSTANDING (o3d-ekn8 r5, Codex HIGH).
+ *
+ * `enqueueFollowUps` returned `void`, so "it did not throw" was the only signal the processing loop
+ * had — and it released the durable follow-up obligation on that. But the deferred-receipt re-drive
+ * is explicitly built never to throw (a receipt that cannot be registered must not fail a sync entry
+ * whose invoice HAS posted), so every way it can leave money unregistered arrived at the release as
+ * success. This carries the fact back instead of leaving the loop to assume it.
+ */
+type FollowUpOutcome = {
+  /** False when a receipt recorded before this invoice is still waiting to reach the ledger. */
+  deferredReceiptsSettled: boolean
 }
 
 async function enqueueSalesInvoiceFollowUps(
@@ -1325,8 +1436,8 @@ async function enqueueSalesInvoiceFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string; invoiceNumber?: string },
-): Promise<void> {
-  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return
+): Promise<FollowUpOutcome> {
+  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return { deferredReceiptsSettled: true }
   // Captured once, so the id handed to the deferred re-drive below is provably the one THIS post
   // returned rather than a re-read of a narrowed property.
   const postedInvoiceId: string = syncResult.externalId
@@ -1423,10 +1534,16 @@ async function enqueueSalesInvoiceFollowUps(
   // this processor made the call, and `syncResult.externalId` is the id the call returned. A connector
   // swap or a delete-and-re-post between the post and the re-drive silently redirected it. Re-resolving
   // after a pin is the race being closed, not a check of it, so the evidence goes IN.
-  await registerDeferredOrderReceipts(referenceId, {
+  //
+  // AND THE ANSWER IS CARRIED BACK (o3d-ekn8 r5, Codex HIGH). It is awaited but never allowed to
+  // throw, which meant "it returned" was indistinguishable from "the receipts reached the ledger" —
+  // including the case this whole hand-off is about, where `updateBackReference` failed, the order
+  // carries no invoice id, and the re-drive has nothing it is allowed to settle against.
+  const redrive = await registerDeferredOrderReceipts(referenceId, {
     connector: 'quickbooks',
     accountingInvoiceId: postedInvoiceId,
   })
+  return { deferredReceiptsSettled: redrive.settled }
 }
 
 async function enqueuePurchaseInvoiceFollowUps(
@@ -1451,15 +1568,14 @@ async function enqueueFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string; invoiceNumber?: string },
-): Promise<void> {
+): Promise<FollowUpOutcome> {
   if (type === 'SALES_INVOICE') {
-    await enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
-    return
+    return enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
   }
 
   if (type === 'PURCHASE_INVOICE') {
     await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
-    return
+    return { deferredReceiptsSettled: true }
   }
 
   if (type === 'INVOICE_PDF' && referenceType === 'SalesOrder') {
@@ -1484,6 +1600,9 @@ async function enqueueFollowUps(
       await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId })
     }
   }
+  // Every remaining type enqueues rows that carry their own document id in the payload; none of them
+  // has a deferred receipt waiting on it.
+  return { deferredReceiptsSettled: true }
 }
 
 // ---------------------------------------------------------------------------

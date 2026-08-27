@@ -140,6 +140,42 @@ export type PostedInvoiceEvidence = {
 }
 
 /**
+ * WHAT THE RE-DRIVE ACTUALLY SETTLED (o3d-ekn8 r5, Codex HIGH).
+ *
+ * This used to return `void`, and the caller read that as "done". It was not: EVERY early return
+ * below — the order carrying no invoice id because the back-reference write failed, the document
+ * having moved, the catch — looks identical to "there was nothing to do" from the outside, and the
+ * connector then RELEASED the follow-up obligation marker that is the only remaining record that
+ * this order still owes the ledger a receipt. A recorded receipt was left permanently unsettled
+ * behind a row that says its follow-ups completed.
+ *
+ * So the answer is now explicit, and `settled` is deliberately not "no error": it is TRUE only when
+ * nothing is left awaiting registration under the PINNED connector AND document — a fact re-read
+ * from the rows that exist afterwards, not inferred from having reached the end of the loop.
+ *
+ * A refusal counts as UNSETTLED. That is the asymmetry the obligation marker was designed around
+ * (see followUpObligationClaim): a marker left set costs one idempotent re-enqueue on a later
+ * sweep, a marker cleared early costs the payment.
+ */
+export type DeferredReceiptRedriveResult = {
+  /** True only when no receipt on this order is still waiting to be registered against this post. */
+  settled: boolean
+  reason:
+    | 'sync-disabled'
+    | 'posting-context-unknown'
+    | 'no-order'
+    | 'no-receipts'
+    | 'not-linked'
+    | 'document-moved'
+    | 'nothing-awaiting'
+    | 'registered'
+    | 'left-unregistered'
+    | 'failed'
+  /** How many receipts were still awaiting registration when this returned. */
+  awaiting?: number
+}
+
+/**
  * Thrown to ROLL BACK a registration that was written under a connector this call did not pin.
  *
  * `queueAccountingSyncTx` resolves the active connector for ITSELF, after the pin was taken, so a clean
@@ -672,14 +708,22 @@ export async function registerInvoicePaymentWithLedger(params: {
  * settlement figure that stops adding up. So they travel in, and every check below is made against
  * them rather than against whatever is live now.
  *
- * Never throws: a follow-up enqueue must not fail the sync entry that posted the invoice.
+ * Never throws: a follow-up enqueue must not fail the sync entry that posted the invoice. It does,
+ * since o3d-ekn8 r5, REPORT what it settled — because "did not throw" and "the receipts reached the
+ * ledger" are different facts, and the caller releases a durable obligation on the answer.
  */
 export async function registerDeferredOrderReceipts(
   orderId: string,
   posted: PostedInvoiceEvidence,
-): Promise<void> {
+): Promise<DeferredReceiptRedriveResult> {
   try {
-    if (!(await isAccountingSyncTypeEnabledFor(posted.connector, 'INVOICE_PAYMENT').catch(() => false))) return
+    // Does the PINNED connector post payments at all? A THROW is not the same answer as "off"
+    // (o3d-ekn8 r5): one says nothing is expected of this order, the other says we could not find
+    // out — and only the first discharges the caller's follow-up obligation. `.catch(() => false)`
+    // collapsed the two into the one that lets the marker be cleared.
+    const paymentsPost = await isAccountingSyncTypeEnabledFor(posted.connector, 'INVOICE_PAYMENT').catch(() => null)
+    if (paymentsPost === null) return { settled: false, reason: 'posting-context-unknown' }
+    if (!paymentsPost) return { settled: true, reason: 'sync-disabled' }
     const order = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: {
@@ -695,7 +739,44 @@ export async function registerDeferredOrderReceipts(
         },
       },
     })
-    if (!order || !order.accountingInvoiceId || order.payments.length === 0) return
+    if (!order) return { settled: true, reason: 'no-order' }
+    // Nothing was recorded before the invoice, so nothing is owed and the caller's obligation is
+    // genuinely discharged. Asked BEFORE the link check on purpose: an order with no receipts must
+    // not hold an obligation open over a back-reference that has nothing to do with money.
+    if (order.payments.length === 0) return { settled: true, reason: 'no-receipts' }
+
+    // THE LINK NEVER LANDED (o3d-ekn8 r5, Codex HIGH). QuickBooks' `updateBackReference` catches its
+    // own failure, so the invoice can post while the order is left with no accountingInvoiceId at
+    // all — and this function's old first line treated that exactly like "no receipts to register"
+    // and returned in silence. Every receipt on this order then stayed unregistered, nothing said
+    // so, and the processor released the marker that was the last record of the debt.
+    //
+    // It is NOT folded into the mismatch arm below, even though `null !== posted.accountingInvoiceId`
+    // would reach it: the cause is different and so is the remedy. A mismatch means somebody
+    // re-posted the invoice; this means the local link write failed and the document in the ledger
+    // has no local record of it at all.
+    if (!order.accountingInvoiceId) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'deferred_invoice_payment_registration_unlinked',
+        tag: 'accounting',
+        level: 'ERROR',
+        description:
+          `The invoice for this order posted to ${posted.connector} as ${posted.accountingInvoiceId}, but the ` +
+          `order carries no invoice id — the back-reference write did not land — so the ` +
+          `${order.payments.length} receipt(s) recorded before it were NOT registered and nothing retries ` +
+          `them. Link the order to ${posted.accountingInvoiceId}, then re-run the invoice sync, or register ` +
+          `the payments in the accounting connector by hand.`,
+        metadata: {
+          orderId,
+          connector: posted.connector,
+          postedInvoiceId: posted.accountingInvoiceId,
+          receipts: order.payments.length,
+        },
+      }).catch(() => { /* logging must never block the follow-up */ })
+      return { settled: false, reason: 'not-linked', awaiting: order.payments.length }
+    }
 
     // The order must still point at the document this post returned. It normally does — updateBackReference
     // runs immediately before this — but "normally" is the whole of the old guarantee, and a re-post in
@@ -719,7 +800,7 @@ export async function registerDeferredOrderReceipts(
           currentInvoiceId: order.accountingInvoiceId,
         },
       }).catch(() => { /* logging must never block the follow-up */ })
-      return
+      return { settled: false, reason: 'document-moved', awaiting: order.payments.length }
     }
 
     const awaiting = selectReceiptsAwaitingRegistration({
@@ -733,7 +814,7 @@ export async function registerDeferredOrderReceipts(
       // as spoken for, and the replacement invoice was never settled by anything.
       accountingInvoiceId: posted.accountingInvoiceId,
     })
-    if (awaiting.length === 0) return
+    if (awaiting.length === 0) return { settled: true, reason: 'nothing-awaiting' }
 
     const orderReference = getSalesOrderReference(order)
     for (const receipt of awaiting) {
@@ -749,6 +830,25 @@ export async function registerDeferredOrderReceipts(
         paidAt: receipt.paidAt,
       })
     }
+
+    // DID THE MONEY ACTUALLY GET QUEUED? (o3d-ekn8 r5, Codex HIGH.) Reaching the end of the loop is
+    // not evidence that it did: `registerInvoicePaymentWithLedger` never throws — it reports every
+    // refusal and every rollback as a warning and returns — so a receipt refused for capacity, or one
+    // whose row was written for another ledger and UNWRITTEN by the pinned-connector fence, leaves
+    // this loop looking exactly like a receipt that was registered.
+    //
+    // So the answer is read back off the rows that now exist, through the SAME selector that chose
+    // the work — scoped to the pinned connector and the pinned document, so a row queued under the
+    // connector that was switched on mid-flight cannot answer for one that was not. A second, laxer
+    // copy of "is this receipt spoken for?" is exactly what o3d-ekn8 r3 had to unpick.
+    const stillAwaiting = selectReceiptsAwaitingRegistration({
+      receipts: order.payments,
+      existing: await loadInvoicePaymentSyncRows(order.id, posted.connector),
+      accountingInvoiceId: posted.accountingInvoiceId,
+    })
+    return stillAwaiting.length === 0
+      ? { settled: true, reason: 'registered' }
+      : { settled: false, reason: 'left-unregistered', awaiting: stillAwaiting.length }
   } catch (error) {
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -762,5 +862,6 @@ export async function registerDeferredOrderReceipts(
         `invoice sync.`,
       metadata: { orderId, error: error instanceof Error ? error.message : String(error) },
     }).catch(() => { /* logging must never block the follow-up either */ })
+    return { settled: false, reason: 'failed' }
   }
 }
