@@ -2530,3 +2530,304 @@ for (const entry of R8_CASES) {
     assert.equal(result.markerExists, true, 'and the fence kept')
   })
 }
+
+// ---------------------------------------------------------------------------
+// FINDING 2 — a failed cron-backup write must not become an authoritative backup.
+//
+// The file used to be created BEFORE the flag saying this run owns it, so a short write or a
+// failed chmod left a truncated file at the authoritative path that the arming unwind
+// disowned and a later run adopted as the previous run's verbatim original. A successful
+// unfence then replaced the real crontab with those contents.
+// ---------------------------------------------------------------------------
+
+/**
+ * publish_cron_backup(), run for real, with one thing broken at a time.
+ *
+ * `shim` is bash injected immediately before the call: `printf` and `chmod` are shadowed by
+ * functions there, which is how a partial write and a permissions failure are produced
+ * without a full disk or a read-only mount.
+ */
+function runPublishCronBackup(
+  entry: (typeof R8_CASES)[number],
+  shim: string,
+  content = '*/5 * * * * /usr/bin/true\n#DEPLOY-FENCE# kept',
+): { status: number; stdout: string; published: string | null; mode: string | null; leftovers: string[] } {
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r8-cron-'))
+  try {
+    const program = [
+      'set -euo pipefail',
+      entry.preamble(dir),
+      TRAP_STUBS,
+      entry.extra,
+      R8_STUBS,
+      shellFunction(entry.source, 'publish_cron_backup'),
+      'CRON_BACKUP_CREATED=false',
+      shim,
+      'RC=0',
+      `publish_cron_backup "$(cat "${dir}/content.txt")" || RC=$?`,
+      'echo "RC=${RC}"',
+      'echo "CRON_BACKUP_CREATED=${CRON_BACKUP_CREATED}"',
+    ].join('\n')
+    writeFileSync(join(dir, 'content.txt'), content)
+    let stdout = ''
+    let status = 0
+    try {
+      stdout = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) {
+      const err = error as { status?: number; stdout?: string; stderr?: string }
+      status = err.status ?? -1
+      stdout = `${err.stdout ?? ''}${err.stderr ?? ''}`
+    }
+    const backup = join(dir, 'crontab.bak')
+    // Anything at all left next to the backup path: a stray temporary is not a correctness
+    // bug, but a stray temporary NAMED like the backup would be adopted by the next run.
+    const leftovers = execFileSync('bash', ['-c', `ls -1 "${dir}" | grep '^crontab' || true`], { encoding: 'utf8' })
+      .split('\n')
+      .filter(Boolean)
+    return {
+      status,
+      stdout,
+      published: existsSync(backup) ? readFileSync(backup, 'utf8') : null,
+      mode: existsSync(backup) ? execFileSync('stat', ['-c', '%a', backup], { encoding: 'utf8' }).trim() : null,
+      leftovers,
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+for (const entry of R8_CASES) {
+  test(`${entry.name} publishes the crontab backup atomically and owns it the moment it exists`, () => {
+    const ok = runPublishCronBackup(entry, ':')
+    assert.match(ok.stdout, /RC=0/, `a clean publish must succeed:\n${ok.stdout}`)
+    assert.equal(
+      ok.published,
+      '*/5 * * * * /usr/bin/true\n#DEPLOY-FENCE# kept\n',
+      'and the backup must be the crontab verbatim, comment lines and all',
+    )
+    assert.equal(ok.mode, '600', 'and readable only by root')
+    assert.match(
+      ok.stdout,
+      /CRON_BACKUP_CREATED=true/,
+      'and owned by THIS run — an unowned backup is one the arming unwind refuses to restore from',
+    )
+    assert.deepEqual(ok.leftovers, ['crontab.bak'], `no temporary file may survive a successful publish: ${ok.leftovers}`)
+  })
+
+  test(`${entry.name} leaves NOTHING at the backup path when the write is short`, () => {
+    // The exact shape of the defect: a partial write. `printf` is shadowed so the file on
+    // disk is not what was asked for.
+    const short = runPublishCronBackup(entry, `printf(){ builtin printf '%s' 'TRUNCATED'; }`)
+
+    assert.ok(short.status === 0, 'the harness itself must not die')
+    assert.match(short.stdout, /RC=1/, `a short write must be reported, not published:\n${short.stdout}`)
+    assert.equal(
+      short.published,
+      null,
+      'a truncated backup at the authoritative path is the whole defect: a later run adopts it as verbatim and a successful unfence replaces the real crontab with it',
+    )
+    assert.match(short.stdout, /CRON_BACKUP_CREATED=false/, 'and nothing may claim to own it')
+    assert.deepEqual(short.leftovers, [], `and no temporary may be left behind: ${short.leftovers}`)
+  })
+
+  test(`${entry.name} leaves NOTHING at the backup path when the permissions cannot be set`, () => {
+    const denied = runPublishCronBackup(entry, `chmod(){ return 1; }`)
+
+    assert.match(denied.stdout, /RC=1/, `a failed chmod must be reported, not published:\n${denied.stdout}`)
+    assert.equal(denied.published, null, 'a world-readable crontab backup is not a backup this script publishes')
+    assert.match(denied.stdout, /CRON_BACKUP_CREATED=false/, 'and nothing may claim to own it')
+    assert.deepEqual(denied.leftovers, [], `and no temporary may be left behind: ${denied.leftovers}`)
+  })
+
+  test(`${entry.name} publishes cleanly on the retry after a failed attempt`, () => {
+    // The failure and then the fix, in one process: the second call must find no wreckage
+    // from the first and must publish the real thing.
+    const retry = runPublishCronBackup(
+      entry,
+      [
+        `printf(){ builtin printf '%s' 'TRUNCATED'; }`,
+        'RC1=0',
+        'publish_cron_backup "$(cat "$(dirname "${CRON_BACKUP}")/content.txt")" || RC1=$?',
+        'echo "FIRST_RC=${RC1}"',
+        'unset -f printf',
+      ].join('\n'),
+    )
+    assert.match(retry.stdout, /FIRST_RC=1/, 'the first attempt must fail')
+    assert.match(retry.stdout, /RC=0/, `and the retry must succeed:\n${retry.stdout}`)
+    assert.equal(retry.published, '*/5 * * * * /usr/bin/true\n#DEPLOY-FENCE# kept\n', 'with the real crontab, not the wreckage')
+    assert.match(retry.stdout, /CRON_BACKUP_CREATED=true/, 'and owned by this run')
+    assert.deepEqual(retry.leftovers, ['crontab.bak'], `and no temporary from either attempt: ${retry.leftovers}`)
+  })
+
+  test(`${entry.name} refuses to fence the cron writers when the backup cannot be published`, () => {
+    // And the wiring: a backup that cannot be verified must stop the run INSIDE the arming
+    // phase, where the trap unwinds it with nothing stopped — not fence a crontab nobody
+    // can put back.
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r8-fence-'))
+    try {
+      const program = [
+        'set -euo pipefail',
+        entry.preamble(dir),
+        TRAP_STUBS,
+        entry.extra,
+        R8_STUBS,
+        'crontab(){ if [[ "${3:-}" == "-l" ]]; then echo "*/5 * * * * /usr/bin/true"; else echo "crontab $*" >> "${LOG}"; fi; return 0; }',
+        shellFunction(entry.source, 'publish_cron_backup'),
+        shellFunction(entry.source, 'fence_cron'),
+        'CRON_FENCED=false',
+        'CRON_BACKUP_CREATED=false',
+        `printf(){ builtin printf '%s' 'TRUNCATED'; }`,
+        'RC=0',
+        'fence_cron || RC=$?',
+        'unset -f printf',
+        'echo "RC=${RC}"',
+        'echo "CRON_FENCED=${CRON_FENCED}"',
+      ].join('\n')
+      let stdout = ''
+      let status = 0
+      try {
+        stdout = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+      } catch (error) {
+        const err = error as { status?: number; stdout?: string; stderr?: string }
+        status = err.status ?? -1
+        stdout = `${err.stdout ?? ''}${err.stderr ?? ''}`
+      }
+      const log = readFileSync(join(dir, 'calls.log'), 'utf8')
+      assert.equal(status, 9, `fence_cron must die when the backup cannot be published:\n${stdout}`)
+      assert.match(stdout, /DIE: .*could not be backed up/, 'and say why')
+      assert.ok(
+        !/crontab -u appuser -$/m.test(log),
+        `and it must NOT comment the crontab out with no backup anyone can restore: ${log}`,
+      )
+      assert.equal(existsSync(join(dir, 'crontab.bak')), false, 'and leave nothing at the backup path')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 3 — the escape hatch closed the teardown window it promises to keep open.
+//
+// IMS_ALLOW_UNIDENTIFIED_DEV_RESPONDER=1 finishes a run in which NOTHING identified the
+// process on the port. Its own warning, and the runbook, say the release is therefore not
+// declared irreversible and a later failure can still be torn down. But the script cleared
+// BOTH phase flags before restoring cron: a failure in that cleanup then matched none of the
+// trap's four branches, so the trap did nothing at all and an unidentified process was left
+// serving the migrated schema.
+//
+// Run for real: the tail of the script from the point-of-no-return decision to DEPLOY_OK,
+// under the real exit trap, with the cron restore failing.
+// ---------------------------------------------------------------------------
+
+/** The end-of-cutover block, lifted verbatim: the arming decision through to DEPLOY_OK. */
+function pointOfNoReturnBlock(source: string): string {
+  const lines = source.split(/\r?\n/)
+  const start = lines.findIndex((line) => /^if \$NEW_BUILD_SERVING \|\| \$DEV_RESPONDER_PROVEN \|\| \$DRY_RUN; then$/.test(line))
+  assert.notEqual(start, -1, 'deploy.sh must decide the point of no return from the proofs, in one place')
+  const end = lines.findIndex((line, index) => index > start && line === 'DEPLOY_OK=true')
+  assert.notEqual(end, -1, 'and finish by declaring the deploy OK')
+  return lines.slice(start, end + 1).join('\n')
+}
+
+function runPointOfNoReturn(state: string, unfenceRc: number): { log: string; stdout: string; trapExit: number } {
+  const entry = R8_CASES.find((candidate) => candidate.name === 'deploy.sh')!
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r8-ponr-'))
+  try {
+    const dropinDir = join(dir, 'dropin')
+    execFileSync('mkdir', ['-p', dropinDir])
+    writeFileSync(join(dir, 'FENCED'), 'phase=stopping\nmigration_attempted=true\nschema_touched=true\n')
+    writeFileSync(join(dropinDir, 'zz-deploy-fence.conf'), '[Unit]\n')
+    writeFileSync(join(dir, 'crontab.bak'), '*/5 * * * * /usr/bin/true\n')
+
+    const program = [
+      'set -euo pipefail',
+      entry.preamble(dir),
+      TRAP_STUBS,
+      entry.extra,
+      R8_STUBS,
+      `unfence_cron(){ echo "unfence_cron" >> "\${LOG}"; return ${unfenceRc}; }`,
+      shellFunction(entry.source, 'restore_cron_from_backup'),
+      shellFunction(entry.source, 'rollback_reboot_fence_install'),
+      shellFunction(entry.source, 'unwind_arming'),
+      shellFunction(entry.source, 'on_exit'),
+      state,
+      // The subshell absorbs the trap's own `exit` so the log can still be read afterwards.
+      // It must NOT be an operand of `||`: bash suppresses errexit for every command of an
+      // AND-OR list but the last, and the whole point here is that a failing cleanup step
+      // reaches the trap the way it does in a real run.
+      'set +e',
+      `( trap on_exit EXIT; set -e\n${pointOfNoReturnBlock(entry.source)}\n)`,
+      'TRAP_STATUS=$?',
+      'set -e',
+      'echo "TRAP_EXIT=${TRAP_STATUS}"',
+    ].join('\n')
+    const stdout = execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    return {
+      log: readFileSync(join(dir, 'calls.log'), 'utf8'),
+      stdout,
+      trapExit: Number(/TRAP_EXIT=(\d+)/.exec(stdout)?.[1] ?? -1),
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+/** Mid-cutover, at the moment the health phase hands over: stopped, migrated, cron fenced. */
+const CUTOVER_STATE = [
+  'FENCE_ARMED=true',
+  'CUTOVER_ARMING=true',
+  'CRON_FENCED=true',
+  'CRON_BACKUP_CREATED=true',
+  'SCHEMA_TOUCHED=true',
+  'DB_FENCE_UP=false',
+  'DEPLOY_OK=false',
+  'PAST_POINT_OF_NO_RETURN=false',
+].join('\n')
+
+test('deploy.sh keeps the escape path tearable-down while its cleanup runs', () => {
+  // The escape hatch: neither proof holds, so the point of no return is never armed. The
+  // cron restore then fails.
+  const result = runPointOfNoReturn(
+    [CUTOVER_STATE, 'NEW_BUILD_SERVING=false', 'DEV_RESPONDER_PROVEN=false', 'DRY_RUN=false'].join('\n'),
+    1,
+  )
+
+  assert.equal(result.trapExit, 1, `the failure status must reach the trap and survive it:\n${result.stdout}`)
+  assert.match(
+    result.stdout,
+    /AFTER THE STOP/,
+    `the trap must still recognise this as a post-stop failure — with both flags cleared it matched no branch at all and printed nothing:\n${result.stdout}`,
+  )
+  assert.match(result.log, /systemctl stop/, 'and re-stop whatever is holding the port')
+  assert.match(result.log, /install_reboot_fence/, 'and re-establish the reboot fence')
+  assert.match(result.log, /refence_db_connections/, 'and close the database again over a schema that has moved')
+})
+
+test('deploy.sh does NOT tear down a proven responder whose cleanup fails', () => {
+  // The control that keeps the fix honest in the other direction: a run that proved its
+  // responder is past the point of no return, and a failing cron restore must not stop it.
+  const result = runPointOfNoReturn(
+    [CUTOVER_STATE, 'NEW_BUILD_SERVING=false', 'DEV_RESPONDER_PROVEN=true', 'DRY_RUN=false'].join('\n'),
+    1,
+  )
+
+  assert.match(result.stdout, /THE DEPLOY IS UP/, `a proven responder must reach the point-of-no-return branch:\n${result.stdout}`)
+  assert.ok(!/systemctl stop/.test(result.log), `and nothing may stop it: ${result.log}`)
+  assert.ok(!/refence_db_connections/.test(result.log), 'nor revoke CONNECT on a deploy that has already succeeded')
+  assert.equal(result.trapExit, 1, 'the cleanup failure is still reported')
+})
+
+test('deploy.sh finishes the escape path cleanly when its cleanup succeeds', () => {
+  // And the control that stops "leave FENCE_ARMED raised for ever" from passing the first
+  // test: once cron and the marker are dealt with, the flag comes down and the run finishes.
+  const result = runPointOfNoReturn(
+    [CUTOVER_STATE, 'NEW_BUILD_SERVING=false', 'DEV_RESPONDER_PROVEN=false', 'DRY_RUN=false'].join('\n'),
+    0,
+  )
+
+  assert.equal(result.trapExit, 0, `a completed escape-path run must exit 0:\n${result.stdout}`)
+  assert.ok(!/systemctl stop/.test(result.log), `and tear nothing down: ${result.log}`)
+  assert.ok(!/AFTER THE STOP/.test(result.stdout), 'and print no failure banner')
+  assert.match(result.log, /unfence_cron/, 'the cleanup it was covering must actually have run')
+})
