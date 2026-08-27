@@ -89,3 +89,69 @@ test('o3d-2k5r r5 affordance: the MISSING_IN_WMS re-push takes the same connecto
   // Fails closed on a connector this build does not know, like every other reader of the policy.
   assert.equal(decideWmsMissingRepush({ connector: '', reference: 'SO-1' }).repushable, false)
 })
+
+// --- the ROW the client receives -------------------------------------------------------
+
+test('o3d-2k5r r5 row: a ShipHero park reaches the inbox with NO replay affordance and the guidance instead', async () => {
+  // The finding, at the point it is observable: the client renders `replayable`, so if the row says
+  // true the button is on screen whatever the action does. This is the row that used to get one.
+  const { buildBlockedWmsPushRow } = await import('../lib/domain/wms/push-recovery-affordance.ts')
+  const row = buildBlockedWmsPushRow({
+    orderId: 'so-1',
+    connector: 'shiphero',
+    state: 'AMBIGUOUS_CREATE',
+    attempts: 1,
+    externalOrderId: null,
+    pushedAt: null,
+    lastError: null,
+    lastAttemptAt: new Date('2026-08-20T09:00:00.000Z'),
+    order: { id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null },
+  })
+  assert.equal(row.replayable, false)
+  assert.match(row.replayRefusal!, /not safe to repeat/)
+  assert.equal(row.why, 'Create outcome unknown', 'and it is not called an ordinary push failure')
+})
+
+test('o3d-2k5r r5 row: the same park on Mintsoft keeps its button', async () => {
+  const { buildBlockedWmsPushRow } = await import('../lib/domain/wms/push-recovery-affordance.ts')
+  const row = buildBlockedWmsPushRow({
+    orderId: 'so-1',
+    connector: 'mintsoft',
+    state: 'AMBIGUOUS_CREATE',
+    attempts: 1,
+    externalOrderId: null,
+    pushedAt: null,
+    lastError: null,
+    lastAttemptAt: null,
+    order: { id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null },
+  })
+  assert.equal(row.replayable, true)
+  assert.equal(row.replayRefusal, null)
+  assert.equal(row.lastAttemptAt, null)
+})
+
+test('o3d-2k5r r5 row: a MISSING_IN_WMS drift row carries the re-push affordance, other categories carry none', async () => {
+  const { buildOrderReconcileDriftRow } = await import('../lib/domain/wms/push-recovery-affordance.ts')
+  const base = {
+    orderId: 'so-1',
+    connector: 'shiphero',
+    detail: null,
+    externalOrderNumber: 'WMS-1',
+    lastSeenAt: new Date('2026-08-20T09:00:00.000Z'),
+    order: { id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null },
+  }
+  const missing = buildOrderReconcileDriftRow({ ...base, category: 'MISSING_IN_WMS' })
+  assert.equal(missing.repushable, false)
+  assert.match(missing.repushRefusal!, /does not refuse a duplicate/)
+
+  assert.equal(buildOrderReconcileDriftRow({ ...base, connector: 'mintsoft', category: 'MISSING_IN_WMS' }).repushable, true)
+
+  // NOT_PUSHED and ACTIVE_AFTER_CANCEL are resolved at the order or in the WMS — no control, and
+  // therefore no refusal text either, or the row would explain the absence of a button that was
+  // never offered for this category in the first place.
+  for (const category of ['NOT_PUSHED', 'ACTIVE_AFTER_CANCEL']) {
+    const row = buildOrderReconcileDriftRow({ ...base, connector: 'mintsoft', category })
+    assert.equal(row.repushable, false, category)
+    assert.equal(row.repushRefusal, null, category)
+  }
+})

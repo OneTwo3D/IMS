@@ -21,9 +21,9 @@ import {
 import { runPostMaintenanceRecheckForActiveConnector } from '@/lib/domain/wms/post-maintenance-recheck'
 import { eligibleCohortDigest, isolatableLinkWhere, loadUnresolvedDriftIncidents, readRawDriftState, unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
 import {
+  buildBlockedWmsPushRow,
+  buildOrderReconcileDriftRow,
   decideWmsMissingRepush,
-  decideWmsPushReplay,
-  describeBlockedWmsPush,
 } from '@/lib/domain/wms/push-recovery-affordance'
 import { wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugins'
@@ -641,25 +641,9 @@ async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
       order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
     },
   })
-  return rows.map((row) => {
-    // o3d-2k5r r5: only MISSING_IN_WMS has a control, and only on a connector whose create refuses
-    // a duplicate. The other categories are resolved in the WMS or at the order and never carried
-    // a button, so they are not asked.
-    const decision = row.category === 'MISSING_IN_WMS'
-      ? decideWmsMissingRepush({ connector: row.connector, reference: wmsPushOrderReference(row.order) })
-      : null
-    return {
-      orderId: row.orderId,
-      orderNumber: row.order.orderNumber,
-      externalOrderNumber: row.externalOrderNumber,
-      category: row.category,
-      detail: row.detail,
-      foundAt: row.lastSeenAt.toISOString(),
-      connector: row.connector,
-      repushable: decision?.repushable === true,
-      repushRefusal: decision && !decision.repushable ? decision.guidance : null,
-    }
-  })
+  // o3d-2k5r r5: the row (and its affordance) is built by the shared rule, not here — see
+  // buildOrderReconcileDriftRow. Only MISSING_IN_WMS ever carried a control.
+  return rows.map(buildOrderReconcileDriftRow)
 }
 
 /**
@@ -1082,21 +1066,9 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   }
 
   const data: Omit<ExceptionInboxData, 'summary' | 'maintenanceRecovery'> = {
-    wmsPushDeadLetters: pushLinks.map((link) => {
-      const decision = decideWmsPushReplay(link, wmsPushOrderReference(link.order))
-      return {
-        orderId: link.orderId,
-        orderNumber: link.order.orderNumber,
-        connector: link.connector,
-        state: link.state,
-        attempts: link.attempts,
-        lastError: link.lastError,
-        lastAttemptAt: link.lastAttemptAt?.toISOString() ?? null,
-        replayable: decision.replayable,
-        replayRefusal: decision.replayable ? null : decision.guidance,
-        why: describeBlockedWmsPush(link),
-      }
-    }),
+    // o3d-2k5r r5: every field including the affordance comes from the shared rule — the client
+    // receives the action's own answer rather than deriving one from `state`.
+    wmsPushDeadLetters: pushLinks.map(buildBlockedWmsPushRow),
     outboxFailures: outbox.map((row) => ({
       id: row.id,
       connector: row.connector,

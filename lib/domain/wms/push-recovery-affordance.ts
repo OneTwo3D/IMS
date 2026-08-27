@@ -3,7 +3,7 @@ import {
   wmsAmbiguousCreateRefusal,
   wmsMissingOrderRepushRefusal,
 } from './create-replay-policy'
-import { wmsCreateOutcomeIsAmbiguous } from './order-push-sweep'
+import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference } from './order-push-sweep'
 
 /**
  * ONE READER FOR "MAY THIS PUSH BE RE-OPENED?", SHARED BY THE CONTROL AND THE ACTION (o3d-2k5r r5).
@@ -151,4 +151,63 @@ export function decideWmsMissingRepush(input: { connector: string; reference: st
     }
   }
   return { repushable: true }
+}
+
+/**
+ * THE ROW THE EXCEPTION INBOX RENDERS, built here rather than in the action (o3d-2k5r r5).
+ *
+ * Not tidiness. The affordance is only worth anything if the row the CLIENT receives carries it,
+ * and a mapping written inline in a `'use server'` module that reads ten other models is a mapping
+ * no test can reach — which is how the client came to be deciding this for itself in the first
+ * place. Built here, "the row says what the action would do" is one assertion.
+ */
+export type BlockedWmsPushRowInput = WmsPushReplayEvidence & {
+  orderId: string
+  lastError: string | null
+  lastAttemptAt: Date | null
+  order: { id: string; orderNumber: string | null; externalOrderNumber: string | null }
+}
+
+export function buildBlockedWmsPushRow(link: BlockedWmsPushRowInput) {
+  const decision = decideWmsPushReplay(link, wmsPushOrderReference(link.order))
+  return {
+    orderId: link.orderId,
+    orderNumber: link.order.orderNumber,
+    connector: link.connector,
+    state: link.state,
+    attempts: link.attempts,
+    lastError: link.lastError,
+    lastAttemptAt: link.lastAttemptAt?.toISOString() ?? null,
+    replayable: decision.replayable,
+    replayRefusal: decision.replayable ? null : decision.guidance,
+    why: describeBlockedWmsPush(link),
+  }
+}
+
+/** The same, for an order-reconciliation drift finding. Only MISSING_IN_WMS ever had a control. */
+export type OrderReconcileDriftRowInput = {
+  orderId: string
+  category: string
+  connector: string
+  detail: string | null
+  externalOrderNumber: string | null
+  lastSeenAt: Date
+  order: { id: string; orderNumber: string | null; externalOrderNumber: string | null }
+}
+
+export function buildOrderReconcileDriftRow(row: OrderReconcileDriftRowInput) {
+  const decision = row.category === 'MISSING_IN_WMS'
+    ? decideWmsMissingRepush({ connector: row.connector, reference: wmsPushOrderReference(row.order) })
+    : null
+  return {
+    orderId: row.orderId,
+    orderNumber: row.order.orderNumber,
+    externalOrderNumber: row.externalOrderNumber,
+    category: row.category,
+    detail: row.detail,
+    foundAt: row.lastSeenAt.toISOString(),
+    connector: row.connector,
+    repushable: decision?.repushable === true,
+    repushRefusal: decision && !decision.repushable ? decision.guidance : null,
+  }
 }
