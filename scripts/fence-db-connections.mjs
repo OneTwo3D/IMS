@@ -1180,6 +1180,16 @@ async function completeFence(client, options, { facts, plan, grants, appRole, re
  * Without the record there is no baseline of the original grantees, and no ACL read reconstructs
  * one, so this function NEVER returns EXIT_OK and NEVER sets fenceProvenAbsent. It returns a
  * refusal with instructions in both directions; the only difference is which refusal.
+ *
+ * @param {{
+ *   status: string,
+ *   detail?: string,
+ *   appRole: string,
+ *   stateFile?: string,
+ *   appStillConnects: boolean,
+ *   appConnection?: { attempted: boolean, connected: boolean, database: string, error: string } | null,
+ *   connectedDatabase?: string,
+ * }} facts
  */
 export function assessUnrecordedRelease({
   status,
