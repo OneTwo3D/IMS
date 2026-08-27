@@ -307,6 +307,64 @@ export function mayReleaseCreateDispatch(basis: CreateDispatchBasis): boolean {
 }
 
 /**
+ * Why a marker was NOT released, when it was not. Reported rather than inferred, because the two
+ * reasons mean different things to whoever reads the row afterwards.
+ */
+export type CreateDispatchReleaseRefusal =
+  /**
+   * Nothing proved the request failed to leave. THIS IS THE COMMON CASE AND THE CORRECT ONE: a
+   * timeout, a socket reset mid-write, a 5xx, a client that threw — the request may have arrived, and
+   * a marker released here would license a create on top of a document that exists.
+   */
+  | 'no-proof-the-request-did-not-leave'
+  /**
+   * The proof is sound but it is about the wrong request: this attempt replayed a marker some earlier
+   * attempt minted, and that one may well have reached the ledger.
+   */
+  | 'marker-is-not-this-attempts'
+
+export type CreateDispatchReleaseVerdict =
+  | { release: true; notSent: string }
+  | { release: false; refusal: CreateDispatchReleaseRefusal }
+
+/**
+ * MAY THIS ATTEMPT RELEASE THE MARKER IT IS STANDING UNDER? (o3d-gvzu)
+ *
+ * PURE, AND SEPARATE FROM THE BRANCH THAT CALLS IT, because this is the decision the whole change
+ * turns on and it must be testable against a real transport outcome rather than reasoned about in
+ * prose. Two independent conditions, both required:
+ *
+ *  1. `notSent` is present — a NAMED member of the transport's enumeration, written by the statement
+ *     that performed the refusal (see `XeroNotSentReason`). Absent for every case where the request
+ *     may have arrived.
+ *  2. `reachedTheWire` is false — the delta of the process-wide HTTP attempt counter across the call.
+ *
+ * WHY BOTH, WHEN EITHER WOULD USUALLY DO. They are measurements of the same fact from opposite ends
+ * and they fail in opposite directions: the counter is process-wide, so a concurrent Xero call by
+ * another row moves it and it reports "sent" for a call that sent nothing; the tag is written at one
+ * statement, so a site that forgot to carry it reports nothing at all. Requiring both means neither a
+ * mislabelled site nor a quiet counter can license a release on its own, and the conjunction can only
+ * ever WITHHOLD a release that one of them would have granted. A withheld release costs a refusal an
+ * operator resolves. A wrong one costs a duplicate journal in a live ledger that nobody will notice.
+ *
+ * AND THE PROOF IS ABOUT THIS ATTEMPT'S REQUEST, so the basis has to admit it — see
+ * {@link mayReleaseCreateDispatch}.
+ */
+export function decideCreateDispatchRelease(params: {
+  basis: CreateDispatchBasis
+  outcome: { reachedTheWire: boolean; notSent?: string }
+}): CreateDispatchReleaseVerdict {
+  const { notSent, reachedTheWire } = params.outcome
+  if (notSent === undefined || reachedTheWire) {
+    return { release: false, refusal: 'no-proof-the-request-did-not-leave' }
+  }
+  if (!mayReleaseCreateDispatch(params.basis)) {
+    return { release: false, refusal: 'marker-is-not-this-attempts' }
+  }
+  return { release: true, notSent }
+}
+
+/**
  * May this create go out — and, when it is the FIRST one, what the fence must record as it sends.
  *
  * `write` is the mint only for `first-dispatch`. A replay does not re-mint: the row already carries

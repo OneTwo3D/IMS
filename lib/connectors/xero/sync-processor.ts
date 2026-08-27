@@ -36,7 +36,7 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
-import { CREATE_DISPATCH_REPLAY_MARGIN_MS, describeCreateDispatchNotSent, mayReleaseCreateDispatch, planCreateDispatch, readCreateDispatchAge, type CreateDispatchAge, type CreateDispatchFenceWrite } from '@/lib/domain/accounting/create-dispatch-record'
+import { CREATE_DISPATCH_REPLAY_MARGIN_MS, decideCreateDispatchRelease, describeCreateDispatchNotSent, planCreateDispatch, readCreateDispatchAge, type CreateDispatchAge, type CreateDispatchFenceWrite } from '@/lib/domain/accounting/create-dispatch-record'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
@@ -6124,12 +6124,12 @@ async function processClaimedEntry(
         // The conjunction is the conservative direction: each half can only WITHHOLD a release the
         // other would have granted, and a withheld release costs a refusal an operator resolves while
         // a wrong one costs a duplicate journal in a live ledger.
-        const releasing = posted.notSent !== undefined && mayReleaseCreateDispatch(dispatch.basis)
+        const verdict = decideCreateDispatchRelease({ basis: dispatch.basis, outcome: posted })
         const message = describeCreateDispatchNotSent({
           label: `${type} for ${referenceType} ${referenceId}`,
           error: posted.error ?? 'the transport gave no reason',
           notSent: posted.notSent,
-          releasing,
+          releasing: verdict.release,
         })
         return {
           success: false,
@@ -6138,7 +6138,9 @@ async function processClaimedEntry(
             reason: 'transport-refused',
             operation: 'manual-journal',
             message,
-            ...(releasing ? { releaseCreateDispatch: { notSent: posted.notSent as string, basis: dispatch.basis } } : {}),
+            ...(verdict.release
+              ? { releaseCreateDispatch: { notSent: verdict.notSent, basis: dispatch.basis } }
+              : {}),
           },
         }
       }
