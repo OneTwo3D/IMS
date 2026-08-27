@@ -20,12 +20,32 @@
 -- THE CONTRACT: every statement returns EXACTLY ONE ROW of (check_name, violations), and every
 -- violations must be 0. The checks are read-only.
 --
--- WHAT A NON-ZERO ANSWER MEANS, and it is NOT the same sentence for all five. Checks 1, 3, 4 and 5
--- are signatures no legitimate writer can produce, so for those "non-zero" does mean "a predecessor
--- binary wrote this table after it was supposed to have been stopped". CHECK 2 IS A SUPERSET — it
+-- WHAT A NON-ZERO ANSWER MEANS, and it is NOT the same sentence for all of them. Checks 1, 3, 4, 5
+-- and 7 are signatures no legitimate writer can produce, so for those "non-zero" does mean "a
+-- predecessor binary wrote this table after it was supposed to have been stopped". CHECK 2 IS A SUPERSET — it
 -- asks "is anything of park shape unstamped?", which is a real invariant but a broader one, and its
 -- own comment says what else can trip it and why the repair is conditional. An earlier revision of
 -- this header claimed all of them had the narrow meaning; they do not.
+--
+-- WHY THERE ARE SEVEN AND NOT SIX (Codex HIGH, round 13). Checks 1-6 all read THE ROW AS IT IS NOW,
+-- and three of them rest on an assumption about which write was the LAST one: check 5 assumes a
+-- REASSIGN is the last payload-relevant mutation, and checks 3, 4 and 6 key on an `errorMessage` or a
+-- `payload` that a later write replaces. A reassigned hold that the predecessor then RE-HOLDS onto
+-- its new order has its payload, externalId and error message overwritten wholesale — the identity
+-- equality is restored, the operator's note is gone, and the backfill stamps what looks exactly like
+-- a legitimate hold. All six return zero over a destroyed accounting payload.
+--
+-- WHEN THE CURRENT STATE CAN BE MADE TO LOOK INNOCENT, THE EVIDENCE HAS TO COME FROM HISTORY. Check
+-- 7 joins the `wc_refund_park_recovered` activity entries — written by `recoverParkedWcRefund`,
+-- naming the row in metadata.shoppingSyncLogId, and never rewritten or deleted by any code path —
+-- to the rows themselves, and fails when a row a park recovery once acted on is now shaped or
+-- stamped as a held sales invoice. It is the only check here whose evidence is not in the row it
+-- accuses, and therefore the only one a later write to that row cannot switch off.
+--
+-- Its one blind spot, said out loud: `logActivity` runs AFTER the update transaction commits, so a
+-- crash in between leaves the recovery with no entry and this check with nothing to join to. That
+-- makes it best-effort in that one direction — which is still strictly more than the six checks
+-- above can see here, and it never produces a false positive from the same gap.
 --
 -- WHY THERE ARE SIX AND NOT FIVE (Codex MEDIUM, round 5). Checks 1-5 model what the predecessor
 -- WRITES INTO A ROW. They do not model what it does to a row's STATUS AND MESSAGE while leaving the
@@ -59,8 +79,10 @@
 -- Run again after any repair. Check 1 is repairable by re-running the two UPDATE statements in
 -- migration.sql, which only ever write a NULL cell. CHECK 2 IS REPAIRABLE ONLY AFTER THE ROWS HAVE
 -- BEEN IDENTIFIED — see its comment; blindly re-running statement 2 is itself a defect. A non-zero
--- answer on check 3, 4, 5 or 6 is NOT repairable automatically and needs the incident handling in
--- migration.sql. On check 6 in particular the row still holds the store's refund body, so the amount
+-- answer on check 3, 4, 5, 6 or 7 is NOT repairable automatically and needs the incident handling in
+-- migration.sql. On check 7 the activity entry names the order the park was taken FROM
+-- (metadata.parkedOrderId) and the refund it described, which is where the lost payload has to be
+-- reconstructed from. On check 6 in particular the row still holds the store's refund body, so the amount
 -- is recoverable by hand — what has been lost is the row's place in the recovery inbox, and its own
 -- error text.
 --
@@ -428,3 +450,76 @@ SELECT 'shopping_sync_logs held-release outcome on a row that is not a hold' AS 
    AND ("errorMessage" = 'The sales order this invoice was held for cannot be found, so it can never be released. Nothing was posted.'
      OR "errorMessage" = 'The held sales-invoice payload is unreadable, so the invoice cannot be released automatically — queue it from the order.'
      OR "errorMessage" LIKE 'Superseded: this order already carries ledger document %');
+
+-- 7. NO ROW A REFUND-PARK RECOVERY TOUCHED MAY NOW BE A HELD SALES INVOICE — the check that reads
+--    HISTORY, because by this point the current state can be made to look innocent.
+--
+--    THE ACT, AND WHY THE SIX ABOVE ALL GO QUIET OVER IT (o3d-xnwu r13, Codex HIGH). Checks 1-6
+--    model what a predecessor WRITES INTO A ROW, and each of them reads the row AS IT IS NOW. Check
+--    5 in particular assumes a REASSIGN is the last payload-relevant mutation there will be. It is
+--    not:
+--
+--      1. the predecessor's recovery inbox admits a held sales invoice for order A as a park and an
+--         operator REASSIGNs it to order B. buildRefundParkReassignData writes entityId = B, status
+--         PENDING and a 'Recovered by operator:' note, and DELIBERATELY leaves the payload alone —
+--         so the row now carries A's held-invoice payload while sitting on B. Check 5 catches
+--         exactly this.
+--      2. then order B genuinely needs a hold. The PREDECESSOR'S `heldSalesInvoiceQueueWhere` has no
+--         recordKind clause, so its findFirst on (entityId = B, payload->>'reason') SELECTS THIS
+--         ROW, and holdWcSalesInvoiceForMissingNumber UPDATES it wholesale: payload, externalId,
+--         errorMessage, status, syncedAt. payload.salesOrderId is B again — equal to entityId — the
+--         operator's note is gone, and the externalId names B's WooCommerce order.
+--
+--    What is left is a row indistinguishable from a legitimate hold for B, which the backfill then
+--    stamps WC_HELD_SALES_INVOICE. Check 5 needs salesOrderId <> entityId: quiet. Checks 3 and 4
+--    need the operator's note in errorMessage: overwritten, quiet. Checks 1 and 2 need a NULL stamp:
+--    stamped, quiet. Check 6 needs a row that is NOT hold-shaped: it is, quiet. ALL SIX RETURN ZERO
+--    — and A's only held accounting payload has been destroyed, so A's invoice may never be queued.
+--
+--    WHEN THE CURRENT STATE CAN BE MADE TO LOOK INNOCENT, THE EVIDENCE HAS TO COME FROM HISTORY.
+--    `recoverParkedWcRefund` writes a `wc_refund_park_recovered` activity entry naming the row it
+--    acted on (metadata.shoppingSyncLogId) — in the same request, after the update, and no code
+--    path rewrites or deletes it. That entry is a fact about the PAST that a later overwrite of the
+--    sync-log row cannot reach. So this check says: a row a park recovery once acted on must never
+--    afterwards be shaped or stamped as a held sales invoice.
+--
+--    BOTH OUTCOMES, NOT ONLY REASSIGN. A DISMISS leaves entityId alone, so the same second step —
+--    the predecessor re-holding order A onto the dismissed row — restores the identity equality and
+--    replaces the note check 4 keys on. Check 4 rests on the same last-mutation assumption as check
+--    5, and this covers it. (It is also why the DISMISS of a MISCLASSIFIED hold is counted here as
+--    well as by check 4: the payload is hold-shaped from the moment of the dismissal. Two checks
+--    naming one incident is a duplicate report, never a false one.)
+--
+--    AND IT CANNOT ACCUSE A GENUINE PARK, WHATEVER THE STORE PUT IN THE REFUND BODY (the r11/r12
+--    lesson, and the reason this is safe to run fenced). The discriminator is the same structural
+--    asymmetry checks 4 and 5 use: `payload->'id' IS NULL`. `WcRefund.id` is REQUIRED and a park
+--    stores the store's refund body WHOLE, so every genuine park has one — decorated with an
+--    `accountingPayload`, a `metaKey` and any `reason` an operator typed or not. Spelled on `->` so
+--    that a body carrying `"id": null` is excluded too. A legitimately recovered park therefore
+--    cannot reach either arm of the disjunction, and a false positive here would be a cutover
+--    outage.
+--
+--    NO STATUS CLAUSE AND NO IDENTITY CLAUSE, deliberately: the identity equality is the very thing
+--    the second write RESTORES, so a check that required it to be broken would be blind again.
+SELECT 'shopping_sync_logs recovered refund park now shaped or stamped as a held sales invoice' AS check_name,
+       count(*)                                                                                 AS violations
+  FROM "shopping_sync_logs"
+ WHERE connector = 'woocommerce'
+   AND direction = 'FROM_CONNECTOR'
+   AND "entityType" = 'SalesOrder'
+   AND jsonb_typeof(payload) = 'object'
+   AND payload->'id' IS NULL
+   AND EXISTS (
+         SELECT 1
+           FROM "activity_logs"
+          WHERE "activity_logs".action = 'wc_refund_park_recovered'
+            AND "activity_logs".metadata->>'shoppingSyncLogId' = "shopping_sync_logs".id
+       )
+   AND (
+            "recordKind" = 'WC_HELD_SALES_INVOICE'
+         OR (
+                  payload->>'reason' = 'missing_wc_invoice_number'
+              AND jsonb_typeof(payload->'accountingPayload') = 'object'
+              AND payload->>'metaKey' IS NOT NULL
+            )
+       );

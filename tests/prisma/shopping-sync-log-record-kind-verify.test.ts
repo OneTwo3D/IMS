@@ -56,7 +56,15 @@ function statements(sql: string): string[] {
 // is here to catch and these tests fail.
 // ---------------------------------------------------------------------------
 
+/**
+ * o3d-xnwu r13 — one `wc_refund_park_recovered` activity entry, which is what check 7 joins to.
+ * The row's own columns can all be overwritten by a later write; this cannot.
+ */
+type Recovery = { action: string; metadata: Record<string, unknown> }
+
 type Row = {
+  /** o3d-xnwu r13: check 7 correlates the activity entry's metadata.shoppingSyncLogId to it. */
+  id: string
   recordKind: string | null
   connector: string
   direction: string
@@ -71,6 +79,8 @@ type Row = {
    * action replaces it with a note beginning REFUND_PARK_RECOVERY_NOTE_PREFIX.
    */
   errorMessage: string | null
+  /** Every `wc_refund_park_recovered` entry naming this row. Not a column — a joined table. */
+  recoveries: Recovery[]
 }
 
 /** SQL NULL. Distinguished from JS undefined so `IS NULL` and a missing key behave alike. */
@@ -154,11 +164,27 @@ function jsonText(value: unknown): Value {
   return String(value)
 }
 
-function term(expression: string, row: Row): Value {
-  const trimmed = expression.trim()
+function term(expression: string, row: Row, entry?: Recovery): Value {
+  let trimmed = expression.trim()
 
   const literal = trimmed.match(/^'([\s\S]*)'$/)
   if (literal) return literal[1]
+
+  // o3d-xnwu r13 — check 7 is the first check to name two tables, so the leaves are qualified.
+  const activityMember = trimmed.match(/^"activity_logs"\.metadata\s*->>\s*'([^']+)'$/i)
+  if (activityMember) {
+    assert.ok(entry, `an activity_logs member was read outside an EXISTS subquery: ${trimmed}`)
+    return jsonText(entry.metadata[activityMember[1]])
+  }
+  const activityColumn = trimmed.match(/^"activity_logs"\.\"?([A-Za-z]+)\"?$/i)
+  if (activityColumn) {
+    assert.ok(entry, `an activity_logs column was read outside an EXISTS subquery: ${trimmed}`)
+    const value = entry[activityColumn[1] as keyof Recovery]
+    return value === undefined || value === null ? NULL : String(value)
+  }
+  // The correlation: inside the subquery the outer row must still be reachable by name.
+  const outerColumn = trimmed.match(/^"shopping_sync_logs"\.\"?([A-Za-z]+)\"?$/i)
+  if (outerColumn) trimmed = `"${outerColumn[1]}"`
 
   const typeOfMember = trimmed.match(/^jsonb_typeof\(\s*payload\s*->\s*'([^']+)'\s*\)$/i)
   if (typeOfMember) return row.payload === null ? NULL : jsonType(row.payload[typeOfMember[1]])
@@ -196,7 +222,15 @@ function likeRegex(pattern: string): RegExp {
   return new RegExp(`${source}$`)
 }
 
-function matchesConjunct(condition: string, row: Row): boolean {
+function matchesConjunct(condition: string, row: Row, entry?: Recovery): boolean {
+  // o3d-xnwu r13 — EXISTS over the recovery history. THE ONLY CHECK WHOSE EVIDENCE IS NOT IN THE
+  // ROW, and therefore the only one a later overwrite of the row cannot switch off.
+  if (/^EXISTS\b/i.test(condition.trim())) {
+    const exists = condition.trim().match(/^EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+"activity_logs"\s+WHERE\s+([\s\S]*?)\s*\)$/i)
+    assert.ok(exists, `the only EXISTS this evaluator models is a correlated one over "activity_logs": ${condition}`)
+    return row.recoveries.some((recovery) => matchesCondition(exists[1], row, recovery))
+  }
+
   // o3d-xnwu r10 — `(<held shape>) IS NOT TRUE`, the null-safe negation backfill statement 2 and
   // check 6 now use. SQL's three-valued logic is what makes the spelling load-bearing: every member
   // being compared may be ABSENT, absent is NULL, and `NOT (UNKNOWN)` is UNKNOWN — so a plain NOT
@@ -204,7 +238,7 @@ function matchesConjunct(condition: string, row: Row): boolean {
   // in with FALSE. This evaluator is two-valued by construction (every leaf returns false for both
   // FALSE and UNKNOWN, see the `=` handler below), so "not TRUE" is exactly its complement.
   const isNotTrue = condition.match(/^([\s\S]*?)\s+IS\s+NOT\s+TRUE$/i)
-  if (isNotTrue) return !matchesCondition(isNotTrue[1], row)
+  if (isNotTrue) return !matchesCondition(isNotTrue[1], row, entry)
 
   // ...and the mutation this is here to stop. `NOT (…)` parses in Postgres and is WRONG, so it is
   // rejected by name rather than falling through to an unhelpful "comparison not modelled".
@@ -215,60 +249,60 @@ function matchesConjunct(condition: string, row: Row): boolean {
   )
 
   const isNotNull = condition.match(/^(.*?)\s+IS\s+NOT\s+NULL$/i)
-  if (isNotNull) return term(isNotNull[1], row) !== NULL
+  if (isNotNull) return term(isNotNull[1], row, entry) !== NULL
 
   const isNull = condition.match(/^(.*?)\s+IS\s+NULL$/i)
-  if (isNull) return term(isNull[1], row) === NULL
+  if (isNull) return term(isNull[1], row, entry) === NULL
 
   const inList = condition.match(/^(.*?)\s+IN\s*\((.*)\)$/i)
   if (inList) {
-    const left = term(inList[1], row)
+    const left = term(inList[1], row, entry)
     if (left === NULL) return false
-    const options = inList[2].split(',').map((option) => term(option, row))
+    const options = inList[2].split(',').map((option) => term(option, row, entry))
     return options.includes(left)
   }
 
   // `IS DISTINCT FROM` and not `<>` in check 5, because a hold-shaped payload that has LOST its
   // salesOrderId is the same contradiction and `<>` against a missing member is UNKNOWN.
   const distinct = condition.match(/^(.*?)\s+IS\s+DISTINCT\s+FROM\s+(.*)$/i)
-  if (distinct) return term(distinct[1], row) !== term(distinct[2], row)
+  if (distinct) return term(distinct[1], row, entry) !== term(distinct[2], row, entry)
 
   // o3d-xnwu r12 — `<>`, which check 5 now uses in place of IS DISTINCT FROM. The difference is the
   // whole finding: `<>` against an ABSENT member is UNKNOWN and selects nothing, which is what keeps
   // a decorated refund body with no salesOrderId out of a check that stops the cutover.
   const notEqual = condition.match(/^(.*?)\s*<>\s*(.*)$/)
   if (notEqual) {
-    const left = term(notEqual[1], row)
-    const right = term(notEqual[2], row)
+    const left = term(notEqual[1], row, entry)
+    const right = term(notEqual[2], row, entry)
     if (left === NULL || right === NULL) return false
     return left !== right
   }
 
   const like = condition.match(/^(.*?)\s+LIKE\s+(.*)$/i)
   if (like) {
-    const left = term(like[1], row)
-    const pattern = term(like[2], row)
+    const left = term(like[1], row, entry)
+    const pattern = term(like[2], row, entry)
     if (left === NULL || pattern === NULL) return false
     return likeRegex(pattern).test(left)
   }
 
   const equality = condition.match(/^(.*?)\s*=\s*(.*)$/)
   assert.ok(equality, `verify.sql uses a comparison this test does not model: ${condition}`)
-  const left = term(equality[1], row)
-  const right = term(equality[2], row)
+  const left = term(equality[1], row, entry)
+  const right = term(equality[2], row, entry)
   // SQL three-valued logic: NULL = anything is UNKNOWN, which does not select the row.
   if (left === NULL || right === NULL) return false
   return left === right
 }
 
 /** AND / OR / parentheses over the leaf comparisons above. */
-function matchesCondition(expression: string, row: Row): boolean {
+function matchesCondition(expression: string, row: Row, entry?: Recovery): boolean {
   const trimmed = unwrap(expression)
   const ors = splitTopLevel(trimmed, 'OR')
-  if (ors.length > 1) return ors.some((part) => matchesCondition(part, row))
+  if (ors.length > 1) return ors.some((part) => matchesCondition(part, row, entry))
   const ands = splitTopLevel(trimmed, 'AND')
-  if (ands.length > 1) return ands.every((part) => matchesCondition(part, row))
-  return matchesConjunct(trimmed, row)
+  if (ands.length > 1) return ands.every((part) => matchesCondition(part, row, entry))
+  return matchesConjunct(trimmed, row, entry)
 }
 
 /** Does the numbered check in verify.sql select this row? */
@@ -334,6 +368,7 @@ const refundPayloadWithTypedReason = {
 }
 
 const base: Row = {
+  id: 'log-1',
   recordKind: 'WC_REFUND_PARK',
   connector: 'woocommerce',
   direction: 'FROM_CONNECTOR',
@@ -344,6 +379,9 @@ const base: Row = {
   status: 'PENDING',
   payload: refundPayloadWithTypedReason,
   errorMessage: null,
+  // No recovery has ever touched this row. Check 7 asks the history first, so this is what keeps
+  // every fixture above out of it.
+  recoveries: [],
 }
 
 /** The exact prefix REFUND_PARK_RECOVERY_NOTE_PREFIX writes; check 4 keys on it. */
@@ -374,15 +412,16 @@ const parkWithTypedReason: Row = { ...base, payload: refundPayloadWithTypedReaso
 const unstampedHold: Row = { ...base, recordKind: null, externalId: '4021', payload: heldPayload }
 const unstampedPark: Row = { ...base, recordKind: null, payload: refundPayloadWithTypedReason }
 
-test('verify.sql declares six checks in the shape the deploy hook executes', () => {
+test('verify.sql declares seven checks in the shape the deploy hook executes', () => {
   const sql = readFileSync(VERIFY, 'utf8')
   const all = statements(sql)
 
   assert.equal(
     all.length,
-    6,
-    'six mandatory checks: unstamped hold, unstamped park, overwritten park, recovery note on a '
-    + 'hold, a hold payload naming another order, and a held-release outcome on a row that is not a hold',
+    7,
+    'seven mandatory checks: unstamped hold, unstamped park, overwritten park, recovery note on a '
+    + 'hold, a hold payload naming another order, a held-release outcome on a row that is not a hold, '
+    + 'and a recovered park that is now shaped or stamped as a hold',
   )
   for (const [index, statement] of all.entries()) {
     // The contract in scripts/run-migration-verifications.mjs: exactly one row of
@@ -393,7 +432,7 @@ test('verify.sql declares six checks in the shape the deploy hook executes', () 
   }
 
   const names = all.map((statement) => statement.match(/^SELECT '([^']+)'/i)![1])
-  assert.equal(new Set(names).size, 6, 'each check names itself distinctly, so a failure says which one')
+  assert.equal(new Set(names).size, 7, 'each check names itself distinctly, so a failure says which one')
 })
 
 test('CASE (b) IS DETECTABLE: check 3 finds a stamped park overwritten with a held-invoice payload', () => {
@@ -1629,4 +1668,206 @@ test('every member checks 4 and 5 rely on is one no recovery action can write', 
   for (const column of ['payload', 'connector', 'direction', 'entityType', 'externalId']) {
     assert.ok(!written.has(column), `neither recovery action may write ${column}`)
   }
+})
+
+/* ------------------------------------------------------------------------------------------------
+ * o3d-xnwu r13 (Codex HIGH) — REASSIGN, AND THEN A HOLD REWRITE THAT MAKES THE SHAPE LEGITIMATE.
+ *
+ * Every check up to here reads the row AS IT IS NOW, and check 5 in particular assumes a REASSIGN
+ * is the last payload-relevant mutation. It is not. After a misclassified hold for order A is
+ * reassigned to order B, the predecessor's `heldSalesInvoiceQueueWhere` — which has no recordKind
+ * clause — can find that same row by (entityId = B, payload->>'reason') and
+ * holdWcSalesInvoiceForMissingNumber UPDATES IT WHOLESALE with B's hold: payload, externalId,
+ * errorMessage, status. salesOrderId equals entityId again, the operator's note is gone, and the
+ * backfill then stamps an apparently legitimate B hold. All six checks return zero while A's only
+ * held accounting payload has been destroyed.
+ *
+ * The previous rounds hardened the SHAPE; this defeats them by making the shape legitimate again
+ * through a later write. So check 7 does not read the shape for its evidence: it reads HISTORY —
+ * the `wc_refund_park_recovered` activity entry naming the row — which no later write to the row
+ * can reach.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** What `recoverParkedWcRefund` logs after it applies a REASSIGN. */
+const REASSIGNED: Recovery = {
+  action: 'wc_refund_park_recovered',
+  metadata: { shoppingSyncLogId: 'log-1', outcome: 'REASSIGN', parkedOrderId: 'order-1', targetOrderId: 'order-2' },
+}
+
+/** ...and after a DISMISS, which moves no entityId at all. */
+const DISMISSED: Recovery = {
+  action: 'wc_refund_park_recovered',
+  metadata: { shoppingSyncLogId: 'log-1', outcome: 'DISMISS', parkedOrderId: 'order-1', targetOrderId: null },
+}
+
+/** STEP 1: the misclassified hold for order-1, reassigned onto order-2. Check 5's row. */
+const reassignedHold: Row = {
+  ...base,
+  recordKind: null,
+  externalId: '4021',
+  entityId: 'order-2',
+  payload: heldPayload,
+  errorMessage: RECOVERY_NOTE,
+  recoveries: [REASSIGNED],
+}
+
+/** The hold buildHeldSalesInvoicePayload writes for order-2 — every member naming order-2. */
+const heldPayloadForOrder2 = {
+  reason: 'missing_wc_invoice_number',
+  connector: 'woocommerce',
+  externalOrderId: '5099',
+  externalOrderNumber: '5099',
+  salesOrderId: 'order-2',
+  orderNumber: 'SO-2',
+  metaKey: '_wcpdf_invoice_number',
+  accountingPayload: { salesOrderId: 'order-2', currency: 'GBP' },
+}
+
+/**
+ * STEP 2: the predecessor's hold writer's FULL update of that same row for order-2. One `data`
+ * object — status, entityId, externalId, payload, errorMessage, syncedAt — over everything the
+ * reassign left behind.
+ */
+const reheldOnOrder2: Row = {
+  ...reassignedHold,
+  externalId: '5099',
+  payload: heldPayloadForOrder2,
+  errorMessage: null,
+  status: 'PENDING',
+}
+
+/** The row as verify.sql actually meets it: after the backfill has classified it. */
+function afterBackfill(row: Row): Row {
+  return { ...row, recordKind: backfillStamp(row) }
+}
+
+test('the reassign-then-rehold row is INVISIBLE to all six earlier checks — which is why there is a seventh', () => {
+  const row = afterBackfill(reheldOnOrder2)
+
+  // The precondition, and the sharp end of the finding: the backfill stamps it a legitimate hold.
+  assert.equal(row.recordKind, 'WC_HELD_SALES_INVOICE', 'the backfill sees an ordinary hold for order-2')
+
+  for (const check of [0, 1, 2, 3, 4, 5]) {
+    assert.equal(selects(check, row), false, `check ${check + 1} cannot see the row once the shape is legitimate again`)
+  }
+})
+
+test('check 7 catches it anyway, because the recovery entry is evidence the rewrite cannot reach', () => {
+  // MUTATION ROUTE: delete the EXISTS subquery from check 7 and this row is no longer distinguished
+  // from a legitimate hold at all — the check then either accuses every hold (see the next test) or
+  // nothing. Delete the OR'd shape arm and it goes quiet on this row too, since the stamp arm alone
+  // would have to carry it.
+  assert.equal(selects(6, afterBackfill(reheldOnOrder2)), true, 'a row a park recovery touched is now a held sales invoice')
+})
+
+test('check 7 does NOT accuse a legitimate hold that no recovery ever touched', () => {
+  // THE FALSE POSITIVE THAT WOULD MATTER: verify.sql runs after the migration with the application
+  // and the database both fenced, so a check that fires on an ordinary hold is a cutover outage
+  // with an identical failure on every retry.
+  //
+  // MUTATION ROUTE: delete the EXISTS subquery and this fails — every hold on a healthy database
+  // is hold-shaped and hold-stamped.
+  assert.equal(selects(6, genuineHold), false)
+  assert.equal(selects(6, afterBackfill(unstampedHold)), false, 'including one the predecessor never stamped')
+})
+
+test('check 7 does NOT accuse a genuine refund park, however the store decorated its body', () => {
+  // The r11/r12 lesson, applied here: every member of a refund payload is store-controlled except
+  // one. `WcRefund.id` is REQUIRED and a park stores the body WHOLE, so `payload->'id' IS NULL` is
+  // the asymmetry no decoration can forge.
+  //
+  // MUTATION ROUTE: delete `payload->'id' IS NULL` from check 7 and both of these fail — a
+  // legitimately reassigned park whose refund reason an operator typed would stop the cutover.
+  const decoratedPark: Row = {
+    ...base,
+    entityId: 'order-2',
+    payload: {
+      id: 993,
+      amount: '12.00',
+      reason: 'missing_wc_invoice_number',
+      metaKey: '_wcpdf_invoice_number',
+      accountingPayload: { forged: true },
+    },
+    errorMessage: RECOVERY_NOTE,
+    recoveries: [REASSIGNED],
+  }
+  assert.equal(selects(6, afterBackfill(decoratedPark)), false)
+
+  // `->` and not `->>`, so a body carrying an explicit null id is excluded too: every ambiguity
+  // about `id` resolves AWAY from the outage.
+  const nullIdPark: Row = { ...decoratedPark, payload: { ...decoratedPark.payload, id: null } }
+  assert.equal(selects(6, afterBackfill(nullIdPark)), false)
+})
+
+test('check 7 catches the REASSIGN on its own, before any rehold, without reading the identity clause', () => {
+  // The identity equality is the very thing the second write RESTORES, so check 7 must not require
+  // it to be broken — it would go blind at exactly the moment the damage is completed.
+  //
+  // MUTATION ROUTE: delete the OR'd payload-shape arm and this fails: the backfill stamps this row
+  // WC_REFUND_PARK (its salesOrderId names order-1, so statement 1 will not have it), so the stamp
+  // arm cannot carry it.
+  const row = afterBackfill(reassignedHold)
+  assert.equal(row.recordKind, 'WC_REFUND_PARK', 'precondition: the backfill calls this one a park')
+  assert.equal(selects(6, row), true)
+  assert.equal(selects(4, row), true, 'check 5 has it too, at this instant — they diverge one write later')
+})
+
+test('check 7 reads the STAMP as well as the shape, so a payload that stops being hold-shaped is still caught', () => {
+  // Defence in depth, and deliberately not redundant: the payload is the column that keeps getting
+  // overwritten, and the stamp is what makes checks 1 and 2 go quiet. A check that could only read
+  // the payload would be one more thing a later write can erase.
+  //
+  // MUTATION ROUTE: delete the `"recordKind" = 'WC_HELD_SALES_INVOICE'` arm and this fails.
+  const stampedWithoutTheWholeShape: Row = {
+    ...base,
+    recordKind: 'WC_HELD_SALES_INVOICE',
+    entityId: 'order-2',
+    externalId: '5099',
+    payload: { reason: 'missing_wc_invoice_number', salesOrderId: 'order-2', metaKey: '_wcpdf_invoice_number' },
+    recoveries: [REASSIGNED],
+  }
+  assert.equal(selects(6, stampedWithoutTheWholeShape), true)
+})
+
+test('check 7 covers DISMISS too, because check 4 rests on the same last-mutation assumption', () => {
+  // A DISMISS moves no entityId, so the predecessor re-holding the SAME order onto the dismissed
+  // row restores everything: the note check 4 keys on is replaced by the hold writer's own
+  // errorMessage, and the payload is a legitimate hold for order-1.
+  //
+  // MUTATION ROUTE: narrow check 7's subquery with `AND "activity_logs".metadata->>'outcome' =
+  // 'REASSIGN'` and this fails, while the reassign tests above still pass.
+  const dismissedThenReheld: Row = {
+    ...base,
+    recordKind: null,
+    externalId: '4021',
+    entityId: 'order-1',
+    payload: heldPayload,
+    errorMessage: null,
+    recoveries: [DISMISSED],
+  }
+  const row = afterBackfill(dismissedThenReheld)
+
+  assert.equal(row.recordKind, 'WC_HELD_SALES_INVOICE', 'the backfill sees an ordinary hold for order-1')
+  assert.equal(selects(3, row), false, 'check 4 lost its note')
+  assert.equal(selects(4, row), false, 'and check 5 never applied: a dismiss moves no entityId')
+  assert.equal(selects(6, row), true)
+})
+
+test('check 7 asks the history FIRST, so nothing without a recovery entry can reach either arm', () => {
+  // MUTATION ROUTE: make the EXISTS uncorrelated — drop
+  // `"activity_logs".metadata->>'shoppingSyncLogId' = "shopping_sync_logs".id` — and a recovery of
+  // ANY row would accuse every hold in the table.
+  const someoneElsesRecovery: Row = {
+    ...genuineHold,
+    id: 'log-2',
+    recoveries: [REASSIGNED],
+  }
+  assert.equal(selects(6, someoneElsesRecovery), false, 'the entry names log-1, and this row is log-2')
+
+  const anotherAction: Row = {
+    ...reheldOnOrder2,
+    recordKind: 'WC_HELD_SALES_INVOICE',
+    recoveries: [{ action: 'wc_refund_park_retried', metadata: { shoppingSyncLogId: 'log-1' } }],
+  }
+  assert.equal(selects(6, anotherAction), false, 'and only a park RECOVERY is evidence a park was there')
 })
