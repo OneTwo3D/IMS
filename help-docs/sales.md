@@ -167,6 +167,19 @@ Reopening:
 - records a **warning in the activity log** — the goods are physically in a box in the warehouse, and
   reopening the record does not unpack them.
 
+Those steps are **all or nothing**: they share one database transaction, so an interrupted recovery
+leaves the shipment exactly as it was rather than a draft whose stock has not been re-netted. If the
+re-allocation cannot run at all — no warehouse is available for sale, say — the reopen is rolled back
+and IMS tells you nothing changed.
+
+There is **one deliberate exception**. If the order carries *another* picking or packed shipment, the
+re-allocation is refused (IMS will not re-net an order that still has committed stock elsewhere) and
+the reopen is kept. It has to be: with two packed shipments, rolling back would refuse each one
+because of the other and neither could ever be reopened. Reopen the second shipment — or dispatch it
+— and that step re-nets the whole order. You can also press **Reopen for repack** again on the draft
+itself once nothing committed is left; on an already-pending draft the button finishes the
+re-allocation rather than refusing.
+
 **Unpack the parcel first, then press "Create Shipments"** in the Stock Allocation panel to rebuild
 the shipment to what actually remains. If every unit was refunded there is nothing left to build and
 IMS says so rather than creating an empty shipment.
