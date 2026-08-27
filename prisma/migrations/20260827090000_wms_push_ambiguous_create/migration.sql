@@ -1,3 +1,24 @@
+-- ============================================================================
+-- RELEASE GATE — o3d-1izw (P0, OPEN). THIS MIGRATION HAS BEEN APPLIED TO NO
+-- DATABASE. It was written under a standing rule that this session applies no
+-- migration anywhere, and that rule was NOT relaxed for it.
+--
+-- Until it is applied, the FIRST create claim that lapses writes AMBIGUOUS_CREATE
+-- and the write FAILS AT THE DATABASE — an invalid input value for the enum. The
+-- order is then neither claimed nor parked, and the sweep errors on every pass.
+--
+-- WHERE IT IS APPLIED FOR FREE, AND WHERE IT IS NOT.
+--   scripts/deploy.sh runs `prisma migrate deploy` and then check-prisma-drift,
+--   so an ordinary deploy applies it and fails loudly if it did not.
+--   `deploy.sh --skip-migrate` does NOT, and neither does any environment served
+--   straight from a working tree by `next dev` (the stage-dev service is one).
+--   Those are the two ways this branch reaches an environment ahead of its own
+--   schema, and they are what o3d-1izw is open against.
+--
+-- Do not close o3d-1izw on the strength of a merge. Close it when a person has
+-- applied this to the environment and check-prisma-drift reports clean.
+-- ============================================================================
+
 -- o3d-2k5r r4: a create whose OUTCOME was never recorded needs a disposition of its own.
 --
 -- claimForCreate writes PENDING_CREATE immediately BEFORE it calls the WMS, so a link still

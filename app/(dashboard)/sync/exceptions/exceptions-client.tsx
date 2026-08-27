@@ -261,9 +261,10 @@ export function ExceptionsClient({ data }: Props) {
                     {/* o3d-2k5r r5 — THE AFFORDANCE IS THE ACTION'S OWN ANSWER (`replayable`,
                         from `decideWmsPushReplay` on the server), never a state name read here.
                         This condition used to be `state === 'VALIDATION_FAILED'`, which meant every
-                        other blocked state got a button — including a ShipHero AMBIGUOUS_CREATE
-                        row, which `replayWmsOrderPush` refuses every single time and which the
-                        docs already promised had no button. Where there is no button there is the
+                        other blocked state got a button — including an AMBIGUOUS_CREATE row on a
+                        connector whose create cannot be repeated safely, which `replayWmsOrderPush`
+                        refuses every single time and which the docs already promised had no button.
+                        Where there is no button there is the
                         manual reconciliation instead, so the row still tells the operator what to
                         do. */}
                     {row.replayable ? (

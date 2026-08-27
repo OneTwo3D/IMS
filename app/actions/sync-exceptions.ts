@@ -194,8 +194,9 @@ export type WmsPushDeadLetterRow = {
   /**
    * o3d-2k5r r5 — the affordance, DERIVED ON THE SERVER from `decideWmsPushReplay`: the same call
    * `replayWmsOrderPush` refuses on. The table used to render Replay for every state except
-   * VALIDATION_FAILED, so a ShipHero AMBIGUOUS_CREATE row got a button the action refuses every
-   * time — and the docs already promised there was no button. A client that decides this for itself
+   * VALIDATION_FAILED, so an AMBIGUOUS_CREATE row on a connector whose create cannot be repeated
+   * safely got a button the action refuses every time — and the docs already promised there was
+   * none. A client that decides this for itself
    * is a second reader of a server-side question, which is the whole defect class.
    */
   replayable: boolean
@@ -2771,12 +2772,13 @@ export async function dismissWithdrawnDispatch(orderId: string): Promise<Mutatio
  *   the lease as PARK_AMBIGUOUS, so the very next sweep parked the "re-queued" order as
  *   AMBIGUOUS_CREATE. Meanwhile this action had already RESOLVED the discrepancy and reported
  *   success, so the finding left the inbox and the order left the create queue in the same click.
- *   On ShipHero that park has no automatic exit at all.
+ *   On a connector whose create cannot be repeated safely, that park has no automatic exit.
  *
  *   AND WHERE THERE WAS NO STAMP IT BYPASSED THE TWO-KEY RULE. A link with a null `lastAttemptAt`
  *   (a legacy row, a restore) reads as CLAIM, so the sweep re-dispatched the create on the strength
  *   of the presence probe ALONE — the exact reasoning create-replay-policy.ts exists to refuse,
- *   and on ShipHero the exact way two warehouse orders get picked under one reference.
+ *   and on a connector with no remote duplicate refusal, the exact way two warehouse orders get
+ *   picked under one reference.
  *
  * So it now takes BOTH KEYS, from the same rule the sweep and the dead-letter replay take:
  *
