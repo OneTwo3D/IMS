@@ -447,50 +447,61 @@ test('ROUND 11 (Codex MEDIUM): only the renderer may instruct a lookup, never a 
 })
 
 // ---------------------------------------------------------------------------------------------
-// ROUND 12 (Codex MEDIUM), REBUILT IN ROUND 13 (Codex HIGH) — AN ACT IS AN ACT IN ANY GRAMMAR.
+// ROUND 14 (Codex HIGH) — THE DEFAULT IS NOW "NO", AND THE EXCEPTIONS ARE WRITTEN DOWN.
 //
-// The lookup fence asks "does this remedy send an operator SEARCHING in its own words?". The thing
-// that actually goes wrong is one step further out: DOES THIS REMEDY TELL AN OPERATOR TO ACT ON A
-// SPECIFIC OBJECT THE RECORD CANNOT IDENTIFY? `open` is not a lookup verb, so
-// `BILL_ATTACHMENT.MADE` shipped "open that bill in {ledger} and remove the duplicate attachment"
-// with no lookup field declared and no bill id retained — and after a factory reset the
-// PurchaseOrder and the sync row are both deleted, so the operator had to guess which ledger bill
-// to strip an attachment off. The sweep found two more of the same shape: `WC_INVOICE_NOTE` ("open
-// that order in WooCommerce") and `TAX_RATE_SYNC` ("correct or archive that rate").
+// FOUR ROUNDS OF THE SAME SHAPE. Round 9 enumerated field phrases and was walked around by writing
+// different words. Round 10 enumerated declarations and was walked around by declaring nothing.
+// Round 12 enumerated imperatives and was walked around by a gerund — in its own new wording, one
+// round later. Round 13 enumerated every inflection and asked GRAMMAR whether an occurrence took a
+// specific object, and Codex walked around that in four ways at once:
 //
-// WHY IT IS BEING REBUILT ONE ROUND LATER. Round 12 asked the question of IMPERATIVES only, and
-// wrote down, as an assertion in this file, that a GERUND is not an imperative and is not caught.
-// Round 12's own new wording then used one: the `BILL_ATTACHMENT.NONE` replay check offered
-// "letting the uploads happen and clearing the duplicates afterwards" — an act, on a bill that cell
-// does not name, through the hole this file had just documented. That is twice in two rounds that a
-// fix landed inside its own stated limitation, so the limitation is the finding. A documented hole
-// in a fence is not a fence; it is a fence with a gate and a sign on it.
+//   • "remove YOUR duplicate attachment"      — a possessive is a determiner the list did not have;
+//   • "remove attachments FROM THAT BILL"     — the object is named after a preposition;
+//   • "remove ONLY that attachment"           — a modifier sits between the verb and the determiner;
+//   • "WITHOUT DELAY, remove that attachment" — `without` was read as a negation and suppressed the
+//                                               rest of the clause.
 //
-// SO THE QUESTION IS ASKED OF THE ACT, NOT OF ITS GRAMMAR. A mutating verb counts in EVERY form it
-// takes — imperative, third person, past, gerund — and so do the nouns those verbs turn into. What
-// makes an occurrence an INSTRUCTION rather than a description is that it takes a specific object:
-// "clearing THE duplicates", "removing THAT allocation", "open THAT bill". A verb with no object
-// ("a reversal POSTS FOR REAL") describes a consequence and instructs nobody. And an occurrence
-// inside a NEGATION instructs nothing either — refusing to act on a thing needs no identifier for
-// it — so a clause is exempt from the point where it negates: "DO NOT REMOVE AN ATTACHMENT FROM A
-// BILL THIS RECORD CANNOT NAME", "there is nothing here to open, keep or void as one", "no action,
-// route or screen removes an unsent row", "nothing this attempt did needs undoing".
+// EVERY ONE OF THOSE USES AN ENUMERATED VERB ON A CONCRETE TARGET. They are not the admitted
+// unlisted-verb hole; they are the fence failing at its own job. THE DIAGNOSIS IS THEREFORE NOT THAT
+// THE HEURISTIC NEEDS A FIFTH PATCH. English scope analysis is the wrong tool: the ways to name an
+// object are an OPEN class, so a detector of "does this name an object" can only ever chase them.
 //
-// THE CLASS IS CLOSED THREE WAYS AT ONCE — the verbs are enumerated, their inflections are
-// generated rather than listed, and the object and the negation are grammar. What it does NOT
-// cover, stated rather than implied:
+// SO THE DEFAULT IS INVERTED. A wording entry that declares no `lookup` cannot name any object at
+// all, so IT MAY NOT CONTAIN A MUTATION LEXEME — in any grammar, with any object or none, inside a
+// negation or outside one. Not "unless it looks like a description"; not at all.
 //
-//   1. IT CHECKS THAT THE ENTRY CAN NAME SOMETHING, NOT THAT THE NAMED THING IS THE THING ACTED
-//      ON. `PAYMENT` declares a lookup on the payment id and instructs removing the payment, which
-//      is right; an entry that declared a lookup on one object and instructed action on another
-//      would pass.
-//   2. A CLAUSE IS EXEMPT FROM ITS FIRST NEGATION ONWARD, so a clause that refuses one act and
-//      instructs another after it, in one breath, is not caught. Nothing in the shipped corpus does
-//      that; it is the shape to watch for when editing one.
-//   3. AN INSTRUCTION PHRASED WITHOUT ANY OF THESE VERBS still passes, for the same reason item 1
-//      of the round-11 block gives: English has no closed set of ways to tell someone to do
-//      something. "Go to that bill and take the second PDF off it" is not caught, and the
-//      assertions at the foot of the test say so rather than leaving it to be found.
+// THE ONLY EXCEPTIONS ARE ENUMERATED, BELOW, AS EXACT STRINGS. A prohibition ("DO NOT VOID IT",
+// "there is nothing to undo") genuinely needs to name the act it refuses, and refusing needs no
+// identifier — but it is now admitted ONE STRING AT A TIME rather than recognised by a rule.
+// `PROHIBITION_TEMPLATES` is a closed allowlist: a new prohibition is a deliberate, reviewable line
+// in this file, and an edit to a shipped one fails until the line is updated to match. That is the
+// whole point — the wording of these sentences has been rewritten twelve times, and a sentence that
+// must match a reviewed template is cheaper than a sentence that must survive a parser.
+//
+// WHAT THE INVERSION BUYS, ITEM BY ITEM AGAINST THE OLD LIST:
+//
+//   • The four constructions above now fail, and so does every construction nobody has thought of,
+//     because none of them is on the allowlist. There is no grammar left to walk around.
+//   • Round 13's item 2 — "a clause is exempt from its first negation onward, so a clause that
+//     refuses one act and instructs another in one breath is not caught" — IS GONE. Only the exact
+//     enumerated span is removed from the prose; anything written next to it is still scanned.
+//
+// WHAT IT STILL DOES NOT BUY, STATED RATHER THAN IMPLIED:
+//
+//   1. THE VERB LIST IS STILL A LIST. An instruction phrased without one of these lexemes passes —
+//      "Go to that bill and take the second PDF off it" is not caught. English has no closed set of
+//      ways to tell someone to do something. What is different is that this is now the ONLY hole
+//      rather than one of four, and it is asserted at the foot of the test rather than described.
+//   2. AN ENUMERATED TEMPLATE IS TRUSTED VERBATIM. The allowlist is where the review happens, so a
+//      badly chosen entry launders whatever it contains. Three checks below make that harder — each
+//      template must contain a mutation lexeme (or it is exempting nothing), must contain a refusal
+//      (or it is not a prohibition), and must actually appear in the shipped corpus (or it is a hole
+//      nothing is standing in) — but none of them replaces reading the line.
+//   3. IT CHECKS THAT THE ENTRY CAN NAME SOMETHING, NOT THAT THE NAMED THING IS THE THING ACTED ON.
+//      An entry that declared a lookup on one object and instructed an act on another would pass.
+//      Unchanged from round 13, and it is what Codex's longer-term remedy — structured instructions
+//      whose target must reference a declared field — would close. Filed as o3d-cvyv; it is a
+//      rewrite of all three wording tables and both formatters, not a fence change.
 // ---------------------------------------------------------------------------------------------
 
 /** Verbs that CHANGE something in somebody else's system. Closed, and enumerated. */
@@ -516,41 +527,101 @@ function everyFormOf(verb: string): string {
 }
 
 /**
- * A determiner or pronoun — what makes the words after a verb A SPECIFIC OBJECT rather than a
- * consequence. This is the whole difference between "clearing the duplicates" and "a reversal
- * POSTS FOR REAL".
+ * A MUTATION LEXEME: one of those acts, in any form, WITH NO REGARD TO WHAT IS AROUND IT. There is
+ * no object rule and no negation rule here, and that absence is the round-14 fix — every rule about
+ * the surrounding words was a place to walk through.
  */
-const OBJECT = '(?:the|that|this|those|these|its|their|any|either|both|each|an|a|it|them|one)\\b'
-
-const INSTRUCTED_ACT = new RegExp(
-  `\\b(?:(${[...ACT_VERBS.map(everyFormOf), ...ACT_VERB_IRREGULARS].join('|')})\\s+${OBJECT}`
-  + `|(${ACT_NOUNS.join('|')})\\s+of\\s+${OBJECT})`,
+const MUTATION_LEXEME = new RegExp(
+  `\\b(?:${[...ACT_VERBS.map(everyFormOf), ...ACT_VERB_IRREGULARS, ...ACT_NOUNS].join('|')})\\b`,
   'gi',
 )
 
-/** Where a clause stops instructing. An occurrence at or after this point is refusing, not telling. */
-const NEGATION = /\b(?:not|never|no|nothing|none|cannot|neither|nor|without|rather than)\b/i
+/**
+ * THE CLOSED ALLOWLIST. Every string a lookup-less entry is permitted to say a mutation lexeme
+ * inside, verbatim and case-sensitive. Each one is a REFUSAL or a statement of incapacity: it names
+ * an act in order to forbid it, or to say the record cannot support it. Adding a line here is the
+ * review; the checks in the test hold each line to the three properties in the block above.
+ */
+const PROHIBITION_TEMPLATES: readonly string[] = [
+  // NOT_A_DOCUMENT_STANDS / NOTHING_CREATED_STANDS — shared by several entries.
+  '{ledger} accepted the write and no reset of ours undoes it, but nothing stands at an id, so '
+  + 'there is nothing here to open, keep or void as one',
+  'there is no document there to open',
+  // The unknown-posting-state remedies (DOCUMENT_INCIDENT_WORDING.OUTCOME_UNRECORDED, UPDATE_UNRECORDED).
+  'DO NOT void, credit-note, reverse or delete anything on the strength of this record',
+  // PURCHASE_CREDIT_NOTE_ALLOCATION.
+  'DO NOT OPEN, KEEP OR VOID EITHER THE BILL OR THE CREDIT NOTE ON THE STRENGTH OF THIS RECORD',
+  // TAX_RATE_SYNC.
+  'THERE IS NOTHING TO VOID OR CREDIT',
+  'so it cannot tell you what correcting it would restore',
+  // BILL_ATTACHMENT, the three cells that cannot name a bill.
+  'DO NOT REMOVE AN ATTACHMENT FROM A BILL THIS RECORD CANNOT NAME',
+  'DO NOT REMOVE AN ATTACHMENT ON THE STRENGTH OF THIS RECORD',
+  'THERE IS NOTHING TO UNDO',
+  'nothing this attempt did needs undoing',
+  'rather than clearing an attachment off a bill picked out any other way',
+  // INVOICE_PDF and WC_INVOICE_NOTE.
+  'There is nothing to void in {ledger}',
+  'rather than clearing notes off an order picked out any other way',
+  // INVOICE_EMAIL, both tables.
+  'IMS CANNOT CANCEL A QUEUED COPY',
+  'no action, route or screen removes an unsent row',
+]
+
+/** What makes an allowlist line a PROHIBITION rather than an exemption for an instruction. */
+const REFUSAL = /\b(?:not|never|no|nothing|none|cannot|neither|nor|rather than|instead of)\b/i
 
 /**
- * A clause boundary, for deciding what is governed by which negation. Deliberately NOT `, ` or
- * ` or `: "DO NOT VOID, CREDIT-NOTE, REVERSE OR DELETE anything on the strength of this record" is
- * ONE prohibition, and splitting on those would orphan every verb after the first from the `not`
- * that governs them all.
+ * Every mutation lexeme a set of templates writes OUTSIDE an enumerated prohibition.
+ *
+ * `allowed` is a parameter so the tests can run the shipped corpus against an EMPTY allowlist and
+ * prove the allowlist is what is carrying it, rather than the corpus happening to be clean.
  */
-const CLAUSE_BOUNDARY = /(?:\.\s|;\s|:\s|—\s|\band\s)/
+function mutationLexemes(
+  templates: readonly string[],
+  allowed: readonly string[] = PROHIBITION_TEMPLATES,
+): string[] {
+  const found: string[] = []
+  for (const template of templates) {
+    // The generated clause is the permitted route, so its own placeholder is not prose.
+    let prose = template.replace(/\{Lookup\}|\{lookup\}/g, ' ')
+    // EXACT, CASE-SENSITIVE, WHOLE-STRING removal. Not a pattern: a prohibition that has been
+    // reworded no longer matches its line, and fails until the line is updated to match it.
+    for (const prohibition of allowed) prose = prose.split(prohibition).join(' ')
+    MUTATION_LEXEME.lastIndex = 0
+    let match: RegExpExecArray | null
+    while ((match = MUTATION_LEXEME.exec(prose)) !== null) found.push(match[0].toLowerCase())
+  }
+  return found
+}
 
-/** Every act these templates INSTRUCT, in whatever grammatical form they instruct it. */
-function actsInstructed(templates: readonly string[]): string[] {
+/**
+ * ROUND 13'S FENCE, KEPT AS THE COUNTER-EXAMPLE AND NOTHING ELSE.
+ *
+ * It is dead to the corpus check above. It survives so that the four constructions Codex walked
+ * through can be run against BOTH fences in one assertion pair: the old one finds nothing in them,
+ * the new one refuses them. Relaxing the guard back to this — the exact regression this round
+ * exists to prevent — turns those pairs red.
+ */
+const LEGACY_OBJECT = '(?:the|that|this|those|these|its|their|any|either|both|each|an|a|it|them|one)\\b'
+const LEGACY_INSTRUCTED_ACT = new RegExp(
+  `\\b(?:(${[...ACT_VERBS.map(everyFormOf), ...ACT_VERB_IRREGULARS].join('|')})\\s+${LEGACY_OBJECT}`
+  + `|(${ACT_NOUNS.join('|')})\\s+of\\s+${LEGACY_OBJECT})`,
+  'gi',
+)
+const LEGACY_NEGATION = /\b(?:not|never|no|nothing|none|cannot|neither|nor|without|rather than)\b/i
+const LEGACY_CLAUSE_BOUNDARY = /(?:\.\s|;\s|:\s|—\s|\band\s)/
+function legacyActsInstructed(templates: readonly string[]): string[] {
   const found: string[] = []
   for (const template of templates) {
     const prose = template.replace(/\{Lookup\}|\{lookup\}/g, ' ')
-    for (const raw of prose.split(CLAUSE_BOUNDARY)) {
+    for (const raw of prose.split(LEGACY_CLAUSE_BOUNDARY)) {
       const clause = raw.trim()
-      const negation = NEGATION.exec(clause)
+      const negation = LEGACY_NEGATION.exec(clause)
       const instructsUntil = negation ? negation.index : clause.length
-      INSTRUCTED_ACT.lastIndex = 0
+      LEGACY_INSTRUCTED_ACT.lastIndex = 0
       let match: RegExpExecArray | null
-      while ((match = INSTRUCTED_ACT.exec(clause)) !== null) {
+      while ((match = LEGACY_INSTRUCTED_ACT.exec(clause)) !== null) {
         if (match.index >= instructsUntil) continue
         found.push((match[1] ?? match[2]).toLowerCase())
       }
@@ -559,36 +630,43 @@ function actsInstructed(templates: readonly string[]): string[] {
   return found
 }
 
-// MUTATION THAT KILLS THIS (run): restore the shipped round-12 wording — put
-// `check: '… and you are choosing between turning it off … and letting the uploads happen and '
-// + 'clearing the duplicates afterwards. …'` back on
-// QBO_OPERATIONS_WITHOUT_REQUEST_ID.BILL_ATTACHMENT.NONE (the cell that names no bill) and this test
-// fails naming that entry and the verb `clearing`. Restoring
-// PURCHASE_CREDIT_NOTE_ALLOCATION's "the only thing that undoes it is removing that allocation from
-// the credit note" kills it the same way, naming `undoes, removing`; so do the three round-11
-// imperatives (`open that bill`, `open that order`, `correct or archive that rate`). All of those
-// mutations are ALSO run inline below against the shipped checker, so weakening the checker fails
-// this test rather than quietly reopening the hole.
+/** The templates of every entry that declares no lookup — the corpus this fence governs. */
+function lookupLessTemplates(): { label: string; templates: string[] }[] {
+  return [...everyWordingEntry(), ...everyReplayWordingEntry()]
+    .filter((entry) => entry.lookup.length === 0)
+    .map(({ label, templates }) => ({ label, templates }))
+}
+
+// MUTATION THAT KILLS THIS (run): write ANY act into a lookup-less entry, in any grammar the four
+// previous rounds argued about — append 'Escalate this record, and remove your duplicate
+// attachment.' to NON_DOCUMENT_INCIDENT_WORDING.WC_INVOICE_NOTE.remedy and this test fails naming
+// that entry and `remove`. RUN, and it is the round-13 finding: the same string passes
+// `legacyActsInstructed` untouched. Deleting any line of PROHIBITION_TEMPLATES kills it the other
+// way — RUN with 'THERE IS NOTHING TO UNDO' removed, it fails naming
+// NON_DOCUMENT_INCIDENT_WORDING.BILL_ATTACHMENT.NONE and `undo` — which is what proves the shipped
+// corpus is passing through the allowlist rather than past it.
 //
 // ROUTE: the templates come from the SHIPPED wording tables — all three of them — and the
-// declaration each entry is judged against is the entry's own `lookup`. Only the verb list and the
-// clause grammar are written down here.
-test('ROUND 13 (Codex HIGH): a remedy may only instruct an act — in ANY form — on an object the record can name', () => {
+// declaration each entry is judged against is the entry's own `lookup`. The verb list and the
+// allowlist are the only things written down here, and both are closed sets.
+test('ROUND 14 (Codex HIGH): an entry that declares no lookup may not contain a mutation lexeme at all', () => {
   const entries = [...everyWordingEntry(), ...everyReplayWordingEntry()]
   assert.ok(entries.length >= 16, `sanity: ${entries.length} wording entries were scanned`)
 
   let sawPermitted = false
   for (const { label, templates, lookup } of entries) {
-    const acts = actsInstructed(templates)
     if (lookup.length > 0) {
-      if (acts.length > 0) sawPermitted = true
+      // An entry that CAN name its object is judged by the round-10/11 declaration tests instead.
+      if (mutationLexemes(templates).length > 0) sawPermitted = true
       continue
     }
+    const lexemes = mutationLexemes(templates)
     assert.deepEqual(
-      acts, [],
-      `${label} instructs an operator to ${acts.join(', ')} — but it declares no lookup, so this `
-      + 'record cannot name the thing being acted on. Either retain and declare an identifier for '
-      + 'it, or replace the instruction with an escalation.',
+      lexemes, [],
+      `${label} writes the mutation lexeme(s) ${lexemes.join(', ')} while declaring no lookup, so `
+      + 'this record cannot name the thing they act on. Either retain and declare an identifier for '
+      + 'it, replace the instruction with an escalation, or — if the sentence REFUSES the act rather '
+      + 'than instructing it — enumerate it verbatim in PROHIBITION_TEMPLATES.',
     )
   }
   assert.ok(
@@ -596,74 +674,148 @@ test('ROUND 13 (Codex HIGH): a remedy may only instruct an act — in ANY form �
     'no entry that CAN name its object instructs an act on it, so the permitted half proves nothing',
   )
 
-  // ---------------------------------------------------------------------------------------------
-  // THE REQUIRED FAILING CASES — the wordings rounds 12 and 13 removed, run against the shipped
-  // checker. The first two are THE ROUND-13 FINDING: an act in a form round 12's fence could not
-  // see.
-  // ---------------------------------------------------------------------------------------------
-  assert.deepEqual(
-    actsInstructed(['if it is ON, the replay uploads to the bill, and you are choosing between '
-      + 'turning it off — which stops attachment uploads for EVERY bill on this connector, not this '
-      + 'one — and letting the uploads happen and clearing the duplicates afterwards.']),
-    ['clearing'],
-    'the round-12 NONE remedy walked through the gerund hole round 12 documented, and it must be refused',
+  // NOT VACUOUS: the shipped corpus passes THROUGH the allowlist, not past it. With no exceptions
+  // enumerated, the same entries are full of lexemes.
+  const bare = lookupLessTemplates().flatMap(({ templates }) => mutationLexemes(templates, []))
+  assert.ok(
+    bare.length >= 10,
+    `the allowlist must be doing work: with it empty the lookup-less corpus yields ${bare.length} lexemes`,
   )
-  assert.deepEqual(
-    actsInstructed(['Both of them existed before this operation and neither was created by it; what '
-      + 'happened is that one was applied to the other, and the only thing that undoes it is '
-      + 'removing that allocation from the credit note in {ledger}.']),
-    ['undoes', 'removing'],
-    'a gerund and a third-person present are acts too, and this entry names neither document',
-  )
-  assert.deepEqual(
-    actsInstructed(['REMEDY: escalate this record. Removal of the duplicate is what undoes it.']),
-    ['removal', 'undoes'],
-    'and so is the noun the verb turns into — otherwise the fence is bypassed by nominalising',
-  )
-  assert.deepEqual(
-    actsInstructed(['REMEDY: open that bill in {ledger} and remove the duplicate attachment. There '
-      + 'is no document to void, and the bill itself was not created by this attempt.']),
-    ['open', 'remove'],
-    'the round-11 attachment remedy is the round-12 finding, and it must still be refused',
-  )
-  assert.deepEqual(
-    actsInstructed(['REMEDY: open that order in WooCommerce and remove any duplicate note. There is '
-      + 'nothing to void in {ledger}.']),
-    ['open', 'remove'],
-    'the WooCommerce note remedy is the same defect and must be refused',
-  )
-  assert.deepEqual(
-    actsInstructed(['REMEDY: THERE IS NOTHING TO VOID OR CREDIT — nothing was posted to a customer '
-      + 'or a supplier account. Review the tax rates in {ledger}, and correct or archive that rate '
-      + 'there if this write was wrong.']),
-    ['archive'],
-    'the tax-rate remedy is the same defect and must be refused',
-  )
+})
 
-  // A PROHIBITION IS NOT AN INSTRUCTION, and must not be caught — refusing to act on a thing needs
-  // no identifier for it. This is the shipped UPDATE_DRAFT sentence.
+// MUTATION THAT KILLS THIS (run): add a line to PROHIBITION_TEMPLATES that is not a prohibition —
+// 'remove the duplicate attachment from that bill' — and the refusal assertion fails naming it. RUN.
+// Deleting a line that no shipped entry contains is caught by the third assertion, which is the
+// round-11 "an exemption must still be needed" rule applied to this allowlist.
+//
+// ROUTE: the allowlist is read here, the corpus out of the SHIPPED wording tables.
+test('ROUND 14: every enumerated exception is a prohibition, and one the shipped corpus still needs', () => {
+  const corpus = lookupLessTemplates().flatMap(({ templates }) => templates)
+  assert.ok(corpus.length > 20, `sanity: ${corpus.length} lookup-less templates were scanned`)
+
+  for (const prohibition of PROHIBITION_TEMPLATES) {
+    assert.ok(
+      prohibition.length >= 20,
+      `"${prohibition}" is too short to be a reviewable template — an allowlist of fragments is the `
+      + 'open blacklist this round replaced, inverted',
+    )
+    assert.notDeepEqual(
+      mutationLexemes([prohibition], []), [],
+      `"${prohibition}" contains no mutation lexeme, so it exempts nothing and should be deleted`,
+    )
+    assert.match(
+      prohibition, REFUSAL,
+      `"${prohibition}" names an act without refusing it — an exception may only be a prohibition`,
+    )
+    assert.ok(
+      corpus.some((template) => template.includes(prohibition)),
+      `"${prohibition}" appears in no lookup-less wording — delete it rather than leaving a hole `
+      + 'nothing is standing in',
+    )
+  }
+
+  // AND THE TEMPLATES ARE EXACT, NOT PATTERNS. One word changed and the exception is gone.
+  const edited = 'DO NOT REMOVE AN ATTACHMENT FROM A BILL THIS RECORD CANNOT IDENTIFY'
   assert.deepEqual(
-    actsInstructed(['DO NOT VOID OR CREDIT-NOTE IT — that would act on a document that was valid '
+    mutationLexemes([edited]), ['remove'],
+    'a reworded prohibition must fail until its line is updated — otherwise the allowlist is a '
+    + 'pattern, and a pattern is what the last four rounds were',
+  )
+})
+
+// MUTATION THAT KILLS THIS (run): relax the guard back to the round-13 heuristic — make
+// `mutationLexemes` return `legacyActsInstructed(templates)` — and this test fails on the FIRST
+// half of the first pair, `remove your duplicate attachment`, because the old fence finds nothing
+// in any of these five. RUN, and it takes three of the other round-14 tests down with it. That is
+// exactly the relaxation this round exists to prevent, and these are the constructions Codex
+// walked through it with.
+//
+// ROUTE: run against the SHIPPED checker. The constructions are written here because they are the
+// wordings that must NEVER be shippable, not wordings that are shipped.
+test('ROUND 14 (Codex HIGH): the four constructions the round-13 grammar could not see', () => {
+  for (const [construction, expected] of [
+    // A POSSESSIVE. `your` was not in round 13's determiner list, and the list of determiners is as
+    // open as everything else about naming an object.
+    ['REMEDY: remove your duplicate attachment.', ['remove']],
+    // THE OBJECT AFTER A PREPOSITION. The words following the verb are a bare plural.
+    ['REMEDY: remove attachments from that bill.', ['remove']],
+    // A MODIFIER BETWEEN THE VERB AND THE DETERMINER.
+    ['REMEDY: remove only that attachment.', ['remove']],
+    // `without`, NOT NEGATING. Round 13 suppressed the rest of the clause from the first negation
+    // word onward, and read this one as a refusal.
+    ['REMEDY: Without delay, remove that attachment.', ['remove']],
+    // …and the same for `rather than`, which round 13 also treated as a negation wherever it fell.
+    ['REMEDY: Rather than waiting for the next sweep, delete that duplicate.', ['delete']],
+  ] as [string, string[]][]) {
+    assert.deepEqual(
+      mutationLexemes([construction]), expected,
+      `${construction} instructs a mutation and must be refused`,
+    )
+    assert.deepEqual(
+      legacyActsInstructed([construction]), [],
+      `${construction} is one of the round-13 findings — the old fence must be shown to miss it, or `
+      + 'this case is not evidence of anything',
+    )
+  }
+})
+
+// MUTATION THAT KILLS THIS (run): as the round-14 corpus test — these are the same checker, and any
+// weakening of it that lets a removed wording back in fails here first.
+//
+// ROUTE: run against the SHIPPED checker, on the wordings rounds 12, 13 and 14 removed.
+test('ROUND 14: every wording the previous rounds removed is still refused', () => {
+  for (const [prose, expected] of [
+    // ROUND 13's two findings: an act in a form round 12's fence could not see.
+    ['if it is ON, the replay uploads to the bill, and you are choosing between turning it off — '
+      + 'which stops attachment uploads for EVERY bill on this connector, not this one — and letting '
+      + 'the uploads happen and clearing the duplicates afterwards.', ['clearing']],
+    ['Both of them existed before this operation and neither was created by it; what happened is '
+      + 'that one was applied to the other, and the only thing that undoes it is removing that '
+      + 'allocation from the credit note in {ledger}.', ['undoes', 'removing']],
+    // The nominalisation.
+    ['REMEDY: escalate this record. Removal of the duplicate is what undoes it.', ['removal', 'undoes']],
+    // ROUND 12's three: imperatives on an object no lookup names.
+    ['REMEDY: open that bill in {ledger} and remove the duplicate attachment. There is no document '
+      + 'to void, and the bill itself was not created by this attempt.', ['open', 'remove', 'void']],
+    ['REMEDY: open that order in WooCommerce and remove any duplicate note. There is nothing to void '
+      + 'in {ledger}.', ['open', 'remove']],
+    ['REMEDY: THERE IS NOTHING TO VOID OR CREDIT — nothing was posted to a customer or a supplier '
+      + 'account. Review the tax rates in {ledger}, and correct or archive that rate there if this '
+      + 'write was wrong.', ['correct', 'archive']],
+  ] as [string, string[]][]) {
+    assert.deepEqual(mutationLexemes([prose]), expected, prose)
+  }
+
+  // THE COST OF THE INVERSION, ASSERTED SO IT IS NOT DISCOVERED. Sentences round 13 admitted by
+  // rule — a prohibition, a consequence with no object — are now refused BY DEFAULT, and reach a
+  // shipped entry only by being enumerated. This is the shipped UPDATE_DRAFT prohibition, which is
+  // permitted there because that entry declares a lookup; written into a lookup-less entry, it
+  // would have to be added to PROHIBITION_TEMPLATES first.
+  assert.deepEqual(
+    mutationLexemes(['DO NOT VOID OR CREDIT-NOTE IT — that would act on a document that was valid '
       + 'before this attempt ran. DO NOT REVERSE IT — a reversal POSTS FOR REAL.']),
+    ['void', 'credit-note', 'reverse', 'reversal'],
+    'a prohibition is no longer admitted by a rule — it is admitted one enumerated line at a time',
+  )
+  // …and the enumerated ones are admitted, which is the other half of that claim.
+  assert.deepEqual(
+    mutationLexemes(['REMEDY: THERE IS NOTHING TO UNDO. No attachment was created, no document was '
+      + 'created, and nothing in {ledger} was touched by this attempt.']),
     [],
-    'a prohibition names an act it forbids, and forbidding needs no lookup',
+    'the shipped BILL_ATTACHMENT.NONE remedy is on the allowlist and must pass',
   )
-  // …and neither is a description of what an act WOULD cost. `a reversal` takes no object.
-  assert.deepEqual(
-    actsInstructed(['A reversal POSTS FOR REAL.']), [],
-    'a nominalised act with no object describes a consequence and instructs nobody',
-  )
-  // …nor is the shipped no-effect sentence, which negates before it names the act at all.
-  assert.deepEqual(
-    actsInstructed(['nothing this attempt did needs undoing — it created no attachment.']), [],
-    'an act named only to say nothing needs it is not an instruction to perform it',
+  assert.notDeepEqual(
+    mutationLexemes(['REMEDY: THERE IS NOTHING TO UNDO. No attachment was created, no document was '
+      + 'created, and nothing in {ledger} was touched by this attempt.'], []),
+    [],
+    'and it must pass BECAUSE of the allowlist, not because it is clean',
   )
 
-  // AND THE HOLE THAT REMAINS, ASSERTED RATHER THAN IMPLIED — item 3 of the block above.
+  // AND THE HOLE THAT REMAINS, ASSERTED RATHER THAN IMPLIED — item 1 of the block above.
   assert.deepEqual(
-    actsInstructed(['Go to that bill and take the second PDF off it.']), [],
-    'an instruction phrased without a listed verb is NOT caught — the fence closes the verb, not '
-    + 'the language',
+    mutationLexemes(['Go to that bill and take the second PDF off it.']), [],
+    'an instruction phrased without a listed lexeme is NOT caught — the fence closes the verb, not '
+    + 'the language, and it is now the only hole rather than one of four',
   )
 })
 

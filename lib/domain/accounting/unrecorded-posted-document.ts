@@ -607,9 +607,9 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
   WC_INVOICE_NOTE: {
     effect: 'a second invoice note is written onto the WooCommerce order, once per sweep',
     check: 'THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER — it holds the IMS reference above and '
-      + 'nothing else, and the IMS record that maps that reference to a WooCommerce order is deleted '
-      + 'by a database reset. Escalate this record to whoever administers this installation rather '
-      + 'than clearing notes off an order picked out any other way',
+      + 'nothing else, and the IMS record that maps that reference to a WooCommerce order does not '
+      + 'survive a database reset. Escalate this record to whoever administers this installation '
+      + 'rather than clearing notes off an order picked out any other way',
   },
 }
 
@@ -1476,7 +1476,7 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
       // same reset that preserves this record.
       remedy: 'REMEDY: THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER. It holds the IMS reference '
         + 'above and nothing else, and the IMS record that maps that reference to a WooCommerce order '
-        + 'is deleted by a database reset. Escalate this record to whoever administers this '
+        + 'does not survive a database reset. Escalate this record to whoever administers this '
         + 'installation rather than clearing notes off an order picked out any other way. There is '
         + 'nothing to void in {ledger}.',
       needs: [],

@@ -181,7 +181,7 @@ const QBO_WC_NOTE =
   + 'the WooCommerce order, once per sweep, unbounded, because no retry is consumed while the row '
   + 'never leaves PROCESSING. WHAT TO DO ABOUT THE EFFECT: THIS RECORD DOES NOT NAME THE '
   + 'WOOCOMMERCE ORDER — it holds the IMS reference above and nothing else, and the IMS record '
-  + 'that maps that reference to a WooCommerce order is deleted by a database reset. Escalate '
+  + 'that maps that reference to a WooCommerce order does not survive a database reset. Escalate '
   + 'this record to whoever administers this installation rather than clearing notes off an order '
   + 'picked out any other way. HOW TO STOP MORE OF IT: turn QuickBooks sync OFF. The control is '
   + 'the checkbox at the top of the SYNC tab of the QuickBooks connector panel, and it writes the '
