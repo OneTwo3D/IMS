@@ -164,7 +164,7 @@ UPDATE "shopping_sync_logs"
 --   2. APPLY THIS MIGRATION. Additive and nullable, so it is metadata-only.
 --   3. RUN THE TWO UPDATE STATEMENTS ABOVE (they are part of this file and run with it). They only
 --      ever write a NULL cell, so they are idempotent and safe to re-run at any time.
---   4. RUN THE VERIFICATION CHECKS. They are declared beside this file as `verify.sql`: six
+--   4. RUN THE VERIFICATION CHECKS. They are declared beside this file as `verify.sql`: seven
 --      statements, each returning one row of (check_name, violations), every count required to be
 --      zero. `scripts/run-migration-verifications.mjs` runs them after the schema has moved and
 --      before anything is started, and a non-zero count stops the cutover.
@@ -305,7 +305,7 @@ UPDATE "shopping_sync_logs"
 -- changed by this migration — it stays keyed on (connector, "externalId") over the wider predicate,
 -- so the failure mode is a unique violation somebody sees rather than two live parks for one refund.
 --
--- VERIFICATION QUERIES — ALL SIX MUST RETURN 0. They live in `verify.sql` beside this file, NOT
+-- VERIFICATION QUERIES — ALL SEVEN MUST RETURN 0. They live in `verify.sql` beside this file, NOT
 -- in this comment: a second copy is a check that can drift from the one that is actually run.
 --
 --   1. shopping_sync_logs unstamped held sales invoice   — an old binary CREATED a hold after the
@@ -344,6 +344,21 @@ UPDATE "shopping_sync_logs"
 --                                                          'Superseded' outcome the park is SYNCED
 --                                                          and gone from the recovery inbox with an
 --                                                          unrefunded amount on it.
+--   7. shopping_sync_logs recovered refund park now shaped or stamped as a held sales invoice
+--                                                        — case (c) FOLLOWED BY A HOLD REWRITE, and
+--                                                          the only check whose evidence is not in
+--                                                          the row it accuses. The predecessor
+--                                                          re-holding the reassigned (or dismissed)
+--                                                          row for its new order restores the
+--                                                          identity equality and replaces the
+--                                                          operator's note, so checks 1-6 all go
+--                                                          quiet over a destroyed accounting
+--                                                          payload. This one joins the
+--                                                          `wc_refund_park_recovered` activity
+--                                                          entries, which that rewrite cannot reach.
+--                                                          The entry's metadata.parkedOrderId names
+--                                                          the order the lost payload has to be
+--                                                          reconstructed for.
 --
 -- ---------------------------------------------------------------------------------------------
 -- A HOLD-SHAPED PAYLOAD WITH NO ORDER ID — MANUAL, AND DELIBERATELY NOT A VERIFY CHECK (Codex r12).

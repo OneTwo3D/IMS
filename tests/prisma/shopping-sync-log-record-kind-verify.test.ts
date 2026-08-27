@@ -1210,7 +1210,7 @@ test('the runner that executes these checks is IN this tree, and the migration s
 
   // What survives from every earlier round: the checks are declared, counted, and not copied inline.
   assert.match(migration, /run-migration-verifications\.mjs/, 'the runner is named as the thing that runs them')
-  assert.match(migration, /ALL SIX MUST RETURN 0/)
+  assert.match(migration, /ALL SEVEN MUST RETURN 0/)
   assert.doesNotMatch(migration, /SELECT count\(\*\) FROM "shopping_sync_logs"/, 'no second copy of the checks')
 })
 
