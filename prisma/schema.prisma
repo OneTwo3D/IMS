@@ -3024,6 +3024,16 @@ enum WmsOrderPushState {
   DEAD_LETTER
   HELD
   MERGED
+  /// o3d-2k5r r4: a create request WAS dispatched for this order and its outcome
+  /// was never recorded — the shape a worker killed mid-push leaves behind, since
+  /// claimForCreate writes its claim immediately before the remote call. Distinct
+  /// from PENDING_CREATE because the queue is precisely what such a link must be
+  /// taken out of (re-pushing is a second warehouse order); distinct from
+  /// DEAD_LETTER because no failure was ever observed; distinct from
+  /// VALIDATION_FAILED because the payload is fine. It leaves the create queue and
+  /// re-enters it only where the connector's own create REFUSES a duplicate — see
+  /// lib/domain/wms/create-replay-policy.ts — and otherwise waits for a person.
+  AMBIGUOUS_CREATE
   /// o3d-92fu: the push payload could not be BUILT from local data (a line with
   /// no SKU, say), so pushOrder was never invoked and no remote side effect is
   /// possible. Distinct from DEAD_LETTER, which spans repeated REMOTE failures

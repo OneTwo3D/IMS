@@ -2,11 +2,14 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   AMBIGUOUS_ATTEMPTS,
+  decideCreateClaim,
   runWmsOrderPushSweepCore,
   shouldGrantCreateClaim,
   type WmsOrderPushPort,
+  type WmsPushAmbiguousCreateLink,
   type WmsPushCandidate,
 } from '../lib/domain/wms/order-push-sweep.ts'
+import { wmsAmbiguousCreateRefusal } from '../lib/domain/wms/create-replay-policy.ts'
 import type { WmsOrderPushInput, WmsOrderPushResult } from '../lib/connectors/wms/types.ts'
 import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
 
@@ -114,8 +117,20 @@ function makeLinkStore(options: { connectorId: string; failLinkWrites?: boolean 
       claimCalls.push({ orderId, at: attemptedAt })
       const existing = links.get(orderId) ?? null
       // MIRRORS THE PRISMA PORT (createPrismaWmsOrderPushPort.claimForCreate): read the link under
-      // the order lock, ask the shared rule, and write PENDING_CREATE BEFORE the remote call.
-      if (!shouldGrantCreateClaim(existing, attemptedAt)) return false
+      // the order lock, DELEGATE TO THE PRODUCTION RULE — not a restatement of it, which is how a
+      // harness quietly stops testing what it claims to — and write PENDING_CREATE BEFORE the
+      // remote call. The park is written here too, in the same place the real port writes it.
+      const decision = decideCreateClaim(existing, attemptedAt)
+      if (decision === 'SKIP') return 'SKIPPED'
+      if (decision === 'PARK_AMBIGUOUS') {
+        write(orderId, {
+          state: 'AMBIGUOUS_CREATE',
+          attempts: Math.max(existing?.attempts ?? 0, AMBIGUOUS_ATTEMPTS),
+          lastError: wmsAmbiguousCreateRefusal(connector, 'SO-1'),
+          lastAttemptAt: attemptedAt,
+        })
+        return 'PARKED_AMBIGUOUS'
+      }
       if (existing) write(orderId, { lastAttemptAt: attemptedAt })
       else {
         seq += 1
@@ -132,7 +147,21 @@ function makeLinkStore(options: { connectorId: string; failLinkWrites?: boolean 
           externalOrderNumber: null,
         })
       }
-      return true
+      return 'CLAIMED'
+    },
+    ambiguousCreateLinks: async () => {
+      const link = links.get('so-1')
+      if (!link || link.state !== 'AMBIGUOUS_CREATE') return { links: [], total: 0 }
+      const row: WmsPushAmbiguousCreateLink = {
+        id: link.id,
+        orderId: link.orderId,
+        lastError: link.lastError,
+        attempts: link.attempts,
+        pushedAt: link.pushedAt,
+        externalOrderId: link.externalOrderId,
+        order: { ...candidate({ pushAttempts: link.attempts }), shipFromWarehouseId: 'wh-1' },
+      }
+      return { links: [row], total: 1 }
     },
     verifiableLinks: async () => [],
     updatableLinks: async () => [],

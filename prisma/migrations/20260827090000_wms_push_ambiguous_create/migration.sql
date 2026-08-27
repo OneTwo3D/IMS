@@ -1,0 +1,19 @@
+-- o3d-2k5r r4: a create whose OUTCOME was never recorded needs a disposition of its own.
+--
+-- claimForCreate writes PENDING_CREATE immediately BEFORE it calls the WMS, so a link still
+-- sitting at PENDING_CREATE with a dispatch stamp means a create request left this system and
+-- nobody ever learned what became of it — the ordinary shape of a worker killed mid-push. Until
+-- now the claim lease simply EXPIRED and handed the same order to the next worker, which pushed
+-- it again: on a WMS whose create does not refuse a duplicate (ShipHero does not enforce
+-- partner_order_id uniqueness) that is a second warehouse order and a second physical picking.
+--
+-- It cannot be derived from the existing states. PENDING_CREATE cannot distinguish "queued" from
+-- "dispatched, outcome unknown" — the queue is exactly what it must be taken OUT of.
+-- VALIDATION_FAILED means the payload could not be built, which is a different fact and carries a
+-- different remedy (fix the order data); DEAD_LETTER means MAX_ATTEMPTS remote failures were
+-- observed, and here nothing was observed at all. The hard-delete guard, the sync-exceptions inbox
+-- and the replay action each have to tell these apart, and no other column on the row can.
+--
+-- Added at the end of the enum: ALTER TYPE ... ADD VALUE takes an exclusive lock on the type for
+-- the length of the statement only, and no existing row changes.
+ALTER TYPE "WmsOrderPushState" ADD VALUE IF NOT EXISTS 'AMBIGUOUS_CREATE';

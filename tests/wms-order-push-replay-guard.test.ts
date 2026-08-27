@@ -36,6 +36,9 @@ const state = {
   probeSupported: true,
   probedReferences: [] as string[],
   activity: [] as Array<Record<string, unknown>>,
+  /** Which WMS connector plugin is enabled. Settable so "not the active one" can be tested for a
+   *  connector whose create IS replay-safe, separately from the replay-policy refusal. */
+  activePlugins: { mintsoft: true } as Record<string, boolean>,
 }
 
 function matches(row: LinkRow, where: Record<string, unknown>): boolean {
@@ -100,7 +103,7 @@ mock.module('@/lib/activity-log', {
 mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
 
 mock.module('@/lib/integration-plugins', {
-  namedExports: { getIntegrationPluginState: async () => ({ mintsoft: true }) },
+  namedExports: { getIntegrationPluginState: async () => state.activePlugins },
 })
 
 mock.module('@/lib/connectors/wms/registry', {
@@ -128,6 +131,7 @@ function deadLetter(over: Partial<LinkRow> = {}): LinkRow {
 }
 
 function reset(links: LinkRow[]) {
+  state.activePlugins = { mintsoft: true }
   state.links = links
   state.mutateAfterRead = null
   state.presence = 'MISSING'
@@ -209,11 +213,28 @@ test('o3d-2k5r r3 replay: a connector that cannot probe refuses rather than assu
 
 test('o3d-2k5r r3 replay: a dead letter belonging to a connector that is not active is refused', async () => {
   // Probing the WRONG warehouse and getting MISSING is not evidence about this order at all.
-  reset([deadLetter({ connector: 'shiphero' })])
+  // mintsoft's create IS replay-safe, so the only thing that can refuse here is the active-connector
+  // check — which is what keeps this test about that check rather than about the replay policy.
+  reset([deadLetter({ connector: 'mintsoft' })])
+  state.activePlugins = { shiphero: true }
   const result = await (await loadAction())('so-1')
 
   assert.equal(result.success, false)
   assert.match(result.error!, /not the active one/)
   assert.deepEqual(state.probedReferences, [])
   assert.equal(state.links[0].state, 'DEAD_LETTER')
+})
+
+test('o3d-2k5r r4 replay: a connector whose create cannot be repeated safely is refused before anything is asked', async () => {
+  // ShipHero's order_create does not enforce partner_order_id uniqueness, so its only dedupe is a
+  // preflight lookup that cannot see a request still on the wire. No answer the warehouse could
+  // give would licence this replay, so nothing is asked and the refusal names WMS-side actions.
+  reset([deadLetter({ connector: 'shiphero' })])
+  const result = await (await loadAction())('so-1')
+
+  assert.equal(result.success, false)
+  assert.match(result.error!, /not safe to repeat/i)
+  assert.match(result.error!, /second warehouse order/i)
+  assert.deepEqual(state.probedReferences, [], 'a probe could not have changed the answer, so none was spent')
+  assert.equal(state.links[0].state, 'DEAD_LETTER', 'nothing written')
 })

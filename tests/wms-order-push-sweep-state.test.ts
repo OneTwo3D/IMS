@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   AMBIGUOUS_ATTEMPTS,
+  decideCreateClaim,
+  mayDisposeCreateClaim,
   runWmsOrderPushSweepCore,
   shouldGrantCreateClaim,
   type WmsOrderPushPort,
@@ -111,7 +113,11 @@ function makePort(seed: Seed) {
     },
     claimForCreate: async (orderId) => {
       claims.push(orderId)
-      return seed.claimForCreate ? seed.claimForCreate(orderId) : true
+      // o3d-2k5r r4: the port now answers with an OUTCOME, because a boolean could not express
+      // "an expired claim was parked". A seed that says false still means "another worker owns
+      // this" — the park has its own suite (wms-create-claim-crash-recovery.test.ts).
+      const granted = seed.claimForCreate ? await seed.claimForCreate(orderId) : true
+      return granted ? 'CLAIMED' : 'SKIPPED'
     },
     verifiableLinks: async () => seed.verifiable ?? [],
     updatableLinks: async () => seed.updatable ?? [],
@@ -385,7 +391,7 @@ test('o3d-92fu create: a whole batch of malformed orders does NOT starve the val
       .map((o) => ({ ...o, pushAttempts: links.get(o.id)?.attempts ?? 0 })),
     // Deliberately absent: this test is about the CREATE queue, and a revalidation pass that
     // re-queued the bad orders would mask the very starvation being pinned.
-    claimForCreate: async () => true,
+    claimForCreate: async () => 'CLAIMED' as const,
     // Models the production write: refuses unless the link is still absent or PENDING_CREATE.
     recordValidationFailure: async (orderId) => {
       const existing = links.get(orderId)
@@ -1065,15 +1071,53 @@ test('claim: a FRESH PENDING_CREATE is refused — another worker holds it (o3d-
   )
 })
 
-test('claim: an EXPIRED PENDING_CREATE is reclaimable — a crashed worker must not strand it (o3d-38gl)', () => {
+test('claim: an EXPIRED PENDING_CREATE is PARKED, never handed on (o3d-2k5r r4)', () => {
+  // This assertion used to be `true`, and that was the defect. o3d-38gl reasoned that a crashed
+  // worker must not STRAND the order, and concluded the next worker should take the claim. But the
+  // claim is written immediately before pushOrder, so what it actually strands is the KNOWLEDGE
+  // that a create left — and re-issuing it on a lapsed timestamp is how one sale became two
+  // warehouse orders. The order is still not stranded: it is parked where the reconciliation pass
+  // and the operator inbox can both see it.
   const stale = { state: 'PENDING_CREATE', lastAttemptAt: new Date('2026-07-20T12:00:00Z') }
-  assert.equal(shouldGrantCreateClaim(stale, new Date('2026-07-20T12:06:00Z')), true)
+  assert.equal(shouldGrantCreateClaim(stale, new Date('2026-07-20T12:06:00Z')), false)
+  assert.equal(decideCreateClaim(stale, new Date('2026-07-20T12:06:00Z')), 'PARK_AMBIGUOUS')
 })
 
-test('claim: the lease boundary is inclusive, so a claim cannot wedge forever (o3d-38gl)', () => {
+test('claim: the lease boundary is inclusive — at the boundary the claim is stale, not live (o3d-2k5r r4)', () => {
   const at = new Date('2026-07-20T12:00:00Z')
   const link = { state: 'PENDING_CREATE', lastAttemptAt: at }
-  assert.equal(shouldGrantCreateClaim(link, new Date(at.getTime() + 1000), 1000), true)
+  // One millisecond earlier the holder may still be inside pushOrder, so nothing may touch it.
+  assert.equal(decideCreateClaim(link, new Date(at.getTime() + 999), 1000), 'SKIP')
+  // At the boundary it stops being live — and becomes PARKABLE, which is a different thing from
+  // becoming claimable. The distinction is the whole of o3d-2k5r r4.
+  assert.equal(decideCreateClaim(link, new Date(at.getTime() + 1000), 1000), 'PARK_AMBIGUOUS')
+  assert.equal(shouldGrantCreateClaim(link, new Date(at.getTime() + 1000), 1000), false)
+})
+
+test('claim: a link in any other state is not parkable either — it belongs to another pass (o3d-2k5r r4)', () => {
+  // The park is for a LAPSED CREATE CLAIM and nothing else. A SYNCED or DEAD_LETTER link has a
+  // writer of its own, and moving it to AMBIGUOUS_CREATE would take a live warehouse order out of
+  // the update, hold, cancel and dispatch passes.
+  for (const state of ['SYNCED', 'PENDING_VERIFY', 'CANCELLED', 'DEAD_LETTER', 'HELD', 'VALIDATION_FAILED', 'AMBIGUOUS_CREATE']) {
+    assert.equal(
+      decideCreateClaim({ state, lastAttemptAt: new Date('2026-07-20T12:00:00Z') }, new Date('2026-07-20T12:06:00Z')),
+      'SKIP',
+      `${state} is not a create claim`,
+    )
+  }
+})
+
+test('disposition: an expired claim may still be CONVERTED, because that write sends nothing (o3d-2k5r r4)', () => {
+  // recordValidationFailure and the create claim ask different questions, and they diverged the
+  // moment an expired claim stopped being claimable. A test that only checked the claim would let
+  // the disposition path silently start refusing every lapsed claim — which would put the
+  // "attempts 0 means no call was dispatched" reading back in the hard-delete guard's hands.
+  const stale = { state: 'PENDING_CREATE', lastAttemptAt: new Date('2026-07-20T12:00:00Z') }
+  const live = { state: 'PENDING_CREATE', lastAttemptAt: new Date('2026-07-20T12:05:59Z') }
+  assert.equal(mayDisposeCreateClaim(stale, new Date('2026-07-20T12:06:00Z')), true)
+  assert.equal(mayDisposeCreateClaim(live, new Date('2026-07-20T12:06:00Z')), false)
+  assert.equal(mayDisposeCreateClaim({ state: 'SYNCED', lastAttemptAt: null }, new Date()), false)
+  assert.equal(mayDisposeCreateClaim(null, new Date()), true)
 })
 
 test('claim: a link in any OTHER state is never claimable by the create pass (o3d-38gl)', () => {

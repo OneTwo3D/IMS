@@ -4,6 +4,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
+import { wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal } from './create-replay-policy'
 import { scrubWmsError } from './error-scrub'
 import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
 
@@ -56,28 +57,97 @@ const PRESENCE_PROBE_BUDGET = 5
  * the slowest plausible pushOrder round trip, short enough that a crashed worker's order is
  * retried in minutes rather than stranded.
  *
- * This is a LEASE, not an owner token: after it expires a crashed worker's in-flight request
- * could still overlap a retry. Closing that needs a token recorded on the link and required when
- * the outcome is written — see o3d-38gl.
+ * o3d-2k5r r4 — AND EXPIRY IS NOT A HANDOVER. The lease used to GRANT the claim to the next
+ * worker once it lapsed, which is what made the ordinary crash duplicate an order: a create that
+ * reached the WMS before the worker died leaves nothing behind but this claim, and five minutes
+ * later the claim was simply re-issued and the create repeated. The lease now decides only whether
+ * a worker may STILL be inside pushOrder; a lapsed one is parked, never handed on. See
+ * {@link decideCreateClaim}.
  */
 const CREATE_CLAIM_LEASE_MS = 5 * 60 * 1000
 
 /**
- * May this worker take the create claim? Pure so the rule can be tested without a database —
- * the claim itself needs the order row lock, which a unit test cannot express.
+ * What a worker may do with the link it found under the order lock (o3d-2k5r r4).
  *
- * `null` existing = never pushed, claim it. A non-PENDING_CREATE state means someone else owns
- * the link (SYNCED, CANCELLED, DEAD_LETTER, HELD) and this pass has no business touching it.
+ * Three answers, because the old two were the defect. `shouldGrantCreateClaim` returned a boolean,
+ * and a boolean forced "an expired claim" into the same bucket as "a link nobody has touched" —
+ * so the only thing the create pass could do with a crashed worker's claim was take it and push
+ * again.
+ */
+export type WmsCreateClaimDecision =
+  /** No create has been dispatched for this order. Take the claim and call the WMS. */
+  | 'CLAIM'
+  /** Someone else owns this link, or is inside pushOrder right now. Do nothing at all. */
+  | 'SKIP'
+  /**
+   * A create WAS dispatched and nothing ever recorded its outcome. Not this pass's to retry:
+   * park it where the ambiguity is visible and let the reconciliation pass apply the connector's
+   * replay policy.
+   */
+  | 'PARK_AMBIGUOUS'
+
+/**
+ * The create-claim rule, pure so it can be tested without a database — the claim itself needs the
+ * order row lock, which a unit test cannot express.
+ *
+ * THE ONE THING THAT LICENCES A CREATE IS THE ABSENCE OF A DISPATCH STAMP. `lastAttemptAt` is
+ * written by `claimForCreate` in the same transaction as the claim and IMMEDIATELY BEFORE the
+ * remote call, so a PENDING_CREATE link carrying one means "a create request left this system and
+ * we may never have learned what became of it". Every writer that legitimately (re-)queues an order
+ * — the HELD release, the revalidation promote, the operator replay — CLEARS the stamp, and that
+ * cleared stamp is the positive evidence this rule grants on. A stamp that is merely OLD is not
+ * evidence of anything except elapsed time.
+ *
+ * `null` existing = no link at all, so no worker has claimed the order and pushOrder cannot have
+ * been invoked. A non-PENDING_CREATE state means someone else owns the link (SYNCED, CANCELLED,
+ * DEAD_LETTER, HELD, AMBIGUOUS_CREATE) and this pass has no business touching it.
+ */
+export function decideCreateClaim(
+  existing: { state: string; lastAttemptAt: Date | null } | null,
+  attemptedAt: Date,
+  leaseMs: number = CREATE_CLAIM_LEASE_MS,
+): WmsCreateClaimDecision {
+  if (!existing) return 'CLAIM'
+  if (existing.state !== 'PENDING_CREATE') return 'SKIP'
+  // Queued and never dispatched — by the claim that has not happened yet, or by a writer that
+  // cleared the stamp precisely to say so.
+  if (!existing.lastAttemptAt) return 'CLAIM'
+  // Inside the lease: another worker is plausibly still talking to the WMS. Touching the link now
+  // would race a live push AND move its lease clock forward.
+  if (attemptedAt.getTime() - existing.lastAttemptAt.getTime() < leaseMs) return 'SKIP'
+  return 'PARK_AMBIGUOUS'
+}
+
+/**
+ * May this worker take the create claim and call the WMS?
+ *
+ * Deliberately NARROWER than it used to be: an expired claim no longer qualifies. Kept as its own
+ * function because it is the question the create path actually asks, and because stating it in
+ * terms of {@link decideCreateClaim} is what stops the two drifting apart.
  */
 export function shouldGrantCreateClaim(
   existing: { state: string; lastAttemptAt: Date | null } | null,
   attemptedAt: Date,
   leaseMs: number = CREATE_CLAIM_LEASE_MS,
 ): boolean {
-  if (!existing) return true
-  if (existing.state !== 'PENDING_CREATE') return false
-  if (!existing.lastAttemptAt) return true
-  return attemptedAt.getTime() - existing.lastAttemptAt.getTime() >= leaseMs
+  return decideCreateClaim(existing, attemptedAt, leaseMs) === 'CLAIM'
+}
+
+/**
+ * May this worker write a DISPOSITION over the link — a state change that sends no request?
+ *
+ * A wider question than the claim, and a different one. `recordValidationFailure` is not going to
+ * call the WMS, so an expired claim is something it may legitimately convert (that conversion is
+ * how a stale claim becomes an AMBIGUOUS disposition rather than silently reading as "nothing
+ * happened"). What it must never do is stamp itself over a link that has MOVED ON, or over a claim
+ * whose holder is still inside pushOrder — which is exactly `SKIP`.
+ */
+export function mayDisposeCreateClaim(
+  existing: { state: string; lastAttemptAt: Date | null } | null,
+  attemptedAt: Date,
+  leaseMs: number = CREATE_CLAIM_LEASE_MS,
+): boolean {
+  return decideCreateClaim(existing, attemptedAt, leaseMs) !== 'SKIP'
 }
 
 /**
@@ -234,6 +304,14 @@ export type WmsOrderPushSweepResult = {
    * or on an operator.
    */
   revalidateAmbiguous: number
+  /**
+   * o3d-2k5r r4 — expired create claims PARKED this sweep because a create was dispatched for them
+   * and nothing recorded the outcome. Counted apart from `failed`: nothing failed, and apart from
+   * `revalidateAmbiguous`, which is the same refusal reached from the validation-failure route.
+   */
+  createClaimParked: number
+  /** ...and parked links this sweep put back in the create queue, on the connector's replay policy. */
+  ambiguousCreateRequeued: number
 }
 
 type OrderForPush = {
@@ -446,7 +524,7 @@ function refundedQtyByLine(order: { refunds?: Array<{ lines: Array<{ salesOrderL
 // tested with an in-memory fake (see tests/wms-order-push-sweep-state.test.ts),
 // mirroring the repository pattern used by the shopping webhook inbox.
 
-type PushState = 'PENDING_CREATE' | 'PENDING_VERIFY' | 'SYNCED' | 'PENDING_CANCEL' | 'CANCELLED' | 'DEAD_LETTER' | 'HELD' | 'VALIDATION_FAILED'
+type PushState = 'PENDING_CREATE' | 'PENDING_VERIFY' | 'SYNCED' | 'PENDING_CANCEL' | 'CANCELLED' | 'DEAD_LETTER' | 'HELD' | 'VALIDATION_FAILED' | 'AMBIGUOUS_CREATE'
 type LinkWrite = {
   connector?: string
   externalOrderId?: string | null
@@ -507,6 +585,14 @@ export type WmsPushRevalidateLink = {
   externalOrderId: string | null
   order: OrderForPush & { shipFromWarehouseId: string | null }
 }
+/**
+ * o3d-2k5r r4 — a link PARKED because a create was dispatched for it and its outcome was never
+ * recorded. Structurally the revalidation candidate's columns, and for the same reason: the
+ * re-queue decision is made from the shared `wmsOrderMayExist` rule rather than by trusting the
+ * port's where-clause to have filtered.
+ */
+export type WmsPushAmbiguousCreateLink = WmsPushRevalidateLink
+
 export type WmsPushLinkRef = { id: string; orderId: string; externalOrderId: string | null }
 /**
  * o3d-bjc.8: a PENDING_VERIFY link, carrying OUR identifiers.
@@ -527,6 +613,12 @@ export type WmsPushVerifyLink = WmsPushLinkRef & {
   shippingService: string | null
 }
 
+/**
+ * o3d-2k5r r4 — what `claimForCreate` did. A boolean could not express the third answer, and that
+ * is precisely why the third answer never happened.
+ */
+export type WmsCreateClaimOutcome = 'CLAIMED' | 'SKIPPED' | 'PARKED_AMBIGUOUS'
+
 export interface WmsOrderPushPort {
   activeBindings(connector: string): Promise<Array<{ warehouseId: string; externalWarehouseId: string }>>
   /** HELD links whose order is back in a ready+paid state. */
@@ -546,11 +638,14 @@ export interface WmsOrderPushPort {
    * lock deleteSalesOrder takes — so the deleter either sees the link and refuses, or
    * commits first and this claim finds the order gone and returns false.
    *
-   * Returns false when the order no longer exists or already has a non-PENDING_CREATE
-   * link (another worker got there first); the caller must then skip the candidate
-   * without calling the WMS.
+   * o3d-2k5r r4 — AND IT NEVER HANDS ON AN EXPIRED CLAIM. `'SKIPPED'` when the order is gone, the
+   * link has moved on, or another worker's claim is still live. `'PARKED_AMBIGUOUS'` when the claim
+   * has LAPSED: a create request left this system and nothing recorded what became of it, so the
+   * link is moved to AMBIGUOUS_CREATE *inside this same transaction* — atomically with the decision
+   * that it is stale, under the row lock, so no second worker can reach the same conclusion and
+   * push. The caller must not call the WMS for either non-`'CLAIMED'` answer.
    */
-  claimForCreate(orderId: string, connector: string, attemptedAt: Date): Promise<boolean>
+  claimForCreate(orderId: string, connector: string, attemptedAt: Date): Promise<WmsCreateClaimOutcome>
   /**
    * o3d-92fu — record a PRE-CALL payload-validation failure, under the order's row lock.
    *
@@ -607,6 +702,24 @@ export interface WmsOrderPushPort {
    * Optional so existing test ports keep compiling; when absent, the pass does not run.
    */
   revalidatableLinks?(connector: string, boundWarehouseIds: string[], limit: number): Promise<{ links: WmsPushRevalidateLink[]; total: number }>
+  /**
+   * o3d-2k5r r4 — AMBIGUOUS_CREATE links whose order is STILL create-eligible.
+   *
+   * The park has to have a door or it is a grave, and the door is the connector's replay policy:
+   * on a WMS whose own create refuses a duplicate, re-dispatching cannot mint a second warehouse
+   * order however the race falls, so the link goes back in the create queue and heals itself. On a
+   * WMS whose create does not, nothing here re-opens it and the reconciliation is a person's.
+   *
+   * Eligibility is deliberately the SAME predicate as createCandidates', for the same reason the
+   * revalidation pass uses it: promoting an order that is no longer ready+paid would re-queue a
+   * cancelled order for fulfilment.
+   *
+   * Returns the batch AND the true total, because a bounded sweep that reports only what it
+   * processed reads as "covered everything".
+   *
+   * Optional so existing test ports keep compiling; when absent, the pass does not run.
+   */
+  ambiguousCreateLinks?(connector: string, boundWarehouseIds: string[], limit: number): Promise<{ links: WmsPushAmbiguousCreateLink[]; total: number }>
   /** SYNCED links whose order is ON_HOLD. */
   holdableLinks(connector: string, limit: number): Promise<WmsPushLinkRef[]>
   /** SYNCED links whose order is CANCELLED in IMS. */
@@ -695,7 +808,7 @@ export async function runWmsOrderPushSweepCore(
   port: WmsOrderPushPort,
   options?: { batchSize?: number; now?: () => Date },
 ): Promise<WmsOrderPushSweepResult> {
-  const result: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0 }
+  const result: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, ambiguousCreateRequeued: 0 }
   if (!connector.pushOrder) return { ...result, skipped: 'Active WMS connector has no order-push support' }
 
   const batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE
@@ -781,7 +894,13 @@ export async function runWmsOrderPushSweepCore(
     // longer held a reference to the first.
     let released = false
     try {
-      released = await port.updateLinkIfState(link.id, 'HELD', { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, cancelledAt: null, ...RESET_DISPATCH_FAILURES })
+      // o3d-2k5r r4: `lastAttemptAt: null` is now LOAD-BEARING, not tidiness. A PENDING_CREATE link
+      // carrying a dispatch stamp means "a create left and we never learned the outcome", and the
+      // claim rule parks such a link instead of claiming it. A release that left the CANCELLED WMS
+      // order's old stamp in place would therefore park the very order it just re-opened. The
+      // release is entitled to clear it: the held order's warehouse order was cancelled when it was
+      // held, so nothing is outstanding — which is the whole reason a release re-creates.
+      released = await port.updateLinkIfState(link.id, 'HELD', { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, lastAttemptAt: null, cancelledAt: null, ...RESET_DISPATCH_FAILURES })
     } catch (error) {
       console.error('[wms-order-push] release link update failed', link.id, error)
       continue
@@ -910,6 +1029,36 @@ export async function runWmsOrderPushSweepCore(
       // genuinely never received re-queues itself as soon as the connector can say so.
       let warehouseAbsenceProved = false
       if (wmsCreateOutcomeIsAmbiguous(link)) {
+        // o3d-2k5r r4 — AND A PROBE IS NOT THE WHOLE RULE EITHER.
+        //
+        // r3 re-queued on `probeOrderPresence === 'MISSING'` alone. MISSING says what the warehouse
+        // HOLDS at the instant it is asked; it does not exclude a create that is still on the wire,
+        // and on a connector whose own create does not refuse a duplicate the loser of that race is
+        // a second warehouse order. So the probe is only asked for at all once the CONNECTOR's
+        // create is known to be safe to repeat — see create-replay-policy.ts, which is also what
+        // keeps this gate and the ambiguous-create pass answering the same question the same way.
+        if (!wmsAmbiguousCreateMayBeReplayed(connectorId)) {
+          const message = wmsAmbiguousCreateRefusal(connectorId, wmsPushOrderReference(link.order))
+          console.warn(`[wms-order-push] link ${link.id} builds a valid payload again but is NOT re-queued — ${connectorId} cannot repeat a create safely`)
+          const restamped = await port
+            .updateLinkIfState(link.id, 'VALIDATION_FAILED', { lastError: message, lastAttemptAt: ts })
+            .catch((e) => {
+              console.error('[wms-order-push] failed to re-stamp an unreplayable revalidation candidate', link.id, e)
+              return false
+            })
+          if (!restamped) continue
+          result.revalidateAmbiguous += 1
+          if (message !== link.lastError) {
+            await audit({
+              action: 'order_validate', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: null,
+              summary: `Order ${link.order.orderNumber ?? link.orderId} can be pushed again, but a previous create may already have reached the WMS and this connector's create cannot be repeated safely — held back for reconciliation`,
+              before: { state: 'VALIDATION_FAILED', lastError: link.lastError },
+              after: { state: 'VALIDATION_FAILED', attempts: link.attempts, remoteOutcomeAmbiguous: true, createReplayable: false },
+              error: message,
+            })
+          }
+          continue
+        }
         const absence = await probeWarehouseAbsence(wmsPushOrderReference(link.order))
         if (!absence.absent) {
           const message = 'A WMS create may already have been dispatched for this order and its outcome was never '
@@ -987,6 +1136,160 @@ export async function runWmsOrderPushSweepCore(
         // disposition that proved no call was ever dispatched, or a connector-authoritative
         // absence check. An auditor should never have to guess which one was relied on.
         after: { state: 'PENDING_CREATE', attempts: link.attempts, warehouseAbsenceProved },
+      })
+    }
+  }
+
+  // --- Ambiguous-create reconciliation pass (o3d-2k5r r4) ---
+  //
+  // AMBIGUOUS_CREATE is where a create claim goes when its holder vanished mid-push. The link is
+  // not a create candidate any more — that is the whole point, it is what stops the next sweep
+  // repeating the create — so something has to be able to let it out again, or the park is a grave
+  // and the order can never be fulfilled OR deleted.
+  //
+  // THE DOOR NEEDS TWO KEYS, because the two risks are different risks.
+  //
+  //   1. THE ORDER MAY ALREADY BE THERE. Answered by the warehouse itself: probeOrderPresence
+  //      === 'MISSING'. Nothing weaker — an operator's assertion is not evidence (o3d-anu8), and
+  //      neither is our own silence.
+  //   2. A REQUEST MAY STILL BE IN FLIGHT. A probe CANNOT answer this one: MISSING describes what
+  //      the warehouse holds at the instant it is asked, and a create on the wire is neither
+  //      present nor proof of absence. Elapsed time cannot answer it either — connectorFetch
+  //      aborts a LIVE worker's request at its timeout, but the case this exists for is a worker
+  //      that is not live, and a stopped process (SIGSTOP, a frozen VM) resumes with no bound at
+  //      all. What answers it is the CONNECTOR'S OWN CONTRACT: if the remote refuses a duplicate,
+  //      the loser of any race is refused by the party that owns the data, and the connector
+  //      reconciles to the order that already exists.
+  //
+  // So both are required, and a connector that cannot supply the second is never re-dispatched
+  // automatically at all — the refusal names what a person can do instead.
+  //
+  // Runs BEFORE the create pass, like the revalidation pass and for the same reason: a link this
+  // sweep re-queues is pushed on this tick rather than the next.
+  if (externalWarehouseByWarehouse.size > 0 && port.ambiguousCreateLinks) {
+    const { links, total } = await port.ambiguousCreateLinks(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize)
+    if (total > links.length) {
+      console.warn(
+        `[wms-order-push] ${total} orders are parked AMBIGUOUS_CREATE and still create-eligible; `
+        + `this sweep re-checked the ${links.length} least-recently-checked. The remaining ${total - links.length} `
+        + 'rotate in on following sweeps — they are NOT dropped.',
+      )
+    }
+    const replayable = wmsAmbiguousCreateMayBeReplayed(connectorId)
+    for (const link of links) {
+      const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
+      if (!externalWarehouseId) continue
+      const ts = now()
+      // The same first gate the revalidation pass applies, from the same shared rule: a link that
+      // positively records a warehouse order must never be re-opened, whatever the policy says.
+      if (wmsOrderMayExist(link)) {
+        console.warn(
+          `[wms-order-push] link ${link.id} is parked AMBIGUOUS_CREATE but carries `
+          + `${link.externalOrderId ? `WMS order ${link.externalOrderId}` : 'a recorded push'} — NOT re-queued; `
+          + 'a create would duplicate a warehouse order. Resolve it by hand.',
+        )
+        continue
+      }
+      const reference = wmsPushOrderReference(link.order)
+      if (!replayable) {
+        const message = wmsAmbiguousCreateRefusal(connectorId, reference)
+        // Re-stamped so the rotation moves on, and audited only when the REASON changed — the same
+        // discipline the revalidation pass uses, for the same reason: a persisted disposition exists
+        // to stop the operator being told the same thing every ten minutes.
+        const restamped = await port
+          .updateLinkIfState(link.id, 'AMBIGUOUS_CREATE', { lastError: message, lastAttemptAt: ts })
+          .catch((e) => {
+            console.error('[wms-order-push] failed to re-stamp a parked create claim', link.id, e)
+            return false
+          })
+        if (!restamped) continue
+        if (message !== link.lastError) {
+          await audit({
+            action: 'order_create', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: null,
+            summary: `Order ${link.order.orderNumber ?? link.orderId} has a WMS create whose outcome was never recorded, and `
+              + `${connectorId} cannot repeat a create safely — it needs a person to reconcile it in the WMS`,
+            before: { state: 'AMBIGUOUS_CREATE', lastError: link.lastError },
+            after: { state: 'AMBIGUOUS_CREATE', attempts: link.attempts, remoteOutcomeAmbiguous: true, createReplayable: false },
+            error: message,
+          })
+        }
+        continue
+      }
+      // Replay-safe connector — the SECOND key. The payload still has to BUILD (a re-queue whose
+      // payload cannot be built would simply be parked again by the create pass's validation route
+      // on the next tick) and the warehouse still has to say it holds no such order.
+      try {
+        buildPushInput(link.order, externalWarehouseId)
+      } catch (error) {
+        const message = `${scrubWmsError(error, 'WMS order payload could not be built')} (a previous create for this order was dispatched with no recorded outcome)`
+        const restamped = await port
+          .updateLinkIfState(link.id, 'AMBIGUOUS_CREATE', { lastError: message, lastAttemptAt: ts })
+          .catch((e) => {
+            console.error('[wms-order-push] failed to re-stamp a parked create claim', link.id, e)
+            return false
+          })
+        if (restamped && message !== link.lastError) {
+          await audit({
+            action: 'order_create', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: null,
+            summary: `Order ${link.order.orderNumber ?? link.orderId} is parked after an unrecorded WMS create and its payload no longer builds: ${message}`,
+            before: { state: 'AMBIGUOUS_CREATE', lastError: link.lastError },
+            after: { state: 'AMBIGUOUS_CREATE', attempts: link.attempts, remoteOutcomeAmbiguous: true },
+            error: message,
+          })
+        }
+        continue
+      }
+      // THE FIRST KEY. The probe budget is shared with the revalidation pass above and is spent
+      // only on links that would otherwise be re-queued on this tick; running out is a DELAY, never
+      // a decision — an unprobed link is re-stamped and rotates back in on a later sweep.
+      const absence = await probeWarehouseAbsence(reference)
+      if (!absence.absent) {
+        const message = 'A WMS create was dispatched for this order and its outcome was never recorded, so it will '
+          + `not be re-queued automatically: ${absence.reason}.`
+        console.warn(`[wms-order-push] link ${link.id} stays parked — ${absence.reason}`)
+        const restamped = await port
+          .updateLinkIfState(link.id, 'AMBIGUOUS_CREATE', { lastError: message, lastAttemptAt: ts })
+          .catch((e) => {
+            console.error('[wms-order-push] failed to re-stamp a parked create claim', link.id, e)
+            return false
+          })
+        if (restamped && message !== link.lastError) {
+          await audit({
+            action: 'order_create', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: null,
+            summary: `Order ${link.order.orderNumber ?? link.orderId} has a WMS create whose outcome was never recorded and the warehouse cannot confirm the order is absent — held back for reconciliation`,
+            before: { state: 'AMBIGUOUS_CREATE', lastError: link.lastError },
+            after: { state: 'AMBIGUOUS_CREATE', attempts: link.attempts, remoteOutcomeAmbiguous: true, createReplayable: true },
+            error: message,
+          })
+        }
+        continue
+      }
+
+      // Both keys turned. Back into the create queue: `lastAttemptAt: null` is the positive
+      // statement the claim rule grants on — "nothing is outstanding that this system knows of" —
+      // and it takes BOTH the warehouse's own word and the connector's duplicate refusal to be
+      // entitled to make it. `attempts` is carried over untouched, so a warehouse that keeps
+      // refusing still walks the ladder to DEAD_LETTER rather than looping forever.
+      let promoted = false
+      try {
+        promoted = await port.updateLinkIfState(link.id, 'AMBIGUOUS_CREATE', { state: 'PENDING_CREATE', lastError: null, lastAttemptAt: null })
+      } catch (error) {
+        console.error('[wms-order-push] failed to re-queue a parked create claim', link.id, error)
+        continue
+      }
+      if (!promoted) {
+        console.warn(`[wms-order-push] link ${link.id} left AMBIGUOUS_CREATE before its re-queue was written — another worker owns it now; not re-queued`)
+        continue
+      }
+      result.ambiguousCreateRequeued += 1
+      await audit({
+        action: 'order_create', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: null,
+        summary: `Order ${link.order.orderNumber ?? link.orderId} had a WMS create with no recorded outcome — re-queued `
+          + `after the WMS confirmed it holds no such order, and because ${connectorId} refuses a duplicate create `
+          + 'and reconciles to the order it already holds',
+        before: { state: 'AMBIGUOUS_CREATE', lastError: link.lastError },
+        // BOTH licences are named, so an auditor never has to guess what a re-queue rested on.
+        after: { state: 'PENDING_CREATE', attempts: link.attempts, warehouseAbsenceProved: true, createReplayPolicy: 'remote-refuses-duplicate' },
       })
     }
   }
@@ -1101,13 +1404,42 @@ export async function runWmsOrderPushSweepCore(
       }
       if (!fenceOk) continue
 
-      let claimed = false
+      let claim: WmsCreateClaimOutcome = 'SKIPPED'
       try {
-        claimed = await port.claimForCreate(order.id, connectorId, ts)
+        claim = await port.claimForCreate(order.id, connectorId, ts)
       } catch (error) {
         console.error('[wms-order-push] create claim failed', order.id, error)
       }
-      if (!claimed) continue
+      // o3d-2k5r r4 — THE CRASHED-CREATE PATH, which had no guard at all.
+      //
+      // A lapsed claim used to be granted straight back to this pass on state and a stale timestamp
+      // alone. But the claim is written IMMEDIATELY BEFORE pushOrder, so a link still sitting at
+      // PENDING_CREATE with a dispatch stamp means a create request left this system and nobody
+      // recorded what became of it — the ordinary shape of a worker killed mid-push, and the one
+      // that leaves a live warehouse order IMS has no id for. Pushing again there is a second
+      // physical fulfilment that cannot be cancelled automatically.
+      //
+      // The park is written by claimForCreate ITSELF, inside the transaction that holds the order
+      // row lock and decided the claim was stale, so the decision and the write cannot be separated
+      // by another worker reaching the same conclusion.
+      if (claim === 'PARKED_AMBIGUOUS') {
+        result.createClaimParked += 1
+        const reference = wmsPushOrderReference(order)
+        console.warn(
+          `[wms-order-push] order ${order.orderNumber ?? order.id} holds a create claim that expired with no `
+          + 'recorded outcome — parked for reconciliation, NOT re-pushed',
+        )
+        await audit({
+          action: 'order_create', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: order.id, externalId: null,
+          summary: `A WMS create was dispatched for order ${order.orderNumber ?? order.id} and its outcome was never `
+            + 'recorded — parked rather than re-pushed, so the warehouse is not asked to fulfil it twice',
+          before: { state: 'PENDING_CREATE', attempts: order.pushAttempts },
+          after: { state: 'AMBIGUOUS_CREATE', attempts: Math.max(order.pushAttempts, AMBIGUOUS_ATTEMPTS), remoteOutcomeAmbiguous: true },
+          error: wmsAmbiguousCreateRefusal(connectorId, reference),
+        })
+        continue
+      }
+      if (claim !== 'CLAIMED') continue
 
       const beforeCreate = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
       // `push` is hoisted so the catch can tell "remote create failed" from "remote
@@ -1729,16 +2061,18 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         // Same row lock deleteSalesOrder takes — this is what makes the claim and the
         // delete mutually exclusive rather than merely racing.
         const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
-        if (locked.length === 0) return false
+        if (locked.length === 0) return 'SKIPPED'
         // o3d-e1yb [wdraw]: re-check UNDER THE LOCK. The candidate query ran
         // earlier, and a withdrawal request can land between the two — the
         // marker is written under this same lock, so checking it here is what
         // makes the two mutually exclusive rather than merely racing.
         const fresh = await tx.salesOrder.findUnique({
           where: { id: orderId },
-          select: { withdrawalHoldAt: true, withdrawalApprovedAt: true },
+          // orderNumber/externalOrderNumber are read for the PARK's operator-facing refusal: it
+          // names the reference a person will search the WMS for, and the sales order id is not it.
+          select: { withdrawalHoldAt: true, withdrawalApprovedAt: true, orderNumber: true, externalOrderNumber: true },
         })
-        if (fresh?.withdrawalHoldAt || fresh?.withdrawalApprovedAt) return false
+        if (fresh?.withdrawalHoldAt || fresh?.withdrawalApprovedAt) return 'SKIPPED'
 
         // o3d-d82p: a live WooCommerce withdrawal SUPPRESSION is a fulfilment
         // fence in its own right, not just an ingestion guard.
@@ -1775,9 +2109,9 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
             // single-use proof minted by the by-ID WooCommerce read taken
             // immediately before this claim — CONSUMED here under the lock, so
             // no other attempt can ride on it.
-            if (!suppressed.retiredAt) return false
-            if (!suppressed.pushProofToken) return false
-            if (!suppressed.verifiedSafeUntil || suppressed.verifiedSafeUntil <= new Date()) return false
+            if (!suppressed.retiredAt) return 'SKIPPED'
+            if (!suppressed.pushProofToken) return 'SKIPPED'
+            if (!suppressed.verifiedSafeUntil || suppressed.verifiedSafeUntil <= new Date()) return 'SKIPPED'
             const consumed = await tx.wcWithdrawalSuppression.updateMany({
               where: {
                 connector: 'woocommerce',
@@ -1786,23 +2120,50 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
               },
               data: { pushProofToken: null, verifiedSafeUntil: null },
             })
-            if (consumed.count === 0) return false
+            if (consumed.count === 0) return 'SKIPPED'
           }
         }
 
         const existing = await tx.wmsOrderPushLink.findUnique({
           where: { orderId },
-          select: { state: true, lastAttemptAt: true },
+          select: { state: true, attempts: true, lastAttemptAt: true },
         })
         // o3d-38gl: refuses while another worker's claim is still fresh. Without the lease,
         // PENDING_CREATE is merely a state that every waiting worker passes, and they all push.
-        if (!shouldGrantCreateClaim(existing, attemptedAt)) return false
+        //
+        // o3d-2k5r r4: and an EXPIRED claim is not granted either — it is parked, HERE, inside the
+        // transaction that holds the order row lock and has just decided it is stale. Doing it in a
+        // later statement would reopen the very race the lock closes: two sweeps could both read
+        // PENDING_CREATE, both find it lapsed, and one of them could still be pushing while the
+        // other wrote the park.
+        const decision = decideCreateClaim(existing, attemptedAt)
+        if (decision === 'SKIP') return 'SKIPPED'
+        if (decision === 'PARK_AMBIGUOUS') {
+          await tx.wmsOrderPushLink.updateMany({
+            // Belt and braces under a lock that already serialises this: the park must not land on
+            // a link some other writer moved between the read above and here.
+            where: { orderId, state: 'PENDING_CREATE', lastAttemptAt: existing?.lastAttemptAt ?? null },
+            data: {
+              state: 'AMBIGUOUS_CREATE',
+              // The same floor recordValidationFailure raises a converted claim to, and for exactly
+              // the same reason: a claim exists only because a worker was about to call the WMS, so
+              // attempts 0 must stop reading as "no call was ever dispatched" the moment we accept
+              // that we will never learn the outcome. `increment` is deliberately not used —
+              // attempts is a floor on calls that MAY have been made, not a retry count, and
+              // re-parking the same link must not inflate it toward MAX_ATTEMPTS.
+              attempts: Math.max(existing?.attempts ?? 0, AMBIGUOUS_ATTEMPTS),
+              lastError: wmsAmbiguousCreateRefusal(connector, wmsPushOrderReference({ id: orderId, orderNumber: fresh?.orderNumber ?? null, externalOrderNumber: fresh?.externalOrderNumber ?? null })),
+              lastAttemptAt: attemptedAt,
+            },
+          })
+          return 'PARKED_AMBIGUOUS'
+        }
         await tx.wmsOrderPushLink.upsert({
           where: { orderId },
           create: { orderId, connector, state: 'PENDING_CREATE', lastAttemptAt: attemptedAt },
           update: { lastAttemptAt: attemptedAt },
         })
-        return true
+        return 'CLAIMED'
       })
     },
     async recordValidationFailure(orderId, connector, error, attemptedAt) {
@@ -1833,7 +2194,11 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         //
         // The caller already treats false as "another worker owns this" and simply re-checks the
         // order next sweep.
-        if (existing && !shouldGrantCreateClaim(existing, attemptedAt)) return false
+        // o3d-2k5r r4: the DISPOSITION predicate, not the claim's. They diverged when an expired
+        // claim stopped being claimable: this write sends nothing, so it may still convert a lapsed
+        // claim (that conversion is what marks the disposition AMBIGUOUS). What it must never do is
+        // land on a link that has moved on, or on a claim whose holder is still inside pushOrder.
+        if (existing && !mayDisposeCreateClaim(existing, attemptedAt)) return false
         await tx.wmsOrderPushLink.upsert({
           where: { orderId },
           // CREATED here = provably pre-call: no link existed, so no worker had claimed the order
@@ -1959,6 +2324,44 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       ])
       return { links: rows, total }
     },
+    async ambiguousCreateLinks(connector, boundWarehouseIds, limit) {
+      // o3d-2k5r r4. Same order predicate as createCandidates', for the reason revalidatableLinks
+      // states: this pass's only outcome is "put it back in that queue", so anything that query
+      // would refuse must not be promoted into PENDING_CREATE here.
+      //
+      // And the same NO_WMS_ORDER_COLUMNS filter, spread from the shared constant: a parked link
+      // that somehow carries a WMS id or a push stamp can never be re-queued, so it must not occupy
+      // a slot in the bounded batch either — the ordering is `lastAttemptAt asc nulls first`, and a
+      // permanently-unpromotable head would starve the tail behind it every sweep. Such a link is
+      // still visible: AMBIGUOUS_CREATE is one of the sync-exceptions inbox's blocked states.
+      const where = {
+        connector,
+        state: 'AMBIGUOUS_CREATE',
+        ...NO_WMS_ORDER_COLUMNS,
+        order: {
+          status: { in: [...READY_STATUSES] },
+          paidAt: { not: null },
+          refundStatus: { not: 'FULL' },
+          withdrawalHoldAt: null,
+          withdrawalApprovedAt: null,
+          shipFromWarehouseId: { in: boundWarehouseIds },
+        },
+      } satisfies Prisma.WmsOrderPushLinkWhereInput
+      const [rows, total] = await Promise.all([
+        db.wmsOrderPushLink.findMany({
+          where,
+          select: {
+            id: true, orderId: true, lastError: true, attempts: true,
+            pushedAt: true, externalOrderId: true,
+            order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true } },
+          },
+          take: limit,
+          orderBy: [{ lastAttemptAt: { sort: 'asc', nulls: 'first' } }, { updatedAt: 'asc' }],
+        }),
+        db.wmsOrderPushLink.count({ where }),
+      ])
+      return { links: rows, total }
+    },
     // o3d-bjc.8: PENDING_VERIFY is deliberately NOT cancellable or holdable.
     // The tempting argument is urgency — a cancelled order must not ship — but
     // the mechanism does not survive it: in the very case this state exists for
@@ -2043,7 +2446,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
 export async function runWmsOrderPushSweep(
   options?: { batchSize?: number },
 ): Promise<WmsOrderPushSweepResult> {
-  const empty: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0 }
+  const empty: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0, validationFailed: 0, revalidated: 0, revalidateAmbiguous: 0, createClaimParked: 0, ambiguousCreateRequeued: 0 }
 
   const state = await getIntegrationPluginState()
   const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])

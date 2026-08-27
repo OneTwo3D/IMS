@@ -7,6 +7,7 @@ import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal } from '@/lib/domain/wms/create-replay-policy'
 import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
 
 /**
@@ -21,7 +22,14 @@ export type WmsOrderPushStateView = {
   attempts: number
   lastError: string | null
   pushedAt: string | null
-  /** Dead-lettered pushes can be re-queued by an operator. */
+  /**
+   * Can an operator re-queue this push from here?
+   *
+   * o3d-2k5r r4 — this is deliberately NOT "is the state one the action accepts". A parked
+   * AMBIGUOUS_CREATE on a connector whose create cannot be repeated safely is refused by the action
+   * every single time, so rendering a button for it would advertise a remedy that cannot be
+   * performed. The control appears only where pressing it can actually do something.
+   */
   canRetry: boolean
 }
 
@@ -29,7 +37,7 @@ export async function getWmsOrderPushStateForSalesOrder(salesOrderId: string): P
   await requireInternalUser()
   const link = await db.wmsOrderPushLink.findUnique({
     where: { orderId: salesOrderId },
-    select: { state: true, externalOrderNumber: true, attempts: true, lastError: true, pushedAt: true },
+    select: { state: true, connector: true, externalOrderNumber: true, attempts: true, lastError: true, pushedAt: true },
   })
   if (!link) return null
   return {
@@ -38,7 +46,8 @@ export async function getWmsOrderPushStateForSalesOrder(salesOrderId: string): P
     attempts: link.attempts,
     lastError: link.lastError,
     pushedAt: link.pushedAt?.toISOString() ?? null,
-    canRetry: link.state === 'DEAD_LETTER',
+    canRetry: link.state === 'DEAD_LETTER'
+      || (link.state === 'AMBIGUOUS_CREATE' && wmsAmbiguousCreateMayBeReplayed(link.connector)),
   }
 }
 
@@ -72,7 +81,12 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
         + 'nothing was sent, so there is nothing to replay. Fix the order data and the push sweep re-queues it by itself.',
     }
   }
-  if (link.state !== 'DEAD_LETTER') return { success: false, error: 'Only dead-lettered pushes can be re-queued.' }
+  // o3d-2k5r r4: AMBIGUOUS_CREATE joins DEAD_LETTER as a re-queueable state — it is the park a
+  // crashed create claim lands in, and without it the only IMS-side door out of that park would be
+  // the sweep's own reconciliation pass.
+  if (link.state !== 'DEAD_LETTER' && link.state !== 'AMBIGUOUS_CREATE') {
+    return { success: false, error: 'Only dead-lettered or outcome-unknown pushes can be re-queued.' }
+  }
   // o3d-bjc.8: a dead letter that still carries an external id is not a failed
   // create — it is an order that EXISTS in the WMS and could not be verified as
   // ours (or was found to be someone else's). Re-queueing it means creating a
@@ -102,6 +116,18 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
   // deliberately NOT an operator override: the person pressing the button is looking at the same
   // screen we are, and an operator assertion must not be promoted into system evidence (o3d-anu8).
   if (wmsCreateOutcomeIsAmbiguous(link)) {
+    // o3d-2k5r r4 — THE FIRST OF TWO KEYS, and the one a probe cannot supply.
+    //
+    // `probeOrderPresence === 'MISSING'` says what the warehouse HOLDS when asked. It does not
+    // exclude a create still on the wire, and no reading available to IMS does: a stopped process
+    // resumes with no bound. What covers that case is the connector's own contract — a remote that
+    // REFUSES a duplicate refuses the loser of any race, whoever it is. A connector without that
+    // property is never re-dispatched from here, and the refusal names WMS-side actions a person
+    // can actually perform rather than an IMS control that does not exist.
+    const reference = wmsPushOrderReference(link.order)
+    if (!wmsAmbiguousCreateMayBeReplayed(link.connector)) {
+      return { success: false, error: wmsAmbiguousCreateRefusal(link.connector, reference) }
+    }
     const pluginState = await getIntegrationPluginState()
     const activeConnectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
     if (!activeConnectorId || activeConnectorId !== link.connector) {
@@ -120,7 +146,6 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
           + 'check the WMS and resolve it by hand.',
       }
     }
-    const reference = wmsPushOrderReference(link.order)
     let presence: 'FOUND' | 'MISSING' | 'AMBIGUOUS'
     try {
       presence = await connector.probeOrderPresence(reference)
@@ -164,7 +189,9 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
   const requeued = await db.wmsOrderPushLink.updateMany({
     where: {
       id: link.id,
-      state: 'DEAD_LETTER',
+      // The state that was INSPECTED, whichever of the two it was — a stale replay must match
+      // nothing rather than convert a park it never looked at.
+      state: link.state,
       attempts: link.attempts,
       externalOrderId: null,
       pushedAt: link.pushedAt,
@@ -175,6 +202,11 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
       state: 'PENDING_CREATE',
       attempts: 0,
       lastError: null,
+      // o3d-2k5r r4: the dispatch stamp is what the claim rule reads as "a create left and we never
+      // learned the outcome", so a re-queue that left it in place would be parked straight back by
+      // the very next sweep. Clearing it is this action's positive statement that the evidence
+      // above was obtained.
+      lastAttemptAt: null,
       dispatchFailureCount: 0,
       dispatchLastError: null,
       dispatchDeadLetteredAt: null,

@@ -190,6 +190,13 @@ export type WmsPushDeadLetterRow = {
 /**
  * o3d-92fu — push states that mean "this order will NOT reach the warehouse without a human".
  *
+ * AMBIGUOUS_CREATE belongs here for the sharpest version of the same reason (o3d-2k5r r4). A
+ * create request left this system and nothing recorded what became of it, so the order may already
+ * be sitting in the warehouse under an id IMS never learned. On a connector whose own create
+ * refuses a duplicate the sweep re-queues it by itself; on one that does not, NOTHING will move it
+ * without a person who can look at the WMS — and that is the state most in need of being seen,
+ * because the order is neither fulfilled nor deletable while it sits there.
+ *
  * VALIDATION_FAILED belongs here even though it is not a failed remote call. It is the state
  * the sweep parks an order in when its payload cannot be BUILT, and its whole purpose is to
  * take the order out of the create queue so malformed orders stop starving valid ones — which
@@ -201,7 +208,7 @@ export type WmsPushDeadLetterRow = {
  * non-function export both fails the repo's server-action guard-coverage test and is a shape
  * `next build` rejects (a plain type-check does not see it). It is only read in this file.
  */
-const BLOCKED_WMS_PUSH_STATES = ['DEAD_LETTER', 'VALIDATION_FAILED'] as const
+const BLOCKED_WMS_PUSH_STATES = ['DEAD_LETTER', 'VALIDATION_FAILED', 'AMBIGUOUS_CREATE'] as const
 
 export type PennyMismatchRow = {
   orderId: string

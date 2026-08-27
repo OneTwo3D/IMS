@@ -83,7 +83,7 @@ function makePort(seed: Seed) {
     activeBindings: async () => BINDINGS,
     releasableHeldOrders: async () => [],
     createCandidates: async () => seed.createCandidates ?? [],
-    claimForCreate: async (orderId) => { claims.push(orderId); return true },
+    claimForCreate: async (orderId) => { claims.push(orderId); return 'CLAIMED' as const },
     // o3d-92fu: this suite's orders all build a valid payload, so this is never reached;
     // it throws rather than returning a value so a future seed that DOES fail to build
     // cannot silently pass through it unnoticed.
