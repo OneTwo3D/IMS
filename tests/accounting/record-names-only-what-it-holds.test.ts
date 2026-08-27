@@ -113,13 +113,19 @@ function lookupFieldsNamedBy(message: string): string[] {
   return [...found].sort()
 }
 
-/** The metadata keys the two record builders actually write, read from their source. */
-async function retainedMetadataKeys(): Promise<Set<string>> {
+/**
+ * The metadata keys each record builder actually writes, read from its source — PER BUILDER, and
+ * then intersected. The wording below is shared by both connectors, so a key only ONE of them
+ * writes is not a key the wording may rely on: a QuickBooks incident would arrive without it.
+ * (Asserting against the union was the first shape of this test, and dropping `referenceId` from
+ * the QuickBooks builder passed it.)
+ */
+async function retainedMetadataKeys(): Promise<{ perBuilder: Map<string, Set<string>>; common: Set<string> }> {
   const sources: [string, string][] = [
     ['lib/connectors/xero/sync-processor.ts', 'unrecordedPostedDocumentRecord'],
     ['lib/connectors/quickbooks/sync-processor.ts', 'unpersistedQboPostRecord'],
   ]
-  const keys = new Set<string>()
+  const perBuilder = new Map<string, Set<string>>()
   for (const [file, builder] of sources) {
     const source = await readFile(path.join(process.cwd(), file), 'utf8')
     const start = source.indexOf(`function ${builder}`)
@@ -128,13 +134,17 @@ async function retainedMetadataKeys(): Promise<Set<string>> {
     assert.ok(metadataAt > start, `${builder} must still build its metadata through sanitizeActivityLogMetadata`)
     const end = source.indexOf('}))', metadataAt)
     assert.ok(end > metadataAt)
-    const block = source.slice(metadataAt, end)
-    for (const line of block.split('\n')) {
+    const keys = new Set<string>()
+    for (const line of source.slice(metadataAt, end).split('\n')) {
       const match = /^\s{6}([A-Za-z][A-Za-z0-9_]*):/.exec(line)
       if (match) keys.add(match[1])
     }
+    assert.ok(keys.size > 0, `${builder}'s metadata object could not be read`)
+    perBuilder.set(builder, keys)
   }
-  return keys
+  const [first, ...rest] = [...perBuilder.values()]
+  const common = new Set([...first].filter((key) => rest.every((other) => other.has(key))))
+  return { perBuilder, common }
 }
 
 // MUTATION THAT KILLS THIS (run): put "its amount and its date" back into either no-identifier
@@ -146,7 +156,7 @@ async function retainedMetadataKeys(): Promise<Set<string>> {
 // THE TWO CONNECTOR SOURCE FILES — neither side of the comparison is written down in this file, so
 // it cannot pass by agreeing with itself.
 test('ROUND 9 (Codex MEDIUM): no wording tells an operator to use a field the record does not retain', async () => {
-  const retained = await retainedMetadataKeys()
+  const { common: retained } = await retainedMetadataKeys()
 
   // NOT VACUOUS: the detector fires on the sentence that was actually shipped.
   assert.deepEqual(
@@ -173,8 +183,8 @@ test('ROUND 9 (Codex MEDIUM): no wording tells an operator to use a field the re
 //
 // ROUTE: the promise is read out of the SHIPPED tail string, the keys out of the SHIPPED builders,
 // and the timestamp out of prisma/schema.prisma.
-test('ROUND 9: every field the record promises it holds is one the builders write', async () => {
-  const retained = await retainedMetadataKeys()
+test('ROUND 9: every field the record promises it holds is one EVERY builder writes', async () => {
+  const { perBuilder } = await retainedMetadataKeys()
   const tail = describeUnpersistedQboPost(
     { entry: ENTRY('INVOICE_PAYMENT'), postedExternalId: null },
     new Error('write conflict'),
@@ -189,9 +199,13 @@ test('ROUND 9: every field the record promises it holds is one the builders writ
   ]
   for (const [clause, key] of promised) {
     assert.match(tail, clause)
-    assert.ok(retained.has(key), `the tail promises ${String(clause)} but no builder writes ${key}`)
+    for (const [builder, keys] of perBuilder) {
+      assert.ok(keys.has(key), `the tail promises ${String(clause)}, but ${builder} does not write ${key}`)
+    }
   }
-  assert.ok(retained.has('referenceType'), 'the reference is only usable with the type of thing it names')
+  for (const [builder, keys] of perBuilder) {
+    assert.ok(keys.has('referenceType'), `${builder}: the reference is only usable with the type of thing it names`)
+  }
 
   // The last clause the tail names is not metadata at all — it is the log row's own timestamp.
   assert.match(tail, /the time this record was written/)
