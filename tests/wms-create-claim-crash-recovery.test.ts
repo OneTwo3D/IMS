@@ -103,7 +103,16 @@ function makeLinkStore(options: { connectorId: string; failLinkWrites?: boolean;
     releasableHeldOrders: async () => {
       const link = links.get('so-1')
       if (!options.releasable || !link || link.state !== 'HELD') return []
-      return [{ id: link.id, orderId: link.orderId, externalOrderId: link.externalOrderId }]
+      return [{
+        id: link.id,
+        orderId: link.orderId,
+        externalOrderId: link.externalOrderId,
+        // o3d-2k5r r6: this store models a CONFIRMED remote cancellation, which is what the hold
+        // pass stamps `cancelledAt` for. These tests are about the create claim, not the release
+        // gate, so they must not accidentally exercise the unconfirmed path.
+        cancelledAt: new Date('2026-06-26T00:00:00.000Z'),
+        order: { id: link.orderId, orderNumber: 'SO-1', externalOrderNumber: null },
+      }]
     },
     createCandidates: async () => {
       const link = links.get('so-1')

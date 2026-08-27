@@ -9,6 +9,7 @@ import {
   type WmsOrderPushPort,
   type WmsPushCandidate,
   type WmsPushLinkRef,
+  type WmsPushReleasableLink,
   type WmsPushUpdateLink,
   type WmsPushRevalidateLink,
   type WmsPushVerifyLink,
@@ -62,9 +63,26 @@ function revalidateLink(overrides: Partial<WmsPushRevalidateLink> = {}): WmsPush
   }
 }
 
+/**
+ * o3d-2k5r r6: a HELD link the release pass may act on. `cancelledAt` DEFAULTS TO SET, i.e. to a
+ * CONFIRMED remote cancellation — the only shape the pre-existing release tests were ever about.
+ * A test that wants the ambiguous shape (the WMS answered NOT_FOUND and nothing was confirmed) has
+ * to ask for `cancelledAt: null`, and then it is testing the release gate.
+ */
+function heldLink(overrides: Partial<WmsPushReleasableLink> = {}): WmsPushReleasableLink {
+  return {
+    id: 'link-1',
+    orderId: 'o1',
+    externalOrderId: 'wms-old',
+    cancelledAt: new Date('2026-06-25T00:00:00.000Z'),
+    order: { id: 'o1', orderNumber: 'SO-1', externalOrderNumber: null },
+    ...overrides,
+  }
+}
+
 type Seed = {
   bindings?: Array<{ warehouseId: string; externalWarehouseId: string }>
-  releasable?: WmsPushLinkRef[]
+  releasable?: WmsPushReleasableLink[]
   /**
    * o3d-2k5r r3: a FUNCTION is evaluated when the CREATE pass asks, i.e. AFTER the revalidation
    * pass has written. That ordering is the whole point — it is the only way one sweep can show a
@@ -813,7 +831,7 @@ test('o3d-2k5r r2 release: the HELD reset is state-guarded — a link that moved
   let r
   try {
     const { port, updates, events } = makePort({
-      releasable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-old' }],
+      releasable: [heldLink()],
       stateAtWrite: () => 'SYNCED',
     })
     r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
@@ -828,7 +846,7 @@ test('o3d-2k5r r2 release: the HELD reset is state-guarded — a link that moved
 
 test('o3d-2k5r r2 release: the winning worker DOES release, guarded on HELD', async () => {
   // The negative above is only worth anything if the guarded write applies in the normal case.
-  const { port, updates } = makePort({ releasable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-old' }] })
+  const { port, updates } = makePort({ releasable: [heldLink()] })
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
   assert.equal(r.released, 1)
   assert.equal(updates[0].ifState, 'HELD')
@@ -836,7 +854,7 @@ test('o3d-2k5r r2 release: the winning worker DOES release, guarded on HELD', as
 })
 
 test('release: a HELD link is reset to PENDING_CREATE (external id cleared)', async () => {
-  const { port, updates } = makePort({ releasable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-old' }] })
+  const { port, updates } = makePort({ releasable: [heldLink()] })
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
   assert.equal(r.released, 1)
   assert.equal(updates[0].id, 'link-1')
@@ -965,7 +983,7 @@ test('audit: a failed create records a FAILED order_create event with the attemp
 
 test('audit: release / hold / cancel each record their state transition', async () => {
   const { port, events } = makePort({
-    releasable: [{ id: 'link-r', orderId: 'o-r', externalOrderId: 'wms-r' }],
+    releasable: [heldLink({ id: 'link-r', orderId: 'o-r', externalOrderId: 'wms-r', order: { id: 'o-r', orderNumber: 'SO-R', externalOrderNumber: null } })],
     holdable: [{ id: 'link-h', orderId: 'o-h', externalOrderId: 'wms-h' }],
     cancellable: [{ id: 'link-c', orderId: 'o-c', externalOrderId: 'wms-c' }],
   })
@@ -1034,7 +1052,7 @@ test('audit: remote create succeeds but the link write fails → event stays SUC
 })
 
 test('audit: a failed release records no event and does not count (Codex r1)', async () => {
-  const { port, events } = makePort({ releasable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-old' }] })
+  const { port, events } = makePort({ releasable: [heldLink()] })
   // o3d-2k5r r2: the release write is the STATE-GUARDED one now, so that is the write to break.
   port.updateLinkIfState = async () => { throw new Error('db down') }
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })

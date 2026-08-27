@@ -81,13 +81,13 @@ test('o3d-2k5r r5 affordance: the Why column is derived from the evidence, not t
 test('o3d-2k5r r5 affordance: the MISSING_IN_WMS re-push takes the same connector contract', () => {
   // A lookup that came back empty is not proof the order is gone — it is the same lookup whose
   // answer is in doubt. Only the remote's own contract covers the case where it was wrong.
-  const shiphero = decideWmsMissingRepush({ connector: 'shiphero', reference: 'SO-1' })
+  const shiphero = decideWmsMissingRepush({ connector: 'shiphero', reference: 'SO-1', createEligible: true })
   assert.equal(shiphero.repushable, false)
   assert.match(shiphero.repushable === false ? shiphero.guidance : '', /does not refuse a duplicate/)
   assert.match(shiphero.repushable === false ? shiphero.guidance : '', /second order under the same reference/)
-  assert.deepEqual(decideWmsMissingRepush({ connector: 'mintsoft', reference: 'SO-1' }), { repushable: true })
+  assert.deepEqual(decideWmsMissingRepush({ connector: 'mintsoft', reference: 'SO-1', createEligible: true }), { repushable: true })
   // Fails closed on a connector this build does not know, like every other reader of the policy.
-  assert.equal(decideWmsMissingRepush({ connector: '', reference: 'SO-1' }).repushable, false)
+  assert.equal(decideWmsMissingRepush({ connector: '', reference: 'SO-1', createEligible: true }).repushable, false)
 })
 
 // --- the ROW the client receives -------------------------------------------------------
@@ -139,6 +139,7 @@ test('o3d-2k5r r5 row: a MISSING_IN_WMS drift row carries the re-push affordance
     externalOrderNumber: 'WMS-1',
     lastSeenAt: new Date('2026-08-20T09:00:00.000Z'),
     order: { id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null },
+    createEligible: true,
   }
   const missing = buildOrderReconcileDriftRow({ ...base, category: 'MISSING_IN_WMS' })
   assert.equal(missing.repushable, false)

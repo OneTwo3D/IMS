@@ -4,9 +4,11 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
-import { wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal } from './create-replay-policy'
+import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal } from './create-replay-policy'
+import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere } from './create-eligibility'
 import { scrubWmsError } from './error-scrub'
 import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
+import { createWmsPushStateSchemaGate, WMS_PUSH_STATE_ENUM } from './push-state-schema-gate'
 
 /**
  * Connector-agnostic outbound order-push sweep (Phase 8). Pushes IMS sales
@@ -594,6 +596,21 @@ export type WmsPushRevalidateLink = {
 export type WmsPushAmbiguousCreateLink = WmsPushRevalidateLink
 
 export type WmsPushLinkRef = { id: string; orderId: string; externalOrderId: string | null }
+
+/**
+ * o3d-2k5r r6 — a HELD link, carrying the evidence its release is decided on.
+ *
+ * A plain {@link WmsPushLinkRef} was not enough and that was the defect: the release pass could
+ * see only the ids, so "was this order's warehouse order actually CANCELLED, or did the WMS merely
+ * fail to find one?" was a question it had no column to ask. `cancelledAt` is that column — from
+ * this revision the hold pass stamps it only on a CONFIRMED remote cancellation — and the order
+ * reference is what the fallback presence probe has to be asked about.
+ */
+export type WmsPushReleasableLink = WmsPushLinkRef & {
+  /** Non-null ONLY where `cancelOrder` answered `cancelled: true`. The affirmative evidence. */
+  cancelledAt: Date | null
+  order: { id: string; orderNumber: string | null; externalOrderNumber: string | null }
+}
 /**
  * o3d-bjc.8: a PENDING_VERIFY link, carrying OUR identifiers.
  *
@@ -621,8 +638,8 @@ export type WmsCreateClaimOutcome = 'CLAIMED' | 'SKIPPED' | 'PARKED_AMBIGUOUS'
 
 export interface WmsOrderPushPort {
   activeBindings(connector: string): Promise<Array<{ warehouseId: string; externalWarehouseId: string }>>
-  /** HELD links whose order is back in a ready+paid state. */
-  releasableHeldOrders(connector: string, limit: number): Promise<WmsPushLinkRef[]>
+  /** HELD links whose order is back in a ready+paid state, with the release evidence. */
+  releasableHeldOrders(connector: string, limit: number): Promise<WmsPushReleasableLink[]>
   /** Ready+paid orders for bound warehouses with no link or a PENDING_CREATE link. */
   createCandidates(connector: string, boundWarehouseIds: string[], limit: number): Promise<WmsPushCandidate[]>
   /**
@@ -881,8 +898,69 @@ export async function runWmsOrderPushSweepCore(
   const externalWarehouseByWarehouse = new Map(bindings.map((b) => [b.warehouseId, b.externalWarehouseId]))
 
   // --- Release pass: a HELD order back in a ready+paid state re-enters the
-  // create queue (its WMS order was cancelled when held, so it re-creates). ---
+  // create queue — BUT ONLY ON EVIDENCE THAT ITS WAREHOUSE ORDER IS GONE. ---
+  //
+  // o3d-2k5r r6. Clearing `externalOrderId` here IS a create re-open: the create pass selects on
+  // state alone, so the next tick pushes the order again. The pass used to do that for every HELD
+  // link, on the reasoning that "its WMS order was cancelled when it was held" — which the hold
+  // pass does not actually establish. It parks a link HELD both when the WMS CONFIRMS the
+  // cancellation and when the WMS merely answers NOT_FOUND, and on ShipHero NOT_FOUND is a lookup
+  // result, not a fact about the warehouse. A lookup that missed a live order, followed by a
+  // release, followed by a create ShipHero does not refuse, is two warehouse orders and two picks.
+  //
+  // So the release takes the two keys the rest of this branch takes, from the one rule in
+  // create-replay-policy.ts. See {@link decideWmsHeldRelease} for what each key is and why a
+  // presence probe is a refusal-only signal here rather than a licence.
   for (const link of await port.releasableHeldOrders(connectorId, batchSize)) {
+    const reference = wmsPushOrderReference(link.order)
+    // The persisted affirmative evidence: `cancelledAt` is stamped by the hold pass ONLY where
+    // cancelOrder answered `cancelled: true`.
+    const gate = decideWmsHeldRelease({
+      connector: connectorId,
+      remoteCancellationConfirmed: link.cancelledAt !== null,
+      reference,
+    })
+    if (!gate.release) {
+      // PARKED FOR MANUAL RECONCILIATION, not skipped. A link left HELD with no automatic exit is
+      // invisible — HELD is not one of the sync-exception inbox's blocked states — and would be
+      // re-examined and re-refused every sweep for ever. DEAD_LETTER is the state this repository
+      // already uses for "a person has to look at the warehouse", and the inbox lists it.
+      let parked = false
+      try {
+        parked = await port.updateLinkIfState(link.id, 'HELD', { state: 'DEAD_LETTER', lastError: gate.guidance, lastAttemptAt: now() })
+      } catch (error) {
+        console.error('[wms-order-push] held-release park failed', link.id, error)
+        continue
+      }
+      if (!parked) {
+        console.warn(`[wms-order-push] link ${link.id} left HELD before its park was written — another worker owns it now`)
+        continue
+      }
+      result.deadLettered += 1
+      console.warn(`[wms-order-push] link ${link.id} held with no confirmed WMS cancellation — parked for manual reconciliation`)
+      await audit({
+        action: 'order_release', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
+        summary: 'Held order NOT re-queued — no confirmed WMS cancellation and this connector does not refuse a duplicate create',
+        before: { state: 'HELD', externalOrderId: link.externalOrderId },
+        after: { state: 'DEAD_LETTER', remoteCancellationConfirmed: false, createReplayPolicy: 'client-side-dedupe-only' },
+        error: gate.guidance,
+      })
+      continue
+    }
+    if (gate.probeRequired) {
+      // Refusal-only. `absent` false covers FOUND, AMBIGUOUS, a throw, no probe at all and an
+      // exhausted budget — every one of which means "not proved gone", and none of which is a
+      // reason to write anything. The link stays HELD and is re-examined next sweep; the reason is
+      // recorded so an operator is not looking at a silent stall.
+      const absence = await probeWarehouseAbsence(reference)
+      if (!absence.absent) {
+        console.warn(`[wms-order-push] link ${link.id} not released — ${absence.reason}`)
+        await port
+          .updateLinkIfState(link.id, 'HELD', { lastError: `Hold not released: ${absence.reason}`, lastAttemptAt: now() })
+          .catch((error) => { console.error('[wms-order-push] held-release note failed', link.id, error) })
+        continue
+      }
+    }
     // Only a release that actually PERSISTED counts and is audited (Codex r1:
     // swallowing the write error while recording SUCCEEDED forged the timeline).
     //
@@ -898,8 +976,10 @@ export async function runWmsOrderPushSweepCore(
       // carrying a dispatch stamp means "a create left and we never learned the outcome", and the
       // claim rule parks such a link instead of claiming it. A release that left the CANCELLED WMS
       // order's old stamp in place would therefore park the very order it just re-opened. The
-      // release is entitled to clear it: the held order's warehouse order was cancelled when it was
-      // held, so nothing is outstanding — which is the whole reason a release re-creates.
+      // release is entitled to clear it ONLY on the evidence gathered above: a confirmed remote
+      // cancellation, or a connector whose create refuses a duplicate plus a warehouse that says it
+      // holds no such order. A cleared stamp is this pass's positive statement that both keys
+      // turned — `decideCreateClaim` grants a claim on it.
       released = await port.updateLinkIfState(link.id, 'HELD', { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, lastAttemptAt: null, cancelledAt: null, ...RESET_DISPATCH_FAILURES })
     } catch (error) {
       console.error('[wms-order-push] release link update failed', link.id, error)
@@ -914,7 +994,9 @@ export async function runWmsOrderPushSweepCore(
       action: 'order_release', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
       summary: 'Held order back in a ready+paid state — re-queued for WMS create',
       before: { state: 'HELD', externalOrderId: link.externalOrderId },
-      after: { state: 'PENDING_CREATE', externalOrderId: null },
+      // The evidence is on the audit row, so "why was this order re-created?" is answerable from
+      // the timeline rather than from the code that happened to be deployed that day.
+      after: { state: 'PENDING_CREATE', externalOrderId: null, releaseEvidence: gate.evidence, warehouseAbsenceProbed: gate.probeRequired },
     })
   }
 
@@ -1760,9 +1842,13 @@ export async function runWmsOrderPushSweepCore(
         if (heldNow) {
           const approved = heldApproved
           let pulled = false
+          // o3d-2k5r r6: hoisted out of the try because the DISPOSITION below turns on which of
+          // the two answers `pulled` was made of — a confirmed cancellation, or a bare NOT_FOUND.
+          let cancelConfirmed = false
           try {
             const cancel = await connector.cancelOrder?.(link.externalOrderId)
             pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND'))
+            cancelConfirmed = cancel?.cancelled === true
           } catch (e) {
             console.error(`[wms-order-push] verified-then-withdrawn cancel failed for ${link.orderId}: ${scrubWmsError(e, 'cancel failed')}`)
           }
@@ -1771,8 +1857,15 @@ export async function runWmsOrderPushSweepCore(
           const evidence = tombstoned
             ? ' (on a standing withdrawal tombstone — held, not cancelled, until the request itself is established)'
             : ''
+          // o3d-2k5r r6: the same distinction the hold pass now draws. `pulled` spans a CONFIRMED
+          // cancellation and a bare NOT_FOUND, and only the first is evidence. A HELD link's
+          // `cancelledAt` is what the release pass reads before it re-opens a create, so stamping
+          // it for a lookup miss would hand the release the very evidence it must not have. The
+          // CANCELLED branch is terminal — nothing re-creates from it — so it keeps its stamp.
           await port.updateLink(link.id, pulled
-            ? { state: approved ? 'CANCELLED' : 'HELD', cancelledAt: new Date(), lastError: null, reconcileCheckedAt: null }
+            ? (approved
+              ? { state: 'CANCELLED', cancelledAt: new Date(), lastError: null, reconcileCheckedAt: null }
+              : { state: 'HELD', cancelledAt: cancelConfirmed ? new Date() : null, lastError: null, reconcileCheckedAt: null })
             : { state: 'SYNCED', lastError: 'Verified ours, but the customer has withdrawn this order and it could not be cancelled — cancel it in the WMS by hand' })
           if (pulled) { if (approved) result.cancelled += 1; else result.held += 1 } else result.failed += 1
           await audit({
@@ -1908,16 +2001,42 @@ export async function runWmsOrderPushSweepCore(
       try {
         cancel = await connector.cancelOrder(link.externalOrderId)
         if (cancel.cancelled || cancel.status === 'NOT_FOUND') {
+          // o3d-2k5r r6 — WHAT THIS WRITE RECORDS IS NOW THE DIFFERENCE BETWEEN THE TWO.
+          //
+          // `cancelled: true` is the warehouse saying it cancelled the order. `NOT_FOUND` is the
+          // warehouse failing to return one, which on ShipHero is a lookup result and nothing more.
+          // Both used to be stamped `cancelledAt: ts` — writing "cancelled at 09:04" for an order
+          // nobody confirmed was cancelled — and the release pass then read that stamp (or rather,
+          // read nothing at all) and re-created the order. The stamp is the persisted affirmative
+          // evidence, so it is written ONLY for the confirmed case.
+          //
+          // And where the unconfirmed case can never be released safely, it is parked HERE rather
+          // than left HELD to be refused by every future sweep: the same rule, asked at the moment
+          // the ambiguity is created. See decideWmsHeldRelease.
+          const confirmed = cancel.cancelled === true
+          const gate = decideWmsHeldRelease({
+            connector: connectorId,
+            remoteCancellationConfirmed: confirmed,
+            reference: link.externalOrderId,
+          })
           // reconcileCheckedAt reset (q66in.4.4): a freshly held/cancelled link
           // must rotate to the FRONT of the reconcile's safety check, not
           // inherit its pre-transition verification recency.
-          await port.updateLink(link.id, { state: 'HELD', cancelledAt: ts, lastError: null, lastAttemptAt: ts, reconcileCheckedAt: null })
-          result.held += 1
+          await port.updateLink(link.id, gate.release
+            ? { state: 'HELD', cancelledAt: confirmed ? ts : null, lastError: null, lastAttemptAt: ts, reconcileCheckedAt: null }
+            : { state: 'DEAD_LETTER', cancelledAt: null, lastError: gate.guidance, lastAttemptAt: ts, reconcileCheckedAt: null })
+          if (gate.release) result.held += 1
+          else result.deadLettered += 1
           await audit({
-            action: 'order_hold', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
-            summary: 'IMS-held order pulled back from the WMS (cancelled remotely, parked HELD)',
+            action: 'order_hold', outcome: gate.release ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
+            summary: gate.release
+              ? (confirmed
+                ? 'IMS-held order pulled back from the WMS (cancellation confirmed, parked HELD)'
+                : 'IMS-held order not found in the WMS (cancellation UNCONFIRMED, parked HELD — this connector refuses a duplicate create)')
+              : 'IMS-held order not found in the WMS and the cancellation was never confirmed — parked for manual reconciliation',
             before: { state: 'SYNCED', externalOrderId: link.externalOrderId },
-            after: { state: 'HELD', wmsCancelStatus: cancel.status },
+            after: { state: gate.release ? 'HELD' : 'DEAD_LETTER', wmsCancelStatus: cancel.status, remoteCancellationConfirmed: confirmed },
+            error: gate.release ? null : gate.guidance,
           })
         } else {
           result.deadLettered += 1
@@ -1998,6 +2117,86 @@ export async function runWmsOrderPushSweepCore(
   return result
 }
 
+/**
+ * The database's OWN vocabulary for the push-state enum — read from `pg_enum`, not from the
+ * generated client, because it is precisely the disagreement between the two that this answers.
+ *
+ * A type that does not exist yields no rows, which the gate treats as "every required value is
+ * missing" — the same refusal, which is right: a database with no `WmsOrderPushState` at all is
+ * further behind, not closer.
+ */
+async function readWmsPushStateEnumValues(): Promise<string[]> {
+  const rows = await db.$queryRaw<Array<{ enumlabel: string }>>`
+    SELECT e.enumlabel AS "enumlabel"
+    FROM pg_enum e
+    JOIN pg_type t ON t.oid = e.enumtypid
+    WHERE t.typname = ${WMS_PUSH_STATE_ENUM}
+  `
+  return rows.map((row) => row.enumlabel)
+}
+
+/**
+ * o3d-1izw — the fail-closed gate, shared by the sweep's preflight and the write site that mints
+ * AMBIGUOUS_CREATE. One instance per process, so the success is cached once and the refusal is
+ * announced once. See lib/domain/wms/push-state-schema-gate.ts.
+ */
+export const assertWmsPushStateSchemaReady = createWmsPushStateSchemaGate(readWmsPushStateEnumValues)
+
+/** The warehouses this connector currently has an ACTIVE binding for, on an ACTIVE connection. */
+function activeBoundWarehouseIds(client: Prisma.TransactionClient, connectorId: string): Promise<Array<{ warehouseId: string }>> {
+  return client.externalWmsBinding.findMany({
+    where: { connector: connectorId, active: true, connection: { active: true } },
+    select: { warehouseId: true },
+  })
+}
+
+/**
+ * WOULD THE CREATE PASS SELECT THESE ORDERS? — the shared predicate, evaluated by the database,
+ * for readers outside this sweep (o3d-2k5r r6).
+ *
+ * Exported so the sync-exceptions inbox can decide whether to render a Re-push control from the
+ * SAME query the sweep selects candidates with. A hand-written copy of three of its six fences is
+ * what let the inbox offer a control for an order the sweep would never pick up, and report success
+ * when it was pressed.
+ */
+export async function wmsCreateEligibleOrderIds(connectorId: string, orderIds: readonly string[]): Promise<Set<string>> {
+  if (orderIds.length === 0) return new Set()
+  const bindings = await activeBoundWarehouseIds(db, connectorId)
+  // No active binding at all: nothing is create-eligible. Returning "all of them" on an empty
+  // binding list would be the same absence-as-an-answer mistake in miniature.
+  if (bindings.length === 0) return new Set()
+  const rows = await db.salesOrder.findMany({
+    where: { id: { in: [...orderIds] }, ...wmsCreateEligibleOrderWhere(bindings.map((b) => b.warehouseId)) },
+    select: { id: true },
+  })
+  return new Set(rows.map((row) => row.id))
+}
+
+/**
+ * The same question, asked INSIDE a write transaction, under the sales order's row lock.
+ *
+ * A render-time answer is a statement about the past: a binding can be disabled, or the order moved
+ * to an unbound warehouse, between the page the operator is looking at and the button they press.
+ * So the writer re-proves it here, holding the same `FOR UPDATE` lock `claimForCreate` and
+ * `deleteSalesOrder` take — which is what makes "eligible" true at the instant the link is reset
+ * rather than true when the page rendered.
+ */
+export async function isWmsCreateEligibleForUpdate(
+  tx: Prisma.TransactionClient,
+  connectorId: string,
+  orderId: string,
+): Promise<boolean> {
+  const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+  if (locked.length === 0) return false
+  const bindings = await activeBoundWarehouseIds(tx, connectorId)
+  if (bindings.length === 0) return false
+  const row = await tx.salesOrder.findFirst({
+    where: { id: orderId, ...wmsCreateEligibleOrderWhere(bindings.map((b) => b.warehouseId)) },
+    select: { id: true },
+  })
+  return row !== null
+}
+
 /** Prisma-backed port — the exact queries the sweep used before the extraction. */
 export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
   return {
@@ -2011,43 +2210,30 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         where: {
           connector,
           state: 'HELD',
-          order: {
-            status: { in: [...READY_STATUSES] },
-            paidAt: { not: null },
-            refundStatus: { not: 'FULL' },
-            // o3d-e1yb [wdraw]: never auto-release a hold placed for an EU
-            // withdrawal request. Releasing re-pushes the order to the
-            // warehouse, and a rejected withdrawal returns the storefront
-            // order to a ready status — so without this a customer-facing
-            // status change would put the goods back on the pick line.
-            // An operator clears withdrawalHoldAt to release.
-            withdrawalHoldAt: null,
-            // ...and an APPROVED withdrawal is terminal: the hold is cleared
-            // once the order is cancelled, so the approval fact is what keeps
-            // it out of the warehouse from then on.
-            withdrawalApprovedAt: null,
-          },
+          // o3d-2k5r r6: the SHARED create fences, spread rather than restated. A release puts the
+          // order straight into the create queue, so anything createCandidates would refuse must
+          // not be released — including the withdrawal fences (o3d-e1yb), which are the reason a
+          // rejected withdrawal returning the storefront order to a ready status must not put the
+          // goods back on the pick line. The bound-warehouse half is deliberately absent: the
+          // create pass re-checks it, and an unbound warehouse is a reason not to CREATE, not a
+          // reason to keep a cancelled warehouse order's id on the link.
+          order: WMS_CREATE_ELIGIBLE_ORDER_FENCES,
         },
-        select: { id: true, orderId: true, externalOrderId: true },
+        // cancelledAt is the affirmative remote-cancellation evidence and the order reference is
+        // what the fallback probe is asked about — see WmsPushReleasableLink.
+        select: {
+          id: true, orderId: true, externalOrderId: true, cancelledAt: true,
+          order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
+        },
         take: limit,
       }),
     async createCandidates(connector, boundWarehouseIds, limit) {
       const rows = await db.salesOrder.findMany({
         where: {
-          status: { in: [...READY_STATUSES] },
-          paidAt: { not: null },
-          refundStatus: { not: 'FULL' },
-          // o3d-e1yb [wdraw]: never push an order the customer has asked to
-          // withdraw. The marker is written before the ON_HOLD transition, so
-          // it also covers the window where the marker landed but the
-          // transition failed — without this, such an order is still a
-          // PROCESSING/paid candidate and enters fulfilment anyway.
-          withdrawalHoldAt: null,
-          // A DIRECT approval (the submitted webhook never arrived) records
-          // only the approval fact until its cancellation finishes, so
-          // checking the hold alone would let the order be pushed in between.
-          withdrawalApprovedAt: null,
-          shipFromWarehouseId: { in: boundWarehouseIds },
+          // o3d-2k5r r6: THE predicate, from lib/domain/wms/create-eligibility.ts. This query is
+          // the definition of "the sweep will create a warehouse order for this", and four other
+          // readers have to agree with it; the last one written by hand agreed with half of it.
+          ...wmsCreateEligibleOrderWhere(boundWarehouseIds),
           OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
         },
         select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, wmsOrderPush: { select: { attempts: true } } },
@@ -2057,6 +2243,13 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       return rows.map(({ wmsOrderPush, ...order }) => ({ ...order, pushAttempts: wmsOrderPush?.attempts ?? 0 }))
     },
     async claimForCreate(orderId, connector, attemptedAt) {
+      // o3d-1izw — THE WRITE-SITE GUARD. This transaction is the one that mints AMBIGUOUS_CREATE,
+      // and on a database without that enum value Postgres rejects it, rolls the transaction back
+      // and leaves the order neither claimed nor parked — so the next sweep reaches the same link
+      // and repeats the same unattributable driver error, for ever. Asked here (and not only in
+      // the sweep's preflight) because this port is reachable from any composition, and a raw
+      // `invalid input value for enum` is not a diagnosis.
+      await assertWmsPushStateSchemaReady()
       return db.$transaction(async (tx) => {
         // Same row lock deleteSalesOrder takes — this is what makes the claim and the
         // delete mutually exclusive rather than merely racing.
@@ -2294,14 +2487,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         connector,
         state: 'VALIDATION_FAILED',
         ...NO_WMS_ORDER_COLUMNS,
-        order: {
-          status: { in: [...READY_STATUSES] },
-          paidAt: { not: null },
-          refundStatus: { not: 'FULL' },
-          withdrawalHoldAt: null,
-          withdrawalApprovedAt: null,
-          shipFromWarehouseId: { in: boundWarehouseIds },
-        },
+        order: wmsCreateEligibleOrderWhere(boundWarehouseIds),
       } satisfies Prisma.WmsOrderPushLinkWhereInput
       const [rows, total] = await Promise.all([
         db.wmsOrderPushLink.findMany({
@@ -2338,14 +2524,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         connector,
         state: 'AMBIGUOUS_CREATE',
         ...NO_WMS_ORDER_COLUMNS,
-        order: {
-          status: { in: [...READY_STATUSES] },
-          paidAt: { not: null },
-          refundStatus: { not: 'FULL' },
-          withdrawalHoldAt: null,
-          withdrawalApprovedAt: null,
-          shipFromWarehouseId: { in: boundWarehouseIds },
-        },
+        order: wmsCreateEligibleOrderWhere(boundWarehouseIds),
       } satisfies Prisma.WmsOrderPushLinkWhereInput
       const [rows, total] = await Promise.all([
         db.wmsOrderPushLink.findMany({
@@ -2454,6 +2633,13 @@ export async function runWmsOrderPushSweep(
 
   const connector = getWmsConnector(connectorId)
   if (!connector.pushOrder) return { ...empty, skipped: 'Active WMS connector has no order-push support' }
+
+  // o3d-1izw — THE PREFLIGHT. Before a candidate is read, a claim is taken or a connector is
+  // called: this build writes push states an unmigrated database does not have, and a sweep that
+  // discovers that half way through a claim leaves a link it cannot finish writing. Throws
+  // WmsPushStateSchemaError, which names the issue and the remedy; the cron route surfaces it as a
+  // failed job rather than a green run that quietly did nothing.
+  await assertWmsPushStateSchemaReady()
 
   return runWmsOrderPushSweepCore(connector, connectorId, createPrismaWmsOrderPushPort(), options)
 }

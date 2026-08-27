@@ -3,6 +3,7 @@ import {
   wmsAmbiguousCreateRefusal,
   wmsMissingOrderRepushRefusal,
 } from './create-replay-policy'
+import { wmsCreateIneligibleRefusal } from './create-eligibility'
 import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference } from './order-push-sweep'
 
 /**
@@ -140,14 +141,43 @@ export function describeBlockedWmsPush(link: WmsPushReplayEvidence): string {
  */
 export type WmsMissingRepushDecision =
   | { repushable: true }
-  | { repushable: false; reason: 'create-not-repeatable'; guidance: string }
+  | { repushable: false; reason: 'create-not-repeatable' | 'not-create-eligible'; guidance: string }
 
-export function decideWmsMissingRepush(input: { connector: string; reference: string }): WmsMissingRepushDecision {
+/**
+ * o3d-2k5r r6 — AND THE THIRD REFUSAL, which is not about duplicates at all.
+ *
+ * Re-opening a create is only a remedy if the create pass will then SELECT the order. The action
+ * checked three of `createCandidates`' six fences by hand — status, `paidAt`, `refundStatus` — and
+ * omitted the ship-from warehouse binding and both withdrawal fences. An order whose binding had
+ * been disabled since the finding was raised therefore probed clean, had its link reset, had the
+ * discrepancy RESOLVED, and was reported a success — while the sweep never picked it up again and
+ * no other finding could see it (MISSING_IN_WMS scans settled links; NOT_PUSHED scans actively
+ * bound warehouses). It vanished.
+ *
+ * `createEligible` is not another hand-written predicate: it is the verdict of
+ * `wmsCreateEligibleOrderWhere` — the where-clause `createCandidates` itself selects on — evaluated
+ * by the database. The inbox evaluates it for the rows it renders so the control cannot appear for
+ * an ineligible order, and the action re-evaluates it under the sales order's row lock inside the
+ * reset transaction so a binding disabled between render and click refuses instead of stranding.
+ */
+export function decideWmsMissingRepush(input: {
+  connector: string
+  reference: string
+  /** The shared create predicate's own answer for this order. */
+  createEligible: boolean
+}): WmsMissingRepushDecision {
   if (!wmsAmbiguousCreateMayBeReplayed(input.connector)) {
     return {
       repushable: false,
       reason: 'create-not-repeatable',
       guidance: wmsMissingOrderRepushRefusal(input.connector, input.reference),
+    }
+  }
+  if (!input.createEligible) {
+    return {
+      repushable: false,
+      reason: 'not-create-eligible',
+      guidance: wmsCreateIneligibleRefusal(input.reference),
     }
   }
   return { repushable: true }
@@ -193,11 +223,23 @@ export type OrderReconcileDriftRowInput = {
   externalOrderNumber: string | null
   lastSeenAt: Date
   order: { id: string; orderNumber: string | null; externalOrderNumber: string | null }
+  /**
+   * o3d-2k5r r6 — the shared create predicate's verdict for THIS order, from the database.
+   *
+   * Required rather than optional, and with no default: a defaulted `true` would render the
+   * control for every caller that had not been updated, which is the failure this parameter
+   * exists to remove.
+   */
+  createEligible: boolean
 }
 
 export function buildOrderReconcileDriftRow(row: OrderReconcileDriftRowInput) {
   const decision = row.category === 'MISSING_IN_WMS'
-    ? decideWmsMissingRepush({ connector: row.connector, reference: wmsPushOrderReference(row.order) })
+    ? decideWmsMissingRepush({
+      connector: row.connector,
+      reference: wmsPushOrderReference(row.order),
+      createEligible: row.createEligible,
+    })
     : null
   return {
     orderId: row.orderId,

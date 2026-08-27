@@ -25,7 +25,8 @@ import {
   buildOrderReconcileDriftRow,
   decideWmsMissingRepush,
 } from '@/lib/domain/wms/push-recovery-affordance'
-import { wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
+import { wmsCreateIneligibleRefusal } from '@/lib/domain/wms/create-eligibility'
+import { isWmsCreateEligibleForUpdate, wmsCreateEligibleOrderIds, wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugins'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity } from '@/lib/activity-log'
@@ -642,9 +643,21 @@ async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
       order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
     },
   })
-  // o3d-2k5r r5: the row (and its affordance) is built by the shared rule, not here — see
-  // buildOrderReconcileDriftRow. Only MISSING_IN_WMS ever carried a control.
-  return rows.map(buildOrderReconcileDriftRow)
+  // o3d-2k5r r6: the affordance needs the create predicate's own verdict, so the control cannot
+  // render for an order the sweep would never select. Evaluated by the DATABASE, from the same
+  // where-clause `createCandidates` selects on — one query for the whole page, and only for the
+  // rows that could carry a control at all.
+  //
+  // A finding belonging to a connector that is not the active one gets `false` by construction: it
+  // is absent from the eligibility query, which is asked of the active connector's bindings. That
+  // is the right answer — its warehouse cannot be asked anything, and the action refuses it too.
+  const missing = rows.filter((row) => row.category === 'MISSING_IN_WMS')
+  const pluginState = await getIntegrationPluginState()
+  const activeConnectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
+  const eligible = activeConnectorId
+    ? await wmsCreateEligibleOrderIds(activeConnectorId, missing.map((row) => row.orderId))
+    : new Set<string>()
+  return rows.map((row) => buildOrderReconcileDriftRow({ ...row, createEligible: eligible.has(row.orderId) }))
 }
 
 /**
@@ -2826,7 +2839,10 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
         externalOrderNumber: true,
         pushedAt: true,
         lastAttemptAt: true,
-        order: { select: { id: true, orderNumber: true, externalOrderNumber: true, status: true, paidAt: true, refundStatus: true } },
+        // o3d-2k5r r6: the eligibility columns are deliberately NOT selected here any more. Reading
+        // them invites a hand-written predicate over them, which is exactly what was wrong; the
+        // decision is the shared where-clause's, evaluated by the database.
+        order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
       },
     })
     if (!link) {
@@ -2842,28 +2858,23 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
       return { success: false, error: `This order's push link is ${link.state}, not a settled push — there is no missing warehouse order to re-create. Check the order's push state.` }
     }
     const reference = wmsPushOrderReference(link.order)
-    // THE FIRST KEY, and the one no probe can supply — see create-replay-policy.ts. Asked before
-    // the probe because no answer the warehouse could give would change it, so spending a lookup
-    // would be spending a connector call on a decision already made.
-    const repush = decideWmsMissingRepush({ connector: link.connector, reference })
+    // THE FIRST TWO REFUSALS, from the rule the inbox renders the control with — see
+    // push-recovery-affordance.ts. Asked before the probe because no answer the warehouse could
+    // give would change either, so spending a lookup would be spending a connector call on a
+    // decision already made.
+    //
+    // o3d-2k5r r6: `createEligible` is the SHARED create predicate's own verdict, from the
+    // database, and it replaces a hand-written check of three of its six fences. The warehouse
+    // binding and the withdrawal fences were the missing three, and an order that failed them was
+    // reset, resolved, reported a success — and then never selected by the sweep again.
+    const createEligible = (await wmsCreateEligibleOrderIds(activeConnectorId, [orderId])).has(orderId)
+    const repush = decideWmsMissingRepush({ connector: link.connector, reference, createEligible })
     if (!repush.repushable) {
       return { success: false, error: repush.guidance }
     }
     const connector = getWmsConnector(activeConnectorId)
     if (!connector.probeOrderPresence) {
       return { success: false, error: 'The active WMS connector cannot verify order absence, so a safe re-push is not possible.' }
-    }
-    // Codex r30 P1: the push sweep's create pass only selects ready
-    // (PROCESSING/ALLOCATED), paid, not-fully-refunded orders — resetting the
-    // link for e.g. a PICKING/PACKING order would resolve the finding while the
-    // order is never re-created and silently never fulfils. Refuse; the
-    // operator must return the order to a ready status first.
-    const order = link.order
-    if (!['PROCESSING', 'ALLOCATED'].includes(order.status) || !order.paidAt || order.refundStatus === 'FULL') {
-      return {
-        success: false,
-        error: `The push sweep only re-creates paid, ready (Processing/Allocated) orders — this order is ${order.status}. Return it to a ready status (or resolve it manually in the WMS); the finding stays open meanwhile.`,
-      }
     }
     // THE SECOND KEY. Both references are asked, and both must come back MISSING: the one a
     // re-create would push under (the duplicate risk) and the one IMS recorded (the finding's own
@@ -2905,6 +2916,18 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
       })
       if (finding.count === 0) {
         return { ok: false as const, error: 'No open missing-in-WMS finding for this order (already resolved or re-verified).' }
+      }
+      // o3d-2k5r r6 — THE ELIGIBILITY IS RE-PROVED HERE, under the sales order's row lock, from
+      // the same where-clause `createCandidates` selects on.
+      //
+      // The read above is a statement about the past: a warehouse binding can be deactivated, or
+      // the order moved to an unbound warehouse, between the page the operator is looking at and
+      // the click. Resolving the finding on a stale answer is precisely how an order becomes
+      // invisible — MISSING_IN_WMS only scans settled links and NOT_PUSHED only scans actively
+      // bound warehouses, so nothing raises it again. Refusing here rolls the resolution back with
+      // it, so the finding stays in the inbox.
+      if (!await isWmsCreateEligibleForUpdate(tx, activeConnectorId, orderId)) {
+        throw new Error('REPUSH_ORDER_NOT_ELIGIBLE')
       }
       const updated = await tx.wmsOrderPushLink.updateMany({
         // o3d-2k5r r5 — THE CAS NAMES EVERY COLUMN THE DECISION WAS READ FROM, not just the
@@ -2962,6 +2985,9 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
     }).catch((error) => {
       if (error instanceof Error && error.message === 'REPUSH_LINK_NOT_RESETTABLE') {
         return { ok: false as const, error: 'This push link changed while you were looking at it — it is no longer the settled link that was inspected. Reload the inbox and check the order\'s current push state.' }
+      }
+      if (error instanceof Error && error.message === 'REPUSH_ORDER_NOT_ELIGIBLE') {
+        return { ok: false as const, error: wmsCreateIneligibleRefusal(reference) }
       }
       throw error
     })
