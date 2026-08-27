@@ -19,7 +19,14 @@ import test, { mock } from 'node:test'
 //
 // Failing to repair is acceptable; repairing onto the wrong document is not. So this file asserts
 // the ABSENCE as firmly as the presence — re-adding the binding is one line, and no other test in
-// the suite would go red. Precondition for re-adding it: o3d-s36z (connector-tenant isolation).
+// the suite would go red.
+//
+// THE PRECONDITION THIS COMMENT USED TO NAME IS THE WRONG ONE (o3d-0bfh r6, Codex MEDIUM). It said
+// o3d-s36z (connector-tenant isolation); that CLOSED on 2026-08-21 and a row's realm is recorded
+// now, so a maintainer checking it would find it satisfied and add back the one line this file
+// exists to forbid. The real prerequisites are POST-TIME AUTHORIZATION (o3d-8prh) and ORIGIN
+// PROPAGATION on the follow-up rows a sweep would create — see the block at the end of
+// lib/connectors/quickbooks/sync-processor.ts.
 // ---------------------------------------------------------------------------
 
 type Call = { connector: string; what: 'process' | 'repair' }

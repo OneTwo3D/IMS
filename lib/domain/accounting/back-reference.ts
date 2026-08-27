@@ -1145,7 +1145,8 @@ export async function backReferenceIsMissing(deps: BackReferenceDeps, params: Ba
 //     company A still holds 145.
 //   • The warning said "link the document by hand". THAT INSTRUCTION COULD NOT BE CARRIED OUT: the
 //     same index refuses a manual link for exactly the same reason. And with the QuickBooks sweep
-//     deliberately unwired (o3d-s36z is its precondition) nothing retried it either.
+//     deliberately unwired — waiting on POST-TIME AUTHORIZATION (o3d-8prh) and origin propagation,
+//     NOT on the long-closed o3d-s36z — nothing retried it either.
 //
 // So the missing piece was never the record — it was the RELEASE. The retired company's claim has
 // to come off before anything, human or machine, can put the id where it belongs.

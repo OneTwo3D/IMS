@@ -1420,19 +1420,34 @@ document in Xero: until you do, that sale is in no reporting period. An invoice 
 already has is never overwritten.
 
 **The sweep runs for Xero only.** There is deliberately no QuickBooks equivalent, and that is not an
-oversight to be reported. A QuickBooks document id is a per-company integer, and disconnecting clears
-the company pin, so a sweep scoped to "the QuickBooks connector" could not tell an id issued by a
-previously connected company from one issued by the current one — it would write a retired company's
-integer onto a live order or bill, and payment polling would then act on it as if it were current.
-Failing to repair is acceptable; repairing onto the wrong document is not. On QuickBooks, a
-back-reference that fails to write is therefore **not retried by anything**: the warning in the
-activity log (`quickbooks_backreference_failed` or `quickbooks_backreference_ambiguous`) says so, and
-the link has to be made by hand. The external id is on the sync row, so nothing is lost — only
-automatic. See *Connecting a different company* below for why the company boundary is the blocker.
+oversight to be reported. A QuickBooks document id is a per-company integer, so a repair that ran
+against the wrong company would write a retired company's integer onto a live order or bill, and
+payment polling would then act on it as if it were current. Failing to repair is acceptable;
+repairing onto the wrong document is not.
+
+**The company boundary is no longer what is missing.** Every sync row now records which connected
+company it was raised against, so a QuickBooks sweep *could* select only the current company's rows.
+What is still missing is on the other side of the repair, and it is why the sweep stays unbound: IMS
+does not yet check **at post time** — as the last thing it does before sending — that the company
+connected at that moment is the company the row was raised against, and the follow-up rows a repair
+would create carry no record of their own origin for such a check to read. A correctly selected row
+could therefore still be posted against whatever company happens to be connected when the sync
+processor reaches it. Both of those have to land before a QuickBooks sweep is safe to bind.
+
+On QuickBooks, a back-reference that fails to write is therefore **not retried by anything**: the
+warning in the activity log (`quickbooks_backreference_failed` or
+`quickbooks_backreference_ambiguous`) says so, and the link has to be made by hand. The external id
+is on the sync row, so nothing is lost — only automatic. See *Connecting a different company* below
+for what a company switch leaves behind.
+
 (QuickBooks *does* record outstanding follow-ups the same way Xero does — that costs nothing and
 crosses no company boundary — so the work is recoverable the day a QuickBooks sweep becomes safe to
 run. Until then it is a record, not a repair: a QuickBooks follow-up that fails still has to be
-re-driven by hand, and `quickbooks_followup_error` in the activity log is the notice that it does.)
+re-driven by hand. **Every such row is listed on Sync → Exceptions, under "Accounting follow-ups
+owed, with nothing to re-drive them"** — that list, not the activity log, is the reliable place to
+find them, because it is read straight off the sync rows themselves rather than depending on a log
+entry having been written. `quickbooks_followup_error` in the activity log is the same news, when it
+could be recorded.)
 
 **When the id itself is the blocker.** One case cannot be resolved by linking the document by hand:
 the write was refused because *another local record already holds that id* — typically a bill from a
@@ -1608,10 +1623,11 @@ read a stored external id — payment matching, reconciliation, document updates
 tell two companies' ids apart, and orders, refunds and credit notes do not record an issuing company
 at all. A refused link is visible and fixable; a payment settling the wrong document is neither.
 
-It is also why there is no back-reference repair sweep on QuickBooks (see *Back-Reference Repair*
-above). The refusal only fires when some local record still holds the id; after a company switch the
-usual case is that **nothing** holds it, and an automatic repair would then link a retired company's
-document with no constraint to stop it.
+It is part of why there is no back-reference repair sweep on QuickBooks (see *Back-Reference Repair*
+above, which describes what a sweep is actually waiting on: a check, at post time, that the company
+connected now is the company the row was raised against). The refusal only fires when some local
+record still holds the id; after a company switch the usual case is that **nothing** holds it, and an
+automatic repair would then link a retired company's document with no constraint to stop it.
 
 **Practically:** if you need to move a QuickBooks connection to a different company, treat it as a
 migration, not a reconnect. Export the existing links first (they are financial records), then clear

@@ -1292,9 +1292,9 @@ function backReferenceLeavesNothingOwed(link: BackReferenceLink): boolean {
  * WHAT RE-DRIVES A RETAINED OBLIGATION ON THIS CONNECTOR: NOTHING (o3d-0bfh r5, Codex HIGH).
  *
  * Passed to every release, so a future QuickBooks caller cannot inherit Xero's "a later sweep will
- * discharge it" by omission. `blockedBy` is the CURRENT blocker and it is not the one this file
- * named for three rounds — see the block at the end of this file for why o3d-s36z closing did not
- * unblock anything.
+ * discharge it" by omission. `blockedBy` is the CURRENT blocker — post-time authorization (o3d-8prh)
+ * and origin propagation — and it is not the one this file named for three rounds; see the block at
+ * the end of this file for why o3d-s36z closing did not unblock anything.
  *
  * READ FROM THE REGISTRY, NOT WRITTEN HERE (o3d-0bfh r6, Codex MEDIUM). r5 declared the recovery as
  * a local literal, and a literal is copyable: a third connector could paste Xero's
@@ -1724,7 +1724,7 @@ async function enqueueFollowUps(
 // ---------------------------------------------------------------------------
 // THERE IS DELIBERATELY NO QuickBooks BINDING OF THE BACK-REFERENCE REPAIR SWEEP, AND THEREFORE NO
 // CONSUMER OF THE FOLLOW-UP OBLIGATION MARKER THIS FILE WRITES (o3d-9kek r6; restated and RE-BASED
-// on the correct blocker at o3d-0bfh r5, Codex HIGH).
+// on the correct blocker — post-time authorization, o3d-8prh — at o3d-0bfh r5, Codex HIGH).
 //
 // One binding existed briefly and was REMOVED on purpose. Read the next two sections before adding
 // one back; the second is the one three rounds of this branch got wrong.
@@ -1751,7 +1751,8 @@ async function enqueueFollowUps(
 // that "a later sweep will discharge it".
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
-// THE PRECONDITION THIS BLOCK USED TO NAME HAS BEEN MET, AND IT WAS THE WRONG ONE.
+// THE PRECONDITION THIS BLOCK USED TO NAME HAS BEEN MET, AND IT WAS THE WRONG ONE. THE REAL ONE IS
+// POST-TIME AUTHORIZATION (o3d-8prh), PLUS ORIGIN PROPAGATION ON THE ROWS A CONSUMER WOULD CREATE.
 //
 // Every earlier revision said: do not re-add the binding before closing o3d-s36z (connector-tenant /
 // realm isolation), because `repairAccountingBackReferences` scopes its candidate query by

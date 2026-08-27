@@ -15,7 +15,13 @@ import test, { mock } from 'node:test'
 // The operator is not left guessing: updateBackReference's ambiguity and failure warnings say in as
 // many words that nothing retries a QuickBooks back-reference and the link must be made by hand.
 // This asserts the absence, because re-adding the call is one line and no other test would notice.
-// Precondition for re-adding it: o3d-s36z (connector-tenant isolation).
+//
+// THE PRECONDITION THIS COMMENT USED TO NAME IS THE WRONG ONE (o3d-0bfh r6, Codex MEDIUM). It said
+// o3d-s36z (connector-tenant isolation). That CLOSED on 2026-08-21 and a row's realm is recorded
+// now, so a maintainer checking it would find it satisfied and make exactly the one-line binding
+// this file exists to prevent. The real prerequisites are POST-TIME AUTHORIZATION (o3d-8prh) and
+// ORIGIN PROPAGATION on the follow-up rows a sweep would create; the order of work is in the block
+// at the end of lib/connectors/quickbooks/sync-processor.ts.
 // ---------------------------------------------------------------------------
 
 const calls: string[] = []
@@ -68,7 +74,12 @@ test('[o3d-9kek r6] the manual QuickBooks sync does NOT run the back-reference r
 
   const result = await triggerQuickBooksSync()
   assert.equal(result.success, true)
-  assert.deepEqual(calls, ['process'], 'no sweep: it can attribute a previous realm\'s external id (o3d-s36z)')
+  assert.deepEqual(
+    calls,
+    ['process'],
+    'no sweep: it can attribute a previous realm\'s external id, and this connector enforces no connection '
+      + 'verdict at post time (o3d-8prh — NOT the closed o3d-s36z)',
+  )
 
   const logged = activities.find((entry) => entry.action === 'quickbooks_manual_sync')
   assert.ok(logged)

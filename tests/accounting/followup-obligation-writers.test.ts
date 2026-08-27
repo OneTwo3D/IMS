@@ -1086,7 +1086,8 @@ test('[o3d-9kek r10 f1] a failed QuickBooks follow-up enqueue leaves the obligat
   // This branch has no catch of its own: the throw reaches the loop's outer handler, which counts a
   // failure and schedules a retry. Either way the marker must survive — it is the only thing left
   // that distinguishes this row from one whose follow-ups ran, and with the QuickBooks sweep
-  // unwired it is also the state that makes the work recoverable the day o3d-s36z lands.
+  // unwired it is also the state that makes the work recoverable the day a consumer is bound — which
+  // waits on post-time authorization (o3d-8prh) and origin propagation, not on the closed o3d-s36z.
   reset('quickbooks')
   state.failFollowUpsFor.add('log-1')
 
