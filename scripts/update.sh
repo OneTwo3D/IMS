@@ -826,6 +826,10 @@ fence_db_connections() {
     5)
       # EXIT 5 IS A FENCE THAT IS STANDING RIGHT NOW (o3d-2sm1.5, Codex r13 HIGH).
       #
+      # It is raised for an INDETERMINATE commit too (o3d-2sm1.5, Codex r14 HIGH): if the
+      # acknowledgement of COMMIT is lost, the transaction's fate is unknown, and unknown is not
+      # the not-committed case. The script reports exit 5 there as well, so this arm covers it.
+      #
       # THE STICKY FLAG USED TO BE RAISED ONLY ON EXIT 0, so "the fence did not succeed" was
       # read as "no fence was raised" — and an exit code is not evidence about what was
       # committed. fence-db-connections.mjs COMMITS its REVOKEs and then asks whether the door
@@ -842,7 +846,7 @@ fence_db_connections() {
       # the database: exit 3 revoked nothing, this revoked and is holding.
       DB_FENCE_UP=true
       DB_FENCE_RAISED=true
-      die "THE FENCE IS STANDING AND CANNOT BE CALLED GOOD (exit 5): the REVOKEs are COMMITTED — the reason this run will not call the database fenced is printed above. CONNECT is currently denied to every grantee it took it from, which may include PUBLIC, monitoring, backup, BI and a second application, so this is NOT a run that changed nothing. Nothing has been migrated. Release it before starting anything: ${DB_FENCE_RELEASE_CMD}"
+      die "THE FENCE MAY BE STANDING AND CANNOT BE CALLED GOOD (exit 5): the REVOKEs were COMMITTED, or were issued to a COMMIT whose acknowledgement was lost — the reason this run will not call the database fenced is printed above. CONNECT may currently be denied to every grantee it took it from, which may include PUBLIC, monitoring, backup, BI and a second application, so this is NOT a run that changed nothing. Nothing has been migrated. Release it before starting anything: ${DB_FENCE_RELEASE_CMD}"
       ;;
     *)
       die "The connection fence failed (exit ${rc}). Nothing has been migrated."

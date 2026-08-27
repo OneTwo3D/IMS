@@ -34,7 +34,8 @@
 //                          connection and asks the same questions.
 //   --fence                revoke CONNECT, drain the existing backends, prove it is quiet.
 //                          Exit 3 means NOTHING WAS REVOKED; exit 5 (EXIT_FENCE_STANDING) means
-//                          the REVOKEs are committed and standing and this run still cannot call
+//                          the REVOKEs may be in force — committed and standing, or issued to a
+//                          COMMIT whose acknowledgement was lost — and this run still cannot call
 //                          the database fenced. The two must never be confused: the callers hold
 //                          a sticky "this run raised a fence" flag, and the second is a fence.
 //   --release              restore EXACTLY the grants that were revoked, and verify they are back.
@@ -173,10 +174,16 @@ export const EXIT_FENCE_UNPROVEN = 4
  * as a run with no fence to its name, and a later `--release` exit 4 took the warning-success
  * branch and let the deploy record a release nobody performed.
  *
- * So every outcome AFTER the revoking COMMIT has its own code. It means exactly one thing:
- * REVOKES ARE COMMITTED AND STANDING RIGHT NOW. Whatever the caller does next, it owes the
- * database a `--release`, and it must never again read its own release's "unproven" verdict as
- * permission to carry on.
+ * So every outcome from the moment the COMMIT IS ISSUED has its own code. It means exactly one
+ * thing: THE REVOKES MAY BE IN FORCE RIGHT NOW. Usually they demonstrably are — the commit was
+ * acknowledged and a later check failed. Once, and it is the case that matters most, the
+ * acknowledgement itself was lost (o3d-2sm1.5, Codex r14 HIGH): the transaction's fate is
+ * unknown, and unknown is reported here rather than as the not-committed case, because a fence
+ * wrongly believed absent is an application locked out with nobody looking for it, while a fence
+ * wrongly believed present costs one `--release` that grants back what nobody took.
+ *
+ * Whatever the caller does next, it owes the database a `--release`, and it must never again read
+ * its own release's "unproven" verdict as permission to carry on.
  */
 export const EXIT_FENCE_STANDING = 5
 
@@ -187,15 +194,18 @@ export function quoteIdent(name) {
   return `"${String(name).replace(/"/g, '""')}"`
 }
 
-/** The role a connection string logs in as, or '' when it does not carry one. */
+/**
+ * The role a connection string logs in as, or '' when it does not carry one.
+ *
+ * Derived from parseConnectionIdentity() rather than from `url.username`, because the username
+ * in the authority is NOT necessarily the role node-postgres authenticates as: `?user=` overrides
+ * it (o3d-2sm1.5, Codex r14 CRITICAL). A URL this function cannot read as one unambiguous role --
+ * unparseable, or naming two different ones -- yields '', which every caller treats as "no role",
+ * and no role is a refusal everywhere it matters.
+ */
 export function parseRoleFromConnectionString(connectionString) {
-  if (!connectionString) return ''
-  try {
-    const url = new URL(connectionString)
-    return url.username ? decodeURIComponent(url.username) : ''
-  } catch {
-    return ''
-  }
+  const identity = parseConnectionIdentity(connectionString)
+  return identity.ok ? identity.user : ''
 }
 
 // ---------------------------------------------------------------------------
@@ -227,19 +237,66 @@ export function parseRoleFromConnectionString(connectionString) {
 //      from the live connection, must equal the database DATABASE_URL names. A URL comparison
 //      alone cannot see an admin URL with no database in its path, which silently connects to
 //      the admin role's own default database.
+//   3. AND IT IS ATTACHED AS THE ROLE THE ADMIN URL NAMES (o3d-2sm1.5, Codex r14 CRITICAL).
+//      The role half is asked the same way the database half is: `session_user` and
+//      `current_user` are READ FROM THE CONNECTION rather than derived from the URL. A URL can
+//      redirect the login role through `?user=` (parseConnectionIdentity() now resolves that,
+//      but PGUSER, a .pgpass entry, an ident/peer map and `options=-c role=` are outside any URL
+//      altogether), and the whole fence turns on knowing which role it is: CONNECT is a property
+//      of the LOGIN role, the admin's own role is the one grantee deliberately NOT revoked, and
+//      `--release` restores against it. A connection running as somebody other than it logged in
+//      as -- `session_user` <> `current_user` -- is refused outright: the ACL answers below would
+//      be about the assumed role while the CONNECT this script revokes belongs to the login one.
 //
-// Fail closed in both directions: no DATABASE_URL, no database name in it, or a connection that
-// will not say where it is attached, are all "not proven", and not proven is refused.
+// Fail closed in every direction: no DATABASE_URL, no database name in it, a connection that will
+// not say where it is attached, or one that will not say what it is attached as, are all
+// "not proven", and not proven is refused.
 // ---------------------------------------------------------------------------
 
 /** Hosts that all mean "the machine this is running on", however they are spelled. */
 const LOCAL_HOSTS = new Set(['', 'localhost', '127.0.0.1', '::1', '[::1]'])
 
+/** Best-effort percent-decoding: a value that will not decode is compared as written. */
+function decodeOrRaw(value) {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
 /**
- * Pure: the (server, database) a libpq connection URL names.
+ * Pure: the (login role, server, database) a libpq connection URL EFFECTIVELY names -- what
+ * node-postgres will actually connect as and to, not what the URL's obvious components suggest.
  *
- * `host` may live in the authority or in a query parameter (a unix socket directory is
- * `postgresql:///db?host=/var/run/postgresql`), and the port defaults the way libpq defaults it.
+ * THE QUERY STRING WINS OVER THE AUTHORITY, AND IT REDIRECTS THE CONNECTION (o3d-2sm1.5, Codex
+ * r14 CRITICAL). This used to read the authority first and consult the query only as a fallback.
+ * The installed parser (pg-connection-string, reached through pg) does the opposite: it copies
+ * every query parameter into the config FIRST, and only then fills in `host`, `port` and `user`
+ * from the authority `if` the query left them unset. So
+ *
+ *     postgres://app@localhost:5432/appdb?host=remote.example&port=6432&user=actual
+ *
+ * was classified here as `app` at localhost:5432 -- it passed against a local admin URL naming
+ * the same database -- while the application's own adapter authenticated as `actual` against
+ * remote.example:6432. Preflight, the fence and the release then all succeeded against the wrong
+ * cluster and the wrong role, and the application went on writing across the migration through a
+ * connection nothing in this script had ever looked at.
+ *
+ * Two rules, both fail-closed:
+ *
+ *   * The EFFECTIVE value is the query parameter when it carries one, exactly as the driver
+ *     resolves it (`config.host || authority`, so an EMPTY parameter still falls back).
+ *   * A URL that says one thing in its authority and a DIFFERENT thing in its query string is
+ *     REFUSED rather than resolved. The driver would take the query value, but an environment
+ *     that disagrees with itself about which server or which role it means is not a thing to
+ *     pick a winner from -- and this check exists precisely to stop "probably what they meant".
+ *
+ * `database` is deliberately taken from the path alone: the driver overwrites `config.database`
+ * from the pathname UNCONDITIONALLY, so `?dbname=`/`?database=` change nothing whatever. Carrying
+ * one is a statement about the database that the connection will not honour, and a false
+ * statement about WHICH DATABASE is the entire subject of this section -- so it is refused rather
+ * than silently ignored.
  */
 export function parseConnectionIdentity(connectionString) {
   if (!connectionString) return { ok: false, reason: 'is not set' }
@@ -249,28 +306,65 @@ export function parseConnectionIdentity(connectionString) {
   } catch {
     return { ok: false, reason: 'cannot be parsed as a URL' }
   }
-  const host = url.hostname || url.searchParams.get('host') || ''
-  const port = url.port || url.searchParams.get('port') || '5432'
-  let database = ''
-  try {
-    database = decodeURIComponent(url.pathname.replace(/^\//, ''))
-  } catch {
-    database = url.pathname.replace(/^\//, '')
+  const params = url.searchParams
+
+  const authorityHost = url.hostname ? decodeOrRaw(url.hostname) : ''
+  const authorityPort = url.port || ''
+  const authorityUser = url.username ? decodeOrRaw(url.username) : ''
+  const queryHost = params.get('host') || ''
+  const queryPort = params.get('port') || ''
+  const queryUser = params.get('user') || ''
+
+  for (const [name, authority, query] of [
+    ['host', authorityHost, queryHost],
+    ['port', authorityPort, queryPort],
+    ['user', authorityUser, queryUser],
+  ]) {
+    if (query && authority && query !== authority) {
+      return {
+        ok: false,
+        reason: `names the ${name} "${authority}" in its authority and "${query}" in its query string. node-postgres takes the QUERY value, so this URL does not connect where it appears to; refusing to guess which one was meant -- delete one of them`,
+      }
+    }
   }
+
+  const database = decodeOrRaw(url.pathname.replace(/^\//, ''))
+  for (const name of ['dbname', 'database']) {
+    const value = params.get(name)
+    if (value && value !== database) {
+      return {
+        ok: false,
+        reason: `carries ?${name}=${value}, which node-postgres IGNORES -- the database always comes from the URL path, which names "${database || '(nothing)'}". A parameter naming a different database from the one the connection actually reaches cannot be left standing here`,
+      }
+    }
+  }
+
+  const host = queryHost || authorityHost
+  const port = queryPort || authorityPort || '5432'
+  const user = queryUser || authorityUser
   const lowered = String(host).toLowerCase()
   const family = String(host).startsWith('/') || LOCAL_HOSTS.has(lowered) ? '(this host)' : lowered
-  return { ok: true, reason: '', host, port, database, server: `${family}:${port}` }
+  return { ok: true, reason: '', host, port, user, database, server: `${family}:${port}` }
 }
 
 /**
- * Pure: may this run treat the connection it opened as the application's own database?
+ * Pure: may this run treat the connection it opened as the application's own database, opened as
+ * the role it was meant to be opened as?
  *
  * `connectedDatabase` is `current_database()` read from that connection — the live half, and the
- * only one that can catch an admin URL whose path is empty. `adminUrl` is compared only when it
- * is set, because without it the connection IS the application's URL and there are not two
- * things to bind together.
+ * only one that can catch an admin URL whose path is empty. `connectedLoginRole` is `session_user`
+ * and `connectedEffectiveRole` is `current_user`, read from the same connection: the role half of
+ * the same question, asked of the connection rather than inferred from the URL. `adminUrl` is
+ * compared only when it is set, because without it the connection IS the application's URL and
+ * there are not two things to bind together.
  */
-export function assessDatabaseIdentity({ adminUrl = '', appUrl = '', connectedDatabase = '' }) {
+export function assessDatabaseIdentity({
+  adminUrl = '',
+  appUrl = '',
+  connectedDatabase = '',
+  connectedLoginRole = '',
+  connectedEffectiveRole = '',
+}) {
   const app = parseConnectionIdentity(appUrl)
   if (!app.ok) {
     return {
@@ -312,6 +406,31 @@ export function assessDatabaseIdentity({ adminUrl = '', appUrl = '', connectedDa
     return {
       bound: false,
       reason: `the connection this run opened is attached to "${connectedDatabase}", and DATABASE_URL names "${app.database}". A connection string with no database in its path connects to the login role's default database, which is how these come apart without either URL looking wrong.`,
+    }
+  }
+  // THE ROLE HALF, ASKED OF THE CONNECTION (o3d-2sm1.5, Codex r14 CRITICAL). Everything below the
+  // identity gate treats the admin's own role as the one grantee it must not revoke, and treats
+  // CONNECT as a property of the role that logged in. Both of those are unanswerable if this run
+  // does not know what it is attached as.
+  if (!connectedLoginRole) {
+    return {
+      bound: false,
+      reason: 'the open connection did not report which role it logged in as, so the role whose CONNECT this run would revoke, exclude and restore is unidentified. session_user is what answers that, and it was not asked or not answered.',
+    }
+  }
+  if (connectedEffectiveRole && connectedEffectiveRole !== connectedLoginRole) {
+    return {
+      bound: false,
+      reason: `the open connection logged in as "${connectedLoginRole}" and is running as "${connectedEffectiveRole}" (a SET ROLE, or options=-c role= on the connection string). CONNECT belongs to the role that logged in, and every ACL answer here would be given as the role it is running as, so the two must be the same role before anything is revoked or restored.`,
+    }
+  }
+  if (adminUrl) {
+    const admin = parseConnectionIdentity(adminUrl)
+    if (admin.ok && admin.user && admin.user !== connectedLoginRole) {
+      return {
+        bound: false,
+        reason: `DEPLOY_ADMIN_DATABASE_URL names the role "${admin.user}" and the connection it opened logged in as "${connectedLoginRole}". The URL is not what decides that -- PGUSER, a .pgpass entry and an ident or peer map all override it -- so the role this run would exclude from the revoke, and restore against, is not the role it is actually holding.`,
+      }
     }
   }
   return { bound: true, reason: '' }
@@ -751,6 +870,10 @@ async function readFacts(client, appRole) {
   const { rows } = await client.query(
     `SELECT current_database()                                  AS database,
             current_user                                        AS admin_role,
+            -- THE ROLE THIS CONNECTION LOGGED IN AS, which is not necessarily current_user and is
+            -- not necessarily the URL's username either (o3d-2sm1.5, Codex r14 CRITICAL). CONNECT
+            -- is checked against the login role, so this is the one the identity gate binds.
+            session_user                                        AS admin_login_role,
             pg_catalog.pg_get_userbyid(d.datdba)                AS owner_role,
             d.datacl::text                                      AS datacl,
             (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS admin_is_superuser,
@@ -856,19 +979,27 @@ function requireAdminUrl(what) {
  * Printed as a refusal rather than returned, because there is exactly one thing to do with a
  * "not proven" here and every caller does it.
  */
-function requireBoundDatabaseIdentity(connectedDatabase, prefix) {
+function requireBoundDatabaseIdentity(attachment, prefix) {
   const verdict = assessDatabaseIdentity({
     adminUrl: process.env.DEPLOY_ADMIN_DATABASE_URL || '',
     appUrl: process.env.DATABASE_URL || '',
-    connectedDatabase,
+    connectedDatabase: attachment.database ?? '',
+    connectedLoginRole: attachment.loginRole ?? '',
+    connectedEffectiveRole: attachment.effectiveRole ?? '',
   })
   if (verdict.bound) return true
   console.error(`${prefix}: ${verdict.reason}`)
   console.error('This run cannot show that the database it is connected to is the one the application uses,')
-  console.error('and every answer it could give — "the fence took", "the application can connect" — would be')
-  console.error('about whichever database it reached. Align DEPLOY_ADMIN_DATABASE_URL and DATABASE_URL on the')
-  console.error('same host, port and database name, and re-run.')
+  console.error('and that it is attached to it as the role it believes it is. Every answer it could give —')
+  console.error('"the fence took", "the application can connect" — would be about whichever database it')
+  console.error('reached, as whichever role it reached it as. Align DEPLOY_ADMIN_DATABASE_URL and DATABASE_URL')
+  console.error('on the same host, port and database name, with a role each URL states plainly, and re-run.')
   return false
+}
+
+/** The live attachment, as the identity gate wants it: what this connection is, asked of itself. */
+function attachmentOf(facts) {
+  return { database: facts.database, loginRole: facts.admin_login_role, effectiveRole: facts.admin_role }
 }
 
 /**
@@ -916,7 +1047,7 @@ async function doPreflight(client, options) {
   // THE SAME QUESTIONS ARE ONLY THE SAME QUESTIONS IF THEY ARE ASKED OF THE SAME DATABASE.
   // Asked here as well as in --fence for the reason this whole mode exists: a preflight that
   // skips a check --fence performs is a preflight that passes and then fails after the stop.
-  if (!requireBoundDatabaseIdentity(facts.database, 'NOT FENCEABLE')) return EXIT_NOT_FENCEABLE
+  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NOT FENCEABLE')) return EXIT_NOT_FENCEABLE
 
   if (appRole && !facts.app_role_exists) {
     console.error(`NOT FENCED: the role ${appRole} from DATABASE_URL does not exist on this server.`)
@@ -973,7 +1104,7 @@ export async function doFence(client, options) {
   // that is not the application's locks other people's clients out of somewhere else while the
   // application keeps writing across the migration, and every verification below — the ACL read,
   // the effective-CONNECT check, the drain — would be a truthful report about the wrong database.
-  if (!requireBoundDatabaseIdentity(facts.database, 'NOT FENCED')) return EXIT_NOT_FENCEABLE
+  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NOT FENCED')) return EXIT_NOT_FENCEABLE
 
   if (appRole && !facts.app_role_exists) {
     console.error(`NOT FENCED: the role ${appRole} from DATABASE_URL does not exist on this server.`)
@@ -1057,13 +1188,50 @@ export async function doFence(client, options) {
     }
   }
 
+  // THE BOUNDARY IS THE COMMIT REQUEST, NOT ITS ACKNOWLEDGEMENT (o3d-2sm1.5, Codex r14 HIGH).
+  //
+  // The post-commit protection below used to begin only after `await client.query('COMMIT')`
+  // RESOLVED. PostgreSQL can commit the REVOKEs and then lose the connection before the
+  // acknowledgement reaches the client — a dropped TCP connection, a timeout, a server restart
+  // an instant after the WAL flush. The promise rejects, and this code took the rejection for
+  // "the transaction did not commit": it rolled back into thin air and threw, main() exited 1,
+  // and all three entrypoints — which raise the sticky DB_FENCE_RAISED only on exit 0 and 5 —
+  // recorded a run with no fence to its name over a database whose CONNECT may be revoked
+  // for PUBLIC, monitoring, backup, BI and a second application.
+  //
+  // A LOST ACKNOWLEDGEMENT IS NOT A NEGATIVE ANSWER. Once COMMIT is on the wire the transaction's
+  // fate is UNKNOWN, and the only safe reading of unknown is that the fence may be standing. So
+  // the boundary is set before the await, and every failure past it reports EXIT_FENCE_STANDING
+  // with the undo statements — the same outcome, and the same sticky flag, as a fence this run
+  // knows it left up. Being told to release a fence that turned out not to exist costs a
+  // `--release` that grants back grants nobody took away; the other way round costs an
+  // application locked out of its own database with nobody looking for it.
   await client.query('BEGIN')
+  let commitIssued = false
   try {
     for (const statement of revokes) await client.query(statement)
+    commitIssued = true
     await client.query('COMMIT')
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw error
+    if (!commitIssued) {
+      // Nothing was ever asked to commit, so the revokes are definitively not in force.
+      await client.query('ROLLBACK').catch(() => {})
+      throw error
+    }
+    // Deliberately NO ROLLBACK: a transaction that has been told to commit is not one this run
+    // can take back, and issuing a rollback here would only make the log claim it undid
+    // something. The state file stays exactly where it was published, because it is the only
+    // account of what may now be revoked.
+    const detail = error instanceof Error ? error.message : String(error)
+    console.error(`THE COMMIT WAS ISSUED AND NOT ACKNOWLEDGED, so the fence MAY BE STANDING: ${detail}`)
+    console.error('The REVOKEs below were sent inside a transaction that was told to commit, and this run never')
+    console.error('learned whether it did. Treat them as in force until the database says otherwise: CONNECT may')
+    console.error('now be denied to every grantee listed, which can include PUBLIC, monitoring, backup, BI and a')
+    console.error('second application. Nothing has been migrated.')
+    console.error(`Check with:  SELECT datacl FROM pg_database WHERE datname = '${facts.database}';`)
+    console.error('Then release it with --release, or run these by hand as a superuser or the database owner:')
+    for (const statement of grants) console.error(`  ${statement}`)
+    return EXIT_FENCE_STANDING
   }
   // FROM HERE THE REVOKES ARE ON THE MEDIUM (o3d-2sm1.5, Codex r13 HIGH).
   //
@@ -1326,9 +1494,18 @@ export async function doRelease(client, options) {
   // that cannot show it is talking to the application's own database either grants CONNECT on
   // somebody else's or — worse, because it is silent — reports the application free while the
   // real database still refuses it.
-  const { rows: attachment } = await client.query('SELECT current_database() AS connected_database')
+  const { rows: attachment } = await client.query(
+    `SELECT current_database() AS connected_database,
+            session_user        AS connected_login_role,
+            current_user        AS connected_effective_role`,
+  )
   const connectedDatabase = attachment[0]?.connected_database ?? ''
-  if (!requireBoundDatabaseIdentity(connectedDatabase, 'NOT RELEASED')) return EXIT_ERROR
+  const released = {
+    database: connectedDatabase,
+    loginRole: attachment[0]?.connected_login_role ?? '',
+    effectiveRole: attachment[0]?.connected_effective_role ?? '',
+  }
+  if (!requireBoundDatabaseIdentity(released, 'NOT RELEASED')) return EXIT_ERROR
 
   const read = options.stateFile ? readState(options.stateFile) : { status: STATE_ABSENT, detail: 'no --state-file was given' }
   if (read.status !== STATE_PRESENT) {
