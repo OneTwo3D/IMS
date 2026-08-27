@@ -21,7 +21,15 @@ import {
 import { buildStockMovementValueFieldsFromConsumed } from '@/lib/domain/inventory/stock-movement-value'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirementQuantities } from '@/lib/products/fulfillment-requirement-snapshot'
-import { shipmentIsUnreopenableCommitment } from '@/lib/domain/sales/repack-recovery-affordance'
+import {
+  dispatchForeclosesRepackRecovery,
+  shipmentIsUnreopenableCommitment,
+  summariseRepackBlockers,
+} from '@/lib/domain/sales/repack-recovery-affordance'
+import {
+  countOutstandingRefundReservationReleases,
+  type OutstandingReleaseReadClient,
+} from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { withSavepoint } from '@/lib/db/savepoint'
 
@@ -970,6 +978,48 @@ export async function reopenShipmentForRepack(
   })
 }
 
+/**
+ * THE DISPATCH FENCE FOR AN OUTSTANDING REPACK RECOVERY (o3d-2k5r r7, Codex).
+ *
+ * `dispatchForeclosesRepackRecovery` carries the reasoning; this is the read that feeds it, and
+ * WHERE it is read is the whole point. The affordance layer answers the same question for the page,
+ * outside any lock, from data that is already stale by the time the operator clicks — and a WMS
+ * despatch feed never renders a page at all. Called from inside the dispatch transaction, after
+ * `lockSalesOrder`, this read is the authoritative one: a repack recovery committing between it and
+ * the dispatch is impossible, because the recovery takes the same lock.
+ *
+ * Both facts are re-read here rather than passed in. The caller's `lockedShipment` is one shipment;
+ * the question is about the ORDER, and the sibling that matters is the one nobody looked at.
+ */
+export async function validateDispatchPreservesRepackRecovery(
+  client: ShipmentServiceClient,
+  orderId: string,
+): Promise<string | null> {
+  const outstanding = await countOutstandingRefundReservationReleases(orderId, {
+    client: client as unknown as OutstandingReleaseReadClient,
+  })
+  const shipments = await client.shipment.findMany({
+    where: { orderId },
+    select: { status: true },
+  })
+  const { orderHasUnreopenableCommitment } = summariseRepackBlockers(
+    shipments.map((shipment) => String(shipment.status)),
+  )
+  if (!dispatchForeclosesRepackRecovery({
+    recoveryOutstanding: outstanding > 0,
+    orderHasUnreopenableCommitment,
+  })) return null
+
+  return 'This order still owes a repack recovery, so its shipments cannot be dispatched yet. '
+    + 'A refund on this order reduced what it is owed, and releasing the refunded units\u2019 stock '
+    + 'reservation was deferred because the order already had a shipment \u2014 the release re-runs '
+    + 'allocation, and allocation is refused while any shipment on the order is not a draft. '
+    + 'Dispatching now would make that permanent: a dispatched shipment can never be reopened, so '
+    + 'the re-allocation would be refused for ever and the reservation would have to be reconciled '
+    + 'by hand. Reopen the order\u2019s committed shipments for repack, run \u201CFinish repack '
+    + 'recovery\u201D on the order, then rebuild with \u201CCreate Shipments\u201D and dispatch that.'
+}
+
 export async function transitionShipmentStatus(
   client: ShipmentServiceClient,
   input: {
@@ -1122,6 +1172,26 @@ export async function transitionShipmentStatus(
         return {
           success: false as const,
           error: dispatchCoverageError,
+        }
+      }
+
+      // o3d-2k5r r7 (Codex): THE LAST FENCE BEFORE THE WALL.
+      //
+      // r6 stopped the repack recovery from CREATING a dead end. It could not stop one being
+      // created immediately after it: the narrowing that lets a refused re-allocation keep its
+      // reopen is only checked at the moment that transaction commits, and the very next thing to
+      // take this order lock can dispatch the packed sibling it was checking. Same order, same
+      // unrecoverable state, one step later — and reachable with no reopen at all by packing two
+      // shipments, refunding, and dispatching one.
+      //
+      // Refusing rather than throwing, for the same reason the cancelled-order and withdrawal-hold
+      // checks above refuse: a WMS-driven dispatch gets a clean, actionable failure on the sync
+      // exception path instead of an exception, and the message names the sequence that clears it.
+      const repackRecoveryError = await validateDispatchPreservesRepackRecovery(tx, lockedShipment.orderId)
+      if (repackRecoveryError) {
+        return {
+          success: false as const,
+          error: repackRecoveryError,
         }
       }
 

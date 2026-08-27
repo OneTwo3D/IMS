@@ -196,3 +196,45 @@ export function repackControlsFor(input: RepackControlInput): Array<'reopen' | '
   if (repackRecoveryControlIsAvailable(input)) controls.push('finish-recovery')
   return controls
 }
+
+/**
+ * MAY THIS DISPATCH GO, GIVEN WHAT THE ORDER STILL OWES (o3d-2k5r r7, Codex)?
+ *
+ * The r6 round put the guard BEFORE the reopen and re-checked it under the order lock, so the
+ * partial commit survives only while every blocker is reopenable. That is true at the instant the
+ * recovery transaction commits — and only then. Nothing held the fact afterwards: with A reopened
+ * to a draft and B still PACKED, the ordinary dispatch screen or a WMS status update could take the
+ * order lock one millisecond later and dispatch B. The order is then A=PENDING / B=SHIPPED, which
+ * is EXACTLY the state the narrowing exists to prevent — reached after the check instead of before
+ * it. `reopenShipmentForRepackAction` re-run on A now aborts (B is unreopenable), the refund is
+ * never netted into `OrderAllocation`, the reservation is never released, and the backstop row can
+ * never resolve. The same wall is reachable with no reopen at all: pack A and B, take a refund,
+ * dispatch B.
+ *
+ * A warning telling an operator not to dispatch is not an invariant, and a WMS despatch feed does
+ * not read warnings. So the rule is enforced where the irreversible act happens, under the same
+ * order lock — see `validateDispatchPreservesRepackRecovery` in shipment-service.
+ *
+ * TWO CONDITIONS, AND THE SECOND ONE IS WHAT KEEPS THIS NARROW.
+ *
+ *  - `recoveryOutstanding` — the same DURABLE evidence the "Finish repack recovery" control is
+ *    gated on: an UNRESOLVED refund-reservation-release outbox row for one of this order's refunds.
+ *    While it is false the order owes no recovery and a dispatch forecloses nothing, which is every
+ *    ordinary dispatch in the system.
+ *  - `orderHasUnreopenableCommitment` — if the order ALREADY holds a dispatched shipment, the
+ *    recovery is already foreclosed. Refusing here would buy nothing and would strand goods that
+ *    can still legitimately go out, on an order that now needs the o3d-339 reconciliation either
+ *    way. A guard that outlives the thing it protects is just a wedge.
+ *
+ * So this refuses only the FIRST dispatch that would turn a recoverable order into an unrecoverable
+ * one, and the remedy is always reachable from that state: no shipment is dispatched yet, so every
+ * committed one can be reopened, the recovery run, and the shipment rebuilt and dispatched.
+ */
+export function dispatchForeclosesRepackRecovery(input: {
+  recoveryOutstanding: boolean
+  orderHasUnreopenableCommitment: boolean
+}): boolean {
+  if (!input.recoveryOutstanding) return false
+  if (input.orderHasUnreopenableCommitment) return false
+  return true
+}
