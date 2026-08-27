@@ -7,8 +7,10 @@ import {
   ACCOUNTING_FOLLOW_UP_RECOVERY,
   CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER,
   FOLLOW_UP_OBLIGATION_AGE_COLUMNS,
+  FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN,
   buildFollowUpObligationBacklogWhere,
   followUpObligationRecoveryFor,
+  readFollowUpObligationDatabaseNow,
 } from '@/lib/domain/accounting/follow-up-obligation-registry'
 
 // ---------------------------------------------------------------------------
@@ -350,11 +352,14 @@ type BacklogWhere = {
   connector: { in: string[] }
   status: { in: string[] }
   backReferenceFollowUpsPendingAt: Record<string, unknown>
-  OR: Array<Record<string, unknown>>
+  OR?: Array<Record<string, unknown>>
 }
 
+/** A stand-in for `readFollowUpObligationDatabaseNow`'s reading — never this host's clock. */
+const DATABASE_NOW = new Date('2026-08-27T12:00:00.000Z')
+
 test('[o3d-0bfh r6] the backlog query selects exactly the connectors with no consumer', () => {
-  const where = buildFollowUpObligationBacklogWhere() as BacklogWhere
+  const where = buildFollowUpObligationBacklogWhere({ databaseNow: DATABASE_NOW }) as BacklogWhere
   assert.deepEqual(where.connector.in, ['quickbooks'], 'derived from the registry, not restated')
   assert.ok(!where.connector.in.includes('xero'), 'a connector WITH a sweep must not be listed as unrecoverable')
   // SYNCED and FAILED only: a PENDING or stale PROCESSING row is still on the processor's own ladder,
@@ -363,11 +368,11 @@ test('[o3d-0bfh r6] the backlog query selects exactly the connectors with no con
   assert.deepEqual(where.backReferenceFollowUpsPendingAt, { not: null })
 })
 
-test('[o3d-0bfh r7] the backlog asks the MARKER only whether it is null, and measures age on real times', () => {
+test('[o3d-0bfh r7] the backlog asks the MARKER only whether it is null, and measures age on DATABASE-STAMPED times', () => {
   // The r6 defect in one assertion. `backReferenceFollowUpsPendingAt` is a generation minted as
   // max(now, observed + 1ms), so under contention it is ahead of every clock; comparing it to one
   // hid stranded obligations for longer than the grace, by an amount that grew with contention.
-  const where = buildFollowUpObligationBacklogWhere() as BacklogWhere
+  const where = buildFollowUpObligationBacklogWhere({ databaseNow: DATABASE_NOW }) as BacklogWhere
   for (const op of ['lt', 'lte', 'gt', 'gte']) {
     assert.ok(
       !(op in where.backReferenceFollowUpsPendingAt),
@@ -376,8 +381,12 @@ test('[o3d-0bfh r7] the backlog asks the MARKER only whether it is null, and mea
     )
   }
   // And the grace is measured on columns that ARE times, one branch per row shape.
+  assert.ok(where.OR)
   const branches = where.OR.map((clause) => Object.keys(clause).sort().join('+'))
-  assert.deepEqual(branches, ['syncedAt', 'createdAt+syncedAt'])
+  assert.deepEqual(branches, [
+    'backReferenceFollowUpsClaimedAtDatabaseClock',
+    'backReferenceFollowUpsClaimedAtDatabaseClock+createdAt',
+  ])
   for (const column of FOLLOW_UP_OBLIGATION_AGE_COLUMNS) {
     assert.ok(
       where.OR.some((clause) => column in clause),
@@ -385,12 +394,15 @@ test('[o3d-0bfh r7] the backlog asks the MARKER only whether it is null, and mea
     )
   }
   const grace = 5 * 60 * 1000
-  const now = new Date('2026-08-27T12:00:00.000Z')
-  const built = buildFollowUpObligationBacklogWhere({ now, settlingGraceMs: grace }) as BacklogWhere
+  const built = buildFollowUpObligationBacklogWhere({
+    databaseNow: DATABASE_NOW, settlingGraceMs: grace,
+  }) as BacklogWhere
+  assert.ok(built.OR)
   assert.equal(
-    ((built.OR[0] as { syncedAt: { lt: Date } }).syncedAt.lt).getTime(),
-    now.getTime() - grace,
-    'the cutoff is now minus the grace, applied to a real completion time',
+    ((built.OR[0] as { backReferenceFollowUpsClaimedAtDatabaseClock: { lt: Date } })
+      .backReferenceFollowUpsClaimedAtDatabaseClock.lt).getTime(),
+    DATABASE_NOW.getTime() - grace,
+    'the cutoff is the DATABASE clock minus the grace, applied to a database-stamped claim time',
   )
 })
 
@@ -510,4 +522,223 @@ test('[o3d-0bfh r7] the remedy never asserts the follow-ups were never enqueued'
         + 'or escalate — rather than "re-drive each one"',
     )
   }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r8 (Codex HIGH) — THE GRACE WAS TWO APPLICATION CLOCKS, AND HIDING IS THE DIRECTION THAT
+// COSTS MONEY.
+//
+// r7's grace compared `syncedAt` — written by the connector's host with `new Date()` — against a
+// cutoff derived from `new Date()` on whichever host renders the inbox. If the minting host runs
+// ahead, or is stepped backwards afterwards, the row stays above the cutoff and a genuinely stranded
+// payment is HIDDEN from the only surface that reports it. This repository already knows application
+// timestamps are not authoritative for ordering: `syncedAtDatabaseClock` is on this very table for
+// exactly that reason.
+// ---------------------------------------------------------------------------
+
+test('[o3d-0bfh r8] every column the grace compares is stamped by the DATABASE — no application clock takes part', () => {
+  // Route: readFollowUpObligationDatabaseNow() -> clock_timestamp() -> `databaseNow` ->
+  // settledBefore -> `lt` on backReferenceFollowUpsClaimedAtDatabaseClock (stamped by the trigger in
+  // migration 20260827120000) and on createdAt (a database now() DEFAULT).
+  //
+  // Mutation: put `syncedAt` back into either branch and the first two assertions fail; restore the
+  // `options?.now ?? new Date()` default and the source assertion fails — which is the entrance the
+  // defect came through, since a default lets a caller take this host's clock without saying so.
+  assert.deepEqual(
+    [...FOLLOW_UP_OBLIGATION_AGE_COLUMNS],
+    ['backReferenceFollowUpsClaimedAtDatabaseClock', 'createdAt'],
+    "syncedAt is an application host's new Date(); it may not be an end of this comparison",
+  )
+  const where = buildFollowUpObligationBacklogWhere({ databaseNow: DATABASE_NOW }) as BacklogWhere
+  assert.ok(where.OR)
+  const columns = new Set(where.OR.flatMap((clause) => Object.keys(clause)))
+  assert.ok(!columns.has('syncedAt'), 'the backlog must not read syncedAt at all')
+
+  // COMMENTS REMOVED FIRST — the block above the function explains that the default was deleted, and
+  // a text scan that read prose would be satisfied by the explanation of the very thing it bans.
+  const source = readSource(
+    path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'follow-up-obligation-registry.ts'),
+  ).code
+  const from = source.indexOf('export function buildFollowUpObligationBacklogWhere')
+  assert.ok(from > 0)
+  const fnBody = source.slice(from, source.indexOf('\n}\n', from))
+  assert.doesNotMatch(
+    fnBody, /new Date\(\)/,
+    'buildFollowUpObligationBacklogWhere must never mint a clock of its own — the cutoff comes from the database',
+  )
+})
+
+test('[o3d-0bfh r8] an unreadable database clock lists EVERY marked row rather than filtering on a clock nobody can identify', () => {
+  // Fail-safe direction. The failure this column addresses is a stranded payment being HIDDEN, so a
+  // backlog that cannot establish an age must show too much, never too little.
+  //
+  // Route: readFollowUpObligationDatabaseNow() catches -> null -> the age predicate is omitted.
+  //
+  // Mutation: fall back to `new Date()` when databaseNow is null, or build the OR from a zero
+  // cutoff, and this fails — the OR reappears, which is this host's clock back in the comparison.
+  const where = buildFollowUpObligationBacklogWhere({ databaseNow: null }) as BacklogWhere
+  assert.equal(where.OR, undefined, 'no database clock, no age filter')
+  assert.deepEqual(where.backReferenceFollowUpsPendingAt, { not: null }, 'but still only MARKED rows')
+  assert.deepEqual(where.connector.in, ['quickbooks'], 'and still only connectors with no consumer')
+})
+
+test('[o3d-0bfh r8] readFollowUpObligationDatabaseNow asks the DATABASE, and fails to null rather than to this host', async () => {
+  // Route: $queryRaw`SELECT clock_timestamp() AT TIME ZONE 'UTC'` -> the Date it returns.
+  //
+  // Mutation: swap clock_timestamp() for now() and the statement assertion fails (now() is
+  // transaction-start time, which can predate the claim it is compared with); return `new Date()`
+  // from the catch and the failure assertion fails.
+  const statements: string[] = []
+  const stamp = new Date('2026-08-27T11:59:00.000Z')
+  const reading = await readFollowUpObligationDatabaseNow({
+    $queryRaw: (async (query: TemplateStringsArray) => {
+      statements.push(query.join('?'))
+      return [{ now: stamp }]
+    }) as never,
+  } as never)
+  assert.equal(reading?.getTime(), stamp.getTime())
+  assert.match(statements[0], /clock_timestamp\(\)/, 'clock_timestamp(), not now(): now() is transaction-start time')
+  assert.match(statements[0], /AT TIME ZONE 'UTC'/, 'the identical expression the trigger stamps with')
+
+  const captured: unknown[][] = []
+  const original = console.error
+  console.error = (...args: unknown[]) => { captured.push(args) }
+  let failed: Date | null
+  try {
+    failed = await readFollowUpObligationDatabaseNow({
+      $queryRaw: (async () => { throw new Error('transient: the database did not answer') }) as never,
+    } as never)
+  } finally {
+    console.error = original
+  }
+  assert.equal(failed, null, 'a database that cannot be asked the time must NOT be answered by this host')
+  assert.equal(captured.length, 1, 'and the failure is reported rather than swallowed')
+
+  // NON-VACUITY: a row shape carrying no Date is also `null`, never a coerced value.
+  assert.equal(await readFollowUpObligationDatabaseNow({ $queryRaw: (async () => []) as never } as never), null)
+})
+
+test('[o3d-0bfh r8] the migration stamps the claim clock from the database and lets no writer supply one', () => {
+  // The stamp is a TRIGGER rather than an extra statement in claimFollowUpObligation, and that is a
+  // decision with a reason: the connectors' claim rides inside the transaction that records the
+  // invoice's external id, so one more statement that can fail there is one more way to roll that
+  // transaction back — and a rolled-back SYNCED write re-posts the invoice to QuickBooks.
+  //
+  // Route: prisma/migrations/20260827120000_.../migration.sql (applied to no database).
+  //
+  // Mutation: drop the ELSE branch and a writer can supply its own value; drop the NULL branch and a
+  // discharged obligation keeps a stale claim time; swap clock_timestamp() for now() and the stamp
+  // becomes transaction-start time, which can predate the claim it is meant to date.
+  const sql = readFileSync(
+    path.join(REPO_ROOT, 'prisma', 'migrations', '20260827120000_followup_obligation_claimed_at_database_clock', 'migration.sql'),
+    'utf8',
+  )
+  assert.match(sql, /ADD COLUMN "backReferenceFollowUpsClaimedAtDatabaseClock" TIMESTAMP\(3\)/)
+  assert.doesNotMatch(sql, /ADD COLUMN[\s\S]{0,120}NOT NULL/, 'nullable and not backfilled — see the migration header')
+  assert.match(sql, /clock_timestamp\(\) AT TIME ZONE 'UTC'/, "the database stamps it, with the reader's own expression")
+  assert.doesNotMatch(sql, /:=\s*now\(\)/, 'now() is transaction-start time and can predate the claim')
+  assert.match(
+    sql,
+    /IF NEW\."backReferenceFollowUpsPendingAt" IS NULL THEN\s*\n\s*NEW\."backReferenceFollowUpsClaimedAtDatabaseClock" := NULL;/,
+    'a discharged obligation must not keep a claim time',
+  )
+  assert.match(
+    sql,
+    /ELSE\s*\n\s*NEW\."backReferenceFollowUpsClaimedAtDatabaseClock" := OLD\."backReferenceFollowUpsClaimedAtDatabaseClock";/,
+    'an unchanged marker carries the OLD stamp over, so no statement can supply its own value',
+  )
+  assert.match(sql, /BEFORE UPDATE OF "backReferenceFollowUpsPendingAt", "backReferenceFollowUpsClaimedAtDatabaseClock"/)
+  assert.match(sql, /BEFORE INSERT ON "accounting_sync_logs"/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r8 (Codex HIGH) — REMOTE ABSENCE IS NOT PROOF THAT CREATION IS SAFE.
+//
+// r7's remedy told an operator to read QuickBooks and "create ONLY what is verifiably absent".
+// `enqueueFollowUps` writes each follow-up as its own local sync-log row and enqueues
+// INVOICE_PAYMENT BEFORE INVOICE_PDF, so the ordinary way this marker is retained — the PDF enqueue
+// failing — leaves a payment already PENDING and simply not executed yet. An operator reading
+// QuickBooks in that window finds no payment, creates one, and the queued row posts its own
+// afterwards. The connector's request id cannot deduplicate a payment a human made in the QuickBooks
+// UI, and a second payment against an invoice is not undoable.
+//
+// The serialized recovery workflow that would make creation safe — hold or cancel every local
+// follow-up row for the document under one lock, then reconcile the remote — does not exist and is
+// gated on o3d-8prh. So no surface may authorise a creation. These tests are what stops the
+// instruction coming back.
+// ---------------------------------------------------------------------------
+
+/** Every operator-facing string this branch is responsible for, and where it is rendered. */
+function remedySurfaces(): Array<{ what: string; text: string }> {
+  const quickbooks = followUpObligationRecoveryFor('quickbooks')
+  const undeclared = followUpObligationRecoveryFor('sage')
+  assert.equal(quickbooks.consumer, 'none')
+  assert.equal(undeclared.consumer, 'none')
+  if (quickbooks.consumer !== 'none' || undeclared.consumer !== 'none') return []
+  return [
+    { what: "the QuickBooks registry remedy (exception inbox + every retained-obligation log line)", text: quickbooks.operatorRemedy },
+    { what: 'the UNDECLARED-connector fallback remedy', text: undeclared.operatorRemedy },
+    { what: 'FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN', text: FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN },
+  ]
+}
+
+test('[o3d-0bfh r8] no operator-facing remedy authorises creating a payment, and each one escalates instead', () => {
+  // Route: followUpObligationRecoveryFor(...).operatorRemedy and
+  // FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN — the three strings the exception inbox and the
+  // connector's log lines are built from (describeFollowUpObligationBacklogRow reads the first).
+  //
+  // Mutation: put r7's "create ONLY what is verifiably absent" back into either remedy and the
+  // authorisation assertion fails on that surface; drop "escalate" and the escalation assertion
+  // fails, which is what stops the fix being "delete the sentence and say nothing".
+  const surfaces = remedySurfaces()
+  assert.equal(surfaces.length, 3, 'all three surfaces must be under test')
+  for (const { what, text } of surfaces) {
+    assert.doesNotMatch(
+      text, /\bcreate (only|ONLY)\b/,
+      `${what} tells an operator to create what is "verifiably absent". Remote absence is not proof that creation `
+        + 'is safe: a payment can be PENDING in the local queue while QuickBooks shows none.',
+    )
+    assert.doesNotMatch(
+      // The lookbehind exempts the exception-inbox SECTION TITLE ("...with nothing to re-drive
+      // them"), which is a statement that nothing will, not an instruction that somebody should.
+      text, /(?<!nothing to )re-?driv(e|en) (it|them|this|the)\b|register the receipt in QuickBooks by hand|re-run the invoice sync/i,
+      `${what} recommends a direct re-drive on a money path`,
+    )
+    assert.match(text, /escalat/i, `${what} must say what to do instead of creating: escalate`)
+  }
+
+  // And the QuickBooks remedy has to explain WHY reading first is not enough, or the next round
+  // reinstates it as an obvious improvement.
+  const [quickbooks] = surfaces
+  assert.match(quickbooks.text, /PENDING/, 'it names the state the queued payment is actually in')
+  assert.match(quickbooks.text, /INVOICE_PAYMENT[\s\S]*INVOICE_PDF/, 'and the enqueue ORDER that creates the window')
+  assert.match(quickbooks.text, /DO NOT CREATE/, 'and it refuses in as many words')
+})
+
+test('[o3d-0bfh r8] the QuickBooks processor no longer asserts that follow-up work was not enqueued', () => {
+  // The registry is not the only surface: the processor writes its own activity-log descriptions,
+  // and r7 corrected the registry while leaving "its follow-up work was NOT enqueued ... need to be
+  // re-driven manually" and "re-run the invoice sync for this reference, or register the receipt in
+  // QuickBooks by hand" in the processor.
+  //
+  // Route: lib/connectors/quickbooks/sync-processor.ts, executable source (comments removed, string
+  // CONTENTS kept — these are strings, and the string is the surface).
+  //
+  // Mutation: restore either sentence and this fails naming it.
+  const source = readSource(path.join(REPO_ROOT, 'lib', 'connectors', 'quickbooks', 'sync-processor.ts'))
+  const banned: Array<{ pattern: RegExp; why: string }> = [
+    { pattern: /work was NOT\s+`?\s*\+?\s*`?enqueued/, why: 'the marker survives a pass whose enqueues succeeded' },
+    { pattern: /need to be re-driven manually/, why: 'a re-drive can double a payment already queued' },
+    { pattern: /register the receipt in QuickBooks by hand/, why: 'a hand-made payment cannot be deduplicated' },
+    { pattern: /re-run the invoice\s+`?\s*\+?\s*'?sync for this reference/, why: 'same: it is a re-drive instruction' },
+  ]
+  for (const { pattern, why } of banned) {
+    assert.doesNotMatch(
+      source.code, pattern,
+      `lib/connectors/quickbooks/sync-processor.ts still tells an operator to act on this row — ${why}`,
+    )
+  }
+  // CONTROL: the scanner is looking at the right file and the right text. The description that
+  // REPLACED them is present, so a rename or a failed read cannot make the four assertions vacuous.
+  assert.match(source.code, /HOW FAR IT GOT IS NOT KNOWN FROM HERE/, 'the replacement wording must be the thing there')
 })

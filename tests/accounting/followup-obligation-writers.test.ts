@@ -48,6 +48,8 @@ type SyncRow = {
   createdAt: Date
   backReferenceCheckedAt: Date | null
   backReferenceFollowUpsPendingAt: Date | null
+  /** o3d-0bfh r8: stamped by the DATABASE, never by a writer — see stampFollowUpClaimClock. */
+  backReferenceFollowUpsClaimedAtDatabaseClock: Date | null
   /**
    * o3d-0m56 r10: the two columns the money-attempt repair reads. `attemptStampingCustodyAt` is
    * written by every production create path, so a row this codebase made carries it and the repair
@@ -70,6 +72,11 @@ const SYNC_COLUMNS = new Set([
   'id', 'connector', 'type', 'referenceType', 'referenceId', 'externalTransactionId', 'status',
   'payload', 'retryCount', 'processingStartedAt', 'syncedAt', 'errorMessage', 'createdAt',
   'backReferenceCheckedAt', 'backReferenceFollowUpsPendingAt', 'backReferenceEvidenceCompactedAt',
+  // o3d-0bfh r8: the claim's DATABASE-stamped wall clock, which the backlog's settling grace is now
+  // aged against. The double writes it the way the trigger in migration 20260827120000 does — see
+  // stampFollowUpClaimClock below — so these assertions are about the predicate production evaluates
+  // against the value the database would actually hold.
+  'backReferenceFollowUpsClaimedAtDatabaseClock',
   // o3d-e2mz: the per-attempt identity every processor write is now fenced on. Listed here rather
   // than tolerated, because this matcher's whole contract is to throw on a predicate it cannot
   // honour — silently ignoring the fence would turn these assertions into assertions about nothing.
@@ -85,6 +92,34 @@ const SYNC_COLUMNS = new Set([
  * everything. A double that silently ignores a predicate turns "the compound where prevents a stale
  * double-write" into an assertion about nothing.
  */
+/**
+ * THE TRIGGER FROM MIGRATION 20260827120000, IN THE DOUBLE (o3d-0bfh r8, Codex HIGH).
+ *
+ * `backReferenceFollowUpsClaimedAtDatabaseClock` is not written by any application writer: a
+ * BEFORE INSERT/UPDATE trigger on `accounting_sync_logs` stamps it from `clock_timestamp()` in the
+ * same statement that mints a new generation, clears it when the marker is cleared, and carries the
+ * old value over otherwise. The backlog's settling grace is aged against it, so a double that did
+ * not model the trigger would leave every claimed row with a NULL stamp and quietly test the
+ * `createdAt` FALLBACK branch instead of the branch production takes.
+ *
+ * `now` is a parameter rather than `new Date()` so the emulation is not itself a second clock: the
+ * caller passes the instant it wants the database to have stamped.
+ */
+function stampFollowUpClaimClock(
+  previous: Date | null | undefined,
+  data: Record<string, unknown>,
+  now: Date,
+): void {
+  if (!('backReferenceFollowUpsPendingAt' in data)) return
+  const next = data.backReferenceFollowUpsPendingAt as Date | null
+  if (next === null) {
+    data.backReferenceFollowUpsClaimedAtDatabaseClock = null
+    return
+  }
+  const changed = previous == null || previous.getTime() !== next.getTime()
+  if (changed) data.backReferenceFollowUpsClaimedAtDatabaseClock = now
+}
+
 function matches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
   for (const [key, condition] of Object.entries(where)) {
     if (key === 'OR') {
@@ -209,6 +244,7 @@ const syncLogClient = {
     return state.syncRows.filter((row) => matches(row, args.where)).length
   },
   async create(args: { data: Record<string, unknown> }) {
+    stampFollowUpClaimClock(null, args.data, new Date())
     const row = {
       ...blankRow(),
       ...args.data,
@@ -221,6 +257,7 @@ const syncLogClient = {
   async update(args: { where: { id: string }; data: Record<string, unknown> }) {
     const row = state.syncRows.find((candidate) => candidate.id === args.where.id)
     if (!row) throw new Error(`fake db: no sync row ${args.where.id}`)
+    stampFollowUpClaimClock(row.backReferenceFollowUpsPendingAt, args.data, new Date())
     Object.assign(row, args.data)
     record('syncLog.update', args.data)
     return { ...row }
@@ -242,7 +279,13 @@ const syncLogClient = {
       }
     }
     const matched = state.syncRows.filter((row) => matches(row, args.where))
-    for (const row of matched) Object.assign(row, args.data)
+    const stampedAt = new Date()
+    for (const row of matched) {
+      // Per row, because the trigger is FOR EACH ROW and each row's OLD value is its own.
+      const data = { ...args.data }
+      stampFollowUpClaimClock(row.backReferenceFollowUpsPendingAt, data, stampedAt)
+      Object.assign(row, data)
+    }
     // The WHERE is journalled too (o3d-xl63 r5 #2): the fresh-post SYNCED write is claim-FENCED now,
     // and a journal that recorded only `data` could not tell a fenced write from an unfenced one.
     record('syncLog.updateMany', args.data, args.where)
@@ -403,6 +446,7 @@ function blankRow(): SyncRow {
     createdAt: new Date('2026-01-01T00:00:00Z'),
     backReferenceCheckedAt: null,
     backReferenceFollowUpsPendingAt: null,
+    backReferenceFollowUpsClaimedAtDatabaseClock: null,
     backReferenceEvidenceCompactedAt: null,
   }
 }
@@ -1360,7 +1404,10 @@ test('[o3d-0bfh r5] CONTROL: the recovery logic works perfectly — it is only u
  */
 function inTheOperatorBacklog(row: SyncRow, atMinutesLater = 30): boolean {
   const where = buildFollowUpObligationBacklogWhere({
-    now: new Date(Date.now() + atMinutesLater * 60_000),
+    // o3d-0bfh r8: the cutoff is a DATABASE clock reading in production
+    // (readFollowUpObligationDatabaseNow). Here it stands in for one, and the parameter is required
+    // precisely so a caller cannot fall back to this host's clock without saying so.
+    databaseNow: new Date(Date.now() + atMinutesLater * 60_000),
   }) as unknown as Record<string, unknown>
   return matches(row as unknown as Record<string, unknown>, where)
 }
