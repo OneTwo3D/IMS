@@ -36,7 +36,9 @@ export type UnrecordablePostedDocumentReason = 'ROW_MISSING' | 'ANOTHER_DOCUMENT
  *     is `resolveInvoiceStatus`/`resolveJournalStatus` reading `payload._postingMode`; on
  *     QuickBooks there is no draft form of any document at all (quickbooks/invoices.ts says so in as
  *     many words: "No DRAFT/AUTHORISED status distinction on creation"), so that connector resolves
- *     LIVE and a test holds it to that.
+ *     LIVE and a test holds it to that. THE SAME FALSEHOOD IS STILL LIVE IN A SIBLING RECORD: the
+ *     fence-loss escalation's `postEffectFor` applies its draft wording to journals only, so a draft
+ *     INVOICE there is still told to be voided or credit-noted (filed as o3d-d3re).
  *   • `externalEffect` — whether the handler touched the remote system at all. `BILL_ATTACHMENT`
  *     returns `{ success: true }` WITHOUT uploading when its connector's attach-PDF setting is
  *     `'false'`, so one operation type covers "an attachment now exists on that bill" and "nothing

@@ -219,9 +219,12 @@ test('ROUND 10: a wording names a record value only through a slot it declared, 
   assert.ok(sawOne, 'the check must actually have seen a record slot, or it proves nothing')
 })
 
-// MUTATION THAT KILLS THIS (run): change `render` to fall back to a literal instead of throwing on
-// an absent value, then select a `{postedExternalId}` remedy on a no-id incident — the leftover /
-// wrong text lands in a generated message and the scan below fails.
+// MUTATION THAT KILLS THIS (run): drop the `render(...)` call from around `w.bothExist` in the Xero
+// formatter — the template's `{ledger}` reaches an operator verbatim and the scan below fails. That
+// is the failure this guards: `render` itself THROWS on an unknown slot and on a declared one whose
+// value is absent, so the only way a slot survives into a message is a template the formatter forgot
+// to put through it. (Making `render` return the literal instead of throwing does NOT kill this
+// today — no wording selects an absent slot — so that weaker mutation was rejected as evidence.)
 //
 // ROUTE: every message is GENERATED from the shipped formatters, over every type, id combination
 // and outcome.
