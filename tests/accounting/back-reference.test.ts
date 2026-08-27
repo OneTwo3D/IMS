@@ -1389,10 +1389,99 @@ test('[o3d-0bfh r4] a claim whose statement fails owns nothing, and the row stil
   assert.equal(written.row.backReferenceFollowUpsPendingAt?.getTime(), stored.getTime(), 'the obligation is still recorded')
 })
 
+// ---------------------------------------------------------------------------
+// o3d-0bfh r5 (Codex HIGH) — THE RELEASE HELPER PROMISED A SWEEP THAT ONE CONNECTOR DOES NOT HAVE.
+//
+// All three of its non-clearing outcomes used to end with some form of "a later sweep will
+// re-enqueue them". That is true on Xero, which binds `repairXeroBackReferences` and has cron invoke
+// it. It is FALSE on QuickBooks, which has no binding and no invocation, so a retained marker there
+// is read by nothing and the outstanding payment, PDF, email or attachment never runs.
+//
+// The distinction is not cosmetic. The whole protocol prefers RETAINING a marker to clearing one on
+// the stated ground that retention costs only "one idempotent re-enqueue on a later sweep". Where
+// there is no sweep, retention costs the payment exactly as clearing it would — the difference is
+// only that the evidence survives — and a log line telling an operator the work is in hand is the
+// difference between someone re-driving it by hand and nobody doing anything.
+//
+// So the caller states it and the helper reports what the caller stated. `SWEEP` below is the
+// control: without it these tests would pass just as well if the recovery wording were deleted
+// outright, which would lose Xero's true and useful promise to fix QuickBooks' false one.
+// ---------------------------------------------------------------------------
+
+const SWEEP = { consumer: 'sweep' } as const
+const NO_CONSUMER = {
+  consumer: 'none',
+  blockedBy: 'no QuickBooks sweep is bound (o3d-8prh)',
+  operatorRemedy: 'find the row by its marker and re-drive the payment by hand',
+} as const
+
+/** Capture what the helper tells an operator, without letting it reach the test runner's output. */
+async function releaseSaying(
+  client: Parameters<typeof releaseFollowUpObligation>[0],
+  params: Parameters<typeof releaseFollowUpObligation>[1],
+): Promise<{ outcome: string; said: string }> {
+  const real = console.error
+  const lines: string[] = []
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+  try {
+    const outcome = await releaseFollowUpObligation(client, params)
+    return { outcome, said: lines.join('\n') }
+  } finally {
+    console.error = real
+  }
+}
+
+test('[o3d-0bfh r5] EVERY refusal on a connector with no consumer says nothing re-enqueues it, and promises no sweep', async () => {
+  // All three non-clearing paths, because the promise was in all three and a fix applied to one
+  // would leave the other two telling an operator the money work is scheduled when it is stalled.
+  const mine = new Date('2026-08-17T09:00:00.000Z')
+  const newer = new Date('2026-08-17T09:00:00.001Z')
+
+  const owningNothing = await releaseSaying(obligationClient(newer).client,
+    { syncLogId: 'log-1', connector: 'quickbooks', generation: null, recovery: NO_CONSUMER })
+  const superseded = await releaseSaying(obligationClient(newer).client,
+    { syncLogId: 'log-1', connector: 'quickbooks', generation: mine, recovery: NO_CONSUMER })
+  const unwritable = await releaseSaying(obligationClient(mine, { failUpdateMany: true }).client,
+    { syncLogId: 'log-1', connector: 'quickbooks', generation: mine, recovery: NO_CONSUMER })
+
+  // THE PRECONDITION, asserted so this cannot pass by reaching none of the paths (a helper that
+  // threw, or an outcome that cleared, would otherwise leave three empty strings satisfying every
+  // negative assertion below).
+  assert.deepEqual(
+    [owningNothing.outcome, superseded.outcome, unwritable.outcome],
+    ['superseded', 'superseded', 'unwritable'],
+    'all three non-clearing paths must actually have been reached',
+  )
+
+  for (const [path, { said }] of Object.entries({ owningNothing, superseded, unwritable })) {
+    assert.ok(said.length > 0, `${path} said nothing at all — a refusal counted nowhere is a settlement`)
+    assert.match(said, /NOTHING re-enqueues them on this connector/,
+      `${path} must tell an operator the work is stalled, not scheduled`)
+    assert.match(said, /o3d-8prh/, `${path} must name why nothing re-enqueues it`)
+    assert.match(said, /re-drive the payment by hand/, `${path} must say what a human has to do instead`)
+    assert.doesNotMatch(said, /later sweep/,
+      `${path} must not promise a sweep this connector does not have — that promise is the finding`)
+  }
+})
+
+test('[o3d-0bfh r5] CONTROL: a connector that DOES have a sweep is still told so', async () => {
+  // Without this, the test above is satisfied by deleting the recovery wording from the helper
+  // entirely — which would replace a false promise with no information, and Xero's promise is true
+  // and is what tells an operator that a stranded row needs nothing from them.
+  const mine = new Date('2026-08-17T09:00:00.000Z')
+  const newer = new Date('2026-08-17T09:00:00.001Z')
+  const { said, outcome } = await releaseSaying(obligationClient(newer).client,
+    { syncLogId: 'log-1', connector: 'xero', generation: mine, recovery: SWEEP })
+
+  assert.equal(outcome, 'superseded', 'the same path as the test above, so the two are comparable')
+  assert.match(said, /a later sweep re-reads the marker and re-enqueues them idempotently/)
+  assert.doesNotMatch(said, /NOTHING re-enqueues/)
+})
+
 test('[o3d-0bfh r4] a release clears ONLY the generation it minted', async () => {
   const mine = new Date('2026-08-17T09:00:00.000Z')
   const { client, row, writes } = obligationClient(mine)
-  const outcome = await releaseFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', generation: mine })
+  const outcome = await releaseFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', generation: mine, recovery: SWEEP })
   assert.equal(outcome, 'released')
   assert.equal(row.backReferenceFollowUpsPendingAt, null)
   assert.deepEqual(writes[0].where, { id: 'log-1', backReferenceFollowUpsPendingAt: mine }, 'fenced on the generation, not the id alone')
@@ -1406,7 +1495,7 @@ test('[o3d-0bfh r4] a release over a NEWER generation is superseded, and the new
   const mine = new Date('2026-08-17T09:00:00.000Z')
   const sweep = new Date('2026-08-17T09:00:00.001Z')
   const { client, row } = obligationClient(sweep)
-  const outcome = await releaseFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', generation: mine })
+  const outcome = await releaseFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', generation: mine, recovery: SWEEP })
   assert.equal(outcome, 'superseded')
   assert.equal(row.backReferenceFollowUpsPendingAt?.getTime(), sweep.getTime(), "the sweep's obligation is intact")
 })
@@ -1414,7 +1503,7 @@ test('[o3d-0bfh r4] a release over a NEWER generation is superseded, and the new
 test('[o3d-0bfh r4] a release that owns no generation writes nothing at all', async () => {
   const sweep = new Date('2026-08-17T09:00:00.000Z')
   const { client, row, writes } = obligationClient(sweep)
-  const outcome = await releaseFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', generation: null })
+  const outcome = await releaseFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', generation: null, recovery: SWEEP })
   assert.equal(outcome, 'superseded')
   assert.equal(writes.length, 0, 'a caller that owns nothing does not get to write')
   assert.equal(row.backReferenceFollowUpsPendingAt?.getTime(), sweep.getTime())
@@ -1426,7 +1515,7 @@ test('[o3d-9kek r10 f1] a release that fails REPORTS rather than throws, leaving
   // costs one idempotent re-enqueue on a later sweep; failing the entry costs a duplicate.
   const mine = new Date('2026-08-17T09:00:00.000Z')
   const { client, row } = obligationClient(mine, { failUpdateMany: true })
-  const failing = await releaseFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', generation: mine })
+  const failing = await releaseFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', generation: mine, recovery: SWEEP })
   assert.equal(failing, 'unwritable', 'reported, not thrown')
   assert.equal(row.backReferenceFollowUpsPendingAt?.getTime(), mine.getTime(), 'and the obligation survives the failure')
 })

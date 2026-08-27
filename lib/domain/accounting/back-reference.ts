@@ -610,6 +610,14 @@ export function syncTypeWritesBackReference(type: AccountingSyncType, referenceT
 //      marker left behind on a row whose follow-ups succeeded costs ONE idempotent re-enqueue on a
 //      later sweep, while a marker cleared too early costs the payment.
 //
+//      THAT ASYMMETRY IS ONLY THIS FAVOURABLE WHERE A SWEEP EXISTS (o3d-0bfh r5, Codex HIGH). It is
+//      stated as a property of the protocol and it is really a property of the CONSUMER: "costs one
+//      idempotent re-enqueue" presumes something re-reads the marker. QuickBooks has no sweep
+//      binding and no cron invocation, so on that connector a retained marker is re-read by nothing
+//      and the outstanding payment, PDF, email or attachment never runs. Retaining is still the
+//      right direction there — it is never worse than clearing — but it buys EVIDENCE, not repair,
+//      and callers must say which they are getting: see {@link FollowUpObligationRecovery}.
+//
 // AND RULE 3, WHICH IS WHAT r4 ADDED (o3d-0bfh r4, Codex HIGH). EVERY WRITER AND EVERY RELEASER OF
 // THIS COLUMN PARTICIPATES IN ONE GENERATION PROTOCOL. r3 made the SWEEP's claim a strictly-later
 // compare-and-set, which is genuinely exclusive between sweeps — and left the connector release
@@ -751,6 +759,52 @@ export async function claimFollowUpObligation(
 export type FollowUpObligationReleaseOutcome = 'released' | 'superseded' | 'unwritable'
 
 /**
+ * WHAT ACTUALLY RE-DRIVES A RETAINED OBLIGATION ON THE CALLER'S CONNECTOR (o3d-0bfh r5, Codex HIGH).
+ *
+ * Every message this module used to emit ended with some form of "a later sweep will re-enqueue
+ * them". On Xero that is true — `repairXeroBackReferences` is bound and cron invokes it. ON
+ * QUICKBOOKS IT IS FALSE: there is no sweep binding and no cron invocation (see the block at the end
+ * of lib/connectors/quickbooks/sync-processor.ts), so a retained marker is read by NOTHING. The
+ * asymmetry of rule 2 above — "a marker left set costs one idempotent re-enqueue on a later sweep" —
+ * silently assumed a consumer that only one of the two connectors has.
+ *
+ * That assumption is not a documentation slip; it is the load-bearing half of the whole design. The
+ * protocol deliberately prefers RETAINING a marker to clearing one, on the ground that retention
+ * costs only noise. Where nothing consumes the marker, retention costs the payment just as surely as
+ * clearing it would — the money work never runs either way — and the only difference is that the
+ * evidence survives. Evidence is worth having. It is not the same thing as recovery, and a module
+ * that says "a later sweep will discharge it" to a caller that has no sweep is telling an operator
+ * the work is in hand when it is not.
+ *
+ * So the caller has to STATE which case it is in, and the compiler makes it: this is a required
+ * field, not an optional one with a convenient default. A default would have been read as `sweep` by
+ * whichever connector forgot to think about it, which is exactly how QuickBooks acquired the claim
+ * side of this protocol without the consumer side and had it read as complete for three rounds.
+ */
+export type FollowUpObligationRecovery =
+  /** A repair sweep is bound for this connector and cron invokes it: a retained marker is re-read. */
+  | { consumer: 'sweep' }
+  /**
+   * NOTHING re-reads a retained marker on this connector. `blockedBy` names why (an issue id and the
+   * one-line reason), and `operatorRemedy` says what a human must do, because nothing automated will.
+   */
+  | { consumer: 'none'; blockedBy: string; operatorRemedy: string }
+
+/**
+ * How to describe, to an operator reading a log line, what happens to an obligation left on the row.
+ *
+ * One definition rather than a phrase repeated at each `console.error`, for the same reason the mint
+ * is one function: a restated copy is how a writer falls out of a protocol, and these three messages
+ * had already drifted into three slightly different promises of the same non-existent sweep.
+ */
+export function followUpObligationRecoveryNote(recovery: FollowUpObligationRecovery): string {
+  return recovery.consumer === 'sweep'
+    ? 'a later sweep re-reads the marker and re-enqueues them idempotently'
+    : `NOTHING re-enqueues them on this connector — ${recovery.blockedBy}. The marker is retained as EVIDENCE, `
+      + `not as scheduled work: ${recovery.operatorRemedy}`
+}
+
+/**
  * Discharge the obligation: the back-reference is written and the follow-ups are enqueued.
  *
  * FENCED ON THE GENERATION THIS CALLER MINTED (o3d-0bfh r4, Codex HIGH). It used to clear by id
@@ -759,16 +813,22 @@ export type FollowUpObligationReleaseOutcome = 'released' | 'superseded' | 'unwr
  * returned, carried down unchanged; `null` means this caller never owned one, and then nothing is
  * written at all.
  *
- * A ZERO-ROW RELEASE IS `superseded`, and it is the same deferral the sweep's settlement already has:
- * another writer's obligation is on the row, nothing went wrong, nothing is written, and the next
- * sweep discharges it after re-reading state that is current. It is NOT a failure, and it must not be
- * silent — a refusal counted nowhere is indistinguishable from a settlement.
+ * A ZERO-ROW RELEASE IS `superseded`: another writer's obligation is on the row, nothing went wrong
+ * and nothing is written. It is NOT a failure, and it must not be silent — a refusal counted nowhere
+ * is indistinguishable from a settlement.
  *
  * SWALLOWS its failure and reports it, and never throws. The follow-ups have already run by the time
  * this is called, so a failure here is not a reason to retry them — driving the caller's
  * follow-up-failure path would re-post work that succeeded. Leaving the marker set is the safe
- * direction: the next sweep finds a linked row that still says it owes follow-ups and re-enqueues
- * them idempotently. Noise, not loss.
+ * direction, in the sense that it is never WORSE than clearing it.
+ *
+ * WHETHER IT IS ALSO RECOVERABLE IS THE CALLER'S FACT TO STATE, NOT THIS MODULE'S TO ASSUME (o3d-0bfh
+ * r5, Codex HIGH). Both deferring outcomes above used to end "and a later sweep will discharge it".
+ * That sentence is true on Xero and false on QuickBooks, which has no sweep binding at all — see
+ * {@link FollowUpObligationRecovery}. `recovery` is therefore required, and what these messages say
+ * about the outstanding work now comes from the caller rather than from a hope this module holds
+ * about connectors in general. On a connector with no consumer the line says so in as many words, so
+ * an operator reading it learns that the money work is stalled rather than scheduled.
  *
  * It is a separate write because it has to be: the SYNCED transition commits BEFORE the follow-ups
  * run (that ordering is the connectors' idempotency guard against double-posting), so there is no
@@ -776,12 +836,19 @@ export type FollowUpObligationReleaseOutcome = 'released' | 'superseded' | 'unwr
  */
 export async function releaseFollowUpObligation(
   client: FollowUpObligationClient,
-  params: { syncLogId: string; connector: string; generation: Date | null },
+  params: {
+    syncLogId: string
+    connector: string
+    generation: Date | null
+    /** What re-drives the obligation this call may leave behind. Required — see the type's header. */
+    recovery: FollowUpObligationRecovery
+  },
 ): Promise<FollowUpObligationReleaseOutcome> {
+  const recovery = followUpObligationRecoveryNote(params.recovery)
   if (params.generation === null) {
     console.error(
       `${params.connector}: follow-ups ran but this pass never took the obligation generation, so it is not the one to clear it; `
-      + 'a later sweep will re-enqueue them',
+      + recovery,
       params.syncLogId,
     )
     return 'superseded'
@@ -794,13 +861,13 @@ export async function releaseFollowUpObligation(
     if (cleared.count > 0) return 'released'
     console.error(
       `${params.connector}: follow-ups ran but the obligation marker has been re-claimed since, so this pass is not the one to `
-      + 'clear it; the newer obligation stands and a later sweep will discharge it',
+      + `clear it; the newer obligation stands and ${recovery}`,
       params.syncLogId,
     )
     return 'superseded'
   } catch (error) {
     console.error(
-      `${params.connector}: follow-ups ran but the obligation marker could not be cleared; a later sweep will re-enqueue them`,
+      `${params.connector}: follow-ups ran but the obligation marker could not be cleared; ${recovery}`,
       params.syncLogId,
       error,
     )

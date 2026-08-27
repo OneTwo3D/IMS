@@ -6749,7 +6749,17 @@ async function settleFollowUpObligation(
     // The release is fenced on `obligation`; a `superseded` answer means a sweep (or a later post)
     // has claimed a NEWER generation since, so its obligation stands and this pass writes nothing.
     // Not an error for this entry — its own follow-ups did run — and the helper says so on the log.
-    await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR, generation: obligation })
+    await releaseFollowUpObligation(db, {
+      syncLogId: entry.id,
+      connector: XERO_CONNECTOR,
+      generation: obligation,
+      // o3d-0bfh r5: Xero is the connector where the "a later sweep will discharge it" reasoning is
+      // actually TRUE — `repairXeroBackReferences` is bound below and the accounting-sync cron
+      // invokes it, so a retained marker is re-read and its follow-ups re-enqueued idempotently.
+      // Stated rather than defaulted, because the sibling connector's answer is the opposite one and
+      // a default would have silently given QuickBooks this one.
+      recovery: { consumer: 'sweep' },
+    })
     return
   }
   await logActivity({
