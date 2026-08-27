@@ -32,7 +32,11 @@
 //                          discovered at drain-verify, AFTER the stop: an outage for a
 //                          missing import. This mode runs the same imports, opens the same
 //                          connection and asks the same questions.
-//   --fence                revoke CONNECT, drain the existing backends, prove it is quiet
+//   --fence                revoke CONNECT, drain the existing backends, prove it is quiet.
+//                          Exit 3 means NOTHING WAS REVOKED; exit 5 (EXIT_FENCE_STANDING) means
+//                          the REVOKEs are committed and standing and this run still cannot call
+//                          the database fenced. The two must never be confused: the callers hold
+//                          a sticky "this run raised a fence" flag, and the second is a fence.
 //   --release              restore EXACTLY the grants that were revoked, and verify they are back.
 //                          When there is no usable record to restore FROM, it does not report
 //                          "nothing to release" — a record that was never written and one a
@@ -119,6 +123,15 @@
 //     same answer from has_database_privilege(); what changes is who may revoke it later.
 //     Said here because the state file calls itself a restore of "exactly the grants".
 //
+// WHICH DATABASE ANY OF THIS IS ABOUT. Every mode above connects through
+// DEPLOY_ADMIN_DATABASE_URL when it is set, and asks its questions of `current_database()` on
+// that connection while taking the ROLE from DATABASE_URL. assessDatabaseIdentity() is what
+// binds the two together — same host, same port, same database name, and the live connection
+// attached to it — and no mode fences or releases without it (o3d-2sm1.5, Codex r13 CRITICAL).
+// `--release` goes further on the path where it has no record: the claim "the application can
+// connect" is made by CONNECTING AS THE APPLICATION, because a privilege read taken over the
+// admin connection answers about the admin connection's database.
+//
 // THE STATE FILE is written BEFORE anything is revoked, and it records what each
 // grantee held beforehand so that `--release` restores that and not "everything".
 // `--fence` on an existing state file re-applies the revoke and re-drains but keeps
@@ -147,6 +160,25 @@ export const EXIT_NOT_FENCEABLE = 3
  * "the application can connect and nothing else here is knowable", but nobody may read it as OK.
  */
 export const EXIT_FENCE_UNPROVEN = 4
+/**
+ * `--fence` GOT PAST COMMIT AND STILL CANNOT CALL THE DATABASE FENCED (o3d-2sm1.5, Codex r13 HIGH).
+ *
+ * AN EXIT CODE IS NOT EVIDENCE ABOUT WHAT WAS COMMITTED, and for a while the callers read one as
+ * if it were: `DB_FENCE_RAISED` was raised only on exit 0, so "the fence did not exit 0" was taken
+ * for "no fence was raised". doFence() REVOKES IN A COMMITTED TRANSACTION and then asks whether
+ * the door is actually shut; when the application keeps CONNECT through role membership, or the
+ * room will not go quiet, it DELIBERATELY LEAVES THE REVOKES STANDING so nothing is half-applied
+ * — and it used to report that with the same exit 1 a failure that revoked nothing produces. The
+ * caller then treated a run that had locked PUBLIC, monitoring, BI and a second application out
+ * as a run with no fence to its name, and a later `--release` exit 4 took the warning-success
+ * branch and let the deploy record a release nobody performed.
+ *
+ * So every outcome AFTER the revoking COMMIT has its own code. It means exactly one thing:
+ * REVOKES ARE COMMITTED AND STANDING RIGHT NOW. Whatever the caller does next, it owes the
+ * database a `--release`, and it must never again read its own release's "unproven" verdict as
+ * permission to carry on.
+ */
+export const EXIT_FENCE_STANDING = 5
 
 export const PUBLIC_GRANTEE = 'PUBLIC'
 
@@ -164,6 +196,125 @@ export function parseRoleFromConnectionString(connectionString) {
   } catch {
     return ''
   }
+}
+
+// ---------------------------------------------------------------------------
+// IS THE DATABASE THIS RUN IS TALKING TO THE DATABASE THE APPLICATION USES?
+// (o3d-2sm1.5, Codex r13 CRITICAL)
+//
+// Every mode but --print-migration-url connects through DEPLOY_ADMIN_DATABASE_URL when it is
+// set, and then asks its questions with `current_database()` — has_database_privilege(appRole,
+// current_database(), 'CONNECT') above all. The ROLE NAME in those questions comes from
+// DATABASE_URL; the DATABASE they are asked of comes from the admin connection. Nothing
+// checked that the two were the same place.
+//
+// Point the admin URL at another database on which the application role happens to hold CONNECT
+// — a copy, a `postgres` maintenance database, a staging URL left in the environment — and
+// `--release` answers "the application can connect" about a database the application never uses,
+// exits 4, and the caller permits startup while the REAL database still denies CONNECT. The
+// health route does not connect to the database, so the deploy reports success with the
+// application locked out. This is the same defect class as asking the right question of the
+// wrong object.
+//
+// So the identity is PROVEN before anything is fenced or released, from two directions:
+//
+//   1. THE TWO URLS NAME THE SAME PLACE. Database name, server host and port, compared as
+//      written. A loopback address, `localhost` and a unix-socket directory are the same
+//      machine and are treated as such; anything else that differs is a refusal rather than a
+//      guess, because "probably the same host by another name" is exactly the reasoning this
+//      check exists to stop.
+//   2. THE CONNECTION THAT WAS ACTUALLY OPENED IS ATTACHED TO IT. `current_database()`, read
+//      from the live connection, must equal the database DATABASE_URL names. A URL comparison
+//      alone cannot see an admin URL with no database in its path, which silently connects to
+//      the admin role's own default database.
+//
+// Fail closed in both directions: no DATABASE_URL, no database name in it, or a connection that
+// will not say where it is attached, are all "not proven", and not proven is refused.
+// ---------------------------------------------------------------------------
+
+/** Hosts that all mean "the machine this is running on", however they are spelled. */
+const LOCAL_HOSTS = new Set(['', 'localhost', '127.0.0.1', '::1', '[::1]'])
+
+/**
+ * Pure: the (server, database) a libpq connection URL names.
+ *
+ * `host` may live in the authority or in a query parameter (a unix socket directory is
+ * `postgresql:///db?host=/var/run/postgresql`), and the port defaults the way libpq defaults it.
+ */
+export function parseConnectionIdentity(connectionString) {
+  if (!connectionString) return { ok: false, reason: 'is not set' }
+  let url
+  try {
+    url = new URL(connectionString)
+  } catch {
+    return { ok: false, reason: 'cannot be parsed as a URL' }
+  }
+  const host = url.hostname || url.searchParams.get('host') || ''
+  const port = url.port || url.searchParams.get('port') || '5432'
+  let database = ''
+  try {
+    database = decodeURIComponent(url.pathname.replace(/^\//, ''))
+  } catch {
+    database = url.pathname.replace(/^\//, '')
+  }
+  const lowered = String(host).toLowerCase()
+  const family = String(host).startsWith('/') || LOCAL_HOSTS.has(lowered) ? '(this host)' : lowered
+  return { ok: true, reason: '', host, port, database, server: `${family}:${port}` }
+}
+
+/**
+ * Pure: may this run treat the connection it opened as the application's own database?
+ *
+ * `connectedDatabase` is `current_database()` read from that connection — the live half, and the
+ * only one that can catch an admin URL whose path is empty. `adminUrl` is compared only when it
+ * is set, because without it the connection IS the application's URL and there are not two
+ * things to bind together.
+ */
+export function assessDatabaseIdentity({ adminUrl = '', appUrl = '', connectedDatabase = '' }) {
+  const app = parseConnectionIdentity(appUrl)
+  if (!app.ok) {
+    return {
+      bound: false,
+      reason: `DATABASE_URL ${app.reason}, so there is nothing to prove this deploy's connection is the application's own database. Every question this script asks is asked of current_database() on the connection it opened, and without the application's URL that database is unidentified.`,
+    }
+  }
+  if (!app.database) {
+    return {
+      bound: false,
+      reason: 'DATABASE_URL names no database in its path, so the database the application actually uses is unidentified and nothing can be bound to it.',
+    }
+  }
+  if (adminUrl) {
+    const admin = parseConnectionIdentity(adminUrl)
+    if (!admin.ok) {
+      return { bound: false, reason: `DEPLOY_ADMIN_DATABASE_URL ${admin.reason}, so it cannot be shown to name the same database as DATABASE_URL.` }
+    }
+    if (admin.database && admin.database !== app.database) {
+      return {
+        bound: false,
+        reason: `DEPLOY_ADMIN_DATABASE_URL names the database "${admin.database}" and DATABASE_URL names "${app.database}". Everything this script asks — including whether the application role can connect — would be asked of "${admin.database}", and answered about a database the application does not use.`,
+      }
+    }
+    if (admin.server !== app.server) {
+      return {
+        bound: false,
+        reason: `DEPLOY_ADMIN_DATABASE_URL points at ${admin.server} and DATABASE_URL at ${app.server}. A privilege read on one server says nothing about the other, so this is refused rather than assumed to be the same host under another name. Make both URLs name the same host and port.`,
+      }
+    }
+  }
+  if (!connectedDatabase) {
+    return {
+      bound: false,
+      reason: 'the open connection did not report which database it is attached to, so it cannot be shown to be the application\'s.',
+    }
+  }
+  if (connectedDatabase !== app.database) {
+    return {
+      bound: false,
+      reason: `the connection this run opened is attached to "${connectedDatabase}", and DATABASE_URL names "${app.database}". A connection string with no database in its path connects to the login role's default database, which is how these come apart without either URL looking wrong.`,
+    }
+  }
+  return { bound: true, reason: '' }
 }
 
 /**
@@ -699,6 +850,54 @@ function requireAdminUrl(what) {
 }
 
 /**
+ * Shared by every mode that connects: the connection in hand must be PROVEN to be the
+ * application's own database before it is fenced, released, or believed about privileges.
+ *
+ * Printed as a refusal rather than returned, because there is exactly one thing to do with a
+ * "not proven" here and every caller does it.
+ */
+function requireBoundDatabaseIdentity(connectedDatabase, prefix) {
+  const verdict = assessDatabaseIdentity({
+    adminUrl: process.env.DEPLOY_ADMIN_DATABASE_URL || '',
+    appUrl: process.env.DATABASE_URL || '',
+    connectedDatabase,
+  })
+  if (verdict.bound) return true
+  console.error(`${prefix}: ${verdict.reason}`)
+  console.error('This run cannot show that the database it is connected to is the one the application uses,')
+  console.error('and every answer it could give — "the fence took", "the application can connect" — would be')
+  console.error('about whichever database it reached. Align DEPLOY_ADMIN_DATABASE_URL and DATABASE_URL on the')
+  console.error('same host, port and database name, and re-run.')
+  return false
+}
+
+/**
+ * The application's OWN connection, opened as the application: not a privilege read taken on
+ * somebody else's connection (o3d-2sm1.5, Codex r13 CRITICAL).
+ *
+ * has_database_privilege() asked over the admin connection answers about the admin connection's
+ * database. This opens DATABASE_URL itself and reports whether it got in and where it landed, so
+ * "the application can connect" is an observation of the application connecting.
+ *
+ * Never throws: a refused connection is the answer, not an error.
+ */
+export async function probeApplicationConnection(connectionString) {
+  if (!connectionString) {
+    return { attempted: false, connected: false, database: '', error: 'DATABASE_URL is not set, so there is no application connection to test.' }
+  }
+  const probe = new pg.Client({ connectionString, application_name: 'ims-deploy-fence-app-probe' })
+  try {
+    await probe.connect()
+    const { rows } = await probe.query('SELECT current_database() AS connected_database')
+    return { attempted: true, connected: true, database: rows[0]?.connected_database ?? '', error: '' }
+  } catch (error) {
+    return { attempted: true, connected: false, database: '', error: error instanceof Error ? error.message : String(error) }
+  } finally {
+    await probe.end().catch(() => {})
+  }
+}
+
+/**
  * --preflight: ask, before anything is stopped, every question that can be asked without
  * changing anything. It revokes nothing, terminates nothing and writes no state file.
  *
@@ -713,6 +912,11 @@ function requireAdminUrl(what) {
 async function doPreflight(client, options) {
   const appRole = options.appRole || parseRoleFromConnectionString(process.env.DATABASE_URL)
   const { facts, plan, role } = await assessFence(client, appRole)
+
+  // THE SAME QUESTIONS ARE ONLY THE SAME QUESTIONS IF THEY ARE ASKED OF THE SAME DATABASE.
+  // Asked here as well as in --fence for the reason this whole mode exists: a preflight that
+  // skips a check --fence performs is a preflight that passes and then fails after the stop.
+  if (!requireBoundDatabaseIdentity(facts.database, 'NOT FENCEABLE')) return EXIT_NOT_FENCEABLE
 
   if (appRole && !facts.app_role_exists) {
     console.error(`NOT FENCED: the role ${appRole} from DATABASE_URL does not exist on this server.`)
@@ -764,6 +968,12 @@ export async function doFence(client, options) {
 
   const appRole = options.appRole || parseRoleFromConnectionString(process.env.DATABASE_URL)
   const { facts, plan: freshPlan, role } = await assessFence(client, appRole)
+
+  // BEFORE ANYTHING IS REVOKED (o3d-2sm1.5, Codex r13 CRITICAL). A fence raised on a database
+  // that is not the application's locks other people's clients out of somewhere else while the
+  // application keeps writing across the migration, and every verification below — the ACL read,
+  // the effective-CONNECT check, the drain — would be a truthful report about the wrong database.
+  if (!requireBoundDatabaseIdentity(facts.database, 'NOT FENCED')) return EXIT_NOT_FENCEABLE
 
   if (appRole && !facts.app_role_exists) {
     console.error(`NOT FENCED: the role ${appRole} from DATABASE_URL does not exist on this server.`)
@@ -855,6 +1065,34 @@ export async function doFence(client, options) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
   }
+  // FROM HERE THE REVOKES ARE ON THE MEDIUM (o3d-2sm1.5, Codex r13 HIGH).
+  //
+  // Everything below can still fail, and none of those failures undo the transaction that has
+  // just committed. They used to be reported with EXIT_ERROR — the same code a failure that
+  // revoked NOTHING returns — and the callers, which raise their sticky "this run fenced" flag
+  // only on exit 0, therefore recorded a run that had locked PUBLIC, monitoring and BI out as
+  // one with no fence to its name. So every outcome past this point is EXIT_FENCE_STANDING,
+  // including a throw: an exception raised after COMMIT is still a database with a fence on it.
+  try {
+    return await completeFence(client, options, { facts, plan, grants, appRole, revokes })
+  } catch (error) {
+    console.error(`THE REVOKES ARE COMMITTED AND THE FENCE IS STANDING, and this run failed afterwards: ${error instanceof Error ? error.message : String(error)}`)
+    console.error('CONNECT has been taken from the grantees below and nothing here has given it back.')
+    console.error('Release it with --release, or run these by hand as a superuser or the database owner:')
+    for (const statement of grants) console.error(`  ${statement}`)
+    return EXIT_FENCE_STANDING
+  }
+}
+
+/**
+ * Everything doFence() does AFTER its revoking transaction has committed: prove the door is
+ * actually shut, drain what was already inside, and prove the room stayed empty.
+ *
+ * Split out so that the caller can say one true thing about every way it ends — the fence is
+ * standing. Its own returns say WHY it could not be called good; they never say "nothing
+ * happened".
+ */
+async function completeFence(client, options, { facts, plan, grants, appRole, revokes }) {
   for (const statement of revokes) console.log(`  ${statement}`)
 
   // ASK THE DATABASE WHETHER THE DOOR IS SHUT. Everything above reasons about ACL entries, and an
@@ -873,7 +1111,11 @@ export async function doFence(client, options) {
     console.error(assessment.reason)
     console.error('The fence is left standing so nothing is half-applied; undo it with --release before starting the application:')
     for (const statement of grants) console.error(`  ${statement}`)
-    return EXIT_ERROR
+    // EXIT_FENCE_STANDING, not EXIT_ERROR: the REVOKEs above are committed and are still in
+    // force. This is the exact shape the r12 release text describes — an application that
+    // connects through membership while PUBLIC, monitoring and BI stay shut out — and the
+    // callers' sticky flag has to be able to see it (o3d-2sm1.5, Codex r13 HIGH).
+    return EXIT_FENCE_STANDING
   }
   console.log(`Verified: has_database_privilege('${appRole}', current_database(), 'CONNECT') is false.`)
 
@@ -915,7 +1157,8 @@ export async function doFence(client, options) {
       console.error(`  - pid ${row.pid} user=${row.usename} app=${row.application_name || '(unnamed)'}`)
     }
     console.error('Refusing to call the database drained. The fence is left in place; release it with --release.')
-    return EXIT_ERROR
+    // The fence is IN PLACE, so this is not the code a fence that revoked nothing returns.
+    return EXIT_FENCE_STANDING
   }
 
   console.log(`Database ${facts.database} is fenced: CONNECT revoked from ${plan.revoke.join(', ')}, no other client backends attached.`)
@@ -938,7 +1181,15 @@ export async function doFence(client, options) {
  * one, so this function NEVER returns EXIT_OK and NEVER sets fenceProvenAbsent. It returns a
  * refusal with instructions in both directions; the only difference is which refusal.
  */
-export function assessUnrecordedRelease({ status, detail = '', appRole, stateFile, appStillConnects }) {
+export function assessUnrecordedRelease({
+  status,
+  detail = '',
+  appRole,
+  stateFile,
+  appStillConnects,
+  appConnection = null,
+  connectedDatabase = '',
+}) {
   const where = stateFile || '<no --state-file was given>'
   const what = `${status}${detail ? `: ${detail}` : ''}`
   if (!appRole) {
@@ -954,13 +1205,53 @@ export function assessUnrecordedRelease({ status, detail = '', appRole, stateFil
     }
   }
   if (appStillConnects) {
+    // A PRIVILEGE READ ON SOMEBODY ELSE'S CONNECTION IS NOT THE APPLICATION CONNECTING
+    // (o3d-2sm1.5, Codex r13 CRITICAL). `appStillConnects` is has_database_privilege() asked over
+    // the ADMIN connection; the only thing that proves the application can reach its database is
+    // the application's own URL reaching it. When the two disagree, the disagreement is the
+    // finding, and it is fatal: the caller is about to start an application on the strength of
+    // the weaker of the two answers.
+    if (!appConnection || !appConnection.connected) {
+      return {
+        exitCode: EXIT_ERROR,
+        fenceProvenAbsent: false,
+        appRoleConnects: false,
+        lines: [
+          `No usable connection-fence record (${what}) at ${where}, AND THE TWO ANSWERS DISAGREE.`,
+          `The connection this run opened${connectedDatabase ? ` (attached to "${connectedDatabase}")` : ''} says ${appRole} holds CONNECT.`,
+          `DATABASE_URL itself CANNOT CONNECT: ${appConnection?.error || 'the application connection was never attempted'}`,
+          'A privilege read is an answer about the database the reading connection is attached to. The',
+          'application uses DATABASE_URL, and DATABASE_URL is being refused — so either a fence is still',
+          'standing over the real database, or this run has been asking its questions somewhere else.',
+          'Refusing to report anything but a failure. Fix the connection or restore CONNECT by hand:',
+          '  SELECT datacl FROM pg_database WHERE datname = current_database();',
+          `  GRANT CONNECT ON DATABASE <the application's database> TO ${appRole};`,
+        ],
+      }
+    }
+    if (connectedDatabase && appConnection.database && appConnection.database !== connectedDatabase) {
+      return {
+        exitCode: EXIT_ERROR,
+        fenceProvenAbsent: false,
+        appRoleConnects: true,
+        lines: [
+          `No usable connection-fence record (${what}) at ${where}, AND THE TWO CONNECTIONS ARE NOT THE SAME DATABASE.`,
+          `This run is attached to "${connectedDatabase}"; DATABASE_URL lands on "${appConnection.database}".`,
+          `Everything this run could say about ${appRole} — CONNECT included — is about "${connectedDatabase}",`,
+          'and the application never uses it. Nothing here can speak for the database that matters.',
+          'Align DEPLOY_ADMIN_DATABASE_URL with DATABASE_URL and re-run before this database is treated as open.',
+        ],
+      }
+    }
     return {
       exitCode: EXIT_FENCE_UNPROVEN,
       fenceProvenAbsent: false,
       appRoleConnects: true,
       lines: [
         `No usable connection-fence record (${what}) at ${where}.`,
-        `${appRole} holds CONNECT on this database. THAT IS THE ONLY THING THIS RUN CAN PROVE.`,
+        `${appRole} holds CONNECT, and DATABASE_URL itself connected to "${appConnection.database || connectedDatabase}"`,
+        'to prove it rather than a privilege read taken over another connection. THAT IS THE ONLY THING',
+        'THIS RUN CAN PROVE.',
         'IT IS NOT PROOF THAT NO FENCE IS STANDING (o3d-2sm1.5, Codex r12 HIGH). A fence revokes CONNECT',
         'from EVERY grantee that held it directly — PUBLIC, monitoring, backup, BI, a second application —',
         `and ${appRole} can hold CONNECT through PUBLIC, through role membership or through a manual grant`,
@@ -999,26 +1290,51 @@ export function assessUnrecordedRelease({ status, detail = '', appRole, stateFil
  * The branch taken when the record cannot answer. Asks the database, which is where the
  * durable half of the fence lives, and reports what it can actually prove.
  */
-async function releaseWithoutRecord(client, options, read) {
+async function releaseWithoutRecord(client, options, read, connectedDatabase = '') {
   const appRole = options.appRole || parseRoleFromConnectionString(process.env.DATABASE_URL)
   const effective = appRole ? await readEffectiveConnect(client, appRole) : { stillConnects: false }
+  // Only when the privilege read says the application is back inside: that claim is the one this
+  // run would let a caller act on, so it is the one that has to be observed rather than inferred.
+  // The other branch already refuses, and an application that cannot connect to a fenced database
+  // is what a fenced database means.
+  const probe = options.probeApplication ?? probeApplicationConnection
+  const appConnection = effective.stillConnects ? await probe(process.env.DATABASE_URL || '') : null
   const verdict = assessUnrecordedRelease({
     status: read.status,
     detail: read.detail,
     appRole,
     stateFile: options.stateFile,
     appStillConnects: effective.stillConnects,
+    appConnection,
+    connectedDatabase,
   })
   for (const line of verdict.lines) (verdict.exitCode === EXIT_OK ? console.log : console.error)(line)
   return verdict.exitCode
 }
 
 export async function doRelease(client, options) {
+  // WHICH DATABASE IS THIS (o3d-2sm1.5, Codex r13 CRITICAL). A release GRANTs, and a release
+  // that cannot show it is talking to the application's own database either grants CONNECT on
+  // somebody else's or — worse, because it is silent — reports the application free while the
+  // real database still refuses it.
+  const { rows: attachment } = await client.query('SELECT current_database() AS connected_database')
+  const connectedDatabase = attachment[0]?.connected_database ?? ''
+  if (!requireBoundDatabaseIdentity(connectedDatabase, 'NOT RELEASED')) return EXIT_ERROR
+
   const read = options.stateFile ? readState(options.stateFile) : { status: STATE_ABSENT, detail: 'no --state-file was given' }
   if (read.status !== STATE_PRESENT) {
-    return releaseWithoutRecord(client, options, read)
+    return releaseWithoutRecord(client, options, read, connectedDatabase)
   }
   const state = read.state
+
+  // The record names the database it fenced. If this connection is attached somewhere else, the
+  // GRANTs below would name that database from a connection that has no business with it.
+  if (connectedDatabase && state.database !== connectedDatabase) {
+    console.error(`NOT RELEASED: the fence record at ${options.stateFile} was written for the database "${state.database}",`)
+    console.error(`and this connection is attached to "${connectedDatabase}". Releasing from here would restore grants`)
+    console.error('recorded somewhere else. Point DEPLOY_ADMIN_DATABASE_URL at the fenced database and re-run.')
+    return EXIT_ERROR
+  }
 
   const grants = buildGrantStatements(state.database, state.revoked)
   for (const statement of grants) {
