@@ -553,6 +553,12 @@ UPGRADE_EXISTING=false
 # THE FENCE STATE MACHINE (phases added o3d-2sm1.5, Codex r7 HIGH). Four phases, one
 # direction only, and on_cutover_exit does something different in each:
 #
+# THE PHASE IS ALSO WRITTEN DOWN. A run that is killed never reaches its trap, so the phase it
+# had reached has to survive in the marker for the NEXT run to read: write_cutover_marker()
+# records `phase=arming|stopping`, and adoption resumes an interrupted `arming` — installation
+# still active, schema untouched — instead of stopping a service nobody had touched
+# (o3d-2sm1.5, Codex r8 HIGH). See marker_phase() and resume_from_interrupted_arming().
+#
 #   none      Nothing this run created needs undoing; the trap just exits.
 #   arming    CUTOVER_ARMING=true. Reversible cutover state exists — the reboot-fence
 #             drop-in and marker, the cron fence — and NOTHING has been asked to stop. The
@@ -723,7 +729,19 @@ write_cutover_marker() {
     echo "failed_step=${CUTOVER_STEP}"
     echo "exit_status=${status}"
     echo "app_dir=${APP_DIR}"
-    echo "migration_attempted=${FENCE_ARMED}"
+    # THE DURABLE PHASE, RECORDED SEPARATELY FROM EVERY INTENT (o3d-2sm1.5, Codex r8 HIGH).
+    #
+    # This marker is written during ARMING, before the first stop, so its EXISTENCE proves
+    # only that some run got as far as creating reversible cutover state. Adoption used to
+    # read that existence as proof the existing installation had been stopped.
+    echo "phase=$(if ${FENCE_ARMED}; then echo stopping; elif ${CUTOVER_ARMING}; then echo arming; else echo none; fi)"
+    # THE INTENT to migrate, which for this script is unconditional: a marker is only ever
+    # written from inside an upgrade cutover, and every upgrade cutover migrates. It used to
+    # be written from FENCE_ARMED — the STOP flag — so it said `false` for the whole arming
+    # phase and `true` afterwards, which is the phase under another name, and adoption here
+    # never read it back. deploy.sh and update.sh DO read this line off a marker this script
+    # may have written, and they must not be told a cutover had no intention of migrating.
+    echo "migration_attempted=true"
     echo "schema_touched=${SCHEMA_TOUCHED}"
     # Whether a drop-in is ACTUALLY loaded, not whether one was intended (o3d-2sm1.5).
     echo "reboot_fence=$(${REBOOT_FENCE_INSTALLED} && echo installed || echo absent)"
@@ -858,6 +876,43 @@ remove_reboot_fence() {
 
 # The forgettable writers: nothing runs between ticks, so the box looks quiet right up
 # until a sweeper wakes up mid-migration. The backup is verbatim and taken once.
+# PUBLISH THE CRONTAB BACKUP ATOMICALLY, OR NOT AT ALL (o3d-2sm1.5, Codex r8 HIGH).
+#
+# It used to be `printf > "${CRON_BACKUP}"` followed by `chmod`, and only then the flag
+# saying THIS run had created it. A full disk, a short write or a failing chmod therefore
+# left a truncated — or wrongly permissioned — file at the authoritative path with
+# CRON_BACKUP_CREATED still false, so the arming unwind regarded it as somebody else's and
+# left it behind. The next run found a backup at the expected path, adopted it as the
+# previous run's verbatim original, and a successful unfence REPLACED the real crontab with
+# those truncated contents — or with contents predating whatever the operator edited after
+# the failed attempt.
+#
+# So: a temporary file in the SAME directory (same filesystem, so the rename is atomic), the
+# complete content and the mode both verified, an atomic rename, and the created-flag raised
+# immediately. Every failure path removes the temporary file, or the file it had just
+# published, and returns non-zero: a failed publish leaves nothing at ${CRON_BACKUP}.
+publish_cron_backup() {
+  local content="$1" tmp
+  mkdir -p "$(dirname "${CRON_BACKUP}")" || return 1
+  tmp="$(mktemp "${CRON_BACKUP}.XXXXXX" 2>/dev/null)" || return 1
+  if ! printf '%s\n' "${content}" > "${tmp}" 2>/dev/null; then rm -f "${tmp}"; return 1; fi
+  if ! chmod 600 "${tmp}" 2>/dev/null; then rm -f "${tmp}"; return 1; fi
+  # The whole content, read back off the filesystem. `$(cat ...)` and the value written both
+  # lose their trailing newlines, so this compares every byte that matters.
+  if [[ "$(cat "${tmp}" 2>/dev/null)" != "${content}" ]]; then rm -f "${tmp}"; return 1; fi
+  if [[ "$(stat -c '%a' "${tmp}" 2>/dev/null)" != "600" ]]; then rm -f "${tmp}"; return 1; fi
+  if ! mv -f "${tmp}" "${CRON_BACKUP}" 2>/dev/null; then rm -f "${tmp}"; return 1; fi
+  # IMMEDIATELY: from here the file is authoritative and must be owned by this run in the
+  # same breath, or the unwind disowns a backup it is the only one able to restore.
+  CRON_BACKUP_CREATED=true
+  if [[ "$(cat "${CRON_BACKUP}" 2>/dev/null)" != "${content}" ]]; then
+    rm -f "${CRON_BACKUP}"
+    CRON_BACKUP_CREATED=false
+    return 1
+  fi
+  return 0
+}
+
 fence_cron() {
   command -v crontab >/dev/null 2>&1 || return 0
   local current active
@@ -871,10 +926,10 @@ fence_cron() {
   info "Fencing ${active} active line(s) in the ${APP_USER} crontab."
   mkdir -p "${DATA_DIR}"
   if [[ ! -f "${CRON_BACKUP}" ]]; then
-    printf '%s\n' "${current}" > "${CRON_BACKUP}"
-    chmod 600 "${CRON_BACKUP}"
-    # THIS run's backup, so the arming unwind may restore from it and delete it.
-    CRON_BACKUP_CREATED=true
+    # THIS run's backup, so the arming unwind may restore from it and delete it — and it is
+    # only ever at that path once it is complete, verified and owned.
+    publish_cron_backup "${current}" || die \
+      "The ${APP_USER} crontab could not be backed up to ${CRON_BACKUP}, so this run will not fence the cron writers: a fence whose backup cannot be verified is a crontab nobody can put back. Nothing was left behind at ${CRON_BACKUP}. Nothing has been stopped and nothing has been migrated."
   fi
   printf '%s\n' "${current}" \
     | awk '{ if ($0 ~ /^[[:space:]]*[^#[:space:]]/) print "#DEPLOY-FENCE# " $0; else print $0 }' \
@@ -890,6 +945,69 @@ unfence_cron() {
   rm -f "${CRON_BACKUP}"
   CRON_FENCED=false
   success "Cron writers restored verbatim."
+}
+
+# --- adopting somebody else's marker ---------------------------------------
+# What phase the run that wrote this marker had actually reached. A marker with no `phase=`
+# line was written by an older version of one of these three scripts, all of which only ever
+# left one behind after a stop; anything unrecognised therefore reads as `stopping`, which is
+# the direction that stops a service rather than leaving one running over a schema that may
+# have moved.
+marker_phase() {
+  local phase
+  phase="$(sed -n 's/^phase=//p' "${FENCE_FILE}" 2>/dev/null | tail -1)"
+  case "${phase}" in
+    arming) printf 'arming' ;;
+    *) printf 'stopping' ;;
+  esac
+}
+
+RESUME_EVIDENCE=""
+# IS THE EXISTING INSTALLATION STILL UP? Asked only to decide whether an interrupted ARMING
+# can be resumed, and answered conservatively: a unit systemd reports active, or anything
+# listening on the app's port, counts as "still serving". A `false` sends the run down the
+# ordinary adoption path, which stops and re-fences — the pre-existing behaviour.
+predecessor_is_active() {
+  if command -v systemctl >/dev/null 2>&1 \
+    && systemctl is-active --quiet "${APP_NAME}.service" 2>/dev/null; then
+    RESUME_EVIDENCE="systemd reports ${APP_NAME}.service active"
+    return 0
+  fi
+  if [[ -n "${APP_PORT:-}" ]] && command -v ss >/dev/null 2>&1 \
+    && ss -ltn 2>/dev/null | awk -v p=":${APP_PORT}\$" '$4 ~ p {found=1} END{exit !found}'; then
+    RESUME_EVIDENCE="something is still listening on :${APP_PORT}"
+    return 0
+  fi
+  return 1
+}
+
+# RESUME AN INTERRUPTED ARMING WITHOUT STOPPING ANYTHING (o3d-2sm1.5, Codex r8 HIGH).
+#
+# The existing installation is up, the schema is untouched and every piece of state on this
+# box is one the arming phase created and the arming phase can remove. So do what
+# unwind_arming would have done had the previous run reached its own trap — crontab back,
+# reversible reboot fence down, any connection fence released — and carry on from here,
+# before the build, with nothing stopped.
+#
+# Order matters: the crontab is restored FIRST and a failure there is fatal BEFORE the fence
+# comes down, so a run that cannot finish the unwind leaves the marker exactly as it found it
+# and the next run adopts the same phase again.
+resume_from_interrupted_arming() {
+  if command -v crontab >/dev/null 2>&1 && [[ -f "${CRON_BACKUP}" ]]; then
+    crontab -u "${APP_USER}" "${CRON_BACKUP}" || die \
+      "The interrupted run had fenced the ${APP_USER} crontab and its backup at ${CRON_BACKUP} could not be restored. Refusing to continue with the cron writers commented out: restore it by hand (crontab -u ${APP_USER} ${CRON_BACKUP}) and re-run. Nothing has been stopped."
+    rm -f "${CRON_BACKUP}"
+    CRON_FENCED=false
+    success "The ${APP_USER} crontab is back exactly as the interrupted run found it."
+  fi
+  release_db_connections || die \
+    "A connection fence was standing over an UNTOUCHED schema and could not be released. Fix that before re-running; nothing has been stopped."
+  remove_reboot_fence
+  if [[ -f "${FENCE_FILE}" ]]; then
+    die "${FENCE_FILE} could not be removed, so this host would still refuse to start ${APP_NAME}.service on its next boot. Remove it by hand (rm -f ${FENCE_FILE}) and re-run. Nothing has been stopped."
+  fi
+  REBOOT_FENCE_INSTALLED=false
+  success "The interrupted arming has been undone. The existing installation was never stopped and is still serving."
 }
 
 # The continuous half of the drain. check-db-writers.mjs snapshots pg_stat_activity and
@@ -1032,6 +1150,36 @@ refence_db_connections() {
 # would not re-run one — there is no such mode here, so this is an assertion, not a flag.
 adopt_existing_fence() {
   [[ -f "${FENCE_FILE}" ]] || return 0
+
+  # WHAT PHASE DID THE RUN THAT LEFT THIS ACTUALLY REACH? (o3d-2sm1.5, Codex r8 HIGH)
+  #
+  # Adoption used to take the marker's mere EXISTENCE as proof that the existing installation
+  # had been stopped: it raised FENCE_ARMED and immediately stopped the unit. But the marker
+  # is written during ARMING, before the first stop — so a SIGKILL, an OOM kill or a power cut
+  # between install_reboot_fence() and that stop left a healthy installation running against
+  # an untouched schema, and THIS run then stopped it, for the whole length of a build, to
+  # recover from a failure that had cost nothing.
+  #
+  # Three things must hold before that is treated as a resumable arming, and all three are
+  # cheap: the marker says the phase was `arming`, it says the schema was never touched, and
+  # the installation is still active right now. Any of them false and the run falls through
+  # to the ordinary adoption below, which stops and re-fences exactly as before.
+  local adopted_phase=stopping adopted_schema_touched=false
+  adopted_phase="$(marker_phase)"
+  if grep -qE '^schema_touched=true$' "${FENCE_FILE}" 2>/dev/null; then
+    adopted_schema_touched=true
+  fi
+  if [[ "${adopted_phase}" == "arming" ]] && ! ${adopted_schema_touched} && predecessor_is_active; then
+    warn "Adopting an INTERRUPTED ARMING — a previous run was killed before it stopped anything:"
+    sed 's/^/         /' "${FENCE_FILE}"
+    warn "The marker says phase=arming and schema_touched=false, and ${RESUME_EVIDENCE}."
+    warn "Nothing was stopped, so nothing is recovered by stopping it now. This run undoes the"
+    warn "reversible state that run had created and RESUMES from here, before the build, with"
+    warn "the existing installation still serving the schema it was built against."
+    resume_from_interrupted_arming
+    return 0
+  fi
+
   warn "Adopting an existing cutover fence — a previous run stopped here:"
   sed 's/^/         /' "${FENCE_FILE}"
   FENCE_ARMED=true
@@ -2325,15 +2473,32 @@ if $NEW_BUILD_SERVING; then
   PAST_POINT_OF_NO_RETURN=true
 fi
 
+# The ARMING phase is over on every path that reaches here: the reboot fence came down before
+# the start and there is nothing reversible left to reverse. Leaving CUTOVER_ARMING raised
+# would send a failure in the rest of the installer into the PRE-STOP branch of the trap,
+# which would report a service that was never stopped and unwind a fence that is already
+# gone.
+CUTOVER_ARMING=false
+
+# THE STOP FLAG COMES DOWN ONLY FOR A RUN THAT NO LONGER NEEDS IT (o3d-2sm1.5, Codex r8).
+#
+# Past the point of no return the trap is governed by PAST_POINT_OF_NO_RETURN and FENCE_ARMED
+# is irrelevant. Any path that reaches here WITHOUT that proof is one where a later failure is
+# still supposed to be torn down — and clearing FENCE_ARMED here would leave such a failure
+# matching none of the trap's four phase branches, so the trap would do nothing at all and an
+# unidentified process would be left serving the migrated schema. deploy.sh has such a path
+# today (its dev-responder escape hatch); this script must not grow one silently.
+if ${PAST_POINT_OF_NO_RETURN}; then
+  FENCE_ARMED=false
+fi
+
 # Cron goes back only once the new build is running, and BEFORE the crontab block below
 # is spliced in — splicing into a fenced crontab would preserve the commented-out lines
 # and leave the queue workers silently off.
 unfence_cron
-# Both phase flags come down together: leaving CUTOVER_ARMING raised would send a failure in
-# the rest of the installer into the PRE-STOP branch of the trap, which would report a
-# service that was never stopped and unwind a fence that is already gone.
+
+# The cleanup this flag covered is complete, so it stands down — and only now.
 FENCE_ARMED=false
-CUTOVER_ARMING=false
 if ${UPGRADE_EXISTING}; then
   success "Upgrade cutover complete: every fence is down."
 fi

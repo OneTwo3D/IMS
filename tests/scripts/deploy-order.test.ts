@@ -1807,10 +1807,37 @@ for (const entry of ARMING_ORDER) {
     // point sends a cleanup failure into the pre-stop branch, which would report a
     // predecessor that was never stopped and unwind a fence that is already gone.
     const disarmed = requireCodeLine(lines, /^\s*CUTOVER_ARMING=false\s*$/, stop, 'the arming phase must be closed when the cutover ends')
-    const fenceDown = requireCodeLine(lines, /^\s*FENCE_ARMED=false\s*$/, stop, 'as must the stopping phase')
+
+    // THE STOPPING PHASE DOES NOT COME DOWN WITH IT (o3d-2sm1.5, Codex r8 MEDIUM).
+    //
+    // The two flags used to be cleared on adjacent lines, and this test asserted exactly
+    // that. It was wrong for the one path that reaches here WITHOUT the point of no return
+    // — deploy.sh's dev-responder escape hatch, which promises in its own warning and in the
+    // runbook that a later failure can still be torn down. With both flags down, a failure
+    // in the cron restore or the marker removal matched NONE of the trap's four phase
+    // branches: no teardown at all, and an unidentified process left serving the migrated
+    // schema.
+    //
+    // So the stop flag comes down HERE only for a run that has proven its responder, and
+    // unguarded only after the cleanup it covers has finished.
+    const guardedDown = requireCodeLine(lines, /^\s*FENCE_ARMED=false\s*$/, disarmed, 'the stopping phase must still be closed')
+    assert.ok(disarmed < guardedDown, 'the arming flag must come down first: nothing reversible is left by then')
+    const guard = lines
+      .slice(Math.max(disarmed, guardedDown - 4), guardedDown)
+      .filter(isCode)
+      .join('\n')
+    assert.match(
+      guard,
+      /if\s+\$?\{?PAST_POINT_OF_NO_RETURN\}?;\s*then/,
+      'the first FENCE_ARMED=false after the cutover must be guarded by the point of no return, or an escape path loses its only teardown branch mid-cleanup',
+    )
+
+    // And there is a SECOND, unguarded one, after the cleanup that flag was covering.
+    const cleanup = requireCodeLine(lines, /^\s*unfence_cron\s*$/, guardedDown, 'cron is restored after the guard')
+    const finalDown = requireCodeLine(lines, /^\s*FENCE_ARMED=false\s*$/, cleanup, 'and the stop flag stands down once cleanup has succeeded')
     assert.ok(
-      Math.abs(disarmed - fenceDown) <= 2,
-      'the two phase flags must come down together, or there is a window in which both branches of the trap are wrong',
+      cleanup < finalDown,
+      'the escape path must keep the stop flag raised until cron and marker cleanup have completed',
     )
   })
 }
@@ -2193,3 +2220,313 @@ test('docs/installation.md describes the build-id policy deploy.sh actually impl
   assert.match(doc, /CUTOVER_ARMING/, 'the runbook must describe the reversible pre-stop phase')
   assert.match(DEPLOY_LINES.join('\n'), /^CUTOVER_ARMING=false$/m, 'which the script must have')
 })
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r8) — ROUND TWO ON THE PHASE STATE MACHINE.
+//
+// Three defects, all of them in the machine the previous round introduced:
+//
+//   HIGH   the reboot-fence marker is written during ARMING, before the first stop, and
+//          adoption treated its mere EXISTENCE as proof the predecessor had been stopped.
+//          A kill between install_reboot_fence() and that stop therefore cost the NEXT run
+//          a stop of a healthy service over an untouched schema.
+//   HIGH   the crontab backup was created before the flag saying THIS run owns it, so a
+//          partial write or a failed chmod left a truncated file at the authoritative path
+//          that the arming unwind disowned and a later run adopted as verbatim.
+//   MEDIUM the escape hatch cleared both phase flags before its own cleanup, so a failure
+//          in that cleanup matched none of the trap's branches and tore nothing down.
+//
+// Everything below runs the REAL functions and the REAL top-level blocks under bash. The
+// controls are load-bearing: without them an implementation that resumed everything, or one
+// whose trap did nothing at all, would pass.
+// ---------------------------------------------------------------------------
+
+/** The extra variables each script's marker writer and adoption block need beyond the trap preamble. */
+const R8_EXTRA_STATE: Record<string, string> = {
+  'deploy.sh': `
+SKIP_MIGRATE=false
+SKIP_MIGRATE_FLAG='--skip-migrate'
+HEALTH_URL='http://127.0.0.1:3000/api/health'
+CRON_FENCED=false
+CRON_BACKUP_CREATED=false
+NEW_BUILD_SERVING=false
+DEV_RESPONDER_PROVEN=false
+DEPLOY_ADMIN_DATABASE_URL='postgres://admin@localhost/app'
+MIGRATION_DATABASE_URL=''
+`,
+  'update.sh': `
+DRY_RUN=false
+CRON_FENCED=false
+CRON_BACKUP_CREATED=false
+FENCE_MASK=false
+APP_DIR=/opt/app
+DEPLOY_ADMIN_DATABASE_URL='postgres://admin@localhost/app'
+MIGRATION_DATABASE_URL=''
+`,
+  'install.sh': `
+APP_DIR=/opt/app
+APP_PORT=39997
+CRON_FENCED=false
+CRON_BACKUP_CREATED=false
+FENCE_MASK=false
+DEPLOY_ADMIN_DATABASE_URL='postgres://admin@localhost/app'
+MIGRATION_DATABASE_URL=''
+DATABASE_URL='postgres://app@localhost/app'
+`,
+}
+
+/** Stubs for everything the adoption path calls that is NOT the subject. */
+const R8_STUBS = `
+FENCE_ARMED=\${FENCE_ARMED:-false}
+die(){ echo "DIE: $*" >&2; exit 9; }
+step(){ :; }
+header(){ :; }
+run(){ "$@"; }
+ss(){ return 1; }
+PREDECESSOR_ACTIVE=false
+systemctl(){
+  echo "systemctl $*" >> "\${LOG}"
+  if [[ "\${1:-}" == "is-active" ]]; then \${PREDECESSOR_ACTIVE}; return $?; fi
+  return 0
+}
+adopt_cron_fence(){ echo "adopt_cron_fence" >> "\${LOG}"; CRON_FENCED=true; return 0; }
+fence_cron(){ echo "fence_cron" >> "\${LOG}"; CRON_FENCED=true; return 0; }
+adopt_db_connections(){ echo "adopt_db_connections" >> "\${LOG}"; DB_FENCE_UP=true; return 0; }
+fence_db_connections(){ echo "fence_db_connections" >> "\${LOG}"; DB_FENCE_UP=true; MIGRATION_DATABASE_URL='postgres://x'; return 0; }
+`
+
+const R8_CASES = ARMING_TRAP_CASES.map((entry) => ({
+  ...entry,
+  writer: entry.name === 'install.sh' ? 'write_cutover_marker' : 'write_fence_marker',
+  extra: R8_EXTRA_STATE[entry.name],
+}))
+
+// ---------------------------------------------------------------------------
+// FINDING 1a — the marker records the phase, and records it separately from the intent.
+// ---------------------------------------------------------------------------
+function runMarkerWriter(entry: (typeof R8_CASES)[number], state: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r8-marker-'))
+  try {
+    const program = [
+      'set -euo pipefail',
+      entry.preamble(dir),
+      TRAP_STUBS,
+      entry.extra,
+      R8_STUBS,
+      shellFunction(entry.source, entry.writer),
+      state,
+      `${entry.writer} "under test"`,
+      'cat "${FENCE_FILE}"',
+    ].join('\n')
+    return execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+for (const entry of R8_CASES) {
+  test(`${entry.name} records the phase it is actually in, not the intent to migrate`, () => {
+    // ARMING: reversible state exists, nothing has been stopped. `migration_attempted` is
+    // ALREADY true here — that is precisely why it could never have carried this answer.
+    const arming = runMarkerWriter(entry, ['CUTOVER_ARMING=true', 'FENCE_ARMED=false', 'FENCE_MASK=true', 'SCHEMA_TOUCHED=false'].join('\n'))
+    assert.match(arming, /^phase=arming$/m, `${entry.name} must record phase=arming before it has stopped anything:\n${arming}`)
+    assert.match(
+      arming,
+      /^migration_attempted=true$/m,
+      'and it must still say a migration is intended — the phase is a SEPARATE fact, not a re-spelling of the mask',
+    )
+    assert.match(arming, /^schema_touched=false$/m, 'and the schema has not moved')
+
+    // STOPPING: a stop has been attempted. Same mask, different phase.
+    const stopping = runMarkerWriter(entry, ['CUTOVER_ARMING=true', 'FENCE_ARMED=true', 'FENCE_MASK=true', 'SCHEMA_TOUCHED=false'].join('\n'))
+    assert.match(stopping, /^phase=stopping$/m, `${entry.name} must record phase=stopping once a stop has been attempted:\n${stopping}`)
+    assert.match(
+      stopping,
+      /^migration_attempted=true$/m,
+      'install.sh used to write this line from FENCE_ARMED — the stop flag — so it was the phase under another name, and false for the whole arming phase',
+    )
+  })
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 1b — adoption, run for real, in the state an interrupted arming leaves behind.
+// ---------------------------------------------------------------------------
+
+/**
+ * The top-level adoption block, lifted out of the script verbatim.
+ *
+ * deploy.sh and update.sh decide this inline rather than in a function, so the block is
+ * located by its own first statement and taken from the enclosing `if [[ -f FENCE_FILE ]]`
+ * to the `fi` that closes it in column 0. install.sh has it as adopt_existing_fence().
+ */
+function adoptionBlock(source: string): string {
+  const lines = source.split(/\r?\n/)
+  const anchor = lines.findIndex((line) => /ADOPTED_PHASE="\$\(marker_phase\)"/.test(line))
+  assert.notEqual(anchor, -1, 'the adoption block must read the marker phase before it decides anything')
+  let start = anchor
+  while (start >= 0 && !/^if \[\[ -f "\$\{?FENCE_FILE\}?" \]\]; then$/.test(lines[start])) start -= 1
+  assert.ok(start >= 0, 'the adoption block must be guarded by the existence of the marker')
+  let end = anchor
+  while (end < lines.length && lines[end] !== 'fi') end += 1
+  assert.ok(end < lines.length, 'the adoption block must be closed by a fi in column 0')
+  return lines.slice(start, end + 1).join('\n')
+}
+
+function adoptionProgram(entry: (typeof R8_CASES)[number], dir: string, state: string): string {
+  const isInstall = entry.name === 'install.sh'
+  const parts = [
+    'set -euo pipefail',
+    entry.preamble(dir),
+    TRAP_STUBS,
+    entry.extra,
+    R8_STUBS,
+    // Stubbed because they reach the network, a database or /etc — never because they are
+    // the subject. Everything the finding is about is the REAL function below.
+    'install_reboot_fence(){ echo "install_reboot_fence $*" >> "${LOG}"; REBOOT_FENCE_INSTALLED=true; return 0; }',
+    'release_db_connections(){ echo "release_db_connections" >> "${LOG}"; DB_FENCE_UP=false; return 0; }',
+  ]
+  if (entry.name === 'deploy.sh') {
+    // The drop-in path is the only thing redirected: the real one is under /etc.
+    parts.push('fence_dropin_file(){ echo "${FENCE_DROPIN_DIR}/${FENCE_DROPIN_NAME}"; }')
+  }
+  parts.push(
+    shellFunction(entry.source, 'marker_phase'),
+    shellFunction(entry.source, 'predecessor_is_active'),
+    shellFunction(entry.source, 'remove_reboot_fence'),
+    shellFunction(entry.source, 'resume_from_interrupted_arming'),
+  )
+  if (isInstall) parts.push(shellFunction(entry.source, 'adopt_existing_fence'))
+  parts.push(state)
+  parts.push(isInstall ? 'adopt_existing_fence' : adoptionBlock(entry.source))
+  parts.push('echo "AFTER_FENCE_ARMED=${FENCE_ARMED}"')
+  parts.push('echo "AFTER_SCHEMA_TOUCHED=${SCHEMA_TOUCHED}"')
+  return parts.join('\n')
+}
+
+function runAdoption(
+  entry: (typeof R8_CASES)[number],
+  marker: string,
+  state: string,
+): { log: string; stdout: string; status: number; markerExists: boolean; dropinExists: boolean; backupExists: boolean } {
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r8-adopt-'))
+  try {
+    const dropinDir = join(dir, 'dropin')
+    execFileSync('mkdir', ['-p', dropinDir])
+    // Exactly what an interrupted arming leaves on disk: the marker, the drop-in it had just
+    // written, and the crontab backup it had just taken.
+    writeFileSync(join(dir, 'FENCED'), marker)
+    writeFileSync(join(dropinDir, 'zz-deploy-fence.conf'), '[Unit]\n')
+    writeFileSync(join(dir, 'crontab.bak'), '*/5 * * * * /usr/bin/true\n')
+
+    let stdout = ''
+    let status = 0
+    try {
+      stdout = execFileSync('bash', ['-c', adoptionProgram(entry, dir, state)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (error) {
+      const err = error as { status?: number; stdout?: string; stderr?: string }
+      status = err.status ?? -1
+      stdout = `${err.stdout ?? ''}${err.stderr ?? ''}`
+    }
+    return {
+      log: readFileSync(join(dir, 'calls.log'), 'utf8'),
+      stdout,
+      status,
+      markerExists: existsSync(join(dir, 'FENCED')),
+      dropinExists: existsSync(join(dropinDir, 'zz-deploy-fence.conf')),
+      backupExists: existsSync(join(dir, 'crontab.bak')),
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+const ARMING_MARKER = 'phase=arming\nmigration_attempted=true\nschema_touched=false\nreboot_fence=installed\n'
+const STOPPING_MARKER = 'phase=stopping\nmigration_attempted=true\nschema_touched=false\nreboot_fence=installed\n'
+
+for (const entry of R8_CASES) {
+  test(`${entry.name} resumes an interrupted arming instead of stopping a predecessor nobody stopped`, () => {
+    const result = runAdoption(entry, ARMING_MARKER, 'PREDECESSOR_ACTIVE=true')
+
+    assert.equal(result.status, 0, `adoption must succeed:\n${result.stdout}`)
+    assert.ok(
+      !/systemctl stop/.test(result.log),
+      `a marker written during ARMING is not evidence of a stop — the run did: ${result.log}`,
+    )
+    assert.ok(
+      !/install_reboot_fence/.test(result.log),
+      'nor may it re-establish a reboot fence it is about to take down',
+    )
+    assert.ok(!/adopt_db_connections/.test(result.log), 'nor hold a connection fence over a schema that never moved')
+    assert.match(result.log, /release_db_connections/, 'the connection fence, if any, is released')
+    assert.match(
+      result.log,
+      /crontab -u appuser \S*crontab\.bak/,
+      'the crontab the interrupted run fenced must be restored from its own backup',
+    )
+    assert.equal(result.backupExists, false, 'and the backup consumed')
+    assert.equal(result.markerExists, false, 'the reversible reboot-fence marker must be removed, or the next boot is refused')
+    assert.equal(result.dropinExists, false, 'and so must the drop-in')
+    assert.match(result.stdout, /INTERRUPTED ARMING/, 'and the operator must be told which kind of adoption this was')
+    assert.match(result.stdout, /AFTER_FENCE_ARMED=false/, 'nothing was stopped, so the stopping phase must NOT be entered')
+  })
+
+  test(`${entry.name} still stops and re-fences when the marker says the stop already happened`, () => {
+    // THE CONTROL. Without it an adoption that resumed unconditionally would pass the test
+    // above, and the defect would be traded for a strictly worse one: a predecessor left
+    // running over a schema that may be half-migrated.
+    const result = runAdoption(entry, STOPPING_MARKER, 'PREDECESSOR_ACTIVE=true')
+
+    assert.equal(result.status, 0, `adoption must succeed:\n${result.stdout}`)
+    assert.match(result.log, /systemctl stop/, 'a marker from a run that had stopped must be adopted by re-stopping')
+    assert.match(result.log, /install_reboot_fence/, 'and by re-establishing the reboot fence')
+    assert.equal(result.markerExists, true, 'the marker stays: this run owns the fence now')
+    assert.match(result.stdout, /AFTER_FENCE_ARMED=true/, 'and the stopping phase is entered')
+  })
+
+  test(`${entry.name} does not resume an arming whose schema had already been touched`, () => {
+    const result = runAdoption(
+      entry,
+      'phase=arming\nmigration_attempted=true\nschema_touched=true\n',
+      'PREDECESSOR_ACTIVE=true',
+    )
+
+    assert.match(
+      result.log,
+      /systemctl stop/,
+      'a half-applied schema is not resumable however early the phase claims to be — the marker is flushed before prisma runs, so schema_touched wins',
+    )
+    assert.ok(
+      !/release_db_connections/.test(result.log),
+      `and the connection fence is HELD, not released — the run did: ${result.log}`,
+    )
+    if (entry.name !== 'install.sh') {
+      // install.sh re-fences through fence_db_connections and only when a fence state file
+      // is present; the other two carry a dedicated adoption path.
+      assert.match(result.log, /adopt_db_connections/, 'through the admin connection this run recovers with')
+    }
+    assert.match(result.stdout, /AFTER_SCHEMA_TOUCHED=true/, 'and the fact is carried forward')
+  })
+
+  test(`${entry.name} does not resume an arming whose predecessor is no longer running`, () => {
+    // A reboot between the fence install and the stop: the drop-in did its job and the unit
+    // is down. There is nothing to leave running, so the ordinary adoption is correct.
+    const result = runAdoption(entry, ARMING_MARKER, 'PREDECESSOR_ACTIVE=false')
+
+    assert.match(result.log, /systemctl stop/, 'with nothing serving, adoption must take the ordinary path')
+    assert.match(result.log, /install_reboot_fence/, 'and re-establish the fence')
+    assert.equal(result.markerExists, true, 'and keep the marker')
+  })
+
+  test(`${entry.name} reads a marker with no phase line as a completed stop`, () => {
+    // Every older version of these scripts only ever left a marker behind AFTER a stop, so
+    // the absent-phase reading has to be the one that stops rather than the one that leaves
+    // a service running over a schema that may have moved.
+    const result = runAdoption(entry, 'migration_attempted=true\nschema_touched=false\n', 'PREDECESSOR_ACTIVE=true')
+
+    assert.match(result.log, /systemctl stop/, 'an unrecognised phase must be adopted conservatively')
+    assert.equal(result.markerExists, true, 'and the fence kept')
+  })
+}
