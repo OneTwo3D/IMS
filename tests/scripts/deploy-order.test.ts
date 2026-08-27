@@ -3522,12 +3522,49 @@ for (const entry of R9_SCRIPTS) {
     assert.match(result.stdout, /Nothing has been stopped/, 'and that nothing has happened yet')
   })
 
+  test(`${entry.name} imports only what the legacy namespace actually holds`, () => {
+    // A legacy directory that exists but is PARTIAL — a run that got as far as the crontab
+    // backup and no further. The two artefacts that are not there must not be conjured: an
+    // empty marker would be adopted as a fence, and an empty grants file would be "released"
+    // over grants nobody recorded.
+    const result = runR9(
+      entry,
+      ['fsync_path', 'publish_durable_file', 'ensure_cutover_state_dirs', 'import_legacy_file', 'import_legacy_cutover_state'],
+      [
+        'import_legacy_cutover_state',
+        'echo "CRON=$(cat "${CRON_BACKUP}" 2>/dev/null)"',
+        '[[ -e "${FENCE_FILE}" ]] && echo MARKER_INVENTED || echo NO_MARKER',
+        '[[ -e "${DB_FENCE_STATE}" ]] && echo DBSTATE_INVENTED || echo NO_DBSTATE',
+      ].join('\n'),
+      [
+        'LEGACY_CUTOVER_STATE_DIR="${CUTOVER_STATE_DIR}/legacy"',
+        'LEGACY_FENCE_FILE="${LEGACY_CUTOVER_STATE_DIR}/FENCED"',
+        'LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-appuser.bak"',
+        'LEGACY_DB_FENCE_STATE="${LEGACY_CUTOVER_STATE_DIR}/db-connect-fence.json"',
+        'DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"',
+        'mkdir -p "${LEGACY_CUTOVER_STATE_DIR}"',
+        `printf '*/5 * * * * /usr/bin/true\\n' > "\${LEGACY_CRON_BACKUP}"`,
+        'chown(){ :; }',
+      ].join('\n'),
+    )
+
+    assert.equal(result.status, 0, `a partial legacy namespace must import cleanly:\n${result.stdout}`)
+    assert.match(result.stdout, /CRON=\*\/5 \* \* \* \* \/usr\/bin\/true/, 'the one artefact present must arrive')
+    assert.match(result.stdout, /NO_MARKER/, `and no marker may be invented from a file that is not there:\n${result.stdout}`)
+    assert.match(result.stdout, /NO_DBSTATE/, 'nor a grants file')
+  })
+
   test(`${entry.name} does nothing at all when there is no legacy namespace`, () => {
     // The overwhelmingly common case, and it must be silent and free.
     const result = runR9(
       entry,
       ['fsync_path', 'publish_durable_file', 'ensure_cutover_state_dirs', 'import_legacy_file', 'import_legacy_cutover_state'],
-      ['import_legacy_cutover_state', 'echo DONE'].join('\n'),
+      [
+        'import_legacy_cutover_state',
+        '[[ -e "${CRON_BACKUP}" ]] && echo CRON_INVENTED || echo NO_CRON',
+        '[[ -e "${DB_FENCE_STATE}" ]] && echo DBSTATE_INVENTED || echo NO_DBSTATE',
+        'echo DONE',
+      ].join('\n'),
       [
         'LEGACY_CUTOVER_STATE_DIR="${CUTOVER_STATE_DIR}/legacy"',
         'LEGACY_FENCE_FILE="${LEGACY_CUTOVER_STATE_DIR}/FENCED"',
@@ -3541,5 +3578,7 @@ for (const entry of R9_SCRIPTS) {
     assert.match(result.stdout, /DONE/, 'and return')
     assert.ok(!/Imported/.test(result.stdout), `and claim no import: ${result.stdout}`)
     assert.equal(result.marker, null, 'and create no marker out of nothing')
+    assert.match(result.stdout, /NO_CRON/, 'nor a crontab backup out of nothing')
+    assert.match(result.stdout, /NO_DBSTATE/, 'nor a set of recorded grants out of nothing')
   })
 }

@@ -460,11 +460,14 @@ npx prisma generate --schema prisma/schema.prisma
 npm run build
 
 # Stop and drain every writer BEFORE the schema moves
-crontab -u imsapp -l > /var/lib/one-two-inventory/crontab.bak   # then comment the jobs out
+crontab -u imsapp -l > /var/lib/one-two-inventory/crontab-imsapp.bak  # then comment the jobs out
 mkdir -p /etc/systemd/system/one-two-inventory.service.d        # reboot fence, BEFORE the migration
 printf '[Unit]\nAssertPathExists=!/var/lib/one-two-inventory/DEPLOY-FENCED\n' \
   > /etc/systemd/system/one-two-inventory.service.d/zz-deploy-fence.conf
-touch /var/lib/one-two-inventory/DEPLOY-FENCED
+# A marker, not a `touch`: the scripts read this file, and one that does not end with
+# marker_complete=1 is read the conservative way (see "One cutover namespace" below)
+printf 'phase=stopping\nmigration_attempted=true\nschema_touched=false\nmarker_complete=1\n' \
+  > /var/lib/one-two-inventory/DEPLOY-FENCED
 systemctl daemon-reload
 systemctl show -p DropInPaths --value one-two-inventory.service # VERIFY it took
 systemctl stop one-two-inventory.service
@@ -484,7 +487,7 @@ rm -f /etc/systemd/system/one-two-inventory.service.d/zz-deploy-fence.conf
 rm -f /var/lib/one-two-inventory/DEPLOY-FENCED
 systemctl daemon-reload
 systemctl start one-two-inventory.service
-crontab -u imsapp /var/lib/one-two-inventory/crontab.bak       # restore cron last
+crontab -u imsapp /var/lib/one-two-inventory/crontab-imsapp.bak  # restore cron last
 ```
 
 ### Deploy order, and what happens on a rollback
@@ -497,6 +500,43 @@ build -> validate -> STOP AND DRAIN EVERY WRITER -> migrate -> verify -> start -
 
 `scripts/update.sh`, `scripts/deploy.sh` **and `scripts/install.sh`'s upgrade cutover** implement
 exactly that, and `tests/scripts/deploy-order.test.ts` fails if the steps are reordered.
+
+### One cutover namespace
+
+All three entrypoints read and write the same four paths, so a fence left standing by any one
+of them is adopted by any other — which is what the failure banners have always told operators
+to do:
+
+| what | path |
+| --- | --- |
+| cutover marker | `/var/lib/one-two-inventory/DEPLOY-FENCED` |
+| crontab backup | `/var/lib/one-two-inventory/crontab-<service user>.bak` |
+| connection-fence state | `/var/lib/one-two-inventory/deploy/db-connect-fence.json` |
+| cutover lock | `/var/lib/one-two-inventory/cutover.lock` |
+
+Set `IMS_CUTOVER_STATE_DIR` to move all four together; `IMS_DEPLOY_STATE_DIR` and
+`IMS_DATA_DIR` are still honoured. Until o3d-2sm1.5 `deploy.sh` kept its own set under
+`/var/lib/ims-deploy` while the other two used the paths above, so following the banner after a
+failed install ran `deploy.sh` against a namespace holding none of it: no marker to adopt, no
+cron backup to reuse, and a fresh backup taken of an already-fenced crontab. Anything still at
+the old paths is **imported** into the table above by the next run of any of the three, before
+it adopts anything and before it touches a unit or a crontab. If both namespaces hold the same
+artefact the run refuses rather than guesses — read both, keep the one that describes the
+interrupted run, delete the other, and re-run.
+
+**The marker is published, never rewritten in place.** It is written to a temporary file in the
+same directory, `fsync`ed, renamed, and the directory `fsync`ed after the rename — so a power
+cut leaves either the previous complete marker or the new one, never a truncated file. The last
+line of a complete marker is `marker_complete=1`. A marker without it (a bare `touch`, or one
+left by a version of these scripts that predates the sentinel) is read the conservative way:
+the schema **may** have moved, so the connection fence is held and the run re-migrates, checks
+drift and re-verifies before anything gets `CONNECT` back.
+
+**The stop is recorded before it is asked for.** The marker says `phase=stopping` on disk
+before the first `systemctl stop`, so a run killed across the stop is adopted as a run that
+stopped something. Without that, adoption falls back to asking whether anything is still
+serving — where an unrelated listener on the port counts as the predecessor, and the fences get
+unwound over a service that had already been asked to stop.
 
 `install.sh` did not, until o3d-2sm1.5: its order was stop → drain → migrate → verify → seed →
 bootstrap → **build** → start, which inverts the founding premise of this whole order — everything
