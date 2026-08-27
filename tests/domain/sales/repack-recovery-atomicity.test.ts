@@ -294,7 +294,10 @@ test('o3d-2k5r r3: a REFUSED re-allocation KEEPS the reopen — otherwise two pa
   assert.equal(result.success, true)
   assert.equal(committed.shipments.get('ship-1')!.status, 'PENDING')
   assert.match(result.warning!, /another committed \(picking or packed\) shipment/)
-  assert.match(result.warning!, /Re-running this recovery on the draft/)
+  // o3d-2k5r r5: and it points at REOPEN, not at "Finish repack recovery", because that control is
+  // not offered while the order still holds a commitment — the action would be refused again.
+  assert.match(result.warning!, /REOPEN that one too/)
+  assert.match(result.warning!, /Once nothing committed is left/)
   assert.deepEqual(committed.resolved, [], 'nothing was netted, so no backstop row may be consumed')
 })
 

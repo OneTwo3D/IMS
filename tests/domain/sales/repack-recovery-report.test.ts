@@ -19,6 +19,18 @@ test('o3d-2k5r: a REFUSED re-allocation names the shipment that blocked it', () 
   assert.doesNotMatch(warning!, /reservation was released/)
 })
 
+test('o3d-2k5r r5: the refusal names REOPEN, and says dispatching the sibling is the wrong move', () => {
+  // The message used to offer "Reopen that one too — or dispatch it —", and the second half was a
+  // remedy the predicate does not honour: `refuseIfCommittedShipmentsExist` matches every status
+  // that is not PENDING, SHIPPED included, and `reopenShipmentForRepack` refuses SHIPPED outright.
+  // An operator who followed it closed the only door out of the partial recovery. Same defect as
+  // the control that rendered where the action refuses, in an error string instead of in JSX.
+  const warning = describeRepackReallocation('SO-1', { success: false, refused: true, committed: false })
+  assert.match(warning!, /REOPEN that one too/)
+  assert.match(warning!, /dispatching\s+it instead makes that impossible/)
+  assert.doesNotMatch(warning!, /or dispatch it/)
+})
+
 test('o3d-2k5r: a COMMITTED backorder reports the netting as DONE, not as a retry', () => {
   // The transaction committed: the refunded units' reservation was released and onReconciledInTx
   // resolved the durable backstop rows immediately before that commit. Sending the operator to
