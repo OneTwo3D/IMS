@@ -186,6 +186,23 @@ function likeRegex(pattern: string): RegExp {
 }
 
 function matchesConjunct(condition: string, row: Row): boolean {
+  // o3d-xnwu r10 — `(<held shape>) IS NOT TRUE`, the null-safe negation backfill statement 2 and
+  // check 6 now use. SQL's three-valued logic is what makes the spelling load-bearing: every member
+  // being compared may be ABSENT, absent is NULL, and `NOT (UNKNOWN)` is UNKNOWN — so a plain NOT
+  // would drop such a row out of BOTH the hold side and the park side. `IS NOT TRUE` folds UNKNOWN
+  // in with FALSE. This evaluator is two-valued by construction (every leaf returns false for both
+  // FALSE and UNKNOWN, see the `=` handler below), so "not TRUE" is exactly its complement.
+  const isNotTrue = condition.match(/^([\s\S]*?)\s+IS\s+NOT\s+TRUE$/i)
+  if (isNotTrue) return !matchesCondition(isNotTrue[1], row)
+
+  // ...and the mutation this is here to stop. `NOT (…)` parses in Postgres and is WRONG, so it is
+  // rejected by name rather than falling through to an unhelpful "comparison not modelled".
+  assert.ok(
+    !/^NOT\s*\(/i.test(condition.trim()),
+    `verify.sql negates with NOT, which is UNKNOWN over an absent json member and drops the row from `
+      + `BOTH sides of the classification. Use "(…) IS NOT TRUE": ${condition}`,
+  )
+
   const isNotNull = condition.match(/^(.*?)\s+IS\s+NOT\s+NULL$/i)
   if (isNotNull) return term(isNotNull[1], row) !== NULL
 
@@ -651,7 +668,9 @@ test('statement 2 refuses the held shape ON ITS OWN, not merely because statemen
   // to be that some earlier statement had been broad enough — which is one narrowing away from
   // mis-stamping an invoice hold.
   //
-  // MUTATION THAT KILLS THIS TEST: drop `AND payload->>'metaKey' IS NULL` from statement 2.
+  // MUTATION THAT KILLS THIS TEST: drop the negated held-shape conjunct from statement 2. (It used
+  // to be `AND payload->>'metaKey' IS NULL` — one field, which r10 showed the store can forge; the
+  // clause is now the null-safe negation of the complete predicate statement 1 asserts.)
   for (const status of ['PENDING', 'FAILED', 'QUARANTINED']) {
     assert.equal(
       backfillSelects(1, { ...unstampedHold, status }),
@@ -737,8 +756,10 @@ test('and NONE of the five earlier checks sees the superseded park — which is 
 
 test('check 6 stays silent on a GENUINE hold settled by the very same sweep', () => {
   // This is the legitimate, everyday act: the sweep closing a hold it really did select. It happens
-  // on healthy databases, so a check that fired here would fail every later deploy. `metaKey` is
-  // what separates them — every hold has one, no WooCommerce refund body does.
+  // on healthy databases, so a check that fired here would fail every later deploy. What separates
+  // them is the COMPLETE held-invoice shape — the reason, the accountingPayload object, the identity
+  // and the key together. It was `metaKey` alone until r10, which is exactly what a store-supplied
+  // member could forge.
   for (const note of [HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE, HELD_SALES_INVOICE_UNREADABLE_MESSAGE, SUPERSEDED_NOTE]) {
     assert.equal(
       selects(5, { ...genuineHold, status: 'FAILED', errorMessage: note }),
@@ -813,6 +834,225 @@ test('check 6 keys on the message the CODE writes, so the writer cannot drift aw
     assert.ok(importer.includes(`errorMessage: ${name}`) || importer.includes(`\${${name}}`),
       `${name} is what the importer writes, not a second copy of the sentence`)
   }
+})
+
+/* ================================================================================================
+ * o3d-xnwu r10 (Codex HIGH) — A STORE-SUPPLIED `metaKey` USED TO DEFEAT BOTH THE BACKFILL AND THE
+ * SETTLED-PARK CHECK.
+ *
+ * Backfill statement 2 and check 6 both treated `payload->>'metaKey' IS NULL` as PROOF that a row is
+ * not a hold. A refund payload is cast from the store's API response and persisted UNCHANGED, so an
+ * extension that decorates the refund object — or a malformed response — can put an unrelated
+ * top-level `metaKey` on a genuine refund body. One forged field then:
+ *
+ *   1. made statement 2 refuse to stamp a genuine park (it left the recovery inbox, which selects on
+ *      the stamp), and
+ *   2. made check 6 blind to the predecessor's sweep superseding that same park — while check 2 was
+ *      off because of the status and checks 1 and 3-5 were off because the payload is a raw refund
+ *      body. Verification returned zero over a real unrefunded park permanently outside the inbox.
+ *
+ * A SINGLE FIELD IS NOT A SHAPE. Both negating readers now negate the COMPLETE held-invoice
+ * predicate that statement 1 and check 1 already assert positively.
+ * ============================================================================================== */
+
+/** The conjuncts of a WHERE clause that speak about the payload — i.e. the held-invoice SHAPE. */
+function heldShapeOf(clause: string): string[] {
+  return splitTopLevel(clause, 'AND')
+    .map((part) => part.trim())
+    .filter((part) => /payload/i.test(part))
+    .sort()
+}
+
+/** The shape inside `(<shape>) IS NOT TRUE`, for the two readers that ask the question backwards. */
+function negatedHeldShapeOf(clause: string): string[] {
+  const negations = splitTopLevel(clause, 'AND')
+    .map((part) => part.trim())
+    .filter((part) => /\sIS\s+NOT\s+TRUE$/i.test(part))
+  assert.equal(negations.length, 1, `expected exactly one "(…) IS NOT TRUE" conjunct in: ${clause}`)
+  const inner = negations[0].replace(/\sIS\s+NOT\s+TRUE$/i, '')
+  return splitTopLevel(unwrap(inner), 'AND').map((part) => part.trim()).sort()
+}
+
+test('the held-invoice shape is ONE predicate and all FOUR readers carry the same text', () => {
+  // ROUTE: pure text, read out of the two shipped .sql files and split on top-level AND. No row is
+  // evaluated here on purpose — this is the assertion that the four copies cannot drift, which is
+  // the only thing that makes the row-level tests below transferable between them.
+  //
+  // MUTATION THAT KILLS THIS TEST: change, add or drop any payload clause in ANY ONE of the four —
+  // e.g. put `payload->>'metaKey' IS NULL` back into statement 2, or drop the identity clause from
+  // check 6's negation. The four lists stop being equal.
+  const verifyStatements = statements(readFileSync(VERIFY, 'utf8'))
+  const positives = [
+    ['check 1', heldShapeOf(whereClauseOf(verifyStatements[0]))],
+    ['backfill statement 1', heldShapeOf(whereClauseOf(backfillStatements()[0]))],
+  ] as const
+  const negatives = [
+    ['backfill statement 2', negatedHeldShapeOf(whereClauseOf(backfillStatements()[1]))],
+    ['check 6', negatedHeldShapeOf(whereClauseOf(verifyStatements[5]))],
+  ] as const
+
+  const expected = [
+    "jsonb_typeof(payload) = 'object'",
+    "payload->>'reason' = 'missing_wc_invoice_number'",
+    "jsonb_typeof(payload->'accountingPayload') = 'object'",
+    'payload->>\'salesOrderId\' = "entityId"',
+    "payload->>'metaKey' IS NOT NULL",
+  ].sort()
+
+  for (const [name, shape] of [...positives, ...negatives]) {
+    assert.deepEqual(shape, expected, `${name} must read the complete held-invoice shape, not one field of it`)
+  }
+})
+
+test('the negation is spelled IS NOT TRUE, so an ABSENT member lands on the not-a-hold side', () => {
+  // ROUTE: the evaluator refuses `NOT (…)` by name (see matchesConjunct), so this is BOTH a text
+  // assertion and a semantic one — and then a row proves the semantics that spelling buys.
+  //
+  // MUTATION THAT KILLS THIS TEST: rewrite either negation as `NOT (…)`. Postgres accepts it; the
+  // evaluator names it as the null-safety defect, and the row below stops being classified at all.
+  const migration = readFileSync(MIGRATION, 'utf8')
+  const verify = readFileSync(VERIFY, 'utf8')
+  for (const [name, sql] of [['migration.sql', migration], ['verify.sql', verify]] as const) {
+    assert.ok(sql.includes(') IS NOT TRUE'), `${name} must negate the shape null-safely`)
+    assert.ok(!/\bNOT\s*\(\s*$/m.test(sql), `${name} must not negate with a bare NOT (…)`)
+  }
+
+  // A row with NO payload at all: every conjunct of the shape is UNKNOWN, so the whole conjunction
+  // is UNKNOWN. `IS NOT TRUE` says "not a hold" and the catch-all claims it; `NOT (…)` would say
+  // UNKNOWN and NEITHER statement would touch it — an actionable row left with no recordKind, which
+  // is precisely the invisibility the discriminator exists to end.
+  const payloadless: Row = { ...unstampedPark, payload: null }
+  assert.equal(backfillStamp(payloadless), 'WC_REFUND_PARK', 'an absent payload is not a hold')
+  assert.equal(backfillSelects(0, payloadless), false, '...and statement 1 does not claim it either')
+})
+
+/** THE HOSTILE ROW: a real WooCommerce refund body an extension has decorated with a `metaKey`. */
+const forgedMetaKeyRefundPayload = {
+  ...refundPayloadWithTypedReason,
+  // Not IMS's `_wcpdf_invoice_number` and not in an accountingPayload — just a top-level member the
+  // store's response happened to carry. Nothing validates it, because nothing built it.
+  metaKey: 'wc_some_extension_meta',
+}
+
+const forgedMetaKeyPark: Row = { ...base, recordKind: null, payload: forgedMetaKeyRefundPayload }
+
+test('a genuine park whose refund body carries a forged metaKey is still STAMPED a park', () => {
+  // ROUTE: backfillStamp — the two UPDATE statements read out of the shipped migration.sql, in file
+  // order, statement 2 unreachable for anything statement 1 stamped.
+  //
+  // MUTATION THAT KILLS THIS TEST: restore `AND payload->>'metaKey' IS NULL` to statement 2. All
+  // three rows below come back null — unstamped, therefore outside activeRefundParkWhere, therefore
+  // outside the recovery inbox with a real unrefunded amount on them.
+  for (const status of ['PENDING', 'FAILED', 'QUARANTINED']) {
+    assert.equal(
+      backfillStamp({ ...forgedMetaKeyPark, status }),
+      'WC_REFUND_PARK',
+      `a ${status} refund body with an unrelated top-level metaKey is still a refund park`,
+    )
+  }
+
+  // ...and the assertion is not vacuous about WHICH clause did it: statement 1 still refuses the row
+  // (it is not a hold), so the stamp above came from the catch-all recognising it as a park.
+  assert.equal(backfillSelects(0, forgedMetaKeyPark), false, 'statement 1 does not mistake it for a hold')
+
+  // ...while the exclusion it replaced still does its job: a REAL hold is refused by the catch-all.
+  assert.equal(backfillSelects(1, unstampedHold), false, 'the complete shape still excludes a genuine hold')
+})
+
+test('check 6 FAILS verification on a superseded park whose refund body carries a forged metaKey', () => {
+  // THE SERIOUS HALF. The predecessor's release sweep picks this park up by its typed `reason`,
+  // finds the order already invoiced, and writes SYNCED + 'Superseded:'. activeRefundParkWhere lists
+  // only PENDING/FAILED/QUARANTINED, so the park is gone from the inbox for ever.
+  //
+  // ROUTE: selects(5, …) — check 6's WHERE clause read out of the shipped verify.sql.
+  //
+  // MUTATION THAT KILLS THIS TEST: restore `AND payload->>'metaKey' IS NULL` to check 6. All three
+  // outcomes go to false and the whole file returns zero over a park nobody will ever be shown.
+  const forgedSupersededPark: Row = {
+    ...forgedMetaKeyPark, recordKind: 'WC_REFUND_PARK', status: 'SYNCED', errorMessage: SUPERSEDED_NOTE,
+  }
+  assert.equal(selects(5, forgedSupersededPark), true, 'the SYNCED outcome — the one that hides the refund')
+  assert.equal(
+    selects(5, { ...forgedMetaKeyPark, status: 'FAILED', errorMessage: HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE }),
+    true,
+    'the missing-order outcome',
+  )
+  assert.equal(
+    selects(5, { ...forgedMetaKeyPark, status: 'FAILED', errorMessage: HELD_SALES_INVOICE_UNREADABLE_MESSAGE }),
+    true,
+    'the unreadable-payload outcome',
+  )
+
+  // AND THE OTHER FIVE ARE STILL BLIND TO IT, which is what makes check 6 the only thing standing
+  // between this row and a green cutover — the same argument as the unforged case, re-proved for the
+  // row that used to slip past all six.
+  for (const check of [0, 1, 2, 3, 4]) {
+    assert.equal(selects(check, forgedSupersededPark), false, `check ${check + 1} returns zero over it`)
+  }
+})
+
+test('the identity clause is IN the negation, and check 5 is what makes that safe', () => {
+  // WHAT NEGATING THE *COMPLETE* PREDICATE COSTS, stated as a test rather than as a comment. The
+  // shape includes `payload->>'salesOrderId' = "entityId"`, so a DEGRADED hold — one a legacy
+  // REASSIGN moved onto another order, leaving the payload naming the first — no longer matches the
+  // shape, falls to the catch-all, and is STAMPED A REFUND PARK. Under the old one-field exclusion
+  // it stayed unstamped instead. Neither outcome is good; this one is the one that is SEEN.
+  //
+  // ROUTE: backfillStamp (the two shipped UPDATE statements, in file order) and then selects(4, …)
+  // — check 5's shipped WHERE clause, which reads neither the stamp nor the status.
+  //
+  // MUTATION THAT KILLS THIS TEST: drop `AND payload->>'salesOrderId' = "entityId"` from statement
+  // 2's negated shape. The degraded hold then matches the shape, the negation goes false, and the
+  // first assertion comes back null.
+  const reassignedHold: Row = { ...unstampedHold, entityId: 'order-2' }
+
+  assert.equal(backfillSelects(0, reassignedHold), false, 'statement 1 will not stamp it a hold — the identity is broken')
+  assert.equal(backfillStamp(reassignedHold), 'WC_REFUND_PARK', 'so the catch-all claims it')
+
+  // ...and that is not silent: check 5 exists for exactly this row, in every status, stamped or not.
+  for (const status of ['PENDING', 'FAILED', 'SYNCED', 'QUARANTINED']) {
+    assert.equal(
+      selects(4, { ...reassignedHold, status, recordKind: 'WC_REFUND_PARK' }),
+      true,
+      `check 5 stops the cutover over a hold-shaped payload naming another order in ${status}`,
+    )
+  }
+
+  // The assertion above is about the identity, not about some other clause of check 5: put the
+  // payload back on its own order and check 5 goes quiet.
+  assert.equal(selects(4, { ...unstampedHold, recordKind: 'WC_REFUND_PARK' }), false)
+
+  // And the alternative the old clause gave — unstamped, therefore only ever reaching check 2, the
+  // superset whose own answer is not diagnostic — is what this trade replaces.
+  assert.equal(selects(1, { ...reassignedHold, recordKind: null }), true,
+    'check 2 is all the old exclusion left; it cannot say WHAT the row is')
+})
+
+test('...and the shape must not DRIFT, or check 6 accuses every hold on a healthy database', () => {
+  // The complete shape is a narrowing as well as a widening. A genuine hold carries the WHOLE shape,
+  // so check 6's negation is FALSE and the check does not select it — in every status, stamped or
+  // not. This is the direction that fails EVERY LATER DEPLOY if the shape stops matching what
+  // buildHeldSalesInvoicePayload writes.
+  //
+  // ROUTE: selects(5, …) over the shipped check 6.
+  //
+  // MUTATION THAT KILLS THIS TEST: drift the reason literal inside check 6's negation (e.g.
+  // 'missing_wc_invoice_numbers'). A genuine hold stops matching the shape, the negation becomes
+  // true, and every settled hold is reported as a contradiction.
+  for (const note of [HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE, HELD_SALES_INVOICE_UNREADABLE_MESSAGE, SUPERSEDED_NOTE]) {
+    for (const row of [genuineHold, unstampedHold]) {
+      assert.equal(selects(5, { ...row, status: 'FAILED', errorMessage: note }), false,
+        'the sweep closing a hold it really did select is not a contradiction')
+    }
+  }
+
+  // ...and the shape is the reason it is quiet, not the message list: strip the payload back to a
+  // refund body and the very same message is reported.
+  assert.equal(
+    selects(5, { ...unstampedPark, status: 'FAILED', errorMessage: HELD_SALES_INVOICE_UNREADABLE_MESSAGE }),
+    true,
+    'the assertions above are not vacuous — check 6 does fire on these messages',
+  )
 })
 
 // ---------------------------------------------------------------------------

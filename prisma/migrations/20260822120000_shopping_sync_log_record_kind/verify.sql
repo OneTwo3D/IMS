@@ -63,6 +63,23 @@
 -- migration.sql. On check 6 in particular the row still holds the store's refund body, so the amount
 -- is recoverable by hand — what has been lost is the row's place in the recovery inbox, and its own
 -- error text.
+--
+-- ONE PREDICATE, FOUR READERS (Codex HIGH, round 10). "Is this row a held sales invoice?" is asked
+-- in four places: backfill statement 1 and CHECK 1 ask it POSITIVELY, backfill statement 2 and
+-- CHECK 6 ask it NEGATED. It is now the SAME five-clause text in all four — payload object, the
+-- queue reason, an accountingPayload OBJECT, salesOrderId equal to the row's own entityId, and the
+-- metaKey — and tests/prisma/shopping-sync-log-record-kind-verify.test.ts asserts that character
+-- for character.
+--
+-- The two negating readers used to test ONE FIELD, `payload->>'metaKey' IS NULL`. A refund payload
+-- is cast from the store's API response and stored unchanged, so an extension or a malformed
+-- response can decorate it with an unrelated top-level `metaKey` — and that one forged field made
+-- statement 2 refuse to stamp a genuine park AND made check 6 blind to the sweep superseding it.
+-- A SINGLE FIELD IS NOT A SHAPE, and any field that arrives from an external system is forgeable.
+--
+-- The negation is spelled `(...) IS NOT TRUE`, never `NOT (...)`: the members compared may be
+-- ABSENT, absent is SQL NULL, and `NOT (UNKNOWN)` is UNKNOWN — which would drop such a row out of
+-- BOTH sides of the classification. Same trap as `<>` versus `IS DISTINCT FROM` in check 5.
 -- =============================================================================
 
 -- 1. NO UNSTAMPED HOLD. Every held sales invoice must say so, or it is never released and the order
@@ -153,8 +170,10 @@ SELECT 'shopping_sync_logs unstamped refund park' AS check_name,
 --    THAT COMBINATION IS THE SIGNATURE, and nothing else produces it. The stamp says park; the
 --    payload is the shape only buildHeldSalesInvoicePayload writes — a top-level accountingPayload
 --    OBJECT, a salesOrderId equal to the row's own entityId, and a metaKey. A raw WooCommerce refund
---    body cannot carry those: an operator controls the free-text `reason` and nothing else, which is
---    exactly the reasoning the backfill above already relies on to tell the families apart. A
+--    body cannot carry that SET: an operator controls the free-text `reason`, and an extension that
+--    decorates the refund object may add a stray member of its own, but neither produces an
+--    accountingPayload OBJECT naming this row's entityId. THE WHOLE SHAPE IS THE TEST, never one
+--    member of it — the same five clauses the backfill relies on to tell the families apart. A
 --    genuine hold is stamped 'WC_HELD_SALES_INVOICE' (backfill step 1 runs before step 2, and the
 --    new writer stamps at write time), so it is not selected here either.
 --
@@ -203,8 +222,14 @@ SELECT 'shopping_sync_logs park stamp over a held-invoice payload' AS check_name
 --    AND THE NOTE IS UNFORGEABLE HERE. The prefix is written by exactly one code path, and the
 --    CURRENT version of that path requires recordKind = 'WC_REFUND_PARK', so it can never put a note
 --    on a held invoice. `accountingPayload` (an OBJECT) and `metaKey` are the two members only
---    buildHeldSalesInvoicePayload writes, and an operator typing into WooCommerce's refund dialog
---    controls neither. A genuine refund park dismissed by an operator carries the note over a RAW
+--    buildHeldSalesInvoicePayload writes, and it is the PAIR that is unforgeable, not either member:
+--    a decorating extension can put a stray top-level `metaKey` on a refund body (that is the r10
+--    HIGH, and it is why check 6 and backfill statement 2 no longer test one field), but
+--    `accountingPayload` is an IMS-internal name a store has no reason to emit, and an operator
+--    typing into WooCommerce's refund dialog controls neither. This check is DELIBERATELY a PARTIAL
+--    shape rather than the complete one: the identity clause is out because a REASSIGN that broke it
+--    and a DISMISS that followed must still be caught, and the reason clause is out for the same
+--    conservatism. A genuine refund park dismissed by an operator carries the note over a RAW
 --    REFUND BODY and is not selected. The stamp is deliberately NOT in this check: an UNSTAMPED hold
 --    (case (a)) that the same action then dismissed must be caught too, and it carries no stamp to
 --    test.
@@ -278,10 +303,30 @@ SELECT 'shopping_sync_logs held-invoice payload naming another order' AS check_n
 --    code paths, both of which act only on a row selected by the CURRENT
 --    `heldSalesInvoiceQueueWhere` — and that predicate requires recordKind = 'WC_HELD_SALES_INVOICE'
 --    and a hold payload. So a row that is NOT a hold carrying one of these messages has no
---    legitimate producer. `metaKey` is what says "not a hold": buildHeldSalesInvoicePayload writes it
---    on every hold, and a WooCommerce refund body has no such member. A genuine hold settled by the
---    sweep carries a metaKey and is not selected here, which is what keeps this check at zero on a
---    healthy database for ever.
+--    legitimate producer.
+--
+--    AND "NOT A HOLD" IS A SHAPE, NOT A FIELD (Codex HIGH, round 10). This check used to say
+--    `payload->>'metaKey' IS NULL`, on the argument that buildHeldSalesInvoicePayload writes a
+--    metaKey on every hold and a WooCommerce refund body has no such member. But a refund payload is
+--    cast from the store's response and stored UNCHANGED, so an extension that decorates the refund
+--    object — or a malformed response — can put an unrelated top-level `metaKey` on a genuine refund
+--    body. The sweep then supersedes that park, writes SYNCED, and THIS CHECK GOES QUIET over it:
+--    check 2 is off because of the status, checks 1 and 3-5 are off because the payload is still a
+--    raw refund body, and check 6 was off because of the forged field. Verification returned zero
+--    while a real unrefunded park sat permanently outside the recovery inbox.
+--
+--    SO IT NEGATES THE COMPLETE HELD-INVOICE PREDICATE — payload object, the queue reason, an
+--    accountingPayload OBJECT, salesOrderId equal to the row's own entityId, and the key. That text
+--    is check 1's, character for character, and backfill statement 1's and statement 2's; a test
+--    asserts all four readers carry the same predicate, so it cannot drift in one place. A genuine
+--    hold settled by the sweep matches the whole shape and is not selected here, which is what keeps
+--    this check at zero on a healthy database for ever.
+--
+--    `IS NOT TRUE` AND NOT `NOT (...)`, because the members being compared may be ABSENT and absent
+--    is SQL NULL: `NOT (UNKNOWN)` is UNKNOWN and selects nothing, so a plain NOT would drop a payload
+--    with no `reason` at all out of BOTH sides of the classification. `IS NOT TRUE` folds UNKNOWN in
+--    with FALSE, which is the reading wanted here: whatever is not provably a hold is not a hold.
+--    Same trap as `<>` versus `IS DISTINCT FROM` in check 5, one level up.
 --
 --    NO STATUS CLAUSE AND NO STAMP CLAUSE, for the same reasons checks 3, 4 and 5 have neither: the
 --    contradiction is between the MESSAGE and the PAYLOAD, and an unstamped park from case (a) that
@@ -292,7 +337,13 @@ SELECT 'shopping_sync_logs held-release outcome on a row that is not a hold' AS 
  WHERE connector = 'woocommerce'
    AND direction = 'FROM_CONNECTOR'
    AND "entityType" = 'SalesOrder'
-   AND payload->>'metaKey' IS NULL
+   AND (
+             jsonb_typeof(payload) = 'object'
+         AND payload->>'reason' = 'missing_wc_invoice_number'
+         AND jsonb_typeof(payload->'accountingPayload') = 'object'
+         AND payload->>'salesOrderId' = "entityId"
+         AND payload->>'metaKey' IS NOT NULL
+       ) IS NOT TRUE
    AND ("errorMessage" = 'The sales order this invoice was held for cannot be found, so it can never be released. Nothing was posted.'
      OR "errorMessage" = 'The held sales-invoice payload is unreadable, so the invoice cannot be released automatically — queue it from the order.'
      OR "errorMessage" LIKE 'Superseded: this order already carries ledger document %');

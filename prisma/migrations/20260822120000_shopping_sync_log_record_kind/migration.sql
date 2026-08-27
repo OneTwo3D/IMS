@@ -43,9 +43,11 @@ ALTER TABLE "shopping_sync_logs" ADD COLUMN "recordKind" TEXT;
 -- 1. THE HELD SALES INVOICES, identified POSITIVELY and by a shape the store cannot forge. The
 --    payload is built by buildHeldSalesInvoicePayload, so it carries a top-level accountingPayload
 --    OBJECT, a salesOrderId equal to the row's own entityId, and a metaKey. A raw WooCommerce refund
---    body has none of those: an operator can type the `reason` string, but they cannot introduce a
---    nested accountingPayload object or an IMS order id. All four clauses together, never the reason
---    alone.
+--    body carries no such SET: an operator can type the `reason` string, and a decorating extension
+--    can add a stray top-level member of its own — but neither introduces a nested accountingPayload
+--    object AND an IMS order id equal to this row's entityId. ALL FIVE CLAUSES TOGETHER, never the
+--    reason alone and never one member alone; a single field is not a shape, and every member here
+--    arrives inside JSON some other system wrote.
 --
 --    AND IT READS NO STATUS (Codex HIGH). This statement used to require PENDING, because that is
 --    the status a hold is WRITTEN in. It is not the status a hold is always FOUND in: the
@@ -92,9 +94,39 @@ UPDATE "shopping_sync_logs"
 --    matches nothing extra — which is the point. This statement is a CATCH-ALL: everything it does
 --    not recognise it declares a refund park, and a catch-all whose only protection is that some
 --    earlier statement was broad enough is one narrowing away from mis-stamping an invoice hold as a
---    refund. `metaKey` is written by buildHeldSalesInvoicePayload on every hold and by nothing a
---    WooCommerce refund body carries, so "no metaKey" is "not a hold", stated where the catch-all is
---    rather than two statements above it.
+--    refund.
+--
+--    IT EXCLUDES THE SHAPE, NOT ONE FIELD OF IT (Codex HIGH, round 10). This clause used to read
+--    `payload->>'metaKey' IS NULL`, on the argument that buildHeldSalesInvoicePayload writes a
+--    metaKey on every hold and a WooCommerce refund body carries none. The first half is true; the
+--    second half is a claim about somebody else's JSON. A refund payload is cast from the store's
+--    response and persisted UNCHANGED, so a WooCommerce extension, a plugin that decorates the
+--    refund object, or a malformed response can put a top-level `metaKey` on a genuine refund body —
+--    and this statement then REFUSED TO STAMP A REAL PARK. Unstamped, it leaves the recovery inbox
+--    (activeRefundParkWhere requires the stamp) with a real unrefunded amount on it.
+--
+--    A SINGLE FIELD IS NOT A SHAPE, AND ANY FIELD THAT ARRIVES FROM AN EXTERNAL SYSTEM IS FORGEABLE.
+--    So the exclusion below is the NEGATION OF THE COMPLETE HELD-INVOICE PREDICATE STATEMENT 1 USES —
+--    payload object, the queue reason, an accountingPayload OBJECT, salesOrderId equal to the row's
+--    own entityId, and the key. Four of those five an operator cannot type into WooCommerce's refund
+--    dialog, and a decorating extension has no reason to synthesise the set. THE SAME TEXT APPEARS IN
+--    EXACTLY THREE PLACES — statement 1 above (positive), verify.sql check 1 (positive, its mirror)
+--    and verify.sql check 6 (negated, as here) — and a test asserts all four readers are the same
+--    predicate character for character, because three hand-written copies could not stay in step.
+--
+--    `IS NOT TRUE`, NOT `NOT (...)`. Every conjunct above is a comparison against a json member that
+--    may be ABSENT, and absent means SQL NULL: `NOT (UNKNOWN)` is UNKNOWN, which selects nothing, so
+--    a plain NOT would drop a payload with no `reason` at all from BOTH sides — neither stamped a
+--    hold by statement 1 nor stamped a park here. `IS NOT TRUE` folds UNKNOWN in with FALSE, which is
+--    the answer wanted: whatever is not provably a hold is a park. It is the `<>` versus
+--    `IS DISTINCT FROM` trap of verify.sql check 5, one level up.
+--
+--    WHAT THE IDENTITY CLAUSE COSTS, AND WHY IT IS STILL IN. Negating the WHOLE predicate means a
+--    degraded hold — one whose payload no longer names the row's own order, i.e. a legacy REASSIGN —
+--    now falls to this catch-all and is stamped a park. That row does not go quiet: verify.sql
+--    check 5 reads neither the stamp nor the status and selects exactly it, so the cutover stops and
+--    a human is shown it. The alternative, leaving it unstamped, only ever reached check 2 — the
+--    superset whose own comment says its answer is not diagnostic.
 UPDATE "shopping_sync_logs"
    SET "recordKind" = 'WC_REFUND_PARK'
  WHERE "recordKind" IS NULL
@@ -103,7 +135,13 @@ UPDATE "shopping_sync_logs"
    AND "entityType" = 'SalesOrder'
    AND status IN ('PENDING', 'FAILED', 'QUARANTINED')
    AND "entityId" IS NOT NULL
-   AND payload->>'metaKey' IS NULL;
+   AND (
+             jsonb_typeof(payload) = 'object'
+         AND payload->>'reason' = 'missing_wc_invoice_number'
+         AND jsonb_typeof(payload->'accountingPayload') = 'object'
+         AND payload->>'salesOrderId' = "entityId"
+         AND payload->>'metaKey' IS NOT NULL
+       ) IS NOT TRUE;
 
 -- ---------------------------------------------------------------------------------------------
 -- CUTOVER — QUIESCENCE IS REQUIRED, NOT ADVISORY. READ THIS BEFORE SHIPPING.
@@ -214,7 +252,11 @@ UPDATE "shopping_sync_logs"
 --       and both code paths that write them act only on a row the CURRENT
 --       heldSalesInvoiceQueueWhere selected — which requires recordKind = 'WC_HELD_SALES_INVOICE'.
 --       A row that is not a hold carrying one of those sentences therefore has no legitimate
---       producer, and `payload->>'metaKey' IS NULL` is what says "not a hold".
+--       producer, and WHAT SAYS "NOT A HOLD" IS THE NEGATED HELD-INVOICE SHAPE — the same five
+--       clauses statement 1 uses, spelled `(...) IS NOT TRUE` so a missing json member lands on the
+--       "not a hold" side instead of vanishing from both. It used to say `payload->>'metaKey' IS
+--       NULL`, and a refund body that arrived carrying a top-level metaKey of its own therefore
+--       switched check 6 OFF over exactly the row it exists to catch (Codex HIGH, round 10).
 --
 --       IT WAS ALSO NOT THE LESSER CORRUPTION IT WAS CALLED. The 'Superseded' outcome writes
 --       status = 'SYNCED', and activeRefundParkWhere lists only PENDING, FAILED and QUARANTINED —
