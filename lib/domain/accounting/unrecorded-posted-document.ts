@@ -522,7 +522,7 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
         + 'connector rather than for this one. TURNING IT OFF IS NOT A FENCE EITHER: the handler '
         + 'reads that setting and then uploads, so a run already past the read still uploads, and '
         + 'nothing in IMS reports whether one is. Only closing the row stops the replay, and IMS '
-        + 'cannot close it (o3d-4b5p). Escalate this record to whoever administers this installation',
+        + 'cannot close it (o3d-4b5p)',
     },
     UNRECORDED: {
       effect: 'either the supplier invoice PDF is uploaded to that bill in QuickBooks AGAIN once per '

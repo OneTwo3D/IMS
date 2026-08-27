@@ -222,7 +222,8 @@ test('ROUND 10 (Codex MEDIUM): the attachment record states the handler outcome,
     posted: null, outcome: { externalEffect: 'MADE', ledgerTargetId: 'XERO-BILL-7' },
   })
   assert.match(uploaded, /THE UPLOAD HAPPENED/)
-  assert.match(uploaded, /AN ATTACHMENT NOW EXISTS ON XERO BILL XERO-BILL-7/)
+  // ROUND 13 (Codex MEDIUM): the historical outcome, not a claim about what is on that bill now.
+  assert.match(uploaded, /THIS ATTEMPT UPLOADED AN ATTACHMENT ONTO XERO BILL XERO-BILL-7/)
   assert.match(uploaded, /no standalone accounting document was created/)
   assert.match(uploaded, /remove the duplicate attachment/)
   // THE DEFECT: it said an upload happened AND that nothing was created at all.

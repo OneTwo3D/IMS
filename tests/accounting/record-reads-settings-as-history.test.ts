@@ -142,8 +142,9 @@ const XERO_MADE_NAMED_BILL =
   + 'but IMS could not record that it did. WHAT THE OPERATION DID: it uploaded a supplier-invoice '
   + 'PDF onto Xero bill XERO-BILL-77, which already existed. THE UPLOAD HAPPENED. No id came back '
   + 'for the attachment itself, because an attachment is not a document. Its sync row log-1 no '
-  + 'longer exists, so nothing in IMS references it. AN ATTACHMENT NOW EXISTS ON XERO BILL '
-  + 'XERO-BILL-77, and no standalone accounting document was created. REMEDY: Find that bill in '
+  + 'longer exists, so nothing in IMS references it. THIS ATTEMPT UPLOADED AN ATTACHMENT ONTO '
+  + 'XERO BILL XERO-BILL-77, and no standalone accounting document was created. REMEDY: Find that '
+  + 'bill in '
   + 'Xero by the ledger document id above and remove the duplicate attachment. There is no '
   + 'document to void, and the bill itself was not created by this attempt. WHAT THIS RECORD '
   + 'HOLDS: the operation type, the IMS reference above, the sync row id, and the time this '
@@ -155,8 +156,9 @@ const XERO_MADE_UNNAMED_BILL =
   + 'but IMS could not record that it did. WHAT THE OPERATION DID: it uploaded a supplier-invoice '
   + 'PDF onto a bill that already existed in Xero. THE UPLOAD HAPPENED. No id came back because '
   + 'an attachment is not a document, and this record does not carry the id of the bill it went '
-  + 'onto either. Its sync row log-1 no longer exists, so nothing in IMS references it. AN '
-  + 'ATTACHMENT NOW EXISTS ON A BILL IN XERO, AND THIS RECORD DOES NOT NAME THAT BILL. REMEDY: DO '
+  + 'onto either. Its sync row log-1 no longer exists, so nothing in IMS references it. THIS '
+  + 'ATTEMPT UPLOADED AN ATTACHMENT ONTO A BILL IN XERO, AND THIS RECORD DOES NOT NAME THAT BILL. '
+  + 'REMEDY: DO '
   + 'NOT REMOVE AN ATTACHMENT FROM A BILL THIS RECORD CANNOT NAME. The upload happened, so a '
   + 'duplicate may exist, but nothing kept here says which bill it is on and nothing kept here '
   + 'derives it. Escalate this record to whoever administers this installation. WHAT THIS RECORD '
@@ -361,8 +363,8 @@ test('ROUND 12 (Codex HIGH): the no-op remedy makes the operator READ the settin
   )
   assert.match(
     message,
-    /if it is ON, the replay uploads to the bill, and you are choosing between turning it off/,
-    'and told to change it if it is not what the no-op depends on',
+    /if it is ON, the replay uploads to a bill THIS RECORD DOES NOT NAME, so there is no duplicate this record can send you to/,
+    'and told that a replay it cannot send anyone to is still a replay',
   )
   assert.match(
     message,
@@ -444,7 +446,7 @@ test('ROUND 12 (Codex MEDIUM): after a reset, the attachment remedy names the bi
   // The claims the equalities above are protecting, said out loud.
   assert.match(QBO_MADE_NAMED_BILL, /uploaded to QuickBooks bill QBO-BILL-77 AGAIN/)
   assert.match(QBO_MADE_NAMED_BILL, /Find that bill in QuickBooks by the ledger document id above/)
-  assert.match(XERO_MADE_NAMED_BILL, /AN ATTACHMENT NOW EXISTS ON XERO BILL XERO-BILL-77/)
+  assert.match(XERO_MADE_NAMED_BILL, /THIS ATTEMPT UPLOADED AN ATTACHMENT ONTO XERO BILL XERO-BILL-77/)
   for (const unnamed of [QBO_MADE_UNNAMED_BILL, XERO_MADE_UNNAMED_BILL]) {
     assert.match(unnamed, /DOES NOT (?:NAME|carry the id of)/)
     assert.doesNotMatch(unnamed, /open that bill/i, 'it may not send anyone to a bill it cannot name')

@@ -447,7 +447,7 @@ test('ROUND 11 (Codex MEDIUM): only the renderer may instruct a lookup, never a 
 })
 
 // ---------------------------------------------------------------------------------------------
-// ROUND 12 (Codex MEDIUM) — THE QUESTION THE LOOKUP-VERB LIST WAS A PROXY FOR.
+// ROUND 12 (Codex MEDIUM), REBUILT IN ROUND 13 (Codex HIGH) — AN ACT IS AN ACT IN ANY GRAMMAR.
 //
 // The lookup fence asks "does this remedy send an operator SEARCHING in its own words?". The thing
 // that actually goes wrong is one step further out: DOES THIS REMEDY TELL AN OPERATOR TO ACT ON A
@@ -458,66 +458,122 @@ test('ROUND 11 (Codex MEDIUM): only the renderer may instruct a lookup, never a 
 // to strip an attachment off. The sweep found two more of the same shape: `WC_INVOICE_NOTE` ("open
 // that order in WooCommerce") and `TAX_RATE_SYNC` ("correct or archive that rate").
 //
-// SO THE FENCE ASKS THE ACTUAL QUESTION. An IMPERATIVE ACT VERB — a verb that changes something in
-// somebody else's system — may appear in a remedy only if that entry DECLARES a lookup, i.e. only
-// if the record can name what is being acted on. Prohibitions are stripped first, because "DO NOT
-// void it" needs no identifier: refusing to act on a thing does not require finding it.
+// WHY IT IS BEING REBUILT ONE ROUND LATER. Round 12 asked the question of IMPERATIVES only, and
+// wrote down, as an assertion in this file, that a GERUND is not an imperative and is not caught.
+// Round 12's own new wording then used one: the `BILL_ATTACHMENT.NONE` replay check offered
+// "letting the uploads happen and clearing the duplicates afterwards" — an act, on a bill that cell
+// does not name, through the hole this file had just documented. That is twice in two rounds that a
+// fix landed inside its own stated limitation, so the limitation is the finding. A documented hole
+// in a fence is not a fence; it is a fence with a gate and a sign on it.
 //
-// THE CLASS IS CLOSED BY GRAMMAR, like the lookup verbs: an imperative is a verb in a clause's
-// first position, and the act verbs are enumerated. What it does NOT cover, stated rather than
-// implied:
+// SO THE QUESTION IS ASKED OF THE ACT, NOT OF ITS GRAMMAR. A mutating verb counts in EVERY form it
+// takes — imperative, third person, past, gerund — and so do the nouns those verbs turn into. What
+// makes an occurrence an INSTRUCTION rather than a description is that it takes a specific object:
+// "clearing THE duplicates", "removing THAT allocation", "open THAT bill". A verb with no object
+// ("a reversal POSTS FOR REAL") describes a consequence and instructs nobody. And an occurrence
+// inside a NEGATION instructs nothing either — refusing to act on a thing needs no identifier for
+// it — so a clause is exempt from the point where it negates: "DO NOT REMOVE AN ATTACHMENT FROM A
+// BILL THIS RECORD CANNOT NAME", "there is nothing here to open, keep or void as one", "no action,
+// route or screen removes an unsent row", "nothing this attempt did needs undoing".
+//
+// THE CLASS IS CLOSED THREE WAYS AT ONCE — the verbs are enumerated, their inflections are
+// generated rather than listed, and the object and the negation are grammar. What it does NOT
+// cover, stated rather than implied:
 //
 //   1. IT CHECKS THAT THE ENTRY CAN NAME SOMETHING, NOT THAT THE NAMED THING IS THE THING ACTED
 //      ON. `PAYMENT` declares a lookup on the payment id and instructs removing the payment, which
 //      is right; an entry that declared a lookup on one object and instructed action on another
 //      would pass.
-//   2. A GERUND OR A NOMINALISATION IS NOT AN IMPERATIVE, and is not caught.
-//      `PURCHASE_CREDIT_NOTE_ALLOCATION` says "the only thing that undoes it is removing that
-//      allocation from the credit note" — descriptive, and followed by an escalation rather than
-//      an instruction, which is why it is left as it stands.
+//   2. A CLAUSE IS EXEMPT FROM ITS FIRST NEGATION ONWARD, so a clause that refuses one act and
+//      instructs another after it, in one breath, is not caught. Nothing in the shipped corpus does
+//      that; it is the shape to watch for when editing one.
 //   3. AN INSTRUCTION PHRASED WITHOUT ANY OF THESE VERBS still passes, for the same reason item 1
 //      of the round-11 block gives: English has no closed set of ways to tell someone to do
-//      something.
+//      something. "Go to that bill and take the second PDF off it" is not caught, and the
+//      assertions at the foot of the test say so rather than leaving it to be found.
 // ---------------------------------------------------------------------------------------------
 
 /** Verbs that CHANGE something in somebody else's system. Closed, and enumerated. */
-const ACT_VERB = /^(open|remove|delete|void|reverse|correct|archive|cancel|credit-note|amend|edit|detach)\b/i
+const ACT_VERBS = [
+  'open', 'remove', 'delete', 'void', 'reverse', 'correct', 'archive', 'cancel', 'credit-note',
+  'amend', 'edit', 'detach', 'undo', 'clear', 'strip',
+] as const
+/** The forms the rule below cannot generate from the stem: irregulars and doubled consonants. */
+const ACT_VERB_IRREGULARS = ['undid', 'undone', 'cancelling', 'cancelled', 'stripping', 'stripped']
+/** The same acts written as nouns — the other half of "in any grammatical form". */
+const ACT_NOUNS = [
+  'removal', 'deletion', 'reversal', 'correction', 'cancellation', 'amendment', 'archival',
+  'detachment',
+]
 
 /**
- * A clause boundary, for deciding what is in IMPERATIVE position. Deliberately NOT `, ` or ` or `:
- * "there is nothing here to open, keep or void as one" is a description, and splitting on those
- * turns its tail into a false imperative.
+ * Every inflection of one verb, GENERATED. A hand-written list of forms is the same open class the
+ * round-9 phrase list was: it is bypassable by conjugating.
+ */
+function everyFormOf(verb: string): string {
+  const stem = verb.endsWith('e') ? verb.slice(0, -1) : verb
+  return `${stem}(?:e|es|ed|ing|d|s)?`
+}
+
+/**
+ * A determiner or pronoun — what makes the words after a verb A SPECIFIC OBJECT rather than a
+ * consequence. This is the whole difference between "clearing the duplicates" and "a reversal
+ * POSTS FOR REAL".
+ */
+const OBJECT = '(?:the|that|this|those|these|its|their|any|either|both|each|an|a|it|them|one)\\b'
+
+const INSTRUCTED_ACT = new RegExp(
+  `\\b(?:(${[...ACT_VERBS.map(everyFormOf), ...ACT_VERB_IRREGULARS].join('|')})\\s+${OBJECT}`
+  + `|(${ACT_NOUNS.join('|')})\\s+of\\s+${OBJECT})`,
+  'gi',
+)
+
+/** Where a clause stops instructing. An occurrence at or after this point is refusing, not telling. */
+const NEGATION = /\b(?:not|never|no|nothing|none|cannot|neither|nor|without|rather than)\b/i
+
+/**
+ * A clause boundary, for deciding what is governed by which negation. Deliberately NOT `, ` or
+ * ` or `: "DO NOT VOID, CREDIT-NOTE, REVERSE OR DELETE anything on the strength of this record" is
+ * ONE prohibition, and splitting on those would orphan every verb after the first from the `not`
+ * that governs them all.
  */
 const CLAUSE_BOUNDARY = /(?:\.\s|;\s|:\s|—\s|\band\s)/
 
-/** Every act this set of templates INSTRUCTS. A prohibition instructs nothing and is stripped. */
+/** Every act these templates INSTRUCT, in whatever grammatical form they instruct it. */
 function actsInstructed(templates: readonly string[]): string[] {
   const found: string[] = []
   for (const template of templates) {
-    const prose = template
-      .replace(/\{Lookup\}|\{lookup\}/g, ' ')
-      .replace(/\bdo not\b[^.;:]*/gi, ' ')
-    for (const clause of prose.split(CLAUSE_BOUNDARY)) {
-      const match = ACT_VERB.exec(clause.trim())
-      if (match) found.push(match[1].toLowerCase())
+    const prose = template.replace(/\{Lookup\}|\{lookup\}/g, ' ')
+    for (const raw of prose.split(CLAUSE_BOUNDARY)) {
+      const clause = raw.trim()
+      const negation = NEGATION.exec(clause)
+      const instructsUntil = negation ? negation.index : clause.length
+      INSTRUCTED_ACT.lastIndex = 0
+      let match: RegExpExecArray | null
+      while ((match = INSTRUCTED_ACT.exec(clause)) !== null) {
+        if (match.index >= instructsUntil) continue
+        found.push((match[1] ?? match[2]).toLowerCase())
+      }
     }
   }
   return found
 }
 
-// MUTATION THAT KILLS THIS (run): restore the shipped round-11 wording — put
-// `remedy: 'REMEDY: open that bill in {ledger} and remove the duplicate attachment. …'` back on
-// NON_DOCUMENT_INCIDENT_WORDING.BILL_ATTACHMENT.MADE_TARGET_UNRECORDED (the cell that cannot name a
-// bill) and this test fails naming that entry and the verbs `open, remove`. Restoring
-// WC_INVOICE_NOTE's "open that order in WooCommerce and remove any duplicate note" or
-// TAX_RATE_SYNC's "correct or archive that rate there" kills it the same way. Both mutations are
-// ALSO run inline below against the shipped checker, so weakening the checker fails this test
-// rather than quietly reopening the hole.
+// MUTATION THAT KILLS THIS (run): restore the shipped round-12 wording — put
+// `check: '… and you are choosing between turning it off … and letting the uploads happen and '
+// + 'clearing the duplicates afterwards. …'` back on
+// QBO_OPERATIONS_WITHOUT_REQUEST_ID.BILL_ATTACHMENT.NONE (the cell that names no bill) and this test
+// fails naming that entry and the verb `clearing`. Restoring
+// PURCHASE_CREDIT_NOTE_ALLOCATION's "the only thing that undoes it is removing that allocation from
+// the credit note" kills it the same way, naming `undoes, removing`; so do the three round-11
+// imperatives (`open that bill`, `open that order`, `correct or archive that rate`). All of those
+// mutations are ALSO run inline below against the shipped checker, so weakening the checker fails
+// this test rather than quietly reopening the hole.
 //
 // ROUTE: the templates come from the SHIPPED wording tables — all three of them — and the
 // declaration each entry is judged against is the entry's own `lookup`. Only the verb list and the
 // clause grammar are written down here.
-test('ROUND 12 (Codex MEDIUM): a remedy may only instruct an act on an object the record can name', () => {
+test('ROUND 13 (Codex HIGH): a remedy may only instruct an act — in ANY form — on an object the record can name', () => {
   const entries = [...everyWordingEntry(), ...everyReplayWordingEntry()]
   assert.ok(entries.length >= 16, `sanity: ${entries.length} wording entries were scanned`)
 
@@ -541,14 +597,34 @@ test('ROUND 12 (Codex MEDIUM): a remedy may only instruct an act on an object th
   )
 
   // ---------------------------------------------------------------------------------------------
-  // THE REQUIRED FAILING CASES. These are the three shipped wordings this round removed, run
-  // against the shipped checker.
+  // THE REQUIRED FAILING CASES — the wordings rounds 12 and 13 removed, run against the shipped
+  // checker. The first two are THE ROUND-13 FINDING: an act in a form round 12's fence could not
+  // see.
   // ---------------------------------------------------------------------------------------------
+  assert.deepEqual(
+    actsInstructed(['if it is ON, the replay uploads to the bill, and you are choosing between '
+      + 'turning it off — which stops attachment uploads for EVERY bill on this connector, not this '
+      + 'one — and letting the uploads happen and clearing the duplicates afterwards.']),
+    ['clearing'],
+    'the round-12 NONE remedy walked through the gerund hole round 12 documented, and it must be refused',
+  )
+  assert.deepEqual(
+    actsInstructed(['Both of them existed before this operation and neither was created by it; what '
+      + 'happened is that one was applied to the other, and the only thing that undoes it is '
+      + 'removing that allocation from the credit note in {ledger}.']),
+    ['undoes', 'removing'],
+    'a gerund and a third-person present are acts too, and this entry names neither document',
+  )
+  assert.deepEqual(
+    actsInstructed(['REMEDY: escalate this record. Removal of the duplicate is what undoes it.']),
+    ['removal', 'undoes'],
+    'and so is the noun the verb turns into — otherwise the fence is bypassed by nominalising',
+  )
   assert.deepEqual(
     actsInstructed(['REMEDY: open that bill in {ledger} and remove the duplicate attachment. There '
       + 'is no document to void, and the bill itself was not created by this attempt.']),
     ['open', 'remove'],
-    'the round-11 attachment remedy is the finding, and it must be refused',
+    'the round-11 attachment remedy is the round-12 finding, and it must still be refused',
   )
   assert.deepEqual(
     actsInstructed(['REMEDY: open that order in WooCommerce and remove any duplicate note. There is '
@@ -560,7 +636,7 @@ test('ROUND 12 (Codex MEDIUM): a remedy may only instruct an act on an object th
     actsInstructed(['REMEDY: THERE IS NOTHING TO VOID OR CREDIT — nothing was posted to a customer '
       + 'or a supplier account. Review the tax rates in {ledger}, and correct or archive that rate '
       + 'there if this write was wrong.']),
-    ['correct'],
+    ['archive'],
     'the tax-rate remedy is the same defect and must be refused',
   )
 
@@ -572,13 +648,18 @@ test('ROUND 12 (Codex MEDIUM): a remedy may only instruct an act on an object th
     [],
     'a prohibition names an act it forbids, and forbidding needs no lookup',
   )
-
-  // AND THE HOLES, ASSERTED RATHER THAN IMPLIED — items 2 and 3 of the block above.
+  // …and neither is a description of what an act WOULD cost. `a reversal` takes no object.
   assert.deepEqual(
-    actsInstructed(['The only thing that undoes it is removing that allocation from the credit note.']),
-    [],
-    'a gerund is not an imperative and is NOT caught — this assertion exists so that is documented',
+    actsInstructed(['A reversal POSTS FOR REAL.']), [],
+    'a nominalised act with no object describes a consequence and instructs nobody',
   )
+  // …nor is the shipped no-effect sentence, which negates before it names the act at all.
+  assert.deepEqual(
+    actsInstructed(['nothing this attempt did needs undoing — it created no attachment.']), [],
+    'an act named only to say nothing needs it is not an instruction to perform it',
+  )
+
+  // AND THE HOLE THAT REMAINS, ASSERTED RATHER THAN IMPLIED — item 3 of the block above.
   assert.deepEqual(
     actsInstructed(['Go to that bill and take the second PDF off it.']), [],
     'an instruction phrased without a listed verb is NOT caught — the fence closes the verb, not '
@@ -665,7 +746,11 @@ test('ROUND 9 (Codex HIGH): a Xero non-document incident with no identifier gets
     // What it says instead — the allocation, and the thing that actually undoes one.
     assert.match(message, /THIS IS NOT A DOCUMENT/, reason)
     assert.match(message, /DO NOT OPEN, KEEP OR VOID EITHER THE BILL OR THE CREDIT NOTE/, reason)
-    assert.match(message, /removing that allocation from the credit note in Xero/, reason)
+    // ROUND 13: the clause that named the undo — "the only thing that undoes it is removing that
+    // allocation from the credit note" — is DELETED, not softened. It told an operator to act on a
+    // credit note this record does not name, in the gerund form round 12's fence could not see.
+    assert.doesNotMatch(message, /removing that allocation/, reason)
+    assert.match(message, /what happened is that one was applied to the other\. Escalate this record/, reason)
     assert.match(message, /Xero accepted the write and no reset of ours undoes it/, reason)
   }
 
