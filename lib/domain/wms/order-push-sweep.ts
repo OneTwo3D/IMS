@@ -586,10 +586,11 @@ export interface WmsOrderPushPort {
    * state alone — pushes the SAME order a second time. Two warehouse orders, goods shipped
    * twice, which is the exact failure the claim lease exists to prevent.
    *
-   * The state predicate is also what makes clearing `lastAttemptAt` here safe: at the instant
-   * the write applies the link is provably NOT PENDING_CREATE, so the column being cleared is a
-   * rotation stamp and never a live create lease. A claim can only be taken after this write has
-   * committed, and it is taken under the order's row lock.
+   * The state predicate is also what makes clearing `lastAttemptAt` here safe: a claim is
+   * granted only from PENDING_CREATE, so at the instant a write guarded on any OTHER state
+   * applies, no create claim can be live and the column being cleared is a rotation stamp
+   * rather than a lease. A claim can only be taken after this write has committed, and it is
+   * taken under the order's row lock.
    */
   updateLinkIfState(id: string, fromState: PushState, data: LinkWrite): Promise<boolean>
   /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
@@ -797,11 +798,14 @@ export async function runWmsOrderPushSweepCore(
       // push had already landed, the same write reverted a SYNCED/PENDING_VERIFY link to
       // PENDING_CREATE while KEEPING its externalOrderId, which the create pass re-pushes.
       //
-      // The predicate is what makes the lease clear safe rather than merely narrower: it applies
-      // only while the link is still VALIDATION_FAILED, and a VALIDATION_FAILED link's
-      // lastAttemptAt is this pass's own rotation stamp, never a live create lease. The lease
-      // must be cleared, or the rotation stamp written a moment ago would make claimForCreate
-      // refuse the re-queued order for a full CREATE_CLAIM_LEASE_MS.
+      // The predicate is what makes the lease CLEAR safe rather than merely narrower, and the
+      // argument is short: the write applies only at an instant when the link is still
+      // VALIDATION_FAILED, and shouldGrantCreateClaim grants a claim ONLY from PENDING_CREATE —
+      // so at that instant no create claim can be live, whoever wrote the stamp (this pass's
+      // rotation re-stamp above, or recordValidationFailure's own, which is equally fresh).
+      // The column being cleared is therefore never a live lease. And it must be cleared: a
+      // stamp written seconds ago would otherwise make claimForCreate refuse the order it has
+      // just re-queued for a full CREATE_CLAIM_LEASE_MS.
       let promoted = false
       try {
         promoted = await port.updateLinkIfState(link.id, 'VALIDATION_FAILED', { state: 'PENDING_CREATE', lastError: null, lastAttemptAt: null })
