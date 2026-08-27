@@ -823,6 +823,27 @@ fence_db_connections() {
       # know is absent is not a degraded fence, it is no fence.
       die "THE DATABASE COULD NOT BE FENCED (exit 3): CONNECT was NOT revoked, so nothing stops a client attaching between now and the end of the migration. Refusing to migrate — the reason is printed above. Fix it (usually: set DEPLOY_ADMIN_DATABASE_URL to a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL, see docs/installation.md) and re-run. Nothing has been migrated."
       ;;
+    5)
+      # EXIT 5 IS A FENCE THAT IS STANDING RIGHT NOW (o3d-2sm1.5, Codex r13 HIGH).
+      #
+      # THE STICKY FLAG USED TO BE RAISED ONLY ON EXIT 0, so "the fence did not succeed" was
+      # read as "no fence was raised" — and an exit code is not evidence about what was
+      # committed. fence-db-connections.mjs COMMITS its REVOKEs and then asks whether the door
+      # is actually shut; when the application keeps CONNECT through role membership, or the
+      # room will not go quiet, it DELIBERATELY LEAVES THEM STANDING so nothing is half-applied.
+      # PUBLIC, monitoring, backup, BI and any second application are locked out at that
+      # moment. With the flag left false, an exit-4 release during cleanup — no record, and only
+      # the application role's own CONNECT provable — took the warning-success branch, lowered
+      # DB_FENCE_UP and let this run record a release nobody performed, over grantees still
+      # revoked and now unrecorded.
+      #
+      # So the flag is raised for EVERY post-commit result, and the unproven release verdict is
+      # fatal after one. This arm aborts like exit 3 does, but it says the opposite thing about
+      # the database: exit 3 revoked nothing, this revoked and is holding.
+      DB_FENCE_UP=true
+      DB_FENCE_RAISED=true
+      die "THE FENCE IS STANDING AND CANNOT BE CALLED GOOD (exit 5): the REVOKEs are COMMITTED — the reason this run will not call the database fenced is printed above. CONNECT is currently denied to every grantee it took it from, which may include PUBLIC, monitoring, backup, BI and a second application, so this is NOT a run that changed nothing. Nothing has been migrated. Release it before starting anything: ${DB_FENCE_RELEASE_CMD}"
+      ;;
     *)
       die "The connection fence failed (exit ${rc}). Nothing has been migrated."
       ;;
@@ -968,6 +989,23 @@ refence_db_connections() {
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
     node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" || rc=$?
+  # EVERY POST-COMMIT RESULT RAISES THE STICKY FLAG (o3d-2sm1.5, Codex r13 HIGH). Exit 5 says
+  # the REVOKEs are COMMITTED and standing: this call could not call the database fenced, but it
+  # certainly fenced something, and DB_FENCE_RAISED is the flag that decides whether a later
+  # "no record, and only the application role's own CONNECT is provable" release may be walked
+  # past. Raised here, that release becomes the refusal it should always have been.
+  if [[ "${rc}" -eq 5 ]]; then
+    DB_FENCE_UP=true
+    DB_FENCE_RAISED=true
+    warn "THE RE-FENCE COMMITTED ITS REVOKES AND COULD NOT CALL THE DATABASE FENCED (exit 5)."
+    warn "CONNECT is denied to the grantees it was taken from and nothing here has given it back,"
+    warn "so this is a fence and not a no-op - but it was NOT proven to shut the application out."
+    warn "The reason is printed above (usually CONNECT reaching the application through role"
+    warn "membership, or a backend that would not drain). Do not trust it as a fence; it still has"
+    warn "to be released before anything starts:"
+    warn "  ${DB_FENCE_RELEASE_CMD}"
+    return 1
+  fi
   [[ "${rc}" -eq 0 ]] || return 1
   DB_FENCE_UP=true
   DB_FENCE_RAISED=true

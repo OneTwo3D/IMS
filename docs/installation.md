@@ -597,6 +597,18 @@ to a temporary in the same directory, `fsync`ed, renamed and the directory `fsyn
 `BEGIN`; if any of that cannot be proven, **nothing is revoked** and the run aborts with exit 3.
 The last field of a complete record is `"state_complete": 1`.
 
+**Both URLs must name the same database, and it is proven rather than assumed** (o3d-2sm1.5).
+Every mode connects through `DEPLOY_ADMIN_DATABASE_URL` when it is set, and then asks its
+questions of `current_database()` on *that* connection while taking the **role** from
+`DATABASE_URL`. Point the admin URL at another database on which the application role happens to
+hold `CONNECT` — a copy, a `postgres` maintenance database, a staging URL left in the environment
+— and `--release` answered "the application can connect" about a database the application never
+uses, while the real one still denied it; the health route does not touch the database, so the
+deploy reported success with the application locked out. `--preflight`, `--fence` and `--release`
+now **refuse** unless the two URLs name the same host, port and database *and* the live connection
+reports it is attached to that database. A loopback address, `localhost` and a unix-socket
+directory are treated as the same machine; anything else that differs is a refusal, not a guess.
+
 **And `--release` never reads a missing record as "no fence".** A record that was never written
 and one a power cut ate are indistinguishable from the file system, so absence is not an answer:
 `--release` asks the database instead. **Neither answer it can get is a success**, because
@@ -606,7 +618,8 @@ revokes `CONNECT` from every grantee that held it:
 | what the database says | exit | what it means |
 | --- | --- | --- |
 | the application role has **no** `CONNECT` | `1` | a fence is standing and its record is gone. It prints the `GRANT` to run by hand and tells you to check `pg_database.datacl` for the other grantees it cannot name. |
-| the application role **has** `CONNECT` | `4` | that, and only that. The application can be back inside through `PUBLIC`, through role membership or through a manual grant while monitoring, backup, BI or a second application is still revoked by the same fence — the shape `--fence` itself leaves standing when it rejects an ineffective fence. Audit `SELECT datacl FROM pg_database WHERE datname = current_database();` before treating the database as open. |
+| the privilege read and `DATABASE_URL` **disagree** | `1` | the connection this run opened says the role holds `CONNECT`, and `DATABASE_URL` itself cannot connect. A privilege read answers about the database the *reading* connection is attached to; the application uses `DATABASE_URL`. Fatal (o3d-2sm1.5). |
+| the application role **has** `CONNECT`, **proven by connecting as it** | `4` | that, and only that. The application can be back inside through `PUBLIC`, through role membership or through a manual grant while monitoring, backup, BI or a second application is still revoked by the same fence — the shape `--fence` itself leaves standing when it rejects an ineffective fence. Audit `SELECT datacl FROM pg_database WHERE datname = current_database();` before treating the database as open. |
 
 Only a usable record licenses "released" (exit 0), because only a record says who held `CONNECT`
 beforehand. A record that exists but cannot be parsed is left in place for inspection, and
@@ -622,6 +635,23 @@ nothing may start or adopt past it); exit 4 is fatal when *that* run had raised 
 and the record has since vanished, and otherwise a loud warning carrying the ACL audit, so a
 `--skip-migrate` run or a resume over an untouched schema is not blocked by a state nothing can
 distinguish from health.
+
+**An exit code is not evidence about what was committed** (o3d-2sm1.5). `--fence` commits its
+`REVOKE`s and *deliberately leaves them standing* when it then finds the fence ineffective (the
+application keeps `CONNECT` through role membership) or the room will not go quiet — the same
+shape the exit-4 text above describes. It used to report that with the same exit 1 a failure that
+revoked **nothing** returns, and the entrypoints raise their sticky "this run raised a fence" flag
+only on exit 0, so a run that had locked PUBLIC, monitoring and BI out was recorded as one with no
+fence to its name; a record lost during cleanup then took the exit-4 *warning* branch and let the
+run claim a release nobody performed. So:
+
+* **exit 3** — nothing was revoked. **exit 5** (`EXIT_FENCE_STANDING`) — the `REVOKE`s are
+  committed and in force, and this run still cannot call the database fenced. Every outcome after
+  the commit returns 5, a thrown error included.
+* `deploy.sh`, `update.sh` and `install.sh` **raise the sticky flag on every post-commit result**,
+  exit 5 as well as exit 0, in `fence_db_connections()` and in the exit trap's re-fence, and abort
+  saying the fence is standing rather than "the fence failed".
+* After such a result the unproven verdict (exit 4) is **fatal in all three**.
 
 **Every grantee, not two of them** (o3d-2sm1.5). It used to revoke from PUBLIC and the application
 role and call the database held closed. A third role with a direct `CONNECT` grant — monitoring,
