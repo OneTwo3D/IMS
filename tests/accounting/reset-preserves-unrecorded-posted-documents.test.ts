@@ -143,9 +143,11 @@ const INCIDENT: ActivityRow = {
   action: UNRECORDED_POSTED_DOCUMENT_ACTION,
   level: 'ERROR',
   // `unrecordedPostedDocumentRecord` writes metadata.type from entry.type. Round 6 classifies on it,
-  // and round 8 also reads `postedExternalId` — which that builder writes too, and which this
-  // fixture's own description names, so the two halves of the record agree.
-  metadata: { type: 'SALES_INVOICE', syncLogId: 'log-1', postedExternalId: 'INV-XERO-SECOND' },
+  // round 8 also reads `postedExternalId`, and round 10 also reads `postingMode` — all three are
+  // written by that builder, and this fixture's own description agrees with all three.
+  metadata: {
+    type: 'SALES_INVOICE', syncLogId: 'log-1', postedExternalId: 'INV-XERO-SECOND', postingMode: 'LIVE',
+  },
   description: 'Xero SALES_INVOICE for SalesOrder order-1 POSTED as INV-XERO-SECOND, but sync row log-1 '
     + 'already names a DIFFERENT document (INV-XERO-FIRST). REMEDY: open both ids in Xero.',
 }
@@ -155,7 +157,9 @@ const QBO_INCIDENT: ActivityRow = {
   level: 'ERROR',
   // `unpersistedQboPostRecord` writes the same fields. A SALES_INVOICE is a real ledger document,
   // and this one came back with an id.
-  metadata: { type: 'SALES_INVOICE', syncLogId: 'log-2', postedExternalId: 'QBO-INV-9' },
+  metadata: {
+    type: 'SALES_INVOICE', syncLogId: 'log-2', postedExternalId: 'QBO-INV-9', postingMode: 'LIVE',
+  },
   description: 'QuickBooks SALES_INVOICE for SalesOrder order-2 POSTED as QBO-INV-9, but IMS could not '
     + 'record that id. REMEDY: open the id above in QuickBooks.',
 }
@@ -386,7 +390,8 @@ test('ROUND 6: an INVOICE_EMAIL incident is NOT described as a document standing
   assert.doesNotMatch(breadcrumb.description, /real money in somebody else's books/)
 
   // What it says instead.
-  assert.match(breadcrumb.description, /1 are NOT ledger documents and created nothing in Xero or QuickBooks/)
+  assert.match(breadcrumb.description, /1 are NOT accounting documents/)
+  assert.match(breadcrumb.description, /no invoice, bill, credit note, payment or journal was created/)
   assert.match(
     breadcrumb.description,
     /only a local email-outbox row, WHICH THIS RESET HAS JUST DELETED/,
@@ -415,8 +420,8 @@ test('ROUND 6: a mixed set gets one truthful count per kind, not one number and 
   const breadcrumb = state.activity.find((row) => row.action === 'database_reset_preserved_unrecorded_documents')
   assert.ok(breadcrumb)
   assert.match(breadcrumb.description, /^Database reset kept 3 record/)
-  assert.match(breadcrumb.description, /2 name a DOCUMENT Xero or QuickBooks accepted and still holds/)
-  assert.match(breadcrumb.description, /1 are NOT ledger documents/)
+  assert.match(breadcrumb.description, /2 name a LIVE effect Xero or QuickBooks accepted and still holds/)
+  assert.match(breadcrumb.description, /1 are NOT accounting documents/)
 
   const metadata = (breadcrumb as unknown as { metadata?: Record<string, unknown> }).metadata
   assert.equal(metadata?.ledgerDocuments, 2)
@@ -434,7 +439,7 @@ test('ROUND 6: a record with no readable type is counted apart rather than guess
   const breadcrumb = state.activity.find((row) => row.action === 'database_reset_preserved_unrecorded_documents')
   assert.ok(breadcrumb)
   assert.doesNotMatch(breadcrumb.description, /Xero or QuickBooks accepted and still holds/)
-  assert.doesNotMatch(breadcrumb.description, /are NOT ledger documents/)
+  assert.doesNotMatch(breadcrumb.description, /are NOT accounting documents/)
   assert.match(breadcrumb.description, /1 carry no operation type this version of IMS has classified/)
 
   const metadata = (breadcrumb as unknown as { metadata?: Record<string, unknown> }).metadata
@@ -459,8 +464,25 @@ test('ROUND 6: the classifier keys on the OPERATION TYPE, not on the connector t
   )
 
   // ROUND 8: a document kind needs the recorded id as well as the operation semantics.
-  assert.equal(classifyUnrecordedIncident({ type: 'SALES_INVOICE', postedExternalId: 'INV-1' }), 'LEDGER_DOCUMENT')
-  assert.equal(classifyUnrecordedIncident({ type: 'PURCHASE_INVOICE', postedExternalId: 'BILL-1' }), 'LEDGER_DOCUMENT')
+  // ROUND 10: and a CREATE needs the recorded posting mode too — without it the record cannot say
+  // whether a balance moved, and says so rather than assuming one did.
+  assert.equal(
+    classifyUnrecordedIncident({ type: 'SALES_INVOICE', postedExternalId: 'INV-1', postingMode: 'LIVE' }),
+    'LEDGER_DOCUMENT',
+  )
+  assert.equal(
+    classifyUnrecordedIncident({ type: 'PURCHASE_INVOICE', postedExternalId: 'BILL-1', postingMode: 'LIVE' }),
+    'LEDGER_DOCUMENT',
+  )
+  assert.equal(
+    classifyUnrecordedIncident({ type: 'SALES_INVOICE', postedExternalId: 'INV-1', postingMode: 'DRAFT' }),
+    'LEDGER_DRAFT',
+  )
+  assert.equal(
+    classifyUnrecordedIncident({ type: 'SALES_INVOICE', postedExternalId: 'INV-1' }),
+    'LEDGER_OUTCOME_UNRECORDED',
+    'a record written before round 10 does not say, and must not be read as saying LIVE',
+  )
 
   for (const unreadable of [null, undefined, 'INVOICE_EMAIL', 42, [], {}, { type: '' }, { type: 7 }]) {
     assert.equal(classifyUnrecordedIncident(unreadable), 'UNCLASSIFIED', JSON.stringify(unreadable) ?? 'undefined')
@@ -514,7 +536,7 @@ test('ROUND 7: a Xero credit-note ALLOCATION is not described as a document stan
   assert.doesNotMatch(breadcrumb.description, /Open the id in that system/)
   assert.doesNotMatch(breadcrumb.description, /real money in somebody else's books/)
   // Nor is it one of the four: something DID reach the ledger.
-  assert.doesNotMatch(breadcrumb.description, /created nothing in Xero or QuickBooks/)
+  assert.doesNotMatch(breadcrumb.description, /are NOT accounting documents/)
 
   assert.match(breadcrumb.description, /1 record a write Xero or QuickBooks ACCEPTED that is NOT a standalone document/)
   assert.match(breadcrumb.description, /has NO id to open/)
@@ -603,6 +625,8 @@ test('ROUND 7: a mixed set counts all four kinds apart', async () => {
 
   const metadata = (breadcrumb as unknown as { metadata?: Record<string, unknown> }).metadata
   assert.equal(metadata?.ledgerDocuments, 1)
+  assert.equal(metadata?.ledgerDrafts, 0)
+  assert.equal(metadata?.ledgerOutcomeUnrecorded, 0)
   assert.equal(metadata?.ledgerNonDocuments, 1)
   assert.equal(metadata?.noIdentifierSideEffects, 1)
   assert.equal(metadata?.unclassified, 1)
@@ -657,7 +681,7 @@ test('ROUND 8: a document type with no recorded identifier is NOT classified as 
     { type: 'INVOICE_PAYMENT', postedExternalId: null },
     { type: 'INVOICE_PAYMENT', postedExternalId: '' },
     { type: 'BILL_PAYMENT', postedExternalId: null },
-    { type: 'SALES_INVOICE', postedExternalId: null },
+    { type: 'SALES_INVOICE', postedExternalId: null, postingMode: 'LIVE' },
   ]) {
     assert.equal(
       classifyUnrecordedIncident(metadata),
@@ -736,6 +760,7 @@ test('ROUND 8: the per-incident record stops promising an id it does not carry',
   // The Xero record has the same hole and the same fix.
   const xeroNoId = describeUnrecordablePostedDocument({
     entry: { id: 'log-8', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-8' },
+    outcome: { postingMode: 'LIVE' },
     postedExternalId: null,
     reason: 'ROW_MISSING',
     namedExternalId: null,
@@ -745,6 +770,7 @@ test('ROUND 8: the per-incident record stops promising an id it does not carry',
 
   const xeroBothIds = describeUnrecordablePostedDocument({
     entry: { id: 'log-8', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-8' },
+    outcome: { postingMode: 'LIVE' },
     postedExternalId: 'INV-SECOND',
     reason: 'ANOTHER_DOCUMENT_NAMED',
     namedExternalId: 'INV-FIRST',
@@ -753,6 +779,7 @@ test('ROUND 8: the per-incident record stops promising an id it does not carry',
 
   const xeroOneId = describeUnrecordablePostedDocument({
     entry: { id: 'log-8', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-8' },
+    outcome: { postingMode: 'LIVE' },
     postedExternalId: null,
     reason: 'ANOTHER_DOCUMENT_NAMED',
     namedExternalId: 'INV-FIRST',

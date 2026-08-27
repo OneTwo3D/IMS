@@ -205,10 +205,16 @@ function incidentRow(over: Partial<SyncRow> = {}): SyncRow {
   }
 }
 
-async function incidentMessage(type = 'INVOICE_EMAIL') {
+async function incidentMessage(type = 'INVOICE_EMAIL', externalEffect?: 'MADE' | 'NONE') {
   const { describeUnpersistedQboPost } = await import('@/lib/domain/accounting/unrecorded-posted-document')
   return describeUnpersistedQboPost(
-    { entry: { id: 'log-1', type: type as never, referenceType: 'SalesOrder', referenceId: 'order-1' }, postedExternalId: null },
+    {
+      entry: { id: 'log-1', type: type as never, referenceType: 'SalesOrder', referenceId: 'order-1' },
+      postedExternalId: null,
+      // ROUND 10: `BILL_ATTACHMENT` is the one of the four whose handler decides whether anything
+      // left the process, so its record has one wording per outcome. The others have none to record.
+      outcome: { postingMode: 'LIVE', externalEffect },
+    },
     new Error('write conflict'),
   )
 }
@@ -824,10 +830,33 @@ test('STEP 7 (round 8): the INVOICE_EMAIL inspection claims no quiescence, becau
   assert.match(description, /Then INSPECT the outbox/)
 })
 
-test('STEP 7: BILL_ATTACHMENT no longer promises a re-upload the attach setting can prevent (round 6)', async () => {
-  const bill = await incidentMessage('BILL_ATTACHMENT')
-  assert.match(bill, /quickbooks_sync_attach_pdf/, 'the setting that makes the handler a no-op must be named')
-  assert.match(bill, /succeeds without uploading anything and the replay attaches nothing/)
+// ROUND 10 (Codex MEDIUM): ROUND 6 WROTE THIS AS A HEDGE INSIDE ONE SENTENCE — "the PDF is uploaded
+// again, UNLESS the setting is false, in which case it attaches nothing" — which is a wording that
+// is never quite false and never simply true. The handler's own outcome is recorded now, so each
+// case gets a sentence that is true of it, and the hedge survives only where the record does not
+// know.
+//
+// MUTATION THAT KILLS THIS: make `describeUnpersistedQboPost` ignore the outcome and always take the
+// UNRECORDED variant — the enabled case stops saying the upload repeats and the disabled case stops
+// saying nothing happens. Returning MADE unconditionally fails the disabled case the other way. Both
+// were run.
+test('STEP 7 (round 10): the BILL_ATTACHMENT replay wording states which of the two the handler did', async () => {
+  const uploaded = await incidentMessage('BILL_ATTACHMENT', 'MADE')
+  assert.match(uploaded, /uploaded to the QuickBooks bill AGAIN, once per sweep/)
+  assert.match(uploaded, /delete any duplicate attachment/)
+  assert.doesNotMatch(uploaded, /unless/i, 'nothing is conditional once the outcome is known')
+  assert.doesNotMatch(uploaded, /quickbooks_sync_attach_pdf/, 'and no setting needs checking')
+
+  const disabled = await incidentMessage('BILL_ATTACHMENT', 'NONE')
+  assert.match(disabled, /NOTHING AT ALL — attachment upload is turned off/)
+  assert.match(disabled, /this attempt created none/)
+  assert.doesNotMatch(disabled, /delete any duplicate attachment/)
+
+  // Only where IMS did not record it does the record name the setting and refuse to prescribe.
+  const unknown = await incidentMessage('BILL_ATTACHMENT')
+  assert.match(unknown, /quickbooks_sync_attach_pdf/, 'the setting that makes the handler a no-op must be named')
+  assert.match(unknown, /IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING/)
+  assert.match(unknown, /do not delete an attachment on the strength of this record/)
 
   // And it is scoped to that operation only — the other three have no such gate.
   for (const type of ['INVOICE_PDF', 'INVOICE_EMAIL', 'WC_INVOICE_NOTE']) {
