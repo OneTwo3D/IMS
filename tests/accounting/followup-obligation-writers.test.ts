@@ -1700,19 +1700,27 @@ test('[o3d-qn21] a no-identifier operation is escalated as a REPLAY, never as a 
   assert.doesNotMatch(description, /cancel the rest/, 'there is no operation that cancels a queued copy')
   assert.doesNotMatch(description, /then settle sync row log-1 by hand/, 'and none that settles this row')
   assert.match(description, /IMS CANNOT CANCEL A QUEUED COPY/)
-  assert.match(description, /WHAT YOU CANNOT DO WHILE QUICKBOOKS IS THE ACTIVE CONNECTOR: settle sync row log-1 by hand/)
-  // Round 4 (Codex HIGH): qualified, and pointing at the stranded-rows banner — the unqualified
-  // version denied the one per-row remedy that exists.
+
+  // ROUND 7, Codex HIGH — AND THE PER-ROW REMEDY ROUNDS 4-6 BUILT WAS RACEABLE ALL ALONG. Its
+  // precondition was the sync toggle, which both claim paths merely READ before calling the
+  // processor, so a run admitted a moment earlier can claim the row afterwards and — because
+  // persistFreshQboPost updates by id with no fence — overwrite the settlement. The whole
+  // count/settle/re-enable procedure is deleted rather than qualified; the race is driven end to
+  // end in tests/accounting/qbo-disable-is-not-quiescence.ts.
+  assert.doesNotMatch(description, /settle sync row log-1/)
   assert.doesNotMatch(description, /refuses EVERY QuickBooks row/)
-  assert.match(description, /STRANDED SYNC ROWS/)
+  assert.doesNotMatch(description, /STRANDED SYNC ROWS/)
+  assert.match(description, /THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE/)
+  assert.match(description, /ESCALATE sync row log-1/)
   assert.match(
     description,
     /kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order id/,
-    'the half that IS runnable — counting them — is still named precisely enough to run',
+    'the half that IS runnable — inspecting them — is still named precisely enough to run',
   )
-  assert.match(description, /quickbooks_sync_enabled/, 'and the one lever that stops the replay is named')
+  assert.match(description, /quickbooks_sync_enabled/, 'and the one lever that stops new runs is named')
   assert.match(description, /o3d-qn21/, 'and the durable fix is named, so the reader can see it is tracked')
   assert.match(description, /o3d-3lhp/, 'as are the two missing operations')
+  assert.match(description, /o3d-4b5p/, 'as is the quiescence fence a per-row remedy would need')
 
   // The console line and the durable record are the SAME wording — one incident, one story.
   assert.equal(escalation.level, 'ERROR')
