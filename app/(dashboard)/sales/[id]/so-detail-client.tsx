@@ -35,6 +35,7 @@ import type { ProductType } from '@/app/generated/prisma/client'
 import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-affordance'
+import { repackControlsFor } from '@/lib/domain/sales/repack-recovery-affordance'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
@@ -743,6 +744,31 @@ function ShipmentsPanel({
     })
   }
 
+  /**
+   * o3d-2k5r r4 — the RESUME, which the action already implemented and no control could reach.
+   *
+   * Same action, deliberately: it treats an already-pending draft as a resume point and runs the
+   * re-allocation and refund-backstop resolution against it. Nothing is reverted here and nothing
+   * physical is implied, so the confirmation says what is actually about to happen rather than
+   * repeating the reopen's "unpack the parcel first".
+   */
+  function handleFinishRepackRecovery(shipmentId: string) {
+    if (!window.confirm(
+      'This order was left part-way through a repack recovery: the shipment was reopened, but the '
+      + 'order was never re-netted against the refund and the refunded units are still reserved.\n\n'
+      + 'Finishing it re-nets the order and releases that reservation. Nothing is unpacked and no '
+      + 'shipment is changed — rebuild the draft with "Create Shipments" afterwards.\n\nContinue?',
+    )) return
+    setError('')
+    setWarning('')
+    startTransition(async () => {
+      const result = await reopenShipmentForRepackAction(shipmentId)
+      if (!result.success) { setError(result.error ?? 'Failed'); return }
+      if (result.warning) setWarning(result.warning)
+      onRefresh()
+    })
+  }
+
   // o3d-4kfh r6 (finding 4): the exit the component-graph refusal names. Dispatching a cancelled
   // order's shipment is refused (it would ship goods for a cancelled sale) and CANCELLED has no
   // transition to CANCELLED, so before this there was no way to clear the blocker at all.
@@ -826,21 +852,47 @@ function ShipmentsPanel({
                     {nextAction.label}
                   </Button>
                 )}
-                {/* o3d-2k5: only a COMMITTED, non-dispatched shipment can be reopened. A PENDING draft
-                    has nothing committed to undo ("Create Shipments" already replaces it), SHIPPED is
-                    terminal, and a cancelled order takes the discard path above instead. */}
-                {!isCancelledOrder && (s.status === 'PICKING' || s.status === 'PACKED') && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-xs"
-                    onClick={() => handleReopenForRepack(s.id, s.status)}
-                    disabled={isPending}
-                  >
-                    {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
-                    Reopen for repack
-                  </Button>
-                )}
+{/* o3d-2k5 / o3d-2k5r r4: which control renders in which state is decided by
+                    repack-recovery-affordance.ts, not by conditions written out here — that is the
+                    thing that was wrong (the resume point had no control at all) and it has to be
+                    assertable without a browser. Reopen acts on a COMMITTED shipment; Finish repack
+                    recovery acts on a DRAFT whose order still owes the recovery's netting and refund
+                    backstop. They are mutually exclusive by construction. */}
+                {(() => {
+                  const controls = repackControlsFor({
+                    shipmentStatus: s.status,
+                    orderStatus: orderStatus,
+                    recoveryOutstanding: s.repackRecoveryOutstanding,
+                  })
+                  return (
+                    <>
+                      {controls.includes('reopen') && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-xs"
+                          onClick={() => handleReopenForRepack(s.id, s.status)}
+                          disabled={isPending}
+                        >
+                          {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
+                          Reopen for repack
+                        </Button>
+                      )}
+                      {controls.includes('finish-recovery') && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-xs"
+                          onClick={() => handleFinishRepackRecovery(s.id)}
+                          disabled={isPending}
+                        >
+                          {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
+                          Finish repack recovery
+                        </Button>
+                      )}
+                    </>
+                  )
+                })()}
                 {s.status === 'SHIPPED' && (
                   <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => handleEditTracking(s)} disabled={isPending}>
                     Edit Tracking

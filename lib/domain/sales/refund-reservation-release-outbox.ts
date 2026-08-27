@@ -47,6 +47,12 @@ export type OutboxUpdateClient = {
   integrationOutbox: { updateMany(args: unknown): Promise<{ count: number }> }
 }
 
+/** o3d-2k5r r4: the READ half — what "is a repack recovery still outstanding?" needs. */
+export type OutstandingReleaseReadClient = {
+  salesOrderRefund: { findMany(args: unknown): Promise<Array<{ id: string }>> }
+  integrationOutbox: { count(args: unknown): Promise<number> }
+}
+
 export const REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR = 'sales'
 export const REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION = 'refund.reservation-release'
 const REFUND_RESERVATION_RELEASE_OUTBOX_WORKER = 'refund-reservation-release-drain'
@@ -185,6 +191,48 @@ export async function scheduleRefundUnmatchedWarningOutbox(
  * has already claimed (PROCESSING) or finished is left untouched. Best-effort: if this
  * fails, the drain re-runs the (numerically idempotent) release on the next tick.
  */
+/**
+ * o3d-2k5r r4 — THE DURABLE EVIDENCE THAT A REPACK RECOVERY IS STILL OUTSTANDING.
+ *
+ * The recovery's third step resolves these rows. So a row still sitting PENDING or
+ * RETRYABLE_FAILED for one of this order's refunds is exactly "the refunded units' reservation has
+ * not been released for this order yet", committed inside the refund's own transaction and
+ * therefore surviving every crash the recovery can suffer. It is what gates the "Finish repack
+ * recovery" control, so that control appears only where there is something to finish — and
+ * disappears once there is not.
+ *
+ * Deliberately NOT "the order has a PENDING shipment": every order with a draft has one, and
+ * offering the control on all of them would be an invitation to re-run a repair that is already
+ * done. Nor "an activity-log row exists": logActivity swallows write failures, so its absence
+ * proves nothing.
+ *
+ * A CLAIMED (PROCESSING) row is deliberately NOT counted. The drain holds it, and the drain is
+ * running the same repair; the operator offering to do it by hand at that moment would be racing a
+ * worker that already has it. If the drain fails it returns the row to RETRYABLE_FAILED and the
+ * control comes back on the next read.
+ */
+export async function countOutstandingRefundReservationReleases(
+  orderId: string,
+  options: { client?: OutstandingReleaseReadClient } = {},
+): Promise<number> {
+  const client = options.client ?? (db as unknown as OutstandingReleaseReadClient)
+  const refunds = await client.salesOrderRefund.findMany({ where: { orderId }, select: { id: true } })
+  if (refunds.length === 0) return 0
+  const idempotencyKeys = refunds.map((refund) => buildOutboxIdempotencyKey(
+    REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
+    REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
+    refund.id,
+  ))
+  return client.integrationOutbox.count({
+    where: {
+      connector: REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
+      operation: REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
+      idempotencyKey: { in: idempotencyKeys },
+      status: { in: [INTEGRATION_OUTBOX_STATUS.PENDING, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED] },
+    },
+  })
+}
+
 export async function resolveRefundReservationReleaseOutbox(
   refundId: string,
   options: { client?: OutboxUpdateClient } = {},
