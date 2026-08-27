@@ -1014,6 +1014,32 @@ export async function repairAccountingBackReferences(
    * again be holding one generation. The `+1ms` floor is not a tie-breaker for a rare case; it is
    * the property the whole fence rests on.
    *
+   * WHAT IT DOES NOT GUARANTEE, STATED BECAUSE r3 OVERCLAIMED IT (o3d-0bfh r4, Codex). r3 argued
+   * livelock was impossible "because the claim is monotonic and the cursor rotates". Both halves are
+   * true and neither is about progress:
+   *
+   *   • Monotonicity buys SAFETY — at most one holder per generation, and no discharge by a
+   *     non-holder. A run that loses writes nothing, so the row is left exactly as it was and the
+   *     next run starts from the same state. Losing costs nothing; it also achieves nothing.
+   *   • The cursor is a FAIRNESS device WITHIN the population, not mutual exclusion BETWEEN runs. It
+   *     stops a persistently failing head eating every run's budget. It does not keep two runs apart
+   *     — they read the same persisted cursor, so overlapping runs tend to scan the same page, which
+   *     makes them MORE likely to meet on a row rather than less.
+   *
+   * The window a competitor has to hit is narrow — claim, enqueue, settle, which is one enqueue call
+   * wide rather than a whole run — but under CONTINUOUSLY overlapping runs (a cron tick that outruns
+   * its period, the manual sweep behind the sync button, and since r4 a connector re-posting the same
+   * row) there is no bound on how long a row's SETTLEMENT can be starved. Each new claim invalidates
+   * the previous holder's pending verdict.
+   *
+   * What is starved is only the verdict. The obligation stays set — the safe direction — and every
+   * deferred pass re-enqueues idempotently, so no money and no work is lost; what does not happen is
+   * `backReferenceCheckedAt`, so the row stays a candidate for ever and occupies a slot in every
+   * scan. The only signal is the `settlementDeferred` counter, which reaches the cron response JSON
+   * and nothing else: o3d-3ix5. So the weaker true version is that this protocol is SAFE
+   * unconditionally and LIVE only on the assumption that some claim-to-settle window eventually
+   * completes uncontended — and that a permanently contended row is invisible until o3d-3ix5 lands.
+   *
    * A monotonic generation is also the honest reading of the column: it stops meaning "the instant
    * the obligation was first recorded" and starts meaning "the instant it was last claimed", which
    * is what every reader of it already uses it for. No reader compares it to a wall clock; the
