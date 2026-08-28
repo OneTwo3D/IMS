@@ -27,7 +27,7 @@ import {
   summariseRepackBlockers,
 } from '@/lib/domain/sales/repack-recovery-affordance'
 import {
-  countOutstandingRefundReservationReleases,
+  countUnfinishedRefundReservationReleases,
   type OutstandingReleaseReadClient,
 } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
@@ -990,12 +990,28 @@ export async function reopenShipmentForRepack(
  *
  * Both facts are re-read here rather than passed in. The caller's `lockedShipment` is one shipment;
  * the question is about the ORDER, and the sibling that matters is the one nobody looked at.
+ *
+ * AND IT IS A DIFFERENT READ FROM THE ONE THAT RENDERS THE BUTTON (o3d-2k5r r8, Codex).
+ *
+ * r7 reused the affordance's read (now `countResumableRefundReservationReleases`) on the reasonable
+ * principle that two surfaces answering one question differently is the defect this whole branch
+ * exists to fix. But these two are not one question. That read excludes PROCESSING — correctly, for
+ * a control: while the drain owns the row the operator has nothing to press. A fence needs the
+ * opposite, because a worker OWNING the row is exactly when a dispatch must not proceed:
+ * `claimIntegrationOutboxWork` writes PROCESSING before the drain calls allocation and WITHOUT
+ * taking this order lock, so a dispatch landing in that window would have counted zero, committed
+ * SHIPPED, and left the worker to discover the wall a moment later with the row already claimed.
+ * The order lock cannot serialize a claim that never took it — so the fence counts the claim.
+ *
+ * `countUnfinishedRefundReservationReleases` therefore counts every non-SUCCEEDED release state.
+ * What it deliberately does NOT count is SUCCEEDED: the release has happened, the order owes
+ * nothing, and that is every ordinary dispatch in the system.
  */
 export async function validateDispatchPreservesRepackRecovery(
   client: ShipmentServiceClient,
   orderId: string,
 ): Promise<string | null> {
-  const outstanding = await countOutstandingRefundReservationReleases(orderId, {
+  const outstanding = await countUnfinishedRefundReservationReleases(orderId, {
     client: client as unknown as OutstandingReleaseReadClient,
   })
   const shipments = await client.shipment.findMany({

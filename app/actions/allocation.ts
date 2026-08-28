@@ -53,7 +53,7 @@ import {
   transitionShipmentStatus,
   type OrderCompletionAuthority,
 } from '@/lib/domain/sales/shipment-service'
-import { countOutstandingRefundReservationReleases, resolveRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
+import { countResumableRefundReservationReleases, resolveRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { describeRepackReallocation } from '@/lib/domain/sales/repack-recovery-report'
 import { shipmentIsUnreopenableCommitment, summariseRepackBlockers } from '@/lib/domain/sales/repack-recovery-affordance'
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
@@ -300,7 +300,13 @@ export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]>
   await requireInternalUser()
   // o3d-2k5r r4: the durable evidence that this order still owes the repack recovery's
   // re-allocation and refund-backstop steps. One count for the order, not one per shipment.
-  const outstandingReleases = await countOutstandingRefundReservationReleases(orderId)
+  //
+  // o3d-2k5r r8: the RESUMABLE read, deliberately narrower than the dispatch fence's
+  // (`countUnfinishedRefundReservationReleases`). This one decides whether to render a BUTTON, so a
+  // row the drain currently holds (PROCESSING) is not evidence for it — there is nothing the
+  // operator can do with a row a worker owns, and the resolver would refuse to clear it. The fence
+  // asks the opposite question and gets the opposite answer for that same row.
+  const outstandingReleases = await countResumableRefundReservationReleases(orderId)
   const rows = await db.shipment.findMany({
     where: { orderId },
     include: {
