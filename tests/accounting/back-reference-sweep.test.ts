@@ -3389,6 +3389,142 @@ test('[o3d-0bfh + o3d-bqw7 r2] a LINKED tombstone whose receipt is still unregis
   )
 })
 
+// ---------------------------------------------------------------------------
+// AND THE OTHER AXIS OF THE SAME ANSWER, AT THE SAME CALL SITE (Codex HIGH, this round).
+//
+// The two tests above and the two o3d-peh1 tests further up were each written about ONE fact:
+// o3d-0bfh about `deferredReceiptsSettled`, o3d-peh1 about `enqueued`. The outcome carries both
+// deliberately, because they are independent — the connector can decline the enqueue outright for a
+// reason that has nothing to do with receipts, while the deferred-receipt re-drive has nothing
+// outstanding to report — and o3d-peh1 reached only two of the three call sites. The LINKED
+// tombstone was the one it did not reach, so `{enqueued: false, deferredReceiptsSettled: true}`
+// walked straight past the only check that branch had.
+//
+// The pair below drives that combination in both directions: refused and clean, then enqueued and
+// clean. One test alone proves nothing here — a guard that refuses everything passes the first and
+// fails the second, which is how an over-broad fix would have shipped.
+// ---------------------------------------------------------------------------
+
+test('[Codex HIGH] a LINKED tombstone whose enqueue was REFUSED is neither settled nor discarded', async () => {
+  // MUTATION THAT KILLS THIS: delete the `if (!(await reportRefusedFollowUps(row, tombstoneOutcome)))`
+  // block from the `evidenceOnly && owesFollowUps` arm of `repairAccountingBackReferences`. RUN: the
+  // row is then stamped, its marker cleared and `xero_backreference_followups_discarded` written —
+  // the terminal loss announced for a rebuildable half that was never queued. Four assertions below
+  // go red on it.
+  //
+  // ROUTE: the real `repairAccountingBackReferences`, over a row that is LINKED
+  // (`orders[0].accountingInvoiceId` is set, so `missing` is false), COMPACTED
+  // (`backReferenceEvidenceCompactedAt`, so `evidenceOnly`) and RECORDS OUTSTANDING WORK
+  // (`followUpObligations`, so `owesFollowUps`) — the exact predicate that selects the branch. The
+  // enqueue double answers a real `refusedFollowUpEnqueue(...)`, and `unsettledFollowUpsFor` is left
+  // EMPTY so `deferredReceiptsSettled` is true: the check that already existed here is satisfied,
+  // and only the new one can stop the settlement.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, {
+      status: 'FAILED',
+      payload: {},
+      backReferenceEvidenceCompactedAt: at(500),
+      connectionProvenance: 'xero:tenant-A',
+      // A TRUE terminal discard is recorded, so the branch really does have something to announce
+      // and consume the marker for — which is what makes the ordering load-bearing rather than moot.
+      followUpObligations: ['payment-registration', 'invoice-pdf'],
+    })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: 'XINV-1' }],
+  })
+  harness.refuseFollowUpsFor.add('log-0001')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  // THE PRECONDITION, ASSERTED RATHER THAN ASSUMED: the branch was reached with the refusal as its
+  // ONLY objection. If the receipt half had also been false this test would pass through the check
+  // that already existed and prove nothing about the new one.
+  assert.equal(run.followUpsUnsettled, 0,
+    'the receipt axis is CLEAN on this run — nothing here is stopped by the check that predates it')
+  assert.equal(harness.followUps.length, 0, 'and nothing was enqueued, which is what a refusal means')
+
+  assert.equal(run.failed, 1,
+    'a pass that queued nothing against a row that owes work is a failure — the sibling '
+    + 'follow-ups-only path counts it the same way, and for the same reason: nothing was written here')
+
+  const row = harness.store.syncRows[0]
+  assert.equal(row.backReferenceCheckedAt, null,
+    'a stamped row is never a candidate again, so stamping this one loses the rebuildable half for good')
+  assert.ok(row.backReferenceFollowUpsPendingAt,
+    'and the marker is the only surviving record that the work is still owed')
+  assert.equal(
+    harness.activities.find((entry) => entry.action === 'xero_backreference_followups_discarded'),
+    undefined,
+    'the TERMINAL discard is not announced either: it CONSUMES the marker, and consuming it for a '
+      + 'rebuildable half that was never queued is exactly the silence this check exists to remove',
+  )
+
+  const refused = harness.activities.find((entry) => entry.action === 'xero_backreference_followup_refused')
+  assert.ok(refused, 'and the operator is told WHY nothing went out, by this caller and not only by the enqueue')
+  assert.match(refused.description, /the ledger already holds a payment matching this attempt/,
+    "the enqueue's own message travels verbatim, as it does at the other two call sites")
+
+  // AND IT CLEARS — a refusal defers this row, it does not retire it.
+  harness.refuseFollowUpsFor.clear()
+  const second = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.equal(second.failed, 0)
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-0001'],
+    'the rebuildable half goes out on the pass that could queue it')
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'NOW it settles')
+  assert.ok(
+    harness.activities.some((entry) => entry.action === 'xero_backreference_followups_discarded'),
+    'and only now is the permanent loss announced',
+  )
+})
+
+test('[Codex HIGH] a LINKED tombstone whose enqueue SUCCEEDED still settles', async () => {
+  // MUTATION THAT KILLS THIS: drop the `if (outcome.enqueued) return true` early-out from
+  // `reportRefusedFollowUps`, so the helper reports and refuses unconditionally. RUN: the row is
+  // never stamped, the marker survives for ever, the discard is never announced and `failed` is 1 —
+  // five assertions below go red. That is the over-broad fix this test exists to refuse, and it is
+  // why the refused case above cannot be shipped on its own.
+  //
+  // ROUTE: the same real `repairAccountingBackReferences` over the same LINKED + COMPACTED +
+  // OWES-FOLLOW-UPS row as the test above, with BOTH `refuseFollowUpsFor` and
+  // `unsettledFollowUpsFor` left empty — `{enqueued: true, deferredReceiptsSettled: true}`, the
+  // combination on which every gate must stand aside.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, {
+      status: 'FAILED',
+      payload: {},
+      backReferenceEvidenceCompactedAt: at(500),
+      connectionProvenance: 'xero:tenant-A',
+      followUpObligations: ['payment-registration', 'invoice-pdf'],
+    })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: 'XINV-1' }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  // THE PRECONDITION: this really is the tombstone branch, not the repair path — nothing was
+  // re-applied, and the enqueue the branch owes was actually made.
+  assert.equal(run.repaired, 0, 'the row was already linked, so no repair happened')
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-0001'],
+    'the rebuildable half went out — this is the branch under test')
+
+  assert.equal(run.failed, 0, 'nothing refused anything, so nothing may be counted as a failure')
+  assert.equal(run.followUpsUnsettled, 0, 'and no receipt is outstanding')
+  assert.equal(
+    harness.activities.some((entry) => entry.action === 'xero_backreference_followup_refused'),
+    false,
+    'a clean enqueue must not be reported as refused — the guard reads the outcome, it does not assume one',
+  )
+
+  const row = harness.store.syncRows[0]
+  assert.ok(row.backReferenceCheckedAt, 'the row settles')
+  assert.equal(row.backReferenceFollowUpsPendingAt, null, 'and its obligation is discharged')
+  assert.ok(
+    harness.activities.some((entry) => entry.action === 'xero_backreference_followups_discarded'),
+    'the terminal half is announced, which is what permits the settlement at all',
+  )
+})
+
 test('[o3d-0bfh r3 + o3d-bqw7 r2] a TOMBSTONE that loses the obligation claim writes nothing at all', async () => {
   // MUTATION THAT KILLS THIS: restore the `if (!evidenceOnly)` guard around
   // `claimFollowUpObligation` on the repair path (and with it
