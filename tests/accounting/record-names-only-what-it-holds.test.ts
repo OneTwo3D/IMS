@@ -7766,6 +7766,94 @@ test('ROUND 32 (Codex HIGH): a prototype method written after import cannot reac
     + 'would be redundant with round 21 and the runtime assertions above would be proving nothing new',
   )
 
+  // (V4b) AND THE REST OF THE DERIVATION IS CHECKED RATHER THAN RECALLED. (V4) closes the one
+  // construct that is unmistakably a dispatch — a call through a receiver — and the list at the foot
+  // of the model claims more than that: that NOTHING either renderer executes resolves a name
+  // through anything a program can write. That claim is only as good as the enumeration behind it,
+  // and an enumeration written from memory is the mistake this round is about. So it is an
+  // ALLOWLIST OF SYNTAX, swept off the two bodies: every kind of node they may contain, each with
+  // the reason it dispatches nothing, and anything else is refused by name.
+  //
+  // What is deliberately NOT on it, and why each would be another entry in the conditions:
+  //   • `for...of`, spread, and array destructuring — all three run the ITERATOR PROTOCOL, which is
+  //     `Array.prototype[Symbol.iterator]` and the iterator's own `next`.
+  //   • a tagged template — it CALLS the tag.
+  //   • `new`, `instanceof`, `in` — a constructor, `Symbol.hasInstance`, `Symbol.unscopables`.
+  //   • `await` / `yield` — `then` is read off whatever is awaited.
+  const ALLOWED_IN_A_RENDERER: readonly { kind: ts.SyntaxKind; because: string }[] = [
+    // Structure. No expression is evaluated by any of these.
+    { kind: ts.SyntaxKind.Block, because: 'a block evaluates nothing itself' },
+    { kind: ts.SyntaxKind.SwitchStatement, because: 'a switch clause is selected by `===`' },
+    { kind: ts.SyntaxKind.CaseBlock, because: 'structure' },
+    { kind: ts.SyntaxKind.CaseClause, because: 'structure' },
+    { kind: ts.SyntaxKind.IfStatement, because: 'a condition this walk has already accounted for' },
+    { kind: ts.SyntaxKind.ReturnStatement, because: 'structure' },
+    { kind: ts.SyntaxKind.VariableStatement, because: 'a local binding is a scope slot, not a property' },
+    { kind: ts.SyntaxKind.VariableDeclarationList, because: 'the same' },
+    { kind: ts.SyntaxKind.VariableDeclaration, because: 'the same' },
+    // Values. A scope lookup, a literal, or a fold over primitives.
+    { kind: ts.SyntaxKind.Identifier, because: 'a scope lookup, which nothing outside the module can reach' },
+    { kind: ts.SyntaxKind.StringLiteral, because: 'a primitive' },
+    { kind: ts.SyntaxKind.NumericLiteral, because: 'a primitive — the two tuple indices' },
+    { kind: ts.SyntaxKind.TemplateExpression, because: 'ToString of a string PRIMITIVE returns it unread' },
+    { kind: ts.SyntaxKind.TemplateHead, because: 'literal text' },
+    { kind: ts.SyntaxKind.TemplateMiddle, because: 'literal text' },
+    { kind: ts.SyntaxKind.TemplateTail, because: 'literal text' },
+    { kind: ts.SyntaxKind.TemplateSpan, because: 'the substitution, whose operand is typed `string`' },
+    { kind: ts.SyntaxKind.ConditionalExpression, because: 'selection, on a condition accounted for below' },
+    { kind: ts.SyntaxKind.QuestionToken, because: 'punctuation' },
+    { kind: ts.SyntaxKind.ColonToken, because: 'punctuation' },
+    { kind: ts.SyntaxKind.BinaryExpression, because: 'only `+` and `===` appear, and both are checked below' },
+    { kind: ts.SyntaxKind.PlusToken, because: 'ToPrimitive of a primitive returns it unread' },
+    { kind: ts.SyntaxKind.EqualsEqualsEqualsToken, because: 'strict equality on primitives reads no property' },
+    // The two reads, both of them own properties — see items 1 to 3 at the foot of the model.
+    { kind: ts.SyntaxKind.PropertyAccessExpression, because: 'an own property of an argument or a frozen table' },
+    { kind: ts.SyntaxKind.ElementAccessExpression, because: 'a fenced key, or an index inside a fixed tuple' },
+    // And the call, which (V4) has already held to a plain name.
+    { kind: ts.SyntaxKind.CallExpression, because: 'held to an identifier callee by (V4)' },
+  ]
+  const kindsOutsideTheList = (source: string): string[] => {
+    const file = ts.createSourceFile('renderer-kinds.ts', source, ts.ScriptTarget.ES2022, true)
+    const allowed = new Set(ALLOWED_IN_A_RENDERER.map((entry) => entry.kind))
+    const offences: string[] = []
+    let swept = 0
+    const sweep = (node: ts.Node): void => {
+      swept += 1
+      if (!allowed.has(node.kind)) offences.push(ts.SyntaxKind[node.kind]!)
+      ts.forEachChild(node, sweep)
+    }
+    const visit = (node: ts.Node): void => {
+      if (ts.isFunctionDeclaration(node) && node.name
+        && ANALYZER_ROOT_RENDERERS.includes(node.name.text as (typeof ANALYZER_ROOT_RENDERERS)[number])) {
+        assert.ok(node.body, `${node.name.text} has no body`)
+        ts.forEachChild(node.body!, sweep)
+      }
+      ts.forEachChild(node, visit)
+    }
+    ts.forEachChild(file, visit)
+    assert.ok(swept > 60, `the kind sweep visited ${swept} nodes, so it read one renderer or neither`)
+    return [...new Set(offences)]
+  }
+  assert.deepEqual(
+    kindsOutsideTheList(model), [],
+    'a renderer executes a construct the conditions at the foot of the model do not account for. Either it '
+    + 'resolves nothing through a prototype — in which case add it here WITH ITS REASON and to that list — or '
+    + 'it does, and the guarantee has quietly acquired another condition',
+  )
+  // NON-VACUITY: the sweep refuses what it is written to refuse, on the construct that would put the
+  // iterator protocol back into a renderer.
+  const withIteration = model.replace(
+    "      const administrator = 'to whoever administers this installation'",
+    "      let administrator = ''\n"
+    + "      for (const part of ['to whoever administers this installation']) administrator = part",
+  )
+  assert.notEqual(withIteration, model, 'the iteration mutation must actually have been applied')
+  assert.ok(
+    kindsOutsideTheList(withIteration).includes('ForOfStatement'),
+    `a \`for...of\` must be refused by the sweep — it dispatches \`Symbol.iterator\` and the iterator's own `
+    + `\`next\`. Saw: ${JSON.stringify(kindsOutsideTheList(withIteration))}`,
+  )
+
   // (V5) AND THE PHRASES ARE STILL DERIVED FROM THE AXES rather than written out beside them. The
   // dispatch went; the derivation did not. Every axis of every list appears in the phrase that list
   // builds, in order, and the phrase indexes exactly as many positions as the list has — so a list
