@@ -3087,6 +3087,14 @@ type ComputedRendererOutput = {
  */
 type ContextBinding = 'SYMBOLIC' | 'CONCRETE'
 
+/**
+ * WHETHER A CHECKER LITERAL TYPE IS FOLDED ON ITS PROVENANCE OR ON THE CHECKER'S WORD ALONE.
+ * `'TRACKED'` is what ships and what every judgement uses; `'UNTRACKED'` reproduces the round-22
+ * fold — any single-literal checker type becomes a concrete string — and exists only so control (K)
+ * can show what that fold let past.
+ */
+type LiteralProvenance = 'TRACKED' | 'UNTRACKED'
+
 /** The three intrinsics this walk will evaluate, and only over a list it computed itself. */
 const INTRINSIC_LIST_OPERATIONS = ['join', 'slice', 'map'] as const
 
@@ -3217,6 +3225,7 @@ function computeRendererOutput(
   model: string,
   extraFiles: Record<string, string> = {},
   contextBinding: ContextBinding = 'SYMBOLIC',
+  literalProvenance: LiteralProvenance = 'TRACKED',
 ): ComputedRendererOutput {
   const program = directionModelProgram(model, extraFiles)
   const checker = program.getTypeChecker()
@@ -3280,6 +3289,96 @@ function computeRendererOutput(
       values.push(part.value)
     }
     return values.length > 0 ? values : null
+  }
+
+  /**
+   * WHERE A CHECKER LITERAL TYPE CAME FROM (round 23, Codex HIGH).
+   *
+   * Reading a discriminant off a value this walk holds only as OPAQUE is sound when the literal
+   * type is DECLARED — a property signature of the closed union this module writes down. Round 22
+   * said as much, and said it too broadly: "knowledge about the program, not a stand-in for a
+   * runtime value" is true ONLY when the literal type has honest provenance. An `as` assertion
+   * MANUFACTURES a literal type out of a value that is not known until run time, and the checker
+   * reports the manufactured one exactly as confidently as the declared one. So
+   * `const { ledger } = context as { ledger: 'QuickBooks'; syncRowId: string }` restores precisely
+   * the pruning round 22 closed: `ledger` is then ONE literal, a comparison against another
+   * connector's name folds FALSE, and the arm production takes at run time is never computed.
+   *
+   * These two answer WHERE: null when the provenance is clean, and the reason to refuse otherwise.
+   * A refusal makes the value UNKNOWN, which makes its comparison indeterminate, which takes BOTH
+   * arms — the same safe direction a SYMBOL takes. THE RULE IS THE ROUND-22 ONE, one level in: a
+   * value whose type this walk did not itself receive from a declaration must make its condition
+   * indeterminate, NEVER false.
+   */
+  function literalOrigin(node: ts.Node, seen: Set<ts.Node>): string | null {
+    if (seen.has(node)) return 'a literal type whose origin leads back to itself, so it cannot be traced'
+    seen.add(node)
+    // `(x)` and `x!` cannot invent a literal that was not already in the type underneath them.
+    if (ts.isParenthesizedExpression(node) || ts.isNonNullExpression(node)) {
+      return literalOrigin(node.expression, seen)
+    }
+    if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) || ts.isSatisfiesExpression(node)) {
+      return 'a literal type MANUFACTURED by an assertion over a value this walk does not know. An assertion '
+        + 'is a claim about run time; the checker reports it as confidently as a declared type, and folding it '
+        + 'would decide away the branch production actually takes'
+    }
+    if (ts.isPropertyAccessExpression(node)) {
+      return literalOrigin(node.expression, seen) ?? symbolOrigin(node.name, seen)
+    }
+    if (ts.isElementAccessExpression(node)) return literalOrigin(node.expression, seen)
+    if (ts.isIdentifier(node)) return symbolOrigin(node, seen)
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return null
+    return `a ${ts.SyntaxKind[node.kind]}, whose literal type this walk cannot trace to a declaration`
+  }
+
+  function symbolOrigin(name: ts.MemberName, seen: Set<ts.Node>): string | null {
+    const symbol = aliasResolved(checker.getSymbolAtLocation(name))
+    if (!symbol) return `"${name.text}" resolves to no symbol, so where its literal type came from is unknown`
+    const declarations = symbol.declarations ?? []
+    if (declarations.length === 0) {
+      return `"${name.text}" has no declaration, so where its literal type came from is unknown`
+    }
+    for (const declaration of declarations) {
+      // A BINDING ELEMENT is INDETERMINATE, always. Its literal type is whatever the value it was
+      // destructured out of was declared OR ASSERTED to have, and that assertion is not on this
+      // node — there is nothing here to read it off. This is Codex's route.
+      if (ts.isBindingElement(declaration)) {
+        return `"${name.text}" is a BINDING ELEMENT: its literal type is whatever the value it was destructured `
+          + 'out of was declared OR ASSERTED to have, so it is not knowledge about the program'
+      }
+      // THE HONEST PROVENANCE, and the only one that folds: a type annotation somebody wrote down.
+      // A property signature of the closed direction union, a parameter's declared contract, an
+      // enum member. `direction.target` and `direction.form` are these, and nothing else here is.
+      if (ts.isParameter(declaration) || ts.isPropertySignature(declaration) || ts.isPropertyDeclaration(declaration)
+        || ts.isEnumMember(declaration) || ts.isTypeAliasDeclaration(declaration)
+        || ts.isInterfaceDeclaration(declaration) || ts.isTypeParameterDeclaration(declaration)) {
+        continue
+      }
+      // A value whose type is its initializer's is honest exactly as far as that initializer is.
+      if (ts.isVariableDeclaration(declaration) || ts.isPropertyAssignment(declaration)) {
+        if (!declaration.initializer) {
+          return `"${name.text}" has no initializer, so where its literal type came from is unknown`
+        }
+        const inner = literalOrigin(declaration.initializer, seen)
+        if (inner) return inner
+        continue
+      }
+      return `"${name.text}" resolves to a ${ts.SyntaxKind[declaration.kind]}, whose literal type this walk `
+        + 'cannot trace to a declaration'
+    }
+    return null
+  }
+
+  /**
+   * The closed set of strings the checker says an expression can be, AS A VALUE — folded to text
+   * only when `literalOrigin` says the type was declared rather than asserted into existence.
+   */
+  const checkerLiterals = (node: ts.Expression): Value | null => {
+    const literals = literalStrings(node)
+    if (literals === null) return null
+    const manufactured = literalProvenance === 'TRACKED' ? literalOrigin(node, new Set()) : null
+    if (manufactured !== null) return unknown(`this walk will not fold a checker literal here: ${manufactured}`)
+    return { kind: 'STRING', shapes: literals.map((value) => shapeOf([{ kind: 'TEXT', text: value }])) }
   }
 
   /** `declare`d here or anywhere above here — an implementation that lives outside this program. */
@@ -3522,8 +3621,8 @@ function computeRendererOutput(
       if (!variable.initializer) return unknown(`"${node.text}" has no initializer, so its value is unknown`)
       return valueOf(variable.initializer)
     }
-    const literals = literalStrings(node)
-    if (literals) return { kind: 'STRING', shapes: literals.map((value) => shapeOf([{ kind: 'TEXT', text: value }])) }
+    const literals = checkerLiterals(node)
+    if (literals) return literals
     return unknown(`"${node.text}" resolves to a ${ts.SyntaxKind[declarations[0]!.kind]}, whose value this walk `
       + 'cannot compute')
   }
@@ -3535,8 +3634,8 @@ function computeRendererOutput(
       if (value !== undefined) return value
     }
     if (object.kind === 'LIST' && node.name.text === 'length') return { kind: 'NUMBER', value: object.items.length }
-    const literals = literalStrings(node)
-    if (literals) return { kind: 'STRING', shapes: literals.map((value) => shapeOf([{ kind: 'TEXT', text: value }])) }
+    const literals = checkerLiterals(node)
+    if (literals) return literals
     if (object.kind === 'UNKNOWN') return object
     return unknown(`the property "${node.name.text}" is read off a value this walk cannot compute`)
   }
@@ -3558,8 +3657,8 @@ function computeRendererOutput(
       if (values.some((value) => value === undefined)) return unknown('a property key that names nothing in the object')
       return unionValues(values as Value[])
     }
-    const literals = literalStrings(node)
-    if (literals) return { kind: 'STRING', shapes: literals.map((value) => shapeOf([{ kind: 'TEXT', text: value }])) }
+    const literals = checkerLiterals(node)
+    if (literals) return literals
     if (object.kind === 'UNKNOWN') return object
     return unknown('an element read off a value this walk cannot compute')
   }
@@ -3729,8 +3828,9 @@ function judgeRendererOutput(
   model: string,
   extraFiles: Record<string, string> = {},
   contextBinding: ContextBinding = 'SYMBOLIC',
+  literalProvenance: LiteralProvenance = 'TRACKED',
 ): string[] {
-  const computed = computeRendererOutput(model, extraFiles, contextBinding)
+  const computed = computeRendererOutput(model, extraFiles, contextBinding, literalProvenance)
   const reviewed = RENDERED_DIRECTIONS.map((entry) => entry.text)
   const complaints = [...computed.unresolved]
   for (const shape of computed.direction) {
