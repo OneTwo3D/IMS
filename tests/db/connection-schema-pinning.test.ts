@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import net from 'node:net'
 import test, { type TestContext } from 'node:test'
 
 import { parse as parseDotenv } from 'dotenv'
@@ -2420,6 +2421,342 @@ test('o3d-2k5r r22 (live): the provisioning seeder refuses a backend the verdict
     }
   } finally {
     resetStartupOptionByteSafety()
+    await scratch.drop()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r23, Codex HIGH — A CLIENT SOCKET IS NOT A SERVER BACKEND.
+//
+// r22 put the check on `onConnect`, which pg-pool awaits once per NEW PHYSICAL CONNECTION and
+// deliberately never on reuse. Under a transaction- or statement-pooling proxy one client socket is
+// many server backends over its life, so the guard runs on A and the application's next statement
+// runs on B with no new pg client created and therefore no second check. The tests below are about
+// the answer chosen for that: a connection that cannot be shown to reach the backend DIRECTLY may
+// not carry licensed non-ASCII bytes at all.
+//
+// WHY REFUSING COSTS NOTHING THAT WORKED — measured, against PgBouncer 1.24.1 in front of
+// PostgreSQL 17.11 with a schema named `tënant` that a direct connection pins correctly:
+//   * default configuration, `pool_mode = transaction` AND `pool_mode = session`: the pooler refuses
+//     the connection outright with `FATAL: unsupported startup parameter in options: search_path`;
+//   * `ignore_startup_parameters = search_path` or `track_extra_parameters = search_path`: the
+//     connection is accepted and the option is DISCARDED — `current_setting('search_path')` came
+//     back `"$user", public` on five consecutive connections and the query resolved
+//     `public.marker`. `-c statement_timeout=1234` sent the same way returned `1234ms` direct and
+//     `0` through the pooler, so no startup `options` content reaches the backend at all.
+// A non-ASCII schema behind a pooler was therefore already broken, silently. See the block comment
+// over `interposedConnectionRefusal()` in lib/db/database-url-schema.mjs.
+// ---------------------------------------------------------------------------
+
+/**
+ * A `pg.Client` stand-in that reports its own socket AND what the backend says it sees, so the
+ * peer comparison has both halves to compare. `servedConnection()` above has neither, which is why
+ * it is admitted by this leg — an answer that carries no peer is unanswerable, not wrong.
+ */
+function servedOverSocket(options: {
+  backend: Record<string, unknown>
+  searchPath: string
+  /** Our end of the socket, as node reports it. */
+  ourPort: number
+  ourAddress?: string
+  /** What the backend says its client is. Equal to ours on a direct connection. */
+  backendSeesPort: string
+  backendSeesAddress?: string
+  /** Answers to any query that is not the guard's — i.e. the consumer's. */
+  onConsumerQuery?: (text: string) => { rows: Array<Record<string, unknown>> }
+}) {
+  const asked: string[] = []
+  return {
+    asked,
+    connection: { stream: { localAddress: options.ourAddress ?? '10.9.9.9', localPort: options.ourPort } },
+    async query(text: string) {
+      asked.push(text)
+      if (text.startsWith('select pg_encoding_to_char')) {
+        return {
+          rows: [{
+            ...options.backend,
+            search_path: options.searchPath,
+            client_address: options.backendSeesAddress ?? '10.9.9.9',
+            client_port: options.backendSeesPort,
+          }],
+        }
+      }
+      return options.onConsumerQuery?.(text) ?? { rows: [] }
+    },
+  }
+}
+
+test('o3d-2k5r r23: the guard reaches backend A, the consumer would reach backend B — and never does', async () => {
+  resetStartupOptionByteSafety()
+  try {
+    // ROUTE: establishStartupOptionByteSafety() -> the verdict's `backend` -> pgConnectionConfig()'s
+    // `onConnect` -> pg-pool's per-physical-connection hook -> interposedConnectionRefusal().
+    await establishStartupOptionByteSafety(R22_URL, { createClient: fanOutClient([ONE_BACKEND]) })
+    const onConnect = pgConnectionConfig(R22_URL).onConnect!
+
+    // THE MULTIPLEXED TOPOLOGY, exactly as Codex states it. The guard's query is answered by the
+    // measured backend A, with the pin intact — both r22 legs pass — because that is what a proxy
+    // that forwards the startup packet looks like at connect time. The consumer's query would be
+    // answered by a DIFFERENT backend B, because between the two the proxy re-assigned the server
+    // side. The only thing that distinguishes this connection from a direct one is that the backend
+    // does not see OUR socket: 55001 is the proxy's port to the server, 41000 is ours to the proxy.
+    let consumerRanOn: string | null = null
+    const multiplexed = servedOverSocket({
+      backend: ONE_BACKEND,
+      searchPath: '"ténant"',
+      ourPort: 41000,
+      ourAddress: '10.9.9.9',
+      backendSeesPort: '55001',
+      backendSeesAddress: '10.0.0.250',
+      onConsumerQuery: () => {
+        consumerRanOn = 'backend B'
+        return { rows: [{ current_schema: 'public' }] }
+      },
+    })
+
+    // MUTATION ROUTE: delete the `interposedConnectionRefusal(client, row)` call from
+    // startupOptionBackendGuard(). Both remaining legs pass — the identity IS the measured backend
+    // and the search_path IS the pin — so the connection is admitted, `consumerRanOn` becomes
+    // 'backend B', and the licensed bytes are spent on a server nothing measured. That is the
+    // finding, in the smallest form it can be stated.
+    await assert.rejects(
+      () => onConnect(multiplexed),
+      (error: unknown) => {
+        assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+        assert.match((error as Error).message, /"10\.0\.0\.250:55001"/, 'the refusal names what the backend sees')
+        assert.match((error as Error).message, /"10\.9\.9\.9:41000"/, 'and what this process actually holds')
+        assert.match((error as Error).message, /terminated the connection and opened its own/)
+        return true
+      },
+      'a connection whose far end is not ours may not carry licensed bytes',
+    )
+    assert.equal(consumerRanOn, null, 'and the consumer statement never reached backend B')
+    assert.equal(multiplexed.asked.length, 1, 'the refusal costs the same one round trip, and no more')
+  } finally {
+    resetStartupOptionByteSafety()
+  }
+})
+
+test('o3d-2k5r r23: a direct connection is admitted, and an absent peer is not treated as a wrong one', async () => {
+  resetStartupOptionByteSafety()
+  try {
+    await establishStartupOptionByteSafety(R22_URL, { createClient: fanOutClient([ONE_BACKEND]) })
+    const onConnect = pgConnectionConfig(R22_URL).onConnect!
+
+    // 1. DIRECT: the backend's client IS this process's socket, so the leg passes. Without this
+    // half the test above would pass on a blanket refusal that strands every deployment.
+    //
+    // MUTATION ROUTE: compare `ours.port` against `backendSees.address`, or drop the `-1`/''
+    // early return so every answer is compared. Either turns this into a refusal and no non-ASCII
+    // deployment can open a connection at all.
+    await onConnect(servedOverSocket({
+      backend: ONE_BACKEND,
+      searchPath: '"ténant"',
+      ourPort: 41000,
+      ourAddress: '10.9.9.9',
+      backendSeesPort: '41000',
+      backendSeesAddress: '10.9.9.9',
+    }))
+
+    // 2. IPv4-MAPPED IPv6: node says `::ffff:10.9.9.9` for the same socket PostgreSQL's `host()`
+    // spells `10.9.9.9`. Two spellings of one address are not two addresses.
+    //
+    // MUTATION ROUTE: drop the `::ffff:` strip from normalisedPeerAddress(). Every dual-stack
+    // deployment with a non-ASCII schema is then refused as though a pooler were in the path.
+    await onConnect(servedOverSocket({
+      backend: ONE_BACKEND,
+      searchPath: '"ténant"',
+      ourPort: 41000,
+      ourAddress: '::ffff:10.9.9.9',
+      backendSeesPort: '41000',
+      backendSeesAddress: '10.9.9.9',
+    }))
+
+    // 3. UNIX SOCKET: the backend reports no peer at all (`client_addr` NULL, `client_port` -1).
+    // That is an unanswerable question, not a failed comparison, and it is SKIPPED — the
+    // `search_path` leg is what covers that case, and the measurements above show it refuses every
+    // real pooler because the pin never arrives. Recorded as a residue, not claimed closed.
+    await onConnect(servedOverSocket({
+      backend: ONE_BACKEND,
+      searchPath: '"ténant"',
+      ourPort: 41000,
+      backendSeesPort: '-1',
+      backendSeesAddress: '',
+    }))
+  } finally {
+    resetStartupOptionByteSafety()
+  }
+})
+
+test('o3d-2k5r r23: a TCP peer the backend reports that this process cannot match is refused', async () => {
+  resetStartupOptionByteSafety()
+  try {
+    await establishStartupOptionByteSafety(R22_URL, { createClient: fanOutClient([ONE_BACKEND]) })
+    const onConnect = pgConnectionConfig(R22_URL).onConnect!
+
+    // The backend names a TCP peer and the client cannot say what its own socket is. Fail closed:
+    // an unreadable half of a comparison is not a passing comparison.
+    //
+    // MUTATION ROUTE: return `null` instead of a refusal when `ownSocketEndpoint()` is null. Any
+    // client wrapper that does not expose `connection.stream` — which is every future one — then
+    // silently skips the leg on a connection the backend says came from somewhere else.
+    const opaque = servedConnection(ONE_BACKEND, '"ténant"') as unknown as {
+      asked: string[]
+      query(text: string): Promise<{ rows: Array<Record<string, unknown>> }>
+    }
+    const withPeer = {
+      asked: opaque.asked,
+      async query(text: string) {
+        const answer = await opaque.query(text)
+        return { rows: answer.rows.map((row) => ({ ...row, client_address: '10.0.0.250', client_port: '55001' })) }
+      },
+    }
+    await assert.rejects(
+      () => onConnect(withPeer),
+      (error: unknown) => {
+        assert.match((error as Error).message, /cannot read its own end of the socket/)
+        return true
+      },
+    )
+  } finally {
+    resetStartupOptionByteSafety()
+  }
+})
+
+/** The identity string `backendIdentityOf()` composes, read over whichever path is handed in. */
+async function backendIdentityOver(connectionString: string, options: string): Promise<string> {
+  const client = new pg.Client({ connectionString, options, connectionTimeoutMillis: 3_000 })
+  await client.connect()
+  try {
+    const row = (await client.query<Record<string, string>>(
+      "select coalesce(host(inet_server_addr()), '') as a, coalesce(inet_server_port()::text, '') as p, " +
+      "coalesce(current_setting('server_version', true), '') as v, pg_encoding_to_char(encoding) as e, " +
+      'datctype as c from pg_database where datname = current_database()',
+    )).rows[0]!
+    return `${row.a}:${row.p}|${row.v}|${row.e}|${row.c}`
+  } finally {
+    await client.end().catch(() => undefined)
+  }
+}
+
+test('o3d-2k5r r23 (live): a TRANSPARENT relay still cannot carry a non-ASCII pin', async (t) => {
+  const scratch = await openScratch(t)
+  if (!scratch) return
+  const slot = Symbol.for('ims.db.startupOptionByteVerdict.v2')
+  const globals = globalThis as unknown as Record<symbol, unknown>
+  resetStartupOptionByteSafety()
+  const pools: pg.Pool[] = []
+  let relay: net.Server | null = null
+  try {
+    const schema = 'ten ant' // U+00A0, as in the r19/r22 live tests
+    await scratch.admin.query(`CREATE SCHEMA ${'"' + schema + '"'}`)
+
+    // THE HARDEST CASE FOR THIS GUARD, and the reason it is a live test rather than a stand-in.
+    // This relay does not speak the PostgreSQL protocol at all — it copies bytes both ways — so the
+    // startup packet, non-ASCII pin included, reaches the backend UNCHANGED. Every other leg
+    // therefore passes: the backend is the measured one and its `search_path` is exactly the pin.
+    // Only the peer comparison can see that the connection was terminated and re-opened, which is
+    // the precondition a transaction-pooling proxy needs in order to re-assign the server side.
+    const upstream = new URL(scratch.url)
+    relay = net.createServer((client) => {
+      const server = net.connect(
+        { host: upstream.hostname, port: Number(upstream.port || 5432) },
+        () => { client.pipe(server); server.pipe(client) },
+      )
+      server.on('error', () => client.destroy())
+      client.on('error', () => server.destroy())
+    })
+    await new Promise<void>((resolve) => relay!.listen(0, '127.0.0.1', resolve))
+    const relayPort = (relay.address() as net.AddressInfo).port
+    const relayed = new URL(scratch.url)
+    relayed.hostname = '127.0.0.1'
+    relayed.port = String(relayPort)
+    const relayBase = relayed.toString()
+    const relayUrl = `${relayBase}?schema=${encodeURIComponent(schema)}`
+    const pin = `-c search_path=${'"' + schema + '"'}`
+
+    // 1. THE RELAY IS TRANSPARENT. Stated first, because everything below is only interesting if
+    // the refusal is NOT the relay having broken the pin. It has not: the server ends up on the
+    // non-ASCII schema, so this is a configuration that works today.
+    const through = new pg.Client({ connectionString: relayBase, options: pin, connectionTimeoutMillis: 3_000 })
+    await through.connect()
+    try {
+      assert.equal(
+        (await through.query<{ s: string }>('select current_schema() as s')).rows[0]?.s,
+        schema,
+        'PRECONDITION: the pin survives the relay, so nothing below is a refusal of a broken pin',
+      )
+    } finally {
+      await through.end().catch(() => undefined)
+    }
+
+    // 2. AND THE PROBE REFUSES IT ANYWAY. This is the outcome chosen for Codex's finding: rather
+    // than re-checking every unit of work, no licence is granted to an endpoint this process cannot
+    // show it is talking to directly. The operator gets ONE message, at boot / preflight / the
+    // pre-deploy check.
+    //
+    // MUTATION ROUTE: delete the `interposedPeerRefusal(measuredOver, servedBy)` block from
+    // establishStartupOptionByteSafety(). The verdict settles POSITIVE — every other leg passes,
+    // because the relay forwards the bytes — and pgConnectionConfig() below stops throwing.
+    const verdict = await establishStartupOptionByteSafety(relayUrl)
+    assert.equal(verdict.established, false, 'no licence is granted through an interposed endpoint')
+    assert.match(verdict.reason, /does not reach the backend directly/)
+    assert.match(verdict.reason, /terminated the connection and opened its own/)
+    assert.throws(() => pgConnectionConfig(relayUrl), DatabaseUrlSchemaConflictError)
+
+    // 3. AND SO DOES THE PER-CONNECTION GUARD, through a REAL pg.Pool. The verdict is planted
+    // rather than probed precisely because step 2 makes it unobtainable: this is the second line,
+    // for an endpoint that became interposed AFTER a positive verdict was earned — a re-pointed
+    // pooler, exactly the case r22 was built for.
+    const relayedIdentity = await backendIdentityOver(relayBase, pin)
+    const directIdentity = await backendIdentityOver(scratch.url, pin)
+    const plant = (target: string, backend: string) => {
+      globals[slot] = Object.freeze({
+        established: true, carries: true, probed: ' ', target, backend,
+        serverEncoding: 'SQL_ASCII', lcCtype: 'C', reason: 'planted: a licence earned before the endpoint moved',
+      })
+    }
+
+    // 3a. THE CONTROL. Same backend, same pin, same schema — only the path is direct. It is
+    // ADMITTED and lands on the schema, so the refusal below is about interposition and nothing else.
+    plant(`${new URL(scratch.url).hostname}:${new URL(scratch.url).port}${new URL(scratch.url).pathname}`, directIdentity)
+    const directConfig = pgConnectionConfig(`${scratch.url}?schema=${encodeURIComponent(schema)}`)
+    assert.equal(typeof directConfig.onConnect, 'function', 'PRECONDITION: the licensed pin carries a guard')
+    const admitted = new pg.Pool({ ...directConfig, max: 1, connectionTimeoutMillis: 3_000 })
+    pools.push(admitted)
+    const client = await admitted.connect()
+    try {
+      assert.equal((await client.query<{ s: string }>('select current_schema() as s')).rows[0]?.s, schema)
+    } finally {
+      client.release()
+    }
+
+    // 3b. THE SAME LICENCE, SPENT THROUGH THE RELAY. Refused before a query can run.
+    //
+    // MUTATION ROUTE: delete the `interposedConnectionRefusal(client, row)` call from
+    // startupOptionBackendGuard(). This pool then hands out the connection — the relay forwards the
+    // pin and the backend is the one named — and the licensed bytes are spent on a socket whose far
+    // end can be re-pointed without this process being told.
+    plant(`127.0.0.1:${relayPort}${new URL(relayBase).pathname}`, relayedIdentity)
+    const refusedConfig = pgConnectionConfig(relayUrl)
+    const refused = new pg.Pool({ ...refusedConfig, max: 1, connectionTimeoutMillis: 3_000 })
+    pools.push(refused)
+    await assert.rejects(
+      async () => { (await refused.connect()).release() },
+      (error: unknown) => {
+        assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+        assert.match((error as Error).message, /terminated the connection and opened its own/)
+        return true
+      },
+      'a real pg.Pool refuses a physical connection that does not reach the backend directly',
+    )
+    assert.equal(refused.totalCount, 0, 'and the refused connection is not left in the pool')
+    await assert.rejects(() => refused.query('select 1'), DatabaseUrlSchemaConflictError)
+  } finally {
+    delete globals[slot]
+    resetStartupOptionByteSafety()
+    for (const pool of pools) await pool.end().catch(() => undefined)
+    await new Promise<void>((resolve) => { relay ? relay.close(() => resolve()) : resolve() })
     await scratch.drop()
   }
 })
