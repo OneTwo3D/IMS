@@ -91,26 +91,66 @@ test('o3d-2k5r r12: a TAB separates a startup option exactly as a space does', (
   assert.deepEqual(splitLibpqOptions('-c application_name=my\\\tapp'), ['-c', 'application_name=my\\\tapp'])
 })
 
-test('o3d-2k5r r12: whitespace outside ASCII is refused rather than guessed at', () => {
-  // ROUTE: the same tokenizer. `isspace()` is asked ONE BYTE AT A TIME by the backend, so whether
-  // U+00A0 ends a token depends on the database's encoding and locale — in a UTF-8 database its
-  // bytes are ordinary characters, in a single-byte encoding under some locales it may split. The
-  // token boundaries decide which schema is pinned, so an unknowable reading is refused, exactly
-  // as a non-ASCII unquoted identifier already is.
+test('o3d-2k5r r18: every non-ASCII character in the startup options is refused, ESCAPED OR NOT', () => {
+  // ROUTE: the tokenizer, for both spellings, and then the whole composition behind it —
+  // `?options=` -> splitLibpqOptions() -> readLibpqSettings() -> resolveDatabaseUrlSchema() ->
+  // pgConnectionConfig()'s pin.
   //
-  // MUTATION: delete the NON_ASCII_WHITESPACE branch from splitLibpqOptions(). The URL below then
-  // resolves silently to a schema named `search_path=tenant` on one server and pins `public` on
-  // another, and this test fails on `assert.throws`.
-  assert.throws(
-    () => pgConnectionConfig(`postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent('-c search_path=tenanta')}`),
-    (error: unknown) => {
-      assert.ok(error instanceof DatabaseUrlSchemaConflictError)
-      assert.match((error as Error).message, /U\+00A0/)
-      return true
-    },
-  )
-  // Escaped, it is a literal and therefore unambiguous on both sides — so it is NOT refused.
-  assert.deepEqual(splitLibpqOptions('-c\\ x=1'), ['-c\\ x=1'])
+  // WHY IT IS ONE RULE AND NOT TWO. `isspace()` is asked ONE BYTE AT A TIME by the backend, and
+  // `pg_split_opts()` lets a backslash cover exactly ONE byte. So an escape in front of a
+  // multi-byte character protects its first byte and hands the rest back to the deployment's own
+  // `LC_CTYPE` — which is the same unknowable boundary the bare form has, not a fix for it. Round
+  // 17 exempted the escaped form; this asserts the exemption is gone.
+  //
+  // MUTATION: delete the NON_ASCII_OPTION_CHARACTER branch from splitLibpqOptions(). The bare
+  // cases then resolve silently to a schema named `search_path=tenanta` on one server and pin
+  // `public` on another, and every `assert.throws` below fails.
+  //
+  // SECOND MUTATION, the one round 17 would have survived: move the branch back BELOW `if
+  // (escaped)`. The three bare cases still throw and the three escaped ones stop throwing, so the
+  // escaped half of this test is what proves the gate is ahead of the escape rather than beside it.
+  for (const [label, character] of [
+    ['U+00A0 no-break space', '\u00A0'],
+    // NOT WHITESPACE TO ANYONE, and that is the point: its UTF-8 bytes are E2 80 A0, carrying the
+    // very byte U+00A0 was refused for. A rule written over `\s` admitted this one.
+    ['U+2020 dagger', '\u2020'],
+    // A NAME AN OPERATOR MIGHT ACTUALLY WRITE, so the refusal is not only about exotica.
+    ['U+00E4 a-umlaut', '\u00E4'],
+  ] as [string, string][]) {
+    for (const [spelling, written] of [
+      ['bare', character],
+      ['escaped', `\\${character}`],
+    ] as [string, string][]) {
+      // PRECONDITION, so this cannot pass by examining nothing: the string under test really does
+      // carry the character, and the escaped spelling really does carry a backslash before it.
+      const options = `-c application_name=x${written}-c search_path=tenanta`
+      assert.ok(options.includes(character), `${label} ${spelling}: the input carries the character`)
+      if (spelling === 'escaped') {
+        assert.ok(options.includes(`\\${character}`), `${label} ${spelling}: and carries the escape`)
+      }
+      assert.throws(
+        () => pgConnectionConfig(`postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent(options)}`),
+        (error: unknown) => {
+          assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${label} ${spelling}: refused`)
+          const codePoint = `U+${character.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}`
+          assert.ok((error as Error).message.includes(codePoint), `${label} ${spelling}: names the character`)
+          // AND THE JUSTIFICATION IS THE SHARED ONE. Round 17 had two refusals whose reasons
+          // disagreed; asserting the byte sentence in BOTH spellings is what stops them drifting
+          // apart again, because narrowing either one changes this string.
+          assert.match(
+            (error as Error).message,
+            /ONE BYTE AT A TIME/,
+            `${label} ${spelling}: refused on the byte-level reason, not a character-level one`,
+          )
+          return true
+        },
+      )
+    }
+  }
+  // ASCII IS UNTOUCHED, so the refusal above is a rule about non-ASCII and not a rule about
+  // escapes: the escaped ASCII separator this module has carried since round 12 still tokenises
+  // as one token.
+  assert.deepEqual(splitLibpqOptions('-c application_name=my\\ app'), ['-c', 'application_name=my\\ app'])
 })
 
 /**
@@ -130,6 +170,111 @@ const BACKEND_SEPARATORS: [string, string][] = [
 
 /** A schema name carrying every one of them at once. */
 const ALL_SEPARATORS_SCHEMA = BACKEND_SEPARATORS.map(([, separator], index) => `t${index}${separator}`).join('') + 'end'
+
+/**
+ * `pg_split_opts()` AS THE BACKEND ACTUALLY RUNS IT: over BYTES, with the locale's own `isspace()`.
+ *
+ * A transcription of src/backend/utils/init/postinit.c — the leading-space skip, the
+ * `last_was_esc` flag carried through the word loop, the escape that consumes ONE byte — with the
+ * one thing this module cannot know left as a parameter. That parameter is the whole finding: the
+ * tokenizer in `lib/db/database-url-schema.mjs` iterates CODE POINTS and has no such parameter, so
+ * it has been answering a question whose answer is set by the deployment's encoding and `LC_CTYPE`.
+ *
+ * Tokens come back as latin1 strings so that individual BYTES are assertable; nothing here decodes
+ * UTF-8, because the backend does not either.
+ */
+function pgSplitOptsOverBytes(options: string, isSpace: (byte: number) => boolean): string[] {
+  const bytes = Buffer.from(options, 'utf8')
+  const tokens: string[] = []
+  let at = 0
+  while (at < bytes.length) {
+    while (at < bytes.length && isSpace(bytes[at]!)) at += 1
+    if (at >= bytes.length) break
+    const word: number[] = []
+    let lastWasEscape = false
+    while (at < bytes.length && (lastWasEscape || !isSpace(bytes[at]!))) {
+      if (bytes[at] === 0x5c && !lastWasEscape) lastWasEscape = true
+      else {
+        word.push(bytes[at]!)
+        lastWasEscape = false
+      }
+      at += 1
+    }
+    tokens.push(Buffer.from(word).toString('latin1'))
+  }
+  return tokens
+}
+
+/** `isspace()` where nothing above 0x7F is space — the C locale, and every UTF-8 database. */
+const isSpaceAscii = (byte: number): boolean => byte === 0x20 || (byte >= 0x09 && byte <= 0x0d)
+
+/** `isspace()` on a single-byte encoding whose locale classes 0xA0 (NBSP) as space. */
+const isSpaceLatin1Nbsp = (byte: number): boolean => isSpaceAscii(byte) || byte === 0xa0
+
+test('o3d-2k5r r18: BYTE-LEVEL — the escape covers one byte, and the boundary moves with the locale', () => {
+  // ROUTE: no server. This is the premise underneath every refusal round 18 adds, proved against a
+  // transcription of `pg_split_opts()` rather than against the module's own reading of it — which
+  // is the reading under suspicion and cannot be its own witness.
+  //
+  // THE INPUT is Codex's: an application name ending in an ESCAPED U+00A0, followed by a second
+  // `-c` assignment. Round 17 accepted it precisely because the character was escaped.
+  const options = `-c application_name=x\\\u00A0-c search_path=tenant`
+
+  // PRECONDITION, so nothing below can pass by examining nothing: the character really is two
+  // bytes, the backslash really does sit in front of the first of them, and the second is 0xA0 —
+  // the byte whose class the locale decides.
+  const bytes = [...Buffer.from(options, 'utf8')]
+  const backslash = bytes.indexOf(0x5c)
+  assert.notEqual(backslash, -1, 'the input carries the escape')
+  assert.deepEqual(bytes.slice(backslash, backslash + 3), [0x5c, 0xc2, 0xa0], 'escape, then the TWO bytes of U+00A0')
+
+  const ascii = pgSplitOptsOverBytes(options, isSpaceAscii)
+  const latin1 = pgSplitOptsOverBytes(options, isSpaceLatin1Nbsp)
+
+  // THE ESCAPE COVERED ONE BYTE. On the locale that classes 0xA0 as space the word ends there, and
+  // the token keeps 0xC2 — the byte the backslash protected — and nothing after it. A
+  // character-level escape would have carried both bytes through and produced no boundary at all.
+  assert.equal(latin1[1], 'application_name=x\u00c2', 'the escape protected 0xC2 and 0xA0 still ended the token')
+
+  // AND THE BOUNDARY IS THE LOCALE'S, NOT THE STRING'S. Same bytes, two `isspace()` answers, two
+  // different startup command lines — one of which hands the server a search_path assignment.
+  assert.deepEqual(
+    ascii,
+    ['-c', 'application_name=x\u00c2\u00a0-c', 'search_path=tenant'],
+    'ASCII locale: THREE tokens, the third of which is not an option at all',
+  )
+  assert.deepEqual(
+    latin1,
+    ['-c', 'application_name=x\u00c2', '-c', 'search_path=tenant'],
+    'NBSP-as-space locale: FOUR tokens, and the fourth is a search_path assignment the server applies',
+  )
+
+  // SO THE MODULE REFUSES TO HAVE A READING AT ALL. Round 17 returned three tokens here, found no
+  // `search_path` among them, resolved the URL to `public` and pinned `public` — while on the
+  // locale above the server is being told `tenant`. `databaseUrlSchema()` is what the two
+  // out-of-process gates ask, so that disagreement is a green gate over a connection on another
+  // schema, which is the one failure this module exists to prevent.
+  //
+  // MUTATION: move the NON_ASCII_OPTION_CHARACTER branch back BELOW `if (escaped)` in
+  // splitLibpqOptions() — round 17 exactly. Both assert.throws below stop throwing;
+  // splitLibpqOptions() returns 3 tokens and resolveDatabaseUrlSchema() returns
+  // `{ parsed: true, explicit: false, schema: 'public' }`, which the two assertions after the
+  // throws state as the wrong answers they are.
+  assert.throws(() => splitLibpqOptions(options), DatabaseUrlSchemaConflictError)
+  const url = new URL('postgresql://u:p@localhost:5432/ims')
+  url.searchParams.set('options', options)
+  assert.throws(
+    () => resolveDatabaseUrlSchema(url.toString()),
+    (error: unknown) => {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+      assert.match((error as Error).message, /ONE BYTE AT A TIME/)
+      return true
+    },
+  )
+  // The two token counts, named so the disagreement is stated as a number and not only as a shape.
+  assert.equal(ascii.length, 3, 'round 17 tokenised the ASCII way — three tokens, no search_path found')
+  assert.equal(latin1.length, 4, 'and the server may run the other, where a search_path IS assigned')
+})
 
 test('o3d-2k5r r13: a schema name containing any backend separator survives emit -> read unchanged', () => {
   // ROUTE: `?schema=<name>` -> resolveDatabaseUrlSchema().schema -> pgConnectionConfig() ->
@@ -180,26 +325,43 @@ test('o3d-2k5r r13: a schema name containing any backend separator survives emit
   }
 })
 
-test('o3d-2k5r r13: whitespace the tokenizer refuses is escaped by the emitter, not written raw', () => {
-  // ROUTE: `?schema=` carrying U+00A0 -> pgConnectionConfig() -> escapeLibpqValue() -> the pin ->
-  // splitLibpqOptions(), which REFUSES an unescaped U+00A0 because whether the backend splits on
-  // it depends on the database's encoding and locale.
+test('o3d-2k5r r18: a name the tokenizer refuses is refused at the SOURCE, not escaped into the pin', () => {
+  // ROUTE: `?schema=` carrying U+00A0 -> resolveDatabaseUrlSchema() -> (round 17: escapeLibpqValue()
+  // -> the pin -> splitLibpqOptions()). Round 13 answered "this module must escape what its own
+  // tokenizer refuses" — right question, wrong door. The escape does not make the character
+  // unambiguous at the backend, so a pin carrying one is a string this module can read back and the
+  // SERVER may split through the middle of the schema name. The invariant is restored from the
+  // other end instead: the name never becomes a pin.
   //
-  // MUTATION: narrow the emitter's character class to the six ASCII separators
-  // (`/[\\ \t\n\v\f\r]/g`). The pin below is then emitted with a bare U+00A0 in it, and the
-  // re-read throws DatabaseUrlSchemaConflictError instead of returning the name — a string this
-  // module emits and then cannot read. Both assertions after the emit fail.
+  // MUTATION: delete the `?schema=` non-ASCII loop from resolveDatabaseUrlSchema(). `assert.throws`
+  // fails immediately; and with the tokenizer branch also removed the emit succeeds and produces
+  // exactly round 17's `-c search_path="ten\<U+00A0>ant"` — which is asserted below NOT to be
+  // producible, so the second half of this test fails too.
   const schema = 'ten\u00A0ant' // U+00A0, written as an escape so it cannot be mistaken for a space
-  const emitted = pgConnectionConfig(`postgresql://u:p@localhost:5432/ims?schema=${encodeURIComponent(schema)}`)
+  // PRECONDITION, so this cannot pass by examining nothing: the name really is non-ASCII, and the
+  // ASCII name beside it really does still produce a pin.
+  assert.ok(/[^\u0000-\u007F]/u.test(schema), 'the name under test is non-ASCII')
   assert.equal(
-    emitted.options,
-    '-c search_path="ten\\\u00A0ant"',
-    'the ambiguous character is escaped, so it is a literal on both sides',
+    pgConnectionConfig('postgresql://u:p@localhost:5432/ims?schema=ten_ant').options,
+    '-c search_path="ten_ant"',
+    'the same name in ASCII is pinned exactly as before',
   )
 
+  assert.throws(
+    () => pgConnectionConfig(`postgresql://u:p@localhost:5432/ims?schema=${encodeURIComponent(schema)}`),
+    (error: unknown) => {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+      assert.match((error as Error).message, /\?schema=/, 'refused as the schema parameter it is')
+      assert.match((error as Error).message, /ONE BYTE AT A TIME/, 'on the same shared justification')
+      return true
+    },
+  )
+
+  // AND THE PIN ROUND 17 EMITTED IS NOT READABLE EITHER, which is what makes the refusal above
+  // necessary rather than merely tidy: had it been emitted, this module could not take it back in.
   const roundTrip = new URL('postgresql://u:p@localhost:5432/ims')
-  roundTrip.searchParams.set('options', emitted.options!)
-  assert.deepEqual(resolveDatabaseUrlSchema(roundTrip.toString()), { parsed: true, explicit: true, schema })
+  roundTrip.searchParams.set('options', '-c search_path="ten\\\u00A0ant"')
+  assert.throws(() => resolveDatabaseUrlSchema(roundTrip.toString()), DatabaseUrlSchemaConflictError)
 })
 
 /**
@@ -257,30 +419,33 @@ test('o3d-2k5r r15: the six ASCII scanner whitespace characters are trimmed off 
   }
 })
 
-test('o3d-2k5r r15: non-ASCII whitespace at either end of a search path is NOT trimmed away', () => {
-  // ROUTE: the same one — `?options=-c search_path=\<ws>tenant` -> splitLibpqOptions() ->
-  // unescapeLibpq() -> singleSchemaOfSearchPath() -> foldUnquotedIdentifier() -> the pin. The
-  // character is escaped, which is how this module has told operators since round 12 to mean an
-  // ambiguous whitespace character literally, so it arrives at the trim intact.
+test('o3d-2k5r r18: an escaped non-ASCII character at either end of a search path is refused, not trimmed', () => {
+  // ROUTE: `?options=-c search_path=\<ws>tenant` -> splitLibpqOptions(), which now REFUSES the
+  // character before `unescapeLibpq()`, `singleSchemaOfSearchPath()`'s trim or
+  // `foldUnquotedIdentifier()` ever see the value. Round 15 let the escaped character through to
+  // the trim and refused it two functions later as an unfoldable name; round 18 refuses it at the
+  // tokenizer, because the fold is not the only thing about it that is unknowable — where the
+  // TOKEN ends is too, and that is decided first.
   //
-  // MUTATION: restore `const trimmed = String(value).trim()` in singleSchemaOfSearchPath().
-  // JavaScript's trim is Unicode-wide, so `<U+00A0>tenant` is silently reduced to `tenant`, folds
-  // cleanly, and resolveDatabaseUrlSchema() RETURNS `{ schema: 'tenant' }` — a schema the URL did
-  // not name, pinned into the emitted options, handed to the Prisma adapter and reported aligned to
-  // all three raw gates while the server resolves `<U+00A0>tenant`. Every assert.throws below fails,
-  // and so does the last assertion, which is the same divergence stated as an equality: the URL
-  // naming the character no longer agrees with `?schema=tenant`, and under the mutation it does.
+  // WHAT THIS STILL PROVES, and why it is not a weaker test: the outcome under test is unchanged —
+  // a URL naming `<ws>tenant` must never resolve to `tenant`. Only the door it is refused at moved.
+  //
+  // MUTATION: delete the NON_ASCII_OPTION_CHARACTER branch from splitLibpqOptions(). The value
+  // reaches `trimScannerWhitespace()`, which does NOT strip these four, and the refusal becomes
+  // round 15's "UNQUOTED identifier this cannot read" — so the message assertion below fails while
+  // `assert.throws` still passes. That is why the message is asserted and not merely the throw:
+  // the two refusals are no longer interchangeable, and this test says which one is correct.
+  //
+  // SECOND MUTATION: that branch removed AND `const trimmed = String(value).trim()` restored in
+  // singleSchemaOfSearchPath(). Nothing throws at all — `<U+00A0>tenant` is silently reduced to
+  // `tenant`, folds cleanly, and resolveDatabaseUrlSchema() returns a schema the URL did not name,
+  // pinned into the options, handed to the Prisma adapter and reported aligned to all three raw
+  // gates while the server resolves `<U+00A0>tenant`. Every assertion below fails.
   for (const [label, whitespace] of KEPT_BY_THE_SERVER) {
-    // PRECONDITION: the character survives tokenizing, so what is being tested is the trim and not
-    // the tokenizer's refusal of an UNESCAPED one.
-    assert.deepEqual(
-      splitLibpqOptions(`-c search_path=${whitespace.replace(/[\\\s]/gu, '\\$&')}tenant`).length,
-      2,
-      `${label}: escaped, it is part of the setting rather than a token boundary`,
-    )
-    // PRECONDITION: JavaScript really does consider it whitespace. Without this the test could pass
-    // against a character `trim()` never touched, proving nothing about the finding.
+    // PRECONDITION: JavaScript really does consider it whitespace, and it really is non-ASCII.
+    // Without these the test could pass against a character neither rule ever touched.
     assert.equal(`${whitespace}tenant`.trim(), 'tenant', `${label}: JavaScript's trim would strip it`)
+    assert.ok(/[^\u0000-\u007F]/u.test(whitespace), `${label}: and it is non-ASCII, which is why it is refused`)
 
     for (const [position, value] of [
       ['leading', `${whitespace}tenant`],
@@ -290,61 +455,86 @@ test('o3d-2k5r r15: non-ASCII whitespace at either end of a search path is NOT t
         () => resolveDatabaseUrlSchema(urlWithSearchPath(value)),
         (error: unknown) => {
           assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${label} ${position}: refused, not resolved`)
-          // The refusal has to be the RIGHT one: the value names exactly one schema, so "name one
-          // schema" would be advice for a problem it does not have. What is actually wrong is that
-          // this is an unquoted name whose fold depends on the database's encoding and collation.
           assert.match(
-            error.message,
-            /UNQUOTED identifier this cannot read/,
-            `${label} ${position}: and refused as an unfoldable name, which tells the operator to quote it`,
+            (error as Error).message,
+            /ONE BYTE AT A TIME/,
+            `${label} ${position}: refused where the token boundary is decided, on the byte-level reason`,
           )
           return true
         },
       )
     }
 
-    // AND THE FALSE AGREEMENT IS GONE. `?schema=tenant` and an options value naming
-    // `<ws>tenant` are different schemas; under the mutation both read as `tenant` and this URL
-    // resolved happily instead of being refused.
+    // AND THE FALSE AGREEMENT IS GONE. `?schema=tenant` and an options value naming `<ws>tenant`
+    // are different schemas; under the second mutation both read as `tenant` and this URL resolved
+    // happily instead of being refused.
     const both = new URL(urlWithSearchPath(`${whitespace}tenant`))
     both.searchParams.set('schema', 'tenant')
     assert.throws(() => resolveDatabaseUrlSchema(both.toString()), DatabaseUrlSchemaConflictError, label)
   }
 })
 
-test('o3d-2k5r r15: QUOTED, the same character is a name this module pins rather than refuses', () => {
-  // ROUTE: `?schema=<ws>tenant` -> pgConnectionConfig() -> escapeLibpqValue() -> the always-quoted
-  // pin -> back in through `?options=` -> splitLibpqOptions() -> singleSchemaOfSearchPath()'s
-  // QUOTED branch -> the schema again. The refusal above is a routing decision about an UNQUOTED
-  // name, not an inability to carry the character: quoted, it round-trips whole.
+test('o3d-2k5r r18: QUOTING does not rescue the character either, and it is the SAME refusal', () => {
+  // ROUTE, both ways in: `?schema=<ws>tenant` -> resolveDatabaseUrlSchema()'s non-ASCII loop, and
+  // `?options=-c search_path="<ws>tenant"` -> splitLibpqOptions()'s non-ASCII gate. Round 15 made
+  // this the EXEMPTION — quoted, the character was carried whole and pinned. That rested on the
+  // same byte-blind reading as the escape: the quotes are ASCII, the bytes between them are not,
+  // and `pg_split_opts()` classifies those bytes with the deployment's own `LC_CTYPE` before any
+  // quote has meaning. A token boundary inside the quoted name gives the server an unterminated
+  // quote or a different schema — the failure the quoting was supposed to prevent.
   //
-  // MUTATION: apply `.trim()` to the quoted branch's captured group — the same Unicode trim this
-  // round removed, one line lower — and the character is dropped from the name read back, so the
-  // round-trip assertion sees `tenant`. Narrowing escapeLibpqValue() to `/[\\ \t\n\v\f\r]/g`
-  // fails it too, by a different route: the pin is then emitted with the character BARE and
-  // splitLibpqOptions() refuses this module's own output. Note that trimScannerWhitespace() applied
-  // to the same capture does NOT fail this test, and should not — it strips six ASCII characters,
-  // none of which is under test here.
+  // THE POINT OF THIS TEST IS THE SHARED JUSTIFICATION. Both doors are asserted to refuse, and
+  // both are asserted to refuse for the same stated reason, so a future round cannot re-open one
+  // of them without visibly contradicting the other.
+  //
+  // MUTATION: delete the `?schema=` non-ASCII loop from resolveDatabaseUrlSchema(). The first
+  // assert.throws in each iteration fails while the second still passes — which is exactly the
+  // split round 17 shipped, one door open and one shut, and is what this test exists to catch.
+  //
+  // SECOND MUTATION: delete the NON_ASCII_OPTION_CHARACTER branch from splitLibpqOptions() instead.
+  // The second assert.throws fails and the quoted name resolves, restoring round 15's behaviour.
   for (const [label, whitespace] of KEPT_BY_THE_SERVER) {
     for (const [position, schema] of [
       ['leading', `${whitespace}tenant`],
       ['trailing', `tenant${whitespace}`],
     ] as [string, string][]) {
-      const emitted = pgConnectionConfig(
-        `postgresql://u:p@localhost:5432/ims?schema=${encodeURIComponent(schema)}`,
+      // PRECONDITION, so neither assertion can pass by examining nothing: the name is non-ASCII,
+      // and the identical ASCII spelling still round-trips through both doors untouched.
+      assert.ok(/[^\u0000-\u007F]/u.test(schema), `${label} ${position}: the name under test is non-ASCII`)
+      const asciiPin = pgConnectionConfig('postgresql://u:p@localhost:5432/ims?schema=tenant').options
+      assert.equal(asciiPin, '-c search_path="tenant"', `${label} ${position}: the ASCII name still pins`)
+
+      const messages: string[] = []
+      // DOOR ONE: the name as `?schema=`, which would be EMITTED into an options string.
+      assert.throws(
+        () => pgConnectionConfig(`postgresql://u:p@localhost:5432/ims?schema=${encodeURIComponent(schema)}`),
+        (error: unknown) => {
+          assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${label} ${position}: ?schema= refused`)
+          messages.push((error as Error).message)
+          return true
+        },
       )
-      assert.ok(emitted.options, `${label} ${position}: a parseable URL always yields a pin`)
-      assert.ok(
-        emitted.options!.includes(`\\${whitespace}`),
-        `${label} ${position}: the character is escaped in the pin, not written raw`,
-      )
+
+      // DOOR TWO: the same name already QUOTED inside an options string — round 15's exemption,
+      // written exactly as round 15's emitter would have written it.
       const roundTrip = new URL('postgresql://u:p@localhost:5432/ims')
-      roundTrip.searchParams.set('options', emitted.options!)
-      assert.deepEqual(
-        resolveDatabaseUrlSchema(roundTrip.toString()),
-        { parsed: true, explicit: true, schema },
-        `${label} ${position}: the quoted name read back is the name that went in, character and all`,
+      roundTrip.searchParams.set('options', `-c search_path="${schema.replace(/[\\\s]/gu, '\\$&')}"`)
+      assert.throws(
+        () => resolveDatabaseUrlSchema(roundTrip.toString()),
+        (error: unknown) => {
+          assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${label} ${position}: the quoted pin refused`)
+          messages.push((error as Error).message)
+          return true
+        },
       )
+
+      // AND THE TWO REFUSALS SAY THE SAME THING about why. Not merely both throwing: both resting
+      // on the one sentence in NON_ASCII_JUSTIFICATION, which is what stops them drifting apart.
+      assert.equal(messages.length, 2, `${label} ${position}: both doors refused`)
+      for (const message of messages) {
+        assert.match(message, /ONE BYTE AT A TIME/, `${label} ${position}: on the byte-level reason`)
+        assert.match(message, /A BACKSLASH DOES NOT MAKE IT KNOWABLE/, `${label} ${position}: and says so about escaping`)
+      }
     }
   }
 })
@@ -970,7 +1160,7 @@ test('o3d-2k5r r14 (live): a NUL in the startup options is refused HERE because 
   }
 })
 
-test('o3d-2k5r r15 (live): the REAL server strips the six and KEEPS the four, and the pin follows it', async (t) => {
+test('o3d-2k5r r18 (live): the REAL server carries the escaped character, and it is refused ANYWAY', async (t) => {
   const scratch = await openScratch(t)
   if (!scratch) return
   const quote = (name: string) => `"${name.replace(/"/g, '""')}"`
@@ -997,11 +1187,23 @@ test('o3d-2k5r r15 (live): the REAL server strips the six and KEEPS the four, an
       return found
     }
 
-    // PRECONDITION — THE PREMISE OF THE WHOLE FIX, ASKED OF THE SERVER rather than read out of its
-    // source. This is `SplitIdentifierString()`/`scanner_isspace()` answering directly, with no
+    // WHICH SERVER IS ANSWERING, recorded rather than assumed, because the whole finding is that
+    // the answers below are a property of THIS encoding and THIS `LC_CTYPE` and not of the string.
+    // A byte above 0x7F is classified by `isspace()` under the database's own ctype; here that is
+    // the C locale, where nothing above 0x7F is space, which is precisely why every measurement in
+    // this test comes out benign — and precisely why a benign measurement cannot license the
+    // module to carry the character.
+    const settings = await scratch.admin.query<{ enc: string; ctype: string }>(
+      `select pg_encoding_to_char(encoding) as enc, datctype as ctype from pg_database where datname = current_database()`,
+    )
+    const { enc, ctype } = settings.rows[0]!
+    assert.ok(enc && ctype, 'the server names its own encoding and ctype')
+
+    // PRECONDITION — THE PREMISE OF SCANNER_WHITESPACE, ASKED OF THE SERVER rather than read out of
+    // its source. This is `SplitIdentifierString()`/`scanner_isspace()` answering directly, with no
     // part of this module involved: set the GUC to the raw value and ask which schema it resolved.
-    // If either half ever changes, the rule in SCANNER_WHITESPACE is wrong and this says so at the
-    // premise instead of leaving the conclusions below untestable.
+    // It is a FIXED list, not the locale's, so unlike `pg_split_opts()` it is reproducible here —
+    // which is why six characters can be trimmed with confidence and no byte above 0x7F can.
     for (const [label, whitespace] of BACKEND_SEPARATORS) {
       await scratch.admin.query('select set_config($1, $2, false)', ['search_path', `${whitespace}tenant`])
       assert.equal(
@@ -1027,8 +1229,13 @@ test('o3d-2k5r r15 (live): the REAL server strips the six and KEEPS the four, an
         ['leading', `${whitespace}tenant`],
         ['trailing', `tenant${whitespace}`],
       ] as [string, string][]) {
-        // WHAT THE OPERATOR'S OWN URL DOES AT THE SERVER, bypassing this module entirely: their
-        // escaped, unquoted value reaches the backend and lands the write in the schema they named.
+        // WHAT THE REFUSAL COSTS, MEASURED. The operator's own escaped value, sent to the REAL
+        // server with this module entirely bypassed, reaches the backend whole and lands the write
+        // in the schema they named. This configuration WORKS on `${enc}`/`${ctype}` today, and
+        // round 18 refuses it regardless. Stating the cost is the point: the refusal is not a claim
+        // that the server mis-handles the character, it is a claim that whether it does is set by
+        // an encoding and an `LC_CTYPE` this module cannot ask about — and this host has no
+        // single-byte non-ASCII locale installed to demonstrate the other answer with.
         const raw: pg.Client = new pg.Client({
           connectionString: scratch.url,
           options: `-c search_path=${escape(value)}`,
@@ -1041,14 +1248,15 @@ test('o3d-2k5r r15 (live): the REAL server strips the six and KEEPS the four, an
           assert.deepEqual(
             await holders(key),
             [value],
-            `${label} ${position}: the URL's own value writes into the schema carrying the character`,
+            `${label} ${position}: on THIS encoding and ctype the URL's own value writes into the schema carrying the character`,
           )
         } finally {
           await raw.end().catch(() => undefined)
         }
 
-        // AND THAT IS A DIFFERENT SCHEMA FROM `tenant` — measured, not assumed. This is the exact
-        // gap `trim()` opened: it pinned `tenant`, whose writes land here instead.
+        // AND THAT IS A DIFFERENT SCHEMA FROM `tenant` — measured, not assumed. This is the gap a
+        // Unicode `trim()` opened and the gap a mis-placed token boundary would open again: both
+        // end with the pin naming `tenant`, whose writes land here instead.
         const trimmed: pg.Client = new pg.Client({ ...pgConnectionConfig(`${scratch.url}?schema=tenant`), connectionTimeoutMillis: 3_000 })
         await trimmed.connect()
         try {
@@ -1057,68 +1265,62 @@ test('o3d-2k5r r15 (live): the REAL server strips the six and KEEPS the four, an
           assert.deepEqual(
             await holders(key),
             ['tenant'],
-            `${label} ${position}: the name trim() produced is a real, DIFFERENT schema`,
+            `${label} ${position}: the name a wrong boundary produces is a real, DIFFERENT schema`,
           )
         } finally {
           await trimmed.end().catch(() => undefined)
         }
 
-        // ROUTE: `?options=-c search_path=\<ws>tenant` -> splitLibpqOptions() -> unescapeLibpq() ->
-        // singleSchemaOfSearchPath() -> foldUnquotedIdentifier(). REFUSED, because an unquoted
-        // non-ASCII name is folded by the database's own encoding and collation.
+        // ROUTE: `?options=-c search_path=\<ws>tenant` -> splitLibpqOptions(). REFUSED, escaped or
+        // not, because the escape covers ONE BYTE and the rest of the character is classified by
+        // the deployment's own `LC_CTYPE`.
         //
-        // MUTATION: restore `const trimmed = String(value).trim()` in singleSchemaOfSearchPath().
-        // This stops throwing and resolves to `tenant` — the schema the two clients above just
-        // proved is a DIFFERENT one — so the adapter, the pin and all three raw gates are aligned
-        // on `tenant` while the URL asked for the schema the first client wrote into. The
-        // assert.throws fails.
+        // MUTATION: delete the NON_ASCII_OPTION_CHARACTER branch from splitLibpqOptions(). This
+        // stops throwing and resolves — on round 15's path, to a refusal with a different message;
+        // with `trim()` also restored, to `tenant`, the schema the two clients above just proved is
+        // a DIFFERENT one. The assert.throws or the message assertion fails.
         const url = new URL(scratch.url)
         url.searchParams.set('options', `-c search_path=${escape(value)}`)
         assert.throws(
           () => pgConnectionConfig(url.toString()),
           (error: unknown) => {
             assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${label} ${position}: refused`)
-            assert.match(error.message, /UNQUOTED identifier this cannot read/, `${label} ${position}: as unfoldable`)
+            assert.match((error as Error).message, /ONE BYTE AT A TIME/, `${label} ${position}: on the byte reason`)
             return true
           },
         )
 
-        // AND QUOTED IT IS CARRIED, not refused: the character reaches the REAL server intact and
-        // the unqualified write lands in the schema whose name contains it.
+        // AND QUOTED IT IS REFUSED TOO — the exemption round 15 measured on this very server is
+        // gone. The quoted pin below is byte-for-byte what round 15's emitter produced and what
+        // this test used to feed back through `splitLibpqOptions()` into a live connection.
         //
-        // ROUTE, deliberately the long way round so the READER is on it: `?schema=<ws>tenant` ->
-        // pgConnectionConfig() -> escapeLibpqValue() -> the always-quoted pin -> back in as
-        // `?options=` -> splitLibpqOptions() -> singleSchemaOfSearchPath()'s QUOTED branch -> the
-        // pin re-emitted -> the startup packet -> current_schema(). Handing `?schema=` straight to
-        // pgConnectionConfig() would never reach singleSchemaOfSearchPath() at all, and a test that
-        // does not touch the changed function cannot be failed by changing it.
-        //
-        // MUTATION: apply `.trim()` to the quoted branch's captured group. The name read back out
-        // of the pin becomes `tenant`, the re-emitted pin says `tenant`, and current_schema() is
-        // `tenant` — a schema the two clients above just proved is a DIFFERENT one — so both
-        // assertions below fail and the write lands in the wrong schema.
-        const carried = new URL(scratch.url)
-        carried.searchParams.set(
-          'options',
-          pgConnectionConfig(`${scratch.url}?schema=${encodeURIComponent(value)}`).options!,
+        // MUTATION: delete the `?schema=` non-ASCII loop from resolveDatabaseUrlSchema() and the
+        // tokenizer branch. `pgConnectionConfig()` composes `-c search_path="<ws>tenant"` again,
+        // the connection opens, `current_schema()` is the character-carrying name — and this
+        // assertion fails, because the module is once more putting a byte on the wire whose token
+        // boundary it cannot reproduce.
+        assert.throws(
+          () => pgConnectionConfig(`${scratch.url}?schema=${encodeURIComponent(value)}`),
+          (error: unknown) => {
+            assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${label} ${position}: ?schema= refused`)
+            assert.match((error as Error).message, /ONE BYTE AT A TIME/, `${label} ${position}: same justification`)
+            return true
+          },
         )
+
+        // AND THE ASCII PATH STILL REACHES THE SERVER, so what has just been asserted is a refusal
+        // of non-ASCII and not a broken pin. `tenant` is one of the schemas created above, so a
+        // wrong answer here is visible rather than an error.
         const pinned: pg.Client = new pg.Client({
-          ...pgConnectionConfig(carried.toString()),
+          ...pgConnectionConfig(`${scratch.url}?schema=tenant`),
           connectionTimeoutMillis: 3_000,
         })
         await pinned.connect()
         try {
           assert.equal(
             (await pinned.query<{ s: string }>('select current_schema() as s')).rows[0]?.s,
-            value,
-            `${label} ${position}: the server resolved the WHOLE name, character included`,
-          )
-          const key = `pinned-${label}-${position}`
-          await pinned.query('insert into settings (key, value, "updatedAt") values ($1, $2, now())', [key, label])
-          assert.deepEqual(
-            await holders(key),
-            [value],
-            `${label} ${position}: and the unqualified write landed there and nowhere else`,
+            'tenant',
+            `${label} ${position}: an ASCII pin still resolves at the real server`,
           )
         } finally {
           await pinned.end().catch(() => undefined)
