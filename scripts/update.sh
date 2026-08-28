@@ -261,8 +261,43 @@ if [[ $EUID -ne 0 ]] && ! $DRY_RUN; then
   die "Run as root: sudo bash update.sh  (--dry-run works unprivileged)"
 fi
 
-[[ -d "$APP_DIR" ]] || die "App directory ${APP_DIR} not found. Run install.sh first."
-[[ -f "${APP_DIR}/.env" ]] || die ".env not found. Run install.sh first."
+# ---------------------------------------------------------------------------
+# THE APPLICATION'S OWN LAYOUT IS INSPECTED HERE AND REFUSED LATER (o3d-2sm1.5 r28, Codex HIGH).
+#
+# These two lines used to be `|| die`. That is the same misplaced refusal r27 moved for the port,
+# in the same script, one screen higher: it runs during top-level initialisation — BEFORE the EXIT
+# trap is installed, before the cutover lock is acquired and before an existing fence marker is
+# adopted — and the thing it refuses on is a path THE APPLICATION USER OWNS.
+#
+# So after an interrupted migration the application account could delete ${APP_DIR}/.env, or
+# replace it with a directory or a dangling symlink, and the recovery run walked out here: the
+# service was left stopped, the reboot fence left standing, the crontab left commented out and the
+# connection fence left un-adopted, with no trap installed to say so. An abandoned fence, caused
+# by a byte the abandoned party controls. Exactly the failure the relocated port gate closed.
+#
+# A REFUSAL IS ONLY SAFE WHERE REFUSING LEAVES THE SYSTEM CONSISTENT. So the SHAPE is read here —
+# reading is free and nothing is decided by it — and the refusal happens at the gate after the
+# adoption block, beside the port gate, where the cutover lock is held, any standing fence has
+# been re-stopped, re-established and verified (or completely unwound), and nothing new has been
+# pulled, built, stopped, fenced or migrated.
+#
+# EVERY OTHER FATAL EXIT AHEAD OF THE ADOPTION WAS RE-READ FOR THIS SHAPE, AND THESE TWO WERE THE
+# ONLY MISPLACED ONES. The `Run as root` refusal is about the invocation and not about anything
+# the application can write, and a non-root run could not adopt a fence in any case. The three
+# refusals inside acquire_cutover_lock()/import_legacy_cutover_state() are the lock itself and the
+# directory the fence state lives in: without either, adoption is not possible at all, so refusing
+# is not abandoning. Everything else — the fence script, the connection identity, the sole-source
+# question, the marker writes — already sits after the adoption.
+APP_LAYOUT_REASON=""
+if [[ ! -d "$APP_DIR" ]]; then
+  APP_LAYOUT_REASON="the application directory ${APP_DIR} does not exist, so there is no installation here to update"
+elif [[ ! -e "${APP_DIR}/.env" ]]; then
+  APP_LAYOUT_REASON="${APP_DIR}/.env does not exist"
+elif [[ ! -f "${APP_DIR}/.env" ]]; then
+  APP_LAYOUT_REASON="${APP_DIR}/.env is not a regular file, so the connection identity this run must fence and migrate cannot be read out of it"
+elif [[ ! -r "${APP_DIR}/.env" ]]; then
+  APP_LAYOUT_REASON="${APP_DIR}/.env is not readable"
+fi
 
 # ---------------------------------------------------------------------------
 # THE APPLICATION'S OWN FILES ARE READ, NEVER EXECUTED (o3d-2sm1.5 r25, Codex CRITICAL).
@@ -660,8 +695,29 @@ require_db_identity() {
 }
 
 # ---------------------------------------------------------------------------
-# IS THE FILE WE READ THE ONLY THING THAT CAN DEFINE DATABASE_URL FOR THIS SERVICE?
-# (o3d-2sm1.5 r20, Codex CRITICAL; r21 asks systemd's BUS instead of its text output)
+# WHAT CAN DEFINE ONE VARIABLE FOR THIS SERVICE?
+# (o3d-2sm1.5 r20, Codex CRITICAL; r21 asks systemd's BUS instead of its text output;
+#  r28 makes it ONE MECHANISM asked of a NAMED VARIABLE, Codex HIGH)
+#
+# IT IS ONE MECHANISM, NOT ONE PER VARIABLE. Until r28 this was written for DATABASE_URL alone,
+# and the round that added the port resolver read `Environment=PORT=` as authoritative — in this
+# same file, one screen below the reasoning that says a directive is not the composed
+# environment. Two variables, one doctrine, applied to one of them. So the scan takes the
+# VARIABLE NAME and the LAYER that is allowed to answer for it as arguments, and a third variable
+# cannot repeat the omission by being forgotten: there is nowhere else to ask the question.
+#
+#   layer=file       the named environment file is the only permitted definition. An
+#                    `Environment=` directive competes with it and is refused. This is how the
+#                    connection identity asks, and every refusal below is written for it.
+#   layer=directive  the unit's own `Environment=` is the permitted definition and NO environment
+#                    file may be loaded at all, because every one of them is composed later. This
+#                    is how unit_listen_port() asks about PORT.
+#
+# WHAT ELSE IN THESE SCRIPTS READS `Environment=`? Nothing. deploy.sh takes its port from the root
+# invocation (IMS_PORT) and install.sh writes the unit rather than reading one; the only other
+# `Environment=` reader in any of the three is this scan itself, in each script's copy, and it has
+# asked the whole composition question since r21. PORT was the one value read from a directive
+# with the assumption, and it is the one fixed here.
 #
 # r19 moved the identity from "worked out by the fence" to "supplied by the entrypoint", and the
 # entrypoint supplies it out of ${APP_DIR_REAL}/.env. That is the PREVIOUS PROBLEM ONE LEVEL UP: an
@@ -725,6 +781,9 @@ require_db_identity() {
 # CONFIGURATION INPUT that these scripts read outright, instead of deriving them from a URL that
 # is only probably the one the service uses (o3d-1yvh, docs/installation.md).
 DB_IDENTITY_SOURCE_REASON="the service's environment has not been asked about yet"
+# The parameterised mechanism's own answer. DB_IDENTITY_SOURCE_REASON above is what the
+# DATABASE_URL call sites read, and the wrapper copies this into it.
+ENV_VAR_SOURCE_REASON="no variable's environment sources have been asked about yet"
 BUS_STRINGS=()
 
 # THE STRINGS IN ONE `busctl` RENDERING, in order, STILL ESCAPED.
@@ -780,11 +839,13 @@ bus_unit_property() {
   busctl get-property org.freedesktop.systemd1 "${1:-}" "org.freedesktop.systemd1.${2:-}" "${3:-}" 2>/dev/null
 }
 
-# Does this element of an environment property NAME DATABASE_URL? Everything before the first `=`
-# is the name, so `DATABASE_URL`, `DATABASE_URL=postgresql://...` and an assignment carrying any
-# value at all are one answer, and `NEXT_PUBLIC_DATABASE_URL=...` is not.
-bus_element_names_database_url() {
-  [[ "${1%%=*}" == "DATABASE_URL" ]]
+# Does this element of an environment property NAME the variable being asked about? Everything
+# before the first `=` is the name, so `DATABASE_URL`, `DATABASE_URL=postgresql://...` and an
+# assignment carrying any value at all are one answer, and `NEXT_PUBLIC_DATABASE_URL=...` is not.
+# The variable is an ARGUMENT since r28: the same rule answers for PORT, and for whatever a later
+# round has to ask about, without a second matcher being written for it.
+bus_element_names_variable() {
+  [[ "${1%%=*}" == "${2}" ]]
 }
 
 # THE `ignore_errors` HALF OF EnvironmentFiles=, which is an `a(sb)` and not an `as`
@@ -820,21 +881,21 @@ bus_read_env_ignore_flags() {
 # about to hand the units to systemd (o3d-2sm1.5 r23).
 DB_IDENTITY_REQUIRE_SNAPSHOT=false
 
-env_file_is_sole_database_url_source() {
-  local env_file="${1:-}"; shift || true
+unit_env_var_sole_source() {
+  local variable="${1:-}" layer="${2:-}" env_file="${3:-}"; shift 3 2>/dev/null || true
   local -a units=("$@")
   local unit object rendering count element expected resolved load_state pam_name snapshot_expected
 
-  DB_IDENTITY_SOURCE_REASON=""
+  ENV_VAR_SOURCE_REASON=""
   expected="$(readlink -f "$env_file" 2>/dev/null || printf '%s' "$env_file")"
   snapshot_expected="$(readlink -f "$DB_ENV_SNAPSHOT_FILE" 2>/dev/null || printf '%s' "$DB_ENV_SNAPSHOT_FILE")"
 
   if [[ "${#units[@]}" -eq 0 || -z "${units[0]}" ]]; then
-    DB_IDENTITY_SOURCE_REASON="no systemd unit was identified for the application, so there is nothing that can say whether ${env_file} is what gives it DATABASE_URL"
+    ENV_VAR_SOURCE_REASON="no systemd unit was identified for the application, so there is nothing that can say whether ${env_file} is what gives it ${variable}"
     return 1
   fi
   if ! command -v busctl >/dev/null 2>&1; then
-    DB_IDENTITY_SOURCE_REASON="busctl — systemd's own bus client, shipped beside systemctl — is not available, so whether anything other than ${env_file} defines DATABASE_URL for the service cannot be established"
+    ENV_VAR_SOURCE_REASON="busctl — systemd's own bus client, shipped beside systemctl — is not available, so whether anything other than ${env_file} defines ${variable} for the service cannot be established"
     return 1
   fi
 
@@ -846,36 +907,36 @@ env_file_is_sole_database_url_source() {
     # load `systemctl show` performs — it starts nothing and queues no job.
     rendering="$(busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LoadUnit s "$unit" 2>/dev/null)" || rendering=''
     if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 || -z "${BUS_STRINGS[0]}" ]]; then
-      DB_IDENTITY_SOURCE_REASON="systemd would not say where ${unit} lives on its bus, so what defines DATABASE_URL for that service is unknown"
+      ENV_VAR_SOURCE_REASON="systemd would not say where ${unit} lives on its bus, so what defines ${variable} for that service is unknown"
       return 1
     fi
     object="${BUS_STRINGS[0]}"
 
     rendering="$(bus_unit_property "$object" Unit LoadState)" || rendering=''
     if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
-      DB_IDENTITY_SOURCE_REASON="systemd would not answer for ${unit}'s LoadState, so what defines DATABASE_URL for that service is unknown"
+      ENV_VAR_SOURCE_REASON="systemd would not answer for ${unit}'s LoadState, so what defines ${variable} for that service is unknown"
       return 1
     fi
     load_state="${BUS_STRINGS[0]}"
     if [[ "$load_state" != "loaded" ]]; then
-      DB_IDENTITY_SOURCE_REASON="systemd reports ${unit} as '${load_state:-unknown}' rather than loaded, so what defines DATABASE_URL for it cannot be read"
+      ENV_VAR_SOURCE_REASON="systemd reports ${unit} as '${load_state:-unknown}' rather than loaded, so what defines ${variable} for it cannot be read"
       return 1
     fi
 
     # PAMName=, which the five-property question did not ask (r21, Codex CRITICAL). systemd.exec
     # lists "variables set by any PAM modules in case PAMName= is in effect" AFTER the
     # EnvironmentFile= layer and says the later source wins, so a unit naming a PAM profile whose
-    # stack runs pam_env can be handed a DATABASE_URL that beats the file this deploy read — while
+    # stack runs pam_env can be handed a ${variable} that beats the file this deploy read — while
     # every other property here still says "only that file". What a PAM stack supplies is not
     # knowable without reading PAM configuration, so ANY non-empty value is refused.
     rendering="$(bus_unit_property "$object" Service PAMName)" || rendering=''
     if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
-      DB_IDENTITY_SOURCE_REASON="systemd would not answer for ${unit}'s PAMName=, so whether a PAM stack also defines DATABASE_URL for it is unknown"
+      ENV_VAR_SOURCE_REASON="systemd would not answer for ${unit}'s PAMName=, so whether a PAM stack also defines ${variable} for it is unknown"
       return 1
     fi
     pam_name="${BUS_STRINGS[0]}"
     if [[ -n "$pam_name" ]]; then
-      DB_IDENTITY_SOURCE_REASON="${unit} sets PAMName=${pam_name}, and systemd applies the variables its PAM modules set AFTER the environment file — the later source wins. Whether that stack exports DATABASE_URL is a question about PAM configuration this will not read, so it is refused rather than guessed at. Remove PAMName=, or state the connection identity explicitly"
+      ENV_VAR_SOURCE_REASON="${unit} sets PAMName=${pam_name}, and systemd applies the variables its PAM modules set AFTER the environment file — the later source wins. Whether that stack exports ${variable} is a question about PAM configuration this will not read, so it is refused rather than guessed at. Remove PAMName=, or state the connection identity explicitly"
       return 1
     fi
 
@@ -884,20 +945,26 @@ env_file_is_sole_database_url_source() {
     # is the same refusal as the bare name (r21, Codex HIGH).
     local property description
     for property in Environment PassEnvironment UnsetEnvironment; do
+      # WHICH LAYER IS ALLOWED TO DEFINE IT. For `file` — the ${variable} question as the database
+      # identity asks it — the environment file is the permitted source, so an `Environment=`
+      # directive is a COMPETING definition and a refusal. For `directive` — how the port asks it —
+      # the unit's own `Environment=` IS what the caller read, so it is not asked about again here.
+      # Every LATER composition source still is, in both.
+      if [[ "$property" == "Environment" && "$layer" == "directive" ]]; then continue; fi
       rendering="$(bus_unit_property "$object" Service "$property")" || rendering=''
       if ! count="$(bus_array_count "$rendering" 'as')" || ! bus_read_strings "$rendering" \
         || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
-        DB_IDENTITY_SOURCE_REASON="systemd would not answer readably for ${unit}'s ${property}=, so what defines DATABASE_URL for that service is unknown"
+        ENV_VAR_SOURCE_REASON="systemd would not answer readably for ${unit}'s ${property}=, so what defines ${variable} for that service is unknown"
         return 1
       fi
       for element in ${BUS_STRINGS[@]+"${BUS_STRINGS[@]}"}; do
-        bus_element_names_database_url "$element" || continue
+        bus_element_names_variable "$element" "$variable" || continue
         case "$property" in
-          Environment) description="sets DATABASE_URL in its own Environment= (${element%%=*}=…). systemd puts that in the service's environment and dotenv will not overwrite an already-set variable, so the application connects where THAT says and not where ${env_file} says" ;;
-          PassEnvironment) description="lists DATABASE_URL in PassEnvironment=, so the service inherits whatever the service manager's own environment holds and ${env_file} does not decide where the application connects" ;;
-          *) description="lists DATABASE_URL in UnsetEnvironment= (as '${element}'), so systemd removes the value ${env_file} supplies — as the final step of composing the environment, whether it is written as a name or as an exact assignment — and the application's own loader decides what replaces it" ;;
+          Environment) description="sets ${variable} in its own Environment= (${element%%=*}=…). systemd puts that in the service's environment and dotenv will not overwrite an already-set variable, so the application connects where THAT says and not where ${env_file} says" ;;
+          PassEnvironment) description="lists ${variable} in PassEnvironment=, so the service inherits whatever the service manager's own environment holds and ${env_file} does not decide where the application connects" ;;
+          *) description="lists ${variable} in UnsetEnvironment= (as '${element}'), so systemd removes the value ${env_file} supplies — as the final step of composing the environment, whether it is written as a name or as an exact assignment — and the application's own loader decides what replaces it" ;;
         esac
-        DB_IDENTITY_SOURCE_REASON="${unit} ${description}. Remove it, or state the connection identity explicitly"
+        ENV_VAR_SOURCE_REASON="${unit} ${description}. Remove it, or state the connection identity explicitly"
         return 1
       done
     done
@@ -907,11 +974,25 @@ env_file_is_sole_database_url_source() {
     rendering="$(bus_unit_property "$object" Service EnvironmentFiles)" || rendering=''
     if ! count="$(bus_array_count "$rendering" 'a(sb)')" || ! bus_read_strings "$rendering" \
       || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
-      DB_IDENTITY_SOURCE_REASON="systemd would not answer readably for ${unit}'s EnvironmentFiles=, so what defines DATABASE_URL for that service is unknown"
+      ENV_VAR_SOURCE_REASON="systemd would not answer readably for ${unit}'s EnvironmentFiles=, so what defines ${variable} for that service is unknown"
       return 1
     fi
+    # THE `directive` LAYER TOLERATES NO ENVIRONMENT FILE AT ALL (o3d-2sm1.5 r28, Codex HIGH).
+    # systemd.exec is explicit that EnvironmentFile= is applied AFTER Environment=, so a file the
+    # unit loads can redefine the variable the directive states — and the file THIS service loads
+    # is written by the APPLICATION USER. Which definition wins is the unbounded precedence
+    # question this script never asks, and opening the file to find out is what r19 stopped doing,
+    # so the EXISTENCE of any file is the refusal. It names the alternative, which for the port is
+    # the one place a later environment source cannot reach: ExecStart=.
+    if [[ "$layer" == "directive" ]]; then
+      if [[ "$count" -ne 0 ]]; then
+        ENV_VAR_SOURCE_REASON="${unit} states ${variable} in its own Environment=, and it also loads ${count} environment file(s) (${BUS_STRINGS[*]}). systemd applies EnvironmentFile= AFTER Environment=, so any of those files can define ${variable} differently and the service would use THAT value while the unit's directive still reads as the answer. They are not opened here, because which definition would win is composition this script does not reproduce. Pin it in ExecStart= instead, where nothing composed later can move it, or state it on this run's invocation"
+        return 1
+      fi
+      continue
+    fi
     if [[ "$count" -eq 0 ]]; then
-      DB_IDENTITY_SOURCE_REASON="${unit} does not load ${env_file} with EnvironmentFile=, so DATABASE_URL reaches the application through its own dotenv loader instead — whose .env.local and per-mode overlays are exactly the composition this deploy stopped reproducing. Add EnvironmentFile=${env_file} to the unit, or state the connection identity explicitly"
+      ENV_VAR_SOURCE_REASON="${unit} does not load ${env_file} with EnvironmentFile=, so ${variable} reaches the application through its own dotenv loader instead — whose .env.local and per-mode overlays are exactly the composition this deploy stopped reproducing. Add EnvironmentFile=${env_file} to the unit, or state the connection identity explicitly"
       return 1
     fi
     # ONE ENVIRONMENT FILE, OR TWO OF WHICH THE SECOND IS THIS RUN'S OWN SNAPSHOT
@@ -921,14 +1002,14 @@ env_file_is_sole_database_url_source() {
     # drop-in that loads ${DB_ENV_SNAPSHOT_FILE} after it. So the shape is stated exactly: the
     # application's file first, and at most one more, which may only be the snapshot THIS RUN
     # published. A snapshot left behind by some earlier run is NOT tolerated — DB_ENV_SNAPSHOT_PUBLISHED
-    # is false until this run writes one — because an unexplained pin is a DATABASE_URL nobody
+    # is false until this run writes one — because an unexplained pin is a ${variable} nobody
     # here chose, which is precisely the condition this function exists to refuse.
     if [[ "$count" -gt 2 ]]; then
-      DB_IDENTITY_SOURCE_REASON="${unit} loads ${count} environment files (${BUS_STRINGS[*]}). Whether any of them but ${env_file} defines DATABASE_URL, and which definition systemd would keep, is composition this will not reproduce — so it is refused rather than guessed at, and without reading them. Load only ${env_file}, or state the connection identity explicitly"
+      ENV_VAR_SOURCE_REASON="${unit} loads ${count} environment files (${BUS_STRINGS[*]}). Whether any of them but ${env_file} defines ${variable}, and which definition systemd would keep, is composition this will not reproduce — so it is refused rather than guessed at, and without reading them. Load only ${env_file}, or state the connection identity explicitly"
       return 1
     fi
     if ! bus_read_env_ignore_flags "$rendering" || [[ "${#BUS_ENV_IGNORE_FLAGS[@]}" -ne "$count" ]]; then
-      DB_IDENTITY_SOURCE_REASON="systemd would not say readably whether ${unit} loads its environment files with a leading '-'. Whether a missing file is skipped or fatal decides what the service gets when one disappears, so it is refused rather than assumed"
+      ENV_VAR_SOURCE_REASON="systemd would not say readably whether ${unit} loads its environment files with a leading '-'. Whether a missing file is skipped or fatal decides what the service gets when one disappears, so it is refused rather than assumed"
       return 1
     fi
     local index
@@ -937,32 +1018,32 @@ env_file_is_sole_database_url_source() {
       element="${BUS_STRINGS[index]}"
       case "$element" in
         *'\'*)
-          DB_IDENTITY_SOURCE_REASON="systemd reports one of ${unit}'s environment files as ${element}, a path it had to escape to state. Decoding that here to compare it with ${env_file} is a reimplementation of somebody else's escaping, so it is refused: give the unit an EnvironmentFile= path with no character needing an escape, or state the connection identity explicitly"
+          ENV_VAR_SOURCE_REASON="systemd reports one of ${unit}'s environment files as ${element}, a path it had to escape to state. Decoding that here to compare it with ${env_file} is a reimplementation of somebody else's escaping, so it is refused: give the unit an EnvironmentFile= path with no character needing an escape, or state the connection identity explicitly"
           return 1 ;;
       esac
       resolved="$(readlink -f "$element" 2>/dev/null || printf '%s' "$element")"
       if [[ "$index" -eq 0 ]]; then
         if [[ "$resolved" != "$expected" ]]; then
-          DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} as its first environment file and not ${env_file}, so the file this deploy read is not the one that gives the service DATABASE_URL. Load ${env_file}, or state the connection identity explicitly"
+          ENV_VAR_SOURCE_REASON="${unit} loads ${element} as its first environment file and not ${env_file}, so the file this deploy read is not the one that gives the service ${variable}. Load ${env_file}, or state the connection identity explicitly"
           return 1
         fi
         continue
       fi
       # THE SECOND ENTRY, WHICH MAY ONLY BE THE BINDING. Three things are required of it and each
-      # is load-bearing: it is the snapshot's path (anything else is a source of DATABASE_URL this
+      # is load-bearing: it is the snapshot's path (anything else is a source of ${variable} this
       # deploy did not write), THIS run published it (an old one pins a value nobody re-validated),
       # and it is loaded WITHOUT a leading '-' (with one, deleting it between here and the exec
       # takes the binding away silently and hands the service back to ${env_file}).
       if ! $DB_ENV_SNAPSHOT_PUBLISHED; then
-        DB_IDENTITY_SOURCE_REASON="${unit} loads a second environment file, ${element}, that this run did not publish. A second file can define DATABASE_URL and systemd keeps the LAST definition, so what the service would connect to is not ${env_file}'s answer. Remove it (if it is a ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in, an earlier cutover left it behind and it is safe to delete), or state the connection identity explicitly"
+        ENV_VAR_SOURCE_REASON="${unit} loads a second environment file, ${element}, that this run did not publish. A second file can define ${variable} and systemd keeps the LAST definition, so what the service would connect to is not ${env_file}'s answer. Remove it (if it is a ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in, an earlier cutover left it behind and it is safe to delete), or state the connection identity explicitly"
         return 1
       fi
       if [[ "$resolved" != "$snapshot_expected" ]]; then
-        DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} as a second environment file, and this run's environment snapshot is ${DB_ENV_SNAPSHOT_FILE}. A second file can define DATABASE_URL and systemd keeps the LAST definition, so the service would connect where that file says. Remove it, or state the connection identity explicitly"
+        ENV_VAR_SOURCE_REASON="${unit} loads ${element} as a second environment file, and this run's environment snapshot is ${DB_ENV_SNAPSHOT_FILE}. A second file can define ${variable} and systemd keeps the LAST definition, so the service would connect where that file says. Remove it, or state the connection identity explicitly"
         return 1
       fi
       if [[ "${BUS_ENV_IGNORE_FLAGS[index]}" != "false" ]]; then
-        DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} with a leading '-', so systemd SKIPS it if it is missing instead of failing the start. The whole point of the snapshot is that its absence stops the service rather than handing it back to ${env_file}; drop the '-' from the ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in"
+        ENV_VAR_SOURCE_REASON="${unit} loads ${element} with a leading '-', so systemd SKIPS it if it is missing instead of failing the start. The whole point of the snapshot is that its absence stops the service rather than handing it back to ${env_file}; drop the '-' from the ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in"
         return 1
       fi
     done
@@ -970,11 +1051,21 @@ env_file_is_sole_database_url_source() {
     # else this function is a refusal of extra sources; at the start it is also the proof that the
     # one source that cannot be replaced under us is loaded.
     if $DB_IDENTITY_REQUIRE_SNAPSHOT && [[ "$count" -ne 2 ]]; then
-      DB_IDENTITY_SOURCE_REASON="${unit} does not load this run's environment snapshot ${DB_ENV_SNAPSHOT_FILE}, so the DATABASE_URL it gets at exec is whatever ${env_file} says at that moment and not the one this run fenced and migrated"
+      ENV_VAR_SOURCE_REASON="${unit} does not load this run's environment snapshot ${DB_ENV_SNAPSHOT_FILE}, so the ${variable} it gets at exec is whatever ${env_file} says at that moment and not the one this run fenced and migrated"
       return 1
     fi
   done
   return 0
+}
+
+# THE DATABASE IDENTITY'S NAME FOR THE QUESTION, and all that is left of the function that used to
+# be it: the same scan, told which variable to ask about and which layer is allowed to answer.
+# Four call sites read `require_env_file_is_sole_definition` exactly as they always did.
+env_file_is_sole_database_url_source() {
+  local rc=0
+  unit_env_var_sole_source DATABASE_URL file "$@" || rc=$?
+  DB_IDENTITY_SOURCE_REASON="$ENV_VAR_SOURCE_REASON"
+  return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -1003,6 +1094,12 @@ env_file_is_sole_database_url_source() {
 # ims-e2e-dev.service pins `Environment=PORT=3002` and `--port 3002`. Both agree, both are read,
 # and NEITHER of their .env files mentions APP_PORT at all — which is the whole finding: the file
 # this script used to believe is silent about the fact it was believed for.
+#
+# RE-VERIFIED AGAINST THE SAME UNITS FOR r28, read-only: both of them ALSO load an
+# `EnvironmentFile=-<their own .env>` with ignore_errors=yes, so the Environment=PORT= each pins
+# is NOT the last word on their port — the `directive` layer refuses both, naming the file. It
+# changes neither answer, because the ExecStart= flag decides first for both; it is exactly the
+# unit shape that would have been believed wrongly with the flag removed.
 #
 # NOTHING HERE READS ${APP_DIR}/.env, and nothing here is influenced by it.
 UNIT_PORT=""
@@ -1120,11 +1217,34 @@ unit_listen_port() {
     return 0
   fi
   if [[ -n "$env_port" ]]; then
+    # AND NOTHING COMPOSED LATER MAY BE ABLE TO MOVE IT (o3d-2sm1.5 r28, Codex HIGH).
+    #
+    # `Environment=PORT=` is a DIRECTIVE, and a directive is not the composed environment. r27
+    # read it and called it authoritative — in the same file that had already established, for
+    # DATABASE_URL, that it is not: systemd applies EnvironmentFile= after Environment=, a `zz-`
+    # drop-in's EnvironmentFile= lands last of all, UnsetEnvironment= is applied as the FINAL
+    # step, and a PAM stack under PAMName= runs later still. A unit with `Environment=PORT=3000`,
+    # `EnvironmentFile=-${APP_DIR}/.env` and no CLI flag binds whatever PORT the APPLICATION
+    # writes into that file, while this returned 3000 — and the APP_PORT cross-check below cannot
+    # see it, because the name in the file would be PORT and not APP_PORT. The health poll then
+    # goes to an address the service never bound: no answer, and a healthy deployment is stopped
+    # and re-fenced; or an answer from something else, which the build-id probe cannot tell apart.
+    #
+    # So the doctrine that was written for one variable is now ASKED FOR THIS ONE, through the
+    # same function — see unit_env_var_sole_source() above, whose `directive` layer refuses every
+    # environment source composed after Environment=. On the installed unit that means a port
+    # pinned ONLY in Environment= is refused outright, because the unit loads ${APP_DIR}/.env:
+    # install.sh writes the port literally into ExecStart= (`next start -p <port>`), which is the
+    # branch above and needs none of this.
+    if ! unit_env_var_sole_source PORT directive "" "$unit"; then
+      UNIT_PORT_REASON="${unit} pins its port only in Environment=PORT=${env_port}, and a directive is not the composed environment: ${ENV_VAR_SOURCE_REASON}"
+      return 1
+    fi
     UNIT_PORT="$env_port"
-    UNIT_PORT_SOURCE="${unit}'s own Environment=PORT="
+    UNIT_PORT_SOURCE="${unit}'s own Environment=PORT=, which nothing composed after it can redefine"
     return 0
   fi
-  UNIT_PORT_REASON="${unit} pins no port at all: its ExecStart= names none and it sets no Environment=PORT=, so the port it listens on is decided somewhere this cannot read — by the application's own loader, or by a default inside the program. Pin it in the unit (Environment=PORT=<port>, or an ExecStart that names it), or state it on this script's invocation as IMS_APP_PORT=<port>"
+  UNIT_PORT_REASON="${unit} pins no port at all: its ExecStart= names none and it sets no Environment=PORT=, so the port it listens on is decided somewhere this cannot read — by the application's own loader, or by a default inside the program. Pin it in the unit's ExecStart= (an --port <port> flag, which nothing composed later can move), or state it on this script's invocation as IMS_APP_PORT=<port>. Environment=PORT= alone is only accepted from a unit that loads no environment file, because systemd applies those after it"
   return 1
 }
 
@@ -1184,12 +1304,46 @@ resolve_app_port() {
 RESPONDER_PIDS=""
 RESPONDER_REASON="the socket on the application's port has not been attributed yet"
 
-# Every pid `ss` attributes the listening socket on ${APP_PORT} to, one per line.
-port_listener_pids() {
-  # `$4 ~ p` selects the row, and the whole row is handed on: `pid=<n>` appears only in ss's
-  # process column, so grep does not need awk to pick a field out for it.
-  ss -ltnp 2>/dev/null | awk -v p=":${APP_PORT}\$" '$4 ~ p' \
-    | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true
+# EVERY MATCHING ROW, NOT EVERY MATCHING PID (o3d-2sm1.5 r28, Codex HIGH).
+#
+# The reader this replaces was one pipeline: select the rows `ss -ltnp` prints for ${APP_PORT},
+# then `grep -oE 'pid=[0-9]+'` them. That grep SILENTLY DROPS a row it cannot attribute — and a
+# dropped row is not an absent listener. With SO_REUSEPORT several sockets can be bound to the
+# same port and the kernel hands an incoming connection to ONE of them, so a box holding two —
+# one the unit's, one a process whose owner this shell cannot see — produced a pid list holding
+# only the trusted holder. Every pid in it then verified against the unit, the proof passed, and
+# the health request that decides the point of no return could have been answered by the other
+# socket. The empty-list refusal below never fired, because the list was not empty: it covered
+# only the case where EVERY row was unattributable.
+#
+# So the ROWS are counted, and the unattributable ones are counted separately. An unattributable
+# holder is an unknown, not an absent one, and the proof now refuses on that count rather than on
+# whatever survived a filter.
+PORT_LISTENER_ROWS=0
+PORT_LISTENER_UNATTRIBUTED=0
+PORT_LISTENER_PIDS=""
+port_listener_scan() {
+  local rows row pids
+  PORT_LISTENER_ROWS=0
+  PORT_LISTENER_UNATTRIBUTED=0
+  PORT_LISTENER_PIDS=""
+  # `$4 ~ p` selects the row, and the WHOLE row is kept: `pid=<n>` appears only in ss's process
+  # column, so the per-row read below does not need awk to pick a field out for it.
+  rows="$(ss -ltnp 2>/dev/null | awk -v p=":${APP_PORT}\$" '$4 ~ p' || true)"
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    PORT_LISTENER_ROWS=$(( PORT_LISTENER_ROWS + 1 ))
+    # ONE ROW CAN NAME SEVERAL PIDS — a forking server's children share the listening socket and
+    # ss lists them all in the one process column — so every pid on the row is collected. A row
+    # naming NONE is what makes the whole answer unknown, and it is counted, not discarded.
+    pids="$(printf '%s\n' "$row" | grep -oE 'pid=[0-9]+' | cut -d= -f2 || true)"
+    if [[ -z "$pids" ]]; then
+      PORT_LISTENER_UNATTRIBUTED=$(( PORT_LISTENER_UNATTRIBUTED + 1 ))
+      continue
+    fi
+    PORT_LISTENER_PIDS+="${pids}"$'\n'
+  done <<< "$rows"
+  PORT_LISTENER_PIDS="$(printf '%s' "$PORT_LISTENER_PIDS" | grep -E '^[0-9]+$' | sort -u || true)"
 }
 
 # Is this pid inside ${SERVICE_UNIT}'s control group? The unified hierarchy line first, then the
@@ -1231,9 +1385,20 @@ prove_service_owns_port() {
     RESPONDER_REASON="systemctl is not available, so the socket on :${APP_PORT} cannot be attributed to ${SERVICE_UNIT}"
     return 1
   fi
-  pids="$(port_listener_pids | grep -E '^[0-9]+$' || true)"
+  port_listener_scan
+  if (( PORT_LISTENER_ROWS == 0 )); then
+    RESPONDER_REASON="something answered on :${APP_PORT}, but 'ss -ltnp' reports no listening socket on that port at all, so the process behind the response cannot be identified"
+    return 1
+  fi
+  # EVERY ROW, BEFORE ANY PID IS VERIFIED. A single unattributable holder is enough: it may be the
+  # socket the health request reached, and nothing here can say that it was not.
+  if (( PORT_LISTENER_UNATTRIBUTED > 0 )); then
+    RESPONDER_REASON="'ss -ltnp' shows ${PORT_LISTENER_ROWS} listening socket(s) on :${APP_PORT} and attributes ${PORT_LISTENER_UNATTRIBUTED} of them to no pid at all. An unattributable holder is an unknown and not an absent one — with SO_REUSEPORT the kernel may hand the health request to that socket rather than to ${SERVICE_UNIT}'s own — so the process behind the response cannot be identified"
+    return 1
+  fi
+  pids="$PORT_LISTENER_PIDS"
   if [[ -z "$pids" ]]; then
-    RESPONDER_REASON="something answered on :${APP_PORT}, but 'ss -ltnp' attributes that listening socket to no pid at all, so the process behind it cannot be identified"
+    RESPONDER_REASON="'ss -ltnp' shows ${PORT_LISTENER_ROWS} listening socket(s) on :${APP_PORT} and no pid could be read out of any of them, so the process behind the response cannot be identified"
     return 1
   fi
   for pid in $pids; do
@@ -2866,6 +3031,21 @@ if [[ -f "${FENCE_FILE}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# THE LAYOUT GATE — THE OTHER REFUSAL THAT USED TO ABANDON A FENCE (o3d-2sm1.5 r28, Codex HIGH).
+#
+# The shape of ${APP_DIR} and ${APP_DIR}/.env was read during initialisation and NOTHING was
+# decided by it there. This is where it is decided, and it is decided here for the same reason the
+# port is: the file is application-owned, and a refusal taken before the adoption hands the
+# application account the power to make a recovery run walk away from a fence it left standing.
+#
+# Everything the adoption promises has already happened by this line — see the port gate below,
+# which states the three conditions in full — so this refusal leaves the box in the state its own
+# message describes, and a re-run adopts the same fence again.
+if [[ -n "${APP_LAYOUT_REASON}" ]]; then
+  die "This run cannot read the application's own configuration: ${APP_LAYOUT_REASON}. Everything below it needs that file — the connection identity the fence is aimed at, the privileged connection the recovery runs through, and the build Next reads it for — so there is nothing this run can safely do next. Run install.sh, or restore the file from its backup, and re-run. NOTHING NEW HAS BEEN STOPPED, FENCED OR MIGRATED BY THIS RUN: no code has been pulled, nothing has been built and the schema has not moved. If a previous run left a fence standing it has just been ADOPTED above — the service was re-stopped, both fences were re-established and verified, and the connection fence was held or released on the marker's own record — so this box is in the state that adoption left it in and not in an abandoned one."
+fi
+
+# ---------------------------------------------------------------------------
 # THE PORT GATE — AFTER THE FENCE IS ADOPTED, BEFORE ANYTHING NEW IS TOUCHED
 # (o3d-2sm1.5 r27, Codex HIGH).
 #
@@ -2891,7 +3071,7 @@ fi
 # Everything that costs something is still ahead. The exit trap is installed and knows which
 # phase this is, so a die here is torn down or left standing by the same machinery as any other.
 if [[ -z "${APP_PORT}" ]]; then
-  die "This run cannot establish which port ${SERVICE_UNIT} listens on, so it has no address to poll: ${APP_PORT_REASON}. That port is what decides whether the new build answered, and therefore whether this update is allowed past its point of no return, so it is not guessed at. ${APP_DIR}/.env is not an answer to it: the application can write that file and nothing in it starts the service. Pin the port in the unit (Environment=PORT=<port>, or an ExecStart that names it) or state it on the invocation (IMS_APP_PORT=<port>), and re-run. NOTHING NEW HAS BEEN STOPPED, FENCED OR MIGRATED BY THIS RUN: no code has been pulled, nothing has been built and the schema has not moved. If a previous run left a fence standing it has just been ADOPTED above — re-stopped, re-fenced and verified, or unwound if it had stopped nothing — so this box is in the state the message above describes, and a re-run adopts it again."
+  die "This run cannot establish which port ${SERVICE_UNIT} listens on, so it has no address to poll: ${APP_PORT_REASON}. That port is what decides whether the new build answered, and therefore whether this update is allowed past its point of no return, so it is not guessed at. ${APP_DIR}/.env is not an answer to it: the application can write that file and nothing in it starts the service. Pin the port in the unit's ExecStart= (an --port <port> flag) or state it on the invocation (IMS_APP_PORT=<port>), and re-run. NOTHING NEW HAS BEEN STOPPED, FENCED OR MIGRATED BY THIS RUN: no code has been pulled, nothing has been built and the schema has not moved. If a previous run left a fence standing it has just been ADOPTED above — re-stopped, re-fenced and verified, or unwound if it had stopped nothing — so this box is in the state the message above describes, and a re-run adopts it again."
 fi
 
 # AND ${APP_DIR}/.env's OWN CLAIM IS CHECKED AGAINST IT, never used instead of it. install.sh
