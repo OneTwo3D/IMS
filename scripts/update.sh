@@ -710,6 +710,122 @@ require_env_file_is_sole_definition() {
 # is stopped or migrated.
 resolve_db_identity "${DATABASE_URL:-}" || true
 DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE} ${DB_FENCE_IDENTITY_ARGS[*]:-}"
+
+# ---------------------------------------------------------------------------
+# AND RE-READ, BECAUSE SYSTEMD READS THAT FILE LATER THAN THIS DID
+# (o3d-2sm1.5 r22, Codex HIGH). The same gap as scripts/deploy.sh, in the same words.
+#
+# The `source` above happens in the preflight, while the old version is still serving —
+# before the build, before the stop, before the migration. `EnvironmentFile=` is read by systemd
+# when it EXECS the service, at the far end of that window. r21's sole-source check closed "is
+# this the file the service uses?" by asking the bus; it compares the configured PATH, and a path
+# is not its contents. So an atomic replacement, a `rm` or a symlink retarget in between still
+# moves the connection: this run fences and migrates database A and the service starts on
+# database B. The unit loads the file with a leading `-`, which makes a MISSING file skipped
+# rather than fatal, so a deletion does not even fail loudly — it hands the application back to
+# its own dotenv overlays, the exact composition r19 stopped reproducing.
+#
+# NOTHING NEW IS CONSULTED. The file is still the single configured source, still proven sole by
+# the bus read, still parsed by the same strict reader with the same refusals. Only WHEN changes.
+DB_IDENTITY_PINNED_HOST="$DB_IDENTITY_HOST"
+DB_IDENTITY_PINNED_PORT="$DB_IDENTITY_PORT"
+DB_IDENTITY_PINNED_USER="$DB_IDENTITY_USER"
+DB_IDENTITY_PINNED_DATABASE="$DB_IDENTITY_DATABASE"
+DB_IDENTITY_DRIFT_REASON="the environment file has not been re-read yet"
+
+# Read ONE variable out of .env WITHOUT `source`, which is how the pin above was taken and is not
+# something to do twice: sourcing executes the file, and re-executing it mid-update would run
+# whatever it has become and overwrite every variable this run is holding. Same reader, and the
+# same dotenv rules, as scripts/deploy.sh — a quoted value ends at its closing quote, an unquoted
+# one at the first whitespace-preceded `#`, later definitions win.
+#
+# THE FIRST RE-READ IS ALSO WHAT PROVES THE TWO READERS AGREE. The pin came from `source` and
+# every re-read comes from here, so the pre-fence comparison is the one that establishes the
+# baseline is reachable through this reader at all — before anything is stopped, where a
+# disagreement costs nothing. After it has passed once, every later comparison is like for like.
+env_file_value() {
+  local key="$1" file="$2" line value
+  [[ -f "$file" ]] || return 0
+  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$file" 2>/dev/null | tail -1 || true)"
+  [[ -n "$line" ]] || return 0
+  value="${line#*=}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  case "$value" in
+    \"*) value="${value#\"}"; value="${value%%\"*}" ;;
+    \'*) value="${value#\'}"; value="${value%%\'*}" ;;
+    *)
+      value="${value%%[[:space:]]#*}"
+      value="${value%"${value##*[![:space:]]}"}"
+      ;;
+  esac
+  printf '%s' "$value"
+}
+
+# Re-read ${APP_DIR}/.env and require it to still state the pinned identity.
+#
+# IT RESTORES THE GLOBALS IT BORROWS, unconditionally. resolve_db_identity() writes DB_IDENTITY_*
+# and CLEARS DB_FENCE_IDENTITY_ARGS as its first act, and those arguments are what
+# release_db_connections() and the exit trap's re-fence are built from. A re-read that failed and
+# left them empty would disarm the release on the one path where the fence is standing.
+env_file_identity_unchanged() {
+  local env_file="${APP_DIR}/.env"
+  DB_IDENTITY_DRIFT_REASON=""
+
+  if [[ -z "${DB_IDENTITY_PINNED_HOST}${DB_IDENTITY_PINNED_PORT}${DB_IDENTITY_PINNED_USER}${DB_IDENTITY_PINNED_DATABASE}" ]]; then
+    DB_IDENTITY_DRIFT_REASON="no connection identity was pinned when this run started, so there is nothing to re-read ${env_file} against"
+    return 1
+  fi
+  if [[ ! -e "$env_file" ]]; then
+    DB_IDENTITY_DRIFT_REASON="${env_file} no longer exists. ${SERVICE_UNIT:-The service unit} loads it with a leading '-', so systemd SKIPS a missing environment file instead of failing on it, and the application would start on whatever its own dotenv overlays supply — not on the database this run fenced and migrated"
+    return 1
+  fi
+  if [[ ! -f "$env_file" || ! -r "$env_file" ]]; then
+    DB_IDENTITY_DRIFT_REASON="${env_file} is no longer a readable regular file, so what it will give the service when systemd execs it cannot be read here"
+    return 1
+  fi
+
+  local saved_host="$DB_IDENTITY_HOST" saved_port="$DB_IDENTITY_PORT"
+  local saved_user="$DB_IDENTITY_USER" saved_database="$DB_IDENTITY_DATABASE"
+  local saved_reason="$DB_IDENTITY_REASON"
+  local -a saved_args=()
+  if [[ "${#DB_FENCE_IDENTITY_ARGS[@]}" -gt 0 ]]; then saved_args=("${DB_FENCE_IDENTITY_ARGS[@]}"); fi
+
+  local rc=0
+  resolve_db_identity "$(env_file_value DATABASE_URL "$env_file")" || rc=$?
+  local now_host="$DB_IDENTITY_HOST" now_port="$DB_IDENTITY_PORT"
+  local now_user="$DB_IDENTITY_USER" now_database="$DB_IDENTITY_DATABASE"
+  local now_reason="$DB_IDENTITY_REASON"
+
+  DB_IDENTITY_HOST="$saved_host"; DB_IDENTITY_PORT="$saved_port"
+  DB_IDENTITY_USER="$saved_user"; DB_IDENTITY_DATABASE="$saved_database"
+  DB_IDENTITY_REASON="$saved_reason"
+  DB_FENCE_IDENTITY_ARGS=()
+  if [[ "${#saved_args[@]}" -gt 0 ]]; then DB_FENCE_IDENTITY_ARGS=("${saved_args[@]}"); fi
+
+  if [[ "$rc" -ne 0 ]]; then
+    DB_IDENTITY_DRIFT_REASON="${env_file} no longer states a connection identity this will accept: ${now_reason}"
+    return 1
+  fi
+  if [[ "$now_host" != "$DB_IDENTITY_PINNED_HOST" || "$now_port" != "$DB_IDENTITY_PINNED_PORT" \
+     || "$now_user" != "$DB_IDENTITY_PINNED_USER" || "$now_database" != "$DB_IDENTITY_PINNED_DATABASE" ]]; then
+    DB_IDENTITY_DRIFT_REASON="${env_file} now names ${now_user}@${now_host}:${now_port}/${now_database}, and this run is fencing and migrating ${DB_IDENTITY_PINNED_USER}@${DB_IDENTITY_PINNED_HOST}:${DB_IDENTITY_PINNED_PORT}/${DB_IDENTITY_PINNED_DATABASE}"
+    return 1
+  fi
+  return 0
+}
+
+# BOTH halves, re-run: the file still says the same thing, AND systemd still says that file is the
+# only thing that can define DATABASE_URL for the service. The second half is not a formality at
+# the later call sites — the unit's loaded configuration is re-read after this run's own final
+# daemon-reload, so a drop-in that appeared during the window is folded in before it is asked.
+require_start_identity_unchanged() {
+  env_file_identity_unchanged || return 1
+  if ! require_env_file_is_sole_definition; then
+    DB_IDENTITY_DRIFT_REASON="$DB_IDENTITY_SOURCE_REASON"
+    return 1
+  fi
+  return 0
+}
 # Is the reboot fence ACTUALLY loaded by systemd right now? Distinct from FENCE_MASK, which
 # only says this run intends to migrate: the failure banner used to describe a drop-in that
 # may never have been installed (o3d-2sm1.5, Codex r4 HIGH).
@@ -1173,6 +1289,13 @@ fence_db_connections() {
   # the wrong database.
   require_env_file_is_sole_definition || die \
     "${DB_IDENTITY_SOURCE_REASON}. The fence, the migration and the release would all agree with each other about the database ${APP_DIR}/.env names, while the application that restarts afterwards connects somewhere else — a migration on a database nothing fenced, and a new build on a database nothing migrated. Nothing has been stopped and nothing has been migrated."
+
+  # AND THE FILE MUST STILL SAY WHAT IT SAID WHEN THIS RUN READ IT (o3d-2sm1.5 r22, Codex HIGH).
+  # The identity above was sourced once, in the preflight, before the build and before the stop;
+  # this is the last moment before the fence is aimed. Nothing has been fenced yet, so a
+  # disagreement here is the cheap one — it costs a restart of the old version and no schema.
+  require_start_identity_unchanged || die \
+    "The connection identity this run pinned is no longer the one ${APP_DIR}/.env gives the service: ${DB_IDENTITY_DRIFT_REASON}. DATABASE_URL was read once, in the preflight, and systemd does not read the environment file until it execs the service — so fencing on the pinned identity now would fence and migrate one database while the application starts on another. NO FENCE HAS BEEN RAISED and nothing has been migrated. Put the file back the way this run found it, or re-run so the identity is pinned from what the file says now."
 
   mkdir -p "${DB_FENCE_DIR}"
   chown "${APP_USER}:${APP_USER}" "${DB_FENCE_DIR}"
@@ -2322,9 +2445,37 @@ header "Starting the new version"
 # applied, the deployed schema matched prisma/schema.prisma and every declared
 # verification returned zero: the schema is known good and the new version is about to
 # start. Every other path either never touched the schema or leaves the fence standing.
+
+# BEFORE THE RELEASE, WITH THE FENCE STILL HELD (o3d-2sm1.5 r22, Codex HIGH). The migration
+# window is closing and the whole point of the fence is that the database it is holding shut is
+# the database that is about to be served. If ${APP_DIR}/.env has been replaced, deleted or
+# retargeted since the pin — or the unit has acquired another definition of DATABASE_URL — then
+# releasing here opens database A and starts the application on database B.
+#
+# SO IT REFUSES, AND THE FENCE STAYS UP. This die reaches the exit trap with FENCE_ARMED and
+# SCHEMA_TOUCHED both true, which is the path that HOLDS the connection fence, re-stops the
+# service, re-installs the reboot fence and prints the release command; the state is stated there
+# rather than claimed here. That is deliberately the expensive answer: a migrated database left
+# closed is recoverable by a re-run, and an application started on the wrong one is not.
+require_start_identity_unchanged || die \
+  "THE CONNECTION FENCE IS BEING HELD AND THE APPLICATION IS NOT BEING STARTED: ${DB_IDENTITY_DRIFT_REASON}. The migration applied and every verification passed, but the identity this run fenced and migrated is no longer the one ${APP_DIR}/.env will give the service when systemd execs it — so releasing the fence and starting now would open the database this run migrated and start the application on a different one. Restore ${APP_DIR}/.env to the identity above and re-run this script, which adopts the standing fence; or, once you are certain which database the service should use, release it by hand with the command printed below. Do NOT start the service until one of those is done."
+
 release_db_connections \
   || die "Refusing to start the application while it has no CONNECT on its own database."
 remove_reboot_fence
+
+# AND ONCE MORE AFTER THIS RUN'S FINAL daemon-reload, WHICH remove_reboot_fence() JUST ISSUED
+# (o3d-2sm1.5 r22, Codex HIGH). That reload is what folds every drop-in written during the window
+# into the unit's loaded configuration, so this is the first moment the LOADED unit can be asked,
+# and the last moment before `systemctl start` hands the file to systemd to read.
+#
+# A refusal here also leaves both fences standing, by the same route and without doing it by
+# hand: the die reaches the exit trap with SCHEMA_TOUCHED true and DB_FENCE_UP false, which is
+# exactly the branch that re-establishes the connection fence through refence_db_connections()
+# and re-installs the reboot fence, and then says which of the two it actually managed.
+require_start_identity_unchanged || die \
+  "THE APPLICATION IS NOT BEING STARTED, AND BOTH FENCES ARE BEING PUT BACK: ${DB_IDENTITY_DRIFT_REASON}. This was checked after the final daemon-reload, so it is the loaded unit configuration and the current file contents that disagree with the identity this run fenced and migrated — the one systemd is about to read. The connection fence was released a moment ago for the start and is being re-established below; the banner that follows says whether that succeeded and what is standing. Restore ${APP_DIR}/.env and the unit to the identity above and re-run this script, which adopts the fence. Do NOT start the service by hand first."
+
 # Lifts a mask left by an older revision of this script, which used `systemctl mask`
 # from its exit trap. Harmless when there is none.
 run systemctl unmask "${SERVICE_UNIT}" >/dev/null 2>&1 || true
