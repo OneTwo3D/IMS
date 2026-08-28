@@ -720,6 +720,38 @@ const MARKER = 'backReferenceFollowUpsPendingAt'
 const RANGE_OPERATORS = new Set(['lt', 'lte', 'gt', 'gte'])
 /** Prisma operators that ask about identity or nullness, which is all this column may be asked. */
 const IDENTITY_OPERATORS = new Set(['not', 'equals', 'in', 'notIn', 'isSet'])
+/**
+ * Prisma keys whose value is a PREDICATE, i.e. where the marker is being asked a question rather
+ * than assigned a value (o3d-0bfh r9, Codex MEDIUM).
+ *
+ * The distinction matters because the same key means opposite things either side of it.
+ * `backReferenceFollowUpsPendingAt: now` under `data:` is the mint; under `where:` it is a
+ * compare-and-set fence. r8's scan had no notion of position, so it had to be lenient enough for
+ * the `data` side — and that leniency is what let a predicate operand through.
+ */
+const PREDICATE_KEYS = new Set(['where', 'AND', 'OR', 'NOT'])
+/**
+ * The property names a marker EQUALITY operand may be read from — THE DELIBERATE WIDENING POINT.
+ *
+ * In a predicate position the operand may only be a generation VALUE: `null`, a filter object the
+ * scan can read, or a plain read of one of these. Everything else is refused, including a call. r8
+ * accepted "anything that is not an inline object literal" as safe, which admits exactly the two
+ * forms Codex named — `olderThan(cutoff)` and an imported `FILTERS.stale` returning `{ lt: cutoff }`
+ * — because neither is an object literal at the point of use and neither can be resolved to one.
+ *
+ * A name-based allowlist is the honest fail-closed rule available without a type checker: the scan
+ * cannot tell a `Date` from a filter object by shape, so it refuses every read it has not been told
+ * about. Adding a name here is a deliberate act with this comment attached to it, which is the
+ * whole difference between an allowlist and an assumption.
+ */
+const PROTOCOL_OPERAND_NAMES = new Set([
+  MARKER,
+  'followUpsPendingAt',
+  'generation',
+  'marker',
+  'pendingAt',
+  'settlementMarker',
+])
 /** JavaScript operators that treat a value as a point on a line. */
 const RANGE_TOKENS = new Set([
   ts.SyntaxKind.LessThanToken,
@@ -742,6 +774,29 @@ function localBindings(sourceFile: ts.SourceFile): Map<string, ts.Expression> {
   }
   visit(sourceFile)
   return bindings
+}
+
+/**
+ * Names that hold a value DESTRUCTURED off the marker column (o3d-0bfh r9, Codex MEDIUM).
+ *
+ * `const { backReferenceFollowUpsPendingAt: pendingAt } = row` puts the generation in a plain
+ * identifier, and `pendingAt < cutoff` is then the exact clock comparison this whole scan exists to
+ * refuse — invisible to it, because `localBindings` only records identifier declarations and
+ * `readsMarker` only recognises a property access. Both destructuring forms are recorded here, the
+ * renaming one and the shorthand.
+ */
+function destructuredMarkerAliases(sourceFile: ts.SourceFile): Set<string> {
+  const aliases = new Set<string>([MARKER])
+  const visit = (node: ts.Node): void => {
+    if (ts.isBindingElement(node) && ts.isIdentifier(node.name)) {
+      const source = node.propertyName ?? node.name
+      const sourceName = ts.isIdentifier(source) || ts.isStringLiteral(source) ? source.text : null
+      if (sourceName === MARKER) aliases.add(node.name.text)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return aliases
 }
 
 /** Follow identifiers and parenthesised/`as` wrappers to the expression they actually name. */
@@ -775,11 +830,18 @@ function keyOf(
 }
 
 /** Does this expression read the marker column — directly, through an alias, or through a call? */
-function readsMarker(expression: ts.Expression, bindings: Map<string, ts.Expression>): boolean {
+function readsMarker(
+  expression: ts.Expression,
+  bindings: Map<string, ts.Expression>,
+  aliases: Set<string> = new Set([MARKER]),
+): boolean {
   const resolved = resolve(expression, bindings)
   let found = false
   const visit = (node: ts.Node): void => {
     if (found) return
+    // A DESTRUCTURED alias is just an identifier by the time it is compared, so the name is the
+    // only evidence left that it holds the generation.
+    if (ts.isIdentifier(node) && aliases.has(node.text)) { found = true; return }
     if (ts.isPropertyAccessExpression(node) && node.name.text === MARKER) { found = true; return }
     if (ts.isElementAccessExpression(node)) {
       const argument = resolve(node.argumentExpression, bindings)
@@ -803,23 +865,29 @@ function judgeMarkerValue(
   bindings: Map<string, ts.Expression>,
   sourceFile: ts.SourceFile,
   depth = 0,
+  strict = false,
 ): string | null {
   const resolved = resolve(value, bindings)
   if (depth > 4) return `${MARKER}: a predicate nested deeper than this scan will follow — state it plainly`
   if (ts.isConditionalExpression(resolved)) {
-    return judgeMarkerValue(resolved.whenTrue, bindings, sourceFile, depth + 1)
-      ?? judgeMarkerValue(resolved.whenFalse, bindings, sourceFile, depth + 1)
+    return judgeMarkerValue(resolved.whenTrue, bindings, sourceFile, depth + 1, strict)
+      ?? judgeMarkerValue(resolved.whenFalse, bindings, sourceFile, depth + 1, strict)
   }
-  // Not an object at all: `null`, `true` in a select, a Date, a generation carried in a variable —
-  // an assignment or a compare-and-set operand, which is the protocol's own use.
-  if (!ts.isObjectLiteralExpression(resolved)) return null
+  if (!ts.isObjectLiteralExpression(resolved)) {
+    // NOT AN OBJECT. In an ASSIGNMENT or a select this is the protocol's own use: `null`, `true`,
+    // `now()`, a generation carried in a variable. In a PREDICATE it is the r8 hole — Codex's
+    // `olderThan(cutoff)` and `FILTERS.stale` both land here, and both were called safe purely for
+    // not being inline object literals. `strict` is where that stops.
+    if (!strict) return null
+    return judgeMarkerPredicateOperand(resolved, sourceFile)
+  }
   for (const property of resolved.properties) {
     if (ts.isSpreadAssignment(property)) {
       const spread = resolve(property.expression, bindings)
       if (!ts.isObjectLiteralExpression(spread)) {
         return `${MARKER}: ${property.getText(sourceFile)} — a spread this scan cannot resolve to an object literal`
       }
-      const verdict = judgeMarkerValue(spread, bindings, sourceFile, depth + 1)
+      const verdict = judgeMarkerValue(spread, bindings, sourceFile, depth + 1, strict)
       if (verdict) return verdict
       continue
     }
@@ -834,11 +902,46 @@ function judgeMarkerValue(
       return `${MARKER}: unrecognised operator "${key}" — only null tests and equality may be asked of a generation`
     }
     if (ts.isPropertyAssignment(property)) {
-      const verdict = judgeMarkerValue(property.initializer, bindings, sourceFile, depth + 1)
+      const verdict = judgeMarkerValue(property.initializer, bindings, sourceFile, depth + 1, strict)
       if (verdict) return verdict
     }
   }
   return null
+}
+
+/**
+ * Judge a non-object operand sitting in a marker PREDICATE — the position r8 could not see.
+ *
+ * ALLOWED: the `null` literal (a null test), and a PLAIN READ — an identifier or a property-access
+ * chain with no call anywhere in it — whose final name is one of {@link PROTOCOL_OPERAND_NAMES}.
+ * That is the compare-and-set fence the protocol is built on, and it is the only reason this
+ * position ever holds something that is not an object.
+ *
+ * REFUSED: everything else, and refused BY DEFAULT rather than by enumeration. A call
+ * (`olderThan(cutoff)`), a read the allowlist does not name (`FILTERS.stale`, which may return
+ * `{ lt: cutoff }`), an `await`, an arithmetic expression, an array. The scan has no type checker
+ * and so cannot tell a `Date` from a filter object; refusing what it cannot read is the only answer
+ * that does not amount to assuming the answer.
+ */
+function judgeMarkerPredicateOperand(resolved: ts.Expression, sourceFile: ts.SourceFile): string | null {
+  const text = resolved.getText(sourceFile).replace(/\s+/g, ' ')
+  if (resolved.kind === ts.SyntaxKind.NullKeyword) return null
+
+  const plainRead = (node: ts.Expression): string | null => {
+    if (ts.isIdentifier(node)) return node.text
+    if (ts.isNonNullExpression(node)) return plainRead(node.expression)
+    if (ts.isPropertyAccessExpression(node)) {
+      // The BASE must itself be a plain read, or a call is hiding inside the chain.
+      return plainRead(node.expression) === null ? null : node.name.text
+    }
+    return null
+  }
+
+  const name = plainRead(resolved)
+  if (name !== null && PROTOCOL_OPERAND_NAMES.has(name)) return null
+  return `${MARKER}: ${text} — a predicate operand this scan cannot read as a generation value. A helper-built `
+    + 'or imported filter can return { lt: cutoff } from exactly this position, so an unrecognised shape is '
+    + 'REFUSED rather than assumed safe. If it really is a generation, name it in PROTOCOL_OPERAND_NAMES'
 }
 
 /**
@@ -850,7 +953,23 @@ function judgeMarkerValue(
 function markerClockReads(code: string, fileName = 'scan.ts'): string[] {
   const sourceFile = ts.createSourceFile(fileName, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
   const bindings = localBindings(sourceFile)
+  const aliases = destructuredMarkerAliases(sourceFile)
   const offences: string[] = []
+
+  /** The object literals a `where`/`AND`/`OR`/`NOT` value actually stands for. */
+  const predicateClauses = (expression: ts.Expression, depth = 0): ts.ObjectLiteralExpression[] => {
+    if (depth > 3) return []
+    const resolved = resolve(expression, bindings)
+    if (ts.isObjectLiteralExpression(resolved)) return [resolved]
+    // `AND: [...]` / `OR: [...]` — each element is a clause in its own right.
+    if (ts.isArrayLiteralExpression(resolved)) {
+      return resolved.elements.flatMap((element) =>
+        ts.isSpreadElement(element)
+          ? predicateClauses(element.expression, depth + 1)
+          : predicateClauses(element, depth + 1))
+    }
+    return []
+  }
 
   const visit = (node: ts.Node): void => {
     // 1. A PRISMA PREDICATE keyed on the marker — including an aliased value, a spread and a
@@ -858,26 +977,47 @@ function markerClockReads(code: string, fileName = 'scan.ts'): string[] {
     if (ts.isObjectLiteralExpression(node)) {
       for (const property of node.properties) {
         const key = keyOf(property, bindings)
-        if (key !== MARKER) continue
-        const value = ts.isShorthandPropertyAssignment(property)
-          ? property.name
-          : (ts.isPropertyAssignment(property) ? property.initializer : null)
-        if (value === null) continue
-        const verdict = judgeMarkerValue(value, bindings, sourceFile)
-        if (verdict) offences.push(verdict)
+        if (key === MARKER) {
+          const value = ts.isShorthandPropertyAssignment(property)
+            ? property.name
+            : (ts.isPropertyAssignment(property) ? property.initializer : null)
+          if (value === null) continue
+          const verdict = judgeMarkerValue(value, bindings, sourceFile)
+          if (verdict) offences.push(verdict)
+          continue
+        }
+        // 1b. THE SAME KEY, JUDGED STRICTLY BECAUSE OF WHERE IT SITS (o3d-0bfh r9). Reached from
+        //     the `where`/`AND`/`OR`/`NOT` side rather than from the literal, so a clause built
+        //     elsewhere and passed in by name is judged as the predicate it becomes — which is
+        //     also the only way position is known at all.
+        if (key === null || !PREDICATE_KEYS.has(key) || !ts.isPropertyAssignment(property)) continue
+        for (const clause of predicateClauses(property.initializer)) {
+          for (const inner of clause.properties) {
+            if (keyOf(inner, bindings) !== MARKER) continue
+            const value = ts.isShorthandPropertyAssignment(inner)
+              ? inner.name
+              : (ts.isPropertyAssignment(inner) ? inner.initializer : null)
+            if (value === null) continue
+            const verdict = judgeMarkerValue(value, bindings, sourceFile, 0, true)
+            if (verdict) offences.push(verdict)
+          }
+        }
       }
     }
     // 2. A DIRECT JAVASCRIPT COMPARISON of a value read from the column. `<` and friends, and `-`,
-    //    which is how an "age" is computed before being compared somewhere else entirely.
+    //    which is how an "age" is computed before being compared somewhere else entirely. A
+    //    destructured alias counts as a read of the column (r9).
     if (ts.isBinaryExpression(node) && RANGE_TOKENS.has(node.operatorToken.kind)) {
-      if (readsMarker(node.left, bindings) || readsMarker(node.right, bindings)) {
+      if (readsMarker(node.left, bindings, aliases) || readsMarker(node.right, bindings, aliases)) {
         offences.push(`direct comparison: ${node.getText(sourceFile).replace(/\s+/g, ' ')}`)
       }
     }
     // 3. RAW SQL naming the column next to a comparison. Prisma's $queryRaw is not covered by
-    //    anything above, and it is the one route where the predicate is a string by design.
+    //    anything above, and it is the one route where the predicate is a string by design. A
+    //    COMPOSED fragment counts: a template whose substitutions resolve to strings is flattened
+    //    first, so `sql\`... "${MARKER_COLUMN}" < $1\`` is read as the statement it becomes (r9).
     if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateExpression(node)) {
-      const text = node.getText(sourceFile)
+      const text = flattenTemplate(node, bindings, sourceFile)
       if (text.includes(MARKER) && /<|>|\bBETWEEN\b|\bINTERVAL\b/i.test(text)) {
         offences.push(`raw SQL: ${text.replace(/\s+/g, ' ').slice(0, 160)}`)
       }
@@ -885,7 +1025,30 @@ function markerClockReads(code: string, fileName = 'scan.ts'): string[] {
     ts.forEachChild(node, visit)
   }
   visit(sourceFile)
-  return offences
+  return [...new Set(offences)]
+}
+
+/**
+ * A string/template as the statement it becomes, following substitutions that resolve to strings.
+ *
+ * Without this, splitting the column name into a constant hides a raw predicate from check 3 —
+ * `sql\`WHERE "${MARKER_COLUMN}" < $1\`` contains neither the column name nor, in the fragment
+ * that carries the comparison, anything to match on.
+ */
+function flattenTemplate(
+  node: ts.Expression,
+  bindings: Map<string, ts.Expression>,
+  sourceFile: ts.SourceFile,
+  depth = 0,
+): string {
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text
+  if (!ts.isTemplateExpression(node) || depth > 3) return node.getText(sourceFile)
+  let text = node.head.text
+  for (const span of node.templateSpans) {
+    text += flattenTemplate(resolve(span.expression, bindings), bindings, sourceFile, depth + 1)
+    text += span.literal.text
+  }
+  return text
 }
 
 /** Every source file the rule applies to. r8 widens this from `lib`+`app`/.ts(x) to include scripts. */
@@ -1431,4 +1594,106 @@ test('[o3d-0bfh r9] the activity messages and the shared recovery note carry the
   // CONTROL: the scanner read the files it names.
   assert.match(processor.code, /Accounting follow-ups owed, with nothing to re-drive them/)
   assert.match(backReference.code, /followUpObligationRecoveryNote/)
+})
+
+test('[o3d-0bfh r9] the marker scan REFUSES the shapes it cannot read, instead of assuming them safe', () => {
+  // CODEX MEDIUM, AS CONTROLS. r8 called its rule an allowlist, but `judgeMarkerValue` returned
+  // "safe" for every resolved expression that was not an inline object literal — so a predicate
+  // built by a helper or imported from elsewhere walked straight through the thing that was
+  // supposed to have to be widened deliberately. These snippets are the escape routes, each run
+  // through the real scanner.
+  //
+  // Route: markerClockReads() — the same function the repository-wide test above runs over ~700
+  // files. Proving it on synthetic sources is the only way to show it can FAIL: the repository is
+  // clean, so the wide test passes whether the scan works or not.
+  //
+  // Mutation: drop the `strict` argument at the `where`-side call, or return null from
+  // judgeMarkerPredicateOperand, and the first four fail. Remove the alias tracking and the
+  // destructuring case fails; remove flattenTemplate and the composed-SQL case fails.
+  const refused: Array<{ what: string; code: string }> = [
+    {
+      what: 'a helper-built range predicate',
+      code: 'const cutoff = new Date(); await db.accountingSyncLog.findMany({ where: { backReferenceFollowUpsPendingAt: olderThan(cutoff) } })',
+    },
+    {
+      what: 'an imported filter object reached by property access',
+      code: 'import { FILTERS } from "./filters"; await db.accountingSyncLog.findMany({ where: { backReferenceFollowUpsPendingAt: FILTERS.stale } })',
+    },
+    {
+      what: 'a filter returned from an awaited call',
+      code: 'await db.accountingSyncLog.findMany({ where: { backReferenceFollowUpsPendingAt: await buildStaleFilter() } })',
+    },
+    {
+      what: 'a clause built elsewhere and passed in by name',
+      code: 'const stale = { backReferenceFollowUpsPendingAt: makeFilter(cutoff) }; await db.accountingSyncLog.findMany({ where: stale })',
+    },
+    {
+      what: 'a helper-built predicate inside an AND array',
+      code: 'await db.accountingSyncLog.findMany({ where: { AND: [{ backReferenceFollowUpsPendingAt: olderThan(cutoff) }] } })',
+    },
+    {
+      what: 'a helper-built operand behind an identity operator',
+      code: 'await db.accountingSyncLog.findMany({ where: { backReferenceFollowUpsPendingAt: { not: olderThan(cutoff) } } })',
+    },
+    {
+      what: 'a destructured marker alias compared to a clock',
+      code: 'const { backReferenceFollowUpsPendingAt: pendingAt } = row; if (pendingAt < cutoff) { park(row) }',
+    },
+    {
+      what: 'a shorthand-destructured marker compared to a clock',
+      code: 'const { backReferenceFollowUpsPendingAt } = row; if (backReferenceFollowUpsPendingAt < cutoff) { park(row) }',
+    },
+    {
+      what: 'raw SQL composed from a column constant',
+      code: 'const MARKER_COLUMN = "backReferenceFollowUpsPendingAt"; await db.$queryRaw(sql`SELECT 1 FROM "accounting_sync_logs" WHERE "${MARKER_COLUMN}" < $1`)',
+    },
+  ]
+  for (const { what, code } of refused) {
+    const offences = markerClockReads(code, 'control.ts')
+    assert.ok(
+      offences.length > 0,
+      `the scan accepted ${what}. An unrecognised shape must be REFUSED, not assumed safe — that is the whole `
+        + `difference between an allowlist and r7's banlist:\n${code}`,
+    )
+  }
+
+  // AND THE OTHER DIRECTION, or "refuse everything" would pass the block above. These are the
+  // protocol's own uses, and the scan must stay quiet on all of them — this is what stops the fix
+  // being made by turning the allowlist into a refusal of the code that already exists.
+  const allowed: Array<{ what: string; code: string }> = [
+    {
+      what: 'the null test the backlog query asks',
+      code: 'const where = { backReferenceFollowUpsPendingAt: { not: null } }; await db.accountingSyncLog.findMany({ where })',
+    },
+    {
+      what: 'the compare-and-set fence, operand read off a parameter',
+      code: 'await db.accountingSyncLog.updateMany({ where: { id: params.syncLogId, backReferenceFollowUpsPendingAt: params.generation }, data: { backReferenceFollowUpsPendingAt: null } })',
+    },
+    {
+      what: 'the settlement fence, operand read off a fence object',
+      code: 'await db.accountingSyncLog.updateMany({ where: { id: fence.id, backReferenceFollowUpsPendingAt: fence.followUpsPendingAt }, data: { backReferenceCheckedAt: now() } })',
+    },
+    {
+      what: 'the claim fence, operand aliased from the row',
+      code: 'const observed = row.backReferenceFollowUpsPendingAt; await db.accountingSyncLog.updateMany({ where: { id: row.id, backReferenceFollowUpsPendingAt: observed }, data: claim })',
+    },
+    {
+      what: 'the mint, which is an ASSIGNMENT and not a predicate',
+      code: 'function followUpObligationClaim(now: Date) { return { backReferenceFollowUpsPendingAt: now } }',
+    },
+    {
+      what: 'selecting the column',
+      code: 'await db.accountingSyncLog.findFirst({ select: { backReferenceFollowUpsPendingAt: true } })',
+    },
+    {
+      what: 'a null equality test written plainly',
+      code: 'await db.accountingSyncLog.findMany({ where: { backReferenceFollowUpsPendingAt: null } })',
+    },
+  ]
+  for (const { what, code } of allowed) {
+    assert.deepEqual(
+      markerClockReads(code, 'control.ts'), [],
+      `the scan refused ${what}, which is the protocol's own use:\n${code}`,
+    )
+  }
 })
