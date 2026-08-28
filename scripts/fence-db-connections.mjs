@@ -183,7 +183,7 @@ import pg from 'pg'
  * It is subtracted rather than corrected, and it is DETECTED BY ASKING THE DRIVER, not by
  * re-reading the URL, so this is still not a reimplementation of anything.
  */
-const OS_ACCOUNT_SENTINEL = ' fence-os-account-default '
+const OS_ACCOUNT_SENTINEL = '\x00fence-os-account-default\x00'
 
 export function resolveDriverIdentity(connectionString) {
   // NOT connected, and never connected: the constructor resolves ConnectionParameters and
