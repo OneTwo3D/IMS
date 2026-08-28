@@ -319,16 +319,23 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       // more rows, it does not fail. Requiring them would turn "the production read lost a filter"
       // into a TypeError in the double, which fails every test at once and so proves nothing about
       // which one the filter was actually holding up.
+      //
+      // o3d-2k5r r9: the status filter now arrives in TWO shapes and the double evaluates both the
+      // way Postgres does — the operator control asks `IN (...)`, the dispatch fence asks
+      // `NOT (status = 'SUCCEEDED')`. A double that understood only `in` could never observe an
+      // unknown status fencing, because it would drop such a row on both sides.
       count: async ({ where }: {
         where: {
           connector: string
           operation: string
           idempotencyKey?: { in: string[] }
-          status?: { in: string[] }
+          status?: { in: string[] } | { not: string }
         }
       }) => (state.releaseOutbox ?? []).filter((row) => (
         (where.idempotencyKey === undefined || where.idempotencyKey.in.includes(row.idempotencyKey))
-        && (where.status === undefined || where.status.in.includes(row.status))
+        && (where.status === undefined || ('in' in where.status
+          ? where.status.in.includes(row.status)
+          : row.status !== where.status.not))
       )).length,
     },
     salesOrderRefundLine: {
@@ -2808,6 +2815,43 @@ test('o3d-2k5r r8: a backstop row the drain has CLAIMED still fences the dispatc
   assert.equal(state.movements.length, 0)
 })
 
+test('o3d-2k5r r9: a backstop row carrying a status THIS BINARY DOES NOT KNOW still fences the dispatch', async () => {
+  // THE VERSION-SKEW HOLE, END TO END (Codex r8 HIGH). r8 built the fence's set by filtering
+  // `Object.values(INTEGRATION_OUTBOX_STATUS)` — a derivation that happens when this binary
+  // COMPILES, against a `status` column that is an unconstrained string written at RUN TIME. Roll
+  // one web process back, or drain from a newer one mid-deploy, and the row carries a state this
+  // process cannot name. Under an `IN (...)` allowlist it matches nothing, the fence counts zero,
+  // and the dispatch commits SHIPPED over a reservation that was never released — the exact
+  // unrecoverable order (stock held, no control, no claimable row) this fence exists to prevent.
+  //
+  // MUTATION / ROUTE: restore r8's shape — `UNFINISHED_RELEASE_STATUS_PREDICATE =
+  // { in: Object.values(INTEGRATION_OUTBOX_STATUS).filter((s) => s !== 'SUCCEEDED') }` — and this
+  // fails with success === true and shipment-b at SHIPPED, while every other fence test in this
+  // file still passes, because they all assert on statuses the enum happens to contain. Route:
+  // transitionShipmentStatus → validateDispatchPreservesRepackRecovery →
+  // countUnfinishedRefundReservationReleases → integrationOutbox.count({ where: { status } }).
+  const state = partlyRefundedTwoShipmentOrder({
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    refunds: [{ id: 'refund-1', orderId: 'order-1' }],
+    // Not in `INTEGRATION_OUTBOX_STATUS`. That is the whole point: no list this file or that module
+    // writes today contains it, and the fence must refuse anyway.
+    releaseOutbox: [{ idempotencyKey: 'sales:refund.reservation-release:refund-1', status: 'QUARANTINED_BY_NEWER_RELEASE' }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-b',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /repack recovery/)
+  assert.equal(state.shipments[1].status, 'PACKED')
+  assert.equal(state.movements.length, 0)
+})
+
 const RELEASE_OUTBOX_EPOCH = new Date('2026-08-27T10:00:00.000Z')
 
 type OutboxWhere = {
@@ -2815,7 +2859,7 @@ type OutboxWhere = {
   connector?: string
   operation?: string
   idempotencyKey?: { in?: string[] }
-  status?: string | { in?: string[] }
+  status?: string | { in?: string[]; not?: string }
   attempts?: { lt?: number; gte?: number }
   lockedAt?: Date | null | { lt?: Date }
   lockedBy?: string
@@ -2834,6 +2878,7 @@ function outboxRowMatches(row: IntegrationOutboxRow, where: OutboxWhere | undefi
   if (where.idempotencyKey?.in && !where.idempotencyKey.in.includes(row.idempotencyKey)) return false
   if (typeof where.status === 'string' && row.status !== where.status) return false
   if (typeof where.status === 'object' && where.status.in && !where.status.in.includes(row.status)) return false
+  if (typeof where.status === 'object' && where.status.not !== undefined && row.status === where.status.not) return false
   if (where.attempts?.lt !== undefined && row.attempts >= where.attempts.lt) return false
   if (where.attempts?.gte !== undefined && row.attempts < where.attempts.gte) return false
   if (where.lockedBy !== undefined && row.lockedBy !== where.lockedBy) return false

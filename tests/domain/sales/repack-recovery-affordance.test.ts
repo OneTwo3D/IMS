@@ -217,6 +217,19 @@ test('o3d-2k5r r4: a cancelled order offers neither — it takes the discard pat
 
 type OutboxRow = { idempotencyKey: string; status: string }
 
+type StatusPredicate = { in: string[] } | { not: string }
+
+/**
+ * o3d-2k5r r9: the double evaluates the status predicate the way POSTGRES would, not the way the
+ * caller hopes. `IN (...)` matches only listed values; `NOT (status = 'SUCCEEDED')` matches anything
+ * else, including a value this test file never enumerated. That distinction IS the finding — a
+ * double that only understood `in` could not have caught the version-skew hole, because it would
+ * have made every unlisted status invisible on both sides.
+ */
+function statusMatches(predicate: StatusPredicate, status: string): boolean {
+  return 'in' in predicate ? predicate.in.includes(status) : status !== predicate.not
+}
+
 function readClient(refundIds: string[], rows: OutboxRow[]) {
   const counted: Array<Record<string, unknown>> = []
   return {
@@ -224,10 +237,10 @@ function readClient(refundIds: string[], rows: OutboxRow[]) {
     client: {
       salesOrderRefund: { findMany: async () => refundIds.map((id) => ({ id })) },
       integrationOutbox: {
-        count: async (args: { where: { idempotencyKey: { in: string[] }; status: { in: string[] } } }) => {
+        count: async (args: { where: { idempotencyKey: { in: string[] }; status: StatusPredicate } }) => {
           counted.push(args.where)
           return rows.filter((row) => args.where.idempotencyKey.in.includes(row.idempotencyKey)
-            && args.where.status.in.includes(row.status)).length
+            && statusMatches(args.where.status, row.status)).length
         },
       },
     },
@@ -275,9 +288,9 @@ test('o3d-2k5r r8 evidence: the two reads answer PROCESSING differently, on purp
 })
 
 test('o3d-2k5r r8 evidence: the fence read counts every non-SUCCEEDED state, and only those', async () => {
-  // Derived from the status enum rather than listed, so a status added later fences by default
-  // instead of becoming a hole. Asserted state by state because "every non-SUCCEEDED" is the whole
-  // claim: drop any one of these from `UNFINISHED_RELEASE_STATUSES` and this fails naming it.
+  // Asserted state by state because "every non-SUCCEEDED" is the whole claim: narrow
+  // `UNFINISHED_RELEASE_STATUS_PREDICATE` to an `in` list missing any one of these and this fails
+  // naming it.
   for (const status of ['PENDING', 'PROCESSING', 'RETRYABLE_FAILED', 'PERMANENT_FAILED']) {
     const { client } = readClient(['r-1'], [{ idempotencyKey: 'sales:refund.reservation-release:r-1', status }])
     assert.equal(await countUnfinishedRefundReservationReleases('order-1', { client }), 1, status)
@@ -286,6 +299,42 @@ test('o3d-2k5r r8 evidence: the fence read counts every non-SUCCEEDED state, and
   // And SUCCEEDED is what stops the widening becoming "has ever been refunded" — the fence must let
   // every ordinary dispatch on a refunded order through once the release is done.
   assert.equal(await countUnfinishedRefundReservationReleases('order-1', { client }), 0)
+})
+
+test('o3d-2k5r r9 evidence: a row whose status THIS BINARY HAS NEVER HEARD OF still fences the dispatch', async () => {
+  // THE VERSION-SKEW HOLE, AS ARITHMETIC (Codex r8 HIGH). r8 derived the fence's set from
+  // `INTEGRATION_OUTBOX_STATUS` so a status added later would fence "by default" — but the
+  // derivation runs when THIS binary compiles, and the row is read at run time. `status` is an
+  // unconstrained string column: during a rolling deploy or a rollback a newer writer persists a
+  // status that is in nobody's `Object.values` here. An `IN (...)` allowlist matches it nowhere,
+  // counts zero, and the fence opens on precisely the state it does not understand — a dispatch
+  // commits SHIPPED over an unreleased reservation, which is the unrecoverable order this fence
+  // exists to prevent.
+  //
+  // MUTATION / ROUTE: point `UNFINISHED_RELEASE_STATUS_PREDICATE` back at any allowlist —
+  //   `{ in: Object.values(INTEGRATION_OUTBOX_STATUS).filter((s) => s !== 'SUCCEEDED') }`, i.e.
+  // exactly r8's shape — and this test fails on the first assertion (0 !== 1), because none of
+  // these statuses is a member. Every other test in this file still passes under that mutation;
+  // this is the only one that reaches the hole, because it is the only one asserting on a status
+  // the module cannot name. Route: countUnfinishedRefundReservationReleases →
+  // countRefundReservationReleasesAt → integrationOutbox.count({ where: { status } }).
+  for (const status of ['QUARANTINED', 'AWAITING_MANUAL_REVIEW', 'succeeded', 'SUCCEEDED_V2', '']) {
+    const { client, counted } = readClient(['r-future'], [
+      { idempotencyKey: 'sales:refund.reservation-release:r-future', status },
+    ])
+    assert.equal(await countUnfinishedRefundReservationReleases('order-1', { client }), 1, status)
+    // And it fences by ASKING NEGATIVELY, not by having grown a longer list: the query names the one
+    // finished value and excludes it, so its completeness does not depend on this binary's enum.
+    assert.deepEqual(counted[0].status, { not: 'SUCCEEDED' })
+  }
+
+  // The operator control keeps its allowlist on purpose, and this is the shape difference: a status
+  // it cannot name is a status whose recovery semantics it cannot vouch for, so it offers no button.
+  const { client, counted } = readClient(['r-future'], [
+    { idempotencyKey: 'sales:refund.reservation-release:r-future', status: 'QUARANTINED' },
+  ])
+  assert.equal(await countResumableRefundReservationReleases('order-1', { client }), 0)
+  assert.deepEqual(counted[0].status, { in: ['PENDING', 'RETRYABLE_FAILED', 'PERMANENT_FAILED'] })
 })
 
 test('o3d-2k5r r6 evidence: a DEAD-LETTERED (PERMANENT_FAILED) row is outstanding — it is the oldest stranded order', async () => {

@@ -47,6 +47,16 @@ export type OutboxUpdateClient = {
   integrationOutbox: { updateMany(args: unknown): Promise<{ count: number }> }
 }
 
+/**
+ * o3d-2k5r r9: how a read asks its question OF THE STATUS COLUMN.
+ *
+ * Two shapes because the two reads want two different things, and neither is a special case of the
+ * other: the operator control wants a KNOWN SET (`in`), the dispatch fence wants EVERYTHING BUT ONE
+ * VALUE (`not`). Passing a `string[]` to the private helper forced both to be allowlists, which is
+ * what let an unknown status slip the fence.
+ */
+export type OutboxStatusPredicate = { in: string[] } | { not: string }
+
 /** o3d-2k5r r4: the READ half — what "is a repack recovery still outstanding?" needs. */
 export type OutstandingReleaseReadClient = {
   salesOrderRefund: { findMany(args: unknown): Promise<Array<{ id: string }>> }
@@ -240,7 +250,7 @@ export async function scheduleRefundUnmatchedWarningOutbox(
  * and a resolver that cleared a claimed row would let the recovery and the drain both believe they
  * finished it. If the drain fails it returns the row to RETRYABLE_FAILED and the control comes back
  * on the next read. THE DISPATCH FENCE MUST NOT COPY THIS EXCLUSION — see
- * `UNFINISHED_RELEASE_STATUSES`.
+ * `UNFINISHED_RELEASE_STATUS_PREDICATE`.
  *
  * SUCCEEDED is the recovery already done.
  */
@@ -251,14 +261,32 @@ const RESUMABLE_RELEASE_STATUSES: string[] = [
 ]
 
 /**
- * THE STATUSES THAT MEAN THE RELEASE HAS NOT HAPPENED (o3d-2k5r r8, Codex).
+ * THE PREDICATE THAT MEANS THE RELEASE HAS NOT HAPPENED (o3d-2k5r r8, widened to a negative in r9).
  *
- * Every status that is not SUCCEEDED, and derived from the status enum rather than listed, so a
- * status added to `INTEGRATION_OUTBOX_STATUS` later fences dispatch by default instead of quietly
- * becoming a hole in it. Being wrong in this direction costs a refused dispatch whose message names
- * the remedy; being wrong in the other costs an order nobody can repair.
+ * NOT a status list. r8 derived the fence's list from `INTEGRATION_OUTBOX_STATUS` so that "a status
+ * added later fences by default" — but a list is still an ALLOWLIST, and it is queried with
+ * `status IN (...)`. The derivation happens when THIS binary compiles; the row is read at run time.
+ * `IntegrationOutbox.status` is an unconstrained string, so during a rolling deploy or a rollback a
+ * newer writer can persist a status this process has never heard of. That value is in nobody's
+ * `Object.values` here, matches no element of the IN list, counts zero — and the fence, whose entire
+ * job is to fail closed, silently opens on exactly the state it does not understand (Codex r8).
  *
- * NOTHING STRANDS ON THIS. Every status here has a way out that does not require a dispatch:
+ * So the fence asks the question the other way round. Not "is the row's status one of the unfinished
+ * ones I happen to know", which can only be as complete as this binary's enum, but "is the row's
+ * status NOT the one value that means finished" — which needs no list, and is complete against every
+ * status that will ever exist. SUCCEEDED is a value written by the resolver in THIS module; an
+ * unknown status is by construction not it, so an unknown status fences. Being wrong in this
+ * direction costs a refused dispatch whose message names the remedy; being wrong in the other costs
+ * an order nobody can repair.
+ *
+ * (`status` is a non-nullable column, so `NOT (status = 'SUCCEEDED')` has no NULL third case to
+ * leak through. The operator control above deliberately KEEPS its allowlist: "which rows may a
+ * human press Finish on" genuinely wants a known, enumerated set — a status this binary cannot name
+ * is a status whose recovery semantics it cannot vouch for, and offering a button for it would be
+ * the same guess in the more dangerous direction.)
+ *
+ * NOTHING STRANDS ON THIS. Every status the predicate catches has a way out that does not
+ * require a dispatch:
  *   - PENDING / RETRYABLE_FAILED / PERMANENT_FAILED are all resumable by the operator control
  *     (`RESUMABLE_RELEASE_STATUSES` above is exactly those three), and while the order holds no
  *     dispatched shipment that control's own prerequisite — reopen the committed siblings — is
@@ -268,11 +296,15 @@ const RESUMABLE_RELEASE_STATUSES: string[] = [
  *     half of `claimableWhere`, and its other half re-claims any PROCESSING row whose `lockedAt` is
  *     older than the stale-lock window. A crashed worker's row therefore returns to a resumable
  *     status on a later drain tick rather than sitting here for ever.
+ *   - a status this binary does not know is, by the same argument, a status some OTHER binary
+ *     writes and drains; the row is owned by the deploy that understands it, and the worst this
+ *     process can do is decline to ship past it until that owner resolves it to SUCCEEDED.
  * And the fence has its own escape hatch regardless: `dispatchForeclosesRepackRecovery` stops
  * refusing once the order already holds a dispatch, so an order past the wall still ships.
  */
-const UNFINISHED_RELEASE_STATUSES: string[] = Object.values(INTEGRATION_OUTBOX_STATUS)
-  .filter((status) => status !== INTEGRATION_OUTBOX_STATUS.SUCCEEDED)
+const UNFINISHED_RELEASE_STATUS_PREDICATE: OutboxStatusPredicate = {
+  not: INTEGRATION_OUTBOX_STATUS.SUCCEEDED,
+}
 
 /**
  * o3d-2k5r r4 — THE DURABLE EVIDENCE THAT A REPACK RECOVERY IS STILL OUTSTANDING.
@@ -291,7 +323,7 @@ const UNFINISHED_RELEASE_STATUSES: string[] = Object.values(INTEGRATION_OUTBOX_S
  */
 async function countRefundReservationReleasesAt(
   orderId: string,
-  statuses: string[],
+  statusPredicate: OutboxStatusPredicate,
   options: { client?: OutstandingReleaseReadClient },
 ): Promise<number> {
   const client = options.client ?? (db as unknown as OutstandingReleaseReadClient)
@@ -307,7 +339,7 @@ async function countRefundReservationReleasesAt(
       connector: REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
       operation: REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
       idempotencyKey: { in: idempotencyKeys },
-      status: { in: statuses },
+      status: statusPredicate,
     },
   })
 }
@@ -326,7 +358,7 @@ export async function countResumableRefundReservationReleases(
   orderId: string,
   options: { client?: OutstandingReleaseReadClient } = {},
 ): Promise<number> {
-  return countRefundReservationReleasesAt(orderId, RESUMABLE_RELEASE_STATUSES, options)
+  return countRefundReservationReleasesAt(orderId, { in: RESUMABLE_RELEASE_STATUSES }, options)
 }
 
 /**
@@ -343,7 +375,7 @@ export async function countUnfinishedRefundReservationReleases(
   orderId: string,
   options: { client?: OutstandingReleaseReadClient } = {},
 ): Promise<number> {
-  return countRefundReservationReleasesAt(orderId, UNFINISHED_RELEASE_STATUSES, options)
+  return countRefundReservationReleasesAt(orderId, UNFINISHED_RELEASE_STATUS_PREDICATE, options)
 }
 
 export async function resolveRefundReservationReleaseOutbox(

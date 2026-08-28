@@ -1006,6 +1006,13 @@ export async function reopenShipmentForRepack(
  * `countUnfinishedRefundReservationReleases` therefore counts every non-SUCCEEDED release state.
  * What it deliberately does NOT count is SUCCEEDED: the release has happened, the order owes
  * nothing, and that is every ordinary dispatch in the system.
+ *
+ * AND IT ASKS THAT NEGATIVELY (o3d-2k5r r9, Codex). "Every non-SUCCEEDED state" as a derived
+ * allowlist is only as complete as the enum THIS binary compiled against, while `status` is an
+ * unconstrained string written at run time — a rolling deploy or a rollback puts a status here that
+ * this process has never heard of, and an `IN (...)` fence would count it zero and open. The query
+ * excludes the one value that means finished instead of listing the ones that mean unfinished, so a
+ * state this binary cannot name fences by construction rather than by keeping a list up to date.
  */
 export async function validateDispatchPreservesRepackRecovery(
   client: ShipmentServiceClient,
