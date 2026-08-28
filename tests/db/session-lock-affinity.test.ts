@@ -927,7 +927,7 @@ test('[o3d-2k5r r27] a connector that connects and then STALLS is given up on, d
   // `measureSharedAdvisoryLockSpace()` and await the probe directly. Nothing ever settles and this
   // test fails on its own 15s timeout instead of passing in ~80ms — which is precisely the defect:
   // a money post, an accounting batch, a WMS sweep or a restore hangs instead of being refused.
-  // MUTATION ROUTE 2: make `destroyProbeClient()` a no-op. The refusal still arrives, and the
+  // MUTATION ROUTE 2: make `destroyClientSocket()` a no-op. The refusal still arrives, and the
   // `destroyed` assertions below fail — the probe would have given up while still holding both
   // sockets, and the holder's advisory lock with them.
 

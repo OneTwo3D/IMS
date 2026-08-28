@@ -1,6 +1,7 @@
 import pg, { Pool, type PoolClient } from 'pg'
 
 import {
+  SESSION_LOCK_ACQUISITION_DEADLINE_MS,
   SESSION_LOCK_DATABASE_URL_ENV,
   pgSessionLockConnectionConfig,
   pinClientToMeasuredBackend,
@@ -93,6 +94,95 @@ export function gateOnFreshLockSpace<C>(
   }
 }
 
+
+/**
+ * Destroy a lock client's socket, rather than asking the server's permission to close it.
+ *
+ * `end()` writes a Terminate and waits for the server to close the socket, which is exactly what a
+ * wedged server will not do -- so on expiry the stream goes first and `end()` follows as the
+ * ordinary-case tidy-up (`discard` above). The same reasoning, and the same shape, as
+ * `destroyClientSocket()` in `database-url-schema.mjs`; it is written here rather than exported
+ * from there because this side has a typed `pg.Client` and that side does not.
+ */
+function destroyClientSocketOf(client: pg.Client): void {
+  const stream = (client as unknown as { connection?: { stream?: { destroy?: () => void } } }).connection?.stream
+  try { stream?.destroy?.() } catch { /* a socket that cannot be destroyed is already gone */ }
+}
+
+/**
+ * AN ACQUISITION THAT CANNOT BE FINISHED MUST END, NOT HANG (o3d-2k5r r28, Codex MEDIUM).
+ *
+ * WHAT WAS WRONG, and it is the shape worth naming: r27 bounded the shared-lock-space PROBE, which
+ * is a pair of throwaway connections, and left the connection the probe exists to license unbounded.
+ * The inner half of that is fixed in `database-url-schema.mjs` (`withLockClientDeadline()`, which
+ * destroys the lock client's own socket from inside `onConnect`). This is the outer half: the parts
+ * of an acquisition that happen OUTSIDE the guard -- pg-pool's own connect path before `onConnect`
+ * is reached, its wait for a free connection when the pool is full, and the per-acquisition
+ * re-measurement `gateOnFreshLockSpace()` performs after the client is in hand.
+ *
+ * HOW THE SOCKET IS ACTUALLY DESTROYED, since this wrapper does not have the client while the
+ * acquisition is still pending. For a lone `pg.Client` it does -- `abandon` closes over it and
+ * destroys it on expiry. For a POOL the client does not exist yet, so the destruction comes from
+ * the inside: the guard's own deadline fires first on a wedged connection and destroys that
+ * socket, which is what makes the pending `connect()` reject. This wrapper is what bounds the
+ * cases the guard never sees, and a client that arrives after expiry is DISCARDED rather than
+ * leaked -- a pool client released without `destroy` would be handed straight back out.
+ *
+ * IT ALSO BOUNDS WAITING FOR A FREE CONNECTION, and that is deliberate rather than incidental.
+ * These pools carry no `connectionTimeoutMillis`, so pg-pool queues an exhausted checkout with no
+ * timer at all and the caller is woken only by a release that may never come -- the same defect
+ * `tests/db/pool-acquisition-bound.test.ts` fixed on the data pool (o3d-xl63). A lock pool of
+ * `max` 2-4 that has been full for the whole deadline is wedged, and every caller here already
+ * treats a failed acquisition as a reason to stop rather than to write.
+ *
+ * @param open the acquisition, gate and all
+ * @param discard how to destroy a client that arrives after the deadline has fired
+ * @param purpose what the lock is for, so the refusal names it
+ * @param deadlineMs the bound; shortened by tests
+ * @param abandon destroys the client's socket on expiry, where the caller has one to destroy
+ */
+export function boundLockAcquisition<C>(
+  open: () => Promise<C>,
+  discard: (client: C) => void,
+  purpose: string,
+  deadlineMs: number = SESSION_LOCK_ACQUISITION_DEADLINE_MS,
+  abandon: (() => void) | null = null,
+): () => Promise<C> {
+  return async () => {
+    let expired = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    // NOT unref()'d, for the reason the probe's timer is not: an unref'd timer does not hold the
+    // event loop open, so an acquisition that stalls with nothing else pending would let the
+    // process exit before the deadline it is relying on ever fired. Cleared on every path below.
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        expired = true
+        try { abandon?.() } catch { /* a socket that cannot be destroyed is already gone */ }
+        reject(
+          new Error(
+            `Acquiring the connection for ${purpose} did not finish within ${deadlineMs}ms, so it was given up on ` +
+              'rather than left pending: an acquisition that hangs is a money post, an accounting batch, a WMS ' +
+              'dispatch sweep or a restore hanging with it. The lock was NOT taken.',
+          ),
+        )
+      }, deadlineMs)
+    })
+    // The loser of the race still settles; without handlers a rejected deadline, or a connection
+    // that arrives after it fired, would surface as an unhandled rejection.
+    deadline.catch(() => undefined)
+    const opening = open()
+    opening.then(
+      (client) => { if (expired) { try { discard(client) } catch { /* the refusal is what the caller sees */ } } },
+      () => undefined,
+    )
+    try {
+      return await Promise.race([opening, deadline])
+    } finally {
+      if (timer !== null) clearTimeout(timer)
+    }
+  }
+}
+
 /**
  * A pool whose every physical connection has been shown to reach the backend directly.
  *
@@ -103,11 +193,17 @@ export function gateOnFreshLockSpace<C>(
 export function createSessionAdvisoryLockPool(purpose: string, max: number): Pool {
   const { config, reestablish } = sessionLockRoute(purpose)
   const pool = new Pool({ ...config, max })
-  if (reestablish === null) return pool
-  const gated = gateOnFreshLockSpace<PoolClient>(
-    pool.connect.bind(pool) as () => Promise<PoolClient>,
-    reestablish,
-    (client) => client.release(true),
+  const discard = (client: PoolClient) => client.release(true)
+  // The deadline is applied whether or not an override is set: the affinity proof runs on EVERY
+  // session-lock connection, so every one of them can stall on it.
+  const gated = boundLockAcquisition<PoolClient>(
+    gateOnFreshLockSpace<PoolClient>(
+      pool.connect.bind(pool) as () => Promise<PoolClient>,
+      reestablish,
+      discard,
+    ),
+    discard,
+    purpose,
   )
   // The CALLBACK form is kept rather than refused: `pool.query()` is implemented on top of it, so
   // refusing it would break an ordinary statement on a lock pool for a shape nothing here uses.
@@ -138,14 +234,21 @@ export function createSessionAdvisoryLockClient(
   const { config: base, reestablish } = sessionLockRoute(purpose)
   const config = { ...base, ...extra }
   const client = pinClientToMeasuredBackend(new pg.Client(config), config)
-  if (reestablish === null) return client
   // For a lone client the connect IS the acquisition: it opens the session the lock will be held
   // on. Same gate, same `notBefore`-before-open ordering; the discard ends the client, since there
-  // is no pool to hand it back to.
-  const gated = gateOnFreshLockSpace<pg.Client>(
-    client.connect.bind(client) as unknown as () => Promise<pg.Client>,
-    reestablish,
-    () => { void Promise.resolve(client.end()).catch(() => undefined) },
+  // is no pool to hand it back to. Here the deadline HAS the client, so on expiry it destroys that
+  // socket itself rather than waiting for the guard to do it from the inside.
+  const discard = () => { void Promise.resolve(client.end()).catch(() => undefined) }
+  const gated = boundLockAcquisition<pg.Client>(
+    gateOnFreshLockSpace<pg.Client>(
+      client.connect.bind(client) as unknown as () => Promise<pg.Client>,
+      reestablish,
+      discard,
+    ),
+    discard,
+    purpose,
+    undefined,
+    () => destroyClientSocketOf(client),
   )
   client.connect = (async (...args: unknown[]) => {
     // `pinClientToMeasuredBackend()` refuses the callback form for the same reason: the check
