@@ -1775,18 +1775,16 @@ test('ROUND 16: the breadcrumb keeps its own instructions, and no incident borro
   }
 })
 
-// MUTATION THAT KILLS THIS (run): delete any RECORD_PROSE line and it fails naming that line as one
-// nothing shipped says. RUN. It is the other half of the closure test: closure stops the list being
-// too small, this stops it being padded with sentences nobody ships, which is how a list stops
-// being a review.
-test('ROUND 16: every reviewed span is one the shipped messages still say', () => {
+// MUTATION THAT KILLS THIS (run): add a line to RECORD_PROSE that nothing ships — 'Nobody says
+// this.' — and it fails naming that line. RUN, and note that the closure test stays GREEN on that
+// mutation, which is why this one exists: closure stops the list being too SMALL, this stops it
+// being padded with sentences nobody ships, and a padded list is how a list stops being a review.
+// The refusal assertion has its own mutation: add 'Delete the duplicate attachment from the bill.'
+// to RECORD_PROSE and it fails there instead, because a span that names an act without refusing is
+// an instruction and instructions live under the cap. RUN — it is checked FIRST for that reason.
+test('ROUND 16: every reviewed span is one the shipped messages still say, and none of them instructs', () => {
   const messages = lookupLessMessages()
   for (const span of RECORD_PROSE) {
-    assert.ok(
-      messages.some(({ text }) => text.includes(span)),
-      `"${span.slice(0, 90)}…" appears in no lookup-less message — delete it rather than leaving a `
-      + 'reviewed line standing in front of nothing',
-    )
     // ROUND 14, KEPT AS A RULE ABOUT THE LIST RATHER THAN ABOUT FREE TEXT. Prose may name an act —
     // "no reset of ours undoes it", "DO NOT void" — but only to say it did not happen or must not.
     if (mutationLexemes([span], []).length > 0) {
@@ -1796,6 +1794,11 @@ test('ROUND 16: every reviewed span is one the shipped messages still say', () =
         + 'prose — it is an instruction, and an instruction belongs in LOCAL_DIRECTIONS under the cap',
       )
     }
+    assert.ok(
+      messages.some(({ text }) => text.includes(span)),
+      `"${span.slice(0, 90)}…" appears in no lookup-less message — delete it rather than leaving a `
+      + 'reviewed line standing in front of nothing',
+    )
   }
 })
 
