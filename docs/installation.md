@@ -809,14 +809,12 @@ of those makes the poll target a URL nothing serves: the service is up and healt
 out after 60s, and `update.sh` then stops the service it has just started and re-establishes the
 post-migration fences. A supported `.env` value turned a successful update into an outage.
 
-`APP_PORT` is now read through the same reader, in the **preflight** — before the crontab is
-taken, before the stop, before the fence and before the migration — and validated there as a
-decimal TCP port in 1–65535 by `valid_tcp_port()`, a function all three entrypoints carry
-identically and all three apply to the port they build a health URL out of (`install.sh` to the
-value it prompts for and writes into the unit, the nginx upstream and the cron base URL;
-`deploy.sh` to `IMS_PORT`). Absent still means 3000; present-and-not-a-port is refused with
-nothing stopped and nothing migrated. The refusal is deliberately at the preflight: the same
-refusal at the health check costs a migrated database and a stopped service.
+`APP_PORT` is now read through the same reader, in the **preflight**. r26 also *validated* it
+there and made the value the port the health check polls; **r27 changed both of those** — see
+below — but `valid_tcp_port()` remains a function all three entrypoints carry identically and all
+three apply to every port they would build a health URL out of (`install.sh` to the value it
+prompts for and writes into the unit, the nginx upstream and the cron base URL; `deploy.sh` to
+`IMS_PORT`; `update.sh` to `IMS_APP_PORT` and to each candidate it reads out of the unit).
 
 The guard behind the single-reader claim changed shape too. r25's recognised a read only when it
 was written `NAME="$(…)"`, which is why one unquoted assignment survived five rounds of review.
@@ -826,6 +824,85 @@ test, a path assignment, `install.sh`'s own writes, `install.sh`'s raw round-tri
 previous `.env` for re-run prompt defaults (the one other declared reader, kept raw on purpose so
 the bytes it writes back are the bytes it read), or operator-facing text. Anything else fails the
 build, printing the line.
+
+**r27: a well-formed `APP_PORT` still pointed wherever the application wanted.** r26 made the
+value *well-formed*. It did not make it *trustworthy*, and those are different properties.
+`APP_DIR/.env` is **application-writable**, and nothing in it starts the service: `install.sh`
+embeds the port **literally** in the unit it generates (`ExecStart=… next start -p <port>`), and
+the units on a stage box pin `Environment=PORT=` as well. Editing `.env` moves neither. So a
+perfectly valid `APP_PORT` could aim the listener probe, the 60s health poll *and* the build-id
+proof at a port the service never binds — where they find nothing (a healthy new deployment
+stopped and re-fenced over a port that was never the service's), or, worse, find **something
+else**: any other responder serves the application-controlled `/_next/static/<BUILD_ID>/` assets
+just as well, so the build-id proof would confirm an unrelated process and carry the run past its
+point of no return. On this host that is not hypothetical — the full-chain e2e rig answers on
+`:3002` from a tree built out of the same repository.
+
+So `.env` no longer decides it. The port the health check polls now comes from, in order:
+
+* `IMS_APP_PORT` on the **root invocation** — the one input to `update.sh` the application cannot
+  write, the same standing `IMS_APP_DIR` and `IMS_SERVICE_UNIT` already have; then
+* the service unit's **own loaded configuration**, asked of systemd's bus through the same three
+  rendering helpers the `DATABASE_URL` question uses. Both directives that can pin a port are
+  read — `Environment=PORT=<n>` and an `ExecStart=` carrying `-p`/`--port` — and when the two
+  **disagree** the run refuses rather than working out which one wins, for the same reason a
+  second `EnvironmentFile=` is refused without being read.
+
+There is no third source and no default. A guessed `3000` for a service listening on `8080` polls
+a URL nothing serves just as surely as a malformed value does, and does it silently.
+
+`.env`'s `APP_PORT` is still **read**, through the one reader, and it is now a **claim that is
+checked**: `install.sh` writes it beside the unit it generates from the same value, so a value
+disagreeing with the unit means the two records of one fact have drifted and the next person to
+read the file will be misled. That is a refusal, not a silent choice of winner. A malformed value
+is refused for the same reason. Deleting the line is always allowed — it decides nothing.
+
+**And the socket is tied to the service.** Knowing the right port is half the question; a health
+check that proves only that *something* answered is not a check. Once `/api/health` responds,
+`update.sh` asks who is holding the socket, by both of the routes `deploy.sh`'s dev path uses:
+every pid `ss -ltnp` attributes the listening socket to must be inside `SERVICE_UNIT`'s **control
+group** (systemd tears that down on stop, so a process that survived the stop cannot be in the one
+the new start created) **or** a descendant of the unit's current **MainPID**. Any pid on the port
+that answers to neither fails the whole proof — "one of them is ours" is not an answer to "which
+process did the health check reach" — and it fails while the teardown window is still open, so the
+run is stopped and re-fenced rather than reported as a success. Verified read-only against this
+host's real units: with `SERVICE_UNIT=ims-stage-dev.service` the proof accepts `:3000` (the
+listener is the `next-server` grandchild of the unit's `MainPID`) and refuses `:3002`.
+
+**r27: and the refusal moved to a point where refusing is safe.** r26 put the fatal port check on
+the line that read the value — during **top-level initialisation**, which is before the `EXIT`
+trap is installed, before the cutover lock is acquired and before an existing fence marker is
+adopted. Its message said "nothing has been stopped and nothing has been migrated", and on a
+**recovery** run that was false: a predecessor may already have stopped the service or begun
+migrating, and re-stopping it, re-establishing and verifying the reboot fence, confirming the cron
+fence and adopting or releasing the connection fence is precisely what the re-run exists to do. A
+malformed value in an application-owned file could make the run walk away from all of it —
+prolonging an outage, or leaving a failed re-fence unrepaired.
+
+The value is still read early, because this script has one reader and that is where its reads
+live. The **refusal** is now immediately after the fence adoption: the cutover lock is held, an
+existing marker has been adopted in full (the service re-stopped and both fences re-established
+and verified, or an interrupted arming completely unwound), and nothing new has been pulled,
+built, stopped, fenced or migrated. Everything that costs something is still ahead, and the exit
+trap is installed and knows which phase this is. Refusing safely means refusing at a point where
+the refusal leaves the system **consistent**, and that is the point.
+
+**r27: the declared-shape guard was matching fragments.** r26's enumeration was right and its
+matching was not: it classified a line if a shape appeared **anywhere** on it, so
+`[[ -f "${APP_DIR}/.env" ]] && bash "${APP_DIR}/.env"` passed as "a file-shape test",
+`echo "$(bash "${APP_DIR}/.env")"` passed as "operator-facing text", a `grep` reader passed by
+appending `# env_file_value` as an inline comment, and `$APP_DIR/.env` without braces was not
+seen at all. Matching is now two stages and a line must survive both: a **hazard** scan
+(substitutions, backticks, interpreters, process substitutions, input redirects — the ones that
+act inside double quotes are matched against the whole line, the rest against the line with its
+quoted strings removed, so prose containing the word "exec" is not condemned) and a **shape** scan
+anchored `^…$` to the entire trimmed line, so a shape can no longer be a fragment of a compound
+command and an inline comment is part of the line rather than something read past. Every bypass
+listed above is a test case that must come back rejected.
+
+That hazard scan found a real one on its first run: two `die` messages contained an unescaped
+`` `systemctl start` ``, inside double quotes, which bash **executes** while composing the text.
+Both are now escaped.
 
 **What this does not protect against.** The privileged driver is still `scripts/update.sh` itself,
 run by root from wherever the operator keeps it, and `APP_DIR/.deploy-meta` still supplies the

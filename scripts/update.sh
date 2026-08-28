@@ -333,42 +333,44 @@ if [[ -f "${DEPLOY_META_FILE}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# THE PORT THE HEALTH CHECK WILL POLL — SIXTH NAME, SAME READER, READ HERE (o3d-2sm1.5 r26,
+# THE PORT THE HEALTH CHECK WILL POLL — READ EARLY, DECIDED BY THE UNIT (o3d-2sm1.5 r27,
 # Codex HIGH).
 #
-# Until this round the health check read it for itself, at the bottom of the script, with
-# `grep "^APP_PORT=" .env | cut -d= -f2`. That is the second reader r25 said did not exist, and
-# it is wrong in two separate ways on values dotenv accepts and the service resolves correctly:
+# r26 moved this read out of the health check and made the value WELL-FORMED. It did not make it
+# TRUSTWORTHY, and those are different properties. ${APP_DIR}/.env is APPLICATION-WRITABLE, and
+# nothing in it decides where the service listens: install.sh embeds the port LITERALLY in the
+# unit it generates (ExecStart=... next start -p <port>), and the units on a stage box pin
+# Environment=PORT= as well. Editing .env moves neither. So a perfectly valid APP_PORT could aim
+# the listener probe, the 60s health poll AND the build-id proof at a port ${SERVICE_UNIT} never
+# binds — where they either find NOTHING (a healthy new deployment stopped and re-fenced over a
+# port that was never the service's) or, worse, find SOMETHING ELSE. Any other responder serves
+# the application-controlled /_next/static/<BUILD_ID>/ assets just as well, so the build-id proof
+# would confirm an unrelated process and carry the run past its point of no return.
 #
-#   APP_PORT="3000"            -> `"3000"` — quotes kept, spliced into the URL
-#   APP_PORT=3000  # internal  -> `3000  # internal` — comment kept, and word-split
-#   APP_PORT declared twice    -> the FIRST line, where dotenv and env_file_value take the last
-#   APP_PORT absent            -> EMPTY, not the `3000` the `|| echo "3000"` suggests: the
-#                                 pipeline's status is `cut`'s, which is 0 when grep matched
-#                                 nothing, so the fallback never fired and the URL became
-#                                 `http://127.0.0.1:/api/health`
+# SO THE FILE NO LONGER DECIDES IT. The port comes from the unit's OWN LOADED CONFIGURATION,
+# asked of systemd's bus through the same helpers this script already trusts for the database
+# identity, or from IMS_APP_PORT on the ROOT INVOCATION — the one input to this script that the
+# application cannot write. See unit_listen_port() and resolve_app_port() below.
 #
-# Every one of those makes `curl` poll a URL nothing serves. The service is up and healthy; the
-# poll times out after 60s; the script then STOPS the service it just started and re-establishes
-# the post-migration fences. A malformed-but-supported port turns a successful update into an
-# outage — which is why the check is here, at preflight, and not at the health check: this is
-# before the crontab is taken, before the stop, before the fence and before the migration, so a
-# refusal costs nothing but a re-run.
+# WHAT .env's APP_PORT IS NOW: a claim, and it is CHECKED rather than used. install.sh writes it
+# beside the unit it generates, so a value disagreeing with the unit means the two records of one
+# fact have drifted and somebody is about to be misled. That is a refusal, not a choice of winner.
 #
-# The value is PINNED here for the same reason DATABASE_URL is: it is what this run is prepared
-# to prove things about. It is also what makes predecessor_is_active()'s listener probe work at
-# all — that check reads ${APP_PORT:-} and, with the read at the bottom of the script, the name
-# was unset every time it was consulted.
-APP_PORT="$(env_file_value APP_PORT "${APP_DIR}/.env")"
-# Absent is not malformed: install.sh's own default is 3000, and an .env that never mentioned the
-# key has always meant that. Present-and-not-a-port is malformed, and is refused rather than
-# guessed at, because guessing 3000 for a service listening on 8080 polls a URL nothing serves
-# just as surely.
-if [[ -z "${APP_PORT}" ]]; then
-  APP_PORT="3000"
-elif ! valid_tcp_port "${APP_PORT}"; then
-  die "APP_PORT in ${APP_DIR}/.env is not a TCP port: '${APP_PORT}'. It is read the way dotenv reads it (quotes and trailing comment removed, last definition wins) and it must be a decimal number in 1-65535, because it becomes the address this script polls to decide whether the new build came up — and a URL that cannot be reached is indistinguishable from a service that did not start. Nothing has been stopped and nothing has been migrated."
-fi
+# IT IS READ HERE because this script has exactly ONE reader and this is where its reads live.
+# THE REFUSAL IT CAN CAUSE IS NOT HERE (o3d-2sm1.5 r27, Codex HIGH). r26 put a fatal
+# valid_tcp_port() check on this line — during top-level initialisation, which is before the EXIT
+# trap is installed, before the cutover lock is acquired and before an existing fence marker is
+# adopted. On a RECOVERY run that is not "nothing has been stopped and nothing has been migrated":
+# a predecessor may already have stopped the service or begun migrating, and re-stopping and
+# re-fencing is exactly what this run is for. A malformed value in an application-owned file must
+# not be able to make this run walk away from that. So the read is early and the gate is late —
+# see "THE PORT GATE" after the fence adoption.
+ENV_FILE_APP_PORT="$(env_file_value APP_PORT "${APP_DIR}/.env")"
+# Resolved after the cutover lock (resolve_app_port), gated after the adoption. Declared here
+# because `set -u` is on and predecessor_is_active() expands APP_PORT during that adoption.
+APP_PORT=""
+APP_PORT_SOURCE=""
+APP_PORT_REASON="the port ${SERVICE_UNIT} listens on has not been asked about yet"
 
 START_TIME=$(date +%s)
 
@@ -975,6 +977,276 @@ env_file_is_sole_database_url_source() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# WHICH PORT DOES THE UNIT ACTUALLY LISTEN ON? (o3d-2sm1.5 r27, Codex HIGH)
+#
+# Asked of the LOADED unit configuration, over systemd's own bus, through the same three helpers
+# the DATABASE_URL question goes through — bus_unit_property(), bus_read_strings() and
+# bus_array_count() — and for the same reason: `systemctl show` renders a property as one line of
+# space-joined values, so where one array element ends and the next begins has to be guessed at,
+# while busctl states the signature and the array's own element count in front of the elements.
+#
+# TWO PROPERTIES CAN PIN THE PORT AND BOTH ARE READ:
+#
+#   Environment=PORT=<n>          an `as`. Next reads PORT out of its environment.
+#   ExecStart=... -p <n>          an `a(sasbttttuii)`. install.sh writes the port here literally
+#                                 (`next start -p ${APP_PORT}`); a stage unit writes both.
+#
+# WHEN THE TWO DISAGREE THIS REFUSES. Next's CLI flag does beat the environment variable, so an
+# answer exists — but "work out which of several definitions wins" is the unbounded question this
+# script never asks (see the EnvironmentFile= scan above, which refuses a second file WITHOUT
+# reading it for exactly that reason), and a unit whose two records of its own port disagree is a
+# unit somebody edited half-way. Naming both and stopping is the honest move.
+#
+# VERIFIED AGAINST THIS HOST'S REAL UNITS before it was made fatal. ims-stage-dev.service pins
+# `Environment=PORT=3000` and `ExecStart=/usr/bin/npm run dev -- --hostname 0.0.0.0 --port 3000`;
+# ims-e2e-dev.service pins `Environment=PORT=3002` and `--port 3002`. Both agree, both are read,
+# and NEITHER of their .env files mentions APP_PORT at all — which is the whole finding: the file
+# this script used to believe is silent about the fact it was believed for.
+#
+# NOTHING HERE READS ${APP_DIR}/.env, and nothing here is influenced by it.
+UNIT_PORT=""
+UNIT_PORT_SOURCE=""
+UNIT_PORT_REASON="the service's listening port has not been asked about yet"
+unit_listen_port() {
+  local unit="${1:-}" object rendering count element value index
+  local env_port="" exec_port=""
+
+  UNIT_PORT=""
+  UNIT_PORT_SOURCE=""
+  UNIT_PORT_REASON=""
+
+  if [[ -z "$unit" ]]; then
+    UNIT_PORT_REASON="no systemd unit was identified for the application, so nothing can say which port it listens on"
+    return 1
+  fi
+  if ! command -v busctl >/dev/null 2>&1; then
+    UNIT_PORT_REASON="busctl — systemd's own bus client, shipped beside systemctl — is not available, so ${unit}'s loaded configuration cannot be read and the port it listens on is unknown"
+    return 1
+  fi
+
+  # LoadUnit, not GetUnit: the same load `systemctl show` performs, which starts nothing and
+  # queues no job, and which answers for a unit the manager has not loaded yet.
+  rendering="$(busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LoadUnit s "$unit" 2>/dev/null)" || rendering=''
+  if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 || -z "${BUS_STRINGS[0]}" ]]; then
+    UNIT_PORT_REASON="systemd would not say where ${unit} lives on its bus, so the port it listens on is unknown"
+    return 1
+  fi
+  object="${BUS_STRINGS[0]}"
+
+  rendering="$(bus_unit_property "$object" Unit LoadState)" || rendering=''
+  if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
+    UNIT_PORT_REASON="systemd would not answer for ${unit}'s LoadState, so the port it listens on is unknown"
+    return 1
+  fi
+  if [[ "${BUS_STRINGS[0]}" != "loaded" ]]; then
+    UNIT_PORT_REASON="systemd reports ${unit} as '${BUS_STRINGS[0]:-unknown}' rather than loaded, so the port it listens on cannot be read"
+    return 1
+  fi
+
+  # Environment=, matched on the element NAME — everything before the first `=` — exactly as the
+  # DATABASE_URL scan matches, so NEXT_PUBLIC_PORT= is not PORT and never can be.
+  rendering="$(bus_unit_property "$object" Service Environment)" || rendering=''
+  if ! bus_read_strings "$rendering"; then
+    UNIT_PORT_REASON="systemd's rendering of ${unit}'s Environment= does not close its quoting, so it is not a rendering this can read"
+    return 1
+  fi
+  count="$(bus_array_count "$rendering" as)" || count=''
+  if [[ -z "$count" || "$count" -ne "${#BUS_STRINGS[@]}" ]]; then
+    UNIT_PORT_REASON="systemd stated ${count:-no} Environment= element(s) for ${unit} and ${#BUS_STRINGS[@]} were read out of the rendering, so it is not being read the way systemd wrote it"
+    return 1
+  fi
+  for (( index = 0; index < ${#BUS_STRINGS[@]}; index++ )); do
+    element="${BUS_STRINGS[index]}"
+    [[ "${element%%=*}" == "PORT" ]] || continue
+    # A later assignment of the same name in ONE Environment= list replaces an earlier one. That
+    # is systemd's documented rule for a single list, not a precedence question between sources,
+    # so the last is taken rather than refused.
+    env_port="${element#*=}"
+  done
+  if [[ -n "$env_port" ]] && ! valid_tcp_port "$env_port"; then
+    UNIT_PORT_REASON="${unit} sets Environment=PORT=${env_port}, which is not a decimal TCP port in 1-65535"
+    return 1
+  fi
+
+  # ExecStart=. Its strings arrive in argv order, so `--port 3000` is read as the pair it is.
+  rendering="$(bus_unit_property "$object" Service ExecStart)" || rendering=''
+  if ! bus_read_strings "$rendering"; then
+    UNIT_PORT_REASON="systemd's rendering of ${unit}'s ExecStart= does not close its quoting, so it is not a rendering this can read"
+    return 1
+  fi
+  count="$(bus_array_count "$rendering" 'a(sasbttttuii)')" || count=''
+  if [[ -z "$count" ]]; then
+    UNIT_PORT_REASON="systemd would not state how many ExecStart= commands ${unit} has, so what it starts — and on which port — cannot be read"
+    return 1
+  fi
+  if [[ "$count" -eq 0 ]]; then
+    UNIT_PORT_REASON="${unit} declares no ExecStart= at all, so it starts nothing and there is no listening port to poll"
+    return 1
+  fi
+  if [[ "$count" -ne 1 ]]; then
+    UNIT_PORT_REASON="${unit} declares ${count} ExecStart= commands. Exactly one is expected of the application service, and which of several holds the listening port is not a question this will guess at"
+    return 1
+  fi
+  for (( index = 0; index < ${#BUS_STRINGS[@]}; index++ )); do
+    element="${BUS_STRINGS[index]}"
+    value=""
+    case "$element" in
+      --port|-p)
+        if (( index + 1 < ${#BUS_STRINGS[@]} )); then value="${BUS_STRINGS[index + 1]}"; fi
+        ;;
+      --port=*) value="${element#--port=}" ;;
+      -p=*) value="${element#-p=}" ;;
+      *) continue ;;
+    esac
+    if ! valid_tcp_port "$value"; then
+      UNIT_PORT_REASON="${unit}'s ExecStart= carries the port option '${element}' whose value '${value}' is not a decimal TCP port in 1-65535, so what it starts cannot be polled"
+      return 1
+    fi
+    if [[ -n "$exec_port" && "$exec_port" != "$value" ]]; then
+      UNIT_PORT_REASON="${unit}'s ExecStart= names two different ports, ${exec_port} and ${value}. Which one the program binds is a question about that program and not about the unit"
+      return 1
+    fi
+    exec_port="$value"
+  done
+
+  if [[ -n "$exec_port" && -n "$env_port" && "$exec_port" != "$env_port" ]]; then
+    UNIT_PORT_REASON="${unit} pins its port twice and the two disagree: ExecStart= says ${exec_port} and Environment=PORT= says ${env_port}. One of them is what the service binds and the other is what somebody believes it binds; make them the same and re-run"
+    return 1
+  fi
+  if [[ -n "$exec_port" ]]; then
+    UNIT_PORT="$exec_port"
+    UNIT_PORT_SOURCE="${unit}'s own ExecStart="
+    return 0
+  fi
+  if [[ -n "$env_port" ]]; then
+    UNIT_PORT="$env_port"
+    UNIT_PORT_SOURCE="${unit}'s own Environment=PORT="
+    return 0
+  fi
+  UNIT_PORT_REASON="${unit} pins no port at all: its ExecStart= names none and it sets no Environment=PORT=, so the port it listens on is decided somewhere this cannot read — by the application's own loader, or by a default inside the program. Pin it in the unit (Environment=PORT=<port>, or an ExecStart that names it), or state it on this script's invocation as IMS_APP_PORT=<port>"
+  return 1
+}
+
+# WHERE THE POLLED PORT COMES FROM, in order, and ${APP_DIR}/.env is not in the list.
+#
+# The root invocation first — it is the operator, and it is the one input to this script the
+# application cannot write (the same standing it has for IMS_APP_DIR and IMS_SERVICE_UNIT) — then
+# the unit's own loaded configuration. There is no third source and no default: a guessed 3000
+# for a service listening on 8080 polls a URL nothing serves just as surely as a malformed value
+# does, and, unlike a malformed value, it does it silently.
+resolve_app_port() {
+  APP_PORT=""
+  APP_PORT_SOURCE=""
+  APP_PORT_REASON=""
+
+  if [[ -n "${IMS_APP_PORT:-}" ]]; then
+    if ! valid_tcp_port "${IMS_APP_PORT}"; then
+      APP_PORT_REASON="IMS_APP_PORT was given on this run's invocation as '${IMS_APP_PORT}', and it is not a decimal TCP port in 1-65535"
+      return 1
+    fi
+    APP_PORT="${IMS_APP_PORT}"
+    APP_PORT_SOURCE="the IMS_APP_PORT deployment input on this run's invocation"
+    return 0
+  fi
+
+  if unit_listen_port "${SERVICE_UNIT:-}"; then
+    APP_PORT="${UNIT_PORT}"
+    APP_PORT_SOURCE="${UNIT_PORT_SOURCE}"
+    return 0
+  fi
+  APP_PORT_REASON="${UNIT_PORT_REASON}"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# AND DOES THE SOCKET THAT ANSWERED BELONG TO THE SERVICE? (o3d-2sm1.5 r27, Codex HIGH)
+#
+# Knowing the right port is half the question. A health check that proves only that SOMETHING
+# answered is the same class of not-a-check as a recorded backend nobody consulted: the run's
+# point of no return is armed by that answer, and past it the exit trap explicitly refuses to
+# stop the service. The build-id probe does not close this on its own — /_next/static/<BUILD_ID>/
+# is served out of the application's own build output, so anything started from this tree (a
+# predecessor that survived the stop, an operator's `next start` in a screen session, the e2e rig
+# pointed at the wrong directory) answers it exactly as the service does.
+#
+# So the listener is asked who it is, by the same two routes deploy.sh's dev path uses, and BOTH
+# are accepted because each covers where the other cannot see:
+#
+#   the control group — systemd tears a unit's cgroup down when it stops it, so a process that
+#     survived the stop cannot be inside the one the new start created; and
+#   the process tree — the same question on a host whose /proc/<pid>/cgroup this cannot read
+#     (cgroup v1, a container): is the pid a descendant of the unit's CURRENT MainPID, which is
+#     the process this run's `systemctl start` created.
+#
+# EVERY pid holding the port must answer to one of them. "One of them is ours" is not an answer
+# when the question is which process the health check reached.
+RESPONDER_PIDS=""
+RESPONDER_REASON="the socket on the application's port has not been attributed yet"
+
+# Every pid `ss` attributes the listening socket on ${APP_PORT} to, one per line.
+port_listener_pids() {
+  # `$4 ~ p` selects the row, and the whole row is handed on: `pid=<n>` appears only in ss's
+  # process column, so grep does not need awk to pick a field out for it.
+  ss -ltnp 2>/dev/null | awk -v p=":${APP_PORT}\$" '$4 ~ p' \
+    | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true
+}
+
+# Is this pid inside ${SERVICE_UNIT}'s control group? The unified hierarchy line first, then the
+# first line of a v1 /proc/<pid>/cgroup, because the two are rendered differently.
+pid_in_service_cgroup() {
+  local pid="$1" pid_cg unit_cg
+  pid_cg="$(sed -n 's#^0::##p' "/proc/${pid}/cgroup" 2>/dev/null | head -1)"
+  [[ -n "$pid_cg" ]] || pid_cg="$(head -1 "/proc/${pid}/cgroup" 2>/dev/null | cut -d: -f3- || true)"
+  [[ -n "$pid_cg" ]] || return 1
+  unit_cg="$(systemctl show -p ControlGroup --value "${SERVICE_UNIT}" 2>/dev/null || true)"
+  [[ -n "$unit_cg" ]] || return 1
+  [[ "$pid_cg" == "$unit_cg" || "$pid_cg" == "${unit_cg}/"* ]]
+}
+
+# The same question by a second route: is the pid a descendant of the unit's current MainPID?
+pid_in_service_process_tree() {
+  local pid="$1" main cur hops
+  main="$(systemctl show -p MainPID --value "${SERVICE_UNIT}" 2>/dev/null || true)"
+  [[ "$main" =~ ^[0-9]+$ && "$main" -gt 1 ]] || return 1
+  cur="$pid"
+  hops=0
+  while [[ "$cur" =~ ^[0-9]+$ && "$cur" -gt 1 && "$hops" -lt 32 ]]; do
+    [[ "$cur" != "$main" ]] || return 0
+    cur="$(awk '/^PPid:/{print $2}' "/proc/${cur}/status" 2>/dev/null || true)"
+    hops=$(( hops + 1 ))
+  done
+  return 1
+}
+
+prove_service_owns_port() {
+  local pids pid
+  RESPONDER_PIDS=""
+  RESPONDER_REASON=""
+  if ! command -v ss >/dev/null 2>&1; then
+    RESPONDER_REASON="ss (iproute2) is not available, so nothing here can say which process holds :${APP_PORT}"
+    return 1
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    RESPONDER_REASON="systemctl is not available, so the socket on :${APP_PORT} cannot be attributed to ${SERVICE_UNIT}"
+    return 1
+  fi
+  pids="$(port_listener_pids | grep -E '^[0-9]+$' || true)"
+  if [[ -z "$pids" ]]; then
+    RESPONDER_REASON="something answered on :${APP_PORT}, but 'ss -ltnp' attributes that listening socket to no pid at all, so the process behind it cannot be identified"
+    return 1
+  fi
+  for pid in $pids; do
+    if pid_in_service_cgroup "$pid" || pid_in_service_process_tree "$pid"; then
+      continue
+    fi
+    RESPONDER_REASON="pid ${pid} holds the listening socket on :${APP_PORT} and belongs to neither ${SERVICE_UNIT}'s control group nor its process tree, so it is not a process this run started"
+    return 1
+  done
+  RESPONDER_PIDS="$(printf '%s' "$pids" | tr '\n' ' ')"
+  RESPONDER_PIDS="${RESPONDER_PIDS% }"
+  return 0
+}
 # The refusal every fence mode goes through, beside require_db_identity: four values, AND a
 # service whose DATABASE_URL nothing but that file can define.
 require_env_file_is_sole_definition() {
@@ -2346,9 +2618,12 @@ RESUME_EVIDENCE=""
 # IS THE OLD VERSION STILL UP? Asked only to decide whether an interrupted ARMING can be
 # resumed, and answered conservatively: a unit systemd reports active, or anything listening
 # on the app's port, counts as "still serving". A `false` sends the run down the ordinary
-# adoption path, which stops and re-fences — the pre-existing behaviour. APP_PORT is read and
-# validated in the preflight above, so by the time this runs it is always known — it was not
-# before r26, when the only read was at the bottom of the script and this probe was dead code.
+# adoption path, which stops and re-fences — the pre-existing behaviour. APP_PORT is resolved
+# from the UNIT immediately after the cutover lock, above this, so by the time this runs it is
+# known whenever it is knowable at all — it was not before r26, when the only read was at the
+# bottom of the script and this probe was dead code. When it is NOT knowable the name is empty
+# and this probe simply has one fewer piece of evidence; the refusal for that belongs to the port
+# gate below, which runs after the adoption this probe is part of (r27, Codex HIGH).
 predecessor_is_active() {
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${SERVICE_UNIT}" 2>/dev/null; then
     RESUME_EVIDENCE="systemd reports ${SERVICE_UNIT} active"
@@ -2400,6 +2675,14 @@ header "Preflight"
 if ! $DRY_RUN; then
   acquire_cutover_lock
 fi
+
+# THE PORT IS RESOLVED HERE and is NOT yet fatal. It is resolved before the adoption below
+# because predecessor_is_active() uses "something is still listening on it" as evidence when it
+# decides whether an interrupted arming can be resumed without stopping anything; it is not
+# fatal here because a refusal before that adoption abandons a fence this run is responsible
+# for. Unresolvable leaves APP_PORT empty, which that probe already treats as "no such
+# evidence", and the gate below is where it becomes a refusal (o3d-2sm1.5 r27, Codex HIGH).
+resolve_app_port || true
 
 # Adoption is the FIRST thing after the lock, before the pull and long before the
 # build. A previous run that failed after the stop left this host in a state where a
@@ -2582,6 +2865,49 @@ if [[ -f "${FENCE_FILE}" ]]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# THE PORT GATE — AFTER THE FENCE IS ADOPTED, BEFORE ANYTHING NEW IS TOUCHED
+# (o3d-2sm1.5 r27, Codex HIGH).
+#
+# r26 refused a malformed port at the top of the script, during top-level initialisation. That is
+# before the EXIT trap is installed, before the cutover lock is acquired and before the block
+# above adopts an existing marker — so its "Nothing has been stopped and nothing has been
+# migrated" was only true of an ORDINARY run. On a RECOVERY run a predecessor may already have
+# stopped the service, or already begun migrating, and re-stopping it, re-establishing the reboot
+# fence, confirming the cron fence and adopting or releasing the connection fence is precisely
+# what this run exists to do. Refusing before all that abandoned the fence instead of adopting
+# it — prolonging an outage, or leaving a failed re-fence unrepaired, on the strength of a value
+# in a file the application can write.
+#
+# So the refusal is HERE. Refusing safely means refusing at a point where the refusal leaves the
+# system CONSISTENT, and this is that point:
+#
+#   the cutover lock is held, so no second run is doing any of this concurrently;
+#   an existing marker has been adopted in full — either the service was re-stopped and both
+#     fences re-established and verified, or an interrupted arming was completely unwound and the
+#     old version is still serving what it was built against;
+#   and NOTHING NEW has been pulled, built, stopped, fenced or migrated by this run.
+#
+# Everything that costs something is still ahead. The exit trap is installed and knows which
+# phase this is, so a die here is torn down or left standing by the same machinery as any other.
+if [[ -z "${APP_PORT}" ]]; then
+  die "This run cannot establish which port ${SERVICE_UNIT} listens on, so it has no address to poll: ${APP_PORT_REASON}. That port is what decides whether the new build answered, and therefore whether this update is allowed past its point of no return, so it is not guessed at. ${APP_DIR}/.env is not an answer to it: the application can write that file and nothing in it starts the service. Pin the port in the unit (Environment=PORT=<port>, or an ExecStart that names it) or state it on the invocation (IMS_APP_PORT=<port>), and re-run. NOTHING NEW HAS BEEN STOPPED, FENCED OR MIGRATED BY THIS RUN: no code has been pulled, nothing has been built and the schema has not moved. If a previous run left a fence standing it has just been ADOPTED above — re-stopped, re-fenced and verified, or unwound if it had stopped nothing — so this box is in the state the message above describes, and a re-run adopts it again."
+fi
+
+# AND ${APP_DIR}/.env's OWN CLAIM IS CHECKED AGAINST IT, never used instead of it. install.sh
+# writes APP_PORT into that file beside the unit it generates from the same value, so the two are
+# meant to say the same thing. When they do not, one of them is what the service binds and the
+# other is what the next person to read the file will believe — and this script has no business
+# picking a winner between a root-owned unit and an application-owned file. It refuses, and it
+# refuses at the same safe point, for the same reason.
+if [[ -n "${ENV_FILE_APP_PORT}" ]] && ! valid_tcp_port "${ENV_FILE_APP_PORT}"; then
+  die "APP_PORT in ${APP_DIR}/.env is not a TCP port: '${ENV_FILE_APP_PORT}'. It is read the way dotenv reads it (quotes and trailing comment removed, last definition wins), and while it is no longer what this run polls — ${SERVICE_UNIT} listens on ${APP_PORT}, from ${APP_PORT_SOURCE} — a record of that port which is not a port is a record that will mislead whoever reads it next. Fix the line or delete it, and re-run. NOTHING NEW HAS BEEN STOPPED, FENCED OR MIGRATED BY THIS RUN, and any fence a previous run left standing has just been adopted above."
+fi
+if [[ -n "${ENV_FILE_APP_PORT}" && "${ENV_FILE_APP_PORT}" != "${APP_PORT}" ]]; then
+  die "${APP_DIR}/.env says APP_PORT=${ENV_FILE_APP_PORT} and ${SERVICE_UNIT} listens on ${APP_PORT}, from ${APP_PORT_SOURCE}. Those are two records of one fact and they have drifted apart. The unit is what starts the service, so ${APP_PORT} is what this run would poll — but a deployment whose own configuration file names a different port is one where the next change is made against the wrong number, and choosing a winner silently is how that happens. Make them agree (or delete the APP_PORT line, which decides nothing) and re-run. NOTHING NEW HAS BEEN STOPPED, FENCED OR MIGRATED BY THIS RUN, and any fence a previous run left standing has just been adopted above."
+fi
+
+info "Health checks will poll port ${APP_PORT}, from ${APP_PORT_SOURCE}."
 if ! $NO_GIT; then
   header "Pulling latest code from git"
 
@@ -2940,7 +3266,7 @@ remove_reboot_fence
 # exactly the branch that re-establishes the connection fence through refence_db_connections()
 # and re-installs the reboot fence, and then says which of the two it actually managed.
 require_start_identity_bound || die \
-  "THE APPLICATION IS NOT BEING STARTED, AND BOTH FENCES ARE BEING PUT BACK: ${DB_IDENTITY_DRIFT_REASON}. This was checked after the final daemon-reload, so it is the loaded unit configuration and the current file contents that disagree with the identity this run fenced and migrated. It is also the check that proves the environment snapshot this run published is in that loaded configuration, loaded last and loaded mandatorily — the binding that makes the answer independent of anything that happens between this line and the exec. NOTHING BETWEEN HERE AND THE START RUNS A UNIT-FILE COMMAND AT ALL: the unmask moved above the final reload in r24 because it reloads implicitly, and every command left in the window is a timestamp, a shell test, a loop, an echo and `systemctl start` itself, which acts on the loaded configuration and does not re-read unit files. So the list of environment files systemd will read is now fixed. The connection fence was released a moment ago for the start and is being re-established below; the banner that follows says whether that succeeded and what is standing. Restore ${APP_DIR}/.env and the unit to the identity above and re-run this script, which adopts the fence. Do NOT start the service by hand first."
+  "THE APPLICATION IS NOT BEING STARTED, AND BOTH FENCES ARE BEING PUT BACK: ${DB_IDENTITY_DRIFT_REASON}. This was checked after the final daemon-reload, so it is the loaded unit configuration and the current file contents that disagree with the identity this run fenced and migrated. It is also the check that proves the environment snapshot this run published is in that loaded configuration, loaded last and loaded mandatorily — the binding that makes the answer independent of anything that happens between this line and the exec. NOTHING BETWEEN HERE AND THE START RUNS A UNIT-FILE COMMAND AT ALL: the unmask moved above the final reload in r24 because it reloads implicitly, and every command left in the window is a timestamp, a shell test, a loop, an echo and \`systemctl start\` itself, which acts on the loaded configuration and does not re-read unit files. So the list of environment files systemd will read is now fixed. The connection fence was released a moment ago for the start and is being re-established below; the banner that follows says whether that succeeded and what is standing. Restore ${APP_DIR}/.env and the unit to the identity above and re-run this script, which adopts the fence. Do NOT start the service by hand first."
 
 run systemctl start "${SERVICE_UNIT}"
 success "Application service started."
@@ -2951,8 +3277,10 @@ success "Application service started."
 CURRENT_STEP="health"
 header "Health check"
 
-# APP_PORT was read out of .env through env_file_value() in the preflight, and validated as a
-# TCP port there — before anything was stopped, fenced or migrated. Nothing re-reads it here.
+# APP_PORT came from ${SERVICE_UNIT}'s own loaded configuration (or from IMS_APP_PORT on the root
+# invocation), was resolved under the cutover lock and was gated right after the fence adoption —
+# before anything was pulled, built, stopped, fenced or migrated by this run. Nothing re-reads it
+# here, and ${APP_DIR}/.env never decided it.
 if $DRY_RUN; then
   echo -e "${YELLOW}[DRY]${RESET}   would poll http://127.0.0.1:${APP_PORT}/api/health"
 else
@@ -2969,6 +3297,19 @@ else
     die "The new version did not answer /api/health within 60s. Leaving it stopped rather than restoring the old one."
   fi
   success "Health check passed — app is responding."
+
+  # ---------------------------------------------------------------------------
+  # WHOSE SOCKET WAS THAT? (o3d-2sm1.5 r27, Codex HIGH)
+  #
+  # Before asking which BUILD answered, ask which PROCESS did — because the build-id probe below
+  # is served out of this tree's own output and therefore cannot tell the service apart from
+  # anything else started from the same directory. This is the check that ties the responding
+  # socket to ${SERVICE_UNIT} itself, and it runs while the teardown window is still open: the
+  # point of no return is below, so a failure here is stopped and re-fenced like any other.
+  # ---------------------------------------------------------------------------
+  prove_service_owns_port || die \
+    "Something answered /api/health on :${APP_PORT}, but it could not be shown to be ${SERVICE_UNIT}: ${RESPONDER_REASON}. The port itself came from ${APP_PORT_SOURCE}, so this is not a case of polling the wrong address — it is a case of the right address being held by something this run did not start. The schema has already moved, and declaring the update irreversible on the strength of an answer from an unidentified process is exactly what that point of no return is there to prevent. Leaving the service stopped and fenced rather than reporting a success nothing proved."
+  success "The socket on :${APP_PORT} belongs to ${SERVICE_UNIT} (pid ${RESPONDER_PIDS})."
 
   # ---------------------------------------------------------------------------
   # AND WHICH BUILD IS IT? (o3d-2sm1.5, Codex r5 HIGH)
