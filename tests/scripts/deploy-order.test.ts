@@ -5341,7 +5341,9 @@ function runLayoutGate(options: { env: string | null; marker: string | null }): 
     const result = runShell(
       `IMS_APP_DIR=${JSON.stringify(dir)} IMS_CUTOVER_STATE_DIR=${JSON.stringify(state)} bash -s -- --dry-run <<'IMS_LAYOUT_EOF'\n${program}\nIMS_LAYOUT_EOF`,
     )
-    return { ...result, log: readFileSync(log, 'utf8') }
+    // A run that never reached the stubs leaves no log at all — which is precisely what the
+    // mutation route below produces — so an absent log is an EMPTY log and not a harness error.
+    return { ...result, log: existsSync(log) ? readFileSync(log, 'utf8') : '' }
   } finally {
     rmSync(dir, { recursive: true, force: true })
     rmSync(state, { recursive: true, force: true })
