@@ -2378,119 +2378,167 @@ test('o3d-2sm1.5 r20: a percent-escaped query KEY is refused, because the driver
   }
 })
 
-/** env_file_is_sole_database_url_source(), lifted out of the shipped script and run by bash. */
+/**
+ * The bus reader and the question it answers, lifted out of the shipped script and run by bash.
+ *
+ * From the first helper to the end of the function, so a mutation anywhere in the mechanism —
+ * the tokenizer, the arity check, the name match or any refusal — reaches this test.
+ */
 function liftSoleSource(script: 'deploy.sh' | 'update.sh'): string {
   const source = readFileSync(join(process.cwd(), `scripts/${script}`), 'utf8')
-  const start = source.indexOf('env_file_is_sole_database_url_source() {')
-  assert.ok(start > 0, `${script}: precondition — the question is asked by the shipped script`)
-  return source.slice(start, source.indexOf('\n  return 0\n}\n', start) + '\n  return 0\n}\n'.length)
+  const start = source.indexOf('bus_read_strings() {')
+  const main = source.indexOf('env_file_is_sole_database_url_source() {')
+  assert.ok(start > 0 && main > start, `${script}: precondition — the question is asked by the shipped script`)
+  const terminator = '\n  return 0\n}\n'
+  return source.slice(start, source.indexOf(terminator, main) + terminator.length)
 }
 
 /**
- * WHAT `systemctl show` SAYS, one fixture per way a second definition can exist.
+ * WHAT SYSTEMD SAYS, one fixture per way a second definition of DATABASE_URL can exist.
  *
- * The shape is this host's own: `systemctl show -p LoadState -p Environment -p EnvironmentFiles
- * -p PassEnvironment -p UnsetEnvironment ims-stage-dev.service` answers with exactly these
- * properties, one per line, EnvironmentFiles as `<path> (ignore_errors=<yes|no>)`, and the real
- * IMS units on this host produce the `sole` fixture below — verified read-only before this test
- * was written.
+ * The shape is this host's own: `busctl get-property org.freedesktop.systemd1 <unit path>
+ * org.freedesktop.systemd1.Service <property>` answers with the property's SIGNATURE, the array's
+ * own ELEMENT COUNT and then the elements — `a(sb) 1 "/opt/app/.env" true`, `as 0`, `s ""` — all
+ * verified read-only against the real ims-stage-dev.service and ims-e2e-dev.service on this host
+ * before this test was written, and those two units answer SOLE through the lifted function.
+ *
+ * Each fixture overrides one property; everything it does not name is the sole-source answer.
  */
-const SYSTEMD_ANSWERS: [string, string, RegExp | null][] = [
-  [
-    'the unit loads that file and nothing else defines it',
-    ['LoadState=loaded', 'Environment=NODE_ENV=production PORT=3000', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
-    null,
-  ],
+type SystemdUnit = Partial<Record<'LoadState' | 'PAMName' | 'Environment' | 'PassEnvironment' | 'UnsetEnvironment' | 'EnvironmentFiles', string>>
+
+const SOLE_UNIT: Required<SystemdUnit> = {
+  LoadState: 's "loaded"',
+  PAMName: 's ""',
+  Environment: 'as 2 "NODE_ENV=production" "PORT=3000"',
+  PassEnvironment: 'as 0',
+  UnsetEnvironment: 'as 0',
+  EnvironmentFiles: 'a(sb) 1 "/opt/app/.env" true',
+}
+
+const SYSTEMD_ANSWERS: [string, SystemdUnit, RegExp | null][] = [
+  ['the unit loads that file and nothing else defines it', {}, null],
   [
     'Environment= carries its own DATABASE_URL',
-    ['LoadState=loaded', 'Environment=NODE_ENV=production DATABASE_URL=postgresql://app:pw@other-cluster:5432/other', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
+    { Environment: 'as 2 "NODE_ENV=production" "DATABASE_URL=postgresql://app:pw@other-cluster:5432/other"' },
     /sets DATABASE_URL in its own Environment=/,
   ],
   [
-    'Environment= carries it FIRST, with no space in front of it',
-    ['LoadState=loaded', 'Environment=DATABASE_URL=postgresql://app:pw@other-cluster:5432/other NODE_ENV=production', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
+    'Environment= carries it FIRST',
+    { Environment: 'as 2 "DATABASE_URL=postgresql://app:pw@other-cluster:5432/other" "NODE_ENV=production"' },
     /sets DATABASE_URL in its own Environment=/,
-  ],
-  [
-    'PassEnvironment= lets the manager supply it',
-    ['LoadState=loaded', 'Environment=NODE_ENV=production', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=LANG DATABASE_URL', 'UnsetEnvironment='].join('\n'),
-    /lists DATABASE_URL in PassEnvironment=/,
-  ],
-  [
-    'UnsetEnvironment= removes what the file supplied',
-    ['LoadState=loaded', 'Environment=NODE_ENV=production', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment=DATABASE_URL'].join('\n'),
-    /lists DATABASE_URL in UnsetEnvironment=/,
-  ],
-  [
-    'a SECOND environment file, which may define it',
-    ['LoadState=loaded', 'Environment=NODE_ENV=production', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'EnvironmentFiles=/etc/ims/override.conf (ignore_errors=yes)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
-    /also loads \/etc\/ims\/override\.conf as an environment file/,
-  ],
-  [
-    'no environment file at all, so the application\'s own loader decides',
-    ['LoadState=loaded', 'Environment=NODE_ENV=production', 'EnvironmentFiles=', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
-    /does not load \/opt\/app\/\.env with EnvironmentFile=/,
-  ],
-  [
-    'a different environment file instead of that one',
-    ['LoadState=loaded', 'Environment=NODE_ENV=production', 'EnvironmentFiles=/etc/ims/other.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
-    /also loads \/etc\/ims\/other\.env as an environment file/,
-  ],
-  [
-    'systemd cannot load the unit at all',
-    ['LoadState=masked', 'Environment=', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
-    /reports one-two-inventory\.service as 'masked' rather than loaded/,
   ],
   [
     'a variable whose NAME merely ends in DATABASE_URL is not a definition of it',
-    ['LoadState=loaded', 'Environment=NEXT_PUBLIC_DATABASE_URL=shown NODE_ENV=production', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
+    { Environment: 'as 2 "NEXT_PUBLIC_DATABASE_URL=shown" "NODE_ENV=production"' },
     null,
+  ],
+  [
+    'a variable whose VALUE contains the text of one is not a definition of it either',
+    { Environment: 'as 1 "SUMMARY=env is NODE_ENV=production DATABASE_URL=postgresql://x/y"' },
+    null,
+  ],
+  [
+    'a value carrying an ESCAPED QUOTE does not end the element early',
+    { Environment: 'as 2 "SUMMARY=he said \\"DATABASE_URL=postgresql://x/y\\"" "NODE_ENV=production"' },
+    null,
+  ],
+  ['PassEnvironment= lets the manager supply it', { PassEnvironment: 'as 2 "LANG" "DATABASE_URL"' }, /lists DATABASE_URL in PassEnvironment=/],
+  ['UnsetEnvironment= removes what the file supplied', { UnsetEnvironment: 'as 1 "DATABASE_URL"' }, /lists DATABASE_URL in UnsetEnvironment=/],
+  [
+    'UnsetEnvironment= removes it in the ASSIGNMENT form, which names no bare token',
+    { UnsetEnvironment: 'as 1 "DATABASE_URL=postgresql://app:pw@db:5432/ims"' },
+    /lists DATABASE_URL in UnsetEnvironment= \(as 'DATABASE_URL=postgresql:\/\/app:pw@db:5432\/ims'\)/,
+  ],
+  ['PAMName= brings a whole environment source with it', { PAMName: 's "login"' }, /sets PAMName=login/],
+  [
+    'a SECOND environment file, which may define it',
+    { EnvironmentFiles: 'a(sb) 2 "/opt/app/.env" false "/etc/ims/override.env" true' },
+    /loads 2 environment files \(\/opt\/app\/\.env \/etc\/ims\/override\.env\)/,
+  ],
+  ['no environment file at all, so the application\'s own loader decides', { EnvironmentFiles: 'a(sb) 0' }, /does not load \/opt\/app\/\.env with EnvironmentFile=/],
+  [
+    'a different environment file instead of that one',
+    { EnvironmentFiles: 'a(sb) 1 "/etc/ims/other.env" false' },
+    /loads \/etc\/ims\/other\.env as its environment file and not \/opt\/app\/\.env/,
+  ],
+  [
+    'a path systemd had to escape, which this will not decode to compare',
+    { EnvironmentFiles: 'a(sb) 1 "/opt/app/\\"quoted\\"/.env" false' },
+    /a path it had to escape to state/,
+  ],
+  ['systemd cannot load the unit at all', { LoadState: 's "masked"' }, /reports one-two-inventory\.service as 'masked' rather than loaded/],
+  [
+    'an array whose stated count and contents disagree is not an answer',
+    { Environment: 'as 2 "NODE_ENV=production"' },
+    /would not answer readably for one-two-inventory\.service's Environment=/,
+  ],
+  [
+    'and neither is a rendering of some other signature',
+    { EnvironmentFiles: 'as 1 "/opt/app/.env"' },
+    /would not answer readably for one-two-inventory\.service's EnvironmentFiles=/,
   ],
 ]
 
-test('o3d-2sm1.5 r20: a unit that can define DATABASE_URL anywhere but that file is refused', () => {
+test('o3d-2sm1.5 r21: a unit that can define DATABASE_URL anywhere but that file is refused', () => {
   // ROUTE: the entrypoint reads DATABASE_URL from the app's .env -> resolve_db_identity() ->
   // DB_FENCE_IDENTITY_ARGS -> the fence, the migration and the release. This is the question that
-  // decides whether that file is the one the SERVICE uses: `systemctl show` for one variable, and
-  // a refusal for every answer but "only that file". It computes nothing and resolves no
-  // precedence — it asks whether a second definition EXISTS.
+  // decides whether that file is the one the SERVICE uses, and r21 asks it of systemd's BUS: the
+  // property's signature, the array's own element count, and the elements. It computes nothing
+  // and resolves no precedence — it asks whether a second definition EXISTS.
   //
-  // MUTATION: delete any one arm from env_file_is_sole_database_url_source() — the Environment=
-  // scan, the PassEnvironment= scan, the UnsetEnvironment= scan, the second-file refusal, the
-  // `loads_our_file` requirement or the LoadState check. That fixture's expectation flips from
+  // MUTATION: delete any one arm from env_file_is_sole_database_url_source() — the PAMName
+  // refusal, the `count -gt 1` refusal, the name match in bus_element_names_database_url(), the
+  // Environment/PassEnvironment/UnsetEnvironment loop, the `loads_our_file` comparison, the
+  // LoadState check or the count-versus-elements check. That fixture's expectation flips from
   // REFUSE to SOLE, and the deploy proceeds to fence, migrate and release one database while the
-  // restarted application connects to another.
+  // restarted application connects to another. Two named mutations of the r20 reader it replaces:
+  // matching UnsetEnvironment with `case " ${value} " in *' DATABASE_URL '*` passes the
+  // assignment-form fixture, and taking the environment file as `${line%% (ignore_errors=*}` off
+  // one text line passes the two-file fixture.
   const dir = mkdtempSync(join(tmpdir(), 'ims-systemd-'))
   try {
     writeFileSync(
-      join(dir, 'systemctl'),
-      ['#!/usr/bin/env bash', '[[ "$1" == "show" ]] || exit 1', 'printf "%s\\n" "$FAKE_SHOW"', ''].join('\n'),
+      join(dir, 'busctl'),
+      [
+        '#!/usr/bin/env bash',
+        // The two calls the reader makes, and nothing else: an unexpected one is an error, so a
+        // reader that asked a different question would not silently get an answer.
+        'if [[ "$1" == "call" ]]; then printf \'o "/org/freedesktop/systemd1/unit/fake_2eservice"\\n\'; exit 0; fi',
+        '[[ "$1" == "get-property" ]] || exit 1',
+        '[[ "$4" == org.freedesktop.systemd1.* ]] || exit 1',
+        'name="FAKE_$5"',
+        '[[ -n "${!name+set}" ]] || exit 1',
+        'printf \'%s\\n\' "${!name}"',
+        '',
+      ].join('\n'),
     )
-    chmodSync(join(dir, 'systemctl'), 0o755)
+    chmodSync(join(dir, 'busctl'), 0o755)
 
     for (const script of ['deploy.sh', 'update.sh'] as const) {
       const lifted = liftSoleSource(script)
-      // PRECONDITION: the whole function was lifted, so a mutation to the shipped script really
+      // PRECONDITION: the whole mechanism was lifted, so a mutation to the shipped script really
       // does reach this test.
-      assert.ok(lifted.includes('UnsetEnvironment'), `${script}: the lifted function is complete`)
+      assert.ok(lifted.includes('PAMName'), `${script}: the lifted reader asks about PAMName`)
+      assert.ok(lifted.includes('bus_array_count'), `${script}: and reads the array's own count`)
 
-      function ask(fixture: string): string {
-        const bash = [
-          'set -uo pipefail',
-          'DB_IDENTITY_SOURCE_REASON=""',
-          lifted,
-          'if env_file_is_sole_database_url_source "$1" "$2"; then printf "SOLE\\n"; else printf "REFUSE %s\\n" "$DB_IDENTITY_SOURCE_REASON"; fi',
-        ].join('\n')
-        const run = spawnSync('bash', ['-c', bash, 'ask', '/opt/app/.env', 'one-two-inventory.service'], {
-          encoding: 'utf8',
-          env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}`, FAKE_SHOW: fixture },
-        })
+      const bash = [
+        'set -uo pipefail',
+        'DB_IDENTITY_SOURCE_REASON=""',
+        lifted,
+        'if env_file_is_sole_database_url_source "$1" "$2"; then printf "SOLE\\n"; else printf "REFUSE %s\\n" "$DB_IDENTITY_SOURCE_REASON"; fi',
+      ].join('\n')
+
+      function ask(unit: SystemdUnit, argv: [string, string] = ['/opt/app/.env', 'one-two-inventory.service']): string {
+        const properties = { ...SOLE_UNIT, ...unit }
+        const env: Record<string, string> = { ...process.env as Record<string, string>, PATH: `${dir}:${process.env.PATH ?? ''}` }
+        for (const [key, value] of Object.entries(properties)) env[`FAKE_${key}`] = value
+        const run = spawnSync('bash', ['-c', bash, 'ask', ...argv], { encoding: 'utf8', env })
         assert.equal(run.status, 0, run.stderr)
         return (run.stdout ?? '').trim()
       }
 
-      for (const [label, fixture, refusal] of SYSTEMD_ANSWERS) {
-        const answer = ask(fixture)
+      for (const [label, unit, refusal] of SYSTEMD_ANSWERS) {
+        const answer = ask(unit)
         if (refusal === null) {
           assert.equal(answer, 'SOLE', `${script}: ${label} — the deploy may proceed`)
         } else {
@@ -2500,28 +2548,18 @@ test('o3d-2sm1.5 r20: a unit that can define DATABASE_URL anywhere but that file
       }
 
       // AND IF SYSTEMD CANNOT BE ASKED, THAT IS A REFUSAL TOO — never a pass by default. An empty
-      // directory as the whole PATH is the smallest way to have no systemctl; bash is invoked by
+      // directory as the whole PATH is the smallest way to have no busctl; bash is invoked by
       // absolute path so that the child is the shell under test and not a PATH lookup failure.
-      const bash = [
-        'set -uo pipefail',
-        'DB_IDENTITY_SOURCE_REASON=""',
-        lifted,
-        'if env_file_is_sole_database_url_source "$1" "$2"; then printf "SOLE\\n"; else printf "REFUSE %s\\n" "$DB_IDENTITY_SOURCE_REASON"; fi',
-      ].join('\n')
       const empty = mkdtempSync(join(tmpdir(), 'ims-nopath-'))
       const absent = spawnSync('/bin/bash', ['-c', bash, 'ask', '/opt/app/.env', 'one-two-inventory.service'], {
         encoding: 'utf8',
         env: { ...process.env, PATH: empty },
       })
       rmSync(empty, { recursive: true, force: true })
-      assert.match((absent.stdout ?? '').trim(), /^REFUSE systemctl is not available/, `${script}: no systemctl is a refusal`)
+      assert.match((absent.stdout ?? '').trim(), /^REFUSE busctl/, `${script}: no busctl is a refusal`)
 
       // AND SO IS HAVING NO UNIT TO ASK ABOUT.
-      const noUnit = spawnSync('bash', ['-c', bash, 'ask', '/opt/app/.env', ''], {
-        encoding: 'utf8',
-        env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}`, FAKE_SHOW: '' },
-      })
-      assert.match((noUnit.stdout ?? '').trim(), /^REFUSE no systemd unit was identified/, `${script}: no unit is a refusal`)
+      assert.match(ask({}, ['/opt/app/.env', '']), /^REFUSE no systemd unit was identified/, `${script}: no unit is a refusal`)
     }
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -2547,7 +2585,12 @@ test('o3d-2sm1.5 r20: every fence path asks it, and the installer is still exemp
     assert.ok(identity >= 3, `${name}: precondition — the identity is required at more than one place (${identity})`)
     assert.equal(sole, identity, `${name}: and its source is questioned at every one of them (${sole} of ${identity})`)
     // It asks systemd, and it asks about the one variable.
-    assert.match(source, /systemctl show -p LoadState -p Environment -p EnvironmentFiles -p PassEnvironment -p UnsetEnvironment/, `${name}: asks systemd`)
+    // It asks SYSTEMD's own bus, and it asks about every property that can carry the variable —
+    // PAMName included, which is the environment source the five-property text query omitted.
+    assert.match(source, /busctl get-property org\.freedesktop\.systemd1/, `${name}: asks systemd over its bus`)
+    assert.match(source, /for property in Environment PassEnvironment UnsetEnvironment/, `${name}: scans all three lists the same way`)
+    assert.match(source, /bus_unit_property "\$object" Service PAMName/, `${name}: and asks about PAMName`)
+    assert.ok(!source.includes('systemctl show -p Environment'), `${name}: and no longer parses systemctl's text rendering for it`)
   }
 
   // THE INSTALLER IS EXEMPT, AND STAYS EXEMPT. It prompts for DB_HOST/DB_PORT/DB_NAME/DB_USER,

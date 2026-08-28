@@ -461,16 +461,16 @@ require_db_identity() {
 
 # ---------------------------------------------------------------------------
 # IS THE FILE WE READ THE ONLY THING THAT CAN DEFINE DATABASE_URL FOR THIS SERVICE?
-# (o3d-2sm1.5 r20, Codex CRITICAL)
+# (o3d-2sm1.5 r20, Codex CRITICAL; r21 asks systemd's BUS instead of its text output)
 #
 # r19 moved the identity from "worked out by the fence" to "supplied by the entrypoint", and the
-# entrypoint supplies it out of ${APP_DIR}/.env. That is the PREVIOUS PROBLEM ONE LEVEL UP: an
-# `Environment=DATABASE_URL=...` directive, a drop-in that adds one, a `PassEnvironment=` entry or
-# a second `EnvironmentFile=` can put a different URL in the service's environment, and dotenv
-# does NOT overwrite a variable that is already set. The fence, the migration and the release
-# would then all be self-consistent about the .env database while the restarted application
-# connects elsewhere — a migration run on a database nothing was fenced off, and a new build
-# started against a database nothing migrated.
+# entrypoint supplies it out of ${APP_DIR_REAL}/.env. That is the PREVIOUS PROBLEM ONE LEVEL UP: an
+# `Environment=DATABASE_URL=...` directive, a drop-in that adds one, a `PassEnvironment=` entry, a
+# `PAMName=` whose PAM stack exports one, or a second `EnvironmentFile=` can put a different URL in
+# the service's environment, and dotenv does NOT overwrite a variable that is already set. The
+# fence, the migration and the release would then all be self-consistent about the .env database
+# while the restarted application connects elsewhere — a migration run on a database nothing was
+# fenced off, and a new build started against a database nothing migrated.
 #
 # THIS DOES NOT REBUILD THE INFERENCE r19 DELETED, and the difference is the whole design. It
 # computes no value and reproduces no precedence. It asks ONE existence question about ONE
@@ -478,14 +478,40 @@ require_db_identity() {
 #
 #     can anything other than the file we read define DATABASE_URL for this unit?
 #
-# `systemctl show` answers that directly, because it reports the COMPOSED Environment=,
-# EnvironmentFiles=, PassEnvironment= and UnsetEnvironment= with every drop-in already folded in
-# by systemd itself. Asking whether a second definition EXISTS is bounded; working out which of
-# several would WIN is the unbounded question, and it is never asked — any answer but "only that
-# file" is a refusal that names what else defines it and tells the operator to state the identity
-# explicitly. A second environment file is refused WITHOUT being read, for the same reason: that
-# it may define the variable is enough, and reading it to find out would put the precedence
-# question straight back.
+# systemd answers that directly, because it reports the COMPOSED Environment=, EnvironmentFiles=,
+# PassEnvironment=, UnsetEnvironment= and PAMName= with every drop-in already folded in by systemd
+# itself. Asking whether a second definition EXISTS is bounded; working out which of several would
+# WIN is the unbounded question, and it is never asked — any answer but "only that file" is a
+# refusal that names what else defines it and tells the operator to state the identity explicitly.
+# A second environment file is refused WITHOUT being read, for the same reason: that it may define
+# the variable is enough, and reading it to find out would put the precedence question straight
+# back. A non-empty PAMName= is refused without reading PAM configuration, for that same reason
+# again.
+#
+# IT IS ASKED OF THE BUS, NOT OF `systemctl show` (r21, Codex CRITICAL). Two of r20's three
+# findings were text-parsing bugs and only text-parsing bugs: `systemctl show` renders a property
+# as one `Name=` line of space-joined values, so where one entry of an ARRAY ends and the next
+# begins has to be guessed at — and `EnvironmentFiles` is an array of (path, ignore_errors) PAIRS
+# whose rendering the previous reader truncated at the first ` (ignore_errors=`. `busctl` — the
+# same package, on every host that has systemctl — prints the property's SIGNATURE and the array's
+# own ELEMENT COUNT before the elements:
+#
+#     a(sb) 1 "/opt/app/.env" true          as 2 "NODE_ENV=production" "PORT=3000"          s ""
+#
+# so "is there more than one environment file?" is answered by systemd's own data structure. The
+# count is read from the rendering and checked against the number of elements found in it; a
+# disagreement is a refusal. Nothing is inferred from where a space falls, and a string systemd had
+# to escape (busctl prints strings through `cescape()`) is REFUSED rather than decoded — decoding
+# it here would be one more reimplementation of somebody else's rules.
+#
+# EVERY ENVIRONMENT PROPERTY IS THEN MATCHED THE SAME WAY: on the NAME of each element, which is
+# everything before its first `=`. That is what makes `UnsetEnvironment=DATABASE_URL=<the value in
+# the .env>` a refusal (r21, Codex HIGH): systemd.exec takes "a space-separated list of variable
+# names or variable assignments", removes an exact assignment as the FINAL step of composing the
+# environment, and a scan for the bare token `DATABASE_URL` sees no such token in it — after which
+# the application's own dotenv loader supplies whatever `.env.local` says. The same rule applies to
+# Environment=, PassEnvironment= and UnsetEnvironment= alike, so no spelling of any of them is
+# matched by a substring.
 #
 # THE FILE MUST ALSO BE ONE SYSTEMD ITSELF LOADS. If the unit loads no environment file, the
 # variable reaches the application through the application's OWN loader instead, by rules that
@@ -493,17 +519,78 @@ require_db_identity() {
 # the layer r19 stopped reproducing. So that is a refusal too, and it says which line to add.
 #
 # WHAT IT CANNOT SEE, STATED RATHER THAN PAPERED OVER: an `ExecStart=` that runs a wrapper which
-# exports DATABASE_URL itself is invisible to `systemctl show`, because that definition lives
-# inside a program rather than in the unit. Closing that would mean reading programs, which is
-# unbounded again. It is the standing argument for making the four values a DEPLOYMENT-OWNED
+# exports DATABASE_URL itself is invisible to systemd's own properties, because that definition
+# lives inside a program rather than in the unit. Closing that would mean reading programs, which
+# is unbounded again. It is the standing argument for making the four values a DEPLOYMENT-OWNED
 # CONFIGURATION INPUT that these scripts read outright, instead of deriving them from a URL that
-# is only probably the one the service uses (docs/installation.md).
+# is only probably the one the service uses (o3d-1yvh, docs/installation.md).
 DB_IDENTITY_SOURCE_REASON="the service's environment has not been asked about yet"
+BUS_STRINGS=()
+
+# THE STRINGS IN ONE `busctl` RENDERING, in order, STILL ESCAPED.
+#
+# busctl prints every string through `cescape()`, so a `"` inside a value arrives as `\"` and
+# cannot end it early. This walks the rendering with that one rule and keeps the escapes: the
+# callers compare against names and paths that contain none, and refuse anything that does.
+# Returns 1 for a rendering whose quoting does not close, which is a rendering this cannot read.
+bus_read_strings() {
+  local text="${1:-}" index=0 length char current='' inside=0
+  BUS_STRINGS=()
+  length=${#text}
+  while (( index < length )); do
+    char="${text:index:1}"
+    if (( inside )); then
+      if [[ "$char" == '\' ]]; then
+        (( index + 1 < length )) || return 1
+        index=$(( index + 1 ))
+        current+="\\${text:index:1}"
+      elif [[ "$char" == '"' ]]; then
+        BUS_STRINGS+=("$current")
+        current=''
+        inside=0
+      else
+        current+="$char"
+      fi
+    elif [[ "$char" == '"' ]]; then
+      inside=1
+      current=''
+    fi
+    index=$(( index + 1 ))
+  done
+  (( inside == 0 )) || return 1
+  return 0
+}
+
+# THE ELEMENT COUNT systemd states in front of an array, for the signature we asked for.
+#
+# This is the number that makes the question bounded: it comes from the array, not from counting
+# separators in a line. A rendering of another signature — or none — is not an answer, and the
+# caller refuses.
+bus_array_count() {
+  local text="${1:-}" signature="${2:-}" rest
+  [[ "$text" == "${signature} "* ]] || return 1
+  rest="${text#"${signature}" }"
+  rest="${rest%% *}"
+  [[ "$rest" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$rest"
+}
+
+# One property of one unit, as systemd's own bus states it.
+bus_unit_property() {
+  busctl get-property org.freedesktop.systemd1 "${1:-}" "org.freedesktop.systemd1.${2:-}" "${3:-}" 2>/dev/null
+}
+
+# Does this element of an environment property NAME DATABASE_URL? Everything before the first `=`
+# is the name, so `DATABASE_URL`, `DATABASE_URL=postgresql://...` and an assignment carrying any
+# value at all are one answer, and `NEXT_PUBLIC_DATABASE_URL=...` is not.
+bus_element_names_database_url() {
+  [[ "${1%%=*}" == "DATABASE_URL" ]]
+}
 
 env_file_is_sole_database_url_source() {
   local env_file="${1:-}"; shift || true
   local -a units=("$@")
-  local unit props line value path load_state loads_our_file expected resolved
+  local unit object rendering count element expected resolved load_state pam_name
 
   DB_IDENTITY_SOURCE_REASON=""
   expected="$(readlink -f "$env_file" 2>/dev/null || printf '%s' "$env_file")"
@@ -512,73 +599,100 @@ env_file_is_sole_database_url_source() {
     DB_IDENTITY_SOURCE_REASON="no systemd unit was identified for the application, so there is nothing that can say whether ${env_file} is what gives it DATABASE_URL"
     return 1
   fi
-  if ! command -v systemctl >/dev/null 2>&1; then
-    DB_IDENTITY_SOURCE_REASON="systemctl is not available, so whether anything other than ${env_file} defines DATABASE_URL for the service cannot be established"
+  if ! command -v busctl >/dev/null 2>&1; then
+    DB_IDENTITY_SOURCE_REASON="busctl — systemd's own bus client, shipped beside systemctl — is not available, so whether anything other than ${env_file} defines DATABASE_URL for the service cannot be established"
     return 1
   fi
 
   for unit in "${units[@]}"; do
     [[ -n "$unit" ]] || continue
-    if ! props="$(systemctl show -p LoadState -p Environment -p EnvironmentFiles -p PassEnvironment -p UnsetEnvironment "$unit" 2>/dev/null)"; then
-      DB_IDENTITY_SOURCE_REASON="'systemctl show ${unit}' could not be run, so what defines DATABASE_URL for that service is unknown"
+
+    # LoadUnit, not GetUnit: it answers for a unit the manager has not loaded yet as well, so the
+    # LoadState below is what says whether there is a readable unit there at all. It is the same
+    # load `systemctl show` performs — it starts nothing and queues no job.
+    rendering="$(busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LoadUnit s "$unit" 2>/dev/null)" || rendering=''
+    if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 || -z "${BUS_STRINGS[0]}" ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not say where ${unit} lives on its bus, so what defines DATABASE_URL for that service is unknown"
       return 1
     fi
-    if [[ -z "$props" ]]; then
-      DB_IDENTITY_SOURCE_REASON="'systemctl show ${unit}' answered nothing, so what defines DATABASE_URL for that service is unknown"
+    object="${BUS_STRINGS[0]}"
+
+    rendering="$(bus_unit_property "$object" Unit LoadState)" || rendering=''
+    if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not answer for ${unit}'s LoadState, so what defines DATABASE_URL for that service is unknown"
       return 1
     fi
-
-    load_state=""
-    loads_our_file=false
-    while IFS= read -r line; do
-      case "$line" in
-        LoadState=*)
-          load_state="${line#LoadState=}"
-          ;;
-        Environment=*)
-          value="${line#Environment=}"
-          case " ${value}" in
-            *' DATABASE_URL='*)
-              DB_IDENTITY_SOURCE_REASON="${unit} sets DATABASE_URL in its own Environment= (see 'systemctl show -p Environment ${unit}'). systemd puts that in the service's environment and dotenv will not overwrite an already-set variable, so the application connects where THAT says and not where ${env_file} says. Remove it, or state the connection identity explicitly"
-              return 1 ;;
-          esac
-          ;;
-        PassEnvironment=*)
-          value="${line#PassEnvironment=}"
-          case " ${value} " in
-            *' DATABASE_URL '*)
-              DB_IDENTITY_SOURCE_REASON="${unit} lists DATABASE_URL in PassEnvironment=, so the service inherits whatever the service manager's own environment holds and ${env_file} does not decide where the application connects. Remove it, or state the connection identity explicitly"
-              return 1 ;;
-          esac
-          ;;
-        UnsetEnvironment=*)
-          value="${line#UnsetEnvironment=}"
-          case " ${value} " in
-            *' DATABASE_URL '*)
-              DB_IDENTITY_SOURCE_REASON="${unit} lists DATABASE_URL in UnsetEnvironment=, so systemd removes the value ${env_file} supplies and the application's own loader decides what replaces it. Remove it, or state the connection identity explicitly"
-              return 1 ;;
-          esac
-          ;;
-        EnvironmentFiles=*)
-          path="${line#EnvironmentFiles=}"
-          path="${path%% (ignore_errors=*}"
-          [[ -n "$path" ]] || continue
-          resolved="$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")"
-          if [[ "$resolved" == "$expected" ]]; then
-            loads_our_file=true
-            continue
-          fi
-          DB_IDENTITY_SOURCE_REASON="${unit} also loads ${path} as an environment file. Whether that file defines DATABASE_URL, and which of the two definitions systemd would keep, is composition this will not reproduce — so it is refused rather than guessed at. Load only ${env_file}, or state the connection identity explicitly"
-          return 1 ;;
-      esac
-    done <<<"$props"
-
+    load_state="${BUS_STRINGS[0]}"
     if [[ "$load_state" != "loaded" ]]; then
       DB_IDENTITY_SOURCE_REASON="systemd reports ${unit} as '${load_state:-unknown}' rather than loaded, so what defines DATABASE_URL for it cannot be read"
       return 1
     fi
-    if ! $loads_our_file; then
+
+    # PAMName=, which the five-property question did not ask (r21, Codex CRITICAL). systemd.exec
+    # lists "variables set by any PAM modules in case PAMName= is in effect" AFTER the
+    # EnvironmentFile= layer and says the later source wins, so a unit naming a PAM profile whose
+    # stack runs pam_env can be handed a DATABASE_URL that beats the file this deploy read — while
+    # every other property here still says "only that file". What a PAM stack supplies is not
+    # knowable without reading PAM configuration, so ANY non-empty value is refused.
+    rendering="$(bus_unit_property "$object" Service PAMName)" || rendering=''
+    if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not answer for ${unit}'s PAMName=, so whether a PAM stack also defines DATABASE_URL for it is unknown"
+      return 1
+    fi
+    pam_name="${BUS_STRINGS[0]}"
+    if [[ -n "$pam_name" ]]; then
+      DB_IDENTITY_SOURCE_REASON="${unit} sets PAMName=${pam_name}, and systemd applies the variables its PAM modules set AFTER the environment file — the later source wins. Whether that stack exports DATABASE_URL is a question about PAM configuration this will not read, so it is refused rather than guessed at. Remove PAMName=, or state the connection identity explicitly"
+      return 1
+    fi
+
+    # The three environment lists, all matched on the element NAME. UnsetEnvironment= takes a name
+    # OR an exact assignment and is applied as the final composition step, so the assignment form
+    # is the same refusal as the bare name (r21, Codex HIGH).
+    local property description
+    for property in Environment PassEnvironment UnsetEnvironment; do
+      rendering="$(bus_unit_property "$object" Service "$property")" || rendering=''
+      if ! count="$(bus_array_count "$rendering" 'as')" || ! bus_read_strings "$rendering" \
+        || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
+        DB_IDENTITY_SOURCE_REASON="systemd would not answer readably for ${unit}'s ${property}=, so what defines DATABASE_URL for that service is unknown"
+        return 1
+      fi
+      for element in ${BUS_STRINGS[@]+"${BUS_STRINGS[@]}"}; do
+        bus_element_names_database_url "$element" || continue
+        case "$property" in
+          Environment) description="sets DATABASE_URL in its own Environment= (${element%%=*}=…). systemd puts that in the service's environment and dotenv will not overwrite an already-set variable, so the application connects where THAT says and not where ${env_file} says" ;;
+          PassEnvironment) description="lists DATABASE_URL in PassEnvironment=, so the service inherits whatever the service manager's own environment holds and ${env_file} does not decide where the application connects" ;;
+          *) description="lists DATABASE_URL in UnsetEnvironment= (as '${element}'), so systemd removes the value ${env_file} supplies — as the final step of composing the environment, whether it is written as a name or as an exact assignment — and the application's own loader decides what replaces it" ;;
+        esac
+        DB_IDENTITY_SOURCE_REASON="${unit} ${description}. Remove it, or state the connection identity explicitly"
+        return 1
+      done
+    done
+
+    # EnvironmentFiles=, an array of (path, ignore_errors) pairs. EXACTLY ONE entry, and it must
+    # be ours: the count is systemd's own, so a second file cannot hide behind the rendering.
+    rendering="$(bus_unit_property "$object" Service EnvironmentFiles)" || rendering=''
+    if ! count="$(bus_array_count "$rendering" 'a(sb)')" || ! bus_read_strings "$rendering" \
+      || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not answer readably for ${unit}'s EnvironmentFiles=, so what defines DATABASE_URL for that service is unknown"
+      return 1
+    fi
+    if [[ "$count" -eq 0 ]]; then
       DB_IDENTITY_SOURCE_REASON="${unit} does not load ${env_file} with EnvironmentFile=, so DATABASE_URL reaches the application through its own dotenv loader instead — whose .env.local and per-mode overlays are exactly the composition this deploy stopped reproducing. Add EnvironmentFile=${env_file} to the unit, or state the connection identity explicitly"
+      return 1
+    fi
+    if [[ "$count" -gt 1 ]]; then
+      DB_IDENTITY_SOURCE_REASON="${unit} loads ${count} environment files (${BUS_STRINGS[*]}). Whether any of them but ${env_file} defines DATABASE_URL, and which definition systemd would keep, is composition this will not reproduce — so it is refused rather than guessed at, and without reading them. Load only ${env_file}, or state the connection identity explicitly"
+      return 1
+    fi
+    element="${BUS_STRINGS[0]}"
+    case "$element" in
+      *'\'*)
+        DB_IDENTITY_SOURCE_REASON="systemd reports ${unit}'s environment file as ${element}, a path it had to escape to state. Decoding that here to compare it with ${env_file} is a reimplementation of somebody else's escaping, so it is refused: give the unit an EnvironmentFile= path with no character needing an escape, or state the connection identity explicitly"
+        return 1 ;;
+    esac
+    resolved="$(readlink -f "$element" 2>/dev/null || printf '%s' "$element")"
+    if [[ "$resolved" != "$expected" ]]; then
+      DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} as its environment file and not ${env_file}, so the file this deploy read is not the one that gives the service DATABASE_URL. Load ${env_file}, or state the connection identity explicitly"
       return 1
     fi
   done

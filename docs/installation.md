@@ -667,27 +667,48 @@ migration on a database nothing fenced, and a new build on a database nothing mi
 
 So `deploy.sh` and `update.sh` ask systemd **one existence question about one variable** before
 they fence, preflight or re-fence — *can anything other than the file we read define
-`DATABASE_URL` for this unit?* — through
-`systemctl show -p LoadState -p Environment -p EnvironmentFiles -p PassEnvironment
--p UnsetEnvironment`, which reports those properties **composed**, with every drop-in already
-folded in. This is not the environment reconstruction the helper lost: no value is computed and no
-precedence is resolved. Which of several definitions would *win* is the unbounded question and is
-never asked. Any answer but "only that file" is a **refusal** naming what else defines it:
+`DATABASE_URL` for this unit?* — reading `LoadState`, `Environment`, `EnvironmentFiles`,
+`PassEnvironment`, `UnsetEnvironment` and `PAMName` **over systemd's own bus** (`busctl
+get-property`, which ships beside `systemctl`), all of them reported **composed**, with every
+drop-in already folded in. This is not the environment reconstruction the helper lost: no value is
+computed and no precedence is resolved. Which of several definitions would *win* is the unbounded
+question and is never asked. Any answer but "only that file" is a **refusal** naming what else
+defines it:
 
-* `DATABASE_URL` in the unit's `Environment=`, `PassEnvironment=` or `UnsetEnvironment=`;
+* an element of the unit's `Environment=`, `PassEnvironment=` or `UnsetEnvironment=` whose **name**
+  — everything before its first `=` — is `DATABASE_URL`. `UnsetEnvironment=` takes *"a
+  space-separated list of variable names or variable assignments"* and is applied as the **final**
+  step of composing the environment, so `UnsetEnvironment=DATABASE_URL=<the value in the .env>` is
+  the same refusal as the bare name: it removes what the file supplied and leaves the application's
+  own dotenv loader to replace it;
 * **any second `EnvironmentFile=`** — refused *without being read*, because that it may define the
   variable is enough, and reading it to find out puts the precedence question straight back;
+* a non-empty **`PAMName=`**. `systemd.exec` lists the variables PAM modules set *after* the
+  `EnvironmentFile=` layer and says the later source wins, so a unit naming a PAM profile whose
+  stack runs `pam_env` can be handed a different `DATABASE_URL` while every other property still
+  says "only that file". What a PAM stack supplies is not knowable without reading PAM
+  configuration, so any value at all is refused rather than read;
 * a unit that loads **no** environment file, because the variable would then reach the application
   through its own dotenv loader, by Next's rules (`.env.local`, the per-mode overlays) rather than
   systemd's. Add `EnvironmentFile=` for the app's `.env`, which is what `install.sh` writes;
-* a unit systemd reports as anything but `loaded`, a host with no `systemctl`, or no unit at all.
+* a unit systemd reports as anything but `loaded`, a host with no `busctl`, or no unit at all.
+
+**It is read from the bus and not from `systemctl show`'s text** (o3d-2sm1.5 r21). `systemctl show`
+renders a property as one `Name=` line of space-joined values, so where one element of an array
+ends and the next begins has to be guessed at — and `EnvironmentFiles` is an array of *(path,
+ignore_errors)* pairs. `busctl` states the property's signature and the array's **own element
+count** before the elements — `a(sb) 1 "/opt/app/.env" true`, `as 0`, `s ""` — so "is there more
+than one environment file?" is answered by systemd's data structure rather than by counting
+separators. The stated count is checked against the elements found, a disagreement is a refusal,
+and a string systemd had to escape (`busctl` prints through `cescape()`) is refused rather than
+decoded.
 
 `install.sh` is **exempt**: it owns the four values, creates the role and the database with them
 and composes `DATABASE_URL` out of them, so it parses nothing and has no file to be wrong about.
 
 One thing this question cannot see, stated rather than papered over: an `ExecStart=` running a
-**wrapper that exports `DATABASE_URL` itself** is invisible to `systemctl show`, because that
-definition lives inside a program. Closing that would mean reading programs, which is unbounded
+**wrapper that exports `DATABASE_URL` itself** is invisible to systemd's own properties, because
+that definition lives inside a program. Closing that would mean reading programs, which is unbounded
 again. It is the standing argument for eventually making the four values a **deployment-owned
 configuration input** these scripts read outright, rather than deriving them from a URL that is
 only probably the one the service uses.
