@@ -2022,3 +2022,250 @@ test('o3d-2k5r r19 (live): the REAL server settles the boundary, and the pin it 
     await scratch.drop()
   }
 })
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r22, Codex HIGH — A RECORDED BACKEND THAT NOTHING READS IS NOT A CHECK.
+//
+// Round 21 bound a positive verdict to the backend that answered it, recorded that identity on the
+// verdict, and then handed the permission out by logical host/port/database anyway. Three agreeing
+// probe samples are evidence of one backend, never a census of one — over two equally-selected
+// members all three land on the same one 12.5% of boots — so the permission still reached every
+// backend behind the endpoint, only less often wrongly.
+//
+// The correction is that the verdict is now SPENT per connection. `pgConnectionConfig()` returns an
+// `onConnect` hook whenever the composed `options` carries a licensed non-ASCII byte; `pg-pool`
+// awaits it for every NEW PHYSICAL connection before the client is handed to anyone, and it asks
+// the backend that just answered who it is and what search path it ended up with.
+//
+// The stand-in below is the connection that hook is handed.
+// ---------------------------------------------------------------------------
+
+/** A connection the guard can interrogate: one backend's identity and one effective search path. */
+function servedConnection(backend: Record<string, unknown>, searchPath: string) {
+  const asked: string[] = []
+  return {
+    asked,
+    async query(text: string) {
+      asked.push(text)
+      return { rows: [{ ...backend, search_path: searchPath }] }
+    },
+  }
+}
+
+const ONE_BACKEND_IDENTITY = '10.0.0.11:5432|17.11|UTF8|C.UTF-8'
+const R22_URL = `postgresql://app:pw@db.internal:5432/ims?schema=${encodeURIComponent('ténant')}`
+
+test('o3d-2k5r r22: a connection served by a backend the verdict is NOT about is refused', async () => {
+  resetStartupOptionByteSafety()
+  try {
+    // ROUTE: establishStartupOptionByteSafety() -> the verdict's `backend` -> pgConnectionConfig()'s
+    // `onConnect` -> pg-pool's per-physical-connection hook -> this call.
+    const verdict = await establishStartupOptionByteSafety(R22_URL, { createClient: fanOutClient([ONE_BACKEND]) })
+    assert.equal(verdict.backend, ONE_BACKEND_IDENTITY, 'PRECONDITION: the probe measured one backend and named it')
+
+    const config = pgConnectionConfig(R22_URL)
+    assert.equal(typeof config.onConnect, 'function', 'PRECONDITION: a licensed non-ASCII pin carries a per-connection guard')
+    const onConnect = config.onConnect!
+
+    // THE MEASURED BACKEND STILL CONNECTS. Without this half the guard could be a blanket refusal
+    // and every assertion below would pass on a gate that strands the deployment it exists to allow.
+    const good = servedConnection(ONE_BACKEND, '"ténant"')
+    await onConnect(good)
+    assert.equal(good.asked.length, 1, 'and it costs exactly one round trip on a new physical connection')
+    assert.match(good.asked[0]!, /^select pg_encoding_to_char/)
+    assert.match(good.asked[0]!, /current_setting\('search_path'\) as search_path/, 'which asks BOTH questions at once')
+
+    // AND THE OTHER BACKEND BEHIND THE SAME ENDPOINT DOES NOT. This is the connection Codex's
+    // finding is about: the probe's three samples all landed on 10.0.0.11 and the application pool
+    // opened this one.
+    //
+    // MUTATION ROUTE: delete the `served !== verdict.backend` block from
+    // startupOptionBackendGuard(). This connection is then admitted — a startup option measured on
+    // one server carried to another, which is the shipped r21 behaviour.
+    const other = { ...ONE_BACKEND, backend_address: '10.0.0.12' }
+    await assert.rejects(
+      () => onConnect(servedConnection(other, '"ténant"')),
+      (error: unknown) => {
+        assert.ok(error instanceof DatabaseUrlSchemaConflictError, 'it is the module\'s own refusal, not a driver error')
+        const message = (error as Error).message
+        assert.match(message, /10\.0\.0\.12/, 'the refusal names the backend that served this connection')
+        assert.match(message, /10\.0\.0\.11/, 'and the one the verdict was measured on')
+        assert.match(message, /refused before it can run a query/)
+        assert.match(message, /ALTER SCHEMA "<current name>" RENAME TO <ascii_name>;/, 'and it still offers the rename')
+        return true
+      },
+    )
+  } finally {
+    resetStartupOptionByteSafety()
+  }
+})
+
+test('o3d-2k5r r22: the MEASURED backend is refused too when the pin did not survive it', async () => {
+  resetStartupOptionByteSafety()
+  try {
+    await establishStartupOptionByteSafety(R22_URL, { createClient: fanOutClient([ONE_BACKEND]) })
+    const onConnect = pgConnectionConfig(R22_URL).onConnect!
+
+    // The identity matches; the startup option did not arrive as written. That is the narrow
+    // dangerous class — a backend that ACCEPTS the packet and tokenises it differently — and it is
+    // silent cross-schema access, not a failed connection.
+    //
+    // MUTATION ROUTE: delete the `searchPath !== expectedSearchPath` block. The connection is then
+    // admitted while resolving `tenant` instead of `ténant`, which is the o3d-1izw split.
+    await assert.rejects(
+      () => onConnect(servedConnection(ONE_BACKEND, '"tenant"')),
+      (error: unknown) => {
+        const message = (error as Error).message
+        assert.match(message, /search_path came back as/)
+        assert.match(message, /"\\"tenant\\""/, 'it quotes what came back')
+        assert.match(message, /"\\"ténant\\""/, 'and what was written')
+        return true
+      },
+    )
+  } finally {
+    resetStartupOptionByteSafety()
+  }
+})
+
+test('o3d-2k5r r22: the guard reads the verdict at CONNECT time, not at config time', async () => {
+  resetStartupOptionByteSafety()
+  try {
+    await establishStartupOptionByteSafety(R22_URL, { createClient: fanOutClient([ONE_BACKEND]) })
+    const onConnect = pgConnectionConfig(R22_URL).onConnect!
+
+    // The config object outlives the verdict that licensed it — a pool is built once and opens
+    // connections for the life of the process. A hook that closed over the verdict at config time
+    // would keep granting on a permission the process no longer holds.
+    //
+    // MUTATION ROUTE: hoist `heldStartupOptionByteVerdict()` out of the returned closure into
+    // startupOptionBackendGuard()'s body. This connection is then admitted on a verdict that has
+    // been withdrawn.
+    resetStartupOptionByteSafety()
+    await assert.rejects(
+      () => onConnect(servedConnection(ONE_BACKEND, '"ténant"')),
+      (error: unknown) => {
+        assert.match((error as Error).message, /No positive verdict naming a backend is held by this process/)
+        return true
+      },
+    )
+  } finally {
+    resetStartupOptionByteSafety()
+  }
+})
+
+test('o3d-2k5r r22: a positive verdict that names NO backend grants nothing', async () => {
+  // The consumer must READ what the verdict records. A record no decision consults is worse than no
+  // record at all, because it reads as a check.
+  const slot = Symbol.for('ims.db.startupOptionByteVerdict.v2')
+  const globals = globalThis as unknown as Record<symbol, unknown>
+  resetStartupOptionByteSafety()
+  try {
+    // Well-shaped — `isStartupOptionByteVerdict()` accepts it — established, carrying, about this
+    // very target, and naming no server. Nothing downstream could hold a connection to it.
+    //
+    // MUTATION ROUTE: delete the `verdict.backend === null || verdict.backend === ''` line from
+    // nonAsciiOptionByteIsCarried(). pgConnectionConfig() then composes the pin from a permission
+    // that is enforceable nowhere, and this assertion stops throwing.
+    globals[slot] = Object.freeze({
+      established: true,
+      carries: true,
+      probed: 'é',
+      target: 'db.internal:5432/ims',
+      backend: null,
+      serverEncoding: 'UTF8',
+      lcCtype: 'C.UTF-8',
+      reason: 'a verdict that names no server',
+    })
+    assert.equal(startupOptionByteSafety().carries, true, 'PRECONDITION: the planted verdict IS positive and IS read back')
+    assert.equal(startupOptionByteSafety().backend, null, 'PRECONDITION: and it names no backend')
+    assert.throws(
+      () => pgConnectionConfig(R22_URL),
+      DatabaseUrlSchemaConflictError,
+      'a permission nothing can be held to is no permission',
+    )
+  } finally {
+    delete globals[slot]
+    resetStartupOptionByteSafety()
+  }
+})
+
+test('o3d-2k5r r22: an ASCII schema pays nothing — no verdict, no hook, no round trip', () => {
+  resetStartupOptionByteSafety()
+  // The cost of this mechanism is bounded by the case it is for. An `options` made of ASCII needs
+  // no verdict, so it gets no guard and no per-connection query.
+  //
+  // MUTATION ROUTE: drop the `NON_ASCII_OPTION_CHARACTER.test(options)` early return from
+  // startupOptionBackendGuard(). Every deployment then pays a round trip per physical connection
+  // AND is refused outright, because no ASCII deployment ever probes and so none names a backend.
+  const config = pgConnectionConfig('postgresql://app:pw@db.internal:5432/ims?schema=tenant_a')
+  assert.equal(config.options, '-c search_path="tenant_a"', 'PRECONDITION: the pin is still composed')
+  assert.equal(config.onConnect, undefined, 'and nothing is attached to the connections it opens')
+})
+
+test('o3d-2k5r r22 (live): the REAL pool admits the measured backend and refuses another', async (t) => {
+  const scratch = await openScratch(t)
+  if (!scratch) return
+  resetStartupOptionByteSafety()
+  const pools: pg.Pool[] = []
+  try {
+    const schema = 'ten\u00A0ant' // U+00A0, written as an escape, as in the r19 live test
+    await scratch.admin.query(`CREATE SCHEMA ${'"' + schema + '"'}`)
+    const url = `${scratch.url}?schema=${encodeURIComponent(schema)}`
+
+    const verdict = await establishStartupOptionByteSafety(url)
+    if (!verdict.carries) {
+      t.skip('this server does not carry the byte, so there is no permission to hold to a backend')
+      return
+    }
+    assert.ok(verdict.backend, 'PRECONDITION: the real probe named the real backend')
+
+    // ROUTE: pgConnectionConfig() -> pg.Pool's own config -> pg-pool's onConnect -> the guard. The
+    // config is composed ONCE, exactly as lib/db/index.ts composes the runtime pool's.
+    const config = pgConnectionConfig(url)
+    assert.equal(typeof config.onConnect, 'function')
+
+    // 1. THE MEASURED BACKEND CONNECTS, through the real pool, and lands on the pinned schema.
+    const admitted = new pg.Pool({ ...config, max: 1, connectionTimeoutMillis: 3_000 })
+    pools.push(admitted)
+    const client = await admitted.connect()
+    try {
+      assert.equal(
+        (await client.query<{ s: string }>('select current_schema() as s')).rows[0]?.s,
+        schema,
+        'the connection the guard admitted is on the schema the URL named',
+      )
+    } finally {
+      client.release()
+    }
+
+    // 2. NOW THE ENDPOINT HANDS OUT A DIFFERENT BACKEND. The verdict is re-established against a
+    // stand-in that answers as another server — which is precisely a failover, a re-pointed pooler,
+    // or the member the three probe samples happened not to reach — while the config, the
+    // connection string and the real server on the other end are all unchanged.
+    //
+    // MUTATION ROUTE: stop returning `onConnect` from pgConnectionConfig(). The pool below then
+    // opens its connection and hands it over, and the non-ASCII startup option measured on one
+    // server is spent on another. That is the finding.
+    await establishStartupOptionByteSafety(url, { createClient: fanOutClient([ONE_BACKEND]) })
+    const refused = new pg.Pool({ ...config, max: 1, connectionTimeoutMillis: 3_000 })
+    pools.push(refused)
+    await assert.rejects(
+      () => refused.connect(),
+      (error: unknown) => {
+        assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+        assert.match((error as Error).message, /10\.0\.0\.11:5432/, 'the refusal names the backend the verdict is about')
+        assert.match((error as Error).message, /handed the application a different backend/)
+        return true
+      },
+      'a real pg pool refuses a physical connection to a backend the verdict is not about',
+    )
+    assert.equal(refused.totalCount, 0, 'and the refused connection is not left in the pool')
+
+    // 3. AND IT IS THE POOL, NOT ONLY `connect()`: a query routed through it fails the same way.
+    await assert.rejects(() => refused.query('select 1'), DatabaseUrlSchemaConflictError)
+  } finally {
+    resetStartupOptionByteSafety()
+    for (const pool of pools) await pool.end().catch(() => undefined)
+    await scratch.drop()
+  }
+})
