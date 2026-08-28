@@ -201,11 +201,37 @@ export type RecordedCreateDispatch = {
   dispatchedAt: Date
   /** Null for a record written before the key was stored, which can never match and so never replays. */
   idempotencyKey: string | null
+  /**
+   * o3d-gvzu — WHEN A LATER STATEMENT PROVED THAT THE DISPATCH ABOVE PUT NOTHING ON THE WIRE, or null
+   * when nothing has proved that.
+   *
+   * NOT the negation of `dispatchedAt`, and not derivable from it: the marker records an INTENTION
+   * committed before a socket, and this records a FACT established after it. Only the second one can
+   * license another attempt, which is why it needs a column of its own — the pair above is write-once
+   * by database trigger, deliberately, because it is a prohibition and a prohibition that tampering
+   * clears hands the tamperer what they wanted.
+   *
+   * IT IS A ONE-SHOT PERMISSION, SPENT BY THE SEND IT PERMITS. The attempt that proceeds on it clears
+   * it in the very statement that re-proves the claim — see {@link CreateDispatchReleaseConsumption}.
+   * Left standing, it would still be there after a send that DID land, and would license a third
+   * attempt: the release says "nothing has been sent for this marker", and that stops being true the
+   * moment the next request leaves.
+   */
+  releasedAt: Date | null
 }
 
 export type CreateDispatchBasis =
   /** Nothing is dispatched for this row yet; the fence must mint the record as it sends. */
   | 'first-dispatch'
+  /**
+   * o3d-gvzu — the marker stands, and a later statement PROVED that the request it records never left
+   * this process. Nothing is in the ledger under it, so this create is still the first one Xero will
+   * ever see, whatever the key and whatever the age of the marker.
+   *
+   * The fence must SPEND the release as it sends (`{@link CreateDispatchReleaseConsumption}`), so this
+   * basis can be taken exactly once per proof.
+   */
+  | 'released-nothing-left-the-process'
   /** The same key, inside the window: Xero answers with the original document. */
   | 'replay-within-idempotency-window'
   /** The create is update-or-create on a number IMS re-mints identically. */
@@ -228,13 +254,127 @@ export type CreateDispatchMint = {
 }
 
 /**
+ * o3d-gvzu — SPENDING THE RELEASE, in the same statement that sends under it.
+ *
+ * Written by the claim fence for exactly the same reason the mint is: a permission that outlives the
+ * send it permitted is a permission standing over a request that may have landed. If this attempt's
+ * request does leave and its settling transaction then fails at COMMIT, the row must be back in the
+ * refusing state the marker alone produces — and it is, because the release is already gone.
+ *
+ * If the transport refuses this attempt too, the hand-back writes a FRESH release, on its own proof.
+ * A release is never inherited; each one describes one attempt that provably sent nothing.
+ */
+export type CreateDispatchReleaseConsumption = {
+  createDispatchReleasedAt: null
+}
+
+/**
+ * The one `data` fragment the fence merges into its renewal statement, whichever kind it is.
+ *
+ * A union rather than two parameters, so the fence cannot be handed both: minting a marker and
+ * spending a release in one statement is a state that has no meaning, and the type refuses it.
+ */
+export type CreateDispatchFenceWrite = CreateDispatchMint | CreateDispatchReleaseConsumption
+
+/**
+ * May the attempt that took this basis RELEASE the marker if its transport proves nothing was sent?
+ *
+ * o3d-gvzu, and this is the narrow half of the whole change. A proof produced by this attempt covers
+ * THIS attempt's request and nothing else, so it may only be turned into a release when the marker on
+ * the row describes a dispatch this process can speak for:
+ *
+ *  • `first-dispatch`                    the marker IS this attempt's — the fence minted it one
+ *                                        statement ago. Proving this attempt sent nothing proves the
+ *                                        marker stands over nothing.
+ *  • `released-nothing-left-the-process` the marker's own dispatch was already proved unsent (that is
+ *                                        why the release existed), and this attempt spent that release
+ *                                        and then sent nothing either. Nothing has ever left for this
+ *                                        row, so the release may be re-established.
+ *
+ * And it may NOT on the other two, which is the case that would be wrong rather than merely useless:
+ *
+ *  • `replay-within-idempotency-window`  the marker records an EARLIER attempt, by this process or
+ *                                        another, and that attempt may well have reached Xero — the
+ *                                        replay arm exists precisely because it might have. Proving
+ *                                        that THIS request never left says nothing about that one, and
+ *                                        a release written on it would license a create on top of a
+ *                                        document that already exists.
+ *  • `natural-key-upsert`                the marker gates nothing for this type, so a release would
+ *                                        add a permission where none was ever withheld.
+ */
+export function mayReleaseCreateDispatch(basis: CreateDispatchBasis): boolean {
+  return basis === 'first-dispatch' || basis === 'released-nothing-left-the-process'
+}
+
+/**
+ * Why a marker was NOT released, when it was not. Reported rather than inferred, because the two
+ * reasons mean different things to whoever reads the row afterwards.
+ */
+export type CreateDispatchReleaseRefusal =
+  /**
+   * Nothing proved the request failed to leave. THIS IS THE COMMON CASE AND THE CORRECT ONE: a
+   * timeout, a socket reset mid-write, a 5xx, a client that threw — the request may have arrived, and
+   * a marker released here would license a create on top of a document that exists.
+   */
+  | 'no-proof-the-request-did-not-leave'
+  /**
+   * The proof is sound but it is about the wrong request: this attempt replayed a marker some earlier
+   * attempt minted, and that one may well have reached the ledger.
+   */
+  | 'marker-is-not-this-attempts'
+
+export type CreateDispatchReleaseVerdict =
+  | { release: true; notSent: string }
+  | { release: false; refusal: CreateDispatchReleaseRefusal }
+
+/**
+ * MAY THIS ATTEMPT RELEASE THE MARKER IT IS STANDING UNDER? (o3d-gvzu)
+ *
+ * PURE, AND SEPARATE FROM THE BRANCH THAT CALLS IT, because this is the decision the whole change
+ * turns on and it must be testable against a real transport outcome rather than reasoned about in
+ * prose. Two independent conditions, both required:
+ *
+ *  1. `notSent` is present — a NAMED member of the transport's enumeration, written by the statement
+ *     that performed the refusal (see `XeroNotSentReason`). Absent for every case where the request
+ *     may have arrived.
+ *  2. `reachedTheWire` is false — the delta of the process-wide HTTP attempt counter across the call.
+ *
+ * WHY BOTH, WHEN EITHER WOULD USUALLY DO. They are measurements of the same fact from opposite ends
+ * and they fail in opposite directions: the counter is process-wide, so a concurrent Xero call by
+ * another row moves it and it reports "sent" for a call that sent nothing; the tag is written at one
+ * statement, so a site that forgot to carry it reports nothing at all. Requiring both means neither a
+ * mislabelled site nor a quiet counter can license a release on its own, and the conjunction can only
+ * ever WITHHOLD a release that one of them would have granted. A withheld release costs a refusal an
+ * operator resolves. A wrong one costs a duplicate journal in a live ledger that nobody will notice.
+ *
+ * AND THE PROOF IS ABOUT THIS ATTEMPT'S REQUEST, so the basis has to admit it — see
+ * {@link mayReleaseCreateDispatch}.
+ */
+export function decideCreateDispatchRelease(params: {
+  basis: CreateDispatchBasis
+  outcome: { reachedTheWire: boolean; notSent?: string }
+}): CreateDispatchReleaseVerdict {
+  const { notSent, reachedTheWire } = params.outcome
+  if (notSent === undefined || reachedTheWire) {
+    return { release: false, refusal: 'no-proof-the-request-did-not-leave' }
+  }
+  if (!mayReleaseCreateDispatch(params.basis)) {
+    return { release: false, refusal: 'marker-is-not-this-attempts' }
+  }
+  return { release: true, notSent }
+}
+
+/**
  * May this create go out — and, when it is the FIRST one, what the fence must record as it sends.
  *
- * `mint` is present only for `first-dispatch`. A replay does not re-mint: the row already carries the
- * record, and moving the instant forward would renew Xero's six-minute window against itself for ever.
+ * `write` is the mint only for `first-dispatch`. A replay does not re-mint: the row already carries
+ * the record, and moving the instant forward would renew Xero's six-minute window against itself for
+ * ever. For `released-nothing-left-the-process` it is the release CONSUMPTION instead — the permission
+ * is spent by the statement that sends under it (o3d-gvzu). For the remaining bases it is null and the
+ * fence writes nothing but its own renewal.
  */
 export type CreateDispatchPlan =
-  | { dispatch: true; basis: CreateDispatchBasis; mint: CreateDispatchMint | null }
+  | { dispatch: true; basis: CreateDispatchBasis; write: CreateDispatchFenceWrite | null }
   | { dispatch: false; error: string }
 
 /**
@@ -257,6 +397,21 @@ export function decideCreateDispatch(params: {
   label: string
 }): CreateDispatchDecision {
   if (params.recorded === null) return { dispatch: true, basis: 'first-dispatch' }
+
+  // o3d-gvzu — THE RELEASE IS ASKED FIRST, AND THE ORDER IS LOAD-BEARING.
+  //
+  // A release is positive evidence that NOTHING WAS EVER SENT under this marker, so it answers the
+  // question the two arms below only approximate: they reason about whether a second request would be
+  // deduplicated, and this says there is no first request to deduplicate against.
+  //
+  // It must win over `replay-within-idempotency-window` even when that arm would also dispatch,
+  // because the two bases produce different WRITES. The replay arm writes nothing; this one spends the
+  // release. A release left standing after a send is a permission over a request that may have landed
+  // — the exact shape of the defect this column exists to remove, in the opposite direction — so the
+  // arm that consumes it has to be the one that is taken.
+  if (params.recorded.releasedAt !== null) {
+    return { dispatch: true, basis: 'released-nothing-left-the-process' }
+  }
 
   const { dispatchedAt, idempotencyKey: recordedKey } = params.recorded
   const sameKey = recordedKey !== null && recordedKey === params.idempotencyKey
@@ -319,15 +474,29 @@ export function decideCreateDispatch(params: {
  * pre-check because a refusal produced from a stale read is as wrong as a permission produced from
  * one. So a refusal there leaves a minted record and NOTHING IN THE LEDGER.
  *
- * AND THE ROW CANNOT TELL THEM APART. Making it able to needs a durable column of its own — the
- * trigger deliberately forbids clearing or moving the pair, which is right, because the pair is a
- * PROHIBITION and a prohibition that tampering clears hands the tamperer what they wanted. That
- * column is filed as o3d-gvzu and is not in this branch.
+ * AND THE ROW COULD NOT TELL THEM APART — UNTIL IT COULD (o3d-gvzu). The pair itself still cannot be
+ * cleared, and must not be: it is a PROHIBITION, and a prohibition that tampering clears hands the
+ * tamperer what they wanted. So the answer is a SECOND column, `createDispatchReleasedAt`, written
+ * only when the transport hands back a NAMED, provably pre-egress refusal — see
+ * {@link XeroNotSentReason} in the Xero client for the enumeration and for why each member is provable
+ * from where its statement sits.
  *
- * WHAT IS IN THIS BRANCH is the evidence trail: an attempt that provably sent nothing now reports
- * itself as `notPosted` rather than as a failure, which logs
- * `xero_sync_transport_refused_before_post` naming this sync log id. So the refusal points at
- * something an operator can actually look up before they go looking in the ledger.
+ * SO THIS MESSAGE IS NOW THE STATE THAT REMAINS AFTER THE RELEASE HAS FAILED TO APPLY, and it is worth
+ * naming which cases those are, because they are exactly the ones where an absence must not be read as
+ * a negative answer:
+ *
+ *  • the request may have arrived  a timeout, a socket reset mid-write, a 5xx, or a client that threw.
+ *                                  Nothing left to prove the negative with, so the marker STANDS. This
+ *                                  is the dominant producer, and it is the correct outcome.
+ *  • the marker is somebody else's this attempt replayed an earlier dispatch's key rather than minting
+ *                                  its own; proving THIS request never left says nothing about that
+ *                                  one. See {@link mayReleaseCreateDispatch}.
+ *  • the release write failed      the hand-back could not commit, so nothing was released and nothing
+ *                                  was handed back either.
+ *
+ * The evidence trail is unchanged and is what an operator should read first: an attempt that provably
+ * sent nothing reports itself as `notPosted` rather than as a failure, which logs
+ * `xero_sync_transport_refused_before_post` naming this sync log id.
  */
 export const CREATE_DISPATCH_UNSETTLED_MEANING =
   'TWO THINGS PRODUCE THAT STATE AND IMS CANNOT TELL THEM APART FROM THIS ROW: either the post '
@@ -343,17 +512,43 @@ export const CREATE_DISPATCH_UNSETTLED_MEANING =
  *
  * Reported through `notPosted`, so the row is handed back intact instead of spending a retry on a
  * send that never happened — the treatment a lost claim and an expired lease already get, for the
- * same reason. It does NOT clear the record: nothing may, and pretending otherwise would be the
+ * same reason. It still does NOT clear the record: nothing may, and pretending otherwise would be the
  * prohibition-that-tampering-clears mistake. What it does is make the false marker LOUD and NAMED at
- * the moment it is created, so the refusal that follows has something to point at.
+ * the moment it is created, so the refusal that follows has something to point at — and, since
+ * o3d-gvzu, say whether a RELEASE was recorded beside the marker or, if not, exactly which of the two
+ * reasons for withholding one applies.
  */
-export function describeCreateDispatchNotSent(params: { label: string; error: string }): string {
-  return `NOTHING WAS SENT for ${params.label}: IMS recorded that a create was about to be dispatched `
-    + `and its own transport then refused before the request left this process — ${params.error}. The `
-    + 'dispatch record STANDS (it is write-once by database trigger, and it is a prohibition, so it is '
-    + 'never cleared), which means a later attempt outside Xero\'s idempotency window will be refused '
-    + 'even though no document was created. That refusal is recoverable and names how; this line is the '
-    + 'evidence it will tell an operator to look for.'
+export function describeCreateDispatchNotSent(params: {
+  label: string
+  error: string
+  /**
+   * o3d-gvzu: the named pre-egress refusal, when the transport produced one, and undefined when it
+   * did not. Undefined is what a timeout, a reset mid-write and a 5xx all look like here.
+   */
+  notSent?: string
+  /** Whether this hand-back will also write the release. See {@link mayReleaseCreateDispatch}. */
+  releasing: boolean
+}): string {
+  const head = `NOTHING WAS SENT for ${params.label}: IMS recorded that a create was about to be `
+    + `dispatched and its own transport then refused before the request left this process — `
+    + `${params.error}.`
+  if (params.releasing) {
+    return `${head} The refusal was \`${params.notSent}\`, which is provably ABOVE the socket, so this `
+      + 'hand-back also records a RELEASE against the dispatch marker: the marker itself is write-once '
+      + 'and stays exactly where it is (it is a prohibition, and one that tampering clears is worth '
+      + 'nothing), but the release beside it says the request it records never left. The next attempt '
+      + 'may therefore send, whatever the age of the marker — and it SPENDS the release as it sends, so '
+      + 'if that request does leave, this row is back under the marker alone.'
+  }
+  return `${head} NO RELEASE IS RECORDED`
+    + (params.notSent
+      ? ', because this attempt did not mint the marker it would be releasing — it replayed an earlier '
+        + 'dispatch, and proving that THIS request never left says nothing about that one.'
+      : ': the transport gave no proof that the request failed to leave, which is what a timeout, a '
+        + 'connection reset mid-write and a 5xx all look like. Any of those may have reached Xero.')
+    + ' The dispatch record therefore STANDS, which means a later attempt outside Xero\'s idempotency '
+    + 'window will be refused even though no document may have been created. That refusal is '
+    + 'recoverable and names how; this line is the evidence it will tell an operator to look for.'
 }
 
 /**
@@ -396,8 +591,16 @@ export type CreateDispatchClient = {
   accountingSyncLog: {
     findUnique(args: {
       where: { id: string }
-      select: { createDispatchedAt: true; createDispatchIdempotencyKey: true }
-    }): Promise<{ createDispatchedAt: Date | null; createDispatchIdempotencyKey: string | null } | null>
+      select: {
+        createDispatchedAt: true
+        createDispatchIdempotencyKey: true
+        createDispatchReleasedAt: true
+      }
+    }): Promise<{
+      createDispatchedAt: Date | null
+      createDispatchIdempotencyKey: string | null
+      createDispatchReleasedAt: Date | null
+    } | null>
   }
 }
 
@@ -445,7 +648,11 @@ export async function planCreateDispatch(
 
     const row = await client.accountingSyncLog.findUnique({
       where: { id: params.entryId },
-      select: { createDispatchedAt: true, createDispatchIdempotencyKey: true },
+      select: {
+        createDispatchedAt: true,
+        createDispatchIdempotencyKey: true,
+        createDispatchReleasedAt: true,
+      },
     })
     if (!row) {
       return {
@@ -460,7 +667,7 @@ export async function planCreateDispatch(
       return {
         dispatch: true,
         basis: 'first-dispatch',
-        mint: { createDispatchedAt: now, createDispatchIdempotencyKey: params.idempotencyKey },
+        write: { createDispatchedAt: now, createDispatchIdempotencyKey: params.idempotencyKey },
       }
     }
 
@@ -470,6 +677,7 @@ export async function planCreateDispatch(
       recorded: {
         dispatchedAt: row.createDispatchedAt,
         idempotencyKey: row.createDispatchIdempotencyKey,
+        releasedAt: row.createDispatchReleasedAt,
       },
       now,
       label: params.label,
@@ -477,7 +685,18 @@ export async function planCreateDispatch(
     // A row that already carries a record is never re-minted: the pair is what the earlier dispatch
     // wrote, the trigger holds it there, and moving the instant forward would renew Xero's six-minute
     // window against itself for ever.
-    return decision.dispatch ? { dispatch: true, basis: decision.basis, mint: null } : decision
+    //
+    // o3d-gvzu: the ONE thing the fence writes on such a row is the release CONSUMPTION, and only on
+    // the basis that was taken because a release was standing. `null` for every other basis, so no
+    // other arm can clear a permission it did not read.
+    if (!decision.dispatch) return decision
+    return {
+      dispatch: true,
+      basis: decision.basis,
+      write: decision.basis === 'released-nothing-left-the-process'
+        ? { createDispatchReleasedAt: null }
+        : null,
+    }
   } catch (error) {
     return {
       dispatch: false,

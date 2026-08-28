@@ -5,7 +5,9 @@ import {
   applyBackReference,
   backReferenceIsMissing,
   followUpObligationClaim,
+  followUpObligationRecoveryNote,
   isExternalDocumentIdConflict,
+  nextFollowUpObligationGeneration,
   recoverPostedBusinessDate,
   resolvePurchaseOrderBackReference,
   syncTypeWritesBackReference,
@@ -18,6 +20,7 @@ import {
   compactionDiscardedFollowUps,
   type CompactedFollowUpLossPhase,
 } from '@/lib/domain/accounting/compacted-followup-loss'
+import { followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 
 // ---------------------------------------------------------------------------
@@ -159,8 +162,16 @@ import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-s
 // So there is no QuickBooks binding, on purpose — failing to repair is acceptable, repairing onto
 // the wrong document is not. Namespacing the id per connection was tried and reverted: it lets both
 // bills exist, which moves the problem to ~190 call sites that read a naked external id, on models
-// that have no provenance column at all. o3d-gt8r carries that design and its findings; o3d-s36z is
-// the realm-isolation work that a QuickBooks binding is waiting on.
+// that have no provenance column at all. o3d-gt8r carries that design and its findings.
+//
+// WHAT A QUICKBOOKS BINDING IS WAITING ON HAS CHANGED (o3d-0bfh r5, Codex HIGH). It was o3d-s36z,
+// the realm-isolation work; that CLOSED on 2026-08-21 and a row's realm is now durably recorded, so
+// this module's candidate query COULD be fenced on it. The remaining blocker is o3d-8prh, post-time
+// authorization, on the other side of the enqueue: QuickBooks checks no connection verdict there, so a row
+// this sweep correctly selected would still be posted against whatever is connected when the
+// processor gets to it. The full order of work is at the end of
+// lib/connectors/quickbooks/sync-processor.ts; do not infer from "o3d-s36z is closed" that a binding
+// is now safe.
 //
 // The sweep must keep refusing to guess: failing to repair is acceptable, repairing onto
 // the wrong bill is not.
@@ -307,6 +318,12 @@ export type BackReferenceSweepRow = {
   status: string
   payload: unknown
   createdAt: Date
+  /**
+   * The attempt this row is AT (o3d-e2mz). Read so the settlement write can be fenced on it: a
+   * concurrent retry that revives the row bumps this, and a verdict reached before that bump is a
+   * verdict about a different attempt.
+   */
+  attemptRevision: number
   /** When this row's PO ambiguity was last reported. NULL = never. */
   backReferenceAmbiguousLoggedAt: Date | null
   /**
@@ -388,6 +405,10 @@ export const BACK_REFERENCE_CANDIDATE_SELECT = {
   // obligation record is what tells a tombstone that lost a payment from one that lost nothing.
   connectionProvenance: true,
   followUpObligations: true,
+  // o3d-0bfh r2 (Codex HIGH): the identity of the attempt this run's decision was taken about, so
+  // the settlement write can compare-and-swap on it. Without it in the SELECT the fence below
+  // cannot be built at all, and the sweep's verdict lands on whatever the row has become.
+  attemptRevision: true,
 } as const
 
 /**
@@ -477,6 +498,13 @@ export type BackReferenceSweepClient = BackReferenceDeps & {
   accountingSyncLog: {
     findMany(args: BackReferenceCandidateQuery): Promise<BackReferenceSweepRow[]>
     update(args: { where: { id: string }; data: Record<string, unknown> }): Promise<unknown>
+    /**
+     * The settlement write's compare-and-set (o3d-0bfh r2). `update` cannot express it: it matches
+     * on the primary key alone and there is no unmatched outcome to observe — it either writes or
+     * throws. `updateMany` reports the rows it actually touched, and a count of zero is the answer
+     * this sweep needs.
+     */
+    updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
   }
   /**
    * The sweep asks the SalesOrder one question `BackReferenceDeps` does not (o3d-r5pj, Codex r10 #3):
@@ -505,6 +533,31 @@ export type BackReferenceSweepActivity = {
   metadata: Record<string, unknown>
 }
 
+/**
+ * WHAT A FOLLOW-UP ENQUEUE LEFT OUTSTANDING (o3d-0bfh).
+ *
+ * Structurally identical to the connectors' own `FollowUpOutcome`, and deliberately NOT imported
+ * from either of them: this module is connector-agnostic, and the point of stating the shape here
+ * is that BOTH connectors must satisfy it. A connector whose enqueue cannot leave money outstanding
+ * answers `{ deferredReceiptsSettled: true }` unconditionally, which is a claim it makes rather
+ * than a default this module assumes on its behalf.
+ */
+export type BackReferenceFollowUpOutcome = {
+  /** False when a receipt recorded before this document is still waiting to reach the ledger. */
+  deferredReceiptsSettled: boolean
+  /**
+   * TRUE WHEN THE ENQUEUE ALREADY CLEARED THE OBLIGATION GENERATION IT WAS HANDED (o3d-0bfh r15,
+   * Codex HIGH).
+   *
+   * The deferred-receipt re-drive re-reads the order's receipts UNDER THE SALES-ORDER LOCK and
+   * clears the generation in that same transaction, because a receipt committing after its snapshot
+   * would otherwise read a live marker — and be told its recovery is retained — and then have that
+   * marker cleared over it. The sweep must therefore fence its own settlement write on the column
+   * being `null` rather than on the generation it claimed: see `settlementFence`.
+   */
+  obligationFenced: boolean
+}
+
 export type BackReferenceSweepDeps = {
   db: BackReferenceSweepClient
   /** AccountingSyncLog.connector value this sweep owns, e.g. 'xero'. */
@@ -529,6 +582,22 @@ export type BackReferenceSweepDeps = {
    * this to logActivityPersisted, whose return value is the confirmation.
    */
   logActivity: (entry: BackReferenceSweepActivity) => Promise<boolean>
+  /**
+   * MUST REPORT WHAT IT LEFT OUTSTANDING (o3d-0bfh, Codex HIGH) — the same contract, and for the
+   * same reason, as `logActivity` directly above.
+   *
+   * This was `Promise<void>`, and that was the whole defect. The connectors' deferred-receipt
+   * re-drive is built NEVER TO THROW — a receipt that cannot be registered must not fail a sync
+   * entry whose invoice HAS posted — so capacity refusals, connector-switch rollbacks and every
+   * other registration failure return `settled: false` and resolve normally. Awaiting a `void`
+   * left "it did not throw" as the only signal, so all of them arrived here as success, and the
+   * sweep stamped the row checked and cleared `backReferenceFollowUpsPendingAt` over money that
+   * had not reached the ledger.
+   *
+   * o3d-ekn8 r5 closed exactly this at the connectors' own four post-path release sites. The sweep
+   * is the OTHER release path — the one that runs for every row those sites left unsettled — so a
+   * discard here is not a lesser copy of that finding, it is the way around the gate it installed.
+   */
   enqueueFollowUps: (
     entryId: string,
     type: AccountingSyncType,
@@ -551,7 +620,40 @@ export type BackReferenceSweepDeps = {
       connectionProvenance: string | null | undefined
       backReferenceEvidenceCompactedAt?: Date | null
     },
-  ) => Promise<void>
+    /**
+     * THE OBLIGATION GENERATION THIS RUN CLAIMED (o3d-0bfh r15, Codex HIGH).
+     *
+     * The sweep is the OTHER release path, and it reaches the finding by the identical route: it
+     * claims a marker, runs an enqueue whose deferred-receipt re-drive snapshots the order's
+     * receipts, and then clears the marker — while a receipt that committed after that snapshot has
+     * read the marker as live. Handing the generation DOWN lets the re-drive clear it inside the
+     * same transaction as its final re-read, under the sales-order lock, which is the only ordering
+     * in which that receipt cannot be settled over. `null` withholds the release entirely.
+     */
+    followUpObligation: Date | null,
+    /**
+     * EVERYTHING ELSE THIS SWEEP MUST HAVE ON RECORD BEFORE THAT GENERATION IS CLEARED (o3d-0bfh
+     * r16, Codex HIGH).
+     *
+     * r15 handed the generation down so the clear could be taken under the sales-order lock. That is
+     * right and it stays — but it also moved the clear to BEFORE this module's own settlement
+     * writes, and two of those are TERMINAL: the warning naming what a tombstone's compaction
+     * destroyed, and the warning that a repaired sale has no invoice date anywhere. Each settles the
+     * row only once it is CONFIRMED PERSISTED, because the loss it describes can never be undone by
+     * a later run.
+     *
+     * With the clear happening first, a warning that failed to persist left the row linked, SYNCED
+     * and MARKER-NULL — and the next sweep reads exactly that as a reconciled row and stamps it in
+     * silence. The obligation was discharged before the record of why.
+     *
+     * So the condition travels down WITH the generation, and the fence answers it between its
+     * re-read and its release. It runs AT MOST ONCE per row, wherever it is first reached: an
+     * enqueue that never reaches the fence (a type with no deferred receipts, a row with no external
+     * id) does not call it, and this module then calls it itself before its own `markChecked` clears
+     * the marker. Either way the ordering is the same — the evidence, then the release.
+     */
+    settlementPrerequisite: () => Promise<boolean>,
+  ) => Promise<BackReferenceFollowUpOutcome>
   now?: () => Date
   /**
    * IS THE SALE THIS ROW BELONGS TO STILL LIVE — and if not, retire the row (o3d-e2mz r8).
@@ -620,6 +722,28 @@ export type BackReferenceRepairResult = {
    * to go and undo in the ledger.
    */
   retiredCancelledSale: number
+  /**
+   * Rows whose follow-up enqueue RETURNED NORMALLY but reported a deferred receipt still not
+   * registered in the ledger (o3d-0bfh). Left unstamped and still marked as owing follow-ups.
+   *
+   * Its own number, and not folded into `failed`, because it is not a failure of this sweep: the
+   * enqueue ran and answered truthfully. It is money the ledger has not seen, and the population it
+   * counts is the one that must not be allowed to shrink silently — which is exactly what happened
+   * while this outcome was discarded, since every one of these rows was previously counted as
+   * `repaired` or as a recovered follow-up and then stamped out of the candidate set for good.
+   */
+  followUpsUnsettled: number
+  /**
+   * Rows whose SETTLEMENT WRITE was refused because the row had moved since the decision was taken
+   * (o3d-0bfh r2, Codex HIGH). The compare-and-set matched nothing, so nothing was written and the
+   * row is left eligible for the next sweep.
+   *
+   * Its own number, and not folded into `failed`, because nothing went wrong here either: another
+   * writer legitimately advanced the row, and this sweep's verdict was simply about an older state
+   * of it. What it must never be is silent — a refusal counted nowhere is indistinguishable from a
+   * settlement, and the whole point of the fence is that this outcome is observable.
+   */
+  settlementDeferred: number
 }
 
 /**
@@ -777,6 +901,63 @@ export function buildBackReferenceCandidateQuery(params: {
   }
 }
 
+/**
+ * The verdict of the follow-ups-only pass, WITH the generation it is about (o3d-0bfh r3).
+ *
+ * `marker` is the obligation generation this run claimed — `null` only when there was no obligation
+ * to claim. The settlement is fenced on it, so it must be the value this run WROTE and never the
+ * value it read: the whole finding was that a read value can be shared with an overlapping run.
+ */
+type FollowUpOnlySettlement = { settle: false } | { settle: true; marker: Date | null }
+
+/**
+ * THE STRING AN OPERATOR ACTUALLY RECEIVES WHEN THIS SWEEP'S OWN ENQUEUE LEAVES A RECEIPT
+ * OUTSTANDING — a named, exported producer, for the same reason
+ * `xeroRetainedFollowUpObligationDescription` became one (o3d-0bfh r12, Codex HIGH).
+ *
+ * WHAT WAS HERE INSTRUCTED A RACING MANUAL RECEIPT, AND SAID SO IN THE SAME BREATH AS THE RETRY:
+ * "The row is deliberately left unsettled and still marked as owing follow-ups, SO THE NEXT SWEEP
+ * RETRIES THEM ... Register the receipt in <connector> by hand if it does not clear." Both halves
+ * are true and together they are the r7/r8/r11 defect in its purest form: the marker is retained on
+ * purpose, THIS sweep re-reads it on the next cron pass and re-enqueues the receipt idempotently,
+ * and a receipt an operator enters in the accounting package's UI in the meantime cannot be
+ * deduplicated against the queued one by any request id the connector generates. A second payment
+ * against one invoice is not undoable.
+ *
+ * "if it does not clear" did not save it. Nothing tells the operator when it has cleared — the row
+ * is SYNCED and carries its external id exactly like a row that completed, which is the very fact
+ * this message exists to announce — so the condition is unobservable and reads as a licence.
+ *
+ * AND IT SHIPPED THROUGH THE ROUND THAT POINTED THE BANNED-INSTRUCTION CONTRACT AT PRODUCERS. That
+ * round extracted the Xero processor's copy of the same sentence into a producer and ran THE ONE
+ * LIST over it, and whole-file-scanned both connector sync-processors — and this one is in neither,
+ * because it is in a third file. Same defect, third file. So this is a producer too, and
+ * tests/accounting/follow-up-recovery-registry.test.ts runs THE ONE LIST over what it returns for
+ * EVERY connector the registry declares plus an undeclared one, and whole-file-scans this module.
+ *
+ * The recovery half is READ FROM THE REGISTRY, never written here: what re-drives a retained
+ * obligation is a declared fact about the connector (`consumer: 'sweep'` for Xero — this sweep),
+ * and a sentence written in the sweep could promise it for a connector the sweep is not bound to.
+ */
+export function sweepRetainedFollowUpObligationDescription(input: {
+  /** The `AccountingSyncLog.connector` value — the registry key, not the display label. */
+  connector: string
+  connectorLabel: string
+  row: Pick<BackReferenceSweepRow, 'type' | 'referenceType' | 'referenceId'>
+}): string {
+  const { connector, connectorLabel, row } = input
+  const recovery = followUpObligationRecoveryNote(followUpObligationRecoveryFor(connector))
+  return `Enqueued the outstanding ${connectorLabel} follow-ups recorded against ${row.type} for `
+    + `${row.referenceType} ${row.referenceId}, but a receipt recorded before this document is still not `
+    + `registered against it in ${connectorLabel}. The row is deliberately left marked as owing follow-ups, `
+    + 'because nothing else about it records that: it is SYNCED and carries its external id exactly like a row '
+    + 'that completed. There is no manual step here, and a hand-made settlement is the one action that costs '
+    + `money: ${recovery}, so a receipt entered by hand would be a SECOND one, racing work that is already `
+    + `queued — and no request id can deduplicate a payment a human entered in the ${connectorLabel} UI. If the `
+    + `row is still marked after the next pass of this sweep, READ the document in ${connectorLabel}, record what `
+    + 'is actually present, and ESCALATE that reading.'
+}
+
 export async function repairAccountingBackReferences(
   deps: BackReferenceSweepDeps,
   options: { limit?: number; pageSize?: number } = {},
@@ -788,7 +969,7 @@ export async function repairAccountingBackReferences(
 
   const result: BackReferenceRepairResult = {
     scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, followUpsDiscarded: 0, skippedUnverified: 0,
-    retiredCancelledSale: 0,
+    retiredCancelledSale: 0, followUpsUnsettled: 0, settlementDeferred: 0,
   }
   // One cutoff for the whole run, so every page of the scan agrees on which deferred rows
   // are due — a per-page `new Date()` would let a row fall on both sides of the boundary.
@@ -804,12 +985,82 @@ export async function repairAccountingBackReferences(
    * leaving the marker behind would make the two columns contradict each other on every settled row,
    * and any future reader of "which rows still owe follow-ups" would have to know to also check
    * whether the row had been stamped. One write, one consistent state.
+   *
+   * FENCED ON THE STATE THE VERDICT WAS REACHED FROM (o3d-0bfh r2, Codex HIGH). It used to update BY
+   * ID ALONE, and that made it the last unfenced writer in a path full of fences. The interleaving
+   * it lost work to is real and needs no exotic timing, because concurrent cron and manual runs
+   * reach it: this sweep reads a FAILED row and its follow-up enqueue answers
+   * `deferredReceiptsSettled: true`; meanwhile `retryFailedXeroSync` returns that same row to the
+   * processor, which BUMPS `attemptRevision`, claims the follow-up marker afresh and discovers a
+   * newly recorded — or still unregistered — receipt. The sweep then arrived here and wrote
+   * unconditionally: it cleared the NEWER marker, stamped `backReferenceCheckedAt` (which removes
+   * the row from the candidate set PERMANENTLY, since the query filters on that column being null),
+   * and — reading a status snapshot that was already stale — could promote the row to SYNCED with
+   * the obligation the other path was truthfully retaining now erased.
+   *
+   * So the write is a COMPARE-AND-SET over four columns, and each one is there for a reason:
+   *
+   *   • `backReferenceCheckedAt: null` — nobody has settled it since; a stamp is terminal and must
+   *     never be written twice with different data.
+   *   • `attemptRevision` — the identity of the attempt this verdict is ABOUT. Status cannot serve:
+   *     every retry path returns the row to a status it already held (see the column's own note in
+   *     prisma/schema.prisma), so only this is a per-attempt identity.
+   *   • `status` — because the `extra` this is called with can carry `status: 'SYNCED'`, and that
+   *     promotion is only sound about the status that was read.
+   *   • `backReferenceFollowUpsPendingAt` — the obligation MARKER GENERATION. Clearing it is the
+   *     part that loses money, and a marker re-claimed by a concurrent post carries a different
+   *     timestamp, so equality on it is what distinguishes "the obligation I discharged" from "an
+   *     obligation somebody else has just recorded".
+   *
+   * A zero-row result is a DEFERRAL, never a failure and never a retry: the row is left exactly as
+   * the other writer made it, still unstamped, so it is a candidate for the next sweep — which will
+   * re-read it and reach its own verdict from state that is actually current. Counted, so the
+   * refusal cannot be silent.
    */
-  const markChecked = async (id: string, extra?: Record<string, unknown>) => {
-    await deps.db.accountingSyncLog.update({
-      where: { id },
+  const settlementFence = (
+    row: BackReferenceSweepRow,
+    followUpsPendingAt: Date | null = row.backReferenceFollowUpsPendingAt,
+  ) => ({
+    id: row.id,
+    status: row.status,
+    attemptRevision: row.attemptRevision,
+    followUpsPendingAt,
+  })
+
+  /**
+   * A REFUSAL THAT COST NOTHING AND MUST NOT BE SILENT. Shared by the settlement write and by the
+   * obligation claim (o3d-0bfh r3), because they are the same event seen at two moments: this run
+   * decided about a state of the row that another writer has since replaced, so it writes nothing
+   * and leaves the row exactly as that writer made it — unstamped, and therefore a candidate for the
+   * next sweep, which re-reads it and reaches its own verdict from state that is current.
+   *
+   * Counted rather than thrown, and counted separately from `failed`: nothing went wrong, and
+   * folding it into failures would make a healthy overlap look like an error while making a real
+   * error harder to see. What it must never be is invisible — a refusal counted nowhere is
+   * indistinguishable from a settlement.
+   */
+  const deferSettlement = (id: string, reason: string) => {
+    result.settlementDeferred++
+    console.error(`${prefix}: ${reason}; leaving the row eligible`, id)
+  }
+
+  const markChecked = async (
+    fence: ReturnType<typeof settlementFence>,
+    extra?: Record<string, unknown>,
+  ): Promise<boolean> => {
+    const settled = await deps.db.accountingSyncLog.updateMany({
+      where: {
+        id: fence.id,
+        backReferenceCheckedAt: null,
+        status: fence.status,
+        attemptRevision: fence.attemptRevision,
+        backReferenceFollowUpsPendingAt: fence.followUpsPendingAt,
+      },
       data: { backReferenceCheckedAt: now(), backReferenceFollowUpsPendingAt: null, ...extra },
     })
+    if (settled.count > 0) return true
+    deferSettlement(fence.id, "back-reference settlement refused — the row moved since this run's verdict was reached")
+    return false
   }
 
   /**
@@ -823,24 +1074,117 @@ export async function repairAccountingBackReferences(
    * follow-ups are outstanding, and the worst case is a marker on a row whose follow-ups then
    * succeed, which costs one extra idempotent re-enqueue on a later sweep.
    *
-   * Returns false if the marker could not be persisted, and the caller then does NOTHING ELSE to the
-   * row: nothing has been written yet, `missing` is still true, and the next sweep retries the whole
-   * repair from scratch.
+   * Returns `claimed: false` if the marker could not be persisted, and the caller then does NOTHING
+   * ELSE to the row: nothing has been written yet, `missing` is still true, and the next sweep
+   * retries the whole repair from scratch.
+   *
+   * AND IT REPORTS THE VALUE IT WROTE (o3d-0bfh r2). The settlement write is fenced on the marker
+   * generation, so the caller has to know WHICH marker its own verdict is about — the one already on
+   * the row, or the one this call has just claimed. Re-reading the row for it would reintroduce the
+   * race one layer down: the value returned here is the value written here.
+   *
+   * AND THE GENERATION IS TAKEN EXCLUSIVELY, NOT MERELY OBSERVED (o3d-0bfh r3, Codex HIGH).
+   *
+   * It used to return the marker already on the row UNCHANGED whenever there was one, and to write
+   * a fresh one BY ID ALONE when there was not. Either way, two overlapping runs — a cron tick that
+   * ran long and the next one, or cron and the manual sweep behind the sync button — could hold the
+   * SAME generation at once, and the settlement fence built on it then proved only that the row had
+   * not moved, which is a weaker thing than it looks:
+   *
+   *   run A: read row (marker M) → enqueue → `deferredReceiptsSettled: true`   … pauses here
+   *   run B: read row (marker M) → enqueue → `deferredReceiptsSettled: false`  … refuses to stamp,
+   *          correctly, because a receipt appeared or a registration was refused between the two
+   *          live probes — but its false verdict writes NOTHING, so the row still reads M
+   *   run A: settle, fenced on M → every column matches → stamped CHECKED, marker cleared, status
+   *          promoted to SYNCED. B's truthful refusal is overwritten by A's stale success, and
+   *          `backReferenceCheckedAt` is what the candidate query filters on, so the row is gone
+   *          from the population for good with the receipt still unregistered.
+   *
+   * So the claim is now a COMPARE-AND-SET IN ITS OWN RIGHT, run on every path that is going to
+   * discharge an obligation — including, and especially, when a marker already exists. Its
+   * predicate is the settlement fence's own four columns (the observed marker, the checked stamp,
+   * the status and the attempt revision), because a run whose verdict is going to be fenced on
+   * those has no business starting if any of them has already moved.
+   *
+   * WHAT MAKES IT EXCLUSIVE rather than just fenced: the value written is STRICTLY LATER than the
+   * value observed. The two runs above then serialise on the row — under READ COMMITTED the second
+   * statement blocks on the first's row lock and re-evaluates its predicate against the committed
+   * version — and the loser sees a marker it did not observe, matches nothing, and defers. A claim
+   * that wrote `now()` plainly would NOT be exclusive: `backReferenceFollowUpsPendingAt` is a
+   * millisecond-resolution timestamp, so two hosts claiming inside the same millisecond would write
+   * the value the other had just observed, both CAS statements would match, and both runs would once
+   * again be holding one generation. The `+1ms` floor is not a tie-breaker for a rare case; it is
+   * the property the whole fence rests on.
+   *
+   * WHAT IT DOES NOT GUARANTEE, STATED BECAUSE r3 OVERCLAIMED IT (o3d-0bfh r4, Codex). r3 argued
+   * livelock was impossible "because the claim is monotonic and the cursor rotates". Both halves are
+   * true and neither is about progress:
+   *
+   *   • Monotonicity buys SAFETY — at most one holder per generation, and no discharge by a
+   *     non-holder. A run that loses writes nothing, so the row is left exactly as it was and the
+   *     next run starts from the same state. Losing costs nothing; it also achieves nothing.
+   *   • The cursor is a FAIRNESS device WITHIN the population, not mutual exclusion BETWEEN runs. It
+   *     stops a persistently failing head eating every run's budget. It does not keep two runs apart
+   *     — they read the same persisted cursor, so overlapping runs tend to scan the same page, which
+   *     makes them MORE likely to meet on a row rather than less.
+   *
+   * The window a competitor has to hit is narrow — claim, enqueue, settle, which is one enqueue call
+   * wide rather than a whole run — but under CONTINUOUSLY overlapping runs (a cron tick that outruns
+   * its period, the manual sweep behind the sync button, and since r4 a connector re-posting the same
+   * row) there is no bound on how long a row's SETTLEMENT can be starved. Each new claim invalidates
+   * the previous holder's pending verdict.
+   *
+   * What is starved is only the verdict. The obligation stays set — the safe direction — and every
+   * deferred pass re-enqueues idempotently, so no money and no work is lost; what does not happen is
+   * `backReferenceCheckedAt`, so the row stays a candidate for ever and occupies a slot in every
+   * scan. The only signal is the `settlementDeferred` counter, which reaches the cron response JSON
+   * and nothing else: o3d-3ix5. So the weaker true version is that this protocol is SAFE
+   * unconditionally and LIVE only on the assumption that some claim-to-settle window eventually
+   * completes uncontended — and that a permanently contended row is invisible until o3d-3ix5 lands.
+   *
+   * A monotonic generation is also the honest reading of the column: it stops meaning "the instant
+   * the obligation was first recorded" and starts meaning "the instant it was last claimed", which
+   * is what every reader of it already uses it for. No reader compares it to a wall clock; the
+   * connectors claim from inside the SYNCED transaction through the SAME mint
+   * (`nextFollowUpObligationGeneration`, o3d-0bfh r4), so their generation is strictly later than
+   * anything a sweep can be holding and refuses the sweep exactly as intended — and, since r4, their
+   * RELEASE is fenced on the generation they minted, so a paused connector can no longer clear a
+   * generation the sweep has taken since.
+   *
+   * Three outcomes, and the caller must tell them apart:
+   *   • `claimed`      — this run owns the generation returned; nobody else can be holding it.
+   *   • `contended`    — another writer owns it. NOT a failure: defer, write nothing, leave the row.
+   *   • neither        — the write itself failed. Also defer, but as a failure, because the reason
+   *                      is a database that did not answer rather than a peer that won.
    */
-  const claimFollowUpObligation = async (row: BackReferenceSweepRow): Promise<boolean> => {
-    if (row.backReferenceFollowUpsPendingAt !== null) return true
+  const claimFollowUpObligation = async (
+    row: BackReferenceSweepRow,
+  ): Promise<{ claimed: boolean; contended: boolean; pendingAt: Date | null }> => {
+    const observed = row.backReferenceFollowUpsPendingAt
+    // Strictly later than what was observed — see above. THE SAME MINT THE CONNECTORS USE
+    // (o3d-0bfh r4): one definition of the generation rule, because a restated copy is exactly how a
+    // writer falls out of a protocol, and this one had already been restated once.
+    const generation = nextFollowUpObligationGeneration(observed, now())
+    // The SAME fragment the connectors merge into their SYNCED write (r10 finding 1). They can
+    // claim it for free because they have a transaction to ride; the sweep has none, so it pays
+    // for a write of its own — but the value written is one definition, not two.
+    const claim = followUpObligationClaim(generation)
     try {
-      // The SAME fragment the connectors merge into their SYNCED write (r10 finding 1). They can
-      // claim it for free because they have a transaction to ride; the sweep has none, so it pays
-      // for a write of its own — but the value written is one definition, not two.
-      await deps.db.accountingSyncLog.update({
-        where: { id: row.id },
-        data: followUpObligationClaim(now()),
+      const won = await deps.db.accountingSyncLog.updateMany({
+        where: {
+          id: row.id,
+          backReferenceCheckedAt: null,
+          status: row.status,
+          attemptRevision: row.attemptRevision,
+          backReferenceFollowUpsPendingAt: observed,
+        },
+        data: claim,
       })
-      return true
+      if (won.count === 0) return { claimed: false, contended: true, pendingAt: observed }
+      return { claimed: true, contended: false, pendingAt: claim.backReferenceFollowUpsPendingAt }
     } catch (pendingError) {
       console.error(`${prefix}: could not record that follow-ups are owed; leaving the repair for the next sweep`, row.id, pendingError)
-      return false
+      return { claimed: false, contended: false, pendingAt: observed }
     }
   }
 
@@ -1038,8 +1382,10 @@ export async function repairAccountingBackReferences(
    * id write needs and drops the payload the FOLLOW-UPS are built from. The id is still
    * repaired — that is the correction r4 forced, and it is why a tombstone is still a candidate —
    * but the PDF, payment or attachment that never ran cannot be reconstructed from `{}` and never
-   * will be. That is a real loss, and it is announced rather than absorbed: an operator can re-drive
-   * a payment by hand if they know one is missing, and cannot if they do not.
+   * will be. That is a real loss, and it is announced rather than absorbed — as a NOTICE, not as a
+   * work order (o3d-0bfh r12): the interrupted pass writes each follow-up as its own sync row, so one
+   * for the discarded part can already be PENDING or FAILED in the queue, and a payment a human
+   * creates afterwards cannot be deduplicated against it. See buildCompactedFollowUpLossActivity.
    *
    * Returns whether the warning was PERSISTED, and the caller settles the row only when it was. Same
    * asymmetry as the ambiguity warning: repeating a warning is noise, losing it is silence — and
@@ -1064,6 +1410,41 @@ export async function repairAccountingBackReferences(
       console.error(`${prefix}: back-reference follow-up discard warning was not persisted; leaving row eligible`, row.id)
     }
     return persisted
+  }
+
+  /**
+   * THE ENQUEUE RAN AND LEFT MONEY OUTSTANDING (o3d-0bfh). Count it, name it, keep the marker.
+   *
+   * NOT the same act as `reportDiscardedFollowUps` above, and the difference decides the policy.
+   * A discard is TERMINAL — the payload is gone, no future sweep can rebuild it — so it settles the
+   * row and the warning is the only remaining artefact, which is why it settles only once the
+   * warning is confirmed persisted. This is the opposite: the work is still rebuildable, the next
+   * sweep can and should retry it, and the row is being LEFT IN the candidate set. Retaining the
+   * marker is therefore ALREADY the safe state, so `logActivity`'s answer is deliberately not read —
+   * failing to describe an outstanding receipt must not be able to make the sweep settle it. That is
+   * the same reasoning, and the same asymmetry, as the connectors' `settleFollowUpObligation`.
+   *
+   * ERROR, not WARNING: a receipt that never reached the ledger is a customer's payment missing from
+   * the accounts, and the row it is owed against is SYNCED and carries its external id exactly like
+   * a row that completed. Nothing else about it says anything is wrong.
+   */
+  const reportUnsettledReceipts = async (row: BackReferenceSweepRow, phase: 'repaired' | 'already-applied') => {
+    result.followUpsUnsettled++
+    await deps.logActivity({
+      entityType: 'SYSTEM',
+      action: `${prefix}_backreference_followups_retained`,
+      tag: 'sync',
+      level: 'ERROR',
+      description: sweepRetainedFollowUpObligationDescription({ connector, connectorLabel, row }),
+      metadata: {
+        syncLogId: row.id,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        externalId: row.externalTransactionId,
+        phase,
+      },
+    }).catch(() => { /* the state is on the row; the log is the notification */ })
   }
 
   /**
@@ -1139,6 +1520,51 @@ export async function repairAccountingBackReferences(
   }
 
   /**
+   * THIS ROW'S OWN SETTLEMENT PREREQUISITES, ASKED ONCE, WHEREVER THEY ARE REACHED FIRST
+   * (o3d-0bfh r16, Codex HIGH).
+   *
+   * The sweep has settlement prerequisites the connector's fence knows nothing about — the terminal
+   * warnings that must be PERSISTED before a row may be settled — and since r15 the fence clears the
+   * obligation generation before this module writes any of them. That is a release outrunning its
+   * own evidence: a warning that then fails to persist leaves the row linked, marker-null and
+   * indistinguishable from a reconciled one, which the next sweep stamps in silence.
+   *
+   * So the check is wrapped here and handed DOWN with the generation. Two properties make it usable
+   * on both sides of that seam:
+   *
+   *   • ONCE. The fence answers it between its re-read and its release; this module then asks the
+   *     same closure again before its own `markChecked`, and gets the recorded verdict rather than a
+   *     second warning. An enqueue that never reaches the fence never calls it, and then this
+   *     module's call is the one that runs it — still before anything clears the marker.
+   *   • IT NEVER THROWS. It runs inside the connector's re-drive, whose contract is that a receipt
+   *     it cannot register must not fail a sync entry whose invoice HAS posted; a throw there would
+   *     be reported as an unsettled RECEIPT, which is a different and untrue story. An unanswerable
+   *     prerequisite is `false` — counted as a failure, exactly as the per-row handler counted it
+   *     when `businessDateSettled` was free to throw into it, and leaving the row eligible.
+   */
+  const settlementPrerequisite = (
+    row: BackReferenceSweepRow,
+    check: () => Promise<boolean>,
+  ): (() => Promise<boolean>) => {
+    let verdict: boolean | null = null
+    return async () => {
+      if (verdict !== null) return verdict
+      try {
+        verdict = await check()
+      } catch (prerequisiteError) {
+        result.failed++
+        console.error(
+          `${prefix}: a settlement prerequisite could not be answered; the obligation stays and the row is left eligible`,
+          row.id,
+          prerequisiteError,
+        )
+        verdict = false
+      }
+      return verdict
+    }
+  }
+
+  /**
    * DISCHARGE A FOLLOW-UP OBLIGATION ON A ROW WITH NO BACK-REFERENCE OF ITS OWN (o3d-p5j3).
    *
    * There is no id to repair here — the row's type writes no back-reference, or the call returned
@@ -1158,9 +1584,14 @@ export async function repairAccountingBackReferences(
    * and that is the correct outcome rather than a special case: the marker was a FALSE obligation,
    * calling the one function that decides what a type owes is how we find that out truthfully, and
    * the row is then stamped and drains out of the column for good.
+   *
+   * It returns the MARKER GENERATION as well as the verdict (o3d-0bfh r3). A bare boolean forced the
+   * caller to fence its settlement on the marker it had READ, which is precisely the generation an
+   * overlapping run could also be holding; the value returned here is the one this run claimed, and
+   * nobody else can be holding it.
    */
-  const settleOutstandingFollowUpsOnly = async (row: BackReferenceSweepRow): Promise<boolean> => {
-    if (row.backReferenceFollowUpsPendingAt === null) return true
+  const settleOutstandingFollowUpsOnly = async (row: BackReferenceSweepRow): Promise<FollowUpOnlySettlement> => {
+    if (row.backReferenceFollowUpsPendingAt === null) return { settle: true, marker: null }
     // DEFECT 7, ON THE PATH THAT HAS NO ID TO WRITE. This row carries no back-reference, so nothing
     // here can stamp a document id — but the enqueue is handed `row.externalTransactionId` as the
     // syncResult's external id, and for an operator-settled row that is the asserted string. An
@@ -1169,7 +1600,7 @@ export async function repairAccountingBackReferences(
     // stamped, so the obligation survives for the sweep that runs after a human has verified it.
     if (isOperatorAssertedSettlement(row.settlementBasis)) {
       await reportUnverifiedAssertion(row, 'the follow-ups')
-      return false
+      return { settle: false }
     }
     result.checked++
     // A compacted payload cannot rebuild anything the payload was carrying, and enqueueing from
@@ -1188,8 +1619,43 @@ export async function repairAccountingBackReferences(
     // which a tombstone keeps. The processor short-circuit already had this order for the reason
     // o3d-nepa r4 gives: the announcement gates the RELEASE, it must never gate the enqueue.
     const discarded = compactionDiscardedFollowUps(row)
+    // THE SAME EXCLUSIVE CLAIM THE REPAIR PATH TAKES (o3d-0bfh r3, Codex HIGH). This path was the
+    // other half of the finding and reaches it by the identical route: it reads a marker, runs an
+    // enqueue whose answer can differ between two overlapping runs, and then settles fenced on the
+    // marker it READ — which an overlapping run is holding too. INVOICE_PDF is the row where that
+    // costs real work, because its follow-ups are the nested email and storefront note. Claimed
+    // BEFORE the enqueue so a run that loses owns nothing and has done nothing.
+    //
+    // AND THE TOMBSTONE TAKES IT TOO (the o3d-bqw7 r2 / o3d-0bfh r3 join). r3 exempted the compacted
+    // row because it returned before any enqueue, so two runs could only ever reach the one answer
+    // its own compaction stamp gives. o3d-bqw7 r2 removed that early return: a discarding tombstone
+    // now runs the enqueue first, for the rebuildable half, which is exactly the enqueue whose answer
+    // two overlapping runs can disagree about. The exemption went with the early return.
+    const obligation = await claimFollowUpObligation(row)
+    if (!obligation.claimed) {
+      if (obligation.contended) {
+        deferSettlement(row.id, 'another run holds this row\'s follow-up obligation, so this pass is not the one to discharge it')
+      } else {
+        result.failed++
+      }
+      return { settle: false }
+    }
+    // o3d-0bfh r16: what THIS module still has to put on record before the generation may be
+    // cleared. Today this path cannot reach the connector's fence at all, on either half of the
+    // predicate that selects it: a row with NO external id makes the deferred re-drive return before
+    // the fence, and a row that HAS one is here only because its (type, referenceType) is not a
+    // back-reference pair — which SALES_INVOICE/SalesOrder, the one pair the re-drive runs for, is.
+    // So the closure is answered below, by this module, before `markChecked`. It is handed down
+    // anyway: that reasoning is a property of BACK_REFERENCE_PAIRS and of the connector's dispatch,
+    // not of the release protocol, and the version of an assumption like that which goes stale
+    // silently is the one that was never stated in the call.
+    const prerequisites = settlementPrerequisite(
+      row,
+      async () => discarded.length === 0 || await reportDiscardedFollowUps(row, 'already-applied'),
+    )
+    let outcome: BackReferenceFollowUpOutcome
     try {
-      await deps.enqueueFollowUps(
+      outcome = await deps.enqueueFollowUps(
         row.id,
         row.type,
         row.referenceType,
@@ -1197,6 +1663,13 @@ export async function repairAccountingBackReferences(
         (row.payload ?? {}) as Record<string, unknown>,
         { externalId: row.externalTransactionId ?? undefined },
         sweepRowOriginRecord(row),
+    // o3d-0bfh r15: the generation this run claimed goes DOWN to the enqueue, so the
+    // deferred-receipt re-drive can clear it inside the same transaction as its final re-read of
+    // the order's receipts, under the sales-order lock. When it does, `obligationFenced` says so
+    // and the settlement below fences on the column being null instead.
+        obligation.pendingAt,
+        // o3d-0bfh r16: and WITH IT, what must be durable before that clear happens.
+        prerequisites,
       )
     } catch (followUpError) {
       result.failed++
@@ -1211,11 +1684,40 @@ export async function repairAccountingBackReferences(
           + 'owing them, so the next sweep retries them.',
         metadata: { syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId },
       })
-      return false
+      return { settle: false }
     }
-    // AND ONLY NOW THE TERMINAL DISCARD. The rebuildable half has gone out; what is left is work this
-    // tombstone can never recover, and the marker may be consumed only once that is on record.
-    if (discarded.length > 0) return reportDiscardedFollowUps(row, 'already-applied')
+    // IT RETURNED — THAT IS NOT THE SAME AS IT SETTLED (o3d-0bfh). The enqueue is built never to
+    // throw for a receipt it could not register, so the refusal arrives here as a normal return and
+    // the row must NOT be stamped on it. Refusing to settle keeps the marker and leaves the row in
+    // the candidate set, which is the identical treatment the throwing case gets immediately above —
+    // the only thing that ever distinguished them was that one of the two was observable.
+    //
+    // THIS IS ASKED BEFORE THE TERMINAL DISCARD BELOW, because that discard CONSUMES the marker:
+    // announcing a permanent loss and settling the row on a pass that also failed to register a
+    // receipt would retire the only record that the receipt is still owed.
+    if (!outcome.deferredReceiptsSettled) {
+      await reportUnsettledReceipts(row, 'already-applied')
+      return { settle: false }
+    }
+    // o3d-0bfh r15: NULL when the re-drive cleared the marker itself under the sales-order lock —
+    // fencing on the generation this run claimed would then match no row and defer the stamp for
+    // ever. The fence is still exclusive: `status`, `attemptRevision` and `backReferenceCheckedAt`
+    // are all in it, and a marker re-claimed by another run since is no longer null, so this fails
+    // closed exactly as before.
+    const settledMarker = (): Date | null => (outcome.obligationFenced ? null : obligation.pendingAt)
+    // AND ONLY NOW THE TERMINAL DISCARD. The rebuildable half has gone out and settled; what is left
+    // is work this tombstone can never recover, and the marker may be consumed only once that is on
+    // record — and only the generation THIS run claimed, never the one it merely read.
+    //
+    // o3d-0bfh r16: ASKED THROUGH THE ONCE-CLOSURE that was handed to the enqueue. If the fence
+    // already answered it, this reads that verdict rather than announcing the loss a second time;
+    // if the fence never ran — which is this path's normal case — this is where it runs, and it
+    // still runs before `markChecked` clears anything.
+    if (discarded.length > 0) {
+      return (await prerequisites())
+        ? { settle: true, marker: settledMarker() }
+        : { settle: false }
+    }
     await deps.logActivity({
       entityType: 'SYSTEM',
       action: `${prefix}_backreference_followups_recovered`,
@@ -1225,7 +1727,7 @@ export async function repairAccountingBackReferences(
         + `${row.referenceType} ${row.referenceId}; this row carries no back-reference of its own.`,
       metadata: { syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId },
     })
-    return true
+    return { settle: true, marker: settledMarker() }
   }
 
   // RESUME where the previous run stopped (r3 finding 4). A cursor that reset to null every
@@ -1282,8 +1784,10 @@ export async function repairAccountingBackReferences(
           // doing so on exactly the row the widened candidate query was opened to reach. An
           // INVOICE_PDF row is the case that costs real work: no external id, not a back-reference
           // type, and a nested INVOICE_EMAIL + WC_INVOICE_NOTE pair that only the enqueue rebuilds.
-          if (!(await settleOutstandingFollowUpsOnly(row))) continue
-          await markChecked(row.id)
+          const settlement = await settleOutstandingFollowUpsOnly(row)
+          if (!settlement.settle) continue
+          // Fenced on the generation THIS run claimed, not the one it read (o3d-0bfh r3).
+          await markChecked(settlementFence(row, settlement.marker))
           continue
         }
 
@@ -1488,8 +1992,37 @@ export async function repairAccountingBackReferences(
             // classification calls REBUILT — an invoice PDF is assembled from `externalTransactionId`
             // and `referenceId`, both of which a tombstone keeps. Enqueue, then announce: the
             // announcement gates the SETTLE (o3d-nepa r4) and must never gate the work.
+            //
+            // AND IT IS CLAIMED AND ITS ANSWER IS READ (o3d-0bfh, applied to the enqueue o3d-bqw7 r2
+            // added here). This branch acquired an enqueue and kept a settlement that predates it:
+            // `markChecked` below discharges the obligation, so an enqueue whose answer was dropped
+            // made this the third alternate release path around the gate the rest of this module now
+            // holds. The re-drive does not throw for a receipt it could not register, so control flow
+            // could never see the case — exactly the shape of the original finding.
+            const obligation = await claimFollowUpObligation(row)
+            if (!obligation.claimed) {
+              if (obligation.contended) {
+                deferSettlement(row.id, 'another run holds this row\'s follow-up obligation, so this pass is not the one to discharge it')
+              } else {
+                result.failed++
+              }
+              continue
+            }
+            // AND ITS SETTLEMENT PREREQUISITE GOES DOWN WITH THE GENERATION (o3d-0bfh r16, Codex
+            // HIGH). This is the path the finding was raised on: a SYNCED tombstone whose link is
+            // already applied reaches the fence, which cleared the generation inside its own
+            // transaction — and only THEN did this module try to persist the discard warning that
+            // is the whole reason the row may be settled at all. A warning that failed left the row
+            // linked, SYNCED and marker-null: `owesFollowUps` is false for exactly that shape, so
+            // the next sweep stamped it reconciled and the compacted payment registration was lost
+            // with nothing anywhere saying so.
+            const prerequisites = settlementPrerequisite(
+              row,
+              async () => !discardsFollowUps || await reportDiscardedFollowUps(row, 'already-applied'),
+            )
+            let tombstoneOutcome: BackReferenceFollowUpOutcome
             try {
-              await deps.enqueueFollowUps(
+              tombstoneOutcome = await deps.enqueueFollowUps(
                 row.id,
                 row.type,
                 row.referenceType,
@@ -1497,16 +2030,36 @@ export async function repairAccountingBackReferences(
                 (row.payload ?? {}) as Record<string, unknown>,
                 { externalId: row.externalTransactionId ?? undefined },
                 sweepRowOriginRecord(row),
+                // o3d-0bfh r15: see the sibling call in `settleOutstandingFollowUpsOnly`.
+                obligation.pendingAt,
+                prerequisites,
               )
             } catch (followUpError) {
               result.failed++
               console.error(`${prefix}: tombstone follow-up enqueue failed`, row.id, followUpError)
               continue
             }
-            if (discardsFollowUps && !(await reportDiscardedFollowUps(row, 'already-applied'))) continue
+            // IT RETURNED IS NOT IT SETTLED. Refusing here leaves the row unstamped and still carrying
+            // the generation this pass claimed, which is what brings it back to the next sweep.
+            if (!tombstoneOutcome.deferredReceiptsSettled) {
+              await reportUnsettledReceipts(row, 'already-applied')
+              continue
+            }
+            // The same closure the fence was handed: either it answered it there, before the
+            // release, or it never got that far and this is the call that runs it — never a second
+            // announcement, and never after a clear.
+            if (!(await prerequisites())) continue
+            // Linked, its recoverable half raised and settled, its terminal half announced. Stamped
+            // against the generation THIS run claimed, never the one it merely read.
+            // o3d-0bfh r15: null when the re-drive cleared it under the order lock — see
+            // `settleOutstandingFollowUpsOnly`.
+            await markChecked(settlementFence(row, tombstoneOutcome.obligationFenced ? null : obligation.pendingAt))
+            continue
           }
-          // Linked, nothing outstanding: reconciled. Stamped, so it never occupies a slot again.
-          await markChecked(row.id)
+          // Linked, nothing outstanding: reconciled. Stamped, so it never occupies a slot again —
+          // unless the row moved under this verdict, in which case the fence refuses and the next
+          // sweep decides again.
+          await markChecked(settlementFence(row))
           continue
         }
         // Counted as CHECKED either way, but a follow-ups-only pass is not a repair: nothing was
@@ -1519,10 +2072,44 @@ export async function repairAccountingBackReferences(
         // persisted, nothing else is done to the row: the link is still missing, so the next sweep
         // repeats this pass from the top rather than linking a document whose outstanding work
         // nothing records.
-        if (!evidenceOnly && !(await claimFollowUpObligation(row))) {
-          result.failed++
+        // The marker generation this run's settlement will be fenced on: the one just written by the
+        // claim below, never the one the row was merely read with.
+        //
+        // AND THE CLAIM IS EXCLUSIVE (o3d-0bfh r3): losing it means another run already owns this
+        // row's obligation, so this one stops HERE — before the id write and before the enqueue —
+        // rather than doing the work twice and racing to report a verdict about a generation it does
+        // not hold. Nothing has been written yet at this point, so the deferral costs exactly
+        // nothing: `missing` is still true and the next sweep repeats the whole pass.
+        //
+        // A TOMBSTONE CLAIMS TOO. r3 exempted it — "marking a discard as pending would promise a
+        // retry that can never happen" — and that was true while a tombstone skipped the enqueue
+        // entirely. o3d-bqw7 r2 removed the skip: the rebuildable half (an invoice PDF, built from
+        // `externalTransactionId` and `referenceId`, which compaction keeps) goes out on this path
+        // like any other row's. So there IS a retry to promise, and there is an enqueue whose answer
+        // two overlapping runs can disagree about — which is the entire condition the claim exists
+        // for. Exempting it would have left one run discharging the generation the other is still
+        // truthfully holding.
+        const obligation = await claimFollowUpObligation(row)
+        if (!obligation.claimed) {
+          if (obligation.contended) {
+            deferSettlement(row.id, 'another run holds this row\'s follow-up obligation, so this pass is not the one to discharge it')
+          } else {
+            result.failed++
+          }
           continue
         }
+        let settlementMarker: Date | null = obligation.pendingAt
+        // o3d-0bfh r16 (Codex HIGH) — WHAT MUST BE ON RECORD BEFORE THE GENERATION IS CLEARED, on
+        // the repaired half of the same finding. Both of this path's terminal notices are in it, in
+        // the order they were evaluated in before, and both settle the row only when CONFIRMED
+        // PERSISTED: the compaction discard (irreversible — the payload it named is gone) and the
+        // unrecoverable invoice date (the sale is in NO reporting period until a human sets one).
+        // The fence answers this between its re-read and its release, so neither can be outrun by
+        // the clear; if the enqueue never reaches the fence, the call below runs it instead.
+        const prerequisites = settlementPrerequisite(row, async () => {
+          if (evidenceOnly && discardsFollowUps && !(await reportDiscardedFollowUps(row, 'repaired'))) return false
+          return businessDateSettled(row, businessDate)
+        })
 
         // Where the write actually landed. For a PO-keyed row that is the bill the FENCED
         // attribution chose, which is the only attribution that ever reaches a write.
@@ -1576,10 +2163,25 @@ export async function repairAccountingBackReferences(
           let followUpsEnqueued = true
           {
             try {
-              await deps.enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, {
+              // AND ITS ANSWER IS READ (o3d-0bfh). `followUpsEnqueued` was set from control flow
+              // alone — assigned false only in the catch — so a non-throwing refusal left it true
+              // and the row was stamped CHECKED, its marker cleared and (for a FAILED row) its
+              // status flipped to SYNCED, with the receipt still unregistered. The re-drive behind
+              // this call cannot throw by design, so control flow was never able to see the case
+              // this variable exists to gate.
+              const outcome = await deps.enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, {
                 externalId: row.externalTransactionId,
                 invoiceNumber,
-              }, sweepRowOriginRecord(row))
+                // o3d-0bfh r15: see the sibling call in `settleOutstandingFollowUpsOnly`.
+              }, sweepRowOriginRecord(row), obligation.pendingAt, prerequisites)
+              if (!outcome.deferredReceiptsSettled) {
+                followUpsEnqueued = false
+                await reportUnsettledReceipts(row, followUpsOnly ? 'already-applied' : 'repaired')
+              }
+              // o3d-0bfh r15: the re-drive cleared the marker itself, under the order lock. The
+              // settlement write below must therefore expect the column to be NULL — fencing on the
+              // generation this run claimed would find no row and defer the stamp for ever.
+              if (outcome.obligationFenced) settlementMarker = null
             } catch (followUpError) {
               followUpsEnqueued = false
               console.error(`${prefix}: back-reference follow-up enqueue failed`, row.id, followUpError)
@@ -1594,16 +2196,19 @@ export async function repairAccountingBackReferences(
                 metadata: { syncLogId: row.id, referenceType: row.referenceType, referenceId: row.referenceId },
               })
             }
-            // The terminal half, announced only after the recoverable half has gone out, and only
-            // when this row RECORDED that it owed something the compaction took away. After the
-            // per-row narrowing there is no false warning left here to hold a row behind a failing
-            // activity log — but a TRUE one still holds it, which is the existing policy and the
-            // whole reason the announcement is persisted rather than best-effort.
-            if (followUpsEnqueued && evidenceOnly && discardsFollowUps
-              && !(await reportDiscardedFollowUps(row, 'repaired'))) {
-              followUpsEnqueued = false
-            }
           }
+          // THE TERMINAL HALF, announced only after the recoverable half has gone out, and only when
+          // this row RECORDED that it owed something the compaction took away. After the per-row
+          // narrowing there is no false warning left here to hold a row behind a failing activity
+          // log — but a TRUE one still holds it, which is the existing policy and the whole reason
+          // the announcement is persisted rather than best-effort.
+          //
+          // o3d-0bfh r16: it is now INSIDE `prerequisites`, together with the invoice-date notice,
+          // and asked through the once-closure the enqueue was handed. Whichever side of the fence
+          // ran it, it ran before anything cleared the marker. Still gated on `followUpsEnqueued`:
+          // a pass that left a receipt unregistered must not announce a terminal loss, because that
+          // announcement is what allows the row to be settled.
+          if (followUpsEnqueued && !(await prerequisites())) followUpsEnqueued = false
           // A row whose back-reference is now applied is fully reconciled — but ONLY if its
           // follow-ups were actually enqueued. Stamping it regardless retired the one source that
           // would retry them, so a transient enqueue failure lost the payment or PDF permanently
@@ -1630,8 +2235,11 @@ export async function repairAccountingBackReferences(
           // wrong. When it does warn, it settles once the warning is CONFIRMED PERSISTED — the same
           // terminal policy as the discarded follow-ups, because the remedy (a human reading the
           // date off the ledger) is not something this sweep can observe.
-          if (followUpsEnqueued && await businessDateSettled(row, businessDate)) {
-            await markChecked(row.id, row.status === 'FAILED' && !evidenceOnly ? { status: 'SYNCED', errorMessage: null } : undefined)
+          if (followUpsEnqueued) {
+            await markChecked(
+              settlementFence(row, settlementMarker),
+              row.status === 'FAILED' && !evidenceOnly ? { status: 'SYNCED', errorMessage: null } : undefined,
+            )
           }
 
           if (followUpsOnly) {

@@ -1029,6 +1029,9 @@ test('o3d-2y1c: a PICKING shipment is refused with a reason instead of hitting t
   // ...and what the operator can actually do about it. Cancellation is a real remedy here:
   // cancelSalesOrderFulfillmentState deletes PICKING/PACKED shipments with the allocation release.
   assert.match(blocker!.message, /Cancel the order instead/)
+  // o3d-2k5: and the remedy that KEEPS the order — reopening reverts the shipment to a PENDING
+  // draft, and PENDING is deliberately not a blocker here, so this genuinely clears it.
+  assert.match(blocker!.message, /"Reopen for repack"/)
 })
 
 test('o3d-2y1c: a PACKED shipment blocks too, and several are summarised by status', async () => {

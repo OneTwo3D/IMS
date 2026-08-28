@@ -153,6 +153,8 @@
  * the raw-SQL writer that must not depend on the trigger being installed yet.
  */
 
+import { orderedAccountingBindingWrites } from '@/lib/connectors/accounting-binding-lock-order'
+
 export type XeroConnectionSummary = {
   tenantId: string
   tenantName?: string | null
@@ -978,14 +980,18 @@ export type XeroPinSqlStatement = { text: string; values: unknown[] }
  * clears is precisely the state being removed.
  */
 export function xeroPinEstablishmentStatements(tenantId: string): XeroPinSqlStatement[] {
-  return [
-    {
+  // ...AND THE ORDER IS TAKEN FROM THE ONE PLACE IT IS DEFINED (o3d-2w2j), not restated here. A
+  // raw-SQL writer is the easiest of the four to get wrong — nothing about `insert into settings`
+  // announces that it is the pin — so the three statements are supplied by row name and the helper
+  // returns them in the canonical sequence.
+  return orderedAccountingBindingWrites<XeroPinSqlStatement>({
+    pin: {
       text:
         `insert into settings (key, value, "updatedAt") values ($1, $2, now())\n` +
         `   on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
       values: [XERO_TENANT_PIN_SETTING_KEY, tenantId],
     },
-    {
+    token: {
       // The receipt, all three columns together. They are written together and cleared together
       // everywhere else (r7), and a half-cleared receipt is `stale-release` — a refusal that would send
       // the operator looking for a restore that never happened.
@@ -999,13 +1005,13 @@ export function xeroPinEstablishmentStatements(tenantId: string): XeroPinSqlStat
         `      and ("pinReleasedAt" is not null or "pinReleasedGeneration" is not null or "pinReleasedTenantId" is not null)`,
       values: [],
     },
-    {
+    witness: {
       // ...and the half that stayed in `settings`. A witness left behind is a half-record waiting for a
       // token row to corroborate, which is the shape of every finding in this file.
       text: `delete from settings where key = $1`,
       values: [XERO_PIN_RELEASE_WITNESS_SETTING_KEY],
     },
-  ]
+  })
 }
 
 /**

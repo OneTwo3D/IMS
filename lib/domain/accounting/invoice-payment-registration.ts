@@ -45,6 +45,14 @@ export type InvoicePaymentRegistrationRefusal =
    * is a document id to go and read, and reading it is what resolves this.
    */
   | 'LEDGER_AMOUNT_ASSERTED'
+  /**
+   * A LIVE row for THIS receipt settles a ledger document this order no longer points at
+   * (o3d-ekn8 r4). The invoice was deleted and re-posted, so the row is dropped by every
+   * document-scoped filter — and it is the record of a payment that was actually SENT. Registering
+   * the receipt again against the replacement pays it twice. See the gate for why this is a refusal
+   * rather than a silent pass, and what clears it.
+   */
+  | 'SETTLED_ON_RETIRED_DOCUMENT'
   /** This receipt does not fit in what is left of the invoice after what the ledger already holds. */
   | 'WOULD_OVERPAY'
 
@@ -124,6 +132,54 @@ export function unresolvedInvoicePaymentAttempts(
     (r.status === 'FAILED' || r.status === 'CANCELLED')
     && (r.paymentId == null || r.paymentId !== paymentId)
     && r.couldHaveReachedLedger !== false)
+}
+
+/**
+ * o3d-ekn8 r4 (Codex HIGH) — A ROW NAMING A RETIRED DOCUMENT IS EVIDENCE, NOT NOISE.
+ *
+ * o3d-hbgo taught four gates that a sync row naming a DIFFERENT ledger document says nothing about
+ * the CURRENT invoice's capacity, and for capacity that is right: a payment against a document this
+ * order no longer has consumes none of the replacement's total. o3d-ekn8 r3 then anchored the
+ * write-side gates on the document for the same reason.
+ *
+ * That is sound as arithmetic and unsound as evidence, and this branch traded one silent loss for a
+ * worse one. Receipt P is SYNCED against invoice A; the order's invoice id moves to B — reachable,
+ * because the delete guard swallows the failure of the back-reference write. Every gate then
+ * discards that row: the selector, the `live` filter, the anchored idempotency key and the post-site
+ * capacity guard are narrowed identically, and the row is SYNCED so the unresolved-attempt probe
+ * never consults the ledger at all. Nothing between the selector and the remote payment POST can
+ * catch it, and a SECOND payment posts for the same receipt.
+ *
+ * THE SAFETY ARGUMENT WAS AN ASSUMPTION ABOUT THE LEDGER THIS CODE NEVER CHECKS — "the old document
+ * has been deleted, so its payment is gone with it". IMS never read that document. On QuickBooks a
+ * deleted invoice leaves its payment behind as an UNAPPLIED CREDIT, so the customer is credited
+ * twice. And it inverts this module's own stated rule: for money, unknown must read as "possibly
+ * this one".
+ *
+ * So a live row naming a retired document REFUSES, at both the enqueue gate and the post-site guard,
+ * which is what keeps the two from disagreeing. What clears it is the one thing that is actual
+ * evidence: the row stops being live. Cancelling it is an operator saying "I looked, and the ledger
+ * does not hold this payment" — and that is exactly the fact the code cannot establish for itself.
+ *
+ * NOT SILENT, which is what o3d-ekn8 exists to prevent. `selectReceiptsAwaitingRegistration` still
+ * SELECTS the receipt, so the guarded decision runs and its refusal is warned about with a nameable
+ * remedy. The replacement invoice is left unsettled — visibly, and with the reason recorded — rather
+ * than settled twice.
+ *
+ * `paymentId == null` counts: an un-attributed row cannot be shown to be some OTHER receipt's, and
+ * unknown reads as "possibly this one".
+ */
+export function retiredDocumentInvoicePaymentAttempts(
+  existing: ExistingInvoicePaymentSync[],
+  paymentId: string,
+  accountingInvoiceId: string,
+): ExistingInvoicePaymentSync[] {
+  return existing.filter((r) =>
+    r.status !== 'FAILED'
+    && r.status !== 'CANCELLED'
+    && r.accountingInvoiceId != null
+    && r.accountingInvoiceId !== accountingInvoiceId
+    && (r.paymentId == null || r.paymentId === paymentId))
 }
 
 /**
@@ -213,6 +269,30 @@ export function decideInvoicePaymentRegistration(input: {
           ? `the ledger already holds ${verdict.detail}, which matches an earlier ${attempt.status} attempt`
           : verdict.reason,
       }
+    }
+  }
+
+  // A PAYMENT THAT WAS SENT AGAINST A DOCUMENT THIS ORDER NO LONGER HAS (o3d-ekn8 r4, Codex HIGH).
+  //
+  // Asked HERE — after the unresolved-attempt probe, before any arithmetic — because the arithmetic
+  // below cannot see it: the `live` filter drops the row for naming a different document, which is
+  // correct for capacity and wrong for evidence. The row is SYNCED, so the FAILED/CANCELLED probe
+  // above never looks at it either. See `retiredDocumentInvoicePaymentAttempts` for why "the old
+  // document was deleted, so its payment is gone" is an assumption about a ledger nothing read, and
+  // for what clears this.
+  const retired = retiredDocumentInvoicePaymentAttempts(
+    input.existing,
+    input.paymentId,
+    input.accountingInvoiceId,
+  )
+  if (retired.length > 0) {
+    return {
+      register: false,
+      refusal: 'SETTLED_ON_RETIRED_DOCUMENT',
+      ledgerTotal: input.ledgerTotal,
+      detail: retired
+        .map((r) => `${r.accountingInvoiceId}${r.externalTransactionId ? ` (payment ${r.externalTransactionId})` : ''}`)
+        .join(', '),
     }
   }
 
@@ -329,18 +409,51 @@ export function decideInvoicePaymentRegistration(input: {
  *    at all, so it cannot be matched to one, and for money "which receipt is this?" unanswered has to
  *    read as "possibly that one".
  *
+ * BOTH RULES ARE ASKED OF THE DOCUMENT, NOT ONLY OF THE ORDER (o3d-ekn8 r3). Every row above is first
+ * narrowed to those that can speak about the invoice being registered against, by the same test
+ * `decideInvoicePaymentRegistration` applies on the read side. Keying this on the receipt alone left
+ * one write-side gate document-blind while the read side was not, and a deleted-and-re-posted invoice
+ * walked straight through the gap: the retired document's row spoke for the receipt, nothing was
+ * awaiting, and the replacement was never settled — with no refusal recorded, because a gate that
+ * returns an empty list has nothing to report.
+ *
+ * AND IT STILL SELECTS A RECEIPT WHOSE ONLY ROW NAMES A RETIRED DOCUMENT (o3d-ekn8 r4). That is
+ * deliberate, and it is not the same as licensing the registration: the guarded decision runs and
+ * REFUSES with SETTLED_ON_RETIRED_DOCUMENT, which is warned about and names its remedy. Dropping the
+ * receipt here instead would return this path to silence — the exact failure o3d-ekn8 exists to end
+ * — while the refusal keeps the replacement visibly unsettled rather than settled twice.
+ *
  * Refunds are the caller's business to exclude: they settle a credit note, not this invoice.
  */
 export function selectReceiptsAwaitingRegistration<T extends { id: string }>(input: {
   receipts: T[]
   existing: ExistingInvoicePaymentSync[]
+  /**
+   * o3d-ekn8 r3 (Codex HIGH) — THE DOCUMENT THESE RECEIPTS WOULD BE REGISTERED AGAINST.
+   *
+   * Without it this gate was keyed on the RECEIPT alone, and that made it blind to the exact case
+   * o3d-hbgo taught the read side to see: an invoice deleted in the ledger and re-posted as a new
+   * document. The receipt's old row still names it, so the receipt read as spoken for, nothing was
+   * awaiting, and this function returned an empty list — SILENTLY. The replacement invoice then
+   * stayed unsettled for ever with no log line anywhere, which is the same loss o3d-ekn8 exists to
+   * close, arriving through a different door.
+   */
+  accountingInvoiceId: string
 }): T[] {
-  const unattributedLive = input.existing.some(
+  // SCOPED TO THE DOCUMENT, mirroring `decideInvoicePaymentRegistration`'s `live` filter exactly
+  // rather than restating a second opinion about it: a row that settled a DIFFERENT ledger document
+  // paid an invoice this order no longer has, so it says nothing about what the CURRENT invoice is
+  // still owed. A row that names NO document keeps speaking — for money, unknown must read as
+  // "possibly this one" — which is the direction that can only ever withhold work, never duplicate it.
+  const aboutThisDocument = input.existing.filter(
+    (r) => r.accountingInvoiceId == null || r.accountingInvoiceId === input.accountingInvoiceId,
+  )
+  const unattributedLive = aboutThisDocument.some(
     (r) => r.status !== 'FAILED' && r.status !== 'CANCELLED' && r.paymentId == null,
   )
   if (unattributedLive) return []
   const spokenFor = new Set(
-    input.existing.map((r) => r.paymentId).filter((id): id is string => typeof id === 'string'),
+    aboutThisDocument.map((r) => r.paymentId).filter((id): id is string => typeof id === 'string'),
   )
   return input.receipts.filter((receipt) => !spokenFor.has(receipt.id))
 }

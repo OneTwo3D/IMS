@@ -143,6 +143,12 @@ export type PostedInvoicePaymentRegistration = {
   /** The ledger document it settled. Null on rows queued before the payload recorded it. */
   accountingInvoiceId: string | null
   /**
+   * The local receipt this row registered (o3d-ekn8 r4). Null on rows queued before the payload
+   * recorded it, which reads as "possibly this one" — an un-attributed row cannot be shown to
+   * belong to a DIFFERENT receipt, and for money that is the direction that has to withhold.
+   */
+  paymentId: string | null
+  /**
    * Whether this row's attempt MAY have reached the ledger (`storedBodyMayHaveReachedTheLedger`).
    * Only consulted for the ambiguous statuses, and `false` is the one sound proof that an attempt
    * never reached it: a body that is present, readable, and missing a field the connector rejects
@@ -179,6 +185,12 @@ export type InvoicePaymentPostRefusal =
    * invoice the ledger already holds cannot be determined at all (Codex round 3 #3).
    */
   | 'AMBIGUOUS_FAILED_REGISTRATION'
+  /**
+   * A LIVE registration for THIS receipt settles a document this order no longer points at
+   * (o3d-ekn8 r4) — the invoice was deleted and re-posted. Every document-scoped filter drops that
+   * row, including the capacity sum below, and it is the record of a payment that was SENT.
+   */
+  | 'SETTLED_ON_RETIRED_DOCUMENT'
   /** This payment does not fit in what is left of the invoice after what the ledger already holds. */
   | 'WOULD_OVERPAY'
 
@@ -206,6 +218,41 @@ export function decideInvoicePaymentPost(input: {
   /** Every INVOICE_PAYMENT sync row for this order on this connector, including this entry's own. */
   registrations: PostedInvoicePaymentRegistration[]
 }): InvoicePaymentPostVerdict {
+  // A PAYMENT ALREADY SENT FOR THIS RECEIPT, AGAINST A DOCUMENT THIS ORDER NO LONGER HAS
+  // (o3d-ekn8 r4, Codex HIGH). Asked FIRST, and asked here rather than only at the enqueue, because
+  // this guard is the one gate no enqueue path can skip — it sits immediately before the remote
+  // call. `againstThisInvoice` below drops the row for naming a different document, which is right
+  // for capacity and wrong for evidence: the invoice was deleted and re-posted, and "the old
+  // document's payment went away with it" is an assumption about a ledger nothing here has read. On
+  // QuickBooks a deleted invoice leaves its payment as an UNAPPLIED CREDIT and the customer is
+  // credited twice.
+  //
+  // Scoped to THIS receipt — a different receipt's retired row is o3d-hbgo's case and stays out of
+  // the way — plus rows that name no receipt at all, which cannot be shown to be someone else's.
+  // What clears it is the row ceasing to be live: an operator cancelling it is a statement that they
+  // read the ledger, which is the fact this code cannot establish for itself.
+  const entryPaymentId = input.registrations.find((row) => row.id === input.entryId)?.paymentId ?? null
+  const retired = input.registrations.filter(
+    (row) =>
+      row.id !== input.entryId
+      // POSTED, i.e. SYNCED: money the ledger acknowledged. A FAILED row on a retired document is
+      // the ambiguity rule's business and a PENDING one is the enqueue gate's — this arm is about a
+      // payment that demonstrably went.
+      && (POSTED_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status)
+      && row.accountingInvoiceId != null
+      && row.accountingInvoiceId !== input.accountingInvoiceId
+      && (row.paymentId == null || entryPaymentId == null || row.paymentId === entryPaymentId),
+  )
+  if (retired.length > 0) {
+    return {
+      post: false,
+      refusal: 'SETTLED_ON_RETIRED_DOCUMENT',
+      alreadyPosted: null,
+      ledgerTotal: input.ledgerTotal,
+      ambiguousIds: retired.map((row) => row.id),
+    }
+  }
+
   const againstThisInvoice = input.registrations.filter(
     (row) =>
       row.id !== input.entryId
@@ -468,6 +515,7 @@ export async function guardInvoicePaymentCapacity(
       settlementBasis: row.settlementBasis,
       amount: payloadNumber(row.payload, 'amount'),
       accountingInvoiceId: payloadString(row.payload, 'accountingInvoiceId'),
+      paymentId: payloadString(row.payload, 'paymentId'),
       bodyCouldHavePosted: storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', row.payload),
       provenNeverAttempted: attemptProvenNeverMade(row),
     })),
@@ -494,6 +542,16 @@ export async function guardInvoicePaymentCapacity(
           + `is what it MEANT to send. How much of this invoice is already settled therefore cannot be `
           + `measured, and IMS will not guess with money. Nothing was sent. Open that payment in the ledger, `
           + `confirm what it actually settled, and register any balance genuinely owed there by hand.`
+      case 'SETTLED_ON_RETIRED_DOCUMENT':
+        return head
+          + `this receipt is ALREADY REGISTERED in the accounting connector against a different document `
+          + `(sync ${verdict.ambiguousIds.join(', ')}) — the invoice it settled was deleted and re-posted, `
+          + `so this order now points somewhere else. That earlier payment was actually SENT, and nothing `
+          + `here has read the ledger to see whether deleting the old invoice took it with it: on some `
+          + `connectors a deleted invoice leaves its payment behind as an unapplied credit, and sending `
+          + `this one would credit the customer twice. Nothing was sent. Open that payment in the `
+          + `accounting system; if it is genuinely gone, cancel the earlier sync row and re-run this one, `
+          + `and if it is still there, apply it to the new invoice by hand.`
       case 'AMBIGUOUS_FAILED_REGISTRATION':
         return head
           + `an earlier registration against this same invoice FAILED `

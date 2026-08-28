@@ -26,7 +26,7 @@
  * protect (the generic `XeroConnector.postJournalEntry` adapter). Its behaviour is unchanged.
  */
 
-import { xeroHttpAttemptCount, xeroPost } from './api'
+import { xeroHttpAttemptCount, xeroPost, type XeroNotSentReason } from './api'
 import type { JournalEntry, JournalLine } from '../types'
 
 type XeroManualJournalResponse = {
@@ -223,7 +223,32 @@ export type ManualJournalPostOutcome = {
    * sent. False means nothing left; true means nothing is claimed.
    */
   reachedTheWire: boolean
+  /**
+   * WHICH PROVABLY PRE-EGRESS REFUSAL STOPPED THIS ATTEMPT, when one did (o3d-gvzu).
+   *
+   * `reachedTheWire: false` says "no request left this process". This says WHICH refusal is
+   * responsible, taken from the statement that made it rather than from the status or the prose —
+   * see {@link XeroNotSentReason} for why each member is provable.
+   *
+   * IT IS NOT A SECOND SPELLING OF `reachedTheWire`, and the caller must require BOTH before it acts
+   * on "nothing was sent". They are independent measurements of the same fact from opposite ends: the
+   * counter delta is measured across the whole call and errs towards `true` (it is process-wide, so a
+   * concurrent Xero call by another row moves it), while the tag is written at one statement and errs
+   * towards absent (it is refused once anything has gone out on this call). Requiring both means a
+   * mislabelled site cannot on its own license the release of a dispatch marker, and neither can a
+   * quiet counter.
+   *
+   * `undefined` covers every case where this process cannot prove the request did not arrive — a real
+   * reply of any status, a timeout, a socket reset mid-write, a 5xx, a `connectorFetch` throw.
+   */
+  notSent?: ManualJournalNotSentReason
 }
+
+/**
+ * The pre-egress refusals a manual-journal post can meet: the transport's four (o3d-gvzu), plus the
+ * one this module makes for itself.
+ */
+export type ManualJournalNotSentReason = XeroNotSentReason | 'body-not-validated'
 
 /**
  * Send the body that has already cleared {@link prepareManualJournal}.
@@ -255,13 +280,25 @@ export async function postPreparedManualJournal(
       success: false,
       error: 'the prepared journal carried no validated body — nothing was sent',
       reachedTheWire: false,
+      // PROVABLE BY CONSTRUCTION, and the only member not owned by the transport: this returns
+      // ABOVE `xeroPost`, so no auth is resolved, no request is built and `performRequest` is never
+      // entered. There is no measurement to take because there is no call.
+      notSent: 'body-not-validated',
     }
   }
   const attemptsBefore = xeroHttpAttemptCount()
   const res = await xeroPost<XeroManualJournalResponse>('ManualJournals', journal, opts)
   const reachedTheWire = xeroHttpAttemptCount() > attemptsBefore
   if (!res.ok || !res.data?.ManualJournals?.length) {
-    return { success: false, error: res.error ?? 'Failed to create manual journal', reachedTheWire }
+    // The tag is carried through UNCHANGED — never inferred here from `reachedTheWire`, and never
+    // widened. A response that arrived (or failed to arrive) with no tag stays untagged, which is
+    // what keeps a timeout, a reset and a 5xx on the "may have been sent" side of the line.
+    return {
+      success: false,
+      error: res.error ?? 'Failed to create manual journal',
+      reachedTheWire,
+      notSent: res.notSent,
+    }
   }
 
   return { success: true, journalId: res.data.ManualJournals[0].ManualJournalID, reachedTheWire }

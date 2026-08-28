@@ -1420,19 +1420,55 @@ document in Xero: until you do, that sale is in no reporting period. An invoice 
 already has is never overwritten.
 
 **The sweep runs for Xero only.** There is deliberately no QuickBooks equivalent, and that is not an
-oversight to be reported. A QuickBooks document id is a per-company integer, and disconnecting clears
-the company pin, so a sweep scoped to "the QuickBooks connector" could not tell an id issued by a
-previously connected company from one issued by the current one — it would write a retired company's
-integer onto a live order or bill, and payment polling would then act on it as if it were current.
-Failing to repair is acceptable; repairing onto the wrong document is not. On QuickBooks, a
-back-reference that fails to write is therefore **not retried by anything**: the warning in the
-activity log (`quickbooks_backreference_failed` or `quickbooks_backreference_ambiguous`) says so, and
-the link has to be made by hand. The external id is on the sync row, so nothing is lost — only
-automatic. See *Connecting a different company* below for why the company boundary is the blocker.
+oversight to be reported. A QuickBooks document id is a per-company integer, so a repair that ran
+against the wrong company would write a retired company's integer onto a live order or bill, and
+payment polling would then act on it as if it were current. Failing to repair is acceptable;
+repairing onto the wrong document is not.
+
+**The company boundary is no longer what is missing.** Every sync row now records which connected
+company it was raised against, so a QuickBooks sweep *could* select only the current company's rows.
+What is still missing is on the other side of the repair, and it is why the sweep stays unbound: IMS
+does not yet check **at post time** — as the last thing it does before sending — that the company
+connected at that moment is the company the row was raised against, and the follow-up rows a repair
+would create carry no record of their own origin for such a check to read. A correctly selected row
+could therefore still be posted against whatever company happens to be connected when the sync
+processor reaches it. Both of those — the **post time** check and the origin record — have to land before a QuickBooks sweep is safe to bind.
+
+On QuickBooks, a back-reference that fails to write is therefore **not retried by anything**: the
+warning in the activity log (`quickbooks_backreference_failed` or
+`quickbooks_backreference_ambiguous`) says so, and the link has to be made by hand. The external id
+is on the sync row, so nothing is lost — only automatic. See *Connecting a different company* below
+for what a company switch leaves behind.
+
 (QuickBooks *does* record outstanding follow-ups the same way Xero does — that costs nothing and
 crosses no company boundary — so the work is recoverable the day a QuickBooks sweep becomes safe to
-run. Until then it is a record, not a repair: a QuickBooks follow-up that fails still has to be
-re-driven by hand, and `quickbooks_followup_error` in the activity log is the notice that it does.)
+run. Until then it is a record, not a repair. **Every such row is listed on Sync → Exceptions, under
+"Accounting follow-ups owed, with nothing to re-drive them"** — that list, not the activity log, is
+the reliable place to find them, because it is read straight off the sync rows themselves rather than
+depending on a log entry having been written. `quickbooks_followup_error` in the activity log is the
+same news, when it could be recorded.
+
+**Do not settle one of these rows by hand.** The marker does not say the follow-up work never ran —
+it survives a pass whose follow-ups all succeeded and whose last write failed, and it survives a pass
+in which the payment was enqueued and the PDF was not, leaving a payment sitting `PENDING` in the
+local queue right now. Reading QuickBooks does not separate those cases: you can find no payment,
+create one, and have the queued row post its own minutes later, against the same invoice, with a
+request id that cannot deduplicate what a human made in the QuickBooks UI. Open the document, record
+what is actually there, and hand that reading to accounting. The page states the same rule at the top
+of the list, and each row carries the connector's own wording — both read from
+`lib/domain/accounting/follow-up-obligation-registry.ts`, which is the only place this instruction is
+written down.)
+
+**On Xero the same marker means something different — and still nothing to do.** Xero *does* have a
+back-reference repair sweep bound (`repairXeroBackReferences`, run by the accounting-sync cron and by
+a manual sync), so a Xero row whose deferred receipt is still unregistered is retained *work* rather
+than stranded work: the sweep re-reads the marker and re-enqueues the follow-ups idempotently, and
+the `xero_followup_obligation_retained` activity now says exactly that. It used to tell the operator
+to drive the sync for that reference again or settle the receipt themselves — which on this connector
+is the *worse* advice, because the automatic retry really does exist and a settlement made in the
+Xero UI races work already queued, producing a second payment no request id can deduplicate. If a row
+is still marked after the next accounting-sync run, read the invoice in Xero, record what is present,
+and escalate that reading.
 
 **When the id itself is the blocker.** One case cannot be resolved by linking the document by hand:
 the write was refused because *another local record already holds that id* — typically a bill from a
@@ -1583,8 +1619,11 @@ succeeded is safe: it reports that the id is already on the document and does no
 row once it is older than the sync-log retention period, keeping only the identifying record. Such a
 row is still repaired — the external id can still be written onto the order or bill — but its
 outstanding follow-ups (PDF, payment, attachment) can no longer be rebuilt. When that happens the
-sweep logs `xero_backreference_followups_discarded` naming the document, so you can check for a
-missing PDF, payment or credit allocation and re-drive it manually.
+sweep logs `xero_backreference_followups_discarded` naming the document. That line is a notice, not a
+work order: the interrupted pass enqueues each follow-up as its own sync row, so one for the part it
+names may already be sitting in the queue, and a payment or attachment created by hand afterwards
+cannot be deduplicated against it. Open the document in Xero, record what is actually present, and
+escalate that reading to accounting. Do not settle one of these rows by hand.
 
 ## Connecting a different company
 
@@ -1608,10 +1647,11 @@ read a stored external id — payment matching, reconciliation, document updates
 tell two companies' ids apart, and orders, refunds and credit notes do not record an issuing company
 at all. A refused link is visible and fixable; a payment settling the wrong document is neither.
 
-It is also why there is no back-reference repair sweep on QuickBooks (see *Back-Reference Repair*
-above). The refusal only fires when some local record still holds the id; after a company switch the
-usual case is that **nothing** holds it, and an automatic repair would then link a retired company's
-document with no constraint to stop it.
+It is part of why there is no back-reference repair sweep on QuickBooks (see *Back-Reference Repair*
+above, which describes what a sweep is actually waiting on: a check, at post time, that the company
+connected now is the company the row was raised against). The refusal only fires when some local
+record still holds the id; after a company switch the usual case is that **nothing** holds it, and an
+automatic repair would then link a retired company's document with no constraint to stop it.
 
 **Practically:** if you need to move a QuickBooks connection to a different company, treat it as a
 migration, not a reconnect. Export the existing links first (they are financial records), then clear

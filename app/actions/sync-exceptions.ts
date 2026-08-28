@@ -28,6 +28,12 @@ import {
 import { wmsCreateIneligibleRefusal } from '@/lib/domain/wms/create-eligibility'
 import { isWmsCreateEligibleForUpdate, wmsCreateEligibleOrderIds, wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugins'
+import {
+  buildFollowUpObligationBacklogOrderBy,
+  buildFollowUpObligationBacklogWhere,
+  describeFollowUpObligationBacklogRow,
+  readFollowUpObligationDatabaseNow,
+} from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
@@ -408,6 +414,32 @@ export type UnresolvedDriftRow = {
   eligibleCount: number
 }
 
+/**
+ * o3d-0bfh r6 — an accounting sync row that posted and still owes follow-up work, on a connector with
+ * no consumer for its marker.
+ *
+ * READ-ONLY, and deliberately so — but NOT because the remedy is a human creation instead of an
+ * automatic one (o3d-0bfh r9). There is no authorised creation here at all, by hand or otherwise:
+ * the marker survives a pass in which a payment is already PENDING in the local queue, so creating
+ * one on a clean read of the accounting package races it, and a second payment against an invoice
+ * is not undoable. The remedy is to READ the document and ESCALATE, and the row carries that remedy
+ * verbatim from lib/domain/accounting/follow-up-obligation-registry.ts rather than from any wording
+ * written here. What the inbox owes the operator is that the debt is VISIBLE and says what it is —
+ * which is exactly what the activity-log line could not guarantee.
+ */
+export type AccountingFollowUpObligationRow = {
+  id: string
+  connector: string
+  type: string
+  status: string
+  referenceType: string
+  referenceId: string
+  externalTransactionId: string | null
+  owedSince: string | null
+  blockedBy: string
+  operatorRemedy: string
+}
+
 export type ExceptionInboxSummary = {
   /**
    * o3d-hl8l r5: a held maintenance window, and/or a booked-in re-check that a closed one still
@@ -424,6 +456,12 @@ export type ExceptionInboxSummary = {
   orderReconcileDrift: number
   productStructureConflicts: number
   unresolvedDrift: number
+  /**
+   * o3d-0bfh r6 (Codex HIGH): accounting sync rows that finished posting still owing follow-up work,
+   * on a connector where NOTHING re-reads the marker. The row is the durable record of the debt; this
+   * is the view that makes it visible without depending on a second write having landed.
+   */
+  accountingFollowUpObligations: number
   total: number
 }
 
@@ -439,6 +477,7 @@ export type ExceptionInboxData = {
   orderReconcileDrift: OrderReconcileDriftRow[]
   productStructureConflicts: ProductStructureConflictRow[]
   unresolvedDrift: UnresolvedDriftRow[]
+  accountingFollowUpObligations: AccountingFollowUpObligationRow[]
 }
 
 // Codex r4: only PERMANENT_FAILED rows are actionable exceptions — a
@@ -675,7 +714,14 @@ async function loadMaintenanceRecoveryState(): Promise<MaintenanceRecoveryState>
 
 /** True per-source totals — never capped by the display limit (Codex r3/r5). */
 async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
-  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents] = await Promise.all([
+  // o3d-0bfh r8 (Codex HIGH): the settling grace is aged against the DATABASE's clock, never this
+  // host's. Read before the batch because the predicate is built from it; `null` (unreadable clock)
+  // means no grace at all, which lists every marked row — noise in the safe direction.
+  const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
+  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations] = await Promise.all([
+    // o3d-92fu / o3d-2k5r: the count is over EVERY blocked push state, not DEAD_LETTER alone — a
+    // VALIDATION_FAILED or AMBIGUOUS_CREATE order reaches the warehouse only via a human, so it
+    // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
     db.wmsOrderPushLink.count({ where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } } }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
@@ -689,6 +735,10 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // blocking anything, and showing it would invite an isolate on stale
     // evidence (o3d-bjc.12).
     getEnabledWmsConnectorId().then((id) => (id ? loadUnresolvedDriftIncidents([id]) : [])),
+    // o3d-0bfh r6 (Codex HIGH). NOT scoped to the active connector: a QuickBooks row that owes a
+    // payment owes it whether or not QuickBooks is the connector enabled today, and the whole reason
+    // the row is here is that nothing will ever come back to it on its own.
+    db.accountingSyncLog.count({ where: buildFollowUpObligationBacklogWhere({ databaseNow: followUpDatabaseNow }) }),
   ])
 
   const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
@@ -704,8 +754,10 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     orderReconcileDrift,
     productStructureConflicts,
     unresolvedDrift: driftIncidents.length,
+    accountingFollowUpObligations,
     total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
-      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + driftIncidents.length,
+      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + driftIncidents.length
+      + accountingFollowUpObligations,
   }
 }
 
@@ -772,7 +824,11 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   await requirePermission('sync')
 
   const counts = await loadExceptionCounts()
-  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents] = await Promise.all([
+  // The same database-clock reading rule as the counts above (o3d-0bfh r8). Taken again rather than
+  // threaded through, because the two loads are independent reads and a cutoff a few milliseconds
+  // apart cannot change which side of a five-minute grace a row falls on.
+  const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
+  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } },
       orderBy: { lastAttemptAt: 'desc' },
@@ -864,6 +920,28 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     // blocking anything, and showing it would invite an isolate on stale
     // evidence (o3d-bjc.12).
     getEnabledWmsConnectorId().then((id) => (id ? loadUnresolvedDriftIncidents([id]) : [])),
+    // o3d-0bfh r6 (Codex HIGH) — the rows behind the count above. Capped like every other section;
+    // the count is the real total, so the client renders "showing N of M".
+    db.accountingSyncLog.findMany({
+      where: buildFollowUpObligationBacklogWhere({ databaseNow: followUpDatabaseNow }),
+      orderBy: buildFollowUpObligationBacklogOrderBy(),
+      take: SECTION_LIMIT,
+      select: {
+        id: true,
+        connector: true,
+        type: true,
+        status: true,
+        referenceType: true,
+        referenceId: true,
+        externalTransactionId: true,
+        backReferenceFollowUpsPendingAt: true,
+        // r8: the AGE columns, and both are stamped by the DATABASE. `owedSince` is the claim's own
+        // clock_timestamp() stamp, else createdAt (a database now() default). NOT the marker, which
+        // is a generation; and NOT syncedAt, which an application host writes with new Date().
+        backReferenceFollowUpsClaimedAtDatabaseClock: true,
+        createdAt: true,
+      },
+    }),
   ])
 
   const refundOrderIds = refundLogs.map((log) => log.entityId).filter((id): id is string => Boolean(id))
@@ -1166,6 +1244,13 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       eligibleVersion: driftCohortDigests.get(incident.connector) ?? eligibleCohortDigest([]),
       eligibleCount: driftCohortEligible.get(incident.connector) ?? 0,
     })),
+    // o3d-0bfh r6: the reason and the remedy come from the connector's OWN recovery declaration
+    // (describeFollowUpObligationBacklogRow reads the registry), so what an operator reads here and
+    // what the connector's log line says cannot drift into two different stories.
+    accountingFollowUpObligations: followUpObligationRows.map((row) => {
+      const described = describeFollowUpObligationBacklogRow(row)
+      return { ...described, owedSince: described.owedSince?.toISOString() ?? null }
+    }),
   }
 
   return {
