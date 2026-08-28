@@ -3630,6 +3630,32 @@ type AnnotationProvenance = 'DEMANDED' | 'IGNORED'
 type BindingMutability = 'CONST_ONLY' | 'ANY_BINDING'
 
 /**
+ * WHETHER A TYPE THAT ACQUIRES MEMBERS OR ARGUMENTS FROM ELSEWHERE HAS THAT ELSEWHERE READ
+ * (round 31, Codex HIGH).
+ *
+ * Round 30 made `typeOrigin` default-deny over type SYNTAX and then accepted three forms on a
+ * justification about where their literals come from rather than on what they are made of:
+ *
+ *   • AN INTERFACE OR A CLASS was accepted whole, because "every literal type it can supply comes
+ *     from a member declaration, and every one of those is read by `symbolOrigin`". HERITAGE is the
+ *     half that misses: `interface Base<T> { mode: T }` plus
+ *     `interface Render extends Base<typeof manufacturedMode> {}` gives `Render` a `mode` member
+ *     WITHOUT it passing through `Render`'s own member list, and `symbolOrigin` sees only the clean
+ *     `mode: T` property signature. The type query arrives through a heritage type ARGUMENT — a
+ *     type node round 30 never visited. That is Codex's route.
+ *   • AN `infer` NODE was accepted because `infer T` names nothing. True of the NAME; `infer T
+ *     extends typeof manufactured` is the same door one keyword along.
+ *   • A FUNCTION OR CONSTRUCTOR TYPE had its parameters and return read and its OWN TYPE
+ *     PARAMETERS skipped, so a constraint or a default on the signature named whatever it liked.
+ *
+ * `'TRACED'` is what ships: heritage clauses are followed recursively — every base, every heritage
+ * type argument, and a base that is an EXPRESSION rather than a name refused outright — and the two
+ * other substitution sites are read. `'IGNORED'` reproduces round 30 exactly. Control (T) shows
+ * what that let past.
+ */
+type HeritageProvenance = 'TRACED' | 'IGNORED'
+
+/**
  * THE TYPE KEYWORDS THAT NAME NO DECLARATION AT ALL, so there is nowhere in one for an assertion to
  * have happened. `typeOrigin` is default-deny around this set and the handful of composite forms it
  * walks into; everything else is refused BY NAME.
@@ -3832,6 +3858,7 @@ function computeRendererOutput(
   fieldProvenance: FieldProvenance = 'DEMANDED',
   annotationProvenance: AnnotationProvenance = 'DEMANDED',
   bindingMutability: BindingMutability = 'CONST_ONLY',
+  heritageProvenance: HeritageProvenance = 'TRACED',
 ): ComputedRendererOutput {
   const program = directionModelProgram(model, extraFiles)
   const checker = program.getTypeChecker()
@@ -4214,7 +4241,14 @@ function computeRendererOutput(
     if (ts.isLiteralTypeNode(node)) return null
     // An object type's members are declarations in their own right — see the block above.
     if (ts.isTypeLiteralNode(node)) return null
-    if (ts.isInferTypeNode(node)) return null
+    // AN `infer` DECLARES A TYPE PARAMETER, AND WHAT IS WRITTEN AFTER THE NAME IS TYPE SYNTAX THAT
+    // CAN NAME A VALUE — `infer T extends typeof manufactured` (round 31). Round 30 accepted the
+    // whole node because `infer T` names nothing, which is true of the NAME and of nothing else in it.
+    if (ts.isInferTypeNode(node)) {
+      return heritageProvenance === 'IGNORED'
+        ? null
+        : each([node.typeParameter.constraint, node.typeParameter.default])
+    }
     if (KEYWORD_TYPE_KINDS.has(node.kind)) return null
     if (ts.isParenthesizedTypeNode(node)) return typeOrigin(node.type, seen)
     if (ts.isUnionTypeNode(node) || ts.isIntersectionTypeNode(node)) return each(node.types)
@@ -4238,7 +4272,12 @@ function computeRendererOutput(
     }
     if (ts.isTemplateLiteralTypeNode(node)) return each(node.templateSpans.map((span) => span.type))
     if (ts.isFunctionTypeNode(node) || ts.isConstructorTypeNode(node)) {
-      return each([...node.parameters.map((parameter) => parameter.type), node.type])
+      // ITS OWN TYPE PARAMETERS TOO (round 31): a signature DECLARES them, and a constraint or a
+      // default is a substitution arriving from outside the parameter and return list round 30 read.
+      const declared = heritageProvenance === 'IGNORED'
+        ? []
+        : (node.typeParameters ?? []).flatMap((parameter) => [parameter.constraint, parameter.default])
+      return each([...declared, ...node.parameters.map((parameter) => parameter.type), node.type])
     }
     if (ts.isTypeReferenceNode(node)) return typeReferenceOrigin(node, seen)
     return `a ${ts.SyntaxKind[node.kind]} in type position, which this walk cannot read end to end`
@@ -4262,12 +4301,22 @@ function computeRendererOutput(
         if (inner) return inner
         continue
       }
-      // AN INTERFACE, A CLASS TYPE AND AN ENUM TYPE name no literal of their own: whatever literal
-      // type they can supply comes from a member declaration, and every one of those is read by
-      // `symbolOrigin` when the member is actually accessed — a class field is REFUSED there, an
-      // ambient enum member is refused there, and a property signature is read there.
+      // AN ENUM TYPE names no literal of its own and inherits from nothing: whatever literal type it
+      // can supply comes from a member declaration, and every one of those is read by `symbolOrigin`
+      // when the member is actually accessed — an ambient enum member is refused there.
+      if (ts.isEnumDeclaration(declaration)) continue
+      // AN INTERFACE AND A CLASS INHERIT, AND THAT IS THE HALF ROUND 30 MISSED (round 31, Codex
+      // HIGH). Round 30 accepted both for the enum's reason — every literal they supply comes from a
+      // member declaration `symbolOrigin` reads. A BASE TYPE'S MEMBERS BECOME THIS TYPE'S MEMBERS
+      // WITHOUT PASSING THROUGH ITS OWN MEMBER LIST, and a heritage type ARGUMENT is a type node
+      // nothing in round 30 ever visited: `interface Render extends Base<typeof manufacturedMode> {}`
+      // gives `Render.mode` the manufactured literal while the only property signature on the path
+      // says `mode: T`. So heritage is DEFAULT-DENY too — see `heritageOrigin`.
       if (ts.isInterfaceDeclaration(declaration) || ts.isClassDeclaration(declaration)
-        || ts.isClassExpression(declaration) || ts.isEnumDeclaration(declaration)) {
+        || ts.isClassExpression(declaration)) {
+        if (heritageProvenance === 'IGNORED') continue
+        const inner = heritageOrigin(declaration, printed, seen)
+        if (inner) return inner
         continue
       }
       if (ts.isTypeParameterDeclaration(declaration)) {
@@ -4279,6 +4328,81 @@ function computeRendererOutput(
       }
       return `"${printed}" in type position resolves to a ${ts.SyntaxKind[declaration.kind]}, which is a VALUE `
         + 'declaration — a type that names a value is honest only as far as that value is'
+    }
+    return null
+  }
+
+  /**
+   * WHAT AN INTERFACE OR A CLASS ACQUIRES FROM SOMEWHERE ELSE, or null (round 31, Codex HIGH).
+   *
+   * The entry points a type has into other types, walked recursively rather than assumed harmless:
+   *
+   *   • EVERY HERITAGE TYPE ARGUMENT — `extends Base<typeof manufacturedMode>` — because that is
+   *     the substitution, and it is the one Codex demonstrated. Its members arrive on this type
+   *     without ever being written in this type's member list, so `symbolOrigin` cannot see them.
+   *   • EVERY BASE, followed into its own declaration: another interface or class recurses here, a
+   *     type alias goes back through `typeOrigin`, a type parameter contributes its constraint and
+   *     default, and anything else — a variable, a function, a `const` holding a class expression —
+   *     is a VALUE declaration and is refused by name.
+   *   • A BASE THAT IS AN EXPRESSION RATHER THAN A NAME (`class X extends mixin(Base) {}`) is
+   *     refused outright: its members come from a value this walk does not evaluate.
+   *
+   * The `seen` set is the same one `typeOrigin` carries, so a cyclic heritage graph terminates on
+   * the visit still on the stack — which introduces no new name, exactly as a cyclic type does.
+   */
+  function heritageOrigin(
+    declaration: ts.InterfaceDeclaration | ts.ClassDeclaration | ts.ClassExpression,
+    printed: string,
+    seen: Set<ts.Node>,
+  ): string | null {
+    if (seen.has(declaration)) return null
+    seen.add(declaration)
+    for (const clause of declaration.heritageClauses ?? []) {
+      for (const base of clause.types) {
+        const named = base.expression.getText()
+        for (const argument of base.typeArguments ?? []) {
+          const inner = typeOrigin(argument, seen)
+          if (inner) {
+            return `"${printed}" INHERITS from "${named}", and that HERITAGE TYPE ARGUMENT is ${inner}`
+          }
+        }
+        if (!ts.isIdentifier(base.expression) && !ts.isPropertyAccessExpression(base.expression)) {
+          return `"${printed}" INHERITS from a ${ts.SyntaxKind[base.expression.kind]} — a heritage base that is `
+            + 'an EXPRESSION rather than a name, so the members it contributes come from a value this walk '
+            + 'does not evaluate'
+        }
+        const symbol = aliasResolved(checker.getSymbolAtLocation(base.expression))
+        if (!symbol) {
+          return `"${printed}" INHERITS from "${named}", which resolves to no symbol, so what it contributes `
+            + 'is unknown'
+        }
+        const bases = symbol.declarations ?? []
+        if (bases.length === 0) {
+          return `"${printed}" INHERITS from "${named}", which has no declaration to read`
+        }
+        for (const inherited of bases) {
+          if (ts.isInterfaceDeclaration(inherited) || ts.isClassDeclaration(inherited)
+            || ts.isClassExpression(inherited)) {
+            const inner = heritageOrigin(inherited, named, seen)
+            if (inner) return inner
+            continue
+          }
+          if (ts.isTypeAliasDeclaration(inherited)) {
+            const inner = typeOrigin(inherited.type, seen)
+            if (inner) return inner
+            continue
+          }
+          if (ts.isTypeParameterDeclaration(inherited)) {
+            const constraint = inherited.constraint ? typeOrigin(inherited.constraint, seen) : null
+            if (constraint) return constraint
+            const fallback = inherited.default ? typeOrigin(inherited.default, seen) : null
+            if (fallback) return fallback
+            continue
+          }
+          return `"${printed}" INHERITS from "${named}", which resolves to a ${ts.SyntaxKind[inherited.kind]} — `
+            + 'a VALUE declaration, so the members it contributes are whatever that value was asserted to be'
+        }
+      }
     }
     return null
   }
@@ -4901,10 +5025,12 @@ function judgeRendererOutput(
   fieldProvenance: FieldProvenance = 'DEMANDED',
   annotationProvenance: AnnotationProvenance = 'DEMANDED',
   bindingMutability: BindingMutability = 'CONST_ONLY',
+  heritageProvenance: HeritageProvenance = 'TRACED',
 ): string[] {
   const computed = computeRendererOutput(
     model, extraFiles, contextBinding, literalProvenance, receiverPropagation, defaultBinding, rootTrust,
     rootEntry, rootProvenance, keyProvenance, fieldProvenance, annotationProvenance, bindingMutability,
+    heritageProvenance,
   )
   const reviewed = RENDERED_DIRECTIONS.map((entry) => entry.text)
   const complaints = [...computed.unresolved]
@@ -6810,6 +6936,318 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     'the const floor must not have stopped the walk reading a `const` — if it had, the sentences composed out '
     + 'of `administrator` and `SETTING_NAME` would have stopped being computable and every judgement above '
     + 'would be vacuous',
+  )
+
+  // (T) A TYPE QUERY THAT ARRIVES THROUGH INTERFACE HERITAGE — THE ROUND-31 ROUTE (Codex HIGH), and
+  // the tenth appearance of one axis: a TYPE standing in for a VALUE.
+  //
+  // ROUND 30 MADE `typeOrigin` DEFAULT-DENY OVER TYPE SYNTAX AND THEN ACCEPTED AN INTERFACE ON A
+  // JUSTIFICATION rather than on a form: "an interface has no type node of its own — every literal
+  // type it can supply comes from a member declaration, and every one of those arrives at
+  // `symbolOrigin` as a `PropertySignature` and is read there". HERITAGE IS WHAT THAT MISSES. A base
+  // type's members become this type's members WITHOUT passing through its own member list, and the
+  // heritage clause carries TYPE ARGUMENTS nothing in round 30 ever visited.
+  //
+  // So every declaration on the path is clean when read one at a time: `Base<T>` has one property
+  // signature and it says `T`, which is a type parameter with no constraint and no default;
+  // `Render` has NO member list at all. `render.mode` nonetheless types as exactly `"REVIEWED"`,
+  // the prohibited arm is folded away, and every caller passing an inherited-mode object gets the
+  // sentence nobody reviewed. This is the third consecutive round in which a JUSTIFICATION, not a
+  // row, was the thing that was wrong.
+  const viaInheritedTypeQuery = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    "const manufacturedMode = 'UNREVIEWED' as unknown as 'REVIEWED'\n"
+    + '\n'
+    + 'export interface RenderBase<T> {\n'
+    + '  mode: T\n'
+    + '}\n'
+    + '\n'
+    + 'export interface RenderMode extends RenderBase<typeof manufacturedMode> {}\n'
+    + '\n'
+    + 'export function renderLocalDirection(\n'
+    + '  direction: LocalDirection,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: RenderMode,\n'
+    + '): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return render.mode === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  ).replace(
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: RenderMode,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+  )
+  for (const fragment of [
+    "const manufacturedMode = 'UNREVIEWED' as unknown as 'REVIEWED'",
+    'export interface RenderBase<T> {\n  mode: T\n}',
+    'export interface RenderMode extends RenderBase<typeof manufacturedMode> {}',
+    "return render.mode === 'REVIEWED'",
+    'renderLocalDirection(direction, context, render)',
+  ]) {
+    assert.ok(
+      viaInheritedTypeQuery.includes(fragment),
+      `the inherited-type-query mutation must actually have been applied — missing ${JSON.stringify(fragment)}`,
+    )
+  }
+  // AND THE INTERFACE THE PARAMETER NAMES DECLARES NO MEMBER OF ITS OWN, which is the whole route:
+  // there is no property signature on `RenderMode` for round 30 to read, and the one on `RenderBase`
+  // says `T`. If `RenderMode` had its own `mode:` this would be control (R) again.
+  assert.ok(
+    viaInheritedTypeQuery.includes('interface RenderMode extends RenderBase<typeof manufacturedMode> {}')
+      && !viaInheritedTypeQuery.includes('interface RenderMode extends RenderBase<typeof manufacturedMode> {\n'),
+    'the inheriting interface must have an EMPTY body, or the type query is reachable through a member list '
+    + 'and (T) is (R) wearing an `extends`',
+  )
+  assert.deepEqual(
+    modelDiagnostics(viaInheritedTypeQuery), modelDiagnostics(model),
+    'the inherited-type-query mutation must type-check exactly as the shipped model does, or it is not a route '
+    + 'anybody could take',
+  )
+  const inheritedQueryComplaints = judgeRendererOutput(viaInheritedTypeQuery)
+  assert.ok(
+    inheritedQueryComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL, THE CODEX ROUTE: an interface reference is refused until its HERITAGE CLAUSES and their type '
+    + `ARGUMENTS have been traced. Saw: ${JSON.stringify(inheritedQueryComplaints)}`,
+  )
+  // ...and the walk still COMPUTES every sentence, so the complaint is the prose it emits rather
+  // than an expression it gave up on.
+  assert.deepEqual(
+    computeRendererOutput(viaInheritedTypeQuery).unresolved, [],
+    'the inherited-type-query mutation must still COMPUTE — the complaint is the sentence it emits',
+  )
+  // ...AND ROUND 30 ENTIRE REPORTS IT CLEAN, asserted rather than described. Every fix through round
+  // 30 is ON here — the annotation IS read, the class field IS refused, the const floor IS in place
+  // — and only the heritage walk is off. No complaint at all, while the sentence ships.
+  assert.deepEqual(
+    judgeRendererOutput(
+      viaInheritedTypeQuery, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'DEMANDED', 'DEMANDED', 'DEMANDED', 'CONST_ONLY', 'IGNORED',
+    ),
+    [],
+    'ROUND 30 MUST STILL LET THIS THROUGH — if it also refused this, control (T) would be passing for some '
+    + 'other reason and would prove nothing',
+  )
+  // ...AND NONE OF THE FIXES THAT CAME BEFORE IT CLOSES IT EITHER. The annotation rule (round 30) is
+  // deliberately NOT in this list, and the distinction is the point: round 30 is what REACHES the
+  // annotation, round 31 is what READS a type once reached. With the annotation unread the route is
+  // let through by construction, which is the assertion immediately below this loop.
+  const withoutEachFixBeforeTheHeritage = [
+    ['receiver propagation (round 24)', judgeRendererOutput(
+      viaInheritedTypeQuery, {}, 'SYMBOLIC', 'TRACKED', 'DEFERRED',
+    )],
+    ['argument provenance (round 24)', judgeRendererOutput(
+      viaInheritedTypeQuery, {}, 'SYMBOLIC', 'CALL_LOCAL', 'PROPAGATED',
+    )],
+    ['modelled defaults (round 25)', judgeRendererOutput(
+      viaInheritedTypeQuery, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'UNBOUND',
+    )],
+    ['the named root set (round 25)', judgeRendererOutput(
+      viaInheritedTypeQuery, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'INFERRED',
+    )],
+    ['abstract root entry (round 26)', judgeRendererOutput(
+      viaInheritedTypeQuery, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'DEFAULTED',
+    )],
+    ['root default provenance (round 27)', judgeRendererOutput(
+      viaInheritedTypeQuery, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'DROPPED',
+    )],
+    ['key provenance (round 28)', judgeRendererOutput(
+      viaInheritedTypeQuery, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'IGNORED',
+    )],
+    ['the field rule (round 29)', judgeRendererOutput(
+      viaInheritedTypeQuery, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'DEMANDED', 'IGNORED',
+    )],
+    ['the const floor (round 30)', judgeRendererOutput(
+      viaInheritedTypeQuery, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'DEMANDED', 'DEMANDED', 'DEMANDED', 'ANY_BINDING',
+    )],
+  ] as const
+  assert.equal(
+    withoutEachFixBeforeTheHeritage.length, 9,
+    'every earlier fix that is independent of the annotation rule must be switched off in turn, or this loop '
+    + 'is a claim about a subset of them',
+  )
+  for (const [what, complaints] of withoutEachFixBeforeTheHeritage) {
+    assert.ok(
+      complaints.some((complaint) => complaint.includes('take the second PDF off it')),
+      `THE HERITAGE WALK IS WHAT CLOSES THIS: with ${what} switched off it is still refused, so it is not that `
+      + 'fix wearing a new coat',
+    )
+  }
+  // ...and with the ANNOTATION unread it is let through, which is what makes round 30 the carrier
+  // and round 31 the reader rather than two names for one rule.
+  assert.deepEqual(
+    judgeRendererOutput(
+      viaInheritedTypeQuery, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'DEMANDED', 'DEMANDED', 'IGNORED',
+    ),
+    [],
+    'with the annotation unread nothing reaches the heritage clause at all, so the route is open — this is the '
+    + 'sentence that says round 31 depends on round 30 rather than replacing it',
+  )
+  // ...AND THE REFUSAL NAMES THE HERITAGE, at the point of refusal — the same demand (R) makes of
+  // the type query. Put the inherited property straight into the prose and the reason lands in
+  // `unresolved`, where a reader is told the query arrived through a heritage type argument and not
+  // that some unrelated rule gave up.
+  const viaInheritedProse = viaInheritedTypeQuery.replace(
+    "      return render.mode === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+    '      return `confirm the invoice PDF stored against the order is the document you expect${render.mode}`',
+  )
+  assert.notEqual(viaInheritedProse, viaInheritedTypeQuery, 'the inherited-prose mutation must have applied')
+  const inheritedProse = computeRendererOutput(viaInheritedProse)
+  assert.ok(
+    inheritedProse.unresolved.some((reason) => reason.includes('HERITAGE TYPE ARGUMENT')
+      && reason.includes('"RenderBase"') && reason.includes('TYPE QUERY')
+      && reason.includes('"manufacturedMode"') && reason.includes('PARAMETER')),
+    'the refusal must NAME the parameter, the base it inherits from and the `typeof` query in the heritage type '
+    + `argument, so the rule that fired is readable at the point of refusal. Saw: ${
+      JSON.stringify(inheritedProse.unresolved)}`,
+  )
+  // ...and round 30 folded that same inherited annotation into the prose instead, which is the other
+  // half of the same demonstration: the sentence it shipped carries the manufactured literal.
+  assert.ok(
+    judgeRendererOutput(
+      viaInheritedProse, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'DEMANDED', 'DEMANDED', 'DEMANDED', 'CONST_ONLY', 'IGNORED',
+    ).some((complaint) => complaint.includes('expectREVIEWED')),
+    'the round-30 walk must have folded the inherited annotation into the prose, or (T) is about nothing',
+  )
+  // ...AND NO SAMPLE CLOSES IT: the mutated renderer keys on a value every caller chooses, so a
+  // runtime pass over the four sampled contexts sees the reviewed sentence and reports nothing.
+  const byInheritedMode = (direction: LocalDirection, mode: 'REVIEWED' | 'UNREVIEWED'): string => (
+    direction.action === 'CONFIRM' && mode !== 'REVIEWED'
+      ? UNDECLARED_REMOTE_ACTION
+      : renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT)
+  )
+  assertRenderedInventory((direction) => byInheritedMode(direction, 'REVIEWED'))
+  assert.throws(
+    () => assertRenderedInventory((direction) => byInheritedMode(direction, 'UNREVIEWED')),
+    /is NOT the reviewed sentence for it/,
+    'the other arm really does emit the prohibited sentence, so what (T) is about is the STATIC report being '
+    + 'clean over a branch a caller selects',
+  )
+
+  // (T2) THE REST OF THE PASS OVER THE WALK'S ENTRY POINTS — and what it found is that HERITAGE WAS
+  // THE ONLY HOLE OF THAT SHAPE. This is written down as two run controls rather than as a claim,
+  // because the interesting result is a NEGATIVE one and a negative result nobody executed is an
+  // opinion.
+  //
+  // THE QUESTION THE PASS ASKED, at every point where `typeOrigin` accepts a node without recursing
+  // all of it: can this type acquire MEMBERS or ARGUMENTS from somewhere other than its own inline
+  // syntax? Three places answer yes.
+  //
+  //   • AN INTERFACE OR A CLASS — heritage. That one is real, and it is (T) above: a base's members
+  //     become this type's members without appearing in its member list, so no member declaration
+  //     `symbolOrigin` ever reads carries the substituted type.
+  //   • AN `infer` NODE, whose `extends` clause is type syntax round 30 never entered.
+  //   • A FUNCTION OR CONSTRUCTOR TYPE, whose OWN type parameters round 30 never entered — it read
+  //     the parameter list and the return type and nothing else.
+  //
+  // THE LAST TWO ARE ALREADY CLOSED, and by the same mechanism as each other: what a type parameter
+  // is constrained to can only reach a VALUE by the parameter being REFERENCED, and a reference to
+  // it is a `TypeReferenceNode` that resolves to a `TypeParameterDeclaration`, whose constraint and
+  // default round 30 already reads. A constraint on a type parameter nothing references decides
+  // nothing at all. So both recursions were added — `typeOrigin` is default-deny and should walk all
+  // of a node it accepts, not most of it — and NEITHER is load-bearing; the two controls below say
+  // so with the heritage walk switched OFF, which is the only way to tell redundancy from closure.
+  //
+  // Heritage is different precisely because it is not a reference: the substitution arrives on a
+  // clause, and the member it lands on is declared in another type entirely.
+  const viaInferredConstraint = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    "const manufacturedMode = 'UNREVIEWED' as unknown as 'REVIEWED'\n"
+    + '\n'
+    + 'export type ModeOf<T> = T extends { mode: infer M extends typeof manufacturedMode } ? M : never\n'
+    + '\n'
+    + 'export function renderLocalDirection(\n'
+    + '  direction: LocalDirection,\n'
+    + '  context: LocalDirectionContext,\n'
+    + "  mode: ModeOf<{ mode: 'REVIEWED' }> = 'REVIEWED',\n"
+    + '): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return mode === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  )
+  const viaSignatureConstraint = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    "const manufacturedMode = 'UNREVIEWED' as unknown as 'REVIEWED'\n"
+    + '\n'
+    + 'export function renderLocalDirection(\n'
+    + '  direction: LocalDirection,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  pick: <M extends typeof manufacturedMode>(mode: M) => M = (mode) => mode,\n'
+    + '): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return pick('REVIEWED') === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  )
+  const substitutionEntryPoints = [
+    ['an `infer` constraint', viaInferredConstraint, [
+      'infer M extends typeof manufacturedMode',
+      "mode: ModeOf<{ mode: 'REVIEWED' }> = 'REVIEWED',",
+      "return mode === 'REVIEWED'",
+    ]],
+    ['a function type\'s own type parameter', viaSignatureConstraint, [
+      'pick: <M extends typeof manufacturedMode>(mode: M) => M = (mode) => mode,',
+      "return pick('REVIEWED') === 'REVIEWED'",
+    ]],
+  ] as const
+  for (const [what, mutated, fragments] of substitutionEntryPoints) {
+    for (const fragment of fragments) {
+      assert.ok(
+        mutated.includes(fragment),
+        `the ${what} mutation must actually have been applied — missing ${JSON.stringify(fragment)}`,
+      )
+    }
+    assert.deepEqual(
+      modelDiagnostics(mutated), modelDiagnostics(model),
+      `the ${what} mutation must type-check exactly as the shipped model does, or it is not a route anybody `
+      + 'could take',
+    )
+    assert.ok(
+      judgeRendererOutput(mutated).some((complaint) => complaint.includes('take the second PDF off it')),
+      `${what} must be refused. Saw: ${JSON.stringify(judgeRendererOutput(mutated))}`,
+    )
+    // AND ROUND 30 REFUSES IT TOO, which is the point of running these: the recursion added for it
+    // in round 31 is REDUNDANCY, not a closure, and saying otherwise would make (T) look like two
+    // findings when it is one.
+    assert.ok(
+      judgeRendererOutput(
+        mutated, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+        'DEMANDED', 'DEMANDED', 'DEMANDED', 'CONST_ONLY', 'IGNORED',
+      ).some((complaint) => complaint.includes('take the second PDF off it')),
+      `${what} was ALREADY refused by round 30, through the reference to the type parameter — if this ever `
+      + 'stops being true the recursion added in round 31 has become load-bearing and needs a control of its '
+      + 'own rather than this note',
+    )
+  }
+  // ...AND THE CONTRAST IS THE WHOLE FINDING: with the heritage walk switched off, the two redundant
+  // routes stay refused and Codex's route goes clean through. One of the three was a hole.
+  assert.deepEqual(
+    judgeRendererOutput(
+      viaInheritedTypeQuery, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'DEMANDED', 'DEMANDED', 'DEMANDED', 'CONST_ONLY', 'IGNORED',
+    ),
+    [],
+    'the heritage route must be the one round 30 lets through, or (T2) has nothing to contrast with',
   )
 
   // ...AND THE FIX DOES NOT UNDO ANY OF THE SEVEN. The routes those controls are about are still
