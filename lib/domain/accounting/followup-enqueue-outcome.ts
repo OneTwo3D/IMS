@@ -128,3 +128,41 @@ export function describeFollowUpEnqueueRefusals(outcome: FollowUpEnqueueOutcome)
     .map((refusal) => `${refusal.type} for ${refusal.referenceType} ${refusal.referenceId} (${refusal.reason}): ${refusal.message}`)
     .join(' | ')
 }
+
+/**
+ * o3d-batch-ret (Codex HIGH) — THE RELEASE PREREQUISITE THE ENQUEUE'S OWN VERDICT BELONGS IN.
+ *
+ * A CORRECT CHECK PLACED AFTER THE IRREVERSIBLE STEP IS NOT A CHECK. Both connectors composed the
+ * enqueue verdict, the receipt verdict and the fence answer at their choke point — `requireFollowUpsEnqueued`
+ * on the post path, `followUpSettlement` in the sweep — and both of those run AFTER
+ * `registerDeferredOrderReceipts` has already taken the marker decision under the sales-order lock.
+ * With no receipt outstanding and no prerequisite stated, the fence answered `released`: the claimed
+ * generation was cleared, and the refusal the choke point then raised could not put it back. The row
+ * is SYNCED, linked, and marker-null — which the next sweep reads as reconciled and stamps, with the
+ * payment or PDF that was REFUSED never re-enqueued. The operator notice made it worse by promising
+ * the opposite: that the row stays marked and the next sweep will pick the work up.
+ *
+ * So the verdict is computed BEFORE the fence is invoked and travels INTO it, as the caller-side
+ * prerequisite the fence already knows how to withhold a release on (`prerequisite-unmet`).
+ *
+ *   • ENQUEUED, no caller prerequisite — `undefined`, so every connector post path keeps the
+ *     single-pass fence exactly as o3d-0bfh r15 left it. Nothing about the hot path changes.
+ *   • ENQUEUED, with a caller prerequisite — the caller's own closure, unchanged.
+ *   • REFUSED — a closure that answers `false` without asking the caller's. The caller's
+ *     prerequisite ANNOUNCES a terminal loss, and announcing one on a pass that queued nothing is
+ *     the same mistake `dischargeDeferredReceiptObligation` avoids when its re-read answers
+ *     `retained`: the announcement is what licenses the settlement, so it must not be spent on a
+ *     pass that is not going to settle.
+ *
+ * The refusal is not folded into the receipt answer, for the reason `combineFollowUpEnqueueOutcomes`
+ * gives: they are different states with different operator remedies. This composes them only where
+ * the question is the single one the fence asks — "may this generation be cleared?" — and the answer
+ * is no while any part of the work is still owed.
+ */
+export function obligationReleasePrerequisite(
+  enqueue: FollowUpEnqueueOutcome,
+  callerPrerequisite?: () => Promise<boolean>,
+): (() => Promise<boolean>) | undefined {
+  if (enqueue.enqueued) return callerPrerequisite
+  return async () => false
+}

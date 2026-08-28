@@ -39,6 +39,7 @@ import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/acc
 import {
   FOLLOW_UPS_ENQUEUED,
   combineFollowUpEnqueueOutcomes,
+  obligationReleasePrerequisite,
   describeFollowUpEnqueueRefusals,
   refusedFollowUpEnqueue,
   type FollowUpEnqueueOutcome,
@@ -2177,6 +2178,17 @@ async function enqueueSalesInvoiceFollowUps(
     invoiceNumber: syncResult.invoiceNumber,
   })
 
+  // o3d-batch-ret (Codex HIGH), CROSS-PORTED WITH THE XERO PATH — THE SAME RELEASE-BEFORE-REQUIRE
+  // ORDERING WAS WHOLE HERE TOO. The verdict was built in the `return` below, past the fence that
+  // clears the marker, and `requireFollowUpsEnqueued` on this connector's post paths reads it after
+  // the generation is already gone. It matters MORE here than on Xero: this connector's recovery
+  // registry entry says nothing re-drives a retained marker, so the sweep that Xero relies on to
+  // pick the refused work back up does not exist — a marker cleared early is the end of the trail.
+  const enqueueOutcome = combineFollowUpEnqueueOutcomes(paymentOutcome, pdfOutcome)
+  // This connector states no settlement prerequisite of its own (no sweep hands one down), so this
+  // is `undefined` whenever the enqueue succeeded and the fence stays on its single pass.
+  const releasePrerequisite = obligationReleasePrerequisite(enqueueOutcome)
+
   // o3d-ekn8, CROSS-PORTED FROM THE XERO PATH (this branch) — REGISTER THE RECEIPTS THAT WERE
   // RECORDED BEFORE THIS INVOICE EXISTED.
   //
@@ -2223,6 +2235,10 @@ async function enqueueSalesInvoiceFollowUps(
     // The same registry answer `settleFollowUpObligation` reads — on this connector it says NOTHING
     // re-drives a retained marker, and that has to reach the operator notice unchanged.
     recovery: QBO_FOLLOW_UP_RECOVERY,
+    // o3d-batch-ret: SPREAD for the reason the Xero twin gives — the field's ABSENCE is what keeps
+    // this on the single-pass fence, and an explicitly-undefined key would be a second thing to get
+    // wrong at every site that reads this object.
+    ...(releasePrerequisite ? { settlementPrerequisite: releasePrerequisite } : {}),
   })
   // `unfenced` is the one answer that leaves the marker to this caller: the re-drive returned on a
   // fact no later receipt can change (payments do not post at all; the order is gone).
@@ -2231,7 +2247,7 @@ async function enqueueSalesInvoiceFollowUps(
   // clear it, an unsettled receipt means money that WAS queued has not landed. One boolean would
   // make each of them the other's blind spot.
   return {
-    ...combineFollowUpEnqueueOutcomes(paymentOutcome, pdfOutcome),
+    ...enqueueOutcome,
     deferredReceiptsSettled: redrive.settled,
     obligationFenced: redrive.release !== 'unfenced',
   }

@@ -58,6 +58,7 @@ import { isMoneyMovingSyncType } from '@/lib/domain/accounting/followup-retry-gu
 import {
   FOLLOW_UPS_ENQUEUED,
   combineFollowUpEnqueueOutcomes,
+  obligationReleasePrerequisite,
   describeFollowUpEnqueueRefusals,
   refusedFollowUpEnqueue,
   type FollowUpEnqueueOutcome,
@@ -7186,6 +7187,19 @@ async function enqueueSalesInvoiceFollowUps(
     sourceEntryId: entryId,
   }, { from: 'postedRow', record: origin })
 
+  // o3d-batch-ret (Codex HIGH) — THE AGGREGATE VERDICT IS COMPUTED HERE, BEFORE THE FENCE, because
+  // the fence is where the marker is cleared and every check after it is a check of something
+  // already spent. It used to be built in the `return` below, four statements past the release it
+  // should have gated: `requireFollowUpsEnqueued` (post path) and `followUpSettlement` (sweep) both
+  // read it correctly and both read it too late to matter, since neither can restore a generation
+  // the fence has already cleared. See `obligationReleasePrerequisite`.
+  const enqueueOutcome = combineFollowUpEnqueueOutcomes(paymentOutcome, pdfOutcome)
+  // Both axes the caller of this function may release on, in ONE closure the fence consults between
+  // its fenced re-read and its fenced release: this enqueue's refusals, and whatever the caller
+  // itself stated. `undefined` when nothing is owed and the caller stated nothing, which keeps the
+  // post path on the single-pass fence.
+  const releasePrerequisite = obligationReleasePrerequisite(enqueueOutcome, settlementPrerequisite)
+
   // o3d-ekn8: receipts recorded BEFORE this invoice existed were refused with DOCUMENT_NOT_POSTED and
   // nothing ever came back for them. This is the moment that refusal stops applying — the CREATE has
   // posted and updateBackReference (which runs before enqueueFollowUps) has written accountingInvoiceId
@@ -7225,7 +7239,7 @@ async function enqueueSalesInvoiceFollowUps(
     // o3d-0bfh r16: SPREAD, not written as `settlementPrerequisite: undefined` — the field's absence
     // is what keeps the post path on the single-pass fence, and an explicitly-undefined key would be
     // a second thing to get wrong at every call site that reads this object.
-    ...(settlementPrerequisite ? { settlementPrerequisite } : {}),
+    ...(releasePrerequisite ? { settlementPrerequisite: releasePrerequisite } : {}),
   })
   // `unfenced` is the one answer that leaves the marker to this caller: the re-drive returned on a
   // fact no later receipt can change (payments do not post at all; the order is gone).
@@ -7235,7 +7249,7 @@ async function enqueueSalesInvoiceFollowUps(
   // answer rather than folded into it — a refusal means nothing was queued, an unsettled receipt
   // means money that WAS queued has not landed, and the operator remedies are different.
   return {
-    ...combineFollowUpEnqueueOutcomes(paymentOutcome, pdfOutcome),
+    ...enqueueOutcome,
     deferredReceiptsSettled: redrive.settled,
     obligationFenced: redrive.release !== 'unfenced',
   }

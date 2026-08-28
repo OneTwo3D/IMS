@@ -2372,11 +2372,30 @@ export async function repairAccountingBackReferences(
               // because fencing on the generation this run claimed would find no row and defer the
               // stamp for ever.
               //
-              // NOT counted as a failure, unlike the two already-linked paths: this pass DID write
-              // the back-reference, and reporting a real repair as a failure would hide it.
-              const settlement = await followUpSettlement(
-                row, outcome, obligation.pendingAt, followUpsOnly ? 'already-applied' : 'repaired', false,
-              )
+              // AND THE TWO CASES ARE TWO CALLS, NOT ONE CALL WITH A COMPUTED BOOLEAN (o3d-batch-ret,
+              // Codex MEDIUM). This is the ONE site both branches reach, and it passed `false` for
+              // `countRefusalAsFailure` unconditionally while passing `followUpsOnly` for the phase
+              // one argument earlier — so the two arguments described different worlds. On the
+              // `followUpsOnly` branch NOTHING was repaired (the back-reference was already applied
+              // and `applyBackReference` was never called), which is exactly the condition the two
+              // sibling sites count: a refusal there left all the requested work undone and returned
+              // `failed: 0`, so the cron result reported a clean run.
+              //
+              // Written out as two calls with LITERAL arguments rather than one call with
+              // `countRefusalAsFailure: followUpsOnly`, because a boolean whose meaning depends on
+              // which branch reached it is how this class of bug persists: a reader at the call site
+              // can see `'repaired', false` and `'already-applied', true` are each internally
+              // consistent, where `followUpsOnly ? … : …, followUpsOnly` only looks consistent once
+              // you have followed both.
+              const settlement = followUpsOnly
+                // NOTHING WAS REPAIRED — this pass existed only to retry the follow-ups, so a
+                // refusal is the whole outcome and there is no repair for the count to hide. Same
+                // answer as the sibling in `settleOutstandingFollowUpsOnly` and the linked-tombstone
+                // site, for the same reason.
+                ? await followUpSettlement(row, outcome, obligation.pendingAt, 'already-applied', true)
+                // A REAL REPAIR: this pass DID write the back-reference, and reporting it as a
+                // failure would hide it.
+                : await followUpSettlement(row, outcome, obligation.pendingAt, 'repaired', false)
               if (!settlement.settle) followUpsEnqueued = false
               settlementMarker = settlement.marker
             } catch (followUpError) {
