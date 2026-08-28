@@ -18,6 +18,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
@@ -824,7 +825,25 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`Accounting follow-ups owed, with nothing to re-drive them (${data.summary.accountingFollowUpObligations})`}
-            detail="These documents reached the accounting package still owing follow-up work — the payment, the PDF, the email, the attachment — and this connector has no repair sweep, so NOTHING will ever come back for them. That much is certain. What is NOT known is whether that work was enqueued before the pass stopped: the same marker survives a pass whose follow-ups all ran and whose last write failed. Treat every row as an UNRESOLVED outcome, not as work known to be undone. Open the document in the accounting package and record what is actually present, which is safe to repeat as often as you like; create only what is verifiably absent, and escalate to accounting instead of re-driving anything you cannot account for — a duplicate payment is not undoable."
+            /*
+             * RENDERED FROM THE REGISTRY, NOT RESTATED (o3d-0bfh r9, Codex HIGH).
+             *
+             * This prop used to hold its own paragraph, and that paragraph still ended "create only
+             * what is verifiably absent" three rounds after the registry remedy stopped saying it.
+             * One rule with two authors: correcting the registry protected nobody, because THIS is
+             * the sentence an operator reads. A payment can be PENDING in the local queue while
+             * QuickBooks shows none — INVOICE_PAYMENT is enqueued before INVOICE_PDF, in separate
+             * transactions — so an operator who creates on a clean read races the queued row, and a
+             * second payment against an invoice is not undoable.
+             *
+             * There is now no second copy to go stale: the section text IS the registry's own
+             * string, and each row's cell below carries that connector's own `operatorRemedy`, also
+             * straight from the registry via `describeFollowUpObligationBacklogRow`. No operator
+             * instruction is authored in this file at all, and
+             * tests/accounting/follow-up-recovery-registry.test.ts scans this file to keep it that
+             * way.
+             */
+            detail={FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN}
             shown={data.accountingFollowUpObligations.length}
             total={data.summary.accountingFollowUpObligations}
           />

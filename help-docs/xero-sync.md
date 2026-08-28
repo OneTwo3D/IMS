@@ -1442,12 +1442,22 @@ for what a company switch leaves behind.
 
 (QuickBooks *does* record outstanding follow-ups the same way Xero does — that costs nothing and
 crosses no company boundary — so the work is recoverable the day a QuickBooks sweep becomes safe to
-run. Until then it is a record, not a repair: a QuickBooks follow-up that fails still has to be
-re-driven by hand. **Every such row is listed on Sync → Exceptions, under "Accounting follow-ups
-owed, with nothing to re-drive them"** — that list, not the activity log, is the reliable place to
-find them, because it is read straight off the sync rows themselves rather than depending on a log
-entry having been written. `quickbooks_followup_error` in the activity log is the same news, when it
-could be recorded.)
+run. Until then it is a record, not a repair. **Every such row is listed on Sync → Exceptions, under
+"Accounting follow-ups owed, with nothing to re-drive them"** — that list, not the activity log, is
+the reliable place to find them, because it is read straight off the sync rows themselves rather than
+depending on a log entry having been written. `quickbooks_followup_error` in the activity log is the
+same news, when it could be recorded.
+
+**Do not settle one of these rows by hand.** The marker does not say the follow-up work never ran —
+it survives a pass whose follow-ups all succeeded and whose last write failed, and it survives a pass
+in which the payment was enqueued and the PDF was not, leaving a payment sitting `PENDING` in the
+local queue right now. Reading QuickBooks does not separate those cases: you can find no payment,
+create one, and have the queued row post its own minutes later, against the same invoice, with a
+request id that cannot deduplicate what a human made in the QuickBooks UI. Open the document, record
+what is actually there, and hand that reading to accounting. The page states the same rule at the top
+of the list, and each row carries the connector's own wording — both read from
+`lib/domain/accounting/follow-up-obligation-registry.ts`, which is the only place this instruction is
+written down.)
 
 **When the id itself is the blocker.** One case cannot be resolved by linking the document by hand:
 the write was refused because *another local record already holds that id* — typically a bill from a

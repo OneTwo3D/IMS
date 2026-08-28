@@ -362,10 +362,14 @@ export type UnresolvedDriftRow = {
  * o3d-0bfh r6 — an accounting sync row that posted and still owes follow-up work, on a connector with
  * no consumer for its marker.
  *
- * READ-ONLY, and deliberately so: the remedy is a human act in the accounting package (register the
- * payment, attach the PDF, send the email), not a button here. What the inbox owes the operator is
- * that the debt is VISIBLE and says what it is — which is exactly what the activity-log line could
- * not guarantee.
+ * READ-ONLY, and deliberately so — but NOT because the remedy is a human creation instead of an
+ * automatic one (o3d-0bfh r9). There is no authorised creation here at all, by hand or otherwise:
+ * the marker survives a pass in which a payment is already PENDING in the local queue, so creating
+ * one on a clean read of the accounting package races it, and a second payment against an invoice
+ * is not undoable. The remedy is to READ the document and ESCALATE, and the row carries that remedy
+ * verbatim from lib/domain/accounting/follow-up-obligation-registry.ts rather than from any wording
+ * written here. What the inbox owes the operator is that the debt is VISIBLE and says what it is —
+ * which is exactly what the activity-log line could not guarantee.
  */
 export type AccountingFollowUpObligationRow = {
   id: string
