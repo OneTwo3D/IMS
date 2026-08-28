@@ -105,9 +105,31 @@ test('resolve marks a still-open backstop row SUCCEEDED so the drain does not re
   assert.equal(where.connector, REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR)
   assert.equal(where.operation, REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION)
   assert.match(String(where.idempotencyKey), /refund-9/)
-  // Only PENDING / RETRYABLE_FAILED rows are resolved — never one the drain already claimed (PROCESSING).
-  assert.deepEqual((where.status as { in: string[] }).in, ['PENDING', 'RETRYABLE_FAILED'])
+  // Only UNRESOLVED rows are resolved — never one the drain already claimed (PROCESSING).
+  assert.deepEqual((where.status as { in: string[] }).in, ['PENDING', 'RETRYABLE_FAILED', 'PERMANENT_FAILED'])
   assert.equal((calls[0].data as Record<string, unknown>).status, 'SUCCEEDED')
+})
+
+test('o3d-2k5r r6: the resolver CLEARS a dead-lettered row, because nothing else ever will', async () => {
+  // The other half of the r6 finding. Counting a PERMANENT_FAILED row as outstanding evidence only
+  // renders the control; if the resolver's own status set still excluded it, pressing the button
+  // would run the recovery, release the reservation, and leave the row exactly as it was — the
+  // control would come back on the next render, forever, and the durable failure would stay
+  // unresolved. `claimIntegrationOutboxWork` never re-claims a PERMANENT_FAILED row, so this
+  // in-transaction resolve is the ONLY thing in the system that can retire it.
+  const seen: Array<{ status: string; nextAttemptAt: unknown }> = []
+  const client = {
+    integrationOutbox: {
+      updateMany: async (args: { where: { status: { in: string[] } }; data: Record<string, unknown> }) => {
+        // Behave like the database: only update a row whose status the predicate actually matches.
+        if (!args.where.status.in.includes('PERMANENT_FAILED')) return { count: 0 }
+        seen.push({ status: String(args.data.status), nextAttemptAt: args.data.nextAttemptAt })
+        return { count: 1 }
+      },
+    },
+  }
+  assert.equal(await resolveRefundReservationReleaseOutbox('refund-dead', { client }), 1)
+  assert.deepEqual(seen, [{ status: 'SUCCEEDED', nextAttemptAt: null }])
 })
 
 test('schedule enqueues a backstop row inside the tx when the order holds allocations', async () => {
