@@ -10,6 +10,7 @@ import {
   FOLLOW_UP_OBLIGATION_AGE_COLUMNS,
   FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN,
   buildFollowUpObligationBacklogWhere,
+  describeFollowUpObligationBacklogRow,
   followUpObligationRecoveryFor,
   readFollowUpObligationDatabaseNow,
 } from '@/lib/domain/accounting/follow-up-obligation-registry'
@@ -799,7 +800,58 @@ function destructuredMarkerAliases(sourceFile: ts.SourceFile): Set<string> {
   return aliases
 }
 
-/** Follow identifiers and parenthesised/`as` wrappers to the expression they actually name. */
+/**
+ * The single expression a function body hands back, or null when there is not exactly one.
+ *
+ * ONE return, deliberately. A body with two of them is a decision this scan cannot make, and the
+ * honest answer to "which clause does this build" is then "unknown" — which is what
+ * {@link couldConcernMarker} is for. Guessing the first branch would be the fail-open shape all over
+ * again, one level further in.
+ */
+function soleReturnExpression(fn: ts.Node): ts.Expression | null {
+  if (ts.isArrowFunction(fn) && !ts.isBlock(fn.body)) return fn.body
+  const body = (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) || ts.isFunctionDeclaration(fn))
+    ? fn.body
+    : undefined
+  if (!body || !ts.isBlock(body)) return null
+  const returns: ts.ReturnStatement[] = []
+  const visit = (node: ts.Node): void => {
+    // A nested function's returns belong to IT, not to this one.
+    if (node !== body && (ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node))) return
+    if (ts.isReturnStatement(node)) returns.push(node)
+    ts.forEachChild(node, visit)
+  }
+  visit(body)
+  return returns.length === 1 && returns[0]!.expression ? returns[0]!.expression : null
+}
+
+/** Every locally declared function, by name — so a call to one can be followed to what it returns. */
+function localFunctions(sourceFile: ts.SourceFile): Map<string, ts.Node> {
+  const functions = new Map<string, ts.Node>()
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionDeclaration(node) && node.name && !functions.has(node.name.text)) {
+      functions.set(node.name.text, node)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return functions
+}
+
+/**
+ * Follow identifiers and parenthesised/`as` wrappers to the expression they actually name — AND A
+ * CALL TO A LOCAL FUNCTION TO THE EXPRESSION IT RETURNS (o3d-0bfh r10, Codex MEDIUM).
+ *
+ * Without the last part, `function stale(c) { return { [MARKER]: olderThan(c) } }` +
+ * `findMany({ where: stale(cutoff) })` was accepted twice over: `predicateClauses` could not resolve
+ * the call and produced NO clauses, so the where-side strict judgement ran over nothing, while the
+ * literal inside the function body was visited in its own right — outside predicate context, where
+ * the judge runs non-strictly and lets a call operand through. Two fail-open answers agreeing.
+ *
+ * Following the return is what puts the literal back INSIDE the predicate, where it is judged
+ * strictly and `olderThan(cutoff)` is refused. It is conservative on purpose: one return statement
+ * only, and a nested function's returns are not this function's.
+ */
 function resolve(expression: ts.Expression, bindings: Map<string, ts.Expression>, seen = new Set<string>()): ts.Expression {
   let current: ts.Expression = expression
   for (;;) {
@@ -809,9 +861,43 @@ function resolve(expression: ts.Expression, bindings: Map<string, ts.Expression>
       const bound = bindings.get(current.text)
       if (bound) { seen.add(current.text); current = bound; continue }
     }
+    if (ts.isCallExpression(current)) {
+      const callee = calleeFunction(current, bindings, seen)
+      const returned = callee ? soleReturnExpression(callee) : null
+      if (returned && !seen.has(`call:${current.getText()}`)) {
+        seen.add(`call:${current.getText()}`)
+        current = returned
+        continue
+      }
+    }
     return current
   }
 }
+
+/** The locally declared function a call expression actually reaches, or null. */
+function calleeFunction(
+  call: ts.CallExpression,
+  bindings: Map<string, ts.Expression>,
+  seen: Set<string>,
+): ts.Node | null {
+  const declared = LOCAL_FUNCTIONS.get(call.getSourceFile())
+  const callee = call.expression
+  if (ts.isIdentifier(callee)) {
+    const named = declared?.get(callee.text)
+    if (named) return named
+    // `const build = () => ({ ... })` lands in the binding table rather than the function table.
+    const bound = bindings.get(callee.text)
+    if (bound && !seen.has(`fn:${callee.text}`)) {
+      seen.add(`fn:${callee.text}`)
+      const inner = resolve(bound, bindings, seen)
+      if (ts.isArrowFunction(inner) || ts.isFunctionExpression(inner)) return inner
+    }
+  }
+  return null
+}
+
+/** Per-source-file function tables, populated by `markerClockReads` before it walks. */
+const LOCAL_FUNCTIONS = new WeakMap<ts.SourceFile, Map<string, ts.Node>>()
 
 /** The property's key as written — following a computed key to its string, when it names one. */
 function keyOf(
@@ -952,23 +1038,70 @@ function judgeMarkerPredicateOperand(resolved: ts.Expression, sourceFile: ts.Sou
  */
 function markerClockReads(code: string, fileName = 'scan.ts'): string[] {
   const sourceFile = ts.createSourceFile(fileName, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  LOCAL_FUNCTIONS.set(sourceFile, localFunctions(sourceFile))
   const bindings = localBindings(sourceFile)
   const aliases = destructuredMarkerAliases(sourceFile)
   const offences: string[] = []
 
-  /** The object literals a `where`/`AND`/`OR`/`NOT` value actually stands for. */
-  const predicateClauses = (expression: ts.Expression, depth = 0): ts.ObjectLiteralExpression[] => {
-    if (depth > 3) return []
+  /**
+   * Does this expression have anything to do with THIS COLUMN? — the question that decides whether
+   * an unreadable predicate is this scan's business (o3d-0bfh r10).
+   *
+   * Scans the resolved subtree, and — for a call — the body of the local function it reaches, for
+   * the column name in any of the forms it can wear: an identifier, a destructured alias, a string
+   * literal (a computed key), a property access.
+   */
+  const couldConcernMarker = (expression: ts.Expression, depth = 0): boolean => {
+    if (depth > 3) return false
     const resolved = resolve(expression, bindings)
-    if (ts.isObjectLiteralExpression(resolved)) return [resolved]
+    let found = false
+    const roots: ts.Node[] = [resolved]
+    if (ts.isCallExpression(resolved)) {
+      const callee = calleeFunction(resolved, bindings, new Set())
+      if (callee) roots.push(callee)
+    }
+    const visit = (node: ts.Node): void => {
+      if (found) return
+      if (ts.isIdentifier(node) && (node.text === MARKER || aliases.has(node.text))) { found = true; return }
+      if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) && node.text === MARKER) { found = true; return }
+      if (ts.isPropertyAccessExpression(node) && node.name.text === MARKER) { found = true; return }
+      ts.forEachChild(node, visit)
+    }
+    for (const root of roots) visit(root)
+    return found
+  }
+
+  /**
+   * The object literals a `where`/`AND`/`OR`/`NOT` value actually stands for, AND THE EXPRESSIONS IT
+   * COULD NOT RESOLVE (o3d-0bfh r10, Codex MEDIUM).
+   *
+   * Returning an empty clause list for anything unreadable was a fail-open answer wearing the shape
+   * of a clean result: the where-side strict judgement then ran over nothing at all, and the caller
+   * could not tell "this predicate holds no marker clause" from "this predicate is unreadable".
+   * Those are the two answers this scan must never confuse — the whole finding, twice now.
+   */
+  const predicateClauses = (
+    expression: ts.Expression,
+    depth = 0,
+  ): { clauses: ts.ObjectLiteralExpression[]; unresolved: ts.Expression[] } => {
+    if (depth > 3) return { clauses: [], unresolved: [expression] }
+    const resolved = resolve(expression, bindings)
+    if (ts.isObjectLiteralExpression(resolved)) return { clauses: [resolved], unresolved: [] }
     // `AND: [...]` / `OR: [...]` — each element is a clause in its own right.
     if (ts.isArrayLiteralExpression(resolved)) {
-      return resolved.elements.flatMap((element) =>
-        ts.isSpreadElement(element)
-          ? predicateClauses(element.expression, depth + 1)
-          : predicateClauses(element, depth + 1))
+      const clauses: ts.ObjectLiteralExpression[] = []
+      const unresolved: ts.Expression[] = []
+      for (const element of resolved.elements) {
+        const inner = predicateClauses(
+          ts.isSpreadElement(element) ? element.expression : element as ts.Expression,
+          depth + 1,
+        )
+        clauses.push(...inner.clauses)
+        unresolved.push(...inner.unresolved)
+      }
+      return { clauses, unresolved }
     }
-    return []
+    return { clauses: [], unresolved: [resolved] }
   }
 
   const visit = (node: ts.Node): void => {
@@ -991,7 +1124,24 @@ function markerClockReads(code: string, fileName = 'scan.ts'): string[] {
         //     elsewhere and passed in by name is judged as the predicate it becomes — which is
         //     also the only way position is known at all.
         if (key === null || !PREDICATE_KEYS.has(key) || !ts.isPropertyAssignment(property)) continue
-        for (const clause of predicateClauses(property.initializer)) {
+        const predicate = predicateClauses(property.initializer)
+        // 1c. AND WHAT IT COULD NOT READ IS AN OFFENCE, NOT AN EMPTY RESULT (o3d-0bfh r10).
+        //
+        //     SCOPED TO THIS COLUMN, and that narrowing is measured rather than assumed: 93 `where`
+        //     values across lib/, app/ and scripts/ are helper-built and unresolvable, essentially
+        //     all of them about other columns entirely. Refusing every one of them would make this
+        //     rule unusable, and an unusable rule gets deleted — which is a worse outcome for this
+        //     column than a rule that refuses only what could possibly concern it. So the test is
+        //     "does this expression, or the local function it calls, mention the marker at all".
+        for (const unreadable of predicate.unresolved) {
+          if (!couldConcernMarker(unreadable)) continue
+          offences.push(
+            `${MARKER}: ${unreadable.getText(sourceFile).replace(/\s+/g, ' ')} — a ${key} clause this scan cannot `
+            + 'resolve, built where the marker is named. An unreadable predicate is not an absent one: it can '
+            + 'return a range comparison on the generation from exactly this position',
+          )
+        }
+        for (const clause of predicate.clauses) {
           for (const inner of clause.properties) {
             if (keyOf(inner, bindings) !== MARKER) continue
             const value = ts.isShorthandPropertyAssignment(inner)
@@ -1337,51 +1487,185 @@ test('[o3d-0bfh r8] the migration stamps the claim clock from the database and l
 // instruction coming back.
 // ---------------------------------------------------------------------------
 
-/** Every operator-facing string this branch is responsible for, and where it is rendered. */
-function remedySurfaces(): Array<{ what: string; text: string }> {
-  const quickbooks = followUpObligationRecoveryFor('quickbooks')
-  const undeclared = followUpObligationRecoveryFor('sage')
-  assert.equal(quickbooks.consumer, 'none')
-  assert.equal(undeclared.consumer, 'none')
-  if (quickbooks.consumer !== 'none' || undeclared.consumer !== 'none') return []
-  return [
-    { what: "the QuickBooks registry remedy (exception inbox + every retained-obligation log line)", text: quickbooks.operatorRemedy },
-    { what: 'the UNDECLARED-connector fallback remedy', text: undeclared.operatorRemedy },
-    { what: 'FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN', text: FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN },
-  ]
+/**
+ * THE ONE LIST. The instructions no surface may carry for a retained follow-up obligation, with why.
+ *
+ * Every check in this file runs THIS array — the registry strings, the exception inbox, the operator
+ * documentation, the connector's activity messages. A pattern added for one is a pattern added for
+ * all, which is the whole point: the r8 failure was two lists, and the r9 failure was that the list
+ * covering the RENDERED strings was the smaller of the two, so `re-driven by hand` was banned in the
+ * UI and permitted in the registry entry the UI renders.
+ */
+const BANNED_OPERATOR_INSTRUCTIONS: Array<{ pattern: RegExp; why: string }> = [
+  {
+    pattern: /\bcreate (only|ONLY)\b/,
+    why: 'remote absence is not proof that creation is safe — a payment can be PENDING in the local queue while '
+      + 'the accounting package shows none',
+  },
+  {
+    // The lookbehind exempts the exception-inbox SECTION TITLE ("...with nothing to re-drive
+    // them"), which is a statement that nothing will, not an instruction that somebody should.
+    pattern: /(?<!nothing to )re-?driv(e|en) (it|them|this|the)\b/i,
+    why: 'a re-drive on the money path can double a payment already queued',
+  },
+  {
+    pattern: /re-?driven by hand/i,
+    why: 'same: it authorises a hand-made payment that no request id can deduplicate',
+  },
+  {
+    pattern: /register the receipt in QuickBooks by hand/i,
+    why: 'a payment created in the QuickBooks UI cannot be deduplicated against the queued row',
+  },
+  {
+    pattern: /re-run the invoice sync/i,
+    why: 'it is a re-drive instruction wearing different words',
+  },
+]
+
+/** Runs the ONE list over one string, naming the surface in every failure. */
+function assertNoBannedInstruction(what: string, text: string): void {
+  for (const { pattern, why } of BANNED_OPERATOR_INSTRUCTIONS) {
+    assert.doesNotMatch(text, pattern, `${what} carries a banned operator instruction — ${why}`)
+  }
 }
 
-test('[o3d-0bfh r8] no operator-facing remedy authorises creating a payment, and each one escalates instead', () => {
-  // Route: followUpObligationRecoveryFor(...).operatorRemedy and
-  // FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN — the three strings the exception inbox and the
-  // connector's log lines are built from (describeFollowUpObligationBacklogRow reads the first).
+/** A connector that is deliberately NOT in the registry, so the fallback branch is exercised. */
+const UNDECLARED_CONNECTOR = 'sage'
+
+/**
+ * EVERY RUNTIME STRING THE REMEDY SURFACES RETURN, taken from the functions that produce them rather
+ * than from the constants they happen to be built out of today.
+ *
+ * `describeFollowUpObligationBacklogRow` is the ONE producer: the exception inbox renders its
+ * `blockedBy` and `operatorRemedy` per row, and `followUpObligationRecoveryNote` composes the same
+ * remedy into every activity message and console line. So this walks every connector the registry
+ * declares PLUS an undeclared one, and takes both strings from each.
+ *
+ * Reading it through the describer rather than off the registry constants is deliberate — r9's
+ * finding was a string that existed only in a surface. `blockedBy` is included for the same reason:
+ * it is rendered beside the remedy and an instruction in it reads exactly like an instruction.
+ */
+function remedySurfaces(): Array<{ what: string; text: string; mustEscalate: boolean }> {
+  const connectors = [...Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY), UNDECLARED_CONNECTOR]
+  // Non-vacuity: the walk must cover the connector the finding is about AND the fallback branch.
+  assert.ok(connectors.includes('quickbooks'), 'the registry must still declare quickbooks')
+  assert.ok(connectors.includes('xero'), 'and xero, whose consumer branch produces its own strings')
+  assert.equal(ACCOUNTING_FOLLOW_UP_RECOVERY[UNDECLARED_CONNECTOR], undefined,
+    `${UNDECLARED_CONNECTOR} must stay undeclared, or this stops exercising the fallback`)
+
+  const surfaces: Array<{ what: string; text: string; mustEscalate: boolean }> = []
+  for (const connector of connectors) {
+    const recovery = followUpObligationRecoveryFor(connector)
+    const row = describeFollowUpObligationBacklogRow({
+      id: `log-${connector}`,
+      connector,
+      type: 'SALES_INVOICE',
+      status: 'SYNCED',
+      referenceType: 'SalesOrder',
+      referenceId: 'so-1',
+      externalTransactionId: 'INV-1',
+      backReferenceFollowUpsPendingAt: new Date('2026-01-01T00:00:00.000Z'),
+      backReferenceFollowUpsClaimedAtDatabaseClock: new Date('2026-01-01T00:00:00.000Z'),
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+    })
+    // A connector WITH a consumer never reaches this backlog, so its two strings are the
+    // "these two disagree" diagnostics rather than a remedy: scanned, but not required to escalate.
+    const noConsumer = recovery.consumer === 'none'
+    surfaces.push({
+      what: `the ${connector} remedy rendered by describeFollowUpObligationBacklogRow`,
+      text: row.operatorRemedy,
+      mustEscalate: noConsumer,
+    })
+    surfaces.push({
+      what: `the ${connector} blockedBy text rendered beside it`,
+      text: row.blockedBy,
+      mustEscalate: false,
+    })
+  }
+  surfaces.push({
+    what: 'FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN (the exception inbox section detail)',
+    text: FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN,
+    mustEscalate: true,
+  })
+  return surfaces
+}
+
+test('[o3d-0bfh r8/r10] no runtime remedy string authorises creating a payment, judged by THE ONE LIST', () => {
+  // Route: describeFollowUpObligationBacklogRow(...).operatorRemedy and .blockedBy for EVERY
+  // registry connector plus an undeclared one, and FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN — i.e.
+  // every string the exception inbox renders and every string followUpObligationRecoveryNote
+  // composes into an activity message or a console line.
   //
-  // Mutation: put r7's "create ONLY what is verifiably absent" back into either remedy and the
-  // authorisation assertion fails on that surface; drop "escalate" and the escalation assertion
-  // fails, which is what stops the fix being "delete the sentence and say nothing".
+  // r9 left this test running a SMALLER inline list of its own while the UI and processor scans ran
+  // BANNED_OPERATOR_INSTRUCTIONS. The two disagreed on `re-driven by hand`, and the disagreement fell
+  // exactly where it mattered: the registry remedy is the string the UI interpolates, so a phrase the
+  // UI scan banned was permitted in the value the UI displays. There is now one list and it is this
+  // one; the inline copy is gone.
+  //
+  // Mutation: put r7's "create ONLY what is verifiably absent" into any remedy, or append
+  // "this still has to be re-driven by hand" to QUICKBOOKS_RECOVERY.operatorRemedy, and this fails
+  // naming the surface. Drop "escalate" and the escalation assertion fails, which is what stops the
+  // fix being "delete the sentence and say nothing". See the dedicated control below.
   const surfaces = remedySurfaces()
-  assert.equal(surfaces.length, 3, 'all three surfaces must be under test')
-  for (const { what, text } of surfaces) {
-    assert.doesNotMatch(
-      text, /\bcreate (only|ONLY)\b/,
-      `${what} tells an operator to create what is "verifiably absent". Remote absence is not proof that creation `
-        + 'is safe: a payment can be PENDING in the local queue while QuickBooks shows none.',
-    )
-    assert.doesNotMatch(
-      // The lookbehind exempts the exception-inbox SECTION TITLE ("...with nothing to re-drive
-      // them"), which is a statement that nothing will, not an instruction that somebody should.
-      text, /(?<!nothing to )re-?driv(e|en) (it|them|this|the)\b|register the receipt in QuickBooks by hand|re-run the invoice sync/i,
-      `${what} recommends a direct re-drive on a money path`,
-    )
-    assert.match(text, /escalat/i, `${what} must say what to do instead of creating: escalate`)
+  // Two strings per registry connector, two for the undeclared fallback, plus the section detail.
+  assert.equal(
+    surfaces.length, (Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY).length + 1) * 2 + 1,
+    'every connector contributes BOTH of its rendered strings, or the walk is not exhaustive',
+  )
+  for (const { what, text, mustEscalate } of surfaces) {
+    assert.ok(text.length > 0, `${what} must actually be a string, or this scan reads nothing`)
+    assertNoBannedInstruction(what, text)
+    if (mustEscalate) assert.match(text, /escalat/i, `${what} must say what to do instead of creating: escalate`)
   }
 
   // And the QuickBooks remedy has to explain WHY reading first is not enough, or the next round
   // reinstates it as an obvious improvement.
-  const [quickbooks] = surfaces
+  const quickbooks = surfaces.find((surface) => surface.what.startsWith('the quickbooks remedy'))
+  assert.ok(quickbooks, 'the QuickBooks remedy must be one of the surfaces walked')
   assert.match(quickbooks.text, /PENDING/, 'it names the state the queued payment is actually in')
   assert.match(quickbooks.text, /INVOICE_PAYMENT[\s\S]*INVOICE_PDF/, 'and the enqueue ORDER that creates the window')
   assert.match(quickbooks.text, /DO NOT CREATE/, 'and it refuses in as many words')
+})
+
+test('[o3d-0bfh r10] CONTROL: the shipped registry remedy with `re-driven by hand` appended is REFUSED', () => {
+  // THE CODEX MEDIUM, AS A CONTROL. The claim "one list covers the rendered strings" is worth
+  // nothing unless the list can be shown to reject the exact instruction it says it bans, ON THE
+  // EXACT STRING the finding named. r9's registry check could not: its inline list had no
+  // `re-driven by hand` pattern, so appending that sentence to QUICKBOOKS_RECOVERY.operatorRemedy
+  // while keeping all the unknown/escalate prose passed every test in this file and was rendered in
+  // the inbox and in every activity message.
+  //
+  // Route: the SHIPPED string, mutated here rather than in the registry, so the control cannot rot
+  // into a test of a hardcoded sentence. If the registry remedy is rewritten, this mutates whatever
+  // it has become.
+  const shipped = followUpObligationRecoveryFor('quickbooks')
+  assert.equal(shipped.consumer, 'none')
+  if (shipped.consumer !== 'none') return
+  // The shipped string passes — the precondition, so a list that rejected everything would not
+  // satisfy this control either.
+  assertNoBannedInstruction('the shipped QuickBooks remedy', shipped.operatorRemedy)
+
+  const mutated = `${shipped.operatorRemedy}. Note that this still has to be re-driven by hand`
+  assert.throws(
+    () => assertNoBannedInstruction('the mutated QuickBooks remedy', mutated),
+    /banned operator instruction/,
+    'THE ONE LIST must reject `re-driven by hand` in the registry remedy — this is the surface the '
+      + 'exception inbox and every retained-obligation log line interpolate, and it is where r9 let it through',
+  )
+
+  // And the other three instructions the r7 rounds produced, on the same shipped string, so the
+  // control covers the list rather than one entry of it.
+  for (const phrase of [
+    ' Read the ledger and create ONLY what is verifiably absent',
+    ' If it is missing, register the receipt in QuickBooks by hand',
+    ' Otherwise re-run the invoice sync for this reference',
+  ]) {
+    assert.throws(
+      () => assertNoBannedInstruction('the mutated QuickBooks remedy', shipped.operatorRemedy + phrase),
+      /banned operator instruction/,
+      `THE ONE LIST must reject "${phrase.trim()}" in the registry remedy`,
+    )
+  }
 })
 
 test('[o3d-0bfh r8] the QuickBooks processor no longer asserts that follow-up work was not enqueued', () => {
@@ -1439,38 +1723,6 @@ test('[o3d-0bfh r8] the QuickBooks processor no longer asserts that follow-up wo
 // somebody writing a fresh paragraph that happens to avoid the banned words.
 // ---------------------------------------------------------------------------
 
-/**
- * The instructions no surface may carry for a retained follow-up obligation, with why.
- *
- * Shared by the registry-string test above and the surface scan below so that a pattern added for
- * one is a pattern added for all — the r8 failure was two lists, not two files.
- */
-const BANNED_OPERATOR_INSTRUCTIONS: Array<{ pattern: RegExp; why: string }> = [
-  {
-    pattern: /\bcreate (only|ONLY)\b/,
-    why: 'remote absence is not proof that creation is safe — a payment can be PENDING in the local queue while '
-      + 'the accounting package shows none',
-  },
-  {
-    // The lookbehind exempts the exception-inbox SECTION TITLE ("...with nothing to re-drive
-    // them"), which is a statement that nothing will, not an instruction that somebody should.
-    pattern: /(?<!nothing to )re-?driv(e|en) (it|them|this|the)\b/i,
-    why: 'a re-drive on the money path can double a payment already queued',
-  },
-  {
-    pattern: /re-?driven by hand/i,
-    why: 'same: it authorises a hand-made payment that no request id can deduplicate',
-  },
-  {
-    pattern: /register the receipt in QuickBooks by hand/i,
-    why: 'a payment created in the QuickBooks UI cannot be deduplicated against the queued row',
-  },
-  {
-    pattern: /re-run the invoice sync/i,
-    why: 'it is a re-drive instruction wearing different words',
-  },
-]
-
 /** The UI section for this backlog, sliced out of the inbox by its own section markers. */
 function accountingFollowUpSection(): { slice: string; whole: string } {
   const full = path.join(REPO_ROOT, 'app', '(dashboard)', 'sync', 'exceptions', 'exceptions-client.tsx')
@@ -1524,12 +1776,7 @@ test('[o3d-0bfh r9] the exception inbox renders the registry remedy and authors 
     'each row must render its connector\'s declared remedy rather than a sentence written here',
   )
 
-  for (const { pattern, why } of BANNED_OPERATOR_INSTRUCTIONS) {
-    assert.doesNotMatch(
-      slice, pattern,
-      `the exception inbox's accounting follow-up section carries a banned instruction — ${why}`,
-    )
-  }
+  assertNoBannedInstruction("the exception inbox's accounting follow-up section", slice)
 })
 
 test('[o3d-0bfh r9] the operator documentation for these rows authorises no hand settlement either', () => {
@@ -1550,12 +1797,7 @@ test('[o3d-0bfh r9] the operator documentation for these rows authorises no hand
 
   assert.equal(scoped.length > 0, true, 'the documentation must still describe the QuickBooks follow-up backlog')
   for (const paragraph of scoped) {
-    for (const { pattern, why } of BANNED_OPERATOR_INSTRUCTIONS) {
-      assert.doesNotMatch(
-        paragraph, pattern,
-        `help-docs/xero-sync.md tells an operator to settle a retained follow-up by hand — ${why}\n${paragraph.slice(0, 300)}`,
-      )
-    }
+    assertNoBannedInstruction(`help-docs/xero-sync.md (${paragraph.slice(0, 80).replace(/\s+/g, ' ')}…)`, paragraph)
   }
   // CONTROL: the doc still carries the refusal, so "delete the guidance" is not a passing strategy.
   assert.match(
@@ -1579,11 +1821,7 @@ test('[o3d-0bfh r9] the activity messages and the shared recovery note carry the
   const processor = readSource(path.join(REPO_ROOT, 'lib', 'connectors', 'quickbooks', 'sync-processor.ts'))
   const backReference = readSource(path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'back-reference.ts'))
 
-  for (const source of [processor, backReference]) {
-    for (const { pattern, why } of BANNED_OPERATOR_INSTRUCTIONS) {
-      assert.doesNotMatch(source.code, pattern, `${source.rel} carries a banned instruction — ${why}`)
-    }
-  }
+  for (const source of [processor, backReference]) assertNoBannedInstruction(source.rel, source.code)
 
   // The shared note must COMPOSE the registry's remedy, so a connector's declaration is what an
   // operator reads wherever the note is logged.
@@ -1611,6 +1849,39 @@ test('[o3d-0bfh r9] the marker scan REFUSES the shapes it cannot read, instead o
   // judgeMarkerPredicateOperand, and the first four fail. Remove the alias tracking and the
   // destructuring case fails; remove flattenTemplate and the composed-SQL case fails.
   const refused: Array<{ what: string; code: string }> = [
+    {
+      // CODEX r9 MEDIUM, AND THE REASON r10 EXISTS. r9 refused the helper-built OPERAND and left the
+      // helper-built WHOLE CLAUSE open, because `predicateClauses` answered "no clauses" for a call
+      // it could not resolve. The literal inside the function was then visited on its own, OUTSIDE
+      // predicate context, where the judge runs non-strictly and accepts a call operand. Two
+      // fail-open answers, each covering for the other, and the range comparison came straight back.
+      what: 'A HELPER RETURNING THE WHOLE WHERE CLAUSE',
+      code: 'function stale(cutoff) { return { backReferenceFollowUpsPendingAt: olderThan(cutoff) } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: stale(cutoff) })',
+    },
+    {
+      what: 'the same helper written as an arrow',
+      code: 'const stale = (cutoff) => ({ backReferenceFollowUpsPendingAt: olderThan(cutoff) })\n'
+        + 'await db.accountingSyncLog.findMany({ where: stale(cutoff) })',
+    },
+    {
+      what: 'a helper returning a whole clause into an AND array',
+      code: 'function stale(cutoff) { return { backReferenceFollowUpsPendingAt: { lt: cutoff } } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: { AND: [stale(cutoff)] } })',
+    },
+    {
+      // The branch the return-following deliberately will NOT guess at: two returns, so the clause
+      // is unknown. Unknown is an OFFENCE now, which is the half of the fix that does not depend on
+      // being able to read the helper at all.
+      what: 'a helper with two returns, so the clause it builds is unknowable',
+      // Both branches use a CALL operand on purpose: a `{ lt: c }` literal would be caught by the
+      // range-operator rule wherever it sits, so the case would not discriminate. This one is
+      // invisible to every other check in the scan, and is caught only because an unreadable
+      // predicate that names the column is now an offence in its own right.
+      code: 'function stale(c, flag) { if (flag) { return { backReferenceFollowUpsPendingAt: olderThan(c) } }\n'
+        + ' return { backReferenceFollowUpsPendingAt: notOlderThan(c) } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: stale(cutoff, true) })',
+    },
     {
       what: 'a helper-built range predicate',
       code: 'const cutoff = new Date(); await db.accountingSyncLog.findMany({ where: { backReferenceFollowUpsPendingAt: olderThan(cutoff) } })',
@@ -1688,6 +1959,20 @@ test('[o3d-0bfh r9] the marker scan REFUSES the shapes it cannot read, instead o
     {
       what: 'a null equality test written plainly',
       code: 'await db.accountingSyncLog.findMany({ where: { backReferenceFollowUpsPendingAt: null } })',
+    },
+    {
+      // THE OTHER HALF OF r10, and the reason the fix follows a local function's return instead of
+      // simply refusing every unreadable clause that names the column. The protocol's own backlog
+      // predicate IS built by a helper, and a rule that refused this would refuse the code it exists
+      // to protect — which is how a rule stops being run.
+      what: 'a LOCAL HELPER returning the protocol\'s own existence predicate as a whole where clause',
+      code: 'function owedWhere() { return { backReferenceFollowUpsPendingAt: { not: null } } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: owedWhere() })',
+    },
+    {
+      what: 'a local helper returning the equality fence as a whole where clause',
+      code: 'const fenceWhere = (id, generation) => ({ id, backReferenceFollowUpsPendingAt: generation })\n'
+        + 'await db.accountingSyncLog.updateMany({ where: fenceWhere(row.id, generation), data: { backReferenceFollowUpsPendingAt: null } })',
     },
   ]
   for (const { what, code } of allowed) {
