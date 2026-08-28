@@ -100,7 +100,11 @@ restored clone or a staging server -- which carries the same database name, sche
 identifier as production -- is refused rather than used (o3d-2k5r r26). That measurement is repeated
 for every lock acquisition rather than cached for the life of the process, and the probe itself is
 bounded (5s per connect, 5s per statement, 20s overall) so a pooler that accepts a socket and then
-stops answering refuses the restore instead of hanging it (o3d-2k5r r27). The refusal happens before
+stops answering refuses the restore instead of hanging it (o3d-2k5r r27). Obtaining the lock
+connection is bounded on the same terms whether or not an override is set -- 5s for the directness
+proof and a 30s backstop over the whole acquisition, with the connection's socket destroyed on
+expiry (o3d-2k5r r28) -- so a restore that cannot take its fence is refused rather than left
+waiting. The refusal happens before
 the restore starts, so nothing is half-applied by it.
 
 What none of that claims: it detects an override that reaches a different PostgreSQL from the data
