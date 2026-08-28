@@ -874,7 +874,9 @@ test('[o3d-batch-ret] a REFUSED enqueue keeps the marker even though every recei
   const result = await redrive('INV-1', OBLIGATION, refusalPrerequisite)
 
   assert.deepEqual(
-    state.markerClears, [],
+    // Mapped rather than compared whole: `assert.deepEqual(state.markerClears, [])` narrows the
+    // property to `never[]` for the rest of this function, and the second half below has to index it.
+    state.markerClears.map((write) => write.where), [],
     'THE LOAD-BEARING ASSERTION: nothing cleared the obligation. The payment was REFUSED and nothing '
     + 'was queued, so the marker is the only record left that the work is owed',
   )
