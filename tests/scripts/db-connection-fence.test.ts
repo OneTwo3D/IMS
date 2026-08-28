@@ -45,6 +45,11 @@ function withPgEnv(values: Record<string, string>): () => void {
 }
 
 import {
+  IDENTITY_ENVIRONMENT_VARIABLES,
+  applyServiceEnvironment,
+  processOsAccount,
+  readServiceEnvironment,
+  serviceEnvironmentPaths,
   EXIT_ERROR,
   EXIT_FENCE_STANDING,
   EXIT_FENCE_UNPROVEN,
@@ -85,13 +90,35 @@ import {
  */
 const ATTACHED_AS_ADMIN = { connectedLoginRole: 'deployadmin', connectedEffectiveRole: 'deployadmin' }
 
-/** Run the shipped script from a directory with no .env, and report what it said. */
-function runFenceScript(args: string[], env: Record<string, string | undefined>) {
+/**
+ * Run the shipped script from a directory with no .env, and report what it said.
+ *
+ * THE SERVICE'S ENVIRONMENT IS SUPPLIED AS A FILE, not as this process's environment
+ * (o3d-2sm1.5, Codex r17 CRITICAL). The script reconstructs PGHOST/PGPORT/PGUSER/PGDATABASE from
+ * the file the unit's `EnvironmentFile=` names and refuses when it cannot read one, precisely so
+ * that a variable in the calling shell cannot decide where the application connects. `serviceEnv`
+ * is that file's contents; passing `null` supplies no file at all, which is the refusal case.
+ */
+function runFenceScript(
+  args: string[],
+  env: Record<string, string | undefined>,
+  serviceEnv: string | null = '',
+) {
+  const cwd = mkdtempSync(join(tmpdir(), 'ims-fence-'))
+  let serviceEnvFile: string | undefined
+  if (serviceEnv !== null) {
+    serviceEnvFile = join(cwd, 'service.env')
+    writeFileSync(serviceEnvFile, serviceEnv)
+  }
   try {
     const stdout = execFileSync('node', [join(process.cwd(), 'scripts/fence-db-connections.mjs'), ...args], {
       encoding: 'utf8',
-      env: { ...process.env, ...env },
-      cwd: mkdtempSync(join(tmpdir(), 'ims-fence-')),
+      env: {
+        ...process.env,
+        IMS_SERVICE_ENV_FILE: serviceEnvFile ?? join(cwd, 'no-such-file.env'),
+        ...env,
+      },
+      cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     return { status: 0, output: stdout }
@@ -1975,4 +2002,225 @@ test('the deploy account\'s own OS user is not the application\'s login role, an
   } finally {
     restore()
   }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r17, CRITICAL + MEDIUM) — WHOSE ENVIRONMENT, AND WHOSE ACCOUNT.
+//
+// r16 moved identity onto the driver, and the driver reads PGHOST/PGPORT/PGUSER/PGDATABASE from
+// the environment OF WHICHEVER PROCESS ASKS. This one's is the deploy shell's; the application's
+// is systemd's `Environment=` plus the unit's `EnvironmentFile=`. So the more faithfully this
+// followed the driver, the more faithfully it followed the wrong environment — and a `PGPORT` in
+// an operator's shell, absent from the service file, moved the whole fence onto another cluster.
+//
+// The tests below are about the two halves of that: the environment the script resolves in, and
+// the OS account it is entitled to treat as the application's.
+// ---------------------------------------------------------------------------
+
+/** Set or DELETE environment variables for the length of one test, and put back what was there. */
+function withEnv(values: Record<string, string | undefined>): () => void {
+  const previous = new Map<string, string | undefined>()
+  for (const [key, value] of Object.entries(values)) {
+    previous.set(key, process.env[key])
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+  return () => {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+/** One service environment file, written where only this test can see it. */
+function serviceEnvFile(contents: string): string {
+  const path = join(mkdtempSync(join(tmpdir(), 'ims-fence-env-')), 'service.env')
+  writeFileSync(path, contents)
+  return path
+}
+
+test('the deploy shell\'s PGPORT is not the application\'s, and the fence resolves the SERVICE\'S', () => {
+  // ROUTE: main() -> readServiceEnvironment(serviceEnvironmentPaths()) -> applyServiceEnvironment()
+  // -> process.env -> the `pg.Client` resolveDriverIdentity() builds -> parseConnectionIdentity()
+  // -> assessDatabaseIdentity(), which is what licenses the fence.
+  //
+  // MUTATION ROUTE: delete the `delete env[name]` loop from applyServiceEnvironment() (or the
+  // applyServiceEnvironment() call from main()). The ambient PGPORT below survives, the identity
+  // reads 6432 -- the port the deploy shell happens to carry -- and the first assertion fails.
+  // Deleting only the re-apply loop instead fails the second: the service's own 5432 is lost and
+  // pg's static default answers for it, which is the same number by accident and NOT by
+  // reconstruction, so the third case (a service file naming 6544) is what pins that half.
+  const file = serviceEnvFile('PGPORT=5432\n')
+  const restore = withEnv({ PGPORT: '6432', PGHOST: 'deploy-shell.example', PGUSER: undefined, PGDATABASE: undefined })
+  try {
+    // PRECONDITION, MEASURED ON THE DRIVER: the ambient variables really do move the connection.
+    // Without this the test could pass against a driver that ignored them.
+    assert.equal(driverConnection('postgres://imsapp@localhost/imsdb').port, 6432, 'precondition: the deploy shell\'s PGPORT reaches the driver')
+
+    const service = readServiceEnvironment([file])
+    assert.equal(service.ok, true, service.reason)
+    const applied = applyServiceEnvironment(service)
+    assert.deepEqual(applied.applied, ['PGPORT=5432'])
+    assert.ok(applied.removed.includes('PGPORT=6432'), 'the deploy shell\'s copy is taken away, not merged with')
+    assert.ok(applied.removed.includes('PGHOST=deploy-shell.example'), 'and so is every other identity variable it carried')
+
+    const identity = parseConnectionIdentity('postgres://imsapp@localhost/imsdb')
+    assert.equal(identity.port, '5432', 'the fence resolves the port the SERVICE has, not the one this shell has')
+    assert.equal(identity.host, 'localhost', 'and a host the deploy shell invented does not survive at all')
+  } finally {
+    restore()
+  }
+
+  // THE OTHER DIRECTION, which a mere `delete` would pass by accident: a service file whose PGPORT
+  // is neither the ambient one nor pg's default has to be the answer.
+  const other = serviceEnvFile('PGPORT=6544\n')
+  const restoreOther = withEnv({ PGPORT: '6432', PGHOST: undefined, PGUSER: undefined, PGDATABASE: undefined })
+  try {
+    applyServiceEnvironment(readServiceEnvironment([other]))
+    assert.equal(parseConnectionIdentity('postgres://imsapp@localhost/imsdb').port, '6544')
+  } finally {
+    restoreOther()
+  }
+})
+
+test('a service environment that cannot be read is a REFUSAL, never a fallback to this shell\'s', () => {
+  // ROUTE: main() -> readServiceEnvironment() -> ok:false -> exit before any connection is opened.
+  //
+  // MUTATION ROUTE: make readServiceEnvironment() return `{ ok: true, values: {} }` when no file
+  // could be read (i.e. "assume the service sets none"). Both assertions fail: the script runs on,
+  // and it runs on the ambient environment -- which is precisely the guess this refuses to make,
+  // because the unreadable file is the only thing that could have contradicted it.
+  const missing = readServiceEnvironment(['/nonexistent/one.env', '/nonexistent/two.env'])
+  assert.equal(missing.ok, false)
+  assert.match(missing.reason, /will NOT fall back to its own shell's environment/)
+
+  // ...and the shipped script exits on it, with the code its callers read as "nothing was
+  // revoked" so a deploy aborts cleanly rather than proceeding unfenced.
+  const refused = runFenceScript(['--preflight'], {
+    DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
+    DATABASE_URL: 'postgresql://imsapp@127.0.0.1:5432/ims',
+  }, null)
+  assert.equal(refused.status, EXIT_NOT_FENCEABLE)
+  assert.match(refused.output, /could be read/)
+})
+
+test('two service environment files that disagree about an identity variable are refused', () => {
+  // ROUTE: readServiceEnvironment() reads `<app dir>/.env` (systemd's EnvironmentFile) and
+  // `<app dir>/.env.local` (Next's own dotenv load). Which one the application ends up connecting
+  // with depends on the order those two happen in, so there is no answer to give.
+  //
+  // MUTATION ROUTE: keep the first value and drop the disagreement check. This returns ok with
+  // PGPORT=5432 while the application may well be on 6432 -- a fence proved against a cluster
+  // nobody chose, which is the whole finding in a second costume.
+  const first = serviceEnvFile('PGPORT=5432\n')
+  const second = serviceEnvFile('PGPORT=6432\n')
+  const clash = readServiceEnvironment([first, second])
+  assert.equal(clash.ok, false)
+  assert.match(clash.reason, /PGPORT="5432"[\s\S]*PGPORT="6432"/)
+  assert.match(clash.reason, /Delete one of them/)
+
+  // The control: the SAME value in both files is not a disagreement.
+  const agreeing = readServiceEnvironment([first, serviceEnvFile('PGPORT=5432\nPGHOST=db.example\n')])
+  assert.equal(agreeing.ok, true)
+  assert.deepEqual(agreeing.values, { PGPORT: '5432', PGHOST: 'db.example' })
+})
+
+test('the OS account is the application\'s when this process owns the service\'s environment file', () => {
+  // r16 subtracted EVERY OS-account fallback, on the grounds that this script runs as the deploy
+  // account. In the supported installation it does not: deploy.sh, update.sh and install.sh all
+  // run this helper through `runuser -u ${APP_USER}`, and the generated unit runs `User=${APP_USER}`.
+  // So a peer-authenticated URL that names no role was refused for naming no role, and upgrades of
+  // a working installation were blocked.
+  //
+  // ROUTE: applyServiceEnvironment() -> PGUSER in the reconstructed environment -> the driver
+  // resolves the login role as a SETTING -> the OS_ACCOUNT_SENTINEL probe in
+  // resolveDriverIdentity() has nothing to catch -> parseConnectionIdentity().user.
+  //
+  // MUTATION ROUTE: drop the `ownedByThisProcess && osAccount` arm from applyServiceEnvironment()
+  // and the first assertion returns to '' -- the r16 behaviour, i.e. the finding. Drop the
+  // `ownedByThisProcess` CONDITION instead and the second assertion fails: the deploy account's
+  // identity is then accepted as the application's, which is what the sentinel exists to stop.
+  const restore = withEnv({ PGUSER: undefined, PGHOST: undefined, PGPORT: undefined, PGDATABASE: undefined })
+  try {
+    const account = processOsAccount()
+    assert.notEqual(account, '', 'precondition: this process has an OS account both ways of asking agree on')
+    assert.equal(driverConnection('postgresql://localhost/ims').user, account, 'precondition: the driver falls back to it')
+
+    applyServiceEnvironment({ ok: true, values: {}, ownedByThisProcess: true, osAccount: account })
+    assert.equal(
+      parseConnectionIdentity('postgresql://localhost/ims').user,
+      account,
+      'the account the service runs as is the application\'s login role, not an anonymous fallback',
+    )
+    assert.equal(parseConnectionIdentity('postgresql://localhost/').database, account, 'and the database libpq derives from it is identified too')
+
+    // NOT OWNED: a deploy running as root, or as any third account, gets the r16 answer.
+    delete process.env.PGUSER
+    applyServiceEnvironment({ ok: true, values: {}, ownedByThisProcess: false, osAccount: account })
+    assert.equal(process.env.PGUSER, undefined, 'nothing is asserted about an account this run cannot show is the application\'s')
+    assert.equal(parseConnectionIdentity('postgresql://localhost/ims').user, '', 'so the fallback stays unidentified, and unidentified is refused')
+
+    // A SERVICE FILE THAT NAMES THE ROLE OUTRIGHT WINS OVER BOTH: it is a deliberate setting.
+    delete process.env.PGUSER
+    applyServiceEnvironment({ ok: true, values: { PGUSER: 'imsapp' }, ownedByThisProcess: true, osAccount: account })
+    assert.equal(parseConnectionIdentity('postgresql://localhost/ims').user, 'imsapp')
+  } finally {
+    restore()
+  }
+})
+
+test('processOsAccount refuses an account the passwd entry and the environment disagree about', () => {
+  // pg's fallback is `process.env.USER`, which is inheritable and can be stale or set by hand;
+  // `userInfo()` reads the passwd entry for the effective uid, which cannot. Only an agreement
+  // is an identity.
+  //
+  // MUTATION ROUTE: return the passwd name (or the driver default) unconditionally. The second
+  // assertion fails, and with it the ownership test above starts vouching for whatever name the
+  // calling shell put in USER.
+  assert.equal(processOsAccount({ userInfo: () => ({ username: 'imsapp' }), driverDefaultUser: 'imsapp' }), 'imsapp')
+  assert.equal(processOsAccount({ userInfo: () => ({ username: 'imsapp' }), driverDefaultUser: 'root' }), '')
+  assert.equal(processOsAccount({ userInfo: () => ({ username: 'imsapp' }), driverDefaultUser: '' }), '')
+})
+
+test('the shipped script runs on the SERVICE\'S environment, end to end', () => {
+  // THE WHOLE PROCESS, not a function: `--print-migration-url` derives the role the migration runs
+  // as from DATABASE_URL, and a URL naming no role falls through to PGUSER. So the two
+  // environments are made to disagree about PGUSER and the emitted URL says which one won.
+  //
+  // ROUTE: node scripts/fence-db-connections.mjs --print-migration-url -> main()'s
+  // readServiceEnvironment/applyServiceEnvironment -> parseRoleFromConnectionString(DATABASE_URL)
+  // -> buildMigrationConnectionString() -> `options=-c role=...` on stdout.
+  //
+  // MUTATION ROUTE: remove the applyServiceEnvironment() call from main(). The emitted URL becomes
+  // `-c role=deployrole` -- the deploy shell's variable deciding what the migration runs as, on a
+  // box where the service has never heard of that role.
+  const result = runFenceScript(['--print-migration-url'], {
+    DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
+    DATABASE_URL: 'postgresql://127.0.0.1:5432/ims',
+    PGUSER: 'deployrole',
+    DIRECT_URL: '',
+  }, 'PGUSER=imsapp\n')
+  assert.equal(result.status, 0, result.output)
+  const emitted = result.output.trim().split('\n').at(-1) ?? ''
+  assert.match(emitted, /^postgresql:\/\//, 'the last line is the URL the deploy captures')
+  assert.match(emitted, /options=-c\+role%3Dimsapp|options=-c%20role%3Dimsapp/, 'the migration runs as the role the SERVICE names')
+  assert.doesNotMatch(emitted, /deployrole/, 'and the deploy shell\'s PGUSER reaches nothing the migration runs through')
+  assert.match(result.output, /Ignoring this shell's PGUSER=deployrole/, 'and it says so out loud')
+})
+
+test('the service environment file is found from the SCRIPT, not from the working directory', () => {
+  // The printed `--release` command is meant to be runnable by an operator from wherever they are
+  // standing, and the deploy scripts `cd` to the app directory for reasons of their own. Resolving
+  // the file against the script's own location makes both work.
+  //
+  // MUTATION ROUTE: resolve against process.cwd(). This test fails on the paths, and the operator
+  // pasting the release command from their home directory gets the refusal above instead of a
+  // release.
+  assert.deepEqual(
+    serviceEnvironmentPaths({} as unknown as NodeJS.ProcessEnv, 'file:///opt/one-two-inventory/scripts/fence-db-connections.mjs'),
+    ['/opt/one-two-inventory/.env', '/opt/one-two-inventory/.env.local'],
+  )
+  assert.deepEqual(serviceEnvironmentPaths({ IMS_SERVICE_ENV_FILE: '/etc/ims/app.env' } as unknown as NodeJS.ProcessEnv), ['/etc/ims/app.env'])
+  assert.deepEqual(IDENTITY_ENVIRONMENT_VARIABLES, ['PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE'])
 })
