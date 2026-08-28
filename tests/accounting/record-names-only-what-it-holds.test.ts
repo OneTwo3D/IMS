@@ -3272,21 +3272,52 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * `EnumDeclaration`; (Q3) asserts that too, since it is the receiver round 28's argument was
  * actually about and the one the roots do not produce.
  *
- * SO HERE IS THE ENUMERATION, RE-DERIVED RATHER THAN RE-STATED — because a table that was wrong
- * once can be wrong twice, and the row that was wrong was wrong in a way the table's own shape
- * hid. Every position that can produce a CONCRETE value from a CHECKER TYPE, which is the only
- * place a type can stand in for a value. (1)-(4) are `a.n`; (5)-(10) are `a[k]`; (11) is a bare
- * identifier, and the table used to stop at ten.
+ * AND A DECLARATION DOES NOT HAVE TO HOLD AN EXPRESSION TO NAME ONE (round 30, Codex HIGH x2).
+ * Round 29's criterion was called airtight and Codex broke it in one round, twice, and both breaks
+ * are the SAME SHAPE: the check follows one syntactic link and stops, while the value is reachable
+ * by another.
+ *
+ *   • A `PropertySignature` holds no INITIALIZER — and its TYPE ANNOTATION can hold a `typeof` query
+ *     that reaches a value declaration. `const manufacturedMode = 'UNREVIEWED' as unknown as
+ *     'REVIEWED'; interface RenderMode { mode: typeof manufacturedMode }` makes `render.mode` type
+ *     as exactly `"REVIEWED"` with no `as` anywhere inside the declaration the resolver reads.
+ *   • A traced variable's DECLARATION INITIALIZER can be honest while a LATER ASSIGNMENT is not.
+ *     `let mode: 'REVIEWED' = 'REVIEWED'; mode = 'UNREVIEWED' as unknown as 'REVIEWED'` has no
+ *     diagnostic, and nothing `symbolOrigin` follows goes near the assignment.
+ *
+ * SO THE CRITERION WAS NOT WRONG ABOUT SYNTAX; IT WAS WRONG ABOUT WHAT "HOLD" MEANS. The fixes are
+ * two, and both are stated as rules rather than as cases:
+ *
+ *   `typeOrigin`      EVERY ANNOTATION THIS WALK TRUSTS IS READ, by a second default-deny walk over
+ *                     TYPE syntax. All four annotation-trusted kinds go through it, not just the one
+ *                     Codex named — and so does the ROOT PARAMETER's own annotation, which is
+ *                     trusted unbacked and is the one position the four kinds do not cover
+ *                     (control (R2)).
+ *   the `const` floor RECURSIVE PROVENANCE RUNS THROUGH `const` AND NOTHING ELSE, a class FIELD is
+ *                     refused outright — `readonly` permits a constructor write, so it does not
+ *                     close it (control (Q4)) — and `resolveIdentifier` takes the same floor for the
+ *                     VALUE it computes, which is the shorter version of the same route and needs no
+ *                     assertion at all (control (S2)).
+ *
+ * SO HERE IS THE ENUMERATION, RE-DERIVED A THIRD TIME — and this time in TWO tables, because the one
+ * below used to say "every position that can produce a CONCRETE value from a CHECKER TYPE" and that
+ * is only ONE of the two things this walk produces concrete values from. The other is a
+ * DECLARATION'S OWN INITIALIZER, read as a value with no checker type involved anywhere, and control
+ * (S2) rides in on it. A table scoped to one producer cannot be a closed count of both.
+ *
+ * TABLE ONE: EVERY POSITION THAT PRODUCES A CONCRETE VALUE FROM A CHECKER TYPE. (1)-(4) are `a.n`;
+ * (5)-(10) are `a[k]`; (11) is a bare identifier.
  *
  *    (1) `a`, OBJECT branch      VALUE-COMPUTED. The walk computed the receiver itself; no checker
  *                                type is consulted, and `valueOf` unwraps an `as` to compute what
- *                                is underneath it. Nothing to demand.
+ *                                is underneath it. Nothing to demand — see TABLE TWO for what the
+ *                                computing itself rests on.
  *    (2) `a`, LIST `.length`     VALUE-COMPUTED — a number this walk counted.
  *    (3) `a`, checker fold       DEMANDED, `literalOrigin` (rounds 23-27).
  *    (4) `n`, the property name  DEMANDED, `symbolOrigin`. `n` is an identifier and never an
  *                                expression, so nothing can be asserted at the access site; what
  *                                CAN be asserted is the declaration it resolves to — see the
- *                                sub-table below, which is where round 28's error actually lived.
+ *                                sub-table below, which is where rounds 28 AND 29 each went wrong.
  *    (5) `a`, LIST branch        VALUE-COMPUTED.
  *    (6) `k`, LIST branch        NOT DEMANDED, AND SOUND — re-derived, not carried over. The branch
  *                                requires a NUMBER, and this walk produces a NUMBER in exactly four
@@ -3300,46 +3331,101 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  *                                one shape unions BOTH properties rather than choosing one.
  *    (9) `a`, checker fold       DEMANDED, `literalOrigin`.
  *   (10) `k`, checker fold       DEMANDED as of round 28, `keyOrigin`.
- *   (11) a bare IDENTIFIER       DEMANDED, `literalOrigin` — and this row is NEW, because the
- *                                round-28 table scoped itself to `resolveProperty` and
- *                                `resolveElement` while `checkerLiterals` has a THIRD caller:
- *                                `resolveIdentifier`'s fall-through, for a name that is neither a
- *                                bound parameter nor a variable. That is not an edge: a DESTRUCTURED
- *                                name is a `BindingElement` and lands here, so round 23's own Codex
- *                                route — `const { ledger } = context as { ledger: 'QuickBooks' }` —
- *                                runs through position (11) and not through (3) or (4) at all.
- *                                Instrumenting the walk over this file's controls reaches it with
- *                                `ledger` as a `BindingElement`, and with a `ClassDeclaration` and
- *                                an `EnumDeclaration` receiver. The table was not merely short at
- *                                the edge; it omitted the position its earliest control uses.
+ *   (11) a bare IDENTIFIER       DEMANDED, `literalOrigin` — `resolveIdentifier`'s fall-through, for
+ *                                a name that is neither a bound parameter nor a variable. A
+ *                                DESTRUCTURED name is a `BindingElement` and lands here, so round
+ *                                23's own Codex route runs through (11) and not through (3) or (4).
  *
- * AND THE SUB-TABLE THE ROWS ABOVE DELEGATE TO, which round 28 did not write down and which is
- * where its one wrong justification was. (3), (4), (9), (10) and (11) all end in `symbolOrigin`,
- * and `symbolOrigin` decides by DECLARATION KIND:
+ * TABLE TWO: EVERY POSITION THAT PRODUCES A CONCRETE VALUE WITHOUT ASKING THE CHECKER AT ALL. This
+ * table is NEW, and it is where round 30's second finding lives. `resolveIdentifier` is the whole of
+ * it, because every other producer in `valueOf` is either syntax it reads in place (a literal, a
+ * template, an object or array literal, a composition) or a call it walked into.
+ *
+ *   (12) a BOUND parameter       SOUND. The value is one this walk put in the frame itself.
+ *   (13) a ROOT parameter        The reviewed context, a list keeping its length floor, or OPAQUE —
+ *                                invented from the DECLARED TYPE, which is why (R2) made the root's
+ *                                own annotation something this walk has to read.
+ *   (14) a VARIABLE's initializer
+ *                                DEMANDED as of round 30 — and demanded as MUTABILITY rather than as
+ *                                provenance, which is why no earlier round's rule was looking.
+ *                                `let mode = 'REVIEWED'` then `mode = 'UNREVIEWED'` manufactures no
+ *                                type at all: it is two ordinary statements, and reading the first
+ *                                as the value is simply wrong. Control (S2). `const` is the floor.
+ *   (15) an AMBIENT variable     REFUSED since round 21 — its value is in code this program has not
+ *                                got.
+ *
+ * AND THE SUB-TABLE BOTH TABLES DELEGATE TO. (3), (4), (9), (10) and (11) all end in `symbolOrigin`,
+ * and `symbolOrigin` decides by DECLARATION KIND. Round 28 defended two rows with a reachability
+ * argument that was false; round 29 replaced it with a structural one — "trusted on its annotation
+ * iff it can hold no expression at all" — that was ALSO false, in the same shape: THE CHECK FOLLOWED
+ * ONE SYNTACTIC LINK AND STOPPED WHILE THE VALUE WAS REACHABLE BY ANOTHER.
  *
  *   REFUSED, always            a binding element (its type is whatever it was destructured out of
- *                              was declared OR asserted to have — round 23).
+ *                              was declared OR asserted to have — round 23); a class FIELD (round
+ *                              30: its initializer is not the only expression that can have written
+ *                              it — `readonly` permits a constructor write and a plain field permits
+ *                              anybody's).
  *   REFUSED unless the
  *   argument was honest        a parameter — `originFrames` carries the argument's provenance, a
- *                              default's provenance is carried at both entries, and only the roots
- *                              in `analyzerRoots` are trusted unbacked (rounds 24-27).
- *   TRACED to its initializer  a variable, a property assignment, and — as of round 29 — a class
- *                              field and an enum member. No initializer, or an ambient one, is
- *                              refused rather than trusted.
- *   ACCEPTED on annotation     a property signature, an interface, a type alias, a type parameter.
- *                              These four hold NO EXPRESSION ANYWHERE, so there is nothing in them
- *                              to assert. That is the criterion; "the receiver would be UNKNOWN"
- *                              was not, and it is what round 28 used for the two kinds above it.
+ *                              default's provenance is carried at both entries, only the roots in
+ *                              `analyzerRoots` are trusted unbacked (rounds 24-27), AND ITS OWN
+ *                              ANNOTATION IS READ (round 30, control (R2)).
+ *   TRACED to its initializer  a `const` variable, a property assignment, and an enum member. A
+ *                              `let` or a `var` is refused (round 30, control (S)); an enum member
+ *                              is not, and the difference is TypeScript's: assigning to one is an
+ *                              error and a computed string-enum initializer is TS18033, so its
+ *                              initializer really is the only writer. No initializer, or an ambient
+ *                              one, is refused rather than trusted (round 29).
+ *   ACCEPTED on annotation —
+ *   AND THE ANNOTATION READ    a property signature, a type alias, a type parameter (round 30: each
+ *                              has a type node, and `typeOrigin` reads it). An INTERFACE is the one
+ *                              kind with no type node of its own: what it can supply comes from its
+ *                              MEMBERS, each of which arrives here as its own declaration.
  *   REFUSED by name            everything else, and `literalOrigin` is DEFAULT-DENY around it.
  *
- * WHAT ELSE RESTED ON THE RECEIVER ARGUMENT: nothing. Re-derived row by row — (1), (2), (5), (7)
- * and (8) consult no checker type at all, so no provenance question arises; (6) is the closed count
- * of NUMBER producers above; (3), (4), (9), (10) and (11) all DEMAND provenance and differ only in
- * which expression they demand it of. The receiver-UNKNOWN argument appeared exactly once, in the
- * sub-table, for exactly the two kinds that carry an expression — and both are now traced instead.
- * `literalOrigin` staying DEFAULT-DENY is what makes eleven a closed count rather than a sample: it
- * admits six syntactic forms and refuses every other by name, and of the six only parenthesis,
- * non-null, property access and element access have sub-expressions at all.
+ * AND `typeOrigin` IS THE SECOND DEFAULT-DENY WALK, over TYPE syntax, for the reason round 29
+ * missed: TYPE SYNTAX HAS ITS OWN DOOR INTO VALUE SPACE. `typeof x` holds no expression and names a
+ * value declaration; an `import(...)` type is a second door; a type reference that resolves to a
+ * `const` or a function is how you walk through either without writing the keyword. It admits the
+ * type keywords, a literal type, an object type (whose members are declarations in their own right)
+ * and the composite forms it recurses through — union, intersection, array, tuple, indexed access,
+ * type operator, conditional, mapped, template literal, function — and refuses every other by name.
+ *
+ * SO THE CRITERION, STATED TO COVER NAMING AS WELL AS CONTAINING:
+ *
+ *   A declaration may be folded on its declared type exactly when (a) every expression it CONTAINS
+ *   and every expression it NAMES is one this walk has itself read to a literal, and (b) that
+ *   declaration is the only write TYPESCRIPT ADMITS to what it declares.
+ *
+ * (a) is the transitive closure over BOTH default-deny walks — `literalOrigin` over expressions,
+ * `typeOrigin` over types — which is what makes "names" mean something rather than gesture at it.
+ * (b) is a RESTRICTION, not a proof: it is satisfied by a `const` binding, an enum member and a
+ * parameter, because TypeScript refuses to compile a second write to any of them from anywhere in
+ * any program. It is NOT satisfied by a `let`, a `var` or a class field, so those are refused.
+ *
+ * AND HERE IS WHAT (b) DOES NOT COVER, NAMED RATHER THAN ARGUED AWAY — because naming a position and
+ * being wrong about it is what rounds 28 and 29 each did, and the third time is not going to be an
+ * argument. A `const` binding cannot be REBOUND, and its object can still be WRITTEN:
+ *
+ *   const modeTable = { mode: 'REVIEWED' }
+ *   modeTable.mode = 'UNREVIEWED'
+ *
+ * type-checks with the same diagnostics as the shipped model, and this walk reports the inventory
+ * CLEAN over a renderer keyed on `modeTable.mode` — verified against this analyzer, not supposed.
+ * Position (14) computes the OBJECT from the initializer and `resolveProperty` reads the property
+ * straight off it; no checker type is consulted, so nothing in TABLE ONE fires. IT IS NOT CLOSED
+ * HERE, and the reason is that every closure available is a proof over the WRONG PROGRAM: this
+ * walk's program is the model file plus whatever a control declares, while the module is importable
+ * by anything, so "no assignment targets a property anywhere in this program" would be an assumption
+ * wearing a scan. Clause (b) is worth having precisely because TypeScript enforces it program-wide;
+ * a property-write rule would not be, and a partial proof here is worse than the restriction.
+ *
+ * WHAT ELSE RESTED ON A JUSTIFICATION RATHER THAN ON A RULE: re-derived row by row — (1), (2), (5),
+ * (7), (8) and (12) consult no checker type at all; (6) is the closed count of NUMBER producers
+ * above; (3), (4), (9), (10) and (11) all DEMAND provenance and differ only in which expression they
+ * demand it of; (13) rests on the root's annotation, which is now read; (14) rests on mutability,
+ * which is now restricted; (15) was closed in round 21. Both `literalOrigin` and `typeOrigin`
+ * staying DEFAULT-DENY is what makes these counts closed rather than sampled.
  *
  * `contextBinding` exists ONLY so a control can re-run this walk with the pre-fix concrete binding
  * and demonstrate that the branch is pruned again. Nothing else passes anything but `'SYMBOLIC'`.
@@ -3494,6 +3580,11 @@ type KeyProvenance = 'DEMANDED' | 'IGNORED'
  * without an implementation this walk can read is honest not at all. `'IGNORED'` reproduces rounds
  * 22-28, every one of which let both kinds through on the annotation alone. Control (Q) shows what
  * that let past.
+ *
+ * ROUND 30 NARROWED WHAT `'DEMANDED'` DOES TO THE CLASS FIELD: it is now REFUSED rather than traced,
+ * because tracing an initializer is only sound where the initializer is the only write — see
+ * `BindingMutability` and control (Q4). The enum member is still traced, for the reason written
+ * there. This toggle still gates the whole branch, so `'IGNORED'` still reproduces rounds 22-28.
  */
 type FieldProvenance = 'DEMANDED' | 'IGNORED'
 
