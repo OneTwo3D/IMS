@@ -93,8 +93,12 @@ advisory lock lives on one backend and is freed the moment that backend goes bac
 behind a transaction pooler the restore fence would be held by nobody while the replay ran. The
 holder connection is therefore refused unless the backend names this process's own socket as its
 peer; if `DATABASE_URL` points at a pooler, set `DATABASE_SESSION_LOCK_URL` to a direct, non-pooled
-URL for the same database and schema (see `docs/installation.md`). The refusal happens before the
-restore starts, so nothing is half-applied by it.
+URL for the same database and schema (see `docs/installation.md`). That override is not trusted
+because it agrees on names: the first lock connection takes an advisory lock through it and
+requires a `DATABASE_URL` connection to be blocked by the same key, so an override pointing at a
+restored clone or a staging server -- which carries the same database name, schema, OID and system
+identifier as production -- is refused rather than used (o3d-2k5r r26). The refusal happens before
+the restore starts, so nothing is half-applied by it.
 
 The lock has no expiry: it is released when the restore finishes, not on a timer. If `psql` overruns
 its five-minute ceiling it is killed, its database backend is terminated from the lock-holding

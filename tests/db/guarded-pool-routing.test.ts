@@ -245,6 +245,29 @@ const TAKES_A_SESSION_ADVISORY_LOCK = /pg_try_advisory_lock\s*\(|pg_advisory_loc
 /** A construction that opens its own connection, rather than asking the lock factory for one. */
 const BUILDS_ITS_OWN_CONNECTION = /new\s+(?:pg\s*\.\s*)?(?:Pool|Client)\s*\(/
 
+/**
+ * THE FACTORY IS NOT ONE OF ITS OWN CALLERS (o3d-2k5r r26).
+ *
+ * `pgSessionLockConnectionConfig()` gained a leg that TAKES a session advisory lock: when
+ * `DATABASE_SESSION_LOCK_URL` is set, it holds one on a connection made from the override and
+ * requires a `DATABASE_URL` connection to be blocked by the same key, because matching database and
+ * schema names do not prove the two URLs reach the same PostgreSQL. That holder cannot be built by
+ * asking the lock factory — the factory's own `onConnect` is what runs the probe, so it would
+ * recurse — and it does not need to be: the probe runs only AFTER the affinity leg has proved
+ * directness on a connection to that same endpoint, which
+ * `tests/db/session-lock-affinity.test.ts` pins ("an interposed lock connection is refused BEFORE
+ * the probe is paid for"). And if the override WERE interposed, the holder's session lock would be
+ * discarded between statements, the witness would not be blocked, and the override would be
+ * refused — the failure is closed either way.
+ *
+ * So the factory file is classified rather than exempted, and the classification is checked two
+ * ways below: exactly ONE file may claim it, and every session advisory lock IN that file must be
+ * taken in the probe's own registered namespace. A future session lock added there for some other
+ * purpose uses a different key and is reported.
+ */
+const DEFINES_THE_LOCK_FACTORY = /export function pgSessionLockConnectionConfig\(/
+const SESSION_LOCK_CALL = /pg_(?:try_)?advisory_lock\s*\(\s*([^,)]*)/g
+
 test('o3d-2k5r r25 / o3d-a5zz: every SESSION advisory lock is taken on a connection the lock factory built', () => {
   // MUTATION ROUTE: in any of `lib/db/pinned-advisory-lock.ts`,
   // `lib/connectors/xero/payment-write-lock.ts`, `lib/domain/wms/dispatch-sweep-lock.ts` or the
@@ -256,6 +279,7 @@ test('o3d-2k5r r25 / o3d-a5zz: every SESSION advisory lock is taken on a connect
   assert.ok(files.length > 400, `the walk must actually reach the runtime tree; it found ${files.length} files`)
 
   const holders: string[] = []
+  const factories: string[] = []
   const offenders: string[] = []
   for (const file of files) {
     // Comments are not code — every one of these call sites now carries a WHY block that QUOTES the
@@ -267,11 +291,24 @@ test('o3d-2k5r r25 / o3d-a5zz: every SESSION advisory lock is taken on a connect
       .replace(/^[ \t]*\/\/.*$/gm, '')
     if (!TAKES_A_SESSION_ADVISORY_LOCK.test(source)) continue
     holders.push(file)
+    if (DEFINES_THE_LOCK_FACTORY.test(source)) {
+      factories.push(file)
+      // The factory's own locks must all be the probe's, in the namespace the registry knows.
+      const keys = [...source.matchAll(SESSION_LOCK_CALL)].map((match) => match[1]?.trim() ?? '')
+      if (keys.length === 0) offenders.push(`${file} (claims to be the factory but takes no lock the scan can read)`)
+      for (const key of keys) {
+        if (key !== '${namespace}') offenders.push(`${file} takes a SESSION advisory lock on ${JSON.stringify(key)}, which is not the shared-lock-space probe's namespace`)
+      }
+      continue
+    }
     const asksTheFactory = /createSessionAdvisoryLock(Pool|Client)/.test(source)
     if (!asksTheFactory || BUILDS_ITS_OWN_CONNECTION.test(source)) {
       offenders.push(`${file}${asksTheFactory ? ' (opens its own connection as well)' : ' (never asks the lock factory)'}`)
     }
   }
+  // The classification may not spread: one file defines the factory, and it is the one that gets
+  // to build its own lock connection.
+  assert.deepEqual(factories, ['lib/db/database-url-schema.mjs'], `exactly one file defines the session-lock config factory; found ${factories.join(', ') || 'none'}`)
 
   // PRECONDITION, so this cannot pass by finding nothing: the four known holders are all present,
   // and the detector really did classify them.
