@@ -95,8 +95,15 @@ test('every SYNCED write in the Xero sync processor stamps from the database clo
   // names a DIFFERENT document" — and the stamp MUST stay below that branch, because a row whose
   // write did not land has no completion to stamp. The window is only a proxy for "in the same
   // transaction", so it is the proxy that gives, not the ordering property.
+  //
+  // AND FROM 45 TO 60 AT THE o3d-batch-ret / o3d-0bfh MERGE, on that same stated principle. Nothing
+  // executable moved: two branches each added PROSE inside the window and neither knew about the
+  // other — o3d-batch-ret r10 explaining the `outcome` record handed to the conflict escalation, and
+  // o3d-0bfh r4 explaining why the obligation claim is no longer a fragment of this `data` block.
+  // Ten lines of comment, and the ordering below is asserted structurally by the sibling test
+  // rather than by this distance.
   for (const [index, tail] of sites.entries()) {
-    const window = tail.split('\n').slice(0, 45).join('\n')
+    const window = tail.split('\n').slice(0, 60).join('\n')
     assert.match(window, /await stampSyncedAtFromDatabaseClock\(tx, entry\.id\)/,
       `SYNCED write site ${index + 1} does not stamp syncedAt from the database clock; the payment `
       + `poller's reversal fence would be comparing this host's wall clock against the poll host's`)
@@ -302,8 +309,12 @@ test('the stamp is the LAST statement of the SYNCED transaction, or it erases it
   assert.equal(sites.length, 1, 'the number of SYNCED write sites changed — check each one still stamps LAST')
 
   for (const [index, tail] of sites.entries()) {
-    // Same widening, same reason as the test above.
-    const window = tail.split('\n').slice(0, 45).join('\n')
+    // Same widening, same reason as the test above — including the 45 → 60 step taken at the
+    // o3d-batch-ret / o3d-0bfh merge, where two branches independently added comment lines between
+    // the status write and the stamp. This test is the one that asserts the ORDERING itself, and it
+    // is unaffected by the distance: it compares the stamp's position against the close of the
+    // Prisma write, not against a line count.
+    const window = tail.split('\n').slice(0, 60).join('\n')
     const stamp = window.indexOf('await stampSyncedAtFromDatabaseClock(tx, entry.id)')
     const closesPrismaWrite = window.indexOf('})')
     assert.ok(stamp > closesPrismaWrite && closesPrismaWrite >= 0,

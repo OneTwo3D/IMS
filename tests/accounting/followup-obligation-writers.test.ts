@@ -1607,19 +1607,45 @@ test('[o3d-peh1 r4] a NON-follow-up failure on an already-posted row never recor
   assert.match(String(subject().errorMessage), /SYNCED transaction could not be written/)
 })
 
-test('[o3d-peh1 r4] and on the FRESH-POST arm, where the in-memory snapshot still says "not posted"', async () => {
-  // THE CASE NO IN-MEMORY TEST COULD GET RIGHT. `entry` is the PRE-CLAIM snapshot: this row starts
-  // with no external id, acquires one when the SYNCED transaction commits, and then the follow-up
-  // catch's announcement throws. `entry.externalTransactionId` is still null in memory while the row
-  // in the database names a document — so the handler has to ask the database, in the write.
+test('[o3d-peh1 r4 + o3d-0bfh r6] the FRESH-POST arm no longer reaches the failure handler at all', async () => {
+  // THE CASE NO IN-MEMORY TEST COULD GET RIGHT, and what the merge did to it. `entry` is the
+  // PRE-CLAIM snapshot: this row starts with no external id, acquires one when the SYNCED
+  // transaction commits, and `entry.externalTransactionId` is still null in memory while the row in
+  // the database names a document. Every route out of this arm after that commit therefore had to
+  // ask the DATABASE, not the snapshot, before it could record anything terminal.
+  //
+  // WHAT THIS TEST USED TO DRIVE, and why it cannot any more. It made the follow-up catch's own
+  // announcement throw, so the throw escaped into the loop's main-post failure handler — which,
+  // with retries exhausted, wrote the terminal transition. o3d-peh1 r4 fenced that handler on
+  // database evidence so it could not stamp a FAILED mirror over the live document.
+  //
+  // o3d-0bfh r6 then closed that escape at its source: the announcement goes through
+  // `reportRetainedObligation`, which CATCHES its own write failure and reports the lost notice to
+  // stderr, on the stated ground that a failed activity-log write is not a reason to fail a posted
+  // invoice. The debt is carried by the ROW and the exception inbox, not by that log line.
+  //
+  // Between that and o3d-peh1 r5 — which took the SYNCED write itself out of the outer handler's
+  // reach, into `persistFreshQboPostOrEscalate` — this arm has NO route left to the main-post
+  // failure handler once the post has committed. So the property is now STRUCTURAL rather than
+  // fenced, and this test pins it that way: both surviving post-commit failures are driven, and
+  // neither may produce a FAILED mirror, lose the external id, or discharge the obligation.
+  //
+  // NOT VACUOUS: the two routes are asserted to reach DIFFERENT counted outcomes. A plain follow-up
+  // failure is best-effort and still counts SUCCEEDED (unchanged on this arm, by both sides); a
+  // REFUSAL counts FAILED and returns the row to UNSETTLED. If either route silently became a no-op
+  // — or if they collapsed into one answer — the counts below stop matching.
+
+  // (1) a plain follow-up failure, with the announcement ALSO failing: the route that used to
+  //     escalate, now swallowed at source.
   reset('quickbooks')
   state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
   state.failFollowUpsFor.add('log-1')
   state.throwingActivityActions.add('quickbooks_followup_error')
 
-  const result = await runQuickBooks()
+  const plain = await runQuickBooks()
 
-  assert.equal(result.failed, 1)
+  assert.equal(plain.succeeded, 1, 'a transient follow-up failure is best-effort on this arm, and a lost NOTICE does not change that')
+  assert.equal(plain.failed, 0, 'the announcement no longer decides the entry\'s outcome — o3d-0bfh r6')
   assert.equal(
     subject().externalTransactionId,
     'XBILL-1',
@@ -1629,11 +1655,32 @@ test('[o3d-peh1 r4] and on the FRESH-POST arm, where the in-memory snapshot stil
     state.mirror.some((entry) => entry.status === 'POSTED'),
     'and the mirror says so, which is what a FAILED write would then contradict',
   )
+  assert.notEqual(subject().status, 'FAILED', 'retries were exhausted, but nothing terminal was ever reached')
+  assert.deepEqual(mirrorFailures(), [], 'THE POINT: no FAILED mirror over a live document')
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date,
+    'the obligation survives: the follow-ups were never enqueued, and the row is the record of that',
+  )
+
+  // (2) a REFUSAL on the same arm, with the same stale snapshot and the same exhausted retries.
+  //     This one IS counted a failure and DOES take a terminal transition — through
+  //     `markSyncLogForFollowUpRetry`, which writes no mirrored event precisely because the
+  //     document posted.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
+  state.throwingActivityActions.add('quickbooks_followup_error')
+  ledgerVerdict = { clear: false, reason: 'a settlement matching this attempt is already in QuickBooks' }
+
+  const refused = await runQuickBooks()
+
+  assert.equal(refused.failed, 1, 'a refusal queued nothing, so the entry is not finished')
+  assert.equal(refused.succeeded, 0, 'and the two routes do NOT reach the same answer')
+  assert.equal(subject().externalTransactionId, 'XBILL-1', 'the document is still in QuickBooks')
   assert.equal(subject().status, 'FAILED', 'the retries are exhausted, so this is the terminal write')
   assert.deepEqual(mirrorFailures(), [], 'and it still writes no FAILED mirror over a live document')
   assert.ok(
     subject().backReferenceFollowUpsPendingAt instanceof Date,
-    'the obligation survives too: the follow-ups were never enqueued',
+    'the obligation survives here too',
   )
 })
 
