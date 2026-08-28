@@ -2310,3 +2310,250 @@ test('o3d-2sm1.5 r19: the four options are parsed, and the one file still read i
     rmSync(cwd, { recursive: true, force: true })
   }
 })
+
+/** resolve_db_identity(), lifted out of the shipped script and run by bash. */
+function liftReader(script: 'deploy.sh' | 'update.sh'): string {
+  const source = readFileSync(join(process.cwd(), `scripts/${script}`), 'utf8')
+  const start = source.indexOf('resolve_db_identity() {')
+  assert.ok(start > 0, `${script}: precondition — the reader is in the shipped script`)
+  return source.slice(start, source.indexOf('\n}\n', start) + 3)
+}
+
+test('o3d-2sm1.5 r20: a percent-escaped query KEY is refused, because the driver decodes keys', () => {
+  // ROUTE: DATABASE_URL in the app's .env -> resolve_db_identity() -> DB_FENCE_IDENTITY_ARGS ->
+  // `node fence-db-connections.mjs --fence --app-host=... --app-port=... --app-user=...` -> the
+  // host, port, role and database CONNECT is revoked on and the migration then runs against.
+  //
+  // MUTATION: delete the `case "$query" in *%*)` arm from resolve_db_identity(). Every URL below
+  // is then ACCEPTED, because the scan under it compares RAW key bytes and `ho%73t` is not
+  // `host` — and the four values it hands on are the AUTHORITY's, while the driver connects to
+  // the decoded key's. The assert.match(/^REFUSE/) fails on each, and the fence is aimed at a
+  // database the application is not using.
+  for (const script of ['deploy.sh', 'update.sh'] as const) {
+    const reader = liftReader(script)
+    assert.ok(reader.includes('DB_FENCE_IDENTITY_ARGS=('), `${script}: precondition — the whole function was lifted`)
+
+    function read(url: string): string {
+      const bash = [
+        'set -uo pipefail',
+        'DB_IDENTITY_HOST=""; DB_IDENTITY_PORT=""; DB_IDENTITY_USER=""; DB_IDENTITY_DATABASE=""; DB_IDENTITY_REASON=""; DB_FENCE_IDENTITY_ARGS=()',
+        reader,
+        'if resolve_db_identity "$1"; then printf "OK %s\\n" "${DB_FENCE_IDENTITY_ARGS[*]}"; else printf "REFUSE %s\\n" "$DB_IDENTITY_REASON"; fi',
+      ].join('\n')
+      const run = spawnSync('bash', ['-c', bash, 'reader', url], { encoding: 'utf8' })
+      assert.equal(run.status, 0, run.stderr)
+      return (run.stdout ?? '').trim()
+    }
+
+    for (const [encoded, field, moved] of [
+      ['postgresql://app:pw@127.0.0.1:5432/main?ho%73t=other-cluster', 'host', 'other-cluster'],
+      ['postgresql://app:pw@127.0.0.1:5432/main?po%72t=6543', 'port', '6543'],
+      ['postgresql://app:pw@127.0.0.1:5432/main?u%73er=other-role', 'user', 'other-role'],
+    ] as [string, 'host' | 'port' | 'user', string][]) {
+      // PRECONDITION — THE PREMISE, MEASURED AGAINST THE INSTALLED DRIVER rather than asserted
+      // from its documentation. Without this the test could be refusing a URL that goes nowhere
+      // in particular, which would make it a style rule instead of a fix. `driverConnection()` is
+      // the configuration `Connection#connect()` is handed, so this is where the socket goes.
+      assert.equal(
+        String(driverConnection(encoded)[field]),
+        moved,
+        `${script}: the driver decodes the KEY and it MOVES the connection's ${field}`,
+      )
+      // AND THE AUTHORITY SAYS OTHERWISE, which is what makes it a false statement rather than a
+      // redundant one — the reader would have handed on these values and been wrong about all of
+      // them.
+      assert.notEqual(String(driverConnection(encoded.replace(/\?.*$/, ''))[field]), moved)
+
+      const answer = read(encoded)
+      assert.match(answer, /^REFUSE /, `${script}: ${encoded} must be refused, not read`)
+      assert.match(answer, /percent-escapes something in its query string/, `${script}: ${encoded}`)
+    }
+
+    // AND AN ESCAPE IN A HARMLESS PARAMETER IS REFUSED TOO, on purpose: telling the two apart
+    // means decoding, and decoding is the reimplementation this reader exists to avoid.
+    assert.match(read('postgresql://app:pw@127.0.0.1:5432/main?sslmode=req%75ire'), /^REFUSE .*percent-escapes/)
+    // While the unescaped forms still read cleanly, so the refusal is about the escape and not
+    // about having a query string at all.
+    assert.match(read('postgresql://app:pw@127.0.0.1:5432/main?sslmode=require'), /^OK --app-host=127.0.0.1 /)
+  }
+})
+
+/** env_file_is_sole_database_url_source(), lifted out of the shipped script and run by bash. */
+function liftSoleSource(script: 'deploy.sh' | 'update.sh'): string {
+  const source = readFileSync(join(process.cwd(), `scripts/${script}`), 'utf8')
+  const start = source.indexOf('env_file_is_sole_database_url_source() {')
+  assert.ok(start > 0, `${script}: precondition — the question is asked by the shipped script`)
+  return source.slice(start, source.indexOf('\n  return 0\n}\n', start) + '\n  return 0\n}\n'.length)
+}
+
+/**
+ * WHAT `systemctl show` SAYS, one fixture per way a second definition can exist.
+ *
+ * The shape is this host's own: `systemctl show -p LoadState -p Environment -p EnvironmentFiles
+ * -p PassEnvironment -p UnsetEnvironment ims-stage-dev.service` answers with exactly these
+ * properties, one per line, EnvironmentFiles as `<path> (ignore_errors=<yes|no>)`, and the real
+ * IMS units on this host produce the `sole` fixture below — verified read-only before this test
+ * was written.
+ */
+const SYSTEMD_ANSWERS: [string, string, RegExp | null][] = [
+  [
+    'the unit loads that file and nothing else defines it',
+    ['LoadState=loaded', 'Environment=NODE_ENV=production PORT=3000', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
+    null,
+  ],
+  [
+    'Environment= carries its own DATABASE_URL',
+    ['LoadState=loaded', 'Environment=NODE_ENV=production DATABASE_URL=postgresql://app:pw@other-cluster:5432/other', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
+    /sets DATABASE_URL in its own Environment=/,
+  ],
+  [
+    'Environment= carries it FIRST, with no space in front of it',
+    ['LoadState=loaded', 'Environment=DATABASE_URL=postgresql://app:pw@other-cluster:5432/other NODE_ENV=production', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
+    /sets DATABASE_URL in its own Environment=/,
+  ],
+  [
+    'PassEnvironment= lets the manager supply it',
+    ['LoadState=loaded', 'Environment=NODE_ENV=production', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=LANG DATABASE_URL', 'UnsetEnvironment='].join('\n'),
+    /lists DATABASE_URL in PassEnvironment=/,
+  ],
+  [
+    'UnsetEnvironment= removes what the file supplied',
+    ['LoadState=loaded', 'Environment=NODE_ENV=production', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment=DATABASE_URL'].join('\n'),
+    /lists DATABASE_URL in UnsetEnvironment=/,
+  ],
+  [
+    'a SECOND environment file, which may define it',
+    ['LoadState=loaded', 'Environment=NODE_ENV=production', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'EnvironmentFiles=/etc/ims/override.conf (ignore_errors=yes)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
+    /also loads \/etc\/ims\/override\.conf as an environment file/,
+  ],
+  [
+    'no environment file at all, so the application\'s own loader decides',
+    ['LoadState=loaded', 'Environment=NODE_ENV=production', 'EnvironmentFiles=', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
+    /does not load \/opt\/app\/\.env with EnvironmentFile=/,
+  ],
+  [
+    'a different environment file instead of that one',
+    ['LoadState=loaded', 'Environment=NODE_ENV=production', 'EnvironmentFiles=/etc/ims/other.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
+    /also loads \/etc\/ims\/other\.env as an environment file/,
+  ],
+  [
+    'systemd cannot load the unit at all',
+    ['LoadState=masked', 'Environment=', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
+    /reports one-two-inventory\.service as 'masked' rather than loaded/,
+  ],
+  [
+    'a variable whose NAME merely ends in DATABASE_URL is not a definition of it',
+    ['LoadState=loaded', 'Environment=NEXT_PUBLIC_DATABASE_URL=shown NODE_ENV=production', 'EnvironmentFiles=/opt/app/.env (ignore_errors=no)', 'PassEnvironment=', 'UnsetEnvironment='].join('\n'),
+    null,
+  ],
+]
+
+test('o3d-2sm1.5 r20: a unit that can define DATABASE_URL anywhere but that file is refused', () => {
+  // ROUTE: the entrypoint reads DATABASE_URL from the app's .env -> resolve_db_identity() ->
+  // DB_FENCE_IDENTITY_ARGS -> the fence, the migration and the release. This is the question that
+  // decides whether that file is the one the SERVICE uses: `systemctl show` for one variable, and
+  // a refusal for every answer but "only that file". It computes nothing and resolves no
+  // precedence — it asks whether a second definition EXISTS.
+  //
+  // MUTATION: delete any one arm from env_file_is_sole_database_url_source() — the Environment=
+  // scan, the PassEnvironment= scan, the UnsetEnvironment= scan, the second-file refusal, the
+  // `loads_our_file` requirement or the LoadState check. That fixture's expectation flips from
+  // REFUSE to SOLE, and the deploy proceeds to fence, migrate and release one database while the
+  // restarted application connects to another.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-systemd-'))
+  try {
+    writeFileSync(
+      join(dir, 'systemctl'),
+      ['#!/usr/bin/env bash', '[[ "$1" == "show" ]] || exit 1', 'printf "%s\\n" "$FAKE_SHOW"', ''].join('\n'),
+    )
+    chmodSync(join(dir, 'systemctl'), 0o755)
+
+    for (const script of ['deploy.sh', 'update.sh'] as const) {
+      const lifted = liftSoleSource(script)
+      // PRECONDITION: the whole function was lifted, so a mutation to the shipped script really
+      // does reach this test.
+      assert.ok(lifted.includes('UnsetEnvironment'), `${script}: the lifted function is complete`)
+
+      function ask(fixture: string): string {
+        const bash = [
+          'set -uo pipefail',
+          'DB_IDENTITY_SOURCE_REASON=""',
+          lifted,
+          'if env_file_is_sole_database_url_source "$1" "$2"; then printf "SOLE\\n"; else printf "REFUSE %s\\n" "$DB_IDENTITY_SOURCE_REASON"; fi',
+        ].join('\n')
+        const run = spawnSync('bash', ['-c', bash, 'ask', '/opt/app/.env', 'one-two-inventory.service'], {
+          encoding: 'utf8',
+          env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}`, FAKE_SHOW: fixture },
+        })
+        assert.equal(run.status, 0, run.stderr)
+        return (run.stdout ?? '').trim()
+      }
+
+      for (const [label, fixture, refusal] of SYSTEMD_ANSWERS) {
+        const answer = ask(fixture)
+        if (refusal === null) {
+          assert.equal(answer, 'SOLE', `${script}: ${label} — the deploy may proceed`)
+        } else {
+          assert.match(answer, /^REFUSE /, `${script}: ${label} — must be refused`)
+          assert.match(answer, refusal, `${script}: ${label} — and named`)
+        }
+      }
+
+      // AND IF SYSTEMD CANNOT BE ASKED, THAT IS A REFUSAL TOO — never a pass by default. An empty
+      // directory as the whole PATH is the smallest way to have no systemctl; bash is invoked by
+      // absolute path so that the child is the shell under test and not a PATH lookup failure.
+      const bash = [
+        'set -uo pipefail',
+        'DB_IDENTITY_SOURCE_REASON=""',
+        lifted,
+        'if env_file_is_sole_database_url_source "$1" "$2"; then printf "SOLE\\n"; else printf "REFUSE %s\\n" "$DB_IDENTITY_SOURCE_REASON"; fi',
+      ].join('\n')
+      const empty = mkdtempSync(join(tmpdir(), 'ims-nopath-'))
+      const absent = spawnSync('/bin/bash', ['-c', bash, 'ask', '/opt/app/.env', 'one-two-inventory.service'], {
+        encoding: 'utf8',
+        env: { PATH: empty },
+      })
+      rmSync(empty, { recursive: true, force: true })
+      assert.match((absent.stdout ?? '').trim(), /^REFUSE systemctl is not available/, `${script}: no systemctl is a refusal`)
+
+      // AND SO IS HAVING NO UNIT TO ASK ABOUT.
+      const noUnit = spawnSync('bash', ['-c', bash, 'ask', '/opt/app/.env', ''], {
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}`, FAKE_SHOW: '' },
+      })
+      assert.match((noUnit.stdout ?? '').trim(), /^REFUSE no systemd unit was identified/, `${script}: no unit is a refusal`)
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('o3d-2sm1.5 r20: every fence path asks it, and the installer is still exempt', () => {
+  // The question is only worth asking where it gates something. This is the other half of the
+  // test above: that the shipped entrypoints actually put it in front of the fence, the
+  // preflight and the exit-trap re-fence.
+  //
+  // MUTATION: delete a `require_env_file_is_sole_definition ||` line from either script and the
+  // matching count assertion fails by name.
+  const deploy = readFileSync(join(process.cwd(), 'scripts/deploy.sh'), 'utf8')
+  const update = readFileSync(join(process.cwd(), 'scripts/update.sh'), 'utf8')
+  const install = readFileSync(join(process.cwd(), 'scripts/install.sh'), 'utf8')
+
+  for (const [name, source] of [['deploy.sh', deploy], ['update.sh', update]] as const) {
+    // Wherever the identity is required, the source of that identity is required too: the two
+    // refusals are the same refusal split in half, and one without the other is the finding.
+    const identity = source.split('\n').filter((line) => line.includes('require_db_identity ||')).length
+    const sole = source.split('\n').filter((line) => line.includes('require_env_file_is_sole_definition ||')).length
+    assert.ok(identity >= 3, `${name}: precondition — the identity is required at more than one place (${identity})`)
+    assert.equal(sole, identity, `${name}: and its source is questioned at every one of them (${sole} of ${identity})`)
+    // It asks systemd, and it asks about the one variable.
+    assert.match(source, /systemctl show -p LoadState -p Environment -p EnvironmentFiles -p PassEnvironment -p UnsetEnvironment/, `${name}: asks systemd`)
+  }
+
+  // THE INSTALLER IS EXEMPT, AND STAYS EXEMPT. It prompts for DB_HOST/DB_PORT/DB_NAME/DB_USER,
+  // creates the role and the database with them and composes DATABASE_URL out of them, so it
+  // parses nothing and has no file to be wrong about. Giving it this check would be asking a
+  // question about a service that does not exist yet.
+  assert.ok(!install.includes('env_file_is_sole_database_url_source'), 'install.sh owns the values and asks nothing')
+  assert.ok(!install.includes('require_env_file_is_sole_definition'), 'install.sh is not gated on a file it never reads')
+})

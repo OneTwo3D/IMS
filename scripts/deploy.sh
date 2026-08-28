@@ -588,9 +588,20 @@ resolve_db_identity() {
   case "${user}${host}${database}" in *%*) DB_IDENTITY_REASON="DATABASE_URL percent-escapes part of its role, host or database, and this will not decode it — write them plainly or run with --skip-migrate"; return 1 ;; esac
   # WHITESPACE would also be a value this cannot hand on unambiguously.
   case "${user}${host}${database}${port}" in *[[:space:]]*) DB_IDENTITY_REASON="DATABASE_URL states a role, host or database containing whitespace"; return 1 ;; esac
-  # THE QUERY STRING MAY NOT RESTATE ANY OF THE FOUR. node-postgres copies every query parameter
-  # into its config, so one of these makes the URL's own authority a false statement about where
-  # it connects — which is the whole class of defect this reader exists to refuse.
+  # AND NOT ONE PERCENT ESCAPE ANYWHERE IN THE QUERY STRING (o3d-2sm1.5 r20, Codex CRITICAL).
+  # The scan below compares RAW key bytes, and the driver does not: pg-connection-string runs the
+  # query through URLSearchParams, which decodes the KEY as well as the value. Measured against
+  # the installed pg-connection-string, `?ho%73t=other-cluster` yields host=other-cluster,
+  # `?po%72t=6543` yields port=6543 and `?u%73er=other` yields user=other — every one of them past
+  # a scan looking for `host`, `port` and `user`. So the URL's authority would state four values,
+  # this reader would hand those four to the fence, and the application would connect to a
+  # different cluster: the fence, the migration and the release all correct about a database
+  # nothing uses. Decoding it here to compare properly is the reimplementation this reader exists
+  # to avoid, so ANY escape in the query is refused instead — the same answer the role, host and
+  # database already get one check above, applied to the part that names them again.
+  if [[ -n "$query" ]]; then
+    case "$query" in *%*) DB_IDENTITY_REASON="DATABASE_URL percent-escapes something in its query string, and this will not decode it to find out whether the escape spells host, port, user or dbname — node-postgres decodes query KEYS, so ?ho%73t= reaches the driver as host= and moves the connection off the address the URL states. Write the query plainly, or run with --skip-migrate"; return 1 ;; esac
+  fi
   if [[ -n "$query" ]]; then
     IFS='&' read -r -a pairs <<<"$query"
     local pair name
@@ -622,6 +633,138 @@ resolve_db_identity() {
 require_db_identity() {
   [[ "${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]] && return 0
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# IS THE FILE WE READ THE ONLY THING THAT CAN DEFINE DATABASE_URL FOR THIS SERVICE?
+# (o3d-2sm1.5 r20, Codex CRITICAL)
+#
+# r19 moved the identity from "worked out by the fence" to "supplied by the entrypoint", and the
+# entrypoint supplies it out of ${APP_DIR_REAL}/.env. That is the PREVIOUS PROBLEM ONE LEVEL UP: an
+# `Environment=DATABASE_URL=...` directive, a drop-in that adds one, a `PassEnvironment=` entry or
+# a second `EnvironmentFile=` can put a different URL in the service's environment, and dotenv
+# does NOT overwrite a variable that is already set. The fence, the migration and the release
+# would then all be self-consistent about the .env database while the restarted application
+# connects elsewhere — a migration run on a database nothing was fenced off, and a new build
+# started against a database nothing migrated.
+#
+# THIS DOES NOT REBUILD THE INFERENCE r19 DELETED, and the difference is the whole design. It
+# computes no value and reproduces no precedence. It asks ONE existence question about ONE
+# variable:
+#
+#     can anything other than the file we read define DATABASE_URL for this unit?
+#
+# `systemctl show` answers that directly, because it reports the COMPOSED Environment=,
+# EnvironmentFiles=, PassEnvironment= and UnsetEnvironment= with every drop-in already folded in
+# by systemd itself. Asking whether a second definition EXISTS is bounded; working out which of
+# several would WIN is the unbounded question, and it is never asked — any answer but "only that
+# file" is a refusal that names what else defines it and tells the operator to state the identity
+# explicitly. A second environment file is refused WITHOUT being read, for the same reason: that
+# it may define the variable is enough, and reading it to find out would put the precedence
+# question straight back.
+#
+# THE FILE MUST ALSO BE ONE SYSTEMD ITSELF LOADS. If the unit loads no environment file, the
+# variable reaches the application through the application's OWN loader instead, by rules that
+# belong to Next and not to systemd — `.env.local` and the per-mode overlays, which is precisely
+# the layer r19 stopped reproducing. So that is a refusal too, and it says which line to add.
+#
+# WHAT IT CANNOT SEE, STATED RATHER THAN PAPERED OVER: an `ExecStart=` that runs a wrapper which
+# exports DATABASE_URL itself is invisible to `systemctl show`, because that definition lives
+# inside a program rather than in the unit. Closing that would mean reading programs, which is
+# unbounded again. It is the standing argument for making the four values a DEPLOYMENT-OWNED
+# CONFIGURATION INPUT that these scripts read outright, instead of deriving them from a URL that
+# is only probably the one the service uses (docs/installation.md).
+DB_IDENTITY_SOURCE_REASON="the service's environment has not been asked about yet"
+
+env_file_is_sole_database_url_source() {
+  local env_file="${1:-}"; shift || true
+  local -a units=("$@")
+  local unit props line value path load_state loads_our_file expected resolved
+
+  DB_IDENTITY_SOURCE_REASON=""
+  expected="$(readlink -f "$env_file" 2>/dev/null || printf '%s' "$env_file")"
+
+  if [[ "${#units[@]}" -eq 0 || -z "${units[0]}" ]]; then
+    DB_IDENTITY_SOURCE_REASON="no systemd unit was identified for the application, so there is nothing that can say whether ${env_file} is what gives it DATABASE_URL"
+    return 1
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    DB_IDENTITY_SOURCE_REASON="systemctl is not available, so whether anything other than ${env_file} defines DATABASE_URL for the service cannot be established"
+    return 1
+  fi
+
+  for unit in "${units[@]}"; do
+    [[ -n "$unit" ]] || continue
+    if ! props="$(systemctl show -p LoadState -p Environment -p EnvironmentFiles -p PassEnvironment -p UnsetEnvironment "$unit" 2>/dev/null)"; then
+      DB_IDENTITY_SOURCE_REASON="'systemctl show ${unit}' could not be run, so what defines DATABASE_URL for that service is unknown"
+      return 1
+    fi
+    if [[ -z "$props" ]]; then
+      DB_IDENTITY_SOURCE_REASON="'systemctl show ${unit}' answered nothing, so what defines DATABASE_URL for that service is unknown"
+      return 1
+    fi
+
+    load_state=""
+    loads_our_file=false
+    while IFS= read -r line; do
+      case "$line" in
+        LoadState=*)
+          load_state="${line#LoadState=}"
+          ;;
+        Environment=*)
+          value="${line#Environment=}"
+          case " ${value}" in
+            *' DATABASE_URL='*)
+              DB_IDENTITY_SOURCE_REASON="${unit} sets DATABASE_URL in its own Environment= (see 'systemctl show -p Environment ${unit}'). systemd puts that in the service's environment and dotenv will not overwrite an already-set variable, so the application connects where THAT says and not where ${env_file} says. Remove it, or state the connection identity explicitly"
+              return 1 ;;
+          esac
+          ;;
+        PassEnvironment=*)
+          value="${line#PassEnvironment=}"
+          case " ${value} " in
+            *' DATABASE_URL '*)
+              DB_IDENTITY_SOURCE_REASON="${unit} lists DATABASE_URL in PassEnvironment=, so the service inherits whatever the service manager's own environment holds and ${env_file} does not decide where the application connects. Remove it, or state the connection identity explicitly"
+              return 1 ;;
+          esac
+          ;;
+        UnsetEnvironment=*)
+          value="${line#UnsetEnvironment=}"
+          case " ${value} " in
+            *' DATABASE_URL '*)
+              DB_IDENTITY_SOURCE_REASON="${unit} lists DATABASE_URL in UnsetEnvironment=, so systemd removes the value ${env_file} supplies and the application's own loader decides what replaces it. Remove it, or state the connection identity explicitly"
+              return 1 ;;
+          esac
+          ;;
+        EnvironmentFiles=*)
+          path="${line#EnvironmentFiles=}"
+          path="${path%% (ignore_errors=*}"
+          [[ -n "$path" ]] || continue
+          resolved="$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")"
+          if [[ "$resolved" == "$expected" ]]; then
+            loads_our_file=true
+            continue
+          fi
+          DB_IDENTITY_SOURCE_REASON="${unit} also loads ${path} as an environment file. Whether that file defines DATABASE_URL, and which of the two definitions systemd would keep, is composition this will not reproduce — so it is refused rather than guessed at. Load only ${env_file}, or state the connection identity explicitly"
+          return 1 ;;
+      esac
+    done <<<"$props"
+
+    if [[ "$load_state" != "loaded" ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd reports ${unit} as '${load_state:-unknown}' rather than loaded, so what defines DATABASE_URL for it cannot be read"
+      return 1
+    fi
+    if ! $loads_our_file; then
+      DB_IDENTITY_SOURCE_REASON="${unit} does not load ${env_file} with EnvironmentFile=, so DATABASE_URL reaches the application through its own dotenv loader instead — whose .env.local and per-mode overlays are exactly the composition this deploy stopped reproducing. Add EnvironmentFile=${env_file} to the unit, or state the connection identity explicitly"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# The refusal every fence mode goes through, beside require_db_identity: four values, AND a
+# service whose DATABASE_URL nothing but that file can define.
+require_env_file_is_sole_definition() {
+  env_file_is_sole_database_url_source "${APP_DIR_REAL}/.env" "${SERVICE_UNITS[@]:-}"
 }
 
 # Read once, from the file the application itself is given. A failure is NOT fatal here: a
@@ -1101,6 +1244,12 @@ fence_db_connections() {
   require_db_identity || die \
     "The application's connection identity could not be read from ${APP_DIR_REAL}/.env: ${DB_IDENTITY_REASON}. The connection fence is TOLD which host, port, role and database it is closing — it no longer works that out from the environment, because seven rounds of doing so each uncovered another layer of systemd, Next and libpq composition. Write DATABASE_URL as a URL that states all four (postgresql://ROLE:PASSWORD@HOST:PORT/DATABASE, with no host/port/user/dbname query parameter), or re-run with --skip-migrate, which moves no schema and needs no fence. Nothing has been stopped and nothing has been migrated."
 
+  # AND THE FILE IT WAS READ FROM MUST BE THE ONLY THING THAT CAN DEFINE IT (o3d-2sm1.5 r20,
+  # Codex CRITICAL). Four values read out of a file the service may not use are four values about
+  # the wrong database.
+  require_env_file_is_sole_definition || die \
+    "${DB_IDENTITY_SOURCE_REASON}. The fence, the migration and the release would all agree with each other about the database ${APP_DIR_REAL}/.env names, while the application that restarts afterwards connects somewhere else — a migration on a database nothing fenced, and a new build on a database nothing migrated. Re-run with --skip-migrate, which moves no schema and needs no fence. Nothing has been stopped and nothing has been migrated."
+
   ensure_cutover_state_dirs
 
   local rc=0
@@ -1195,6 +1344,13 @@ require_fenceable_database() {
       warn "host/port/user/dbname query parameter. Nothing has been changed by this dry run."
       return 0
     fi
+    if ! require_env_file_is_sole_definition; then
+      warn "A REAL RUN WOULD BE REFUSED HERE: ${DB_IDENTITY_SOURCE_REASON}."
+      warn "The identity the fence is given is read from ${APP_DIR_REAL}/.env, so anything else that"
+      warn "can define DATABASE_URL for the service means the fence and the application could be"
+      warn "talking about different databases. Nothing has been changed by this dry run."
+      return 0
+    fi
     # The preflight changes nothing, so a dry run may run it for real — and reporting what it
     # actually says is the whole point of --dry-run. It is NOT fatal here: a dry run that
     # cannot reach the database must still exit 0, having said so.
@@ -1217,6 +1373,8 @@ require_fenceable_database() {
     "${DB_OBJECT_ACCESS_SCRIPT} is missing from this checkout, so nothing would check that the application role can use what the migration creates. Nothing has been stopped and nothing has been migrated."
   require_db_identity || die \
     "The application's connection identity could not be read from ${APP_DIR_REAL}/.env: ${DB_IDENTITY_REASON}. The connection fence is TOLD which host, port, role and database it is closing — it no longer works that out from the environment. Write DATABASE_URL as a URL that states all four (postgresql://ROLE:PASSWORD@HOST:PORT/DATABASE, with no host/port/user/dbname query parameter), or re-run with --skip-migrate. Nothing has been stopped and nothing has been migrated."
+  require_env_file_is_sole_definition || die \
+    "${DB_IDENTITY_SOURCE_REASON}. The connection identity handed to the fence is read from ${APP_DIR_REAL}/.env, and a service whose DATABASE_URL something else can define is a service the fence may be aimed away from. Re-run with --skip-migrate, which moves no schema and needs no fence. Nothing has been stopped and nothing has been migrated."
 
   # AND IT IS RUN, NOT LOOKED AT (o3d-2sm1.5, Codex r4 HIGH). This used to be `[[ -f ... ]]`
   # and nothing more, which proves the file exists and nothing about whether it works. Its
@@ -1313,6 +1471,10 @@ refence_db_connections() {
   $DRY_RUN && return 1
   [[ -f "$DB_FENCE_SCRIPT" ]] || return 1
   [[ -n "$DEPLOY_ADMIN_DATABASE_URL" ]] || return 1
+  # The same two questions the forward path asks, asked again rather than assumed: this runs from
+  # an exit trap, where dying would lose the banner, so it RETURNS and the caller reports no fence.
+  require_db_identity || return 1
+  require_env_file_is_sole_definition || return 1
 
   local rc=0
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
