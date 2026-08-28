@@ -633,18 +633,36 @@ DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"
 # application user (a root-owned state file is one it cannot release). So: root-owned, world
 # readable, and not writable by the account whose loss this recovers from.
 #
-# AND IT IS A LITERAL, for the reason DB_ENV_SNAPSHOT_DIR is: a trust root chosen by a variable is
-# only as trustworthy as whatever can set that variable, and there is no spelling of an override
-# that is safe and also worth having. A deployment that must move it edits this line.
+# AND THEY ARE LITERALS, for the reason DB_ENV_SNAPSHOT_DIR is: a trust root chosen by a variable
+# is only as trustworthy as whatever can set that variable, and there is no spelling of an
+# override that is safe and also worth having. A deployment that must move it edits the library.
 #
 # NOT the cutover state directory, which is where the fence MARKER lives: that is the
 # application's own data directory, and therefore writable by the application user (see
 # DB_ENV_SNAPSHOT_DIR below, which was moved out of it for exactly this reason). Putting the
 # identity in the marker would hand the account this recovers from the ability to aim the recovery
 # re-fence at a database of its choosing.
-DB_FENCE_RECOVERY_DIR="/etc/ims-cutover-recovery"
-DB_FENCE_IDENTITY_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-identity.env"
-DB_FENCE_SCRIPT_COPY="${DB_FENCE_RECOVERY_DIR}/fence-db-connections.mjs"
+#
+# THE PROTECTED-HELPER HALF OF THIS IS A LIBRARY, SHARED WITH deploy.sh AND install.sh
+# (o3d-2sm1.5 r31, Codex CRITICAL). Two rounds running, the finding was one rule with several
+# readers: r30 inverted the precedence here and left the other two entrypoints handing
+# DEPLOY_ADMIN_DATABASE_URL to a helper under the application checkout. So which bytes may run
+# with that credential is decided in ONE place — scripts/lib/db-fence-protected.sh — and this
+# script has no fence-script resolution of its own. It defines DB_FENCE_RECOVERY_DIR,
+# DB_FENCE_IDENTITY_FILE, DB_FENCE_SCRIPT_COPY, file_sha256(), fence_record_script_digest(),
+# publish_fence_script_copy(), db_fence_script_in_use() and the dry-run probe.
+#
+# SOURCED FROM THIS SCRIPT'S OWN DIRECTORY, NOT FROM ${APP_DIR}. It is read at startup, in the
+# same instant as the body of this file and out of the same tree, so it adds no window the
+# entrypoint itself does not already have — unlike the fence helper, which is executed several
+# phases later, after the application account has had a cutover's worth of time to replace it.
+# That difference is the whole reason the helper needs protecting and this file does not.
+IMS_SCRIPT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
+# shellcheck source=lib/db-fence-protected.sh
+source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
+  echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh could not be sourced. It decides which bytes the connection fence may be executed with, and without it this run cannot fence a migration window. Nothing has been changed." >&2
+  exit 1
+}
 # Did the identity this run is fencing with come from that record rather than from
 # ${APP_DIR}/.env? Only then are the two .env-drift questions in fence_db_connections() skipped —
 # they are questions about a file that is gone, and the record is the better answer to both.
@@ -2227,44 +2245,31 @@ remove_db_identity_snapshot() {
 # create, replace or remove anything in it. "No record and no copy" therefore means no fence this
 # script ever recorded — nothing is being substituted FOR — and the checkout's script is
 # published into the protected path and run from there, never in place.
+#
+# AND SUBSTITUTION AT WRITE, WHICH r30 DID NOT CLOSE (o3d-2sm1.5 r31, Codex CRITICAL). The rule
+# above is about which artefact WINS WHEN READ. The publication step went on taking whatever was
+# in the checkout and promoting it into the protected path on every fence, so the third form of
+# the same bug was still open: the application account replaces ${DB_FENCE_SCRIPT} between the
+# preflight and the fence, root publishes the replacement, the record's digest is computed from
+# those same bytes, and the account being defended against has supplied the trusted artefact. A
+# digest taken from the thing it is meant to authenticate proves self-consistency and nothing
+# else.
+#
+#   AN EXISTING PROTECTED COPY IS NEVER OVERWRITTEN FROM ${APP_DIR}. Bootstrap publishes when
+#   there is none; after that an upgrade is an AUTHENTICATED ROTATION — IMS_FENCE_SCRIPT_SHA256
+#   on the root invocation, taken from the release and not from this box, verified against the
+#   bytes already staged inside the root-owned directory — or root removing the protected copy.
+#   A checkout that merely DIFFERS is reported and not promoted.
+#
+# The mechanism now lives in scripts/lib/db-fence-protected.sh, which is where the reasoning in
+# full is, and it is shared with deploy.sh and install.sh: those two still handed
+# DEPLOY_ADMIN_DATABASE_URL to ${DB_FENCE_SCRIPT} directly, so r30 fixed one of three readers of
+# one rule.
 
-# The digest of a file, or nothing. sha256sum is coreutils and is present wherever this script
-# runs; a box without it cannot bind the copy to the record, and publish_fence_recovery_record()
-# refuses rather than raising a fence it cannot bind.
-file_sha256() {
-  local path="$1" out
-  [[ -f "$path" ]] || return 1
-  out="$(sha256sum -- "$path" 2>/dev/null)" || return 1
-  out="${out%% *}"
-  [[ -n "$out" ]] || return 1
-  printf '%s' "$out"
-}
-
-# The digest ${DB_FENCE_IDENTITY_FILE} binds to the fence it records, and only from a COMPLETE
-# record: a half-written one is not evidence about anything, here as everywhere else in this file.
-fence_record_script_digest() {
-  local digest
-  [[ -f "${DB_FENCE_IDENTITY_FILE}" ]] || return 1
-  grep -qE '^fence_identity_complete=1$' "${DB_FENCE_IDENTITY_FILE}" 2>/dev/null || return 1
-  digest="$(env_file_value fence_script_sha256 "${DB_FENCE_IDENTITY_FILE}")"
-  [[ -n "$digest" ]] || return 1
-  printf '%s' "$digest"
-}
-
-# THE ONLY WRITER of ${DB_FENCE_SCRIPT_COPY}. Copies the checkout's fence script into the
-# root-owned path; the caller decides whether it is allowed to.
-publish_fence_script_copy() {
-  [[ -f "${DB_FENCE_SCRIPT}" ]] || return 1
-  # The directory's mode is not left to root's umask: the fence runs AS THE APPLICATION USER and
-  # has to traverse this to read the copy, so a 0700 directory is a fence that cannot be raised.
-  mkdir -p "${DB_FENCE_RECOVERY_DIR}" || return 1
-  chown root:root "${DB_FENCE_RECOVERY_DIR}" 2>/dev/null || true
-  chmod 755 "${DB_FENCE_RECOVERY_DIR}" || return 1
-  publish_durable_file "${DB_FENCE_SCRIPT_COPY}" < "${DB_FENCE_SCRIPT}" || return 1
-  chown root:root "${DB_FENCE_SCRIPT_COPY}" 2>/dev/null || true
-  chmod 644 "${DB_FENCE_SCRIPT_COPY}" || return 1
-  return 0
-}
+# file_sha256(), fence_record_script_digest() and publish_fence_script_copy() are defined ONCE,
+# in scripts/lib/db-fence-protected.sh, and shared with deploy.sh and install.sh. They used to
+# live here; three entrypoints each with their own copy of the rule about which bytes may run
+# with DEPLOY_ADMIN_DATABASE_URL is the shape both of the last two rounds’ findings had.
 
 # Publish the identity this run is about to fence with, and the script that will raise the fence,
 # where only root can change them.
@@ -2293,15 +2298,16 @@ publish_fence_recovery_record() {
   mkdir -p "${DB_FENCE_RECOVERY_DIR}" || return 1
   chown root:root "${DB_FENCE_RECOVERY_DIR}" 2>/dev/null || true
   chmod 755 "${DB_FENCE_RECOVERY_DIR}" || return 1
-  # The script that is about to raise the fence, copied out of the application checkout while it
-  # is still there — and it is the COPY that gets executed, so this is a publication and not a
-  # backup. NOT re-copied when the checkout no longer has one: that is a run re-fencing with the
-  # copy an earlier one published, and re-copying it over itself proves nothing.
-  if [[ -f "${DB_FENCE_SCRIPT}" ]]; then
-    publish_fence_script_copy || return 1
-  elif [[ ! -f "${DB_FENCE_SCRIPT_COPY}" ]]; then
-    return 1
-  fi
+  # ENSURE A PROTECTED COPY EXISTS; DO NOT REPLACE THE ONE THAT DOES (o3d-2sm1.5 r31, Codex
+  # CRITICAL). This used to read "if the checkout has a fence script, publish it" — which is the
+  # finding in one line: the application account replaces ${DB_FENCE_SCRIPT} between the preflight
+  # and here, root promotes the replacement into the protected path, and the digest recorded three
+  # lines down is taken from those same substituted bytes, so it proves only that the substitution
+  # is consistent with itself. publish_fence_script_copy() now bootstraps when there is no
+  # protected copy and otherwise leaves the standing one alone; an upgrade is an authenticated
+  # rotation (IMS_FENCE_SCRIPT_SHA256 on the root invocation) and never an implicit consequence of
+  # raising a fence. See scripts/lib/db-fence-protected.sh.
+  publish_fence_script_copy || return 1
   # THE DIGEST IS TAKEN FROM THE PUBLISHED COPY, not from the checkout, because the copy is what
   # will run. Binding the two closes the copy/use race r29 left: the file whose digest the record
   # names is the file the fence is raised with, and every later adoption, release and re-fence
@@ -2326,49 +2332,10 @@ publish_fence_recovery_record() {
   return 0
 }
 
-# Which copy of the fence script this run may EXECUTE. It is always the root-owned one.
-#
-# ${DB_FENCE_SCRIPT} IS NEVER EXECUTED FROM ITS OWN PATH (o3d-2sm1.5 r30, Codex HIGH). It sits
-# under ${APP_DIR}, so the application account can replace it as easily as delete it, and every
-# caller of this function hands the result DEPLOY_ADMIN_DATABASE_URL and runs it — the adoption,
-# the release, and the exit trap's re-fence included. Preferring it "because it is the current
-# one" made the current one whatever that account last wrote.
-#
-# Prints the path it chose; on failure prints the reason on stderr and returns non-zero. The
-# reason goes to stderr rather than into a variable because every caller reads this through a
-# command substitution, and a global set inside one dies with the subshell.
-db_fence_script_in_use() {
-  local recorded actual
-  recorded="$(fence_record_script_digest)" || recorded=""
-
-  if [[ -f "${DB_FENCE_SCRIPT_COPY}" ]]; then
-    if [[ -n "${recorded}" ]]; then
-      actual="$(file_sha256 "${DB_FENCE_SCRIPT_COPY}")" || actual=""
-      if [[ "${actual}" != "${recorded}" ]]; then
-        echo "The root-owned fence script at ${DB_FENCE_SCRIPT_COPY} is not the one the recovery record binds to this fence (record: ${recorded}; file: ${actual:-unreadable}). Refusing to run it." >&2
-        return 1
-      fi
-    fi
-    printf '%s' "${DB_FENCE_SCRIPT_COPY}"
-    return 0
-  fi
-
-  if [[ -n "${recorded}" ]]; then
-    echo "The recovery record binds this fence to the root-owned fence script at ${DB_FENCE_SCRIPT_COPY}, and that file is gone. Only root can remove it, so this is not a state the application account can have produced." >&2
-    return 1
-  fi
-
-  # NO RECORD AND NO PROTECTED COPY: nothing this script ever recorded is standing, so there is
-  # nothing here to substitute FOR. The checkout's script is PUBLISHED into the protected path and
-  # run from there — never executed in place, so the file that runs cannot change between the
-  # decision and the execution.
-  if ! publish_fence_script_copy; then
-    echo "Neither a root-owned fence script at ${DB_FENCE_SCRIPT_COPY} nor ${DB_FENCE_SCRIPT} could be used." >&2
-    return 1
-  fi
-  printf '%s' "${DB_FENCE_SCRIPT_COPY}"
-  return 0
-}
+# db_fence_script_in_use() is defined in scripts/lib/db-fence-protected.sh. It is the only thing
+# that decides which file this script executes with the privileged credential, and it never
+# returns ${DB_FENCE_SCRIPT}: the checkout is application-owned, and the account this defends
+# against does not have to delete its file — it only has to supply one that works.
 
 # Take the connection identity from the recovery record instead of from ${APP_DIR}/.env.
 #
@@ -2637,7 +2604,7 @@ require_fenceable_database() {
   # A dry run stops nothing and migrates nothing, so it REPORTS the refusal instead of being
   # it: the point of --dry-run is to find out what a real run would do.
   if $DRY_RUN; then
-    if [[ -z "${DEPLOY_ADMIN_DATABASE_URL}" ]] || [[ ! -f "${DB_FENCE_SCRIPT}" ]] || [[ ! -f "${DB_OBJECT_ACCESS_SCRIPT}" ]]; then
+    if [[ -z "${DEPLOY_ADMIN_DATABASE_URL}" ]] || { [[ ! -f "${DB_FENCE_SCRIPT}" ]] && [[ ! -f "${DB_FENCE_SCRIPT_COPY}" ]]; } || [[ ! -f "${DB_OBJECT_ACCESS_SCRIPT}" ]]; then
       warn "A REAL RUN WOULD BE REFUSED HERE: the migration window cannot be fenced."
       warn "DEPLOY_ADMIN_DATABASE_URL is not set (or fence-db-connections.mjs is missing), so CONNECT"
       warn "could not be revoked for the window and nothing would stop a client attaching across the"
@@ -2663,21 +2630,30 @@ require_fenceable_database() {
     # actually answered is the whole point of --dry-run. Not fatal here: a dry run that cannot
     # reach the database still exits 0, having said so.
     #
-    # THE SAME PRECEDENCE AS EVERY OTHER MODE, MINUS THE PUBLICATION (o3d-2sm1.5 r30). The
+    # THE SAME PRECEDENCE AS EVERY OTHER MODE, MINUS THE PUBLICATION (o3d-2sm1.5 r30/r31). The
     # root-owned copy wins whenever there is one — a dry run on a box mid-recovery must probe with
     # the script the fence was raised by, not with whatever is in the checkout now. It does not
-    # PUBLISH one when there is none: a dry run writes nothing, least of all under /etc, and with
-    # no copy there is nothing for the checkout to be substituted for.
-    local dry_rc=0 dry_script="${DB_FENCE_SCRIPT}"
-    if [[ -f "${DB_FENCE_SCRIPT_COPY}" ]]; then
-      dry_script="${DB_FENCE_SCRIPT_COPY}"
+    # PUBLISH one when there is none: a dry run writes nothing, least of all under /etc. But it no
+    # longer runs the checkout's file IN PLACE either (r31): --preflight opens the admin connection
+    # with DEPLOY_ADMIN_DATABASE_URL, and "it only reads" is a property of the SHIPPED script and
+    # not of whatever is at that path. db_fence_probe_script() snapshots the checkout's bytes into
+    # a throwaway ROOT-OWNED directory and returns that, so the file that runs cannot change
+    # between this line and the exec, and nothing durable is written.
+    local dry_rc=0
+    db_fence_probe_script || {
+      warn "A REAL RUN WOULD BE REFUSED HERE: there is no fence script this run could execute."
+      warn "Nothing has been changed by this dry run."
+      return 0
+    }
+    if [[ "${DB_FENCE_PROBE_SCRIPT}" == "${DB_FENCE_SCRIPT_COPY}" ]]; then
       warn "A fence raised by an earlier run is recorded here, so this dry run probes with the"
-      warn "root-owned copy of the fence script at ${dry_script} rather than the checkout's."
+      warn "root-owned copy of the fence script at ${DB_FENCE_PROBE_SCRIPT} rather than the checkout's."
     fi
     run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${dry_script}" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || dry_rc=$?
+      node "${DB_FENCE_PROBE_SCRIPT}" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || dry_rc=$?
+    db_fence_probe_cleanup
     if [[ "${dry_rc}" -eq 0 ]]; then
       success "A REAL RUN WOULD BE FENCEABLE: the preflight above asked the database and it answered yes."
     else
@@ -2688,8 +2664,12 @@ require_fenceable_database() {
   fi
   [[ -n "${DEPLOY_ADMIN_DATABASE_URL}" ]] || die \
     "DEPLOY_ADMIN_DATABASE_URL is not set, so this update has no privileged connection that would survive revoking CONNECT from the application role — the database cannot be held closed for the migration window. Set it in ${APP_DIR}/.env (a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL; docs/installation.md) and re-run. Nothing has been stopped and nothing has been migrated."
-  [[ -f "${DB_FENCE_SCRIPT}" ]] || die \
-    "${DB_FENCE_SCRIPT} is missing from this checkout, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
+  # A RECOVERY PATH MAY NOT DEPEND ON THE THING WHOSE LOSS IT RECOVERS FROM (o3d-2sm1.5 r31).
+  # A box that already has a protected copy needs nothing from the checkout to fence with, and
+  # refusing there would make a deleted ${DB_FENCE_SCRIPT} enough to strand a standing fence —
+  # which is the deletion attack r29 closed, reopened one layer up as a refusal.
+  [[ -f "${DB_FENCE_SCRIPT}" || -f "${DB_FENCE_SCRIPT_COPY}" ]] || die \
+    "Neither ${DB_FENCE_SCRIPT} nor the root-owned copy at ${DB_FENCE_SCRIPT_COPY} exists, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
   [[ -f "${DB_OBJECT_ACCESS_SCRIPT}" ]] || die \
     "${DB_OBJECT_ACCESS_SCRIPT} is missing from this checkout, so nothing would check that the application role can use what the migration creates. Nothing has been stopped and nothing has been migrated."
   require_db_identity || die \
