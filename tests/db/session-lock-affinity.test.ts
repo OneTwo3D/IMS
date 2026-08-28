@@ -15,7 +15,9 @@ import {
   pgSessionLockConnectionConfig,
   resetSessionLockSpaceMeasurements,
   resetStartupOptionByteSafety,
+  sessionLockSpaceReestablisher,
 } from '../../lib/db/database-url-schema.mjs'
+import { gateOnFreshLockSpace } from '../../lib/db/session-lock-pool'
 
 /**
  * o3d-2k5r r25, Codex HIGH — o3d-a5zz: THE AFFINITY CHECK IS A PROPERTY OF TAKING A SESSION LOCK,
@@ -442,7 +444,9 @@ function sameNamesDifferentEndpoint(base: string, port: number): string {
 function standInConnector(answers: { taken?: unknown; acquired?: unknown }) {
   const asked: string[] = []
   const dialled: string[] = []
+  const configs: Record<string, unknown>[] = []
   const createClient = async (config: object) => {
+    configs.push(config as Record<string, unknown>)
     dialled.push(String((config as { connectionString?: unknown }).connectionString ?? ''))
     return {
       async connect() { return undefined },
@@ -455,7 +459,7 @@ function standInConnector(answers: { taken?: unknown; acquired?: unknown }) {
       async end() { return undefined },
     }
   }
-  return { createClient, asked, dialled }
+  return { createClient, asked, dialled, configs }
 }
 
 test('[o3d-2k5r r26] an override on a DIFFERENT instance with the SAME database and schema names is REFUSED', async () => {
@@ -554,13 +558,18 @@ test('[o3d-2k5r r26] the probe key is RANDOM, so two instances booting at once c
   assert.ok(keys.size > 1, `five probes produced ${keys.size} distinct keys`)
 })
 
-test('[o3d-2k5r r26] the probe is measured ONCE per process, not once per connection', async () => {
+test('[o3d-2k5r r27] the per-connection leg REUSES a verdict, so one acquisition never pays for the probe twice', async () => {
   // The cost statement, counted rather than asserted in prose: two throwaway connections and four
-  // statements, on the first lock connection that needs them and never again.
+  // statements for a measurement, and the `onConnect` leg does not add a second one.
   //
-  // MUTATION ROUTE: return `measureSharedAdvisoryLockSpace(...)` directly from
-  // `sharedAdvisoryLockSpaceEstablished()` without the memo. The counts below multiply by the
-  // number of connections.
+  // THIS IS NOT "once per process" ANY MORE (r27). The `onConnect` leg passes `notBefore = 0` and
+  // so reuses whatever the memo holds — deliberately, because it is NOT the authority: the
+  // acquisition gate that runs immediately after it is, and it accepts only a verdict measured for
+  // itself (the test below). Passing 0 here is what stops a brand-new physical connection paying
+  // for the probe twice inside one acquisition.
+  //
+  // MUTATION ROUTE: make the `onConnect` leg pass `Date.now()` instead of 0. `dialled.length`
+  // becomes 8 across the four connections below, and every new lock connection pays twice.
   resetSessionLockSpaceMeasurements()
   const { createClient, asked, dialled } = standInConnector({ taken: true, acquired: false })
   const config = pgSessionLockConnectionConfig(
@@ -814,4 +823,242 @@ test('[o3d-2k5r r26] (live): an override whose lock space is NOT the data path i
     await relay.close()
     resetSessionLockSpaceMeasurements()
   }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r27, Codex HIGH + MEDIUM (review of r26).
+//
+// HIGH: "a cached success remains authoritative after the endpoints diverge". The probe sampled one
+// connection from each endpoint and memoised the verdict for the life of the process. The URL
+// STRINGS do not change when a pooler is restarted onto another primary, a DNS record is
+// re-pointed or a managed failover promotes a replica — so a process that measured at boot goes on
+// treating that sample as authorisation for an EXTERNAL MONEY POST for as long as it lives, while a
+// process started after the change locks the other server. Both are told they hold the lock.
+//
+// WHAT THESE TESTS DO AND DO NOT CLAIM. They pin that the verdict is re-measured for every lock
+// ACQUISITION, which takes the exposure from the process's lifetime to the milliseconds between the
+// probe and the `pg_try_advisory_lock` it licenses. They do NOT claim the finding is closed: a
+// check is a sample taken before the thing it licenses, and no number of samples becomes the
+// property. The mechanism that would close it — durable, fenced state written through the
+// authoritative DATABASE_URL transaction — is o3d-ic9a (P0), and is not written inside this branch.
+//
+// MEDIUM: "the probe has no deadline after connection establishment". Only `connectionTimeoutMillis`
+// was set, so once either socket was up the holder query, `begin`, the witness query, `rollback`,
+// the unlock and both shutdowns could hang forever — a boot-path hang on a money-lock path, in place
+// of the fail-closed refusal this module promises.
+// ---------------------------------------------------------------------------
+
+const POOLED = 'postgresql://app:pw@pooler.internal:6432/ims?schema=public'
+const DIRECT_ELSEWHERE = 'postgresql://app:pw@10.9.9.9:5432/ims?schema=public'
+
+test('[o3d-2k5r r27] the verdict is re-measured for each ACQUISITION and never inherited from an earlier one', async () => {
+  // ROUTE: createSessionAdvisoryLockPool() -> gateOnFreshLockSpace() -> sessionLockSpaceReestablisher()
+  // -> sharedAdvisoryLockSpaceEstablished(notBefore = the instant this acquisition began).
+  //
+  // MUTATION ROUTE: restore the r26 memo — `if (held !== undefined) return held.promise`, ignoring
+  // `notBefore`. The second acquisition then reuses the first acquisition's sample, `dialled.length`
+  // stays 2, and the first assertion below fails. That is exactly the shape Codex named: a verdict
+  // that outlives the relationship it measured.
+  resetSessionLockSpaceMeasurements()
+  const { createClient, dialled } = standInConnector({ taken: true, acquired: false })
+  const reestablish = sessionLockSpaceReestablisher(POOLED, DIRECT_ELSEWHERE, { createClient })
+  assert.ok(reestablish !== null, 'PRECONDITION: an override is set, so there is something to re-establish')
+
+  await reestablish(Date.now())
+  assert.equal(dialled.length, 2, `PRECONDITION: one acquisition measures once; it dialled ${dialled.length}`)
+
+  // A later acquisition. `Date.now()` is millisecond-resolution, so the wait is what makes
+  // "started before this acquisition began" true rather than a coin toss.
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  await reestablish(Date.now())
+  assert.equal(dialled.length, 4, `the second acquisition measured for itself; it dialled ${dialled.length} in total`)
+
+  // And the ONE caller that is allowed to reuse still does: the per-connection `onConnect` leg,
+  // which passes 0 because the acquisition gate behind it is the authority.
+  await reestablish(0)
+  assert.equal(dialled.length, 4, 'the per-connection leg reuses, so a new connection does not probe twice in one acquisition')
+})
+
+test('[o3d-2k5r r27] with NO override there is nothing to re-establish, so an acquisition pays nothing', () => {
+  // MUTATION ROUTE: drop the `if (override === null) return null` branch from
+  // `sessionLockSpaceReestablisher()`. Every ordinary deployment — one URL, one derivation, no
+  // second endpoint that could disagree — starts opening two connections per lock acquisition.
+  assert.equal(sessionLockSpaceReestablisher(POOLED, undefined), null)
+  assert.equal(sessionLockSpaceReestablisher(POOLED, ''), null)
+  assert.equal(sessionLockSpaceReestablisher(POOLED, '   '), null)
+  assert.ok(sessionLockSpaceReestablisher(POOLED, DIRECT_ELSEWHERE) !== null, 'and an override really does produce one')
+})
+
+/**
+ * A connector that CONNECTS SUCCESSFULLY and then never answers — the case Codex asked for.
+ *
+ * It records what was destroyed at the socket, which is the thing that actually frees a wedged
+ * backend (and releases the probe key the holder is holding); `end()` is recorded separately
+ * because on a stalled connection it is a conversation the server will not have.
+ */
+function stallingConnector(stallOn: RegExp) {
+  const destroyed: string[] = []
+  const ended: string[] = []
+  const createClient = async (config: object) => {
+    const url = String((config as { connectionString?: unknown }).connectionString ?? '')
+    return {
+      connection: { stream: { destroy() { destroyed.push(url) } } },
+      async connect() { return undefined },
+      async query(text: string) {
+        if (stallOn.test(text)) return new Promise<{ rows: Array<Record<string, unknown>> }>(() => {})
+        if (text.includes('pg_try_advisory_lock')) return { rows: [{ taken: true }] }
+        if (text.includes('pg_try_advisory_xact_lock')) return { rows: [{ acquired: false }] }
+        return { rows: [{}] }
+      },
+      async end() { ended.push(url); return undefined },
+    }
+  }
+  return { createClient, destroyed, ended }
+}
+
+test('[o3d-2k5r r27] a connector that connects and then STALLS is given up on, destroyed, and REFUSED', { timeout: 15_000 }, async () => {
+  // ROUTE: the lock connection's onConnect -> the shared-lock-space probe -> a witness that
+  // connects and then never answers `begin` -> the whole-probe deadline -> both clients destroyed
+  // at the socket -> DatabaseUrlSchemaConflictError, i.e. the promised fail-closed refusal.
+  //
+  // MUTATION ROUTE 1: delete the `Promise.race([..., deadline])` in
+  // `measureSharedAdvisoryLockSpace()` and await the probe directly. Nothing ever settles and this
+  // test fails on its own 15s timeout instead of passing in ~80ms — which is precisely the defect:
+  // a money post, an accounting batch, a WMS sweep or a restore hangs instead of being refused.
+  // MUTATION ROUTE 2: make `destroyProbeClient()` a no-op. The refusal still arrives, and the
+  // `destroyed` assertions below fail — the probe would have given up while still holding both
+  // sockets, and the holder's advisory lock with them.
+
+  // (a) THE WITNESS stalls, so BOTH connections are open when the deadline fires.
+  resetSessionLockSpaceMeasurements()
+  const witnessStalls = stallingConnector(/^begin$/)
+  const config = pgSessionLockConnectionConfig(POOLED, DIRECT_ELSEWHERE, 'the money-post lock', {
+    createClient: witnessStalls.createClient,
+    probeDeadlineMs: 80,
+  })
+  await assert.rejects(
+    () => (config.onConnect as (c: unknown) => Promise<void>)(directStandIn().client),
+    (error: unknown) => {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError, `expected a refusal, got ${String(error)}`)
+      const message = (error as Error).message
+      assert.match(message, /could not be established within 80ms/, 'the refusal says it ran out of time')
+      assert.match(message, /stopped answering/, 'and what that looked like')
+      assert.match(message, /may only be passed by an answer/, 'and that silence is not a yes')
+      assert.match(message, /pay the same document twice/, 'and what the misconfiguration would cost')
+      assert.match(message, /WHAT TO CHANGE/, 'and what to do about it')
+      return true
+    },
+  )
+  assert.deepEqual(
+    witnessStalls.destroyed.map((url) => new URL(url).host).sort(),
+    ['10.9.9.9:5432', 'pooler.internal:6432'],
+    'BOTH probe connections were destroyed at the socket, not left wedged',
+  )
+
+  // (b) THE HOLDER stalls, before the witness exists. The one connection that was opened is the one
+  // that is destroyed — a deadline that only worked when both were up would leave the common case
+  // (an unreachable primary behind a live pooler) holding a socket.
+  resetSessionLockSpaceMeasurements()
+  const holderStalls = stallingConnector(/pg_try_advisory_lock/)
+  const holderConfig = pgSessionLockConnectionConfig(POOLED, DIRECT_ELSEWHERE, 'the money-post lock', {
+    createClient: holderStalls.createClient,
+    probeDeadlineMs: 80,
+  })
+  await assert.rejects(
+    () => (holderConfig.onConnect as (c: unknown) => Promise<void>)(directStandIn().client),
+    (error: unknown) => {
+      assert.match((error as Error).message, /could not be established within 80ms/)
+      return true
+    },
+  )
+  assert.deepEqual(
+    holderStalls.destroyed.map((url) => new URL(url).host),
+    ['10.9.9.9:5432'],
+    'the one connection that was open is destroyed, and the witness was never dialled',
+  )
+})
+
+test('[o3d-2k5r r27] every probe connection carries a per-STATEMENT deadline, not only a connect timeout', async () => {
+  // The deadline above is the backstop; this is the bound that makes the ordinary stall cheap.
+  // CLIENT-side (`pg`'s `query_timeout`) deliberately: a server `statement_timeout` travels as a
+  // startup option, and this module has already MEASURED PgBouncer accepting the connection and
+  // silently discarding those (`-c statement_timeout=1234` came back `0`). The override exists
+  // because DATABASE_URL goes through a pooler, so a deadline a pooler can drop is not a deadline.
+  //
+  // MUTATION ROUTE: remove `query_timeout` from `probeConnectionConfig()`. Both assertions fail,
+  // and a stalled statement is then bounded only by the 20s whole-probe backstop.
+  resetSessionLockSpaceMeasurements()
+  const { createClient, configs } = standInConnector({ taken: true, acquired: false })
+  const config = pgSessionLockConnectionConfig(POOLED, DIRECT_ELSEWHERE, 'a test lock', { createClient })
+  await (config.onConnect as (c: unknown) => Promise<void>)(directStandIn().client)
+  assert.equal(configs.length, 2, `PRECONDITION: both probe legs were configured; ${configs.length} were`)
+  for (const dialledWith of configs) {
+    assert.equal(dialledWith.connectionTimeoutMillis, 5_000, 'the connect is bounded')
+    assert.equal(dialledWith.query_timeout, 5_000, 'and so is every statement on it')
+  }
+})
+
+// ---------------------------------------------------------------------------
+// The gate itself: what a lock ACQUISITION does around obtaining its connection.
+// ---------------------------------------------------------------------------
+
+test('[o3d-2k5r r27] the acquisition gate reads its instant BEFORE opening, so a verdict measured for an earlier acquisition cannot satisfy it', async () => {
+  // MUTATION ROUTE: move `const notBefore = Date.now()` below `await open()` in
+  // `gateOnFreshLockSpace()`. `notBefore` then lands after the connection came up — after the
+  // `onConnect` probe that ran on the way up — so that probe is rejected as too old and every new
+  // physical connection measures twice; the assertion below fails on the same instant.
+  const seen: number[] = []
+  let openedAt = 0
+  const gated = gateOnFreshLockSpace<string>(
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      openedAt = Date.now()
+      return 'client'
+    },
+    async (notBefore) => { seen.push(notBefore) },
+    () => { throw new Error('nothing was refused, so nothing may be discarded') },
+  )
+  assert.equal(await gated(), 'client', 'an admitted acquisition gets its connection')
+  assert.equal(seen.length, 1, 'and the gate really ran')
+  assert.ok(seen[0]! <= openedAt, `notBefore (${seen[0]}) was taken before the connection opened (${openedAt})`)
+})
+
+test('[o3d-2k5r r27] a refused acquisition DISCARDS its connection and rethrows, rather than handing it out', async () => {
+  // A pool client released without `destroy` goes straight back into the pool, so a checkout that
+  // was refused would leak a connection per refusal — and behind a broken endpoint every
+  // acquisition is a refusal.
+  //
+  // MUTATION ROUTE: delete the `discard(client)` call in `gateOnFreshLockSpace()`'s catch.
+  // `discarded` stays empty and this fails.
+  const discarded: string[] = []
+  const refused = gateOnFreshLockSpace<string>(
+    async () => 'client',
+    async () => { throw new DatabaseUrlSchemaConflictError('does NOT share an advisory-lock space') },
+    (client) => { discarded.push(client) },
+  )
+  await assert.rejects(refused, (error: unknown) => {
+    assert.ok(error instanceof DatabaseUrlSchemaConflictError, `the refusal reaches the caller unchanged, got ${String(error)}`)
+    return true
+  })
+  assert.deepEqual(discarded, ['client'], 'the connection it obtained was destroyed')
+
+  // AND A FAILING DISCARD DOES NOT REPLACE THE REFUSAL. MUTATION ROUTE: drop the try/catch around
+  // `discard(client)`; the caller then sees "teardown exploded" instead of what is actually wrong.
+  const alsoRefused = gateOnFreshLockSpace<string>(
+    async () => 'client',
+    async () => { throw new DatabaseUrlSchemaConflictError('does NOT share an advisory-lock space') },
+    () => { throw new Error('teardown exploded') },
+  )
+  await assert.rejects(alsoRefused, (error: unknown) => {
+    assert.match((error as Error).message, /does NOT share an advisory-lock space/)
+    return true
+  })
+})
+
+test('[o3d-2k5r r27] with no override the gate is the identity, so an ordinary deployment pays nothing for it', async () => {
+  // MUTATION ROUTE: drop the `if (reestablish === null) return open` early return. Every
+  // deployment without an override then pays a closure, a `Date.now()` and a try/catch per
+  // acquisition for a check that cannot run.
+  const open = async () => 'client'
+  assert.equal(gateOnFreshLockSpace<string>(open, null, () => { throw new Error('unreachable') }), open)
 })
