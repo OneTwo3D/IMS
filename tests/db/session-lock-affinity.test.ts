@@ -17,7 +17,7 @@ import {
   resetStartupOptionByteSafety,
   sessionLockSpaceReestablisher,
 } from '../../lib/db/database-url-schema.mjs'
-import { gateOnFreshLockSpace } from '../../lib/db/session-lock-pool'
+import { boundLockAcquisition, gateOnFreshLockSpace } from '../../lib/db/session-lock-pool'
 
 /**
  * o3d-2k5r r25, Codex HIGH — o3d-a5zz: THE AFFINITY CHECK IS A PROPERTY OF TAKING A SESSION LOCK,
@@ -1070,4 +1070,217 @@ test('[o3d-2k5r r27] with no override the gate is the identity, so an ordinary d
   // acquisition for a check that cannot run.
   const open = async () => 'client'
   assert.equal(gateOnFreshLockSpace<string>(open, null, () => { throw new Error('unreachable') }), open)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r28, Codex MEDIUM: the deadline on the connection the probe LICENSES.
+//
+// r27 bounded the probe -- two throwaway clients -- and left unbounded the one statement that runs
+// on the ACTUAL lock socket before any probe client exists. Codex's reproduction: `probeDeadlineMs:
+// 25`, still pending at 100ms, ZERO probe clients created. These tests drive that exact case.
+// ---------------------------------------------------------------------------
+
+/**
+ * The ACTUAL lock client: it connects, answers the peer question as a direct connection would --
+ * or, when asked to stall, never answers at all -- and records what was done to its SOCKET.
+ *
+ * `end()` is recorded separately from `destroy()` on purpose. On a wedged connection `end()` is a
+ * conversation the server will not have, so a teardown that only called it would leave the socket
+ * exactly where it was; destroying the stream is the thing that actually frees the backend.
+ */
+function lockClientStandIn(stall = false) {
+  const destroyed: string[] = []
+  const ended: string[] = []
+  const asked: string[] = []
+  const client = {
+    connection: {
+      stream: {
+        localAddress: '127.0.0.1',
+        localPort: 51515,
+        destroy() { destroyed.push('socket') },
+      },
+    },
+    async query(text: string) {
+      asked.push(text)
+      if (stall) return new Promise<{ rows: Array<Record<string, unknown>> }>(() => {})
+      return {
+        rows: [{
+          client_address: '127.0.0.1',
+          client_port: '51515',
+          server_encoding: 'UTF8',
+          lc_ctype: 'C.UTF-8',
+          backend_address: '127.0.0.1',
+          backend_port: '5432',
+          server_version: '17.11',
+          search_path: '"public"',
+        }],
+      }
+    },
+    async end() { ended.push('end'); return undefined },
+  }
+  return { client, destroyed, ended, asked }
+}
+
+test('[o3d-2k5r r28] the LOCK client connects and then STALLS: the affinity query is bounded, its socket destroyed, and the acquisition REFUSED', { timeout: 15_000 }, async () => {
+  // ROUTE: createSessionAdvisoryLockPool()/createSessionAdvisoryLockClient() ->
+  // pgSessionLockConnectionConfig() -> the connection's `onConnect` -> sessionLockAffinityGuard()
+  // -> `select client_addr, ...` ON THE LOCK SOCKET, which never answers -> the per-statement
+  // deadline in `withLockClientDeadline()` -> that client's stream is DESTROYED -> a fail-closed
+  // DatabaseUrlSchemaConflictError. This is the connection every session lock in the process is
+  // taken on; the probe's deadline is not reachable from here and never was.
+  //
+  // MUTATION ROUTE 1: in `sessionLockAffinityGuard()`, replace the inner
+  // `withLockClientDeadline(client, peerQueryTimeoutMs, ...)` wrapper with a bare
+  // `await client.query(SESSION_LOCK_PEER_SQL)` -- i.e. restore r27. Nothing settles, and this test
+  // fails on its own 15s timeout instead of passing in ~60ms. VERIFIED by making exactly that edit.
+  // MUTATION ROUTE 2: make `destroyClientSocket()` a no-op. The refusal still arrives and the
+  // `destroyed` assertion below fails -- the acquisition would have given up while still holding
+  // the socket, and a wedged backend is freed by nothing else.
+
+  // (a) NO OVERRIDE AT ALL, which is the ordinary deployment: there is no probe, so there is
+  //     nothing for a probe deadline to protect, and the stall is bounded anyway.
+  resetSessionLockSpaceMeasurements()
+  const plain = lockClientStandIn(true)
+  const plainConfig = pgSessionLockConnectionConfig(POOLED, undefined, 'the money-post lock', {
+    peerQueryTimeoutMs: 60,
+  })
+  await assert.rejects(
+    () => (plainConfig.onConnect as (c: unknown) => Promise<void>)(plain.client),
+    (error: unknown) => {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError, `expected a refusal, got ${String(error)}`)
+      const message = (error as Error).message
+      assert.match(message, /SESSION advisory lock \(the money-post lock\)/, 'the refusal names the lock')
+      assert.match(message, /the connection-affinity query did not finish within 60ms/, 'and which leg ran out of time')
+      assert.match(message, /socket was DESTROYED/, 'and that the connection was not left pending')
+      assert.match(message, /WHAT TO CHANGE/, 'and what an operator can do about it')
+      return true
+    },
+  )
+  assert.deepEqual(plain.asked.length, 1, 'PRECONDITION: the affinity query was actually reached and is what stalled')
+  assert.deepEqual(plain.destroyed, ['socket'], "the LOCK client's socket was destroyed, not left wedged")
+
+  // (b) WITH AN OVERRIDE, so a probe EXISTS -- and is never reached, which is the whole finding.
+  //     The probe deadline is left at its default 20s: if this test were relying on it, it would
+  //     time out rather than pass.
+  resetSessionLockSpaceMeasurements()
+  const stalled = lockClientStandIn(true)
+  const probes = standInConnector({ taken: true, acquired: false })
+  const config = pgSessionLockConnectionConfig(POOLED, DIRECT_ELSEWHERE, 'the money-post lock', {
+    createClient: probes.createClient,
+    peerQueryTimeoutMs: 60,
+  })
+  await assert.rejects(
+    () => (config.onConnect as (c: unknown) => Promise<void>)(stalled.client),
+    (error: unknown) => {
+      assert.match((error as Error).message, /the connection-affinity query did not finish within 60ms/)
+      return true
+    },
+  )
+  assert.deepEqual(stalled.destroyed, ['socket'], "the lock client's socket is destroyed on this path too")
+  assert.deepEqual(probes.dialled, [], 'and NO probe client was ever created -- exactly the reproduction, so the probe deadline cannot have been what ended this')
+
+  // (c) NOT VACUOUS: a lock client that ANSWERS is admitted by the same code path, so the bound is
+  //     not simply refusing everything.
+  resetSessionLockSpaceMeasurements()
+  const healthy = lockClientStandIn(false)
+  const healthyConfig = pgSessionLockConnectionConfig(POOLED, undefined, 'the money-post lock', {
+    peerQueryTimeoutMs: 60,
+  })
+  await (healthyConfig.onConnect as (c: unknown) => Promise<void>)(healthy.client)
+  assert.deepEqual(healthy.destroyed, [], 'a connection that answered keeps its socket')
+})
+
+test('[o3d-2k5r r28] the whole-guard backstop ends a leg whose OWN bound is longer than the acquisition may take', { timeout: 15_000 }, async () => {
+  // The affinity query answers; the stall is in the shared-lock-space probe, whose own deadline is
+  // deliberately set LONGER than the acquisition deadline here. The backstop is what ends it, and
+  // it destroys the LOCK client's socket -- not just the probe's -- because the lock connection is
+  // what the caller is waiting on.
+  //
+  // MUTATION ROUTE: remove the outer `withLockClientDeadline(client, acquisitionDeadlineMs, ...)`
+  // in `sessionLockAffinityGuard()` and await the three legs directly. The refusal then arrives at
+  // the probe's 400ms instead of 60ms and says "could not be established within 400ms", so both the
+  // timing-independent message assertions below fail. VERIFIED by making exactly that edit.
+  resetSessionLockSpaceMeasurements()
+  const held = lockClientStandIn(false)
+  const neverConnects = {
+    createClient: async () => ({
+      async connect() { return new Promise<undefined>(() => {}) },
+      async query() { return { rows: [{}] } },
+      async end() { return undefined },
+    }),
+  }
+  const config = pgSessionLockConnectionConfig(POOLED, DIRECT_ELSEWHERE, 'the money-post lock', {
+    createClient: neverConnects.createClient,
+    probeDeadlineMs: 400,
+    acquisitionDeadlineMs: 60,
+  })
+  await assert.rejects(
+    () => (config.onConnect as (c: unknown) => Promise<void>)(held.client),
+    (error: unknown) => {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError, `expected a refusal, got ${String(error)}`)
+      const message = (error as Error).message
+      assert.match(message, /the session-lock acquisition did not finish within 60ms/, 'the BACKSTOP is what ended it, at its own number')
+      assert.doesNotMatch(message, /could not be established within 400ms/, 'not the probe deadline, which had not fired yet')
+      return true
+    },
+  )
+  assert.deepEqual(held.destroyed, ['socket'], "the lock client's socket is destroyed even though the stall was downstream of it")
+  resetSessionLockSpaceMeasurements()
+})
+
+test('[o3d-2k5r r28] an acquisition that never completes is given up on, and a connection that arrives afterwards is DISCARDED', async () => {
+  // The outer half, in `lib/db/session-lock-pool.ts`: the parts of an acquisition that happen
+  // OUTSIDE the guard -- pg-pool's connect path before `onConnect` is reached, and its unbounded
+  // wait for a free connection when the pool is full (these pools carry no
+  // `connectionTimeoutMillis`, which is the o3d-xl63 defect on a lock pool).
+  //
+  // MUTATION ROUTE 1: make `boundLockAcquisition()` return `open` unchanged. (a) never settles and
+  // this test fails on the runner's timeout. VERIFIED by making exactly that edit.
+  // MUTATION ROUTE 2: delete the `abandon?.()` call. (a)'s `abandoned` assertion fails, and a lone
+  // lock client would be left holding a socket nobody will ever close.
+  // MUTATION ROUTE 3: drop the `if (expired) discard(client)` handler on `opening`. (b)'s
+  // `discarded` assertion fails -- a pool client that arrives after the refusal goes back into the
+  // pool and is handed straight out to the next caller.
+
+  // (a) THE ACQUISITION NEVER COMPLETES.
+  let abandoned = 0
+  const hangs = boundLockAcquisition<string>(
+    () => new Promise<string>(() => {}),
+    () => { throw new Error('nothing arrived, so nothing may be discarded') },
+    'the money-post lock',
+    40,
+    () => { abandoned += 1 },
+  )
+  await assert.rejects(hangs, (error: unknown) => {
+    const message = (error as Error).message
+    assert.match(message, /Acquiring the connection for the money-post lock did not finish within 40ms/)
+    assert.match(message, /The lock was NOT taken/, 'and the caller is told the acquisition failed CLOSED')
+    return true
+  })
+  assert.equal(abandoned, 1, "the client's socket was destroyed by the caller that had one to destroy")
+
+  // (b) IT COMPLETES, LATE. The refusal has already been delivered, so the connection must be
+  //     destroyed rather than returned.
+  const discarded: string[] = []
+  const late = boundLockAcquisition<string>(
+    () => new Promise<string>((resolve) => setTimeout(() => resolve('client'), 60)),
+    (client) => { discarded.push(client) },
+    'the money-post lock',
+    20,
+  )
+  await assert.rejects(late, (error: unknown) => {
+    assert.match((error as Error).message, /did not finish within 20ms/)
+    return true
+  })
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  assert.deepEqual(discarded, ['client'], 'the connection that arrived after the deadline was destroyed, not leaked')
+
+  // (c) NOT VACUOUS: an acquisition that completes in time is returned untouched.
+  const fine = boundLockAcquisition<string>(
+    async () => 'client',
+    () => { throw new Error('an admitted acquisition may not be discarded') },
+    'the money-post lock',
+    40,
+  )
+  assert.equal(await fine(), 'client')
 })
