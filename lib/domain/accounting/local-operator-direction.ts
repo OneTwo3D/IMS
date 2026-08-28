@@ -85,12 +85,41 @@ export type LocalTarget =
   | 'THIS_RECORD_AND_ITS_SYNC_ROW'
 
 /**
+ * RUNTIME IMMUTABILITY FOR EVERY TABLE THIS MODULE RENDERS OFF (o3d-batch-ret r31, Codex HIGH).
+ *
+ * `const` binds a NAME; it says nothing about the OBJECT the name holds. Every table below was an
+ * exported object literal read by `renderLocalDirection` AT INVOCATION TIME, so
+ * `SETTING_NAME.SETTING_SYNC_ENABLED = 'anything at all'` in any importer — an ordinary assignment
+ * its `Record<..., string>` type admits, with no assertion and no diagnostic — changed what the
+ * shipped TURN_OFF sentence says, AFTER the analysis that read the initializer and approved the
+ * inventory. The analyzer folds the literal in THIS file and can see no write in any other, so the
+ * whole "the renderer's output set is exactly the reviewed one" guarantee rested on nobody writing
+ * to a table. `OUTBOX_READ_LIST` had the same runtime mutability behind its `as const` view, and so
+ * did `LOCAL_DIRECTIONS` and the sequences behind `readonly`: a `readonly` TYPE is erased.
+ *
+ * BOTH HALVES ARE CLOSED. `SETTING_NAME` and `OUTBOX_READ_LIST` are no longer exported, so no
+ * importer can name them at all; and every table — the two private ones and the four that must stay
+ * exported because the reviewed inventory is judged against them — is DEEP-FROZEN at module
+ * evaluation, before any renderer can run. A module is always strict-mode code, so a write to a
+ * frozen table THROWS rather than being silently dropped. Not exporting alone would not have been
+ * enough: a private mutable table is still mutable from inside this module.
+ */
+function freezeDeep<T>(table: T, seen: WeakSet<object> = new WeakSet()): T {
+  if (table === null || typeof table !== 'object') return table
+  if (seen.has(table)) return table
+  seen.add(table)
+  Object.freeze(table)
+  for (const inner of Object.values(table as Record<string, unknown>)) freezeDeep(inner, seen)
+  return table
+}
+
+/**
  * What each target IS, and the words a message must already be using for a direction at it to be
  * about it. The `anchor` is the second half of the coupling: generation makes the sentence a
  * function of the target, and the anchor check makes the MESSAGE the sentence ships in name that
  * same target — so a direction cannot be a fragment floating in a message about something else.
  */
-export const LOCAL_TARGET: Record<LocalTarget, {
+export const LOCAL_TARGET: Readonly<Record<LocalTarget, Readonly<{
   object: string
   anchor: string
   /**
@@ -107,7 +136,7 @@ export const LOCAL_TARGET: Record<LocalTarget, {
    * there is no field to put other prose in.
    */
   reach: 'DISTINGUISHING' | 'UNIVERSAL'
-}> = {
+}>>> = {
   ORDER_INVOICE_PDF: {
     object: 'the invoice PDF IMS stored against the order',
     anchor: 'invoice PDF',
@@ -150,7 +179,7 @@ export type OutboxReadAxis = 'status' | 'attempts' | 'lastError' | 'createdAt' |
  * A LIST IS A NAME NOW. Three of them, each a non-empty tuple of axes the type still fences, so the
  * prose a direction can produce is finite and every value of it is in the reviewed inventory.
  */
-export const OUTBOX_READ_LIST = {
+const OUTBOX_READ_LIST = {
   /** This order's own rows, read for where each one got to. */
   THIS_ORDERS_ROWS: ['status', 'attempts', 'lastError', 'sentAt'],
   /** The same, plus when the row was made — the query that cannot be narrowed to one attempt. */
@@ -159,8 +188,14 @@ export const OUTBOX_READ_LIST = {
   WHEN_NARROWING_IS_IMPOSSIBLE: ['status', 'lastError', 'time'],
 } as const satisfies Record<string, readonly [OutboxReadAxis, ...OutboxReadAxis[]]>
 
-/** The two settings IMS itself holds. There is no third, and no way to name anything else. */
-export const SETTING_NAME: Record<'SETTING_SYNC_ENABLED' | 'SETTING_ATTACH_PDF', string> = {
+/**
+ * The two settings IMS itself holds. There is no third, and no way to name anything else.
+ *
+ * NOT EXPORTED, and frozen at the foot of this file (o3d-batch-ret r31, Codex HIGH): the renderer reads
+ * this table at invocation time, so while it was exported and writable an importer could rewrite the
+ * setting name a shipped sentence prints without touching a line the analyzer reads.
+ */
+const SETTING_NAME: Readonly<Record<'SETTING_SYNC_ENABLED' | 'SETTING_ATTACH_PDF', string>> = {
   SETTING_SYNC_ENABLED: 'quickbooks_sync_enabled',
   SETTING_ATTACH_PDF: 'quickbooks_sync_attach_pdf',
 }
@@ -366,3 +401,28 @@ export const LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE: LocalDirectionSequence = [
 export const LOCAL_DIRECTION_SEQUENCES: readonly LocalDirectionSequence[] = [
   LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE,
 ]
+
+// ---------------------------------------------------------------------------
+// AND EVERY ONE OF THEM IS FROZEN BEFORE ANYTHING CAN RENDER (o3d-batch-ret r31, Codex HIGH).
+//
+// These six statements run at module evaluation, which is before the first `renderLocalDirection`
+// call by construction: a module body runs to completion before any of its exports can be read.
+// From here on a write to any of these tables — from an importer, from this module, at any depth —
+// throws a TypeError instead of changing what an operator is told to do.
+//
+// WHAT THE GUARANTEE NOW RESTS ON, stated plainly rather than implied. The analyzer's conclusion —
+// "the set of sentences these renderers can emit is exactly the reviewed inventory" — is
+// UNCONDITIONAL on data: there is no longer any object a renderer reads at invocation time that
+// anything can write after the analysis. It still rests on two things that are not data, and both
+// are diffs to THIS FILE in front of a reviewer: the renderer's own branch strings, and these
+// freeze calls themselves. It also assumes `Object.freeze` is the standard one — a program that
+// replaced the global intrinsic before this module loaded would defeat it, as it would defeat every
+// other use of it in the process.
+// ---------------------------------------------------------------------------
+
+freezeDeep(LOCAL_TARGET)
+freezeDeep(OUTBOX_READ_LIST)
+freezeDeep(SETTING_NAME)
+freezeDeep(LOCAL_DIRECTIONS)
+freezeDeep(LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE)
+freezeDeep(LOCAL_DIRECTION_SEQUENCES)
