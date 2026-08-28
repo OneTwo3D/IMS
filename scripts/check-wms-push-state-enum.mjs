@@ -21,6 +21,7 @@
 
 import { config as loadDotenv } from 'dotenv'
 
+import { establishStartupOptionByteSafety, nonAsciiStartupOptionCharacters } from '../lib/db/database-url-schema.mjs'
 import {
   pgConnectionConfig,
   WMS_PUSH_STATE_COLUMN,
@@ -40,6 +41,18 @@ if (!databaseUrl) {
   console.error(`FAIL ${ENUM}: DATABASE_URL is not set, so the database's enum vocabulary cannot be read.`)
   console.error('Refusing rather than assuming it is fine — see o3d-1izw.')
   process.exit(1)
+}
+
+// o3d-2k5r r19 — THE COMPATIBILITY QUESTION, ASKED BEFORE THE DEPLOY STOPS ANYTHING.
+//
+// `deploy.sh` runs this gate ahead of the stop and the migration, so it is the right place to
+// settle whether this server can carry a non-ASCII schema name. Without it, a deployment whose
+// URL names one would learn about the refusal from a service that failed to restart, after the
+// predecessor was already down. A URL with no such bytes settles without opening a connection;
+// where there are some, the verdict this leaves behind is what `pgConnectionConfig()` below
+// consults, so the failure is reported here with the rename procedure attached.
+if (nonAsciiStartupOptionCharacters(databaseUrl) !== '') {
+  await establishStartupOptionByteSafety(databaseUrl)
 }
 
 const { Client } = await import('pg')

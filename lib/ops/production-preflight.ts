@@ -251,6 +251,18 @@ async function checkWmsPushStateSchema(
     if (readWmsPushStates) {
       labels = await readWmsPushStates(databaseUrl)
     } else {
+      // o3d-2k5r r19 — settle the non-ASCII startup-byte question against THIS server before the
+      // connection config is composed from the URL. A URL with no such bytes opens nothing; where
+      // there are some, the verdict this leaves behind is what pgConnectionConfig() consults, so a
+      // schema this deployment cannot carry is reported here with the rename procedure attached
+      // rather than as an opaque "could not read the catalogue".
+      const { establishStartupOptionByteSafety, nonAsciiStartupOptionCharacters } = await import(
+        '../db/database-url-schema.mjs'
+      )
+      if (nonAsciiStartupOptionCharacters(databaseUrl) !== '') {
+        await establishStartupOptionByteSafety(databaseUrl)
+      }
+
       const { Client } = await import('pg')
       // The search path is aligned with Prisma's deliberately: this check opens its OWN connection,
       // and the shared statement resolves the table through whatever search path the asking
