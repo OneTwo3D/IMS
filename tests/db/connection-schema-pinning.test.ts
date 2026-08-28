@@ -202,6 +202,153 @@ test('o3d-2k5r r13: whitespace the tokenizer refuses is escaped by the emitter, 
 })
 
 /**
+ * WHITESPACE THE SERVER DOES NOT STRIP FROM A `search_path` VALUE, named once for both tests below.
+ *
+ * `SplitIdentifierString()` trims each element with `scanner_isspace()`, which is a FIXED list.
+ * Every character here is whitespace to JavaScript — `trim()` removes all four — and an ordinary
+ * character to PostgreSQL, which keeps it inside the identifier. Measured on the installed server
+ * by the live test at the bottom of this file, so this list is not a claim taken on trust.
+ */
+const KEPT_BY_THE_SERVER: [string, string][] = [
+  ['U+00A0 no-break space', '\u00A0'],
+  ['U+2007 figure space', '\u2007'],
+  ['U+2028 line separator', '\u2028'],
+  ['U+FEFF zero-width no-break space', '\uFEFF'],
+]
+
+/** The URL an operator writes when they mean that character literally: escaped, inside `options=`. */
+function urlWithSearchPath(value: string): string {
+  const url = new URL('postgresql://u:p@localhost:5432/ims')
+  url.searchParams.set('options', `-c search_path=${value.replace(/[\\\s]/gu, '\\$&')}`)
+  return url.toString()
+}
+
+test('o3d-2k5r r15: the six ASCII scanner whitespace characters are trimmed off a search path', () => {
+  // ROUTE: DATABASE_URL `?options=-c search_path=\<ws>tenant` -> splitLibpqOptions() (the escape is
+  // why the character survives tokenizing) -> unescapeLibpq() -> singleSchemaOfSearchPath()'s trim
+  // -> foldUnquotedIdentifier() -> the schema pinned and compared against `?schema=`. This is the
+  // half of the rule that must KEEP working: PostgreSQL really does strip these, so stripping them
+  // here is agreement, not mutation.
+  //
+  // MUTATION: empty `SCANNER_WHITESPACE` (or delete the two while-loops from
+  // trimScannerWhitespace() so it returns `value` unchanged). ` tenant` then still carries a space,
+  // the SCANNER_WHITESPACE guard in singleSchemaOfSearchPath() returns null, and every assertion
+  // below throws "does not name exactly one schema" instead of resolving to `tenant`.
+  for (const [label, whitespace] of BACKEND_SEPARATORS) {
+    // PRECONDITION, so this cannot pass by examining nothing: the character really did reach the
+    // trim rather than being eaten by the tokenizer, which is what the backslash is for.
+    assert.deepEqual(
+      splitLibpqOptions(`-c search_path=${whitespace.replace(/[\\\s]/gu, '\\$&')}tenant`).length,
+      2,
+      `${label}: escaped, it is part of the setting rather than a token boundary`,
+    )
+    for (const [position, value] of [
+      ['leading', `${whitespace}tenant`],
+      ['trailing', `tenant${whitespace}`],
+      ['both ends', `${whitespace}tenant${whitespace}`],
+    ] as [string, string][]) {
+      assert.deepEqual(
+        resolveDatabaseUrlSchema(urlWithSearchPath(value)),
+        { parsed: true, explicit: true, schema: 'tenant' },
+        `${label} ${position}: trimmed here because the server trims it there`,
+      )
+    }
+  }
+})
+
+test('o3d-2k5r r15: non-ASCII whitespace at either end of a search path is NOT trimmed away', () => {
+  // ROUTE: the same one — `?options=-c search_path=\<ws>tenant` -> splitLibpqOptions() ->
+  // unescapeLibpq() -> singleSchemaOfSearchPath() -> foldUnquotedIdentifier() -> the pin. The
+  // character is escaped, which is how this module has told operators since round 12 to mean an
+  // ambiguous whitespace character literally, so it arrives at the trim intact.
+  //
+  // MUTATION: restore `const trimmed = String(value).trim()` in singleSchemaOfSearchPath().
+  // JavaScript's trim is Unicode-wide, so `<U+00A0>tenant` is silently reduced to `tenant`, folds
+  // cleanly, and resolveDatabaseUrlSchema() RETURNS `{ schema: 'tenant' }` — a schema the URL did
+  // not name, pinned into the emitted options, handed to the Prisma adapter and reported aligned to
+  // all three raw gates while the server resolves `<U+00A0>tenant`. Every assert.throws below fails,
+  // and so does the last assertion, which is the same divergence stated as an equality: the URL
+  // naming the character no longer agrees with `?schema=tenant`, and under the mutation it does.
+  for (const [label, whitespace] of KEPT_BY_THE_SERVER) {
+    // PRECONDITION: the character survives tokenizing, so what is being tested is the trim and not
+    // the tokenizer's refusal of an UNESCAPED one.
+    assert.deepEqual(
+      splitLibpqOptions(`-c search_path=${whitespace.replace(/[\\\s]/gu, '\\$&')}tenant`).length,
+      2,
+      `${label}: escaped, it is part of the setting rather than a token boundary`,
+    )
+    // PRECONDITION: JavaScript really does consider it whitespace. Without this the test could pass
+    // against a character `trim()` never touched, proving nothing about the finding.
+    assert.equal(`${whitespace}tenant`.trim(), 'tenant', `${label}: JavaScript's trim would strip it`)
+
+    for (const [position, value] of [
+      ['leading', `${whitespace}tenant`],
+      ['trailing', `tenant${whitespace}`],
+    ] as [string, string][]) {
+      assert.throws(
+        () => resolveDatabaseUrlSchema(urlWithSearchPath(value)),
+        (error: unknown) => {
+          assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${label} ${position}: refused, not resolved`)
+          // The refusal has to be the RIGHT one: the value names exactly one schema, so "name one
+          // schema" would be advice for a problem it does not have. What is actually wrong is that
+          // this is an unquoted name whose fold depends on the database's encoding and collation.
+          assert.match(
+            error.message,
+            /UNQUOTED identifier this cannot read/,
+            `${label} ${position}: and refused as an unfoldable name, which tells the operator to quote it`,
+          )
+          return true
+        },
+      )
+    }
+
+    // AND THE FALSE AGREEMENT IS GONE. `?schema=tenant` and an options value naming
+    // `<ws>tenant` are different schemas; under the mutation both read as `tenant` and this URL
+    // resolved happily instead of being refused.
+    const both = new URL(urlWithSearchPath(`${whitespace}tenant`))
+    both.searchParams.set('schema', 'tenant')
+    assert.throws(() => resolveDatabaseUrlSchema(both.toString()), DatabaseUrlSchemaConflictError, label)
+  }
+})
+
+test('o3d-2k5r r15: QUOTED, the same character is a name this module pins rather than refuses', () => {
+  // ROUTE: `?schema=<ws>tenant` -> pgConnectionConfig() -> escapeLibpqValue() -> the always-quoted
+  // pin -> back in through `?options=` -> splitLibpqOptions() -> singleSchemaOfSearchPath()'s
+  // QUOTED branch -> the schema again. The refusal above is a routing decision about an UNQUOTED
+  // name, not an inability to carry the character: quoted, it round-trips whole.
+  //
+  // MUTATION: apply `.trim()` to the quoted branch's captured group — the same Unicode trim this
+  // round removed, one line lower — and the character is dropped from the name read back, so the
+  // round-trip assertion sees `tenant`. Narrowing escapeLibpqValue() to `/[\\ \t\n\v\f\r]/g`
+  // fails it too, by a different route: the pin is then emitted with the character BARE and
+  // splitLibpqOptions() refuses this module's own output. Note that trimScannerWhitespace() applied
+  // to the same capture does NOT fail this test, and should not — it strips six ASCII characters,
+  // none of which is under test here.
+  for (const [label, whitespace] of KEPT_BY_THE_SERVER) {
+    for (const [position, schema] of [
+      ['leading', `${whitespace}tenant`],
+      ['trailing', `tenant${whitespace}`],
+    ] as [string, string][]) {
+      const emitted = pgConnectionConfig(
+        `postgresql://u:p@localhost:5432/ims?schema=${encodeURIComponent(schema)}`,
+      )
+      assert.ok(emitted.options, `${label} ${position}: a parseable URL always yields a pin`)
+      assert.ok(
+        emitted.options!.includes(`\\${whitespace}`),
+        `${label} ${position}: the character is escaped in the pin, not written raw`,
+      )
+      const roundTrip = new URL('postgresql://u:p@localhost:5432/ims')
+      roundTrip.searchParams.set('options', emitted.options!)
+      assert.deepEqual(
+        resolveDatabaseUrlSchema(roundTrip.toString()),
+        { parsed: true, explicit: true, schema },
+        `${label} ${position}: the quoted name read back is the name that went in, character and all`,
+      )
+    }
+  }
+})
+
+/**
  * EVERY WAY A STARTUP `options` CAN ASSIGN A GUC, which is every spelling `ParseLongOption()` sees.
  *
  * `process_postgres_switches()` runs getopt over the split tokens with `"...c:...-:"`, so `-c x=y`
@@ -744,6 +891,166 @@ test('o3d-2k5r r14 (live): a NUL in the startup options is refused HERE because 
       () => pgConnectionConfig(`${scratch.url}?schema=${encodeURIComponent(`ten${NUL}ant`)}`),
       DatabaseUrlSchemaConflictError,
     )
+  } finally {
+    await scratch.drop()
+  }
+})
+
+test('o3d-2k5r r15 (live): the REAL server strips the six and KEEPS the four, and the pin follows it', async (t) => {
+  const scratch = await openScratch(t)
+  if (!scratch) return
+  const quote = (name: string) => `"${name.replace(/"/g, '""')}"`
+  const escape = (value: string) => value.replace(/[\\\s]/gu, '\\$&')
+  try {
+    // Every name this test can land on, so that landing on the WRONG one is observable rather than
+    // an error. `tenant` is the name `trim()` produced; `<ws>tenant` is the name the URL wrote.
+    const names = ['tenant']
+    for (const [, whitespace] of KEPT_BY_THE_SERVER) names.push(`${whitespace}tenant`, `tenant${whitespace}`)
+    for (const name of names) {
+      await scratch.admin.query(`CREATE SCHEMA ${quote(name)}`)
+      await scratch.admin.query(
+        `CREATE TABLE ${quote(name)}.settings (key text primary key, value text not null, "updatedAt" timestamptz not null)`,
+      )
+    }
+
+    /** Which of the schemas above holds a row with this key. */
+    const holders = async (key: string): Promise<string[]> => {
+      const found: string[] = []
+      for (const name of names) {
+        const rows = await scratch.admin.query(`select 1 from ${quote(name)}.settings where key = $1`, [key])
+        if (rows.rowCount) found.push(name)
+      }
+      return found
+    }
+
+    // PRECONDITION — THE PREMISE OF THE WHOLE FIX, ASKED OF THE SERVER rather than read out of its
+    // source. This is `SplitIdentifierString()`/`scanner_isspace()` answering directly, with no
+    // part of this module involved: set the GUC to the raw value and ask which schema it resolved.
+    // If either half ever changes, the rule in SCANNER_WHITESPACE is wrong and this says so at the
+    // premise instead of leaving the conclusions below untestable.
+    for (const [label, whitespace] of BACKEND_SEPARATORS) {
+      await scratch.admin.query('select set_config($1, $2, false)', ['search_path', `${whitespace}tenant`])
+      assert.equal(
+        (await scratch.admin.query<{ s: string }>('select current_schema() as s')).rows[0]?.s,
+        'tenant',
+        `${label}: PostgreSQL itself strips this one off a search path element`,
+      )
+    }
+    for (const [label, whitespace] of KEPT_BY_THE_SERVER) {
+      for (const value of [`${whitespace}tenant`, `tenant${whitespace}`]) {
+        await scratch.admin.query('select set_config($1, $2, false)', ['search_path', value])
+        assert.equal(
+          (await scratch.admin.query<{ s: string }>('select current_schema() as s')).rows[0]?.s,
+          value,
+          `${label}: PostgreSQL KEEPS this one inside the identifier — it is not whitespace to the server`,
+        )
+      }
+    }
+    await scratch.admin.query("select set_config('search_path','public',false)")
+
+    for (const [label, whitespace] of KEPT_BY_THE_SERVER) {
+      for (const [position, value] of [
+        ['leading', `${whitespace}tenant`],
+        ['trailing', `tenant${whitespace}`],
+      ] as [string, string][]) {
+        // WHAT THE OPERATOR'S OWN URL DOES AT THE SERVER, bypassing this module entirely: their
+        // escaped, unquoted value reaches the backend and lands the write in the schema they named.
+        const raw: pg.Client = new pg.Client({
+          connectionString: scratch.url,
+          options: `-c search_path=${escape(value)}`,
+          connectionTimeoutMillis: 3_000,
+        })
+        await raw.connect()
+        try {
+          const key = `raw-${label}-${position}`
+          await raw.query('insert into settings (key, value, "updatedAt") values ($1, $2, now())', [key, label])
+          assert.deepEqual(
+            await holders(key),
+            [value],
+            `${label} ${position}: the URL's own value writes into the schema carrying the character`,
+          )
+        } finally {
+          await raw.end().catch(() => undefined)
+        }
+
+        // AND THAT IS A DIFFERENT SCHEMA FROM `tenant` — measured, not assumed. This is the exact
+        // gap `trim()` opened: it pinned `tenant`, whose writes land here instead.
+        const trimmed: pg.Client = new pg.Client({ ...pgConnectionConfig(`${scratch.url}?schema=tenant`), connectionTimeoutMillis: 3_000 })
+        await trimmed.connect()
+        try {
+          const key = `trimmed-${label}-${position}`
+          await trimmed.query('insert into settings (key, value, "updatedAt") values ($1, $2, now())', [key, label])
+          assert.deepEqual(
+            await holders(key),
+            ['tenant'],
+            `${label} ${position}: the name trim() produced is a real, DIFFERENT schema`,
+          )
+        } finally {
+          await trimmed.end().catch(() => undefined)
+        }
+
+        // ROUTE: `?options=-c search_path=\<ws>tenant` -> splitLibpqOptions() -> unescapeLibpq() ->
+        // singleSchemaOfSearchPath() -> foldUnquotedIdentifier(). REFUSED, because an unquoted
+        // non-ASCII name is folded by the database's own encoding and collation.
+        //
+        // MUTATION: restore `const trimmed = String(value).trim()` in singleSchemaOfSearchPath().
+        // This stops throwing and resolves to `tenant` — the schema the two clients above just
+        // proved is a DIFFERENT one — so the adapter, the pin and all three raw gates are aligned
+        // on `tenant` while the URL asked for the schema the first client wrote into. The
+        // assert.throws fails.
+        const url = new URL(scratch.url)
+        url.searchParams.set('options', `-c search_path=${escape(value)}`)
+        assert.throws(
+          () => pgConnectionConfig(url.toString()),
+          (error: unknown) => {
+            assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${label} ${position}: refused`)
+            assert.match(error.message, /UNQUOTED identifier this cannot read/, `${label} ${position}: as unfoldable`)
+            return true
+          },
+        )
+
+        // AND QUOTED IT IS CARRIED, not refused: the character reaches the REAL server intact and
+        // the unqualified write lands in the schema whose name contains it.
+        //
+        // ROUTE, deliberately the long way round so the READER is on it: `?schema=<ws>tenant` ->
+        // pgConnectionConfig() -> escapeLibpqValue() -> the always-quoted pin -> back in as
+        // `?options=` -> splitLibpqOptions() -> singleSchemaOfSearchPath()'s QUOTED branch -> the
+        // pin re-emitted -> the startup packet -> current_schema(). Handing `?schema=` straight to
+        // pgConnectionConfig() would never reach singleSchemaOfSearchPath() at all, and a test that
+        // does not touch the changed function cannot be failed by changing it.
+        //
+        // MUTATION: apply `.trim()` to the quoted branch's captured group. The name read back out
+        // of the pin becomes `tenant`, the re-emitted pin says `tenant`, and current_schema() is
+        // `tenant` — a schema the two clients above just proved is a DIFFERENT one — so both
+        // assertions below fail and the write lands in the wrong schema.
+        const carried = new URL(scratch.url)
+        carried.searchParams.set(
+          'options',
+          pgConnectionConfig(`${scratch.url}?schema=${encodeURIComponent(value)}`).options!,
+        )
+        const pinned: pg.Client = new pg.Client({
+          ...pgConnectionConfig(carried.toString()),
+          connectionTimeoutMillis: 3_000,
+        })
+        await pinned.connect()
+        try {
+          assert.equal(
+            (await pinned.query<{ s: string }>('select current_schema() as s')).rows[0]?.s,
+            value,
+            `${label} ${position}: the server resolved the WHOLE name, character included`,
+          )
+          const key = `pinned-${label}-${position}`
+          await pinned.query('insert into settings (key, value, "updatedAt") values ($1, $2, now())', [key, label])
+          assert.deepEqual(
+            await holders(key),
+            [value],
+            `${label} ${position}: and the unqualified write landed there and nowhere else`,
+          )
+        } finally {
+          await pinned.end().catch(() => undefined)
+        }
+      }
+    }
   } finally {
     await scratch.drop()
   }
