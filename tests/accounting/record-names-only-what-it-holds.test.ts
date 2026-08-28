@@ -3119,8 +3119,9 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * and both arms are evaluated and both outputs judged. THE RULE, stated once: a value that is
  * unknown at analysis time must make its condition indeterminate, NEVER false.
  *
- * The only other stand-ins this walk binds are already sound under that rule. A function parameter
- * with no argument is `OPAQUE` (never a string, so never one constant, so never decidable); a list
+ * The only other stand-ins this walk binds are already sound under that rule. A ROOT parameter with
+ * no argument is `OPAQUE` (never a string, so never one constant, so never decidable) — and since
+ * round 25 only a root gets one at all; a list
  * parameter becomes an `OPEN_LIST` carrying only its type's length FLOOR, and reading `.length` off
  * one is `UNKNOWN` rather than a number; a discriminant read off an `OPAQUE` value is resolved from
  * the CHECKER's literal type, which folds only when the type itself admits exactly one string —
@@ -3148,6 +3149,27 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * `UNKNOWN`. But assert over `direction` instead and the receiver is `OPAQUE`, so propagation never
  * fires and only provenance refuses it. Control (L) holds both halves, each against the evaluator
  * that lacked it.
+ *
+ * AND AN ABSENCE IS NOT A POSITIVE FACT (round 25, Codex HIGH). Round 24's rule for the other side
+ * of the boundary was: "a parameter with no origin entry was never given an argument, so it is a
+ * root this walk supplied itself, so its declared type is the module's own word". That reads TRUST
+ * OUT OF AN ABSENCE, and the absence has more than one cause. An INTERNAL CALL THAT OMITS AN
+ * ARGUMENT does not leave the parameter unbound: JavaScript evaluates the parameter's DEFAULT
+ * INITIALIZER, which is an expression like any other and can be an `as`. So the assertion simply
+ * moved from the call site into the parameter list, nothing was recorded for it, and the
+ * manufactured literal was trusted for exactly the reason round 24 wrote down. Two changes, and the
+ * second is the general one:
+ *
+ *   • DEFAULTS ARE MODELLED. `callImplementation` binds parameters in order inside the frame: an
+ *     argument when there is one, otherwise the initializer's VALUE and the initializer's
+ *     PROVENANCE, read by the same `argumentOrigin` a written-out argument goes through. An
+ *     omitted argument is not a missing binding; it is a binding to the default.
+ *   • THE TRUSTED SET IS WRITTEN DOWN. `ANALYZER_ROOT_RENDERERS` names the two renderers
+ *     `rootShapes` calls with no arguments, and `analyzerRoots` holds exactly their parameters.
+ *     Those are the only argument-less parameters this walk will invent a value for or trust an
+ *     annotation on. Every other parameter carries provenance or is UNKNOWN — including one left
+ *     unbound because the call omitted an optional argument, which is `undefined` at run time and
+ *     is not a value anybody's annotation describes.
  *
  * `contextBinding` exists ONLY so a control can re-run this walk with the pre-fix concrete binding
  * and demonstrate that the branch is pruned again. Nothing else passes anything but `'SYMBOLIC'`.
@@ -3225,6 +3247,37 @@ type LiteralProvenance = 'TRACKED' | 'CALL_LOCAL' | 'UNTRACKED'
  * can show what that ordering let past.
  */
 type ReceiverPropagation = 'PROPAGATED' | 'DEFERRED'
+
+/**
+ * WHAT AN OMITTED ARGUMENT BINDS ITS PARAMETER TO (round 25, Codex HIGH).
+ *
+ * `'MODELLED'` is what ships and what every judgement uses: JavaScript evaluates the parameter's
+ * DEFAULT INITIALIZER when the argument is omitted, so the parameter takes that expression's value
+ * AND that expression's provenance. `'UNBOUND'` reproduces the round-24 binding — an omitted
+ * argument recorded nothing at all, so the parameter fell through to the argument-less case and was
+ * read as a root this walk had supplied itself. Control (M) shows what that let past.
+ */
+type DefaultBinding = 'MODELLED' | 'UNBOUND'
+
+/**
+ * WHICH ARGUMENT-LESS PARAMETERS THIS WALK TRUSTS (round 25, Codex HIGH).
+ *
+ * `'NAMED'` is what ships: the ONLY parameters this walk may invent a value for are the ones it
+ * creates itself, at the calls in `rootShapes` — the parameters of `ANALYZER_ROOT_RENDERERS`, held
+ * in `analyzerRoots` and named there. `'INFERRED'` reproduces round 24's rule, which read trust out
+ * of an ABSENCE: "no origin entry, so nobody passed one, so this walk must have made it". That
+ * inference is false for every other way a parameter can go unbound — a default initializer above
+ * all — and an absence is not a positive fact. Control (M) shows the difference.
+ */
+type RootTrust = 'NAMED' | 'INFERRED'
+
+/**
+ * THE ROOTS THIS WALK CREATES, BY NAME. `rootShapes` calls exactly these two with no arguments, so
+ * exactly their parameters are values this walk supplied and whose declared types are therefore the
+ * module's own word about itself. Everything else in the program is reached through a call, and
+ * carries provenance or is unknown.
+ */
+const ANALYZER_ROOT_RENDERERS = ['renderLocalDirection', 'renderLocalDirectionSequence'] as const
 
 /** The three intrinsics this walk will evaluate, and only over a list it computed itself. */
 const INTRINSIC_LIST_OPERATIONS = ['join', 'slice', 'map'] as const
@@ -3378,6 +3431,8 @@ function computeRendererOutput(
   contextBinding: ContextBinding = 'SYMBOLIC',
   literalProvenance: LiteralProvenance = 'TRACKED',
   receiverPropagation: ReceiverPropagation = 'PROPAGATED',
+  defaultBinding: DefaultBinding = 'MODELLED',
+  rootTrust: RootTrust = 'NAMED',
 ): ComputedRendererOutput {
   const program = directionModelProgram(model, extraFiles)
   const checker = program.getTypeChecker()
@@ -3395,6 +3450,15 @@ function computeRendererOutput(
    * makes reading `direction.target` off it sound.
    */
   const originFrames: Array<Map<ts.Symbol, string | null>> = []
+  /**
+   * THE TRUSTED SET, WRITTEN DOWN RATHER THAN INFERRED (round 25, Codex HIGH). Round 24 decided a
+   * parameter was analyzer-created by observing that no argument had been recorded for it — an
+   * absence read as a positive fact, and false the moment a call omits an argument that has a
+   * default. `rootShapes` puts the parameters of `ANALYZER_ROOT_RENDERERS` in here, and those are
+   * the only ones for which this walk will invent a value or trust a declared type unbacked by an
+   * argument.
+   */
+  const analyzerRoots = new Set<ts.Symbol>()
   const inProgress = new Set<ts.Node>()
 
   const where = (node: ts.Node): string => {
@@ -3530,6 +3594,17 @@ function computeRendererOutput(
         if (carried) {
           return `"${name.text}" is a PARAMETER bound to an argument whose own literal type is not honest: ${carried}`
         }
+        // NO ENTRY IS NOT A LICENCE (round 25, Codex HIGH). Round 24 read the absence as "nobody
+        // passed one, so this walk supplied it", and that inference is false for an internal call
+        // with an OMITTED argument: JavaScript evaluates the parameter's default, which can be an
+        // assertion. Defaults are modelled at the call now (see `callImplementation`), and the
+        // trusted set is the one this walk wrote down rather than the one it can no longer
+        // distinguish from an omission.
+        if (carried === undefined && rootTrust === 'NAMED' && !analyzerRoots.has(symbol)) {
+          return `"${name.text}" is a PARAMETER with no argument traced into it and is not one this walk created `
+            + `as a root (${ANALYZER_ROOT_RENDERERS.join(', ')}), so its declared literal type is a contract `
+            + 'somebody may have asserted their way through rather than knowledge about the program'
+        }
         continue
       }
       // THE HONEST PROVENANCE, and the only one that folds: a type annotation somebody wrote down.
@@ -3652,20 +3727,39 @@ function computeRendererOutput(
     if (inProgress.has(implementation)) return unknown('a recursive call, whose value cannot be computed by this walk')
     const frame = new Map<ts.Symbol, Value>()
     const originFrame = new Map<ts.Symbol, string | null>()
-    implementation.parameters.forEach((parameter, index) => {
-      const symbol = ts.isIdentifier(parameter.name) ? checker.getSymbolAtLocation(parameter.name) : undefined
-      const argument = args[index]
-      if (symbol && argument !== undefined) {
-        frame.set(symbol, argument.value)
-        // Recorded even when it is null, so a bound parameter says "an argument was passed and it
-        // was honest" rather than falling back to "this walk supplied this root itself".
-        originFrame.set(symbol, argument.origin)
-      }
-    })
     inProgress.add(implementation)
     frames.push(frame)
     originFrames.push(originFrame)
     try {
+      // BOUND IN PARAMETER ORDER, INSIDE THE FRAME, because that is the order and the scope the
+      // language uses: a default initializer sees the parameters to its left.
+      implementation.parameters.forEach((parameter, index) => {
+        const symbol = ts.isIdentifier(parameter.name) ? checker.getSymbolAtLocation(parameter.name) : undefined
+        if (!symbol) return
+        const argument = args[index]
+        if (argument !== undefined) {
+          frame.set(symbol, argument.value)
+          // Recorded even when it is null, so a bound parameter says "an argument was passed and it
+          // was honest" rather than falling back to "this walk supplied this root itself".
+          originFrame.set(symbol, argument.origin)
+          return
+        }
+        // AN OMITTED ARGUMENT TAKES THE DEFAULT'S VALUE AND THE DEFAULT'S PROVENANCE (round 25,
+        // Codex HIGH). Round 24 recorded nothing here, so the parameter arrived at `symbolOrigin`
+        // looking exactly like a root this walk had created — and `helper()` with
+        // `claimed: T = context as { syncRowId: 'claimed-row' }` laundered a manufactured literal
+        // through the omission. The initializer IS the argument in that call; it is evaluated as
+        // one, and `argumentOrigin` reads its provenance the same way a written-out argument's is
+        // read.
+        if (defaultBinding === 'MODELLED' && parameter.initializer) {
+          frame.set(symbol, valueOf(parameter.initializer))
+          originFrame.set(symbol, argumentOrigin(parameter.initializer))
+          return
+        }
+        // No argument and no default: `undefined` at run time. Nothing is recorded, and the
+        // argument-less case in `resolveIdentifier`/`symbolOrigin` decides what that is worth —
+        // which, unless this is one of the roots this walk created, is nothing.
+      })
       return returnValueOf(implementation)
     } finally {
       originFrames.pop()
@@ -3821,6 +3915,14 @@ function computeRendererOutput(
     if (declarations.length === 0) return unknown(`"${node.text}" has no declaration, so what it contributes is unknown`)
     const parameter = declarations.find(ts.isParameter)
     if (parameter) {
+      // ONLY A ROOT THIS WALK CREATED GETS A VALUE INVENTED FOR IT (round 25, Codex HIGH). Any
+      // other parameter that reached here was left unbound by a call — no argument and no default
+      // — so at run time it is `undefined`, and inventing an OPAQUE root for it hands a value this
+      // walk knows nothing about the standing of one it made itself.
+      if (rootTrust === 'NAMED' && !analyzerRoots.has(symbol)) {
+        return unknown(`"${node.text}" is a PARAMETER no call bound and this walk did not create as a root `
+          + `(${ANALYZER_ROOT_RENDERERS.join(', ')}), so what it contributes is unknown`)
+      }
       // The renderer's own two parameters. `context` is bound to the reviewed placeholders; a list
       // parameter keeps its length floor; anything else is a value this walk never emits.
       const declared = checker.typeToString(checker.getTypeAtLocation(parameter))
@@ -4019,7 +4121,7 @@ function computeRendererOutput(
   }
 
   const exported = checker.getExportsOfModule(checker.getSymbolAtLocation(modelFile)!)
-  const rootShapes = (root: string): readonly Shape[] => {
+  const rootShapes = (root: (typeof ANALYZER_ROOT_RENDERERS)[number]): readonly Shape[] => {
     const symbol = exported.find((candidate) => candidate.name === root)
     assert.ok(symbol, `${root} must be exported from the direction model, or this walk reads nothing`)
     const declarations = symbol!.declarations ?? []
@@ -4029,6 +4131,15 @@ function computeRendererOutput(
       if (!ts.isFunctionDeclaration(declaration) || !declaration.body) {
         unresolved.push(`${where(declaration)}: ${root} is not a function with a body in this module`)
         continue
+      }
+      // THE ROOT CREATION, AND THE ONLY ONE. These parameters get no argument because this walk
+      // is the caller; they are named here so that "argument-less and therefore trustworthy" is a
+      // set somebody wrote down rather than a conclusion drawn from a missing map entry.
+      for (const parameter of declaration.parameters) {
+        const parameterSymbol = ts.isIdentifier(parameter.name)
+          ? checker.getSymbolAtLocation(parameter.name)
+          : undefined
+        if (parameterSymbol) analyzerRoots.add(parameterSymbol)
       }
       const value = callImplementation(declaration, [])
       if (value.kind !== 'STRING') {
@@ -4040,8 +4151,8 @@ function computeRendererOutput(
     return shapes
   }
 
-  const direction = rootShapes('renderLocalDirection')
-  const sequence = rootShapes('renderLocalDirectionSequence')
+  const direction = rootShapes(ANALYZER_ROOT_RENDERERS[0])
+  const sequence = rootShapes(ANALYZER_ROOT_RENDERERS[1])
   return { direction, sequence, unresolved }
 }
 
@@ -4055,8 +4166,12 @@ function judgeRendererOutput(
   contextBinding: ContextBinding = 'SYMBOLIC',
   literalProvenance: LiteralProvenance = 'TRACKED',
   receiverPropagation: ReceiverPropagation = 'PROPAGATED',
+  defaultBinding: DefaultBinding = 'MODELLED',
+  rootTrust: RootTrust = 'NAMED',
 ): string[] {
-  const computed = computeRendererOutput(model, extraFiles, contextBinding, literalProvenance, receiverPropagation)
+  const computed = computeRendererOutput(
+    model, extraFiles, contextBinding, literalProvenance, receiverPropagation, defaultBinding, rootTrust,
+  )
   const reviewed = RENDERED_DIRECTIONS.map((entry) => entry.text)
   const complaints = [...computed.unresolved]
   for (const shape of computed.direction) {
@@ -4647,4 +4762,179 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
       /is NOT the reviewed sentence for it/,
     )
   }
+
+  // (M) AN OMITTED ARGUMENT, WHOSE DEFAULT CARRIES THE ASSERTION — THE ROUND-25 ROUTE (Codex HIGH),
+  // and the fourth control here about the EVALUATOR. Round 24 closed the laundering that goes
+  // through a written-out argument by carrying its provenance into the parameter. It then read the
+  // ABSENCE of such an entry as a positive fact: "no origin recorded, so nobody passed one, so this
+  // walk supplied this root itself and its declared type is the module's own word". That inference
+  // is false for an INTERNAL CALL WITH AN OMITTED ARGUMENT. JavaScript does not leave the parameter
+  // unbound: it evaluates the parameter's DEFAULT INITIALIZER, and that initializer is an
+  // expression like any other — it can be an `as`. So the assertion moves from the call site to the
+  // parameter list, the walk records nothing for it, and the manufactured literal is trusted for
+  // exactly the reason round 24 wrote down.
+  //
+  // (M1) THE DEFAULT. `claimed` is never passed; its default asserts the real context into a
+  // literal `syncRowId`, and the branch keyed on that literal is pruned. At run time `claimed` IS
+  // the context, so the branch is live for any id — including one nobody sampled.
+  const viaDefaultedParameter = model.replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    '      return fromDefaultedContext(context)',
+  ).replace(
+    'function andList(',
+    'function fromDefaultedContext(\n'
+    + '  runtime: LocalDirectionContext,\n'
+    + "  claimed: { syncRowId: 'claimed-row' } = runtime as { syncRowId: 'claimed-row' },\n"
+    + '): string {\n'
+    + "  const offSampleRow: string = '" + OFF_SAMPLE_SYNC_ROW + "'\n"
+    + '  return claimed.syncRowId === offSampleRow\n'
+    + "    ? '" + UNDECLARED_REMOTE_ACTION + "'\n"
+    + "    : 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + '}\n\nfunction andList(',
+  )
+  assert.notEqual(viaDefaultedParameter, model, 'the defaulted-parameter mutation must actually have been applied')
+  // AND IT IS A MUTATION THE COMPILER ADMITS, byte for byte the same diagnostics as the shipped
+  // model: `LocalDirectionContext` is comparable to `{ syncRowId: 'claimed-row' }`, so the
+  // assertion is legal, and `offSampleRow` is `string`, so the comparison is not the "have no
+  // overlap" one TypeScript rejects.
+  assert.deepEqual(
+    modelDiagnostics(viaDefaultedParameter), modelDiagnostics(model),
+    'the defaulted-parameter mutation must type-check exactly as the shipped model does, or it is not a route '
+    + 'anybody could take',
+  )
+  const defaultedComplaints = judgeRendererOutput(viaDefaultedParameter)
+  assert.ok(
+    defaultedComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL, THE CODEX ROUTE: an omitted argument takes its parameter\'s DEFAULT — the default\'s value and '
+    + 'the default\'s provenance. A parameter list is not a laundering step, and "no argument was recorded" is '
+    + `not a licence to trust the annotation. Saw: ${JSON.stringify(defaultedComplaints)}`,
+  )
+  // ...AND THE ROUND-24 EVALUATOR LETS IT THROUGH, asserted rather than described — the same shape
+  // as (J), (K) and (L). Re-run the SAME judgement over the SAME mutated renderer with an omitted
+  // argument binding nothing and trust inferred from that absence: a clean inventory, while the
+  // sentence ships.
+  assert.deepEqual(
+    judgeRendererOutput(viaDefaultedParameter, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'UNBOUND', 'INFERRED'), [],
+    'THE ROUND-24 EVALUATOR MUST STILL LET IT THROUGH — if it also refused this, control (M) would be passing '
+    + 'for some other reason and would prove nothing about either half',
+  )
+  assert.deepEqual(
+    judgeRendererOutput(viaDefaultedParameter, {}, 'SYMBOLIC', 'CALL_LOCAL', 'DEFERRED', 'UNBOUND', 'INFERRED'), [],
+    'and so must the round-23 evaluator entire',
+  )
+  // ...and EITHER HALF ALONE closes THIS route, which is stated rather than implied: modelling the
+  // default binds `claimed` to the context and its symbolic id, and naming the trusted roots makes
+  // an unbound non-root parameter unknown. (M2) below is the route only the second half closes, so
+  // neither is decoration.
+  assert.ok(
+    judgeRendererOutput(viaDefaultedParameter, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'INFERRED').length > 0,
+    'modelling default-parameter semantics must close this route on its own',
+  )
+  assert.ok(
+    judgeRendererOutput(viaDefaultedParameter, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'UNBOUND', 'NAMED').length > 0,
+    'and so must reserving argument-less trust to the roots this walk names, on its own',
+  )
+  // ...AND THE RUNTIME PASS CANNOT SEE IT, asserted against the sample that pass actually uses. The
+  // laundered branch is keyed on a sync row id exactly as (L1)'s is — the same run-time behaviour,
+  // reached through a parameter default instead of an argument — so the same `laundered` renderer
+  // measures it: all four sampled contexts report the reviewed inventory, and the off-sample id
+  // does not.
+  assert.equal(RUNTIME_CONTEXTS.length, 4, 'the four sampled contexts, unchanged')
+  for (const context of RUNTIME_CONTEXTS) {
+    assertRenderedInventory(
+      (direction) => laundered(direction, context),
+      (text) => substitutePlaceholders(text, context),
+    )
+  }
+  assert.throws(
+    () => assertRenderedInventory(
+      (direction) => laundered(direction, offSampleContext),
+      (text) => substitutePlaceholders(text, offSampleContext),
+    ),
+    /is NOT the reviewed sentence for it/,
+    'and the SAME renderer refused the moment the id is one nobody sampled — no finite sample of an '
+    + 'unbounded id closes this route, which is why it has to be closed statically',
+  )
+
+  // (M2) THE PARAMETER WITH NO ARGUMENT AND NO DEFAULT, which is the half modelling defaults does
+  // NOT reach. TypeScript admits the call because the parameter is optional; the walk then invents
+  // an OPAQUE root for it and folds its asserted annotation. What ships is not an unreviewed
+  // sentence but a renderer that cannot emit the reviewed one at all — `claimed` is `undefined` at
+  // run time and `claimed!.syncRowId` throws — and round 24's evaluator reports a clean inventory
+  // for it. THAT is why the trusted set has to be written down: the walk was not distinguishing
+  // "this walk created this value" from "nobody gave this value to anybody".
+  const viaArgumentlessParameter = model.replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    '      return fromArgumentlessParameter()',
+  ).replace(
+    'function andList(',
+    "function fromArgumentlessParameter(claimed?: { syncRowId: 'claimed-row' }): string {\n"
+    + "  const offSampleRow: string = '" + OFF_SAMPLE_SYNC_ROW + "'\n"
+    + '  return claimed!.syncRowId === offSampleRow\n'
+    + "    ? '" + UNDECLARED_REMOTE_ACTION + "'\n"
+    + "    : 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + '}\n\nfunction andList(',
+  )
+  assert.notEqual(viaArgumentlessParameter, model, 'the argument-less-parameter mutation must actually have been applied')
+  assert.deepEqual(
+    modelDiagnostics(viaArgumentlessParameter), modelDiagnostics(model),
+    'the argument-less-parameter mutation must type-check exactly as the shipped model does — an optional '
+    + 'parameter may be omitted, and the non-null assertion is one TypeScript allows',
+  )
+  const argumentlessComplaints = judgeRendererOutput(viaArgumentlessParameter)
+  assert.ok(
+    argumentlessComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL: an unbound parameter that is not one of the roots this walk created must be UNKNOWN, so the '
+    + 'comparison it decides is indeterminate and BOTH arms are computed — rather than the arm its own '
+    + `annotation picks. Saw: ${JSON.stringify(argumentlessComplaints)}`,
+  )
+  // ...AND MODELLING DEFAULTS DOES NOT CLOSE IT, which is the answer to "is naming the roots still
+  // needed": there is no default here to evaluate, so that half never fires and the fold happens
+  // exactly as it did in round 24.
+  assert.deepEqual(
+    judgeRendererOutput(viaArgumentlessParameter, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'INFERRED'), [],
+    'MODELLING DEFAULTS ALONE MUST STILL LET THIS THROUGH — it is why the trusted root set is named as well as '
+    + 'defaults modelled. If this were also refused, naming the roots would be dead weight',
+  )
+  assert.deepEqual(
+    judgeRendererOutput(viaArgumentlessParameter, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'UNBOUND', 'INFERRED'), [],
+    'and the round-24 evaluator entire reports the same clean inventory for a renderer that throws',
+  )
+
+  // (M3) AND THE REFUSAL NAMES THE SET, which is the difference between a trusted set that is
+  // WRITTEN DOWN and one inferred from a missing map entry. Put the unbound parameter's field
+  // straight into the prose and the reason lands in `unresolved`, where a reader is told which
+  // parameter was refused and which roots this walk does create. Asserted so that a later round
+  // cannot quietly go back to inferring trust while the complaint text still reads the same.
+  const viaArgumentlessProse = model.replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    '      return fromArgumentlessProse()',
+  ).replace(
+    'function andList(',
+    "function fromArgumentlessProse(claimed?: { syncRowId: 'claimed-row' }): string {\n"
+    + '  return `confirm the invoice PDF stored against the order is the document you expect'
+    + '${claimed!.syncRowId}`\n'
+    + '}\n\nfunction andList(',
+  )
+  assert.notEqual(viaArgumentlessProse, model, 'the argument-less prose mutation must actually have been applied')
+  assert.deepEqual(
+    modelDiagnostics(viaArgumentlessProse), modelDiagnostics(model),
+    'the argument-less prose mutation must type-check exactly as the shipped model does',
+  )
+  const argumentlessProse = computeRendererOutput(viaArgumentlessProse)
+  assert.ok(
+    argumentlessProse.unresolved.some((reason) => reason.includes('"claimed" is a PARAMETER no call bound')
+      && reason.includes('renderLocalDirection, renderLocalDirectionSequence')),
+    'the refusal must NAME the parameter and the roots this walk creates, so the trusted set is readable at '
+    + `the point of refusal rather than implied by an absence. Saw: ${JSON.stringify(argumentlessProse.unresolved)}`,
+  )
+  // ...and round 24 folded it to the annotation instead, shipping a sentence built out of a literal
+  // type nobody's argument ever carried.
+  assert.ok(
+    judgeRendererOutput(viaArgumentlessProse, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'UNBOUND', 'INFERRED')
+      .some((complaint) => complaint.includes('claimed-row')),
+    'the round-24 walk must have folded the asserted annotation into the prose, or (M3) is about nothing',
+  )
 })
