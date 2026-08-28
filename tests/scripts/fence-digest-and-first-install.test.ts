@@ -79,7 +79,14 @@ function contentDigest(dir: string): string {
   })
 }
 
-/** The environment of a build host: no credential, no pin, no deployment, and not root. */
+/**
+ * The environment of a build host, and nothing else: four variables, none of them a credential, a
+ * pin, or a pointer at a deployment. `env` is not inherited — no DEPLOY_ADMIN_DATABASE_URL, no
+ * IMS_FENCE_*, no DATABASE_URL — so "it needs nothing from the environment" is measured.
+ *
+ * The cast is for this repository's own ProcessEnv typing, which declares NODE_ENV required; the
+ * command under test has no opinion about it and is deliberately not given one.
+ */
 function buildHostEnv(root: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
     PATH: process.env.PATH ?? '/usr/bin:/bin',
@@ -91,7 +98,7 @@ function buildHostEnv(root: string, extra: Record<string, string> = {}): NodeJS.
     // rather than of whichever machine it runs on.
     IMS_APP_DIR: join(root, 'no-such-installation'),
     ...extra,
-  }
+  } as unknown as NodeJS.ProcessEnv
 }
 
 test('r35: the documented release command prints the digest from a checkout with nothing installed', () => {
@@ -167,10 +174,10 @@ test('r35: the documented release command prints the digest from a checkout with
 })
 
 test('r35: the digest-report mode needs no database, no credential and no standing artefact', () => {
-  // "If it needs nothing from the environment, prove it needs nothing." The run above already has
-  // no .env and no installation; this one additionally strips the environment to the three
-  // variables a shell cannot work without, and points the recovery literals at a directory that
-  // does not exist so that a mode which quietly read the standing artefact would be visible.
+  // "If it needs nothing from the environment, prove it needs nothing." buildHostEnv() does not
+  // inherit this process's environment, so there is no DEPLOY_ADMIN_DATABASE_URL, no DATABASE_URL
+  // and no IMS_FENCE_* of any kind on the invocation — and there is no standing artefact anywhere
+  // near the scratch root, so a mode that quietly consulted one would be visible as a refusal.
   //
   // MUTATION ROUTE: make db_fence_report_candidate_digest() call db_fence_probe_script() instead
   // of db_fence_probe_candidate_digest() — it then consults ${DB_FENCE_SCRIPT_COPY} and, with no
@@ -180,12 +187,7 @@ test('r35: the digest-report mode needs no database, no credential and no standi
     const checkout = join(root, 'checkout')
     const run = execFileSync('bash', ['scripts/update.sh', '--print-fence-digest'], {
       cwd: checkout,
-      env: {
-        PATH: process.env.PATH ?? '/usr/bin:/bin',
-        HOME: root,
-        TMPDIR: join(root, 'tmp'),
-        IMS_APP_DIR: join(root, 'no-such-installation'),
-      },
+      env: buildHostEnv(root),
       encoding: 'utf8',
     })
     assert.match(run, DIGEST_LINE)
@@ -280,6 +282,7 @@ function firstInstallFixture(): { root: string; digest: string } {
   // is the join between the two findings: what --print-fence-digest reports is what authenticates
   // a first install's publication, and if the two ever diverge this line stops producing a digest
   // the publication accepts.
+  mkdirSync(join(root, 'tmp'), { recursive: true })
   mkdirSync(join(root, 'release', 'scripts', 'lib'), { recursive: true })
   const release = join(root, 'release')
   cpSync(join(REPO, 'scripts/update.sh'), join(release, 'scripts/update.sh'))
@@ -288,11 +291,7 @@ function firstInstallFixture(): { root: string; digest: string } {
   writeCheckoutPg(release)
   const printed = execFileSync('bash', ['scripts/update.sh', '--print-fence-digest'], {
     cwd: release,
-    env: {
-      PATH: process.env.PATH ?? '/usr/bin:/bin',
-      HOME: root,
-      IMS_APP_DIR: join(root, 'no-such-installation'),
-    },
+    env: buildHostEnv(root),
     encoding: 'utf8',
   })
   const digest = DIGEST_LINE.exec(printed)?.[1]
@@ -312,8 +311,10 @@ test('r35: a first install with no pin publishes nothing, and cannot execute the
   //      shipped, where the policy was true only because nothing happened to call it.
   //   2. drop `FIRST_INSTALL_NO_CREDENTIALED_FENCE=true` from first_install_fence_policy(): same
   //      failure, from the other end.
-  //   3. make the no-pin branch call publish_fence_script_copy: the "publishes nothing"
-  //      assertion fails on the artefact record appearing.
+  //   3. make the no-pin branch call publish_fence_script_copy: the recovery-directory assertion
+  //      fails. The artefact-record assertions alone do NOT fail — the library refuses the
+  //      unpinned publication by itself — which is why that third assertion is written about the
+  //      attempt rather than about the outcome.
   const { root } = firstInstallFixture()
   try {
     const policy = runFirstInstall(root, { IMS_FENCE_ARTEFACT_SHA256: '', IMS_FENCE_SCRIPT_SHA256: '' }, `
@@ -328,6 +329,16 @@ test('r35: a first install with no pin publishes nothing, and cannot execute the
       'nothing may be published: an unauthenticated artefact from an application-owned checkout is the whole thing this refuses',
     )
     assert.ok(!existsSync(join(root, 'recovery', 'app')), 'and no artefact tree either')
+    // AND NO PUBLICATION MAY HAVE BEEN ATTEMPTED. The two assertions above are satisfied by the
+    // LIBRARY refusing an unpinned publication from an application-writable checkout, which is a
+    // different mechanism from the policy branch under test — so on their own they stay green
+    // when the no-pin branch calls publish_fence_script_copy anyway (measured). The recovery
+    // DIRECTORY is what separates them: _fence_stage_and_publish() creates it before it reaches
+    // that refusal, so its absence is the proof that nothing tried.
+    assert.ok(
+      !existsSync(join(root, 'recovery')),
+      'the no-pin path must not even reach a publication attempt: the recovery directory would exist if it had',
+    )
 
     // AND THE HELPER CANNOT BE RUN. This is the enforcement: not "nothing calls it today" but
     // "the call refuses".
@@ -340,8 +351,8 @@ test('r35: a first install with no pin publishes nothing, and cannot execute the
     assert.match(execution.output, /REFUSED_RC=1/, 'it must refuse, and say so')
     assert.match(execution.output, /FIRST INSTALL/, 'naming the policy that refused')
     assert.ok(
-      !existsSync(join(root, 'recovery', 'db-fence-artefact.sha256')),
-      'and the refused call must not have published on its way out',
+      !existsSync(join(root, 'recovery')),
+      'and the refused call must not have published, or attempted to publish, on its way out',
     )
   } finally {
     rmSync(root, { recursive: true, force: true })
@@ -370,6 +381,7 @@ test('r35: a first install WITH the release pin publishes the artefact before it
     assert.equal(run.status, 0, run.output)
     assert.match(run.output, /POLICY_RC=0/)
 
+    assert.ok(existsSync(join(root, 'recovery')), 'the pinned path must reach a publication at all')
     const record = readFileSync(join(root, 'recovery', 'db-fence-artefact.sha256'), 'utf8')
     // PRECONDITION, ASSERTED RATHER THAN ASSUMED: the pin is what permitted this. The fixture's
     // checkout is application-writable, so an unpinned publication from it is refused outright —
