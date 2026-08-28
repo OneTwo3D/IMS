@@ -201,6 +201,157 @@ test('o3d-2k5r r13: whitespace the tokenizer refuses is escaped by the emitter, 
   assert.deepEqual(resolveDatabaseUrlSchema(roundTrip.toString()), { parsed: true, explicit: true, schema })
 })
 
+/**
+ * EVERY WAY A STARTUP `options` CAN ASSIGN A GUC, which is every spelling `ParseLongOption()` sees.
+ *
+ * `process_postgres_switches()` runs getopt over the split tokens with `"...c:...-:"`, so `-c x=y`
+ * (separated), `-cx=y` (attached) and `--x=y` (long) all arrive at the same normaliser. A reader
+ * that understands one spelling and not the others is reading a different startup line from the
+ * one the server reads.
+ */
+const GUC_SPELLINGS: [string, (setting: string) => string][] = [
+  ['separated -c', (setting) => `-c ${setting}`],
+  ['attached -c', (setting) => `-c${setting}`],
+  ['long option', (setting) => `--${setting}`],
+]
+
+test('o3d-2k5r r14: a hyphen in a GUC NAME is an underscore to PostgreSQL, so it is here too', () => {
+  // ROUTE: DATABASE_URL `?options=-c search-path=Tenant_A` -> splitLibpqOptions() ->
+  // readLibpqSettings() -> canonicalGucName() -> the `search_path` entry ->
+  // resolveDatabaseUrlSchema().schema -> BOTH the `{ schema }` the Prisma adapter is given and the
+  // pin pgConnectionConfig() puts in the startup packet.
+  //
+  // MUTATION: delete `.replace(/-/g, '_')` from canonicalGucName(). Each spelling below is then
+  // read as an unrelated setting: resolveDatabaseUrlSchema() returns
+  // `{ parsed: true, explicit: false, schema: 'public' }` and the emitted options become
+  // `-c search-path=Tenant_A -c search_path="public"` — the operator's own pin carried through and
+  // then OVERRIDDEN by the appended default, which is the silent retargeting itself. The deepEqual,
+  // the equivalence assertion, the options assertion and the conflict assertion all fail.
+  for (const [label, spell] of GUC_SPELLINGS) {
+    const hyphenated = `postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent(spell('search-path=Tenant_A'))}`
+    const underscored = `postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent(spell('search_path=Tenant_A'))}`
+
+    // PRECONDITION, so this cannot pass by examining nothing: the URL under test really is written
+    // with a hyphen, and the underscored URL it is compared against really is not.
+    assert.ok(decodeURIComponent(hyphenated).includes('search-path='), `${label}: the URL under test is hyphenated`)
+    assert.ok(!decodeURIComponent(underscored).includes('search-path='), `${label}: its control is not`)
+
+    assert.deepEqual(
+      resolveDatabaseUrlSchema(hyphenated),
+      { parsed: true, explicit: true, schema: 'tenant_a' },
+      `${label}: the hyphenated spelling names the schema, folded as the server folds it`,
+    )
+    assert.deepEqual(
+      resolveDatabaseUrlSchema(hyphenated),
+      resolveDatabaseUrlSchema(underscored),
+      `${label}: and it is THE SAME setting as the underscored spelling, not a second, unrelated one`,
+    )
+    assert.equal(
+      pgConnectionConfig(hyphenated).options,
+      '-c search_path="tenant_a"',
+      `${label}: so the pin is the schema the URL named, with nothing carried through ahead to be overridden`,
+    )
+
+    // AND IT PARTICIPATES IN THE CROSS-CHECK. A spelling the reader does not recognise cannot
+    // disagree with `?schema=`, so the disagreement this module exists to refuse became silent
+    // agreement on whichever schema `?schema=` named.
+    assert.throws(
+      () =>
+        pgConnectionConfig(
+          `postgresql://u:p@localhost:5432/ims?schema=other&options=${encodeURIComponent(spell('search-path=tenant_a'))}`,
+        ),
+      DatabaseUrlSchemaConflictError,
+      `${label}: a hyphenated search path that disagrees with ?schema= is refused, not ignored`,
+    )
+  }
+
+  // MIXED CASE AND HYPHENS AT ONCE, because the backend applies both normalisations:
+  // `guc_name_compare()` folds A-Z and `ParseLongOption()` rewrites `-` to `_`.
+  assert.deepEqual(
+    resolveDatabaseUrlSchema(
+      `postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent('-c Search-Path=Tenant_A')}`,
+    ),
+    { parsed: true, explicit: true, schema: 'tenant_a' },
+  )
+
+  // THE NAME ONLY. `ParseLongOption()` rewrites the characters of the name and never touches the
+  // value, so a schema whose own name contains a hyphen keeps it.
+  // MUTATION: canonicalise the whole `name=value` setting instead of the name, and this returns
+  // `tenant_a` for a schema called `tenant-a` — a pin onto a schema that may not exist.
+  assert.deepEqual(
+    resolveDatabaseUrlSchema(
+      `postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent('-c search-path="tenant-a"')}`,
+    ),
+    { parsed: true, explicit: true, schema: 'tenant-a' },
+  )
+
+  // AND EVERY OTHER SETTING IS STILL CARRIED THROUGH IN THE TOKENS IT WAS WRITTEN AS. Recognising
+  // a name for the purpose of finding `search_path` must not rewrite what reaches the backend:
+  // `application-name` is the server's business to normalise, not this module's to edit.
+  assert.equal(
+    pgConnectionConfig(
+      `postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent('-c application-name=my-app -c search-path=tenant_a')}`,
+    ).options,
+    '-c application-name=my-app -c search_path="tenant_a"',
+  )
+})
+
+test('o3d-2k5r r14: U+0000 is refused, because no startup packet can carry one', () => {
+  // ROUTE: `?schema=` / `?options=` -> resolveDatabaseUrlSchema() / splitLibpqOptions() ->
+  // pgConnectionConfig() -> pg's startup-packet serialiser, which writes each parameter as a
+  // NUL-TERMINATED C string. Measured against the installed pg and a real PostgreSQL, a NUL
+  // anywhere in `options` does not mis-resolve the schema — the connection is REFUSED with
+  // `invalid startup packet layout: expected terminator as last byte`. The module's own reader,
+  // meanwhile, round-tripped the name intact, so this was a value the emitter accepted, claimed to
+  // have round-tripped, and the server could never receive. No PostgreSQL identifier may contain
+  // U+0000 either, so there is no schema of that name to reach in the first place.
+  //
+  // MUTATION: delete the U+0000 branch from splitLibpqOptions() and the `named.includes(NUL)`
+  // branch from resolveDatabaseUrlSchema(). Every assert.throws below fails; `?schema=ten<NUL>ant`
+  // then emits `-c search_path="ten<NUL>ant"` and reads back as `ten<NUL>ant`, a self-consistent
+  // round trip of a string no connection can be opened with.
+  const NUL = String.fromCharCode(0)
+  const cases: [string, string][] = [
+    ['?schema=', `postgresql://u:p@localhost:5432/ims?schema=${encodeURIComponent(`ten${NUL}ant`)}`],
+    [
+      'an unquoted search path',
+      `postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent(`-c search_path=ten${NUL}ant`)}`,
+    ],
+    [
+      'a quoted search path',
+      `postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent(`-c search_path="ten${NUL}ant"`)}`,
+    ],
+    [
+      'an ESCAPED NUL, which the splitter unescapes back into the value',
+      `postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent(`-c search_path=ten\\${NUL}ant`)}`,
+    ],
+    [
+      'a startup option that is not the search path at all',
+      `postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent(`-c application_name=my${NUL}app`)}`,
+    ],
+  ]
+  for (const [label, url] of cases) {
+    // PRECONDITION: the URL really does carry a NUL after URL parsing — `%00` survives
+    // URLSearchParams — so the refusal below is caused by the NUL and not by the syntax around it.
+    const parameters = new URL(url).searchParams
+    assert.ok(
+      (parameters.get('schema') ?? parameters.get('options') ?? '').includes(NUL),
+      `${label}: the parsed URL really carries a NUL`,
+    )
+    assert.throws(
+      () => pgConnectionConfig(url),
+      (error: unknown) => {
+        assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${label}: refused as a schema conflict`)
+        assert.match((error as Error).message, /U\+0000/, `${label}: and the message names the character`)
+        return true
+      },
+      `${label}: is refused`,
+    )
+    // AND THE SAME URL WITHOUT THE NUL IS ACCEPTED, so the guard is not refusing the shape.
+    assert.ok(pgConnectionConfig(url.replaceAll('%00', '')).options, `${label}: the NUL-free spelling still resolves`)
+  }
+})
+
 // ---------------------------------------------------------------------------
 // Live: a throwaway database, and the schema the row actually landed in.
 // ---------------------------------------------------------------------------
@@ -489,6 +640,110 @@ test('o3d-2k5r r13 (live): a schema name containing every backend separator is p
         await client.end().catch(() => undefined)
       }
     }
+  } finally {
+    await scratch.drop()
+  }
+})
+
+test('o3d-2k5r r14 (live): a hyphenated search-path name pins the REAL server on the schema the URL named', async (t) => {
+  const scratch = await openScratch(t)
+  if (!scratch) return
+  try {
+    for (const [label, spell] of GUC_SPELLINGS) {
+      // PRECONDITION — THE PREMISE OF THE FIX, ASKED OF THE SERVER rather than read out of its
+      // source. This client deliberately BYPASSES pgConnectionConfig() and hands the hyphenated
+      // spelling straight to pg, so what it measures is PostgreSQL's own `ParseLongOption()`. If
+      // this ever fails, the normalisation is wrong and the test says so at the premise instead of
+      // silently making the conclusion below untestable.
+      const raw: pg.Client = new pg.Client({
+        connectionString: scratch.url,
+        options: spell('search-path=tenant_a'),
+        connectionTimeoutMillis: 3_000,
+      })
+      await raw.connect()
+      try {
+        assert.equal(
+          (await raw.query<{ schema: string }>('select current_schema() as schema')).rows[0]?.schema,
+          'tenant_a',
+          `${label}: PostgreSQL itself reads a hyphenated GUC name as the underscored one`,
+        )
+      } finally {
+        await raw.end().catch(() => undefined)
+      }
+
+      // ROUTE: `options=<hyphenated spelling>` -> canonicalGucName() -> the schema
+      // resolveDatabaseUrlSchema() reads -> the pin pgConnectionConfig() composes -> the startup
+      // packet -> the connection's own `search_path` -> where an UNQUALIFIED insert lands.
+      //
+      // MUTATION: delete `.replace(/-/g, '_')` from canonicalGucName(). The emitted options become
+      // `-c search-path=Tenant_A -c search_path="public"`; the backend applies both, the LAST
+      // assignment wins, `current_schema()` is `public` and the row below lands in
+      // `public.settings`. A test that only inspected the transmitted string would still find
+      // `Tenant_A` in it and pass — which is exactly how this spelling survived thirteen rounds.
+      const url: string = `${scratch.url}?options=${encodeURIComponent(spell('search-path=Tenant_A'))}`
+      const client: pg.Client = new pg.Client({ ...pgConnectionConfig(url), connectionTimeoutMillis: 3_000 })
+      await client.connect()
+      try {
+        assert.equal(
+          (await client.query<{ schema: string }>('select current_schema() as schema')).rows[0]?.schema,
+          'tenant_a',
+          `${label}: the pinned connection is on the schema the URL named, folded as the server folds it`,
+        )
+        const key = `probe-hyphen-${label.replace(/\s+/g, '-')}`
+        await client.query('insert into settings (key, value, "updatedAt") values ($1, $2, now())', [key, label])
+        assert.deepEqual(
+          await schemasHolding(scratch.admin, key),
+          ['tenant_a'],
+          `${label}: and the unqualified write landed there and nowhere else`,
+        )
+      } finally {
+        await client.end().catch(() => undefined)
+      }
+    }
+  } finally {
+    await scratch.drop()
+  }
+})
+
+test('o3d-2k5r r14 (live): a NUL in the startup options is refused HERE because the server refuses it there', async (t) => {
+  const scratch = await openScratch(t)
+  if (!scratch) return
+  try {
+    // THE OTHER HALF OF THE MEDIUM FINDING, measured rather than reasoned about: this is what the
+    // module would be emitting if it did not refuse. The raw client below is handed the exact pin
+    // `pgConnectionConfig()` used to compose for `?schema=ten<NUL>ant`, and the server rejects the
+    // CONNECTION — so the value the reader round-tripped happily is a value no connection can
+    // carry.
+    //
+    // The first assertion constrains POSTGRESQL, not this module: it is what makes the refusal in
+    // the pure test above a fix rather than a preference, and it is the reason the module can say
+    // the value is impossible instead of merely unusual.
+    // MUTATION (for the second assertion): delete the U+0000 branches from splitLibpqOptions() and
+    // resolveDatabaseUrlSchema(). `pgConnectionConfig()` then returns a config carrying that same
+    // impossible pin, the assert.throws fails, and the only remaining signal an operator gets is
+    // the wire error the first assertion just captured.
+    const NUL = String.fromCharCode(0)
+    const raw: pg.Client = new pg.Client({
+      connectionString: scratch.url,
+      options: `-c search_path="ten${NUL}ant"`,
+      connectionTimeoutMillis: 3_000,
+    })
+    await assert.rejects(
+      raw.connect(),
+      (error: unknown) => {
+        assert.ok(error instanceof Error, 'the connection fails')
+        return true
+      },
+      'a startup options string carrying U+0000 cannot open a connection at all',
+    )
+    await raw.end().catch(() => undefined)
+
+    // AND SO THE MODULE REFUSES IT BEFORE A CLIENT IS EVER BUILT, with a sentence that names the
+    // parameter — instead of handing the operator the wire-level packet-layout error above.
+    assert.throws(
+      () => pgConnectionConfig(`${scratch.url}?schema=${encodeURIComponent(`ten${NUL}ant`)}`),
+      DatabaseUrlSchemaConflictError,
+    )
   } finally {
     await scratch.drop()
   }
