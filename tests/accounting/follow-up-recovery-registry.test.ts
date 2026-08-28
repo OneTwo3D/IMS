@@ -5,6 +5,11 @@ import test from 'node:test'
 import ts from 'typescript'
 
 import { followUpObligationRecoveryNote } from '@/lib/domain/accounting/back-reference'
+import { sweepRetainedFollowUpObligationDescription } from '@/lib/domain/accounting/back-reference-sweep'
+import {
+  buildCompactedFollowUpLossActivity,
+  type CompactedFollowUpLossPhase,
+} from '@/lib/domain/accounting/compacted-followup-loss'
 import { xeroRetainedFollowUpObligationDescription } from '@/lib/connectors/xero/sync-processor'
 import {
   ACCOUNTING_FOLLOW_UP_RECOVERY,
@@ -856,25 +861,107 @@ function localFunctions(sourceFile: ts.SourceFile): Map<string, ts.Node> {
  * only, and a nested function's returns are not this function's.
  */
 function resolve(expression: ts.Expression, bindings: Map<string, ts.Expression>, seen = new Set<string>()): ts.Expression {
+  return resolveIn(expression, bindings, seen).node
+}
+
+/**
+ * A resolution AND THE SCOPE IT WAS REACHED IN (o3d-0bfh r12, Codex MEDIUM).
+ *
+ * Following a call to the expression it returns changes scope: the returned expression is written in
+ * terms of the callee's FORMAL PARAMETERS, and the values they stand for are the call's ACTUAL
+ * ARGUMENTS. r11 substituted the return and threw the arguments away, so
+ * `predicates.stale(olderThan(cutoff))` resolved to `{ [MARKER]: generation }` with `generation`
+ * meaning nothing — and `generation` is an ALLOWLISTED protocol operand name, so the range-building
+ * argument disappeared and the shape was judged as a legitimate compare-and-set fence. The argument
+ * carrying the offence was the one thing not looked at.
+ *
+ * `unbound` is the fail-closed half: a formal parameter this scan could NOT pair with an argument —
+ * a destructuring pattern, a rest parameter, a spread call, a missing argument with no default —
+ * must not then be readable as a generation just because it is spelled `generation`.
+ */
+type ResolvedExpression = {
+  node: ts.Expression
+  /** The binding table the node must be read in: the caller's, plus this call's parameters. */
+  bindings: Map<string, ts.Expression>
+  /** Parameter names substituted past whose actual argument could not be identified. */
+  unbound: Set<string>
+}
+
+function resolveIn(
+  expression: ts.Expression,
+  bindings: Map<string, ts.Expression>,
+  seen = new Set<string>(),
+  unbound = new Set<string>(),
+): ResolvedExpression {
   let current: ts.Expression = expression
+  let scope = bindings
   for (;;) {
     if (ts.isParenthesizedExpression(current)) { current = current.expression; continue }
     if (ts.isAsExpression(current) || ts.isSatisfiesExpression(current)) { current = current.expression; continue }
     if (ts.isIdentifier(current) && !seen.has(current.text)) {
-      const bound = bindings.get(current.text)
+      const bound = scope.get(current.text)
       if (bound) { seen.add(current.text); current = bound; continue }
     }
     if (ts.isCallExpression(current)) {
-      const callee = calleeFunction(current, bindings, seen)
+      const callee = calleeFunction(current, scope, seen)
       const returned = callee ? soleReturnExpression(callee) : null
-      if (returned && !seen.has(`call:${current.getText()}`)) {
+      if (callee && returned && !seen.has(`call:${current.getText()}`)) {
         seen.add(`call:${current.getText()}`)
+        scope = bindCallArguments(callee, current, scope, unbound)
         current = returned
         continue
       }
     }
-    return current
+    return { node: current, bindings: scope, unbound }
   }
+}
+
+/** Every identifier a parameter's binding name introduces — a pattern binds several. */
+function parameterNames(name: ts.BindingName): string[] {
+  if (ts.isIdentifier(name)) return [name.text]
+  const names: string[] = []
+  for (const element of name.elements) {
+    if (ts.isOmittedExpression(element)) continue
+    names.push(...parameterNames(element.name))
+  }
+  return names
+}
+
+/**
+ * Pair a followed call's actual arguments with the callee's formal parameters (o3d-0bfh r12).
+ *
+ * EVERY parameter name is first REMOVED from the scope and recorded as unbound, because a parameter
+ * SHADOWS whatever the enclosing file called that name — reading an outer `const generation` through
+ * a parameter of the same name is a second way to lose the argument, and it is a way that reads as a
+ * clean result. A name is only put back when this scan can point at the expression it stands for.
+ *
+ * FAIL-CLOSED ON EVERYTHING IT CANNOT PAIR POSITIONALLY: a spread call (`stale(...args)`) makes
+ * every index a guess, a rest parameter has no single argument, a destructuring pattern binds names
+ * that are properties of an argument rather than the argument, and a missing argument with no
+ * default is `undefined` and is certainly not a generation.
+ */
+function bindCallArguments(
+  callee: ts.Node,
+  call: ts.CallExpression,
+  scope: Map<string, ts.Expression>,
+  unbound: Set<string>,
+): Map<string, ts.Expression> {
+  const parameters = (callee as Partial<ts.SignatureDeclarationBase>).parameters
+  if (!parameters) return scope
+  const next = new Map(scope)
+  const spreadCall = call.arguments.some(ts.isSpreadElement)
+  parameters.forEach((parameter, index) => {
+    for (const name of parameterNames(parameter.name)) {
+      next.delete(name)
+      unbound.add(name)
+    }
+    if (spreadCall || parameter.dotDotDotToken || !ts.isIdentifier(parameter.name)) return
+    const argument = call.arguments[index] ?? parameter.initializer
+    if (!argument) return
+    next.set(parameter.name.text, argument)
+    unbound.delete(parameter.name.text)
+  })
+  return next
 }
 
 /** The locally declared function a call expression actually reaches, or null. */
@@ -979,12 +1066,20 @@ function judgeMarkerValue(
   sourceFile: ts.SourceFile,
   depth = 0,
   strict = false,
+  /** Parameter names inherited from a call already followed to get here — see {@link resolveIn}. */
+  carried: Set<string> = new Set(),
 ): string | null {
-  const resolved = resolve(value, bindings)
+  // o3d-0bfh r12: resolved WITH its scope. Everything below reads the resolved node in `scope`, not
+  // in the caller's table, or a substituted parameter means whatever the enclosing file happens to
+  // call that name.
+  const resolution = resolveIn(value, bindings, new Set(), new Set(carried))
+  const resolved = resolution.node
+  const scope = resolution.bindings
+  const unbound = resolution.unbound
   if (depth > 4) return `${MARKER}: a predicate nested deeper than this scan will follow — state it plainly`
   if (ts.isConditionalExpression(resolved)) {
-    return judgeMarkerValue(resolved.whenTrue, bindings, sourceFile, depth + 1, strict)
-      ?? judgeMarkerValue(resolved.whenFalse, bindings, sourceFile, depth + 1, strict)
+    return judgeMarkerValue(resolved.whenTrue, scope, sourceFile, depth + 1, strict, unbound)
+      ?? judgeMarkerValue(resolved.whenFalse, scope, sourceFile, depth + 1, strict, unbound)
   }
   if (!ts.isObjectLiteralExpression(resolved)) {
     // NOT AN OBJECT. In an ASSIGNMENT or a select this is the protocol's own use: `null`, `true`,
@@ -992,19 +1087,19 @@ function judgeMarkerValue(
     // `olderThan(cutoff)` and `FILTERS.stale` both land here, and both were called safe purely for
     // not being inline object literals. `strict` is where that stops.
     if (!strict) return null
-    return judgeMarkerPredicateOperand(resolved, sourceFile)
+    return judgeMarkerPredicateOperand(resolved, sourceFile, unbound)
   }
   for (const property of resolved.properties) {
     if (ts.isSpreadAssignment(property)) {
-      const spread = resolve(property.expression, bindings)
-      if (!ts.isObjectLiteralExpression(spread)) {
+      const spread = resolveIn(property.expression, scope, new Set(), new Set(unbound))
+      if (!ts.isObjectLiteralExpression(spread.node)) {
         return `${MARKER}: ${property.getText(sourceFile)} — a spread this scan cannot resolve to an object literal`
       }
-      const verdict = judgeMarkerValue(spread, bindings, sourceFile, depth + 1, strict)
+      const verdict = judgeMarkerValue(spread.node, spread.bindings, sourceFile, depth + 1, strict, spread.unbound)
       if (verdict) return verdict
       continue
     }
-    const key = keyOf(property, bindings)
+    const key = keyOf(property, scope)
     if (key === null) {
       return `${MARKER}: ${property.getText(sourceFile)} — a key this scan cannot read`
     }
@@ -1015,7 +1110,7 @@ function judgeMarkerValue(
       return `${MARKER}: unrecognised operator "${key}" — only null tests and equality may be asked of a generation`
     }
     if (ts.isPropertyAssignment(property)) {
-      const verdict = judgeMarkerValue(property.initializer, bindings, sourceFile, depth + 1, strict)
+      const verdict = judgeMarkerValue(property.initializer, scope, sourceFile, depth + 1, strict, unbound)
       if (verdict) return verdict
     }
   }
@@ -1036,7 +1131,11 @@ function judgeMarkerValue(
  * and so cannot tell a `Date` from a filter object; refusing what it cannot read is the only answer
  * that does not amount to assuming the answer.
  */
-function judgeMarkerPredicateOperand(resolved: ts.Expression, sourceFile: ts.SourceFile): string | null {
+function judgeMarkerPredicateOperand(
+  resolved: ts.Expression,
+  sourceFile: ts.SourceFile,
+  unbound: Set<string> = new Set(),
+): string | null {
   const text = resolved.getText(sourceFile).replace(/\s+/g, ' ')
   if (resolved.kind === ts.SyntaxKind.NullKeyword) return null
 
@@ -1051,10 +1150,26 @@ function judgeMarkerPredicateOperand(resolved: ts.Expression, sourceFile: ts.Sou
   }
 
   const name = plainRead(resolved)
+  // o3d-0bfh r12 (Codex MEDIUM): AN ALLOWLISTED NAME IS NOT A LICENCE WHEN IT IS A PARAMETER THIS
+  // SCAN COULD NOT PAIR WITH AN ARGUMENT. `predicates.stale(olderThan(cutoff))` returning
+  // `{ [MARKER]: generation }` reads exactly like the compare-and-set fence, and the range was in
+  // the argument. Checked BEFORE the allowlist, because the allowlist is what it defeats.
+  if (name !== null && unbound.has(name)) {
+    return `${MARKER}: ${text} — a callee parameter whose actual argument this scan could not identify. The `
+      + 'range comparison can be IN that argument, so an allowlisted parameter name is refused rather than read '
+      + 'as the generation the protocol fences on'
+  }
   if (name !== null && PROTOCOL_OPERAND_NAMES.has(name)) return null
   return `${MARKER}: ${text} — a predicate operand this scan cannot read as a generation value. A helper-built `
     + 'or imported filter can return { lt: cutoff } from exactly this position, so an unrecognised shape is '
     + 'REFUSED rather than assumed safe. If it really is a generation, name it in PROTOCOL_OPERAND_NAMES'
+}
+
+/** A `where` clause together with the scope it has to be read in (o3d-0bfh r12). */
+type PredicateClause = {
+  clause: ts.ObjectLiteralExpression
+  bindings: Map<string, ts.Expression>
+  unbound: Set<string>
 }
 
 /**
@@ -1110,18 +1225,28 @@ function markerClockReads(code: string, fileName = 'scan.ts'): string[] {
   const predicateClauses = (
     expression: ts.Expression,
     depth = 0,
-  ): { clauses: ts.ObjectLiteralExpression[]; unresolved: ts.Expression[] } => {
+    // o3d-0bfh r12: the scope the expression must be read in. A clause reached THROUGH a call is
+    // written in the callee's parameters, and judging it in the caller's table is how the actual
+    // argument disappears.
+    scope: Map<string, ts.Expression> = bindings,
+    carried: Set<string> = new Set(),
+  ): { clauses: PredicateClause[]; unresolved: ts.Expression[] } => {
     if (depth > 3) return { clauses: [], unresolved: [expression] }
-    const resolved = resolve(expression, bindings)
-    if (ts.isObjectLiteralExpression(resolved)) return { clauses: [resolved], unresolved: [] }
+    const resolution = resolveIn(expression, scope, new Set(), new Set(carried))
+    const resolved = resolution.node
+    if (ts.isObjectLiteralExpression(resolved)) {
+      return { clauses: [{ clause: resolved, bindings: resolution.bindings, unbound: resolution.unbound }], unresolved: [] }
+    }
     // `AND: [...]` / `OR: [...]` — each element is a clause in its own right.
     if (ts.isArrayLiteralExpression(resolved)) {
-      const clauses: ts.ObjectLiteralExpression[] = []
+      const clauses: PredicateClause[] = []
       const unresolved: ts.Expression[] = []
       for (const element of resolved.elements) {
         const inner = predicateClauses(
           ts.isSpreadElement(element) ? element.expression : element as ts.Expression,
           depth + 1,
+          resolution.bindings,
+          resolution.unbound,
         )
         clauses.push(...inner.clauses)
         unresolved.push(...inner.unresolved)
@@ -1168,14 +1293,14 @@ function markerClockReads(code: string, fileName = 'scan.ts'): string[] {
             + 'return a range comparison on the generation from exactly this position',
           )
         }
-        for (const clause of predicate.clauses) {
+        for (const { clause, bindings: clauseScope, unbound } of predicate.clauses) {
           for (const inner of clause.properties) {
-            if (keyOf(inner, bindings) !== MARKER) continue
+            if (keyOf(inner, clauseScope) !== MARKER) continue
             const value = ts.isShorthandPropertyAssignment(inner)
               ? inner.name
               : (ts.isPropertyAssignment(inner) ? inner.initializer : null)
             if (value === null) continue
-            const verdict = judgeMarkerValue(value, bindings, sourceFile, 0, true)
+            const verdict = judgeMarkerValue(value, clauseScope, sourceFile, 0, true, unbound)
             if (verdict) offences.push(verdict)
           }
         }
@@ -1983,6 +2108,57 @@ test('[o3d-0bfh r9] the marker scan REFUSES the shapes it cannot read, instead o
       code: 'const predicates = { staleAt(cutoff) { return { lt: cutoff } } }\n'
         + 'await db.accountingSyncLog.findMany({ where: { backReferenceFollowUpsPendingAt: predicates.staleAt(cutoff) } })',
     },
+    {
+      // CODEX r11 MEDIUM. r11 replaced a call with the callee's return expression and never bound
+      // the FORMAL PARAMETERS to the ACTUAL ARGUMENTS, so this resolved to
+      // `{ MARKER: generation }` — and `generation` is an ALLOWLISTED protocol operand name. The
+      // argument carrying the range comparison was the one thing not looked at, and the shape read
+      // as the compare-and-set fence the protocol is built on.
+      what: 'AN ALLOWLISTED PARAMETER NAME HOLDING A RANGE-BUILDING ARGUMENT',
+      code: 'const predicates = { stale(generation) { return { backReferenceFollowUpsPendingAt: generation } } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: predicates.stale(olderThan(cutoff)) })',
+    },
+    {
+      what: 'the same, with a clock read as the argument',
+      code: 'const predicates = { stale(generation) { return { backReferenceFollowUpsPendingAt: generation } } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: predicates.stale(new Date()) })',
+    },
+    {
+      what: 'the same, through a plain function rather than a method',
+      code: 'function stale(marker) { return { backReferenceFollowUpsPendingAt: marker } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: stale(olderThan(cutoff)) })',
+    },
+    {
+      what: 'the same, with the range literal handed in directly as the argument',
+      code: 'function stale(pendingAt) { return { backReferenceFollowUpsPendingAt: pendingAt } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: stale({ lt: cutoff }) })',
+    },
+    {
+      // The fail-closed half: the parameter cannot be paired with an argument at all, so an
+      // allowlisted name must not be read as a generation just because it is spelled like one.
+      what: 'an allowlisted parameter with NO argument passed for it',
+      code: 'function stale(generation) { return { backReferenceFollowUpsPendingAt: generation } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: stale() })',
+    },
+    {
+      what: 'an allowlisted name arriving through a DESTRUCTURED parameter',
+      code: 'function stale({ generation }) { return { backReferenceFollowUpsPendingAt: generation } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: stale({ generation: olderThan(cutoff) }) })',
+    },
+    {
+      what: 'an allowlisted parameter reached through a SPREAD call, where no index can be trusted',
+      code: 'function stale(flag, generation) { return { backReferenceFollowUpsPendingAt: generation } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: stale(...args) })',
+    },
+    {
+      // AND THE SHADOWING ROUTE. Without deleting the parameter names from the scope first, the
+      // outer `const generation` would be read through the parameter and the argument lost again —
+      // a clean-looking result built from a value the call never passed.
+      what: 'an allowlisted parameter SHADOWING an outer binding of the same name',
+      code: 'const generation = someRow.backReferenceFollowUpsPendingAt\n'
+        + 'function stale(generation) { return { backReferenceFollowUpsPendingAt: generation } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: stale(olderThan(cutoff)) })',
+    },
   ]
   for (const { what, code } of refused) {
     const offences = markerClockReads(code, 'control.ts')
@@ -2094,8 +2270,71 @@ function activityProducers(): Array<{ what: string; text: string; mustEscalate: 
       mustEscalate: false,
     })
   }
+
+  // 3. THE SWEEP'S OWN RETAINED-OBLIGATION ACTIVITY (o3d-0bfh r12, Codex HIGH) — the THIRD file to
+  //    carry this instruction. Walked for every connector plus the fallback rather than for the one
+  //    the sweep is bound to today, because the producer is connector-parameterised and a second
+  //    binding would otherwise reach it unexercised.
+  for (const connector of [...Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY), UNDECLARED_CONNECTOR]) {
+    produced.push({
+      what: `sweepRetainedFollowUpObligationDescription for ${connector} `
+        + `(the ${connector}_backreference_followups_retained activity)`,
+      text: sweepRetainedFollowUpObligationDescription({
+        connector,
+        connectorLabel: connector === 'xero' ? 'Xero' : connector,
+        row: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-1' },
+      }),
+      mustEscalate: true,
+    })
+  }
+
+  // 4. THE COMPACTED-TOMBSTONE DISCARD ANNOUNCEMENT — the same rows, the same sweep, and the FOURTH
+  //    producer of an instruction about outstanding follow-ups. It said "check whether it is missing
+  //    and re-drive it manually", which is the hand settlement the whole issue is about: the
+  //    interrupted pass writes each follow-up as its own sync row, so one for the discarded part can
+  //    already be PENDING or FAILED in the queue.
+  //
+  //    Every PHASE and both CLASSIFICATION BASES are walked, because the instruction is composed
+  //    after the branch and a basis-specific tail would otherwise go unread. The `type-table` basis
+  //    is the dangerous one: it OVER-reports, so it can name a payment registration a row never owed.
+  for (const phase of ['repaired', 'already-applied', 'processor-short-circuit'] as CompactedFollowUpLossPhase[]) {
+    for (const basis of ['row-record', 'type-table', 'unrecognised-key'] as const) {
+      produced.push({
+        what: `buildCompactedFollowUpLossActivity (${phase}, ${basis})`,
+        text: buildCompactedFollowUpLossActivity({
+          connectorLabel: 'Xero',
+          activityActionPrefix: 'xero',
+          phase,
+          row: {
+            id: 'log-compacted-1',
+            type: 'SALES_INVOICE',
+            referenceType: 'SalesOrder',
+            referenceId: 'so-1',
+            externalTransactionId: 'XINV-1',
+            backReferenceEvidenceCompactedAt: new Date('2026-01-01T00:00:00.000Z'),
+            followUpObligations: basis === 'row-record'
+              ? ['payment-registration', 'invoice-pdf']
+              : basis === 'unrecognised-key'
+                ? ['a-follow-up-this-build-does-not-know']
+                : undefined,
+          },
+        }).description,
+        mustEscalate: true,
+      })
+    }
+  }
   return produced
 }
+
+/** How many strings {@link activityProducers} must yield — stated, so a dropped producer is loud. */
+const EXPECTED_ACTIVITY_PRODUCERS =
+  // the Xero processor's retained-obligation activity
+  1
+  // the shared recovery note, and the sweep's retained-obligation activity, for every registry
+  // connector plus the undeclared fallback
+  + (Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY).length + 1) * 2
+  // the compacted-tombstone discard, over three phases and three classification bases
+  + 9
 
 test('[o3d-0bfh r11] every activity string an operator can receive is judged by THE ONE LIST, taken from its producer', () => {
   // Route: xeroRetainedFollowUpObligationDescription() — the function that composes the
@@ -2108,8 +2347,9 @@ test('[o3d-0bfh r11] every activity string an operator can receive is judged by 
   // instruction without replacing it is not a passing fix either.
   const produced = activityProducers()
   assert.equal(
-    produced.length, Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY).length + 2,
-    'one Xero activity plus the shared note for every registry connector and the fallback',
+    produced.length, EXPECTED_ACTIVITY_PRODUCERS,
+    'the Xero activity, the shared note and the sweep activity for every registry connector and the '
+      + 'fallback, and the compacted-tombstone discard over every phase and basis',
   )
   for (const { what, text, mustEscalate } of produced) {
     assert.ok(text.length > 0, `${what} must actually produce a string, or this scan reads nothing`)
@@ -2144,21 +2384,102 @@ test('[o3d-0bfh r11] every activity string an operator can receive is judged by 
     shipped, /a later sweep re-reads the marker and re-enqueues them idempotently/,
     'the recovery half must be the registry\'s declared fact for this connector, not a sentence written in the processor',
   )
+
+  // ---- THE r12 PRODUCER, THE SAME WAY (Codex HIGH). ----
+  //
+  // Route: sweepRetainedFollowUpObligationDescription() — the function that composes the
+  // `<connector>_backreference_followups_retained` activity the SWEEP writes. Mutation: restore
+  // either half of the shipped sentence ("so the next sweep retries them", "Register the receipt in
+  // Xero by hand if it does not clear") and this fails naming the producer.
+  const sweep = sweepRetainedFollowUpObligationDescription({
+    connector: 'xero',
+    connectorLabel: 'Xero',
+    row: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-1' },
+  })
+  for (const phrase of [
+    ' Register the receipt in Xero by hand if it does not clear',
+    ' Re-run the invoice sync for this reference',
+    ' This still has to be re-driven by hand',
+  ]) {
+    assert.throws(
+      () => assertNoBannedInstruction('the mutated sweep activity description', sweep + phrase),
+      /banned operator instruction/,
+      `THE ONE LIST must reject "${phrase.trim()}" in the sweep's retained-obligation activity — this is the `
+        + 'surface that shipped it through the round that pointed the contract at producers',
+    )
+  }
+  // It is the UNSETTLED outcome, so it must still name the outstanding receipt rather than fall
+  // silent, and its recovery half must be the REGISTRY's fact about this connector.
+  assert.match(sweep, /a receipt recorded before this document is still not registered against it in Xero/)
+  assert.match(sweep, /deliberately left marked as owing follow-ups/)
+  assert.match(
+    sweep, /a later sweep re-reads the marker and re-enqueues them idempotently/,
+    'the recovery half must come from the registry, not from a sentence written in the sweep',
+  )
+  // And on a connector with NO consumer the same producer says so instead of promising the sweep.
+  const sweepUndeclared = sweepRetainedFollowUpObligationDescription({
+    connector: UNDECLARED_CONNECTOR,
+    connectorLabel: UNDECLARED_CONNECTOR,
+    row: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-1' },
+  })
+  assert.match(sweepUndeclared, /NOTHING re-enqueues them on this connector/)
+
+  // ---- AND THE COMPACTED-TOMBSTONE DISCARD (o3d-0bfh r12). ----
+  //
+  // Route: buildCompactedFollowUpLossActivity().description. Mutation: restore "check whether it is
+  // missing and re-drive it manually" and this fails naming the producer.
+  const compacted = buildCompactedFollowUpLossActivity({
+    connectorLabel: 'Xero',
+    activityActionPrefix: 'xero',
+    phase: 'repaired',
+    row: {
+      id: 'log-compacted-1',
+      type: 'SALES_INVOICE',
+      referenceType: 'SalesOrder',
+      referenceId: 'so-1',
+      externalTransactionId: 'XINV-1',
+      backReferenceEvidenceCompactedAt: new Date('2026-01-01T00:00:00.000Z'),
+      followUpObligations: ['payment-registration', 'invoice-pdf'],
+    },
+  }).description
+  assert.throws(
+    () => assertNoBannedInstruction(
+      'the mutated compacted-tombstone discard', `${compacted} Check whether it is missing and re-drive it manually.`,
+    ),
+    /banned operator instruction/,
+    'THE ONE LIST must reject the sentence this producer shipped for eleven rounds',
+  )
+  // It still NAMES what was lost — "stop saying anything" is not a passing fix — and refuses the
+  // hand settlement in as many words.
+  assert.match(compacted, /the payment registration can no longer be enqueued/)
+  assert.match(compacted, /Nothing here authorises settling that by hand/)
 })
 
-test('[o3d-0bfh r11] BOTH connector sync-processors are scanned whole, so an unextracted string cannot hide behind an extracted one', () => {
+test('[o3d-0bfh r11/r12] every FILE that writes about a retained obligation is scanned whole, so an unextracted string cannot hide behind an extracted one', () => {
   // The producer test above can only judge the producers somebody named. This one judges the files,
-  // for exactly the reason r10 failed: the list was pointed at two connector files and the sentence
-  // was in the third.
+  // for exactly the reason r10 and r11 both failed: r10's list was pointed at two connector files
+  // and the sentence was in a third, and r11's producer walk named the Xero processor while the
+  // SWEEP — a fourth file — was still telling an operator to register the receipt by hand.
   //
-  // Route: lib/connectors/xero/sync-processor.ts and lib/connectors/quickbooks/sync-processor.ts,
+  // Route: the four modules that compose operator prose about an outstanding follow-up obligation —
+  // both connector sync-processors, the sweep, and the compacted-tombstone announcement — as
   // executable source with comments stripped and string CONTENTS kept.
   //
+  // DELIBERATELY NOT SCANNED: lib/domain/accounting/follow-up-obligation-registry.ts. Its remedy
+  // splits the exception-inbox SECTION TITLE across a string concatenation ("...with nothing to " +
+  // "re-drive them"), and the exemption in the second pattern is a lookbehind that a file scan
+  // cannot see across the `+`. The registry is judged at RUNTIME instead, by remedySurfaces() above,
+  // where the two halves are one string — which is the whole reason the contract is pointed at
+  // producers and only backed up by file scans.
+  //
   // Mutation: put "Re-run the invoice sync for this reference, or register the receipt in Xero by
-  // hand." back into the Xero processor and this fails naming the file.
+  // hand." back into the Xero processor, or "Register the receipt in Xero by hand if it does not
+  // clear." back into the sweep, and this fails naming the file.
   const sources = [
     readSource(path.join(REPO_ROOT, 'lib', 'connectors', 'xero', 'sync-processor.ts')),
     readSource(path.join(REPO_ROOT, 'lib', 'connectors', 'quickbooks', 'sync-processor.ts')),
+    readSource(path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'back-reference-sweep.ts')),
+    readSource(path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'compacted-followup-loss.ts')),
   ]
   for (const source of sources) assertNoBannedInstruction(source.rel, source.code)
 
@@ -2170,4 +2491,14 @@ test('[o3d-0bfh r11] BOTH connector sync-processors are scanned whole, so an une
     'and its recovery guidance must come from the registry',
   )
   assert.match(sources[1]!.code, /HOW FAR IT GOT IS NOT KNOWN FROM HERE/)
+  // And the r12 files carry their REPLACEMENTS rather than merely having lost the sentence.
+  assert.match(
+    sources[2]!.code, /sweepRetainedFollowUpObligationDescription\(\{ connector, connectorLabel, row \}\)/,
+    'the sweep must compose its activity from the named producer, not from prose written at the call site',
+  )
+  assert.match(
+    sources[2]!.code, /followUpObligationRecoveryNote\(followUpObligationRecoveryFor\(connector\)\)/,
+    'and its recovery guidance must come from the registry',
+  )
+  assert.match(sources[3]!.code, /Nothing here authorises settling that by hand/)
 })
