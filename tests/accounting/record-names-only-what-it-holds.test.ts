@@ -1481,16 +1481,126 @@ function lookupLessMessages(): { label: string; text: string }[] {
 const LOCAL_DIRECTION_CONTEXT: LocalDirectionContext = { ledger: '{ledger}', syncRowId: '{syncRowId}' }
 
 /**
- * The prose of the inventory, which is generated and never written down.
+ * EVERY STRING THE DIRECTION RENDERER CAN EMIT, WRITTEN OUT AND REVIEWED (round 20, Codex HIGH).
  *
- * ROUND 19: the declared SEQUENCES are rendered too, because the conjunction that joins them is
- * prose an operator reads and it is contributed by `renderLocalDirectionSequence` rather than by
- * either element. A word no span accounts for is the thing the closure scan below reports, and the
- * join would otherwise be exactly such a word.
+ * ROUND 19 DERIVED THIS LIST FROM THE RENDERER — `LOCAL_DIRECTIONS.map(renderLocalDirection)` — and
+ * that is the vacuity `RECORD_PROSE` is duplicated by hand to avoid, arriving in the one place the
+ * file had stopped applying it. Codex's route, in full: append "Go to that bill and take the second
+ * PDF off it." to the ESCALATE branch of the production renderer. The round-19 one-action proof
+ * passes it (it contains no other direction whole, names no other target's anchor, and neither `go`
+ * nor `take` is on the twelve-verb banlist), and the corpus closure below passes it too — because
+ * the span it strips from the shipped message is whatever the renderer now returns. The generator
+ * was introduced to make prose safe, and its output had become the one unreviewed surface in the
+ * file.
+ *
+ * SO THE OUTPUT IS THE INVENTORY. Fourteen directions and one sequence, each written out verbatim
+ * beside the direction that produces it, and the renderer is held to EXACT EQUALITY with them (see
+ * the round-20 test). A sentence the renderer emits that is not here fails twice over: the equality
+ * assertion names the branch, and the corpus closure stops accounting for the words. Updating this
+ * list is where the new sentence gets read — which is the whole of the discipline the reviewed prose
+ * lists already run on.
+ *
+ * `{ledger}` and `{syncRowId}` are the placeholders `LOCAL_DIRECTION_CONTEXT` substitutes, so an
+ * entry shows exactly where the message's own values land and nothing else.
+ */
+const RENDERED_DIRECTIONS: readonly { direction: LocalDirection; text: string }[] = [
+  {
+    direction: { action: 'CONFIRM', target: 'ORDER_INVOICE_PDF' },
+    text: 'confirm the invoice PDF stored against the order is the document you expect',
+  },
+  {
+    direction: {
+      action: 'INSPECT',
+      target: 'EMAIL_OUTBOX_ROWS',
+      selector: 'THIS_ORDERS_ROWS',
+      read: ['status', 'attempts', 'lastError', 'sentAt'],
+    },
+    text: "Inspect the outbox rows for this order and read each row's status, attempts, lastError and sentAt.",
+  },
+  {
+    direction: {
+      action: 'INSPECT',
+      target: 'EMAIL_OUTBOX_ROWS',
+      selector: 'BY_KIND_AND_REFERENCE',
+      read: ['status', 'attempts', 'lastError', 'createdAt', 'sentAt'],
+    },
+    text: 'Then INSPECT the outbox: query it for kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId '
+      + "= the order id (no page in IMS lists them) and read each row's status, attempts, lastError, createdAt "
+      + 'and sentAt.',
+  },
+  {
+    direction: { action: 'RE_READ', target: 'EMAIL_OUTBOX_ROWS' },
+    text: 'so re-run the query rather than treating one result as the final list',
+  },
+  {
+    direction: { action: 'READ', target: 'EMAIL_OUTBOX_ROWS', read: ['status', 'lastError', 'time'] },
+    text: 'Read them by status, lastError and time',
+  },
+  {
+    direction: { action: 'TURN_OFF', target: 'SETTING_SYNC_ENABLED', control: 'LEVER_BELOW' },
+    text: 'TURN THE LEVER BELOW OFF FIRST, so that no NEW run is admitted',
+  },
+  {
+    direction: { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', lead: 'THEN_GO_AND', purpose: 'NONE' },
+    text: 'THEN GO AND READ quickbooks_sync_attach_pdf AS IT STANDS NOW',
+  },
+  {
+    direction: {
+      action: 'READ_SETTING',
+      target: 'SETTING_ATTACH_PDF',
+      lead: 'NONE',
+      purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO',
+    },
+    text: 'READ quickbooks_sync_attach_pdf AS IT STANDS NOW to learn what a replay would do',
+  },
+  {
+    direction: { action: 'TURN_OFF', target: 'SETTING_SYNC_ENABLED', control: 'CONNECTOR_PANEL_CHECKBOX' },
+    text: 'HOW TO STOP MORE OF IT: turn {ledger} sync OFF. The control is the checkbox at the top of the SYNC '
+      + 'tab of the {ledger} connector panel, and it writes the setting quickbooks_sync_enabled.',
+  },
+  {
+    direction: { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'NOT_A_FENCE' },
+    text: 'THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE.',
+  },
+  {
+    direction: { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'BEFORE_ESCALATION' },
+    text: 'Leave the toggle off',
+  },
+  {
+    direction: { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW' },
+    text: 'ESCALATE sync row {syncRowId}, with this record, to whoever administers this installation',
+  },
+  {
+    direction: { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+    text: 'Escalate this record to whoever administers this installation',
+  },
+  {
+    direction: { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'CLAUSE' },
+    text: 'escalate this record to whoever administers this installation',
+  },
+]
+
+/**
+ * The sequences, likewise written out. The conjunction that joins the elements is prose an operator
+ * reads and is contributed by `renderLocalDirectionSequence` rather than by either element, so it
+ * has to be reviewed as prose and not inferred from the two halves.
+ */
+const RENDERED_DIRECTION_SEQUENCES: readonly { sequence: LocalDirectionSequence; text: string }[] = [
+  {
+    sequence: LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE,
+    text: 'Leave the toggle off and ESCALATE sync row {syncRowId}, with this record, to whoever administers '
+      + 'this installation',
+  },
+]
+
+/**
+ * The spans the corpus closure is allowed to strip — TAKEN FROM THE REVIEWED INVENTORY, never from
+ * the renderer. That substitution is the round-20 fix: the closure now accounts for the sentences
+ * somebody read, so a renderer whose output has drifted from them stops being accounted for at all.
  */
 const LOCAL_DIRECTION_SPANS: readonly string[] = [
-  ...LOCAL_DIRECTIONS.map((direction) => renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT)),
-  ...LOCAL_DIRECTION_SEQUENCES.map((sequence) => renderLocalDirectionSequence(sequence, LOCAL_DIRECTION_CONTEXT)),
+  ...RENDERED_DIRECTIONS.map((entry) => entry.text),
+  ...RENDERED_DIRECTION_SEQUENCES.map((entry) => entry.text),
 ]
 
 /**
@@ -2157,6 +2267,99 @@ function composedDirections(sourceText: string): ComposedDirection[] {
 }
 
 /**
+ * The text of an expression, when it is a string a reader could have typed: a literal, a `+` chain of
+ * them, or an IMMUTABLE CONSTANT holding one (round 20, Codex MEDIUM).
+ *
+ * The constant half is the addition. `flattenedLiterals` broke at every non-literal operand and never
+ * resolved an identifier, so `const A = 'Escalate this record to whoever'; const B = ' administers
+ * this installation'; A + B` produced no run containing the direction — the fragment straddled a
+ * binding instead of a `+`, which is the round-19 defect one level along. Runtime corpus closure then
+ * removed the byte-identical sentence as a reviewed span, so nothing anywhere reported it.
+ *
+ * ONLY `const`, and only initializers that are themselves resolvable this way. A `let`, a call, a
+ * template hole or anything this cannot evaluate still returns null and still breaks the run, which
+ * is the fail-closed direction: a composition point is not a hand-written sentence.
+ */
+function constantText(node: ts.Expression, bindings: ReadonlyMap<string, string>): string | null {
+  if (ts.isParenthesizedExpression(node)) return constantText(node.expression, bindings)
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text
+  if (ts.isIdentifier(node)) return bindings.get(node.text) ?? null
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = constantText(node.left, bindings)
+    const right = constantText(node.right, bindings)
+    return left === null || right === null ? null : left + right
+  }
+  return null
+}
+
+/**
+ * Every module-level `const` in the file that holds a string a reader could have typed.
+ *
+ * Iterated to a fixed point so a constant built out of earlier constants resolves too — one pass
+ * would leave exactly the two-hop form open, which is the mutation the control below runs.
+ */
+function constantStringBindings(sourceFile: ts.SourceFile): Map<string, string> {
+  const bindings = new Map<string, string>()
+  for (let pass = 0; pass < 5; pass++) {
+    const before = bindings.size
+    for (const statement of sourceFile.statements) {
+      if (!ts.isVariableStatement(statement)) continue
+      if (!(statement.declarationList.flags & ts.NodeFlags.Const)) continue
+      for (const declaration of statement.declarationList.declarations) {
+        if (!ts.isIdentifier(declaration.name) || !declaration.initializer) continue
+        const text = constantText(declaration.initializer, bindings)
+        if (text !== null) bindings.set(declaration.name.text, text)
+      }
+    }
+    if (bindings.size === before) break
+  }
+  return bindings
+}
+
+/**
+ * Every declaration of a renderer name in the given source that is NOT the production import
+ * (round 20, Codex MEDIUM).
+ *
+ * `composedDirections` recognises its call sites by identifier SPELLING, so a locally declared
+ * `renderLocalDirection` would satisfy the composition walk while composing nothing. Within one file
+ * a binding check is exact: the name must be imported from the direction model and declared nowhere
+ * else, and anything else that binds it is reported.
+ */
+function shadowedRendererBindings(sourceText: string): string[] {
+  const sourceFile = ts.createSourceFile('formatter.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const names = new Set(['renderLocalDirection', 'renderLocalDirectionSequence'])
+  const offences: string[] = []
+  const imported = new Set<string>()
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportSpecifier(node) && names.has(node.name.text)) {
+      const declaration = node.parent.parent.parent
+      const from = ts.isImportDeclaration(declaration) && ts.isStringLiteral(declaration.moduleSpecifier)
+        ? declaration.moduleSpecifier.text
+        : ''
+      if (!/local-operator-direction$/.test(from)) {
+        offences.push(`${node.name.text} is imported from "${from}", not from the production direction model`)
+      } else {
+        imported.add(node.name.text)
+      }
+      return
+    }
+    const bindsAName = (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node) || ts.isVariableDeclaration(node)
+      || ts.isParameter(node) || ts.isBindingElement(node) || ts.isFunctionExpression(node))
+      && node.name !== undefined && ts.isIdentifier(node.name) && names.has(node.name.text)
+    if (bindsAName) {
+      offences.push(`${(node as { name: ts.Identifier }).name.text} is declared locally, so the call sites the `
+        + 'composition walk reads by name need not be the production renderer at all')
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  for (const name of names) {
+    if (!imported.has(name)) offences.push(`${name} is never imported from the production direction model`)
+  }
+  return offences
+}
+
+/**
  * The formatter's string literals, CONCATENATION-FLATTENED.
  *
  * `'a' + 'b'` becomes `ab`, so a sentence split across literals reads exactly as a sentence typed in
@@ -2174,9 +2377,8 @@ function composedDirections(sourceText: string): ComposedDirection[] {
 function flattenedLiterals(sourceText: string): string[] {
   const sourceFile = ts.createSourceFile('formatter.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
   const runs: string[] = []
-  const plainLiteral = (node: ts.Expression): string | null => (
-    ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ? node.text : null
-  )
+  const bindings = constantStringBindings(sourceFile)
+  const plainLiteral = (node: ts.Expression): string | null => constantText(node, bindings)
   /** Every operand of one `+` chain, in source order, however the tree associates. */
   const operands = (node: ts.Expression, out: ts.Expression[]): ts.Expression[] => {
     if (ts.isParenthesizedExpression(node)) return operands(node.expression, out)
@@ -2243,6 +2445,29 @@ test('ROUND 19 (Codex HIGH): the formatter COMPOSES every direction it ships, ju
   // CONTROL: the files are the ones being read, so nothing below passes on an empty string.
   assert.match(model, /export function renderLocalDirection/, 'the renderer must live in production')
   assert.match(formatter, /renderLocalDirection\(/, 'and the formatter must call it')
+
+  // ROUND 20 (Codex MEDIUM): AND THE NAME AT THOSE CALL SITES IS THE PRODUCTION RENDERER. The walk
+  // below recognises a callee by its spelling, so a locally declared `renderLocalDirection` would
+  // satisfy every assertion in this test while composing nothing at all. Within one file the binding
+  // is decidable exactly: imported from the direction model, declared nowhere else.
+  assert.deepEqual(
+    shadowedRendererBindings(formatter), [],
+    `${FORMATTER_FILE} binds a renderer name to something other than the production import`,
+  )
+  // CONTROLS, so that assertion is not green on a checker that reports nothing.
+  assert.ok(
+    shadowedRendererBindings(
+      "import { renderLocalDirection, renderLocalDirectionSequence } from '@/lib/domain/accounting/local-operator-direction'\n"
+      + "function renderLocalDirection(d: unknown, c: unknown) { return 'Escalate this record' }\n",
+    ).length > 0,
+    'a locally declared renderer must be reported — it is the route the identifier-spelling walk cannot see',
+  )
+  assert.ok(
+    shadowedRendererBindings(
+      "import { renderLocalDirection, renderLocalDirectionSequence } from './my-own-directions'\n",
+    ).length > 0,
+    'and so must a renderer imported from a module that is not the production direction model',
+  )
 
   const composed = composedDirections(formatter)
   assert.ok(composed.length > 0, 'the walk must find composition points, or it is reading nothing')
@@ -2321,6 +2546,43 @@ test('ROUND 19 (Codex HIGH): no direction prose is written down, and SPLITTING T
   assert.deepEqual(
     composedDirections(split).filter((entry) => entry.direction !== null), [],
     'the split-literal mutation leaves no composition point at all, which the per-direction walk reports',
+  )
+
+  // ROUND 20 (Codex MEDIUM): AND THE SAME SENTENCE ASSEMBLED THROUGH CONSTANTS. `+` was the only
+  // seam round 19 could see through; a binding is another, and the composition walk cannot notice
+  // because it only asks whether each inventory value is composed SOMEWHERE — nine escalations, one
+  // of them replaced, eight still there.
+  const escalation = renderLocalDirection(
+    { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+    LOCAL_DIRECTION_CONTEXT,
+  )
+  const cut = Math.floor(escalation.length / 2)
+  const viaConstants = `const HEAD = '${escalation.slice(0, cut)}'\n`
+    + `const TAIL = '${escalation.slice(cut)}'\n`
+    + 'const message = HEAD + TAIL\n'
+  assert.deepEqual(
+    handWrittenDirectionProse(viaConstants).length, 1,
+    'THE CODEX MEDIUM: the direction split across two immutable constants. Neither half holds the fragment '
+    + 'and no flattened run did either, so the sentence shipped byte-identical and the corpus closure stripped '
+    + 'it as a reviewed span. Resolving const bindings is what closes it',
+  )
+  // ...and to a FIXED POINT, so a constant built out of other constants resolves however they are
+  // ordered — declared here BEFORE its operands, which one pass in source order would miss.
+  const twoHop = 'const JOINED = HEAD + TAIL\n'
+    + `const HEAD = '${escalation.slice(0, cut)}'\n`
+    + `const TAIL = '${escalation.slice(cut)}'\n`
+    + "const message = 'prefix ' + JOINED\n"
+  assert.deepEqual(
+    handWrittenDirectionProse(twoHop).length, 1,
+    'a constant assembled from constants declared after it must still resolve, or the two-hop form is the '
+    + 'next way through',
+  )
+  // ...while a genuine composition point is still not a hand-written sentence: an identifier the
+  // resolver cannot evaluate must break the run rather than be bridged.
+  const unresolvable = 'const message = prefix + renderLocalDirection(d, ctx) + suffix\n'
+  assert.deepEqual(
+    handWrittenDirectionProse(unresolvable), [],
+    'an operand this cannot evaluate breaks the run — the fail-closed direction is to report nothing there',
   )
 })
 
@@ -2531,3 +2793,217 @@ test('ROUND 18 (Codex HIGH): a formatter composing a MISMATCHED direction does n
     )
   }
 })
+
+// ---------------------------------------------------------------------------
+// ROUND 20 (Codex HIGH) — THE GENERATOR'S OWN OUTPUT WAS THE UNREVIEWED SURFACE.
+//
+// Round 19 proved three properties of the RENDERED prose: no direction contains another whole, none
+// names another target's anchor, none uses one of twelve banned verbs. Codex's counterexample walks
+// through all three — append the suite's own sentence, "Go to that bill and take the second PDF off
+// it.", to the ESCALATE branch: it contains no other direction, no other LOCAL_TARGET anchor, and
+// neither `go` nor `take` is a banned verb. The older round-14 test already PROVES that sentence
+// evades `mutationLexemes`, and the corpus closure trusted it automatically, because
+// LOCAL_DIRECTION_SPANS was derived by calling the renderer.
+//
+// Codex offered two closures — action-specific structured tokens, or an independently reviewed
+// exact-output inventory. THE INVENTORY IS THE ONE TAKEN. The renderer's outputs are a finite,
+// enumerable set (fourteen directions and one sequence), and the file already runs exactly this
+// discipline for RECORD_PROSE and BREADCRUMB_DIRECTIONS: the sentence is written out where a
+// reviewer reads it, and the module is held to it. `RENDERED_DIRECTIONS` above is that list, and it
+// is what LOCAL_DIRECTION_SPANS is built from — so a drifted renderer fails on exact equality here,
+// AND its new words stop being accounted for by the closure scan.
+// ---------------------------------------------------------------------------
+
+/** Codex's sentence, kept in one place so both round-20 refusal cases use the same bytes. */
+const UNDECLARED_REMOTE_ACTION = 'Go to that bill and take the second PDF off it.'
+
+/**
+ * Hold a rendering of the model to the reviewed inventory. Taking the renderer as an argument is
+ * what lets the refusal case below run the SAME check over a mutated one.
+ */
+function assertRenderedInventory(render: (direction: LocalDirection) => string): void {
+  assert.equal(
+    RENDERED_DIRECTIONS.length, LOCAL_DIRECTIONS.length,
+    'every declared direction needs exactly one reviewed output, and the inventory no more than that',
+  )
+  for (const direction of LOCAL_DIRECTIONS) {
+    const entries = RENDERED_DIRECTIONS.filter((entry) => sameDirection(entry.direction, direction))
+    assert.equal(
+      entries.length, 1,
+      `${JSON.stringify(direction)} has ${entries.length} reviewed outputs — it must have exactly one`,
+    )
+    assert.equal(
+      render(direction), entries[0]!.text,
+      `the ${direction.action}/${direction.target} branch emits prose that is NOT the reviewed sentence for it. `
+      + 'Every string this renderer can emit is written out in RENDERED_DIRECTIONS and read there; a branch that '
+      + 'produces something else is an instruction nobody reviewed',
+    )
+  }
+}
+
+test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out and reviewed', () => {
+  // Route: renderLocalDirection / renderLocalDirectionSequence over the production inventory, at
+  // runtime, compared for EXACT EQUALITY against RENDERED_DIRECTIONS.
+  //
+  // Mutation: append UNDECLARED_REMOTE_ACTION to the ESCALATE branch of
+  // lib/domain/accounting/local-operator-direction.ts and this fails naming ESCALATE — and so does
+  // the round-16 corpus closure, because the span it strips is now the reviewed sentence rather than
+  // whatever the renderer returns. Run as a control immediately below, so the claim is demonstrated.
+  assertRenderedInventory((direction) => renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT))
+
+  // The sequences too: the conjunction is prose, and it is nobody's element.
+  assert.equal(RENDERED_DIRECTION_SEQUENCES.length, LOCAL_DIRECTION_SEQUENCES.length)
+  for (const { sequence, text } of RENDERED_DIRECTION_SEQUENCES) {
+    assert.equal(renderLocalDirectionSequence(sequence, LOCAL_DIRECTION_CONTEXT), text)
+  }
+
+  // THE REFUSAL CASE CODEX ASKED FOR, run against the same check the shipped renderer passes.
+  assert.throws(
+    () => assertRenderedInventory((direction) => (
+      direction.action === 'ESCALATE'
+        ? `${renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT)} ${UNDECLARED_REMOTE_ACTION}`
+        : renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT)
+    )),
+    /is NOT the reviewed sentence for it/,
+    'a renderer that appends an undeclared destructive remote action must be refused by the inventory',
+  )
+
+  // AND WHY THE INVENTORY WAS NEEDED: the round-19 proofs accept that same sentence. Asserted rather
+  // than described, so a later round cannot quietly conclude the old checks were sufficient.
+  const escalate = renderLocalDirection(
+    { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW' }, LOCAL_DIRECTION_CONTEXT,
+  )
+  const smuggled = `${escalate} ${UNDECLARED_REMOTE_ACTION}`
+  const others = LOCAL_DIRECTIONS
+    .map((direction) => renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT))
+    .filter((text) => text !== escalate)
+  assert.ok(
+    !others.some((text) => smuggled.includes(text)),
+    'round 19 (1) accepts it: it contains no other direction whole',
+  )
+  assert.ok(
+    !Object.entries(LOCAL_TARGET)
+      .filter(([name]) => name !== 'THIS_RECORD_AND_ITS_SYNC_ROW')
+      .some(([, target]) => smuggled.includes(target.anchor)),
+    'round 19 (2) accepts it: it names no other target\'s anchor',
+  )
+  assert.ok(
+    !UNDECLARED_IMPERATIVES.some((pattern) => pattern.test(smuggled)),
+    'round 19 (3) accepts it: neither `go` nor `take` is on the twelve-verb banlist',
+  )
+  assert.deepEqual(
+    mutationLexemes([smuggled], []), [],
+    'and round 14 accepts it too — this is the suite\'s own standing counterexample',
+  )
+})
+
+/**
+ * Every string literal the renderer's own code can put into its return value.
+ *
+ * Walked from the two exported renderers, following identifiers into the module-level declarations
+ * they name, so a sentence parked in a helper or a constant is read as the renderer's prose. What is
+ * SKIPPED is the literal that selects a branch rather than being emitted by one: a `case` label, an
+ * operand of `===`/`!==`, a literal type, a property name. Those choose a sentence; they are not one.
+ */
+function rendererEmittedLiterals(sourceText: string): string[] {
+  const sourceFile = ts.createSourceFile('model.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const declarations = new Map<string, ts.Node>()
+  for (const statement of sourceFile.statements) {
+    if (ts.isFunctionDeclaration(statement) && statement.name) declarations.set(statement.name.text, statement)
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name)) declarations.set(declaration.name.text, declaration)
+      }
+    }
+  }
+  const selectsABranch = (node: ts.Node): boolean => {
+    const parent = node.parent as ts.Node | undefined
+    if (!parent) return false
+    if (ts.isCaseClause(parent)) return true
+    if (ts.isLiteralTypeNode(parent)) return true
+    if (ts.isPropertyAssignment(parent) && parent.name === node) return true
+    if (ts.isBinaryExpression(parent)) {
+      const kind = parent.operatorToken.kind
+      return kind === ts.SyntaxKind.EqualsEqualsEqualsToken || kind === ts.SyntaxKind.ExclamationEqualsEqualsToken
+        || kind === ts.SyntaxKind.EqualsEqualsToken || kind === ts.SyntaxKind.ExclamationEqualsToken
+    }
+    return false
+  }
+  const literals: string[] = []
+  const walked = new Set<string>()
+  const walk = (node: ts.Node): void => {
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+      if (node.text && !selectsABranch(node)) literals.push(node.text)
+      return
+    }
+    if (ts.isTemplateExpression(node)) {
+      if (node.head.text) literals.push(node.head.text)
+      for (const span of node.templateSpans) {
+        walk(span.expression)
+        if (span.literal.text) literals.push(span.literal.text)
+      }
+      return
+    }
+    if (ts.isIdentifier(node)) {
+      const declaration = declarations.get(node.text)
+      if (declaration && !walked.has(node.text)) {
+        walked.add(node.text)
+        walk(declaration)
+      }
+      return
+    }
+    ts.forEachChild(node, walk)
+  }
+  for (const root of ['renderLocalDirection', 'renderLocalDirectionSequence']) {
+    const declaration = declarations.get(root)
+    assert.ok(declaration, `${root} must be a module-level declaration, or this walk reads nothing`)
+    walked.add(root)
+    walk(declaration!)
+  }
+  return literals
+}
+
+test('ROUND 20 (Codex HIGH): the inventory is kept in step — no renderer literal escapes it', async () => {
+  // The other half of "anything it emits that is not in that inventory fails". Exact equality above
+  // covers every branch a DECLARED direction reaches; this covers the rest of the renderer's code,
+  // including a parameter combination the inventory does not declare and a sentence parked in a
+  // helper. Every literal the renderer can emit must already read inside a reviewed sentence.
+  //
+  // Route: the AST of lib/domain/accounting/local-operator-direction.ts, walked from the two
+  // exported renderers through the module-level declarations they name.
+  //
+  // Mutation: add a sentence to ANY branch — reachable or not — and it fails naming the literal.
+  // Controls below run both a reachable and an unreachable one.
+  const model = await readFile(path.join(process.cwd(), DIRECTION_MODEL_FILE), 'utf8')
+  const literals = rendererEmittedLiterals(model)
+  assert.ok(literals.length > 20, `only ${literals.length} literals were read — the walk found nothing`)
+
+  const reviewed = LOCAL_DIRECTION_SPANS
+  const escaped = literals.filter((literal) => !reviewed.some((span) => span.includes(literal)))
+  assert.deepEqual(
+    escaped, [],
+    'the renderer can emit prose that appears in no reviewed sentence. Write the sentence it produces into '
+    + 'RENDERED_DIRECTIONS, where somebody reads it, or take it out of the renderer',
+  )
+
+  // NON-VACUITY, both ways.
+  const reachable = model.replace(
+    "return `ESCALATE sync row ${context.syncRowId}, with this record, ${administrator}`",
+    "return `ESCALATE sync row ${context.syncRowId}, with this record, ${administrator}. " + UNDECLARED_REMOTE_ACTION + "`",
+  )
+  assert.notEqual(reachable, model, 'the reachable-branch mutation must actually have been applied')
+  assert.ok(
+    rendererEmittedLiterals(reachable).some((literal) => !reviewed.some((span) => span.includes(literal))),
+    'CONTROL: the sentence appended to the ESCALATE branch is reported as prose no reviewed sentence holds',
+  )
+  const unreachable = model.replace(
+    "case 'CONFIRM':",
+    "case 'CONFIRM':\n      if (context.ledger === 'never') return '" + UNDECLARED_REMOTE_ACTION + "'",
+  )
+  assert.notEqual(unreachable, model, 'the unreachable-branch mutation must actually have been applied')
+  assert.ok(
+    rendererEmittedLiterals(unreachable).some((literal) => !reviewed.some((span) => span.includes(literal))),
+    'CONTROL: and so is one on a branch no declared direction reaches, which exact equality alone cannot see',
+  )
+})
+
