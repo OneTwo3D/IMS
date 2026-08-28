@@ -165,11 +165,17 @@ test('[o3d-0bfh r2] an UNSETTLED deferred receipt reaches the sweep unchanged th
     referenceId: string,
     payload: Record<string, unknown>,
     syncResult: { externalId?: string; invoiceNumber?: string },
+    origin: { payload: unknown; connectionProvenance: string | null; backReferenceEvidenceCompactedAt: Date | null },
   ) => Promise<{ deferredReceiptsSettled: boolean }>
   assert.equal(typeof enqueueFollowUps, 'function')
 
   const outcome = await enqueueFollowUps(
     'log-1', 'SALES_INVOICE', 'SalesOrder', 'so-1', {}, { externalId: 'XINV-1' },
+    // The seventh argument is the posting row's ORIGIN record (o3d-bqw7 r2). It is supplied because
+    // the signature demands it, not because this test is about it: what is under test is that the
+    // SETTLEMENT ANSWER survives the seam, and an origin that records nothing is the least
+    // interesting one to send through it.
+    { payload: {}, connectionProvenance: null, backReferenceEvidenceCompactedAt: null },
   )
 
   assert.deepEqual(
@@ -195,7 +201,8 @@ test('[o3d-0bfh r2] and a SETTLED one is not turned into a refusal either', asyn
   const enqueueFollowUps = captured[0].deps.enqueueFollowUps as (
     ...args: unknown[]
   ) => Promise<{ deferredReceiptsSettled: boolean }>
-  const outcome = await enqueueFollowUps('log-1', 'SALES_INVOICE', 'SalesOrder', 'so-1', {}, { externalId: 'XINV-1' })
+  const outcome = await enqueueFollowUps('log-1', 'SALES_INVOICE', 'SalesOrder', 'so-1', {}, { externalId: 'XINV-1' },
+    { payload: {}, connectionProvenance: null, backReferenceEvidenceCompactedAt: null })
 
   assert.deepEqual(outcome, { deferredReceiptsSettled: true })
 })
