@@ -615,9 +615,18 @@ connection config first and fills `host`, `port` and `user` from the authority o
 left them unset — so those three parameters *redirect the connection*. A `DATABASE_URL` of
 `postgres://app@localhost:5432/appdb?host=remote.example&port=6432&user=actual` authenticates as
 `actual` against `remote.example:6432`, and the identity proof used to read it as `app` at
-`localhost:5432` and pass it against a local admin URL. The parse now resolves the **effective**
-host, port and login role the same way the driver does, and:
+`localhost:5432` and pass it against a local admin URL. The parse no longer *imitates* the
+driver's rules: the effective host, port, user and database are read straight out of the
+`pg-connection-string` module `pg` itself requires, resolved from `pg`'s own directory so it is
+the same code and not merely the same version. Two rounds running, a hand-rolled copy of libpq's
+rules disagreed with libpq — first about the authority, then about repetition — and each time the
+fence proved itself against a connection nobody uses. And:
 
+* a **repeated** `?host=`, `?port=`, `?user=`, `?dbname=` or `?database=` is **refused** outright.
+  The driver copies every query entry into one config object, so the **last** one is the one it
+  connects with, while anything reading the URL a parameter at a time — `URLSearchParams.get()`,
+  an operator's eye, a log line — sees the **first**. `?host=local&host=remote` is therefore a URL
+  that passes a check about `local` and opens on `remote`;
 * a URL whose authority and query string **disagree** about the host, port or user is **refused**
   rather than resolved — the driver would take the query value, but an environment that
   contradicts itself about which server or which role it means is not something to pick a winner

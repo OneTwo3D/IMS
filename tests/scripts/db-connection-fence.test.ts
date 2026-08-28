@@ -1703,10 +1703,15 @@ test('the effective host, port, user and database are the installed parser\'s an
   // parse are in here: the query/authority precedence (r14) and the database path, which the
   // driver decodes with decodeURI — NOT decodeURIComponent, so `%2F` survives.
   //
-  // MUTATION ROUTE: put any one field back on its hand-rolled expression. Restoring
-  // `decodeOrRaw(url.pathname.replace(/^\//, ''))` for the database makes the last case resolve
-  // to 'ims/db' while the driver connects to a database literally named 'ims%2Fdb'; restoring
-  // `url.hostname || params.get('host')` for the host breaks the `@/` case.
+  // MUTATION ROUTE, verified on each of three fields: restore
+  // `decodeOrRaw(url.pathname.replace(/^\//, ''))` for the database and the last case resolves to
+  // 'ims/db' while the driver connects to a database literally named 'ims%2Fdb'; restore
+  // `url.username` for the user and `ims%2Bapp` stops being decoded; restore
+  // `authorityPort || '5432'` for the port and the `@/` case reads 5432 while the driver dials
+  // 6432. The HOST is the one field this loop cannot move on its own — the authority/query
+  // conflict refusal above already rejects every URL whose two spellings disagree, so nothing
+  // reaches the derivation with a host to get wrong. It is read from the driver anyway, because
+  // the next round's finding is the one nobody predicted.
   for (const url of [
     'postgres://imsapp@localhost:5432/onetwo3d_ims',
     'postgres://imsapp@localhost/onetwo3d_ims',
