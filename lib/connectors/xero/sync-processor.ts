@@ -61,7 +61,9 @@ import {
   type FollowUpEnqueueOutcome,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import {
+  describeUnburiedOutboxJobForUnwrittenEvidence,
   describeUnrecordablePostedDocument,
+  describeUnrecordedPostedDocumentRecordedOutOfTransaction,
   ledgerTargetIdFromPayload,
   PostedDocumentEvidenceUnwritten,
   UNRECORDED_POSTED_DOCUMENT_ACTION,
@@ -833,8 +835,7 @@ export async function escalateUnwrittenPostedEvidence(error: PostedDocumentEvide
         // The incident's own wording, not `operatorMessage`: the same sentence the transactional write
         // would have stored, so one incident reads identically wherever it landed. `operatorMessage`
         // ends by saying the identifier exists only in that message, which this write makes untrue.
-        `${describeUnrecordablePostedDocument(error.incident)} (Recorded outside its own transaction, `
-        + `which could not be committed: ${String(error.cause)}.)`,
+        describeUnrecordedPostedDocumentRecordedOutOfTransaction(error.incident, error.cause),
       ),
     })
     return true
@@ -888,12 +889,12 @@ export async function buryOutboxJobForUnwrittenPostedEvidence(
     }
   }
   throw new XeroOutboxBurialError(
-    `${error.operatorMessage} THE OUTBOX JOB ${job.id} COULD NOT BE BURIED EITHER: ${String(lastFailure)}. `
-    + (recordFiled
-      ? 'The incident IS on record in the activity log, and the next run reads it before completing this '
-        + 'job, so the reclaim will bury the job rather than complete it.'
-      : 'NOTHING WAS WRITTEN DOWN: not the record, not the job. This message is the only copy of the '
-        + 'identifier, and a reclaim of this job will find a settled row and complete it as a success.'),
+    describeUnburiedOutboxJobForUnwrittenEvidence({
+      operatorMessage: error.operatorMessage,
+      jobId: job.id,
+      lastFailure,
+      recordFiled,
+    }),
     { cause: lastFailure },
   )
 }

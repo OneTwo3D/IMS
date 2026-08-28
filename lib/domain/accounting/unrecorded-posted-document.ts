@@ -222,6 +222,57 @@ export class PostedDocumentEvidenceUnwritten extends Error {
   }
 }
 
+/**
+ * THE THREE WRAPPED FORMS OF THE SAME INCIDENT, AS NAMED PRODUCERS (o3d-batch-ret r18, Codex MEDIUM).
+ *
+ * `describeUnrecordablePostedDocument` is not the whole of what an operator receives. Three wrappers
+ * APPEND to it, each on a durable recovery surface, and each was outside the reviewed corpus — so an
+ * instruction added to any of those suffixes needed no allowlist change to pass. They are producers
+ * now, for exactly the reason the base formatters are: a corpus can only judge what it can call.
+ *
+ *   • the `PostedDocumentEvidenceUnwritten` message (below) — the outbox job's failure column and
+ *     the process log;
+ *   • {@link describeUnrecordedPostedDocumentRecordedOutOfTransaction} — the standalone activity-log
+ *     row `escalateUnwrittenPostedEvidence` writes when the transactional one could not be;
+ *   • {@link describeUnburiedOutboxJobForUnwrittenEvidence} — the run-failing message when the
+ *     outbox job could not even be buried.
+ */
+
+/**
+ * The record written OUTSIDE the transaction that should have carried it.
+ *
+ * The incident's own wording, never `operatorMessage`: that one ends by saying the identifier exists
+ * only in that message, which this write makes untrue. The suffix says where the reader is.
+ */
+export function describeUnrecordedPostedDocumentRecordedOutOfTransaction(
+  incident: UnrecordablePostedDocument,
+  cause: unknown,
+): string {
+  return `${describeUnrecordablePostedDocument(incident)} (Recorded outside its own transaction, `
+    + `which could not be committed: ${String(cause)}.)`
+}
+
+/**
+ * The message that fails the RUN when the outbox job could not be buried either.
+ *
+ * `recordFiled` decides the tail, and the two tails say opposite things about what survives this
+ * process — which is the whole reason the caller has to pass it rather than this module guessing.
+ */
+export function describeUnburiedOutboxJobForUnwrittenEvidence(input: {
+  operatorMessage: string
+  jobId: string
+  lastFailure: unknown
+  recordFiled: boolean
+}): string {
+  return `${input.operatorMessage} THE OUTBOX JOB ${input.jobId} COULD NOT BE BURIED EITHER: `
+    + `${String(input.lastFailure)}. `
+    + (input.recordFiled
+      ? 'The incident IS on record in the activity log, and the next run reads it before completing this '
+        + 'job, so the reclaim will bury the job rather than complete it.'
+      : 'NOTHING WAS WRITTEN DOWN: not the record, not the job. This message is the only copy of the '
+        + 'identifier, and a reclaim of this job will find a settled row and complete it as a success.')
+}
+
 /* ---------------------------------------------------------------------------------------------
  * THE SAME INCIDENT, ARRIVING BY A DIFFERENT DOOR, ON THE OTHER CONNECTOR (o3d-peh1 r5).
  *

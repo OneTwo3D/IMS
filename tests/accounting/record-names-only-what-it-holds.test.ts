@@ -10,9 +10,12 @@ import {
   OPERATION_SEMANTIC_BY_TYPE,
   QBO_OPERATIONS_WITHOUT_REQUEST_ID,
   RECORD_LOOKUP_FIELDS,
+  PostedDocumentEvidenceUnwritten,
   describePreservedUnrecordedIncidents,
+  describeUnburiedOutboxJobForUnwrittenEvidence,
   describeUnpersistedQboPost,
   describeUnrecordablePostedDocument,
+  describeUnrecordedPostedDocumentRecordedOutOfTransaction,
   incidentKindForOperation,
   type LedgerPostingMode,
   type PostedOperationOutcome,
@@ -108,12 +111,43 @@ function everyIncidentMessage(): { label: string; text: string }[] {
         })
         for (const named of [null, 'EXT-OTHER']) {
           for (const reason of ['ROW_MISSING', 'ANOTHER_DOCUMENT_NAMED'] as const) {
+            const incident = {
+              entry: ENTRY(type), postedExternalId: posted, namedExternalId: named, reason, outcome,
+            }
             messages.push({
               label: `xero ${type} posted=${String(posted)} named=${String(named)} ${reason} outcome=${o}`,
-              text: describeUnrecordablePostedDocument({
-                entry: ENTRY(type), postedExternalId: posted, namedExternalId: named, reason, outcome,
-              }),
+              text: describeUnrecordablePostedDocument(incident),
             })
+            // ROUND 18 (Codex MEDIUM): THE WRAPPERS AN OPERATOR ACTUALLY RECEIVES. Each of these
+            // APPENDS to the base wording above, on a durable recovery surface, and each was outside
+            // the corpus — so an instruction added to any of the three suffixes needed no allowlist
+            // change to pass every round-17 assertion. They are constructed here now, from the
+            // production producers, so the closure below reads the COMPLETE emitted message.
+            const unwritten = new PostedDocumentEvidenceUnwritten(incident, new Error('write conflict'))
+            messages.push({
+              label: `unwritten ${type} posted=${String(posted)} named=${String(named)} ${reason} outcome=${o}`,
+              // The outbox job's failure column and the process log — `markXeroOutboxPermanent(job,
+              // error.operatorMessage)` and `console.error` in escalateUnwrittenPostedEvidence.
+              text: unwritten.operatorMessage,
+            })
+            messages.push({
+              label: `out-of-transaction ${type} posted=${String(posted)} named=${String(named)} ${reason} outcome=${o}`,
+              // The standalone ActivityLog row escalateUnwrittenPostedEvidence writes.
+              text: describeUnrecordedPostedDocumentRecordedOutOfTransaction(incident, new Error('write conflict')),
+            })
+            for (const recordFiled of [true, false]) {
+              messages.push({
+                label: `burial-failed recordFiled=${String(recordFiled)} ${type} posted=${String(posted)} `
+                  + `named=${String(named)} ${reason} outcome=${o}`,
+                // The XeroOutboxBurialError that fails the RUN, carrying the wording with it.
+                text: describeUnburiedOutboxJobForUnwrittenEvidence({
+                  operatorMessage: unwritten.operatorMessage,
+                  jobId: 'outbox-1',
+                  lastFailure: new Error('write conflict'),
+                  recordFiled,
+                }),
+              })
+            }
           }
         }
       }
@@ -1384,6 +1418,8 @@ const OPERATION_TYPES_LONGEST_FIRST = [...EVERY_GENERATED_TYPE].sort((a, b) => b
 function normaliseIncidentValues(text: string): string {
   let t = normaliseRenderedValues(text)
     .split('Error: write conflict').join('{cause}')
+    // ROUND 18: the outbox job the burial-failure message names. A fixture id like any other.
+    .split('outbox-1').join('{outboxJobId}')
     .split('SalesOrder order-1').join('{reference}')
     .split('EXT-OTHER').join('{namedExternalId}')
     .split('EXT-1').join('{postedExternalId}')
@@ -1476,6 +1512,16 @@ const BREADCRUMB_DIRECTIONS: readonly string[] = [
  * updates it, and updating it is where the sentence gets read.
  */
 const RECORD_PROSE: readonly string[] = [
+  // ROUND 18 (Codex MEDIUM): THE THREE WRAPPER SUFFIXES. Each appends to the base wording on a
+  // durable recovery surface — the outbox job's failure column and the process log, the standalone
+  // activity-log row written when the transactional one could not be, and the message that fails the
+  // run when the job could not even be buried. None of them was in the corpus, so none of them was
+  // ever decomposed against these lists; all three are prose about what happened and what is no
+  // longer written down, and none of them instructs anything.
+  ' AND THIS RECORD COULD NOT BE SAVED: {cause}. The identifier above exists only in this message.',
+  ' (Recorded outside its own transaction, which could not be committed: {cause}.)',
+  ' THE OUTBOX JOB {outboxJobId} COULD NOT BE BURIED EITHER: {cause}. The incident IS on record in the activity log, and the next run reads it before completing this job, so the reclaim will bury the job rather than complete it.',
+  ' THE OUTBOX JOB {outboxJobId} COULD NOT BE BURIED EITHER: {cause}. NOTHING WAS WRITTEN DOWN: not the record, not the job. This message is the only copy of the identifier, and a reclaim of this job will find a settled row and complete it as a success.',
   ". AND IMS CANNOT NARROW IT: no outbox row records the sync attempt that queued it, so nothing attributes a copy to this incident; the authenticated accounting-invoice email action writes the identical shape, so ordinary operator sends are in the same result; a SENT row has already gone; and A FAILED ROW IS NOT PROOF THAT NOTHING WENT — it means IMS HOLDS NO DURABLE CONFIRMATION OF DELIVERY. NO FAILED ROW PROVES A COPY WAS NEVER SENT, WHATEVER ITS lastError SAYS — NOT EVEN \"Suppressed recipient:\". The sender stamps SENT only after the transport call has returned, and that stamp is inside the same try whose catch writes FAILED on the fifth attempt (and PENDING before it, which sends the copy again), so a copy that WAS delivered and could not be stamped ends up FAILED; a send is judged from the transport error alone, which cannot say whether the server had already accepted the message; and the suppression check that writes that prefix runs at the top of the sweep, reads only the suppression table, and overwrites whatever the row already carried — so it speaks for the attempt that wrote it and for no attempt before it. IMS keeps no per-attempt outcome, so no row can be read backwards into its own history (o3d-ch0h).",
   "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 are NOT accounting documents — no invoice, bill, credit note, payment or journal was created in {ledger} or {ledger} for any of them. They record an effect that landed somewhere else and can repeat: a file attached to an EXISTING bill, an invoice PDF written over the stored copy, an invoice email QUEUED to a customer, a note written onto a WooCommerce order. AN ATTACHMENT RECORD IN HERE MAY BE A NO-OP: that handler returns success WITHOUT uploading when attachment upload is off for its connector. Records written since IMS began capturing that outcome say which of the two happened; OLDER ONES SAY THEY DO NOT KNOW, and this count does not separate them, so it cannot tell you how many of either there are. The queued-email one never had a remote document at all — only a local email-outbox row, WHICH THIS RESET HAS JUST DELETED: the outbox rows that record tells you to inspect are gone with it, so their statuses can no longer be inspected.",
   "do not go looking for a document. 1 are NOT accounting documents — no invoice, bill, credit note, payment or journal was created in {ledger} or {ledger} for any of them. They record an effect that landed somewhere else and can repeat: a file attached to an EXISTING bill, an invoice PDF written over the stored copy, an invoice email QUEUED to a customer, a note written onto a WooCommerce order. AN ATTACHMENT RECORD IN HERE MAY BE A NO-OP: that handler returns success WITHOUT uploading when attachment upload is off for its connector. Records written since IMS began capturing that outcome say which of the two happened; OLDER ONES SAY THEY DO NOT KNOW, and this count does not separate them, so it cannot tell you how many of either there are. The queued-email one never had a remote document at all — only a local email-outbox row, WHICH THIS RESET HAS JUST DELETED: the outbox rows that record tells you to inspect are gone with it, so their statuses can no longer be inspected. 1 carry no operation type this version of IMS has classified, so it cannot say which kind they are.",
