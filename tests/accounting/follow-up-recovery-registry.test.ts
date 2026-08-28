@@ -12,6 +12,7 @@ import {
 } from '@/lib/domain/accounting/compacted-followup-loss'
 import { xeroRetainedFollowUpObligationDescription } from '@/lib/connectors/xero/sync-processor'
 import {
+  deferredReceiptRecoveryWhere,
   deferredReceiptsDocumentMovedDescription,
   deferredReceiptsFailedDescription,
   deferredReceiptsUnlinkedDescription,
@@ -22,7 +23,10 @@ import {
   invoicePaymentPostingContextChangedDescription,
   invoicePaymentRedriveFor,
   invoicePaymentRemedyNote,
+  readDeferredReceiptRecovery,
+  type DeferredReceiptRecoveryClient,
 } from '@/lib/domain/accounting/invoice-payment-enqueue'
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import {
   ACCOUNTING_FOLLOW_UP_RECOVERY,
   CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER,
@@ -2743,6 +2747,16 @@ function deferredEnqueueProducers(): Array<{ what: string; text: string }> {
     what: 'invoicePaymentRemedyNote (invoice-post)',
     text: invoicePaymentRemedyNote({ redrive: 'invoice-post' }),
   })
+  // And the FOURTH, added in r14: the durable obligation state could not be read, so a recovery is
+  // assumed to exist. Both forms — a connector guess and none at all — because a state that carries
+  // an optional field can be reached with it absent, and the walk must judge the string that is
+  // actually emitted then.
+  for (const connector of [...REDRIVE_CONNECTORS, null]) {
+    produced.push({
+      what: `invoicePaymentRemedyNote (recovery-unknown, ${connector ?? 'no connector'})`,
+      text: invoicePaymentRemedyNote({ redrive: 'recovery-unknown', connector }),
+    })
+  }
   return produced
 }
 
@@ -2754,6 +2768,8 @@ const EXPECTED_DEFERRED_ENQUEUE_PRODUCERS =
   REDRIVE_CONNECTORS.length * (1 + (INVOICE_PAYMENT_REFUSALS.length - 1) + 2 + 2 + 1 + 1 + 3)
   // plus the pre-post state, which has no connector
   + 1
+  // plus the unreadable-state remedy, for every connector and for none (o3d-0bfh r14)
+  + REDRIVE_CONNECTORS.length + 1
 
 test('[o3d-0bfh r13] every enqueue string written while an obligation is outstanding is judged by THE ONE LIST', () => {
   // Route: the producers in lib/domain/accounting/invoice-payment-enqueue.ts, at runtime, in the
@@ -2833,13 +2849,18 @@ test('[o3d-0bfh r13] the UNPINNED refusal deliberately KEEPS its hand remedy, be
   // was actually answered. A pin means the deferred re-drive is the caller; no pin and no document
   // means the post that triggers it is still ahead; no pin and a posted document means nothing is
   // coming.
+  //
+  // o3d-0bfh r14: every one of these is the state with NO deferred recovery outstanding, which is
+  // now said rather than assumed — the third argument is required precisely so this exemption has to
+  // be claimed.
+  const noRecovery = { state: 'none' } as const
   assert.deepEqual(
-    invoicePaymentRedriveFor({ connector: 'xero', accountingInvoiceId: 'INV-1' }, 'WOULD_OVERPAY'),
+    invoicePaymentRedriveFor({ connector: 'xero', accountingInvoiceId: 'INV-1' }, 'WOULD_OVERPAY', noRecovery),
     { redrive: 'deferred', connector: 'xero' },
   )
-  assert.deepEqual(invoicePaymentRedriveFor(null, 'DOCUMENT_NOT_POSTED'), { redrive: 'invoice-post' })
-  assert.deepEqual(invoicePaymentRedriveFor(null, 'WOULD_OVERPAY'), { redrive: 'none' })
-  assert.deepEqual(invoicePaymentRedriveFor(null, null), { redrive: 'none' })
+  assert.deepEqual(invoicePaymentRedriveFor(null, 'DOCUMENT_NOT_POSTED', noRecovery), { redrive: 'invoice-post' })
+  assert.deepEqual(invoicePaymentRedriveFor(null, 'WOULD_OVERPAY', noRecovery), { redrive: 'none' })
+  assert.deepEqual(invoicePaymentRedriveFor(null, null, noRecovery), { redrive: 'none' })
 })
 
 test('[o3d-0bfh r13] the enqueue module writes NO remedy sentence outside the one producer', () => {
@@ -2876,4 +2897,195 @@ test('[o3d-0bfh r13] the enqueue module writes NO remedy sentence outside the on
   assert.match(rest, /describeInvoicePaymentRefusal\(\{/)
   assert.match(rest, /invoicePaymentDocumentMovedDescription\(\{/)
   assert.match(rest, /deferredReceiptsUnlinkedDescription\(\{/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r14 (Codex HIGH) — THE THREE-STATE VALUE WAS A PROPERTY OF THE CALL, AND THE QUESTION IT
+// ANSWERS IS A PROPERTY OF THE RECEIPT.
+//
+// r13 derived "will anything come back for this receipt?" from whether THIS INVOCATION was handed a
+// `postedUnder`. That is not the same question, and Codex found the interleaving where they differ:
+// the SALES_INVOICE post claims its follow-up obligation and writes the back-reference; an operator
+// records a receipt in the window before `registerDeferredOrderReceipts` reads the payments; the
+// unpinned call sees a POSTED document, so it is not DOCUMENT_NOT_POSTED, refuses for something both
+// paths share such as NO_BANK_ACCOUNT, and licenses a hand settlement — while the deferred pass then
+// selects the very same receipt under its pin, leaves it unregistered and RETAINS the obligation for
+// the sweep. The operator's payment races the registration the marker exists to schedule.
+//
+// The fix consults the DURABLE STATE instead: is a follow-up obligation live for this receipt's
+// order? That state is written strictly before the window opens (the claim commits in the SYNCED
+// transaction, ahead of the back-reference write) and cleared only when the deferred pass reports
+// the receipts settled, so it covers the whole window. The tests below hold the classifier to it,
+// hold the module to consulting it rather than inventing an answer, and pin the failure direction.
+// ---------------------------------------------------------------------------
+
+/** A double for the one query the durable read makes, recording the predicate it was given. */
+function obligationClient(
+  answer: Array<{ connector: string }> | Error,
+  seen: Array<Record<string, unknown>>,
+): DeferredReceiptRecoveryClient {
+  return {
+    accountingSyncLog: {
+      async findMany(args) {
+        seen.push(args.where)
+        if (answer instanceof Error) throw answer
+        return answer
+      },
+    },
+  }
+}
+
+/** The refusal the interleaving actually lands on: reachable from BOTH paths, so r13 called it `none`. */
+const SHARED_REFUSAL = 'NO_BANK_ACCOUNT' as const
+
+function refusalNotice(redrive: Parameters<typeof invoicePaymentRemedyNote>[0]): string {
+  const notice = describeInvoicePaymentRefusal({
+    refused: { register: false, refusal: SHARED_REFUSAL },
+    orderReference: 'SO-1',
+    amount: 100,
+    currency: 'GBP',
+    orderCurrency: 'GBP',
+    method: 'card',
+    redrive,
+  })
+  assert.ok(notice, 'NO_BANK_ACCOUNT must produce a notice, or this test reads nothing')
+  return notice.description
+}
+
+test('[o3d-0bfh r14] an UNPINNED call for a receipt that already has a deferred recovery offers no hand remedy', async () => {
+  // Route: readDeferredReceiptRecovery(orderId, connector, client) -> { state: 'held' } ->
+  // invoicePaymentRedriveFor(null, 'NO_BANK_ACCOUNT', recovery) -> { redrive: 'deferred' } ->
+  // invoicePaymentRemedyNote -> describeInvoicePaymentRefusal — i.e. exactly the chain the unpinned
+  // caller runs while the SALES_INVOICE post's obligation is still outstanding.
+  //
+  // Mutation: drop the `recovery.state === 'held'` arm from `invoicePaymentRedriveFor` (which is
+  // r13's shipped classifier verbatim) and this fails on the first assertion — the notice reverts to
+  // "register it in the accounting connector by hand". Make the reader return `{ state: 'none' }` on
+  // a non-empty result and it fails the same way.
+  const seen: Array<Record<string, unknown>> = []
+  const recovery = await readDeferredReceiptRecovery('order-1', 'xero', obligationClient([{ connector: 'xero' }], seen))
+  assert.deepEqual(recovery, { state: 'held', connector: 'xero' })
+
+  const redrive = invoicePaymentRedriveFor(null, SHARED_REFUSAL, recovery)
+  assert.deepEqual(redrive, { redrive: 'deferred', connector: 'xero' })
+
+  const description = refusalNotice(redrive)
+  assert.match(description, /HAND SETTLEMENT IS REFUSED HERE/)
+  assert.doesNotMatch(description, /register it in the accounting connector by hand/i)
+  assertNoBannedInstruction('the unpinned notice while an obligation is outstanding', description)
+  assert.match(description, /ESCALATE/)
+
+  // THE QUESTION IS ASKED ABOUT THE RECEIPT'S ORDER, not about the caller, and the marker is tested
+  // for EXISTENCE ONLY — it is a generation, and any other operator on it is the r7 defect.
+  assert.equal(seen.length, 1, 'the durable state must actually have been read')
+  assert.deepEqual(seen[0], deferredReceiptRecoveryWhere('order-1', 'xero'))
+  assert.deepEqual(seen[0], {
+    // EXHAUSTIVE, and read from the connector registry rather than spelt here — it is only present
+    // so the read can use @@index([connector, referenceType, referenceId]), and a list that named
+    // fewer connectors than exist would answer `none` for an obligation held by the one it omitted.
+    connector: { in: ACCOUNTING_CONNECTORS.map((connector) => connector.id) },
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    backReferenceFollowUpsPendingAt: { not: null },
+  })
+  // ...and a connector outside the registry is added rather than dropped: the direction that costs
+  // money is a live obligation the query did not look for.
+  assert.deepEqual(
+    (deferredReceiptRecoveryWhere('order-1', UNDECLARED_CONNECTOR) as { connector: { in: string[] } }).connector.in,
+    [...ACCOUNTING_CONNECTORS.map((connector) => connector.id), UNDECLARED_CONNECTOR],
+  )
+  assert.deepEqual(markerClockReads(JSON.stringify(deferredReceiptRecoveryWhere('order-1', 'xero'))), [])
+
+  // NON-VACUITY. The same unpinned call, same refusal, with NO obligation outstanding, still keeps
+  // the hand remedy — so the assertion above is about the durable state and not about the wording of
+  // NO_BANK_ACCOUNT. Without this an "always refuse" classifier would pass the test it is meant to
+  // fail, and would strand every genuinely unrecoverable receipt.
+  const none = await readDeferredReceiptRecovery('order-1', 'xero', obligationClient([], seen))
+  assert.deepEqual(none, { state: 'none' })
+  assert.deepEqual(invoicePaymentRedriveFor(null, SHARED_REFUSAL, none), { redrive: 'none' })
+  assert.match(refusalNotice({ redrive: 'none' }), /register it in the accounting connector by hand/i)
+
+  // AND A CONNECTOR THE ACTIVE ONE IS NOT. The obligation belongs to whichever connector claimed it;
+  // a re-drive pinned to that one selects this receipt just the same, because it has no sync row on
+  // any ledger. The remedy must therefore be that connector's registry answer, not the active one's.
+  const elsewhere = await readDeferredReceiptRecovery('order-1', 'xero', obligationClient([{ connector: 'quickbooks' }], seen))
+  assert.deepEqual(elsewhere, { state: 'held', connector: 'quickbooks' })
+  assert.match(
+    refusalNotice(invoicePaymentRedriveFor(null, SHARED_REFUSAL, elsewhere)),
+    /NOTHING re-enqueues them on this connector/,
+  )
+})
+
+test('[o3d-0bfh r14] a durable state that cannot be READ fails toward assuming a recovery exists', async () => {
+  // Route: the read throws -> { state: 'unreadable' } -> { redrive: 'recovery-unknown' } ->
+  // invoicePaymentRemedyNote's fourth branch.
+  //
+  // Mutation: return `{ state: 'none' }` from the catch in `readDeferredReceiptRecovery` — the
+  // tempting simplification, since it restores r13's behaviour exactly — and this fails: the notice
+  // starts offering a hand settlement again on a database nobody could ask.
+  const seen: Array<Record<string, unknown>> = []
+  const unreadable = await readDeferredReceiptRecovery('order-1', 'xero', obligationClient(new Error('connection reset'), seen))
+  assert.deepEqual(unreadable, { state: 'unreadable', connector: 'xero' })
+  assert.equal(seen.length, 1, 'the read must have been attempted, not skipped')
+
+  for (const refusal of INVOICE_PAYMENT_REFUSALS) {
+    if (refusal === 'SYNC_DISABLED') continue
+    const redrive = invoicePaymentRedriveFor(null, refusal, unreadable)
+    // DOCUMENT_NOT_POSTED already refuses hand settlement on its own account; every other refusal
+    // must land in the unknown state rather than in `none`.
+    assert.notDeepEqual(redrive, { redrive: 'none' }, `${refusal} must not be classified as unrecoverable`)
+    assert.match(invoicePaymentRemedyNote(redrive), /HAND SETTLEMENT IS REFUSED HERE/, refusal)
+  }
+
+  // The unknown state promises nothing about what WILL come back — it cannot — but it still has to
+  // pass THE ONE LIST and still has to say what a human should do instead.
+  for (const connector of ['xero', 'quickbooks', UNDECLARED_CONNECTOR, null]) {
+    const text = invoicePaymentRemedyNote({ redrive: 'recovery-unknown', connector })
+    assertNoBannedInstruction(`the unreadable-state remedy (${connector ?? 'no connector'})`, text)
+    assert.match(text, /ESCALATE/)
+    assert.doesNotMatch(text, /a later sweep re-reads the marker/, 'it must not promise a sweep it has not established')
+  }
+})
+
+test('[o3d-0bfh r14] the enqueue module classifies from the durable read and from nothing else', () => {
+  // The structural half, and the reason the third parameter is REQUIRED rather than defaulted: a
+  // default is how "a property of the call" gets back in one keystroke at a time.
+  //
+  // Mutation: pass `{ state: 'none' }` at the call site instead of the read, or give
+  // `invoicePaymentRedriveFor` a default third argument, and the assertions below fail.
+  const source = readSource(path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'invoice-payment-enqueue.ts'))
+
+  // The classifier takes the recovery, and takes it without a default.
+  assert.match(
+    source.code,
+    /export function invoicePaymentRedriveFor\(\s*pinned: PostedInvoiceEvidence \| null,\s*refusal: InvoicePaymentRegistrationRefusal \| null,\s*recovery: DeferredReceiptRecovery,\s*\)/,
+    'the recovery must be a required parameter of the classifier',
+  )
+
+  // Exactly ONE call of it in the module, and its third argument is the durable read.
+  const calls = source.code.split('invoicePaymentRedriveFor(').length - 1
+  assert.equal(calls, 2, 'the declaration and exactly one call — a second call site is a second opinion')
+  assert.match(
+    source.code,
+    /invoicePaymentRedriveFor\(pinned, refusal, await deferredRecovery\(\)\)/,
+    'the one call must classify from the durable read',
+  )
+  assert.match(
+    source.code,
+    /recoveryRead \?\?= readDeferredReceiptRecovery\(params\.orderId, preferredConnector, db\)/,
+    'and that read must be the query against this ORDER, not a value assembled locally',
+  )
+
+  // And inside the enqueue itself, every redrive handed to a producer comes from that one classifier.
+  const from = source.code.indexOf('export async function registerInvoicePaymentWithLedger(')
+  assert.ok(from > 0)
+  const to = source.code.indexOf('\n}\n', from)
+  assert.ok(to > from)
+  const body = source.code.slice(from, to)
+  const redrives = body.match(/redrive: [^,\n]+/g) ?? []
+  assert.ok(redrives.length >= 3, `only ${redrives.length} redrive arguments found — the scan is reading nothing`)
+  for (const site of redrives) {
+    assert.match(site, /^redrive: await redriveFor\(/, `a redrive was decided somewhere other than the classifier: ${site}`)
+  }
 })

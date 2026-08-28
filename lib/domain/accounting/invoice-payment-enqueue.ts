@@ -9,6 +9,7 @@
  */
 
 import { db } from '@/lib/db'
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import {
@@ -307,6 +308,14 @@ export type InvoicePaymentRedrive =
    * that the message already tells the operator to chase.
    */
   | { redrive: 'invoice-post' }
+  /**
+   * THE DURABLE STATE COULD NOT BE READ (o3d-0bfh r14, Codex HIGH), so it is assumed that a recovery
+   * exists. Suppressing a remedy a human could have carried out is recoverable — somebody asks again
+   * — and licensing a settlement that races a queued registration is not. `connector` is the best
+   * available guess and may be null; nothing in this state promises what will come back, because
+   * nothing here knows.
+   */
+  | { redrive: 'recovery-unknown'; connector: string | null }
   /** Nothing holds an obligation and no re-drive is ahead: the hand remedy is the only exit. */
   | { redrive: 'none' }
 
@@ -321,6 +330,14 @@ export type InvoicePaymentRedrive =
  * both the registry's answers, not this module's guesses.
  */
 export function invoicePaymentRemedyNote(redrive: InvoicePaymentRedrive): string {
+  if (redrive.redrive === 'recovery-unknown') {
+    return 'HAND SETTLEMENT IS REFUSED HERE: IMS could not read whether a registration is still owed for this '
+      + 'receipt — the follow-up obligation state for this order was unreadable — so it must be assumed that one '
+      + 'is. That is the only safe direction: a remedy withheld from a human can be asked for again, while a '
+      + "payment keyed into the accounting package's own UI carries no request id, so nothing could deduplicate "
+      + 'it against a registration that turns out to be owed, and both would settle the invoice, which is not '
+      + 'undoable. Read the document, record what is actually there, and ESCALATE.'
+  }
   if (redrive.redrive === 'none') {
     return 'Nothing will come back for this receipt, so register it in the accounting connector by hand if it is '
       + 'genuinely owed.'
@@ -339,15 +356,162 @@ export function invoicePaymentRemedyNote(redrive: InvoicePaymentRedrive): string
     + 'the document, record what is actually there, and ESCALATE.'
 }
 
-/** The redrive state for one call of {@link registerInvoicePaymentWithLedger}. */
+// ---------------------------------------------------------------------------
+// DOES A DEFERRED RECOVERY EXIST FOR *THIS RECEIPT*? (o3d-0bfh r14, Codex HIGH.)
+//
+// r13 answered that with `postedUnder`, which is a property of THIS INVOCATION, while the question
+// the operator message actually answers is a property of THE RECEIPT — is anything going to come
+// back for it? The two come apart in one interleaving, and it is reachable today:
+//
+//   1. the SALES_INVOICE post commits its SYNCED transaction, which CLAIMS the follow-up obligation
+//      (claimFollowUpObligation, inside that transaction);
+//   2. `updateBackReference` then writes `salesOrder.accountingInvoiceId`;
+//   3. `addPayment` commits a receipt and calls this module with NO pin. The document is now posted,
+//      so the refusal is not DOCUMENT_NOT_POSTED — on a refusal both paths share, such as
+//      NO_BANK_ACCOUNT, r13's classifier answered `none` and the notice licensed a hand settlement;
+//   4. `registerDeferredOrderReceipts` only then reads the payments. It selects that same receipt —
+//      having no sync row of its own is exactly what `selectReceiptsAwaitingRegistration` looks for
+//      — refuses it under the pin, answers `settled: false`, and the connector RETAINS the marker
+//      precisely so its sweep comes back to it.
+//
+// So the settlement licensed at (3) races the registration (4) schedules, which is the double
+// payment this whole round exists to prevent.
+//
+// WHY THE DURABLE STATE RATHER THAN A LOCK. The other way to close this is to serialize receipt
+// creation and registration against deferred-receipt selection and obligation release. That means
+// every operator-entered receipt taking a lock the connector holds across its whole follow-up span,
+// remote calls included — a far wider change than this branch has been making, and one that puts a
+// network round trip inside a lock on the money path. It is also unnecessary, because the state that
+// answers the question is ALREADY WRITTEN AND ALREADY READ HERE: the obligation marker is claimed at
+// step (1), STRICTLY BEFORE the back-reference write at step (2) that opens the window at all, and
+// it is cleared only once the deferred pass reports the receipts settled. For the whole of the
+// window in which an unpinned call can see a posted document from that pass, the marker is live.
+//
+// TESTED FOR EXISTENCE ONLY. It is a generation, not a time — see the "WHAT
+// `backReferenceFollowUpsPendingAt` IS, AND WHAT IT IS NOT" block in
+// lib/domain/accounting/follow-up-obligation-registry.ts, and the scan over `lib` that enforces it.
+//
+// SCOPED TO (SALES_INVOICE, SalesOrder), the one pair in BACK_REFERENCE_PAIRS that writes
+// `SalesOrder.accountingInvoiceId` and therefore the one whose follow-ups call
+// `registerDeferredOrderReceipts`.
+//
+// NOT NARROWED TO THE CONNECTOR THAT IS ACTIVE NOW. A pass pinned to whichever connector holds the
+// obligation selects this receipt just the same — it has no sync row on any ledger — and would
+// register it against THAT one, so asking only about today's active connector would be the same
+// wrong-object mistake one level along. The connector predicate that IS there enumerates the WHOLE
+// accounting registry (plus the caller's own, if it somehow is not in it), which is a set the row
+// cannot be outside; it exists so the read uses an index rather than scanning the sync log. See
+// `connectorsThatCanOweFollowUps`.
+// ---------------------------------------------------------------------------
+
+/** What the durable follow-up obligation state says about a receipt on this order. */
+export type DeferredReceiptRecovery =
+  /** A follow-up obligation for this order is live, so a deferred registration can still select it. */
+  | { state: 'held'; connector: string }
+  /** No obligation is outstanding: nothing pinned to this order is going to come back for it. */
+  | { state: 'none' }
+  /**
+   * The state could not be read. NOT collapsed into `none` — that is the answer that licenses a
+   * settlement, and "we could not find out" is not evidence for it.
+   */
+  | { state: 'unreadable'; connector: string | null }
+
+/** The minimal Prisma surface the read touches. Structural, so a test double fits. */
+export type DeferredReceiptRecoveryClient = {
+  accountingSyncLog: {
+    findMany(args: {
+      where: Record<string, unknown>
+      select: { connector: true }
+      orderBy: Array<Record<string, 'asc' | 'desc'>>
+    }): Promise<Array<{ connector: string }>>
+  }
+}
+
+/**
+ * EVERY accounting connector, from the one registry that defines them — never a list spelt here.
+ *
+ * The predicate below names it so the read can use @@index([connector, referenceType, referenceId]);
+ * without a leading connector this is a sequential scan of the sync log. It is EXHAUSTIVE rather than
+ * a guess: `AccountingSyncLog.connector` is written by an accounting connector and
+ * `AccountingConnectorId` is the closed type of those, so "in the registry" and "any row that exists"
+ * are the same set. A caller's own connector is unioned in anyway, because the one direction that
+ * costs money here is a live obligation this query did not look for.
+ */
+function connectorsThatCanOweFollowUps(preferredConnector: string | null): string[] {
+  const declared = ACCOUNTING_CONNECTORS.map((connector) => connector.id as string)
+  return preferredConnector && !declared.includes(preferredConnector) ? [...declared, preferredConnector] : declared
+}
+
+/**
+ * The predicate, as a value, so the test that proves this asks about the RECEIPT'S ORDER rather than
+ * about the caller can read the question instead of re-typing it.
+ *
+ * `{ not: null }` and nothing else on the marker. Any other operator on that column is a range
+ * comparison against a generation and is rejected by the scan named above.
+ */
+export function deferredReceiptRecoveryWhere(orderId: string, preferredConnector: string | null): Record<string, unknown> {
+  return {
+    connector: { in: connectorsThatCanOweFollowUps(preferredConnector) },
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: orderId,
+    backReferenceFollowUpsPendingAt: { not: null },
+  }
+}
+
+/**
+ * Read whether a deferred registration is still owed for this order.
+ *
+ * NEVER THROWS, and the failure answer is `unreadable` rather than `none`: see the type. The
+ * `preferredConnector` only decides WHICH live obligation names the remedy when more than one
+ * connector holds one; it never decides whether one exists.
+ */
+export async function readDeferredReceiptRecovery(
+  orderId: string,
+  preferredConnector: string | null,
+  client: DeferredReceiptRecoveryClient,
+): Promise<DeferredReceiptRecovery> {
+  try {
+    const rows = await client.accountingSyncLog.findMany({
+      where: deferredReceiptRecoveryWhere(orderId, preferredConnector),
+      select: { connector: true },
+      // Deterministic, so two renders of the same state name the same connector.
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    })
+    if (rows.length === 0) return { state: 'none' }
+    const held = rows.find((row) => row.connector === preferredConnector) ?? rows[0]!
+    return { state: 'held', connector: held.connector }
+  } catch (error) {
+    console.error(
+      'invoice payment registration: could not read whether a deferred registration is owed for this order, '
+      + 'so it is assumed to be',
+      orderId,
+      error,
+    )
+    return { state: 'unreadable', connector: preferredConnector }
+  }
+}
+
+/**
+ * The redrive state for one call of {@link registerInvoicePaymentWithLedger}.
+ *
+ * `recovery` is REQUIRED (o3d-0bfh r14). It was the absence of this argument that let the classifier
+ * answer a question about the receipt with a fact about the call; making it optional, or defaulting
+ * it to `{ state: 'none' }`, would put that back one keystroke at a time.
+ */
 export function invoicePaymentRedriveFor(
   pinned: PostedInvoiceEvidence | null,
   refusal: InvoicePaymentRegistrationRefusal | null,
+  recovery: DeferredReceiptRecovery,
 ): InvoicePaymentRedrive {
   if (pinned) return { redrive: 'deferred', connector: pinned.connector }
+  // Unpinned, but the durable state says a follow-up obligation for this order is still outstanding,
+  // so a deferred pass can still select this receipt. Same state, same remedy, whoever is asking.
+  if (recovery.state === 'held') return { redrive: 'deferred', connector: recovery.connector }
   // Unpinned, and the document is not there yet: the post that triggers the deferred re-drive is
   // still ahead of us, and this receipt is what it will select.
   if (refusal === 'DOCUMENT_NOT_POSTED') return { redrive: 'invoice-post' }
+  if (recovery.state === 'unreadable') return { redrive: 'recovery-unknown', connector: recovery.connector }
   return { redrive: 'none' }
 }
 
@@ -647,6 +811,30 @@ export async function registerInvoicePaymentWithLedger(params: {
 
   const pinned = params.postedUnder ?? null
 
+  // WHICH live obligation names the remedy when more than one connector holds one — filled in below
+  // once the active connector is resolved. It never decides WHETHER one exists (o3d-0bfh r14).
+  let preferredConnector: string | null = pinned?.connector ?? null
+
+  /**
+   * THE DURABLE ANSWER TO "IS ANYTHING GOING TO COME BACK FOR THIS RECEIPT?", read at most once.
+   *
+   * A PINNED call needs no query: it IS the deferred pass, holding the obligation this would look
+   * for. A receipt that registers cleanly asks nothing either — this is only ever awaited on a path
+   * that is about to write an operator message.
+   */
+  let recoveryRead: Promise<DeferredReceiptRecovery> | null = null
+  const deferredRecovery = (): Promise<DeferredReceiptRecovery> => {
+    if (pinned) return Promise.resolve<DeferredReceiptRecovery>({ state: 'held', connector: pinned.connector })
+    recoveryRead ??= readDeferredReceiptRecovery(params.orderId, preferredConnector, db)
+    return recoveryRead
+  }
+  /**
+   * THE ONE PLACE THIS MODULE CLASSIFIES A REFUSAL, so no path can be given a redrive state that was
+   * decided from something other than the durable read above.
+   */
+  const redriveFor = async (refusal: InvoicePaymentRegistrationRefusal | null): Promise<InvoicePaymentRedrive> =>
+    invoicePaymentRedriveFor(pinned, refusal, await deferredRecovery())
+
   try {
     const [paymentSyncEnabled, so, activeConnector] = await Promise.all([
       // Not merely "is the connector on": if INVOICE_PAYMENT posting is off, queueAccountingSync would
@@ -672,6 +860,8 @@ export async function registerInvoicePaymentWithLedger(params: {
     if (!so) return
 
     const connectorId: PostedInvoiceEvidence['connector'] | null = pinned ? pinned.connector : (activeConnector?.id ?? null)
+    // Only a tie-break for the remedy's wording — see `deferredRecovery`.
+    preferredConnector = connectorId
 
     // o3d-ekn8 r2: THE DOCUMENT THIS RECEIPT WOULD SETTLE. Pinned, it is the id the post returned — but
     // only while the order still points at it. If the invoice has been deleted and re-posted since (or
@@ -757,8 +947,10 @@ export async function registerInvoicePaymentWithLedger(params: {
     // THE REDRIVE STATE FOR THIS CALL (o3d-0bfh r13, Codex HIGH). Not a property of the refusal
     // reason: most of these branches are reachable from BOTH the operator-entered receipt and the
     // deferred re-drive, and the hand remedy that is the only exit on one races a queued
-    // registration on the other. `pinned` is the fact that separates them.
-    const redriveFor = (refusal: InvoicePaymentRegistrationRefusal) => invoicePaymentRedriveFor(pinned, refusal)
+    // registration on the other. `pinned` is one of the two facts that separate them; the other —
+    // o3d-0bfh r14 — is whether the durable follow-up obligation state says a deferred pass can
+    // still select this receipt, which is a fact about the RECEIPT and not about this call.
+    // Both are weighed by the hoisted `redriveFor` above.
 
     const reportRefusal = async (refused: InvoicePaymentRegistrationDecision & { register: false }) => {
       const notice = describeInvoicePaymentRefusal({
@@ -768,7 +960,7 @@ export async function registerInvoicePaymentWithLedger(params: {
         currency: params.currency,
         orderCurrency: so.currency,
         method: params.method,
-        redrive: redriveFor(refused.refusal),
+        redrive: await redriveFor(refused.refusal),
       })
       // SYNC_DISABLED produces no notice: nothing was expected to post at all.
       if (!notice) return
@@ -931,7 +1123,7 @@ export async function registerInvoicePaymentWithLedger(params: {
           orderReference: params.orderReference,
           amount: params.amount,
           currency: params.currency,
-          redrive: invoicePaymentRedriveFor(pinned, null),
+          redrive: await redriveFor(null),
         }),
         { amount: params.amount, currency: params.currency, refusal: 'POSTING_CONTEXT_CHANGED' })
     }
@@ -949,7 +1141,7 @@ export async function registerInvoicePaymentWithLedger(params: {
         orderReference: params.orderReference,
         amount: params.amount,
         currency: params.currency,
-        redrive: invoicePaymentRedriveFor(pinned, null),
+        redrive: await redriveFor(null),
       }),
       metadata: {
         orderNumber: params.orderReference,
