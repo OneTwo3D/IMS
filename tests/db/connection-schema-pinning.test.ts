@@ -475,13 +475,13 @@ test('o3d-2k5r r13 (live): a schema name containing every backend separator is p
         )
         const key = `probe-${label.replace(/\s+/g, '-')}`
         await client.query('insert into settings (key, value, "updatedAt") values ($1, $2, now())', [key, label])
-        const landed = await scratch.admin.query<{ nspname: string }>(
-          `select n.nspname from ${quoted}.settings s, pg_namespace n where s.key = $1 and n.nspname = $2`,
-          [key, schema],
-        )
-        assert.equal(landed.rowCount, 1, `${label}: the unqualified write landed in the named schema`)
         assert.equal(
-          (await scratch.admin.query('select 1 from public.settings where key = $1', [key])).rowCount,
+          (await scratch.admin.query(`select key from ${quoted}.settings where key = $1`, [key])).rowCount,
+          1,
+          `${label}: the unqualified write landed in the schema the URL named`,
+        )
+        assert.equal(
+          (await scratch.admin.query('select key from public.settings where key = $1', [key])).rowCount,
           0,
           `${label}: and not in the login role's default schema`,
         )
