@@ -1435,7 +1435,10 @@ test('[o3d-9kek r4 f3] a retention TOMBSTONE is still repaired — only its foll
   const discarded = harness.activities.find((entry) => entry.action === 'xero_backreference_followups_discarded')
   assert.ok(discarded, 'the discard is permanent, so it must be announced')
   assert.equal(discarded.level, 'WARNING')
-  assert.match(discarded.description, /re-drive it manually/)
+  // o3d-0bfh r12: the announcement no longer authorises a hand settlement — a follow-up row for the
+  // discarded part can already be PENDING or FAILED in the queue — so it is read-and-escalate.
+  assert.match(discarded.description, /Nothing here authorises settling that by hand/)
+  assert.match(discarded.description, /ESCALATE that reading/)
 
   // Settled, because nothing further is ever possible for this row — but NOT flipped to SYNCED:
   // its follow-ups were abandoned, not done, and SYNCED would erase the only trace of that.

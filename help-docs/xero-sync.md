@@ -1619,8 +1619,11 @@ succeeded is safe: it reports that the id is already on the document and does no
 row once it is older than the sync-log retention period, keeping only the identifying record. Such a
 row is still repaired — the external id can still be written onto the order or bill — but its
 outstanding follow-ups (PDF, payment, attachment) can no longer be rebuilt. When that happens the
-sweep logs `xero_backreference_followups_discarded` naming the document, so you can check for a
-missing PDF, payment or credit allocation and re-drive it manually.
+sweep logs `xero_backreference_followups_discarded` naming the document. That line is a notice, not a
+work order: the interrupted pass enqueues each follow-up as its own sync row, so one for the part it
+names may already be sitting in the queue, and a payment or attachment created by hand afterwards
+cannot be deduplicated against it. Open the document in Xero, record what is actually present, and
+escalate that reading to accounting. Do not settle one of these rows by hand.
 
 ## Connecting a different company
 

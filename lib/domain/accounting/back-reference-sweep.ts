@@ -5,6 +5,7 @@ import {
   applyBackReference,
   backReferenceIsMissing,
   followUpObligationClaim,
+  followUpObligationRecoveryNote,
   isExternalDocumentIdConflict,
   nextFollowUpObligationGeneration,
   recoverPostedBusinessDate,
@@ -19,6 +20,7 @@ import {
   compactionDiscardedFollowUps,
   type CompactedFollowUpLossPhase,
 } from '@/lib/domain/accounting/compacted-followup-loss'
+import { followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 
 // ---------------------------------------------------------------------------
@@ -864,6 +866,54 @@ export function buildBackReferenceCandidateQuery(params: {
  */
 type FollowUpOnlySettlement = { settle: false } | { settle: true; marker: Date | null }
 
+/**
+ * THE STRING AN OPERATOR ACTUALLY RECEIVES WHEN THIS SWEEP'S OWN ENQUEUE LEAVES A RECEIPT
+ * OUTSTANDING — a named, exported producer, for the same reason
+ * `xeroRetainedFollowUpObligationDescription` became one (o3d-0bfh r12, Codex HIGH).
+ *
+ * WHAT WAS HERE INSTRUCTED A RACING MANUAL RECEIPT, AND SAID SO IN THE SAME BREATH AS THE RETRY:
+ * "The row is deliberately left unsettled and still marked as owing follow-ups, SO THE NEXT SWEEP
+ * RETRIES THEM ... Register the receipt in <connector> by hand if it does not clear." Both halves
+ * are true and together they are the r7/r8/r11 defect in its purest form: the marker is retained on
+ * purpose, THIS sweep re-reads it on the next cron pass and re-enqueues the receipt idempotently,
+ * and a receipt an operator enters in the accounting package's UI in the meantime cannot be
+ * deduplicated against the queued one by any request id the connector generates. A second payment
+ * against one invoice is not undoable.
+ *
+ * "if it does not clear" did not save it. Nothing tells the operator when it has cleared — the row
+ * is SYNCED and carries its external id exactly like a row that completed, which is the very fact
+ * this message exists to announce — so the condition is unobservable and reads as a licence.
+ *
+ * AND IT SHIPPED THROUGH THE ROUND THAT POINTED THE BANNED-INSTRUCTION CONTRACT AT PRODUCERS. That
+ * round extracted the Xero processor's copy of the same sentence into a producer and ran THE ONE
+ * LIST over it, and whole-file-scanned both connector sync-processors — and this one is in neither,
+ * because it is in a third file. Same defect, third file. So this is a producer too, and
+ * tests/accounting/follow-up-recovery-registry.test.ts runs THE ONE LIST over what it returns for
+ * EVERY connector the registry declares plus an undeclared one, and whole-file-scans this module.
+ *
+ * The recovery half is READ FROM THE REGISTRY, never written here: what re-drives a retained
+ * obligation is a declared fact about the connector (`consumer: 'sweep'` for Xero — this sweep),
+ * and a sentence written in the sweep could promise it for a connector the sweep is not bound to.
+ */
+export function sweepRetainedFollowUpObligationDescription(input: {
+  /** The `AccountingSyncLog.connector` value — the registry key, not the display label. */
+  connector: string
+  connectorLabel: string
+  row: Pick<BackReferenceSweepRow, 'type' | 'referenceType' | 'referenceId'>
+}): string {
+  const { connector, connectorLabel, row } = input
+  const recovery = followUpObligationRecoveryNote(followUpObligationRecoveryFor(connector))
+  return `Enqueued the outstanding ${connectorLabel} follow-ups recorded against ${row.type} for `
+    + `${row.referenceType} ${row.referenceId}, but a receipt recorded before this document is still not `
+    + `registered against it in ${connectorLabel}. The row is deliberately left marked as owing follow-ups, `
+    + 'because nothing else about it records that: it is SYNCED and carries its external id exactly like a row '
+    + 'that completed. There is no manual step here, and a hand-made settlement is the one action that costs '
+    + `money: ${recovery}, so a receipt entered by hand would be a SECOND one, racing work that is already `
+    + `queued — and no request id can deduplicate a payment a human entered in the ${connectorLabel} UI. If the `
+    + `row is still marked after the next pass of this sweep, READ the document in ${connectorLabel}, record what `
+    + 'is actually present, and ESCALATE that reading.'
+}
+
 export async function repairAccountingBackReferences(
   deps: BackReferenceSweepDeps,
   options: { limit?: number; pageSize?: number } = {},
@@ -1288,8 +1338,10 @@ export async function repairAccountingBackReferences(
    * id write needs and drops the payload the FOLLOW-UPS are built from. The id is still
    * repaired — that is the correction r4 forced, and it is why a tombstone is still a candidate —
    * but the PDF, payment or attachment that never ran cannot be reconstructed from `{}` and never
-   * will be. That is a real loss, and it is announced rather than absorbed: an operator can re-drive
-   * a payment by hand if they know one is missing, and cannot if they do not.
+   * will be. That is a real loss, and it is announced rather than absorbed — as a NOTICE, not as a
+   * work order (o3d-0bfh r12): the interrupted pass writes each follow-up as its own sync row, so one
+   * for the discarded part can already be PENDING or FAILED in the queue, and a payment a human
+   * creates afterwards cannot be deduplicated against it. See buildCompactedFollowUpLossActivity.
    *
    * Returns whether the warning was PERSISTED, and the caller settles the row only when it was. Same
    * asymmetry as the ambiguity warning: repeating a warning is noise, losing it is silence — and
@@ -1339,12 +1391,7 @@ export async function repairAccountingBackReferences(
       action: `${prefix}_backreference_followups_retained`,
       tag: 'sync',
       level: 'ERROR',
-      description: `Enqueued the outstanding ${connectorLabel} follow-ups recorded against ${row.type} for `
-        + `${row.referenceType} ${row.referenceId}, but a receipt recorded before this document is STILL NOT `
-        + `registered against it in ${connectorLabel}. The row is deliberately left unsettled and still marked as `
-        + 'owing follow-ups, so the next sweep retries them — it is SYNCED and carries its external id exactly '
-        + `like a row that completed, so nothing else about it records this. Register the receipt in ${connectorLabel} `
-        + 'by hand if it does not clear.',
+      description: sweepRetainedFollowUpObligationDescription({ connector, connectorLabel, row }),
       metadata: {
         syncLogId: row.id,
         type: row.type,

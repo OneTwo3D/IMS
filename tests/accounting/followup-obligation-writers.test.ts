@@ -714,7 +714,9 @@ test('[o3d-nepa r3] retrying a COMPACTED row announces the follow-ups it can no 
   assert.match(String(warning.description), /had already posted, so this retry settled the sync row without re-sending it/)
   assert.match(String(warning.description), /its payload was compacted away/)
   assert.match(String(warning.description), /XBILL-1/, 'names the external id the operator has to go and look at')
-  assert.match(String(warning.description), /re-drive it manually/)
+  // o3d-0bfh r12: read-and-escalate, not a hand re-drive — see buildCompactedFollowUpLossActivity.
+  assert.match(String(warning.description), /Nothing here authorises settling that by hand/)
+  assert.match(String(warning.description), /ESCALATE that reading/)
   // Settled only because the warning landed.
   assert.equal(subject().backReferenceFollowUpsPendingAt, null)
   assert.equal(subject().status, 'SYNCED')
