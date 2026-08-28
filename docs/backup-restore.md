@@ -89,8 +89,11 @@ interleave with the replay. If the lock cannot be taken within 60 seconds the re
 immediately, having changed nothing, and says another restore or connector change is in progress.
 
 The lock-holding session must be able to show that it reaches PostgreSQL **directly**. A session
-advisory lock lives on one backend and is freed the moment that backend goes back to a pool, so
-behind a transaction pooler the restore fence would be held by nobody while the replay ran. The
+advisory lock lives on one backend session, and pooling destroys the affinity between the IMS client
+and that session; what then happens to the lock is per pooler -- reset/released with the server
+connection (measured: **Odyssey 1.5.3-rc1** in transaction-pooling mode released it), or left attached
+to a backend handed to another client. Behind a transaction pooler the restore fence is therefore
+either held by nobody while the replay ran, or held on a session that is no longer this one. The
 holder connection is therefore refused unless the backend names this process's own socket as its
 peer; if `DATABASE_URL` points at a pooler, set `DATABASE_SESSION_LOCK_URL` to a direct, non-pooled
 URL for the same database and schema (see `docs/installation.md`). A transaction-pooling proxy in
