@@ -93,7 +93,10 @@ advisory lock lives on one backend and is freed the moment that backend goes bac
 behind a transaction pooler the restore fence would be held by nobody while the replay ran. The
 holder connection is therefore refused unless the backend names this process's own socket as its
 peer; if `DATABASE_URL` points at a pooler, set `DATABASE_SESSION_LOCK_URL` to a direct, non-pooled
-URL for the same database and schema (see `docs/installation.md`). That override is not trusted
+URL for the same database and schema (see `docs/installation.md`). A transaction-pooling proxy in
+front of `DATABASE_URL` is **not a supported deployment** in the first place, and that is not planned;
+the override keeps the restore fence correct where one is nonetheless interposed, and does not make
+the deployment supported. That override is not trusted
 because it agrees on names: the lock connection takes an advisory lock through it and
 requires a `DATABASE_URL` connection to be blocked by the same key, so an override pointing at a
 restored clone or a staging server -- which carries the same database name, schema, OID and system
