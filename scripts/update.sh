@@ -456,6 +456,12 @@ DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
 DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
 DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
+# install.sh has had this line since r23; update.sh did not, and used the variable in FIVE places
+# inside publish_db_identity_snapshot() and remove_db_identity_binding(). Under `set -u` the
+# first of them aborts the run with "unbound variable", so the binding this branch added to
+# update.sh could never actually be published (o3d-2sm1.5 r25). Found by the reference scan in
+# tests/scripts/deploy-order.test.ts, which is there so the next one is found the same way.
+DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
 # ONE lock for all three entrypoints. This script held ${DATA_DIR}/update.lock and deploy.sh
 # held its own, so "refusing to run two cutovers at once" was true of two updates and false
 # of an update racing a deploy; install.sh took no lock at all.

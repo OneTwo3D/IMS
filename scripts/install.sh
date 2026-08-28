@@ -670,7 +670,9 @@ DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # snapshot exists to distrust is not a trust root. So it is a literal: a deployment that must
 # move it edits this line, which is a root-owned change to a root-owned file, reviewed like any
 # other. The same reasoning is why nothing else in this script resolves a privileged path from a
-# variable the application can set — see the deploy-control restore after the .env source.
+# variable the application can set. This script never put ${APP_DIR}/.env into its environment at
+# all — it reads one key at a time with env_file_value() — and since r25 update.sh does the same,
+# so no IMS_* line in that file becomes a variable in any of the three entrypoints.
 DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
 DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
 DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"

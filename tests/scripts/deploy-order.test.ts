@@ -4626,19 +4626,24 @@ for (const entry of FENCE_HARNESS) {
 }
 
 // ---------------------------------------------------------------------------
-// o3d-2sm1.5 r24, Codex HIGH #1 — THE APPLICATION-OWNED .env DECIDED WHERE THE
-// ROOT-PROTECTED SNAPSHOT WENT.
+// o3d-2sm1.5 r25, Codex CRITICAL — THE APPLICATION'S OWN FILES EXECUTED INSIDE THE ROOT SHELL.
 //
-// update.sh sources ${APP_DIR}/.env as root with `set -a`, and then resolved
-// `DB_ENV_SNAPSHOT_DIR="${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}"` out of the resulting
-// environment. The whole point of /etc/ims-cutover is that the application user cannot reach it;
-// an override read from the file the snapshot exists to distrust hands that boundary straight
-// back. publish_db_identity_snapshot() chowns and chmods only the FINAL directory, so a path
-// under an app-writable parent is secured after the parent has already been chosen.
+// r24's answer to "the application-owned .env decided where the root-protected snapshot went"
+// was to snapshot every IMS_* deploy-control variable from the root invocation and restore it
+// after the source. That repairs the VALUES and not the EXECUTION, and the execution is the
+// finding: `source` runs a file. `EVIL=$(id > /tmp/x)`, a bare command on a line of its own, a
+// redefinition of run_as_user(), `SERVICE_UNIT=attacker.service`, `APP_DIR=…`, or an assignment
+// straight into `DEPLOY_CONTROL_SAVED[...]` all took effect AS ROOT, before the restore loop ran
+// — and none of SERVICE_UNIT, APP_DIR or DEPLOY_META_FILE was in the restored list anyway.
 //
-// The same shape was wider than that one variable: EVERY `${IMS_...:-default}` update.sh resolves
-// after the source was app-settable, including the cutover namespace (marker, cron backup,
-// connection-fence record, lock) and the legacy namespace this run IMPORTS state from.
+// So both `source` calls are gone. update.sh reads the five names it needs out of the two files
+// by name, with env_file_value() — install.sh's and deploy.sh's reader, moved to the top of
+// update.sh so the preflight load and every later re-read go through ONE parser. The r24
+// capture/restore went with them: with nothing sourced, no application-owned byte reaches this
+// shell's variables, so IMS_* can only come from the root invocation.
+//
+// The tests below run the script's OWN PRELUDE against real hostile files. They are the reason
+// the claim is allowed to be "not executed" rather than "restored afterwards".
 // ---------------------------------------------------------------------------
 
 /** The lines of a script from the top down to and including the last top-level path assignment. */
@@ -4646,6 +4651,24 @@ function preludeThrough(lines: string[], lastAssignment: RegExp): string {
   const end = lines.findIndex((line) => lastAssignment.test(line))
   assert.notEqual(end, -1, 'the prelude must still contain the assignment it is cut at')
   return lines.slice(0, end + 1).join('\n')
+}
+
+/**
+ * Run update.sh's prelude — everything from line 1 to the last top-level path assignment — with
+ * `--dry-run` (which is what lets it run unprivileged) against a real ${APP_DIR}, and echo the
+ * resolved values of `names` through the script's own variables.
+ *
+ * IMS_APP_DIR comes from the ROOT INVOCATION's environment, which is the one source that
+ * legitimately steers this script; `extraEnv` is how a test supplies more of it.
+ */
+function runUpdatePrelude(dir: string, names: string[], extraEnv = ''): { status: number; output: string } {
+  const program = [
+    preludeThrough(UPDATE_LINES, /^DB_OBJECT_ACCESS_SCRIPT=/),
+    ...names.map((name) => `echo "${name}=\${${name}-<unset>}"`),
+  ].join('\n')
+  return runShell(
+    `${extraEnv} IMS_APP_DIR=${JSON.stringify(dir)} bash -s -- --dry-run <<'IMS_PRELUDE_EOF'\n${program}\nIMS_PRELUDE_EOF`,
+  )
 }
 
 test('the environment snapshot lives at a literal path in all three entrypoints, not behind an override', () => {
@@ -4670,17 +4693,43 @@ test('the environment snapshot lives at a literal path in all three entrypoints,
   }
 })
 
-test('an IMS_CUTOVER_ENV_DIR in the application-owned .env is ignored by update.sh, and so is the rest of the namespace', () => {
-  // THE SCRIPT'S OWN PRELUDE, EXECUTED — not a re-description of it. Everything from line 1 down
-  // to the last namespace assignment runs, against a real .env that tries to move all four paths,
-  // and the resolved values are printed by the script's own variables.
-  const dir = mkdtempSync(join(tmpdir(), 'ims-envdir-'))
+test('nothing in the application-owned .env is EXECUTED by update.sh, and the values it needs still arrive', () => {
+  // THE LOAD-BEARING ONE. The .env below is not a file with an awkward value in it — it is a
+  // file with SHELL CODE in it, of every shape the old `source` would have run as root:
+  //
+  //   a command substitution in an ordinary-looking assignment,
+  //   a bare command on a line of its own,
+  //   a redefinition of one of the functions the prelude defines above the load,
+  //   an assignment to a privileged variable that r24 never restored (SERVICE_UNIT, APP_DIR,
+  //     DEPLOY_META_FILE),
+  //   an assignment INTO r24's own saved array, which is Codex's exact case: the restore would
+  //     then have installed the attacker's path,
+  //   and the IMS_* namespace overrides r24 was written for.
+  //
+  // Each of the first three leaves a FILE behind if it ran, so "was it executed" is answered by
+  // the filesystem and not by parsing output.
+  //
+  // MUTATION ROUTE (verified against the pre-fix script, not asserted from reading it): restore
+  // `set -a; source "${APP_DIR}/.env"; set +a` at the load and all three marker files appear and
+  // SERVICE_UNIT comes back as attacker.service.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-envexec-'))
   try {
+    const marker = (name: string) => join(dir, name)
     writeFileSync(
       join(dir, '.env'),
       [
         'DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/ims',
-        // The attack: the application user writes these into the file update.sh sources as root.
+        'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@127.0.0.1:5432/ims"  # the privileged one',
+        `EVIL_SUBSTITUTION=$(touch ${JSON.stringify(marker('EXECUTED-substitution'))})`,
+        `touch ${JSON.stringify(marker('EXECUTED-command'))}`,
+        `run_as_user() { touch ${JSON.stringify(marker('EXECUTED-function'))}; }`,
+        // Not in r24's restored list, so the restore was no answer to any of these.
+        'SERVICE_UNIT=attacker.service',
+        'APP_DIR=/tmp/attacker-appdir',
+        'DEPLOY_META_FILE=/tmp/attacker-meta',
+        // Codex's array case: mutate the snapshot the restore reads back.
+        'DEPLOY_CONTROL_SAVED[IMS_CUTOVER_STATE_DIR]=/tmp/attacker-array',
+        // And the r24 namespace overrides, which must still be ignored.
         'IMS_CUTOVER_ENV_DIR=/tmp/attacker-owned',
         'IMS_CUTOVER_STATE_DIR=/tmp/attacker-state',
         'IMS_DEPLOY_STATE_DIR=/tmp/attacker-deploy',
@@ -4689,50 +4738,120 @@ test('an IMS_CUTOVER_ENV_DIR in the application-owned .env is ignored by update.
         '',
       ].join('\n'),
     )
-    const program = [
-      preludeThrough(UPDATE_LINES, /^DB_OBJECT_ACCESS_SCRIPT=/),
-      'echo "SNAPSHOT_DIR=${DB_ENV_SNAPSHOT_DIR}"',
-      'echo "SNAPSHOT_FILE=${DB_ENV_SNAPSHOT_FILE}"',
-      'echo "CUTOVER_STATE_DIR=${CUTOVER_STATE_DIR}"',
-      'echo "LEGACY_CUTOVER_STATE_DIR=${LEGACY_CUTOVER_STATE_DIR}"',
-      'echo "DATABASE_URL=${DATABASE_URL}"',
-    ].join('\n')
-    // `--dry-run` is what lets the prelude run unprivileged; IMS_APP_DIR comes from the ROOT
-    // INVOCATION's environment, which is the one source that legitimately steers this script.
-    const result = runShell(`IMS_APP_DIR=${JSON.stringify(dir)} bash -s -- --dry-run <<'IMS_PRELUDE_EOF'\n${program}\nIMS_PRELUDE_EOF`)
 
-    // MUTATION ROUTE: restore `DB_ENV_SNAPSHOT_DIR="${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}"`
-    // and this assertion reports /tmp/attacker-owned. Restore the namespace expressions' exposure
-    // by deleting the deploy-control restore loop after the source, and the two below report the
-    // attacker's paths instead.
+    const result = runUpdatePrelude(dir, [
+      'DATABASE_URL',
+      'DEPLOY_ADMIN_DATABASE_URL',
+      'SERVICE_UNIT',
+      'APP_DIR',
+      'DEPLOY_META_FILE',
+      'DB_ENV_SNAPSHOT_DIR',
+      'DB_ENV_SNAPSHOT_FILE',
+      'DB_ENV_SNAPSHOT_DROPIN_FILE',
+      'CUTOVER_STATE_DIR',
+      'LEGACY_CUTOVER_STATE_DIR',
+    ])
+
     assert.equal(result.status, 0, `the prelude must run cleanly:\n${result.output}`)
-    assert.match(result.output, /^DATABASE_URL=postgresql:\/\/app:pw@127\.0\.0\.1:5432\/ims$/m, 'precondition: the .env really was sourced, so the values below were reachable')
-    assert.match(result.output, /^SNAPSHOT_DIR=\/etc\/ims-cutover$/m, 'the snapshot directory is not the application’s to choose')
-    assert.match(result.output, /^SNAPSHOT_FILE=\/etc\/ims-cutover\/db-identity-snapshot\.env$/m, 'and neither is the file inside it')
+
+    // PRECONDITION, so this cannot pass by never reading the file at all: the two values that
+    // genuinely do come from .env arrived, quoting and trailing comment removed.
+    assert.match(
+      result.output,
+      /^DATABASE_URL=postgresql:\/\/app:pw@127\.0\.0\.1:5432\/ims$/m,
+      'precondition: the reader really did read this .env, so everything below was reachable',
+    )
+    assert.match(
+      result.output,
+      /^DEPLOY_ADMIN_DATABASE_URL=postgresql:\/\/admin:pw@127\.0\.0\.1:5432\/ims$/m,
+      'and the privileged connection arrived unquoted and without its trailing comment',
+    )
+
+    // NOT EXECUTED. Three shapes of shell code, three files that do not exist.
+    for (const name of ['EXECUTED-substitution', 'EXECUTED-command', 'EXECUTED-function']) {
+      assert.equal(existsSync(marker(name)), false, `${name}: the application-owned .env was EXECUTED in the root shell`)
+    }
+
+    // NOT STEERED. Nothing the file said became a variable, restored or otherwise.
+    assert.match(result.output, /^SERVICE_UNIT=one-two-inventory\.service$/m, 'the unit this run acts on is not the application’s to choose')
+    assert.match(result.output, new RegExp(`^APP_DIR=${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'), 'nor the directory it reads from')
+    assert.match(result.output, /^DEPLOY_META_FILE=.*\/\.deploy-meta$/m, 'nor which metadata file it reads')
+    assert.match(result.output, /^DB_ENV_SNAPSHOT_DIR=\/etc\/ims-cutover$/m, 'nor the root-protected snapshot directory')
+    assert.match(result.output, /^DB_ENV_SNAPSHOT_FILE=\/etc\/ims-cutover\/db-identity-snapshot\.env$/m, 'nor the file inside it')
+    assert.match(
+      result.output,
+      /^DB_ENV_SNAPSHOT_DROPIN_FILE=\/etc\/systemd\/system\/one-two-inventory\.service\.d\/zz-deploy-db-identity\.conf$/m,
+      'nor the drop-in that binds the unit to it — which update.sh used in five places and never assigned until r25, so under `set -u` publishing the binding aborted with "unbound variable"',
+    )
     assert.match(result.output, /^CUTOVER_STATE_DIR=\/var\/lib\/one-two-inventory$/m, 'nor the namespace holding the marker, the cron backup, the fence record and the lock')
     assert.match(result.output, /^LEGACY_CUTOVER_STATE_DIR=\/var\/lib\/ims-deploy$/m, 'nor the legacy namespace this run IMPORTS state from')
-    assert.ok(!/attacker/.test(result.output.replace(/^DATABASE_URL=.*$/m, '')), `no path may come from the .env: ${result.output}`)
+    assert.ok(
+      !/attacker/.test(result.output.replace(/^(DATABASE_URL|DEPLOY_ADMIN_DATABASE_URL)=.*$/gm, '')),
+      `no path may come from the .env: ${result.output}`,
+    )
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('a deploy-control variable set on the root invocation still wins, so the restore is a restore and not a reset', () => {
-  // The other half: the capture/restore must put the INVOCATION's value back, not clear it. A
-  // restore that unset everything would be a different bug wearing the same fix.
+test('nothing in the application-owned .deploy-meta is EXECUTED by update.sh either, and the git metadata still arrives', () => {
+  // .deploy-meta is written by install.sh, owned by the application user like .env, and was
+  // sourced by the same block — so it is exactly as good a way in, and Codex named it.
+  //
+  // MUTATION ROUTE: restore `set -a; source "${DEPLOY_META_FILE}"; set +a` and the marker file
+  // appears and SERVICE_UNIT comes back as meta-attacker.service.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-metaexec-'))
+  try {
+    const marker = join(dir, 'EXECUTED-meta')
+    writeFileSync(join(dir, '.env'), 'DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/ims\n')
+    writeFileSync(
+      join(dir, '.deploy-meta'),
+      [
+        'INSTALL_FROM_GIT=y',
+        'GIT_REPO_URL=git@github.com:one-two-3d/onetwo3d-ims.git',
+        'GIT_BRANCH=production',
+        'GIT_DEPLOY_KEY_ENABLED=y',
+        `touch ${JSON.stringify(marker)}`,
+        'SERVICE_UNIT=meta-attacker.service',
+        'IMS_CUTOVER_STATE_DIR=/tmp/attacker-state',
+        '',
+      ].join('\n'),
+    )
+
+    const result = runUpdatePrelude(dir, [
+      'GIT_REPO_URL',
+      'GIT_BRANCH',
+      'GIT_DEPLOY_KEY_ENABLED',
+      'SERVICE_UNIT',
+      'CUTOVER_STATE_DIR',
+    ])
+
+    assert.equal(result.status, 0, `the prelude must run cleanly:\n${result.output}`)
+    // PRECONDITION: the file was read, so the assertions below are about a file that was reached.
+    assert.match(result.output, /^GIT_REPO_URL=git@github\.com:one-two-3d\/onetwo3d-ims\.git$/m, 'precondition: the re-clone source still arrives')
+    assert.match(result.output, /^GIT_BRANCH=production$/m, 'and the branch it clones')
+    assert.match(result.output, /^GIT_DEPLOY_KEY_ENABLED=y$/m, 'and whether the deploy key is in play')
+    assert.equal(existsSync(marker), false, 'the application-owned .deploy-meta was EXECUTED in the root shell')
+    assert.match(result.output, /^SERVICE_UNIT=one-two-inventory\.service$/m, 'and it does not get to name the unit either')
+    assert.match(result.output, /^CUTOVER_STATE_DIR=\/var\/lib\/one-two-inventory$/m, 'or move the cutover namespace')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a deploy-control variable set on the root invocation still steers update.sh', () => {
+  // The other half, kept from r24 with its mechanism changed: removing the capture/restore must
+  // not have removed the OPERATOR's ability to move the namespace. The invocation is the one
+  // source that may steer this script, and it still does — now because nothing overwrites it
+  // rather than because something puts it back.
+  //
+  // MUTATION ROUTE: change CUTOVER_STATE_DIR's default chain to a literal and this reports
+  // /var/lib/one-two-inventory instead of the operator's path.
   const dir = mkdtempSync(join(tmpdir(), 'ims-envdir-inv-'))
   try {
     writeFileSync(join(dir, '.env'), 'DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/ims\nIMS_CUTOVER_STATE_DIR=/tmp/attacker-state\n')
-    const program = [
-      preludeThrough(UPDATE_LINES, /^DB_OBJECT_ACCESS_SCRIPT=/),
-      'echo "CUTOVER_STATE_DIR=${CUTOVER_STATE_DIR}"',
-    ].join('\n')
-    const result = runShell(
-      `IMS_APP_DIR=${JSON.stringify(dir)} IMS_CUTOVER_STATE_DIR=/srv/operator-chose-this bash -s -- --dry-run <<'IMS_PRELUDE_EOF'\n${program}\nIMS_PRELUDE_EOF`,
-    )
+    const result = runUpdatePrelude(dir, ['CUTOVER_STATE_DIR'], 'IMS_CUTOVER_STATE_DIR=/srv/operator-chose-this')
 
-    // MUTATION ROUTE: change the restore loop's `printf -v` branch to an unconditional `unset`
-    // and this reports /var/lib/one-two-inventory instead of the operator's path.
     assert.equal(result.status, 0, `the prelude must run cleanly:\n${result.output}`)
     assert.match(result.output, /^CUTOVER_STATE_DIR=\/srv\/operator-chose-this$/m, 'the root invocation is the source that may steer this script')
   } finally {
@@ -4740,37 +4859,84 @@ test('a deploy-control variable set on the root invocation still wins, so the re
   }
 })
 
-test('update.sh restores every deploy-control variable it reads, not only the ones resolved after the source', () => {
-  // The list is the guard. A future edit that moves an assignment below the source, or adds a new
-  // IMS_* path variable, must add it here too — otherwise the shape comes straight back.
-  const restored = /^DEPLOY_CONTROL_VARS=\(\n([\s\S]*?)\n\)$/m.exec(UPDATE_LINES.join('\n'))
-  assert.notEqual(restored, null, 'update.sh must declare the deploy-control variables it protects')
-  const covered = new Set((restored as RegExpExecArray)[1].split(/\s+/).filter(Boolean))
-
-  const read = new Set(
-    UPDATE_LINES.filter((line) => !/^\s*#/.test(line))
-      .flatMap((line) => Array.from(line.matchAll(/\$\{(IMS_[A-Z0-9_]+):-/g)).map((match) => match[1])),
-  )
-  const missing = Array.from(read).filter((name) => !covered.has(name))
-  assert.deepEqual(missing, [], `update.sh resolves a path from ${missing} but does not restore it after sourcing the application-owned .env`)
-})
-
-test('install.sh and deploy.sh never source the application-owned .env into their environment', () => {
-  // Why they need no restore loop: install.sh reads .env into an associative array
-  // (load_existing_env) and deploy.sh greps one key at a time (env_file_value). Neither exports
-  // anything from it. If either ever starts sourcing it, this fails and the restore has to follow.
+test('none of the three entrypoints source an application-owned file', () => {
+  // Structural, and it replaces r24's "restores every deploy-control variable" guard. That guard
+  // policed a LIST that had to be kept in step with the script; this polices the property the
+  // list was standing in for, and it cannot be satisfied by adding a name somewhere.
   //
-  // MUTATION ROUTE: add `set -a; source "${APP_DIR}/.env"; set +a` to either script.
-  for (const entry of [
-    { name: 'install.sh', source: INSTALL_SOURCE },
-    { name: 'deploy.sh', source: DEPLOY_LINES.join('\n') },
-  ]) {
+  // MUTATION ROUTE: add `set -a; source "${APP_DIR}/.env"; set +a` — or a source of
+  // "${DEPLOY_META_FILE}", or of any path under ${APP_DIR} — to any one of the three, and the
+  // deepEqual below fails naming that script and that line.
+  for (const entry of R9_SCRIPTS) {
     const sourced = entry.source
       .split(/\r?\n/)
       .filter((line) => !/^\s*#/.test(line))
-      .filter((line) => /(^|[\s;])(source|\.)\s+"?\$\{APP_DIR(_REAL)?\}\/\.env/.test(line))
-    assert.deepEqual(sourced, [], `${entry.name} sources the application-owned .env: ${sourced}`)
+      .filter((line) => /(^|[\s;{(])(source|\.)\s+"?(\$\{(APP_DIR(_REAL)?|DEPLOY_META_FILE|TMP_CLONE_WORKTREE)\}|\S*\.(env|deploy-meta))/.test(line))
+    assert.deepEqual(sourced, [], `${entry.name} sources an application-owned file into a privileged shell: ${sourced}`)
   }
+  // And update.sh in particular reads those two files ONLY through the non-evaluating reader.
+  const readers = UPDATE_LINES.filter((line) => !/^\s*#/.test(line)).filter(
+    (line) => /\$\{APP_DIR\}\/\.env|\$\{DEPLOY_META_FILE\}/.test(line) && /^\s*[A-Z_]+="\$\(/.test(line),
+  )
+  assert.ok(readers.length >= 4, `update.sh must load .env and .deploy-meta by key: found ${readers.length} such reads`)
+  for (const line of readers) {
+    assert.match(line, /env_file_value /, `update.sh loads an application-owned file some other way: ${line}`)
+  }
+})
+
+test('update.sh never reads a shell variable that only the deleted `source` could have supplied', () => {
+  // WHAT THE r24 LIST WAS REALLY FOR, generalised. Removing the two `source` calls means every
+  // name that used to arrive by being exported out of .env or .deploy-meta now has to be read
+  // explicitly — and a name that is neither read nor assigned is a `set -u` abort on a
+  // production update, not a fallback. (That is not hypothetical: this scan is what found
+  // DB_ENV_SNAPSHOT_DROPIN_FILE, used in five places in update.sh and assigned in none.)
+  //
+  // So: every UPPER_SNAKE variable update.sh EXPANDS without a `:-`/`-` default, minus every one
+  // it assigns, must be empty. A name legitimately supplied by the root invocation is always
+  // expanded with a default, so it does not appear here.
+  //
+  // MUTATION ROUTE: delete the `DB_ENV_SNAPSHOT_DROPIN_FILE=` assignment (or the DATABASE_URL
+  // one) from update.sh and this reports it by name.
+  const code = UPDATE_LINES.filter((line) => !/^\s*#/.test(line))
+
+  const assigned = new Set<string>()
+  for (const line of code) {
+    for (const match of line.matchAll(/(?:^|[\s;&|({])(?:export\s+|local\s+(?:-\w+\s+)?|declare\s+(?:-\w+\s+)?|readonly\s+)?([A-Z][A-Z0-9_]*)(?:\+?=|\[)/g)) {
+      assigned.add(match[1])
+    }
+    for (const match of line.matchAll(/\b(?:local|declare|readonly|unset|export)\s+((?:-\w+\s+)?[A-Z][A-Z0-9_ ]*)/g)) {
+      for (const name of match[1].split(/\s+/)) if (/^[A-Z][A-Z0-9_]*$/.test(name)) assigned.add(name)
+    }
+    for (const match of line.matchAll(/\bfor\s+([A-Z][A-Z0-9_]*)\s+in\b/g)) assigned.add(match[1])
+    for (const match of line.matchAll(/\bread\s+(?:-\w+\s+)*((?:[A-Z][A-Z0-9_]*\s*)+)/g)) {
+      for (const name of match[1].trim().split(/\s+/)) assigned.add(name)
+    }
+    for (const match of line.matchAll(/printf\s+-v\s+"?([A-Z][A-Z0-9_]*)/g)) assigned.add(match[1])
+  }
+
+  // Set by bash itself, or by the shell that invoked the script.
+  const SHELL_PROVIDED = new Set([
+    'PATH', 'HOME', 'PWD', 'OLDPWD', 'SHELL', 'USER', 'LOGNAME', 'TERM', 'LANG', 'TMPDIR',
+    'EUID', 'UID', 'PPID', 'BASHPID', 'HOSTNAME', 'OSTYPE', 'IFS', 'RANDOM', 'SECONDS', 'LINENO',
+    'FUNCNAME', 'BASH_SOURCE', 'BASH_REMATCH', 'PIPESTATUS', 'REPLY', 'PS4', 'SUDO_USER',
+  ])
+
+  const undefined_: string[] = []
+  for (const line of code) {
+    // `${NAME}` and `$NAME`, but NOT `${NAME:-…}` / `${NAME-…}` / `${NAME:=…}` / `${#NAME…}` /
+    // `${NAME[@]…}` — a default is the script saying "this may be absent", which is the case
+    // this test is not about.
+    for (const match of line.matchAll(/\$\{([A-Z][A-Z0-9_]*)\}|\$([A-Z][A-Z0-9_]*)\b/g)) {
+      const name = match[1] ?? match[2]
+      if (!assigned.has(name) && !SHELL_PROVIDED.has(name)) undefined_.push(name)
+    }
+  }
+
+  assert.deepEqual(
+    Array.from(new Set(undefined_)).sort(),
+    [],
+    'update.sh expands these with no default and never assigns them: with the `source` of .env and .deploy-meta gone, nothing supplies them and `set -u` aborts the update',
+  )
 })
 
 // ---------------------------------------------------------------------------
