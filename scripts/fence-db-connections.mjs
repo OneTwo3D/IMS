@@ -1439,6 +1439,25 @@ export async function doFence(client, options) {
     return EXIT_NOT_FENCEABLE
   }
   const existing = read.status === STATE_PRESENT ? read.state : null
+
+  // AND A RECORD FOR ANOTHER DATABASE IS NOT THIS DATABASE'S RECORD (o3d-2sm1.5 r30, Codex
+  // CRITICAL). `--release` has asked this since it was written; `--fence` did not, and the
+  // re-apply path is where it matters most. Re-applying an existing state means reusing the
+  // grantee list that state recorded — the set of roles a fence on THAT database took CONNECT
+  // from — so if this connection is attached somewhere else, the revokes land on roles chosen
+  // for a different ACL, the appended record claims that database as fenced, and the fence the
+  // record was actually written for is left standing with nothing tracking it. That is exactly
+  // the shape a substituted DATABASE_URL produces, and it is refused here even when the caller
+  // above was fooled.
+  if (existing && existing.database && existing.database !== facts.database) {
+    console.error(`NOT FENCED: the fence record at ${options.stateFile} was written for the database "${existing.database}",`)
+    console.error(`but this connection is attached to "${facts.database}". The grantees it lists lost CONNECT on`)
+    console.error(`"${existing.database}", and re-applying them here would revoke CONNECT on a database that fence was`)
+    console.error(`never raised on while leaving "${existing.database}" fenced with nothing recording it.`)
+    console.error('Nothing has been revoked. Point this run at the database the record names, or release that fence first.')
+    return EXIT_NOT_FENCEABLE
+  }
+
   const plan = existing ? { fenceable: true, reason: '', revoke: existing.revoked } : freshPlan
 
   if (!plan.fenceable) {
