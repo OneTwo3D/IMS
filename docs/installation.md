@@ -1064,7 +1064,7 @@ and nothing else:
 
 | state | what happens |
 | --- | --- |
-| no protected copy yet | the checkout's helper **and its resolved dependency closure** are staged into the root-owned directory and published there. Trust on first use — and since r33 the run **says so**, names the path that made the source application-writable, and prints the artefact digest to pin every host after this one with. There is no earlier artefact and no operator digest, and the alternative is a mechanism that cannot start. A supplied digest is still enforced, and `IMS_FENCE_SCRIPT_SHA256` **on its own is refused here**: see below. |
+| no protected copy yet | the checkout's helper **and its resolved dependency closure** are staged into the root-owned directory and published there — **only when something authenticated them**. From an application-writable checkout that means `IMS_FENCE_ARTEFACT_SHA256`, which ships with the release; without it the bootstrap is **refused**, and the refusal prints every route to the value it wants. `IMS_FENCE_SCRIPT_SHA256` **on its own is refused here** too: see below. r33 published here with a `TRUST ON FIRST USE` warning and r34 removed that — a warning nobody has to acknowledge is not a control over bytes that get handed an administrative credential. |
 | a protected copy, no expected digest | the protected copy is used unchanged. A checkout that **differs** is reported — both digests, and the invocation that would adopt it, which since r33 names **both** pins because a rotation republishes the closure too — and **not** promoted. |
 | a protected copy and an expected digest | an authenticated rotation (below). |
 
@@ -1099,13 +1099,42 @@ to obtain it, rather than publishing an unauthenticated closure under a pin that
 authorisation. It is *not* refused where nothing would be published: a pin that already matches the
 standing copy is still "nothing to rotate".
 
-**Where the whole-tree digest comes from before you have one.** From the release, or from a host
-that has already published it (`grep '^fence_artefact_sha256=' /etc/ims-cutover-recovery/db-fence-artefact.sha256`),
-or from `--dry-run` on the box itself: the dry run assembles exactly the tree a real run would
-publish, into a throwaway root-owned directory, prints what it hashes to, and writes nothing. A
-refusal also reports the value the checkout in front of it assembles to — clearly labelled as
-**reported and not authenticated**, because it is what the tree under question says about itself.
-Compare it with the release before pinning with it.
+<a id="artefact-digest-first-install"></a>
+**Where the whole-tree digest comes from, including on a first-ever install.** Since r34 this is a
+**required input**, not a hardening, so it needs an answer that does not assume a previous
+deployment. There are three sources and they are not interchangeable:
+
+1. **The release publishes it.** The release is built on a host that is not the target: a clean
+   checkout of the tag, `npm ci`, then
+
+   ```bash
+   sudo bash scripts/update.sh --dry-run
+   ```
+
+   which assembles exactly the tree a publication would record, hashes it, and prints
+
+   ```text
+   THE FENCE ARTEFACT THIS CHECKOUT WOULD PUBLISH HASHES TO <64 hex>
+   ```
+
+   It **writes nothing outside its own throwaway and executes no part of the tree** — the digest
+   is computed by reading bytes, not by running them — so it needs no database, no
+   `DEPLOY_ADMIN_DATABASE_URL` and no fence, and it is printed **before** any of the dry run's
+   other refusals can return. That value is published with the release checksums, and it is what
+   the operator passes as `IMS_FENCE_ARTEFACT_SHA256` on every target.
+2. **A host that has already published this release.**
+   `grep '^fence_artefact_sha256=' /etc/ims-cutover-recovery/db-fence-artefact.sha256` there.
+3. **`--dry-run` on the target itself — for comparison only.** It prints the same line, assembled
+   from the checkout under question, so it can **confirm** the release's value and can never stand
+   in for one. Every refusal that reports a digest labels it **reported and not authenticated** for
+   the same reason.
+
+**And the route that needs no digest at all:** bootstrap from a source only root can write. Install
+the release tree as root and take group and other write off it — every path the vendoring reads,
+and every directory from the application directory up to `/` — and the provenance question answers
+itself, so an unpinned publication is accepted. This is the "root-owned authenticated release
+source" option; it is the right shape for an image-built or configuration-managed box, and the
+wrong one for a checkout the application account deploys into.
 
 The digest comes **from the release and not from the box** — `git show <tag>:scripts/fence-db-connections.mjs | sha256sum`
 run somewhere that is *not* the machine being deployed, or the checksum published with the release.
@@ -1256,15 +1285,15 @@ already published a release on one host uses to require byte-identity on the nex
 
 **What the application account still controls — stated rather than implied.**
 
-* **Bootstrap.** The first publication takes the entry file *and the packages* from the checkout,
-  because there is nothing else on the box to take them from. `IMS_FENCE_ARTEFACT_SHA256` is how
-  an operator refuses to trust that; `IMS_FENCE_SCRIPT_SHA256` alone is **not**, and is refused
-  here rather than accepted for less than it appears to cover. An **unpinned** bootstrap still
-  proceeds — refusing it would leave a mechanism that cannot start on a release nobody has
-  published anywhere yet — but it is no longer silent: the run prints `TRUST ON FIRST USE`, names
-  the path that made the source application-writable, and gives the digest to pin the next host
-  with. That one publication is the only moment the application account can choose these bytes;
-  from then on the tree is root-owned and its digest is verified before every execution.
+* **Nothing, at bootstrap, since r34.** The first publication takes the entry file *and the
+  packages* from the checkout, because there is nothing else on the box to take them from — and it
+  is therefore **refused** unless `IMS_FENCE_ARTEFACT_SHA256` authenticates the whole tree, or the
+  source is one only the publishing account can write. `IMS_FENCE_SCRIPT_SHA256` alone is **not**
+  sufficient and is refused rather than accepted for less than it appears to cover. r33 let the
+  unpinned case through with a `TRUST ON FIRST USE` warning on the grounds that refusing would
+  leave a mechanism that cannot start; the premise was that the digest can only come from a prior
+  publication, and it can also
+  [ship with the release](#artefact-digest-first-install), which is where it comes from now.
 * **The process it runs as.** The helper is executed **as the application user** on every in-script
   path, by design — the fence state file has to be releasable by that account — so
   `DEPLOY_ADMIN_DATABASE_URL` is reachable from that account through `/proc` and `ptrace` whatever
@@ -1277,6 +1306,52 @@ already published a release on one host uses to require byte-identity on the nex
 * **`APP_DIR/.env`.** It still holds the credential, and the recovery wrapper still reads it from
   there — with a one-key reader and never `source`. That is a *credential* the account already
   has, not code.
+
+#### r34: what the dry run may run, and what was under the copy
+
+Three findings of one shape: **something authenticated the wrong thing, or authenticated it at the
+wrong moment.**
+
+**The dry run stopped executing the checkout.** r31 made `--dry-run` snapshot the fence helper into
+a root-owned throwaway rather than run it in place, and r33 extended that snapshot to the whole
+resolved dependency closure. Root ownership freezes the copied bytes; it says nothing about where
+they came from. So the dry run's `--preflight` — which opens the admin connection with
+`DEPLOY_ADMIN_DATABASE_URL` — was executing a graph the application account had chosen, on the
+exact command this page recommends for **obtaining the digest that would authenticate it**. It is
+now split in two:
+
+* **the candidate digest is computed by reading.** The helper and its closure are assembled into a
+  root-owned throwaway, hashed, and destroyed. Computing a digest needs the bytes read, not run, so
+  the answer the dry run exists to give survives the restriction intact.
+* **nothing is executed with the admin credential unless it is already authenticated.** Two sources
+  qualify: the **standing protected artefact**, when it is sealed and hashes to what its own record
+  binds (this is the preferred one — it went through the publication gate), and the **candidate**,
+  only when `IMS_FENCE_ARTEFACT_SHA256` was supplied and the assembled tree hashes to it. With
+  neither, **preflight is unavailable**: the dry run says so, says why, and still prints the
+  candidate digest, because that is the value the first real run needs.
+
+**The dry run also reports the right digest.** It used to return the *standing* artefact's digest
+the moment one existed and never assemble the checkout at all — so during an upgrade it printed the
+**old** tree's value, which cannot authorise the new candidate. It now reports both, separately and
+labelled, and pins are taken against the candidate.
+
+**And the provenance question grew an ancestor walk and moved after the copy.** r33 asked "could
+anyone but the publisher have chosen these bytes?" about the application directory and everything
+under it, before copying:
+
+* it never looked **above** the application directory. Rename permission in Unix belongs to the
+  *containing* directory, so an account that can write the parent can move a root-owned, mode-clean
+  tree aside and put its own in its place — every check below then passes over bytes it wrote. The
+  walk now runs from the application directory to `/`. Two relaxations are deliberate and stated:
+  **uid 0** is accepted (root can replace anything regardless, and refusing `/usr` for being
+  root-owned would be a rule nobody could satisfy), and a group- or world-writable directory
+  carrying the **sticky bit** is accepted (`/tmp` is `1777`, and sticky is the kernel already
+  forbidding exactly the rename in question).
+* a check followed by a copy is a check with a window after it. The order is inverted — **copy
+  first, then verify what was copied** — and the device/inode identity of every path involved is
+  compared across the copy, because ownership and modes survive a rename and an inode does not.
+  Either answer coming back wrong is a refusal with nothing published.
+
 
 #### The two commands an operator is ever given
 
