@@ -180,6 +180,35 @@ run_git_as_user() {
   fi
 }
 
+# Read ONE variable out of a dotenv-style file WITHOUT `source`, which EXECUTES the file, and
+# without `grep | cut`, which keeps the surrounding quotes and any trailing comment. This is the
+# only way this script ever looks inside ${APP_DIR}/.env or ${APP_DIR}/.deploy-meta: both are
+# owned by the application user, this script is root, and an application-owned byte must never
+# be evaluated in a privileged shell (o3d-2sm1.5 r25, Codex CRITICAL). Byte-for-byte the reader
+# scripts/install.sh and scripts/deploy.sh use.
+#
+# The quoting rules followed are dotenv's own, because dotenv is what reads .env everywhere else:
+# a quoted value ends at its closing quote, an unquoted one ends at the first whitespace-preceded
+# `#`, and later definitions win. A key that is absent, or a file that is not there, prints
+# nothing and returns 0 — every caller decides for itself what an empty answer means.
+env_file_value() {
+  local key="$1" file="$2" line value
+  [[ -f "$file" ]] || return 0
+  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$file" 2>/dev/null | tail -1 || true)"
+  [[ -n "$line" ]] || return 0
+  value="${line#*=}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  case "$value" in
+    \"*) value="${value#\"}"; value="${value%%\"*}" ;;
+    \'*) value="${value#\'}"; value="${value%%\'*}" ;;
+    *)
+      value="${value%%[[:space:]]#*}"
+      value="${value%"${value##*[![:space:]]}"}"
+      ;;
+  esac
+  printf '%s' "$value"
+}
+
 APP_NAME="one-two-inventory"
 APP_USER="imsapp"
 APP_DIR="${IMS_APP_DIR:-/opt/${APP_NAME}}"
@@ -220,64 +249,72 @@ fi
 [[ -f "${APP_DIR}/.env" ]] || die ".env not found. Run install.sh first."
 
 # ---------------------------------------------------------------------------
-# THE APPLICATION'S OWN FILES DO NOT GET TO STEER THIS RUN (o3d-2sm1.5 r24, Codex HIGH).
+# THE APPLICATION'S OWN FILES ARE READ, NEVER EXECUTED (o3d-2sm1.5 r25, Codex CRITICAL).
 #
-# The two files below are sourced AS ROOT and both live under ${APP_DIR}, which the application
-# user owns. `set -a` exports everything in them, so every `${IMS_...:-default}` this script
-# resolves AFTERWARDS was a value THE APPLICATION COULD SET: the cutover namespace (the fence
-# marker, the crontab backup, the connection-fence record and the lock), the legacy namespace
-# this run IMPORTS state from before it touches a unit or a crontab, and — until this round —
-# the environment-snapshot directory whose entire purpose is to be somewhere the application
-# user cannot reach.
+# This script is root by the check above. ${APP_DIR}/.env and ${APP_DIR}/.deploy-meta are both
+# owned by the APPLICATION user, and until this round both were `source`d here with `set -a`.
+# `source` EXECUTES a file. Not "reads its assignments": a `$(...)` anywhere in it, a bare
+# command on a line of its own, a redefinition of one of the functions above, an assignment to
+# SERVICE_UNIT or APP_DIR or DEPLOY_META_FILE, an assignment INTO the array a later restore loop
+# was going to read back — all of it ran AS ROOT, and all of it ran BEFORE any restore could put
+# anything back. r24 restored the IMS_* deploy-control inputs afterwards, which repairs the
+# values and not the execution, so it was not a boundary at all: an application-account
+# compromise still reached root on the next update.
 #
-# They are sourced because DATABASE_URL and DEPLOY_ADMIN_DATABASE_URL genuinely do come from
-# there. WHERE THIS SCRIPT PUTS PRIVILEGED STATE DOES NOT. So the deploy-control variables are
-# snapshotted from the ROOT INVOCATION's environment first and put back verbatim afterwards: set
-# in the invocation, they stand; absent from it, they are unset again, whatever the file said.
-# Nothing between the capture and the restore resolves a path from any of them.
+# NOTHING IN EITHER FILE IS EVALUATED NOW. Each variable this script actually needs is read out
+# by name with env_file_value() — the non-evaluating dotenv reader defined at the top, the one
+# install.sh and deploy.sh already use, and the one every later re-read of .env goes through. A
+# line the reader is not asked for is never looked at. A line it is asked for becomes a string
+# and nothing else: `IMS_CUTOVER_STATE_DIR=/tmp/x`, `SERVICE_UNIT=other.service` and
+# `EVIL=$(id > /tmp/pwned)` are all just text on a line nobody asked about.
 #
-# The list is every IMS_* variable this script reads to DECIDE A PATH, not only the ones
-# currently resolved after the source — several are resolved above it today and would become
-# steerable the moment a line moved.
+# THAT IS ALSO WHY r24'S DEPLOY-CONTROL CAPTURE/RESTORE IS GONE. It snapshotted every IMS_* path
+# variable from the root invocation's environment and put it back after the source. With no
+# source, no application-owned byte reaches this shell's variables at all — IMS_* can only come
+# from the root invocation, which is the one source that legitimately steers this run — so the
+# restore restored nothing and protected nothing that this does not. Two mechanisms where one
+# suffices are two things to keep true; the property is asserted directly instead, in
+# tests/scripts/deploy-order.test.ts.
+#
+# WHAT IS READ, AND FROM WHERE. Five names, and no others:
+#
+#   .env          DATABASE_URL               the application's connection. The file decides it
+#                                            and an invocation value cannot override it — the
+#                                            bus question below refuses unless this file is the
+#                                            SOLE thing that defines it for the service, and a
+#                                            value from somewhere else would make that a lie.
+#                 DEPLOY_ADMIN_DATABASE_URL  the privileged connection the fence runs through.
+#                                            Absent from the file, an invocation value stands.
+#   .deploy-meta  GIT_REPO_URL               re-clone source, used ONLY as argv of a `git clone`
+#                 GIT_BRANCH                 run AS THE APPLICATION USER (run_git_as_user) —
+#                 GIT_DEPLOY_KEY_ENABLED     data that account already controls, and passed after
+#                                            `--` so it cannot become an option. Never evaluated
+#                                            here, and no privilege is crossed by it.
+#
+# INSTALL_FROM_GIT is written into .deploy-meta by install.sh and read by nothing here, so it is
+# not read here either.
+#
+# AND NOTHING ELSE IN .env IS NEEDED. `set -a` exported the whole file into this shell and into
+# every child process; that export is gone with the source. It was never what carried the
+# values: every child that touches the database is handed DATABASE_URL and
+# DEPLOY_ADMIN_DATABASE_URL explicitly through `env`, and the build reads ${APP_DIR}/.env itself
+# through Next's own dotenv loader from ${APP_DIR}.
 # ---------------------------------------------------------------------------
-DEPLOY_CONTROL_VARS=(
-  IMS_APP_DIR
-  IMS_DATA_DIR
-  IMS_BACKUP_DIR
-  IMS_SERVICE_UNIT
-  IMS_CUTOVER_STATE_DIR
-  IMS_DEPLOY_STATE_DIR
-  IMS_LEGACY_CUTOVER_STATE_DIR
-)
-declare -A DEPLOY_CONTROL_SAVED=()
-for _deploy_control_var in "${DEPLOY_CONTROL_VARS[@]}"; do
-  if [[ -v "${_deploy_control_var}" ]]; then
-    DEPLOY_CONTROL_SAVED["${_deploy_control_var}"]="${!_deploy_control_var}"
-  fi
-done
+DATABASE_URL="$(env_file_value DATABASE_URL "${APP_DIR}/.env")"
 
-# Load env for DATABASE_URL
-set -a; source "${APP_DIR}/.env"; set +a
+# May be absent from .env, and `set -u` is on. Empty means "no privileged connection", which the
+# connection fence reports as NOT FENCED rather than silently skipping. A value in the root
+# invocation's environment is the FALLBACK, not an override — the `source` this replaced
+# overwrote the invocation whenever the file named the key, and that precedence is kept.
+_env_file_admin_url="$(env_file_value DEPLOY_ADMIN_DATABASE_URL "${APP_DIR}/.env")"
+DEPLOY_ADMIN_DATABASE_URL="${_env_file_admin_url:-${DEPLOY_ADMIN_DATABASE_URL:-}}"
+unset _env_file_admin_url
+
 if [[ -f "${DEPLOY_META_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1090  # path is composed at runtime from APP_DIR
-  source "${DEPLOY_META_FILE}"
-  set +a
+  GIT_REPO_URL="$(env_file_value GIT_REPO_URL "${DEPLOY_META_FILE}")"
+  GIT_BRANCH="$(env_file_value GIT_BRANCH "${DEPLOY_META_FILE}")"
+  GIT_DEPLOY_KEY_ENABLED="$(env_file_value GIT_DEPLOY_KEY_ENABLED "${DEPLOY_META_FILE}")"
 fi
-
-# ... and straight back, before anything resolves a path from them.
-for _deploy_control_var in "${DEPLOY_CONTROL_VARS[@]}"; do
-  if [[ -v "DEPLOY_CONTROL_SAVED[${_deploy_control_var}]" ]]; then
-    printf -v "${_deploy_control_var}" '%s' "${DEPLOY_CONTROL_SAVED[${_deploy_control_var}]}"
-  else
-    unset "${_deploy_control_var}"
-  fi
-done
-unset _deploy_control_var
-
-# May be absent from .env, and `set -u` is on. Empty means "no privileged connection",
-# which the connection fence reports as NOT FENCED rather than silently skipping.
-DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL:-}"
 
 START_TIME=$(date +%s)
 
@@ -400,9 +437,9 @@ DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # leading `-` — the unit would refuse to start. Fail-closed, but an outage the app user could
 # cause. This directory is created root-owned and 0700 by publish_db_identity_snapshot().
 # AND ITS PATH IS A CONSTANT, NOT AN OVERRIDE (o3d-2sm1.5 r24, Codex HIGH). It used to be
-# ${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}, and update.sh sources ${APP_DIR}/.env into the
-# environment AS ROOT before it resolves this line — so the variable that chose where the
-# snapshot goes was one THE APPLICATION USER WRITES. That hands back the entire point of the
+# ${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}, and update.sh loaded ${APP_DIR}/.env into the
+# environment AS ROOT — with `source`, until r25 — before it resolved this line, so the variable
+# that chose where the snapshot goes was one THE APPLICATION USER WRITES. That hands back the entire point of the
 # location. publish_db_identity_snapshot() chowns and chmods only the FINAL directory, so a path
 # under an app-writable parent is secured after the parent has already been chosen: rename the
 # secured child away, put an attacker-owned directory at the same path, and PID 1 reads that
@@ -414,7 +451,8 @@ DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # snapshot exists to distrust is not a trust root. So it is a literal: a deployment that must
 # move it edits this line, which is a root-owned change to a root-owned file, reviewed like any
 # other. The same reasoning is why nothing else in this script resolves a privileged path from a
-# variable the application can set — see the deploy-control restore after the .env source.
+# variable the application can set — and since r25 the file is READ rather than executed, so an
+# IMS_* line in it never becomes a variable in this shell in the first place. See the load above.
 DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
 DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
 DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
@@ -883,7 +921,7 @@ require_env_file_is_sole_definition() {
   env_file_is_sole_database_url_source "${APP_DIR}/.env" "${SERVICE_UNIT:-}"
 }
 
-# `.env` was sourced above, so DATABASE_URL is in hand. A failure here is not fatal at this
+# `.env` was read above, so DATABASE_URL is in hand. A failure here is not fatal at this
 # point — it is fatal in fence_db_connections() below, with the reason printed, before anything
 # is stopped or migrated.
 resolve_db_identity "${DATABASE_URL:-}" || true
@@ -911,33 +949,13 @@ DB_IDENTITY_PINNED_USER="$DB_IDENTITY_USER"
 DB_IDENTITY_PINNED_DATABASE="$DB_IDENTITY_DATABASE"
 DB_IDENTITY_DRIFT_REASON="the environment file has not been re-read yet"
 
-# Read ONE variable out of .env WITHOUT `source`, which is how the pin above was taken and is not
-# something to do twice: sourcing executes the file, and re-executing it mid-update would run
-# whatever it has become and overwrite every variable this run is holding. Same reader, and the
-# same dotenv rules, as scripts/deploy.sh — a quoted value ends at its closing quote, an unquoted
-# one at the first whitespace-preceded `#`, later definitions win.
-#
-# THE FIRST RE-READ IS ALSO WHAT PROVES THE TWO READERS AGREE. The pin came from `source` and
-# every re-read comes from here, so the pre-fence comparison is the one that establishes the
-# baseline is reachable through this reader at all — before anything is stopped, where a
-# disagreement costs nothing. After it has passed once, every later comparison is like for like.
-env_file_value() {
-  local key="$1" file="$2" line value
-  [[ -f "$file" ]] || return 0
-  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$file" 2>/dev/null | tail -1 || true)"
-  [[ -n "$line" ]] || return 0
-  value="${line#*=}"
-  value="${value#"${value%%[![:space:]]*}"}"
-  case "$value" in
-    \"*) value="${value#\"}"; value="${value%%\"*}" ;;
-    \'*) value="${value#\'}"; value="${value%%\'*}" ;;
-    *)
-      value="${value%%[[:space:]]#*}"
-      value="${value%"${value##*[![:space:]]}"}"
-      ;;
-  esac
-  printf '%s' "$value"
-}
+# The re-read goes through env_file_value(), defined at the top beside run_as_user() — THE SAME
+# READER THAT TOOK THE PIN. Since r25 there is only one reader in this script: the preflight load
+# is a key-by-key read too, not a `source`, so the pinned value and every re-read below come
+# through identical parsing rules and "the two readers disagree" is a class of failure that no
+# longer exists. Nothing here re-executes the file, which is the other half of why: a `source`
+# repeated mid-update would run whatever the file had become and overwrite every variable this
+# run is holding.
 
 # Re-read ${APP_DIR}/.env and require it to still state the pinned identity.
 #
@@ -1604,7 +1622,7 @@ fence_db_connections() {
     "${DB_IDENTITY_SOURCE_REASON}. The fence, the migration and the release would all agree with each other about the database ${APP_DIR}/.env names, while the application that restarts afterwards connects somewhere else — a migration on a database nothing fenced, and a new build on a database nothing migrated. Nothing has been stopped and nothing has been migrated."
 
   # AND THE FILE MUST STILL SAY WHAT IT SAID WHEN THIS RUN READ IT (o3d-2sm1.5 r22, Codex HIGH).
-  # The identity above was sourced once, in the preflight, before the build and before the stop;
+  # The identity above was read once, in the preflight, before the build and before the stop;
   # this is the last moment before the fence is aimed. Nothing has been fenced yet, so a
   # disagreement here is the cheap one — it costs a restart of the old version and no schema.
   require_start_identity_unchanged || die \
@@ -2535,8 +2553,12 @@ if ! $NO_GIT; then
     CURRENT_COMMIT="none"
 
     info "Cloning ${GIT_REPO_URL} (${GIT_BRANCH}) into a temporary worktree..."
+    # `--` before the URL: GIT_REPO_URL comes out of the application-owned .deploy-meta, and a
+    # value beginning with `-` would otherwise be parsed by git as an OPTION rather than a
+    # repository (`--upload-pack=…` runs a command). The clone already runs AS THE APPLICATION
+    # USER, so that was never a privilege crossing — this keeps it from being a surprise either.
     run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
-      "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
+      -- "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
     NEW_COMMIT="$(run_git_as_user "${APP_USER}" git -C "${TMP_CLONE_WORKTREE}" rev-parse HEAD)"
     info "Fetched commit: ${NEW_COMMIT:0:8}"
 
