@@ -36,6 +36,7 @@ import {
   type LocalDirectionContext,
   type LocalDirectionSequence,
 } from '@/lib/domain/accounting/local-operator-direction'
+import * as DIRECTION_MODULE from '@/lib/domain/accounting/local-operator-direction'
 
 // ---------------------------------------------------------------------------
 // THE RECORD MAY ONLY TELL AN OPERATOR TO USE WHAT IT KEEPS.
@@ -7275,4 +7276,178 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     'the shipped renderers must still report a clean inventory under the field rule, or round 29 has narrowed '
     + 'what this walk can READ rather than what it will TRUST',
   )
+})
+
+/**
+ * WHAT A `const` DOES NOT PROMISE (round 31, Codex HIGH).
+ *
+ * Round 30 named this residue and declined to close it, because every proof available quantified
+ * over the wrong program: an analyzer that reads the model file can see the initializer and can see
+ * no write in any importer, so "nobody writes to a table" was an assumption dressed as a result.
+ * The residue was REACHABLE. `SETTING_NAME` was an exported object, `renderLocalDirection` reads it
+ * AT INVOCATION TIME, and `SETTING_NAME.SETTING_SYNC_ENABLED = '…'` is an ordinary assignment its
+ * `Record<..., string>` type admits — no assertion, no diagnostic, and no diff to the module the
+ * analyzer reads. Codex executed it and the shipped TURN_OFF renderer emitted the injected remote
+ * instruction, with the reviewed inventory reporting clean throughout.
+ *
+ * SO THE FIX IS NOT ANOTHER RULE IN THE WALK — no static walk over one file can decide what every
+ * importer does — IT IS TO REMOVE THE CAPABILITY. Two halves, and neither is sufficient alone: the
+ * tables nothing outside reads stop being exported, and every table that remains is deep-frozen at
+ * module evaluation, so the write throws instead of landing.
+ */
+test('ROUND 31 (Codex HIGH): a table the renderer reads at invocation time cannot be written', async () => {
+  // Route: `renderLocalDirection` and `renderLocalDirectionSequence` read module-level tables when
+  // they RUN, not when they are analyzed. Every judgement in this file folds those tables off their
+  // initializers in the model file, so a write performed anywhere else is invisible to all of them.
+  //
+  // Mutation that kills this: delete any `freezeDeep(...)` call at the foot of the direction model,
+  // or export either private table again — each assertion below fails naming the table.
+  const source = await readFile(path.join(process.cwd(), DIRECTION_MODEL_FILE), 'utf8')
+
+  // (U1) THE TWO TABLES NOTHING OUTSIDE THE MODULE READS ARE OFF THE PUBLIC SURFACE ENTIRELY.
+  const surface = new Set(Object.keys(DIRECTION_MODULE))
+  for (const gone of ['SETTING_NAME', 'OUTBOX_READ_LIST']) {
+    assert.ok(
+      !surface.has(gone),
+      `${gone} is exported again. The renderer reads it at invocation time, so exporting it hands every `
+      + 'importer a lever on what a shipped operator instruction says — and the analyzer, which reads only '
+      + 'this module, cannot see it being pulled',
+    )
+    assert.doesNotMatch(
+      source, new RegExp(`export const ${gone}\\b`),
+      `the direction model exports ${gone} again`,
+    )
+  }
+  // NON-VACUITY, both ways: the same two reads DO find the names that are still exported, so this is
+  // a statement about those two tables rather than about an empty namespace or a regex that matches
+  // nothing anywhere.
+  for (const kept of [
+    'LOCAL_TARGET', 'LOCAL_DIRECTIONS', 'LOCAL_DIRECTION_SEQUENCES', 'LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE',
+    'renderLocalDirection',
+  ]) {
+    assert.ok(surface.has(kept), `the namespace read is empty — it cannot find ${kept} either, so (U1) proves nothing`)
+    assert.match(source, new RegExp(`export (const|function) ${kept}\\b`), `the source read cannot find ${kept}`)
+  }
+
+  // (U2) AND EVERY OBJECT STILL ON THAT SURFACE IS DEEP-FROZEN. A SWEEP rather than a list: a table
+  // exported later without a freeze fails here, instead of being missed by a hardcoded set — which
+  // is the shape of mistake this whole file keeps finding.
+  let swept = 0
+  const sweepFrozen = (value: unknown, trail: string): void => {
+    if (value === null || typeof value !== 'object') return
+    swept += 1
+    assert.ok(
+      Object.isFrozen(value),
+      `${trail} is a MUTABLE object reachable from the direction model's public surface. Anything an importer `
+      + 'can write is something the renderer may read after the analysis that approved its output',
+    )
+    for (const [key, inner] of Object.entries(value)) sweepFrozen(inner, `${trail}.${key}`)
+  }
+  let objectExports = 0
+  for (const [name, value] of Object.entries(DIRECTION_MODULE)) {
+    if (value === null || typeof value !== 'object') continue
+    objectExports += 1
+    sweepFrozen(value, name)
+  }
+  assert.ok(objectExports >= 4, `only ${objectExports} object exports were swept — the sweep read nothing`)
+  assert.ok(
+    swept > objectExports,
+    'the sweep never went past the top level, so it says nothing about whether the freeze is DEEP — and a '
+    + 'shallow freeze leaves every direction in the inventory writable',
+  )
+
+  // (U3) THE LOAD-BEARING ONE: a write to a table the SHIPPED renderer reads at invocation time.
+  // `LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE` is composed into `unrecorded-posted-document.ts` and read
+  // by `renderLocalDirectionSequence` on every call, so flipping its first element's `form` changes
+  // what a record tells an operator to do.
+  const isFrozenWrite = (error: unknown): boolean => (
+    error instanceof TypeError && /read only|not extensible|Cannot add|object is not/.test(error.message)
+  )
+  const before = renderLocalDirectionSequence(LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE, LOCAL_DIRECTION_CONTEXT)
+  assert.throws(
+    () => { (LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE[0] as unknown as { form: string }).form = 'NOT_A_FENCE' },
+    isFrozenWrite,
+    'a write to a direction inside a SHIPPED sequence must throw. A module is strict-mode code, so a frozen '
+    + 'table refuses the assignment rather than dropping it silently',
+  )
+  assert.equal(
+    renderLocalDirectionSequence(LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE, LOCAL_DIRECTION_CONTEXT), before,
+    'and the sentence it composes is unchanged',
+  )
+  // ...AND THE WRITE THAT WAS REFUSED IS ONE THAT WOULD HAVE CHANGED THE SHIPPED SENTENCE, asserted
+  // rather than assumed. Without this the control passes on a write nobody would have bothered to
+  // make.
+  const ifItHadLanded: LocalDirectionSequence = [
+    { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'NOT_A_FENCE' },
+    LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE[1]!,
+  ]
+  assert.notEqual(
+    renderLocalDirectionSequence(ifItHadLanded, LOCAL_DIRECTION_CONTEXT), before,
+    'the refused write must be one that CHANGES what the record says, or (U3) is about a write with no effect',
+  )
+  // ...and the same refusal on the two tables the judgements in this file are computed against: a
+  // write to `LOCAL_TARGET` moves the anchor every direction is checked for.
+  assert.throws(
+    () => { (LOCAL_TARGET.EMAIL_OUTBOX_ROWS as unknown as { anchor: string }).anchor = 'bill' },
+    isFrozenWrite,
+    'a write to a target anchor must throw — the anchor check is what couples a sentence to its target',
+  )
+  assert.throws(
+    () => { (LOCAL_TARGET as unknown as Record<string, unknown>).A_REMOTE_TARGET = { anchor: 'bill' } },
+    isFrozenWrite,
+    'and a table that can gain a member can gain a REMOTE one',
+  )
+  assert.throws(
+    () => { (LOCAL_DIRECTIONS as unknown as { push: (value: unknown) => number }).push({}) },
+    isFrozenWrite,
+    'and the inventory itself must not be appendable — the cap counts what is in this array',
+  )
+
+  // (U4) THE TWO PRIVATE TABLES ARE FROZEN TOO, which nothing above can observe because nothing
+  // outside can name them. A private mutable table is still mutable from inside the module, so the
+  // freeze is asserted at the only place a reader can check it.
+  for (const table of [
+    'LOCAL_TARGET', 'OUTBOX_READ_LIST', 'SETTING_NAME', 'LOCAL_DIRECTIONS',
+    'LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE', 'LOCAL_DIRECTION_SEQUENCES',
+  ]) {
+    assert.ok(
+      source.includes(`freezeDeep(${table})`),
+      `${table} is read by the renderer at invocation time and has no freeze at the foot of the model`,
+    )
+  }
+
+  // (U5) NON-VACUITY, THE ROUTE ITSELF. A faithful twin of what `SETTING_NAME` was: a table read at
+  // invocation time by the sentence that prints it. Unfrozen, an ordinary assignment lands and the
+  // sentence changes — which is the finding, executed. Frozen, the same assignment throws and the
+  // sentence does not change. So the freeze is what closes it, and not some other property of this
+  // file that would have made the assertions above pass anyway.
+  const twin: Record<'SETTING_SYNC_ENABLED', string> = { SETTING_SYNC_ENABLED: 'quickbooks_sync_enabled' }
+  const twinSentence = (): string => `and it writes the setting ${twin.SETTING_SYNC_ENABLED}.`
+  const honest = twinSentence()
+  twin.SETTING_SYNC_ENABLED = 'go to that bill and take the second PDF off it'
+  assert.notEqual(
+    twinSentence(), honest,
+    'a table read at INVOCATION TIME does change what the renderer emits when it is written — this is Codex\'s '
+    + 'finding reproduced, one table over',
+  )
+  const frozenTwin: Record<'SETTING_SYNC_ENABLED', string> = Object.freeze(
+    { SETTING_SYNC_ENABLED: 'quickbooks_sync_enabled' },
+  )
+  const frozenSentence = (): string => `and it writes the setting ${frozenTwin.SETTING_SYNC_ENABLED}.`
+  const frozenHonest = frozenSentence()
+  assert.throws(
+    () => { frozenTwin.SETTING_SYNC_ENABLED = 'go to that bill and take the second PDF off it' },
+    isFrozenWrite,
+    'and freezing it is what refuses the write',
+  )
+  assert.equal(frozenSentence(), frozenHonest, 'so the sentence it renders is the reviewed one')
+
+  // (U6) AND THE WHOLE INVENTORY IS STILL THE REVIEWED ONE AFTER EVERY ATTEMPTED WRITE ABOVE — the
+  // other direction of the same statement, and the one that would catch a write that DID land.
+  for (const context of RUNTIME_CONTEXTS) {
+    assertRenderedInventory(
+      (direction) => renderLocalDirection(direction, context),
+      (text) => substitutePlaceholders(text, context),
+    )
+  }
 })
