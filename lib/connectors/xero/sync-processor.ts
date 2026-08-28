@@ -6865,6 +6865,13 @@ async function enqueueSalesInvoiceFollowUps(
    * obligation.
    */
   followUpObligation: Date | null,
+  /**
+   * WHAT ELSE THE CALLER MUST HAVE MADE DURABLE BEFORE THE GENERATION MAY BE CLEARED (o3d-0bfh r16,
+   * Codex HIGH). Absent on the post path — this processor has no settlement write of its own after
+   * the enqueue — and supplied by the back-reference sweep, whose terminal warnings gate its
+   * settlement and were being written AFTER the fenced clear. See `DeferredReceiptObligation`.
+   */
+  settlementPrerequisite?: () => Promise<boolean>,
 ): Promise<FollowUpOutcome> {
   if (referenceType !== 'SalesOrder' || !syncResult.externalId) return { deferredReceiptsSettled: true, obligationFenced: false }
   // Captured once, so the id handed to the deferred re-drive below is provably the one THIS post
@@ -6963,6 +6970,10 @@ async function enqueueSalesInvoiceFollowUps(
     // The same registry answer `settleFollowUpObligation` reads, for the same reason: what re-drives
     // a retained obligation is a declared fact about the connector, never a sentence written here.
     recovery: followUpObligationRecoveryFor(XERO_CONNECTOR),
+    // o3d-0bfh r16: SPREAD, not written as `settlementPrerequisite: undefined` — the field's absence
+    // is what keeps the post path on the single-pass fence, and an explicitly-undefined key would be
+    // a second thing to get wrong at every call site that reads this object.
+    ...(settlementPrerequisite ? { settlementPrerequisite } : {}),
   })
   // `unfenced` is the one answer that leaves the marker to this caller: the re-drive returned on a
   // fact no later receipt can change (payments do not post at all; the order is gone).
@@ -7061,9 +7072,18 @@ async function enqueueFollowUps(
    * obligation.
    */
   followUpObligation: Date | null,
+  /**
+   * o3d-0bfh r16 (Codex HIGH) — THE CALLER'S OWN SETTLEMENT PREREQUISITE, carried down to the fence
+   * so the generation cannot be cleared before the caller's terminal warnings are durable. Optional
+   * because this processor's own post sites have nothing left to settle after the enqueue; the
+   * back-reference sweep does, and passing it is what stops the fenced release outrunning it.
+   */
+  settlementPrerequisite?: () => Promise<boolean>,
 ): Promise<FollowUpOutcome> {
   if (type === 'SALES_INVOICE') {
-    return enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin, followUpObligation)
+    return enqueueSalesInvoiceFollowUps(
+      entryId, referenceType, referenceId, payload, syncResult, origin, followUpObligation, settlementPrerequisite,
+    )
   }
 
   if (type === 'PURCHASE_INVOICE') {

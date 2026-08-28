@@ -57,7 +57,15 @@ const logActivityPersisted = async () => true
 //     benign shape for every call so that no branch of the enqueue can be the thing this test is
 //     really measuring.
 // ---------------------------------------------------------------------------
-const deferredReceipts = { settled: true, obligation: null as { syncLogId: string; generation: Date | null } | null }
+const deferredReceipts = {
+  settled: true,
+  obligation: null as {
+    syncLogId: string
+    generation: Date | null
+    /** o3d-0bfh r16: the caller's settlement prerequisite, present only when one was handed over. */
+    settlementPrerequisite?: () => Promise<boolean>
+  } | null,
+}
 
 mock.module('@/lib/domain/accounting/invoice-payment-enqueue', {
   namedExports: {
@@ -67,7 +75,7 @@ mock.module('@/lib/domain/accounting/invoice-payment-enqueue', {
     registerDeferredOrderReceipts: async (
       _orderId: string,
       _posted: unknown,
-      obligation: { syncLogId: string; generation: Date | null } | null,
+      obligation: NonNullable<typeof deferredReceipts.obligation> | null,
     ) => {
       deferredReceipts.obligation = obligation
       return { settled: deferredReceipts.settled, reason: 'registered', release: 'released' }
@@ -158,6 +166,15 @@ test('[o3d-9kek] the Xero sweep binding passes a persisted cursor store and the 
 // `{ deferredReceiptsSettled: true }`. Verified in one run: the old identity + `.name` assertions
 // BOTH pass under it, and the unsettled test below FAILS. That is the whole finding.
 // ---------------------------------------------------------------------------
+
+/**
+ * Clear what the re-drive double captured. A function rather than an inline `= null`, so the
+ * property's DECLARED type survives: an assignment narrows it to `null` for the rest of the test
+ * body and TypeScript then refuses to read the fields the assertions are about.
+ */
+function forgetCapturedObligation(): void {
+  deferredReceipts.obligation = null
+}
 
 /** The generation the sweep claims before its enqueue — the value that must reach the re-drive. */
 const SWEEP_GENERATION = new Date('2026-08-01T00:00:00.000Z')
@@ -256,4 +273,67 @@ test('[o3d-9kek r6] QuickBooks exports NO back-reference sweep binding, and neve
   // call or a re-export under a different name would be caught here rather than in production.
   assert.deepEqual(captured, [], 'no QuickBooks sweep run')
   assert.deepEqual(cursorStoreConnectors, [], 'no QuickBooks sweep cursor')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r16 (Codex HIGH) — AND THE CALLER'S SETTLEMENT PREREQUISITE REACHES THE FENCE TOO.
+//
+// r15 got the generation down to the re-drive so the clear could be taken under the sales-order
+// lock. That put the clear BEFORE the sweep's own terminal warnings, which are what permit the row
+// to be settled at all — so the sweep now hands its condition down alongside the generation, and the
+// fence answers it between its re-read and its release.
+//
+// This is the same class of seam assertion as the one above and needs to be made here for the same
+// reason: the sweep's own tests inject their own enqueue, so a binding that accepted the argument
+// and dropped it on the floor would leave all of them green while the release went back to
+// outrunning the warning. Nothing in the RETURN VALUE would differ.
+// ---------------------------------------------------------------------------
+
+test('[o3d-0bfh r16] the SETTLEMENT PREREQUISITE the sweep hands down reaches the deferred-receipt fence', async () => {
+  captured.length = 0
+  deferredReceipts.settled = true
+  forgetCapturedObligation()
+
+  const mod = await import('@/lib/connectors/xero/sync-processor')
+  await mod.repairXeroBackReferences()
+
+  const enqueueFollowUps = captured[0].deps.enqueueFollowUps as (
+    ...args: unknown[]
+  ) => Promise<{ deferredReceiptsSettled: boolean; obligationFenced: boolean }>
+
+  const prerequisite = async () => true
+  await enqueueFollowUps(
+    'log-1', 'SALES_INVOICE', 'SalesOrder', 'so-1', {}, { externalId: 'XINV-1' },
+    { payload: {}, connectionProvenance: null, backReferenceEvidenceCompactedAt: null },
+    SWEEP_GENERATION,
+    // The NINTH argument: what the sweep must have made durable before that generation is cleared.
+    prerequisite,
+  )
+
+  assert.equal(
+    deferredReceipts.obligation?.settlementPrerequisite, prerequisite,
+    'the fence has to be able to ASK it — a binding that drops it releases the obligation before the '
+      + 'sweep has written the notice that permits the settlement, which is exactly r16',
+  )
+  assert.deepEqual(deferredReceipts.obligation?.generation, SWEEP_GENERATION, 'still alongside the generation')
+})
+
+test('[o3d-0bfh r16] and the POST path hands none, so it stays on the single fenced pass', async () => {
+  // The control, and it is what keeps the field's ABSENCE meaningful: this processor has no
+  // settlement write left after the enqueue, so it states no condition, and the fence must not
+  // acquire a second pass — or a `settlementPrerequisite: undefined` key — on its account.
+  captured.length = 0
+  forgetCapturedObligation()
+
+  const mod = await import('@/lib/connectors/xero/sync-processor')
+  await mod.repairXeroBackReferences()
+
+  const enqueueFollowUps = captured[0].deps.enqueueFollowUps as (
+    ...args: unknown[]
+  ) => Promise<{ deferredReceiptsSettled: boolean; obligationFenced: boolean }>
+  await enqueueFollowUps('log-1', 'SALES_INVOICE', 'SalesOrder', 'so-1', {}, { externalId: 'XINV-1' },
+    { payload: {}, connectionProvenance: null, backReferenceEvidenceCompactedAt: null }, SWEEP_GENERATION)
+
+  assert.equal('settlementPrerequisite' in (deferredReceipts.obligation ?? {}), false,
+    'not even as an explicitly-undefined key: absence is what selects the single-pass fence')
 })

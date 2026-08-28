@@ -631,6 +631,28 @@ export type BackReferenceSweepDeps = {
      * in which that receipt cannot be settled over. `null` withholds the release entirely.
      */
     followUpObligation: Date | null,
+    /**
+     * EVERYTHING ELSE THIS SWEEP MUST HAVE ON RECORD BEFORE THAT GENERATION IS CLEARED (o3d-0bfh
+     * r16, Codex HIGH).
+     *
+     * r15 handed the generation down so the clear could be taken under the sales-order lock. That is
+     * right and it stays — but it also moved the clear to BEFORE this module's own settlement
+     * writes, and two of those are TERMINAL: the warning naming what a tombstone's compaction
+     * destroyed, and the warning that a repaired sale has no invoice date anywhere. Each settles the
+     * row only once it is CONFIRMED PERSISTED, because the loss it describes can never be undone by
+     * a later run.
+     *
+     * With the clear happening first, a warning that failed to persist left the row linked, SYNCED
+     * and MARKER-NULL — and the next sweep reads exactly that as a reconciled row and stamps it in
+     * silence. The obligation was discharged before the record of why.
+     *
+     * So the condition travels down WITH the generation, and the fence answers it between its
+     * re-read and its release. It runs AT MOST ONCE per row, wherever it is first reached: an
+     * enqueue that never reaches the fence (a type with no deferred receipts, a row with no external
+     * id) does not call it, and this module then calls it itself before its own `markChecked` clears
+     * the marker. Either way the ordering is the same — the evidence, then the release.
+     */
+    settlementPrerequisite: () => Promise<boolean>,
   ) => Promise<BackReferenceFollowUpOutcome>
   now?: () => Date
   /**
@@ -1498,6 +1520,51 @@ export async function repairAccountingBackReferences(
   }
 
   /**
+   * THIS ROW'S OWN SETTLEMENT PREREQUISITES, ASKED ONCE, WHEREVER THEY ARE REACHED FIRST
+   * (o3d-0bfh r16, Codex HIGH).
+   *
+   * The sweep has settlement prerequisites the connector's fence knows nothing about — the terminal
+   * warnings that must be PERSISTED before a row may be settled — and since r15 the fence clears the
+   * obligation generation before this module writes any of them. That is a release outrunning its
+   * own evidence: a warning that then fails to persist leaves the row linked, marker-null and
+   * indistinguishable from a reconciled one, which the next sweep stamps in silence.
+   *
+   * So the check is wrapped here and handed DOWN with the generation. Two properties make it usable
+   * on both sides of that seam:
+   *
+   *   • ONCE. The fence answers it between its re-read and its release; this module then asks the
+   *     same closure again before its own `markChecked`, and gets the recorded verdict rather than a
+   *     second warning. An enqueue that never reaches the fence never calls it, and then this
+   *     module's call is the one that runs it — still before anything clears the marker.
+   *   • IT NEVER THROWS. It runs inside the connector's re-drive, whose contract is that a receipt
+   *     it cannot register must not fail a sync entry whose invoice HAS posted; a throw there would
+   *     be reported as an unsettled RECEIPT, which is a different and untrue story. An unanswerable
+   *     prerequisite is `false` — counted as a failure, exactly as the per-row handler counted it
+   *     when `businessDateSettled` was free to throw into it, and leaving the row eligible.
+   */
+  const settlementPrerequisite = (
+    row: BackReferenceSweepRow,
+    check: () => Promise<boolean>,
+  ): (() => Promise<boolean>) => {
+    let verdict: boolean | null = null
+    return async () => {
+      if (verdict !== null) return verdict
+      try {
+        verdict = await check()
+      } catch (prerequisiteError) {
+        result.failed++
+        console.error(
+          `${prefix}: a settlement prerequisite could not be answered; the obligation stays and the row is left eligible`,
+          row.id,
+          prerequisiteError,
+        )
+        verdict = false
+      }
+      return verdict
+    }
+  }
+
+  /**
    * DISCHARGE A FOLLOW-UP OBLIGATION ON A ROW WITH NO BACK-REFERENCE OF ITS OWN (o3d-p5j3).
    *
    * There is no id to repair here — the row's type writes no back-reference, or the call returned
@@ -1573,6 +1640,17 @@ export async function repairAccountingBackReferences(
       }
       return { settle: false }
     }
+    // o3d-0bfh r16: what THIS module still has to put on record before the generation may be
+    // cleared. Structurally this path can never reach the connector's fence — it is selected on the
+    // row having no external id or no back-reference pair, and the deferred-receipt re-drive returns
+    // before the fence without one — so the closure is answered below, by this module. It is handed
+    // down anyway, because "this path cannot reach the fence today" is a property of the candidate
+    // predicate and not of the release protocol, and the version of that assumption that goes stale
+    // silently is the one that is not stated in the call.
+    const prerequisites = settlementPrerequisite(
+      row,
+      async () => discarded.length === 0 || await reportDiscardedFollowUps(row, 'already-applied'),
+    )
     let outcome: BackReferenceFollowUpOutcome
     try {
       outcome = await deps.enqueueFollowUps(
@@ -1588,6 +1666,8 @@ export async function repairAccountingBackReferences(
     // the order's receipts, under the sales-order lock. When it does, `obligationFenced` says so
     // and the settlement below fences on the column being null instead.
         obligation.pendingAt,
+        // o3d-0bfh r16: and WITH IT, what must be durable before that clear happens.
+        prerequisites,
       )
     } catch (followUpError) {
       result.failed++
@@ -1626,8 +1706,13 @@ export async function repairAccountingBackReferences(
     // AND ONLY NOW THE TERMINAL DISCARD. The rebuildable half has gone out and settled; what is left
     // is work this tombstone can never recover, and the marker may be consumed only once that is on
     // record — and only the generation THIS run claimed, never the one it merely read.
+    //
+    // o3d-0bfh r16: ASKED THROUGH THE ONCE-CLOSURE that was handed to the enqueue. If the fence
+    // already answered it, this reads that verdict rather than announcing the loss a second time;
+    // if the fence never ran — which is this path's normal case — this is where it runs, and it
+    // still runs before `markChecked` clears anything.
     if (discarded.length > 0) {
-      return (await reportDiscardedFollowUps(row, 'already-applied'))
+      return (await prerequisites())
         ? { settle: true, marker: settledMarker() }
         : { settle: false }
     }
@@ -1921,6 +2006,18 @@ export async function repairAccountingBackReferences(
               }
               continue
             }
+            // AND ITS SETTLEMENT PREREQUISITE GOES DOWN WITH THE GENERATION (o3d-0bfh r16, Codex
+            // HIGH). This is the path the finding was raised on: a SYNCED tombstone whose link is
+            // already applied reaches the fence, which cleared the generation inside its own
+            // transaction — and only THEN did this module try to persist the discard warning that
+            // is the whole reason the row may be settled at all. A warning that failed left the row
+            // linked, SYNCED and marker-null: `owesFollowUps` is false for exactly that shape, so
+            // the next sweep stamped it reconciled and the compacted payment registration was lost
+            // with nothing anywhere saying so.
+            const prerequisites = settlementPrerequisite(
+              row,
+              async () => !discardsFollowUps || await reportDiscardedFollowUps(row, 'already-applied'),
+            )
             let tombstoneOutcome: BackReferenceFollowUpOutcome
             try {
               tombstoneOutcome = await deps.enqueueFollowUps(
@@ -1933,6 +2030,7 @@ export async function repairAccountingBackReferences(
                 sweepRowOriginRecord(row),
                 // o3d-0bfh r15: see the sibling call in `settleOutstandingFollowUpsOnly`.
                 obligation.pendingAt,
+                prerequisites,
               )
             } catch (followUpError) {
               result.failed++
@@ -1945,7 +2043,10 @@ export async function repairAccountingBackReferences(
               await reportUnsettledReceipts(row, 'already-applied')
               continue
             }
-            if (discardsFollowUps && !(await reportDiscardedFollowUps(row, 'already-applied'))) continue
+            // The same closure the fence was handed: either it answered it there, before the
+            // release, or it never got that far and this is the call that runs it — never a second
+            // announcement, and never after a clear.
+            if (!(await prerequisites())) continue
             // Linked, its recoverable half raised and settled, its terminal half announced. Stamped
             // against the generation THIS run claimed, never the one it merely read.
             // o3d-0bfh r15: null when the re-drive cleared it under the order lock — see
@@ -1996,6 +2097,17 @@ export async function repairAccountingBackReferences(
           continue
         }
         let settlementMarker: Date | null = obligation.pendingAt
+        // o3d-0bfh r16 (Codex HIGH) — WHAT MUST BE ON RECORD BEFORE THE GENERATION IS CLEARED, on
+        // the repaired half of the same finding. Both of this path's terminal notices are in it, in
+        // the order they were evaluated in before, and both settle the row only when CONFIRMED
+        // PERSISTED: the compaction discard (irreversible — the payload it named is gone) and the
+        // unrecoverable invoice date (the sale is in NO reporting period until a human sets one).
+        // The fence answers this between its re-read and its release, so neither can be outrun by
+        // the clear; if the enqueue never reaches the fence, the call below runs it instead.
+        const prerequisites = settlementPrerequisite(row, async () => {
+          if (evidenceOnly && discardsFollowUps && !(await reportDiscardedFollowUps(row, 'repaired'))) return false
+          return businessDateSettled(row, businessDate)
+        })
 
         // Where the write actually landed. For a PO-keyed row that is the bill the FENCED
         // attribution chose, which is the only attribution that ever reaches a write.
@@ -2059,7 +2171,7 @@ export async function repairAccountingBackReferences(
                 externalId: row.externalTransactionId,
                 invoiceNumber,
                 // o3d-0bfh r15: see the sibling call in `settleOutstandingFollowUpsOnly`.
-              }, sweepRowOriginRecord(row), obligation.pendingAt)
+              }, sweepRowOriginRecord(row), obligation.pendingAt, prerequisites)
               if (!outcome.deferredReceiptsSettled) {
                 followUpsEnqueued = false
                 await reportUnsettledReceipts(row, followUpsOnly ? 'already-applied' : 'repaired')
@@ -2082,16 +2194,19 @@ export async function repairAccountingBackReferences(
                 metadata: { syncLogId: row.id, referenceType: row.referenceType, referenceId: row.referenceId },
               })
             }
-            // The terminal half, announced only after the recoverable half has gone out, and only
-            // when this row RECORDED that it owed something the compaction took away. After the
-            // per-row narrowing there is no false warning left here to hold a row behind a failing
-            // activity log — but a TRUE one still holds it, which is the existing policy and the
-            // whole reason the announcement is persisted rather than best-effort.
-            if (followUpsEnqueued && evidenceOnly && discardsFollowUps
-              && !(await reportDiscardedFollowUps(row, 'repaired'))) {
-              followUpsEnqueued = false
-            }
           }
+          // THE TERMINAL HALF, announced only after the recoverable half has gone out, and only when
+          // this row RECORDED that it owed something the compaction took away. After the per-row
+          // narrowing there is no false warning left here to hold a row behind a failing activity
+          // log — but a TRUE one still holds it, which is the existing policy and the whole reason
+          // the announcement is persisted rather than best-effort.
+          //
+          // o3d-0bfh r16: it is now INSIDE `prerequisites`, together with the invoice-date notice,
+          // and asked through the once-closure the enqueue was handed. Whichever side of the fence
+          // ran it, it ran before anything cleared the marker. Still gated on `followUpsEnqueued`:
+          // a pass that left a receipt unregistered must not announce a terminal loss, because that
+          // announcement is what allows the row to be settled.
+          if (followUpsEnqueued && !(await prerequisites())) followUpsEnqueued = false
           // A row whose back-reference is now applied is fully reconciled — but ONLY if its
           // follow-ups were actually enqueued. Stamping it regardless retired the one source that
           // would retry them, so a transient enqueue failure lost the payment or PDF permanently
@@ -2118,7 +2233,7 @@ export async function repairAccountingBackReferences(
           // wrong. When it does warn, it settles once the warning is CONFIRMED PERSISTED — the same
           // terminal policy as the discarded follow-ups, because the remedy (a human reading the
           // date off the ledger) is not something this sweep can observe.
-          if (followUpsEnqueued && await businessDateSettled(row, businessDate)) {
+          if (followUpsEnqueued) {
             await markChecked(
               settlementFence(row, settlementMarker),
               row.status === 'FAILED' && !evidenceOnly ? { status: 'SYNCED', errorMessage: null } : undefined,

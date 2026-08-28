@@ -1910,6 +1910,15 @@ async function enqueueFollowUps(
 // discards it — but only if the outcome is RETURNED rather than awaited-and-swallowed inside an
 // adapter, which type-checks just as happily. Return it directly.
 //
+// AND IT MUST ACCEPT AND FORWARD THE SWEEP'S SETTLEMENT PREREQUISITE (o3d-0bfh r16, Codex HIGH).
+// The dep's ninth argument is a condition the SWEEP must have made durable — its terminal warnings —
+// before the deferred-receipt fence may clear the obligation generation. `enqueueSalesInvoiceFollowUps`
+// below takes no such argument today, and a function with fewer parameters is assignable to a
+// signature with more: a binding wired without threading it would compile, run, and clear the marker
+// before the warning that permits the settlement was written. That is the r16 finding, and on this
+// connector it would arrive silently. Thread it into the `registerDeferredOrderReceipts` obligation
+// exactly as the Xero processor does, or do not bind the sweep.
+//
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // THE MARKER IS STILL CLAIMED HERE, AND THAT IS STILL NOT A CONTRADICTION (r10 finding 1).
 //

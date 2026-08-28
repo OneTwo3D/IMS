@@ -200,6 +200,9 @@ export type DeferredReceiptRedriveResult = {
  *   • `unwritable` — the clearing write failed; the marker stands.
  *   • `retained`   — the fence found a receipt still awaiting registration, so nothing was cleared.
  *   • `not-held`   — the caller handed over no obligation, so there was none to clear.
+ *   • `prerequisite-unmet` — the receipts settled, but the CALLER's own settlement prerequisite did
+ *     not (o3d-0bfh r16). Nothing was cleared, and the caller must not clear it either: it is the
+ *     party that just said its own settlement cannot be recorded.
  *   • `unfenced`   — the pass answered before the fence ran, on a fact no later receipt can change
  *     (payments do not post on this connector at all; the order no longer exists). ONLY on this
  *     answer may a caller clear a marker of its own.
@@ -208,6 +211,7 @@ export type DeferredReceiptRelease =
   | FollowUpObligationReleaseOutcome
   | 'retained'
   | 'not-held'
+  | 'prerequisite-unmet'
   | 'unfenced'
 
 /**
@@ -227,6 +231,29 @@ export type DeferredReceiptObligation = {
   generation: Date | null
   /** What re-drives an obligation this call leaves behind. Required — see the type's header. */
   recovery: FollowUpObligationRecovery
+  /**
+   * WHAT ELSE MUST ALREADY BE DURABLE BEFORE THIS GENERATION MAY BE CLEARED (o3d-0bfh r16, Codex
+   * HIGH).
+   *
+   * The fence knows one half of the settlement question — whether any receipt on this order is still
+   * awaiting registration. It cannot know the other half, because the other half belongs to the
+   * CALLER: the back-reference sweep discharges this same generation only once it has PERSISTED the
+   * warning naming what a retention tombstone's compaction destroyed, and only once the sale's
+   * invoice date is either recovered or announced as unrecoverable. Both are terminal notices — the
+   * loss they describe cannot be undone by a later run — so a marker cleared before they are on
+   * record retires the work and the notice together.
+   *
+   * r15 handed the generation down to this module so the clear could be taken under the order lock.
+   * That closed the receipt race and, by the same move, put the clear BEFORE those caller-side
+   * writes: a release that outruns its own evidence. So the caller states its condition here, and
+   * the clear is not attempted until this answers true.
+   *
+   * Run OUTSIDE the fence transaction, between a fenced re-read that found nothing awaiting and the
+   * fenced release itself — see {@link dischargeDeferredReceiptObligation}. It must not throw; a
+   * caller whose prerequisite cannot answer must answer `false`, which is the safe direction (the
+   * marker stays and the row comes back).
+   */
+  settlementPrerequisite?: () => Promise<boolean>
 }
 
 /**
@@ -288,15 +315,72 @@ const RECEIPT_FENCE_TX_OPTIONS = { maxWait: 5000, timeout: 10000 }
 
 /**
  * Re-read every receipt on this order under the sales-order lock and, only if none awaits
- * registration, clear the caller's obligation generation in the SAME transaction.
+ * registration AND the caller's own settlement prerequisite holds, clear the caller's obligation
+ * generation in the SAME transaction as that re-read.
  *
  * Exported so the interleaving regression test can drive the fence directly rather than through a
  * connector, and so nothing has to re-implement "is this order finished with?" a second time.
  *
- * NEVER re-reads the caller's snapshot. The `receipts` selection, the sync rows and the release are
- * all inside one transaction that holds `lockSalesOrder`.
+ * NEVER re-reads the caller's snapshot. The `receipts` selection, the sync rows and the release all
+ * happen inside a transaction that holds `lockSalesOrder`, and a release NEVER happens in a
+ * different transaction from the re-read that permitted it — which is the property, rather than the
+ * number of transactions the call takes.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY IT IS SPLIT IN TWO WHEN A PREREQUISITE IS HANDED OVER (o3d-0bfh r16, Codex HIGH).
+ *
+ * r15 put the release inside the fence, which is right and stays. What it also did was make the
+ * clear the FIRST of the caller's settlement writes rather than the last: the back-reference sweep
+ * hands its generation down here, and only afterwards persists the warning that says WHY a
+ * tombstone's follow-ups will never run. A warning that then failed to persist left the row with its
+ * obligation already discharged — SYNCED, linked, marker null — which the next sweep reads as a
+ * reconciled row and stamps in silence. The compacted payment registration is gone, and so is the
+ * notice that was supposed to gate its loss.
+ *
+ * So the two facts are established in order, each under the lock, with the caller's write between
+ * them:
+ *
+ *   1. A FENCED RE-READ that clears nothing. If a receipt is still awaiting registration this
+ *      answers `retained` and stops — the caller is not told to announce anything, which keeps the
+ *      existing rule that a terminal discard is never announced on a pass that also failed to
+ *      register a receipt.
+ *   2. THE CALLER'S PREREQUISITE, outside any transaction. Deliberately not run inside the fence:
+ *      it writes to the activity log and reads the order, and holding the sales-order row lock —
+ *      the lock `addPayment` takes on the money path — across a caller's I/O is how the sweep and
+ *      the live path would deadlock. The failure being gated on is precisely a slow or unavailable
+ *      log, which is the worst thing to hold that lock through.
+ *   3. THE FENCED RELEASE, over a FRESH re-read. A receipt that commits between (1) and (3) is seen
+ *      by (3) and keeps the marker, exactly as r15 requires — the window is not reopened by the
+ *      split, because the release still only ever happens in the same transaction as a re-read that
+ *      found nothing awaiting. The only cost is that a terminal warning can be announced once for a
+ *      row that then retains its marker; the row is not settled, so it comes back and re-announces,
+ *      which is noise rather than loss.
+ * ---------------------------------------------------------------------------
  */
 export async function dischargeDeferredReceiptObligation(
+  orderId: string,
+  posted: PostedInvoiceEvidence,
+  obligation: DeferredReceiptObligation | null,
+): Promise<{ awaiting: number; release: DeferredReceiptRelease }> {
+  const prerequisite = obligation?.settlementPrerequisite
+  // No prerequisite stated: one pass, exactly as r15 left it. Every connector post path is here.
+  if (!prerequisite) return fencedReceiptPass(orderId, posted, obligation)
+  // (1) The obligation is WITHHELD from this pass — `null` is what makes it clear nothing — so its
+  // answer is only ever "is anything still awaiting?".
+  const observed = await fencedReceiptPass(orderId, posted, null)
+  if (observed.awaiting > 0) return observed
+  // (2) The caller's own settlement evidence, before anything is discharged on the strength of it.
+  if (!(await prerequisite())) return { awaiting: 0, release: 'prerequisite-unmet' }
+  // (3) And only now the release, fenced again over receipts as they are at this instant.
+  return fencedReceiptPass(orderId, posted, obligation)
+}
+
+/**
+ * ONE fenced pass: take the order lock, re-read the receipts, and release the caller's generation in
+ * the same transaction if — and only if — nothing awaits registration and a generation was handed
+ * over. Handed `null` it is a pure read, which is what the first pass above needs.
+ */
+async function fencedReceiptPass(
   orderId: string,
   posted: PostedInvoiceEvidence,
   obligation: DeferredReceiptObligation | null,

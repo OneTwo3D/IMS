@@ -172,13 +172,22 @@ mock.module('@/lib/accounting', {
 /** The generation the "caller" claimed — the exact value the fenced release must clear on. */
 const OBLIGATION = new Date('2026-08-01T00:00:00.000Z')
 
-async function redrive(postedInvoiceId = 'INV-1', obligation: Date | null = OBLIGATION) {
+async function redrive(
+  postedInvoiceId = 'INV-1',
+  obligation: Date | null = OBLIGATION,
+  /**
+   * o3d-0bfh r16: the CALLER'S own settlement prerequisite. Absent on every test above, which is the
+   * post path's shape — one fenced pass, exactly as r15 left it.
+   */
+  settlementPrerequisite?: () => Promise<boolean>,
+) {
   const m = await import('@/lib/domain/accounting/invoice-payment-enqueue')
   return m.registerDeferredOrderReceipts('order-1', { connector: 'xero', accountingInvoiceId: postedInvoiceId }, {
     syncLogId: 'sync-1',
     connector: 'xero',
     generation: obligation,
     recovery: { consumer: 'sweep' },
+    ...(settlementPrerequisite ? { settlementPrerequisite } : {}),
   })
 }
 
@@ -684,4 +693,127 @@ test('[o3d-0bfh r15] a fence that cannot be taken retains the marker rather than
   assert.equal(result.reason, 'failed')
   assert.equal(result.release, 'retained')
   assert.deepEqual(state.markerClears, [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r16 (Codex HIGH) — THE RELEASE MUST NOT OUTRUN THE CALLER'S OWN EVIDENCE.
+//
+// r15 put the clear inside the fence, which is right. What it also did was make the clear the FIRST
+// of the caller's settlement writes: the back-reference sweep hands its generation down here and
+// only afterwards persists the terminal warning that says WHY a tombstone's follow-ups will never
+// run. A warning that then failed to persist left the row discharged with nothing recording the loss.
+//
+// So a caller may state a prerequisite, and it is answered BETWEEN a fenced re-read that found
+// nothing awaiting and the fenced release. The fence is not weakened: the release still only ever
+// happens in the same transaction as a re-read that found nothing awaiting — which is what the
+// third test here drives, by landing a receipt in the window the split creates.
+// ---------------------------------------------------------------------------
+
+const ONE_SETTLED_RECEIPT = () => {
+  state.payments = [...ONE_RECEIPT]
+  state.syncRows = [{
+    id: 'log-existing',
+    status: 'SYNCED',
+    externalTransactionId: null,
+    errorMessage: null,
+    retryCount: 0,
+    payload: { amount: 100, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' },
+  }]
+}
+
+test('[o3d-0bfh r16] a prerequisite that cannot be met clears NOTHING, and says which of the two failed', async () => {
+  // The regression. Nothing is awaiting registration — the receipt half is finished — and the marker
+  // must still survive, because the caller has just said its own record of the settlement is not
+  // durable.
+  //
+  // MUTATION THAT KILLS THIS: drop the prerequisite branch from
+  // `dischargeDeferredReceiptObligation` (call `fencedReceiptPass(orderId, posted, obligation)`
+  // unconditionally). The marker is then cleared over a warning that was never written.
+  ONE_SETTLED_RECEIPT()
+
+  const result = await redrive('INV-1', OBLIGATION, async () => false)
+
+  assert.deepEqual(
+    state.markerClears, [],
+    'THE LOAD-BEARING ASSERTION: no write cleared the obligation. The caller is the party that just '
+    + 'said its terminal notice is not on record, and the marker is what brings the row back for it.',
+  )
+  assert.equal(result.release, 'prerequisite-unmet',
+    'and it is named, not folded into `retained`: the receipts DID settle, and the caller has to be able '
+    + 'to tell "a receipt is still owed" from "my own notice did not land"')
+  assert.equal(result.settled, true, 'the receipt half is genuinely finished, and saying otherwise would be a second untruth')
+})
+
+test('[o3d-0bfh r16] a prerequisite that IS met is answered BEFORE the clear, and the clear still happens once', async () => {
+  // The control. Without it, "nothing was cleared" above is also what a fence that never clears
+  // anything produces.
+  ONE_SETTLED_RECEIPT()
+  let clearsWhenAsked = -1
+
+  const result = await redrive('INV-1', OBLIGATION, async () => {
+    clearsWhenAsked = state.markerClears.length
+    return true
+  })
+
+  assert.equal(clearsWhenAsked, 0,
+    'the caller is asked while the marker is still there — being asked after the clear is the whole finding')
+  assert.equal(result.release, 'released')
+  assert.equal(result.settled, true)
+  assert.equal(state.markerClears.length, 1, 'exactly one clearing write, after the answer')
+  assert.deepEqual(state.markerClears[0].where, { id: 'sync-1', backReferenceFollowUpsPendingAt: OBLIGATION },
+    'still fenced on the generation THIS pass was handed')
+})
+
+test('[o3d-0bfh r16] a receipt landing in the window the split creates is STILL seen, and keeps the marker', async () => {
+  // THE FENCE IS NOT WEAKENED BY THE SPLIT. Splitting the pass in two opens a window between the
+  // re-read and the release — so the release re-reads AGAIN, under the lock, and a receipt that
+  // commits while the caller is writing its warning is seen by that second pass exactly as r15
+  // requires.
+  //
+  // MUTATION THAT KILLS THIS: have the second phase release without re-reading (e.g. call
+  // `releaseFollowUpObligation` directly once the prerequisite answers true). The late receipt is
+  // then settled over — the r15 defect, reopened one step further along.
+  ONE_SETTLED_RECEIPT()
+
+  const result = await redrive('INV-1', OBLIGATION, async () => {
+    // `addPayment` commits while the caller is persisting its notice: the receipt lands on the NEXT
+    // lock acquisition, which is the release's own.
+    onOrderLock = () => {
+      state.payments = [...state.payments, {
+        id: 'pay-late', amount: 25, currency: 'GBP', method: 'card', reference: null, paidAt: new Date('2026-08-02T00:00:00.000Z'),
+      }]
+    }
+    return true
+  })
+
+  assert.deepEqual(state.markerClears, [], 'the late receipt keeps the marker it read as held')
+  assert.equal(result.settled, false)
+  assert.equal(result.reason, 'left-unregistered')
+  assert.equal(result.awaiting, 1)
+  assert.equal(result.release, 'retained')
+})
+
+test('[o3d-0bfh r16] a receipt already awaiting is answered BEFORE the caller is ever asked', async () => {
+  // The ordering that keeps the sweep's existing rule intact: a terminal loss is never announced on
+  // a pass that also failed to register a receipt, because announcing it is what permits the
+  // settlement. The first fenced pass answers that without consulting the caller at all.
+  //
+  // MUTATION THAT KILLS THIS: ask the prerequisite before the `awaiting > 0` check.
+  ONE_SETTLED_RECEIPT()
+  // A receipt commits the instant the FIRST fenced pass takes the lock — the r15 window — so that
+  // pass finds one awaiting and must answer on it alone.
+  onOrderLock = () => {
+    state.payments = [...state.payments, {
+      id: 'pay-late', amount: 25, currency: 'GBP', method: 'card', reference: null, paidAt: new Date('2026-08-02T00:00:00.000Z'),
+    }]
+  }
+  let asked = false
+
+  const result = await redrive('INV-1', OBLIGATION, async () => { asked = true; return true })
+
+  assert.equal(asked, false, 'the caller is not asked to announce anything while a receipt is still owed')
+  assert.deepEqual(state.markerClears, [])
+  assert.equal(result.settled, false)
+  assert.equal(result.awaiting, 1)
+  assert.equal(result.release, 'retained')
 })
