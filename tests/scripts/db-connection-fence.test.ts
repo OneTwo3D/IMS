@@ -2511,7 +2511,7 @@ test('o3d-2sm1.5 r20: a unit that can define DATABASE_URL anywhere but that file
       const empty = mkdtempSync(join(tmpdir(), 'ims-nopath-'))
       const absent = spawnSync('/bin/bash', ['-c', bash, 'ask', '/opt/app/.env', 'one-two-inventory.service'], {
         encoding: 'utf8',
-        env: { PATH: empty },
+        env: { ...process.env, PATH: empty },
       })
       rmSync(empty, { recursive: true, force: true })
       assert.match((absent.stdout ?? '').trim(), /^REFUSE systemctl is not available/, `${script}: no systemctl is a refusal`)

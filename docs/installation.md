@@ -631,8 +631,15 @@ supply the values:
   already read `DEPLOY_ADMIN_DATABASE_URL` from — with a strict reader (`resolve_db_identity`,
   the same twenty lines in both) that **accepts only a URL stating all four**. No port, no path,
   more than one path segment, a `?host=`/`?port=`/`?user=`/`?dbname=`/`?database=` query
-  parameter, a percent-escape, whitespace: each one is a **refusal** that stops the run before
-  anything is stopped or migrated. Never a default. In particular the libpq unix-socket spelling
+  parameter, a percent-escape **anywhere in the query string**, whitespace: each one is a
+  **refusal** that stops the run before anything is stopped or migrated. Never a default.
+  The query-string rule is deliberately blunt because the driver decodes query **keys**:
+  measured against the installed `pg-connection-string`, `?ho%73t=other-cluster` arrives as
+  `host=other-cluster`, `?po%72t=6543` as `port=6543` and `?u%73er=other` as `user=other`, none of
+  which a scan for the literal names catches. Decoding it here to compare properly is the
+  reimplementation this reader exists to avoid, so an escape in a *harmless* parameter is refused
+  too — telling the two apart is the thing that cannot be done without decoding. Write the query
+  plainly. In particular the libpq unix-socket spelling
   `postgres://role@/db?host=/var/run/postgresql` is **refused** here — it states neither host nor
   port in its authority and puts the host in the query string, which is the one shape this reader
   will not accept. Nothing this repo ships composes that form (`install.sh` and `.env.example`
@@ -649,6 +656,41 @@ refusal in place of a guess.
 If your `DATABASE_URL` does not state all four, write it as
 `postgresql://ROLE:PASSWORD@HOST:PORT/DATABASE`. A `deploy.sh` run that only needs no schema
 change can also use `--skip-migrate`, which moves nothing and needs no fence.
+
+**And the file it is read from must be the file the service uses.** Supplying the identity out of
+`APP_DIR/.env` is only worth anything if that file is what gives the *service* its `DATABASE_URL`,
+and systemd can put a different one there: `Environment=DATABASE_URL=`, a drop-in that adds one,
+`PassEnvironment=`, `UnsetEnvironment=`, or a second `EnvironmentFile=`. dotenv does not overwrite
+a variable that is already set, so the fence, the migration and the release would all agree with
+each other about the `.env` database while the restarted application connects somewhere else — a
+migration on a database nothing fenced, and a new build on a database nothing migrated.
+
+So `deploy.sh` and `update.sh` ask systemd **one existence question about one variable** before
+they fence, preflight or re-fence — *can anything other than the file we read define
+`DATABASE_URL` for this unit?* — through
+`systemctl show -p LoadState -p Environment -p EnvironmentFiles -p PassEnvironment
+-p UnsetEnvironment`, which reports those properties **composed**, with every drop-in already
+folded in. This is not the environment reconstruction the helper lost: no value is computed and no
+precedence is resolved. Which of several definitions would *win* is the unbounded question and is
+never asked. Any answer but "only that file" is a **refusal** naming what else defines it:
+
+* `DATABASE_URL` in the unit's `Environment=`, `PassEnvironment=` or `UnsetEnvironment=`;
+* **any second `EnvironmentFile=`** — refused *without being read*, because that it may define the
+  variable is enough, and reading it to find out puts the precedence question straight back;
+* a unit that loads **no** environment file, because the variable would then reach the application
+  through its own dotenv loader, by Next's rules (`.env.local`, the per-mode overlays) rather than
+  systemd's. Add `EnvironmentFile=` for the app's `.env`, which is what `install.sh` writes;
+* a unit systemd reports as anything but `loaded`, a host with no `systemctl`, or no unit at all.
+
+`install.sh` is **exempt**: it owns the four values, creates the role and the database with them
+and composes `DATABASE_URL` out of them, so it parses nothing and has no file to be wrong about.
+
+One thing this question cannot see, stated rather than papered over: an `ExecStart=` running a
+**wrapper that exports `DATABASE_URL` itself** is invisible to `systemctl show`, because that
+definition lives inside a program. Closing that would mean reading programs, which is unbounded
+again. It is the standing argument for eventually making the four values a **deployment-owned
+configuration input** these scripts read outright, rather than deriving them from a URL that is
+only probably the one the service uses.
 
 **Being told an identity is not the same as being on it**, so what can be proven still is:
 

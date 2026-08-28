@@ -650,6 +650,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 ok() { :; }
@@ -681,6 +688,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 success() { :; }
@@ -711,6 +725,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 success() { :; }
@@ -1028,6 +1049,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 info() { :; }
@@ -1059,6 +1087,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 info() { :; }
@@ -1090,6 +1125,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 info() { :; }
@@ -1565,6 +1607,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 ok() { :; }
@@ -1605,6 +1654,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 success() { :; }
@@ -1642,6 +1698,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 success() { :; }
@@ -2191,6 +2254,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 `,
@@ -2232,6 +2302,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 `,
@@ -2268,6 +2345,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 `,
@@ -3315,6 +3399,13 @@ DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localho
 DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
 require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
 DB_IDENTITY_REASON=''
+# o3d-2sm1.5 r20: and the second half of the same refusal — whether the file that identity was
+# read from is the only thing that can define DATABASE_URL for the service. Stubbed to "yes" here
+# because these harnesses are about the ORDER of the fence, the stop and the migration, not about
+# where the identity came from; tests/scripts/db-connection-fence.test.ts exercises the question
+# itself against a fake systemctl.
+require_env_file_is_sole_definition() { return 0; }
+DB_IDENTITY_SOURCE_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 info(){ :; }
