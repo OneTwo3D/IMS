@@ -4282,7 +4282,11 @@ for (const entry of FENCE_HARNESS) {
       assert.match(calls(dir), /--fence/, 'precondition: the fence was attempted')
       assert.match(calls(dir), /--release/, 'and the cleanup asked the database')
       assert.ok(!result.output.includes('REACHED THE MIGRATION'), 'exit 5 must abort like exit 3 does')
-      assert.match(result.output, /FENCE IS STANDING/, 'and say the revokes are committed, not that nothing happened')
+      // "MAY BE standing": exit 5 now also covers a COMMIT whose acknowledgement was lost, where
+      // the transaction's fate is unknown and unknown is not the not-committed case (o3d-2sm1.5,
+      // Codex r14 HIGH). What the entrypoint must say either way is that this run may have
+      // changed the database — never that nothing happened.
+      assert.match(result.output, /FENCE MAY BE STANDING/, 'and say the revokes may be in force, not that nothing happened')
       assert.match(result.output, /TRAP RELEASE REFUSED/, 'a record lost under a committed fence is not releasable')
       assert.ok(!result.output.includes('TRAP RELEASE SAID OK'), 'and must never be walked past')
       assert.match(result.output, /RECORD IS GONE/, 'with the grantees it can no longer name')

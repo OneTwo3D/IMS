@@ -609,6 +609,34 @@ now **refuse** unless the two URLs name the same host, port and database *and* t
 reports it is attached to that database. A loopback address, `localhost` and a unix-socket
 directory are treated as the same machine; anything else that differs is a refusal, not a guess.
 
+**The comparison is of the connection node-postgres will really open, not of the URL's obvious
+parts** (o3d-2sm1.5). `pg-connection-string`, which `pg` uses, copies the **query string** into the
+connection config first and fills `host`, `port` and `user` from the authority only if the query
+left them unset — so those three parameters *redirect the connection*. A `DATABASE_URL` of
+`postgres://app@localhost:5432/appdb?host=remote.example&port=6432&user=actual` authenticates as
+`actual` against `remote.example:6432`, and the identity proof used to read it as `app` at
+`localhost:5432` and pass it against a local admin URL. The parse now resolves the **effective**
+host, port and login role the same way the driver does, and:
+
+* a URL whose authority and query string **disagree** about the host, port or user is **refused**
+  rather than resolved — the driver would take the query value, but an environment that
+  contradicts itself about which server or which role it means is not something to pick a winner
+  from;
+* a `?dbname=` / `?database=` parameter is **refused** when it names anything but the URL path,
+  because the driver overwrites the database from the path unconditionally and the parameter does
+  nothing at all;
+* `postgres://role@/db?host=/var/run/postgresql` — a login role with no host in the authority — is
+  read the way the driver reads it, not rejected as unparseable.
+
+**And the role is asked of the connection, not derived from the URL** (o3d-2sm1.5). `PGUSER`, a
+`.pgpass` entry, an ident or peer map and `options=-c role=` are all outside any URL. Every mode
+now reads `session_user` and `current_user` from the connection it opened, alongside
+`current_database()`, and refuses when the connection will not say what it logged in as, when it
+is **running as** a different role than it **logged in as** (`CONNECT` belongs to the login role,
+while every ACL answer would be given as the assumed one), or when `DEPLOY_ADMIN_DATABASE_URL`
+names a role other than the one that actually logged in — that role is the one grantee the fence
+deliberately does not revoke, and the one `--release` restores against.
+
 **And `--release` never reads a missing record as "no fence".** A record that was never written
 and one a power cut ate are indistinguishable from the file system, so absence is not an answer:
 `--release` asks the database instead. **Neither answer it can get is a success**, because
@@ -645,9 +673,20 @@ only on exit 0, so a run that had locked PUBLIC, monitoring and BI out was recor
 fence to its name; a record lost during cleanup then took the exit-4 *warning* branch and let the
 run claim a release nobody performed. So:
 
-* **exit 3** — nothing was revoked. **exit 5** (`EXIT_FENCE_STANDING`) — the `REVOKE`s are
-  committed and in force, and this run still cannot call the database fenced. Every outcome after
-  the commit returns 5, a thrown error included.
+* **exit 3** — nothing was revoked. **exit 5** (`EXIT_FENCE_STANDING`) — the `REVOKE`s may be in
+  force, and this run still cannot call the database fenced. Every outcome from the moment `COMMIT`
+  is **issued** returns 5, a thrown error included.
+* **A lost `COMMIT` acknowledgement is one of those outcomes** (o3d-2sm1.5). PostgreSQL can commit
+  the `REVOKE`s and then lose the connection before the acknowledgement arrives — a dropped
+  connection, a timeout, a server restart an instant after the WAL flush. The client's promise
+  rejects, and that used to be read as "the transaction did not commit": it rolled back into thin
+  air, exited 1, and all three entrypoints recorded a run with no fence to its name over a database
+  whose `CONNECT` may have been revoked from PUBLIC, monitoring, backup, BI and a second
+  application. **An absent answer is not a negative one.** The post-commit boundary is now the
+  moment `COMMIT` is issued, not the moment it is acknowledged; an unacknowledged commit reports
+  exit 5, raises the same sticky flag, prints the `GRANT`s and a `SELECT datacl …` to check with,
+  issues **no** `ROLLBACK` (a transaction told to commit is not one the run can take back) and
+  leaves `db-connect-fence.json` exactly where it was published.
 * `deploy.sh`, `update.sh` and `install.sh` **raise the sticky flag on every post-commit result**,
   exit 5 as well as exit 0, in `fence_db_connections()` and in the exit trap's re-fence, and abort
   saying the fence is standing rather than "the fence failed".
