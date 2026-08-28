@@ -2727,7 +2727,7 @@ test('o3d-2sm1.5 r22: a DATABASE_URL that changes between the pin and the fence 
           'deleted, which the unit ignores rather than fails on',
           plain,
           `rm -f "$1/.env"`,
-          /no longer exists.*leading '-'.*dotenv overlays/s,
+          /no longer exists[\s\S]*leading '-'[\s\S]*dotenv overlays/,
         ],
         [
           'a symlink retargeted at a different file',
